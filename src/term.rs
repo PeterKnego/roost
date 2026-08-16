@@ -4,26 +4,38 @@ use crate::session;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use tungstenite::handshake::server::{Request as WsRequest, Response as WsResponse};
-use tungstenite::protocol::Role;
-use tungstenite::{accept_hdr, Message, WebSocket};
+use tungstenite::protocol::{Role, WebSocketConfig};
+use tungstenite::{accept_hdr_with_config, Message, WebSocket};
+
+/// See wsconn.rs's identical constant for the rationale: bound below
+/// tungstenite's 64 MiB default so an oversized frame is refused at the
+/// protocol layer rather than buffered, with headroom above the 2 MB text
+/// cap for framing overhead. This socket never carries file text, but there
+/// is no reason its cap should be looser than the one that does.
+const MAX_FRAME_BYTES: usize = crate::workspace::MAX_TEXT_BYTES * 4;
 
 pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     let mut path = String::new();
     // WebSocket handshakes bypass the same-origin policy: without this check any
     // page the user visits can open this socket and get a shell. See spec §Security.
     let allowed = crate::config::allowed_origins();
-    let accepted = accept_hdr(stream, |req: &WsRequest, resp: WsResponse| {
-        path = req.uri().path().to_string();
-        let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
-        if !crate::origin::origin_allowed(origin, &allowed) {
-            eprintln!("deadlight: rejected ws origin={origin:?} (set allowed_origins)");
-            return Err(tungstenite::http::Response::builder()
-                .status(403)
-                .body(Some("origin not allowed".to_string()))
-                .expect("static 403"));
-        }
-        Ok(resp)
-    });
+    let config = WebSocketConfig { max_message_size: Some(MAX_FRAME_BYTES), ..Default::default() };
+    let accepted = accept_hdr_with_config(
+        stream,
+        |req: &WsRequest, resp: WsResponse| {
+            path = req.uri().path().to_string();
+            let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
+            if !crate::origin::origin_allowed(origin, &allowed) {
+                eprintln!("deadlight: rejected ws origin={origin:?} (set allowed_origins)");
+                return Err(tungstenite::http::Response::builder()
+                    .status(403)
+                    .body(Some("origin not allowed".to_string()))
+                    .expect("static 403"));
+            }
+            Ok(resp)
+        },
+        Some(config),
+    );
     let Ok(mut ws_read) = accepted else { return };
 
     // /ws/{project}/term/{name}

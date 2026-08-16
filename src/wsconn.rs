@@ -7,8 +7,16 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tungstenite::handshake::server::{Request as WsRequest, Response as WsResponse};
-use tungstenite::protocol::Role;
-use tungstenite::{accept_hdr, Message, WebSocket};
+use tungstenite::protocol::{Role, WebSocketConfig};
+use tungstenite::{accept_hdr_with_config, Message, WebSocket};
+
+/// tungstenite defaults to a 64 MiB max message; an `EditBuffer` intent is
+/// capped at `workspace::MAX_TEXT_BYTES` of *text*, but the frame carrying
+/// it is JSON (the text gets escaped, plus the envelope), so the protocol
+/// ceiling needs headroom above that — this is a coarse backstop against an
+/// oversized frame being buffered at all, not the precise limit. The
+/// precise, friendly-error limit is enforced in `workspace::apply_layout`.
+const MAX_FRAME_BYTES: usize = crate::workspace::MAX_TEXT_BYTES * 4;
 
 /// Unsubscribes on drop, not just on the happy path: if `Hub::handle` ever
 /// panics, unwinding runs this instead of the tail of `handle` below, so the
@@ -31,18 +39,23 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     // any page the user visits can drive this socket, and this socket can
     // write files. See spec §Security and src/term.rs's identical check.
     let allowed = crate::config::allowed_origins();
-    let accepted = accept_hdr(stream, |req: &WsRequest, resp: WsResponse| {
-        let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
-        if !crate::origin::origin_allowed(origin, &allowed) {
-            eprintln!("deadlight: rejected workspace ws origin={origin:?} (set allowed_origins)");
-            let body = Some("origin not allowed".to_string());
-            return Err(tungstenite::http::Response::builder()
-                .status(403)
-                .body(body)
-                .expect("static 403 response"));
-        }
-        Ok(resp)
-    });
+    let config = WebSocketConfig { max_message_size: Some(MAX_FRAME_BYTES), ..Default::default() };
+    let accepted = accept_hdr_with_config(
+        stream,
+        |req: &WsRequest, resp: WsResponse| {
+            let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
+            if !crate::origin::origin_allowed(origin, &allowed) {
+                eprintln!("deadlight: rejected workspace ws origin={origin:?} (set allowed_origins)");
+                let body = Some("origin not allowed".to_string());
+                return Err(tungstenite::http::Response::builder()
+                    .status(403)
+                    .body(body)
+                    .expect("static 403 response"));
+            }
+            Ok(resp)
+        },
+        Some(config),
+    );
     let Ok(mut ws_read) = accepted else { return };
 
     // Obtained *before* any hub lock is taken, and the registry lock inside

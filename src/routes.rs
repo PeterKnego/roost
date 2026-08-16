@@ -135,7 +135,14 @@ fn serve_frag(
                 Err(e) => http::html(w, &render::hint(&e)),
             }
         }
-        ["theme.css"] => match std::fs::read(dir.join(".deadlight/theme.css")) {
+        // Resolved through `safe_resolve`, not a bare `fs::read`, so a
+        // `.deadlight/theme.css` that is a symlink pointing outside the
+        // project (planted by a cloned repo) is refused rather than served
+        // to the browser as text/css. Every other file read in this module
+        // already goes through this confinement; this one predates it.
+        ["theme.css"] => match projects::safe_resolve(&dir, ".deadlight/theme.css")
+            .and_then(|p| std::fs::read(&p).map_err(|e| e.to_string()))
+        {
             Ok(css) => http::respond(w, 200, "OK", "text/css; charset=utf-8", &css),
             Err(_) => http::not_found(w, "no theme.css"),
         },

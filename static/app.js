@@ -56,7 +56,15 @@ function onEvent(ev) {
     case "StatusChanged": refreshKind("Changes"); break;
     case "FileChanged": refreshKind("Diff"); break;
     case "SaveConflict": showConflict(ev); break;
-    case "Error": console.warn("deadlight:", ev.msg); break;
+    case "Error":
+      // Every server-side failure funnels through here (already-exists,
+      // directory-not-empty, path-outside-project, too-many-buffers,
+      // no-buffer-for-X, save I/O errors, malformed intents...) — without a
+      // visible banner, e.g. deleting a non-empty directory looks like a
+      // silent no-op. console.warn stays too, for anyone actually watching devtools.
+      console.warn("deadlight:", ev.msg);
+      showError(ev.msg);
+      break;
   }
 }
 
@@ -337,6 +345,22 @@ function showConflict(ev) {
   reload.onclick = () => { send({ t: "CloseBuffer", rel: ev.rel }); box.remove(); };
   box.append(over, reload);
   document.querySelector('.pane[data-pane="2"] .content').prepend(box);
+}
+
+// Transient, dismissible: reuses .conflict's border/padding/button styling
+// (positioned as a fixed overlay via .error-banner) rather than inventing a
+// new visual language just for this.
+function showError(msg) {
+  const box = document.createElement("div");
+  box.className = "conflict error-banner";
+  const text = document.createElement("b");
+  text.textContent = `Error: ${msg}`;
+  const dismiss = document.createElement("button");
+  dismiss.textContent = "dismiss";
+  dismiss.onclick = () => box.remove();
+  box.append(text, dismiss);
+  document.body.appendChild(box);
+  setTimeout(() => box.remove(), 8000);
 }
 
 function closeTab(pi, ti, t) {
