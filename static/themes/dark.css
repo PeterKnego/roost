@@ -1,0 +1,6 @@
+:root {
+  --bg: #0d1117; --bg2: #161b22; --fg: #c9d1d9; --muted: #8b949e;
+  --accent: #58a6ff; --border: #30363d; --sel-bg: #1f6feb33;
+  --add-bg: #12261e; --add-fg: #3fb950; --del-bg: #2d1214; --del-fg: #f85149;
+  --hunk: #a371f7;
+}
