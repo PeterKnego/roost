@@ -52,7 +52,7 @@ function onEvent(ev) {
       if (b) { b.stale = true; render(); }
       break;
     }
-    case "TreeChanged": refreshKind("Tree"); break;
+    case "TreeChanged": refreshTree(); break;
     case "StatusChanged": refreshKind("Changes"); break;
     case "FileChanged": refreshKind("Diff"); break;
     case "SaveConflict": showConflict(ev); break;
@@ -206,6 +206,45 @@ function mountTab(content, t) {
     content.innerHTML = html;
     content.querySelectorAll("pre code").forEach((b) => window.hljs && hljs.highlightElement(b));
     wireFragment(content);
+    // Tree fragments carry lazy <details hx-get="...tree?dir=..."
+    // hx-trigger="toggle once"> nodes (render::tree_level). htmx only binds
+    // hx-* attributes when it walks the DOM itself (page boot, or its own
+    // ajax swaps); content dropped in via plain innerHTML — like this fetch
+    // — is invisible to it until told, so a freshly loaded tree needs an
+    // explicit process() or every closed directory would be inert forever.
+    if (t.k === "Tree") window.htmx && htmx.process(content);
+  });
+}
+
+// TreeChanged fires on every filesystem write — including every file Claude
+// edits from a terminal pane, which is deadlight's core use case — so this
+// must NOT do what refreshKind("Tree") does: a full re-fetch replaces the
+// whole tree with a fresh one-level render that only pre-expands the
+// currently open file's path, collapsing everything else the user had
+// opened. Expansion is deliberately not server state (no protocol change),
+// so the only place to learn what's currently expanded is the DOM itself:
+// re-fetch each open <details data-rel> in place and leave the rest alone.
+function refreshTree() {
+  if (!state) return;
+  state.panes.forEach((pane, pi) => {
+    const active = pane.tabs[pane.active];
+    if (!active || active.k !== "Tree") return;
+    const content = document.querySelector(`.pane[data-pane="${pi}"] .content`);
+    if (!content) return;
+    content.querySelectorAll("details[open][data-rel]").forEach((d) => {
+      const rel = d.dataset.rel;
+      const url = `/frag/${PROJECT}/tree?dir=${encodeURIComponent(rel)}`;
+      fetch(url).then((r) => r.text()).then((html) => {
+        // The node this <details> belongs to may itself have been replaced
+        // by an ancestor's refresh completing first; writing into a
+        // detached child is harmless (it's just discarded with the node).
+        const ul = d.querySelector(":scope > ul");
+        if (!ul) return;
+        ul.innerHTML = html;
+        wireFragment(ul);
+        window.htmx && htmx.process(ul);
+      });
+    });
   });
 }
 
@@ -409,6 +448,14 @@ window.onmousemove = (e) => {
 };
 
 window.addEventListener("resize", () => terms.forEach((e) => { try { e.fit.fit(); sendResize(e); } catch {} }));
+
+// A directory's first expand is driven by real htmx (hx-get + hx-trigger
+// "toggle once" on the <details>, see render::tree_level) rather than the
+// manual fetch() path everything else in this file uses, so it never runs
+// through mountTab's own wireFragment() call. Rewire file-click handling on
+// whatever htmx just swapped in — a no-op for the one other thing htmx
+// drives (#gitinfo's status span, which has no a.file to find).
+window.htmx && htmx.on("htmx:afterSwap", (e) => wireFragment(e.detail.target));
 
 const refreshBtn = document.getElementById("refresh");
 if (refreshBtn) refreshBtn.onclick = () => {

@@ -118,6 +118,38 @@ fn diff_traversal_path_is_rejected_with_hint() {
     assert!(!body.contains("root:"));
 }
 
+#[test]
+fn tree_dir_traversal_is_rejected_with_hint_and_leaks_no_listing() {
+    // `dir` is network-supplied and must be confined through
+    // `safe_resolve` the same way `file`'s `path` is (see routes.rs) —
+    // a `dir` that escapes the project must never render a listing.
+    let (d, port) = fixture();
+    std::fs::write(d.path().join("secret.txt"), "top secret\n").unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    // ".." from the project dir resolves to the tempdir root, which holds
+    // `secret.txt` alongside `proj` — a real, canonicalizable escape.
+    let body = ureq::get(&format!("{base}/frag/proj/tree?dir=.."))
+        .call().unwrap().into_string().unwrap();
+    assert!(body.contains("class=\"hint\""));
+    assert!(!body.contains("secret.txt"));
+    assert!(!body.contains("<li"));
+}
+
+#[test]
+fn tree_dir_lazily_returns_a_subdirectorys_children() {
+    let (d, port) = fixture();
+    std::fs::create_dir(d.path().join("proj/sub")).unwrap();
+    std::fs::write(d.path().join("proj/sub/inner.txt"), "").unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    // the root render shows `sub` closed, without its child inlined
+    let root = ureq::get(&format!("{base}/frag/proj/tree")).call().unwrap().into_string().unwrap();
+    assert!(root.contains("data-rel=\"sub\""));
+    assert!(!root.contains("inner.txt"));
+    // the lazy fetch for that same directory returns exactly its children
+    let sub = ureq::get(&format!("{base}/frag/proj/tree?dir=sub")).call().unwrap().into_string().unwrap();
+    assert!(sub.contains("inner.txt"));
+}
+
 // DEADLIGHT_CMD is process-global; both ws tests set it, and if they ran in
 // parallel one could overwrite the other's value mid-connect. Serialize them.
 static WS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

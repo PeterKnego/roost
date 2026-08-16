@@ -64,56 +64,85 @@ pub fn file_fragment(rel: &str, content: &str) -> String {
     }
 }
 
+// Whole-tree eager rendering (the old design) is what made this slow: a
+// 41k-entry project produced 895 KB of HTML and still hit the 4,000-entry
+// budget with ~90% of the tree missing. Instead we render one level at a
+// time, IDE-style — only directories on the currently-open file's path are
+// expanded inline; everything else renders closed and lazily fetches its
+// own children (see the `dir` query param on the `tree` fragment endpoint
+// in routes.rs) the first time the user expands it.
 pub fn tree_fragment(project: &str, dir: &Path, open: &str, hide: &[String]) -> String {
-    let mut budget = 4000usize;
     let mut out = String::from("<ul class=\"tree\">");
-    tree_level(project, dir, "", open, hide, &mut budget, &mut out);
+    tree_level(project, dir, "", open, hide, &mut out);
     out.push_str("</ul>");
-    if budget == 0 {
-        out.push_str("<div class=\"hint\">tree truncated (too many entries)</div>");
-    }
     out
 }
 
-fn tree_level(
-    project: &str,
-    dir: &Path,
-    rel: &str,
-    open: &str,
-    hide: &[String],
-    budget: &mut usize,
-    out: &mut String,
-) {
+/// Renders the immediate children of `dir` as `<li>` items only (no `<ul>`
+/// wrapper) — used both to seed `tree_fragment`'s top level and to answer a
+/// lazy `?dir=` fetch for one previously-closed directory, so a fetched
+/// subtree slots into its parent's `<ul>` the same way the initial render
+/// built it. `rel` is `dir`'s path relative to the project root ("" at the
+/// project root itself).
+///
+/// The 4,000 budget is applied fresh on every call, i.e. per directory
+/// level rather than to the whole recursive walk: an ordinary large project
+/// (many modest directories) never trips it, while one pathological
+/// directory with thousands of direct entries still gets capped.
+pub fn tree_level(project: &str, dir: &Path, rel: &str, open: &str, hide: &[String], out: &mut String) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut entries: Vec<_> = rd.flatten().collect();
     entries.sort_by_key(|e| (e.path().is_file(), e.file_name().to_ascii_lowercase()));
+    let mut budget = 4000usize;
     for e in entries {
-        if *budget == 0 {
-            return;
+        if budget == 0 {
+            out.push_str("<li class=\"hint\">tree truncated (too many entries)</li>");
+            break;
         }
         let name = e.file_name().to_string_lossy().into_owned();
         if crate::projects::SKIP_DIRS.contains(&name.as_str()) || hide.iter().any(|h| h == &name)
         {
             continue;
         }
-        *budget -= 1;
+        budget -= 1;
         let erel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
         if e.path().is_dir() {
             let is_open = open == erel || open.starts_with(&format!("{erel}/"));
-            out.push_str(&format!(
-                "<li><details{}><summary>{}</summary><ul>",
-                if is_open { " open" } else { "" },
-                esc(&name)
-            ));
-            tree_level(project, &e.path(), &erel, open, hide, budget, out);
-            out.push_str("</ul></details></li>");
+            if is_open {
+                // On the open file's path: expand inline, recursively, so
+                // the file is visible on load with no extra round trip.
+                out.push_str(&format!(
+                    "<li><details open data-rel=\"{}\"><summary>{}</summary><ul>",
+                    esc(&erel),
+                    esc(&name)
+                ));
+                tree_level(project, &e.path(), &erel, open, hide, out);
+                out.push_str("</ul></details></li>");
+            } else {
+                // Closed, with an empty <ul>: `data-rel` lets the client find
+                // this node again (TreeChanged re-fetches whatever is
+                // currently expanded), and the hx-get/hx-trigger pair fetches
+                // this directory's children exactly once, on first expand.
+                out.push_str(&format!(
+                    "<li><details data-rel=\"{rel}\" hx-get=\"/frag/{proj}/tree?dir={qrel}\" hx-trigger=\"toggle once\" hx-target=\"find ul\"><summary>{name}</summary><ul></ul></details></li>",
+                    rel = esc(&erel),
+                    proj = crate::http::percent_encode(project),
+                    qrel = crate::http::percent_encode(&erel),
+                    name = esc(&name)
+                ));
+            }
         } else {
+            // No hx-get here: the app wires file clicks itself (wireFragment
+            // in app.js, via data-rel) rather than through htmx's own ajax
+            // pipeline. Leaving hx-get on would make htmx.process() (now
+            // called on tree content so lazy <details> bind — see app.js)
+            // ALSO bind a real click handler on the same anchor, racing our
+            // own and firing a pointless request at a #content target that
+            // doesn't exist in the four-pane layout.
             let sel = if open == erel { " sel" } else { "" };
             out.push_str(&format!(
-                "<li><a class=\"file{sel}\" data-rel=\"{}\" hx-get=\"/frag/{}/file?path={}\" hx-target=\"#content\">{}</a></li>",
+                "<li><a class=\"file{sel}\" data-rel=\"{}\">{}</a></li>",
                 esc(&erel),
-                crate::http::percent_encode(project),
-                crate::http::percent_encode(&erel),
                 esc(&name)
             ));
         }
@@ -279,13 +308,62 @@ mod tests {
         fs::write(d.path().join("src/sub/x.rs"), "").unwrap();
         fs::write(d.path().join("README.md"), "").unwrap();
         let h = tree_fragment("proj", d.path(), "src/main.rs", &["dist".to_string()]);
-        assert!(h.contains("<details open><summary>src</summary>"));
-        assert!(h.contains("<details><summary>sub</summary>")); // not on open path
+        assert!(h.contains("<details open data-rel=\"src\"><summary>src</summary>"));
         assert!(h.contains("class=\"file sel\""));
-        assert!(h.contains("hx-get=\"/frag/proj/file?path=src/main.rs\""));
+        assert!(h.contains("data-rel=\"src/main.rs\""));
         assert!(h.contains("README.md"));
         assert!(!h.contains("<summary>target</summary>"));
         assert!(!h.contains("<summary>dist</summary>"));
+    }
+
+    // `sub` sits under `src`, which is on the open path, but `sub` itself is
+    // not — this is the one-level contract: a directory not itself on the
+    // open path renders as a closed stub (lazy hx-get, empty <ul>) and must
+    // not leak its children's markup into the initial response.
+    #[test]
+    fn tree_renders_one_level_and_closed_dirs_omit_children() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src/sub")).unwrap();
+        fs::write(d.path().join("src/main.rs"), "").unwrap();
+        fs::write(d.path().join("src/sub/x.rs"), "").unwrap();
+        let h = tree_fragment("proj", d.path(), "src/main.rs", &[]);
+        assert!(h.contains(
+            "<details data-rel=\"src/sub\" hx-get=\"/frag/proj/tree?dir=src/sub\" \
+             hx-trigger=\"toggle once\" hx-target=\"find ul\"><summary>sub</summary><ul></ul></details>"
+        ));
+        assert!(!h.contains("x.rs")); // sub's child must not be inlined
+    }
+
+    // Every directory along the open file's path is pre-expanded inline,
+    // recursively, so the open file is visible on first load with no lazy
+    // fetch required.
+    #[test]
+    fn tree_pre_expands_the_whole_open_path() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("a/b/c")).unwrap();
+        fs::write(d.path().join("a/b/c/main.rs"), "").unwrap();
+        let h = tree_fragment("proj", d.path(), "a/b/c/main.rs", &[]);
+        assert!(h.contains("<details open data-rel=\"a\">"));
+        assert!(h.contains("<details open data-rel=\"a/b\">"));
+        assert!(h.contains("<details open data-rel=\"a/b/c\">"));
+        assert!(h.contains("class=\"file sel\" data-rel=\"a/b/c/main.rs\""));
+    }
+
+    // The lazy `?dir=` fetch (routes.rs) renders through the same one-level
+    // machinery, just scoped to a subdirectory and without the outer <ul>
+    // wrapper, so it slots straight into the parent <details>'s own <ul>.
+    #[test]
+    fn tree_level_answers_a_lazy_dir_fetch() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src/sub")).unwrap();
+        fs::write(d.path().join("src/main.rs"), "").unwrap();
+        fs::write(d.path().join("src/sub/x.rs"), "").unwrap();
+        let mut out = String::new();
+        tree_level("proj", &d.path().join("src"), "src", "", &[], &mut out);
+        assert!(!out.starts_with("<ul"));
+        assert!(out.contains("data-rel=\"src/main.rs\""));
+        assert!(out.contains("data-rel=\"src/sub\"")); // closed stub, not expanded
+        assert!(!out.contains("x.rs")); // sub's own child stays lazy
     }
 
     #[test]
