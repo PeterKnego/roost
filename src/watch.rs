@@ -50,13 +50,63 @@ pub fn is_self_write(
     }
 }
 
-/// Register per-directory, non-recursive watches while walking the tree,
-/// skipping SKIP_DIRS. Non-recursive and per-directory (not one recursive
-/// watch on the root) because a recursive watch on a Rust project turns
-/// every `cargo build` into thousands of events from `target/` — except we
-/// skip `target/` entirely anyway, but the same trap applies to any other
-/// large generated directory a project happens to have.
+type ProjectDebouncer =
+    notify_debouncer_full::Debouncer<notify::RecommendedWatcher, notify_debouncer_full::RecommendedCache>;
+
+/// Walk `root` (skipping SKIP_DIRS), registering a non-recursive watch on
+/// every directory found, `root` included. Used both for the initial walk
+/// in `spawn` and, from inside the running watcher, to pick up directories
+/// created after startup.
 ///
+/// Non-recursive and per-directory (not one recursive watch on the root)
+/// because a recursive watch on a Rust project turns every `cargo build`
+/// into thousands of events from `target/` — except we skip `target/`
+/// entirely anyway, but the same trap applies to any other large generated
+/// directory a project happens to have.
+///
+/// Uses `DirEntry::file_type()`, not `Path::is_dir()`: the latter follows
+/// symlinks, so a self-referential symlink inside the project (`ln -s .
+/// loop`) would make this recurse forever. The first call runs synchronously
+/// on the thread that called `spawn` (a connection thread, inside
+/// `Hub::for_project`), so an unbounded walk there would hang that request.
+fn watch_tree(debouncer: &mut ProjectDebouncer, project: &str, root: PathBuf) -> bool {
+    use notify::RecursiveMode;
+    let mut ok = true;
+    let mut stack = vec![root];
+    while let Some(d) = stack.pop() {
+        if let Err(e) = debouncer.watch(&d, RecursiveMode::NonRecursive) {
+            eprintln!("deadlight: {project}: failed to watch {}: {e}", d.display());
+            ok = false;
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_dir && !crate::projects::SKIP_DIRS.contains(&name.as_str()) {
+                stack.push(p);
+            }
+        }
+    }
+    ok
+}
+
+/// True when a panic anywhere in one debounced batch's handling should not
+/// be allowed to end watching for the rest of the process's life. Stringify
+/// the payload defensively: `Any` panic payloads are almost always `&str`
+/// or `String`, but not guaranteed to be, and this is a log line, not a
+/// place to panic-on-panic.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 /// Returns false if watching could not be established (e.g. inotify
 /// instance limits) — correctness never depends on it, so callers only use
 /// this to flag the workspace as degraded, not to fail project setup.
@@ -78,57 +128,77 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
             return false;
         }
     };
-    let mut ok = true;
-    let mut stack = vec![dir.clone()];
-    while let Some(d) = stack.pop() {
-        if let Err(e) = debouncer.watch(&d, RecursiveMode::NonRecursive) {
-            eprintln!("deadlight: {project}: failed to watch {}: {e}", d.display());
-            ok = false;
-            continue;
-        }
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            let name = e.file_name().to_string_lossy().into_owned();
-            if p.is_dir() && !crate::projects::SKIP_DIRS.contains(&name.as_str()) {
-                stack.push(p);
-            }
-        }
-    }
-    // .git itself is skipped for the tree walk above, but index/HEAD drive
-    // the status pane, so watch that one directory deliberately.
+    let ok = watch_tree(&mut debouncer, project, dir.clone());
+    // .git itself is skipped by watch_tree (it's in SKIP_DIRS), but
+    // index/HEAD drive the status pane, so watch that one directory
+    // deliberately.
     let _ = debouncer.watch(&dir.join(".git"), RecursiveMode::NonRecursive);
 
     let base = dir.clone();
+    let project_name = project.to_string();
     std::thread::spawn(move || {
-        let _keep = debouncer; // dropping the debouncer stops the watch
+        let mut keep = debouncer; // dropping the debouncer stops the watch
         for res in rx {
             let Ok(events) = res else { continue };
-            // Lock once per debounced batch, not once per event: the batch
-            // is already coalesced by the debouncer, and re-locking per
-            // event would mean more lock/unlock churn for no benefit —
-            // the lock is never held across I/O either way, since
-            // `file_changed_externally`'s read is a filesystem read, not a
-            // network or PTY write.
-            let mut h = Hub::lock(&hub);
-            let open: Vec<String> = h.ws.buffers.keys().cloned().collect();
-            let mut tree = false;
-            let mut status = false;
-            // A single save (temp file + rename) fires several raw events
-            // (Create, Modify(Name), Modify(Data)) for the same path within
-            // one debounced batch. Collect the distinct buffer paths first
-            // and visit each once: `is_self_write` consumes its match, so
-            // calling `file_changed_externally` per raw event would let the
-            // first occurrence eat the suppression token and the second
-            // occurrence in the same batch would read as a "real" external
-            // edit — echoing the save straight back at the author, exactly
-            // what self-write suppression exists to prevent.
-            let mut buffer_rels = std::collections::HashSet::new();
-            for ev in &events {
-                for path in &ev.paths {
-                    let Ok(rel) = path.strip_prefix(&base) else { continue };
-                    let rel = rel.to_string_lossy().replace('\\', "/");
-                    match classify(&rel, &open, &[]) {
+            // One panic anywhere below must not silently end watching for
+            // this project for the rest of the process's life: the spec
+            // treats a live view of external edits as a core requirement,
+            // not a nicety, so losing it needs to be loud and recoverable,
+            // not a quiet, permanent stop.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // First pass: resolve every event to a project-relative
+                // path, and eagerly register a watch on any newly created
+                // directory. This does not touch the hub — no lock is held
+                // across the filesystem I/O in `watch_tree` (readdir plus
+                // watch registration). Necessary on Linux: unlike macOS
+                // FSEvents, inotify never reports anything from inside a
+                // directory that was never explicitly watched, so a `git
+                // checkout` or a plain `mkdir` that adds a new directory
+                // would go permanently unseen without this.
+                let mut rels: Vec<String> = Vec::new();
+                for ev in &events {
+                    for path in &ev.paths {
+                        let Ok(rel) = path.strip_prefix(&base) else { continue };
+                        rels.push(rel.to_string_lossy().replace('\\', "/"));
+                        let skip = path
+                            .file_name()
+                            .map(|n| crate::projects::SKIP_DIRS.contains(&n.to_string_lossy().as_ref()))
+                            .unwrap_or(true);
+                        // `symlink_metadata`, not `metadata`: do not follow
+                        // a symlink into recursing on it, same reasoning as
+                        // `watch_tree`'s use of `file_type()`.
+                        let is_dir =
+                            std::fs::symlink_metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+                        if !skip && is_dir {
+                            watch_tree(&mut keep, &project_name, path.clone());
+                        }
+                    }
+                }
+
+                // Lock once per debounced batch, not once per event: the
+                // batch is already coalesced by the debouncer, and
+                // re-locking per event would mean more lock/unlock churn
+                // for no benefit — the lock is never held across blocking
+                // I/O either way, since `file_changed_externally`'s read is
+                // a small local filesystem read, not a network or PTY
+                // write.
+                let mut h = Hub::lock(&hub);
+                let open: Vec<String> = h.ws.buffers.keys().cloned().collect();
+                let mut tree = false;
+                let mut status = false;
+                // A single save (temp file + rename) fires several raw
+                // events (Create, Modify(Name), Modify(Data)) for the same
+                // path within one debounced batch. Collect the distinct
+                // buffer paths first and visit each once: `is_self_write`
+                // consumes its match, so calling `file_changed_externally`
+                // per raw event would let the first occurrence eat the
+                // suppression token and the second occurrence in the same
+                // batch would read as a "real" external edit — echoing the
+                // save straight back at the author, exactly what
+                // self-write suppression exists to prevent.
+                let mut buffer_rels = std::collections::HashSet::new();
+                for rel in &rels {
+                    match classify(rel, &open, &[]) {
                         Class::Tree => tree = true,
                         Class::Status => status = true,
                         Class::Buffer(r) => {
@@ -137,15 +207,27 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                         Class::Ignore => {}
                     }
                 }
-            }
-            for r in buffer_rels {
-                h.file_changed_externally(&base, &r);
-            }
-            if tree {
-                h.broadcast(&crate::proto::Event::TreeChanged);
-            }
-            if status {
-                h.broadcast(&crate::proto::Event::StatusChanged);
+                for r in buffer_rels {
+                    // A deleted buffer's file can't be read back, and
+                    // `classify` already routed it away from `Class::Tree`,
+                    // so nothing else here would ever refresh the listing
+                    // for it — treat "could not read" as a tree change too.
+                    if !h.file_changed_externally(&base, &r) {
+                        tree = true;
+                    }
+                }
+                if tree {
+                    h.broadcast(&crate::proto::Event::TreeChanged);
+                }
+                if status {
+                    h.broadcast(&crate::proto::Event::StatusChanged);
+                }
+            }));
+            if let Err(payload) = outcome {
+                eprintln!(
+                    "deadlight: {project_name}: watcher batch panicked, continuing: {}",
+                    panic_message(payload.as_ref())
+                );
             }
         }
     });
@@ -204,5 +286,37 @@ mod tests {
         assert!(is_self_write(&mut seen, "a.rs", 42));
         // and only once — a later external edit with other content is real
         assert!(!is_self_write(&mut seen, "a.rs", 43));
+    }
+
+    // `spawn`'s initial tree walk runs synchronously on the caller — in
+    // production, a connection thread inside `Hub::for_project` — so a
+    // symlink that resolves back into the tree it's inside of must not be
+    // followed, or the walk (and the HTTP request behind it) never returns.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_loop_does_not_hang_the_walk() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sd = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "hi").unwrap();
+        std::os::unix::fs::symlink(".", d.path().join("loop")).unwrap();
+
+        let hub = Arc::new(Mutex::new(Hub::new("proj", d.path().to_path_buf())));
+        let dir = d.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Run the call on its own thread and bound the wait: a regression
+        // here should fail this test, not hang the whole suite.
+        std::thread::spawn(move || {
+            let ok = spawn("proj", dir, hub, Duration::from_millis(50));
+            let _ = tx.send(ok);
+        });
+        let ok = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawn must return promptly even with a symlink loop in the tree");
+        assert!(ok);
+
+        std::env::remove_var("DEADLIGHT_STATE_DIR");
     }
 }

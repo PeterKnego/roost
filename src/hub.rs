@@ -59,18 +59,32 @@ impl Hub {
         // so locking the hub next cannot deadlock against another thread
         // that holds the hub lock and wants the registry lock.
         drop(map);
-        if !Hub::lock(&arc).watching {
+        // Test-and-set inside one critical section on the hub lock: two
+        // connections racing into a brand-new project must not both decide
+        // "not watching yet" and both spawn a watcher. That would be more
+        // than wasteful — two watcher threads racing on the same
+        // `self_writes` entry means one of them finds the token already
+        // consumed by the other and re-broadcasts a save's own content back
+        // at the author, exactly the cursor-fight self-write suppression
+        // exists to prevent. `watching` is set to true here, *before*
+        // spawning, so the flag itself is the lock; the actual spawn still
+        // happens with no hub lock held, since it walks the filesystem.
+        let need_watcher = {
+            let mut h = Hub::lock(&arc);
+            if h.watching {
+                false
+            } else {
+                h.watching = true;
+                true
+            }
+        };
+        if need_watcher {
             let ms: u64 = std::env::var("DEADLIGHT_DEBOUNCE_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300);
-            // Spawned with no hub lock held: walking the tree and registering
-            // watches touches the filesystem, and that must never happen
-            // while blocking every other connection to this project.
             let ok = crate::watch::spawn(project, dir, arc.clone(), std::time::Duration::from_millis(ms));
-            let mut h = Hub::lock(&arc);
-            h.watching = true;
-            h.ws.watch_degraded = !ok;
+            Hub::lock(&arc).ws.watch_degraded = !ok;
         }
         arc
     }
@@ -192,13 +206,20 @@ impl Hub {
     /// file so you watch Claude's edits land live; dirty buffers are only
     /// flagged stale, so unsaved work is never overwritten by a background
     /// writer.
-    pub fn file_changed_externally(&mut self, base: &std::path::Path, rel: &str) {
-        let Ok(disk) = std::fs::read_to_string(base.join(rel)) else { return };
+    ///
+    /// Returns false when the file could not be read — almost always because
+    /// it was deleted. `classify` routes an open buffer's path to `Buffer`,
+    /// not `Tree`, so without this the caller's tree pane would keep listing
+    /// a file that no longer exists until some unrelated event happened to
+    /// arrive and trigger a refresh. Callers must treat `false` as a tree
+    /// change too.
+    pub fn file_changed_externally(&mut self, base: &std::path::Path, rel: &str) -> bool {
+        let Ok(disk) = std::fs::read_to_string(base.join(rel)) else { return false };
         let disk_hash = workspace::hash_text(&disk);
         if crate::watch::is_self_write(&mut self.self_writes, rel, disk_hash) {
-            return; // our own save; broadcasting it would echo back at the author
+            return true; // our own save; broadcasting it would echo back at the author
         }
-        let Some(b) = self.ws.buffers.get_mut(rel) else { return };
+        let Some(b) = self.ws.buffers.get_mut(rel) else { return true };
         if b.dirty {
             b.stale = true;
             let ev = Event::BufferStale { rel: rel.to_string() };
@@ -216,6 +237,7 @@ impl Hub {
         }
         self.ws.version += 1;
         self.broadcast(&Event::FileChanged { rel: rel.to_string() });
+        true
     }
 
     fn do_fileop(&mut self, from: &ConnId, r: Result<std::path::PathBuf, String>) {
