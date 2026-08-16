@@ -13,7 +13,7 @@ pub struct Status {
     pub changes: Vec<Change>,
 }
 
-fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
+fn run_git(repo: &Path, args: &[&str], allow_exit_1: bool) -> Result<String, String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -21,8 +21,8 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
         .output()
         .map_err(|e| e.to_string())?;
     let code = out.status.code().unwrap_or(-1);
-    if code != 0 && code != 1 {
-        // git diff exits 1 when differences exist
+    if code != 0 && !(allow_exit_1 && code == 1) {
+        // git diff exits 1 when differences exist (only allowed if allow_exit_1 is true)
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -58,12 +58,12 @@ pub fn status(repo: &Path) -> Result<Status, String> {
     if !repo.join(".git").exists() {
         return Err("not a git repository".into());
     }
-    run_git(repo, &["status", "--porcelain=v2", "-b"]).map(|s| parse_status(&s))
+    run_git(repo, &["status", "--porcelain=v2", "-b"], false).map(|s| parse_status(&s))
 }
 
 pub fn diff(repo: &Path, path: Option<&str>) -> Result<String, String> {
     match path {
-        None => run_git(repo, &["diff", "HEAD"]),
+        None => run_git(repo, &["diff", "HEAD"], true),
         Some(p) => {
             let tracked = Command::new("git")
                 .arg("-C")
@@ -73,11 +73,11 @@ pub fn diff(repo: &Path, path: Option<&str>) -> Result<String, String> {
                 .map(|o| o.status.success())
                 .unwrap_or(false);
             if tracked {
-                run_git(repo, &["diff", "HEAD", "--", p])
+                run_git(repo, &["diff", "HEAD", "--", p], true)
             } else {
                 // untracked: synthesize an all-new diff; confine the read
                 let abs = crate::projects::safe_resolve(repo, p)?;
-                let body = std::fs::read_to_string(&abs).unwrap_or_default();
+                let body = crate::projects::read_text_file(&abs)?;
                 let lines: Vec<&str> = body.lines().collect();
                 let mut d = format!("--- /dev/null\n+++ b/{p}\n@@ -0,0 +1,{} @@\n", lines.len());
                 for l in &lines {
@@ -163,5 +163,14 @@ mod tests {
     fn status_errors_outside_a_repo() {
         let d = tempfile::tempdir().unwrap();
         assert!(status(d.path()).is_err());
+    }
+
+    #[test]
+    fn diff_untracked_binary_file_errors() {
+        let d = repo_fixture();
+        std::fs::write(d.path().join("bin.bin"), b"\x00\x01\x02").unwrap();
+        let result = diff(d.path(), Some("bin.bin"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_lowercase().contains("binary"));
     }
 }
