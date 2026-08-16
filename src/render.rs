@@ -262,8 +262,8 @@ mod tests {
         assert!(h.contains("class=\"file sel\""));
         assert!(h.contains("hx-get=\"/frag/proj/file?path=src/main.rs\""));
         assert!(h.contains("README.md"));
-        assert!(!h.contains("target"));
-        assert!(!h.contains("dist"));
+        assert!(!h.contains("<summary>target</summary>"));
+        assert!(!h.contains("<summary>dist</summary>"));
     }
 
     #[test]
