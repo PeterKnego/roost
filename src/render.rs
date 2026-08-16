@@ -201,15 +201,20 @@ pub fn workspace_page(project: &str, s: &Settings, has_theme_css: bool) -> Strin
 </head><body data-project="{proj_txt}" data-default-tab="{tab}">
 <header>
   <a class="home" href="/">◆</a><span class="proj">{proj_txt}</span>
-  <nav><button id="tab-terminal">Terminal</button><button id="tab-files">Files</button><button id="tab-changes">Changes</button></nav>
   <span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body"></span>
   {warn}
   <button id="refresh" title="refresh (r)">⟳</button>
 </header>
-<main>
-  <section id="term-pane"><div id="term"></div><div id="term-overlay" class="hidden">disconnected — reconnecting…</div></section>
-  <section id="viewer" class="hidden"><nav id="sidebar"></nav><div id="content"></div></section>
+<main id="grid">
+  <section class="pane" data-pane="0"><div class="tabstrip"></div><div class="content"></div></section>
+  <div class="divider" data-div="left-split"></div>
+  <section class="pane" data-pane="1"><div class="tabstrip"></div><div class="content"></div></section>
+  <div class="divider" data-div="left-w"></div>
+  <section class="pane" data-pane="2"><div class="tabstrip"></div><div class="content"></div></section>
+  <div class="divider" data-div="right-w"></div>
+  <section class="pane" data-pane="3"><div class="tabstrip"></div><div class="content"></div></section>
 </main>
+<div id="termpool" hidden></div>
 <script src="/static/app.js"></script>
 </body></html>"#,
         theme = esc(&s.theme),
@@ -309,7 +314,8 @@ mod tests {
         assert!(h.contains("data-project=\"proj\""));
         assert!(h.contains("data-default-tab=\"terminal\""));
         assert!(h.contains("htmx.min.js"));
-        assert!(h.contains("id=\"term\""));
+        assert!(h.contains("data-pane=\"3\""));
+        assert!(h.contains("id=\"termpool\""));
         let no_custom = workspace_page("proj", &s, false);
         assert!(!no_custom.contains("theme.css\">"));
     }
