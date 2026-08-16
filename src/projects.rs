@@ -220,8 +220,23 @@ mod tests {
         assert!(safe_resolve_parent(&alpha, "/etc/newfile").is_err());
         assert!(safe_resolve_parent(&alpha, "").is_err());
         assert!(safe_resolve_parent(&alpha, "..").is_err());
+        // `sub` doesn't exist under alpha, so this case fails on ENOENT
+        // before ever reaching the confinement check below — it doesn't
+        // prove the `..`-in-the-middle case is actually confined.
         assert!(safe_resolve_parent(&alpha, "sub/../../out.txt").is_err());
         // a missing parent directory is an error, not a silent mkdir -p
         assert!(safe_resolve_parent(&alpha, "nodir/new.txt").is_err());
+    }
+
+    #[test]
+    fn safe_resolve_parent_confines_a_dot_dot_that_actually_canonicalizes() {
+        let d = root_fixture();
+        let alpha = d.path().join("alpha");
+        // `alpha/.git` genuinely exists (see root_fixture), so
+        // `.git/../..` canonicalizes cleanly to the tempdir root, one level
+        // above `alpha` — this is the case that must actually hit the
+        // `starts_with` confinement branch, not bail out on ENOENT first.
+        let err = safe_resolve_parent(&alpha, ".git/../../out.txt").unwrap_err();
+        assert!(err.contains("outside project"), "unexpected error: {err}");
     }
 }
