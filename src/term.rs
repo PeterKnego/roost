@@ -12,8 +12,20 @@ use tungstenite::{accept_hdr, Message, WebSocket};
 
 pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     let mut path = String::new();
+    // WebSocket handshakes bypass the same-origin policy: without this check any
+    // page the user visits can open this socket and get a shell. See spec §Security.
+    let allowed = crate::config::allowed_origins();
     let accepted = accept_hdr(stream, |req: &WsRequest, resp: WsResponse| {
         path = req.uri().path().to_string();
+        let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
+        if !crate::origin::origin_allowed(origin, &allowed) {
+            eprintln!("deadlight: rejected ws origin={origin:?} (set allowed_origins)");
+            let body = Some("origin not allowed".to_string());
+            return Err(tungstenite::http::Response::builder()
+                .status(403)
+                .body(body)
+                .expect("static 403 response"));
+        }
         Ok(resp)
     });
     let Ok(mut ws_read) = accepted else { return };

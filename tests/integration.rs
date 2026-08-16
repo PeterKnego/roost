@@ -79,16 +79,47 @@ fn diff_traversal_path_is_rejected_with_hint() {
 // parallel one could overwrite the other's value mid-connect. Serialize them.
 static WS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Connect with an explicit Origin. The server rejects handshakes without one
+/// (spec §Security), so every legitimate ws client must supply it.
+fn ws_connect(
+    port: u16,
+    origin: Option<&str>,
+) -> Result<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, tungstenite::Error>
+{
+    use tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://127.0.0.1:{port}/ws/proj").into_client_request().unwrap();
+    if let Some(o) = origin {
+        req.headers_mut().insert("origin", o.parse().unwrap());
+    }
+    let (ws, _resp) = tungstenite::connect(req)?;
+    if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    }
+    Ok(ws)
+}
+
+#[test]
+fn ws_rejects_foreign_and_missing_origin() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    std::env::set_var("DEADLIGHT_CMD", "cat");
+    let (_d, port) = fixture();
+    // The drive-by attack: a page the user visits opens this socket for a shell.
+    assert!(
+        ws_connect(port, Some("https://evil.example.com")).is_err(),
+        "foreign origin must not reach the shell"
+    );
+    // Non-browser clients send no Origin at all.
+    assert!(ws_connect(port, None).is_err(), "missing origin must be rejected");
+    // Loopback still works without any configuration.
+    assert!(ws_connect(port, Some("http://127.0.0.1:8444")).is_ok());
+}
+
 #[test]
 fn terminal_ws_echoes_through_pty() {
     let _g = WS_TEST_LOCK.lock().unwrap();
     std::env::set_var("DEADLIGHT_CMD", "cat");
     let (_d, port) = fixture();
-    let (mut ws, _resp) =
-        tungstenite::connect(format!("ws://127.0.0.1:{port}/ws/proj")).unwrap();
-    if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
-        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-    }
+    let mut ws = ws_connect(port, Some("http://127.0.0.1:8444")).unwrap();
     ws.send(tungstenite::Message::Text("resize:100x30".into())).unwrap();
     ws.send(tungstenite::Message::Binary(b"hello\r".to_vec())).unwrap();
     let mut seen = String::new();
@@ -111,10 +142,7 @@ fn ws_closes_when_child_exits_first() {
     let _g = WS_TEST_LOCK.lock().unwrap();
     std::env::set_var("DEADLIGHT_CMD", "true"); // exits immediately
     let (_d, port) = fixture();
-    let (mut ws, _resp) = tungstenite::connect(format!("ws://127.0.0.1:{port}/ws/proj")).unwrap();
-    if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
-        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-    }
+    let mut ws = ws_connect(port, Some("http://127.0.0.1:8444")).unwrap();
     // child exited at spawn; the server must close/shutdown the socket rather than hang
     let mut closed = false;
     for _ in 0..50 {
@@ -124,4 +152,18 @@ fn ws_closes_when_child_exits_first() {
         }
     }
     assert!(closed, "socket did not close after child exit");
+}
+
+#[test]
+fn http_rejects_rebinding_host() {
+    use std::io::{Read, Write};
+    let (_d, port) = fixture();
+    // DNS rebinding: the browser resolves a hostile name to 127.0.0.1, so the
+    // page becomes same-origin and CORS no longer protects these reads.
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: evil.example.com\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    assert!(resp.starts_with("HTTP/1.1 403"), "got: {}", &resp[..resp.len().min(60)]);
 }

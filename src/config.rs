@@ -9,6 +9,7 @@ struct RawConfig {
     theme: Option<String>,
     default_tab: Option<String>,
     hide: Option<Vec<String>>,
+    allowed_origins: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,6 +62,30 @@ pub fn load(paths: &[&Path]) -> Settings {
         s.warning = Some(warnings.join("; "));
     }
     s
+}
+
+/// Origins allowed to open a websocket or issue requests, from
+/// `DEADLIGHT_ORIGINS` (comma-separated) or the global config's
+/// `allowed_origins`. Deliberately **not** part of [`Settings`]: a per-project
+/// `.deadlight/config.toml` must never be able to allowlist an origin, or a
+/// hostile repo could allowlist itself. Loopback is always allowed without
+/// configuration — see [`crate::origin`].
+pub fn allowed_origins() -> Vec<String> {
+    let from_env: Vec<String> = std::env::var("DEADLIGHT_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    if !from_env.is_empty() {
+        return from_env;
+    }
+    std::fs::read_to_string(global_config_path())
+        .ok()
+        .and_then(|t| toml::from_str::<RawConfig>(&t).ok())
+        .and_then(|r| r.allowed_origins)
+        .unwrap_or_default()
 }
 
 pub fn for_project(project_dir: &Path) -> Settings {

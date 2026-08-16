@@ -6,6 +6,8 @@ use std::io::{BufRead, Write};
 pub struct Request {
     pub path: String,
     pub query: HashMap<String, String>,
+    /// Header names lowercased. Only Host / X-Forwarded-Host are consulted.
+    pub headers: HashMap<String, String>,
 }
 
 pub fn parse<R: BufRead>(r: &mut R) -> Result<Request, String> {
@@ -17,12 +19,16 @@ pub fn parse<R: BufRead>(r: &mut R) -> Result<Request, String> {
     if method != "GET" {
         return Err(format!("method {method} not allowed"));
     }
+    let mut headers = HashMap::new();
     loop {
-        // drain headers; we need none of them for plain GETs
         let mut h = String::new();
         let n = r.read_line(&mut h).map_err(|e| e.to_string())?;
         if n == 0 || h == "\r\n" || h == "\n" {
             break;
+        }
+        // Host and X-Forwarded-Host gate DNS-rebinding; the rest are ignored.
+        if let Some((k, v)) = h.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
         }
     }
     let (path, query_str) = match target.split_once('?') {
@@ -34,7 +40,7 @@ pub fn parse<R: BufRead>(r: &mut R) -> Result<Request, String> {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         query.insert(percent_decode(k), percent_decode(v));
     }
-    Ok(Request { path: percent_decode(&path), query })
+    Ok(Request { path: percent_decode(&path), query, headers })
 }
 
 pub fn percent_decode(s: &str) -> String {
