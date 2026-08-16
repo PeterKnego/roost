@@ -11,11 +11,29 @@ const TEXT_EXTENSIONS: &[&str] = &[
     "ini", "service", "env", "gitignore", "dockerignore",
 ];
 
-pub fn roots() -> Vec<PathBuf> {
+/// The deploy host's roots. Used unless `DEADLIGHT_ROOTS` overrides them.
+pub fn default_roots() -> Vec<PathBuf> {
     vec![
         PathBuf::from("/home/claude/ultima"),
         PathBuf::from("/home/claude/projects"),
     ]
+}
+
+/// Roots to scan for projects: `DEADLIGHT_ROOTS` (colon-separated) when set
+/// and non-empty, otherwise [`default_roots`]. Lets the binary run on a
+/// machine that isn't the deploy host.
+pub fn roots() -> Vec<PathBuf> {
+    let from_env: Vec<PathBuf> = std::env::var("DEADLIGHT_ROOTS")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    if from_env.is_empty() {
+        default_roots()
+    } else {
+        from_env
+    }
 }
 
 pub struct Project {
@@ -154,5 +172,16 @@ mod tests {
         let bin = d.path().join("alpha/blob.bin");
         fs::write(&bin, b"\x00\x01\x02").unwrap();
         assert!(read_text_file(&bin).unwrap_err().contains("binary"));
+    }
+
+    #[test]
+    fn roots_env_overrides_defaults() {
+        std::env::set_var("DEADLIGHT_ROOTS", "/one:/two");
+        assert_eq!(roots(), vec![PathBuf::from("/one"), PathBuf::from("/two")]);
+        // empty or unset falls back to the built-in roots
+        std::env::set_var("DEADLIGHT_ROOTS", "");
+        assert_eq!(roots(), default_roots());
+        std::env::remove_var("DEADLIGHT_ROOTS");
+        assert_eq!(roots(), default_roots());
     }
 }
