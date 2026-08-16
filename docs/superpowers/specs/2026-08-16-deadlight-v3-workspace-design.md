@@ -136,8 +136,8 @@ socket carries JSON text frames.
 ← {"t":"State","version":41,"origin":"c7","ws":{...}}
 ← {"t":"BufferText","rel":"...","text":"...","origin":"c7"}
 ← {"t":"BufferStale","rel":"..."}
-← {"t":"SaveResult","rel":"...","ok":true}
-← {"t":"SaveResult","rel":"...","conflict":{"diff_html":"..."}}
+← {"t":"SaveOk","rel":"..."}
+← {"t":"SaveConflict","rel":"...","diff_html":"..."}
 ← {"t":"FileChanged","rel":"..."}
 ← {"t":"TreeChanged"} | {"t":"StatusChanged"} | {"t":"Error","msg":"..."}
 ```
@@ -378,6 +378,6 @@ running under zellij and can be attached from a shell until they are retired.
 
 ## Nice-to-haves (post-v3, only if asked)
 
-Drag-and-drop tab reordering (v3 ships a "move to pane" command), images in
-markdown preview, git log view, mobile layout, per-theme favicon, `retach` as
+Drag-and-drop tab reordering (v3 ships a "move to pane" command), drag-n-drop upload of local files to remote fs pane, images in
+markdown preview, copy-paste file content, paste images into claude terminal (ctrl+v), git log view, mobile layout, per-theme favicon, `retach` as
 the session backend if its scrollback replay proves worth the immaturity.
