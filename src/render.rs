@@ -268,7 +268,8 @@ fn picker_rows(entries: &[Entry]) -> String {
 /// than being collapsed into one "nothing to show" hint.
 pub fn index_page(at: &str, entries: &[Entry], refused: bool) -> String {
     let notice = if refused { hint("no such directory — showing the top level") } else { String::new() };
-    let rows = if entries.is_empty() { hint("empty directory") } else { picker_rows(entries) };
+    let rows_hint = if entries.is_empty() { hint("empty directory") } else { String::new() };
+    let rows = if entries.is_empty() { String::new() } else { picker_rows(entries) };
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>deadlight</title>\
          <link rel=\"stylesheet\" href=\"/static/themes/dark.css\">\
@@ -276,7 +277,7 @@ pub fn index_page(at: &str, entries: &[Entry], refused: bool) -> String {
          </head><body><header><span class=\"proj\">deadlight</span></header>\
          <main>{notice}{crumbs}\
          <ul class=\"picker\" id=\"picker\" data-at=\"{at_attr}\" tabindex=\"0\">{rows}</ul>\
-         <div class=\"pickerbar\"><button id=\"openBtn\" type=\"button\">Open</button></div>\
+         {rows_hint}<div class=\"pickerbar\"><button id=\"openBtn\" type=\"button\">Open</button></div>\
          </main>\
          <script src=\"/static/picker.js\"></script>\
          </body></html>",
