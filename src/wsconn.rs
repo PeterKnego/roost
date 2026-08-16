@@ -1,7 +1,7 @@
 //! The /ws/{project}/_workspace endpoint. Intents up, events down. Two
 //! directions over one socket, as term.rs does: a writer thread drains the
 //! hub's channel, this thread reads intents.
-use crate::hub::Hub;
+use crate::hub::{ConnId, Hub};
 use crate::proto;
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -9,6 +9,22 @@ use std::sync::{Arc, Mutex};
 use tungstenite::handshake::server::{Request as WsRequest, Response as WsResponse};
 use tungstenite::protocol::Role;
 use tungstenite::{accept_hdr, Message, WebSocket};
+
+/// Unsubscribes on drop, not just on the happy path: if `Hub::handle` ever
+/// panics, unwinding runs this instead of the tail of `handle` below, so the
+/// subscriber's `Sender` still leaves `hub.subs`. Without it a panic mid-loop
+/// would leave the writer thread's `rx.recv()` blocked forever on a sender
+/// nobody reads for anymore — a zombie half-connection that accumulates.
+struct UnsubGuard {
+    hub: Arc<Mutex<Hub>>,
+    id: ConnId,
+}
+
+impl Drop for UnsubGuard {
+    fn drop(&mut self) {
+        Hub::lock(&self.hub).unsubscribe(&self.id);
+    }
+}
 
 pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     // WebSocket handshakes bypass the same-origin policy: without this check
@@ -38,6 +54,9 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         let mut h = Hub::lock(&hub);
         h.subscribe()
     };
+    // Guards the subscription from here on: if we return early (the
+    // try_clone below fails) or the read loop below panics, this still runs.
+    let unsub = UnsubGuard { hub: hub.clone(), id: id.clone() };
 
     let Ok(write_half) = ws_read.get_ref().try_clone() else { return };
     let mut ws_write: WebSocket<TcpStream> =
@@ -80,9 +99,10 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         }
     }
 
-    {
-        let mut h = Hub::lock(&hub);
-        h.unsubscribe(&id);
-    }
+    // Unsubscribe *before* joining: the writer's rx.recv() only returns once
+    // this connection's Sender is gone from hub.subs, and that removal is
+    // what UnsubGuard::drop performs. Joining first would deadlock waiting
+    // for a thread that is itself waiting on us.
+    drop(unsub);
     let _ = writer.join();
 }
