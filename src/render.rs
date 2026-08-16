@@ -217,16 +217,31 @@ fn breadcrumb(at: &str) -> String {
 /// are rendered but carry no such hooks — `.file`'s CSS greys them out, and
 /// the absence of any click handler is what makes them actually
 /// unselectable, not just visually muted.
+///
+/// Git repos additionally get a `⎇` shortcut: a real `<a href>` straight to
+/// the workspace URL, not a `<span>` with a JS click handler, so opening it
+/// gets keyboard reachability (Tab + Enter), middle-click-for-new-tab, and
+/// ctrl/cmd-click for free from the browser rather than reimplementing them.
+/// picker.js still needs a couple of lines to stop this anchor's click/
+/// dblclick from *also* bubbling to the row's own listeners below (which
+/// would select or descend the row in addition to navigating).
 fn picker_rows(entries: &[Entry]) -> String {
     entries
         .iter()
         .map(|e| {
             if e.is_dir {
+                let git = if e.git {
+                    format!(
+                        " <a class=\"git\" href=\"/{href}\" title=\"open this repo\">⎇</a>",
+                        href = crate::http::percent_encode(&e.rel)
+                    )
+                } else {
+                    String::new()
+                };
                 format!(
                     "<li class=\"dir\" data-rel=\"{rel}\"><span class=\"name\">{name}</span>{git}</li>",
                     rel = esc(&e.rel),
-                    name = esc(&e.name),
-                    git = if e.git { " <span class=\"git\">⎇</span>" } else { "" }
+                    name = esc(&e.name)
                 )
             } else {
                 format!(
@@ -489,7 +504,11 @@ mod tests {
         let h = index_page("", &entries);
         assert!(h.contains("data-rel=\"alpha\""));
         assert!(h.contains("class=\"dir\""));
-        assert!(h.contains("⎇")); // alpha's git marker
+        // alpha is a git repo: gets a one-click shortcut straight to its
+        // workspace URL, not just the plain ⎇ marker
+        assert!(h.contains("<a class=\"git\" href=\"/alpha\" title=\"open this repo\">⎇</a>"));
+        // beta is not a git repo: no shortcut anchor for it at all
+        assert!(!h.contains("href=\"/beta\""));
         assert!(h.contains("id=\"openBtn\""));
         assert!(h.contains("crumb-current\">deadlight"));
         assert!(h.contains("/static/picker.js"));
@@ -506,6 +525,32 @@ mod tests {
         assert!(h2.contains("class=\"dir\" data-rel=\"karpie/sub\""));
         assert!(h2.contains("class=\"file\""));
         assert!(!h2.contains("data-rel=\"karpie/main.rs\"")); // files carry no selection hook
+    }
+
+    // The shortcut's href is a real workspace URL, so it needs the same
+    // slash-preserving percent-encoding as breadcrumb's `?at=` links (a `/`
+    // between segments must stay a literal separator, not become %2F) plus
+    // HTML-escaping on the visible bits, since both the segment names and
+    // the entry name come straight off the filesystem.
+    #[test]
+    fn git_shortcut_href_is_percent_encoded_for_a_nested_path() {
+        let entries = vec![Entry {
+            name: "sp ace\"<>".into(),
+            rel: "karpie/sp ace\"<>".into(),
+            is_dir: true,
+            git: true,
+        }];
+        let h = index_page("karpie", &entries);
+        // "/" between segments survives; the space and quote/angle-bracket
+        // characters inside the leaf segment are percent-encoded, not left
+        // raw (which would break the URL) and not HTML-entity-encoded
+        // (which would break the URL differently) — this is the URL
+        // encoder, distinct from `esc`'s HTML entities used elsewhere in
+        // the same row for the visible name.
+        assert!(h.contains("href=\"/karpie/sp%20ace%22%3C%3E\""));
+        // the visible name is still HTML-escaped, same as any other text
+        assert!(h.contains("sp ace&quot;&lt;&gt;"));
+        assert!(!h.contains("sp ace\"<>")); // raw, unescaped name must not appear
     }
 
     #[test]

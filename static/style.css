@@ -82,7 +82,8 @@ ul.picker li.dir { cursor: pointer; font-weight: 600; user-select: none; }
 ul.picker li.dir:hover { background: var(--sel-bg); }
 ul.picker li.dir.sel { background: var(--sel-bg); color: var(--accent); }
 ul.picker li.file { color: var(--muted); font-weight: normal; cursor: default; }
-ul.picker li .git { color: var(--accent); margin-left: 6px; font-weight: normal; }
+ul.picker li .git { color: var(--accent); margin-left: 6px; font-weight: normal; text-decoration: none; cursor: pointer; }
+ul.picker li .git:hover { text-decoration: underline; }
 .pickerbar { padding: 12px 24px; max-width: 700px; margin: 0 auto; width: 100%; display: flex; justify-content: flex-end; }
 .pickerbar button { font: inherit; padding: 6px 18px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg2); color: var(--fg); cursor: pointer; }
 .pickerbar button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
