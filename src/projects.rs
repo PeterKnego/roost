@@ -88,6 +88,31 @@ pub fn safe_resolve(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// Confine a path whose *target does not exist yet* (creation, rename
+/// destination). `safe_resolve` canonicalizes the target and so cannot be
+/// used here. Canonicalize the parent instead, confine that, then validate
+/// the final component separately.
+pub fn safe_resolve_parent(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
+    let rel = rel.trim_start_matches('/');
+    let (parent_rel, name) = match rel.rsplit_once('/') {
+        Some((p, n)) => (p, n),
+        None => ("", rel),
+    };
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(format!("bad name: {name:?}"));
+    }
+    let base = project_dir.canonicalize().map_err(|e| e.to_string())?;
+    let parent = if parent_rel.is_empty() {
+        base.clone()
+    } else {
+        base.join(parent_rel).canonicalize().map_err(|e| format!("no such directory: {e}"))?
+    };
+    if !parent.starts_with(&base) {
+        return Err(format!("path outside project: {rel}"));
+    }
+    Ok(parent.join(name))
+}
+
 pub fn read_text_file(path: &Path) -> Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("not found: {e}"))?;
     if meta.len() > MAX_FILE_BYTES {
@@ -183,5 +208,20 @@ mod tests {
         assert_eq!(roots(), default_roots());
         std::env::remove_var("DEADLIGHT_ROOTS");
         assert_eq!(roots(), default_roots());
+    }
+
+    #[test]
+    fn safe_resolve_parent_allows_new_names_and_blocks_escapes() {
+        let d = root_fixture();
+        let alpha = d.path().join("alpha");
+        // the point of this resolver: the target does not exist yet
+        assert!(safe_resolve_parent(&alpha, "new.txt").is_ok());
+        assert!(safe_resolve_parent(&alpha, "../escape.txt").is_err());
+        assert!(safe_resolve_parent(&alpha, "/etc/newfile").is_err());
+        assert!(safe_resolve_parent(&alpha, "").is_err());
+        assert!(safe_resolve_parent(&alpha, "..").is_err());
+        assert!(safe_resolve_parent(&alpha, "sub/../../out.txt").is_err());
+        // a missing parent directory is an error, not a silent mkdir -p
+        assert!(safe_resolve_parent(&alpha, "nodir/new.txt").is_err());
     }
 }
