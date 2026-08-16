@@ -5,28 +5,56 @@ body { background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, sans-s
 header { display: flex; align-items: center; gap: 12px; padding: 6px 12px; background: var(--bg2); border-bottom: 1px solid var(--border); flex: none; }
 header .home { color: var(--accent); text-decoration: none; font-size: 16px; }
 header .proj { font-weight: 600; }
-header nav { display: flex; gap: 4px; }
-header button { background: none; border: 1px solid transparent; border-radius: 6px; color: var(--muted); padding: 3px 10px; cursor: pointer; font: inherit; }
-header button.active { color: var(--fg); background: var(--bg); border-color: var(--border); }
-header button:hover { color: var(--fg); }
 #gitinfo { color: var(--muted); }
 #gitinfo #badge { color: var(--accent); margin-left: 4px; }
 .warn { color: #d29922; cursor: help; }
-#refresh { margin-left: auto; }
-main { flex: 1; min-height: 0; display: flex; }
-#term-pane { position: relative; flex: 1; background: var(--bg); }
-#term { position: absolute; inset: 4px; }
-#term-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); background: var(--bg2); opacity: 0.9; z-index: 5; }
-#viewer { flex: 1; display: grid; grid-template-columns: 280px 1fr; min-height: 0; }
-#sidebar { border-right: 1px solid var(--border); overflow: auto; padding: 8px; background: var(--bg2); }
-#content { overflow: auto; }
-#sidebar ul { list-style: none; padding-left: 14px; }
-#sidebar > ul { padding-left: 0; }
-#sidebar a { color: var(--fg); text-decoration: none; display: block; padding: 1px 4px; border-radius: 4px; white-space: nowrap; cursor: pointer; }
-#sidebar a:hover { background: var(--sel-bg); }
-#sidebar a.sel { background: var(--sel-bg); color: var(--accent); }
-#sidebar summary { cursor: pointer; color: var(--muted); padding: 1px 4px; white-space: nowrap; }
-#sidebar summary:hover { color: var(--fg); }
+#refresh { margin-left: auto; background: none; border: 1px solid transparent; border-radius: 6px; color: var(--muted); padding: 3px 10px; cursor: pointer; font: inherit; }
+#refresh:hover { color: var(--fg); }
+main { flex: 1; min-height: 0; }
+
+/* ---- four-pane grid: left column stacks tree/changes, middle and right span both rows ---- */
+:root { --divider: 4px; }
+#grid {
+  display: grid;
+  height: calc(100vh - var(--header-h, 36px));
+  grid-template-columns: var(--left-w, 260px) var(--divider) 1fr var(--divider) var(--right-w, 520px);
+  grid-template-rows: var(--left-split, 60%) var(--divider) 1fr;
+}
+.pane[data-pane="0"] { grid-column: 1; grid-row: 1; }
+.divider[data-div="left-split"] { grid-column: 1; grid-row: 2; cursor: row-resize; }
+.pane[data-pane="1"] { grid-column: 1; grid-row: 3; }
+.divider[data-div="left-w"] { grid-column: 2; grid-row: 1 / -1; cursor: col-resize; }
+.pane[data-pane="2"] { grid-column: 3; grid-row: 1 / -1; }
+.divider[data-div="right-w"] { grid-column: 4; grid-row: 1 / -1; cursor: col-resize; }
+.pane[data-pane="3"] { grid-column: 5; grid-row: 1 / -1; }
+
+.pane { display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border); background: var(--bg); }
+.tabstrip { display: flex; overflow-x: auto; background: var(--bg2); flex: 0 0 auto; }
+.tabstrip .tab { padding: 4px 10px; cursor: pointer; white-space: nowrap; border-right: 1px solid var(--border); color: var(--fg); }
+.tabstrip .tab.active { background: var(--bg); font-weight: 600; }
+.tabstrip .tab .dirty { color: var(--accent); }
+.tabstrip .tab .stale { color: var(--warn, #d79921); }
+.tabstrip .tab .x { opacity: .5; margin-left: 6px; }
+.tabstrip .tab .x:hover { opacity: 1; }
+.tabstrip .newterm { padding: 4px 10px; cursor: pointer; color: var(--muted); }
+.tabstrip .newterm:hover { color: var(--fg); }
+.content { flex: 1 1 auto; overflow: auto; position: relative; }
+.content .termhost { position: absolute; inset: 0; }
+.divider { background: var(--border); }
+#termpool { display: none; }
+.editor { width: 100%; height: 100%; border: 0; font: 13px/1.5 ui-monospace, monospace; resize: none; padding: 8px; background: var(--bg); color: var(--fg); }
+.conflict { border: 1px solid var(--warn, #d79921); padding: 8px; margin: 8px; background: var(--bg2); }
+.conflict button { margin: 8px 8px 0 0; font: inherit; cursor: pointer; }
+
+/* ---- fragment content shared by tree/changes/file/diff (rendered server-side) ---- */
+.content ul.tree, .content ul.changes { padding: 8px; }
+.tree, .changes { list-style: none; padding-left: 14px; }
+.tree > ul, .changes { padding-left: 0; }
+.content a.file { color: var(--fg); text-decoration: none; display: block; padding: 1px 4px; border-radius: 4px; white-space: nowrap; cursor: pointer; }
+.content a.file:hover { background: var(--sel-bg); }
+.content a.file.sel { background: var(--sel-bg); color: var(--accent); }
+.content summary { cursor: pointer; color: var(--muted); padding: 1px 4px; white-space: nowrap; }
+.content summary:hover { color: var(--fg); }
 .xy { display: inline-block; min-width: 2.2em; color: var(--hunk); font-family: ui-monospace, monospace; font-size: 12px; }
 .hint { color: var(--muted); padding: 16px; }
 .path { position: sticky; top: 0; background: var(--bg2); border-bottom: 1px solid var(--border); padding: 6px 12px; font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
