@@ -216,6 +216,54 @@ function mountTab(content, t) {
   });
 }
 
+// Stable identity for a tree <li>: a directory's own rel (render::tree_level
+// puts `data-rel` on its <details>, open or closed) or a file's rel (on its
+// <a class="file">). Used to match old DOM nodes against a freshly-fetched
+// listing during reconciliation. Returns null for identity-less rows (e.g.
+// the "tree truncated" hint <li>), which just get replaced wholesale since
+// they carry no state worth preserving.
+function treeItemId(li) {
+  const d = li.querySelector(":scope > details[data-rel]");
+  if (d) return "dir:" + d.dataset.rel;
+  const a = li.querySelector(":scope > a.file[data-rel]");
+  if (a) return "file:" + a.dataset.rel;
+  return null;
+}
+
+// Merge a freshly-fetched listing into an existing <ul> (the tree root, or
+// one directory's children) without discarding what's already there. A
+// naive innerHTML swap would replace every child <details>, collapsing any
+// subdirectory the user had expanded — exactly the problem TreeChanged
+// exists to avoid. Instead: walk the fresh listing in the order the server
+// sent it (tree_level already sorts dirs-before-files, case-insensitive —
+// we never re-sort client-side) and for each entry, reuse the existing DOM
+// node when one with the same identity is already present. A reused
+// <details> keeps its `open` attribute and whatever children it already
+// loaded; a reused file <a> keeps its "sel" class. Anything left over in
+// `existing` (present before, absent from the fresh listing) is simply
+// never re-appended, i.e. removed. This is also what fixes the nested-open
+// race the reviewer flagged: reconciling a parent never tears down a still-
+// present child <details>, so a subdirectory's own in-flight refresh always
+// lands on a node that's still there (or, if that entry vanished from the
+// parent's listing, on a harmlessly detached one).
+function reconcileList(ul, html) {
+  const fresh = document.createElement("ul");
+  fresh.innerHTML = html;
+  const existing = new Map();
+  Array.from(ul.children).forEach((li) => {
+    const id = treeItemId(li);
+    if (id) existing.set(id, li);
+  });
+  const ordered = Array.from(fresh.children).map((li) => {
+    const id = treeItemId(li);
+    return (id && existing.get(id)) || li;
+  });
+  ul.innerHTML = "";
+  ordered.forEach((li) => ul.appendChild(li));
+  wireFileLinks(ul); // see wireFileLinks: no container oncontextmenu here
+  window.htmx && htmx.process(ul);
+}
+
 // TreeChanged fires on every filesystem write — including every file Claude
 // edits from a terminal pane, which is deadlight's core use case — so this
 // must NOT do what refreshKind("Tree") does: a full re-fetch replaces the
@@ -223,7 +271,9 @@ function mountTab(content, t) {
 // currently open file's path, collapsing everything else the user had
 // opened. Expansion is deliberately not server state (no protocol change),
 // so the only place to learn what's currently expanded is the DOM itself:
-// re-fetch each open <details data-rel> in place and leave the rest alone.
+// reconcile the root listing (a new root-level file must still show up
+// without a reload) and every open <details data-rel>, in place, via
+// reconcileList — never a wholesale replace.
 function refreshTree() {
   if (!state) return;
   state.panes.forEach((pane, pi) => {
@@ -231,25 +281,32 @@ function refreshTree() {
     if (!active || active.k !== "Tree") return;
     const content = document.querySelector(`.pane[data-pane="${pi}"] .content`);
     if (!content) return;
+    const root = content.querySelector(":scope > ul.tree");
+    if (root) {
+      // `dir=` (empty rel) asks tree_level for the project root's children
+      // in the same <li>-only shape used for every lazy subdirectory fetch.
+      fetch(`/frag/${PROJECT}/tree?dir=`).then((r) => r.text()).then((html) => reconcileList(root, html));
+    }
     content.querySelectorAll("details[open][data-rel]").forEach((d) => {
       const rel = d.dataset.rel;
+      const ul = d.querySelector(":scope > ul");
+      if (!ul) return;
       const url = `/frag/${PROJECT}/tree?dir=${encodeURIComponent(rel)}`;
-      fetch(url).then((r) => r.text()).then((html) => {
-        // The node this <details> belongs to may itself have been replaced
-        // by an ancestor's refresh completing first; writing into a
-        // detached child is harmless (it's just discarded with the node).
-        const ul = d.querySelector(":scope > ul");
-        if (!ul) return;
-        ul.innerHTML = html;
-        wireFragment(ul);
-        window.htmx && htmx.process(ul);
-      });
+      fetch(url).then((r) => r.text()).then((html) => reconcileList(ul, html));
     });
   });
 }
 
-function wireFragment(content) {
-  content.querySelectorAll("a.file[data-rel]").forEach((a) => {
+// Wires the file <a> elements only — no container-level oncontextmenu.
+// reconcileList calls this (not wireFragment) on the <ul> it just merged:
+// a `ul`/`details` oncontextmenu handler doesn't stop propagation, so
+// assigning one at every reconciled nesting level would make a blank-space
+// right-click inside a refreshed subdirectory bubble through each level's
+// own handler in turn and pop fileMenu's prompt() more than once. The single
+// container handler wireFragment sets once, at the pane's outer `.content`
+// mount, already catches blank clicks anywhere inside via bubbling.
+function wireFileLinks(root) {
+  root.querySelectorAll("a.file[data-rel]").forEach((a) => {
     a.onclick = (e) => {
       e.preventDefault();
       // These anchors still carry hx-get/hx-target="#content" from the
@@ -268,6 +325,10 @@ function wireFragment(content) {
     };
     a.oncontextmenu = (e) => { e.preventDefault(); fileMenu(e, a.dataset.rel); };
   });
+}
+
+function wireFragment(content) {
+  wireFileLinks(content);
   // right-clicking blank space in a tree targets the project root
   content.oncontextmenu = (e) => {
     if (e.target.closest("a.file")) return;
