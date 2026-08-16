@@ -52,7 +52,28 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     let hub: Arc<Mutex<Hub>> = Hub::for_project(project, dir);
     let (id, rx) = {
         let mut h = Hub::lock(&hub);
-        h.subscribe()
+        let (id, rx) = h.subscribe();
+        // Subscribing and sending this connection's own initial snapshot
+        // happen inside one lock acquisition, not two: releasing the lock in
+        // between would let another connection's broadcast land in this
+        // subscriber's channel first (subs.send is fifo per-channel, but
+        // *which* message gets sent first across threads depends on lock
+        // order, not send order). A client that received a foreign
+        // connection's State first would latch that id as its own origin
+        // and then silently drop that peer's own BufferText forever.
+        let ev = h.snapshot_event(&id);
+        h.send_to(&id, &ev);
+        // State is metadata-only — it never carries buffer text — so a
+        // client reconnecting onto a layout with open Edit buffers would
+        // otherwise render them blank forever: nothing else re-sends
+        // BufferText for a buffer that isn't actively being typed into.
+        let open_buffers: Vec<(String, String)> =
+            h.ws.buffers.iter().map(|(rel, b)| (rel.clone(), b.text.clone())).collect();
+        for (rel, text) in open_buffers {
+            let ev = proto::Event::BufferText { rel, text, origin: String::new() };
+            h.send_to(&id, &ev);
+        }
+        (id, rx)
     };
     // Guards the subscription from here on: if we return early (the
     // try_clone below fails) or the read loop below panics, this still runs.
@@ -74,13 +95,6 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         let _ = ws_write.close(None);
         let _ = ws_write.get_ref().shutdown(std::net::Shutdown::Both);
     });
-
-    // Send the current state immediately so a fresh tab renders without asking.
-    {
-        let mut h = Hub::lock(&hub);
-        let ev = h.snapshot_event(&id);
-        h.send_to(&id, &ev);
-    }
 
     loop {
         match ws_read.read() {

@@ -135,15 +135,6 @@ fn serve_frag(
                 Err(e) => http::html(w, &render::hint(&e)),
             }
         }
-        ["raw"] => match req.query.get("path") {
-            None => http::respond(w, 200, "OK", "text/plain; charset=utf-8", b""),
-            Some(rel) => match projects::safe_resolve(&dir, rel)
-                .and_then(|p| projects::read_text_file(&p))
-            {
-                Ok(content) => http::respond(w, 200, "OK", "text/plain; charset=utf-8", content.as_bytes()),
-                Err(e) => http::respond(w, 200, "OK", "text/plain; charset=utf-8", e.as_bytes()),
-            },
-        },
         ["theme.css"] => match std::fs::read(dir.join(".deadlight/theme.css")) {
             Ok(css) => http::respond(w, 200, "OK", "text/css; charset=utf-8", &css),
             Err(_) => http::not_found(w, "no theme.css"),

@@ -18,6 +18,22 @@ fn fixture() -> (tempfile::TempDir, u16) {
     (d, port)
 }
 
+/// Like `fixture()`, but under a project name unique to the caller instead
+/// of the shared "proj". `Hub` is a process-global registry keyed by project
+/// name (see hub.rs) that outlives any single test's `TempDir`: once some
+/// other test's "proj" hub exists, every later connection to "proj" reuses
+/// that *same* Hub — including its `dir`, which points at a directory that
+/// test's TempDir has since deleted. Any test whose server-side code touches
+/// the filesystem (not just in-memory buffer state) needs its own project
+/// name to avoid silently reading/writing through a stale path.
+fn fixture_named(project: &str) -> (tempfile::TempDir, u16) {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir(d.path().join(project)).unwrap();
+    std::fs::write(d.path().join(project).join("hello.md"), "# Hello\n").unwrap();
+    let port = start(vec![d.path().to_path_buf()]);
+    (d, port)
+}
+
 #[test]
 fn index_lists_projects() {
     let (_d, port) = fixture();
@@ -394,6 +410,92 @@ fn external_edit_updates_a_clean_buffer_live() {
     let _ = a.close(None);
     std::env::remove_var("DEADLIGHT_STATE_DIR");
     std::env::remove_var("DEADLIGHT_DEBOUNCE_MS");
+}
+
+#[test]
+fn set_mode_edit_then_save_writes_the_file() {
+    // End-to-end regression for the live-verified bug: SetMode{Edit} must
+    // make the server read the file (setting a real base_hash) before the
+    // client ever calls SaveBuffer, or every first save reports a conflict
+    // and the file on disk never changes.
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    let (d, port) = fixture_named("editproj1");
+    let mut a = ws_connect_path(port, "/ws/editproj1/_workspace").unwrap();
+    let _ = read_until(&mut a, r#""t":"State""#); // a's own initial snapshot
+
+    a.send(tungstenite::Message::Text(
+        r#"{"t":"OpenTab","pane":2,"tab":{"k":"File","rel":"hello.md","mode":"Preview"}}"#.into(),
+    ))
+    .unwrap();
+    let _ = read_until(&mut a, "hello.md");
+
+    a.send(tungstenite::Message::Text(
+        r#"{"t":"SetMode","rel":"hello.md","mode":"Edit"}"#.into(),
+    ))
+    .unwrap();
+    // The server must push the disk content with an empty origin — a
+    // non-empty origin equal to a's own id would be dropped client-side by
+    // the echo rule and the editor would open blank.
+    let text_ev = read_until(&mut a, r#""t":"BufferText""#);
+    assert!(text_ev.contains("# Hello"), "got: {text_ev}");
+    assert!(text_ev.contains(r#""origin":"""#), "must be authorless; got: {text_ev}");
+
+    a.send(tungstenite::Message::Text(
+        "{\"t\":\"EditBuffer\",\"rel\":\"hello.md\",\"text\":\"# Hello, edited\\n\"}".into(),
+    ))
+    .unwrap();
+    a.send(tungstenite::Message::Text(
+        r#"{"t":"SaveBuffer","rel":"hello.md","force":false}"#.into(),
+    ))
+    .unwrap();
+    // force:false is the whole point of this test: only a correct base_hash
+    // (set by SetMode's disk read) lets an *unforced* save through.
+    let saved = read_until(&mut a, r#""t":"SaveOk""#);
+    assert!(saved.contains(r#""t":"SaveOk""#));
+    assert_eq!(
+        std::fs::read_to_string(d.path().join("editproj1/hello.md")).unwrap(),
+        "# Hello, edited\n",
+        "the file on disk must actually change"
+    );
+
+    let _ = a.close(None);
+    std::env::remove_var("DEADLIGHT_STATE_DIR");
+}
+
+#[test]
+fn reconnect_replays_buffer_text_for_open_edit_buffers() {
+    // A client that (re)connects onto a layout with an already-open Edit
+    // buffer gets metadata-only State — never text — so without a replay,
+    // that editor renders permanently blank until someone happens to edit
+    // the same file again.
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    let (_d, port) = fixture_named("editproj2");
+    let mut a = ws_connect_path(port, "/ws/editproj2/_workspace").unwrap();
+    let _ = read_until(&mut a, r#""t":"State""#);
+    a.send(tungstenite::Message::Text(
+        r#"{"t":"OpenTab","pane":2,"tab":{"k":"File","rel":"hello.md","mode":"Preview"}}"#.into(),
+    ))
+    .unwrap();
+    let _ = read_until(&mut a, "hello.md");
+    a.send(tungstenite::Message::Text(
+        r#"{"t":"SetMode","rel":"hello.md","mode":"Edit"}"#.into(),
+    ))
+    .unwrap();
+    let _ = read_until(&mut a, r#""t":"BufferText""#);
+
+    // A second connection joins after the buffer already exists — this is
+    // the reconnect-onto-existing-state path, not the original open.
+    let mut b = ws_connect_path(port, "/ws/editproj2/_workspace").unwrap();
+    let b_text = read_until(&mut b, r#""t":"BufferText""#);
+    assert!(b_text.contains("hello.md") && b_text.contains("# Hello"), "got: {b_text}");
+
+    let _ = a.close(None);
+    let _ = b.close(None);
+    std::env::remove_var("DEADLIGHT_STATE_DIR");
 }
 
 #[test]
