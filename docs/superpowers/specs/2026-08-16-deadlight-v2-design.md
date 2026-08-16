@@ -141,23 +141,30 @@ Claude can pick a theme or author one.
 
 ## Stack
 
-Rust binary, no async runtime:
+Rust binary, no async runtime, single port. One `TcpListener`; each accepted
+connection is peeked: if the request line starts `GET /ws/` the untouched
+stream goes to tungstenite (`accept_hdr` performs the whole websocket
+handshake and exposes the path), otherwise a hand-rolled GET-only HTTP/1.1
+parser (~60 lines: request line, header drain, percent-decoding) handles it,
+thread-per-connection, `Connection: close`.
 
 | Crate | Role |
 |-------|------|
-| tiny_http | HTTP serving + connection upgrade |
-| tungstenite | websocket over the upgraded stream |
+| tungstenite | websocket handshake + framing (over a plain TcpStream, so it splits cleanly via `try_clone` for the two pump directions) |
 | portable-pty | PTY for `zellij attach` |
 | pulldown-cmark | markdown |
 | toml + serde | config |
 
 git operations shell out to the `git` binary (porcelain=v2 parsing ports from
-server.py). No serde_json — responses are HTML.
+server.py). No HTTP-server crate and no serde_json — requests are trivial
+GETs, responses are HTML.
 
-Known risk: the tiny_http → tungstenite upgrade handshake is manual (~30
-lines: compute `Sec-WebSocket-Accept`, send 101, wrap the raw stream). If it
-fights us, the sanctioned fallback is switching to axum; nothing else in the
-design changes.
+History: the first draft used tiny_http + a manual upgrade handshake, but
+tiny_http's upgraded stream is an opaque box that sync tungstenite can't
+split or set timeouts on, so the bidirectional terminal pump can't work over
+it; approved switch to hand-rolled HTTP on 2026-08-16 (one port is a hard
+requirement for tailscale serve). Sanctioned fallback if the hand-rolled
+layer misbehaves: axum; nothing else in the design changes.
 
 ## Security
 
