@@ -452,9 +452,28 @@ fn external_edit_updates_a_clean_buffer_live() {
     .unwrap();
     let _ = read_until(&mut a, "SaveOk"); // buffer is now clean
 
-    // Claude, in the next pane, rewrites the file
-    std::fs::write(d.path().join("proj/hello.md"), "# Rewritten by Claude\n").unwrap();
+    // Claude, in the next pane, rewrites the file. The watcher now spins up
+    // on a background thread (the large-project fix: `for_project` must
+    // return promptly regardless of tree size, so it can no longer walk and
+    // register OS watches inline before answering this connection) — so
+    // there's a short, expected window right after connecting where the
+    // watcher isn't live yet. Keep rewriting the file in the background
+    // instead of writing once, so the test doesn't depend on winning that
+    // race on the first try.
+    let hello_path = d.path().join("proj/hello.md");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let writer = std::thread::spawn(move || {
+        let mut n = 0u32;
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            std::fs::write(&hello_path, format!("# Rewritten by Claude {n}\n")).unwrap();
+            n += 1;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
     let seen = read_until(&mut a, "Rewritten by Claude");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = writer.join();
     assert!(seen.contains(r#""t":"BufferText""#), "a clean buffer must follow the file");
 
     // Hub is a process-global registry keyed by project name (see hub.rs),

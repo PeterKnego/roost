@@ -83,8 +83,30 @@ impl Hub {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300);
-            let ok = crate::watch::spawn(project, dir, arc.clone(), std::time::Duration::from_millis(ms));
-            Hub::lock(&arc).ws.watch_degraded = !ok;
+            // `watch::spawn` walks the tree and registers OS watches, which
+            // on a large project (thousands of directories) can take long
+            // enough that the connection thread calling `for_project` would
+            // never get to send the client's first `State` snapshot — this
+            // is the bug reported live: the workspace pane stayed empty
+            // because nothing was ever sent. Doing the setup on its own
+            // thread means `for_project` returns immediately regardless of
+            // project size. `watching` is already set (above, under the hub
+            // lock), so a second connection racing in here sees
+            // `need_watcher == false` and does not spawn a second one.
+            let arc2 = arc.clone();
+            let project2 = project.to_string();
+            std::thread::spawn(move || {
+                let ok = crate::watch::spawn(&project2, dir, arc2.clone(), std::time::Duration::from_millis(ms));
+                let mut h = Hub::lock(&arc2);
+                h.ws.watch_degraded = !ok;
+                if !ok {
+                    // Clients already served a snapshot saw watch_degraded
+                    // still false, since setup hadn't finished yet — tell
+                    // them now, or the UI never learns watching failed.
+                    let ev = h.snapshot_event(&String::new());
+                    h.broadcast(&ev);
+                }
+            });
         }
         arc
     }
@@ -817,6 +839,38 @@ mod tests {
             "\"src2\" is not \"src\" followed by a '/' boundary and must be untouched"
         );
         assert!(h.ws.buffers.contains_key("src2/b.rs"));
+    }
+
+    #[test]
+    fn for_project_returns_promptly_on_a_large_tree() {
+        // The bug reported live: `for_project` used to walk the entire
+        // project tree, registering an OS watch per directory, on the
+        // connection thread — before the client's first `State` snapshot
+        // could be sent. On a project with thousands of directories that
+        // made the workspace pane stay empty indefinitely. Watcher setup
+        // must now happen off this thread, so `for_project` returns almost
+        // immediately no matter how large the tree is.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sd = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+
+        let d = tempfile::tempdir().unwrap();
+        // A few thousand directories is enough to make the old synchronous
+        // walk take a noticeable amount of time without making the test
+        // itself slow.
+        for i in 0..4000 {
+            std::fs::create_dir(d.path().join(format!("dir{i}"))).unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let _hub = Hub::for_project("large_tree_project", d.path().to_path_buf());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "for_project must return promptly regardless of project size; took {elapsed:?}"
+        );
+
+        std::env::remove_var("DEADLIGHT_STATE_DIR");
     }
 
     #[test]

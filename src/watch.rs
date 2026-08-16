@@ -53,43 +53,113 @@ pub fn is_self_write(
 type ProjectDebouncer =
     notify_debouncer_full::Debouncer<notify::RecommendedWatcher, notify_debouncer_full::RecommendedCache>;
 
-/// Walk `root` (skipping SKIP_DIRS), registering a non-recursive watch on
-/// every directory found, `root` included. Used both for the initial walk
-/// in `spawn` and, from inside the running watcher, to pick up directories
-/// created after startup.
+/// inotify's default `max_user_watches` is commonly 8192–65536 depending on
+/// the distro (tunable via `fs.inotify.max_user_watches`, but deadlight
+/// can't assume it was tuned). Once this many directories are watched, stop
+/// registering more instead of either erroring the walk out or silently
+/// eating the whole machine's inotify budget. VS Code's watcher backend and
+/// IntelliJ's `fsnotifier` both degrade the same way on Linux — a visible
+/// "incomplete" state, or a fallback to periodic scans — rather than
+/// failing or hanging, and that's what `watch_degraded` communicates to the
+/// UI here.
+// Only the per-directory (Linux) `watch_tree` and the tests below use this
+// and `collect_watch_dirs` outside of a `cargo test` build; on macOS/Windows
+// a plain `cargo build` would otherwise warn about both as dead code.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+const MAX_WATCHED_DIRS: usize = 8192;
+
+/// Collect directories under `root` (skipping SKIP_DIRS), up to a total of
+/// `cap` counted from `already` — so the initial walk and later calls that
+/// pick up newly-created directories share one budget for the life of a
+/// watcher rather than each independently walking past the cap. Returns the
+/// directories to watch and whether the cap was hit.
 ///
-/// Non-recursive and per-directory (not one recursive watch on the root)
-/// because a recursive watch on a Rust project turns every `cargo build`
-/// into thousands of events from `target/` — except we skip `target/`
-/// entirely anyway, but the same trap applies to any other large generated
-/// directory a project happens to have.
+/// Pure filesystem walking, no OS watch calls, so the cap can be tested
+/// directly without a real watcher.
 ///
 /// Uses `DirEntry::file_type()`, not `Path::is_dir()`: the latter follows
 /// symlinks, so a self-referential symlink inside the project (`ln -s .
-/// loop`) would make this recurse forever. The first call runs synchronously
-/// on the thread that called `spawn` (a connection thread, inside
-/// `Hub::for_project`), so an unbounded walk there would hang that request.
-fn watch_tree(debouncer: &mut ProjectDebouncer, project: &str, root: PathBuf) -> bool {
-    use notify::RecursiveMode;
-    let mut ok = true;
+/// loop`) would make this recurse forever.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn collect_watch_dirs(root: PathBuf, already: usize, cap: usize) -> (Vec<PathBuf>, bool) {
+    let mut out = Vec::new();
+    let mut count = already;
     let mut stack = vec![root];
     while let Some(d) = stack.pop() {
+        if count >= cap {
+            return (out, true);
+        }
+        count += 1;
+        // The directory itself counts toward the cap and is returned
+        // whether or not it can be listed — matching the pre-cap behavior
+        // of watching every directory reached, even one whose contents
+        // turn out to be unreadable.
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().into_owned();
+                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if is_dir && !crate::projects::SKIP_DIRS.contains(&name.as_str()) {
+                    stack.push(p);
+                }
+            }
+        }
+        out.push(d);
+    }
+    (out, false)
+}
+
+/// Register a watch on `root` and (Linux/other) every directory beneath it,
+/// or (macOS/Windows) `root` alone. Used both for the initial walk in
+/// `spawn` and, from inside the running watcher, to pick up directories
+/// created after startup — except on the recursive platforms, where the
+/// caller skips that second use entirely since one watch already covers
+/// the whole subtree.
+///
+/// inotify has no recursive mode, so Linux registers one non-recursive
+/// watch per directory, bounded by `MAX_WATCHED_DIRS` (see its doc comment)
+/// via the `watched` counter the caller threads through every call for the
+/// life of one watcher. FSEvents (macOS) and ReadDirectoryChangesW
+/// (Windows) watch subtrees natively and cheaply, so there registering one
+/// `Recursive` watch on `root` replaces the whole walk — no per-directory
+/// cap needed, and no filtering of SKIP_DIRS at registration time either:
+/// `classify` already filters those out of the events this delivers, so
+/// the cost is some discarded events, not incorrect behavior.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn watch_tree(debouncer: &mut ProjectDebouncer, project: &str, root: PathBuf, watched: &mut usize) -> bool {
+    use notify::RecursiveMode;
+    let already = *watched;
+    let (dirs, hit_cap) = collect_watch_dirs(root, already, MAX_WATCHED_DIRS);
+    if hit_cap && already < MAX_WATCHED_DIRS {
+        // Only log the transition into degraded, not once per subsequent
+        // directory discovered afterward — those all hit the same cap.
+        eprintln!(
+            "deadlight: {project}: hit the {MAX_WATCHED_DIRS}-directory watch cap; \
+             file-change tracking is now incomplete for this project"
+        );
+    }
+    let mut ok = !hit_cap;
+    for d in dirs {
         if let Err(e) = debouncer.watch(&d, RecursiveMode::NonRecursive) {
             eprintln!("deadlight: {project}: failed to watch {}: {e}", d.display());
             ok = false;
             continue;
         }
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            let name = e.file_name().to_string_lossy().into_owned();
-            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if is_dir && !crate::projects::SKIP_DIRS.contains(&name.as_str()) {
-                stack.push(p);
-            }
-        }
+        *watched += 1;
     }
     ok
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn watch_tree(debouncer: &mut ProjectDebouncer, project: &str, root: PathBuf) -> bool {
+    use notify::RecursiveMode;
+    match debouncer.watch(&root, RecursiveMode::Recursive) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("deadlight: {project}: failed to watch {}: {e}", root.display());
+            false
+        }
+    }
 }
 
 /// True when a panic anywhere in one debounced batch's handling should not
@@ -128,16 +198,34 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
             return false;
         }
     };
+    // On the per-directory (Linux/other) platform, `watched` is the running
+    // total shared between this initial walk and every later call that
+    // picks up a directory created after startup, so the cap in
+    // `watch_tree` applies across the whole life of the watcher, not per
+    // call.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut watched = 0usize;
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let ok = watch_tree(&mut debouncer, project, dir.clone(), &mut watched);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let ok = watch_tree(&mut debouncer, project, dir.clone());
-    // .git itself is skipped by watch_tree (it's in SKIP_DIRS), but
-    // index/HEAD drive the status pane, so watch that one directory
-    // deliberately.
+    // .git itself is skipped by the per-directory walk (it's in SKIP_DIRS),
+    // and isn't implied by the recursive root watch either on the other
+    // platforms — index/HEAD drive the status pane, so watch that one
+    // directory deliberately regardless of which path was taken above.
     let _ = debouncer.watch(&dir.join(".git"), RecursiveMode::NonRecursive);
 
     let base = dir.clone();
     let project_name = project.to_string();
     std::thread::spawn(move || {
-        let mut keep = debouncer; // dropping the debouncer stops the watch
+        // Dropping the debouncer stops the watch, so it must stay bound for
+        // the loop's whole lifetime regardless of platform. Only the
+        // per-directory (Linux) platform ever reads it again afterward, to
+        // register a watch on a directory created after startup.
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let mut keep = debouncer;
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let _keep = debouncer;
         for res in rx {
             let Ok(events) = res else { continue };
             // One panic anywhere below must not silently end watching for
@@ -147,30 +235,38 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
             // not a quiet, permanent stop.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // First pass: resolve every event to a project-relative
-                // path, and eagerly register a watch on any newly created
-                // directory. This does not touch the hub — no lock is held
-                // across the filesystem I/O in `watch_tree` (readdir plus
-                // watch registration). Necessary on Linux: unlike macOS
-                // FSEvents, inotify never reports anything from inside a
-                // directory that was never explicitly watched, so a `git
-                // checkout` or a plain `mkdir` that adds a new directory
-                // would go permanently unseen without this.
+                // path, and — per-directory platforms only — eagerly
+                // register a watch on any newly created directory. This
+                // does not touch the hub — no lock is held across the
+                // filesystem I/O in `watch_tree` (readdir plus watch
+                // registration). Necessary on Linux: unlike macOS FSEvents,
+                // inotify never reports anything from inside a directory
+                // that was never explicitly watched, so a `git checkout` or
+                // a plain `mkdir` that adds a new directory would go
+                // permanently unseen without this. Unnecessary — and
+                // skipped — on macOS/Windows, where the single recursive
+                // watch registered in `spawn` already covers any directory
+                // created later, existing or not.
                 let mut rels: Vec<String> = Vec::new();
                 for ev in &events {
                     for path in &ev.paths {
                         let Ok(rel) = path.strip_prefix(&base) else { continue };
                         rels.push(rel.to_string_lossy().replace('\\', "/"));
-                        let skip = path
-                            .file_name()
-                            .map(|n| crate::projects::SKIP_DIRS.contains(&n.to_string_lossy().as_ref()))
-                            .unwrap_or(true);
-                        // `symlink_metadata`, not `metadata`: do not follow
-                        // a symlink into recursing on it, same reasoning as
-                        // `watch_tree`'s use of `file_type()`.
-                        let is_dir =
-                            std::fs::symlink_metadata(path).map(|m| m.is_dir()).unwrap_or(false);
-                        if !skip && is_dir {
-                            watch_tree(&mut keep, &project_name, path.clone());
+                        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                        {
+                            let skip = path
+                                .file_name()
+                                .map(|n| crate::projects::SKIP_DIRS.contains(&n.to_string_lossy().as_ref()))
+                                .unwrap_or(true);
+                            // `symlink_metadata`, not `metadata`: do not
+                            // follow a symlink into recursing on it, same
+                            // reasoning as `watch_tree`'s use of
+                            // `file_type()`.
+                            let is_dir =
+                                std::fs::symlink_metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+                            if !skip && is_dir {
+                                watch_tree(&mut keep, &project_name, path.clone(), &mut watched);
+                            }
                         }
                     }
                 }
@@ -318,5 +414,44 @@ mod tests {
         assert!(ok);
 
         std::env::remove_var("DEADLIGHT_STATE_DIR");
+    }
+
+    // The per-directory (Linux) watch path must stop growing once it hits
+    // MAX_WATCHED_DIRS rather than walking (and trying to watch) every one
+    // of a huge tree's directories — this is the bounded-walk half of the
+    // large-project fix; `collect_watch_dirs` is exercised directly here so
+    // the test doesn't depend on inotify or run on a platform that has it.
+    #[test]
+    fn bounded_walk_stops_at_the_cap() {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            std::fs::create_dir(d.path().join(format!("d{i}"))).unwrap();
+        }
+        // root + 50 children = 51 directories total, well under a cap of 10.
+        let (dirs, hit_cap) = collect_watch_dirs(d.path().to_path_buf(), 0, 10);
+        assert!(hit_cap, "a tree bigger than the cap must report it was hit");
+        assert_eq!(dirs.len(), 10, "must stop exactly at the cap, not walk past it");
+    }
+
+    #[test]
+    fn bounded_walk_does_not_hit_the_cap_on_a_small_tree() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("a")).unwrap();
+        std::fs::create_dir(d.path().join("b")).unwrap();
+        let (dirs, hit_cap) = collect_watch_dirs(d.path().to_path_buf(), 0, 8192);
+        assert!(!hit_cap);
+        assert_eq!(dirs.len(), 3, "root plus its two children");
+    }
+
+    #[test]
+    fn bounded_walk_honors_an_already_count_from_a_prior_call() {
+        // Mirrors how `watch_tree` threads `watched` across the initial
+        // walk and later per-created-directory calls: a call that starts
+        // already at the cap must add nothing and report degraded.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("a")).unwrap();
+        let (dirs, hit_cap) = collect_watch_dirs(d.path().to_path_buf(), 5, 5);
+        assert!(hit_cap);
+        assert!(dirs.is_empty());
     }
 }
