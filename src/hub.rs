@@ -1,7 +1,7 @@
 //! One Hub per project: owns the Workspace, the subscriber list, and the
 //! dispatch from intent to either a pure transition or a file operation.
 //! Everything the sockets do goes through here, so mirroring is automatic.
-use crate::proto::{Event, Intent};
+use crate::proto::{Event, Intent, Mode, Tab};
 use crate::workspace::{self, Workspace};
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -190,6 +190,19 @@ impl Hub {
         match workspace::apply_layout(&mut self.ws, &intent) {
             Ok(true) => {
                 self.ws.version += 1;
+                // Entering Edit mode is the server's cue to become this
+                // buffer's owner: read the file now, so base_hash/base_mtime
+                // reflect what's actually on disk. Without this, a buffer
+                // opened purely client-side (the old /frag/raw flow) never
+                // got a real base_hash and every first save reported a
+                // conflict against content it never compared against.
+                match &intent {
+                    Intent::SetMode { rel, mode: Mode::Edit } => self.open_for_edit(from, rel),
+                    Intent::OpenTab { tab: Tab::File { rel, mode: Mode::Edit }, .. } => {
+                        self.open_for_edit(from, rel)
+                    }
+                    _ => {}
+                }
                 let snap = self.snapshot_event(from);
                 self.broadcast(&snap);
                 self.persist();
@@ -200,6 +213,45 @@ impl Hub {
                 self.send_to(from, &ev);
             }
         }
+    }
+
+    /// Reads a file into its buffer the moment a tab enters Edit mode, and
+    /// tells every client what's in it. Skips the disk read when the buffer
+    /// is already dirty: reactivating an in-progress edit (the tab getting
+    /// reopened, e.g. by a second browser) must never clobber unsaved text
+    /// with what's on disk — only `SaveBuffer`/`CloseBuffer` may do that.
+    fn open_for_edit(&mut self, from: &ConnId, rel: &str) {
+        let already_dirty = self.ws.buffers.get(rel).map(|b| b.dirty).unwrap_or(false);
+        if !already_dirty {
+            if !self.ws.buffers.contains_key(rel) && self.ws.buffers.len() >= workspace::MAX_BUFFERS {
+                self.send_to(from, &Event::Error { msg: "too many open buffers".into() });
+                return;
+            }
+            match crate::projects::safe_resolve(&self.dir, rel)
+                .and_then(|p| crate::projects::read_text_file(&p))
+            {
+                Ok(text) => {
+                    let hash = workspace::hash_text(&text);
+                    let mtime =
+                        std::fs::metadata(self.dir.join(rel)).ok().and_then(|m| m.modified().ok());
+                    let b = self.ws.buffers.entry(rel.to_string()).or_default();
+                    b.text = text;
+                    b.base_hash = hash;
+                    b.base_mtime = mtime;
+                    b.dirty = false;
+                    b.stale = false;
+                }
+                Err(e) => {
+                    self.send_to(from, &Event::Error { msg: e });
+                    return;
+                }
+            }
+        }
+        let text = self.ws.buffers.get(rel).map(|b| b.text.clone()).unwrap_or_default();
+        // No author: everyone applies it, including the client that just
+        // switched to Edit — otherwise its own echo-suppression rule would
+        // drop this and the editor would open blank (the bug this fixes).
+        self.broadcast(&Event::BufferText { rel: rel.to_string(), text, origin: String::new() });
     }
 
     /// A file with an open buffer changed on disk. Clean buffers follow the
@@ -414,6 +466,76 @@ mod tests {
         assert!(
             !drain(&rx_other).iter().any(|m| m.contains(r#""t":"SaveConflict""#)),
             "a save conflict must go only to the client that tried to save"
+        );
+    }
+
+    #[test]
+    fn set_mode_edit_reads_the_file_so_the_first_save_does_not_conflict() {
+        // Regression for the bug reported live: switching to Edit used to
+        // leave base_hash at its Default::default() of 0, which never
+        // matches any real file, so the very first save always reported a
+        // conflict and the file was never written.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.txt"), "on disk\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(
+            &c,
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::File { rel: "a.txt".into(), mode: Mode::Preview } },
+        );
+        drain(&rx);
+        h.handle(&c, Intent::SetMode { rel: "a.txt".into(), mode: Mode::Edit });
+        let msgs = drain(&rx);
+        assert!(
+            msgs.iter().any(|m| {
+                m.contains(r#""t":"BufferText""#) && m.contains("on disk") && m.contains(r#""origin":"""#)
+            }),
+            "entering Edit must push the disk text with an empty origin, or the \
+             requester's own echo rule drops it and the editor opens blank; got {msgs:?}"
+        );
+        assert_eq!(h.ws.buffers["a.txt"].base_hash, workspace::hash_text("on disk\n"));
+        assert!(!h.ws.buffers["a.txt"].dirty, "a freshly-read buffer must not be marked dirty");
+
+        // The whole point: an unmodified save against a real base_hash must
+        // succeed, not conflict, now that the buffer actually knows what's
+        // on disk.
+        h.handle(&c, Intent::SaveBuffer { rel: "a.txt".into(), force: false });
+        assert!(drain(&rx).iter().any(|m| m.contains(r#""t":"SaveOk""#)));
+    }
+
+    #[test]
+    fn set_mode_edit_does_not_clobber_an_already_dirty_buffer() {
+        // Reactivating an in-progress edit (e.g. the tab reopened from a
+        // second browser) must not silently discard unsaved text by
+        // re-reading the file out from under it.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.txt"), "on disk\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(
+            &c,
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::File { rel: "a.txt".into(), mode: Mode::Edit } },
+        );
+        drain(&rx);
+        h.handle(&c, Intent::EditBuffer { rel: "a.txt".into(), text: "unsaved work".into() });
+        drain(&rx);
+        assert!(h.ws.buffers["a.txt"].dirty);
+
+        h.handle(&c, Intent::SetMode { rel: "a.txt".into(), mode: Mode::Edit });
+        let msgs = drain(&rx);
+        assert_eq!(h.ws.buffers["a.txt"].text, "unsaved work", "dirty text must survive");
+        assert!(h.ws.buffers["a.txt"].dirty, "SetMode must not clear dirty for unsaved work");
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"BufferText""#) && m.contains("unsaved work")),
+            "the requester must still get the current (unsaved) text, not blank; got {msgs:?}"
         );
     }
 

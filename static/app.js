@@ -10,14 +10,16 @@ const wsUrl = (p) => `${location.protocol === "https:" ? "wss" : "ws"}://${locat
 let state = null;
 let myOrigin = null;
 let ctrl = null;
-const terms = new Map();   // session -> {node, term, fit, sock}
-const editors = new Map(); // rel -> textarea
+const terms = new Map();   // session -> {node, term, fit, sock, stale}
+const editors = new Map(); // rel -> textarea (the currently mounted one, if any)
+const texts = new Map();   // rel -> latest known buffer text (server-authoritative)
 
 function send(intent) {
   if (ctrl && ctrl.readyState === 1) ctrl.send(JSON.stringify(intent));
 }
 
 function connectControl() {
+  myOrigin = null; // a reconnect must not keep a stale id from the last socket
   ctrl = new WebSocket(wsUrl(`/ws/${PROJECT}/_workspace`));
   ctrl.onmessage = (e) => onEvent(JSON.parse(e.data));
   ctrl.onclose = () => setTimeout(connectControl, 1000);
@@ -32,8 +34,12 @@ function onEvent(ev) {
       break;
     case "BufferText": {
       // Skip our own text or the cursor jumps; empty origin = external change
-      // (a background save or Claude editing the file on disk).
+      // (a background save, SetMode's initial disk read, or Claude editing
+      // the file directly). texts is updated unconditionally (not gated on
+      // an editor being mounted right now) so mountEditor can always seed
+      // from it, even for text that arrived before its tab was ever opened.
       if (ev.origin && ev.origin === myOrigin) break;
+      texts.set(ev.rel, ev.text);
       const ta = editors.get(ev.rel);
       if (ta && ta.value !== ev.text) ta.value = ev.text;
       break;
@@ -56,7 +62,9 @@ function onEvent(ev) {
 
 function tabKey(t) {
   switch (t.k) {
-    case "File": return `File:${t.rel}`;
+    // Mode is part of the key: toggling Preview<->Edit must force a remount
+    // (fetched HTML vs. a live textarea), not be treated as "unchanged".
+    case "File": return `File:${t.rel}:${t.mode}`;
     case "Diff": return `Diff:${t.rel || ""}`;
     case "Terminal": return `Terminal:${t.session}`;
     default: return t.k;
@@ -81,12 +89,14 @@ function render() {
   document.documentElement.style.setProperty("--right-w", state.sizes.right_w + "px");
   document.documentElement.style.setProperty("--left-split", state.sizes.left_split + "%");
 
+  const liveSessions = new Set();
   state.panes.forEach((pane, pi) => {
     const el = document.querySelector(`.pane[data-pane="${pi}"]`);
     const strip = el.querySelector(".tabstrip");
     const content = el.querySelector(".content");
-    strip.innerHTML = "";
+    strip.innerHTML = ""; // cheap and holds no focus — always safe to rebuild
     pane.tabs.forEach((t, ti) => {
+      if (t.k === "Terminal") liveSessions.add(t.session);
       const b = document.createElement("span");
       b.className = "tab" + (ti === pane.active ? " active" : "");
       const meta = t.k === "File" ? state.buffers.find((x) => x.rel === t.rel) : null;
@@ -120,11 +130,34 @@ function render() {
     plus.textContent = "+";
     plus.onclick = () => newTerminal(pi);
     strip.appendChild(plus);
+
+    const active = pane.tabs[pane.active];
+    const activeKey = active ? tabKey(active) : "";
+    if (content.dataset.mountedKey === activeKey) {
+      // The same tab is still active in this pane. A State snapshot fires
+      // on every EditBuffer — including ones caused by the user's own
+      // typing in the very editor this pane is showing — so rebuilding
+      // content here on every call would tear the textarea (and its focus
+      // and caret) out from under the user's cursor on each debounce tick.
+      return;
+    }
     // Park every terminal before clearing, so nodes are never destroyed.
     content.querySelectorAll(".termhost").forEach((n) => pool().appendChild(n));
     content.innerHTML = "";
-    const active = pane.tabs[pane.active];
+    content.dataset.mountedKey = activeKey;
     if (active) mountTab(content, active);
+  });
+
+  // A closed/moved-away terminal tab means no pane anywhere still
+  // references that session (sessions are deduped globally, same as File
+  // tabs by rel) — tear its socket and xterm instance down instead of
+  // leaking a live PTY reader for the rest of the page's life.
+  terms.forEach((e, session) => {
+    if (liveSessions.has(session)) return;
+    try { e.sock.close(); } catch {}
+    try { e.term.dispose(); } catch {}
+    e.node.remove();
+    terms.delete(session);
   });
 }
 
@@ -141,10 +174,16 @@ function newTerminal(pane) {
 }
 
 function mountTab(content, t) {
+  // Invalidate any fetch already in flight for this content element: a
+  // response landing after the pane has moved on (e.g. to a Terminal tab)
+  // must not clobber whatever is here now — see the dataset.url check below.
+  delete content.dataset.url;
   if (t.k === "Terminal") {
     const e = ensureTerm(t.session);
     content.appendChild(e.node);   // MOVE, not rebuild — the socket survives
-    requestAnimationFrame(() => { try { e.fit.fit(); sendResize(e); } catch {} });
+    requestAnimationFrame(() => {
+      try { e.fit.fit(); e.term.focus(); sendResize(e); } catch {}
+    });
     return;
   }
   if (t.k === "File" && t.mode === "Edit") { mountEditor(content, t.rel); return; }
@@ -155,6 +194,7 @@ function mountTab(content, t) {
     : `/frag/${PROJECT}/diff${t.rel ? "?path=" + encodeURIComponent(t.rel) : ""}`;
   content.dataset.url = url;
   fetch(url).then((r) => r.text()).then((html) => {
+    if (content.dataset.url !== url) return; // this pane moved on before we got here
     content.innerHTML = html;
     content.querySelectorAll("pre code").forEach((b) => window.hljs && hljs.highlightElement(b));
     wireFragment(content);
@@ -226,7 +266,15 @@ function refreshKind(kind) {
 }
 
 function ensureTerm(session) {
-  if (terms.has(session)) return terms.get(session);
+  const existing = terms.get(session);
+  if (existing && !existing.stale) return existing;
+  if (existing) {
+    // The socket died (server restart, network blip) — the pooled node is
+    // just as dead, so replace it rather than reattach to a closed xterm.
+    try { existing.term.dispose(); } catch {}
+    existing.node.remove();
+    terms.delete(session);
+  }
   const node = document.createElement("div");
   node.className = "termhost";
   node.dataset.session = session;
@@ -239,7 +287,9 @@ function ensureTerm(session) {
   sock.binaryType = "arraybuffer";
   sock.onmessage = (e) => term.write(new Uint8Array(e.data));
   term.onData((d) => { if (sock.readyState === 1) sock.send(new TextEncoder().encode(d)); });
-  const entry = { node, term, fit, sock };
+  const entry = { node, term, fit, sock, stale: false };
+  sock.onclose = () => { entry.stale = true; };
+  sock.onerror = () => { entry.stale = true; };
   terms.set(session, entry);
   return entry;
 }
@@ -252,8 +302,12 @@ function mountEditor(content, rel) {
   const ta = document.createElement("textarea");
   ta.className = "editor";
   ta.spellcheck = false;
-  const existing = editors.get(rel);
-  ta.value = existing ? existing.value : "";
+  // The server reads the file itself the moment this rel enters Edit mode
+  // (SetMode/OpenTab, see hub.rs) and pushes the content as a BufferText
+  // with an empty origin, landing in `texts` — there is no client-side
+  // fetch here. If that push hasn't arrived yet, the textarea starts empty
+  // and the BufferText handler in onEvent fills it in as soon as it does.
+  ta.value = texts.has(rel) ? texts.get(rel) : "";
   editors.set(rel, ta);
   let timer = null;
   ta.oninput = () => {
@@ -268,8 +322,6 @@ function mountEditor(content, rel) {
     }
   };
   content.appendChild(ta);
-  if (!existing) fetch(`/frag/${PROJECT}/raw?path=${encodeURIComponent(rel)}`)
-    .then((r) => r.text()).then((txt) => { ta.value = txt; send({ t: "EditBuffer", rel, text: txt }); });
 }
 
 function showConflict(ev) {
