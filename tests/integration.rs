@@ -65,3 +65,12 @@ fn static_assets_served_with_type() {
         .call().unwrap();
     assert!(resp.content_type().starts_with("text/javascript"));
 }
+
+#[test]
+fn diff_traversal_path_is_rejected_with_hint() {
+    let (_d, port) = fixture();
+    let body = ureq::get(&format!("http://127.0.0.1:{port}/frag/proj/diff?path=../../../etc/passwd"))
+        .call().unwrap().into_string().unwrap();
+    assert!(body.contains("class=\"hint\""));
+    assert!(!body.contains("root:"));
+}
