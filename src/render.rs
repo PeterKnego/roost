@@ -1,0 +1,307 @@
+//! All HTML generation. Plain string building, no template engine.
+//! Fragments target htmx swap sites; pages are full documents.
+use crate::config::Settings;
+use crate::gitio::Status;
+use crate::projects::Project;
+use std::path::Path;
+
+pub fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+pub fn hint(msg: &str) -> String {
+    format!("<div class=\"hint\">{}</div>", esc(msg))
+}
+
+pub fn diff_html(diff: &str) -> String {
+    diff.lines()
+        .map(|l| {
+            let cls = if l.starts_with("+++") || l.starts_with("---") || l.starts_with("diff ") {
+                "meta"
+            } else if l.starts_with("@@") {
+                "hunk"
+            } else if l.starts_with('+') {
+                "add"
+            } else if l.starts_with('-') {
+                "del"
+            } else {
+                "ctx"
+            };
+            let body = if l.is_empty() { " ".to_string() } else { esc(l) };
+            format!("<div class=\"dl {cls}\">{body}</div>")
+        })
+        .collect()
+}
+
+pub fn markdown_html(md: &str) -> String {
+    use pulldown_cmark::{html, Options, Parser};
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let mut out = String::new();
+    html::push_html(&mut out, Parser::new_ext(md, opts));
+    format!("<article class=\"markdown-body\">{out}</article>")
+}
+
+pub fn file_fragment(rel: &str, content: &str) -> String {
+    let ext = rel.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    if ext == "md" || ext == "markdown" {
+        format!("<div class=\"path\">{}</div>{}", esc(rel), markdown_html(content))
+    } else {
+        format!(
+            "<div class=\"path\">{}</div><pre class=\"codeview\"><code class=\"language-{}\">{}</code></pre>",
+            esc(rel),
+            esc(&ext),
+            esc(content)
+        )
+    }
+}
+
+pub fn tree_fragment(project: &str, dir: &Path, open: &str, hide: &[String]) -> String {
+    let mut budget = 4000usize;
+    let mut out = String::from("<ul class=\"tree\">");
+    tree_level(project, dir, "", open, hide, &mut budget, &mut out);
+    out.push_str("</ul>");
+    if budget == 0 {
+        out.push_str("<div class=\"hint\">tree truncated (too many entries)</div>");
+    }
+    out
+}
+
+fn tree_level(
+    project: &str,
+    dir: &Path,
+    rel: &str,
+    open: &str,
+    hide: &[String],
+    budget: &mut usize,
+    out: &mut String,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|e| (e.path().is_file(), e.file_name().to_ascii_lowercase()));
+    for e in entries {
+        if *budget == 0 {
+            return;
+        }
+        let name = e.file_name().to_string_lossy().into_owned();
+        if crate::projects::SKIP_DIRS.contains(&name.as_str()) || hide.iter().any(|h| h == &name)
+        {
+            continue;
+        }
+        *budget -= 1;
+        let erel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+        if e.path().is_dir() {
+            let is_open = open == erel || open.starts_with(&format!("{erel}/"));
+            out.push_str(&format!(
+                "<li><details{}><summary>{}</summary><ul>",
+                if is_open { " open" } else { "" },
+                esc(&name)
+            ));
+            tree_level(project, &e.path(), &erel, open, hide, budget, out);
+            out.push_str("</ul></details></li>");
+        } else {
+            let sel = if open == erel { " sel" } else { "" };
+            out.push_str(&format!(
+                "<li><a class=\"file{sel}\" data-rel=\"{}\" hx-get=\"/frag/{}/file?path={}\" hx-target=\"#content\">{}</a></li>",
+                esc(&erel),
+                project,
+                crate::http::percent_encode(&erel),
+                esc(&name)
+            ));
+        }
+    }
+}
+
+pub fn changes_fragment(project: &str, st: &Status) -> String {
+    if st.changes.is_empty() {
+        return hint("working tree clean");
+    }
+    let mut out = format!(
+        "<ul class=\"changes\"><li><a class=\"file\" data-rel=\"\" hx-get=\"/frag/{project}/diff\" hx-target=\"#content\"><b>— full diff —</b></a></li>"
+    );
+    for c in &st.changes {
+        out.push_str(&format!(
+            "<li><a class=\"file\" data-rel=\"{}\" hx-get=\"/frag/{}/diff?path={}\" hx-target=\"#content\"><span class=\"xy\">{}</span> {}</a></li>",
+            esc(&c.path),
+            project,
+            crate::http::percent_encode(&c.path),
+            esc(&c.xy),
+            esc(&c.path)
+        ));
+    }
+    out.push_str("</ul>");
+    out
+}
+
+pub fn status_fragment(st: &Status) -> String {
+    format!(
+        "<span id=\"branch\">{}</span><span id=\"badge\">{}</span>",
+        if st.branch.is_empty() { String::new() } else { format!("⎇ {}", esc(&st.branch)) },
+        if st.changes.is_empty() { String::new() } else { format!("({})", st.changes.len()) }
+    )
+}
+
+pub fn index_page(projects: &[Project]) -> String {
+    let rows: String = projects
+        .iter()
+        .map(|p| {
+            format!(
+                "<li><a href=\"/{0}\">{0}</a><span class=\"path\">{1}{2}</span></li>",
+                esc(&p.name),
+                esc(&p.path.to_string_lossy()),
+                if p.git { " ⎇" } else { "" }
+            )
+        })
+        .collect();
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>deadlight</title>\
+         <link rel=\"stylesheet\" href=\"/static/themes/dark.css\">\
+         <link rel=\"stylesheet\" href=\"/static/style.css\">\
+         </head><body><header><span class=\"proj\">deadlight</span></header>\
+         <main><ul class=\"projects\">{rows}</ul></main></body></html>"
+    )
+}
+
+pub fn workspace_page(project: &str, s: &Settings, has_theme_css: bool) -> String {
+    let warn = s
+        .warning
+        .as_deref()
+        .map(|w| format!("<span class=\"warn\" title=\"{}\">⚠ config</span>", esc(w)))
+        .unwrap_or_default();
+    let theme_css = if has_theme_css {
+        format!("<link rel=\"stylesheet\" href=\"/frag/{project}/theme.css\">")
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{project} — deadlight</title>
+<link rel="stylesheet" href="/static/vendor/xterm.css">
+<link rel="stylesheet" href="/static/vendor/hljs-github-dark.min.css">
+<link rel="stylesheet" href="/static/vendor/github-markdown.min.css">
+<link rel="stylesheet" href="/static/themes/{theme}.css">
+<link rel="stylesheet" href="/static/style.css">
+{theme_css}
+<script src="/static/vendor/htmx.min.js"></script>
+<script src="/static/vendor/xterm.js"></script>
+<script src="/static/vendor/xterm-addon-fit.js"></script>
+<script src="/static/vendor/highlight.min.js"></script>
+</head><body data-project="{project}" data-default-tab="{tab}">
+<header>
+  <a class="home" href="/">◆</a><span class="proj">{project}</span>
+  <nav><button id="tab-terminal">Terminal</button><button id="tab-files">Files</button><button id="tab-changes">Changes</button></nav>
+  <span id="gitinfo" hx-get="/frag/{project}/status" hx-trigger="load, refresh from:body"></span>
+  {warn}
+  <button id="refresh" title="refresh (r)">⟳</button>
+</header>
+<main>
+  <section id="term-pane"><div id="term"></div><div id="term-overlay" class="hidden">disconnected — reconnecting…</div></section>
+  <section id="viewer" class="hidden"><nav id="sidebar"></nav><div id="content"></div></section>
+</main>
+<script src="/static/app.js"></script>
+</body></html>"#,
+        theme = esc(&s.theme),
+        tab = esc(&s.default_tab)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn esc_escapes_html() {
+        assert_eq!(esc("a<b>&\"c\""), "a&lt;b&gt;&amp;&quot;c&quot;");
+    }
+
+    #[test]
+    fn diff_lines_are_classified() {
+        let d = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old <\n+new\n ctx";
+        let h = diff_html(d);
+        assert!(h.contains("dl meta"));
+        assert!(h.contains("dl hunk"));
+        assert!(h.contains("dl del"));
+        assert!(h.contains("dl add"));
+        assert!(h.contains("dl ctx"));
+        assert!(h.contains("-old &lt;")); // escaped
+    }
+
+    #[test]
+    fn markdown_renders_wrapped() {
+        let h = markdown_html("# Hi\n\n- a\n");
+        assert!(h.starts_with("<article class=\"markdown-body\">"));
+        assert!(h.contains("<h1>Hi</h1>"));
+        assert!(h.contains("<li>a</li>"));
+    }
+
+    #[test]
+    fn file_fragment_md_vs_code() {
+        let md = file_fragment("readme.md", "# T");
+        assert!(md.contains("markdown-body"));
+        let code = file_fragment("main.rs", "fn x() -> Vec<u8> {}");
+        assert!(code.contains("language-rs"));
+        assert!(code.contains("Vec&lt;u8&gt;")); // escaped, hljs runs client-side
+    }
+
+    #[test]
+    fn tree_marks_open_path_and_skips_hidden() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src/sub")).unwrap();
+        fs::create_dir(d.path().join("target")).unwrap();
+        fs::create_dir(d.path().join("dist")).unwrap();
+        fs::write(d.path().join("src/main.rs"), "").unwrap();
+        fs::write(d.path().join("src/sub/x.rs"), "").unwrap();
+        fs::write(d.path().join("README.md"), "").unwrap();
+        let h = tree_fragment("proj", d.path(), "src/main.rs", &["dist".to_string()]);
+        assert!(h.contains("<details open><summary>src</summary>"));
+        assert!(h.contains("<details><summary>sub</summary>")); // not on open path
+        assert!(h.contains("class=\"file sel\""));
+        assert!(h.contains("hx-get=\"/frag/proj/file?path=src/main.rs\""));
+        assert!(h.contains("README.md"));
+        assert!(!h.contains("target"));
+        assert!(!h.contains("dist"));
+    }
+
+    #[test]
+    fn changes_and_status_fragments() {
+        let st = Status {
+            branch: "main".into(),
+            changes: vec![crate::gitio::Change { xy: ".M".into(), path: "a.txt".into() }],
+        };
+        let c = changes_fragment("proj", &st);
+        assert!(c.contains("full diff"));
+        assert!(c.contains("class=\"xy\""));
+        assert!(c.contains("hx-get=\"/frag/proj/diff?path=a.txt\""));
+        let s = status_fragment(&st);
+        assert!(s.contains("main"));
+        assert!(s.contains("(1)"));
+        let clean = changes_fragment("proj", &Status { branch: "main".into(), changes: vec![] });
+        assert!(clean.contains("working tree clean"));
+    }
+
+    #[test]
+    fn workspace_page_wires_everything() {
+        let s = Settings { theme: "gruvbox".into(), ..Settings::default() };
+        let h = workspace_page("proj", &s, true);
+        assert!(h.contains("/static/themes/gruvbox.css"));
+        assert!(h.contains("/frag/proj/theme.css")); // has_theme_css
+        assert!(h.contains("data-project=\"proj\""));
+        assert!(h.contains("data-default-tab=\"terminal\""));
+        assert!(h.contains("htmx.min.js"));
+        assert!(h.contains("id=\"term\""));
+        let no_custom = workspace_page("proj", &s, false);
+        assert!(!no_custom.contains("theme.css\">"));
+    }
+
+    #[test]
+    fn index_page_lists_projects() {
+        let ps = vec![Project { name: "alpha".into(), path: "/tmp/alpha".into(), git: true }];
+        let h = index_page(&ps);
+        assert!(h.contains("href=\"/alpha\""));
+        assert!(h.contains("/tmp/alpha"));
+    }
+}
