@@ -50,8 +50,16 @@ pub fn is_self_write(
     }
 }
 
-type ProjectDebouncer =
-    notify_debouncer_full::Debouncer<notify::RecommendedWatcher, notify_debouncer_full::RecommendedCache>;
+/// Upper bound on how many raw events accumulate into one debounced batch
+/// before it's processed regardless of whether the quiet period was
+/// reached. Raw `notify` (unlike the old debouncer) delivers several events
+/// per single file save — a temp-file-then-rename can be Create,
+/// Modify(Name), and Modify(Data) for one path in one save — so a large
+/// batch is ordinary, not a sign of trouble. This cap exists only so an
+/// unusually bursty change (a big `git checkout` or `rm -rf`) can't grow
+/// the batch Vec without bound while new events keep arriving before the
+/// debounce timer gets a chance to fire.
+const MAX_BATCH_EVENTS: usize = 10_000;
 
 /// inotify's default `max_user_watches` is commonly 8192–65536 depending on
 /// the distro (tunable via `fs.inotify.max_user_watches`, but deadlight
@@ -126,8 +134,8 @@ fn collect_watch_dirs(root: PathBuf, already: usize, cap: usize) -> (Vec<PathBuf
 /// `classify` already filters those out of the events this delivers, so
 /// the cost is some discarded events, not incorrect behavior.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn watch_tree(debouncer: &mut ProjectDebouncer, project: &str, root: PathBuf, watched: &mut usize) -> bool {
-    use notify::RecursiveMode;
+fn watch_tree(watcher: &mut notify::RecommendedWatcher, project: &str, root: PathBuf, watched: &mut usize) -> bool {
+    use notify::{RecursiveMode, Watcher};
     let already = *watched;
     let (dirs, hit_cap) = collect_watch_dirs(root, already, MAX_WATCHED_DIRS);
     if hit_cap && already < MAX_WATCHED_DIRS {
@@ -140,7 +148,7 @@ fn watch_tree(debouncer: &mut ProjectDebouncer, project: &str, root: PathBuf, wa
     }
     let mut ok = !hit_cap;
     for d in dirs {
-        if let Err(e) = debouncer.watch(&d, RecursiveMode::NonRecursive) {
+        if let Err(e) = watcher.watch(&d, RecursiveMode::NonRecursive) {
             eprintln!("deadlight: {project}: failed to watch {}: {e}", d.display());
             ok = false;
             continue;
@@ -151,9 +159,9 @@ fn watch_tree(debouncer: &mut ProjectDebouncer, project: &str, root: PathBuf, wa
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn watch_tree(debouncer: &mut ProjectDebouncer, project: &str, root: PathBuf) -> bool {
-    use notify::RecursiveMode;
-    match debouncer.watch(&root, RecursiveMode::Recursive) {
+fn watch_tree(watcher: &mut notify::RecommendedWatcher, project: &str, root: PathBuf) -> bool {
+    use notify::{RecursiveMode, Watcher};
+    match watcher.watch(&root, RecursiveMode::Recursive) {
         Ok(()) => true,
         Err(e) => {
             eprintln!("deadlight: {project}: failed to watch {}: {e}", root.display());
@@ -181,7 +189,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// instance limits) — correctness never depends on it, so callers only use
 /// this to flag the workspace as degraded, not to fail project setup.
 pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Duration) -> bool {
-    use notify::RecursiveMode;
+    use notify::{RecursiveMode, Watcher};
     // The OS reports fully-resolved paths in events (e.g. FSEvents on macOS
     // resolves `/var` -> `/private/var`), but callers may hand us a path
     // that still has a symlink component (a temp dir root, or a project
@@ -190,9 +198,22 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
     // dropped by the `let Ok(rel) = ... else { continue }` guard, and
     // watching quietly does nothing.
     let dir = dir.canonicalize().unwrap_or(dir);
-    let (tx, rx) = std::sync::mpsc::channel();
-    let mut debouncer = match notify_debouncer_full::new_debouncer(debounce, None, tx) {
-        Ok(d) => d,
+    let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+    // Plain `notify`, not `notify-debouncer-full`: the debouncer's
+    // rename-correlation queue silently drops `Remove` events under
+    // FSEvents' coalescing on macOS (confirmed empirically — raw `notify`
+    // on the same delete delivers `Remove(File)`, the debounced stream
+    // never does), so a deleted file never reached the UI. Debouncing is
+    // done by hand in the loop below instead, on the channel's own
+    // `recv_timeout`.
+    let mut watcher = match notify::recommended_watcher(move |res| {
+        // Runs on notify's internal event thread. The receiver end can
+        // already be gone (process shutdown tearing threads down in some
+        // order) — a dropped receiver must not panic notify's thread, so
+        // the send error is discarded rather than unwrapped.
+        let _ = tx.send(res);
+    }) {
+        Ok(w) => w,
         Err(e) => {
             eprintln!("deadlight: watcher unavailable for {project}: {e}");
             return false;
@@ -206,28 +227,56 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let mut watched = 0usize;
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let ok = watch_tree(&mut debouncer, project, dir.clone(), &mut watched);
+    let ok = watch_tree(&mut watcher, project, dir.clone(), &mut watched);
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    let ok = watch_tree(&mut debouncer, project, dir.clone());
+    let ok = watch_tree(&mut watcher, project, dir.clone());
     // .git itself is skipped by the per-directory walk (it's in SKIP_DIRS),
     // and isn't implied by the recursive root watch either on the other
     // platforms — index/HEAD drive the status pane, so watch that one
     // directory deliberately regardless of which path was taken above.
-    let _ = debouncer.watch(&dir.join(".git"), RecursiveMode::NonRecursive);
+    let _ = watcher.watch(&dir.join(".git"), RecursiveMode::NonRecursive);
 
     let base = dir.clone();
     let project_name = project.to_string();
     std::thread::spawn(move || {
-        // Dropping the debouncer stops the watch, so it must stay bound for
+        // Dropping the watcher stops the watch, so it must stay bound for
         // the loop's whole lifetime regardless of platform. Only the
         // per-directory (Linux) platform ever reads it again afterward, to
         // register a watch on a directory created after startup.
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let mut keep = debouncer;
+        let mut keep = watcher;
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        let _keep = debouncer;
-        for res in rx {
-            let Ok(events) = res else { continue };
+        let _keep = watcher;
+        // Hand-rolled debounce: block for the first event of a batch, then
+        // keep folding in whatever else arrives within `debounce` of the
+        // last one, so a burst of raw events for one save (or one delete)
+        // still produces a single downstream batch — matching what the
+        // debouncer used to hand this loop, minus the dropped `Remove`s.
+        loop {
+            let first = match rx.recv() {
+                Ok(r) => r,
+                // Sender side is gone, which only happens if the watcher
+                // itself was dropped — nothing left to watch for.
+                Err(_) => break,
+            };
+            let mut events: Vec<notify::Event> = Vec::new();
+            match first {
+                Ok(ev) => events.push(ev),
+                Err(e) => {
+                    eprintln!("deadlight: {project_name}: watch error: {e}");
+                    continue;
+                }
+            }
+            while events.len() < MAX_BATCH_EVENTS {
+                match rx.recv_timeout(debounce) {
+                    Ok(Ok(ev)) => events.push(ev),
+                    Ok(Err(e)) => eprintln!("deadlight: {project_name}: watch error: {e}"),
+                    // Quiet period reached (or sender gone, which the next
+                    // outer `recv()` will notice and exit on) — either way,
+                    // the batch collected so far is ready to process.
+                    Err(_) => break,
+                }
+            }
             // One panic anywhere below must not silently end watching for
             // this project for the rest of the process's life: the spec
             // treats a live view of external edits as a core requirement,
@@ -272,7 +321,7 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                 }
 
                 // Lock once per debounced batch, not once per event: the
-                // batch is already coalesced by the debouncer, and
+                // batch is already coalesced by the recv loop above, and
                 // re-locking per event would mean more lock/unlock churn
                 // for no benefit — the lock is never held across blocking
                 // I/O either way, since `file_changed_externally`'s read is
@@ -453,5 +502,68 @@ mod tests {
         let (dirs, hit_cap) = collect_watch_dirs(d.path().to_path_buf(), 5, 5);
         assert!(hit_cap);
         assert!(dirs.is_empty());
+    }
+
+    /// Polls a hub subscriber for a broadcast message containing `needle`
+    /// until it arrives or `deadline` passes, checking the clock instead of
+    /// sleeping a guessed-at duration: OS watch latency plus the watcher's
+    /// own debounce window make any fixed sleep either flaky (too short) or
+    /// slow (padded well past what's needed) on a shared CI box.
+    fn wait_for(rx: &std::sync::mpsc::Receiver<String>, needle: &str, deadline: std::time::Instant) -> bool {
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match rx.recv_timeout(remaining) {
+                Ok(msg) if msg.contains(needle) => return true,
+                Ok(_) => continue, // some other broadcast; keep waiting for `needle`
+                Err(_) => return false, // deadline elapsed inside recv_timeout
+            }
+        }
+    }
+
+    // Regression test for the bug this whole change fixes: on macOS,
+    // `notify-debouncer-full` 0.7's rename-correlation queue silently drops
+    // `Remove` events under FSEvents' coalescing, so a file deleted from a
+    // watched project never produced a `TreeChanged` broadcast — the tree
+    // pane just kept showing a file that was gone. Creates and modifies
+    // went through the debouncer fine, which is exactly why this class of
+    // bug survived: nothing exercised a delete through a real watcher.
+    // Drives `spawn` end to end against a real temp directory and a real
+    // OS watch, not just `classify`, since the bug lived in the debouncing
+    // layer that `classify` never sees.
+    #[test]
+    fn deleted_files_reach_the_ui_same_as_created_ones() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sd = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+
+        let d = tempfile::tempdir().unwrap();
+        let hub = Arc::new(Mutex::new(Hub::new("watch-delete-regression", d.path().to_path_buf())));
+        let rx = Hub::lock(&hub).subscribe().1;
+
+        let ok = spawn(
+            "watch-delete-regression",
+            d.path().to_path_buf(),
+            hub.clone(),
+            Duration::from_millis(50),
+        );
+        assert!(ok, "watcher must start on a plain temp dir");
+
+        let file = d.path().join("a.txt");
+        std::fs::write(&file, "hi").unwrap();
+        assert!(
+            wait_for(&rx, "TreeChanged", std::time::Instant::now() + std::time::Duration::from_secs(10)),
+            "a created file must be observed"
+        );
+
+        std::fs::remove_file(&file).unwrap();
+        assert!(
+            wait_for(&rx, "TreeChanged", std::time::Instant::now() + std::time::Duration::from_secs(10)),
+            "a deleted file must be observed too — this is the debouncer's dropped Remove event"
+        );
+
+        std::env::remove_var("DEADLIGHT_STATE_DIR");
     }
 }
