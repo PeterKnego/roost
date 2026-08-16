@@ -95,7 +95,24 @@ fn serve_frag(
     match what {
         ["tree"] => {
             let open = req.query.get("open").map(String::as_str).unwrap_or("");
-            http::html(w, &render::tree_fragment(project, &dir, open, &settings.hide));
+            match req.query.get("dir") {
+                None => http::html(w, &render::tree_fragment(project, &dir, open, &settings.hide)),
+                // `dir` names a subtree the client wants to lazily expand —
+                // it arrives from the network, so it must be confined
+                // through `safe_resolve` before any read, exactly like
+                // `file`'s `path`. A `dir` that resolves outside the
+                // project (or doesn't exist, or isn't a directory) renders
+                // the standard hint, never a listing.
+                Some(rel) => match projects::safe_resolve(&dir, rel) {
+                    Ok(sub) if sub.is_dir() => {
+                        let mut out = String::new();
+                        render::tree_level(project, &sub, rel, open, &settings.hide, &mut out);
+                        http::html(w, &out);
+                    }
+                    Ok(_) => http::html(w, &render::hint("not a directory")),
+                    Err(e) => http::html(w, &render::hint(&e)),
+                },
+            }
         }
         ["file"] => match req.query.get("path") {
             None => http::html(w, &render::hint("missing path")),
