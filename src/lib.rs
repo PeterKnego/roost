@@ -4,6 +4,7 @@ pub mod http;
 pub mod projects;
 pub mod render;
 pub mod routes;
+pub mod term;
 
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -15,8 +16,7 @@ pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
         let roots = roots.clone();
         std::thread::spawn(move || {
             if is_ws(&stream) {
-                // Task 7 replaces this drop with term::handle_ws(stream, &roots)
-                drop(stream);
+                term::handle_ws(stream, &roots);
             } else {
                 routes::handle(stream, &roots);
             }
