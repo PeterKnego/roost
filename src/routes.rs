@@ -24,6 +24,23 @@ pub fn handle(stream: TcpStream, roots: &[PathBuf]) {
 }
 
 fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
+    // DNS rebinding: a hostile name resolved to 127.0.0.1 is same-origin to the
+    // browser, so CORS stops protecting these reads. Behind `tailscale serve`
+    // the real name arrives as X-Forwarded-Host. See spec §Security.
+    if !crate::origin::host_allowed(
+        req.headers.get("host").map(String::as_str),
+        req.headers.get("x-forwarded-host").map(String::as_str),
+        &config::allowed_origins(),
+    ) {
+        // Logged, not silent: behind a proxy the effective host is not obvious,
+        // and a misconfigured allowlist otherwise looks like an outage.
+        eprintln!(
+            "deadlight: rejected host={:?} x-forwarded-host={:?} (set allowed_origins)",
+            req.headers.get("host"),
+            req.headers.get("x-forwarded-host")
+        );
+        return http::respond(w, 403, "Forbidden", "text/plain; charset=utf-8", b"host not allowed");
+    }
     let segs: Vec<&str> = req.path.split('/').filter(|s| !s.is_empty()).collect();
     match segs.as_slice() {
         [] => http::html(w, &render::index_page(&projects::list_projects(roots))),
