@@ -14,18 +14,56 @@ pub struct Status {
 }
 
 fn run_git(repo: &Path, args: &[&str], allow_exit_1: bool) -> Result<String, String> {
-    let out = Command::new("git")
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| e.to_string())?;
-    let code = out.status.code().unwrap_or(-1);
+    // Drain stdout/stderr on dedicated threads concurrently with the wait loop below:
+    // git can fill the ~64KB pipe buffer and block on write while we poll try_wait,
+    // which would deadlock if we only read after the process exits.
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(s) = stdout_pipe.as_mut() {
+            let _ = s.read_to_string(&mut buf);
+        }
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(s) = stderr_pipe.as_mut() {
+            let _ = s.read_to_string(&mut buf);
+        }
+        buf
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let status = loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(st) => break st,
+            None if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("git {} timed out after 15s", args.first().unwrap_or(&"")));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    };
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    let code = status.code().unwrap_or(-1);
     if code != 0 && !(allow_exit_1 && code == 1) {
         // git diff exits 1 when differences exist (only allowed if allow_exit_1 is true)
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        return Err(stderr.trim().to_string());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(stdout)
 }
 
 pub fn parse_status(porcelain: &str) -> Status {

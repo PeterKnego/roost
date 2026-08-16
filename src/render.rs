@@ -37,10 +37,16 @@ pub fn diff_html(diff: &str) -> String {
 }
 
 pub fn markdown_html(md: &str) -> String {
-    use pulldown_cmark::{html, Options, Parser};
+    use pulldown_cmark::{html, Event, Options, Parser};
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let events = Parser::new_ext(md, opts).map(|ev| match ev {
+        // raw HTML from repo content must never reach the page: render it as text
+        Event::Html(h) => Event::Text(h),
+        Event::InlineHtml(h) => Event::Text(h),
+        other => other,
+    });
     let mut out = String::new();
-    html::push_html(&mut out, Parser::new_ext(md, opts));
+    html::push_html(&mut out, events);
     format!("<article class=\"markdown-body\">{out}</article>")
 }
 
@@ -239,6 +245,14 @@ mod tests {
         assert!(h.starts_with("<article class=\"markdown-body\">"));
         assert!(h.contains("<h1>Hi</h1>"));
         assert!(h.contains("<li>a</li>"));
+    }
+
+    #[test]
+    fn markdown_raw_html_is_neutralized() {
+        let h = markdown_html("hello <script>alert(1)</script>\n\n<iframe src=x></iframe>\n");
+        assert!(!h.contains("<script>"));
+        assert!(!h.contains("<iframe"));
+        assert!(h.contains("&lt;script&gt;"));
     }
 
     #[test]
