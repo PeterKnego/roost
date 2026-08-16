@@ -74,3 +74,29 @@ fn diff_traversal_path_is_rejected_with_hint() {
     assert!(body.contains("class=\"hint\""));
     assert!(!body.contains("root:"));
 }
+
+#[test]
+fn terminal_ws_echoes_through_pty() {
+    std::env::set_var("DEADLIGHT_CMD", "cat");
+    let (_d, port) = fixture();
+    let (mut ws, _resp) =
+        tungstenite::connect(format!("ws://127.0.0.1:{port}/ws/proj")).unwrap();
+    if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    }
+    ws.send(tungstenite::Message::Text("resize:100x30".into())).unwrap();
+    ws.send(tungstenite::Message::Binary(b"hello\r".to_vec())).unwrap();
+    let mut seen = String::new();
+    for _ in 0..100 {
+        match ws.read() {
+            Ok(tungstenite::Message::Binary(b)) => seen.push_str(&String::from_utf8_lossy(&b)),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if seen.contains("hello") {
+            break;
+        }
+    }
+    assert!(seen.contains("hello"), "PTY echo not received; got: {seen:?}");
+    let _ = ws.close(None);
+}
