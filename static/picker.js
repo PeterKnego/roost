@@ -49,6 +49,16 @@
     li.addEventListener("dblclick", () => descend(li.dataset.rel));
   });
 
+  // The per-row git shortcut (render.rs's `a.git`) is a real `<a href>` so
+  // the browser handles the actual navigation (and Enter/middle-click/
+  // ctrl-click) on its own — this only has to stop the click/dblclick from
+  // bubbling up to the row's own listeners just above, which would select
+  // or descend the row in addition to the icon's own navigation.
+  Array.from(picker.querySelectorAll("a.git")).forEach((a) => {
+    a.addEventListener("click", (e) => e.stopPropagation());
+    a.addEventListener("dblclick", (e) => e.stopPropagation());
+  });
+
   openBtn.addEventListener("click", () => {
     if (selected) return open(selected.dataset.rel);
     if (at !== "") return open(at);
