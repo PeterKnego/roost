@@ -36,7 +36,23 @@ pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
 /// here so each gets its own handler; both re-check Origin themselves.
 fn route_ws(stream: TcpStream, roots: &[PathBuf]) {
     let mut buf = [0u8; 512];
-    let Ok(n) = stream.peek(&mut buf) else { return };
+    // Poll like is_ws does, but wait for the whole request line (CRLF), not
+    // just a fixed byte count: a short peek can land mid-path (e.g.
+    // "GET /ws/proj/_worksp"), truncating "_workspace" and silently
+    // misrouting the connection to the wrong handler.
+    let mut n = 0usize;
+    for _ in 0..50 {
+        match stream.peek(&mut buf) {
+            Ok(k) => {
+                n = k;
+                if buf[..n].windows(2).any(|w| w == b"\r\n") || n == buf.len() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => return,
+        }
+    }
     let head = String::from_utf8_lossy(&buf[..n]);
     let Some(target) = head.split_whitespace().nth(1) else { return };
     let segs: Vec<&str> = target.trim_start_matches("/ws/").split('/').collect();

@@ -187,6 +187,18 @@ fn read_until(
     panic!("never saw {needle:?}");
 }
 
+/// Pulls the `origin` field out of an `Event::State` frame's JSON: the
+/// connection id of whichever client's action produced this snapshot. Used
+/// to prove a mirrored event really came from the *other* browser, not from
+/// the reading client's own initial snapshot.
+fn extract_origin(json: &str) -> String {
+    let key = r#""origin":""#;
+    let start = json.find(key).expect("frame has no origin field") + key.len();
+    let rest = &json[start..];
+    let end = rest.find('"').expect("unterminated origin field");
+    rest[..end].to_string()
+}
+
 #[test]
 fn workspace_state_mirrors_between_two_clients() {
     let _g = WS_TEST_LOCK.lock().unwrap();
@@ -194,7 +206,20 @@ fn workspace_state_mirrors_between_two_clients() {
     std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
     let (_d, port) = fixture();
     let mut a = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    // a's own initial snapshot carries a's connection id in `origin`; capture
+    // it now so we can later prove the *mirrored* event names this same id,
+    // rather than just asserting on ordering-dependent text like "hello.md".
+    let a_init = read_until(&mut a, r#""t":"State""#);
+    let a_id = extract_origin(&a_init);
+
     let mut b = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    // Hub is a process-global registry keyed by project name (see hub.rs), so
+    // "proj" can carry state left behind by another test in this binary.
+    // Prove b's own snapshot starts clean, or a stale "hello.md" from a
+    // previous test could make the assertion below pass for the wrong
+    // reason — off b's own state, without exercising mirroring at all.
+    let b_init = read_until(&mut b, r#""t":"State""#);
+    assert!(!b_init.contains("hello.md"), "b's own snapshot must not already contain hello.md");
 
     a.send(tungstenite::Message::Text(
         r#"{"t":"OpenTab","pane":2,"tab":{"k":"File","rel":"hello.md","mode":"Preview"}}"#.into(),
@@ -204,6 +229,12 @@ fn workspace_state_mirrors_between_two_clients() {
     // the *other* browser must learn about it without asking
     let seen = read_until(&mut b, "hello.md");
     assert!(seen.contains(r#""t":"State""#));
+    // ...and it must be attributed to *a*, the client that actually acted —
+    // not something b could have produced from its own state.
+    assert!(
+        seen.contains(&format!(r#""origin":"{a_id}""#)),
+        "mirrored event must carry the originating client's id ({a_id}), got: {seen}"
+    );
     let _ = a.close(None);
     let _ = b.close(None);
     std::env::remove_var("DEADLIGHT_STATE_DIR");
@@ -217,6 +248,40 @@ fn workspace_socket_rejects_foreign_origin() {
     let mut req = format!("ws://127.0.0.1:{port}/ws/proj/_workspace").into_client_request().unwrap();
     req.headers_mut().insert("origin", "https://evil.example.com".parse().unwrap());
     assert!(tungstenite::connect(req).is_err(), "the write socket must not be cross-origin");
+}
+
+#[test]
+fn workspace_socket_rejects_missing_origin() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let (_d, port) = fixture();
+    use tungstenite::client::IntoClientRequest;
+    // No Origin header at all: term.rs's socket already rejects this
+    // (ws_rejects_foreign_and_missing_origin); the socket that can write
+    // files needs the identical guarantee.
+    let req = format!("ws://127.0.0.1:{port}/ws/proj/_workspace").into_client_request().unwrap();
+    assert!(tungstenite::connect(req).is_err(), "missing origin must be rejected");
+}
+
+#[test]
+fn workspace_socket_malformed_json_is_reported_not_fatal() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    let (_d, port) = fixture();
+    let mut ws = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    let _ = read_until(&mut ws, r#""t":"State""#); // the initial snapshot
+
+    ws.send(tungstenite::Message::Text("not json".into())).unwrap();
+    let err = read_until(&mut ws, r#""t":"Error""#);
+    assert!(err.contains(r#""t":"Error""#));
+
+    // the socket must still be alive: a well-formed intent afterward still works
+    ws.send(tungstenite::Message::Text(r#"{"t":"RequestState"}"#.into())).unwrap();
+    let state = read_until(&mut ws, r#""t":"State""#);
+    assert!(state.contains(r#""t":"State""#));
+
+    let _ = ws.close(None);
+    std::env::remove_var("DEADLIGHT_STATE_DIR");
 }
 
 #[test]
