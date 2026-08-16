@@ -1,4 +1,5 @@
 pub mod config;
+pub mod fileops;
 pub mod gitio;
 pub mod http;
 pub mod origin;
