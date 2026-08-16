@@ -2,7 +2,7 @@
 //! Fragments target htmx swap sites; pages are full documents.
 use crate::config::Settings;
 use crate::gitio::Status;
-use crate::projects::Project;
+use crate::projects::Entry;
 use std::path::Path;
 
 pub fn esc(s: &str) -> String {
@@ -179,24 +179,83 @@ pub fn status_fragment(st: &Status) -> String {
     )
 }
 
-pub fn index_page(projects: &[Project]) -> String {
-    let rows: String = projects
+/// Breadcrumb for the directory picker: "deadlight" always links back to the
+/// top level (`at=""`), every segment but the last is a clickable link to
+/// browsing that prefix, and the last segment is plain text (you're already
+/// there — the picker doesn't render a `..` row, this is the way up).
+fn breadcrumb(at: &str) -> String {
+    if at.is_empty() {
+        return "<nav class=\"crumbs\"><span class=\"crumb-current\">deadlight</span></nav>".to_string();
+    }
+    let mut out = String::from("<nav class=\"crumbs\"><a href=\"/\">deadlight</a>");
+    let segs: Vec<&str> = at.split('/').collect();
+    let mut acc = String::new();
+    for (i, seg) in segs.iter().enumerate() {
+        if !acc.is_empty() {
+            acc.push('/');
+        }
+        acc.push_str(seg);
+        out.push_str(" / ");
+        if i + 1 == segs.len() {
+            out.push_str(&format!("<span class=\"crumb-current\">{}</span>", esc(seg)));
+        } else {
+            // Slash-preserving encode, like tree_level's `dir=` query value
+            // above — `acc` is itself a rel path, not an opaque token.
+            out.push_str(&format!(
+                "<a href=\"/?at={}\">{}</a>",
+                crate::http::percent_encode(&acc),
+                esc(seg)
+            ));
+        }
+    }
+    out.push_str("</nav>");
+    out
+}
+
+/// One `<li>` per picker row. Directories are selectable (click/dblclick/
+/// keyboard, wired client-side by `/static/picker.js` off `li.dir`); files
+/// are rendered but carry no such hooks — `.file`'s CSS greys them out, and
+/// the absence of any click handler is what makes them actually
+/// unselectable, not just visually muted.
+fn picker_rows(entries: &[Entry]) -> String {
+    entries
         .iter()
-        .map(|p| {
-            format!(
-                "<li><a href=\"/{0}\">{0}</a><span class=\"path\">{1}{2}</span></li>",
-                esc(&p.name),
-                esc(&p.path.to_string_lossy()),
-                if p.git { " ⎇" } else { "" }
-            )
+        .map(|e| {
+            if e.is_dir {
+                format!(
+                    "<li class=\"dir\" data-rel=\"{rel}\"><span class=\"name\">{name}</span>{git}</li>",
+                    rel = esc(&e.rel),
+                    name = esc(&e.name),
+                    git = if e.git { " <span class=\"git\">⎇</span>" } else { "" }
+                )
+            } else {
+                format!(
+                    "<li class=\"file\"><span class=\"name\">{}</span></li>",
+                    esc(&e.name)
+                )
+            }
         })
-        .collect();
+        .collect()
+}
+
+/// The `/` directory picker (see routes::route's `?at=` handling). `at` is
+/// the rel path currently being browsed ("" for the merged top level);
+/// `entries` is its already-confined listing (`projects::list_dir`).
+pub fn index_page(at: &str, entries: &[Entry]) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>deadlight</title>\
          <link rel=\"stylesheet\" href=\"/static/themes/dark.css\">\
          <link rel=\"stylesheet\" href=\"/static/style.css\">\
          </head><body><header><span class=\"proj\">deadlight</span></header>\
-         <main><ul class=\"projects\">{rows}</ul></main></body></html>"
+         <main>{crumbs}\
+         <ul class=\"picker\" id=\"picker\" data-at=\"{at_attr}\" tabindex=\"0\">{rows}</ul>\
+         <div class=\"pickerbar\"><button id=\"openBtn\" type=\"button\">Open</button></div>\
+         </main>\
+         <script src=\"/static/picker.js\"></script>\
+         </body></html>",
+        crumbs = breadcrumb(at),
+        at_attr = esc(at),
+        rows = picker_rows(entries)
     )
 }
 
@@ -422,11 +481,39 @@ mod tests {
     }
 
     #[test]
-    fn index_page_lists_projects() {
-        let ps = vec![Project { name: "alpha".into(), path: "/tmp/alpha".into(), git: true }];
-        let h = index_page(&ps);
-        assert!(h.contains("href=\"/alpha\""));
-        assert!(h.contains("/tmp/alpha"));
+    fn index_page_renders_picker_rows_and_breadcrumb() {
+        let entries = vec![
+            Entry { name: "alpha".into(), rel: "alpha".into(), is_dir: true, git: true },
+            Entry { name: "beta".into(), rel: "beta".into(), is_dir: true, git: false },
+        ];
+        let h = index_page("", &entries);
+        assert!(h.contains("data-rel=\"alpha\""));
+        assert!(h.contains("class=\"dir\""));
+        assert!(h.contains("⎇")); // alpha's git marker
+        assert!(h.contains("id=\"openBtn\""));
+        assert!(h.contains("crumb-current\">deadlight"));
+        assert!(h.contains("/static/picker.js"));
+
+        // browsing a subdirectory: breadcrumb links back up, files are
+        // present but not marked selectable the way directories are
+        let sub = vec![
+            Entry { name: "sub".into(), rel: "karpie/sub".into(), is_dir: true, git: false },
+            Entry { name: "main.rs".into(), rel: "karpie/main.rs".into(), is_dir: false, git: false },
+        ];
+        let h2 = index_page("karpie", &sub);
+        assert!(h2.contains("<a href=\"/\">deadlight</a>"));
+        assert!(h2.contains("crumb-current\">karpie"));
+        assert!(h2.contains("class=\"dir\" data-rel=\"karpie/sub\""));
+        assert!(h2.contains("class=\"file\""));
+        assert!(!h2.contains("data-rel=\"karpie/main.rs\"")); // files carry no selection hook
+    }
+
+    #[test]
+    fn index_page_breadcrumb_links_every_intermediate_segment() {
+        let h = index_page("a/b/c", &[]);
+        assert!(h.contains("<a href=\"/?at=a\">a</a>"));
+        assert!(h.contains("<a href=\"/?at=a/b\">b</a>"));
+        assert!(h.contains("crumb-current\">c")); // the current directory itself is not a link
     }
 
     #[test]

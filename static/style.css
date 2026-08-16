@@ -71,7 +71,19 @@ main { flex: 1; min-height: 0; }
 .dl.hunk { color: var(--hunk); padding-top: 6px; }
 .dl.meta { color: var(--muted); }
 .markdown-body { max-width: 900px; margin: 0 auto; padding: 24px; }
-ul.projects { list-style: none; padding: 24px; max-width: 700px; margin: 0 auto; width: 100%; }
-ul.projects li { display: flex; justify-content: space-between; gap: 12px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
-ul.projects a { color: var(--accent); text-decoration: none; font-weight: 600; }
-ul.projects .path { position: static; background: none; border: none; padding: 0; }
+/* ---- directory picker (index page) ---- */
+.crumbs { padding: 20px 24px 0; max-width: 700px; margin: 0 auto; width: 100%; color: var(--muted); font-family: ui-monospace, monospace; font-size: 13px; }
+.crumbs a { color: var(--accent); text-decoration: none; }
+.crumbs a:hover { text-decoration: underline; }
+.crumbs .crumb-current { color: var(--fg); font-weight: 600; }
+ul.picker { list-style: none; padding: 8px 24px; max-width: 700px; margin: 0 auto; width: 100%; outline: none; }
+ul.picker li { padding: 6px 10px; border-radius: 4px; border-bottom: 1px solid var(--border); }
+ul.picker li.dir { cursor: pointer; font-weight: 600; user-select: none; }
+ul.picker li.dir:hover { background: var(--sel-bg); }
+ul.picker li.dir.sel { background: var(--sel-bg); color: var(--accent); }
+ul.picker li.file { color: var(--muted); font-weight: normal; cursor: default; }
+ul.picker li .git { color: var(--accent); margin-left: 6px; font-weight: normal; }
+.pickerbar { padding: 12px 24px; max-width: 700px; margin: 0 auto; width: 100%; display: flex; justify-content: flex-end; }
+.pickerbar button { font: inherit; padding: 6px 18px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg2); color: var(--fg); cursor: pointer; }
+.pickerbar button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.pickerbar button:disabled { opacity: .4; cursor: not-allowed; }

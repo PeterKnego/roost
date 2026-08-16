@@ -23,14 +23,34 @@ pub fn valid_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// Defense in depth for `attach`, not the primary gate: both call sites
+/// (wsconn.rs, term.rs) already resolve `project` through
+/// `projects::resolve_project` before ever reaching here, but this function
+/// also builds a socket path and a session-registry key from it, so it
+/// re-validates independently rather than trusting a caller never to
+/// regress. Mirrors resolve_project's *syntactic* checks only (no empty,
+/// absolute, or leading-dot segment) — it has no `roots` to canonicalize
+/// against, and doesn't need one, since the filesystem-confinement half of
+/// that check already happened before this project ever had a live `dir`
+/// to spawn a shell in. A nested project (`karpie/src`) is legitimate here.
+fn valid_project(project: &str) -> bool {
+    !project.is_empty() && project.split('/').all(|s| !s.is_empty() && !s.starts_with('.'))
+}
+
 /// `{project}/{name}` rather than a flattened `{project}-{name}`: project and
 /// session names can each contain `-`, so a flat join is ambiguous (project
-/// `a` + session `b-c` collides with project `a-b` + session `c`). Neither
-/// side can contain `/` (`valid_name` forbids it in session names; project
-/// names are resolved through `projects::resolve_project` first), so this
-/// join is unambiguous and doubles as the on-disk directory layout.
+/// `a` + session `b-c` collides with project `a-b` + session `c`). `name`
+/// can't contain `/` (`valid_name` forbids it), but `project` now can — it
+/// may be a nested rel path like `karpie/src` — so `project` is run through
+/// `storage_key` first to hide its own `/` before this join, or a nested
+/// project's directory structure would leak into (and collide with) this
+/// one's, and the on-disk directory layout this join doubles as would gain
+/// a directory level nothing else expects.
 fn sock_path(project: &str, name: &str) -> PathBuf {
-    crate::wsstate::state_dir().join("sock").join(project).join(name)
+    crate::wsstate::state_dir()
+        .join("sock")
+        .join(crate::projects::storage_key(project))
+        .join(name)
 }
 
 pub fn default_command(project: &str, name: &str) -> Vec<String> {
@@ -106,12 +126,21 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
     if !valid_name(name) {
         return Err("invalid session name".into());
     }
-    if !valid_name(project) && project.contains('/') {
+    if !valid_project(project) {
         return Err("invalid project name".into());
     }
-    let key = format!("{project}/{name}");
+    // storage_key, not the raw project string: `project` may be a nested
+    // rel path (`karpie/src`), and its `/` must not be mistaken for this
+    // key's own `project/name` separator — see storage_key's doc comment.
+    // Without this, project "karpie" + session "src" and project
+    // "karpie/src" + session "shell" (a real, distinct pair) would produce
+    // keys "karpie/src" and "karpie/src/shell" that alias under the
+    // `starts_with` prefix check just below, inflating one project's
+    // session cap with another's sessions.
+    let skey = crate::projects::storage_key(project);
+    let key = format!("{skey}/{name}");
     let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
-    let live_for_project = map.keys().filter(|k| k.starts_with(&format!("{project}/"))).count();
+    let live_for_project = map.keys().filter(|k| k.starts_with(&format!("{skey}/"))).count();
     if !map.contains_key(&key) && live_for_project >= MAX_SESSIONS_PER_PROJECT {
         return Err("too many terminal sessions".into());
     }
@@ -258,6 +287,29 @@ mod tests {
         assert!(!valid_name("a/b"));
         assert!(!valid_name(&"x".repeat(33)));
         assert!(valid_name(&"x".repeat(32)));
+    }
+
+    #[test]
+    fn valid_project_accepts_nested_and_rejects_bad_segments() {
+        assert!(valid_project("proj"));
+        assert!(valid_project("karpie/src"));
+        assert!(!valid_project(""));
+        assert!(!valid_project("/abs"));
+        assert!(!valid_project("a//b"));
+        assert!(!valid_project(".hidden"));
+        assert!(!valid_project("a/../b"));
+    }
+
+    #[test]
+    fn storage_key_keeps_a_nested_projects_session_key_unambiguous() {
+        // project "karpie" with session "src", vs. project "karpie/src"
+        // with session "shell": before storage_key was used here, both
+        // produced keys under the "karpie/" prefix, so the second's
+        // sessions counted against the first's MAX_SESSIONS_PER_PROJECT cap.
+        let key_a = format!("{}/{}", crate::projects::storage_key("karpie"), "src");
+        let key_b = format!("{}/{}", crate::projects::storage_key("karpie/src"), "shell");
+        assert!(!key_b.starts_with(&format!("{}/", crate::projects::storage_key("karpie"))));
+        assert_ne!(key_a, key_b);
     }
 
     #[test]

@@ -45,7 +45,11 @@ pub fn state_dir() -> PathBuf {
 }
 
 fn path_for(project: &str) -> PathBuf {
-    state_dir().join(format!("{project}.json"))
+    // storage_key, not the raw project string: a nested project's `/`
+    // would otherwise land literally in a filename (or, worse, get
+    // interpreted as a directory separator by the OS). See its doc comment
+    // for why this isn't `http::percent_encode`.
+    state_dir().join(format!("{}.json", crate::projects::storage_key(project)))
 }
 
 pub fn save(project: &str, w: &Workspace) -> Result<(), String> {
@@ -177,6 +181,20 @@ mod tests {
             assert_eq!(got.panes[proto::MIDDLE as usize].tabs.len(), 1);
             assert_eq!(got.buffers["a.rs"].text, "unsaved", "unsaved text is crash-safe");
             assert!(got.buffers["a.rs"].dirty);
+        });
+    }
+
+    #[test]
+    fn nested_project_state_lands_in_an_encoded_filename() {
+        with_state_dir(|| {
+            save("karpie/src", &Workspace::default_layout()).unwrap();
+            // the `/` must not land in the filename literally (it would be
+            // parsed as a directory separator) or in a subdirectory (that
+            // would need its own creation, which save() never does)
+            assert!(state_dir().join("karpie%2Fsrc.json").is_file());
+            let (got, warn) = load("karpie/src");
+            assert!(warn.is_none());
+            assert_eq!(got.sizes.left_w, Workspace::default_layout().sizes.left_w);
         });
     }
 

@@ -38,20 +38,23 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     );
     let Ok(mut ws_read) = accepted else { return };
 
-    // /ws/{project}/term/{name}
+    // /ws/{project}/term/{name} — {project} may itself be multi-segment
+    // (a nested rel path), so split from the right off the two fixed
+    // trailing segments ("term", {name}) rather than assuming project is
+    // segs[0], same rationale as lib.rs's route_ws for `_workspace`.
     let rest = path.trim_start_matches("/ws/");
-    let segs: Vec<&str> = rest.split('/').collect();
-    let (Some(project), Some(&"term"), Some(name)) =
-        (segs.first().copied(), segs.get(1), segs.get(2).copied())
-    else {
+    let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() < 3 || segs[segs.len() - 2] != "term" {
+        let _ = ws_read.close(None);
+        return;
+    }
+    let name = segs[segs.len() - 1];
+    let project = segs[..segs.len() - 2].join("/");
+    let Some(dir) = crate::projects::resolve_project(roots, &project) else {
         let _ = ws_read.close(None);
         return;
     };
-    let Some(dir) = crate::projects::resolve_project(roots, project) else {
-        let _ = ws_read.close(None);
-        return;
-    };
-    let att = match session::attach(project, name, &dir) {
+    let att = match session::attach(&project, name, &dir) {
         Ok(a) => a,
         Err(_) => {
             let _ = ws_read.close(None);
