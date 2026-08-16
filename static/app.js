@@ -355,7 +355,23 @@ document.querySelectorAll(".divider").forEach((d) => {
   d.onmousedown = (e) => { drag = { which: d.dataset.div, x: e.clientX, y: e.clientY }; e.preventDefault(); };
 });
 window.onmouseup = () => {
-  if (drag && state) send({ t: "Resize", sizes: state.sizes });
+  if (drag && state) {
+    send({ t: "Resize", sizes: state.sizes });
+    // A divider drag resizes a pane's .content without going through
+    // render()'s mountedKey guard (which correctly skips remounting a
+    // still-active terminal), so nothing else re-fits a terminal that was
+    // sitting in that pane. Do it once here instead of on every mousemove
+    // frame: the PTY takes the *smallest* attached client's geometry, so a
+    // stale cols/rows here would clip output for every other mirroring
+    // client until this tab happened to be switched away and back.
+    terms.forEach((e) => {
+      // Skip anything parked in #termpool: it's display:none, so fit()
+      // would measure a 0x0 box and send a bogus resize.
+      if (e.node.parentElement && e.node.parentElement.classList.contains("content")) {
+        try { e.fit.fit(); sendResize(e); } catch {}
+      }
+    });
+  }
   drag = null;
 };
 window.onmousemove = (e) => {
