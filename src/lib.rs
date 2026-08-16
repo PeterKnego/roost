@@ -10,6 +10,7 @@ pub mod render;
 pub mod routes;
 pub mod term;
 pub mod workspace;
+pub mod wsconn;
 pub mod wsstate;
 
 use std::net::{TcpListener, TcpStream};
@@ -22,11 +23,28 @@ pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
         let roots = roots.clone();
         std::thread::spawn(move || {
             if is_ws(&stream) {
-                term::handle_ws(stream, &roots);
+                route_ws(stream, &roots);
             } else {
                 routes::handle(stream, &roots);
             }
         });
+    }
+}
+
+/// `/ws/{project}/_workspace` and `/ws/{project}/term/{name}` (still the old
+/// v2 shape `/ws/{project}` until Task 7 rewrites term.rs) are peeked apart
+/// here so each gets its own handler; both re-check Origin themselves.
+fn route_ws(stream: TcpStream, roots: &[PathBuf]) {
+    let mut buf = [0u8; 512];
+    let Ok(n) = stream.peek(&mut buf) else { return };
+    let head = String::from_utf8_lossy(&buf[..n]);
+    let Some(target) = head.split_whitespace().nth(1) else { return };
+    let segs: Vec<&str> = target.trim_start_matches("/ws/").split('/').collect();
+    let Some(project) = segs.first().copied().filter(|s| !s.is_empty()) else { return };
+    let Some(dir) = projects::resolve_project(roots, project) else { return };
+    match segs.get(1).copied() {
+        Some("_workspace") => wsconn::handle(stream, project, dir),
+        _ => term::handle_ws(stream, roots),
     }
 }
 

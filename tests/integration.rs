@@ -154,6 +154,71 @@ fn ws_closes_when_child_exits_first() {
     assert!(closed, "socket did not close after child exit");
 }
 
+fn ws_connect_path(
+    port: u16,
+    path: &str,
+) -> Result<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, tungstenite::Error>
+{
+    use tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://127.0.0.1:{port}{path}").into_client_request().unwrap();
+    req.headers_mut().insert("origin", "http://127.0.0.1:8444".parse().unwrap());
+    let (ws, _r) = tungstenite::connect(req)?;
+    if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    }
+    Ok(ws)
+}
+
+fn read_until(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    needle: &str,
+) -> String {
+    for _ in 0..40 {
+        match ws.read() {
+            Ok(tungstenite::Message::Text(t)) => {
+                if t.contains(needle) {
+                    return t.to_string();
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    panic!("never saw {needle:?}");
+}
+
+#[test]
+fn workspace_state_mirrors_between_two_clients() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    let (_d, port) = fixture();
+    let mut a = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    let mut b = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+
+    a.send(tungstenite::Message::Text(
+        r#"{"t":"OpenTab","pane":2,"tab":{"k":"File","rel":"hello.md","mode":"Preview"}}"#.into(),
+    ))
+    .unwrap();
+
+    // the *other* browser must learn about it without asking
+    let seen = read_until(&mut b, "hello.md");
+    assert!(seen.contains(r#""t":"State""#));
+    let _ = a.close(None);
+    let _ = b.close(None);
+    std::env::remove_var("DEADLIGHT_STATE_DIR");
+}
+
+#[test]
+fn workspace_socket_rejects_foreign_origin() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let (_d, port) = fixture();
+    use tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://127.0.0.1:{port}/ws/proj/_workspace").into_client_request().unwrap();
+    req.headers_mut().insert("origin", "https://evil.example.com".parse().unwrap());
+    assert!(tungstenite::connect(req).is_err(), "the write socket must not be cross-origin");
+}
+
 #[test]
 fn http_rejects_rebinding_host() {
     use std::io::{Read, Write};
