@@ -56,13 +56,29 @@ fn route_ws(stream: TcpStream, roots: &[PathBuf]) {
     }
     let head = String::from_utf8_lossy(&buf[..n]);
     let Some(target) = head.split_whitespace().nth(1) else { return };
-    let segs: Vec<&str> = target.trim_start_matches("/ws/").split('/').collect();
-    let Some(project) = segs.first().copied().filter(|s| !s.is_empty()) else { return };
-    let Some(dir) = projects::resolve_project(roots, project) else { return };
-    match segs.get(1).copied() {
-        Some("_workspace") => wsconn::handle(stream, project, dir),
-        _ => term::handle_ws(stream, roots),
+    let segs: Vec<&str> =
+        target.trim_start_matches("/ws/").split('/').filter(|s| !s.is_empty()).collect();
+    // The project identifier can now be a nested rel path (e.g.
+    // /ws/karpie/src/_workspace), so it's no longer just `segs[0]` — split
+    // from the right off the fixed trailing marker instead, the same way
+    // routes.rs's frag route does. This can misfire only if a real project
+    // directory is itself named "_workspace" at exactly this position;
+    // unlike static/ws/frag (checked by projects::RESERVED because they sit
+    // on the plain-HTTP URL surface too), "_workspace" isn't reserved
+    // there, since it belongs only to this websocket surface.
+    let is_workspace_request =
+        segs.len() >= 2 && segs[segs.len() - 1] == "_workspace";
+    if is_workspace_request {
+        let project = segs[..segs.len() - 1].join("/");
+        if let Some(dir) = projects::resolve_project(roots, &project) {
+            return wsconn::handle(stream, &project, dir);
+        }
+        return;
     }
+    // Anything else (including a well-formed .../term/{name}) is
+    // term::handle_ws's own job to parse and validate for real; this
+    // function's only other responsibility is routing _workspace.
+    term::handle_ws(stream, roots);
 }
 
 /// Peek the first bytes without consuming them: websocket requests go to

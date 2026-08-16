@@ -67,6 +67,96 @@ fn fragments_render_and_errors_become_hints() {
     assert!(!esc.contains("root:"));
 }
 
+/// A project with a real nested subdirectory, for the multi-segment
+/// workspace URL / directory-picker tests below.
+fn nested_fixture() -> (tempfile::TempDir, u16) {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(d.path().join("karpie/sub")).unwrap();
+    std::fs::write(d.path().join("karpie/sub/inner.rs"), "fn main() {}").unwrap();
+    std::fs::write(d.path().join("karpie/top.txt"), "top").unwrap();
+    let port = start(vec![d.path().to_path_buf()]);
+    (d, port)
+}
+
+#[test]
+fn multi_segment_workspace_url_resolves_the_nested_directory() {
+    let (_d, port) = nested_fixture();
+    let body = ureq::get(&format!("http://127.0.0.1:{port}/karpie/sub"))
+        .call().unwrap().into_string().unwrap();
+    assert!(body.contains("data-project=\"karpie/sub\""));
+}
+
+#[test]
+fn frag_route_resolves_a_nested_projects_fragment_kind() {
+    let (_d, port) = nested_fixture();
+    let tree = ureq::get(&format!("http://127.0.0.1:{port}/frag/karpie/sub/tree"))
+        .call().unwrap().into_string().unwrap();
+    assert!(tree.contains("inner.rs"));
+}
+
+#[test]
+fn picker_at_shows_a_directorys_children_marked_distinctly() {
+    let (_d, port) = nested_fixture();
+    let body = ureq::get(&format!("http://127.0.0.1:{port}/?at=karpie"))
+        .call().unwrap().into_string().unwrap();
+    assert!(body.contains("class=\"dir\" data-rel=\"karpie/sub\""));
+    assert!(body.contains("class=\"file\""));
+    assert!(body.contains("top.txt"));
+    assert!(body.contains("crumb-current\">karpie"));
+}
+
+#[test]
+fn picker_at_outside_the_roots_falls_back_to_the_top_level_not_a_leak() {
+    let (_d, port) = nested_fixture();
+    // `at` is fully attacker-controlled query text; a traversal attempt or
+    // a bogus rel must never surface foreign directory content — it must
+    // fall back to the same safe top level opening the page fresh would show.
+    for at in ["../../etc", "nonexistent", "/etc"] {
+        let body = ureq::get(&format!("http://127.0.0.1:{port}/?at={at}"))
+            .call().unwrap().into_string().unwrap();
+        assert!(!body.contains("passwd"), "leaked for at={at}: {body}");
+        assert!(body.contains("crumb-current\">deadlight"), "did not fall back for at={at}");
+        assert!(body.contains("data-rel=\"karpie\""), "top level missing for at={at}");
+    }
+}
+
+#[test]
+fn nested_project_websockets_connect() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    std::env::set_var("DEADLIGHT_CMD", "cat");
+    let (_d, port) = nested_fixture();
+
+    // routes::route's `[project, rest @ ..]` change is only half the fix —
+    // lib.rs's route_ws and term.rs's handle_ws each had their own
+    // single-segment-project assumption to update, or a nested workspace
+    // page would render while its sockets silently failed to connect.
+    let mut ws = ws_connect_path(port, "/ws/karpie/sub/_workspace").unwrap();
+    let state = read_until(&mut ws, r#""t":"State""#);
+    assert!(state.contains(r#""t":"State""#));
+    let _ = ws.close(None);
+
+    let mut term = ws_connect_path(port, "/ws/karpie/sub/term/shell").unwrap();
+    term.send(tungstenite::Message::Binary(b"hi\r".to_vec())).unwrap();
+    let mut seen = String::new();
+    for _ in 0..60 {
+        match term.read() {
+            Ok(tungstenite::Message::Binary(b)) => seen.push_str(&String::from_utf8_lossy(&b)),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if seen.contains("hi") {
+            break;
+        }
+    }
+    assert!(seen.contains("hi"), "nested project's terminal must echo through the PTY");
+    let _ = term.close(None);
+
+    std::env::remove_var("DEADLIGHT_STATE_DIR");
+    std::env::remove_var("DEADLIGHT_CMD");
+}
+
 #[test]
 fn unknown_pages_are_404() {
     let (_d, port) = fixture();

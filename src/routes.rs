@@ -1,8 +1,11 @@
 //! HTTP request routing. URL surface (spec §URLs):
-//!   /                    index page
-//!   /{project}           workspace page
+//!   /                    directory picker (?at=<rel> browses a subdirectory)
+//!   /{project}           workspace page — {project} may be multi-segment,
+//!                        e.g. /karpie/src, naming a nested directory
 //!   /static/*            assets
-//!   /frag/{project}/*    htmx fragments
+//!   /frag/{project}/*    htmx fragments — {project} may likewise be
+//!                        multi-segment; the *last* segment is always the
+//!                        fragment kind (tree/file/changes/status/diff/theme.css)
 //! Fragment errors render as 200 + hint (htmx ignores 4xx bodies).
 use crate::{config, gitio, http, projects, render};
 use std::io::{BufReader, Write};
@@ -43,12 +46,58 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
     }
     let segs: Vec<&str> = req.path.split('/').filter(|s| !s.is_empty()).collect();
     match segs.as_slice() {
-        [] => http::html(w, &render::index_page(&projects::list_projects(roots))),
+        [] => serve_index(w, req, roots),
         ["static", rest @ ..] => serve_static(w, &rest.join("/")),
-        ["frag", project, what @ ..] => serve_frag(w, req, roots, project, what),
-        [project] => serve_workspace(w, roots, project),
-        _ => http::not_found(w, "no such page"),
+        // The fragment *kind* (tree/file/…) is always exactly the last
+        // segment (routes.rs's fragment endpoints never take path segments
+        // of their own — `dir=`/`path=` arrive as query params, see
+        // serve_frag below), so splitting from the right rather than
+        // assuming `project` is a single segment is unambiguous and leaves
+        // every existing single-segment call (`/frag/proj/tree`) unchanged.
+        ["frag", rest @ ..] if rest.len() >= 2 => {
+            let (what, proj_segs) = rest.split_last().expect("len >= 2 guarantees a last element");
+            serve_frag(w, req, roots, &proj_segs.join("/"), std::slice::from_ref(what))
+        }
+        // `[project, rest @ ..]` accepts one or more segments; they're
+        // rejoined into a single nested rel path below rather than treating
+        // `rest` as something separate from `project` — e.g. /karpie/src is
+        // one workspace identifier, "karpie/src", not project "karpie" with
+        // some other meaning attached to "src". This is safe to fall
+        // through to unconditionally (no guard, unlike the frag arm above)
+        // because the arms above it already intercept every RESERVED first
+        // segment that has a real meaning here: "static" and "frag" are
+        // matched literally, in source order, before this arm is ever
+        // tried, and "ws" is intercepted even earlier — lib.rs's `is_ws`
+        // diverts any request whose raw path starts with "/ws/" to
+        // route_ws before it ever reaches HTTP parsing, let alone this
+        // match. A single-segment `/frag` or `/static` (no trailing
+        // segment) still falls through to here, but then lands on
+        // `resolve_project`, whose own first-segment RESERVED check (see
+        // projects.rs) refuses it independently — belt and suspenders, not
+        // reliance on this comment being right forever.
+        // Every non-empty path lands here or in one of the two arms above,
+        // so this is deliberately the last arm, not followed by a
+        // catch-all: `[]` (handled above) and `[project, rest @ ..]`
+        // together are exhaustive over segs, and the compiler enforces
+        // that (an unreachable-pattern warning caught it when this arm
+        // used to sit behind a redundant `_`).
+        [project, rest @ ..] => {
+            let full = if rest.is_empty() { project.to_string() } else { format!("{project}/{}", rest.join("/")) };
+            serve_workspace(w, roots, &full)
+        }
     }
+}
+
+/// `/` — the directory picker. `?at=<rel>` browses one directory; with no
+/// `at` (or one that fails to resolve — refused the same way opening it as
+/// a workspace would be) it shows the merged top level of both ROOTS.
+fn serve_index(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
+    let requested = req.query.get("at").map(String::as_str).unwrap_or("");
+    let (at, entries) = match projects::list_dir(roots, requested) {
+        Some(entries) => (requested, entries),
+        None => ("", projects::list_dir(roots, "").expect("top level never fails to resolve")),
+    };
+    http::html(w, &render::index_page(at, &entries));
 }
 
 fn serve_workspace(w: &mut impl Write, roots: &[PathBuf], project: &str) {

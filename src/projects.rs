@@ -64,15 +64,119 @@ pub fn list_projects(roots: &[PathBuf]) -> Vec<Project> {
     out
 }
 
+/// Resolves a project identifier — `"karpie"` or a nested `"karpie/src"` —
+/// to a real, confined directory under one of `roots`. `name` is a full rel
+/// path from a ROOT, joined with `/`, not just a single path component: a
+/// workspace URL can now name a subdirectory (routes::route's
+/// `[project, rest @ ..]` match joins the segments back into this string
+/// before calling here), and the directory picker reuses this exact
+/// function to confine `?at=` (see `list_dir`) — opening a workspace and
+/// browsing into a directory share one security boundary.
+///
+/// Every segment is checked syntactically first, before any filesystem
+/// access: an empty segment rules out a leading `/`, a trailing `/`, and a
+/// `//` in the middle (so absolute paths are rejected here too); a
+/// leading-`.` segment rules out both hidden directories and `..`
+/// traversal in one check, since `..` itself starts with `.`. RESERVED is
+/// checked only against the *first* segment — matching `list_projects`,
+/// which likewise only ever excludes RESERVED names at the top level. A
+/// real subdirectory two levels down that happens to be named e.g.
+/// `static` is not this application's reserved URL prefix and must stay
+/// browsable and openable.
+///
+/// The canonicalize-and-prefix-check loop afterward is the same discipline
+/// `safe_resolve` uses: the segment checks above are necessary but not
+/// sufficient, since a symlink planted partway down a project's own tree
+/// (not just in the URL text) could still resolve outside the root.
 pub fn resolve_project(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
-    if name.is_empty()
-        || name.contains('/')
-        || name.starts_with('.')
-        || RESERVED.contains(&name)
-    {
+    let segs: Vec<&str> = name.split('/').collect();
+    if RESERVED.contains(&segs[0]) {
         return None;
     }
-    roots.iter().map(|r| r.join(name)).find(|p| p.is_dir())
+    if segs.iter().any(|s| s.is_empty() || s.starts_with('.')) {
+        return None;
+    }
+    for root in roots {
+        let Ok(base) = root.canonicalize() else { continue };
+        let Ok(canon) = base.join(name).canonicalize() else { continue };
+        if canon.starts_with(&base) && canon.is_dir() {
+            return Some(canon);
+        }
+    }
+    None
+}
+
+/// Encodes a project identifier for use as a filesystem-adjacent storage
+/// key: a state-file stem (`wsstate.rs`'s `path_for`) or a socket-path /
+/// session-key component (`session.rs`'s `sock_path` and `attach`). Project
+/// identifiers are now nested rel paths like `karpie/src`, and in those two
+/// contexts `/` means "directory separator" or "session-key separator"
+/// respectively — never project-name structure — so it must be hidden.
+/// This is deliberately NOT `http::percent_encode`, which keeps `/` literal
+/// because URLs want it readable; the two encoders solve opposite problems
+/// for the same string. `%` is escaped too, or a literal `%2F` inside a
+/// real directory name (e.g. one named `a%2Fb`) would collide with the
+/// encoding of the nested project `a/b`. The escaping is otherwise narrow
+/// on purpose: an ordinary top-level project name — every name that
+/// predates this feature — contains neither character and comes back
+/// unchanged, so existing state files and live sessions are unaffected.
+pub fn storage_key(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        match b {
+            b'/' => out.push_str("%2F"),
+            b'%' => out.push_str("%25"),
+            _ => out.push(b as char),
+        }
+    }
+    out
+}
+
+/// One row in the directory picker (see `render::index_page`): either a
+/// browsable/openable directory or a greyed-out, unselectable file.
+pub struct Entry {
+    pub name: String,
+    /// Full rel path from the ROOTS, e.g. `"karpie/src"` — used both as the
+    /// next `?at=` value (browsing) and as the workspace path (opening).
+    pub rel: String,
+    pub is_dir: bool,
+    /// Only ever true for directories; a useful cue when choosing where to open.
+    pub git: bool,
+}
+
+/// Lists the picker's rows for `at`: the merged top level (both ROOTS'
+/// children, directories only — unchanged from the pre-picker index) when
+/// `at` is empty, or one directory's immediate children otherwise. `None`
+/// means `at` is not a legitimate, confined directory — refused the same
+/// way `resolve_project` refuses to open it as a workspace, which is
+/// exactly the function this reuses to resolve it.
+pub fn list_dir(roots: &[PathBuf], at: &str) -> Option<Vec<Entry>> {
+    if at.is_empty() {
+        return Some(
+            list_projects(roots)
+                .into_iter()
+                .map(|p| Entry { rel: p.name.clone(), name: p.name, is_dir: true, git: p.git })
+                .collect(),
+        );
+    }
+    let dir = resolve_project(roots, at)?;
+    let rd = std::fs::read_dir(&dir).ok()?;
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|e| (e.path().is_file(), e.file_name().to_ascii_lowercase()));
+    let mut out = Vec::new();
+    for e in entries {
+        let name = e.file_name().to_string_lossy().into_owned();
+        // Same hidden-entry convention as list_projects: dotfiles (which
+        // includes each directory's own .git) never appear as rows.
+        if name.starts_with('.') {
+            continue;
+        }
+        let p = e.path();
+        let is_dir = p.is_dir();
+        let git = is_dir && p.join(".git").exists();
+        out.push(Entry { rel: format!("{at}/{name}"), name, is_dir, git });
+    }
+    Some(out)
 }
 
 pub fn safe_resolve(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
@@ -180,6 +284,39 @@ mod tests {
         assert!(resolve_project(&roots, "").is_none());
     }
 
+    // A future change to resolve_project could easily regress any one of
+    // these while "fixing" another — each is a distinct property this
+    // security boundary must keep holding for a nested rel, not just a
+    // single-segment name.
+    #[test]
+    fn resolve_project_accepts_nested_rel_and_keeps_every_safety_property() {
+        let d = root_fixture();
+        // its own fixture directory (not root_fixture's shared `alpha`),
+        // so this doesn't perturb safe_resolve_parent's tests, which rely
+        // on `sub` *not* existing under `alpha` to exercise their ENOENT case
+        fs::create_dir_all(d.path().join("alpha/sub")).unwrap();
+        fs::write(d.path().join("alpha/sub/inner.txt"), "hi").unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        // legitimate nested rel resolves to the real, canonicalized directory
+        let got = resolve_project(&roots, "alpha/sub").expect("alpha/sub exists");
+        assert_eq!(got, d.path().join("alpha/sub").canonicalize().unwrap());
+        // `..` traversal, anywhere in the rel, not just at the start
+        assert!(resolve_project(&roots, "alpha/..").is_none());
+        assert!(resolve_project(&roots, "alpha/../beta").is_none());
+        assert!(resolve_project(&roots, "..").is_none());
+        // absolute path (a leading `/` produces a leading empty segment)
+        assert!(resolve_project(&roots, "/etc/passwd").is_none());
+        // leading-dot segment, whether first or nested
+        assert!(resolve_project(&roots, ".hidden/sub").is_none());
+        assert!(resolve_project(&roots, "alpha/.git").is_none());
+        // reserved name as the first segment only — a real nested directory
+        // that happens to share a name with a reserved word, two levels
+        // down, is not this application's URL prefix and stays resolvable
+        fs::create_dir(d.path().join("alpha/static")).unwrap();
+        assert!(resolve_project(&roots, "static/sub").is_none());
+        assert!(resolve_project(&roots, "alpha/static").is_some());
+    }
+
     #[test]
     fn safe_resolve_blocks_escapes() {
         let d = root_fixture();
@@ -238,5 +375,61 @@ mod tests {
         // `starts_with` confinement branch, not bail out on ENOENT first.
         let err = safe_resolve_parent(&alpha, ".git/../../out.txt").unwrap_err();
         assert!(err.contains("outside project"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn storage_key_round_trips_and_leaves_plain_names_unchanged() {
+        // The overwhelmingly common case — every project name that predates
+        // this feature — must come back byte-for-byte, or existing state
+        // files and live sessions break on upgrade.
+        assert_eq!(storage_key("proj"), "proj");
+        assert_eq!(storage_key("karpie-2"), "karpie-2");
+        // `/` is hidden: it means "directory separator" or "session-key
+        // separator" in the two places this key is used, not project structure.
+        assert_eq!(storage_key("karpie/src"), "karpie%2Fsrc");
+        // `%` is escaped too, or a literal `%2F` in a real (if unusual)
+        // directory name would collide with the encoding of a nested project.
+        assert_eq!(storage_key("a%2Fb"), "a%252Fb");
+        assert_ne!(storage_key("a%2Fb"), storage_key("a/b"), "must not collide");
+        // distinct inputs must never encode to the same key
+        assert_ne!(storage_key("karpie/src"), storage_key("karpie-src"));
+    }
+
+    #[test]
+    fn list_dir_at_empty_is_the_merged_top_level() {
+        let d = root_fixture();
+        let entries = list_dir(&[d.path().to_path_buf()], "").unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta"]); // same set/order as list_projects
+        assert!(entries.iter().all(|e| e.is_dir), "top level is directories only");
+        assert!(entries.iter().find(|e| e.name == "alpha").unwrap().git);
+    }
+
+    #[test]
+    fn list_dir_at_a_directory_shows_its_children_marked_distinctly() {
+        let d = root_fixture();
+        fs::create_dir_all(d.path().join("alpha/sub/.git")).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let entries = list_dir(&roots, "alpha").unwrap();
+        let file = entries.iter().find(|e| e.name == "readme.md").unwrap();
+        assert!(!file.is_dir, "files are listed but must be marked non-directory");
+        assert!(!file.git);
+        let dir = entries.iter().find(|e| e.name == "sub").unwrap();
+        assert!(dir.is_dir);
+        assert!(dir.git, "sub's own .git marks it, independent of alpha's");
+        assert_eq!(dir.rel, "alpha/sub"); // rel is the full path from the ROOTS
+        // .git itself and other dotfiles never appear as rows
+        assert!(!entries.iter().any(|e| e.name == ".git"));
+    }
+
+    #[test]
+    fn list_dir_refuses_an_at_outside_the_roots() {
+        let d = root_fixture();
+        let roots = vec![d.path().join("alpha")]; // root is alpha itself
+        // "beta" is a real directory, but it's a sibling of the root, not
+        // under it — the same escape list_dir must refuse that
+        // resolve_project already refuses for opening a workspace.
+        assert!(list_dir(&roots, "../beta").is_none());
+        assert!(list_dir(&roots, "nonexistent").is_none());
     }
 }
