@@ -38,7 +38,7 @@ function setMode(next, rel) {
   }
   mirror();
 }
-document.getElementById("tab-terminal").onclick = () => setMode("terminal");
+document.getElementById("tab-terminal").onclick = () => setMode("terminal", openRel);
 document.getElementById("tab-files").onclick = () => setMode("files", openRel);
 document.getElementById("tab-changes").onclick = () => setMode("changes", openRel);
 
@@ -81,11 +81,13 @@ term.loadAddon(fitAddon);
 term.open(document.getElementById("term"));
 let ws = null;
 let retry = 250;
+let reconnectTimer = null;
 function fit() {
   try { fitAddon.fit(); } catch {}
   if (ws && ws.readyState === 1) ws.send("resize:" + term.cols + "x" + term.rows);
 }
 function connect() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   ws = new WebSocket(
     (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/" + PROJECT
   );
@@ -99,7 +101,7 @@ function connect() {
   ws.onmessage = (e) => term.write(new Uint8Array(e.data));
   ws.onclose = () => {
     document.getElementById("term-overlay").classList.remove("hidden");
-    setTimeout(connect, retry);
+    reconnectTimer = setTimeout(connect, retry);
     retry = Math.min(retry * 2, 5000);
   };
 }
@@ -108,7 +110,11 @@ term.onData((d) => {
 });
 new ResizeObserver(() => { if (mode === "terminal") fit(); }).observe(termPane);
 window.addEventListener("focus", () => {
-  if (ws && ws.readyState !== 1) { try { ws.close(); } catch {} }
+  if (!ws || ws.readyState === 3) {   // fully closed: skip the remaining backoff
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    retry = 250;
+    connect();
+  }
 });
 
 setMode(mode, openRel);
