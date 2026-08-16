@@ -45,6 +45,10 @@ pub fn save(
         return Err(format!("file too large ({} bytes)", text.len()));
     }
     let abs = safe_resolve(project_dir, rel)?;
+    let disk_meta = std::fs::metadata(&abs).map_err(|e| e.to_string())?;
+    if disk_meta.len() > MAX_WRITE_BYTES as u64 {
+        return Err(format!("file too large ({} bytes)", disk_meta.len()));
+    }
     let disk = std::fs::read_to_string(&abs).map_err(|e| e.to_string())?;
     if !force && crate::workspace::hash_text(&disk) != base_hash {
         return Ok(SaveOutcome::Conflict { disk_text: disk });
@@ -55,7 +59,11 @@ pub fn save(
 
 pub fn create_file(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     let abs = safe_resolve_parent(project_dir, rel)?;
-    if abs.exists() {
+    // symlink_metadata (not exists/metadata) does not follow symlinks: a
+    // dangling symlink inside the project must still count as "already
+    // there", otherwise fs::write below would follow it and create the
+    // file wherever the link points — outside the project.
+    if abs.symlink_metadata().is_ok() {
         return Err(format!("already exists: {rel}"));
     }
     std::fs::write(&abs, "").map_err(|e| e.to_string())?;
@@ -64,7 +72,10 @@ pub fn create_file(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
 
 pub fn create_dir(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     let abs = safe_resolve_parent(project_dir, rel)?;
-    if abs.exists() {
+    // See create_file: refuse a dangling symlink rather than follow it.
+    // mkdir(2) itself doesn't follow symlinks, so this is currently safe
+    // either way, but make the intent explicit rather than relying on that.
+    if abs.symlink_metadata().is_ok() {
         return Err(format!("already exists: {rel}"));
     }
     std::fs::create_dir(&abs).map_err(|e| e.to_string())?;
@@ -158,8 +169,56 @@ mod tests {
 
     #[test]
     fn save_is_confined() {
+        // Build our own layout (rather than reusing `proj()`, which is
+        // rooted directly under the system temp dir) so the sibling
+        // "outside" file is guaranteed to exist at a known path, and so
+        // both it and the project dir are cleaned up together.
+        let outer = tempfile::tempdir().unwrap();
+        let project = outer.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let outside = outer.path().join("outside.txt");
+        fs::write(&outside, "safe\n").unwrap();
+
+        let err = match save(&project, "../outside.txt", "x", 0, true) {
+            Err(e) => e,
+            Ok(_) => panic!("save through a `..` escape must not succeed"),
+        };
+        assert!(err.contains("outside project"), "unexpected error: {err}");
+        assert_eq!(
+            fs::read_to_string(&outside).unwrap(),
+            "safe\n",
+            "a save through a `..` escape must not touch the file it reached"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_file_refuses_a_symlink_that_escapes_the_project() {
+        use std::os::unix::fs::symlink;
+
         let d = proj();
-        assert!(save(d.path(), "../outside.txt", "x", 0, true).is_err());
+        let outside_dir = tempfile::tempdir().unwrap();
+        let missing = outside_dir.path().join("nope.txt"); // never created
+        let existing = outside_dir.path().join("real.txt");
+        fs::write(&existing, "real\n").unwrap();
+
+        // Case 1: dangling symlink. `symlink_metadata` (not `exists`, which
+        // follows the link and sees nothing) must treat this as "already
+        // there" and refuse, rather than letting `fs::write` follow the
+        // link and create the file outside the project.
+        symlink(&missing, d.path().join("dangling")).unwrap();
+        assert!(create_file(d.path(), "dangling").is_err());
+        assert!(!missing.exists(), "must not have created the file outside the project");
+
+        // Case 2: symlink to a file that already exists outside the
+        // project. Must also be refused, and the target left untouched.
+        symlink(&existing, d.path().join("linked")).unwrap();
+        assert!(create_file(d.path(), "linked").is_err());
+        assert_eq!(
+            fs::read_to_string(&existing).unwrap(),
+            "real\n",
+            "existing outside file must be untouched"
+        );
     }
 
     #[test]
