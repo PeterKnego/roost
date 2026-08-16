@@ -1,0 +1,18 @@
+[package]
+name = "deadlight"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+tungstenite = "0.24"
+portable-pty = "0.8"
+pulldown-cmark = "0.13"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+ureq = "2"
+tempfile = "3"
+
+[profile.release]
+strip = true
