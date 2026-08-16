@@ -171,6 +171,12 @@ pub fn list_dir(roots: &[PathBuf], at: &str) -> Option<Vec<Entry>> {
         if name.starts_with('.') {
             continue;
         }
+        // Skip build/vendor directories (target, node_modules, __pycache__).
+        // The picker chooses a workspace, and these are never that; hiding
+        // them here keeps the picker consistent with the file tree's SKIP_DIRS.
+        if SKIP_DIRS.contains(&name.as_str()) {
+            continue;
+        }
         let p = e.path();
         let is_dir = p.is_dir();
         let git = is_dir && p.join(".git").exists();
@@ -431,5 +437,25 @@ mod tests {
         // resolve_project already refuses for opening a workspace.
         assert!(list_dir(&roots, "../beta").is_none());
         assert!(list_dir(&roots, "nonexistent").is_none());
+    }
+
+    #[test]
+    fn list_dir_skips_build_and_vendor_dirs() {
+        let d = root_fixture();
+        let roots = vec![d.path().to_path_buf()];
+        // Create a subdirectory with normal dirs, build dirs, and a file.
+        fs::create_dir(d.path().join("alpha/src")).unwrap();
+        fs::create_dir(d.path().join("alpha/target")).unwrap();
+        fs::create_dir(d.path().join("alpha/node_modules")).unwrap();
+        fs::create_dir(d.path().join("alpha/__pycache__")).unwrap();
+        fs::write(d.path().join("alpha/cargo.toml"), "").unwrap();
+        // list_dir should return src and cargo.toml, but not the build/vendor dirs.
+        let entries = list_dir(&roots, "alpha").unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"src"), "normal dirs should be listed");
+        assert!(names.contains(&"cargo.toml"), "files should be listed");
+        assert!(!names.contains(&"target"), "target should be skipped");
+        assert!(!names.contains(&"node_modules"), "node_modules should be skipped");
+        assert!(!names.contains(&"__pycache__"), "__pycache__ should be skipped");
     }
 }
