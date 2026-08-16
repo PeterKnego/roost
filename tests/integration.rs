@@ -360,6 +360,43 @@ fn workspace_socket_malformed_json_is_reported_not_fatal() {
 }
 
 #[test]
+fn external_edit_updates_a_clean_buffer_live() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    std::env::set_var("DEADLIGHT_DEBOUNCE_MS", "10");
+    let (d, port) = fixture();
+    let mut a = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    a.send(tungstenite::Message::Text(
+        "{\"t\":\"EditBuffer\",\"rel\":\"hello.md\",\"text\":\"# Hello\\n\"}".into(),
+    ))
+    .unwrap();
+    a.send(tungstenite::Message::Text(
+        r#"{"t":"SaveBuffer","rel":"hello.md","force":true}"#.into(),
+    ))
+    .unwrap();
+    let _ = read_until(&mut a, "SaveOk"); // buffer is now clean
+
+    // Claude, in the next pane, rewrites the file
+    std::fs::write(d.path().join("proj/hello.md"), "# Rewritten by Claude\n").unwrap();
+    let seen = read_until(&mut a, "Rewritten by Claude");
+    assert!(seen.contains(r#""t":"BufferText""#), "a clean buffer must follow the file");
+
+    // Hub is a process-global registry keyed by project name (see hub.rs),
+    // so "proj" outlives this test for the rest of the binary's run. Close
+    // the buffer we opened, or its leftover entry pollutes every later
+    // test's State snapshot for "proj" (see the comment in
+    // workspace_state_mirrors_between_two_clients, which already guards
+    // against exactly this class of cross-test leakage).
+    a.send(tungstenite::Message::Text(r#"{"t":"CloseBuffer","rel":"hello.md"}"#.into())).unwrap();
+    let _ = read_until(&mut a, r#""t":"State""#);
+
+    let _ = a.close(None);
+    std::env::remove_var("DEADLIGHT_STATE_DIR");
+    std::env::remove_var("DEADLIGHT_DEBOUNCE_MS");
+}
+
+#[test]
 fn http_rejects_rebinding_host() {
     use std::io::{Read, Write};
     let (_d, port) = fixture();

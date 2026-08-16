@@ -18,6 +18,10 @@ pub struct Hub {
     /// Paths deadlight itself just wrote, with the resulting hash. The watcher
     /// (Task 8) drops matching events so a save does not echo back.
     pub self_writes: HashMap<String, u64>,
+    /// Set once a filesystem watcher has been spawned for this hub, so
+    /// `for_project` starts at most one watcher per project even though it
+    /// runs on every connection.
+    pub watching: bool,
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<Hub>>>>> = OnceLock::new();
@@ -35,16 +39,40 @@ impl Hub {
             subs: HashMap::new(),
             next_id: 0,
             self_writes: HashMap::new(),
+            watching: false,
         }
     }
 
-    /// One hub per project, shared by every connection to it.
+    /// One hub per project, shared by every connection to it. Also the place
+    /// a project's filesystem watcher is started: the first connection to
+    /// see a fresh hub spawns it, and `watching` makes that idempotent so a
+    /// second connection racing in does not start a second watcher.
     pub fn for_project(project: &str, dir: std::path::PathBuf) -> Arc<Mutex<Hub>> {
         let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
         let mut map = reg.lock().unwrap_or_else(|e| e.into_inner());
-        map.entry(project.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(Hub::new(project, dir))))
-            .clone()
+        let arc = map
+            .entry(project.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(Hub::new(project, dir.clone()))))
+            .clone();
+        // The registry lock is dropped by the time we get here (this is
+        // after the `entry` call completes, and `map` is not touched again),
+        // so locking the hub next cannot deadlock against another thread
+        // that holds the hub lock and wants the registry lock.
+        drop(map);
+        if !Hub::lock(&arc).watching {
+            let ms: u64 = std::env::var("DEADLIGHT_DEBOUNCE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300);
+            // Spawned with no hub lock held: walking the tree and registering
+            // watches touches the filesystem, and that must never happen
+            // while blocking every other connection to this project.
+            let ok = crate::watch::spawn(project, dir, arc.clone(), std::time::Duration::from_millis(ms));
+            let mut h = Hub::lock(&arc);
+            h.watching = true;
+            h.ws.watch_degraded = !ok;
+        }
+        arc
     }
 
     /// Lock a hub, recovering from poisoning. A panic in one connection thread
@@ -158,6 +186,36 @@ impl Hub {
                 self.send_to(from, &ev);
             }
         }
+    }
+
+    /// A file with an open buffer changed on disk. Clean buffers follow the
+    /// file so you watch Claude's edits land live; dirty buffers are only
+    /// flagged stale, so unsaved work is never overwritten by a background
+    /// writer.
+    pub fn file_changed_externally(&mut self, base: &std::path::Path, rel: &str) {
+        let Ok(disk) = std::fs::read_to_string(base.join(rel)) else { return };
+        let disk_hash = workspace::hash_text(&disk);
+        if crate::watch::is_self_write(&mut self.self_writes, rel, disk_hash) {
+            return; // our own save; broadcasting it would echo back at the author
+        }
+        let Some(b) = self.ws.buffers.get_mut(rel) else { return };
+        if b.dirty {
+            b.stale = true;
+            let ev = Event::BufferStale { rel: rel.to_string() };
+            self.broadcast(&ev);
+        } else {
+            b.text = disk.clone();
+            b.base_hash = disk_hash;
+            b.stale = false;
+            let ev = Event::BufferText {
+                rel: rel.to_string(),
+                text: disk,
+                origin: String::new(), // no author: everyone applies it
+            };
+            self.broadcast(&ev);
+        }
+        self.ws.version += 1;
+        self.broadcast(&Event::FileChanged { rel: rel.to_string() });
     }
 
     fn do_fileop(&mut self, from: &ConnId, r: Result<std::path::PathBuf, String>) {

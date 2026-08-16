@@ -10,6 +10,7 @@ pub mod render;
 pub mod routes;
 pub mod session;
 pub mod term;
+pub mod watch;
 pub mod workspace;
 pub mod wsconn;
 pub mod wsstate;
