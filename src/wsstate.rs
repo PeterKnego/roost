@@ -178,6 +178,37 @@ mod tests {
     }
 
     #[test]
+    fn out_of_range_active_index_is_clamped_on_load() {
+        with_state_dir(|| {
+            // Written by hand, not via save(): save() can never produce an
+            // out-of-range `active`, so it would not exercise the clamp.
+            let raw = r#"{
+                "sizes": {"left_w": 260, "right_w": 520, "left_split": 60},
+                "panes": [
+                    {"tabs": [{"k": "Tree"}], "active": 9},
+                    {"tabs": [], "active": 4},
+                    {"tabs": [], "active": 0},
+                    {"tabs": [], "active": 0}
+                ],
+                "buffers": {}
+            }"#;
+            std::fs::create_dir_all(state_dir()).unwrap();
+            std::fs::write(state_dir().join("clamp.json"), raw).unwrap();
+
+            let (w, warn) = load("clamp");
+            assert!(warn.is_none());
+            assert_eq!(
+                w.panes[proto::LEFT_TOP as usize].active, 0,
+                "active must clamp into a single-tab pane, not stay past the end"
+            );
+            assert_eq!(
+                w.panes[proto::LEFT_BOTTOM as usize].active, 0,
+                "empty tabs is where saturating_sub must prevent underflow"
+            );
+        });
+    }
+
+    #[test]
     fn state_file_is_not_world_readable() {
         with_state_dir(|| {
             save("proj", &Workspace::default_layout()).unwrap();
