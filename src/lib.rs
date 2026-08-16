@@ -8,6 +8,7 @@ pub mod render;
 pub mod routes;
 pub mod term;
 pub mod workspace;
+pub mod wsstate;
 
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
