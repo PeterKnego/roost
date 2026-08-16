@@ -3,6 +3,7 @@ pub mod gitio;
 pub mod http;
 pub mod origin;
 pub mod projects;
+pub mod proto;
 pub mod render;
 pub mod routes;
 pub mod term;
