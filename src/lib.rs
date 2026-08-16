@@ -1,6 +1,7 @@
 pub mod config;
 pub mod fileops;
 pub mod gitio;
+pub mod hub;
 pub mod http;
 pub mod origin;
 pub mod projects;
