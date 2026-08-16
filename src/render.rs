@@ -106,7 +106,7 @@ fn tree_level(
             out.push_str(&format!(
                 "<li><a class=\"file{sel}\" data-rel=\"{}\" hx-get=\"/frag/{}/file?path={}\" hx-target=\"#content\">{}</a></li>",
                 esc(&erel),
-                project,
+                crate::http::percent_encode(project),
                 crate::http::percent_encode(&erel),
                 esc(&name)
             ));
@@ -118,14 +118,15 @@ pub fn changes_fragment(project: &str, st: &Status) -> String {
     if st.changes.is_empty() {
         return hint("working tree clean");
     }
+    let project_url = crate::http::percent_encode(project);
     let mut out = format!(
-        "<ul class=\"changes\"><li><a class=\"file\" data-rel=\"\" hx-get=\"/frag/{project}/diff\" hx-target=\"#content\"><b>— full diff —</b></a></li>"
+        "<ul class=\"changes\"><li><a class=\"file\" data-rel=\"\" hx-get=\"/frag/{project_url}/diff\" hx-target=\"#content\"><b>— full diff —</b></a></li>"
     );
     for c in &st.changes {
         out.push_str(&format!(
             "<li><a class=\"file\" data-rel=\"{}\" hx-get=\"/frag/{}/diff?path={}\" hx-target=\"#content\"><span class=\"xy\">{}</span> {}</a></li>",
             esc(&c.path),
-            project,
+            project_url,
             crate::http::percent_encode(&c.path),
             esc(&c.xy),
             esc(&c.path)
@@ -170,15 +171,17 @@ pub fn workspace_page(project: &str, s: &Settings, has_theme_css: bool) -> Strin
         .as_deref()
         .map(|w| format!("<span class=\"warn\" title=\"{}\">⚠ config</span>", esc(w)))
         .unwrap_or_default();
+    let proj_url = crate::http::percent_encode(project);
+    let proj_txt = esc(project);
     let theme_css = if has_theme_css {
-        format!("<link rel=\"stylesheet\" href=\"/frag/{project}/theme.css\">")
+        format!("<link rel=\"stylesheet\" href=\"/frag/{proj_url}/theme.css\">")
     } else {
         String::new()
     };
     format!(
         r#"<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{project} — deadlight</title>
+<title>{proj_txt} — deadlight</title>
 <link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/vendor/hljs-github-dark.min.css">
 <link rel="stylesheet" href="/static/vendor/github-markdown.min.css">
@@ -189,11 +192,11 @@ pub fn workspace_page(project: &str, s: &Settings, has_theme_css: bool) -> Strin
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
-</head><body data-project="{project}" data-default-tab="{tab}">
+</head><body data-project="{proj_txt}" data-default-tab="{tab}">
 <header>
-  <a class="home" href="/">◆</a><span class="proj">{project}</span>
+  <a class="home" href="/">◆</a><span class="proj">{proj_txt}</span>
   <nav><button id="tab-terminal">Terminal</button><button id="tab-files">Files</button><button id="tab-changes">Changes</button></nav>
-  <span id="gitinfo" hx-get="/frag/{project}/status" hx-trigger="load, refresh from:body"></span>
+  <span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body"></span>
   {warn}
   <button id="refresh" title="refresh (r)">⟳</button>
 </header>
@@ -303,5 +306,14 @@ mod tests {
         let h = index_page(&ps);
         assert!(h.contains("href=\"/alpha\""));
         assert!(h.contains("/tmp/alpha"));
+    }
+
+    #[test]
+    fn project_name_is_escaped_everywhere() {
+        let s = Settings::default();
+        let h = workspace_page("a\"><script>", &s, false);
+        assert!(!h.contains("a\"><script>"));
+        let c = changes_fragment("a\"><script>", &Status { branch: String::new(), changes: vec![crate::gitio::Change { xy: "??".into(), path: "x".into() }] });
+        assert!(!c.contains("\"><script>"));
     }
 }
