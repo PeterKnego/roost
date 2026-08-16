@@ -65,6 +65,19 @@ install -m 755 ~/.cache/cargo-target/release/deadlight ~/.local/bin/deadlight
 systemctl --user restart deadlight
 ```
 
+Check the branch before pulling — the box was once left on a feature branch,
+where `git pull --ff-only` cheerfully reported "Already up to date" while
+sitting on an old commit.
+
+**`KillMode=process` in the unit is load-bearing.** deadlight spawns its
+`dtach` sessions as child processes, and systemd's default
+`KillMode=control-group` kills the entire cgroup on stop — taking every
+dtach session with it and defeating the whole reason dtach is used. Verified
+in production: with the default, restarting deadlight lost the running shell
+(`pgrep -c dtach` went to 0); with `KillMode=process`, only the client dies
+and the session survives, so a shell variable set before a restart is still
+there afterwards.
+
 `tailscale serve` and `tailscale set` work without sudo (the account is the
 tailscale operator); the account's sudo password is *not* its ssh password.
 - URLs: `/` (index), `/{project}` (workspace). Everything else is plumbing
