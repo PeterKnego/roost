@@ -30,6 +30,18 @@ function onEvent(ev) {
     case "State":
       myOrigin = myOrigin || ev.origin;
       state = ev.ws;
+      // A rel missing from the fresh buffer list is gone server-side (the
+      // last tab on it closed clean, or its edits were explicitly
+      // discarded) — prune it here rather than let texts/editors grow for
+      // the life of the session. This is safe because hub::open_for_edit
+      // always re-broadcasts a fresh BufferText the moment a rel re-enters
+      // Edit mode, even for a buffer it kept around dirty; nothing here can
+      // be the last copy of unsaved text.
+      {
+        const openRels = new Set(state.buffers.map((b) => b.rel));
+        for (const rel of texts.keys()) if (!openRels.has(rel)) texts.delete(rel);
+        for (const rel of editors.keys()) if (!openRels.has(rel)) editors.delete(rel);
+      }
       render();
       break;
     case "BufferText": {
@@ -38,6 +50,17 @@ function onEvent(ev) {
       // the file directly). texts is updated unconditionally (not gated on
       // an editor being mounted right now) so mountEditor can always seed
       // from it, even for text that arrived before its tab was ever opened.
+      // NOT gated on the buffer being dirty: EditBuffer's handler (hub.rs)
+      // broadcasts BufferText to every *other* client on every keystroke,
+      // dirty or not — that's how a second client watching the same file
+      // live-syncs with the one typing — and open_for_edit re-broadcasts
+      // the current text on reopen even when already dirty, so a freshly
+      // opened tab picks up in-progress edits instead of stale disk
+      // content. The one case that must never reach here (a dirty buffer's
+      // file changing externally) is handled entirely server-side: the
+      // server sends BufferStale instead of BufferText for exactly that
+      // case, so a client-side dirty check here would be redundant at best
+      // and would break the two legitimate cases above at worst.
       if (ev.origin && ev.origin === myOrigin) break;
       texts.set(ev.rel, ev.text);
       const ta = editors.get(ev.rel);
@@ -419,6 +442,15 @@ function mountEditor(content, rel) {
   editors.set(rel, ta);
   let timer = null;
   ta.oninput = () => {
+    // texts must reflect what's on screen the instant it changes, not 200ms
+    // later when the debounced EditBuffer actually goes out: render() can
+    // re-mount this same rel (a pane switch and back, a BufferStale patch,
+    // etc.) at any time in between, and mountEditor always seeds from
+    // texts. Updating it here — not in the BufferText handler, which only
+    // ever hears about this client's own edit as an echo it discards — is
+    // what makes texts an accurate record of the user's current text
+    // instead of the last thing the server confirmed.
+    texts.set(rel, ta.value);
     clearTimeout(timer);
     timer = setTimeout(() => send({ t: "EditBuffer", rel, text: ta.value }), 200);
   };
