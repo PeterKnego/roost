@@ -47,6 +47,12 @@ impl Hub {
             .clone()
     }
 
+    /// Lock a hub, recovering from poisoning. A panic in one connection thread
+    /// must not take the project down for every other browser.
+    pub fn lock(h: &Arc<Mutex<Hub>>) -> std::sync::MutexGuard<'_, Hub> {
+        h.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn subscribe(&mut self) -> (ConnId, Receiver<String>) {
         self.next_id += 1;
         let id = format!("c{}", self.next_id);
@@ -274,6 +280,14 @@ mod tests {
             "echoing text back stomps the author's cursor"
         );
         assert!(to_b.iter().any(|m| m.contains("typed")), "other clients must receive the text");
+        // Guard against `broadcast_except`'s retain predicate being inverted:
+        // that bug would also make `to_a` empty (by pruning `a` outright)
+        // and would otherwise pass the assertions above undetected.
+        assert!(
+            to_a.iter().any(|m| m.contains(r#""t":"State""#)),
+            "author must survive broadcast_except"
+        );
+        assert_eq!(h.subs.len(), 2, "skipping the originator must not prune it");
     }
 
     #[test]
@@ -283,11 +297,20 @@ mod tests {
         std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
         let mut h = Hub::new("proj", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
+        let (_other, rx_other) = h.subscribe();
         drain(&rx);
+        drain(&rx_other);
         let before = h.ws.version;
         h.handle(&c, Intent::ActivateTab { pane: proto::MIDDLE, idx: 9 }); // invalid
         assert_eq!(h.ws.version, before, "a rejected intent must not bump the version");
         assert!(drain(&rx).iter().any(|m| m.contains(r#""t":"Error""#)));
+        // An Error is the requesting client's business, not a broadcast: a
+        // second subscriber must see nothing, or `send_to` could silently
+        // regress into `broadcast` without any test catching it.
+        assert!(
+            !drain(&rx_other).iter().any(|m| m.contains(r#""t":"Error""#)),
+            "an Error must go only to the client that sent the bad intent"
+        );
     }
 
     #[test]
@@ -298,12 +321,20 @@ mod tests {
         std::fs::write(d.path().join("a.txt"), "on disk\n").unwrap();
         let mut h = Hub::new("proj", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
+        let (_other, rx_other) = h.subscribe();
         // buffer opened against different content => base_hash mismatch
         h.handle(&c, Intent::EditBuffer { rel: "a.txt".into(), text: "mine\n".into() });
         drain(&rx);
+        drain(&rx_other);
         h.handle(&c, Intent::SaveBuffer { rel: "a.txt".into(), force: false });
         assert!(drain(&rx).iter().any(|m| m.contains(r#""t":"SaveConflict""#)));
         assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "on disk\n");
+        // A conflict is the saving client's business, not everyone's: with
+        // only one subscriber, `send_to` and `broadcast` are indistinguishable.
+        assert!(
+            !drain(&rx_other).iter().any(|m| m.contains(r#""t":"SaveConflict""#)),
+            "a save conflict must go only to the client that tried to save"
+        );
     }
 
     #[test]
