@@ -3,12 +3,17 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::path::Path;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const MAX_SCROLLBACK: usize = 1_000_000;
 pub const MAX_SESSIONS_PER_PROJECT: usize = 16;
+// Bound on queued-but-unread chunks per subscriber. A client that falls this
+// far behind its own terminal (frozen tab, dead socket the kernel hasn't
+// noticed yet) is functionally gone; better to drop it than let the queue
+// grow without bound.
+const SUB_CHANNEL_CAP: usize = 64;
 
 /// Session names land in a dtach socket path and a command line. Anything
 /// outside this set is a path-traversal or argument-injection vector.
@@ -18,13 +23,23 @@ pub fn valid_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// `{project}/{name}` rather than a flattened `{project}-{name}`: project and
+/// session names can each contain `-`, so a flat join is ambiguous (project
+/// `a` + session `b-c` collides with project `a-b` + session `c`). Neither
+/// side can contain `/` (`valid_name` forbids it in session names; project
+/// names are resolved through `projects::resolve_project` first), so this
+/// join is unambiguous and doubles as the on-disk directory layout.
+fn sock_path(project: &str, name: &str) -> PathBuf {
+    crate::wsstate::state_dir().join("sock").join(project).join(name)
+}
+
 pub fn default_command(project: &str, name: &str) -> Vec<String> {
     if let Ok(c) = std::env::var("DEADLIGHT_CMD") {
         if !c.trim().is_empty() {
             return c.split_whitespace().map(String::from).collect();
         }
     }
-    let sock = crate::wsstate::state_dir().join("sock").join(format!("{project}-{name}"));
+    let sock = sock_path(project, name);
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     vec![
         "dtach".into(),
@@ -53,11 +68,15 @@ pub fn push_scrollback(ring: &mut VecDeque<u8>, data: &[u8]) {
 }
 
 struct Session {
-    writer: Box<dyn Write + Send>,
+    // Arc<Mutex<..>> rather than a bare writer: write_input must be able to
+    // release the *registry* lock before doing a blocking write to the
+    // child (see write_input's comment), so the writer needs its own lock
+    // that outlives the registry critical section.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     scrollback: VecDeque<u8>,
-    subs: HashMap<u64, Sender<Vec<u8>>>,
+    subs: HashMap<u64, SyncSender<Vec<u8>>>,
     sizes: HashMap<u64, (u16, u16)>,
     next_id: u64,
 }
@@ -90,9 +109,9 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
     if !valid_name(project) && project.contains('/') {
         return Err("invalid project name".into());
     }
-    let key = format!("{project}-{name}");
+    let key = format!("{project}/{name}");
     let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
-    let live_for_project = map.keys().filter(|k| k.starts_with(&format!("{project}-"))).count();
+    let live_for_project = map.keys().filter(|k| k.starts_with(&format!("{project}/"))).count();
     if !map.contains_key(&key) && live_for_project >= MAX_SESSIONS_PER_PROJECT {
         return Err("too many terminal sessions".into());
     }
@@ -101,6 +120,23 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         let cmd = default_command(project, name);
         if cmd.is_empty() {
             return Err("empty command".into());
+        }
+        // dtach -A refuses to create a socket in a directory that doesn't
+        // exist yet; nothing else creates it. 0o700: this directory grants
+        // shell access to whoever can connect to a socket in it. Gated on
+        // the command actually being dtach so DEADLIGHT_CMD-overridden test
+        // runs (which never touch sock_path) don't create directories under
+        // a real, unconfigured $HOME.
+        if cmd[0] == "dtach" {
+            if let Some(sock_dir) = sock_path(project, name).parent() {
+                std::fs::create_dir_all(sock_dir).map_err(|e| e.to_string())?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(sock_dir, std::fs::Permissions::from_mode(0o700));
+                }
+            }
         }
         let pty = native_pty_system();
         let pair = pty
@@ -117,7 +153,7 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         map.insert(
             key.clone(),
             Session {
-                writer,
+                writer: Arc::new(Mutex::new(writer)),
                 master: pair.master,
                 child,
                 scrollback: VecDeque::new(),
@@ -139,7 +175,10 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                         let Some(s) = map.get_mut(&pump_key) else { break };
                         push_scrollback(&mut s.scrollback, &buf[..n]);
                         let chunk = buf[..n].to_vec();
-                        s.subs.retain(|_, tx| tx.send(chunk.clone()).is_ok());
+                        // try_send, not send: a subscriber whose queue is full
+                        // (frozen tab, dead socket) is dropped rather than
+                        // backing up the whole fan-out (I4).
+                        s.subs.retain(|_, tx| tx.try_send(chunk.clone()).is_ok());
                     }
                 }
             }
@@ -155,20 +194,30 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
     let s = map.get_mut(&key).ok_or("session vanished")?;
     s.next_id += 1;
     let id = s.next_id;
-    let (tx, rx) = channel();
+    let (tx, rx) = sync_channel(SUB_CHANNEL_CAP);
     let replay: Vec<u8> = s.scrollback.iter().copied().collect();
     if !replay.is_empty() {
-        let _ = tx.send(replay);
+        let _ = tx.try_send(replay);
     }
     s.subs.insert(id, tx);
     Ok(Attachment { id, key, rx })
 }
 
+/// Takes the registry lock only long enough to clone the writer's `Arc`,
+/// then drops it before the blocking write. Holding the registry lock across
+/// I/O to a child would deadlock: if the child stops draining stdin (e.g.
+/// it's itself blocked writing output faster than the browser reads it), the
+/// write blocks indefinitely, and the pump thread — the only thing that can
+/// unblock it by draining output — needs that same lock to make progress.
 pub fn write_input(key: &str, data: &[u8]) -> Result<(), String> {
-    let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
-    let s = map.get_mut(key).ok_or("no such session")?;
-    s.writer.write_all(data).map_err(|e| e.to_string())?;
-    s.writer.flush().map_err(|e| e.to_string())
+    let writer = {
+        let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        let s = map.get_mut(key).ok_or("no such session")?;
+        s.writer.clone()
+    };
+    let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
+    w.write_all(data).map_err(|e| e.to_string())?;
+    w.flush().map_err(|e| e.to_string())
 }
 
 pub fn resize(key: &str, id: u64, cols: u16, rows: u16) {
@@ -217,7 +266,7 @@ mod tests {
         assert_eq!(c[0], "dtach");
         assert!(c.contains(&"-E".to_string()), "no escape character");
         assert!(c.contains(&"-z".to_string()), "no suspend key");
-        assert!(c.iter().any(|a| a.contains("proj-shell")), "socket is per project+session");
+        assert!(c.iter().any(|a| a.contains("proj/shell")), "socket is per project+session");
     }
 
     #[test]

@@ -137,21 +137,50 @@ fn terminal_ws_echoes_through_pty() {
     let _ = ws.close(None);
 }
 
+/// Waits for the server to genuinely close the socket, distinguishing that
+/// from the client's own read timeout: a timeout means the server may be
+/// hanging and must fail the test, not be mistaken for a close.
+fn assert_ws_closes(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    context: &str,
+) {
+    for _ in 0..50 {
+        match ws.read() {
+            Ok(tungstenite::Message::Close(_)) => return,
+            Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => {
+                return;
+            }
+            Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return;
+            }
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                panic!("{context}: timed out waiting for the socket to close");
+            }
+            Ok(_) => {}
+            Err(e) => panic!("{context}: unexpected error while waiting for close: {e:?}"),
+        }
+    }
+    panic!("{context}: socket did not close within the read budget");
+}
+
 #[test]
 fn ws_closes_when_child_exits_first() {
     let _g = WS_TEST_LOCK.lock().unwrap();
     std::env::set_var("DEADLIGHT_CMD", "true"); // exits immediately
     let (_d, port) = fixture();
-    let mut ws = ws_connect(port, Some("http://127.0.0.1:8444")).unwrap();
+    // Own session name: the process-global registry may already hold a live
+    // "proj/shell" session from another test in this binary (e.g.
+    // terminal_ws_echoes_through_pty's `cat`), in which case DEADLIGHT_CMD
+    // would never be consulted for a fresh spawn and this test would prove
+    // nothing about a child exiting first.
+    let mut ws = ws_connect_path(port, "/ws/proj/term/exiter").unwrap();
     // child exited at spawn; the server must close/shutdown the socket rather than hang
-    let mut closed = false;
-    for _ in 0..50 {
-        match ws.read() {
-            Ok(tungstenite::Message::Close(_)) | Err(_) => { closed = true; break; }
-            Ok(_) => {}
-        }
-    }
-    assert!(closed, "socket did not close after child exit");
+    assert_ws_closes(&mut ws, "ws_closes_when_child_exits_first");
 }
 
 #[test]
@@ -189,16 +218,15 @@ fn invalid_session_name_is_refused() {
     let _g = WS_TEST_LOCK.lock().unwrap();
     std::env::set_var("DEADLIGHT_CMD", "cat");
     let (_d, port) = fixture();
-    let mut ws = ws_connect_path(port, "/ws/proj/term/bad%20name").unwrap();
-    // the server closes immediately rather than spawning anything
-    let mut closed = false;
-    for _ in 0..20 {
-        match ws.read() {
-            Ok(tungstenite::Message::Close(_)) | Err(_) => { closed = true; break; }
-            Ok(_) => {}
-        }
+    // "bad%20name" is rejected because '%' is itself outside valid_name's
+    // charset — req.uri().path() is never percent-decoded, so the server
+    // never even sees a space there. "bad.name" exercises a character that
+    // survives undecoded, proving the rejection isn't an artifact of that.
+    for path in ["/ws/proj/term/bad%20name", "/ws/proj/term/bad.name"] {
+        let mut ws = ws_connect_path(port, path).unwrap();
+        // the server closes immediately rather than spawning anything
+        assert_ws_closes(&mut ws, path);
     }
-    assert!(closed);
 }
 
 fn ws_connect_path(
