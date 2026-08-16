@@ -150,6 +150,24 @@ fn tree_dir_lazily_returns_a_subdirectorys_children() {
     assert!(sub.contains("inner.txt"));
 }
 
+#[test]
+fn tree_dir_with_empty_rel_returns_the_root_listing() {
+    // app.js reconciles the root level of the tree in place on every
+    // TreeChanged (see refreshTree/reconcileList) instead of re-fetching
+    // the whole `tree_fragment`, so a brand-new root-level file doesn't
+    // wait for a reload while an existing open subdirectory doesn't
+    // collapse. It does that by hitting `dir=` (empty rel) — the same
+    // lazy-fetch endpoint a subdirectory expansion uses — which must
+    // resolve to the project root itself, not 404 or error.
+    let (d, port) = fixture();
+    std::fs::create_dir(d.path().join("proj/sub")).unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let root_dir = ureq::get(&format!("{base}/frag/proj/tree?dir=")).call().unwrap().into_string().unwrap();
+    assert!(!root_dir.contains("class=\"hint\""));
+    assert!(root_dir.contains("data-rel=\"hello.md\""));
+    assert!(root_dir.contains("data-rel=\"sub\""));
+}
+
 // DEADLIGHT_CMD is process-global; both ws tests set it, and if they ran in
 // parallel one could overwrite the other's value mid-connect. Serialize them.
 static WS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

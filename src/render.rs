@@ -366,6 +366,29 @@ mod tests {
         assert!(!out.contains("x.rs")); // sub's own child stays lazy
     }
 
+    // app.js's TreeChanged handler reconciles the root level (not just open
+    // subdirectories) by fetching `dir=""` — the same lazy-fetch codepath a
+    // subdirectory expansion uses, just scoped to the project root — and
+    // matching its <li> entries against the DOM by data-rel. That only
+    // works if this rel="" call produces list items shaped exactly like
+    // tree_fragment's own top level: same data-rel values, no <ul> wrapper.
+    #[test]
+    fn tree_level_at_empty_rel_matches_the_fragments_top_level() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir(d.path().join("src")).unwrap();
+        fs::write(d.path().join("README.md"), "").unwrap();
+        let mut out = String::new();
+        tree_level("proj", d.path(), "", "", &[], &mut out);
+        assert!(!out.starts_with("<ul"));
+        assert!(out.contains("data-rel=\"src\""));
+        assert!(out.contains("data-rel=\"README.md\""));
+        // must match the identity render::tree_fragment assigns those same
+        // entries at the top level, since the client keys reconciliation on it
+        let full = tree_fragment("proj", d.path(), "", &[]);
+        assert!(full.contains("data-rel=\"src\""));
+        assert!(full.contains("data-rel=\"README.md\""));
+    }
+
     #[test]
     fn changes_and_status_fragments() {
         let st = Status {
