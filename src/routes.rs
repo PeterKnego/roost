@@ -100,6 +100,11 @@ fn serve_frag(
         }
         ["diff"] => {
             let path = req.query.get("path").map(String::as_str);
+            if let Some(p) = path {
+                if path_is_suspicious(p) {
+                    return http::html(w, &render::hint("path outside project"));
+                }
+            }
             match gitio::diff(&dir, path) {
                 Ok(d) if d.trim().is_empty() => http::html(w, &render::hint("no diff")),
                 Ok(d) => http::html(
@@ -119,4 +124,8 @@ fn serve_frag(
         },
         _ => http::not_found(w, "no such fragment"),
     }
+}
+
+fn path_is_suspicious(p: &str) -> bool {
+    p.starts_with('/') || std::path::Path::new(p).components().any(|c| matches!(c, std::path::Component::ParentDir))
 }
