@@ -8,6 +8,7 @@ pub mod projects;
 pub mod proto;
 pub mod render;
 pub mod routes;
+pub mod session;
 pub mod term;
 pub mod workspace;
 pub mod wsconn;
@@ -31,9 +32,8 @@ pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
     }
 }
 
-/// `/ws/{project}/_workspace` and `/ws/{project}/term/{name}` (still the old
-/// v2 shape `/ws/{project}` until Task 7 rewrites term.rs) are peeked apart
-/// here so each gets its own handler; both re-check Origin themselves.
+/// `/ws/{project}/_workspace` and `/ws/{project}/term/{name}` are peeked
+/// apart here so each gets its own handler; both re-check Origin themselves.
 fn route_ws(stream: TcpStream, roots: &[PathBuf]) {
     let mut buf = [0u8; 512];
     // Poll like is_ws does, but wait for the whole request line (CRLF), not

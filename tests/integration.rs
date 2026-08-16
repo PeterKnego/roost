@@ -87,7 +87,7 @@ fn ws_connect(
 ) -> Result<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, tungstenite::Error>
 {
     use tungstenite::client::IntoClientRequest;
-    let mut req = format!("ws://127.0.0.1:{port}/ws/proj").into_client_request().unwrap();
+    let mut req = format!("ws://127.0.0.1:{port}/ws/proj/term/shell").into_client_request().unwrap();
     if let Some(o) = origin {
         req.headers_mut().insert("origin", o.parse().unwrap());
     }
@@ -152,6 +152,53 @@ fn ws_closes_when_child_exits_first() {
         }
     }
     assert!(closed, "socket did not close after child exit");
+}
+
+#[test]
+fn two_terminal_clients_mirror_one_session() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    std::env::set_var("DEADLIGHT_CMD", "cat");
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    let (_d, port) = fixture();
+    let mut a = ws_connect_path(port, "/ws/proj/term/shell").unwrap();
+    let mut b = ws_connect_path(port, "/ws/proj/term/shell").unwrap();
+    a.send(tungstenite::Message::Binary(b"mirrored\r".to_vec().into())).unwrap();
+
+    for ws in [&mut a, &mut b] {
+        let mut seen = String::new();
+        for _ in 0..60 {
+            match ws.read() {
+                Ok(tungstenite::Message::Binary(x)) => seen.push_str(&String::from_utf8_lossy(&x)),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            if seen.contains("mirrored") {
+                break;
+            }
+        }
+        assert!(seen.contains("mirrored"), "both attachments must see the output");
+    }
+    let _ = a.close(None);
+    let _ = b.close(None);
+    std::env::remove_var("DEADLIGHT_STATE_DIR");
+}
+
+#[test]
+fn invalid_session_name_is_refused() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    std::env::set_var("DEADLIGHT_CMD", "cat");
+    let (_d, port) = fixture();
+    let mut ws = ws_connect_path(port, "/ws/proj/term/bad%20name").unwrap();
+    // the server closes immediately rather than spawning anything
+    let mut closed = false;
+    for _ in 0..20 {
+        match ws.read() {
+            Ok(tungstenite::Message::Close(_)) | Err(_) => { closed = true; break; }
+            Ok(_) => {}
+        }
+    }
+    assert!(closed);
 }
 
 fn ws_connect_path(
