@@ -75,8 +75,13 @@ fn diff_traversal_path_is_rejected_with_hint() {
     assert!(!body.contains("root:"));
 }
 
+// DEADLIGHT_CMD is process-global; both ws tests set it, and if they ran in
+// parallel one could overwrite the other's value mid-connect. Serialize them.
+static WS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn terminal_ws_echoes_through_pty() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
     std::env::set_var("DEADLIGHT_CMD", "cat");
     let (_d, port) = fixture();
     let (mut ws, _resp) =
@@ -99,4 +104,24 @@ fn terminal_ws_echoes_through_pty() {
     }
     assert!(seen.contains("hello"), "PTY echo not received; got: {seen:?}");
     let _ = ws.close(None);
+}
+
+#[test]
+fn ws_closes_when_child_exits_first() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    std::env::set_var("DEADLIGHT_CMD", "true"); // exits immediately
+    let (_d, port) = fixture();
+    let (mut ws, _resp) = tungstenite::connect(format!("ws://127.0.0.1:{port}/ws/proj")).unwrap();
+    if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    }
+    // child exited at spawn; the server must close/shutdown the socket rather than hang
+    let mut closed = false;
+    for _ in 0..50 {
+        match ws.read() {
+            Ok(tungstenite::Message::Close(_)) | Err(_) => { closed = true; break; }
+            Ok(_) => {}
+        }
+    }
+    assert!(closed, "socket did not close after child exit");
 }
