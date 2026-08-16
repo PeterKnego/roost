@@ -104,18 +104,41 @@ pub fn load(project: &str) -> (Workspace, Option<String>) {
                     })
                     .collect();
             }
-            for (k, b) in d.buffers {
-                w.buffers.insert(
-                    k,
-                    Buffer {
-                        base_hash: crate::workspace::hash_text(&b.text),
-                        text: b.text,
-                        dirty: b.dirty,
-                        ..Buffer::default()
-                    },
-                );
+            // MAX_BUFFERS is enforced on the live insert path (apply_layout);
+            // without a matching cap here, a corrupt or hand-edited state
+            // file restores unboundedly. HashMap iteration order is
+            // unspecified, so sort the keys before truncating: otherwise
+            // which buffers survive a too-big file would differ from one
+            // load to the next, which would make this untestable and the
+            // dropped-buffer set effectively random.
+            let mut keys: Vec<String> = d.buffers.keys().cloned().collect();
+            keys.sort();
+            let warn = if keys.len() > crate::workspace::MAX_BUFFERS {
+                let dropped = keys.len() - crate::workspace::MAX_BUFFERS;
+                keys.truncate(crate::workspace::MAX_BUFFERS);
+                Some(format!(
+                    "workspace state had {} buffers, kept {} (dropped {dropped})",
+                    keys.len() + dropped,
+                    crate::workspace::MAX_BUFFERS,
+                ))
+            } else {
+                None
+            };
+            let mut buffers = d.buffers;
+            for k in keys {
+                if let Some(b) = buffers.remove(&k) {
+                    w.buffers.insert(
+                        k,
+                        Buffer {
+                            base_hash: crate::workspace::hash_text(&b.text),
+                            text: b.text,
+                            dirty: b.dirty,
+                            ..Buffer::default()
+                        },
+                    );
+                }
             }
-            (w, None)
+            (w, warn)
         }
         Err(e) => (w, Some(format!("workspace state unreadable: {e}"))),
     }
@@ -205,6 +228,47 @@ mod tests {
                 w.panes[proto::LEFT_BOTTOM as usize].active, 0,
                 "empty tabs is where saturating_sub must prevent underflow"
             );
+        });
+    }
+
+    #[test]
+    fn load_caps_restored_buffers_deterministically() {
+        // MAX_BUFFERS is enforced going in (apply_layout) but a state file
+        // can also arrive corrupted, hand-edited, or from an older binary
+        // with a looser cap — load() must not trust it to already be small.
+        with_state_dir(|| {
+            std::fs::create_dir_all(state_dir()).unwrap();
+            let n = crate::workspace::MAX_BUFFERS + 7;
+            let mut buffers = serde_json::Map::new();
+            for i in 0..n {
+                buffers.insert(
+                    format!("f{i:03}.txt"),
+                    serde_json::json!({"text": "x", "dirty": false}),
+                );
+            }
+            let raw = serde_json::json!({
+                "sizes": {"left_w": 260, "right_w": 520, "left_split": 60},
+                "panes": [
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0},
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0}
+                ],
+                "buffers": buffers,
+            });
+            std::fs::write(state_dir().join("oversized.json"), raw.to_string()).unwrap();
+
+            let (w, warn) = load("oversized");
+            assert_eq!(w.buffers.len(), crate::workspace::MAX_BUFFERS, "must be capped on load too");
+            assert!(warn.is_some(), "a truncated restore must be visible, not silent");
+
+            // Determinism: sorted-key truncation means the kept set is
+            // exactly the first MAX_BUFFERS names in lexical order, every
+            // time — not whatever HashMap iteration happened to yield.
+            let mut expected: Vec<String> = (0..n).map(|i| format!("f{i:03}.txt")).collect();
+            expected.sort();
+            expected.truncate(crate::workspace::MAX_BUFFERS);
+            let mut got: Vec<String> = w.buffers.keys().cloned().collect();
+            got.sort();
+            assert_eq!(got, expected);
         });
     }
 

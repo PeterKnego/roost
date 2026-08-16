@@ -82,6 +82,33 @@ fn static_assets_served_with_type() {
     assert!(resp.content_type().starts_with("text/javascript"));
 }
 
+#[cfg(unix)]
+#[test]
+fn theme_css_symlink_escaping_the_project_is_refused() {
+    // A cloned repo controls .deadlight/theme.css. If the fragment handler
+    // did a bare fs::read of that path, a symlink planted there pointing at
+    // e.g. ~/.ssh/id_rsa would be served straight to the browser as
+    // text/css. serve_frag must resolve it through safe_resolve like every
+    // other file read, so the escape is refused the same way path
+    // traversal already is.
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir(d.path().join("themeleak")).unwrap();
+    std::fs::create_dir(d.path().join("themeleak/.deadlight")).unwrap();
+    let secret = d.path().join("secret.txt");
+    std::fs::write(&secret, "top secret\n").unwrap();
+    std::os::unix::fs::symlink(&secret, d.path().join("themeleak/.deadlight/theme.css")).unwrap();
+    let port = start(vec![d.path().to_path_buf()]);
+
+    match ureq::get(&format!("http://127.0.0.1:{port}/frag/themeleak/theme.css")).call() {
+        Err(ureq::Error::Status(code, r)) => {
+            assert_eq!(code, 404);
+            assert!(!r.into_string().unwrap().contains("top secret"));
+        }
+        Ok(r) => panic!("symlink escape must not be served; got {:?}", r.into_string()),
+        Err(e) => panic!("unexpected error: {e:?}"),
+    }
+}
+
 #[test]
 fn diff_traversal_path_is_rejected_with_hint() {
     let (_d, port) = fixture();

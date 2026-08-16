@@ -182,11 +182,27 @@ impl Hub {
             }
             Intent::RenamePath { from: f, to } => {
                 let dir = self.dir.clone();
+                let (old, new) = (f.clone(), to.clone());
                 let r = crate::fileops::rename(&dir, f, to);
-                return self.do_fileop(from, r);
+                return self.do_rename(from, r, &old, &new);
             }
             _ => {}
         }
+        // CloseTab removes the tab from `self.ws` inside `apply_layout`
+        // below, so the rel it pointed at (if any) must be captured before
+        // that call, not after.
+        let closing_rel: Option<String> = match &intent {
+            Intent::CloseTab { pane, idx } => self
+                .ws
+                .panes
+                .get(*pane as usize)
+                .and_then(|p| p.tabs.get(*idx))
+                .and_then(|t| match t {
+                    Tab::File { rel, .. } => Some(rel.clone()),
+                    _ => None,
+                }),
+            _ => None,
+        };
         match workspace::apply_layout(&mut self.ws, &intent) {
             Ok(true) => {
                 self.ws.version += 1;
@@ -200,6 +216,17 @@ impl Hub {
                     Intent::SetMode { rel, mode: Mode::Edit } => self.open_for_edit(from, rel),
                     Intent::OpenTab { tab: Tab::File { rel, mode: Mode::Edit }, .. } => {
                         self.open_for_edit(from, rel)
+                    }
+                    // Closing a File tab is the only way a buffer is ever
+                    // freed short of the conflict banner's "discard mine" —
+                    // without this, every buffer a user opens accumulates
+                    // (up to MAX_BUFFERS) and is persisted with its full
+                    // text to disk forever, including secrets like a .env
+                    // opened once in Edit.
+                    Intent::CloseTab { .. } => {
+                        if let Some(rel) = &closing_rel {
+                            self.maybe_drop_buffer(rel);
+                        }
                     }
                     _ => {}
                 }
@@ -302,6 +329,82 @@ impl Hub {
         }
     }
 
+    /// A rename is a fileop like the others, but unlike create/delete it can
+    /// leave in-memory state pointing at a path that no longer exists: an
+    /// open Edit tab's buffer is keyed by the old rel, and every tab
+    /// referencing it still shows the old path. Left alone, the next save
+    /// against that tab fails `safe_resolve` with "not found" — silently,
+    /// per the Error-banner gap this branch fixes alongside (A2) — and the
+    /// unsaved text becomes permanently unsaveable. So a successful rename
+    /// also rekeys buffers/tabs and broadcasts `State`, not just `TreeChanged`.
+    fn do_rename(&mut self, from: &ConnId, r: Result<std::path::PathBuf, String>, old: &str, new: &str) {
+        match r {
+            Ok(_) => {
+                self.rekey_after_rename(old, new);
+                self.ws.version += 1;
+                self.broadcast(&Event::TreeChanged);
+                let snap = self.snapshot_event(from);
+                self.broadcast(&snap);
+                self.persist();
+            }
+            Err(e) => {
+                let ev = Event::Error { msg: e };
+                self.send_to(from, &ev);
+            }
+        }
+    }
+
+    /// Move the buffer and rewrite every tab's rel from `old` to `new` after
+    /// a filesystem rename succeeds. A rename can move a whole subtree (a
+    /// directory), so this rewrites not just an exact match on `old` but
+    /// every rel that has `old` as a `/`-boundary prefix — `has_prefix_boundary`
+    /// is what keeps that from also matching an unrelated sibling like
+    /// renaming "src" from clobbering "src2/x.rs".
+    fn rekey_after_rename(&mut self, old: &str, new: &str) {
+        if let Some(buf) = self.ws.buffers.remove(old) {
+            self.ws.buffers.insert(new.to_string(), buf);
+        }
+        let nested: Vec<String> =
+            self.ws.buffers.keys().filter(|k| has_prefix_boundary(k, old)).cloned().collect();
+        for k in nested {
+            if let Some(buf) = self.ws.buffers.remove(&k) {
+                self.ws.buffers.insert(format!("{new}{}", &k[old.len()..]), buf);
+            }
+        }
+        for p in self.ws.panes.iter_mut() {
+            for t in p.tabs.iter_mut() {
+                if let Tab::File { rel, .. } | Tab::Diff { rel: Some(rel) } = t {
+                    if rel == old {
+                        *rel = new.to_string();
+                    } else if has_prefix_boundary(rel, old) {
+                        *rel = format!("{new}{}", &rel[old.len()..]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop a File tab's buffer once closing a tab leaves nothing else
+    /// pointing at it — but never while it's dirty. Discarding unsaved text
+    /// on close would violate the exact crash-safety property `Buffer`
+    /// exists for; only an explicit `SaveBuffer`/`CloseBuffer` (the conflict
+    /// banner's "discard mine") may do that.
+    fn maybe_drop_buffer(&mut self, rel: &str) {
+        let still_open = self.ws.panes.iter().any(|p| {
+            p.tabs.iter().any(|t| match t {
+                Tab::File { rel: r, .. } => r == rel,
+                Tab::Diff { rel: Some(r) } => r == rel,
+                _ => false,
+            })
+        });
+        if still_open {
+            return;
+        }
+        if self.ws.buffers.get(rel).is_some_and(|b| !b.dirty) {
+            self.ws.buffers.remove(rel);
+        }
+    }
+
     fn do_save(&mut self, from: &ConnId, rel: String, force: bool) {
         let Some(buf) = self.ws.buffers.get(&rel).cloned() else {
             let ev = Event::Error { msg: format!("no buffer for {rel}") };
@@ -336,6 +439,13 @@ impl Hub {
             }
         }
     }
+}
+
+/// True when `prefix` names a directory containing `path` — i.e. `path` is
+/// `prefix` followed by a `/` and more. A plain `starts_with` would wrongly
+/// match "src2/x.rs" against prefix "src"; this requires the `/` boundary.
+fn has_prefix_boundary(path: &str, prefix: &str) -> bool {
+    path.len() > prefix.len() && path.starts_with(prefix) && path.as_bytes()[prefix.len()] == b'/'
 }
 
 /// A minimal unified-diff rendering of disk vs buffer. Uses the existing
@@ -537,6 +647,176 @@ mod tests {
             msgs.iter().any(|m| m.contains(r#""t":"BufferText""#) && m.contains("unsaved work")),
             "the requester must still get the current (unsaved) text, not blank; got {msgs:?}"
         );
+    }
+
+    #[test]
+    fn closing_a_clean_file_tab_drops_its_buffer_but_a_dirty_one_survives() {
+        // A1: nothing else in the app frees a buffer on the common path, so
+        // without this every file ever opened in Edit lingers — with its
+        // full text — in the persisted state file forever, including things
+        // like a .env opened once.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("clean.txt"), "on disk\n").unwrap();
+        std::fs::write(d.path().join("dirty.txt"), "on disk\n").unwrap();
+        let mut h = Hub::new("a1_close_buffer", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(
+            &c,
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::File { rel: "clean.txt".into(), mode: Mode::Edit } },
+        );
+        h.handle(
+            &c,
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::File { rel: "dirty.txt".into(), mode: Mode::Edit } },
+        );
+        drain(&rx);
+        assert!(h.ws.buffers.contains_key("clean.txt"));
+        assert!(h.ws.buffers.contains_key("dirty.txt"));
+
+        h.handle(&c, Intent::EditBuffer { rel: "dirty.txt".into(), text: "unsaved".into() });
+        drain(&rx);
+        assert!(h.ws.buffers["dirty.txt"].dirty);
+
+        // Tabs are [clean.txt, dirty.txt] in that pane; close index 0.
+        h.handle(&c, Intent::CloseTab { pane: proto::MIDDLE, idx: 0 });
+        assert!(
+            !h.ws.buffers.contains_key("clean.txt"),
+            "a closed, clean, unreferenced buffer must not linger"
+        );
+        assert!(h.ws.buffers.contains_key("dirty.txt"), "closing a different tab must not touch it");
+
+        h.handle(&c, Intent::CloseTab { pane: proto::MIDDLE, idx: 0 });
+        assert!(
+            h.ws.buffers.contains_key("dirty.txt"),
+            "unsaved work must survive closing its tab — only an explicit \
+             save or the conflict banner's 'discard mine' may drop it"
+        );
+    }
+
+    #[test]
+    fn closing_a_tab_still_referenced_elsewhere_keeps_the_buffer() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("shared.txt"), "on disk\n").unwrap();
+        let mut h = Hub::new("a1_shared_buffer", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        // A Diff tab for the same rel, in a different pane, still counts as
+        // "references that rel" even though it doesn't read the buffer
+        // directly — closing the Edit tab must not drop the buffer under it.
+        h.handle(&c, Intent::OpenTab { pane: proto::LEFT_TOP, tab: Tab::Diff { rel: Some("shared.txt".into()) } });
+        h.handle(
+            &c,
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::File { rel: "shared.txt".into(), mode: Mode::Edit } },
+        );
+        drain(&rx);
+        assert!(h.ws.buffers.contains_key("shared.txt"));
+
+        h.handle(&c, Intent::CloseTab { pane: proto::MIDDLE, idx: 0 });
+        assert!(
+            h.ws.buffers.contains_key("shared.txt"),
+            "another pane still references this rel; the buffer must survive"
+        );
+    }
+
+    #[test]
+    fn rename_rekeys_the_buffer_and_the_open_tab_so_a_later_save_still_works() {
+        // A3: before this fix, a rename left the buffer and every tab
+        // pointing at the old rel — only TreeChanged was broadcast — so the
+        // next save against that tab failed safe_resolve with "not found",
+        // silently (per A2), and unsaved text became permanently unsaveable.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("old.txt"), "on disk\n").unwrap();
+        let mut h = Hub::new("a3_rename_file", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(
+            &c,
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::File { rel: "old.txt".into(), mode: Mode::Edit } },
+        );
+        drain(&rx);
+        h.handle(&c, Intent::EditBuffer { rel: "old.txt".into(), text: "unsaved work".into() });
+        drain(&rx);
+        assert!(h.ws.buffers["old.txt"].dirty);
+
+        h.handle(&c, Intent::RenamePath { from: "old.txt".into(), to: "new.txt".into() });
+        let msgs = drain(&rx);
+        assert!(msgs.iter().any(|m| m.contains(r#""t":"TreeChanged""#)));
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"State""#)),
+            "a rename must also broadcast State, or clients keep showing the tab at the old path"
+        );
+
+        assert!(!h.ws.buffers.contains_key("old.txt"), "the old key must not linger");
+        assert_eq!(h.ws.buffers["new.txt"].text, "unsaved work", "unsaved text must survive the rename");
+        assert!(h.ws.buffers["new.txt"].dirty);
+        assert_eq!(
+            h.ws.panes[proto::MIDDLE as usize].tabs[0],
+            Tab::File { rel: "new.txt".into(), mode: Mode::Edit },
+            "the open tab must follow the file, not keep pointing at a name that no longer exists"
+        );
+
+        // The whole point: a save against the new rel must actually work —
+        // before the fix this failed with "not found" because the buffer
+        // and tab still pointed at "old.txt".
+        h.handle(&c, Intent::SaveBuffer { rel: "new.txt".into(), force: true });
+        assert!(drain(&rx).iter().any(|m| m.contains(r#""t":"SaveOk""#)));
+        assert_eq!(std::fs::read_to_string(d.path().join("new.txt")).unwrap(), "unsaved work");
+    }
+
+    #[test]
+    fn renaming_a_directory_rewrites_buffers_and_tabs_for_the_whole_subtree() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::fs::create_dir(d.path().join("src")).unwrap();
+        std::fs::write(d.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+        // A sibling that merely starts with the same characters must not be
+        // touched — this is the `/`-boundary case `has_prefix_boundary` exists for.
+        std::fs::create_dir(d.path().join("src2")).unwrap();
+        std::fs::write(d.path().join("src2/b.rs"), "fn b() {}\n").unwrap();
+
+        let mut h = Hub::new("a3_rename_dir", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(
+            &c,
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::File { rel: "src/a.rs".into(), mode: Mode::Edit } },
+        );
+        h.handle(
+            &c,
+            Intent::OpenTab { pane: proto::RIGHT, tab: Tab::File { rel: "src2/b.rs".into(), mode: Mode::Edit } },
+        );
+        drain(&rx);
+        h.handle(&c, Intent::EditBuffer { rel: "src/a.rs".into(), text: "unsaved a".into() });
+        drain(&rx);
+
+        h.handle(&c, Intent::RenamePath { from: "src".into(), to: "lib".into() });
+        drain(&rx);
+
+        assert!(!h.ws.buffers.contains_key("src/a.rs"));
+        assert_eq!(h.ws.buffers["lib/a.rs"].text, "unsaved a");
+        assert_eq!(
+            h.ws.panes[proto::MIDDLE as usize].tabs[0],
+            Tab::File { rel: "lib/a.rs".into(), mode: Mode::Edit }
+        );
+        // default_layout seeds RIGHT with a Terminal tab already, so the
+        // opened file lands at index 1, not 0.
+        assert_eq!(
+            h.ws.panes[proto::RIGHT as usize].tabs[1],
+            Tab::File { rel: "src2/b.rs".into(), mode: Mode::Edit },
+            "\"src2\" is not \"src\" followed by a '/' boundary and must be untouched"
+        );
+        assert!(h.ws.buffers.contains_key("src2/b.rs"));
     }
 
     #[test]

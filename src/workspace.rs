@@ -6,6 +6,16 @@ use std::time::SystemTime;
 
 pub const MAX_BUFFERS: usize = 50;
 
+/// Same ceiling as the file read/write path (`projects::MAX_FILE_BYTES`,
+/// `fileops::MAX_WRITE_BYTES`): the spec's 2 MB file cap is meant to bound
+/// what a client can push into server memory here too, not just what lands
+/// on disk — otherwise a single oversized `EditBuffer` frame lands in
+/// memory uncapped and then gets re-serialized whole into the state file on
+/// every keystroke. Duplicated rather than imported: those two constants
+/// are private to their own modules and this crate has no shared "limits"
+/// module yet.
+pub const MAX_TEXT_BYTES: usize = 2_000_000;
+
 #[derive(Debug, Clone)]
 pub struct Buffer {
     pub text: String,
@@ -179,6 +189,9 @@ pub fn apply_layout(w: &mut Workspace, intent: &Intent) -> Result<bool, String> 
             }
         }
         Intent::EditBuffer { rel, text } => {
+            if text.len() > MAX_TEXT_BYTES {
+                return Err(format!("buffer too large ({} bytes)", text.len()));
+            }
             if !w.buffers.contains_key(rel) && w.buffers.len() >= MAX_BUFFERS {
                 return Err("too many open buffers".into());
             }
@@ -311,6 +324,20 @@ mod tests {
             );
         }
         assert!(w.buffers.len() <= MAX_BUFFERS, "buffer count must stay capped");
+    }
+
+    #[test]
+    fn edit_buffer_rejects_oversize_text() {
+        // MAX_BUFFERS caps buffer *count*; this is the separate cap on a
+        // single buffer's *size*, matching the 2 MB read/write cap so a
+        // huge frame can't land in memory and then get re-serialized whole
+        // into the state file.
+        let mut w = Workspace::default_layout();
+        let huge = "x".repeat(MAX_TEXT_BYTES + 1);
+        let err = apply_layout(&mut w, &Intent::EditBuffer { rel: "a.rs".into(), text: huge })
+            .unwrap_err();
+        assert!(err.contains("too large"), "unexpected error: {err}");
+        assert!(!w.buffers.contains_key("a.rs"), "a rejected write must not create a buffer");
     }
 
     #[test]
