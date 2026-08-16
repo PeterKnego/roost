@@ -93,11 +93,11 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
 /// a workspace would be) it shows the merged top level of both ROOTS.
 fn serve_index(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
     let requested = req.query.get("at").map(String::as_str).unwrap_or("");
-    let (at, entries) = match projects::list_dir(roots, requested) {
-        Some(entries) => (requested, entries),
-        None => ("", projects::list_dir(roots, "").expect("top level never fails to resolve")),
+    let (at, entries, refused) = match projects::list_dir(roots, requested) {
+        Some(entries) => (requested, entries, false),
+        None => ("", projects::list_dir(roots, "").expect("top level never fails to resolve"), true),
     };
-    http::html(w, &render::index_page(at, &entries));
+    http::html(w, &render::index_page(at, &entries, refused));
 }
 
 fn serve_workspace(w: &mut impl Write, roots: &[PathBuf], project: &str) {

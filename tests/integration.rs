@@ -117,6 +117,10 @@ fn picker_at_outside_the_roots_falls_back_to_the_top_level_not_a_leak() {
         assert!(!body.contains("passwd"), "leaked for at={at}: {body}");
         assert!(body.contains("crumb-current\">deadlight"), "did not fall back for at={at}");
         assert!(body.contains("data-rel=\"karpie\""), "top level missing for at={at}");
+        // The fallback is silent to the URL (still `at=""`) but must not be
+        // silent to the reader — a notice explains why they landed at the
+        // top level instead of where `?at=` pointed.
+        assert!(body.contains("showing the top level"), "no notice for at={at}");
     }
 }
 

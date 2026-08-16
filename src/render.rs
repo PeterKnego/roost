@@ -256,13 +256,25 @@ fn picker_rows(entries: &[Entry]) -> String {
 /// The `/` directory picker (see routes::route's `?at=` handling). `at` is
 /// the rel path currently being browsed ("" for the merged top level);
 /// `entries` is its already-confined listing (`projects::list_dir`).
-pub fn index_page(at: &str, entries: &[Entry]) -> String {
+///
+/// `refused` marks the case where the caller's `?at=` did not resolve
+/// (missing, outside ROOTS, or otherwise rejected) and routes.rs silently
+/// fell back to the top level rather than erroring. The rejected path
+/// itself is never echoed here — it's query-string input the user can
+/// already see in their own URL bar, and folding it into the message would
+/// just be another string to escape for no benefit. That's a distinct
+/// situation from `entries` being empty (a real, successfully-opened
+/// directory with nothing in it), so the two get separate messages rather
+/// than being collapsed into one "nothing to show" hint.
+pub fn index_page(at: &str, entries: &[Entry], refused: bool) -> String {
+    let notice = if refused { hint("no such directory — showing the top level") } else { String::new() };
+    let rows = if entries.is_empty() { hint("empty directory") } else { picker_rows(entries) };
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>deadlight</title>\
          <link rel=\"stylesheet\" href=\"/static/themes/dark.css\">\
          <link rel=\"stylesheet\" href=\"/static/style.css\">\
          </head><body><header><span class=\"proj\">deadlight</span></header>\
-         <main>{crumbs}\
+         <main>{notice}{crumbs}\
          <ul class=\"picker\" id=\"picker\" data-at=\"{at_attr}\" tabindex=\"0\">{rows}</ul>\
          <div class=\"pickerbar\"><button id=\"openBtn\" type=\"button\">Open</button></div>\
          </main>\
@@ -270,7 +282,6 @@ pub fn index_page(at: &str, entries: &[Entry]) -> String {
          </body></html>",
         crumbs = breadcrumb(at),
         at_attr = esc(at),
-        rows = picker_rows(entries)
     )
 }
 
@@ -501,7 +512,7 @@ mod tests {
             Entry { name: "alpha".into(), rel: "alpha".into(), is_dir: true, git: true },
             Entry { name: "beta".into(), rel: "beta".into(), is_dir: true, git: false },
         ];
-        let h = index_page("", &entries);
+        let h = index_page("", &entries, false);
         assert!(h.contains("data-rel=\"alpha\""));
         assert!(h.contains("class=\"dir\""));
         // alpha is a git repo: gets a one-click shortcut straight to its
@@ -519,7 +530,7 @@ mod tests {
             Entry { name: "sub".into(), rel: "karpie/sub".into(), is_dir: true, git: false },
             Entry { name: "main.rs".into(), rel: "karpie/main.rs".into(), is_dir: false, git: false },
         ];
-        let h2 = index_page("karpie", &sub);
+        let h2 = index_page("karpie", &sub, false);
         assert!(h2.contains("<a href=\"/\">deadlight</a>"));
         assert!(h2.contains("crumb-current\">karpie"));
         assert!(h2.contains("class=\"dir\" data-rel=\"karpie/sub\""));
@@ -540,7 +551,7 @@ mod tests {
             is_dir: true,
             git: true,
         }];
-        let h = index_page("karpie", &entries);
+        let h = index_page("karpie", &entries, false);
         // "/" between segments survives; the space and quote/angle-bracket
         // characters inside the leaf segment are percent-encoded, not left
         // raw (which would break the URL) and not HTML-entity-encoded
@@ -555,7 +566,7 @@ mod tests {
 
     #[test]
     fn index_page_breadcrumb_links_every_intermediate_segment() {
-        let h = index_page("a/b/c", &[]);
+        let h = index_page("a/b/c", &[], false);
         assert!(h.contains("<a href=\"/?at=a\">a</a>"));
         assert!(h.contains("<a href=\"/?at=a/b\">b</a>"));
         assert!(h.contains("crumb-current\">c")); // the current directory itself is not a link
@@ -568,5 +579,46 @@ mod tests {
         assert!(!h.contains("a\"><script>"));
         let c = changes_fragment("a\"><script>", &Status { branch: String::new(), changes: vec![crate::gitio::Change { xy: "??".into(), path: "x".into() }] });
         assert!(!c.contains("\"><script>"));
+    }
+
+    // Genuinely empty directory (successfully resolved, nothing in it) reads
+    // as "broken" with zero rows and no text — the hint fills the rows area
+    // so it reads as "empty" instead. `refused` is false here: this is the
+    // opposite situation from a rejected `?at=`, and must not also print
+    // the refused notice.
+    #[test]
+    fn index_page_empty_listing_shows_empty_hint() {
+        let h = index_page("karpie", &[], false);
+        assert!(h.contains("class=\"hint\">empty directory"));
+        assert!(!h.contains("showing the top level"));
+        assert!(h.contains("id=\"openBtn\"")); // Open stays present and enabled by picker.js's own logic
+    }
+
+    // A rejected `?at=` (missing, outside ROOTS, refused for any other
+    // reason) still falls back to the top level, but that fallback must not
+    // be silent — the caller sees a notice explaining why they landed here
+    // instead of where they asked to go, and the fallback listing itself is
+    // still rendered (this is not an error page, just an annotated
+    // redirect). The two hints are independent: a refused `?at=` whose
+    // fallback happens to have entries must show the notice but not the
+    // empty-directory hint.
+    #[test]
+    fn index_page_refused_at_shows_notice_and_still_lists_top_level() {
+        let entries = vec![Entry { name: "alpha".into(), rel: "alpha".into(), is_dir: true, git: false }];
+        let h = index_page("", &entries, true);
+        assert!(h.contains("class=\"hint\">no such directory"));
+        assert!(h.contains("showing the top level"));
+        assert!(h.contains("data-rel=\"alpha\"")); // fallback listing still renders
+        assert!(!h.contains("class=\"hint\">empty directory"));
+    }
+
+    // Baseline: an ordinary, non-empty, successfully-resolved listing shows
+    // neither hint — both are edge-case annotations, not part of the normal
+    // render.
+    #[test]
+    fn index_page_normal_listing_shows_neither_hint() {
+        let entries = vec![Entry { name: "alpha".into(), rel: "alpha".into(), is_dir: true, git: false }];
+        let h = index_page("", &entries, false);
+        assert!(!h.contains("class=\"hint\""));
     }
 }
