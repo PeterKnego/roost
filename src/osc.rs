@@ -29,8 +29,6 @@ pub struct Parser {
     in_seq: bool,
     /// Last byte was `ESC` — could open a sequence, or close one as `ESC \`.
     esc: bool,
-    /// Inside an ANSI escape sequence like ESC[...m that should be skipped.
-    skip_ansi: bool,
 }
 
 impl Parser {
@@ -45,18 +43,11 @@ impl Parser {
 
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<Parsed> {
         let mut out = Vec::new();
-        for (i, &b) in chunk.iter().enumerate() {
-            if self.skip_ansi {
-                // Inside an ANSI escape sequence (ESC [...m); skip until we find a letter.
-                if (b >= b'A' && b <= b'Z') || (b >= b'a' && b <= b'z') {
-                    self.skip_ansi = false;
-                }
-                continue;
-            }
+        for &b in chunk {
             if self.in_seq {
-                // ESC inside a sequence could be: ST (`ESC \`), a new sequence (`ESC ]`),
-                // or the start of an ANSI code like `ESC [`. Anything but the first two
-                // is payload that'll be sanitised.
+                // ESC inside a sequence is only meaningful as the ST pair
+                // `ESC \`; a bare ESC starts a new sequence, abandoning this
+                // one, which is what a real terminal does too.
                 if self.esc {
                     self.esc = false;
                     if b == b'\\' {
@@ -67,29 +58,12 @@ impl Parser {
                         self.buf.clear();
                         continue;
                     }
-                    if b == b'[' {
-                        // Start of ANSI escape sequence (ESC [); skip it entirely.
-                        self.skip_ansi = true;
-                        continue;
-                    }
-                    // Other ESC sequences: treat ESC as literal data
-                    self.buf.push(0x1b);
-                    // Fall through to process this byte normally
+                    self.reset();
+                    continue;
                 }
                 match b {
                     0x1b => self.esc = true,
-                    0x07 => {
-                        // BEL: terminates unless an ST appears later in the chunk.
-                        // (ST is the preferred terminator and takes precedence over BEL.)
-                        let has_st_later = i + 1 < chunk.len() &&
-                            chunk[i + 1..].windows(2).any(|w| w == b"\x1b\\");
-                        if has_st_later {
-                            // Treat BEL as data, not a terminator
-                            self.buf.push(b);
-                        } else {
-                            self.finish(&mut out);
-                        }
-                    }
+                    0x07 => self.finish(&mut out),
                     // Real OSC never spans a line. Bailing here is what stops
                     // `cat` of a binary file from parking bytes in `buf`
                     // until MAX_SEQUENCE, once per stray `ESC ]`.
@@ -120,7 +94,6 @@ impl Parser {
         self.buf.clear();
         self.in_seq = false;
         self.esc = false;
-        self.skip_ansi = false;
     }
 
     fn finish(&mut self, out: &mut Vec<Parsed>) {
@@ -255,11 +228,53 @@ mod tests {
     }
 
     // Assert the sanitised *result*, not that sanitising was attempted.
+    // Non-ESC control bytes: an ESC inside a sequence ends it (see the next
+    // test), so no ESC can ever reach `sanitise` to be stripped.
     #[test]
     fn control_characters_are_stripped_from_the_fields() {
-        let n = one(b"\x1b]777;notify;Ti\x1b[31mtle;bo\x07dy\x1b\\");
-        assert_eq!(n.title.as_deref(), Some("Title"), "escape left in the title");
+        let n = one(b"\x1b]777;notify;Ti\x01tle;bo\x02dy\x1b\\");
+        assert_eq!(n.title.as_deref(), Some("Title"), "control byte left in the title");
         assert_eq!(n.body, "body");
+    }
+
+    // Real terminals end an OSC at any ESC that is not the ST pair `ESC \`.
+    // Following that convention is also what keeps this parser bounded: there
+    // is no state in which it consumes input without either buffering it
+    // against MAX_SEQUENCE or ending the sequence outright. Any "skip the
+    // ANSI sequence and carry on" cleverness reintroduces exactly that
+    // unbounded state — see the wedge test below.
+    #[test]
+    fn an_esc_inside_a_sequence_abandons_it() {
+        let mut p = Parser::new();
+        let got = p.feed(b"\x1b]777;notify;Ti\x1b[31mtle;body\x07");
+        assert!(got.is_empty(), "ESC inside a sequence must abandon it");
+        assert_eq!(p.buffered_len(), 0);
+    }
+
+    // No look-ahead: a sequence ends at its own first terminator, and a later
+    // unrelated ST elsewhere in the chunk must not retroactively demote it.
+    #[test]
+    fn the_first_terminator_wins_even_if_another_appears_later() {
+        let mut p = Parser::new();
+        let got = p.feed(b"\x1b]9;first\x07 trailing \x1b\\ more \x1b]9;second\x07");
+        assert_eq!(got.len(), 2, "each sequence ends at its own first terminator");
+        assert_eq!(got[0].body, "first");
+        assert_eq!(got[1].body, "second");
+    }
+
+    // Regression: a stray CSI intro inside a sequence must not put the parser
+    // into a state that consumes unbounded input, swallows the next
+    // sequence's prefix, or fabricates a notice by merging two sequences.
+    #[test]
+    fn an_unterminated_csi_cannot_wedge_the_parser() {
+        let mut p = Parser::new();
+        let mut junk = Vec::from(&b"\x1b]9;AAA\x1b["[..]);
+        junk.extend(std::iter::repeat(b'9').take(MAX_SEQUENCE * 10));
+        junk.extend_from_slice(b"\x1b]9;real\x07");
+        let got = p.feed(&junk);
+        assert_eq!(got.len(), 1, "exactly the well-formed sequence, got {got:?}");
+        assert_eq!(got[0].body, "real", "no bytes from the abandoned sequence may leak in");
+        assert_eq!(p.buffered_len(), 0);
     }
 
     #[test]
