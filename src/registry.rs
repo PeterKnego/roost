@@ -13,7 +13,13 @@ pub struct ProjectStatus {
     /// URL form, readable slashes (`karpie/src`).
     pub url: String,
     pub live: usize,
-    pub oldest_age_secs: u64,
+    /// Age of the longest-running session, or `None` when it is genuinely not
+    /// known — which is the normal case immediately after a restart, when this
+    /// process's in-memory session map is empty and only the socket-file floor
+    /// below is available. Rendering an unknown age as `0` claimed every
+    /// project's oldest shell had just started, at exactly the moment "what did
+    /// I leave running for days?" is the question the strip exists to answer.
+    pub oldest_age_secs: Option<u64>,
     pub has_layout: bool,
     /// Branch name: the repo's own current branch for a plain/main-worktree
     /// entry, or a linked worktree's branch. Empty when nothing has ever
@@ -100,8 +106,20 @@ fn parse_ps_snapshot(out: &std::process::Output) -> Option<Vec<(u32, String)>> {
 /// that itself contains a space, which a project directory name may
 /// (`list_projects`, `resolve_project`, and `valid_project` all permit
 /// spaces; only *session* names are restricted).
+/// `-ww` and a cleared `COLUMNS` both defend the same thing: a **truncated**
+/// args column is indistinguishable from a socket path that isn't there, and
+/// the consequence of "isn't there" here is unlinking a live session's socket.
+/// procps honours `COLUMNS` when deciding how wide to print, and a long socket
+/// path under a deeply nested project is exactly the line that would get cut.
+/// macOS was measured not to truncate when piped, but the deploy host is Linux
+/// and could not be tested (unreachable by ssh), and `-ww` is accepted on both
+/// platforms at no cost — so take it rather than rely on the untested half.
 fn process_snapshot() -> Option<Vec<(u32, String)>> {
-    let out = std::process::Command::new("ps").args(["-Ao", "pid=,args="]).output().ok()?;
+    let out = std::process::Command::new("ps")
+        .args(["-Aww", "-o", "pid=,args="])
+        .env_remove("COLUMNS")
+        .output()
+        .ok()?;
     parse_ps_snapshot(&out)
 }
 
@@ -772,7 +790,7 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
                     key: key.to_string(),
                     url: decode_key(key),
                     live: 0,
-                    oldest_age_secs: 0,
+                    oldest_age_secs: None,
                     has_layout: true,
                     branch: String::new(),
                     parent: None,
@@ -801,7 +819,7 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
             // attachment counts. Once something in this process actually
             // attaches, the in-memory list becomes authoritative again.
             let (live, oldest) = if !sessions.is_empty() {
-                (sessions.len(), sessions.iter().map(|s| s.age_secs).max().unwrap_or(0))
+                (sessions.len(), sessions.iter().map(|s| s.age_secs).max())
             } else {
                 // Excludes `.origin` (see reconcile's identical skip): it's
                 // metadata about the project key, not a session socket, and
@@ -814,7 +832,9 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
                             .count()
                     })
                     .unwrap_or(0);
-                (floor, 0)
+                // No age is available from a socket-file count — say so rather
+                // than passing 0 off as an answer.
+                (floor, None)
             };
             // Only ever *create* a listing here when there's an actual live
             // session. Since C2, `sock/<key>/` can contain nothing but a
@@ -832,7 +852,7 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
                     key: key.clone(),
                     url: decode_key(&key),
                     live: 0,
-                    oldest_age_secs: 0,
+                    oldest_age_secs: None,
                     has_layout: false,
                     branch: String::new(),
                     parent: None,
@@ -842,7 +862,7 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
                 slot.oldest_age_secs = oldest;
             } else if let Some(slot) = by_key.get_mut(&key) {
                 slot.live = 0;
-                slot.oldest_age_secs = 0;
+                slot.oldest_age_secs = None;
             }
         }
     }
@@ -899,7 +919,7 @@ fn group_worktrees(roots: &[PathBuf], by_key: &mut std::collections::BTreeMap<St
                         key: child_key,
                         url: child_url,
                         live: 0,
-                        oldest_age_secs: 0,
+                        oldest_age_secs: None,
                         has_layout: false,
                         branch: String::new(),
                         parent: None,
@@ -922,7 +942,7 @@ fn group_worktrees(roots: &[PathBuf], by_key: &mut std::collections::BTreeMap<St
                         key: child_key,
                         url: raw,
                         live: 0,
-                        oldest_age_secs: 0,
+                        oldest_age_secs: None,
                         has_layout: false,
                         branch: w.branch,
                         parent: Some(key.clone()),
