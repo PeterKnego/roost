@@ -65,6 +65,14 @@ pub fn record(project: &str, session: &str, p: Parsed) -> Option<Notice> {
     let ts = now();
     let notice = {
         let mut s = store().lock().unwrap_or_else(|e| e.into_inner());
+        // Bound the rate-limit map by activity rather than by uptime. An
+        // entry whose window has expired and that carries no undelivered
+        // suppression count has nothing left to say. Without this, the map
+        // gains one permanent entry per session name ever seen — and this
+        // server's whole job is spinning worktree sessions up and down, so
+        // that is unbounded in practice, not merely in theory. Everything
+        // else in deadlight is capped; this must be too.
+        s.windows.retain(|_, w| ts.saturating_sub(w.started) < WINDOW_SECS || w.suppressed > 0);
         let key = format!("{project}/{session}");
         let w = s.windows.entry(key).or_default();
         if ts.saturating_sub(w.started) >= WINDOW_SECS {
@@ -142,10 +150,25 @@ fn persist() {
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return eprintln!("deadlight: notifications dir: {e}");
     }
+    // The same hardening wsstate::save applies, and for a sharper reason:
+    // a notice body is terminal output, so it must not be readable by other
+    // local users. Done here rather than relying on some earlier
+    // wsstate::save having already tightened the directory — a notice can
+    // be recorded before any workspace has ever been saved.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     let Ok(json) = serde_json::to_string(&snapshot) else { return };
     let tmp = path().with_extension("json.tmp");
     if let Err(e) = std::fs::write(&tmp, json) {
         return eprintln!("deadlight: notifications write: {e}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
     if let Err(e) = std::fs::rename(&tmp, path()) {
         eprintln!("deadlight: notifications rename: {e}");
@@ -164,6 +187,13 @@ pub fn load() {
     // hand out ids that already name a different notice.
     s.next_id = list.iter().map(|n| n.id).max().unwrap_or(0);
     s.notices = list.into();
+}
+
+/// Lets the eviction test observe the map that is supposed to stay bounded.
+#[cfg(test)]
+pub fn window_count() -> usize {
+    let s = store().lock().unwrap_or_else(|e| e.into_inner());
+    s.windows.len()
 }
 
 #[cfg(test)]
@@ -293,6 +323,41 @@ mod tests {
         load(); // must not panic
         assert!(list().is_empty());
         assert!(record("p", "s", parsed("still works")).is_some());
+    }
+
+    #[test]
+    fn expired_rate_limit_windows_are_evicted() {
+        let (_g, _d) = setup();
+        record("p", "gone", parsed("one")).unwrap();
+        assert_eq!(window_count(), 1);
+        expire_window_for_test("p", "gone");
+        record("p", "here", parsed("two")).unwrap();
+        assert_eq!(window_count(), 1, "the expired window must be evicted, not accumulate");
+
+        // But an expired window still holding an undelivered suppression
+        // count must survive, or the count it exists to report is lost.
+        for i in 0..RATE_LIMIT_PER_MIN {
+            record("p", "loud", parsed(&format!("n{i}")));
+        }
+        record("p", "loud", parsed("dropped"));
+        expire_window_for_test("p", "loud");
+        record("p", "other", parsed("three")).unwrap(); // triggers a prune
+        let n = record("p", "loud", parsed("back")).unwrap();
+        assert!(n.body.contains('1'), "suppression count must survive the prune: {:?}", n.body);
+    }
+
+    #[test]
+    fn persisted_state_is_not_readable_by_other_users() {
+        let (_g, d) = setup();
+        record("p", "s", parsed("private terminal output")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let f = std::fs::metadata(d.path().join("notifications.json")).unwrap();
+            assert_eq!(f.permissions().mode() & 0o077, 0, "notifications.json is group/world readable");
+            let dir = std::fs::metadata(d.path()).unwrap();
+            assert_eq!(dir.permissions().mode() & 0o077, 0, "state dir is group/world readable");
+        }
     }
 
     #[test]
