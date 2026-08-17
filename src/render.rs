@@ -402,6 +402,25 @@ mod tests {
         assert!(!h.contains("<summary>dist</summary>"));
     }
 
+    // Claude Code checks a worktree out at `{repo}/.claude/worktrees/{name}`:
+    // a second, full copy of the repository inside the project directory. The
+    // tree hides dot-directories nowhere else — it filters on SKIP_DIRS and
+    // `hide` and nothing more — so without `.claude` on that list a project
+    // renders a duplicate of itself under its own tree.
+    #[test]
+    fn a_worktree_checked_out_under_dot_claude_stays_out_of_its_parents_tree() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir(d.path().join("src")).unwrap();
+        fs::write(d.path().join("src/main.rs"), "").unwrap();
+        fs::create_dir_all(d.path().join(".claude/worktrees/feat/src")).unwrap();
+        fs::write(d.path().join(".claude/worktrees/feat/src/main.rs"), "").unwrap();
+        let h = tree_fragment("proj", d.path(), "src/main.rs", &[]);
+        // the project's own tree is unaffected
+        assert!(h.contains("data-rel=\"src/main.rs\""));
+        assert!(!h.contains(".claude"), "the worktree's parent directory must not appear");
+        assert!(!h.contains("worktrees"), "nor anything beneath it");
+    }
+
     // `sub` sits under `src`, which is on the open path, but `sub` itself is
     // not — this is the one-level contract: a directory not itself on the
     // open path renders as a closed stub (lazy hx-get, empty <ul>) and must
