@@ -32,7 +32,7 @@ impl Hub {
         if let Some(w) = warn {
             eprintln!("deadlight: {w}");
         }
-        Hub {
+        let mut hub = Hub {
             project: project.to_string(),
             dir,
             ws,
@@ -40,7 +40,13 @@ impl Hub {
             next_id: 0,
             self_writes: HashMap::new(),
             watching: false,
-        }
+        };
+        // A freshly loaded hub must report reality, not whatever the
+        // persisted layout happened to say last time: sessions may have
+        // died (or kept running under dtach) since the last save, and
+        // `.git` may have appeared or vanished on disk in the meantime.
+        hub.refresh_live_sessions();
+        hub
     }
 
     /// One hub per project, shared by every connection to it. Also the place
@@ -208,6 +214,9 @@ impl Hub {
                 let r = crate::fileops::rename(&dir, f, to);
                 return self.do_rename(from, r, &old, &new);
             }
+            Intent::StartTerminal { session } => return self.do_start_terminal(from, session.clone()),
+            Intent::InitGit => return self.do_init_git(from),
+            Intent::CloseProject => return self.do_close_project(from),
             _ => {}
         }
         // CloseTab removes the tab from `self.ws` inside `apply_layout`
@@ -460,6 +469,81 @@ impl Hub {
                 self.send_to(from, &ev);
             }
         }
+    }
+
+    /// Recompute what is actually running/present. Cheap enough to call
+    /// after any intent that could change it, and the single source of
+    /// truth for the client's placeholder-versus-attach decision. Uses the
+    /// *raw* project string — `session::list_sessions` does its own
+    /// `storage_key` encoding internally to build its map keys, so passing
+    /// an already-encoded key here would double-encode and silently match
+    /// zero sessions.
+    pub fn refresh_live_sessions(&mut self) {
+        self.ws.live_sessions =
+            crate::session::list_sessions(&self.project).into_iter().map(|s| s.name).collect();
+        self.ws.is_git = self.dir.join(".git").exists();
+    }
+
+    /// The client's websocket connect to `/ws/{project}/term/{name}` is what
+    /// actually spawns the PTY (via `session::attach`); this intent only
+    /// validates the name, enforces the per-project cap, and tells every
+    /// mirrored client the tab is now live. Spawning here too would double-
+    /// spawn.
+    fn do_start_terminal(&mut self, from: &ConnId, session: String) {
+        if !crate::session::valid_name(&session) {
+            let ev = Event::Error { msg: format!("invalid session name: {session}") };
+            return self.send_to(from, &ev);
+        }
+        let live = crate::session::list_sessions(&self.project).len();
+        if !crate::session::has_session(&self.project, &session)
+            && live >= crate::session::MAX_SESSIONS_PER_PROJECT
+        {
+            let ev = Event::Error { msg: "too many terminal sessions".into() };
+            return self.send_to(from, &ev);
+        }
+        self.ws.version += 1;
+        self.broadcast(&Event::TerminalStarted { session });
+        self.refresh_live_sessions();
+        let snap = self.snapshot_event(from);
+        self.broadcast(&snap);
+    }
+
+    /// `git init` takes no user-supplied arguments and always runs with the
+    /// project directory as cwd — this is a fixed, server-chosen command,
+    /// not something a client can steer.
+    fn do_init_git(&mut self, from: &ConnId) {
+        let out = std::process::Command::new("git").arg("init").current_dir(&self.dir).output();
+        let (ok, msg) = match out {
+            Ok(o) if o.status.success() => (true, String::from_utf8_lossy(&o.stdout).trim().to_string()),
+            Ok(o) => (false, String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            Err(e) => (false, e.to_string()),
+        };
+        self.broadcast(&Event::GitInit { ok, msg });
+        self.refresh_live_sessions();
+        let snap = self.snapshot_event(from);
+        self.broadcast(&snap);
+    }
+
+    /// Ends every running terminal session for this project, but keeps the
+    /// saved layout so reopening restores panes and tabs. Refused outright
+    /// while any buffer is dirty: unsaved text is the one piece of state
+    /// that cannot be reconstructed, so a resource-cleanup operation must
+    /// never destroy it. `CloseRefused` goes only to the requesting client
+    /// (`send_to`) — a conflict here is that client's business, not
+    /// something every mirrored browser needs to hear about.
+    fn do_close_project(&mut self, from: &ConnId) {
+        let dirty: Vec<String> =
+            self.ws.buffers.iter().filter(|(_, b)| b.dirty).map(|(r, _)| r.clone()).collect();
+        if !dirty.is_empty() {
+            let ev = Event::CloseRefused { dirty };
+            return self.send_to(from, &ev);
+        }
+        let ended = crate::session::kill_project(&self.project);
+        self.ws.version += 1;
+        self.broadcast(&Event::ProjectClosed { ended });
+        self.refresh_live_sessions();
+        let snap = self.snapshot_event(from);
+        self.broadcast(&snap);
     }
 }
 
@@ -885,5 +969,58 @@ mod tests {
         h.handle(&a, Intent::Resize { sizes: proto::Sizes::default() });
         assert_eq!(h.subs.len(), 1, "a closed socket must not accumulate");
         drop(rx_a);
+    }
+
+    #[test]
+    fn close_project_is_refused_while_a_buffer_is_dirty() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.txt"), "disk\n").unwrap();
+        let mut h = Hub::new("closeproj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        h.handle(&c, Intent::EditBuffer { rel: "a.txt".into(), text: "unsaved".into() });
+        while rx.try_recv().is_ok() {}
+
+        h.handle(&c, Intent::CloseProject);
+        let msgs: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"CloseRefused""#) && m.contains("a.txt")),
+            "unsaved work must block a close and name the file"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains(r#""t":"ProjectClosed""#)),
+            "nothing may be ended while work is unsaved"
+        );
+        std::env::remove_var("DEADLIGHT_STATE_DIR");
+    }
+
+    #[test]
+    fn close_project_with_clean_buffers_reports_what_it_ended() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("closeclean", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        while rx.try_recv().is_ok() {}
+        h.handle(&c, Intent::CloseProject);
+        let msgs: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(msgs.iter().any(|m| m.contains(r#""t":"ProjectClosed""#)));
+        std::env::remove_var("DEADLIGHT_STATE_DIR");
+    }
+
+    #[test]
+    fn start_terminal_rejects_an_invalid_session_name() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("startproj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        while rx.try_recv().is_ok() {}
+        h.handle(&c, Intent::StartTerminal { session: "bad name;rm".into() });
+        let msgs: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(msgs.iter().any(|m| m.contains(r#""t":"Error""#)));
+        assert!(!msgs.iter().any(|m| m.contains(r#""t":"TerminalStarted""#)));
+        std::env::remove_var("DEADLIGHT_STATE_DIR");
     }
 }
