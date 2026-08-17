@@ -15,6 +15,20 @@ pub struct ProjectStatus {
     pub live: usize,
     pub oldest_age_secs: u64,
     pub has_layout: bool,
+    /// Branch name: the repo's own current branch for a plain/main-worktree
+    /// entry, or a linked worktree's branch. Empty when nothing has ever
+    /// asked git (a project entry that wasn't found to be a git repo).
+    pub branch: String,
+    /// The parent project's storage key, for a worktree grouped under the
+    /// repository it belongs to. `None` for a main worktree or a plain
+    /// project — the two render identically at the top level.
+    pub parent: Option<String>,
+    /// False only for a worktree git reports that does not canonicalise
+    /// under any of ROOTS — real (git vouches for it existing), but outside
+    /// the confinement boundary, so it is rendered dimmed and unclickable
+    /// rather than silently omitted. Always true for entries not discovered
+    /// via worktree grouping.
+    pub reachable: bool,
 }
 
 pub struct ReapReport {
@@ -348,6 +362,9 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
                     live: 0,
                     oldest_age_secs: 0,
                     has_layout: true,
+                    branch: String::new(),
+                    parent: None,
+                    reachable: true,
                 },
             );
         }
@@ -383,13 +400,143 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
                 live: 0,
                 oldest_age_secs: 0,
                 has_layout: false,
+                branch: String::new(),
+                parent: None,
+                reachable: true,
             });
             slot.live = live;
             slot.oldest_age_secs = oldest;
         }
     }
 
-    by_key.into_values().collect()
+    group_worktrees(roots, &mut by_key);
+    order_with_children(by_key.into_values().collect())
+}
+
+/// For every already-known entry that is a git repository, asks git for its
+/// worktrees and folds the answer in: the entry's own `branch` (from the main
+/// worktree record) and, for each linked worktree, either an existing or a
+/// freshly-created child entry carrying `branch` and `parent`.
+///
+/// Deliberately narrow about when it pays the `git worktree list` subprocess
+/// cost: only entries already in `by_key` (i.e. already being displayed —
+/// has a saved layout or a live session) and only once `.git` (a cheap
+/// `Path::exists` check) confirms the directory is actually a repository.
+/// A plain project, or one that hasn't resolved, is skipped outright.
+fn group_worktrees(roots: &[PathBuf], by_key: &mut std::collections::BTreeMap<String, ProjectStatus>) {
+    let parent_keys: Vec<String> = by_key.keys().cloned().collect();
+    for key in parent_keys {
+        let url = by_key[&key].url.clone();
+        let Some(dir) = crate::projects::resolve_project(roots, &url) else { continue };
+        if !dir.join(".git").exists() {
+            continue;
+        }
+        for w in crate::worktree::list(&dir) {
+            if w.is_main {
+                // The repo's own entry is the main worktree; its branch is
+                // git's branch, not a separate row.
+                if let Some(slot) = by_key.get_mut(&key) {
+                    slot.branch = w.branch;
+                }
+                continue;
+            }
+            match rel_under_roots(roots, &w.path) {
+                Some(child_url) => {
+                    let child_key = crate::projects::storage_key(&child_url);
+                    let slot = by_key.entry(child_key.clone()).or_insert(ProjectStatus {
+                        key: child_key,
+                        url: child_url,
+                        live: 0,
+                        oldest_age_secs: 0,
+                        has_layout: false,
+                        branch: String::new(),
+                        parent: None,
+                        reachable: true,
+                    });
+                    slot.branch = w.branch;
+                    slot.parent = Some(key.clone());
+                }
+                None => {
+                    // git reports this worktree, but its path canonicalises
+                    // under no ROOT — a repository's worktree metadata lives
+                    // *inside* the repo, so a cloned repo could point one
+                    // anywhere. Confinement (not the dot-segment allowlist)
+                    // is what keeps it from ever being opened; it is still
+                    // shown, dimmed and unclickable, rather than dropped, so
+                    // the user isn't left wondering where it went.
+                    let raw = w.path.to_string_lossy().into_owned();
+                    let child_key = crate::projects::storage_key(&raw);
+                    by_key.entry(child_key.clone()).or_insert(ProjectStatus {
+                        key: child_key,
+                        url: raw,
+                        live: 0,
+                        oldest_age_secs: 0,
+                        has_layout: false,
+                        branch: w.branch,
+                        parent: Some(key.clone()),
+                        reachable: false,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// `w.path` (git's own, absolute report) rewritten as a rel path from one of
+/// `roots`, the same form every other `ProjectStatus.url` uses — or `None`
+/// when it canonicalises under none of them. Not `projects::resolve_project`:
+/// that takes the rel *string* and re-derives the path; here it's the reverse
+/// direction, an already-known absolute path being turned back into a rel
+/// string, and reusing resolve_project would mean re-parsing a path we
+/// already have just to throw the parsed form away.
+fn rel_under_roots(roots: &[PathBuf], path: &std::path::Path) -> Option<String> {
+    let canon = path.canonicalize().ok()?;
+    for root in roots {
+        // One root failing to canonicalize (unreadable, doesn't exist here)
+        // must not abandon the whole search — `?` would bail out of this
+        // function on the first bad root even if a later one matches, the
+        // same hazard `confined_path` avoids with `continue`.
+        let Ok(base) = root.canonicalize() else { continue };
+        if let Ok(rel) = canon.strip_prefix(&base) {
+            if !rel.as_os_str().is_empty() {
+                return Some(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    None
+}
+
+/// Orders entries so a parent (`parent: None`) is immediately followed by its
+/// children (`parent: Some(parent_key)`), which plain key order can't
+/// guarantee — a child worktree's storage key has no relationship to its
+/// parent's. Top-level entries keep key order; children of one parent sort
+/// by branch.
+fn order_with_children(mut items: Vec<ProjectStatus>) -> Vec<ProjectStatus> {
+    items.sort_by(|a, b| a.key.cmp(&b.key));
+    let mut children: std::collections::HashMap<String, Vec<ProjectStatus>> = Default::default();
+    let mut parents = Vec::new();
+    for item in items {
+        match &item.parent {
+            Some(pk) => children.entry(pk.clone()).or_default().push(item),
+            None => parents.push(item),
+        }
+    }
+    let mut out = Vec::with_capacity(parents.len());
+    for parent in parents {
+        let key = parent.key.clone();
+        out.push(parent);
+        if let Some(mut kids) = children.remove(&key) {
+            kids.sort_by(|a, b| a.branch.cmp(&b.branch));
+            out.extend(kids);
+        }
+    }
+    // A child whose parent key isn't itself a top-level entry can't happen
+    // through group_worktrees (a child is only ever created alongside its
+    // parent's own key), but stay defensive rather than silently drop rows.
+    let mut leftover: Vec<ProjectStatus> = children.into_values().flatten().collect();
+    leftover.sort_by(|a, b| a.key.cmp(&b.key));
+    out.extend(leftover);
+    out
 }
 
 #[cfg(test)]
@@ -443,6 +590,108 @@ mod tests {
             assert_eq!(p.live, 0, "no sessions means idle, not live");
             assert_eq!(p.url, "karpie");
         });
+    }
+
+    /// Real `git worktree add`, same reasoning as `worktree`'s own test: the
+    /// porcelain format and the confinement check are the things under test
+    /// here (end to end, through `known_projects` itself), so a hand-built
+    /// `ProjectStatus` fixture would only prove the render layer, not that
+    /// registry actually wires worktree discovery in.
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn known_projects_groups_a_repos_worktrees_under_it_labelled_by_branch() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let repo = root.path().join("repo");
+            fs::create_dir_all(&repo).unwrap();
+            run_git(&repo, &["init", "-q", "-b", "main"]);
+            run_git(&repo, &["config", "user.email", "t@t"]);
+            run_git(&repo, &["config", "user.name", "t"]);
+            fs::write(repo.join("a.txt"), "x").unwrap();
+            run_git(&repo, &["add", "."]);
+            run_git(&repo, &["commit", "-qm", "init"]);
+            run_git(&repo, &["worktree", "add", "-q", "-b", "feat", ".claude/worktrees/feat"]);
+
+            // The repo must already be "known" (a saved layout, here) for
+            // its worktrees to even be looked up — see group_worktrees's
+            // cost-control comment. Without this, the assertions below would
+            // pass trivially because nothing was ever grouped.
+            fs::create_dir_all(state).unwrap();
+            fs::write(state.join("repo.json"), "{}").unwrap();
+
+            let ps = known_projects(&[root.path().to_path_buf()]);
+
+            let idx_parent = ps.iter().position(|p| p.key == "repo").expect("repo must be known");
+            assert_eq!(ps[idx_parent].branch, "main", "the repo's own branch comes from the main worktree record");
+            assert!(ps[idx_parent].parent.is_none());
+
+            let child_key = crate::projects::storage_key("repo/.claude/worktrees/feat");
+            let idx_child = ps.iter().position(|p| p.key == child_key).expect(
+                "the worktree must appear even though nobody ever opened it or saved a layout for it",
+            );
+            assert_eq!(ps[idx_child].branch, "feat");
+            assert_eq!(ps[idx_child].parent.as_deref(), Some("repo"));
+            assert!(ps[idx_child].reachable);
+            assert_eq!(idx_child, idx_parent + 1, "a child must be sorted immediately after its parent");
+        });
+    }
+
+    // Confinement, not the dot-segment allowlist, is what forbids opening a
+    // worktree outside ROOTS — but git still reports it exists (a repository
+    // clone can name a worktree anywhere), so `known_projects` must still
+    // surface it, just as unreachable, rather than silently drop the row.
+    #[test]
+    fn known_projects_marks_a_worktree_outside_roots_unreachable_but_still_lists_it() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let repo = root.path().join("repo");
+            fs::create_dir_all(&repo).unwrap();
+            run_git(&repo, &["init", "-q", "-b", "main"]);
+            run_git(&repo, &["config", "user.email", "t@t"]);
+            run_git(&repo, &["config", "user.name", "t"]);
+            fs::write(repo.join("a.txt"), "x").unwrap();
+            run_git(&repo, &["add", "."]);
+            run_git(&repo, &["commit", "-qm", "init"]);
+
+            let outside = tempfile::tempdir().unwrap(); // deliberately not under `root`
+            let stray_path = outside.path().join("stray");
+            run_git(
+                &repo,
+                &["worktree", "add", "-q", "-b", "stray", stray_path.to_str().unwrap()],
+            );
+
+            fs::create_dir_all(state).unwrap();
+            fs::write(state.join("repo.json"), "{}").unwrap();
+
+            let ps = known_projects(&[root.path().to_path_buf()]);
+            let child = ps
+                .iter()
+                .find(|p| p.branch == "stray")
+                .expect("a worktree outside ROOTS must still be listed, not omitted");
+            assert!(!child.reachable, "a worktree outside ROOTS must never be marked reachable");
+            assert_eq!(child.parent.as_deref(), Some("repo"));
+        });
+    }
+
+    // The default deploy config ships two ROOTS. A worktree confined under
+    // the *second* one must still resolve even when the first is bogus —
+    // `rel_under_roots` must try every root, not bail out via `?` the moment
+    // the first one fails to canonicalize (that was a real bug caught here:
+    // `Option::ok()?` inside the loop returned `None` from the whole
+    // function on the first bad root, never trying the one that actually
+    // matched).
+    #[test]
+    fn rel_under_roots_tries_every_root_not_just_the_first() {
+        let good = tempfile::tempdir().unwrap();
+        let nested = good.path().join("repo/.claude/worktrees/feat");
+        fs::create_dir_all(&nested).unwrap();
+        let roots = vec![PathBuf::from("/definitely-not-a-real-root-xyz"), good.path().to_path_buf()];
+        let rel = rel_under_roots(&roots, &nested).expect("must still resolve via the second, good root");
+        assert_eq!(rel, "repo/.claude/worktrees/feat");
     }
 
     #[test]
