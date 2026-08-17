@@ -232,7 +232,13 @@ Close deadlight?
   until they are saved or discarded. Unsaved text is the one piece of state that
   cannot be reconstructed, so it is never destroyed by a resource operation.
 
-After closing, the project becomes ○ idle: still listed, nothing running.
+After closing, a project with a saved workspace becomes ○ idle: still listed,
+nothing running. A project that never acquired one — opened, a shell started,
+nothing else touched — stops being *known* and leaves the strip entirely, which
+follows directly from the definition above: no saved workspace and no live
+session means there is no state left to list. Keeping it would need a third kind
+of state, a "recently opened" list, which this design deliberately does not
+have.
 
 ## Errors
 
