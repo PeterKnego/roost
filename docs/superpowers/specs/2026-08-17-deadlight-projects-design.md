@@ -115,6 +115,19 @@ directory no longer exists is killed and its socket removed. Both are logged.
 Reaping runs at startup and whenever the registry is enumerated, so the mess
 observed above cannot re-accumulate silently.
 
+**"No longer exists" must not be inferred from a failed lookup.** A key that
+does not resolve under the current `ROOTS` may simply belong to another
+configuration — a second instance, or this one restarted with different roots
+against the same state dir. Treating that as *gone* SIGKILLs a live shell whose
+directory is untouched, which is the exact opposite of what the registry is for.
+So each project's socket directory carries an `.origin` marker recording the
+absolute path it resolved to; a failed lookup consults that recorded path
+instead, and a key with no marker is never reaped. The same rule governs the
+process listing: if `ps` cannot be trusted, reaping is suspended rather than
+guessing. **Destruction requires positive evidence, never the absence of
+evidence** — this design's costliest recurring mistake, and the one every review
+round found another instance of.
+
 **Reaping is serialised and throttled.** Because enumeration happens on a
 request path, a mutex prevents interleaved sweeps and a minimum interval (a few
 seconds) skips redundant ones. The cost is a bounded staleness window: a project

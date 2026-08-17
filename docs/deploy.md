@@ -18,7 +18,10 @@ silent failure at least once each.
 | `DEADLIGHT_DEBOUNCE_MS` | Filesystem-watch debounce | 300 |
 
 Running anywhere other than the deploy host needs at least `DEADLIGHT_ROOTS`,
-since the defaults are that host's paths.
+since the defaults are that host's paths. Give a second instance its own
+`DEADLIGHT_STATE_DIR` too — sharing one is safe as of the `.origin` marker (see
+*Projects and sessions*), but two instances sharing a state dir will still show
+each other's projects in the strip, which is rarely what you want.
 
 `dtach` is a **runtime prerequisite** (`brew install dtach` / `apt install
 dtach`). Without it, terminals fail at spawn.
@@ -47,10 +50,33 @@ live `dtach` still holds. Reaping runs at startup and, throttled to once every
 few seconds, whenever the project list is enumerated:
 
 - a socket with no process is deleted;
-- a session whose project directory is gone is killed and its socket removed;
+- a session whose project directory is confirmed gone is killed and its socket
+  removed;
 - a socket is only ever unlinked *after* its holder is confirmed dead, so a
   failed kill leaves an ugly-but-discoverable session rather than an
   unreachable orphan nothing can find again.
+
+**"Confirmed gone" is deliberately narrower than "I can't find it."** Each
+project's socket directory holds an `.origin` marker recording the absolute path
+the project resolved to. When a key no longer resolves under the current
+`DEADLIGHT_ROOTS`, reaping consults that recorded path rather than concluding the
+project vanished — and a key with **no** marker is never reaped at all.
+
+This matters because two deadlight instances, or one restarted with different
+roots, can share a state dir. Without the distinction, starting deadlight with
+different `DEADLIGHT_ROOTS` against the same `DEADLIGHT_STATE_DIR` SIGKILLed
+every session outside those roots and logged "project directory is gone" about
+directories that were never touched — destroying exactly the state dtach exists
+to preserve. Reproduced against real dtach before the fix; a regression test
+pins it.
+
+Consequence for the first deploy of this version: a state dir written by the
+previous version has no markers, so its pre-existing sessions are never reaped
+automatically. That is the safe direction — stale rows, not dead shells — and
+they gain markers as soon as each project is opened again. Reaping is also
+suspended entirely when `ps` cannot be trusted (non-zero exit, or empty output,
+which on a live host means the listing failed rather than that nothing is
+running), for the same reason.
 
 Both are logged, so `journalctl --user -u deadlight | grep -i reap` after a
 restart tells you what the startup sweep decided.
