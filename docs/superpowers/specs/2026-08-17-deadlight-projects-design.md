@@ -42,6 +42,60 @@ least one live session. Both states appear in the UI, distinguished:
 Projects are normally git repositories, but a plain directory is allowed — see
 *Git*. Nothing about project identity depends on git.
 
+## Worktrees
+
+A git worktree is **its own project** and needs no special handling to be one:
+it is a distinct directory with its own rel path, storage key, dtach sockets
+and saved layout, and you work on several in parallel precisely because they
+are independent. Detection already works — a linked worktree's `.git` is a
+*file* rather than a directory, and every git check in the codebase uses
+`.exists()`.
+
+What worktrees add is a **display relationship**: they are siblings of one
+repository, so the UI groups them parent-and-child. That grouping is
+presentation only; nothing about state, sessions or identity is shared.
+
+**Discovery goes through git, not the filesystem.** `git worktree list
+--porcelain` on a repository enumerates its worktrees authoritatively, wherever
+they live. This matters because the dominant real-world location is a
+*dot-directory*: Claude Code creates worktrees under
+`{repo}/.claude/worktrees/{name}`, and deadlight exists for AI-assisted
+development, so those are exactly the worktrees a user wants side by side. A
+path convention would miss a worktree placed in a sibling directory; asking git
+does not.
+
+**The dot-segment rule gets a narrow exception, not a repeal.** `resolve_project`
+rejects any path segment beginning with `.`, which today makes
+`.claude/worktrees/site-launch` unopenable even if the user knows the URL. A
+dot-segment path resolves **only** when git itself reports it as a worktree of a
+repository under `ROOTS`. The general rule stands for everything else, so
+`.git`, `.venv` and `.config` remain non-projects.
+
+**Confinement is unchanged and still does the real work.** A repository's
+worktree metadata lives inside the repository, so a cloned repo could name a
+worktree anywhere. The git allowlist only relaxes the *dot* rule; every path
+still has to canonicalise under a root, so a worktree outside `ROOTS` cannot be
+opened no matter what git says about it. Such a worktree is listed as
+unreachable rather than silently omitted, so the user is not left wondering
+where it went.
+
+**Grouping key** is the main worktree's absolute path — the first entry `git
+worktree list` reports — rather than `--git-common-dir`, which returns a
+relative string and would need canonicalising anyway.
+
+**Branch is the label.** Worktrees of one repository differ only by branch, so
+the picker and the strip show it:
+
+```
+▸ ultima_marketing        ⎇ main          ● 2 shells
+    └ site-launch         ⎇ site-launch   ○
+```
+
+**Cost control:** `git worktree list` is a subprocess, so it runs only for
+directories that are already known to be repositories, and only for the entries
+being displayed. Results are cached briefly, since a worktree set changes rarely
+compared to how often a listing renders.
+
 ## The project registry
 
 A process-wide registry, keyed by project, holding for each: its absolute
@@ -122,7 +176,8 @@ refresh control:
 
 Each entry shows the project name with its ● / ○ marker and a tooltip carrying
 the session count and the age of the oldest (`2 sessions · oldest 8h`). The
-current project is marked as such.
+current project is marked as such. Worktrees appear grouped with their parent
+repository and labelled by branch, since that is what distinguishes them.
 
 **Tab reuse.** Each link is `<a href="/{project}" target="dl-{key}">`. A named
 target reuses the browsing context of that name, so clicking navigates the
@@ -190,11 +245,24 @@ therefore a normal GET fragment.
 Session names remain `[A-Za-z0-9_-]{1,32}`. `git init` runs with the project
 directory as cwd and takes no user-supplied arguments.
 
+The worktree dot-segment exception is a **relaxation of one naming rule, not of
+confinement**. A worktree path is accepted only when git reports it *and* it
+canonicalises under a root; a repository that names a worktree outside `ROOTS`
+gets it listed as unreachable, never opened. `git worktree list` is read-only
+and takes no user-supplied arguments.
+
 ## Testing
 
 - **Unit:** registry rebuild from a fixture state dir + socket dir, including a
   socket with no process (reaped) and a session whose project directory is gone
   (killed); session-age formatting; the ● / ○ classification.
+- **Unit, worktrees:** parsing `git worktree list --porcelain` into a main
+  worktree plus children with branches; a dot-segment path resolves when git
+  vouches for it and is still refused when git does not; a worktree outside
+  `ROOTS` is reported unreachable rather than resolved. These use a real
+  `git worktree add` in a temp repo, because the porcelain format is the thing
+  under test and a hand-written fixture would not prove we parse git's actual
+  output.
 - **Integration:** opening a project creates **no** session; an explicit start
   creates exactly one; Close Project ends all of a project's sessions and leaves
   another project's untouched; Close Project is refused while a buffer is dirty.
