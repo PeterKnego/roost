@@ -279,14 +279,17 @@ pub fn detach(key: &str, id: u64) {
     }
 }
 
-/// The `SESSIONS` map key. Takes the *raw* slashed project form (e.g.
-/// `karpie/src`), matching how callers already invoke `attach` — not the
-/// percent-encoded `storage_key` form, which is reserved for filesystem
-/// paths (see `sock_path`). Callers of this function, `list_sessions`,
-/// `has_session`, and `kill_project` must all agree on that raw form; a
-/// later task is responsible for converting at the registry boundary.
+/// The `SESSIONS` map key. Callers pass the *raw* slashed project form (e.g.
+/// `karpie/src`), matching how they already invoke `attach` — but this
+/// function encodes it via `storage_key` internally, because that's what
+/// `attach` itself keys the map with. A raw, unencoded key would let project
+/// `karpie` + session `src` (raw key `karpie/src`) alias with project
+/// `karpie/src` + session `shell` under the `starts_with(&format!("{project}/"))`
+/// prefix checks in `list_sessions`/`kill_project`, inflating one project's
+/// session cap and visibility with another project's sessions — the exact
+/// ambiguity `attach` already guards against (see `sock_path`'s comment).
 pub fn key_for(project: &str, name: &str) -> String {
-    format!("{project}/{name}")
+    format!("{}/{name}", crate::projects::storage_key(project))
 }
 
 pub struct SessionInfo {
@@ -335,9 +338,11 @@ fn parse_etime(s: &str) -> Option<u64> {
     Some(((days * 24 + hours) * 60 + mins) * 60 + secs)
 }
 
-/// All sessions for one project. `project` is the raw form (see `key_for`).
+/// All sessions for one project. `project` is the raw form (see `key_for`);
+/// the prefix is built from its `storage_key` so nested projects match the
+/// keys `attach` actually inserted, rather than silently matching nothing.
 pub fn list_sessions(project: &str) -> Vec<SessionInfo> {
-    let prefix = format!("{project}/");
+    let prefix = format!("{}/", crate::projects::storage_key(project));
     let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
     let mut out: Vec<SessionInfo> = map
         .iter()
@@ -363,8 +368,9 @@ pub fn has_session(project: &str, name: &str) -> bool {
 
 /// Ends every session belonging to one project. This is the only way to end
 /// a session from the UI; detaching a tab deliberately leaves it running.
+/// Prefix built from `storage_key` for the same reason as `list_sessions`.
 pub fn kill_project(project: &str) -> usize {
-    let prefix = format!("{project}/");
+    let prefix = format!("{}/", crate::projects::storage_key(project));
     let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
     let keys: Vec<String> = map.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
     let mut ended = 0;
@@ -468,7 +474,10 @@ mod tests {
     #[test]
     fn key_for_is_the_map_key_shape() {
         assert_eq!(key_for("karpie", "shell"), "karpie/shell");
-        assert_eq!(key_for("karpie%2Fsrc", "claude"), "karpie%2Fsrc/claude");
+        // Caller passes the raw slashed project form (as `attach` callers
+        // do); key_for encodes it via storage_key internally so the key
+        // matches what `attach` actually inserted into the map.
+        assert_eq!(key_for("karpie/src", "claude"), "karpie%2Fsrc/claude");
     }
 
     #[test]
@@ -504,6 +513,44 @@ mod tests {
         assert_eq!(list_sessions("otherproj").len(), 1, "another project must be untouched");
 
         kill_project("otherproj");
+        std::env::remove_var("DEADLIGHT_CMD");
+    }
+
+    #[test]
+    fn nested_project_sessions_are_found_and_never_alias_the_flat_prefix() {
+        // Regression for the aliasing hazard key_for's doc comment describes:
+        // project "nest" + session "sub" (raw key "nest/sub") and project
+        // "nest/sub" + session "shell" (encoded key "nest%2Fsub/shell") both
+        // start with "nest/" as *text*, but must never be confused by any
+        // prefix-based lookup. Every other test here uses a flat project
+        // name, so storage_key is the identity function and this bug is
+        // invisible to them — that's exactly why this dedicated case exists.
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("DEADLIGHT_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+
+        attach("nest/sub", "shell", d.path()).unwrap();
+        attach("nest", "sub", d.path()).unwrap();
+
+        assert!(has_session("nest/sub", "shell"));
+        let nested_names: Vec<String> =
+            list_sessions("nest/sub").into_iter().map(|s| s.name).collect();
+        assert_eq!(nested_names, vec!["shell"]);
+
+        // "nest"'s own session ("sub") must not be shadowed or duplicated by
+        // "nest/sub"'s.
+        let flat_names: Vec<String> = list_sessions("nest").into_iter().map(|s| s.name).collect();
+        assert_eq!(flat_names, vec!["sub"]);
+
+        // Ending project "nest" must leave "nest/sub"'s session running.
+        let ended = kill_project("nest");
+        assert_eq!(ended, 1);
+        assert!(
+            has_session("nest/sub", "shell"),
+            "kill_project(\"nest\") must not end nest/sub's session"
+        );
+
+        kill_project("nest/sub");
         std::env::remove_var("DEADLIGHT_CMD");
     }
 }
