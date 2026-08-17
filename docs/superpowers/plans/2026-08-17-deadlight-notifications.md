@@ -1238,6 +1238,14 @@ the parser were never wired in.
 inline `sh -c 'printf …'` would be torn apart by that split. Hence the script
 file.
 
+Both tests use `fixture_named` with a project of their own, and distinct
+session names, rather than the shared `fixture()` and a shared `"claude"`.
+Two process-global registries outlive any one test: `Hub`'s, keyed by project
+name (see `fixture_named`'s own doc comment), and `session::SESSIONS`, keyed
+by `{project}/{session}`. Two tests sharing both keys means the second
+silently attaches to the first's still-running child and reads the wrong
+script's output — passing or failing depending on test order.
+
 ```rust
 #[test]
 fn an_escape_sequence_from_a_terminal_becomes_a_notice() {
@@ -1260,18 +1268,18 @@ fn an_escape_sequence_from_a_terminal_becomes_a_notice() {
     }
     std::env::set_var("DEADLIGHT_CMD", script.to_str().unwrap());
 
-    let (_d, port) = fixture();
-    let mut ctrl = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    let (_d, port) = fixture_named("notifyproj");
+    let mut ctrl = ws_connect_path(port, "/ws/notifyproj/_workspace").unwrap();
     read_until(&mut ctrl, r#""t":"State""#);
     // Attaching the terminal socket is what spawns the session and its pump.
-    let mut term = ws_connect_path(port, "/ws/proj/term/claude").unwrap();
+    let mut term = ws_connect_path(port, "/ws/notifyproj/term/claude").unwrap();
 
     let seen = read_until(&mut ctrl, r#""t":"Notice""#);
     assert!(seen.contains("Build done"), "title missing: {seen}");
     assert!(seen.contains("42 tests passed"), "body missing: {seen}");
     // Attribution comes from the pump's own identity, not from the payload.
     assert!(seen.contains(r#""session":"claude""#), "session missing: {seen}");
-    assert!(seen.contains(r#""project":"proj""#), "project missing: {seen}");
+    assert!(seen.contains(r#""project":"notifyproj""#), "project missing: {seen}");
 
     let _ = term.close(None);
     std::env::remove_var("DEADLIGHT_CMD");
@@ -1294,8 +1302,8 @@ fn a_terminal_child_can_discover_that_notifications_exist() {
     }
     std::env::set_var("DEADLIGHT_CMD", script.to_str().unwrap());
 
-    let (_d, port) = fixture();
-    let mut term = ws_connect_path(port, "/ws/proj/term/claude").unwrap();
+    let (_d, port) = fixture_named("envproj");
+    let mut term = ws_connect_path(port, "/ws/envproj/term/envprobe").unwrap();
     let mut seen = String::new();
     for _ in 0..100 {
         match term.read() {
@@ -1308,8 +1316,8 @@ fn a_terminal_child_can_discover_that_notifications_exist() {
         }
     }
     assert!(seen.contains("NOTIFY=1"), "capability flag missing: {seen:?}");
-    assert!(seen.contains("PROJ=proj"), "project missing: {seen:?}");
-    assert!(seen.contains("SESS=claude"), "session missing: {seen:?}");
+    assert!(seen.contains("PROJ=envproj"), "project missing: {seen:?}");
+    assert!(seen.contains("SESS=envprobe"), "session missing: {seen:?}");
     let _ = term.close(None);
     std::env::remove_var("DEADLIGHT_CMD");
 }
