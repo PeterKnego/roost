@@ -307,7 +307,14 @@ pub fn key_for(project: &str, name: &str) -> String {
 pub struct SessionInfo {
     pub name: String,
     pub pid: u32,
-    pub age_secs: u64,
+    /// `None` when the OS could not tell us — a pid `ps` cannot read, or the
+    /// 0 sentinel `child_pid` carries when portable-pty gave no pid. Not `0`:
+    /// an unknown age reported as zero claims the shell just started, which is
+    /// the opposite of the truth and wrong on exactly the question a session
+    /// age is asked for. See CLAUDE.md, "Absence of evidence is not evidence
+    /// of absence" — the same rule, in a rendering rather than a destructive
+    /// position.
+    pub age_secs: Option<u64>,
     pub attached: usize,
 }
 
@@ -383,7 +390,7 @@ pub fn list_sessions(project: &str) -> Vec<SessionInfo> {
         .map(|(name, pid, attached)| SessionInfo {
             name,
             pid,
-            age_secs: process_age_secs(pid).unwrap_or(0),
+            age_secs: process_age_secs(pid),
             attached,
         })
         .collect()
@@ -652,28 +659,56 @@ mod tests {
         // Warm up, so the measurement is not about first-fork cost.
         assert_eq!(list_sessions("lockproj").len(), names.len());
 
+        // The contender acquires *repeatedly* until told to stop, rather than
+        // timing one acquisition. A single timed acquire can pass with the bug
+        // fully in place: if the scheduler preempts this thread between the
+        // start signal and `list_sessions` taking the lock, the contender
+        // acquires uncontended, measures ~0, and the assertion succeeds. That
+        // is a flaky *pass*, which CLAUDE.md names as this codebase's dominant
+        // failure mode — a test that cannot fail is worse than no test.
+        //
+        // Looping pins two independent properties that the bug breaks together
+        // and a scheduling accident cannot satisfy: no single acquisition waits
+        // for a large fraction of the call, *and* the lock was genuinely
+        // available many times during it. Under the bug the contender blocks
+        // once for the whole fork run, so it fails both — one long wait, and
+        // far too few acquisitions.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_for_thread = stop.clone();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let contender = std::thread::spawn(move || {
             started_rx.recv().unwrap();
-            let t = std::time::Instant::now();
-            let guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
-            let waited = t.elapsed();
-            drop(guard);
-            waited
+            let mut acquisitions = 0usize;
+            let mut max_wait = std::time::Duration::ZERO;
+            while !stop_for_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                let guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+                max_wait = max_wait.max(t.elapsed());
+                drop(guard);
+                acquisitions += 1;
+                std::thread::yield_now();
+            }
+            (acquisitions, max_wait)
         });
 
         started_tx.send(()).unwrap();
         let start = std::time::Instant::now();
         let listed = list_sessions("lockproj");
         let total = start.elapsed();
-        let waited = contender.join().unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (acquisitions, max_wait) = contender.join().unwrap();
 
         assert_eq!(listed.len(), names.len(), "the listing itself must still be correct");
         assert!(
-            waited * 2 < total,
-            "a competing thread waited {waited:?} for the registry lock out of a {total:?} \
-             list_sessions call — the forks are happening inside the critical section, which \
-             stalls every terminal's output on this process for their duration"
+            max_wait * 2 < total,
+            "a competing thread's longest wait for the registry lock was {max_wait:?} out of a \
+             {total:?} list_sessions call — the forks are happening inside the critical section, \
+             which stalls every terminal's output on this process for their duration"
+        );
+        assert!(
+            acquisitions >= 5,
+            "a competing thread got the registry lock only {acquisitions} time(s) during a \
+             {total:?} list_sessions call — it is held across the `ps` forks, not just the map scan"
         );
 
         kill_project("lockproj");
