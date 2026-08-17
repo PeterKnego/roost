@@ -129,7 +129,11 @@ fn parse_payload(payload: &str) -> Option<Parsed> {
 /// notification centre, and it arrived over a terminal, so it is untrusted:
 /// leaving an ESC in would let a notification re-colour or reposition
 /// whatever renders it.
-fn sanitise(s: &str, max: usize) -> String {
+///
+/// `pub(crate)` so `cli::notify_sequence` can sanitise before it emits,
+/// rather than relying solely on this parser to reject what it produces —
+/// see cli.rs's module doc for why that mattered in practice.
+pub(crate) fn sanitise(s: &str, max: usize) -> String {
     s.chars()
         .filter(|c| !c.is_control() && !matches!(*c, '\u{80}'..='\u{9f}'))
         .take(max)
@@ -204,7 +208,7 @@ mod tests {
     fn an_overlong_sequence_is_abandoned_and_drains_the_buffer() {
         let mut p = Parser::new();
         let mut junk = Vec::from(&b"\x1b]777;notify;t;"[..]);
-        junk.extend(std::iter::repeat(b'x').take(MAX_SEQUENCE + 100));
+        junk.extend(std::iter::repeat_n(b'x', MAX_SEQUENCE + 100));
         let got = p.feed(&junk);
         assert!(got.is_empty(), "overlong sequence must not emit");
         assert_eq!(p.buffered_len(), 0, "overlong sequence must not stay buffered");
@@ -269,7 +273,7 @@ mod tests {
     fn an_unterminated_csi_cannot_wedge_the_parser() {
         let mut p = Parser::new();
         let mut junk = Vec::from(&b"\x1b]9;AAA\x1b["[..]);
-        junk.extend(std::iter::repeat(b'9').take(MAX_SEQUENCE * 10));
+        junk.extend(std::iter::repeat_n(b'9', MAX_SEQUENCE * 10));
         junk.extend_from_slice(b"\x1b]9;real\x07");
         let got = p.feed(&junk);
         assert_eq!(got.len(), 1, "exactly the well-formed sequence, got {got:?}");
@@ -280,9 +284,9 @@ mod tests {
     #[test]
     fn oversized_fields_are_truncated_to_the_caps() {
         let mut seq = Vec::from(&b"\x1b]777;notify;"[..]);
-        seq.extend(std::iter::repeat(b'T').take(300));
+        seq.extend(std::iter::repeat_n(b'T', 300));
         seq.push(b';');
-        seq.extend(std::iter::repeat(b'B').take(900));
+        seq.extend(std::iter::repeat_n(b'B', 900));
         seq.push(0x07);
         let n = one(&seq);
         assert_eq!(n.title.as_deref().unwrap().chars().count(), MAX_TITLE);

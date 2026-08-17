@@ -26,6 +26,14 @@ controlling terminal and no usable stdout is a loud failure (exit 1) rather
 than a silent no-op — a misconfigured hook that did nothing would otherwise
 look exactly like a hook that never fired.
 
+Title and body are sanitised and capped (control characters stripped, 100 and
+500 characters respectively — the same rules the parser applies on the way
+in) before the sequence is emitted, and a `;` in the title is replaced with
+`,`. This is what lets multi-line tool output or ANSI-coloured output pass
+through `deadlight notify "$title" "$(some_command)"` and still produce a
+notification: unsanitised, a newline or an escape code in the body would have
+made the parser abandon the sequence outright, silently, with exit status 0.
+
 ## Discovering that it is available
 
 Every terminal deadlight spawns carries:

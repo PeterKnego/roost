@@ -15,6 +15,23 @@ fn tty() -> Option<std::fs::File> {
 }
 
 pub fn notify_sequence(title: &str, body: &str) -> String {
+    // The parser this feeds (osc.rs) abandons a sequence outright on any
+    // embedded CR/LF or ESC — that's exactly what real multi-line tool
+    // output or ANSI-coloured output contains, so emitting raw text here
+    // would make this command silently produce nothing, with exit status 0,
+    // for precisely the inputs it exists to carry (see the module doc).
+    // Reusing osc::sanitise means this can never emit a sequence its own
+    // parser would reject: whatever it strips here, the parser would have
+    // stripped or abandoned on anyway.
+    let title = crate::osc::sanitise(title, crate::osc::MAX_TITLE);
+    let body = crate::osc::sanitise(body, crate::osc::MAX_BODY);
+    // Only the title's ';' is structural to the parser's own split (the
+    // first three ';' delimit 777/notify/title/body; the body's own ';'s
+    // are always literal) — so a ';' in the title, and only the title,
+    // would shift the parse boundary into the body. Replacing it here means
+    // the title/body split the parser recovers always matches what was
+    // asked for.
+    let title = title.replace(';', ",");
     format!("\x1b]777;notify;{title};{body}\x07")
 }
 
@@ -59,14 +76,37 @@ mod tests {
 
     #[test]
     fn a_semicolon_in_the_title_cannot_forge_a_body_boundary() {
-        // Only the body may contain ';' — a title that does would otherwise
-        // shift the parse.
+        // A ';' in the title used to shift the parse boundary into the body
+        // (the emitted title "a" and the body gained a spurious "b;"
+        // prefix) — this is the bug the name describes. Now the title's
+        // ';' is replaced before emission, so the boundary cannot shift:
+        // the title/body the parser recovers matches what was asked for.
         let s = notify_sequence("a;b", "body");
         let mut p = crate::osc::Parser::new();
         let got = p.feed(s.as_bytes());
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].title.as_deref(), Some("a"), "title must be sanitised, not trusted");
-        assert_eq!(got[0].body, "b;body");
+        assert_eq!(got[0].title.as_deref(), Some("a,b"), "the title's ';' must not survive to shift the parse");
+        assert_eq!(got[0].body, "body", "the body must not gain a spurious prefix from the title");
+    }
+
+    #[test]
+    fn multiline_and_ansi_input_still_produces_a_notice() {
+        // The exact failure this command exists to prevent (see the module
+        // doc): raw multi-line tool output or ANSI-coloured output used to
+        // hit the parser's own CR/LF-abandons and ESC-abandons rules,
+        // producing nothing with exit status 0. Sanitising before
+        // interpolation means the emitter can no longer produce a sequence
+        // its own parser rejects.
+        let s = notify_sequence("Build", "line one\nline two\r\n\x1b[31mred\x1b[0m");
+        let mut p = crate::osc::Parser::new();
+        let got = p.feed(s.as_bytes());
+        assert_eq!(got.len(), 1, "sanitised body must not abandon the sequence");
+        assert_eq!(got[0].title.as_deref(), Some("Build"));
+        assert!(
+            !got[0].body.contains('\n') && !got[0].body.contains('\r') && !got[0].body.contains('\x1b'),
+            "got {:?}",
+            got[0].body
+        );
     }
 
     #[test]
