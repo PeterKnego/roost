@@ -24,6 +24,13 @@ across restarts, outside the repo, so pane drags never appear in `git status`.
 restart. deadlight keeps a 1 MB scrollback ring per session and fans output out
 to every attached client.
 
+**Sessions are visible and deliberate.** Opening a project starts nothing — a
+terminal tab waits for you to press Enter — and the header shows which projects
+have shells running, with their count and age. Close Project ends them all,
+keeps your layout, and refuses while a buffer is unsaved. Sessions that outlive
+a restart are rediscovered at startup; sockets with no process, and shells whose
+directory is gone, are reaped.
+
 **Editing is conflict-guarded.** Save refuses if the file changed on disk since
 your buffer was opened, showing a diff of yours versus disk. A clean buffer
 follows external writes live; a buffer with unsaved changes is only flagged

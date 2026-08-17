@@ -23,6 +23,45 @@ since the defaults are that host's paths.
 `dtach` is a **runtime prerequisite** (`brew install dtach` / `apt install
 dtach`). Without it, terminals fail at spawn.
 
+## Projects and sessions
+
+A **project** is any directory under `DEADLIGHT_ROOTS` that has been opened in
+deadlight. It is normally a git repository; a plain directory still works — the
+terminal placeholder offers `git init` and a "start without git" escape.
+A git worktree is its own project, and is discovered by asking
+`git worktree list`, not by walking the filesystem, so worktrees under
+`.claude/worktrees/` are found even though `.claude` is otherwise skipped.
+
+Terminals are **never started implicitly**. Opening a project creates a
+Terminal *tab*, not a session; the session begins only when the user presses
+Enter or clicks the placeholder. Before this, merely looking at a project
+forked a shell that nothing ever reaped — which is how the deploy host
+accumulated 13 live shells, 9 of them belonging to directories that no longer
+existed.
+
+Sessions outlive both the browser tab and the deadlight process, so the
+**registry is rebuilt at startup** rather than kept only in memory: deadlight
+lists `$DEADLIGHT_STATE_DIR/*.json` for saved workspaces, walks
+`$DEADLIGHT_STATE_DIR/sock/` for candidate sessions, and checks which sockets a
+live `dtach` still holds. Reaping runs at startup and, throttled to once every
+few seconds, whenever the project list is enumerated:
+
+- a socket with no process is deleted;
+- a session whose project directory is gone is killed and its socket removed;
+- a socket is only ever unlinked *after* its holder is confirmed dead, so a
+  failed kill leaves an ugly-but-discoverable session rather than an
+  unreachable orphan nothing can find again.
+
+Both are logged, so `journalctl --user -u deadlight | grep -i reap` after a
+restart tells you what the startup sweep decided.
+
+**Close Project** is the only way to end sessions from the UI. It ends all of a
+project's sessions — including each `dtach` **master**, which is the part that
+matters: in `-A` mode dtach forks a master that reparents to init, so killing
+only deadlight's own client is a *detach*, not an end. It keeps the saved
+layout (reopening restores panes and tabs) and refuses while any buffer has
+unsaved changes, listing them by name.
+
 ## Deploying to ubuntu-16gb-hel1-2
 
 **The unit runs `~/.local/bin/deadlight`, not `target/release/deadlight`** —
