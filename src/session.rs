@@ -95,6 +95,10 @@ struct Session {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    // Only for age lookup via `ps`; not used for signaling (child.kill()
+    // does that). 0 is a legitimate "unknown" sentinel, not a real pid, so
+    // callers must treat a 0 age as "unknown" rather than "brand new".
+    child_pid: u32,
     scrollback: VecDeque<u8>,
     subs: HashMap<u64, SyncSender<Vec<u8>>>,
     sizes: HashMap<u64, (u16, u16)>,
@@ -176,6 +180,10 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         cb.cwd(dir);
         cb.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(cb).map_err(|e| e.to_string())?;
+        // Best-effort: some platforms/backends can decline to report a pid.
+        // 0 degrades list_sessions' age lookup to "unknown" rather than
+        // panicking or failing the attach outright.
+        let child_pid = child.process_id().unwrap_or(0);
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
@@ -185,6 +193,7 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                 writer: Arc::new(Mutex::new(writer)),
                 master: pair.master,
                 child,
+                child_pid,
                 scrollback: VecDeque::new(),
                 subs: HashMap::new(),
                 sizes: HashMap::new(),
@@ -270,6 +279,114 @@ pub fn detach(key: &str, id: u64) {
     }
 }
 
+/// The `SESSIONS` map key. Takes the *raw* slashed project form (e.g.
+/// `karpie/src`), matching how callers already invoke `attach` — not the
+/// percent-encoded `storage_key` form, which is reserved for filesystem
+/// paths (see `sock_path`). Callers of this function, `list_sessions`,
+/// `has_session`, and `kill_project` must all agree on that raw form; a
+/// later task is responsible for converting at the registry boundary.
+pub fn key_for(project: &str, name: &str) -> String {
+    format!("{project}/{name}")
+}
+
+pub struct SessionInfo {
+    pub name: String,
+    pub pid: u32,
+    pub age_secs: u64,
+    pub attached: usize,
+}
+
+/// Elapsed seconds for a pid, via `ps -o etime=`. Age is read from the OS
+/// rather than recorded in memory because dtach sessions outlive deadlight —
+/// an in-process timestamp would reset on every restart and report a
+/// days-old shell as brand new.
+///
+/// `etime` rather than the brief's suggested `etimes`: this macOS `ps`
+/// (BSD-derived) rejects `etimes` outright ("keyword not found") and only
+/// offers `etime`, GNU `ps` on Linux accepts either. `etime` prints
+/// `[[dd-]hh:]mm:ss` instead of a raw second count, so it needs parsing —
+/// see `parse_etime`.
+pub fn process_age_secs(pid: u32) -> Option<u64> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "etime=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_etime(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+/// Parses `ps -o etime=` output: `mm:ss`, `hh:mm:ss`, or `dd-hh:mm:ss`.
+/// Malformed input (unexpected pid format, a future ps that changes shape)
+/// yields None rather than panicking — callers already treat None as
+/// "unknown".
+fn parse_etime(s: &str) -> Option<u64> {
+    let (days, rest) = match s.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, s),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let (hours, mins, secs) = match parts.as_slice() {
+        [h, m, s] => (h.parse::<u64>().ok()?, m.parse::<u64>().ok()?, s.parse::<u64>().ok()?),
+        [m, s] => (0, m.parse::<u64>().ok()?, s.parse::<u64>().ok()?),
+        _ => return None,
+    };
+    Some(((days * 24 + hours) * 60 + mins) * 60 + secs)
+}
+
+/// All sessions for one project. `project` is the raw form (see `key_for`).
+pub fn list_sessions(project: &str) -> Vec<SessionInfo> {
+    let prefix = format!("{project}/");
+    let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<SessionInfo> = map
+        .iter()
+        .filter_map(|(k, s)| {
+            let name = k.strip_prefix(&prefix)?;
+            let pid = s.child_pid;
+            Some(SessionInfo {
+                name: name.to_string(),
+                pid,
+                age_secs: process_age_secs(pid).unwrap_or(0),
+                attached: s.subs.len(),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+pub fn has_session(project: &str, name: &str) -> bool {
+    let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    map.contains_key(&key_for(project, name))
+}
+
+/// Ends every session belonging to one project. This is the only way to end
+/// a session from the UI; detaching a tab deliberately leaves it running.
+pub fn kill_project(project: &str) -> usize {
+    let prefix = format!("{project}/");
+    let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let keys: Vec<String> = map.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+    let mut ended = 0;
+    for k in keys {
+        if let Some(mut s) = map.remove(&k) {
+            let _ = s.child.kill();
+            let _ = s.child.wait();
+            ended += 1;
+        }
+    }
+    ended
+}
+
+// Serializes tests that mutate the process-global DEADLIGHT_CMD env var.
+// cargo runs a binary's tests in parallel threads by default, and an env var
+// is process-wide state, so two such tests interleaving would have one see
+// the other's value mid-test (or after its cleanup already ran). This
+// project shipped exactly that flakiness once before; every test below that
+// touches DEADLIGHT_CMD takes this lock for its whole body.
+#[cfg(test)]
+pub static SESSION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +440,7 @@ mod tests {
 
     #[test]
     fn env_override_replaces_the_command() {
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("DEADLIGHT_CMD", "cat");
         assert_eq!(default_command("proj", "shell"), vec!["cat".to_string()]);
         std::env::remove_var("DEADLIGHT_CMD");
@@ -345,5 +463,47 @@ mod tests {
             push_scrollback(&mut ring, &[b'x'; 10]);
         }
         assert!(ring.len() <= MAX_SCROLLBACK);
+    }
+
+    #[test]
+    fn key_for_is_the_map_key_shape() {
+        assert_eq!(key_for("karpie", "shell"), "karpie/shell");
+        assert_eq!(key_for("karpie%2Fsrc", "claude"), "karpie%2Fsrc/claude");
+    }
+
+    #[test]
+    fn process_age_of_our_own_process_is_small_and_present() {
+        // Our own pid is guaranteed to exist; a fresh test process is young.
+        let me = std::process::id();
+        let age = process_age_secs(me).expect("our own process must be readable");
+        assert!(age < 60 * 60, "own process age looked wrong: {age}");
+        // A pid that cannot exist yields None rather than panicking.
+        assert!(process_age_secs(0).is_none() || process_age_secs(4_294_967_294).is_none());
+    }
+
+    #[test]
+    fn listing_and_killing_are_scoped_to_one_project() {
+        // DEADLIGHT_CMD is process-global; hold the lock for the whole body.
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("DEADLIGHT_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        // Two projects, so we can prove kill_project does not spill over.
+        attach("listproj", "shell", d.path()).unwrap();
+        attach("listproj", "claude", d.path()).unwrap();
+        attach("otherproj", "shell", d.path()).unwrap();
+
+        let mut names: Vec<String> = list_sessions("listproj").into_iter().map(|s| s.name).collect();
+        names.sort();
+        assert_eq!(names, vec!["claude", "shell"]);
+        assert!(has_session("listproj", "shell"));
+        assert!(!has_session("listproj", "nope"));
+
+        let ended = kill_project("listproj");
+        assert_eq!(ended, 2);
+        assert!(list_sessions("listproj").is_empty(), "all of the project's sessions must go");
+        assert_eq!(list_sessions("otherproj").len(), 1, "another project must be untouched");
+
+        kill_project("otherproj");
+        std::env::remove_var("DEADLIGHT_CMD");
     }
 }
