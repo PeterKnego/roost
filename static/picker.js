@@ -74,21 +74,35 @@
         e.key === "ArrowDown" ? rows[Math.min(i + 1, rows.length - 1)] : rows[Math.max(i - 1, 0)];
       select(next);
       next.scrollIntoView({ block: "nearest" });
-    } else if (e.key === "Enter") {
-      // Enter descends into the selection, mirroring double-click, rather
-      // than duplicating the [Open] button: Backspace already goes back up
-      // one level (below), so Enter/Backspace form one symmetric
-      // keyboard-only up/down navigation pair — the file-manager convention
-      // (Midnight Commander, Explorer's own list) — while [Open] stays the
-      // single, deliberate "finalize" action, reachable by mouse or by
-      // Tab-ing to its own button.
-      if (selected) {
-        e.preventDefault();
-        descend(selected.dataset.rel);
-      }
-    } else if (e.key === "Backspace") {
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      // Selectable rows are always directories (files carry no click
+      // listener, so they can never become `selected`), but that's an
+      // invariant of the current markup, not of this handler — check it
+      // rather than assume it.
+      if (selected && selected.classList.contains("dir")) descend(selected.dataset.rel);
+    } else if (e.key === "ArrowLeft" || e.key === "Backspace") {
       e.preventDefault();
       if (at !== "") descend(parentOf(at));
+    } else if (e.key === "Enter") {
+      // The picker is a chooser dialog — a bottom [Open] button is its
+      // visible default action — so Enter activates [Open], exactly as
+      // Enter does in any OS Open/Save dialog. Navigation moves to → / ←
+      // instead, the way Finder's column view and keyboard-driven file
+      // managers separate "go deeper/shallower" from "choose this one".
+      // Dispatching a real click (rather than reimplementing the
+      // selected-or-current-directory logic here) means Enter can never
+      // drift from what the button does, including staying a no-op when
+      // [Open] is disabled — disabled elements don't receive click().
+      openBtn.click();
+    } else if (e.key === "Escape") {
+      if (selected) select(null);
+    } else if (e.key === "Home" || e.key === "End") {
+      e.preventDefault();
+      if (rows.length === 0) return;
+      const target = e.key === "Home" ? rows[0] : rows[rows.length - 1];
+      select(target);
+      target.scrollIntoView({ block: "nearest" });
     }
   });
 
