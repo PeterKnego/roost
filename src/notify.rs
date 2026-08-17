@@ -50,6 +50,21 @@ fn store() -> &'static Mutex<Store> {
     STORE.get_or_init(|| Mutex::new(Store::default()))
 }
 
+/// Serialises `persist()` against itself. `record`/`mark_read`/`mark_all_read`/
+/// `clear` all release the store mutex before calling `persist`, and all of
+/// them write the same `notifications.json.tmp` path — so two racing callers
+/// (the PTY pump via `record`, a connection thread via `mark_read`) can
+/// interleave their write-then-rename: one's rename can find the other's tmp
+/// file already gone (a lost update), or worse, a slower writer's `O_TRUNC`
+/// truncate-and-write can land *after* a faster writer already renamed,
+/// leaving a zero-length file for `rename` to move into place — which makes
+/// `load()` hit its corrupt-file arm and discard the whole history, not just
+/// the racing update. This must be a lock of its own, not the store mutex:
+/// the store mutex is the leaf lock `record` et al. deliberately release
+/// before doing I/O (see the module doc), and holding it across a file write
+/// would put a leaf lock across blocking I/O.
+static PERSIST_LOCK: Mutex<()> = Mutex::new(());
+
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -96,7 +111,17 @@ pub fn record(project: &str, session: &str, p: Parsed) -> Option<Notice> {
         s.next_id += 1;
         let mut body = p.body;
         if suppressed > 0 {
-            body = format!("{body} ({suppressed} suppressed)");
+            // p.body is already truncated to MAX_BODY by osc::sanitise, so
+            // simply appending here and truncating the result from the front
+            // would — whenever the body was already at the cap, which is
+            // exactly when a suppression count is most likely — discard the
+            // whole suffix and keep none of the information it exists to
+            // report. Reserve room for the suffix instead, so it always
+            // survives and the total still never exceeds MAX_BODY.
+            let suffix = format!(" ({suppressed} suppressed)");
+            let avail = crate::osc::MAX_BODY.saturating_sub(suffix.chars().count());
+            let truncated: String = body.chars().take(avail).collect();
+            body = format!("{truncated}{suffix}");
         }
         let n = Notice {
             id: s.next_id,
@@ -145,6 +170,10 @@ pub fn clear() {
 /// propagated — notifications are best-effort, and a full disk must not take
 /// down a terminal.
 fn persist() {
+    // Held across the write+rename below, deliberately: see PERSIST_LOCK's
+    // doc comment for why a lock across this I/O is correct here even though
+    // the store's own leaf lock must never be.
+    let _guard = PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let snapshot: Vec<Notice> = list();
     let dir = crate::wsstate::state_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -172,8 +201,18 @@ fn persist() {
     }
     if let Err(e) = std::fs::rename(&tmp, path()) {
         eprintln!("deadlight: notifications rename: {e}");
+        #[cfg(test)]
+        RENAME_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
+
+/// Test-only: counts `rename` failures from `persist()`, which is otherwise
+/// only observable as an stderr line. Without PERSIST_LOCK, a racing writer
+/// can find its own tmp file already moved away by a faster writer's rename
+/// — this is that failure, counted rather than merely printed, so a test can
+/// assert on it directly instead of scraping stderr.
+#[cfg(test)]
+static RENAME_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Called once at startup. A corrupt or absent file leaves an empty store —
 /// losing notification history is not worth failing a boot over.
@@ -200,6 +239,12 @@ pub fn window_count() -> usize {
 pub fn reset_for_test() {
     let mut s = store().lock().unwrap_or_else(|e| e.into_inner());
     *s = Store::default();
+    RENAME_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub fn rename_failures() -> usize {
+    RENAME_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Ages out a session's rate-limit window so a test can cross it without
@@ -285,6 +330,28 @@ mod tests {
     }
 
     #[test]
+    fn the_suppressed_suffix_cannot_push_the_body_over_its_own_cap() {
+        // p.body already arrives at exactly MAX_BODY (osc::sanitise's job);
+        // appending "(N suppressed)" after that must still respect the cap,
+        // not exceed it — the suffix has to eat into the body, not add to it.
+        let (_g, _d) = setup();
+        let full = parsed(&"x".repeat(crate::osc::MAX_BODY));
+        for _ in 0..RATE_LIMIT_PER_MIN {
+            record("p", "loud", full.clone());
+        }
+        record("p", "loud", full.clone()); // dropped, suppressed count = 1
+        expire_window_for_test("p", "loud");
+        let n = record("p", "loud", full).unwrap();
+        assert!(n.body.contains("suppressed"), "the suffix must survive, not just fit: got {:?}", n.body);
+        assert_eq!(
+            n.body.chars().count(),
+            crate::osc::MAX_BODY,
+            "total length must stay at the cap, not exceed it: {:?}",
+            n.body
+        );
+    }
+
+    #[test]
     fn mark_read_and_clear_change_what_list_returns() {
         let (_g, _d) = setup();
         let a = record("p", "s1", parsed("one")).unwrap();
@@ -365,5 +432,45 @@ mod tests {
         let (_g, _d) = setup();
         let n = record("p", "claude", Parsed { title: None, body: "hi".into() }).unwrap();
         assert_eq!(n.title, "claude");
+    }
+
+    /// Several threads racing record()->persist() at once, all writing the
+    /// same tmp path. This is the shape of the real bug: 8 threads x 200
+    /// calls reliably produced ~16 `rename: No such file or directory`
+    /// errors without PERSIST_LOCK when this was diagnosed. Asserting
+    /// `rename_failures() == 0` is the direct claim PERSIST_LOCK makes —
+    /// under the lock, a persist() call always creates its own tmp file
+    /// immediately before renaming it, with no other writer able to touch
+    /// that path in between, so the rename can never find it already gone.
+    /// (A plain "does the final count match" assertion is much weaker here:
+    /// once the ring is full, *every* possible snapshot has exactly
+    /// MAX_NOTICES entries, so a lost update that swaps one full snapshot
+    /// for a slightly different one would not show up in the count at all.)
+    #[test]
+    fn concurrent_persists_never_lose_a_rename_and_leave_a_file_load_can_recover() {
+        let (_g, _d) = setup();
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 150;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        record(&format!("p{t}"), &format!("s{i}"), parsed("x")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            rename_failures(),
+            0,
+            "a concurrent writer found its own tmp file already moved — PERSIST_LOCK should make that impossible"
+        );
+
+        reset_for_test();
+        load(); // must not hit the corrupt-file arm
+        assert_eq!(list().len(), MAX_NOTICES, "the ring should read back full after this many records");
     }
 }
