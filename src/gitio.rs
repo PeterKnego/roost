@@ -99,6 +99,16 @@ pub fn status(repo: &Path) -> Result<Status, String> {
     run_git(repo, &["status", "--porcelain=v2", "-b"], false).map(|s| parse_status(&s))
 }
 
+/// `git init`, with no arguments beyond that: `run_git` fixes `-C repo` as
+/// the only path input and this passes nothing else, so there is no room
+/// for a caller to smuggle extra git arguments through here. Routed through
+/// `run_git` rather than a bare `Command`, so it gets the same 15s
+/// deadline-and-kill as every other git call in this module — callers that
+/// run this under a long-lived lock (the hub does) depend on that bound.
+pub fn init(repo: &Path) -> Result<String, String> {
+    run_git(repo, &["init"], false)
+}
+
 pub fn diff(repo: &Path, path: Option<&str>) -> Result<String, String> {
     match path {
         None => run_git(repo, &["diff", "HEAD"], true),
