@@ -34,6 +34,20 @@ fn fixture_named(project: &str) -> (tempfile::TempDir, u16) {
     (d, port)
 }
 
+/// Two sibling projects under one root, for tests that must prove isolation
+/// *between* projects. A test that only ever looks at one project cannot
+/// catch `kill_project` (or anything else project-scoped) degenerating to
+/// "affect everything" — it would still pass.
+fn two_project_fixture(a: &str, b: &str) -> (tempfile::TempDir, u16) {
+    let d = tempfile::tempdir().unwrap();
+    for name in [a, b] {
+        std::fs::create_dir(d.path().join(name)).unwrap();
+        std::fs::write(d.path().join(name).join("hello.md"), "# Hello\n").unwrap();
+    }
+    let port = start(vec![d.path().to_path_buf()]);
+    (d, port)
+}
+
 #[test]
 fn index_lists_projects() {
     let (_d, port) = fixture();
@@ -704,6 +718,217 @@ fn reconnect_replays_buffer_text_for_open_edit_buffers() {
     let _ = a.close(None);
     let _ = b.close(None);
     std::env::remove_var("DEADLIGHT_STATE_DIR");
+}
+
+/// Reads every frame currently queued on `ws`, returning the *last*
+/// `"t":"State"` one seen (`None` if there wasn't one). Uses a short read
+/// timeout to detect "nothing left queued" rather than blocking on the
+/// socket's normal multi-second one.
+///
+/// This matters because the server can push a `State` broadcast this client
+/// never asked for: term.rs attaches and broadcasts its own post-attach
+/// snapshot from the connecting thread, but the client's `connect()` call
+/// already returned once the handshake finished, well before that
+/// server-side thread gets to attach+broadcast — so a workspace socket that
+/// connects afterward can still end up subscribed in time to receive that
+/// broadcast as an *extra*, unsolicited frame racing against whatever this
+/// client explicitly asked for with `RequestState`. A plain "read the next
+/// matching frame" after sending a request can therefore return a frame
+/// that predates the request, leaving the real response queued unread for
+/// some later, unrelated call to wrongly pick up — which is exactly the
+/// stale-read trap that made an earlier version of this file's isolation
+/// test pass while the server was secretly killing the other project's
+/// session too. Draining to the last frame sidesteps the ordering ambiguity
+/// entirely: whatever the most recent frame says is authoritative.
+fn drain_latest_state(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+) -> Option<String> {
+    if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+        s.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+    }
+    let mut last = None;
+    loop {
+        match ws.read() {
+            Ok(tungstenite::Message::Text(t)) => {
+                if t.contains(r#""t":"State""#) {
+                    last = Some(t.to_string());
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break, // timed out (or closed): nothing more queued right now
+        }
+    }
+    if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    }
+    last
+}
+
+/// Sends `RequestState` and returns the freshest resulting snapshot, via
+/// `drain_latest_state` so a frame that predates this request can't be
+/// mistaken for the answer to it. Polls (rather than reading exactly once)
+/// because the response itself isn't guaranteed to land inside a single
+/// 200ms drain window under load; a deadline bounds the wait instead of a
+/// fixed sleep.
+fn fresh_state(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+) -> String {
+    ws.send(tungstenite::Message::Text(r#"{"t":"RequestState"}"#.into())).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(s) = drain_latest_state(ws) {
+            return s;
+        }
+        assert!(std::time::Instant::now() < deadline, "no State frame arrived within the deadline");
+    }
+}
+
+/// Polls `fresh_state` until the snapshot contains `needle`, or panics after
+/// a deadline. Used both to wait for a session to go live and to wait for
+/// `CloseProject`'s effect to be visible, so a test never depends on
+/// guessing how many broadcasts to skip past.
+fn wait_for_state_containing(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    needle: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let state = fresh_state(ws);
+        if state.contains(needle) {
+            return state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "state never contained {needle:?} within the deadline; last: {state}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Waits for `session` to appear in `live_sessions` specifically — not just
+/// anywhere in the frame: a `State` with an open Terminal tab also carries
+/// `"session":"shell"` in its pane/tab data even while `live_sessions` is
+/// still empty, and a bare `contains("shell")` would match that instead.
+fn wait_for_live_session(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    session: &str,
+) -> String {
+    wait_for_state_containing(ws, &format!("\"live_sessions\":[\"{session}\"]"))
+}
+
+// This is the single behavioral promise of the whole projects feature:
+// opening a project (fetching its page, opening its workspace socket —
+// everything a browser does on arrival) must not itself start a shell.
+// Before Tasks 3-4, the default layout shipped a Terminal tab, mounting it
+// connected a socket, and connecting spawned a shell, so merely *looking*
+// at a project forked a bash nobody used — the mechanism behind nine
+// orphaned shells for deleted directories in production.
+#[test]
+fn opening_a_project_spawns_no_terminal_session() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    std::env::set_var("DEADLIGHT_CMD", "cat");
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    // A name unique to this test: the session registry (session.rs's
+    // `SESSIONS`) is a process-global map keyed by project name that
+    // outlives any one test's TempDir, and several other tests in this
+    // binary attach a real "proj/shell" session and only ever detach it
+    // (never kill it — see ws_closes_when_child_exits_first's comment).
+    // Reusing "proj" here would let a leftover session from a test that
+    // happened to run first make this assertion pass for the wrong reason.
+    let (_d, port) = fixture_named("spawncheck");
+
+    // Fetch the workspace page and open a workspace socket — everything a
+    // browser does on arrival except starting a terminal.
+    let body = ureq::get(&format!("http://127.0.0.1:{port}/spawncheck"))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(body.contains("data-project"));
+    let mut ws = ws_connect_path(port, "/ws/spawncheck/_workspace").unwrap();
+    let state = fresh_state(&mut ws);
+    assert!(
+        state.contains(r#""live_sessions":[]"#),
+        "merely opening a project must not spawn a shell; got: {state}"
+    );
+
+    // Prove the assertion above is not vacuous, i.e. that it would have
+    // failed had a session really been spawned: the identical
+    // RequestState/State path, against the identical project, does report a
+    // session once a terminal socket genuinely attaches one. Without this,
+    // "live_sessions":[] could just as well mean the field is hardcoded
+    // empty, or State ignores live_sessions entirely, as it could mean
+    // nothing was spawned.
+    let mut term = ws_connect_path(port, "/ws/spawncheck/term/shell").unwrap();
+    let live_state = wait_for_live_session(&mut ws, "shell");
+    assert!(
+        live_state.contains(r#""live_sessions":["shell"]"#),
+        "attaching a real terminal must make it show up live; got: {live_state}"
+    );
+
+    let _ = term.close(None);
+    let _ = ws.close(None);
+    std::env::remove_var("DEADLIGHT_STATE_DIR");
+    std::env::remove_var("DEADLIGHT_CMD");
+}
+
+// CloseProject must end every session belonging to one project and report
+// how many, while leaving every other project's sessions running. A test
+// that only ever opens one project cannot prove that second half: had
+// `kill_project` degenerated into "kill every session in every project", a
+// single-project version of this test would still pass.
+#[test]
+fn close_project_ends_sessions_and_isolates_other_projects() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    std::env::set_var("DEADLIGHT_CMD", "cat");
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    let (_d, port) = two_project_fixture("closealpha", "closebeta");
+
+    // Starting a terminal is what creates a session: connect its socket.
+    let mut term_a = ws_connect_path(port, "/ws/closealpha/term/shell").unwrap();
+    let mut term_b = ws_connect_path(port, "/ws/closebeta/term/shell").unwrap();
+
+    let mut ws_a = ws_connect_path(port, "/ws/closealpha/_workspace").unwrap();
+    let mut ws_b = ws_connect_path(port, "/ws/closebeta/_workspace").unwrap();
+    // Wait for both attaches to land before closing, so "ended" reflects a
+    // session that genuinely exists rather than racing term.rs's attach.
+    // `wait_for_live_session` (via `fresh_state`/`drain_latest_state`)
+    // absorbs each connection's unsolicited initial snapshot and term.rs's
+    // own post-attach broadcast, so no manual draining is needed here.
+    wait_for_live_session(&mut ws_a, "shell");
+    wait_for_live_session(&mut ws_b, "shell");
+
+    ws_a.send(tungstenite::Message::Text(r#"{"t":"CloseProject"}"#.into())).unwrap();
+    let closed = read_until(&mut ws_a, r#""t":"ProjectClosed""#);
+    assert!(closed.contains(r#""ended":1"#), "expected one session ended; got: {closed}");
+
+    // closealpha itself must now report no live sessions.
+    let state_a = wait_for_state_containing(&mut ws_a, r#""live_sessions":[]"#);
+    assert!(
+        state_a.contains(r#""live_sessions":[]"#),
+        "closealpha must have no sessions left after CloseProject; got: {state_a}"
+    );
+
+    // closebeta's session must be untouched — proof this was project-scoped,
+    // not a global kill that happened to only be observed from one project.
+    // A single `fresh_state` call (not a polling wait) is deliberate: if
+    // isolation were broken, the session would already be gone by now, and
+    // polling for it to reappear would just make a broken test hang until
+    // its deadline instead of failing promptly.
+    let state_b = fresh_state(&mut ws_b);
+    assert!(
+        state_b.contains(r#""live_sessions":["shell"]"#),
+        "closing closealpha must not touch closebeta's session; got: {state_b}"
+    );
+
+    let _ = term_a.close(None);
+    let _ = term_b.close(None);
+    let _ = ws_a.close(None);
+    let _ = ws_b.close(None);
+    std::env::remove_var("DEADLIGHT_STATE_DIR");
+    std::env::remove_var("DEADLIGHT_CMD");
 }
 
 #[test]
