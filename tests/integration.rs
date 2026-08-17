@@ -761,3 +761,78 @@ fn notices_are_replayed_on_connect_and_read_state_mirrors() {
     let after = read_until(&mut a, r#""read":true"#);
     assert!(after.contains(r#""t":"Notices""#), "a was not re-sent the list: {after}");
 }
+
+#[test]
+fn an_escape_sequence_from_a_terminal_becomes_a_notice() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+
+    // A single-token command: DEADLIGHT_CMD splits on whitespace.
+    let bin = tempfile::tempdir().unwrap();
+    let script = bin.path().join("emit.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf '\\033]777;notify;Build done;42 tests passed\\007'\nsleep 5\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::env::set_var("DEADLIGHT_CMD", script.to_str().unwrap());
+
+    let (_d, port) = fixture_named("notifyproj");
+    let mut ctrl = ws_connect_path(port, "/ws/notifyproj/_workspace").unwrap();
+    read_until(&mut ctrl, r#""t":"State""#);
+    // Attaching the terminal socket is what spawns the session and its pump.
+    let mut term = ws_connect_path(port, "/ws/notifyproj/term/claude").unwrap();
+
+    let seen = read_until(&mut ctrl, r#""t":"Notice""#);
+    assert!(seen.contains("Build done"), "title missing: {seen}");
+    assert!(seen.contains("42 tests passed"), "body missing: {seen}");
+    // Attribution comes from the pump's own identity, not from the payload.
+    assert!(seen.contains(r#""session":"claude""#), "session missing: {seen}");
+    assert!(seen.contains(r#""project":"notifyproj""#), "project missing: {seen}");
+
+    let _ = term.close(None);
+    std::env::remove_var("DEADLIGHT_CMD");
+}
+
+#[test]
+fn a_terminal_child_can_discover_that_notifications_exist() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let script = bin.path().join("env.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho \"NOTIFY=$DEADLIGHT_NOTIFY PROJ=$DEADLIGHT_PROJECT SESS=$DEADLIGHT_SESSION\"\nsleep 5\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::env::set_var("DEADLIGHT_CMD", script.to_str().unwrap());
+
+    let (_d, port) = fixture_named("envproj");
+    let mut term = ws_connect_path(port, "/ws/envproj/term/envprobe").unwrap();
+    let mut seen = String::new();
+    for _ in 0..100 {
+        match term.read() {
+            Ok(tungstenite::Message::Binary(b)) => seen.push_str(&String::from_utf8_lossy(&b)),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if seen.contains("NOTIFY=") {
+            break;
+        }
+    }
+    assert!(seen.contains("NOTIFY=1"), "capability flag missing: {seen:?}");
+    assert!(seen.contains("PROJ=envproj"), "project missing: {seen:?}");
+    assert!(seen.contains("SESS=envprobe"), "session missing: {seen:?}");
+    let _ = term.close(None);
+    std::env::remove_var("DEADLIGHT_CMD");
+}
