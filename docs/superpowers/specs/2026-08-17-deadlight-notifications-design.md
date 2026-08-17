@@ -78,9 +78,19 @@ turning the parser into an accumulator:
 - An in-flight sequence is abandoned on `CR` or `LF`. Real OSC never contains
   either, and this bounds the damage from `cat` of a binary file that happens
   to contain `ESC ]`.
+- An `ESC` inside a sequence ends it, unless it is the `ESC \` terminator.
+  That is what real terminals do, and it is also what keeps the parser
+  bounded: there is no state in which it consumes input without either
+  buffering it against the 4 KiB cap or ending the sequence. A parser that
+  instead tries to skip over an embedded ANSI sequence and carry on
+  reintroduces exactly that unbounded state, and can swallow the next
+  sequence's prefix.
+- A sequence ends at its own first terminator. No look-ahead: a later,
+  unrelated `ESC \` in the same chunk must not retroactively demote an
+  earlier `BEL`.
 - Parsed fields are sanitised: invalid UTF-8 is replaced lossily, C0/C1
-  control characters (including any surviving `ESC`) are stripped, then title
-  and body are truncated to their caps.
+  control characters are stripped, then title and body are truncated to their
+  caps. No `ESC` can reach this step — one would have ended the sequence.
 
 **The byte stream is not modified.** The parser scans a copy; the original
 bytes reach xterm.js untouched. xterm.js silently discards OSC codes it has no

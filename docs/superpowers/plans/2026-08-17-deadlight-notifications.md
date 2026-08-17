@@ -180,11 +180,53 @@ mod tests {
     }
 
     // Assert the sanitised *result*, not that sanitising was attempted.
+    // Non-ESC control bytes: an ESC inside a sequence ends it (see the next
+    // test), so no ESC can ever reach `sanitise` to be stripped.
     #[test]
     fn control_characters_are_stripped_from_the_fields() {
-        let n = one(b"\x1b]777;notify;Ti\x1b[31mtle;bo\x07dy\x1b\\");
-        assert_eq!(n.title.as_deref(), Some("Title"), "escape left in the title");
+        let n = one(b"\x1b]777;notify;Ti\x01tle;bo\x02dy\x1b\\");
+        assert_eq!(n.title.as_deref(), Some("Title"), "control byte left in the title");
         assert_eq!(n.body, "body");
+    }
+
+    // Real terminals end an OSC at any ESC that is not the ST pair `ESC \`.
+    // Following that convention is also what keeps this parser bounded: there
+    // is no state in which it consumes input without either buffering it
+    // against MAX_SEQUENCE or ending the sequence outright. Any "skip the
+    // ANSI sequence and carry on" cleverness reintroduces exactly that
+    // unbounded state — see the wedge test below.
+    #[test]
+    fn an_esc_inside_a_sequence_abandons_it() {
+        let mut p = Parser::new();
+        let got = p.feed(b"\x1b]777;notify;Ti\x1b[31mtle;body\x07");
+        assert!(got.is_empty(), "ESC inside a sequence must abandon it");
+        assert_eq!(p.buffered_len(), 0);
+    }
+
+    // No look-ahead: a sequence ends at its own first terminator, and a later
+    // unrelated ST elsewhere in the chunk must not retroactively demote it.
+    #[test]
+    fn the_first_terminator_wins_even_if_another_appears_later() {
+        let mut p = Parser::new();
+        let got = p.feed(b"\x1b]9;first\x07 trailing \x1b\\ more \x1b]9;second\x07");
+        assert_eq!(got.len(), 2, "each sequence ends at its own first terminator");
+        assert_eq!(got[0].body, "first");
+        assert_eq!(got[1].body, "second");
+    }
+
+    // Regression: a stray CSI intro inside a sequence must not put the parser
+    // into a state that consumes unbounded input, swallows the next
+    // sequence's prefix, or fabricates a notice by merging two sequences.
+    #[test]
+    fn an_unterminated_csi_cannot_wedge_the_parser() {
+        let mut p = Parser::new();
+        let mut junk = Vec::from(&b"\x1b]9;AAA\x1b["[..]);
+        junk.extend(std::iter::repeat(b'9').take(MAX_SEQUENCE * 10));
+        junk.extend_from_slice(b"\x1b]9;real\x07");
+        let got = p.feed(&junk);
+        assert_eq!(got.len(), 1, "exactly the well-formed sequence, got {got:?}");
+        assert_eq!(got[0].body, "real", "no bytes from the abandoned sequence may leak in");
+        assert_eq!(p.buffered_len(), 0);
     }
 
     #[test]
@@ -389,7 +431,7 @@ pub mod osc;
 cd /Users/peter/Projects/deadlight/.claude/worktrees/notifications && cargo test osc
 ```
 
-Expected: PASS, 13 tests.
+Expected: PASS, 16 tests.
 
 - [ ] **Step 5: Commit**
 
