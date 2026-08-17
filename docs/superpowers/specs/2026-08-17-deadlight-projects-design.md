@@ -181,8 +181,21 @@ directory that is not one, the placeholder offers initialisation instead:
 └──────────────────────────────────┘
 ```
 
-`git init` runs in the project directory; on success the session starts
-normally. **"start without git" is a real escape hatch**, not decoration —
+`git init` runs in the project directory; on success the placeholder swaps back
+to the ordinary "press Enter to start a terminal" hint, and the user starts the
+session with the same gesture as anywhere else. It deliberately does *not*
+auto-start: this whole section exists because implicit shell spawning is the bug
+being fixed, and having one button both initialise a repo and fork a shell
+reintroduces it in miniature.
+
+**A project is "in a repository" if it is inside any work tree**, not only if it
+has its own `.git`. A nested project (`karpie/src`) has none of its own while
+sitting inside its parent's, and offering to initialise there would create an
+embedded repository that silently detaches the subtree from its parent's
+history — while the changes pane beside it is already showing the parent's
+status, making the offer look credible.
+
+**"start without git" is a real escape hatch**, not decoration —
 scratch directories stay usable. The gate exists to make the common case
 (a repo) the default path, not to forbid the uncommon one.
 
