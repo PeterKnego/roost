@@ -57,27 +57,42 @@ pub fn save(
     Ok(SaveOutcome::Written)
 }
 
+/// Refuses unless the OS *positively reports* nothing at `abs`. Three outcomes,
+/// not two: something is there (refuse), nothing is there (proceed), or the
+/// question could not be answered (refuse).
+///
+/// `symlink_metadata` rather than `exists()`/`metadata()` on two counts. It does
+/// not follow symlinks, so a dangling symlink inside the project counts as
+/// "already there" instead of being followed and written through to wherever it
+/// points — outside the project. And it surfaces the error kind, where
+/// `exists()` folds every failure into `false`: an `EACCES` on a parent, or a
+/// path on a filesystem that has gone away, read as "nothing there" and the
+/// caller then created or replaced through it.
+///
+/// That second half is the rule `registry`'s reaping had to learn eleven times
+/// over (CLAUDE.md, "Absence of evidence is not evidence of absence"), and
+/// leaving these two modules disagreeing about what a failed stat means is how a
+/// twelfth instance gets written.
+fn must_not_exist(abs: &Path, rel: &str) -> Result<(), String> {
+    match abs.symlink_metadata() {
+        Ok(_) => Err(format!("already exists: {rel}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot check whether {rel} exists: {e}")),
+    }
+}
+
 pub fn create_file(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     let abs = safe_resolve_parent(project_dir, rel)?;
-    // symlink_metadata (not exists/metadata) does not follow symlinks: a
-    // dangling symlink inside the project must still count as "already
-    // there", otherwise fs::write below would follow it and create the
-    // file wherever the link points — outside the project.
-    if abs.symlink_metadata().is_ok() {
-        return Err(format!("already exists: {rel}"));
-    }
+    must_not_exist(&abs, rel)?;
     std::fs::write(&abs, "").map_err(|e| e.to_string())?;
     Ok(abs)
 }
 
 pub fn create_dir(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     let abs = safe_resolve_parent(project_dir, rel)?;
-    // See create_file: refuse a dangling symlink rather than follow it.
-    // mkdir(2) itself doesn't follow symlinks, so this is currently safe
-    // either way, but make the intent explicit rather than relying on that.
-    if abs.symlink_metadata().is_ok() {
-        return Err(format!("already exists: {rel}"));
-    }
+    // mkdir(2) doesn't follow symlinks, so the symlink half of `must_not_exist`
+    // is belt-and-braces here; the "couldn't stat" half is not.
+    must_not_exist(&abs, rel)?;
     std::fs::create_dir(&abs).map_err(|e| e.to_string())?;
     Ok(abs)
 }
@@ -99,15 +114,11 @@ pub fn delete(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
 pub fn rename(project_dir: &Path, from: &str, to: &str) -> Result<PathBuf, String> {
     let src = safe_resolve(project_dir, from)?;
     let dst = safe_resolve_parent(project_dir, to)?;
-    // symlink_metadata, not exists(), for the same reason create_file and
-    // create_dir use it — plus one this file didn't state: `exists()` folds
-    // every error into `false`, so a dangling symlink (or a destination it
-    // simply could not stat) read as "nothing there" and `rename` then
-    // replaced it. Destroying something requires evidence it isn't there,
-    // and "I could not tell" is not that evidence.
-    if dst.symlink_metadata().is_ok() {
-        return Err(format!("already exists: {to}"));
-    }
+    // The most destructive of the three: `rename` replaces its destination
+    // outright. `must_not_exist` is what stands between a dangling symlink (or
+    // a destination that merely could not be stat'd) and silently overwriting
+    // whatever is really there.
+    must_not_exist(&dst, to)?;
     std::fs::rename(&src, &dst).map_err(|e| e.to_string())?;
     Ok(dst)
 }
@@ -286,5 +297,52 @@ mod tests {
         assert!(create_file(d.path(), "../evil.txt").is_err());
         assert!(delete(d.path(), "../../etc/passwd").is_err());
         assert!(rename(d.path(), "a.txt", "../evil.txt").is_err());
+    }
+
+    /// A stat that fails for a reason other than "not there" must refuse, not
+    /// proceed. `exists()` — and `symlink_metadata().is_ok()` before this —
+    /// folded `EACCES` into "nothing there", so `create_file` would write and
+    /// `rename` would replace through a destination nobody could actually see.
+    ///
+    /// Made unstattable by removing search permission from the parent
+    /// directory, which is what an `EACCES` on a real deployment looks like.
+    /// Skipped when running as root, since root ignores the permission bits and
+    /// the stat would succeed — a silent pass there would make this vacuous.
+    #[cfg(unix)]
+    #[test]
+    fn an_unstattable_destination_is_refused_rather_than_written_through() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = proj();
+        let locked = d.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let victim = locked.join("target.txt");
+        std::fs::write(&victim, "precious\n").unwrap();
+
+        // 0o000: cannot even resolve names inside it.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let stat_blocked = std::fs::symlink_metadata(&victim).is_err();
+        if !stat_blocked {
+            // Running as root (or a filesystem ignoring the mode) — the
+            // premise doesn't hold, so asserting anything here would prove
+            // nothing at all.
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipping: this process can stat through a 0o000 directory");
+            return;
+        }
+
+        let err = must_not_exist(&victim, "locked/target.txt")
+            .expect_err("an unstattable path must not be reported as absent");
+        assert!(
+            err.contains("cannot check"),
+            "the refusal must say the check failed, not claim the file exists: {err}"
+        );
+
+        // Restore so the TempDir can clean itself up.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "precious\n",
+            "and nothing may have been written through it"
+        );
     }
 }

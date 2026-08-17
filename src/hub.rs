@@ -586,7 +586,11 @@ impl Hub {
     /// every other project's connection setup, not just this one's.
     pub fn refresh_live_sessions(&mut self) {
         self.ws.live_sessions = crate::session::live_names(&self.project);
-        self.ws.is_git = self.dir.join(".git").exists();
+        // Any enclosing work tree counts, not just this directory's own `.git`
+        // — see `gitio::is_inside_work_tree`. A nested project has no `.git` of
+        // its own, and offering `git init` there embeds a repository inside its
+        // parent.
+        self.ws.is_git = crate::gitio::is_inside_work_tree(&self.dir);
     }
 
     /// The client's websocket connect to `/ws/{project}/term/{name}` is what
