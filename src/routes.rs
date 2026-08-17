@@ -48,6 +48,10 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
     match segs.as_slice() {
         [] => serve_index(w, req, roots),
         ["static", rest @ ..] => serve_static(w, &rest.join("/")),
+        // Root scope, not /static/sw.js: a service worker may only control
+        // URLs under its own path, and this one has to focus and navigate
+        // workspace tabs at /{project}.
+        ["sw.js"] => serve_static(w, "sw.js"),
         // The fragment *kind* (tree/file/…) is always exactly the last
         // segment (routes.rs's fragment endpoints never take path segments
         // of their own — `dir=`/`path=` arrive as query params, see
@@ -65,9 +69,9 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
         // some other meaning attached to "src". This is safe to fall
         // through to unconditionally (no guard, unlike the frag arm above)
         // because the arms above it already intercept every RESERVED first
-        // segment that has a real meaning here: "static" and "frag" are
-        // matched literally, in source order, before this arm is ever
-        // tried, and "ws" is intercepted even earlier — lib.rs's `is_ws`
+        // segment that has a real meaning here: "static", "sw.js", and
+        // "frag" are matched literally, in source order, before this arm is
+        // ever tried, and "ws" is intercepted even earlier — lib.rs's `is_ws`
         // diverts any request whose raw path starts with "/ws/" to
         // route_ws before it ever reaches HTTP parsing, let alone this
         // match. A single-segment `/frag` or `/static` (no trailing
