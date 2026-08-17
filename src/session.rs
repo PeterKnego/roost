@@ -361,6 +361,23 @@ pub fn list_sessions(project: &str) -> Vec<SessionInfo> {
     out
 }
 
+/// Just the names of a project's live sessions — no `ps` invocation, unlike
+/// `list_sessions`. `Hub::refresh_live_sessions` calls this on every
+/// terminal-affecting intent (and from `Hub::new`, which runs under the
+/// hub *and* the process-global hub-registry lock via `for_project`), so it
+/// must stay a plain map scan: `list_sessions`'s per-session `ps` fork,
+/// done while holding this same `SESSIONS` mutex, would otherwise stall
+/// every other project's connection setup for the duration of up to
+/// `MAX_SESSIONS_PER_PROJECT` subprocess spawns.
+pub fn live_names(project: &str) -> Vec<String> {
+    let prefix = format!("{}/", crate::projects::storage_key(project));
+    let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<String> =
+        map.keys().filter_map(|k| k.strip_prefix(&prefix)).map(str::to_string).collect();
+    out.sort();
+    out
+}
+
 pub fn has_session(project: &str, name: &str) -> bool {
     let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
     map.contains_key(&key_for(project, name))

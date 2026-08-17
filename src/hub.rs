@@ -169,6 +169,15 @@ impl Hub {
     pub fn handle(&mut self, from: &ConnId, intent: Intent) {
         match &intent {
             Intent::RequestState => {
+                // Safety net for anything that changed `live_sessions`/`is_git`
+                // without going through a hub intent — chiefly a terminal
+                // websocket's own `session::attach`, which normally pushes a
+                // refresh itself (see term.rs) but a client that reconnects
+                // and asks for state directly should not have to wait for
+                // some unrelated intent to arrive first. Cheap now that this
+                // is `session::live_names` rather than `list_sessions` (no
+                // `ps` fork per session).
+                self.refresh_live_sessions();
                 let ev = self.snapshot_event(from);
                 self.send_to(from, &ev);
                 return;
@@ -474,13 +483,17 @@ impl Hub {
     /// Recompute what is actually running/present. Cheap enough to call
     /// after any intent that could change it, and the single source of
     /// truth for the client's placeholder-versus-attach decision. Uses the
-    /// *raw* project string — `session::list_sessions` does its own
+    /// *raw* project string — `session::live_names` does its own
     /// `storage_key` encoding internally to build its map keys, so passing
     /// an already-encoded key here would double-encode and silently match
-    /// zero sessions.
+    /// zero sessions. Deliberately `session::live_names`, not
+    /// `list_sessions`: the latter forks a `ps` per session *while holding
+    /// the global session-registry mutex*, and this is called from
+    /// `Hub::new` — which itself runs under the process-global hub-registry
+    /// lock (`for_project`'s `or_insert_with`) — so that cost would stall
+    /// every other project's connection setup, not just this one's.
     pub fn refresh_live_sessions(&mut self) {
-        self.ws.live_sessions =
-            crate::session::list_sessions(&self.project).into_iter().map(|s| s.name).collect();
+        self.ws.live_sessions = crate::session::live_names(&self.project);
         self.ws.is_git = self.dir.join(".git").exists();
     }
 
@@ -494,7 +507,9 @@ impl Hub {
             let ev = Event::Error { msg: format!("invalid session name: {session}") };
             return self.send_to(from, &ev);
         }
-        let live = crate::session::list_sessions(&self.project).len();
+        // `live_names`, not `list_sessions` — see refresh_live_sessions's
+        // comment; the cap check needs only a count, not per-session `ps` ages.
+        let live = crate::session::live_names(&self.project).len();
         if !crate::session::has_session(&self.project, &session)
             && live >= crate::session::MAX_SESSIONS_PER_PROJECT
         {
@@ -510,13 +525,16 @@ impl Hub {
 
     /// `git init` takes no user-supplied arguments and always runs with the
     /// project directory as cwd — this is a fixed, server-chosen command,
-    /// not something a client can steer.
+    /// not something a client can steer. Routed through `gitio::run_git`
+    /// rather than a bare `Command::output()` so it inherits the same 15s
+    /// deadline-and-kill every other git invocation in this project gets:
+    /// this runs under the hub lock, so a hanging git (stalled network
+    /// mount, a slow hook) would otherwise freeze every websocket on the
+    /// project permanently.
     fn do_init_git(&mut self, from: &ConnId) {
-        let out = std::process::Command::new("git").arg("init").current_dir(&self.dir).output();
-        let (ok, msg) = match out {
-            Ok(o) if o.status.success() => (true, String::from_utf8_lossy(&o.stdout).trim().to_string()),
-            Ok(o) => (false, String::from_utf8_lossy(&o.stderr).trim().to_string()),
-            Err(e) => (false, e.to_string()),
+        let (ok, msg) = match crate::gitio::init(&self.dir) {
+            Ok(out) => (true, out.trim().to_string()),
+            Err(e) => (false, e),
         };
         self.broadcast(&Event::GitInit { ok, msg });
         self.refresh_live_sessions();
@@ -979,11 +997,20 @@ mod tests {
         std::fs::write(d.path().join("a.txt"), "disk\n").unwrap();
         let mut h = Hub::new("closeproj", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
+        // Second, mirrored client: proves CloseRefused is this requester's
+        // business only. Without this subscriber, `send_to` accidentally
+        // regressing into `broadcast` (leaking one client's conflict to
+        // every mirrored browser) would pass undetected — see
+        // `version_advances_on_change_only` and `save_conflict_is_reported...`
+        // for the two earlier occurrences of this exact gap in this file.
+        let (_other, rx_other) = h.subscribe();
         h.handle(&c, Intent::EditBuffer { rel: "a.txt".into(), text: "unsaved".into() });
         while rx.try_recv().is_ok() {}
+        while rx_other.try_recv().is_ok() {}
 
         h.handle(&c, Intent::CloseProject);
         let msgs: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs_other: Vec<String> = std::iter::from_fn(|| rx_other.try_recv().ok()).collect();
         assert!(
             msgs.iter().any(|m| m.contains(r#""t":"CloseRefused""#) && m.contains("a.txt")),
             "unsaved work must block a close and name the file"
@@ -991,6 +1018,10 @@ mod tests {
         assert!(
             !msgs.iter().any(|m| m.contains(r#""t":"ProjectClosed""#)),
             "nothing may be ended while work is unsaved"
+        );
+        assert!(
+            !msgs_other.iter().any(|m| m.contains(r#""t":"CloseRefused""#)),
+            "a close conflict is the requester's business, not every mirrored browser's"
         );
         std::env::remove_var("DEADLIGHT_STATE_DIR");
     }
@@ -1002,10 +1033,21 @@ mod tests {
         std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
         let mut h = Hub::new("closeclean", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
+        // A second subscriber must also learn the project closed — this is
+        // the mirror-everyone-but-CloseRefused half of the routing contract;
+        // without it, `broadcast` accidentally regressing into `send_to`
+        // (mirrors never learning the project closed) would pass undetected.
+        let (_other, rx_other) = h.subscribe();
         while rx.try_recv().is_ok() {}
+        while rx_other.try_recv().is_ok() {}
         h.handle(&c, Intent::CloseProject);
         let msgs: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs_other: Vec<String> = std::iter::from_fn(|| rx_other.try_recv().ok()).collect();
         assert!(msgs.iter().any(|m| m.contains(r#""t":"ProjectClosed""#)));
+        assert!(
+            msgs_other.iter().any(|m| m.contains(r#""t":"ProjectClosed""#)),
+            "ProjectClosed must be broadcast, not sent only to the requester"
+        );
         std::env::remove_var("DEADLIGHT_STATE_DIR");
     }
 
@@ -1016,11 +1058,51 @@ mod tests {
         std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
         let mut h = Hub::new("startproj", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
+        // A second, mirrored client must never see this client's own Error.
+        let (_other, rx_other) = h.subscribe();
         while rx.try_recv().is_ok() {}
+        while rx_other.try_recv().is_ok() {}
         h.handle(&c, Intent::StartTerminal { session: "bad name;rm".into() });
         let msgs: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs_other: Vec<String> = std::iter::from_fn(|| rx_other.try_recv().ok()).collect();
         assert!(msgs.iter().any(|m| m.contains(r#""t":"Error""#)));
         assert!(!msgs.iter().any(|m| m.contains(r#""t":"TerminalStarted""#)));
+        assert!(
+            !msgs_other.iter().any(|m| m.contains(r#""t":"Error""#)),
+            "an invalid session name is the requester's business, not every mirrored browser's"
+        );
+        std::env::remove_var("DEADLIGHT_STATE_DIR");
+    }
+
+    #[test]
+    fn init_git_creates_a_repo_and_flips_is_git_for_every_client() {
+        // Entirely unverified before this test: the handler could be
+        // deleted and every other test would still pass. GitInit and the
+        // is_git flip are exactly what the terminal/tree placeholder in the
+        // client depends on to know a repo now exists.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("initgit", d.path().to_path_buf());
+        assert!(!h.ws.is_git, "a fresh project must not already look like a git repo");
+        let (c, rx) = h.subscribe();
+        let (_other, rx_other) = h.subscribe();
+        while rx.try_recv().is_ok() {}
+        while rx_other.try_recv().is_ok() {}
+
+        h.handle(&c, Intent::InitGit);
+        let msgs: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs_other: Vec<String> = std::iter::from_fn(|| rx_other.try_recv().ok()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"GitInit""#) && m.contains(r#""ok":true"#)),
+            "got {msgs:?}"
+        );
+        assert!(
+            msgs_other.iter().any(|m| m.contains(r#""t":"GitInit""#) && m.contains(r#""ok":true"#)),
+            "GitInit must be broadcast, not sent only to the requester"
+        );
+        assert!(d.path().join(".git").exists(), "git init must actually create the repo on disk");
+        assert!(h.ws.is_git, "refresh_live_sessions must flip is_git once .git exists");
         std::env::remove_var("DEADLIGHT_STATE_DIR");
     }
 }

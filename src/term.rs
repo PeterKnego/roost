@@ -61,6 +61,24 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
             return;
         }
     };
+    // `StartTerminal` (hub.rs) refreshes `live_sessions` before the PTY
+    // actually exists — the real spawn happens here, via `attach` — so
+    // without this, every mirrored browser (and the tab's own client, on
+    // its next `State`) would keep seeing "not live" until some unrelated
+    // intent happened to touch the hub. No later task wires attach back to
+    // the hub, so this connection does it directly: look the hub up (this
+    // does not spawn it — `for_project` walks the tree only for a truly
+    // fresh hub, off its own thread), lock it just long enough to refresh
+    // and broadcast, then release before entering the blocking read loop
+    // below. The lock is never held across `attach` itself (already
+    // returned above) or across any blocking socket I/O.
+    {
+        let hub = crate::hub::Hub::for_project(&project, dir.clone());
+        let mut h = crate::hub::Hub::lock(&hub);
+        h.refresh_live_sessions();
+        let ev = h.snapshot_event(&String::new());
+        h.broadcast(&ev);
+    }
 
     let Ok(write_half) = ws_read.get_ref().try_clone() else { return };
     let mut ws_write: WebSocket<TcpStream> =
