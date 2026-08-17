@@ -27,8 +27,52 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   one deadlock that way (the global session registry held across a PTY write,
   which wedged every session in every project).
 - **No panics may escape a socket or watcher thread.**
+- **Destruction requires positive evidence.** See below — this is the constraint
+  this codebase breaks most often.
 - Caps: ≤16 sessions per project, ≤50 open buffers, 1 MB scrollback, 2 MB file
   cap for reads *and* writes.
+
+## Absence of evidence is not evidence of absence
+
+**Eleven separate defects in one feature were the same mistake**: code concluded
+something was gone, dead, or empty because the *check* failed, then destroyed it.
+Every one could kill a user's long-running shell or overwrite their file.
+
+| What failed | What it was read as | What it destroyed |
+|---|---|---|
+| A form decoder turning `+` into a space | project `gtk+` doesn't exist | its live session |
+| `pgrep -f` treating a path as a regex | nothing holds this socket | its live session |
+| An unreadable root | every project is gone | every live session |
+| A *partially* unreadable root | those projects are gone | their live sessions |
+| A space in a path defeating word-splitting | nothing holds this socket | its live session |
+| `ps` failing to spawn (empty `Vec`) | no process holds it | a live session's socket |
+| The socket's holder not yet visible | the socket is an orphan | an unreachable shell |
+| A key not resolving under *these* roots | the directory was deleted | every session outside them |
+| An empty or truncated `.origin` marker | the directory was deleted | the recorded session |
+| `Path::is_dir()` swallowing `EACCES` | the directory was deleted | the recorded session |
+| `Path::exists()` on a dangling symlink | the destination is free | the symlink's target |
+
+The last one is in a different module from the rest, so treat this as systemic,
+not as a `registry.rs` quirk.
+
+**The rule:** "I could not determine X" is a third outcome, never folded into
+"X is false". Concretely:
+
+- A subprocess has three results, not two: success, failure, and *ran but I
+  cannot trust the output* (non-zero exit, or empty stdout where a live system
+  must produce some). Check `status.success()`; never `unwrap_or_default()` a
+  snapshot that gates a kill.
+- `Path::exists()` / `is_dir()` collapse "not there" and "cannot look" into
+  `false`, and both follow symlinks. Before anything destructive use
+  `symlink_metadata` and match: `Err(NotFound)` → absent, `Err(_)` → **cannot
+  tell, do nothing**, `Ok(_)` → present.
+- Prefer suspending a sweep over guessing at one item. Stale rows in the UI are
+  recoverable; a SIGKILLed shell is not.
+- Write persistent evidence atomically (temp file with a pid-unique name, then
+  `rename`), or a reader will see it half-written and act on the gap.
+
+When a decision is destructive and irreversible, the burden of proof is on
+destroying, not on keeping.
 
 ## Style
 
