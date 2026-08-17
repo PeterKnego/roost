@@ -97,7 +97,7 @@ ul.picker li .git:hover { text-decoration: underline; }
   font-size: 10px; line-height: 14px; text-align: center;
 }
 #noticepanel {
-  position: absolute; top: var(--header-h); right: 8px; z-index: 20;
+  position: absolute; top: var(--header-h, 36px); right: 8px; z-index: 20;
   width: 340px; max-height: 60vh; overflow-y: auto;
   background: var(--bg2); border: 1px solid var(--border);
   border-radius: 4px; padding: 4px;

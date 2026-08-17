@@ -585,7 +585,13 @@ setFavicon(false);
 if (location.hash.startsWith("#session=")) {
   const want = decodeURIComponent(location.hash.slice("#session=".length));
   history.replaceState(null, "", location.pathname);
-  const tryFocus = () => { if (state) focusSession(want); else setTimeout(tryFocus, 100); };
+  // Bounded: if the socket never connects there is nothing to focus, and an
+  // uncapped poll would spin for the life of the page.
+  let tries = 0;
+  const tryFocus = () => {
+    if (state) focusSession(want);
+    else if (++tries < 50) setTimeout(tryFocus, 100);
+  };
   tryFocus();
 }
 
@@ -699,10 +705,18 @@ function setFavicon(badged) {
   link.href = "data:image/svg+xml," + encodeURIComponent(svg);
 }
 
+// Mirrors http::percent_encode on the Rust side: encode each segment but keep
+// the `/` separators, because a project may be a nested rel path like
+// `karpie/src` whose slashes are structural. Encoding the whole string breaks
+// nested projects; encoding none of it breaks any project whose directory name
+// contains a URL-significant character — a directory called `foo#bar` would
+// send the browser to `/foo` with the rest swallowed as a fragment.
+const projectPath = (p) => p.split("/").map(encodeURIComponent).join("/");
+
 function openNotice(x) {
   if (!x.read) send({ t: "MarkNoticeRead", id: x.id });
   if (x.project !== PROJECT) {
-    location.href = `/${x.project}#session=${encodeURIComponent(x.session)}`;
+    location.href = `/${projectPath(x.project)}#session=${encodeURIComponent(x.session)}`;
     return;
   }
   focusSession(x.session);
