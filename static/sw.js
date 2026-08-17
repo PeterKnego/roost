@@ -14,19 +14,31 @@ self.addEventListener("message", (e) => {
   const m = e.data;
   if (!m || m.kind !== "notify") return;
   const n = m.notice;
-  self.registration.showNotification(n.title, {
-    body: n.body,
-    // One notification per session: a chatty session replaces its own
-    // rather than stacking twenty.
-    tag: `${n.project}/${n.session}`,
-    data: { project: n.project, session: n.session },
-    renotify: true,
-  });
+  // Guard the payload even though only first-party page code posts here: an
+  // undefined `notice` would throw a TypeError inside the worker, and an
+  // uncaught throw in this context is invisible from the page.
+  if (!n || !n.title) return;
+  // waitUntil because showNotification is async and this is an
+  // ExtendableMessageEvent: without it the browser may terminate the worker
+  // between this dispatch and the notification actually appearing, and the
+  // notice is lost with nothing to show for it.
+  e.waitUntil(
+    self.registration.showNotification(n.title, {
+      body: n.body,
+      // One notification per session: a chatty session replaces its own
+      // rather than stacking twenty.
+      tag: `${n.project}/${n.session}`,
+      data: { project: n.project, session: n.session },
+      renotify: true,
+    })
+  );
 });
 
 self.addEventListener("notificationclick", (e) => {
   e.notification.close();
   const { project, session } = e.notification.data || {};
+  // Deliberate bail-out with no waitUntil: there is nothing to focus or
+  // navigate to, and close() above already ran synchronously.
   if (!project) return;
   const target = `/${project}#session=${encodeURIComponent(session || "")}`;
   e.waitUntil(
