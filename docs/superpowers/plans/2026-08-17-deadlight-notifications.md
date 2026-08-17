@@ -681,7 +681,13 @@ pub fn record(project: &str, session: &str, p: Parsed) -> Option<Notice> {
         let key = format!("{project}/{session}");
         let w = s.windows.entry(key).or_default();
         if ts.saturating_sub(w.started) >= WINDOW_SECS {
-            *w = Window { started: ts, count: 0, suppressed: 0 };
+            // A new window resets the allowance but carries the suppression
+            // count across. Counting drops exists solely to tell the user
+            // they happened, and the next admitted notice is the first
+            // chance to say so — zeroing here would silently discard the
+            // very thing the count is for.
+            let carried = w.suppressed;
+            *w = Window { started: ts, count: 0, suppressed: carried };
         }
         if w.count >= RATE_LIMIT_PER_MIN {
             // Dropped, but counted: a runaway loop must not be able to evict
