@@ -20,11 +20,12 @@ be `BEL` (`\007`) or `ESC \`; in the `777` form only the first three `;` are
 structural (separating `777`, `notify`, title, and body), so a body
 containing `;` needs no escaping.
 
-`deadlight notify` writes to `/dev/tty`, falling back to stdout if there is no
-controlling terminal. A missing title is a usage error (exit 2); no
-controlling terminal and no usable stdout is a loud failure (exit 1) rather
-than a silent no-op — a misconfigured hook that did nothing would otherwise
-look exactly like a hook that never fired.
+`deadlight notify` writes to `/dev/tty`, falling back to stdout only when
+stdout is *itself a terminal*. A missing title is a usage error (exit 2); having
+no terminal to write to at all is a loud failure (exit 1) rather than a silent
+no-op — a misconfigured hook that did nothing would otherwise look exactly like
+a hook that never fired. The fallback deliberately does not accept a pipe:
+nothing on the other end of one can interpret an escape sequence.
 
 Title and body are sanitised and capped (control characters stripped, 100 and
 500 characters respectively — the same rules the parser applies on the way
@@ -70,21 +71,23 @@ permission prompt without watching the tab:
 actually runs in: inside a deadlight terminal with stdout captured by a pipe,
 `deadlight notify` still reaches the terminal and the notice is delivered.
 
-**A process with no controlling terminal at all is still a silent no-op.** That
-is the subagent case. With no `/dev/tty` and stdout captured, the sequence is
-written to that captured stdout, nothing is delivered, and the exit status is
-**0**:
+**A process with no terminal anywhere now fails loudly.** That is the subagent
+case: no `/dev/tty`, and stdout a pipe rather than a terminal. It used to write
+the sequence into that pipe and exit **0** — a silent no-op wearing a success
+code, which is the exact failure this command exists to prevent, since an OSC
+sequence in a pipe has no terminal to interpret it. Now:
 
 ```
 $ deadlight notify "Claude" "finished"     # no /dev/tty, stdout a pipe
-exit=0
-stdout=^[]777;notify;Claude;finished^G
+deadlight notify: no controlling terminal, and stdout is not one either —
+nothing would read the sequence, so no notification was sent. This is what a
+hook invoked without a terminal (e.g. a subagent) looks like.
+exit=1
 ```
 
-This meets the rule stated below — a pipe *is* a usable stdout — but not its
-intent, since an escape sequence written into a pipe can never produce a
-notification, making failure indistinguishable from success. If you wire a hook
-that may run detached, verify it fires rather than trusting its exit status.
+The stdout fallback is unchanged where it was ever meaningful: a process whose
+stdout *is* a terminal still uses it. Only the case where nothing could possibly
+read the sequence became an error.
 
 ## In the browser
 

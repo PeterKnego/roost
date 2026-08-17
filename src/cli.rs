@@ -4,7 +4,7 @@
 //! IPC here and no socket to connect to: printing the escape sequence to the
 //! controlling terminal IS the mechanism. That is also why this never binds a
 //! port or touches the notice store.
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 /// `/dev/tty` rather than stdout, because the intended caller is a Claude
 /// Code hook and Claude Code captures hook stdout — a hook printing to stdout
@@ -35,6 +35,44 @@ pub fn notify_sequence(title: &str, body: &str) -> String {
     format!("\x1b]777;notify;{title};{body}\x07")
 }
 
+/// Where the escape sequence can actually be delivered.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Sink {
+    /// The controlling terminal — the PTY deadlight is reading.
+    Tty,
+    /// stdout, but *only* when it is itself a terminal.
+    Stdout,
+    /// Nowhere it could possibly be read. Must not be reported as success.
+    Nowhere,
+}
+
+/// Kept pure so the whole matrix is testable: whether a process has a
+/// controlling terminal, and whether its stdout is one, are both environmental
+/// facts a unit test cannot arrange for itself.
+///
+/// The case that matters is `(false, false)` — no `/dev/tty`, stdout a pipe.
+/// This used to write the sequence into that pipe and return 0, which is a
+/// silent no-op wearing a success exit code: an OSC sequence in a pipe has no
+/// terminal to interpret it, so nothing can ever come of it. That is exactly the
+/// failure this command's own module doc says it exists to prevent, and exactly
+/// the shape a Claude Code *subagent* hook runs in. Verified against the real
+/// binary: it printed `^[]777;notify;hook;finished^G` to the captured pipe,
+/// exited 0, and delivered nothing.
+///
+/// `Stdout` stays a real option rather than being dropped, because the
+/// fallback's stated purpose — "the interactive case where it is a tty anyway"
+/// — is genuine: a process can have stdout on a terminal without holding that
+/// terminal as its controlling one.
+pub fn choose_sink(tty_available: bool, stdout_is_terminal: bool) -> Sink {
+    if tty_available {
+        Sink::Tty
+    } else if stdout_is_terminal {
+        Sink::Stdout
+    } else {
+        Sink::Nowhere
+    }
+}
+
 pub fn run_notify(args: &[String]) -> i32 {
     let Some(title) = args.first() else {
         eprintln!("usage: deadlight notify <title> [body]");
@@ -42,20 +80,36 @@ pub fn run_notify(args: &[String]) -> i32 {
     };
     let body = args.get(1).map(String::as_str).unwrap_or("");
     let seq = notify_sequence(title, body);
-    if let Some(mut f) = tty() {
-        if f.write_all(seq.as_bytes()).is_ok() && f.flush().is_ok() {
-            return 0;
+
+    let mut tty_file = tty();
+    match choose_sink(tty_file.is_some(), std::io::stdout().is_terminal()) {
+        Sink::Tty => {
+            let f = tty_file.as_mut().expect("Tty implies the file opened");
+            if f.write_all(seq.as_bytes()).is_ok() && f.flush().is_ok() {
+                return 0;
+            }
+            eprintln!("deadlight notify: could not write to the controlling terminal");
+            1
+        }
+        Sink::Stdout => {
+            let mut out = std::io::stdout();
+            if out.write_all(seq.as_bytes()).is_ok() && out.flush().is_ok() {
+                return 0;
+            }
+            eprintln!("deadlight notify: could not write to stdout");
+            1
+        }
+        // Loud, not silent: a misconfigured hook that quietly did nothing would
+        // look exactly like a feature that does not work.
+        Sink::Nowhere => {
+            eprintln!(
+                "deadlight notify: no controlling terminal, and stdout is not one either — \
+                 nothing would read the sequence, so no notification was sent. \
+                 This is what a hook invoked without a terminal (e.g. a subagent) looks like."
+            );
+            1
         }
     }
-    // Fall back to stdout for the interactive case where it is a tty anyway.
-    let mut out = std::io::stdout();
-    if out.write_all(seq.as_bytes()).is_ok() && out.flush().is_ok() {
-        return 0;
-    }
-    // Loud, not silent: a misconfigured hook that quietly did nothing would
-    // look exactly like a feature that does not work.
-    eprintln!("deadlight notify: no controlling terminal and stdout unavailable");
-    1
 }
 
 #[cfg(test)]
@@ -121,5 +175,26 @@ mod tests {
     #[test]
     fn no_arguments_is_an_error_not_a_silent_success() {
         assert_ne!(run_notify(&[]), 0, "a hook with no title must fail loudly");
+    }
+
+    /// The whole delivery matrix. The `(false, false)` row is the regression:
+    /// with no controlling terminal and a piped stdout, this used to write the
+    /// sequence into the pipe and return 0 — a silent no-op reported as
+    /// success, in precisely the shape a Claude Code subagent hook runs in.
+    #[test]
+    fn a_sequence_nothing_can_read_is_never_treated_as_delivered() {
+        assert_eq!(choose_sink(true, true), Sink::Tty, "a controlling terminal always wins");
+        assert_eq!(choose_sink(true, false), Sink::Tty, "…including when stdout is a pipe");
+        assert_eq!(
+            choose_sink(false, true),
+            Sink::Stdout,
+            "no controlling terminal but stdout IS one: the fallback is genuine and must stay"
+        );
+        assert_eq!(
+            choose_sink(false, false),
+            Sink::Nowhere,
+            "no terminal anywhere: an OSC sequence written to a pipe can never be read, so this \
+             must not be reported as delivered"
+        );
     }
 }
