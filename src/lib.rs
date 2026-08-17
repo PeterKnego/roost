@@ -6,6 +6,7 @@ pub mod http;
 pub mod origin;
 pub mod projects;
 pub mod proto;
+pub mod registry;
 pub mod render;
 pub mod routes;
 pub mod session;
@@ -20,6 +21,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
+    // Sessions outlive deadlight, so the registry must be rebuilt from disk
+    // and live processes rather than assumed empty.
+    let report = registry::reconcile(&roots);
+    if report.dead_sockets > 0 || report.gone_projects > 0 {
+        eprintln!(
+            "deadlight: startup reap — {} dead sockets, {} sessions for missing projects",
+            report.dead_sockets, report.gone_projects
+        );
+    }
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let roots = roots.clone();
