@@ -71,6 +71,37 @@ main { flex: 1; min-height: 0; }
 .dl.hunk { color: var(--hunk); padding-top: 6px; }
 .dl.meta { color: var(--muted); }
 .markdown-body { max-width: 900px; margin: 0 auto; padding: 24px; }
+
+/* ---- terminal start placeholder: opening a project must never spawn a
+   shell on its own, so a Terminal tab shows this hint until the user
+   explicitly asks for a session (Enter or a click — see terminalPlaceholder
+   in app.js). Centered like .editor/.termhost fill their pane. ---- */
+.termstart { display:flex; flex-direction:column; align-items:center; justify-content:center;
+             height:100%; gap:8px; opacity:.75; cursor:pointer; text-align:center; }
+.termstart:focus { outline:1px solid var(--accent); opacity:1; }
+.termstart kbd { border:1px solid var(--border); border-radius:3px; padding:0 4px; }
+.termstart .initgit { font: inherit; padding: 4px 12px; border-radius: 6px; border: 1px solid var(--border);
+                       background: var(--bg2); color: var(--fg); cursor: pointer; }
+.termstart .initgit:hover { border-color: var(--accent); color: var(--accent); }
+.termstart .nogit { color: var(--muted); font-size: 12px; text-decoration: none; }
+.termstart .nogit:hover { color: var(--fg); text-decoration: underline; }
+
+/* ---- header project strip: ● live / ○ idle, current project underlined,
+   worktrees indented and labelled with their own branch under their repo
+   (see render::projects_strip). ---- */
+.projstrip { display:inline-flex; gap:8px; margin:0 8px; }
+.projstrip .proj { text-decoration:none; opacity:.6; white-space:nowrap; }
+.projstrip .proj.live { opacity:1; }
+.projstrip .proj.current { font-weight:600; text-decoration:underline; }
+.projstrip .proj.child { margin-left: 2px; }
+.projstrip .indent { color: var(--muted); }
+.projstrip .branch { color: var(--muted); font-size: 12px; }
+/* A worktree git reports but that isn't reachable under any configured
+   root (see `reachable` in render::projects_strip) deliberately carries no
+   href — it renders as plain text so the user still knows it exists, but
+   can't be clicked into. Style must make that non-interactivity visible,
+   not just implicit in the missing link. */
+.projstrip .proj.unreachable { opacity:.35; cursor:default; pointer-events:none; }
 /* ---- directory picker (index page) ---- */
 .crumbs { padding: 20px 24px 0; max-width: 700px; margin: 0 auto; width: 100%; color: var(--muted); font-family: ui-monospace, monospace; font-size: 13px; }
 .crumbs a { color: var(--accent); text-decoration: none; }
