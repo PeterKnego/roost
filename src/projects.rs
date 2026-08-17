@@ -106,7 +106,14 @@ pub fn resolve_project(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
     if RESERVED.contains(&segs[0]) {
         return None;
     }
-    if segs.iter().any(|s| s.is_empty() || s.starts_with('.')) {
+    if segs.iter().any(|s| s.is_empty()) {
+        return None;
+    }
+    // Dot segments stay forbidden — `.git`, `.venv`, `.config` are not
+    // projects — with one exception: git itself vouching for the path as a
+    // worktree. Confinement below is unchanged and still does the real work,
+    // because a cloned repo could name a worktree anywhere.
+    if segs.iter().any(|s| s.starts_with('.')) && !crate::worktree::is_vouched_worktree(roots, name) {
         return None;
     }
     for root in roots {
