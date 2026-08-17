@@ -22,30 +22,68 @@ pub struct ReapReport {
     pub gone_projects: usize,
 }
 
-/// Inverse of the storage-key encoding used by `wsstate` and `session`.
+/// Inverse of the storage-key encoding used by `wsstate` and `session`. Not
+/// `http::percent_decode` — see `projects::decode_storage_key`'s doc comment
+/// for why that general form-decoder is the wrong inverse for this specific
+/// encoding (it would mangle a project literally named `gtk+`).
 pub fn decode_key(key: &str) -> String {
-    crate::http::percent_decode(key)
+    crate::projects::decode_storage_key(key)
 }
 
 fn sock_root() -> PathBuf {
     crate::wsstate::state_dir().join("sock")
 }
 
-/// Pids of every live process whose command line contains this socket path.
-/// `pgrep -f` matches the full command line, which is where dtach carries
-/// its socket path. Returns an empty vec (not a panic) on any `pgrep`
-/// failure — including "no match", which `pgrep` reports as a nonzero exit.
-fn socket_pids(path: &std::path::Path) -> Vec<u32> {
-    let Ok(out) = std::process::Command::new("pgrep").arg("-f").arg(path.to_string_lossy().as_ref()).output()
-    else {
+/// One snapshot of every process's pid and its whitespace-split command-line
+/// arguments, taken with a single `ps` call. Passed around so that sweeping
+/// every socket under `sock/` to see which are still held costs one
+/// subprocess total, not one per socket. Deliberately not `pgrep -f`: that
+/// treats its pattern as an extended regex matched anywhere in the command
+/// line, which is wrong two different ways for a filesystem path — (1) a
+/// project name may contain regex metacharacters (`valid_project` allows
+/// them; only *session* names are restricted to `[A-Za-z0-9_-]`), which can
+/// make the "pattern" an invalid ERE and silently match nothing, so a live
+/// socket's process looks dead; and (2) unanchored substring matching means
+/// session `claude`'s socket path matches inside session `claude-2`'s
+/// command line too, so an actually-dead `claude` socket is never reaped
+/// once `claude-2` exists. Comparing a whitespace-split argument for exact
+/// string equality (see `pids_holding`) sidesteps both: no regex is ever
+/// built from untrusted text, and a path is either a component of the
+/// command line or it isn't.
+fn process_snapshot() -> Vec<(u32, Vec<String>)> {
+    let Ok(out) = std::process::Command::new("ps").args(["-Ao", "pid=,args="]).output() else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect()
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let pid: u32 = words.next()?.parse().ok()?;
+            Some((pid, words.map(str::to_string).collect()))
+        })
+        .collect()
 }
 
-/// True when some live process holds this socket path.
+/// Pids in `snapshot` whose command line has this socket path as one whole
+/// argument. `dtach` always carries the socket path as a single, whole
+/// argument (see `session::default_command`) — never embedded in a larger
+/// word — so an exact-equality match against one whitespace-split component
+/// is the right test, not a substring search over the raw line.
+fn pids_holding(snapshot: &[(u32, Vec<String>)], path: &std::path::Path) -> Vec<u32> {
+    let target = path.to_string_lossy();
+    snapshot
+        .iter()
+        .filter(|(_, args)| args.iter().any(|w| w == target.as_ref()))
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
+/// True when some live process holds this socket path right now. Takes its
+/// own fresh snapshot — used for one-off checks (tests, and re-polling after
+/// a kill to see whether it has taken effect yet), where the whole point is
+/// to observe current state rather than a sweep's frozen-in-time one.
 fn socket_has_process(path: &std::path::Path) -> bool {
-    !socket_pids(path).is_empty()
+    !pids_holding(&process_snapshot(), path).is_empty()
 }
 
 /// What to do with one socket file, given what's known about it. Kept as a
@@ -107,9 +145,31 @@ fn reap_decision(project_gone: bool, held_before: bool, held_after_kill_attempt:
 /// worse than the orphan accumulation this function exists to fix, so the
 /// socket is removed only once the pid(s) are confirmed dead; if a kill
 /// fails or a process survives, the socket is left in place on purpose.
+///
+/// "Cannot verify whether a project exists" must never be treated as
+/// "the project is gone": `resolve_project` returns `None` for every
+/// project alike when every root fails to canonicalize (a mount not up yet,
+/// a permissions problem, a `DEADLIGHT_ROOTS` typo, or just running on a
+/// host where the configured roots don't exist there). Without a guard, that
+/// transient condition would make this function SIGKILL every live session
+/// on the machine — strictly worse than doing nothing, for a tool whose
+/// whole premise is that sessions survive a restart. So the project-gone
+/// branch only ever runs once at least one root is confirmed reachable;
+/// otherwise every socket is left alone (dead-socket reaping, which needs no
+/// project information, still runs).
 pub fn reconcile(roots: &[PathBuf]) -> ReapReport {
     let mut report = ReapReport { dead_sockets: 0, gone_projects: 0 };
+    let roots_ok = !roots.is_empty() && roots.iter().any(|r| r.canonicalize().is_ok());
+    if !roots_ok {
+        eprintln!(
+            "deadlight: none of the configured roots could be read ({roots:?}) — \
+             reaping sessions for missing projects is suspended this pass"
+        );
+    }
     let Ok(rd) = std::fs::read_dir(sock_root()) else { return report };
+    // One process listing for the whole sweep (see process_snapshot's doc
+    // comment) rather than one `ps` per socket file.
+    let snapshot = process_snapshot();
     for entry in rd.flatten() {
         // Directory entry names under sock/ are storage keys (percent-encoded:
         // `karpie%2Fsrc`), not the raw project form. `session`'s functions
@@ -120,10 +180,10 @@ pub fn reconcile(roots: &[PathBuf]) -> ReapReport {
         // decoded, raw form) is what every `session::*` call below must use.
         let key = entry.file_name().to_string_lossy().into_owned();
         let url = decode_key(&key);
-        let project_gone = crate::projects::resolve_project(roots, &url).is_none();
+        let project_gone = roots_ok && crate::projects::resolve_project(roots, &url).is_none();
         let Ok(inner) = std::fs::read_dir(entry.path()) else { continue };
         for sock in inner.flatten() {
-            let pids = socket_pids(&sock.path());
+            let pids = pids_holding(&snapshot, &sock.path());
             let held_before = !pids.is_empty();
             let name = sock.file_name().to_string_lossy().into_owned();
 
@@ -217,8 +277,22 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
             // and the project shows idle while shells are actually running.
             let key = e.file_name().to_string_lossy().into_owned();
             let sessions = crate::session::list_sessions(&decode_key(&key));
-            let live = sessions.len();
-            let oldest = sessions.iter().map(|s| s.age_secs).max().unwrap_or(0);
+            // `reconcile` (just run, above) guarantees every socket file
+            // still here is process-backed: a socket with no process is
+            // reaped outright, and a live one for a since-deleted project is
+            // killed before its socket is removed. So right after a
+            // restart — when this process's in-memory session map is empty
+            // and `list_sessions` can only ever report 0 — the number of
+            // socket files under this key is a truthful floor for "how many
+            // are live", even though it can't yet supply real ages or
+            // attachment counts. Once something in this process actually
+            // attaches, the in-memory list becomes authoritative again.
+            let (live, oldest) = if !sessions.is_empty() {
+                (sessions.len(), sessions.iter().map(|s| s.age_secs).max().unwrap_or(0))
+            } else {
+                let floor = std::fs::read_dir(e.path()).map(|rd| rd.flatten().count()).unwrap_or(0);
+                (floor, 0)
+            };
             let slot = by_key.entry(key.clone()).or_insert(ProjectStatus {
                 key: key.clone(),
                 url: decode_key(&key),
@@ -253,6 +327,10 @@ mod tests {
         assert_eq!(decode_key("karpie"), "karpie");
         assert_eq!(decode_key("karpie%2Fsrc"), "karpie/src");
         assert_eq!(decode_key("a%2Fb%2Fc"), "a/b/c");
+        // Regression: http::percent_decode (a form decoder) would turn `+`
+        // into a space; decode_key must not, or a project literally named
+        // `gtk+` would look gone and have its live session killed.
+        assert_eq!(decode_key("gtk+"), "gtk+");
     }
 
     #[test]
@@ -317,37 +395,55 @@ mod tests {
         );
     }
 
+    /// Spawns `dtach -n <sock_path> sleep 30`: it creates the socket, forks a
+    /// detached session, and its own foreground process exits once that
+    /// setup is done — so `Command::status()` returning is itself the
+    /// synchronization point (no arbitrary sleep needed to wait for the
+    /// socket to appear), and no in-memory `session::SESSIONS` entry is ever
+    /// created, mirroring exactly what a session that outlived a previous
+    /// deadlight process leaves behind. Returns `None` (rather than
+    /// panicking) if `dtach` genuinely isn't installed, since its own setup
+    /// step could not have succeeded either. `dtach` is a hard runtime
+    /// prerequisite of this project (see README.md, docs/deploy.md), so this
+    /// isn't introducing a new kind of test dependency.
+    fn spawn_detached_dtach(sock_path: &std::path::Path) -> Option<()> {
+        let status = std::process::Command::new("dtach")
+            .args(["-n", sock_path.to_str().unwrap(), "sleep", "30"])
+            .status()
+            .ok()?;
+        if !status.success() {
+            return None;
+        }
+        Some(())
+    }
+
     // Regression for the startup case: a session that outlived a previous
     // deadlight process has no entry in `session`'s in-memory map, so
     // `session::kill_project` alone is a no-op. Uses a real `dtach` process
-    // (a runtime prerequisite of this project, see README/docs/deploy.md) so
-    // this actually proves the OS-level pid is killed, not just forgotten
-    // about by having its socket file deleted out from under it.
+    // so this actually proves the OS-level pid is killed, not just forgotten
+    // about by having its socket file deleted out from under it. Roots point
+    // at a real, existing directory that genuinely does not contain
+    // "ghost-proj" — not a nonexistent path — so `project_gone` becomes true
+    // for the right reason (the project really isn't there) rather than by
+    // accident of the C3 "roots unverifiable" guard also forcing it false.
     #[test]
     fn a_live_session_for_a_deleted_project_is_actually_killed_not_just_forgotten() {
         with_state(|state| {
             let sock_dir = state.join("sock/ghost-proj");
             fs::create_dir_all(&sock_dir).unwrap();
             let sock_path = sock_dir.join("shell");
+            let root = tempfile::tempdir().unwrap(); // exists, but has no "ghost-proj" child
 
-            // `dtach -n` creates the socket, forks a detached session running
-            // `sleep 30`, and its own foreground process exits once that
-            // setup is done — no in-memory `session::SESSIONS` entry is ever
-            // created, mirroring exactly what a restart leaves behind.
-            let status = std::process::Command::new("dtach")
-                .args(["-n", sock_path.to_str().unwrap(), "sleep", "30"])
-                .status();
-            let Ok(status) = status else {
+            if spawn_detached_dtach(&sock_path).is_none() {
                 eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
                 return;
-            };
-            assert!(status.success(), "dtach -n setup must succeed for this test to mean anything");
+            }
             assert!(
                 socket_has_process(&sock_path),
-                "test setup: the detached process must be observable via pgrep before reconcile runs"
+                "test setup: the detached process must be observable before reconcile runs"
             );
 
-            let report = reconcile(&[PathBuf::from("/nonexistent-root")]);
+            let report = reconcile(&[root.path().to_path_buf()]);
 
             assert_eq!(report.gone_projects, 1, "the gone-project session must be counted as reaped");
             assert!(
@@ -355,6 +451,111 @@ mod tests {
                 "the dtach process itself must be killed, not merely forgotten by deleting its socket"
             );
             assert!(!sock_path.exists(), "the socket must be removed only once the process is confirmed gone");
+        });
+    }
+
+    // I5: the end-to-end guard the review asked for. Without this, a future
+    // change to the project_gone condition could start deleting live
+    // sockets for projects that still exist with every other test green.
+    #[test]
+    fn a_live_session_for_a_project_that_still_exists_is_never_touched() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join("still-here")).unwrap();
+            let sock_dir = state.join("sock/still-here");
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+
+            if spawn_detached_dtach(&sock_path).is_none() {
+                eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
+                return;
+            }
+            assert!(socket_has_process(&sock_path), "test setup: process must be observable");
+
+            let report = reconcile(&[root.path().to_path_buf()]);
+
+            assert_eq!(report.gone_projects, 0, "the project still exists; nothing should be reaped");
+            assert!(sock_path.exists(), "the socket of a live session for an existing project must survive");
+            assert!(
+                socket_has_process(&sock_path),
+                "the process itself must survive — the project was never gone"
+            );
+
+            // Clean up: this process was never in any in-memory map, so
+            // nothing else will ever end it.
+            for pid in pids_holding(&process_snapshot(), &sock_path) {
+                let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            }
+        });
+    }
+
+    // C3: a root that cannot be verified must never be mistaken for "the
+    // project is gone". Without this guard, a transiently unreadable mount
+    // or a DEADLIGHT_ROOTS typo would make startup reconcile SIGKILL every
+    // live session on the machine.
+    #[test]
+    fn unreadable_roots_suspend_gone_project_reaping_but_dead_sockets_still_reap() {
+        with_state(|state| {
+            let sock_dir = state.join("sock/whatever-proj");
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+
+            if spawn_detached_dtach(&sock_path).is_none() {
+                eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
+                return;
+            }
+
+            // Every root fails to canonicalize: roots_ok must be false.
+            let report = reconcile(&[PathBuf::from("/nonexistent-root-a"), PathBuf::from("/nonexistent-root-b")]);
+
+            assert_eq!(report.gone_projects, 0, "must not reap anything when roots can't be verified");
+            assert!(sock_path.exists(), "a live session must survive when its project can't be checked");
+            assert!(socket_has_process(&sock_path), "the process itself must survive");
+
+            for pid in pids_holding(&process_snapshot(), &sock_path) {
+                let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            }
+
+            // Dead-socket reaping needs no project information at all, and
+            // must still work even while gone-project reaping is suspended.
+            let dead = state.join("sock/other-proj");
+            fs::create_dir_all(&dead).unwrap();
+            fs::write(dead.join("shell"), "").unwrap();
+            let report2 = reconcile(&[PathBuf::from("/nonexistent-root-a")]);
+            assert!(report2.dead_sockets >= 1, "a socket with no process must still be reaped");
+        });
+    }
+
+    // I4: after a restart, `session::list_sessions` can only ever report 0
+    // (its map is in-memory and starts empty), but `reconcile` guarantees
+    // every socket file left standing is process-backed — so `live` must
+    // reflect that floor rather than falsely reporting an active project as
+    // idle, which is exactly the invisibility this whole module exists to
+    // remove.
+    #[test]
+    fn known_projects_reports_a_live_floor_from_socket_files_when_the_in_memory_map_is_empty() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join("survivor")).unwrap();
+            let sock_dir = state.join("sock/survivor");
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+
+            if spawn_detached_dtach(&sock_path).is_none() {
+                eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
+                return;
+            }
+
+            let ps = known_projects(&[root.path().to_path_buf()]);
+            let p = ps.iter().find(|p| p.key == "survivor").expect("survivor must be listed");
+            assert_eq!(
+                p.live, 1,
+                "a process-backed socket with no in-memory record must still count as live, not idle"
+            );
+
+            for pid in pids_holding(&process_snapshot(), &sock_path) {
+                let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            }
         });
     }
 }

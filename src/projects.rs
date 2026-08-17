@@ -132,6 +132,27 @@ pub fn storage_key(name: &str) -> String {
     out
 }
 
+/// The true inverse of `storage_key`: `karpie%2Fsrc` decodes back to
+/// `karpie/src`. Deliberately not `http::percent_decode` — that is a general
+/// *form* decoder (it also turns `+` into a space, among other rules meant
+/// for URL query strings), which is the wrong inverse here: a project
+/// literally named `gtk+` has storage key `gtk+` (storage_key never touches
+/// `+`), and `percent_decode("gtk+")` would wrongly turn it into `"gtk "`,
+/// making a live project look like it no longer exists.
+///
+/// `storage_key` only ever emits the two literal sequences `%2F` and `%25`,
+/// and — because every `%` in its output is the head of one of those two
+/// fixed-length blocks, never a lone literal `%` — those sequences can never
+/// appear by coincidence at a different offset. So a plain, unconditional
+/// `replace` of each correctly reverses it, *provided* `%2F` is replaced
+/// before `%25`: reversing that order would misdecode a project literally
+/// named `a%2Fb` (storage key `a%252Fb`) as `a/b` instead of back to
+/// `a%2Fb`, because the first pass would turn its `%25` into `%`, creating a
+/// new, spurious `%2F` for the second pass to wrongly consume.
+pub fn decode_storage_key(key: &str) -> String {
+    key.replace("%2F", "/").replace("%25", "%")
+}
+
 /// One row in the directory picker (see `render::index_page`): either a
 /// browsable/openable directory or a greyed-out, unselectable file.
 pub struct Entry {
@@ -399,6 +420,23 @@ mod tests {
         assert_ne!(storage_key("a%2Fb"), storage_key("a/b"), "must not collide");
         // distinct inputs must never encode to the same key
         assert_ne!(storage_key("karpie/src"), storage_key("karpie-src"));
+    }
+
+    #[test]
+    fn decode_storage_key_is_a_true_inverse_of_storage_key() {
+        // `gtk+` is the regression case: http::percent_decode (a form
+        // decoder) would turn a literal `+` into a space, making a real
+        // project named `gtk+` decode to `"gtk "` and look like it no
+        // longer exists. decode_storage_key must leave `+` alone.
+        for name in ["karpie", "a/b", "a%2Fb", "gtk+", "karpie/src"] {
+            assert_eq!(decode_storage_key(&storage_key(name)), name, "round trip broke for {name:?}");
+        }
+        assert_ne!(
+            crate::http::percent_decode("gtk+"),
+            "gtk+",
+            "percent_decode is a form decoder and is NOT storage_key's inverse — that's the bug this guards"
+        );
+        assert_eq!(decode_storage_key("gtk+"), "gtk+");
     }
 
     #[test]
