@@ -134,6 +134,15 @@ function onEvent(ev) {
       render();
       document.body.dispatchEvent(new Event("refresh")); // strip marker -> ○
       break;
+    case "Notice": onNotice(ev.notice); break;
+    case "Notices":
+      notices = ev.list;
+      // The tab-strip dot (hasAttention) is derived straight from `notices`
+      // on every render — nothing to reconcile here, unlike a separately
+      // maintained set that could drift from what the server just said.
+      renderNotices();
+      render();
+      break;
     case "Error":
       // Every server-side failure funnels through here (already-exists,
       // directory-not-empty, path-outside-project, too-many-buffers,
@@ -195,13 +204,20 @@ function render() {
     pane.tabs.forEach((t, ti) => {
       if (t.k === "Terminal") liveSessions.add(t.session);
       const b = document.createElement("span");
-      b.className = "tab" + (ti === pane.active ? " active" : "");
+      b.className =
+        "tab" +
+        (ti === pane.active ? " active" : "") +
+        (t.k === "Terminal" && hasAttention(t.session) ? " attn" : "");
       const meta = t.k === "File" ? state.buffers.find((x) => x.rel === t.rel) : null;
       b.innerHTML =
         (meta && meta.dirty ? '<span class="dirty">●</span> ' : "") +
         (meta && meta.stale ? '<span class="stale">⚠</span> ' : "") +
         escapeHtml(tabLabel(t));
-      b.onclick = () => send({ t: "ActivateTab", pane: pi, idx: ti });
+      // Terminal tabs route through focusSession, not a bare ActivateTab, so
+      // the obvious gesture of clicking a dotted tab is what clears its dot
+      // — see hasAttention/focusSession below.
+      b.onclick = () =>
+        t.k === "Terminal" ? focusSession(t.session) : send({ t: "ActivateTab", pane: pi, idx: ti });
       if (t.k === "File") {
         const e = document.createElement("span");
         e.className = "x";
@@ -707,4 +723,217 @@ if (closeBtn) closeBtn.onclick = () => {
   if (confirm(msg + "\nEnd sessions?")) send({ t: "CloseProject" });
 };
 
+const bell = document.getElementById("bell");
+if (bell) {
+  bell.onclick = () => {
+    const p = document.getElementById("noticepanel");
+    p.hidden = !p.hidden;
+    renderNotices();
+  };
+}
+setFavicon(false);
+
+// A notification click can land on a cold load; consume the fragment once and
+// clear it so a later reload does not re-focus.
+if (location.hash.startsWith("#session=")) {
+  const want = decodeURIComponent(location.hash.slice("#session=".length));
+  history.replaceState(null, "", location.pathname);
+  // Bounded: if the socket never connects there is nothing to focus, and an
+  // uncapped poll would spin for the life of the page.
+  let tries = 0;
+  const tryFocus = () => {
+    if (state) focusSession(want);
+    else if (++tries < 50) setTimeout(tryFocus, 100);
+  };
+  tryFocus();
+}
+
 connectControl();
+
+// ---- notifications ----------------------------------------------------
+// Notices are machine-wide, so this list spans projects; only the tab dot
+// below is scoped to what is on screen.
+let notices = [];
+let swReg = null;
+const baseTitle = document.title;
+
+// A secure context is required for both service workers and the Notification
+// API. localhost and `tailscale serve` HTTPS qualify; plain http:// to a
+// tailnet IP does not — there the panel still works and OS notifications
+// simply are not offered.
+const canNotify = () => window.isSecureContext && "Notification" in window;
+
+if (canNotify() && "serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").then(
+    (r) => { swReg = r; },
+    (e) => console.warn("deadlight: service worker registration failed", e)
+  );
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    if (e.data && e.data.kind === "focus") focusSession(e.data.session);
+  });
+}
+
+function unread() { return notices.filter((n) => !n.read).length; }
+
+function renderNotices() {
+  const n = unread();
+  const count = document.getElementById("bellcount");
+  if (count) count.textContent = n ? String(n) : "";
+  // The only cue that works from a background tab with no permission granted.
+  document.title = n ? `(${n}) ${baseTitle}` : baseTitle;
+  setFavicon(n > 0);
+
+  const panel = document.getElementById("noticepanel");
+  if (!panel || panel.hidden) return;
+  panel.replaceChildren();
+  if (!notices.length) {
+    const empty = document.createElement("div");
+    empty.className = "notice-empty";
+    empty.textContent = "no notifications";
+    panel.appendChild(empty);
+  }
+  for (const x of [...notices].reverse()) {
+    const row = document.createElement("div");
+    row.className = "notice" + (x.read ? " read" : "");
+    const who = document.createElement("span");
+    who.className = "notice-who";
+    // Attribution is server truth; the message text is not. Both go in as
+    // textContent regardless.
+    who.textContent = `${x.project} · ${x.session}`;
+    const title = document.createElement("span");
+    title.className = "notice-title";
+    title.textContent = x.title;
+    const body = document.createElement("span");
+    body.className = "notice-body";
+    body.textContent = x.body;
+    const when = document.createElement("span");
+    when.className = "notice-when";
+    when.textContent = ago(x.at);
+    row.append(who, title, body, when);
+    row.onclick = () => openNotice(x);
+    panel.appendChild(row);
+  }
+  const foot = document.createElement("div");
+  foot.className = "notice-foot";
+  const markAll = document.createElement("button");
+  markAll.textContent = "Mark all read";
+  markAll.onclick = (e) => { e.stopPropagation(); send({ t: "MarkAllNoticesRead" }); };
+  foot.appendChild(markAll);
+  const clear = document.createElement("button");
+  clear.textContent = "Clear";
+  clear.onclick = (e) => { e.stopPropagation(); send({ t: "ClearNotices" }); };
+  foot.appendChild(clear);
+  if (canNotify() && Notification.permission === "denied") {
+    // Browsers never re-prompt after an explicit denial, so offering the
+    // same "Enable" button here would be a silent no-op on click — the spec
+    // requires saying which of the two situations (denied vs. no secure
+    // context) this is, not failing silently either way.
+    const s = document.createElement("span");
+    s.textContent = "OS notifications are blocked for this site — re-enable them in your browser's site settings";
+    foot.appendChild(s);
+  } else if (canNotify() && Notification.permission !== "granted") {
+    const b = document.createElement("button");
+    b.textContent = "Enable OS notifications";
+    // Requested from a click, never on load: browsers penalise spontaneous
+    // permission prompts, and an unprompted one is worse than none.
+    b.onclick = (e) => { e.stopPropagation(); Notification.requestPermission().then(renderNotices); };
+    foot.appendChild(b);
+  } else if (!canNotify()) {
+    const s = document.createElement("span");
+    s.textContent = "OS notifications need a secure context (https or localhost)";
+    foot.appendChild(s);
+  }
+  panel.appendChild(foot);
+}
+
+function ago(secs) {
+  const d = Math.max(0, Math.floor(Date.now() / 1000) - secs);
+  if (d < 60) return `${d}s`;
+  if (d < 3600) return `${Math.floor(d / 60)}m`;
+  if (d < 86400) return `${Math.floor(d / 3600)}h`;
+  return `${Math.floor(d / 86400)}d`;
+}
+
+// A badged favicon, drawn rather than shipped as a second asset so it follows
+// whatever the page's icon already is.
+function setFavicon(badged) {
+  let link = document.querySelector("link#dlfav");
+  if (!link) {
+    link = document.createElement("link");
+    link.id = "dlfav";
+    link.rel = "icon";
+    document.head.appendChild(link);
+  }
+  const svg = badged
+    ? `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><text y="13" font-size="13">◆</text><circle cx="12.5" cy="3.5" r="3.5" fill="#e5534b"/></svg>`
+    : `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><text y="13" font-size="13">◆</text></svg>`;
+  link.href = "data:image/svg+xml," + encodeURIComponent(svg);
+}
+
+// Mirrors http::percent_encode on the Rust side: encode each segment but keep
+// the `/` separators, because a project may be a nested rel path like
+// `karpie/src` whose slashes are structural. Encoding the whole string breaks
+// nested projects; encoding none of it breaks any project whose directory name
+// contains a URL-significant character — a directory called `foo#bar` would
+// send the browser to `/foo` with the rest swallowed as a fragment.
+const projectPath = (p) => p.split("/").map(encodeURIComponent).join("/");
+
+function openNotice(x) {
+  if (!x.read) send({ t: "MarkNoticeRead", id: x.id });
+  if (x.project !== PROJECT) {
+    location.href = `/${projectPath(x.project)}#session=${encodeURIComponent(x.session)}`;
+    return;
+  }
+  focusSession(x.session);
+}
+
+// Marks every unread notice for one session read. Used wherever a route
+// lands on a session — a tab-strip click, an in-page notice click, an OS
+// notification click (the SW's "focus" message), or a cold #session= load —
+// so "cleared when that tab becomes active" (the spec's words for the dot)
+// holds no matter which of those gestures got you there. Always scoped to
+// PROJECT: the SW only posts "focus" to a window already on that project,
+// and the cold-load path is by definition this page's own project.
+function markSessionNoticesRead(session) {
+  for (const n of notices) {
+    if (!n.read && n.project === PROJECT && n.session === session) send({ t: "MarkNoticeRead", id: n.id });
+  }
+}
+
+// Activate the terminal tab for `session`, opening it if it is not on screen.
+// Both paths are ordinary intents, so every connected client follows.
+function focusSession(session) {
+  if (!session || !SESSION_RE.test(session) || !state) return;
+  markSessionNoticesRead(session);
+  for (let pi = 0; pi < state.panes.length; pi++) {
+    const ti = state.panes[pi].tabs.findIndex((t) => t.k === "Terminal" && t.session === session);
+    if (ti >= 0) {
+      send({ t: "ActivateTab", pane: pi, idx: ti });
+      return;
+    }
+  }
+  send({ t: "OpenTab", pane: 3, tab: { k: "Terminal", session } });
+}
+
+// The tab-strip dot for a session in THIS project: derived from `notices`
+// rather than maintained as a separate set, so it can never drift from the
+// server's read state in either direction (a dot that never lights because
+// nothing ever adds to a separate set, or one that never clears because
+// nothing ever removes from it — both were real bugs here). A session in
+// another project has no tab here; that is what the bell badge is for.
+function hasAttention(session) {
+  return notices.some((n) => n.project === PROJECT && n.session === session && !n.read);
+}
+
+function onNotice(n) {
+  notices.push(n);
+  if (canNotify() && Notification.permission === "granted") {
+    if (swReg) swReg.active && swReg.active.postMessage({ kind: "notify", notice: n });
+    // Fallback when there's no service worker: same attribution rule as
+    // sw.js — project/session (server truth) in the title, payload text in
+    // the body — so a hostile payload cannot forge another project's banner.
+    else new Notification(`${n.project} · ${n.session}`, { body: `${n.title} — ${n.body}`, tag: `${n.project}/${n.session}` });
+  }
+  renderNotices();
+  render();
+}

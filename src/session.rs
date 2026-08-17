@@ -191,6 +191,13 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         cb.args(&cmd[1..]);
         cb.cwd(dir);
         cb.env("TERM", "xterm-256color");
+        // How a process in this terminal — Claude, mainly — discovers that it
+        // can raise a notification at all, and what to attribute it to. A
+        // model can answer "can I notify?" from its own environment rather
+        // than having to be told in a prompt.
+        cb.env("DEADLIGHT_NOTIFY", "1");
+        cb.env("DEADLIGHT_PROJECT", project);
+        cb.env("DEADLIGHT_SESSION", name);
         let child = pair.slave.spawn_command(cb).map_err(|e| e.to_string())?;
         // Best-effort: some platforms/backends can decline to report a pid.
         // 0 degrades list_sessions' age lookup to "unknown" rather than
@@ -213,22 +220,39 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
             },
         );
         let pump_key = key.clone();
+        let pump_project = project.to_string();
+        let pump_session = name.to_string();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
+            // Parser state lives here, not on `Session`: scanning then needs
+            // no lock at all, and a sequence split across two reads still
+            // parses.
+            let mut osc = crate::osc::Parser::new();
             loop {
                 // The blocking read happens with the lock released: only the
                 // fan-out after a chunk arrives needs the registry.
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
-                        let Some(s) = map.get_mut(&pump_key) else { break };
-                        push_scrollback(&mut s.scrollback, &buf[..n]);
-                        let chunk = buf[..n].to_vec();
-                        // try_send, not send: a subscriber whose queue is full
-                        // (frozen tab, dead socket) is dropped rather than
-                        // backing up the whole fan-out (I4).
-                        s.subs.retain(|_, tx| tx.try_send(chunk.clone()).is_ok());
+                        // Scanned before the lock is taken (pure CPU), and
+                        // published after it is dropped: `publish` locks the
+                        // hub registry, and holding the session registry
+                        // across that would invert a lock order and risk the
+                        // deadlock this project has already shipped once.
+                        let notices = osc.feed(&buf[..n]);
+                        {
+                            let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+                            let Some(s) = map.get_mut(&pump_key) else { break };
+                            push_scrollback(&mut s.scrollback, &buf[..n]);
+                            let chunk = buf[..n].to_vec();
+                            // try_send, not send: a subscriber whose queue is
+                            // full (frozen tab, dead socket) is dropped rather
+                            // than backing up the whole fan-out (I4).
+                            s.subs.retain(|_, tx| tx.try_send(chunk.clone()).is_ok());
+                        }
+                        for p in notices {
+                            crate::hub::publish(&pump_project, &pump_session, p);
+                        }
                     }
                 }
             }
