@@ -32,6 +32,17 @@ pub struct Hub {
     /// running a close synchronously, matching their assumption that the
     /// broadcast messages are ready immediately after `handle()` returns.
     self_ref: std::sync::Weak<Mutex<Hub>>,
+    /// Set under the hub lock before `do_close_project` spawns its
+    /// session-killing thread, cleared by that thread once it re-locks to
+    /// broadcast. Without this, the window between spawning and re-locking
+    /// is unguarded: `StartTerminal` would create a fresh session while the
+    /// close is still killing the project's *old* ones, and
+    /// `kill_and_unlink` would then find and SIGKILL that brand-new
+    /// session's master too — the terminal the user just started dies and
+    /// is reported as already closed. It also collapses a rapid double
+    /// `CloseProject` into the first attempt rather than spawning a second,
+    /// redundant thread whose `ended: 0` would overwrite the true count.
+    closing: bool,
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<Hub>>>>> = OnceLock::new();
@@ -51,6 +62,7 @@ impl Hub {
             self_writes: HashMap::new(),
             watching: false,
             self_ref: std::sync::Weak::new(),
+            closing: false,
         };
         // A freshly loaded hub must report reality, not whatever the
         // persisted layout happened to say last time: sessions may have
@@ -531,6 +543,19 @@ impl Hub {
             let ev = Event::Error { msg: format!("invalid session name: {session}") };
             return self.send_to(from, &ev);
         }
+        // I4: a close in flight is killing every one of this project's
+        // sessions on a background thread. Starting a new one now would
+        // race it — the browser's own follow-up connect to
+        // `/ws/{project}/term/{session}` (term.rs, not this intent) is what
+        // actually spawns the PTY, and if that lands while `kill_project`
+        // is still running, `kill_and_unlink` can find and SIGKILL the
+        // *new* session's master too: the terminal the user just started
+        // dies and is reported as already closed. Refusing the intent here
+        // stops the browser from ever issuing that connect.
+        if self.closing {
+            let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
+            return self.send_to(from, &ev);
+        }
         // `live_names`, not `list_sessions` — see refresh_live_sessions's
         // comment; the cap check needs only a count, not per-session `ps` ages.
         let live = crate::session::live_names(&self.project).len();
@@ -595,6 +620,23 @@ impl Hub {
     /// messages immediately after `handle()` returns, so that path falls
     /// back to running the close synchronously, preserving that assumption
     /// exactly rather than turning dozens of unrelated tests into pollers.
+    ///
+    /// `closing` (I4) is set here, under the lock, before the thread is
+    /// even spawned — not inside it — so the window in which a fresh
+    /// `StartTerminal` could race the kill is closed from the very start of
+    /// this call, and a second `CloseProject` arriving before the first
+    /// finishes is a no-op rather than a redundant second kill pass whose
+    /// `ended: 0` would overwrite the true count. Cleared only once the
+    /// thread re-locks to broadcast (or, on the synchronous fallback,
+    /// implicitly — it never gets set in the first place).
+    ///
+    /// Broadcasts an empty origin (`snapshot_event(&String::new())`), like
+    /// every other broadcast in this file (`do_init_git`, `do_start_terminal`,
+    /// `term.rs`) — *not* `from`: this `State` now arrives asynchronously,
+    /// after `handle` has already returned, so a later `RequestState` could
+    /// otherwise mistake it for the answer to its own request (see
+    /// `tests/integration.rs`'s `fresh_state` doc comment, which already
+    /// documents this as the invariant).
     fn do_close_project(&mut self, from: &ConnId) {
         let dirty: Vec<String> =
             self.ws.buffers.iter().filter(|(_, b)| b.dirty).map(|(r, _)| r.clone()).collect();
@@ -602,39 +644,66 @@ impl Hub {
             let ev = Event::CloseRefused { dirty };
             return self.send_to(from, &ev);
         }
+        if self.closing {
+            return;
+        }
         let project = self.project.clone();
-        let from = from.clone();
         match self.self_ref.upgrade() {
             Some(hub_arc) => {
-                std::thread::spawn(move || {
-                    // No panic may escape a socket thread. One here (from
-                    // anything session::kill_project calls) must not strand
-                    // ProjectClosed/State unsent forever with the hub lock
-                    // never reacquired — that would leave the UI showing a
-                    // close that silently never finished.
-                    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::session::kill_project(&project)
-                    }))
-                    .unwrap_or_else(|_| {
-                        eprintln!(
-                            "deadlight: kill_project panicked while closing {project}; reporting 0 ended"
-                        );
-                        0
-                    });
-                    let mut h = Hub::lock(&hub_arc);
-                    h.ws.version += 1;
-                    h.broadcast(&Event::ProjectClosed { ended });
-                    h.refresh_live_sessions();
-                    let snap = h.snapshot_event(&from);
-                    h.broadcast(&snap);
-                });
+                self.closing = true;
+                // I3: thread creation itself can fail (fork/EAGAIN — the
+                // same process-table pressure C1 already contemplates), and
+                // a panic from that would escape `handle` through
+                // `wsconn::handle`, which has no `catch_unwind` — killing
+                // the browser's workspace socket mid-session. `Builder::spawn`
+                // returns a `Result` instead of panicking, so a failure here
+                // is just an `Err` to handle, not a crash to survive.
+                // Cloned rather than moved into the closure below: `Err`
+                // from `spawn` means the closure — and whatever it
+                // captured — was never run, but it was still consumed by
+                // the `spawn` call itself, so the error path below needs
+                // its own owned copy to log which project failed to close.
+                let thread_project = project.clone();
+                let spawned = std::thread::Builder::new().name("close-project".into()).spawn(
+                    move || {
+                        // No panic may escape a socket thread. One here
+                        // (from anything session::kill_project calls) must
+                        // not strand ProjectClosed/State unsent forever
+                        // with the hub lock never reacquired and `closing`
+                        // stuck true — that would leave the UI showing a
+                        // close that silently never finished, and refuse
+                        // every later StartTerminal/CloseProject forever.
+                        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            crate::session::kill_project(&thread_project)
+                        }))
+                        .unwrap_or_else(|_| {
+                            eprintln!(
+                                "deadlight: kill_project panicked while closing {thread_project}; reporting 0 ended"
+                            );
+                            0
+                        });
+                        let mut h = Hub::lock(&hub_arc);
+                        h.closing = false;
+                        h.ws.version += 1;
+                        h.broadcast(&Event::ProjectClosed { ended });
+                        h.refresh_live_sessions();
+                        let snap = h.snapshot_event(&String::new());
+                        h.broadcast(&snap);
+                    },
+                );
+                if let Err(e) = spawned {
+                    self.closing = false;
+                    eprintln!("deadlight: could not spawn close-project thread for {project}: {e}");
+                    let ev = Event::Error { msg: "could not close the project; try again".into() };
+                    self.send_to(from, &ev);
+                }
             }
             None => {
                 let ended = crate::session::kill_project(&project);
                 self.ws.version += 1;
                 self.broadcast(&Event::ProjectClosed { ended });
                 self.refresh_live_sessions();
-                let snap = self.snapshot_event(&from);
+                let snap = self.snapshot_event(&String::new());
                 self.broadcast(&snap);
             }
         }
@@ -1177,6 +1246,53 @@ mod tests {
             elapsed < std::time::Duration::from_millis(50),
             "handle(CloseProject) must return promptly rather than kill sessions inline \
              under the hub lock — took {elapsed:?}"
+        );
+
+        std::env::remove_var("DEADLIGHT_STATE_DIR");
+    }
+
+    // I4: without a guard, the window between do_close_project spawning its
+    // kill thread and that thread finishing is unprotected — a
+    // StartTerminal landing in it would let the browser's follow-up connect
+    // to /ws/{project}/term/{session} (term.rs) spawn a brand-new session
+    // while kill_project is still tearing down the old ones, and
+    // kill_and_unlink would then find and SIGKILL that new session's master
+    // too. Reliable without polling or sleeping: handle(CloseProject)
+    // itself returns in well under 1ms (see close_project_returns_promptly,
+    // above — it only spawns a thread), while the real kill it kicks off
+    // takes on the order of 100ms (real ps/kill subprocess spawns), so the
+    // very next `handle` call on the same thread is certain to land while
+    // `closing` is still true.
+    #[test]
+    fn start_terminal_is_refused_while_a_close_is_in_flight() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("DEADLIGHT_CMD"); // real dtach: needs a kill that takes real wall time
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let hub = Hub::for_project("closeinflight", project_dir.path().to_path_buf());
+        let (c, rx) = Hub::lock(&hub).subscribe();
+
+        let Ok(_att) = crate::session::attach("closeinflight", "shell", project_dir.path()) else {
+            eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
+            std::env::remove_var("DEADLIGHT_STATE_DIR");
+            return;
+        };
+        while rx.try_recv().is_ok() {}
+
+        Hub::lock(&hub).handle(&c, Intent::CloseProject);
+        Hub::lock(&hub).handle(&c, Intent::StartTerminal { session: "fresh".into() });
+
+        let msgs: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("closing")),
+            "StartTerminal must be refused while a close is in flight; got: {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains(r#""t":"TerminalStarted""#)),
+            "a refused StartTerminal must not also announce the tab as started; got: {msgs:?}"
         );
 
         std::env::remove_var("DEADLIGHT_STATE_DIR");

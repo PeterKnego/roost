@@ -992,9 +992,19 @@ fn close_project_ends_sessions_and_isolates_other_projects() {
 /// a real process is or isn't there.
 fn any_process_holds(path: &std::path::Path) -> bool {
     let target = path.to_string_lossy();
-    let Ok(out) = std::process::Command::new("ps").args(["-Ao", "args="]).output() else {
-        return false;
-    };
+    let out = std::process::Command::new("ps")
+        .args(["-Ao", "args="])
+        .output()
+        .expect("ps must be runnable for this check to mean anything");
+    // C1's exact shape, inside the test that guards C1: treating a failed
+    // or empty `ps` as `false` ("nothing holds it") would let the central
+    // `assert!(!any_process_holds(&sock))` pass vacuously on a broken `ps`,
+    // proving nothing. Panic instead — a test that can't verify what it's
+    // asserting must not report a pass.
+    assert!(
+        out.status.success() && !out.stdout.is_empty(),
+        "ps failed or returned nothing; this test cannot trust its own assertions right now"
+    );
     String::from_utf8_lossy(&out.stdout).lines().any(|l| l.contains(target.as_ref()))
 }
 

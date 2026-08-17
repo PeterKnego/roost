@@ -239,8 +239,81 @@ fn kill_and_unlink_with(sock_path: &std::path::Path, snapshot_fn: SnapshotFn) ->
     true
 }
 
+/// The only public entry point for `kill_and_unlink_with`'s logic — see its
+/// doc comment for the full contract. Used by `reconcile`'s project-gone
+/// branch and by `session::kill_project` (an explicit "Close Project" from
+/// the UI), so both end a session's `dtach` master, not merely the
+/// in-process client, through one shared, confirm-before-unlink
+/// implementation.
 pub fn kill_and_unlink(sock_path: &std::path::Path) -> bool {
     kill_and_unlink_with(sock_path, &process_snapshot)
+}
+
+fn origin_marker_path(key_dir: &std::path::Path) -> PathBuf {
+    key_dir.join(".origin")
+}
+
+/// Records the resolved absolute directory a project maps to, so a *later*
+/// check for "is this project gone" can consult this exact path directly —
+/// independent of whatever `DEADLIGHT_ROOTS` the process performing that
+/// later check happens to be configured with. See `confirmed_gone`'s doc
+/// comment for why that independence matters.
+///
+/// Called by `session::attach` (the moment a session's socket directory is
+/// created — its caller has already resolved `dir`) and by `reconcile`
+/// itself (to keep the marker fresh on every pass that reconfirms the same
+/// resolution). Best-effort: a write failure here just means a later pass
+/// falls back to "no marker, never reap" — the safe direction to fail in.
+pub fn record_origin(project: &str, dir: &std::path::Path) {
+    let key_dir = sock_root().join(crate::projects::storage_key(project));
+    let _ = std::fs::create_dir_all(&key_dir);
+    let _ = std::fs::write(origin_marker_path(&key_dir), dir.to_string_lossy().as_bytes());
+}
+
+/// True only when a project is *confirmed* to have existed before — a
+/// `.origin` marker recording its resolved absolute directory was written
+/// by `record_origin` — and that exact recorded path no longer exists.
+///
+/// Deliberately not "resolve_project(roots, url).is_none()" alone: that
+/// conflates two situations that look identical from inside a single
+/// `reconcile` call — "the directory was deleted" and "the directory
+/// exists, just not under the roots *this particular process* happens to
+/// be configured with". Two deadlight processes — or the same one,
+/// restarted with a different `DEADLIGHT_ROOTS` — can share one
+/// `DEADLIGHT_STATE_DIR`: `docs/deploy.md` tells users to override
+/// `DEADLIGHT_ROOTS` to run a second instance locally and says nothing
+/// about also separating `DEADLIGHT_STATE_DIR`, so the documented way to
+/// run deadlight locally reaches this. Reproduced directly against a real
+/// `dtach` session, outside the test suite entirely: a live session for
+/// `victimproj` was SIGKILLed and its socket unlinked simply because
+/// deadlight was started with different roots against the same state dir
+/// — logging "project directory is gone" about a directory that existed
+/// the whole time. This is the eighth instance in this feature of one
+/// shape: a false "gone" verdict destroying a live session. The rule the
+/// previous seven taught applies exactly: "I cannot map this key to a
+/// directory" is not "the directory is gone."
+///
+/// So: `resolve_project` succeeding refreshes the marker (this project
+/// genuinely is where we think it is, under *these* roots specifically).
+/// `resolve_project` failing checks the marker's *recorded* path directly,
+/// independent of whatever roots this particular pass happens to be
+/// running with. No marker at all — a key this process has never
+/// positively confirmed under any configuration it has seen — is never
+/// treated as gone: it is left completely alone, neither killed nor
+/// unlinked (`known_projects` may still list it; that's a separate,
+/// unaffected concern from reaping).
+fn confirmed_gone(key_dir: &std::path::Path, roots: &[PathBuf], url: &str) -> bool {
+    let marker = origin_marker_path(key_dir);
+    match crate::projects::resolve_project(roots, url) {
+        Some(dir) => {
+            let _ = std::fs::write(&marker, dir.to_string_lossy().as_bytes());
+            false
+        }
+        None => match std::fs::read_to_string(&marker) {
+            Ok(recorded) => !std::path::Path::new(recorded.trim()).is_dir(),
+            Err(_) => false,
+        },
+    }
 }
 
 /// What to do with one socket file, given what's known about it. Kept as a
@@ -329,14 +402,28 @@ pub fn reconcile(roots: &[PathBuf]) -> ReapReport {
     reconcile_with(roots, &process_snapshot)
 }
 
+// Both flip only on a genuine state *change*, not every suspended pass —
+// `known_projects` calls `reconcile` (throttled, but still every few
+// seconds) on every project listing or header-strip load, so a
+// permanently broken `ps` or a permanently unreadable root would otherwise
+// spam the journal forever with the identical line. `Relaxed` is enough:
+// these coordinate nothing beyond "did I already say this", and a stray
+// duplicate or missing log line from a race between two sweeps is
+// harmless, unlike the sockets/processes reconcile actually touches.
+static ROOTS_WERE_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static PROCESS_LIST_WAS_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
     let mut report = ReapReport { dead_sockets: 0, gone_projects: 0 };
     let roots_ok = !roots.is_empty() && roots.iter().all(|r| r.canonicalize().is_ok());
-    if !roots_ok {
+    let roots_were_ok = ROOTS_WERE_OK.swap(roots_ok, std::sync::atomic::Ordering::Relaxed);
+    if !roots_ok && roots_were_ok {
         eprintln!(
             "deadlight: none of the configured roots could be read ({roots:?}) — \
-             reaping sessions for missing projects is suspended this pass"
+             reaping sessions for missing projects is suspended until this recovers"
         );
+    } else if roots_ok && !roots_were_ok {
+        eprintln!("deadlight: configured roots are readable again — reaping resumed");
     }
     let Ok(rd) = std::fs::read_dir(sock_root()) else { return report };
     // One process listing for the whole sweep (see process_snapshot's doc
@@ -345,13 +432,22 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
     // bail out of the entire pass rather than reap anything on a guess;
     // the next pass (throttled, but not indefinitely deferred — see
     // `known_projects`) gets another chance.
-    let Some(snapshot) = snapshot_fn() else {
-        eprintln!(
-            "deadlight: could not read the process list (ps failed, exited non-zero, or returned \
-             nothing) — reaping is suspended this pass"
-        );
+    let snapshot_opt = snapshot_fn();
+    let process_list_ok = snapshot_opt.is_some();
+    let process_list_was_ok =
+        PROCESS_LIST_WAS_OK.swap(process_list_ok, std::sync::atomic::Ordering::Relaxed);
+    let Some(snapshot) = snapshot_opt else {
+        if process_list_was_ok {
+            eprintln!(
+                "deadlight: could not read the process list (ps failed, exited non-zero, or \
+                 returned nothing) — reaping is suspended until this recovers"
+            );
+        }
         return report;
     };
+    if !process_list_was_ok {
+        eprintln!("deadlight: process listing is readable again — reaping resumed");
+    }
     for entry in rd.flatten() {
         // Directory entry names under sock/ are storage keys (percent-encoded:
         // `karpie%2Fsrc`), not the raw project form. `session`'s functions
@@ -362,7 +458,12 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
         // decoded, raw form) is what every `session::*` call below must use.
         let key = entry.file_name().to_string_lossy().into_owned();
         let url = decode_key(&key);
-        let project_gone = roots_ok && crate::projects::resolve_project(roots, &url).is_none();
+        // Not "resolve_project(...).is_none()" alone — see confirmed_gone's
+        // doc comment. A key that doesn't resolve under *these* roots is
+        // not evidence the directory is gone; only a key whose resolved
+        // path was previously recorded, and is now confirmed missing,
+        // counts.
+        let project_gone = roots_ok && confirmed_gone(&entry.path(), roots, &url);
         // In-process sessions first, once per project rather than once per
         // socket file below: `session::kill_project` now ends each session's
         // dtach master too (via `kill_and_unlink`, the same helper the loop
@@ -378,12 +479,23 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
             report.gone_projects += in_process_ended;
             if in_process_ended > 0 {
                 eprintln!(
-                    "deadlight: reaped {in_process_ended} in-process session(s) for {key} — project directory is gone"
+                    "deadlight: reaped {in_process_ended} in-process session(s) for {key} — its recorded directory no longer exists"
                 );
             }
         }
         let Ok(inner) = std::fs::read_dir(entry.path()) else { continue };
         for sock in inner.flatten() {
+            // `.origin` (this pass's own `confirmed_gone` may have just
+            // written or refreshed it, right above) is metadata about the
+            // project key, not a session socket — a real session name can
+            // never start with `.` (`^[A-Za-z0-9_-]{1,32}$`), so this is an
+            // unambiguous, safe skip. Without it, the marker — held by no
+            // process — reads as a dead socket and gets reaped by this same
+            // sweep instants after being written, wiping out the exact
+            // cross-restart record `confirmed_gone` depends on.
+            if sock.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
             let pids = pids_holding(&snapshot, &sock.path());
             let held_before = !pids.is_empty();
             let name = sock.file_name().to_string_lossy().into_owned();
@@ -395,7 +507,7 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
                 if kill_and_unlink_with(&sock.path(), snapshot_fn) {
                     report.gone_projects += 1;
                     eprintln!(
-                        "deadlight: reaped session {key}/{name} — project directory is gone (pids {pids:?})"
+                        "deadlight: reaped session {key}/{name} — its recorded directory no longer exists (pids {pids:?})"
                     );
                 } else {
                     eprintln!(
@@ -534,21 +646,47 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
             let (live, oldest) = if !sessions.is_empty() {
                 (sessions.len(), sessions.iter().map(|s| s.age_secs).max().unwrap_or(0))
             } else {
-                let floor = std::fs::read_dir(e.path()).map(|rd| rd.flatten().count()).unwrap_or(0);
+                // Excludes `.origin` (see reconcile's identical skip): it's
+                // metadata about the project key, not a session socket, and
+                // would otherwise inflate this floor by one for every
+                // project reconcile has ever positively confirmed.
+                let floor = std::fs::read_dir(e.path())
+                    .map(|rd| {
+                        rd.flatten()
+                            .filter(|f| !f.file_name().to_string_lossy().starts_with('.'))
+                            .count()
+                    })
+                    .unwrap_or(0);
                 (floor, 0)
             };
-            let slot = by_key.entry(key.clone()).or_insert(ProjectStatus {
-                key: key.clone(),
-                url: decode_key(&key),
-                live: 0,
-                oldest_age_secs: 0,
-                has_layout: false,
-                branch: String::new(),
-                parent: None,
-                reachable: true,
-            });
-            slot.live = live;
-            slot.oldest_age_secs = oldest;
+            // Only ever *create* a listing here when there's an actual live
+            // session. Since C2, `sock/<key>/` can contain nothing but a
+            // `.origin` marker — deliberately persisted indefinitely (see
+            // `record_origin`/`confirmed_gone`), not just until the next
+            // sweep — for any project ever opened, even one closed long ago
+            // with no saved layout. Without this guard, every such project
+            // would show up as a permanent phantom row (`has_layout: false,
+            // live: 0`) forever, not merely for the up-to-3-second window a
+            // still-emptying directory used to cause. A project that
+            // already has a listing (a saved layout, from the `.json` scan
+            // above) still gets its live count refreshed either way.
+            if live > 0 {
+                let slot = by_key.entry(key.clone()).or_insert(ProjectStatus {
+                    key: key.clone(),
+                    url: decode_key(&key),
+                    live: 0,
+                    oldest_age_secs: 0,
+                    has_layout: false,
+                    branch: String::new(),
+                    parent: None,
+                    reachable: true,
+                });
+                slot.live = live;
+                slot.oldest_age_secs = oldest;
+            } else if let Some(slot) = by_key.get_mut(&key) {
+                slot.live = 0;
+                slot.oldest_age_secs = 0;
+            }
         }
     }
 
@@ -759,6 +897,36 @@ mod tests {
         });
     }
 
+    // Side effect of C2's fix, caught while implementing it: `.origin`
+    // markers persist indefinitely (not just until the next sweep) for any
+    // project ever confirmed — that's the whole point, it's what lets a
+    // *later* pass tell "genuinely deleted" apart from "not under my
+    // current roots". But `known_projects`'s sock/ scan used to treat any
+    // directory under sock/ as evidence a project is "known"; without this
+    // guard, a project closed long ago with no saved layout would show up
+    // as a permanent phantom row forever, not merely for the brief window
+    // an emptying-out directory used to cause before C2.
+    #[test]
+    fn known_projects_does_not_list_a_closed_project_with_only_an_origin_marker() {
+        with_state(|_state| {
+            let root = tempfile::tempdir().unwrap();
+            let project_dir = root.path().join("onceopened");
+            fs::create_dir_all(&project_dir).unwrap();
+
+            // Simulates a project opened once (record_origin ran, as
+            // session::attach does) and since closed with no saved layout:
+            // sock/<key>/ now holds only the marker, no session files.
+            record_origin("onceopened", &project_dir);
+
+            let ps = known_projects(&[root.path().to_path_buf()]);
+            assert!(
+                !ps.iter().any(|p| p.key == "onceopened"),
+                "a project with no live session and no saved layout must not be listed \
+                 just because it was once confirmed to exist"
+            );
+        });
+    }
+
     /// Real `git worktree add`, same reasoning as `worktree`'s own test: the
     /// porcelain format and the confinement check are the things under test
     /// here (end to end, through `known_projects` itself), so a hand-built
@@ -952,18 +1120,28 @@ mod tests {
     // deadlight process has no entry in `session`'s in-memory map, so
     // `session::kill_project` alone is a no-op. Uses a real `dtach` process
     // so this actually proves the OS-level pid is killed, not just forgotten
-    // about by having its socket file deleted out from under it. Roots point
-    // at a real, existing directory that genuinely does not contain
-    // "ghost-proj" — not a nonexistent path — so `project_gone` becomes true
-    // for the right reason (the project really isn't there) rather than by
-    // accident of the C3 "roots unverifiable" guard also forcing it false.
+    // about by having its socket file deleted out from under it.
+    //
+    // Two `reconcile` passes, not one — this is the corrected shape after
+    // C2: a key must be *positively confirmed* (a `.origin` marker written
+    // while its directory genuinely resolved) before a later failure to
+    // resolve counts as "gone". The first pass runs while "ghost-proj"
+    // still exists on disk, purely to produce that confirmation; only the
+    // second pass, after the directory is actually removed, is expected to
+    // reap. Skipping the first pass (as an earlier version of this test
+    // did, pointing roots at a directory that never contained "ghost-proj"
+    // at all) is now indistinguishable from the cross-configuration case
+    // C2 exists to protect — a key never confirmed under any roots this
+    // process has seen — and must NOT be reaped.
     #[test]
     fn a_live_session_for_a_deleted_project_is_actually_killed_not_just_forgotten() {
         with_state(|state| {
             let sock_dir = state.join("sock/ghost-proj");
             fs::create_dir_all(&sock_dir).unwrap();
             let sock_path = sock_dir.join("shell");
-            let root = tempfile::tempdir().unwrap(); // exists, but has no "ghost-proj" child
+            let root = tempfile::tempdir().unwrap();
+            let project_dir = root.path().join("ghost-proj");
+            fs::create_dir_all(&project_dir).unwrap(); // exists, for now
 
             if spawn_detached_dtach(&sock_path).is_none() {
                 eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
@@ -973,6 +1151,15 @@ mod tests {
                 socket_has_process(&sock_path),
                 "test setup: the detached process must be observable before reconcile runs"
             );
+
+            // Confirming pass: the directory exists, so this must not reap
+            // anything — and it's what writes the `.origin` marker the
+            // second pass needs.
+            let confirming = reconcile(&[root.path().to_path_buf()]);
+            assert_eq!(confirming.gone_projects, 0, "must not be reaped while the directory still exists");
+            assert!(socket_has_process(&sock_path), "must survive the confirming pass");
+
+            fs::remove_dir_all(&project_dir).unwrap();
 
             let report = reconcile(&[root.path().to_path_buf()]);
 
@@ -1292,6 +1479,65 @@ mod tests {
             );
             assert_eq!(report.gone_projects, 0);
             assert!(sock_path.exists(), "the socket must survive when the process list is unverifiable");
+        });
+    }
+
+    // C2: reproduced directly against real dtach, outside the test suite
+    // entirely — a session for a project genuinely on disk was SIGKILLed
+    // and its socket unlinked simply because reconcile was run with
+    // different DEADLIGHT_ROOTS than what created the session, sharing the
+    // same DEADLIGHT_STATE_DIR (exactly what docs/deploy.md tells users to
+    // do to run a second instance locally). "Not resolvable under my
+    // roots" is not evidence of "gone"; only a key whose recorded
+    // directory is confirmed missing counts.
+    //
+    // Goes through the real `session::attach` (not a raw `dtach -n` spawn
+    // like the other tests in this file use), because it's specifically
+    // `attach`'s call to `record_origin` under test here — without it, this
+    // would be indistinguishable from "never confirmed at all", which
+    // reconcile also correctly leaves alone, and the test would prove
+    // nothing about the marker mechanism specifically.
+    #[test]
+    fn a_session_outside_the_configured_roots_survives_reconcile() {
+        with_state(|state| {
+            let _g = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("DEADLIGHT_CMD");
+            let real_root = tempfile::tempdir().unwrap();
+            let project_dir = real_root.path().join("victimproj");
+            fs::create_dir_all(&project_dir).unwrap();
+
+            let Ok(_att) = crate::session::attach("victimproj", "shell", &project_dir) else {
+                eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
+                return;
+            };
+            let sock_path = state.join("sock/victimproj/shell");
+            let mut waited = 0;
+            while !(sock_path.exists() && socket_has_process(&sock_path)) && waited < 200 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                waited += 1;
+            }
+            assert!(
+                socket_has_process(&sock_path),
+                "test setup: the session must be observable before reconcile runs"
+            );
+
+            // A completely different root than the one victimproj actually
+            // lives under — simulating a second deadlight instance (or the
+            // same one, restarted with an overridden DEADLIGHT_ROOTS)
+            // sharing this state dir.
+            let foreign_root = tempfile::tempdir().unwrap();
+            let report = reconcile(&[foreign_root.path().to_path_buf()]);
+
+            assert_eq!(
+                report.gone_projects, 0,
+                "a project outside the current roots must never be treated as gone"
+            );
+            assert!(sock_path.exists(), "its socket must survive");
+            assert!(socket_has_process(&sock_path), "its process must survive");
+
+            for pid in test_cleanup_pids(&sock_path) {
+                let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            }
         });
     }
 }

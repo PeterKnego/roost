@@ -50,13 +50,22 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     }
     let name = segs[segs.len() - 1];
     let project = segs[..segs.len() - 2].join("/");
+    // Every failure below closes the socket, which the client sees only as a
+    // terminal that never starts — no error text reaches the UI, because a
+    // closed socket carries none. So each one must say why on the way out, or
+    // a user whose terminal silently refuses to start (and whoever reads
+    // `journalctl --user -u deadlight` afterwards) has nothing at all to go
+    // on. Diagnosing an intermittent "live_sessions stayed empty" needed
+    // exactly this and did not have it.
     let Some(dir) = crate::projects::resolve_project(roots, &project) else {
+        eprintln!("deadlight: term socket refused — project {project:?} does not resolve under the roots");
         let _ = ws_read.close(None);
         return;
     };
     let att = match session::attach(&project, name, &dir) {
         Ok(a) => a,
-        Err(_) => {
+        Err(e) => {
+            eprintln!("deadlight: term socket refused — attach {project}/{name} failed: {e}");
             let _ = ws_read.close(None);
             return;
         }
