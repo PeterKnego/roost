@@ -76,6 +76,13 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         // and then silently drop that peer's own BufferText forever.
         let ev = h.snapshot_event(&id);
         h.send_to(&id, &ev);
+        // Replay the whole store to a fresh client: a notice raised while no
+        // browser was open is exactly the case this feature exists for. Sent
+        // inside the same lock acquisition as the snapshot, for the reason
+        // the existing comment above gives — releasing in between lets a
+        // foreign broadcast land first.
+        let ev = proto::Event::Notices { list: crate::notify::list() };
+        h.send_to(&id, &ev);
         // State is metadata-only — it never carries buffer text — so a
         // client reconnecting onto a layout with open Edit buffers would
         // otherwise render them blank forever: nothing else re-sends
@@ -112,13 +119,24 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     loop {
         match ws_read.read() {
             Ok(Message::Text(t)) => {
-                let mut h = Hub::lock(&hub);
-                match proto::decode(&t) {
-                    Ok(intent) => h.handle(&id, intent),
-                    Err(e) => {
-                        let ev = proto::Event::Error { msg: e };
-                        h.send_to(&id, &ev);
+                let dirty = {
+                    let mut h = Hub::lock(&hub);
+                    match proto::decode(&t) {
+                        Ok(intent) => h.handle(&id, intent),
+                        Err(e) => {
+                            let ev = proto::Event::Error { msg: e };
+                            h.send_to(&id, &ev);
+                        }
                     }
+                    std::mem::take(&mut h.notices_dirty)
+                };
+                // Outside the block above, so this hub's lock is released:
+                // broadcast_all locks every hub including this one, and a
+                // Mutex is not reentrant.
+                if dirty {
+                    crate::hub::broadcast_all(&proto::Event::Notices {
+                        list: crate::notify::list(),
+                    });
                 }
             }
             Ok(Message::Close(_)) | Err(_) => break,

@@ -48,6 +48,34 @@ fn two_project_fixture(a: &str, b: &str) -> (tempfile::TempDir, u16) {
     (d, port)
 }
 
+/// Existing tests call `ureq::get(...)` inline and only need the body; this
+/// is for the cases that also need to assert on status and content-type.
+fn get_full(port: u16, path: &str) -> (u16, String, String) {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let resp = ureq::get(&url).call();
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let ctype = r.header("content-type").unwrap_or("").to_string();
+            (status, ctype, r.into_string().unwrap_or_default())
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let ctype = r.header("content-type").unwrap_or("").to_string();
+            (code, ctype, r.into_string().unwrap_or_default())
+        }
+        Err(e) => panic!("request failed: {e}"),
+    }
+}
+
+#[test]
+fn the_service_worker_is_served_from_the_root_scope() {
+    let (_d, port) = fixture();
+    let (status, ctype, body) = get_full(port, "/sw.js");
+    assert_eq!(status, 200, "sw.js must be at the root, or its scope cannot cover /{{project}}");
+    assert!(ctype.contains("javascript"), "wrong content-type: {ctype}");
+    assert!(body.contains("notificationclick"), "not the service worker: {body:.120}");
+}
+
 #[test]
 fn index_lists_projects() {
     let (_d, port) = fixture();
@@ -1082,4 +1110,149 @@ fn http_rejects_rebinding_host() {
     let mut resp = String::new();
     s.read_to_string(&mut resp).unwrap();
     assert!(resp.starts_with("HTTP/1.1 403"), "got: {}", &resp[..resp.len().min(60)]);
+}
+
+#[test]
+fn a_notice_reaches_a_client_watching_a_different_project() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(d.path().join("alpha")).unwrap();
+    std::fs::create_dir_all(d.path().join("beta")).unwrap();
+    let port = start(vec![d.path().to_path_buf()]);
+
+    let mut a = ws_connect_path(port, "/ws/alpha/_workspace").unwrap();
+    let mut b = ws_connect_path(port, "/ws/beta/_workspace").unwrap();
+    read_until(&mut a, r#""t":"State""#);
+    read_until(&mut b, r#""t":"State""#);
+
+    // Published against alpha; beta's client must still see it.
+    deadlight::hub::publish(
+        "alpha",
+        "claude",
+        deadlight::osc::Parsed { title: Some("build".into()), body: "green".into() },
+    );
+
+    let seen_b = read_until(&mut b, r#""t":"Notice""#);
+    assert!(seen_b.contains(r#""project":"alpha""#), "beta got: {seen_b}");
+    assert!(seen_b.contains("green"), "beta got: {seen_b}");
+    let seen_a = read_until(&mut a, r#""t":"Notice""#);
+    assert!(seen_a.contains("green"), "alpha got: {seen_a}");
+}
+
+#[test]
+fn notices_are_replayed_on_connect_and_read_state_mirrors() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    let (_d, port) = fixture();
+
+    deadlight::hub::publish(
+        "proj",
+        "claude",
+        deadlight::osc::Parsed { title: None, body: "waiting for you".into() },
+    );
+
+    // A client connecting *after* the fact still learns about it.
+    let mut a = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    let replay = read_until(&mut a, r#""t":"Notices""#);
+    assert!(replay.contains("waiting for you"), "connect replay missing it: {replay}");
+    let id: u64 = {
+        // The notice store is process-global across the whole integration
+        // binary and never reset between tests, so the *first* "id": in the
+        // replay can belong to a notice some other test left behind, not
+        // this one — grabbing that id would still happen to make this test
+        // fail if mark_read broke (any id works for that), but it would not
+        // be testing the notice this test actually published. Anchor on the
+        // matched body instead: `id` is the first field on `Notice` (see
+        // proto.rs's struct field order), so the nearest `"id":` preceding
+        // this specific body belongs to this specific notice.
+        let key = r#""id":"#;
+        let body_pos = replay.find("waiting for you").expect("body missing from replay");
+        let start = replay[..body_pos].rfind(key).expect("no id preceding the matched body") + key.len();
+        replay[start..].split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap()
+    };
+
+    // Read state is global: b marks read, a must be told.
+    let mut b = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    read_until(&mut b, r#""t":"Notices""#);
+    b.send(tungstenite::Message::Text(format!(r#"{{"t":"MarkNoticeRead","id":{id}}}"#))).unwrap();
+    let after = read_until(&mut a, r#""read":true"#);
+    assert!(after.contains(r#""t":"Notices""#), "a was not re-sent the list: {after}");
+}
+
+#[test]
+fn an_escape_sequence_from_a_terminal_becomes_a_notice() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+
+    // A single-token command: DEADLIGHT_CMD splits on whitespace.
+    let bin = tempfile::tempdir().unwrap();
+    let script = bin.path().join("emit.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf '\\033]777;notify;Build done;42 tests passed\\007'\nsleep 5\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::env::set_var("DEADLIGHT_CMD", script.to_str().unwrap());
+
+    let (_d, port) = fixture_named("notifyproj");
+    let mut ctrl = ws_connect_path(port, "/ws/notifyproj/_workspace").unwrap();
+    read_until(&mut ctrl, r#""t":"State""#);
+    // Attaching the terminal socket is what spawns the session and its pump.
+    let mut term = ws_connect_path(port, "/ws/notifyproj/term/claude").unwrap();
+
+    let seen = read_until(&mut ctrl, r#""t":"Notice""#);
+    assert!(seen.contains("Build done"), "title missing: {seen}");
+    assert!(seen.contains("42 tests passed"), "body missing: {seen}");
+    // Attribution comes from the pump's own identity, not from the payload.
+    assert!(seen.contains(r#""session":"claude""#), "session missing: {seen}");
+    assert!(seen.contains(r#""project":"notifyproj""#), "project missing: {seen}");
+
+    let _ = term.close(None);
+    std::env::remove_var("DEADLIGHT_CMD");
+}
+
+#[test]
+fn a_terminal_child_can_discover_that_notifications_exist() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let script = bin.path().join("env.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho \"NOTIFY=$DEADLIGHT_NOTIFY PROJ=$DEADLIGHT_PROJECT SESS=$DEADLIGHT_SESSION\"\nsleep 5\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::env::set_var("DEADLIGHT_CMD", script.to_str().unwrap());
+
+    let (_d, port) = fixture_named("envproj");
+    let mut term = ws_connect_path(port, "/ws/envproj/term/envprobe").unwrap();
+    let mut seen = String::new();
+    for _ in 0..100 {
+        match term.read() {
+            Ok(tungstenite::Message::Binary(b)) => seen.push_str(&String::from_utf8_lossy(&b)),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if seen.contains("NOTIFY=") {
+            break;
+        }
+    }
+    assert!(seen.contains("NOTIFY=1"), "capability flag missing: {seen:?}");
+    assert!(seen.contains("PROJ=envproj"), "project missing: {seen:?}");
+    assert!(seen.contains("SESS=envprobe"), "session missing: {seen:?}");
+    let _ = term.close(None);
+    std::env::remove_var("DEADLIGHT_CMD");
 }

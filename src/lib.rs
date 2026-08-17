@@ -1,9 +1,12 @@
+pub mod cli;
 pub mod config;
 pub mod fileops;
 pub mod gitio;
 pub mod hub;
 pub mod http;
+pub mod notify;
 pub mod origin;
+pub mod osc;
 pub mod projects;
 pub mod proto;
 pub mod registry;
@@ -22,6 +25,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
+    // Notices raised while no browser was connected are the point of the
+    // store; load them before anything can connect.
+    crate::notify::load();
     // Sessions outlive deadlight, so the registry must be rebuilt from disk
     // and live processes rather than assumed empty.
     let report = registry::reconcile(&roots);

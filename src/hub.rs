@@ -43,6 +43,11 @@ pub struct Hub {
     /// `CloseProject` into the first attempt rather than spawning a second,
     /// redundant thread whose `ended: 0` would overwrite the true count.
     closing: bool,
+    /// Set by the notice intents, drained by the socket layer after the hub
+    /// lock is released. `broadcast_all` locks every hub, including this one,
+    /// and `Mutex` is not reentrant — so the broadcast cannot happen inside
+    /// `handle`.
+    pub notices_dirty: bool,
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<Hub>>>>> = OnceLock::new();
@@ -63,6 +68,7 @@ impl Hub {
             watching: false,
             self_ref: std::sync::Weak::new(),
             closing: false,
+            notices_dirty: false,
         };
         // A freshly loaded hub must report reality, not whatever the
         // persisted layout happened to say last time: sessions may have
@@ -244,6 +250,28 @@ impl Hub {
                 self.refresh_live_sessions();
                 let ev = self.snapshot_event(from);
                 self.send_to(from, &ev);
+                return;
+            }
+            Intent::MarkNoticeRead { id } => {
+                crate::notify::mark_read(*id);
+                // Everyone, not just the caller: read state is global, so a
+                // second browser's badge must not keep counting it. The
+                // actual broadcast happens outside `handle` (see
+                // `notices_dirty`) because `broadcast_all` locks every hub,
+                // including this one, which is already locked here.
+                self.notices_dirty = true;
+                return;
+            }
+            Intent::MarkAllNoticesRead => {
+                crate::notify::mark_all_read();
+                // Same reasoning as MarkNoticeRead above: dirty-flag, don't
+                // broadcast_all from in here.
+                self.notices_dirty = true;
+                return;
+            }
+            Intent::ClearNotices => {
+                crate::notify::clear();
+                self.notices_dirty = true;
                 return;
             }
             Intent::EditBuffer { rel, text } => {
@@ -738,6 +766,32 @@ impl Hub {
     }
 }
 
+/// Send an event to every connected client of every project. Notices are
+/// machine-wide: a browser on one project must still learn that another one
+/// wants attention.
+///
+/// The registry lock is dropped before any hub lock is taken. `for_project`
+/// already established that order (registry, then hub); taking them the other
+/// way round here would deadlock against a connection racing in.
+pub fn broadcast_all(ev: &Event) {
+    let Some(reg) = REGISTRY.get() else { return };
+    let hubs: Vec<Arc<Mutex<Hub>>> = {
+        let map = reg.lock().unwrap_or_else(|e| e.into_inner());
+        map.values().cloned().collect()
+    };
+    for h in hubs {
+        Hub::lock(&h).broadcast(ev);
+    }
+}
+
+/// Record a parsed sequence and tell every client. Called from the PTY pump
+/// thread, which holds no lock at this point and must never panic.
+pub fn publish(project: &str, session: &str, p: crate::osc::Parsed) {
+    if let Some(notice) = crate::notify::record(project, session, p) {
+        broadcast_all(&Event::Notice { notice });
+    }
+}
+
 /// True when `prefix` names a directory containing `path` — i.e. `path` is
 /// `prefix` followed by a `/` and more. A plain `starts_with` would wrongly
 /// match "src2/x.rs" against prefix "src"; this requires the `/` boundary.
@@ -1146,6 +1200,33 @@ mod tests {
         );
 
         std::env::remove_var("DEADLIGHT_STATE_DIR");
+    }
+
+    #[test]
+    fn mark_all_notices_read_flags_dirty_and_updates_the_store() {
+        // Regression for the missing "mark all read" plumbing: the panel
+        // needs a way to clear every notice at once without one round trip
+        // per id, and — like MarkNoticeRead — it must flag notices_dirty
+        // rather than call broadcast_all itself, since that would try to
+        // lock this very hub a second time.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        crate::notify::reset_for_test();
+        crate::notify::record("proj", "claude", crate::osc::Parsed { title: None, body: "one".into() });
+        crate::notify::record("proj", "shell", crate::osc::Parsed { title: None, body: "two".into() });
+
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        assert!(!h.notices_dirty);
+        h.handle(&c, Intent::MarkAllNoticesRead);
+        assert!(h.notices_dirty, "the socket layer relies on this flag to broadcast Notices");
+        assert!(
+            crate::notify::list().iter().all(|n| n.read),
+            "the store itself must be updated, not just the dirty flag"
+        );
     }
 
     #[test]

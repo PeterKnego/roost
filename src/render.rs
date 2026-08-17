@@ -428,8 +428,10 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, has_theme_css: boo
   {warn}
   <span id="projstrip" hx-get="/frag/_projects?current={qkey}" hx-trigger="load, refresh from:body"></span>
   <button id="closeproj" title="close project — ends all its terminal sessions">✕ Close</button>
+  <button id="bell" title="notifications (n)">🔔<span id="bellcount"></span></button>
   <button id="refresh" title="refresh (r)">⟳</button>
 </header>
+<div id="noticepanel" hidden></div>
 <main id="grid">
   <section class="pane" data-pane="0"><div class="tabstrip"></div><div class="content"></div></section>
   <div class="divider" data-div="left-split"></div>
@@ -650,6 +652,18 @@ mod tests {
         let s = Settings::default();
         let h = workspace_page("karpie/src", "karpie%2Fsrc", &s, false);
         assert!(h.contains("hx-get=\"/frag/_projects?current=karpie%252Fsrc\""));
+    }
+
+    #[test]
+    fn the_workspace_page_carries_the_notification_centre() {
+        let s = crate::config::Settings::default();
+        let html = workspace_page("proj", "proj", &s, false);
+        assert!(html.contains(r#"id="bell""#), "no bell button");
+        assert!(html.contains(r#"id="bellcount""#), "no unread badge");
+        assert!(html.contains(r#"id="noticepanel""#), "no panel container");
+        // The panel is filled from JS with textContent; it must ship empty,
+        // or notice text would be interpolated into HTML somewhere.
+        assert!(html.contains(r#"<div id="noticepanel" hidden></div>"#), "panel must ship empty");
     }
 
     #[test]

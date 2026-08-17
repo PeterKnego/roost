@@ -58,6 +58,9 @@ pub enum Intent {
     StartTerminal { session: String },
     InitGit,
     CloseProject,
+    MarkNoticeRead { id: u64 },
+    MarkAllNoticesRead,
+    ClearNotices,
 }
 
 /// Snapshot sent as `Event::State`. Deliberately carries buffer *metadata*
@@ -106,6 +109,14 @@ pub enum Event {
     GitInit { ok: bool, msg: String },
     CloseRefused { dirty: Vec<String> },
     ProjectClosed { ended: usize },
+    /// One live notice. Deliberately not folded into `WorkspaceView`: that
+    /// snapshot goes out on every workspace change, and history does not
+    /// belong on that path.
+    Notice { notice: crate::notify::Notice },
+    /// The whole store — every project's notices, not just this client's —
+    /// sent on connect and after any read-state change, so no two browsers
+    /// disagree about the badge count.
+    Notices { list: Vec<crate::notify::Notice> },
 }
 
 pub fn decode(s: &str) -> Result<Intent, String> {
@@ -181,5 +192,37 @@ mod tests {
         assert!(s.contains(r#""t":"CloseRefused""#) && s.contains("a.rs"));
         let s = encode(&Event::GitInit { ok: false, msg: "boom".into() });
         assert!(s.contains(r#""ok":false"#) && s.contains("boom"));
+    }
+
+    #[test]
+    fn decodes_the_notice_intents() {
+        let i = decode(r#"{"t":"MarkNoticeRead","id":7}"#).unwrap();
+        assert!(matches!(i, Intent::MarkNoticeRead { id: 7 }));
+        let i = decode(r#"{"t":"MarkAllNoticesRead"}"#).unwrap();
+        assert!(matches!(i, Intent::MarkAllNoticesRead));
+        let i = decode(r#"{"t":"ClearNotices"}"#).unwrap();
+        assert!(matches!(i, Intent::ClearNotices));
+    }
+
+    #[test]
+    fn encodes_a_notice_with_its_attribution() {
+        let n = crate::notify::Notice {
+            id: 3,
+            project: "karpie/src".into(),
+            session: "claude".into(),
+            title: "done".into(),
+            body: "42 tests".into(),
+            at: 1_700_000_000,
+            read: false,
+        };
+        let s = encode(&Event::Notice { notice: n.clone() });
+        assert!(s.contains(r#""t":"Notice""#));
+        // Attribution must reach the client, or it cannot route a click.
+        assert!(s.contains(r#""project":"karpie/src""#), "got {s}");
+        assert!(s.contains(r#""session":"claude""#), "got {s}");
+        assert!(s.contains(r#""id":3"#), "got {s}");
+        let s = encode(&Event::Notices { list: vec![n] });
+        assert!(s.contains(r#""t":"Notices""#));
+        assert!(s.contains(r#""list":["#), "got {s}");
     }
 }

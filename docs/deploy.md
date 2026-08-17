@@ -6,8 +6,10 @@ silent failure at least once each.
 
 ## Running
 
-`cargo run` binds `127.0.0.1:8444`; the sole CLI argument is the port. Tests:
-`cargo test` (never `--release`). Everything else is environment:
+`cargo run` binds `127.0.0.1:8444`; the sole CLI argument to the server itself
+is the port. The one other subcommand is `deadlight notify <title> [body]`,
+which never binds a port — see [`docs/notifications.md`](notifications.md).
+Tests: `cargo test` (never `--release`). Everything else is environment:
 
 | Variable | Purpose | Default |
 |---|---|---|
@@ -25,6 +27,12 @@ each other's projects in the strip, which is rarely what you want.
 
 `dtach` is a **runtime prerequisite** (`brew install dtach` / `apt install
 dtach`). Without it, terminals fail at spawn.
+
+`notifications.json` (the persisted notice store) lives alongside workspace
+state under `DEADLIGHT_STATE_DIR`. OS notifications additionally need a
+secure context — `localhost` or an HTTPS origin such as `tailscale serve`;
+plain `http://` to a tailnet IP still shows the in-page notice panel but
+cannot ask the OS for permission.
 
 ## Projects and sessions
 
