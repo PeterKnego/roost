@@ -40,13 +40,22 @@ self.addEventListener("notificationclick", (e) => {
   // Deliberate bail-out with no waitUntil: there is nothing to focus or
   // navigate to, and close() above already ran synchronously.
   if (!project) return;
-  const target = `/${project}#session=${encodeURIComponent(session || "")}`;
+  // Same segment-wise encoding as app.js's projectPath, and for the same
+  // reason: a project name is a directory name, so it may contain characters
+  // that are structural in a URL. `/` stays literal because a nested project
+  // like `karpie/src` really is a multi-segment path.
+  const target =
+    "/" + project.split("/").map(encodeURIComponent).join("/") +
+    "#session=" + encodeURIComponent(session || "");
   e.waitUntil(
     self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((wins) => {
       // Prefer a window already on this project: focusing it needs no
       // navigation, so nothing in that tab is disturbed.
       const onProject = wins.find((c) => {
-        try { return new URL(c.url).pathname === `/${project}`; } catch { return false; }
+        // Compare decoded: the browser hands back a percent-encoded pathname,
+        // so a raw `/${project}` would never match precisely those names that
+        // needed encoding in the first place.
+        try { return decodeURIComponent(new URL(c.url).pathname) === `/${project}`; } catch { return false; }
       });
       if (onProject) {
         return onProject.focus().then((c) => {
