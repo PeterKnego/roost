@@ -124,6 +124,13 @@ function onEvent(ev) {
         try { e.node.remove(); } catch {}
       });
       terms.clear();
+      // Every node above is gone, but `state.live_sessions` is still the
+      // stale pre-close list until the trailing State broadcast lands —
+      // tabKey would keep reading ":live" from it, render()'s mountedKey
+      // guard would see an unchanged key, and the now-empty pane would sit
+      // blank instead of remounting the placeholder. Clear the local view
+      // immediately so this render() actually recomputes the key.
+      if (state) state.live_sessions = [];
       render();
       document.body.dispatchEvent(new Event("refresh")); // strip marker -> ○
       break;
@@ -324,10 +331,18 @@ function terminalPlaceholder(session) {
        <p><a class="nogit" href="#">start without git</a></p>`;
   // A held or double-tapped Enter must not fire several StartTerminal
   // intents before the box is remounted away — the server already dedupes
-  // to one socket, but every extra intent is still a wasted broadcast.
+  // to one socket, but every extra intent is still a wasted broadcast. The
+  // guard must release itself: a refusal (e.g. the 16-session cap in
+  // hub.rs) only ever sends this client an Error, which carries no session
+  // or tab identity to key a remount on, so no State/TerminalStarted event
+  // is guaranteed to come along and remount this box away. Without the
+  // timeout a refused start would leave the placeholder permanently inert.
+  // 2s is well past any held-Enter repeat rate, so the burst-suppression
+  // this guard exists for is unaffected.
   const start = () => {
     if (box.dataset.sent) return;
     box.dataset.sent = "1";
+    setTimeout(() => { delete box.dataset.sent; }, 2000);
     send({ t: "StartTerminal", session });
   };
   if (isGit) {
