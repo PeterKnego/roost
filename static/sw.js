@@ -23,8 +23,17 @@ self.addEventListener("message", (e) => {
   // between this dispatch and the notification actually appearing, and the
   // notice is lost with nothing to show for it.
   e.waitUntil(
-    self.registration.showNotification(n.title, {
-      body: n.body,
+    // The design's threat model renders attribution "from those fields
+    // only" — project/session, which the server derived from the PTY pump's
+    // own identity, never from the payload. The in-page panel already does
+    // this (a separate "notice-who" span); putting project/session in the
+    // *title* here — an OS notification's most prominent field — is what
+    // keeps a hostile payload (e.g. a `cat`ted file containing a forged OSC
+    // sequence) from producing a banner indistinguishable from a real one
+    // from another project. n.title/n.body are payload text and go in the
+    // body only, never the attribution line.
+    self.registration.showNotification(`${n.project} · ${n.session}`, {
+      body: `${n.title} — ${n.body}`,
       // One notification per session: a chatty session replaces its own
       // rather than stacking twenty.
       tag: `${n.project}/${n.session}`,

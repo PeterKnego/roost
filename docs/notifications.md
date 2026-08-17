@@ -84,6 +84,13 @@ HTTPS. Over plain `http://` to a tailnet IP the notice panel still works but
 the OS cannot be asked. Permission is requested from the panel's own button,
 never automatically on load.
 
+The OS notification's title is always `project · session` — server truth,
+the same attribution the in-page panel shows — never the payload's own
+title, which goes in the body alongside the payload's body instead. This is
+what stops a hostile payload (`cat` of a file containing a forged OSC
+sequence) from producing a banner that looks like it came from a different
+project.
+
 None of the browser-side behaviour — the OS notification actually appearing,
 click focusing the right tab and terminal, the badge clearing — has been
 exercised in a real browser yet. It is implemented against the design, not
