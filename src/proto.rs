@@ -55,6 +55,9 @@ pub enum Intent {
     DeleteFile { rel: String },
     RenamePath { from: String, to: String },
     RequestState,
+    StartTerminal { session: String },
+    InitGit,
+    CloseProject,
 }
 
 /// Snapshot sent as `Event::State`. Deliberately carries buffer *metadata*
@@ -79,6 +82,12 @@ pub struct WorkspaceView {
     pub panes: Vec<PaneView>,
     pub buffers: Vec<BufferMeta>,
     pub watch_degraded: bool,
+    /// Session names currently running for this project. A Terminal tab whose
+    /// name is absent renders its start placeholder instead of attaching.
+    pub live_sessions: Vec<String>,
+    /// Whether the project directory is a git repository — drives the
+    /// initialise-git offer on the placeholder.
+    pub is_git: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +102,10 @@ pub enum Event {
     TreeChanged,
     StatusChanged,
     Error { msg: String },
+    TerminalStarted { session: String },
+    GitInit { ok: bool, msg: String },
+    CloseRefused { dirty: Vec<String> },
+    ProjectClosed { ended: usize },
 }
 
 pub fn decode(s: &str) -> Result<Intent, String> {
@@ -148,5 +161,25 @@ mod tests {
     fn diff_tab_none_is_the_full_diff_entry() {
         let i = decode(r#"{"t":"OpenTab","pane":2,"tab":{"k":"Diff","rel":null}}"#).unwrap();
         assert!(matches!(i, Intent::OpenTab { tab: Tab::Diff { rel: None }, .. }));
+    }
+
+    #[test]
+    fn decodes_the_new_project_intents() {
+        assert!(matches!(
+            decode(r#"{"t":"StartTerminal","session":"shell"}"#).unwrap(),
+            Intent::StartTerminal { .. }
+        ));
+        assert!(matches!(decode(r#"{"t":"InitGit"}"#).unwrap(), Intent::InitGit));
+        assert!(matches!(decode(r#"{"t":"CloseProject"}"#).unwrap(), Intent::CloseProject));
+    }
+
+    #[test]
+    fn encodes_the_new_project_events() {
+        let s = encode(&Event::ProjectClosed { ended: 3 });
+        assert!(s.contains(r#""t":"ProjectClosed""#) && s.contains(r#""ended":3"#));
+        let s = encode(&Event::CloseRefused { dirty: vec!["a.rs".into()] });
+        assert!(s.contains(r#""t":"CloseRefused""#) && s.contains("a.rs"));
+        let s = encode(&Event::GitInit { ok: false, msg: "boom".into() });
+        assert!(s.contains(r#""ok":false"#) && s.contains("boom"));
     }
 }
