@@ -1,6 +1,6 @@
 //! Workspace state and its pure transitions. No I/O lives here — that is
 //! exactly what makes the transition table cheap to test.
-use crate::proto::{self, Intent, Mode, PaneId, Sizes, Tab, PANE_COUNT};
+use crate::proto::{self, Intent, PaneId, Sizes, Tab, PANE_COUNT};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -224,6 +224,7 @@ pub fn apply_layout(w: &mut Workspace, intent: &Intent) -> Result<bool, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::Mode;
 
     fn file(rel: &str) -> Tab {
         Tab::File { rel: rel.into(), mode: Mode::Preview }
