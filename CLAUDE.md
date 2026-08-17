@@ -86,7 +86,7 @@ destroying, not on keeping.
 ## Testing: the lesson this codebase learned the hard way
 
 **Tests that pass for the wrong reason are the dominant failure mode here.**
-Four separate reviews caught tests that could not fail:
+Seven separate reviews caught tests that could not fail:
 
 - Path-confinement tests that failed with `ENOENT` before ever reaching the
   confinement check — which is why a symlink escape survived review.
@@ -95,9 +95,30 @@ Four separate reviews caught tests that could not fail:
 - Tests with a single subscriber, where `send_to` and `broadcast` are
   indistinguishable, so message privacy could regress silently.
 - A test that asserted nothing and passed off its own 5-second read timeout.
+- Strip tests with no glyph assertion, so swapping ● and ○ left them all green.
+- An escaping test whose fixture contained no metacharacter to escape.
+- A worktree self-parenting test whose buggy branch never executed, because the
+  fixture never entered the state that triggers it.
+- A test whose subject was `attach`'s call to `record_origin`, but which only
+  asserted survival — also true with no marker written at all.
 
 When writing a test, ask: **would this fail if I deleted the code it covers?**
 If a negative test errors, assert on *why* — the message, not just `is_err()`.
+
+**The technique that actually works: revert the fix and watch the test fail.**
+Not a thought experiment — apply the broken version, run it, read the failure,
+restore. This caught two tests that would have shipped green and vacuous, and
+one whose whole design was non-discriminating (it measured client-visible
+response ordering, which this project pipelines through a per-connection writer
+thread, so it passed with the bug fully restored). Doing it also documents the
+failure mode in the test's own comment for the next reader.
+
+**A green suite proves less than it looks.** A deadlock *hangs* rather than
+fails, so counting failures across repeated runs says nothing about lock
+ordering — time the runs too. And a defect that only manifests between
+concurrently-running tests will look like a flake in whichever test loses; a
+"~1-in-8 flake" here turned out to be one test's `reconcile` reaping another
+test's live session, which no amount of retrying would have revealed.
 
 ## The dev/prod substitution trap
 
