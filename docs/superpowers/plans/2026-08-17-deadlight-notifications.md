@@ -2025,11 +2025,25 @@ if (location.hash.startsWith("#session=")) {
 }
 ```
 
-In `render()`, where a terminal tab's element is built, add the dot. Find the
-tab-strip construction and add, for tabs where `t.k === "Terminal" &&
-attention.has(t.session)`, the class `attn` on the tab element. Read the
-existing `render()` to place this correctly — do not guess at the variable
-names.
+In `render()`, the tab element's class is built on one line inside
+`pane.tabs.forEach`:
+
+```js
+      b.className = "tab" + (ti === pane.active ? " active" : "");
+```
+
+Add the attention class to that same expression:
+
+```js
+      b.className =
+        "tab" +
+        (ti === pane.active ? " active" : "") +
+        (t.k === "Terminal" && attention.has(t.session) ? " attn" : "");
+```
+
+Nothing else in `render()` changes. The strip is rebuilt wholesale on every
+render (`strip.innerHTML = ""` a few lines above), so the dot appears and
+clears purely as a function of `attention` — no separate DOM bookkeeping.
 
 Append to `static/style.css`:
 
@@ -2038,28 +2052,31 @@ Append to `static/style.css`:
 #bellcount:not(:empty) {
   position: absolute; top: -2px; right: -4px;
   min-width: 14px; padding: 0 3px;
-  border-radius: 7px; background: #e5534b; color: #fff;
+  border-radius: 7px; background: var(--accent); color: var(--bg);
   font-size: 10px; line-height: 14px; text-align: center;
 }
 #noticepanel {
   position: absolute; top: var(--header-h); right: 8px; z-index: 20;
   width: 340px; max-height: 60vh; overflow-y: auto;
-  background: var(--bg, #1c1c1c); border: 1px solid var(--border, #333);
+  background: var(--bg2); border: 1px solid var(--border);
   border-radius: 4px; padding: 4px;
 }
-.notice { display: grid; grid-template-columns: 1fr auto; gap: 2px 6px; padding: 6px; cursor: pointer; border-bottom: 1px solid var(--border, #333); }
-.notice:hover { background: var(--hover, #262626); }
+.notice { display: grid; grid-template-columns: 1fr auto; gap: 2px 6px; padding: 6px; cursor: pointer; border-bottom: 1px solid var(--border); }
+.notice:hover { background: var(--bg); }
 .notice.read { opacity: 0.55; }
-.notice-who { grid-column: 1; font-size: 11px; opacity: 0.7; }
-.notice-when { grid-column: 2; grid-row: 1; font-size: 11px; opacity: 0.7; }
-.notice-title { grid-column: 1 / -1; font-weight: 600; }
-.notice-body { grid-column: 1 / -1; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
-.notice-empty, .notice-foot { padding: 8px; font-size: 12px; opacity: 0.8; display: flex; gap: 8px; align-items: center; }
-.tab.attn::after { content: "●"; color: #e5534b; margin-left: 4px; font-size: 9px; vertical-align: middle; }
+.notice-who { grid-column: 1; font-size: 11px; color: var(--muted); }
+.notice-when { grid-column: 2; grid-row: 1; font-size: 11px; color: var(--muted); }
+.notice-title { grid-column: 1 / -1; font-weight: 600; color: var(--fg); }
+.notice-body { grid-column: 1 / -1; font-size: 12px; color: var(--fg); white-space: pre-wrap; word-break: break-word; }
+.notice-empty, .notice-foot { padding: 8px; font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+.tabstrip .tab.attn::after { content: "●"; color: var(--accent); margin-left: 4px; font-size: 9px; vertical-align: middle; }
 ```
 
-Adapt the CSS variable names and the `.tab` selector to whatever
-`static/style.css` already uses — read it first.
+These use the variables `static/style.css` already defines — `--bg`, `--bg2`,
+`--border`, `--fg`, `--accent`, `--muted` — so the panel themes with
+everything else rather than hardcoding a palette. The tab-dot selector is
+`.tabstrip .tab.attn::after` to match the specificity of the existing
+`.tabstrip .tab .dirty` and `.stale` rules.
 
 - [ ] **Step 6: Run the full suite**
 
