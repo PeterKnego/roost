@@ -170,15 +170,42 @@ equivalent today; the difference is that this is the form that later grows a
 `project/session`, so a chatty session replaces its own notification instead
 of stacking twenty.
 
-`notificationclick` in the service worker calls `clients.matchAll()`, focuses
-an existing deadlight client and posts it the route; failing that,
-`clients.openWindow('/<project>')`.
+**Clicking targets a specific browser tab.** `notificationclick` runs with
+user-gesture privilege, so the handler may focus and navigate windows. In
+order:
 
-**Click routing** reuses existing machinery. If the notice's project differs
-from the page's, `location.href = '/<project>'` carrying the target session in
-the fragment; otherwise send `ActivateTab` for the terminal tab, or `OpenTab`
-first if that session is not open in any pane. Every connected client follows,
-because that is already how the workspace socket behaves.
+1. `clients.matchAll({type: 'window', includeUncontrolled: true})`, find a
+   window whose URL is already the notice's project → `client.focus()`, then
+   `postMessage` the target session.
+2. Otherwise focus any deadlight window and `client.navigate('/<project>')`,
+   carrying the session in the fragment.
+3. Otherwise `clients.openWindow('/<project>#session=<name>')`.
+
+The service worker calls `clients.claim()` on activate, or a freshly
+registered worker would not control the page until the next reload and step 1
+would find nothing to focus.
+
+**Once focused**, routing reuses existing machinery: send `ActivateTab` for
+the terminal tab, or `OpenTab` first if that session is not open in any pane.
+Every connected client follows, because that is already how the workspace
+socket behaves. On load, a `#session=<name>` fragment is consumed the same
+way and then cleared from the URL.
+
+## Attention cues
+
+OS notifications are the out-of-app channel. These are the in-app ones, for
+when deadlight is on screen and no notification is shown — and for when
+permission was never granted:
+
+- **Bell badge** in the header: unread count across all projects.
+- **Browser tab**: `document.title` gains an `(N)` prefix while unread, and
+  the favicon swaps to a badged variant. This is the only cue that works from
+  a background tab without notification permission.
+- **Terminal tab dot** in the tab strip for the session that fired, cleared
+  when that tab becomes active. This one is necessarily per-project — a
+  session in another project has no tab on screen — so it complements the
+  badge rather than replacing it. Attention needed *elsewhere* is the bell's
+  job; attention needed *here* is the dot's.
 
 **Notification centre.** A bell button in the existing `<header>`, beside
 `#refresh`, carrying an unread count badge. Clicking opens a panel listing
@@ -321,9 +348,15 @@ test writes a small script to a temp dir and points `DEADLIGHT_CMD` at it.
 the OS notification actually appears, that clicking it focuses the tab and
 activates the right terminal tab, that the cross-project click navigates, and
 that permission denial degrades to the panel rather than a broken bell. Also
-verify the `/dev/tty` write actually reaches deadlight from a real Claude Code
-`Stop` hook — that is the one assumption in this design that is inferred
-rather than observed.
+that clicking focuses the *right* window when two projects are open in two
+tabs, and that the title/favicon badge appears and clears.
+
+Verify the `/dev/tty` write actually reaches deadlight from a real Claude Code
+`Stop` hook — the one assumption here that is inferred rather than observed.
+It is checked early during implementation, and if hook output cannot reach the
+terminal the hook layer is reassessed then. Nothing else depends on it: the
+escape sequence and `deadlight notify` work regardless, and only the
+fires-automatically-on-stop convenience is at stake.
 
 **Linux host.** Run the suite there too; the parser is platform-independent
 but the PTY pump is where this hooks in.
@@ -340,9 +373,9 @@ but the PTY pump is where this hooks in.
 | `src/render.rs` | bell + badge in `<header>`, notification panel markup |
 | `src/routes.rs` | `/sw.js` |
 | `src/main.rs` | `notify` subcommand |
-| `static/app.js` | socket handling, panel, permission, click routing |
-| `static/sw.js` | new — `showNotification`, `notificationclick` |
-| `static/style.css` | bell, badge, panel |
+| `static/app.js` | socket handling, panel, permission, click routing, title/favicon badge, tab dot |
+| `static/sw.js` | new — `showNotification`, `notificationclick`, `clients.claim` |
+| `static/style.css` | bell, badge, panel, tab dot |
 | `docs/notifications.md` | new — sequence, subcommand, env, hook config |
 | `README.md`, `docs/deploy.md` | the CLI is no longer "only a port" |
 
@@ -356,5 +389,5 @@ but the PTY pump is where this hooks in.
   cheaper route to the phone than Web Push, at the cost of a third party and a
   token to store.
 - **Per-project mute** and a quiet-hours window.
-- **Terminal tab dot** in the tab strip for the session that fired, cleared on
-  focus. Complements rather than replaces the centre.
+- **Notification centre on the picker page** (`/`) as well as the workspace
+  page. The store is already global; only the markup is missing.
