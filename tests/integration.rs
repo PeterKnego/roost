@@ -158,7 +158,7 @@ fn picker_at_outside_the_roots_falls_back_to_the_top_level_not_a_leak() {
 
 #[test]
 fn nested_project_websockets_connect() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
     std::env::set_var("DEADLIGHT_CMD", "cat");
@@ -319,7 +319,7 @@ fn ws_connect(
 
 #[test]
 fn ws_rejects_foreign_and_missing_origin() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("DEADLIGHT_CMD", "cat");
     let (_d, port) = fixture();
     // The drive-by attack: a page the user visits opens this socket for a shell.
@@ -335,7 +335,7 @@ fn ws_rejects_foreign_and_missing_origin() {
 
 #[test]
 fn terminal_ws_echoes_through_pty() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("DEADLIGHT_CMD", "cat");
     let (_d, port) = fixture();
     let mut ws = ws_connect(port, Some("http://127.0.0.1:8444")).unwrap();
@@ -389,7 +389,7 @@ fn assert_ws_closes(
 
 #[test]
 fn ws_closes_when_child_exits_first() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("DEADLIGHT_CMD", "true"); // exits immediately
     let (_d, port) = fixture();
     // Own session name: the process-global registry may already hold a live
@@ -404,7 +404,7 @@ fn ws_closes_when_child_exits_first() {
 
 #[test]
 fn two_terminal_clients_mirror_one_session() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("DEADLIGHT_CMD", "cat");
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
@@ -434,7 +434,7 @@ fn two_terminal_clients_mirror_one_session() {
 
 #[test]
 fn invalid_session_name_is_refused() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("DEADLIGHT_CMD", "cat");
     let (_d, port) = fixture();
     // "bad%20name" is rejected because '%' is itself outside valid_name's
@@ -495,7 +495,7 @@ fn extract_origin(json: &str) -> String {
 
 #[test]
 fn workspace_state_mirrors_between_two_clients() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
     let (_d, port) = fixture();
@@ -536,7 +536,7 @@ fn workspace_state_mirrors_between_two_clients() {
 
 #[test]
 fn workspace_socket_rejects_foreign_origin() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (_d, port) = fixture();
     use tungstenite::client::IntoClientRequest;
     let mut req = format!("ws://127.0.0.1:{port}/ws/proj/_workspace").into_client_request().unwrap();
@@ -546,7 +546,7 @@ fn workspace_socket_rejects_foreign_origin() {
 
 #[test]
 fn workspace_socket_rejects_missing_origin() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (_d, port) = fixture();
     use tungstenite::client::IntoClientRequest;
     // No Origin header at all: term.rs's socket already rejects this
@@ -558,7 +558,7 @@ fn workspace_socket_rejects_missing_origin() {
 
 #[test]
 fn workspace_socket_malformed_json_is_reported_not_fatal() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
     let (_d, port) = fixture();
@@ -580,7 +580,7 @@ fn workspace_socket_malformed_json_is_reported_not_fatal() {
 
 #[test]
 fn external_edit_updates_a_clean_buffer_live() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
     std::env::set_var("DEADLIGHT_DEBOUNCE_MS", "10");
@@ -640,7 +640,7 @@ fn set_mode_edit_then_save_writes_the_file() {
     // make the server read the file (setting a real base_hash) before the
     // client ever calls SaveBuffer, or every first save reports a conflict
     // and the file on disk never changes.
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
     let (d, port) = fixture_named("editproj1");
@@ -692,7 +692,7 @@ fn reconnect_replays_buffer_text_for_open_edit_buffers() {
     // buffer gets metadata-only State — never text — so without a replay,
     // that editor renders permanently blank until someone happens to edit
     // the same file again.
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
     let (_d, port) = fixture_named("editproj2");
@@ -855,7 +855,7 @@ fn wait_for_live_session(
 // orphaned shells for deleted directories in production.
 #[test]
 fn opening_a_project_spawns_no_terminal_session() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("DEADLIGHT_CMD", "cat");
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
@@ -924,7 +924,7 @@ fn opening_a_project_spawns_no_terminal_session() {
 // of those three broken.
 #[test]
 fn close_project_ends_sessions_and_isolates_other_projects() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("DEADLIGHT_CMD", "cat");
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
@@ -1011,7 +1011,7 @@ fn any_process_holds(path: &std::path::Path) -> bool {
 // session map the old, buggy code also lied through.
 #[test]
 fn close_project_ends_the_real_dtach_master_not_just_the_client() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("DEADLIGHT_CMD");
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
@@ -1026,9 +1026,14 @@ fn close_project_ends_the_real_dtach_master_not_just_the_client() {
     let sock =
         sd.path().join("sock").join(deadlight::projects::storage_key("realclose")).join("shell");
     // Poll rather than a fixed sleep: dtach's own fork-and-detach takes an
-    // unpredictable, usually-small amount of wall time to complete.
+    // unpredictable, usually-small amount of wall time to complete. The
+    // budget is deliberately far larger than the ~50ms this normally needs,
+    // because the loop exits the moment the condition holds — so a generous
+    // ceiling costs nothing on a fast run, while a tight one turns a loaded
+    // machine (a concurrent `cargo test`, a cold `ps`) into a setup-assert
+    // panic that reads as a genuine product failure.
     let mut waited = 0;
-    while !(sock.exists() && any_process_holds(&sock)) && waited < 40 {
+    while !(sock.exists() && any_process_holds(&sock)) && waited < 200 {
         std::thread::sleep(std::time::Duration::from_millis(25));
         waited += 1;
     }

@@ -624,8 +624,12 @@ mod tests {
         let sock = sock_path("realdtach", "shell");
         // Poll rather than a fixed sleep: dtach's own fork-and-detach takes
         // an unpredictable, usually-small amount of wall time to complete.
+        // Budget deliberately far above the ~50ms this normally needs — the
+        // loop exits as soon as the condition holds, so a generous ceiling is
+        // free on a fast run, while a tight one lets a loaded machine turn a
+        // setup assert into what looks like a real product failure.
         let mut waited = 0;
-        while !(sock.exists() && any_process_holds(&sock)) && waited < 40 {
+        while !(sock.exists() && any_process_holds(&sock)) && waited < 200 {
             std::thread::sleep(std::time::Duration::from_millis(25));
             waited += 1;
         }
