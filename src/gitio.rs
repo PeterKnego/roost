@@ -99,6 +99,43 @@ pub fn status(repo: &Path) -> Result<Status, String> {
     run_git(repo, &["status", "--porcelain=v2", "-b"], false).map(|s| parse_status(&s))
 }
 
+/// Whether `dir` sits inside *any* git work tree — its own, or an ancestor's.
+/// What `git rev-parse --is-inside-work-tree` answers, computed by walking
+/// ancestors instead of forking, because the only caller is
+/// `Hub::refresh_live_sessions`, which runs under the process-global
+/// hub-registry lock: a subprocess there would stall every other project's
+/// connection setup, the constraint CLAUDE.md states outright.
+///
+/// A project's *own* `.git` is not the question. A **nested** project
+/// (`karpie/src` — explicitly supported) has none of its own while sitting
+/// squarely inside its parent's work tree, and answering "not a git
+/// repository" there made the terminal placeholder offer `git init`, one click
+/// from creating an embedded repository that silently detaches that subtree
+/// from the parent's history. The changes pane beside it is already showing
+/// the *parent's* status, because `git status -C dir` succeeds anywhere inside
+/// a work tree — so the wrong offer looked entirely credible.
+///
+/// Walks to the filesystem root rather than stopping at a project root, which
+/// is not over-reach: if an ancestor outside the roots is a repository, then
+/// this directory really is inside its work tree and `git init` really would
+/// embed one. `symlink_metadata` rather than `exists()` for the usual reason —
+/// `exists()` follows symlinks and folds every error into "absent" — and a
+/// stat error that is not `NotFound` counts as *present*, since the safe
+/// direction here is to withhold the `git init` offer rather than to make it
+/// on the strength of a failed check.
+pub fn is_inside_work_tree(dir: &Path) -> bool {
+    // `.git` is a directory in a normal clone and a *file* in a linked
+    // worktree, so this must not test for a directory specifically.
+    for anc in dir.ancestors() {
+        match std::fs::symlink_metadata(anc.join(".git")) {
+            Ok(_) => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
 /// `git init`, with no arguments beyond that: `run_git` fixes `-C repo` as
 /// the only path input and this passes nothing else, so there is no room
 /// for a caller to smuggle extra git arguments through here. Routed through
@@ -220,5 +257,65 @@ mod tests {
         let result = diff(d.path(), Some("bin.bin"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_lowercase().contains("binary"));
+    }
+
+    /// A **nested** project inside a real repository is the case that matters:
+    /// it has no `.git` of its own, so a bare `dir.join(".git").exists()` said
+    /// "not a git repository" and the terminal placeholder offered `git init` —
+    /// one click from embedding a repo inside its parent and detaching that
+    /// subtree from the parent's history. A fixture whose parent is not a repo
+    /// would pass either way and prove nothing, so the parent here is a real
+    /// one, created by a real `git init`.
+    #[test]
+    fn a_nested_directory_inside_a_repo_is_inside_a_work_tree() {
+        let d = repo_fixture();
+        let nested = d.path().join("src").join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert!(
+            !nested.join(".git").exists(),
+            "fixture must have no .git of its own, or this proves nothing"
+        );
+        assert!(
+            is_inside_work_tree(&nested),
+            "a directory inside a repo's work tree must count as git, or the placeholder \
+             offers `git init` and embeds a repository inside its parent"
+        );
+        // The repo root itself, the easy case, must still work.
+        assert!(is_inside_work_tree(d.path()));
+        // And `status` already succeeds there, which is why the wrong offer
+        // looked credible: the changes pane was showing the parent's status.
+        assert!(status(&nested).is_err(), "status still keys off the project's own .git");
+    }
+
+    /// A linked worktree's `.git` is a *file*, not a directory — worktrees are
+    /// first-class projects here, so a check that tested specifically for a
+    /// directory would offer `git init` inside every one of them.
+    #[test]
+    fn a_linked_worktrees_git_file_counts_as_a_work_tree() {
+        let d = tempfile::tempdir().unwrap();
+        let fake_worktree = d.path().join("wt");
+        std::fs::create_dir_all(&fake_worktree).unwrap();
+        std::fs::write(fake_worktree.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n")
+            .unwrap();
+        assert!(
+            is_inside_work_tree(&fake_worktree),
+            "a .git *file* marks a linked worktree and must count"
+        );
+    }
+
+    /// The negative case, so the two above cannot pass by the function simply
+    /// returning true. A tempdir under the OS temp root has no repository
+    /// anywhere above it.
+    #[test]
+    fn a_directory_with_no_repo_anywhere_above_it_is_not_a_work_tree() {
+        let d = tempfile::tempdir().unwrap();
+        let deep = d.path().join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert!(
+            !is_inside_work_tree(&deep),
+            "with no repo in any ancestor this must be false, or `git init` is never offered \
+             and the escape hatch for a plain directory is unreachable"
+        );
     }
 }
