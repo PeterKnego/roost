@@ -778,16 +778,49 @@ mod tests {
         assert!(h.contains("class=\"proj live current\"") || h.contains("current"));
         assert!(h.contains("glow"));
         assert!(h.contains("2 sessions"), "the tooltip must carry the session count");
+        // The headline behaviour: ● pinned to the live project, ○ pinned to
+        // the idle one — not just "a ● and a ○ appear somewhere". Swapping
+        // the two glyphs in projects_strip must fail this test.
+        assert!(h.contains(">● karpie</a>"), "live project must be marked with the filled dot");
+        assert!(h.contains(">○ glow</a>"), "idle project must be marked with the hollow dot");
     }
 
     #[test]
     fn strip_escapes_project_names() {
-        let ps = vec![crate::registry::ProjectStatus {
-            key: "a%3Cb".into(), url: "a<b".into(),
-            live: 0, oldest_age_secs: 0, has_layout: true,
-        }];
+        let ps = vec![
+            crate::registry::ProjectStatus {
+                key: "a%3Cb".into(), url: "a<b".into(),
+                live: 0, oldest_age_secs: 0, has_layout: true,
+            },
+            // storage_key only escapes '/' and '%' — a raw '"' from a
+            // filesystem name can reach `key` unescaped, so this must be
+            // neutralized here, in the target="dl-{key}" attribute, not
+            // just in a text position (a fixture with no HTML metacharacter
+            // at all, like the entry above, would pass even with `esc`
+            // deleted from that call site).
+            crate::registry::ProjectStatus {
+                key: "a\" onmouseover=x".into(), url: "b".into(),
+                live: 0, oldest_age_secs: 0, has_layout: true,
+            },
+        ];
         let h = projects_strip("", &ps);
-        assert!(h.contains("a&lt;b"));
+        assert!(h.contains("a&lt;b"), "the visible label must be HTML-escaped");
         assert!(!h.contains("<b\""), "a name must never break out of the markup");
+        assert!(
+            h.contains("target=\"dl-a&quot; onmouseover=x\""),
+            "the target attribute must be escaped too, not just the visible text"
+        );
+        assert!(!h.contains("dl-a\" "), "a quote in the key must not break out of the target attribute");
+    }
+
+    #[test]
+    fn human_age_picks_the_coarsest_unit_that_fits() {
+        assert_eq!(human_age(0), "0s");
+        assert_eq!(human_age(59), "59s");
+        assert_eq!(human_age(60), "1m");
+        assert_eq!(human_age(3599), "59m");
+        assert_eq!(human_age(3600), "1h");
+        assert_eq!(human_age(86399), "23h");
+        assert_eq!(human_age(86400), "1d");
     }
 }

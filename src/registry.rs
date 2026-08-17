@@ -282,10 +282,58 @@ pub fn reconcile(roots: &[PathBuf]) -> ReapReport {
     report
 }
 
+// `known_projects` runs `reconcile` on every call, and it is itself called on
+// every picker load, every `?at=` browse, every workspace load, and every
+// header-strip refresh (routes.rs) — while lib.rs spawns one thread per
+// connection, so two of those can land concurrently. Unguarded, that means:
+// (a) two sweeps of sock/ racing their own kill/remove decisions against each
+// other, and (b) a project whose process ignores SIGKILL (`ReapAction::Leave`
+// — the socket is deliberately left in place) paying reconcile's ~500ms
+// bounded confirmation poll again on every single subsequent load, forever,
+// since nothing remembers that this pass already tried and failed. The mutex
+// below serializes sweeps; the minimum interval, checked and updated while
+// still holding that same lock, skips a sweep entirely when the last one
+// finished recently enough that its result is still trustworthy — which
+// also means a second thread that loses the race to the first simply finds
+// "too soon" once it gets the lock, rather than duplicating the work.
+//
+// This throttling lives in a wrapper around `reconcile`, not inside
+// `reconcile` itself: startup (lib.rs) and the test suite both call
+// `reconcile` directly and need every call to actually run, unthrottled.
+const RECONCILE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn reconcile_gate() -> &'static std::sync::Mutex<Option<std::time::Instant>> {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<Option<std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Pure timing decision, factored out so it can be unit-tested with
+/// constructed `Instant`s rather than real sleeps.
+fn should_reconcile(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.duration_since(t) >= RECONCILE_MIN_INTERVAL,
+    }
+}
+
+fn reconcile_throttled(roots: &[PathBuf]) {
+    // A poisoned lock (a prior sweep panicked mid-sweep while holding it)
+    // must not take every future request down with it — recovering and
+    // proceeding is strictly safer than propagating the panic onto this
+    // socket thread.
+    let mut last = reconcile_gate().lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    if should_reconcile(*last, now) {
+        let _ = reconcile(roots);
+        *last = Some(now);
+    }
+}
+
 /// Every project deadlight knows about: those with a saved layout, those with
 /// live sessions, and those with both.
 pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
-    let _ = reconcile(roots);
+    reconcile_throttled(roots);
     let mut by_key: std::collections::BTreeMap<String, ProjectStatus> = Default::default();
 
     if let Ok(rd) = std::fs::read_dir(crate::wsstate::state_dir()) {
@@ -367,6 +415,20 @@ mod tests {
         // into a space; decode_key must not, or a project literally named
         // `gtk+` would look gone and have its live session killed.
         assert_eq!(decode_key("gtk+"), "gtk+");
+    }
+
+    // Pure arithmetic over constructed `Instant`s rather than real sleeping,
+    // so this stays fast and non-flaky while still pinning the exact
+    // boundary `reconcile_throttled` relies on to skip redundant sweeps.
+    #[test]
+    fn reconcile_throttle_skips_within_the_interval_and_resumes_after() {
+        let t0 = std::time::Instant::now();
+        assert!(should_reconcile(None, t0), "first call always runs");
+        assert!(!should_reconcile(Some(t0), t0), "immediately after: still within interval");
+        let just_under = t0 + RECONCILE_MIN_INTERVAL - std::time::Duration::from_millis(1);
+        assert!(!should_reconcile(Some(t0), just_under), "just under the interval: still skipped");
+        let at_interval = t0 + RECONCILE_MIN_INTERVAL;
+        assert!(should_reconcile(Some(t0), at_interval), "interval elapsed: runs again");
     }
 
     #[test]
