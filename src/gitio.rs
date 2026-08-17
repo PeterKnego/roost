@@ -13,7 +13,7 @@ pub struct Status {
     pub changes: Vec<Change>,
 }
 
-fn run_git(repo: &Path, args: &[&str], allow_exit_1: bool) -> Result<String, String> {
+pub(crate) fn run_git(repo: &Path, args: &[&str], allow_exit_1: bool) -> Result<String, String> {
     use std::io::Read;
     use std::process::Stdio;
     let mut child = Command::new("git")

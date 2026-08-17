@@ -17,20 +17,42 @@ pub struct Worktree {
 }
 
 /// Parse `git worktree list --porcelain`: blank-line separated records, each
-/// starting with `worktree <path>`. The first record is the main worktree.
+/// starting with `worktree <path>`. The first non-bare record is the main
+/// worktree.
 pub fn parse_porcelain(out: &str) -> Vec<Worktree> {
     let mut ws = Vec::new();
     for record in out.split("\n\n") {
         let mut path: Option<PathBuf> = None;
         let mut branch = String::new();
+        let mut bare = false;
         for line in record.lines() {
             if let Some(p) = line.strip_prefix("worktree ") {
                 path = Some(PathBuf::from(p.trim()));
             } else if let Some(b) = line.strip_prefix("branch ") {
-                branch = b.trim().rsplit('/').next().unwrap_or("").to_string();
+                // `branch` carries the full ref (`refs/heads/feature/x`), not
+                // just the leaf component — branch is the *entire* label
+                // grouping worktrees are keyed on, so truncating it to the
+                // last `/`-segment (the old `rsplit('/').next()`) would
+                // silently collide `feature/a` and `bugfix/a` into the same
+                // displayed "a".
+                let b = b.trim();
+                branch = b.strip_prefix("refs/heads/").unwrap_or(b).to_string();
             } else if line.trim() == "detached" {
                 branch = "(detached)".to_string();
+            } else if line.trim() == "bare" {
+                bare = true;
             }
+        }
+        // A bare repository's own record (a real, common worktree layout is
+        // `repo/.bare`, git's own main entry for it) has a path and no
+        // branch — it is not a working tree, nothing is checked out, there
+        // is nothing to open as a project. Narrowing the dot-segment
+        // exception to genuine worktrees is the whole point of this module,
+        // so this record is dropped entirely rather than merely mislabelled
+        // "(detached)": keeping it out of the returned list is what keeps
+        // `is_vouched_worktree` from ever vouching for it.
+        if bare {
+            continue;
         }
         if let Some(p) = path {
             let is_main = ws.is_empty();
@@ -43,15 +65,17 @@ pub fn parse_porcelain(out: &str) -> Vec<Worktree> {
     ws
 }
 
+/// Runs through `gitio::run_git`, not a bare `Command::output()`: this is
+/// reachable from an HTTP request path (`/frag/_projects`, polled by
+/// `hx-trigger="load, refresh from:body"`), so a wedged repository or
+/// filesystem must not hang the request indefinitely — the same 15s
+/// deadline (with stdout/stderr drained concurrently so a full pipe buffer
+/// can't itself deadlock the wait) that every other git call in this
+/// codebase already gets.
 pub fn list(repo: &Path) -> Vec<Worktree> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["worktree", "list", "--porcelain"])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => parse_porcelain(&String::from_utf8_lossy(&o.stdout)),
-        _ => Vec::new(),
+    match crate::gitio::run_git(repo, &["worktree", "list", "--porcelain"], false) {
+        Ok(out) => parse_porcelain(&out),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -106,17 +130,34 @@ mod tests {
     #[test]
     fn parses_main_and_linked_worktrees_with_branches() {
         // Real `git worktree list --porcelain` shape: blank-line separated
-        // records, `branch refs/heads/<name>`, and `bare`/`detached` variants.
-        let out = "worktree /r/main\nHEAD abc\nbranch refs/heads/main\n\n\
+        // records, `branch refs/heads/<name>`, and a leading bare record —
+        // git itself emits one whenever the repo has a bare gitdir (the
+        // common `repo/.bare` worktree layout), before any real worktree.
+        let out = "worktree /r/.bare\nbare\n\n\
+                   worktree /r/main\nHEAD abc\nbranch refs/heads/main\n\n\
                    worktree /r/.claude/worktrees/feat\nHEAD def\nbranch refs/heads/feat\n\n";
         let ws = parse_porcelain(out);
+        // The bare record is dropped entirely, not merely skipped over for
+        // is_main purposes — it never becomes a Worktree at all.
+        assert!(!ws.iter().any(|w| w.path == PathBuf::from("/r/.bare")));
         assert_eq!(ws.len(), 2);
         assert_eq!(ws[0].path, PathBuf::from("/r/main"));
         assert_eq!(ws[0].branch, "main");
-        assert!(ws[0].is_main, "the first record is the main worktree");
+        assert!(ws[0].is_main, "the first non-bare record is the main worktree");
         assert_eq!(ws[1].path, PathBuf::from("/r/.claude/worktrees/feat"));
         assert_eq!(ws[1].branch, "feat");
         assert!(!ws[1].is_main);
+    }
+
+    // A slashed branch name is common (`feature/x`, `bugfix/x`) and branch is
+    // the *entire* label the grouping UI keys on — truncating to the last
+    // `/`-segment would silently collide `feature/a` and `bugfix/a`.
+    #[test]
+    fn parses_a_slashed_branch_name_without_truncating_it() {
+        let out = "worktree /r/main\nHEAD abc\nbranch refs/heads/main\n\n\
+                   worktree /r/wt\nHEAD def\nbranch refs/heads/feature/nested/thing\n\n";
+        let ws = parse_porcelain(out);
+        assert_eq!(ws[1].branch, "feature/nested/thing");
     }
 
     #[test]
@@ -152,10 +193,17 @@ mod tests {
         run(&repo, &["add", "."]);
         run(&repo, &["commit", "-qm", "init"]);
         run(&repo, &["worktree", "add", "-q", "-b", "feat", ".claude/worktrees/feat"]);
+        // A slashed branch name is common (`feature/x`) — real git output,
+        // not just the hand-written fixture, must not truncate it either.
+        run(&repo, &["worktree", "add", "-q", "-b", "feature/nested", ".claude/worktrees/nested"]);
 
         let ws = list(&repo);
-        assert_eq!(ws.len(), 2, "git must report both worktrees");
+        assert_eq!(ws.len(), 3, "git must report every worktree");
         assert!(ws.iter().any(|w| w.branch == "feat"));
+        assert!(
+            ws.iter().any(|w| w.branch == "feature/nested"),
+            "a real slashed branch name must reach here intact, not truncated to its last segment"
+        );
 
         let roots = vec![root.path().to_path_buf()];
         // The dot-segment path is vouched for, so it resolves...
@@ -165,6 +213,37 @@ mod tests {
         assert!(!is_vouched_worktree(&roots, "repo/.claude"));
         assert!(crate::projects::resolve_project(&roots, "repo/.claude").is_none());
         assert!(crate::projects::resolve_project(&roots, "repo/.git").is_none());
+    }
+
+    // A bare clone placed in a dot directory (`repo/.bare`) is a real,
+    // common worktree layout — and, without M7's fix, would itself become a
+    // vouched, openable "worktree" (a path with no branch, mislabelled
+    // "(detached)"), which is exactly the kind of thing the dot-segment
+    // exception must stay narrow enough to exclude: nothing is checked out
+    // in it, there's no working tree to open.
+    #[test]
+    fn a_bare_repo_in_a_dot_directory_is_never_vouched_for() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@t"]);
+        run(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "init"]);
+        run(&repo, &["clone", "--bare", "-q", ".", ".bare"]);
+
+        let ws = list(&repo.join(".bare"));
+        assert!(ws.is_empty(), "a bare repository's own record must never surface as a worktree");
+
+        let roots = vec![root.path().to_path_buf()];
+        assert!(!is_vouched_worktree(&roots, "repo/.bare"));
+        assert!(crate::projects::resolve_project(&roots, "repo/.bare").is_none());
     }
 
     #[test]
