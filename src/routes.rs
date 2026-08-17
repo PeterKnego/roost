@@ -7,7 +7,7 @@
 //!                        multi-segment; the *last* segment is always the
 //!                        fragment kind (tree/file/changes/status/diff/theme.css)
 //! Fragment errors render as 200 + hint (htmx ignores 4xx bodies).
-use crate::{config, gitio, http, projects, render};
+use crate::{config, gitio, http, projects, registry, render};
 use std::io::{BufReader, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -48,6 +48,20 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
     match segs.as_slice() {
         [] => serve_index(w, req, roots),
         ["static", rest @ ..] => serve_static(w, &rest.join("/")),
+        // Cross-project data (the header strip) has no single project to
+        // hang off — `serve_frag` below always resolves a project first, so
+        // this cannot be folded into it. Must come before the general frag
+        // arm and the catch-all `[project, rest @ ..]` below: with only two
+        // segments `_projects` doesn't satisfy that arm's `rest.len() >= 2`
+        // guard, so without this arm sitting first, `/frag/_projects` would
+        // fall all the way through to the catch-all and be treated as a
+        // request to open a workspace project literally named
+        // "frag/_projects" instead of serving the fragment.
+        ["frag", "_projects"] => {
+            let current = req.query.get("current").map(String::as_str).unwrap_or("");
+            let ps = registry::known_projects(roots);
+            http::html(w, &render::projects_strip(current, &ps));
+        }
         // The fragment *kind* (tree/file/…) is always exactly the last
         // segment (routes.rs's fragment endpoints never take path segments
         // of their own — `dir=`/`path=` arrive as query params, see
@@ -97,7 +111,8 @@ fn serve_index(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
         Some(entries) => (requested, entries, false),
         None => ("", projects::list_dir(roots, "").expect("top level never fails to resolve"), true),
     };
-    http::html(w, &render::index_page(at, &entries, refused));
+    let ps = registry::known_projects(roots);
+    http::html(w, &render::index_page(at, &entries, refused, &ps));
 }
 
 fn serve_workspace(w: &mut impl Write, roots: &[PathBuf], project: &str) {
@@ -106,7 +121,8 @@ fn serve_workspace(w: &mut impl Write, roots: &[PathBuf], project: &str) {
     };
     let settings = config::for_project(&dir);
     let has_theme_css = dir.join(".deadlight/theme.css").is_file();
-    http::html(w, &render::workspace_page(project, &settings, has_theme_css));
+    let key = projects::storage_key(project);
+    http::html(w, &render::workspace_page(project, &key, &settings, has_theme_css));
 }
 
 fn serve_static(w: &mut impl Write, rel: &str) {

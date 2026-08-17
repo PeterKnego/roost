@@ -225,7 +225,20 @@ fn breadcrumb(at: &str) -> String {
 /// picker.js still needs a couple of lines to stop this anchor's click/
 /// dblclick from *also* bubbling to the row's own listeners below (which
 /// would select or descend the row in addition to navigating).
-fn picker_rows(entries: &[Entry]) -> String {
+/// Same ●/○ distinction as `projects_strip`, matched against `entries` via
+/// rel path (`ProjectStatus.url` is the readable slashed form, exactly what
+/// `Entry.rel` is), so a directory that turns out to be a known project
+/// carries the same live/idle cue in the picker as it does in the header
+/// strip — without leaving the picker to open it.
+fn project_marker(rel: &str, projects: &[crate::registry::ProjectStatus]) -> &'static str {
+    match projects.iter().find(|p| p.url == rel) {
+        Some(p) if p.live > 0 => " ●",
+        Some(_) => " ○",
+        None => "",
+    }
+}
+
+fn picker_rows(entries: &[Entry], projects: &[crate::registry::ProjectStatus]) -> String {
     entries
         .iter()
         .map(|e| {
@@ -238,8 +251,9 @@ fn picker_rows(entries: &[Entry]) -> String {
                 } else {
                     String::new()
                 };
+                let marker = project_marker(&e.rel, projects);
                 format!(
-                    "<li class=\"dir\" data-rel=\"{rel}\"><span class=\"name\">{name}</span>{git}</li>",
+                    "<li class=\"dir\" data-rel=\"{rel}\"><span class=\"name\">{name}</span>{marker}{git}</li>",
                     rel = esc(&e.rel),
                     name = esc(&e.name)
                 )
@@ -266,10 +280,14 @@ fn picker_rows(entries: &[Entry]) -> String {
 /// situation from `entries` being empty (a real, successfully-opened
 /// directory with nothing in it), so the two get separate messages rather
 /// than being collapsed into one "nothing to show" hint.
-pub fn index_page(at: &str, entries: &[Entry], refused: bool) -> String {
+///
+/// `projects` (`registry::known_projects`) marks any row that is itself a
+/// known project with the same ●/○ the header strip uses — see
+/// `project_marker`.
+pub fn index_page(at: &str, entries: &[Entry], refused: bool, projects: &[crate::registry::ProjectStatus]) -> String {
     let notice = if refused { hint("no such directory — showing the top level") } else { String::new() };
     let rows_hint = if entries.is_empty() { hint("empty directory") } else { String::new() };
-    let rows = if entries.is_empty() { String::new() } else { picker_rows(entries) };
+    let rows = if entries.is_empty() { String::new() } else { picker_rows(entries, projects) };
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>deadlight</title>\
          <link rel=\"stylesheet\" href=\"/static/themes/dark.css\">\
@@ -286,7 +304,55 @@ pub fn index_page(at: &str, entries: &[Entry], refused: bool) -> String {
     )
 }
 
-pub fn workspace_page(project: &str, s: &Settings, has_theme_css: bool) -> String {
+/// The header strip of known projects. ● means live sessions, ○ means a saved
+/// layout with nothing running — the distinction that answers "what did I
+/// leave running?" without opening anything.
+pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectStatus]) -> String {
+    let mut out = String::from("<span class=\"projstrip\">");
+    for p in projects {
+        let live = p.live > 0;
+        let marker = if live { "●" } else { "○" };
+        let mut cls = String::from("proj");
+        if live {
+            cls.push_str(" live");
+        }
+        if p.key == current_key {
+            cls.push_str(" current");
+        }
+        let title = if live {
+            format!("{} sessions · oldest {}", p.live, human_age(p.oldest_age_secs))
+        } else {
+            "saved layout, nothing running".to_string()
+        };
+        out.push_str(&format!(
+            "<a class=\"{}\" href=\"/{}\" target=\"dl-{}\" title=\"{}\">{} {}</a>",
+            cls,
+            crate::http::percent_encode(&p.url),
+            esc(&p.key),
+            esc(&title),
+            marker,
+            esc(&p.url)
+        ));
+    }
+    out.push_str("</span>");
+    out
+}
+
+/// Coarse, human-readable age. Precision beyond this is noise when the
+/// question is only "is this old enough that I have forgotten it?".
+pub fn human_age(secs: u64) -> String {
+    if secs >= 86_400 {
+        format!("{}d", secs / 86_400)
+    } else if secs >= 3_600 {
+        format!("{}h", secs / 3_600)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+pub fn workspace_page(project: &str, key: &str, s: &Settings, has_theme_css: bool) -> String {
     let warn = s
         .warning
         .as_deref()
@@ -294,6 +360,14 @@ pub fn workspace_page(project: &str, s: &Settings, has_theme_css: bool) -> Strin
         .unwrap_or_default();
     let proj_url = crate::http::percent_encode(project);
     let proj_txt = esc(project);
+    // `key` is the storage-key form (registry::ProjectStatus.key), which
+    // only escapes '/' and '%' — it can still carry raw '"', '<', '&' from
+    // a filesystem name, so it goes through percent_encode (not esc) before
+    // landing in a query string: that keeps it a single, round-trippable
+    // percent-escape rather than corrupting the '%XX' the storage key
+    // already contains, and it happens to be HTML-attribute-safe too, since
+    // percent_encode's output is restricted to plain ASCII.
+    let qkey = crate::http::percent_encode(key);
     let theme_css = if has_theme_css {
         format!("<link rel=\"stylesheet\" href=\"/frag/{proj_url}/theme.css\">")
     } else {
@@ -318,6 +392,8 @@ pub fn workspace_page(project: &str, s: &Settings, has_theme_css: bool) -> Strin
   <a class="home" href="/">◆</a><span class="proj">{proj_txt}</span>
   <span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body"></span>
   {warn}
+  <span id="projstrip" hx-get="/frag/_projects?current={qkey}" hx-trigger="load, refresh from:body"></span>
+  <button id="closeproj" title="close project — ends all its terminal sessions">✕ Close</button>
   <button id="refresh" title="refresh (r)">⟳</button>
 </header>
 <main id="grid">
@@ -336,6 +412,7 @@ pub fn workspace_page(project: &str, s: &Settings, has_theme_css: bool) -> Strin
         tab = esc(&s.default_tab)
     )
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -514,7 +591,7 @@ mod tests {
     #[test]
     fn workspace_page_wires_everything() {
         let s = Settings { theme: "gruvbox".into(), ..Settings::default() };
-        let h = workspace_page("proj", &s, true);
+        let h = workspace_page("proj", "proj", &s, true);
         assert!(h.contains("/static/themes/gruvbox.css"));
         assert!(h.contains("/frag/proj/theme.css")); // has_theme_css
         assert!(h.contains("data-project=\"proj\""));
@@ -522,8 +599,23 @@ mod tests {
         assert!(h.contains("htmx.min.js"));
         assert!(h.contains("data-pane=\"3\""));
         assert!(h.contains("id=\"termpool\""));
-        let no_custom = workspace_page("proj", &s, false);
+        assert!(h.contains("hx-get=\"/frag/_projects?current=proj\""));
+        assert!(h.contains("id=\"projstrip\""));
+        assert!(h.contains("id=\"closeproj\""));
+        let no_custom = workspace_page("proj", "proj", &s, false);
         assert!(!no_custom.contains("theme.css\">"));
+    }
+
+    // The strip's `?current=` value is the storage key, not the URL form —
+    // a nested project's key contains a raw '%2F', and that '%' must round
+    // trip through the query string as a single percent-escape rather than
+    // being corrupted by a second layer of encoding (see workspace_page's
+    // `qkey` comment).
+    #[test]
+    fn workspace_page_percent_encodes_the_current_key_for_the_query_string() {
+        let s = Settings::default();
+        let h = workspace_page("karpie/src", "karpie%2Fsrc", &s, false);
+        assert!(h.contains("hx-get=\"/frag/_projects?current=karpie%252Fsrc\""));
     }
 
     #[test]
@@ -532,7 +624,7 @@ mod tests {
             Entry { name: "alpha".into(), rel: "alpha".into(), is_dir: true, git: true },
             Entry { name: "beta".into(), rel: "beta".into(), is_dir: true, git: false },
         ];
-        let h = index_page("", &entries, false);
+        let h = index_page("", &entries, false, &[]);
         assert!(h.contains("data-rel=\"alpha\""));
         assert!(h.contains("class=\"dir\""));
         // alpha is a git repo: gets a one-click shortcut straight to its
@@ -550,12 +642,38 @@ mod tests {
             Entry { name: "sub".into(), rel: "karpie/sub".into(), is_dir: true, git: false },
             Entry { name: "main.rs".into(), rel: "karpie/main.rs".into(), is_dir: false, git: false },
         ];
-        let h2 = index_page("karpie", &sub, false);
+        let h2 = index_page("karpie", &sub, false, &[]);
         assert!(h2.contains("<a href=\"/\">deadlight</a>"));
         assert!(h2.contains("crumb-current\">karpie"));
         assert!(h2.contains("class=\"dir\" data-rel=\"karpie/sub\""));
         assert!(h2.contains("class=\"file\""));
         assert!(!h2.contains("data-rel=\"karpie/main.rs\"")); // files carry no selection hook
+    }
+
+    // A picker row for a directory that is also a known project carries the
+    // same ●/○ the header strip uses; an ordinary directory with no
+    // matching project carries neither.
+    #[test]
+    fn picker_rows_mark_known_projects_live_or_idle() {
+        let entries = vec![
+            Entry { name: "karpie".into(), rel: "karpie".into(), is_dir: true, git: false },
+            Entry { name: "glow".into(), rel: "glow".into(), is_dir: true, git: false },
+            Entry { name: "plain".into(), rel: "plain".into(), is_dir: true, git: false },
+        ];
+        let ps = vec![
+            crate::registry::ProjectStatus {
+                key: "karpie".into(), url: "karpie".into(),
+                live: 2, oldest_age_secs: 60, has_layout: true,
+            },
+            crate::registry::ProjectStatus {
+                key: "glow".into(), url: "glow".into(),
+                live: 0, oldest_age_secs: 0, has_layout: true,
+            },
+        ];
+        let h = index_page("", &entries, false, &ps);
+        assert!(h.contains("<span class=\"name\">karpie</span> ●"), "live project row carries ●");
+        assert!(h.contains("<span class=\"name\">glow</span> ○"), "idle-but-known project row carries ○");
+        assert!(h.contains("<span class=\"name\">plain</span></li>"), "unknown directory carries neither marker");
     }
 
     // The shortcut's href is a real workspace URL, so it needs the same
@@ -571,7 +689,7 @@ mod tests {
             is_dir: true,
             git: true,
         }];
-        let h = index_page("karpie", &entries, false);
+        let h = index_page("karpie", &entries, false, &[]);
         // "/" between segments survives; the space and quote/angle-bracket
         // characters inside the leaf segment are percent-encoded, not left
         // raw (which would break the URL) and not HTML-entity-encoded
@@ -586,7 +704,7 @@ mod tests {
 
     #[test]
     fn index_page_breadcrumb_links_every_intermediate_segment() {
-        let h = index_page("a/b/c", &[], false);
+        let h = index_page("a/b/c", &[], false, &[]);
         assert!(h.contains("<a href=\"/?at=a\">a</a>"));
         assert!(h.contains("<a href=\"/?at=a/b\">b</a>"));
         assert!(h.contains("crumb-current\">c")); // the current directory itself is not a link
@@ -595,7 +713,7 @@ mod tests {
     #[test]
     fn project_name_is_escaped_everywhere() {
         let s = Settings::default();
-        let h = workspace_page("a\"><script>", &s, false);
+        let h = workspace_page("a\"><script>", "a\"><script>", &s, false);
         assert!(!h.contains("a\"><script>"));
         let c = changes_fragment("a\"><script>", &Status { branch: String::new(), changes: vec![crate::gitio::Change { xy: "??".into(), path: "x".into() }] });
         assert!(!c.contains("\"><script>"));
@@ -608,7 +726,7 @@ mod tests {
     // the refused notice.
     #[test]
     fn index_page_empty_listing_shows_empty_hint() {
-        let h = index_page("karpie", &[], false);
+        let h = index_page("karpie", &[], false, &[]);
         assert!(h.contains("class=\"hint\">empty directory"));
         assert!(!h.contains("showing the top level"));
         assert!(h.contains("id=\"openBtn\"")); // Open stays present and enabled by picker.js's own logic
@@ -625,7 +743,7 @@ mod tests {
     #[test]
     fn index_page_refused_at_shows_notice_and_still_lists_top_level() {
         let entries = vec![Entry { name: "alpha".into(), rel: "alpha".into(), is_dir: true, git: false }];
-        let h = index_page("", &entries, true);
+        let h = index_page("", &entries, true, &[]);
         assert!(h.contains("class=\"hint\">no such directory"));
         assert!(h.contains("showing the top level"));
         assert!(h.contains("data-rel=\"alpha\"")); // fallback listing still renders
@@ -638,7 +756,38 @@ mod tests {
     #[test]
     fn index_page_normal_listing_shows_neither_hint() {
         let entries = vec![Entry { name: "alpha".into(), rel: "alpha".into(), is_dir: true, git: false }];
-        let h = index_page("", &entries, false);
+        let h = index_page("", &entries, false, &[]);
         assert!(!h.contains("class=\"hint\""));
+    }
+
+    #[test]
+    fn strip_marks_live_and_idle_projects() {
+        let ps = vec![
+            crate::registry::ProjectStatus {
+                key: "karpie".into(), url: "karpie".into(),
+                live: 2, oldest_age_secs: 8 * 3600, has_layout: true,
+            },
+            crate::registry::ProjectStatus {
+                key: "glow".into(), url: "glow".into(),
+                live: 0, oldest_age_secs: 0, has_layout: true,
+            },
+        ];
+        let h = projects_strip("karpie", &ps);
+        assert!(h.contains("target=\"dl-karpie\""), "links reuse a named browsing context");
+        assert!(h.contains("href=\"/karpie\""));
+        assert!(h.contains("class=\"proj live current\"") || h.contains("current"));
+        assert!(h.contains("glow"));
+        assert!(h.contains("2 sessions"), "the tooltip must carry the session count");
+    }
+
+    #[test]
+    fn strip_escapes_project_names() {
+        let ps = vec![crate::registry::ProjectStatus {
+            key: "a%3Cb".into(), url: "a<b".into(),
+            live: 0, oldest_age_secs: 0, has_layout: true,
+        }];
+        let h = projects_strip("", &ps);
+        assert!(h.contains("a&lt;b"));
+        assert!(!h.contains("<b\""), "a name must never break out of the markup");
     }
 }
