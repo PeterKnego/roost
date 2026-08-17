@@ -82,11 +82,9 @@ function onEvent(ev) {
     case "Notice": onNotice(ev.notice); break;
     case "Notices":
       notices = ev.list;
-      // Read state is global, so a notice someone else cleared must stop
-      // pulling at this client's attention too.
-      for (const s of [...attention]) {
-        if (!notices.some((n) => n.project === PROJECT && n.session === s && !n.read)) attention.delete(s);
-      }
+      // The tab-strip dot (hasAttention) is derived straight from `notices`
+      // on every render — nothing to reconcile here, unlike a separately
+      // maintained set that could drift from what the server just said.
       renderNotices();
       render();
       break;
@@ -143,13 +141,17 @@ function render() {
       b.className =
         "tab" +
         (ti === pane.active ? " active" : "") +
-        (t.k === "Terminal" && attention.has(t.session) ? " attn" : "");
+        (t.k === "Terminal" && hasAttention(t.session) ? " attn" : "");
       const meta = t.k === "File" ? state.buffers.find((x) => x.rel === t.rel) : null;
       b.innerHTML =
         (meta && meta.dirty ? '<span class="dirty">●</span> ' : "") +
         (meta && meta.stale ? '<span class="stale">⚠</span> ' : "") +
         escapeHtml(tabLabel(t));
-      b.onclick = () => send({ t: "ActivateTab", pane: pi, idx: ti });
+      // Terminal tabs route through focusSession, not a bare ActivateTab, so
+      // the obvious gesture of clicking a dotted tab is what clears its dot
+      // — see hasAttention/focusSession below.
+      b.onclick = () =>
+        t.k === "Terminal" ? focusSession(t.session) : send({ t: "ActivateTab", pane: pi, idx: ti });
       if (t.k === "File") {
         const e = document.createElement("span");
         e.className = "x";
@@ -662,7 +664,23 @@ function renderNotices() {
   }
   const foot = document.createElement("div");
   foot.className = "notice-foot";
-  if (canNotify() && Notification.permission !== "granted") {
+  const markAll = document.createElement("button");
+  markAll.textContent = "Mark all read";
+  markAll.onclick = (e) => { e.stopPropagation(); send({ t: "MarkAllNoticesRead" }); };
+  foot.appendChild(markAll);
+  const clear = document.createElement("button");
+  clear.textContent = "Clear";
+  clear.onclick = (e) => { e.stopPropagation(); send({ t: "ClearNotices" }); };
+  foot.appendChild(clear);
+  if (canNotify() && Notification.permission === "denied") {
+    // Browsers never re-prompt after an explicit denial, so offering the
+    // same "Enable" button here would be a silent no-op on click — the spec
+    // requires saying which of the two situations (denied vs. no secure
+    // context) this is, not failing silently either way.
+    const s = document.createElement("span");
+    s.textContent = "OS notifications are blocked for this site — re-enable them in your browser's site settings";
+    foot.appendChild(s);
+  } else if (canNotify() && Notification.permission !== "granted") {
     const b = document.createElement("button");
     b.textContent = "Enable OS notifications";
     // Requested from a click, never on load: browsers penalise spontaneous
@@ -674,10 +692,6 @@ function renderNotices() {
     s.textContent = "OS notifications need a secure context (https or localhost)";
     foot.appendChild(s);
   }
-  const clear = document.createElement("button");
-  clear.textContent = "Clear";
-  clear.onclick = (e) => { e.stopPropagation(); send({ t: "ClearNotices" }); };
-  foot.appendChild(clear);
   panel.appendChild(foot);
 }
 
@@ -722,32 +736,52 @@ function openNotice(x) {
   focusSession(x.session);
 }
 
+// Marks every unread notice for one session read. Used wherever a route
+// lands on a session — a tab-strip click, an in-page notice click, an OS
+// notification click (the SW's "focus" message), or a cold #session= load —
+// so "cleared when that tab becomes active" (the spec's words for the dot)
+// holds no matter which of those gestures got you there. Always scoped to
+// PROJECT: the SW only posts "focus" to a window already on that project,
+// and the cold-load path is by definition this page's own project.
+function markSessionNoticesRead(session) {
+  for (const n of notices) {
+    if (!n.read && n.project === PROJECT && n.session === session) send({ t: "MarkNoticeRead", id: n.id });
+  }
+}
+
 // Activate the terminal tab for `session`, opening it if it is not on screen.
 // Both paths are ordinary intents, so every connected client follows.
 function focusSession(session) {
   if (!session || !SESSION_RE.test(session) || !state) return;
+  markSessionNoticesRead(session);
   for (let pi = 0; pi < state.panes.length; pi++) {
     const ti = state.panes[pi].tabs.findIndex((t) => t.k === "Terminal" && t.session === session);
     if (ti >= 0) {
       send({ t: "ActivateTab", pane: pi, idx: ti });
-      attention.delete(session);
-      renderNotices();
       return;
     }
   }
   send({ t: "OpenTab", pane: 3, tab: { k: "Terminal", session } });
 }
 
-// Sessions in THIS project with unseen notices — the tab-strip dot. A session
-// in another project has no tab here; that is what the bell badge is for.
-const attention = new Set();
+// The tab-strip dot for a session in THIS project: derived from `notices`
+// rather than maintained as a separate set, so it can never drift from the
+// server's read state in either direction (a dot that never lights because
+// nothing ever adds to a separate set, or one that never clears because
+// nothing ever removes from it — both were real bugs here). A session in
+// another project has no tab here; that is what the bell badge is for.
+function hasAttention(session) {
+  return notices.some((n) => n.project === PROJECT && n.session === session && !n.read);
+}
 
 function onNotice(n) {
   notices.push(n);
-  if (n.project === PROJECT) attention.add(n.session);
   if (canNotify() && Notification.permission === "granted") {
     if (swReg) swReg.active && swReg.active.postMessage({ kind: "notify", notice: n });
-    else new Notification(n.title, { body: n.body, tag: `${n.project}/${n.session}` });
+    // Fallback when there's no service worker: same attribution rule as
+    // sw.js — project/session (server truth) in the title, payload text in
+    // the body — so a hostile payload cannot forge another project's banner.
+    else new Notification(`${n.project} · ${n.session}`, { body: `${n.title} — ${n.body}`, tag: `${n.project}/${n.session}` });
   }
   renderNotices();
   render();
