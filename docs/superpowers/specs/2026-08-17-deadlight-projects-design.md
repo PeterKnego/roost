@@ -245,6 +245,16 @@ therefore a normal GET fragment.
 Session names remain `[A-Za-z0-9_-]{1,32}`. `git init` runs with the project
 directory as cwd and takes no user-supplied arguments.
 
+**A GET can trigger reaping.** The cross-project strip endpoint is a read, but
+it calls `known_projects`, which reconciles — deleting stale sockets and
+killing processes whose project directory is gone. So a hostile page's
+`<img src="http://localhost:8444/frag/_projects">` sends a genuine `Host`,
+passes the `Host` check (which defends DNS rebinding, not this), and triggers a
+sweep. The impact is bounded — reaping only ends sessions whose project
+directory has already been deleted — and this is a single-user tool on
+loopback, so it is accepted rather than fixed. Reaping is serialised and
+rate-limited so the endpoint cannot be used to amplify `ps` invocations.
+
 The worktree dot-segment exception is a **relaxation of one naming rule, not of
 confinement**. A worktree path is accepted only when git reports it *and* it
 canonicalises under a root; a repository that names a worktree outside `ROOTS`
