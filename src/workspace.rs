@@ -44,6 +44,14 @@ pub struct Workspace {
     pub panes: Vec<Pane>,
     pub buffers: HashMap<String, Buffer>,
     pub watch_degraded: bool,
+    /// Session names with a live pty attached. Empty on a freshly opened
+    /// project — the default layout still lists a Terminal tab, but listing
+    /// it is not the same as running it; the client uses this to decide
+    /// whether that tab attaches immediately or shows its start placeholder.
+    pub live_sessions: Vec<String>,
+    /// Whether the project root is a git repository, cached here so the
+    /// hub doesn't re-stat the filesystem on every view.
+    pub is_git: bool,
 }
 
 /// Stable content hash used as the conflict guard. FNV-1a: no dependency,
@@ -69,6 +77,8 @@ impl Workspace {
             panes,
             buffers: HashMap::new(),
             watch_degraded: false,
+            live_sessions: vec![],
+            is_git: false,
         }
     }
 
@@ -101,6 +111,8 @@ impl Workspace {
                 .collect(),
             buffers,
             watch_degraded: self.watch_degraded,
+            live_sessions: self.live_sessions.clone(),
+            is_git: self.is_git,
         }
     }
 }
@@ -351,5 +363,18 @@ mod tests {
         assert!(v.buffers[0].dirty);
         let json = serde_json::to_string(&v).unwrap();
         assert!(!json.contains("secret"), "State must never carry buffer text");
+    }
+
+    #[test]
+    fn view_reports_live_sessions_and_git_status() {
+        let mut w = Workspace::default_layout();
+        w.live_sessions = vec!["shell".into()];
+        w.is_git = true;
+        let v = w.view();
+        assert_eq!(v.live_sessions, vec!["shell".to_string()]);
+        assert!(v.is_git);
+        // Default is neither: a fresh workspace has spawned nothing.
+        let fresh = Workspace::default_layout().view();
+        assert!(fresh.live_sessions.is_empty(), "opening a project must not imply a session");
     }
 }
