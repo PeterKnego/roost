@@ -30,6 +30,19 @@ when they're actually picked up.
   (`2026-08-16-deadlight-v3-workspace-design.md`).
 - Paste images into the claude terminal (ctrl+v) — speculative idea, v3 spec
   (`2026-08-16-deadlight-v3-workspace-design.md`).
+- Notification centre on the picker page (`/`) as well as the workspace
+  page — the notice store is already global, only the markup is missing
+  (`2026-08-17-deadlight-notifications-design.md`).
+- Per-project notification mute and a quiet-hours window — deferred out of
+  v1 alongside sound (`2026-08-17-deadlight-notifications-design.md`).
+- Web Push for notifications. The service worker gains a `push` handler; the
+  server gains VAPID signing, payload encryption, and subscription storage —
+  the step that reaches a phone with no tab open, and the reason the client
+  already uses a service worker
+  (`2026-08-17-deadlight-notifications-design.md`).
+- A relay sink (ntfy/Pushover) for notifications: a configured webhook POSTed
+  on publish, a cheaper route to a phone than Web Push at the cost of a third
+  party and a token to store (`2026-08-17-deadlight-notifications-design.md`).
 
 ## Editing
 
