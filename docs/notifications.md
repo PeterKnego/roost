@@ -116,10 +116,34 @@ the 10-per-minute limit and its `(N suppressed)` accounting, mark-all-read
 clearing the badges while keeping history, and 18 notices with 14 unread
 surviving a restart with badges and panel restored.
 
-**Two things remain unverified**: the OS banner actually rendering, and
-click-to-focus. Both sit behind a permission grant that needs a real gesture on
-the browser's own prompt — the code path feeding them is exercised, the OS-level
-render is not. The 100-notice retention cap is also untested.
+**The OS notification and the click routing are verified too**, with the
+permission actually granted (via CDP, in a throwaway Chromium profile) rather
+than skipped:
+
+- The service worker registers **and activates**, and `showNotification` really
+  produces a notification object. Fired from a session whose payload claimed a
+  different project, it came back as
+  `{title: "projA · shell", body: "projB — spoof attempt", tag: "projA/shell"}`
+  — so the attribution rule holds in the OS banner's most prominent field, which
+  is the whole point of it.
+- Two sessions' notifications coexist under distinct tags (`projA/shell`,
+  `projB/shell`), so the per-session `tag` replaces a session's own banner
+  without collapsing different ones.
+- Click routing: `clients.matchAll` finds the window whose decoded pathname
+  matches the notice's project, the page receives
+  `{kind: "focus", project, session}`, and `focusSession` then marks that
+  session's notices read on the server (3 unread → 0) and activates its terminal
+  tab. With only a `/projA` window open, a `projB` notice correctly takes the
+  other branch instead — reuse a window and navigate it to
+  `/projB#session=shell`.
+
+**What still cannot be proven by automation:** the browser dispatching a real
+`notificationclick` from a real desktop click, and `client.focus()` succeeding.
+A synthetically constructed `NotificationEvent` cannot call `waitUntil` (it
+throws, aborting the handler before the routing), and `focus()` needs user
+activation — in headless it raises `InvalidAccessError`. Both are browser-side
+preconditions rather than deadlight logic, and the code they gate is exercised
+above. The 100-notice retention cap is also still untested.
 
 ## Limits
 
