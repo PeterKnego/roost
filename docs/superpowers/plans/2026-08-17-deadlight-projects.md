@@ -19,6 +19,7 @@
 - Project storage keys are percent-encoded (`karpie%2Fsrc`); URLs keep readable slashes. Existing top-level keys must stay byte-for-byte identical.
 - Caps unchanged: ≤16 sessions per project, ≤50 buffers, 1 MB scrollback, 2 MB file cap.
 - `git init` runs with the project directory as cwd and takes **no** user-supplied arguments.
+- The worktree dot-segment exception relaxes **one naming rule, never confinement**: a dot-segment path resolves only when `git worktree list` vouches for it AND it canonicalises under a root. `git worktree list` is read-only and takes no user-supplied arguments.
 - Crate edition `2021`. Run `cargo test` (never `--release`) from the repo root.
 - No panics may escape a socket or watcher thread.
 - House style: module-level `//!` doc explaining *why*; implementation above, `#[cfg(test)] mod tests` at the bottom of the same file; comments give rationale, not mechanics.
@@ -29,6 +30,7 @@
 |---|---|
 | `src/session.rs` (modify) | Session enumeration with age, existence check, kill-all-for-project |
 | `src/registry.rs` (new) | Startup reconciliation, orphan reaping, cross-project status |
+| `src/worktree.rs` (new) | `git worktree list` parsing, the dot-segment allowlist, parent/child grouping |
 | `src/proto.rs` (modify) | New intents/events; `live_sessions` + `is_git` in the state view |
 | `src/workspace.rs` (modify) | Carry live-session names into the view |
 | `src/hub.rs` (modify) | Dispatch `StartTerminal`, `InitGit`, `CloseProject` |
@@ -38,7 +40,7 @@
 | `static/app.js` (modify) | Terminal placeholder, git gate, strip, close dialog |
 | `static/style.css` (modify) | Placeholder, strip and dialog styling |
 
-Tasks 1–6 are server-side and each ends green with `cargo test`. Task 7 is the client. Task 8 is docs + deploy.
+Tasks 1–6 are server-side and each ends green with `cargo test`. Task 6a adds worktree discovery. Task 7 is the client. Task 8 is docs + deploy.
 
 ---
 
@@ -915,6 +917,288 @@ Expected: initially FAIL on `live_sessions` being absent or non-empty; PASS once
 git add tests/integration.rs
 git commit -m "projects: prove opening a project spawns nothing, and close ends sessions"
 ```
+
+---
+
+### Task 6a: `worktree` — git-sourced discovery, the dot allowlist, and grouping
+
+**Files:**
+- Create: `src/worktree.rs`
+- Modify: `src/projects.rs` (`resolve_project` consults the allowlist), `src/lib.rs` (add `pub mod worktree;`)
+
+**Interfaces:**
+- Consumes: `projects::resolve_project` (for the confinement check), `projects::roots`.
+- Produces: `worktree::Worktree { path: PathBuf, branch: String, is_main: bool }`; `worktree::parse_porcelain(&str) -> Vec<Worktree>`; `worktree::list(repo: &Path) -> Vec<Worktree>`; `worktree::is_vouched_worktree(roots: &[PathBuf], rel: &str) -> bool`.
+
+**Why this exists.** A worktree is already a project by deadlight's rules, but the real-world ones are unreachable: Claude Code puts them at `{repo}/.claude/worktrees/{name}`, the picker hides dot-directories, and `resolve_project` rejects any path segment starting with `.`. Discovery therefore goes through git — authoritative wherever a worktree lives — and the dot rule gains one narrow exception gated on git vouching for the path.
+
+- [ ] **Step 1: Create `src/worktree.rs` with tests only**
+
+```rust
+//! Git worktrees. A worktree is its own project — separate directory, rel
+//! path, sessions and layout — and only its *display* is parent-and-child.
+//!
+//! Discovery asks git rather than walking the filesystem, because the
+//! dominant real location is a dot-directory (`{repo}/.claude/worktrees/{name}`,
+//! which Claude Code creates) that the picker hides and `resolve_project`
+//! refuses. A path convention would also miss a worktree placed in a sibling
+//! directory; `git worktree list` would not.
+use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_main_and_linked_worktrees_with_branches() {
+        // Real `git worktree list --porcelain` shape: blank-line separated
+        // records, `branch refs/heads/<name>`, and `bare`/`detached` variants.
+        let out = "worktree /r/main\nHEAD abc\nbranch refs/heads/main\n\n\
+                   worktree /r/.claude/worktrees/feat\nHEAD def\nbranch refs/heads/feat\n\n";
+        let ws = parse_porcelain(out);
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws[0].path, PathBuf::from("/r/main"));
+        assert_eq!(ws[0].branch, "main");
+        assert!(ws[0].is_main, "the first record is the main worktree");
+        assert_eq!(ws[1].path, PathBuf::from("/r/.claude/worktrees/feat"));
+        assert_eq!(ws[1].branch, "feat");
+        assert!(!ws[1].is_main);
+    }
+
+    #[test]
+    fn parses_a_detached_worktree_without_panicking() {
+        let out = "worktree /r/main\nHEAD abc\ndetached\n\n";
+        let ws = parse_porcelain(out);
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws[0].branch, "(detached)", "a detached head still needs a label");
+    }
+
+    #[test]
+    fn malformed_output_yields_nothing_rather_than_panicking() {
+        assert!(parse_porcelain("").is_empty());
+        assert!(parse_porcelain("garbage\nmore garbage\n").is_empty());
+    }
+
+    // The porcelain format is the thing under test, so this uses a real
+    // `git worktree add` — a hand-written fixture would not prove we parse
+    // git's actual output.
+    #[test]
+    fn a_real_worktree_in_a_dot_directory_is_vouched_and_resolvable() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@t"]);
+        run(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "init"]);
+        run(&repo, &["worktree", "add", "-q", "-b", "feat", ".claude/worktrees/feat"]);
+
+        let ws = list(&repo);
+        assert_eq!(ws.len(), 2, "git must report both worktrees");
+        assert!(ws.iter().any(|w| w.branch == "feat"));
+
+        let roots = vec![root.path().to_path_buf()];
+        // The dot-segment path is vouched for, so it resolves...
+        assert!(is_vouched_worktree(&roots, "repo/.claude/worktrees/feat"));
+        assert!(crate::projects::resolve_project(&roots, "repo/.claude/worktrees/feat").is_some());
+        // ...while an unvouched dot path is still refused.
+        assert!(!is_vouched_worktree(&roots, "repo/.claude"));
+        assert!(crate::projects::resolve_project(&roots, "repo/.claude").is_none());
+        assert!(crate::projects::resolve_project(&roots, "repo/.git").is_none());
+    }
+
+    #[test]
+    fn a_worktree_outside_the_roots_is_never_resolvable() {
+        // Confinement, not the allowlist, is what forbids this: a cloned repo
+        // could name a worktree anywhere.
+        let root = tempfile::tempdir().unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        assert!(!is_vouched_worktree(&roots, "../escape"));
+        assert!(crate::projects::resolve_project(&roots, "../escape").is_none());
+    }
+}
+```
+
+- [ ] **Step 2: Add `pub mod worktree;` to `src/lib.rs`, run, expect compile failure**
+
+Run: `cargo test worktree`
+Expected: FAIL — `parse_porcelain`, `list`, `is_vouched_worktree` not found.
+
+- [ ] **Step 3: Implement above the test module**
+
+```rust
+pub struct Worktree {
+    pub path: PathBuf,
+    /// Branch name, or `"(detached)"` — a worktree always needs a label
+    /// because worktrees of one repo differ only by branch.
+    pub branch: String,
+    pub is_main: bool,
+}
+
+/// Parse `git worktree list --porcelain`: blank-line separated records, each
+/// starting with `worktree <path>`. The first record is the main worktree.
+pub fn parse_porcelain(out: &str) -> Vec<Worktree> {
+    let mut ws = Vec::new();
+    for record in out.split("\n\n") {
+        let mut path: Option<PathBuf> = None;
+        let mut branch = String::new();
+        for line in record.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(p.trim()));
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                branch = b.trim().rsplit('/').next().unwrap_or("").to_string();
+            } else if line.trim() == "detached" {
+                branch = "(detached)".to_string();
+            }
+        }
+        if let Some(p) = path {
+            let is_main = ws.is_empty();
+            if branch.is_empty() {
+                branch = "(detached)".to_string();
+            }
+            ws.push(Worktree { path: p, branch, is_main });
+        }
+    }
+    ws
+}
+
+pub fn list(repo: &Path) -> Vec<Worktree> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => parse_porcelain(&String::from_utf8_lossy(&o.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// True when git itself reports `rel` as a worktree of some repository under
+/// `roots`. This is the sole exception to the dot-segment rule, and it is an
+/// exception to *naming* only — the caller still confines the path.
+pub fn is_vouched_worktree(roots: &[PathBuf], rel: &str) -> bool {
+    let Some(candidate) = confined_path(roots, rel) else { return false };
+    // Walk up looking for the repository that owns this path, then ask it.
+    let mut probe = candidate.as_path();
+    while let Some(parent) = probe.parent() {
+        if parent.join(".git").exists() {
+            let owned = list(parent).into_iter().any(|w| {
+                w.path.canonicalize().map(|p| p == candidate).unwrap_or(false)
+            });
+            if owned {
+                return true;
+            }
+        }
+        probe = parent;
+        if !roots.iter().any(|r| probe.starts_with(r)) {
+            break;
+        }
+    }
+    false
+}
+
+/// Canonicalise `rel` under some root without applying the dot-segment rule —
+/// confinement only. Returns None when it escapes every root.
+fn confined_path(roots: &[PathBuf], rel: &str) -> Option<PathBuf> {
+    for root in roots {
+        let Ok(base) = root.canonicalize() else { continue };
+        let Ok(canon) = base.join(rel).canonicalize() else { continue };
+        if canon.starts_with(&base) && canon.is_dir() {
+            return Some(canon);
+        }
+    }
+    None
+}
+```
+
+- [ ] **Step 4: Let `resolve_project` accept a vouched worktree**
+
+In `src/projects.rs`, the dot-segment guard currently rejects unconditionally:
+
+```rust
+    if segs.iter().any(|s| s.is_empty() || s.starts_with('.')) {
+        return None;
+    }
+```
+
+Change it so a dot segment is tolerated *only* for a vouched worktree, keeping the
+empty-segment rejection absolute:
+
+```rust
+    if segs.iter().any(|s| s.is_empty()) {
+        return None;
+    }
+    // Dot segments stay forbidden — `.git`, `.venv`, `.config` are not
+    // projects — with one exception: git itself vouching for the path as a
+    // worktree. Confinement below is unchanged and still does the real work,
+    // because a cloned repo could name a worktree anywhere.
+    if segs.iter().any(|s| s.starts_with('.')) && !crate::worktree::is_vouched_worktree(roots, name) {
+        return None;
+    }
+```
+
+Note the recursion hazard: `is_vouched_worktree` must **not** call
+`resolve_project`, or the two will recurse. That is why it has its own
+`confined_path` helper.
+
+- [ ] **Step 5: Run, expect pass**
+
+Run: `cargo test`
+Expected: all pass, including the existing `resolve_rejects_bad_names` test — `.hidden` and `.git` must still be refused, since git does not vouch for them.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/worktree.rs src/projects.rs src/lib.rs
+git commit -m "projects: discover worktrees via git, allowlist their dot paths"
+```
+
+- [ ] **Step 6: Group worktrees under their parent, labelled by branch**
+
+Task 5 built `render::projects_strip` and the picker markers as a flat list.
+Worktrees of one repository differ only by branch, so both views now group them
+and label by branch:
+
+```
+▸ ultima_marketing        ⎇ main          ● 2 shells
+    └ site-launch         ⎇ site-launch   ○
+```
+
+Extend `ProjectStatus` with `branch: String` and `parent: Option<String>` (the
+parent's storage key, `None` for a main worktree or a plain project), populate
+them in `registry::known_projects` using `worktree::list` for entries that are
+repositories, and render children indented under their parent with the branch
+shown. Sort so a parent is immediately followed by its children.
+
+**Cost control:** `git worktree list` is a subprocess, so call it only for
+entries that are already known to be repositories (`.git` exists — cheap), and
+only for the entries being displayed. A worktree git reports but which does not
+canonicalise under a root is rendered dimmed and unclickable rather than
+omitted, so the user is not left wondering where it went.
+
+Add a render test asserting a parent/child pair renders with the child indented
+and both branches shown, and that an unreachable worktree renders without a
+link.
+
+- [ ] **Step 7: Run, expect pass**
+
+Run: `cargo test`
+Expected: all pass
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/worktree.rs src/registry.rs src/render.rs src/projects.rs src/lib.rs
+git commit -m "projects: group worktrees under their repo, labelled by branch"
+```
+
 
 ---
 
