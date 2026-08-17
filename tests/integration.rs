@@ -94,6 +94,24 @@ fn frag_route_resolves_a_nested_projects_fragment_kind() {
     assert!(tree.contains("inner.rs"));
 }
 
+// Guards the route-ordering fix in routes.rs: `_projects` has too few
+// segments to match the general `["frag", rest @ ..] if rest.len() >= 2`
+// arm, so without its own arm sitting ahead of the catch-all, this request
+// falls through to `serve_workspace` and tries to open a project literally
+// named "frag/_projects" instead of serving the cross-project fragment.
+// Deleting the `["frag", "_projects"]` arm, or moving it after the
+// catch-all, is exactly what this test would catch.
+#[test]
+fn frag_projects_route_serves_the_cross_project_strip() {
+    let (_d, port) = fixture();
+    let resp = ureq::get(&format!("http://127.0.0.1:{port}/frag/_projects?current=x"))
+        .call()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_string().unwrap();
+    assert!(body.contains("class=\"projstrip\""));
+}
+
 #[test]
 fn picker_at_shows_a_directorys_children_marked_distinctly() {
     let (_d, port) = nested_fixture();
