@@ -4,6 +4,7 @@ pub mod gitio;
 pub mod hub;
 pub mod http;
 pub mod origin;
+pub mod osc;
 pub mod projects;
 pub mod proto;
 pub mod registry;
