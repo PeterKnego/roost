@@ -472,6 +472,20 @@ fn confirmed_gone(key_dir: &std::path::Path, roots: &[PathBuf], url: &str) -> bo
     }
 }
 
+/// The age of the longest-running session, or `None` when not one of them has
+/// a readable age.
+///
+/// `filter_map`, not `map`: a session whose age the OS could not supply (a pid
+/// `ps` cannot read, or the `0` sentinel used when no pid was available) must
+/// not contribute a `0` that then wins `max()` and renders as "just started".
+/// Unknown has to stay unknown all the way to the tooltip — the same rule as
+/// everywhere else in this module, in a rendering rather than a destructive
+/// position. Kept as a pure function so the all-unknown and mixed cases are
+/// testable without contriving an unreadable process.
+fn oldest_age(sessions: &[crate::session::SessionInfo]) -> Option<u64> {
+    sessions.iter().filter_map(|s| s.age_secs).max()
+}
+
 /// What to do with one socket file, given what's known about it. Kept as a
 /// pure function, separate from the `kill`/`pgrep`/`remove_file` calls that
 /// gather its inputs, so every combination — including "a kill attempt
@@ -621,11 +635,16 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
         // unlinked as an orphan. `storage_key` escapes those bytes now, so this
         // is unreachable for anything deadlight wrote — it guards a key written
         // by an older build, or one dropped in by hand. Skipping costs a stale
-        // row; reaping costs a running shell. `to_string_lossy` also means a
-        // non-UTF8 name arrives with replacement characters, i.e. as a name that
-        // can never resolve, which the `confirmed_gone` marker check already
-        // treats as "cannot tell" rather than "gone".
-        if key.bytes().any(|b| b.is_ascii_control() || b == 0x7F) {
+        // row; reaping costs a running shell.
+        //
+        // This does NOT cover a non-UTF8 key: `to_string_lossy` turns those
+        // bytes into U+FFFD, which is not a control character, so such a key
+        // sails past here. It is safe for a different reason — `pids_holding`
+        // lossy-converts the `ps` line and the socket path the same way, so
+        // they still match — and that is worth knowing rather than assuming
+        // this guard handles it.
+        // `is_ascii_control` already covers 0x7F (DEL), so this is the whole set.
+        if key.bytes().any(|b| b.is_ascii_control()) {
             eprintln!(
                 "deadlight: refusing to reap session key {key:?} — it contains a control byte, \
                  so who holds its socket cannot be determined from `ps` output"
@@ -819,7 +838,7 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
             // attachment counts. Once something in this process actually
             // attaches, the in-memory list becomes authoritative again.
             let (live, oldest) = if !sessions.is_empty() {
-                (sessions.len(), sessions.iter().map(|s| s.age_secs).max())
+                (sessions.len(), oldest_age(&sessions))
             } else {
                 // Excludes `.origin` (see reconcile's identical skip): it's
                 // metadata about the project key, not a session socket, and
@@ -1044,6 +1063,35 @@ mod tests {
         }
     }
 
+    fn si(name: &str, age: Option<u64>) -> crate::session::SessionInfo {
+        crate::session::SessionInfo { name: name.into(), pid: 1, age_secs: age, attached: 0 }
+    }
+
+    /// An unknown age must never be passed off as `0`. Before this, a session
+    /// whose pid `ps` could not read contributed `0` to the max, and the strip
+    /// rendered "oldest 0s" — claiming a possibly days-old shell had just
+    /// started, on precisely the question a session age is asked for. The
+    /// all-unknown case is the one that matters: the answer is "unknown", not
+    /// "zero seconds".
+    #[test]
+    fn oldest_age_reports_unknown_rather_than_zero() {
+        assert_eq!(oldest_age(&[]), None, "no sessions at all: nothing to report");
+        assert_eq!(
+            oldest_age(&[si("a", None), si("b", None)]),
+            None,
+            "every age unknown must stay unknown, not collapse to Some(0)"
+        );
+        assert_eq!(
+            oldest_age(&[si("a", None), si("b", Some(7200)), si("c", None)]),
+            Some(7200),
+            "a known age must win over unknown siblings rather than being dragged to 0"
+        );
+        assert_eq!(oldest_age(&[si("a", Some(5)), si("b", Some(90))]), Some(90));
+        // The specific regression: one unknown next to one genuinely new
+        // session must not report the unknown one as the oldest.
+        assert_eq!(oldest_age(&[si("a", None), si("b", Some(3))]), Some(3));
+    }
+
     #[test]
     fn decode_key_reverses_the_storage_encoding() {
         assert_eq!(decode_key("karpie"), "karpie");
@@ -1242,6 +1290,40 @@ mod tests {
             let report = reconcile(&[PathBuf::from("/nonexistent-root")]);
             assert!(report.dead_sockets >= 1, "a socket with no process must be removed");
             assert!(!sock.join("shell").exists(), "the stale socket file must be gone");
+        });
+    }
+
+    /// The mirror image of the test above, and the reason the control-byte
+    /// skip exists. An identical stale socket under a key containing a raw
+    /// newline must be left alone, because who holds a socket is only knowable
+    /// from line-oriented `ps` output, and a newline in the path splits one
+    /// process's argv across two lines — so a *live* holder is invisible and
+    /// the socket would be unlinked out from under a running shell.
+    ///
+    /// `storage_key` escapes control bytes now, so this key can only come from
+    /// an older build or a hand-made directory; that is exactly what the guard
+    /// is for. Pairing it with `a_socket_with_no_live_process_is_reaped` is
+    /// what makes it meaningful: the same fixture, differing only in the key,
+    /// gets opposite treatment — so this cannot pass merely because reaping is
+    /// broken in general.
+    #[test]
+    fn a_socket_under_a_control_byte_key_is_never_reaped() {
+        with_state(|state| {
+            let sock = state.join("sock/my\nproj");
+            fs::create_dir_all(&sock).unwrap();
+            fs::write(sock.join("shell"), "").unwrap();
+
+            let report = reconcile(&[PathBuf::from("/nonexistent-root")]);
+
+            assert!(
+                sock.join("shell").exists(),
+                "a socket under a key whose holder cannot be identified in `ps` output must be \
+                 left in place — unlinking it would orphan a running shell"
+            );
+            assert_eq!(
+                report.dead_sockets, 0,
+                "and it must not be counted as reaped either"
+            );
         });
     }
 
