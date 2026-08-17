@@ -102,6 +102,13 @@ Check each directory before killing — a key you do not recognise may be a
 project that still exists under different roots, which is exactly the case the
 `.origin` marker was added to protect.
 
+One other legacy case, almost certainly hypothetical: a project whose directory
+name contains a control character (a newline, say) used to be keyed with that
+byte raw and is now percent-encoded, so its old state file and socket directory
+become unreachable — and deliberately unreapable, since who holds such a socket
+cannot be determined from `ps` output. If `ls "$HOME/.local/state/deadlight/sock/"`
+shows a key spanning two lines, that is one; clear it by hand as above.
+
 Reaping is also suspended entirely when `ps` cannot be trusted (non-zero exit,
 or empty output, which on a live host means the listing failed rather than that
 nothing is running), for the same reason.

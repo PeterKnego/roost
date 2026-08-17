@@ -92,8 +92,23 @@ pub fn parse_status(porcelain: &str) -> Status {
     Status { branch, changes }
 }
 
+/// Gated on being inside *any* work tree, matching `is_inside_work_tree` and
+/// therefore `Hub`'s `is_git` — not on this directory having its own `.git`.
+///
+/// A nested project (`karpie/src`) has no `.git` of its own but is genuinely
+/// inside its parent's work tree, and `git status -C` there reports the
+/// subtree's changes perfectly well. Keying this check off the project's own
+/// `.git` while `is_git` asked the broader question left the three git surfaces
+/// disagreeing: the terminal placeholder correctly declined to offer
+/// `git init`, `diff` (which has no such pre-check) happily produced diffs, and
+/// the changes pane in between insisted "not a git repository". One definition
+/// for all three.
+///
+/// The pre-check earns its keep by keeping the *common* non-repo case free of a
+/// subprocess — `run_git`'s error would be equivalent, but every workspace load
+/// hits this path.
 pub fn status(repo: &Path) -> Result<Status, String> {
-    if !repo.join(".git").exists() {
+    if !is_inside_work_tree(repo) {
         return Err("not a git repository".into());
     }
     run_git(repo, &["status", "--porcelain=v2", "-b"], false).map(|s| parse_status(&s))
@@ -283,9 +298,19 @@ mod tests {
         );
         // The repo root itself, the easy case, must still work.
         assert!(is_inside_work_tree(d.path()));
-        // And `status` already succeeds there, which is why the wrong offer
-        // looked credible: the changes pane was showing the parent's status.
-        assert!(status(&nested).is_err(), "status still keys off the project's own .git");
+        // All three git surfaces must agree on one definition. `status` used to
+        // key off the project's own `.git`, so a nested project got no
+        // `git init` offer (right) but a changes pane reading "not a git
+        // repository" — while `diff`, which never had that pre-check, produced
+        // diffs happily. Three surfaces, three answers, for one directory.
+        assert!(
+            status(&nested).is_ok(),
+            "the changes pane must agree with is_git: a nested project is inside a work tree"
+        );
+        assert!(
+            diff(&nested, None).is_ok(),
+            "and diff, which never had a .git pre-check, must keep working"
+        );
     }
 
     /// A linked worktree's `.git` is a *file*, not a directory — worktrees are
