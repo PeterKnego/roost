@@ -386,17 +386,67 @@ pub fn has_session(project: &str, name: &str) -> bool {
 /// Ends every session belonging to one project. This is the only way to end
 /// a session from the UI; detaching a tab deliberately leaves it running.
 /// Prefix built from `storage_key` for the same reason as `list_sessions`.
+///
+/// Killing `s.child` alone — the whole of what this function used to do —
+/// only ends dtach's *client*, the process deadlight itself spawned. In
+/// `-A` mode `dtach` forks a *master* that immediately detaches and
+/// reparents to init; killing the client is therefore just a *detach*, not
+/// an end. The master and the user's shell survive with a live socket,
+/// unreachable through deadlight and invisibly still running — exactly the
+/// failure "Close Project" exists to prevent, silently doing what closing a
+/// tab already does while telling the user the session ended. So this now
+/// also kills whatever still holds each session's socket path (the master
+/// included) via `registry::kill_and_unlink` — the identical helper
+/// `reconcile` uses to reap a session whose project has been deleted, since
+/// both need the same "kill, confirm, then unlink — leave the socket in
+/// place on any failure" behavior.
+///
+/// `ended` counts only sessions actually confirmed ended (client killed
+/// *and* every socket-holding process confirmed dead), not merely removed
+/// from the in-memory map, so a caller reporting this number (e.g.
+/// `ProjectClosed`) never overstates what happened.
+///
+/// The registry lock is held only long enough to remove each matching
+/// entry and kill its in-process client — never across the socket
+/// kill-and-poll below, which can block for up to ~500ms per session and
+/// shells out to `ps`/`kill`. Holding it across that would freeze every
+/// other project's terminal traffic (any operation needing this same lock)
+/// for the duration, the identical hazard `write_input`'s doc comment
+/// already describes for a blocking write.
 pub fn kill_project(project: &str) -> usize {
     let prefix = format!("{}/", crate::projects::storage_key(project));
-    let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
-    let keys: Vec<String> = map.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
-    let mut ended = 0;
-    for k in keys {
-        if let Some(mut s) = map.remove(&k) {
-            let _ = s.child.kill();
-            let _ = s.child.wait();
-            ended += 1;
+    let removed_names: Vec<String> = {
+        let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<String> = map.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+        let mut names = Vec::with_capacity(keys.len());
+        for k in keys {
+            if let Some(mut s) = map.remove(&k) {
+                let _ = s.child.kill();
+                let _ = s.child.wait();
+                if let Some(name) = k.strip_prefix(&prefix) {
+                    names.push(name.to_string());
+                }
+            }
         }
+        names
+    }; // registry lock released here, before any blocking socket work
+
+    let mut ended = 0;
+    for name in &removed_names {
+        if crate::registry::kill_and_unlink(&sock_path(project, name)) {
+            ended += 1;
+        } else {
+            eprintln!(
+                "deadlight: Close Project could not fully end session {project}/{name} — a process survived the kill attempt; its socket was left in place so it stays discoverable"
+            );
+        }
+    }
+    // Best-effort: fails silently (and correctly) if anything is left in
+    // this project's socket directory, e.g. a session whose kill above
+    // failed, or one this call never touched because a name didn't parse.
+    if !removed_names.is_empty() {
+        let sock_dir = crate::wsstate::state_dir().join("sock").join(crate::projects::storage_key(project));
+        let _ = std::fs::remove_dir(&sock_dir);
     }
     ended
 }
@@ -531,6 +581,72 @@ mod tests {
 
         kill_project("otherproj");
         std::env::remove_var("DEADLIGHT_CMD");
+    }
+
+    /// Minimal, test-only "is anything holding this path" check via `ps`.
+    /// Deliberately not `registry`'s own `socket_has_process` (module-
+    /// private, and hardened against regex metacharacters / spaces in a way
+    /// this test's own known, plain tempdir paths don't need) — just enough
+    /// to prove a real process is or isn't there.
+    fn any_process_holds(path: &std::path::Path) -> bool {
+        let target = path.to_string_lossy();
+        let Ok(out) = std::process::Command::new("ps").args(["-Ao", "args="]).output() else {
+            return false;
+        };
+        String::from_utf8_lossy(&out.stdout).lines().any(|l| l.contains(target.as_ref()))
+    }
+
+    // The regression this whole task exists to fix. DEADLIGHT_CMD=cat (used
+    // everywhere else in this file, including the test just above) cannot
+    // reproduce it at all: a `cat` child has no detached master to leave
+    // behind, so killing it really does end the "session" outright — that
+    // gap is exactly why a fully-passing suite never caught this bug in the
+    // first place. This test uses the real, unoverridden `dtach` command
+    // (a runtime prerequisite of this project) and checks OS-level process
+    // state directly, not just the in-memory session map, since the map
+    // alone is exactly what lied about this before the fix.
+    #[test]
+    fn kill_project_ends_the_detached_dtach_master_and_shell_not_just_the_client() {
+        let _g1 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("DEADLIGHT_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", state.path());
+        let dir = tempfile::tempdir().unwrap();
+
+        let attach_result = attach("realdtach", "shell", dir.path());
+        let Ok(_att) = attach_result else {
+            eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
+            std::env::remove_var("DEADLIGHT_STATE_DIR");
+            return;
+        };
+
+        let sock = sock_path("realdtach", "shell");
+        // Poll rather than a fixed sleep: dtach's own fork-and-detach takes
+        // an unpredictable, usually-small amount of wall time to complete.
+        let mut waited = 0;
+        while !(sock.exists() && any_process_holds(&sock)) && waited < 40 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            waited += 1;
+        }
+        assert!(sock.exists(), "test setup: dtach must have created its socket");
+        assert!(
+            any_process_holds(&sock),
+            "test setup: a detached dtach master must be observable before kill_project runs \
+             — otherwise this test would prove nothing"
+        );
+
+        let ended = kill_project("realdtach");
+
+        assert_eq!(ended, 1, "the session must be reported as fully ended, not merely detached");
+        assert!(
+            !any_process_holds(&sock),
+            "the dtach master — and, through it, the shell — must actually be dead, \
+             not merely the in-process client this function used to kill alone"
+        );
+        assert!(!sock.exists(), "the socket must be removed only once the holding process is confirmed gone");
+
+        std::env::remove_var("DEADLIGHT_STATE_DIR");
     }
 
     #[test]

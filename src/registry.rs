@@ -121,6 +121,55 @@ fn socket_has_process(path: &std::path::Path) -> bool {
     !pids_holding(&process_snapshot(), path).is_empty()
 }
 
+/// Kills every process currently holding `sock_path`, waits (bounded) for
+/// them to die, and removes the socket file only once none remain. Leaves
+/// the file in place if a kill fails or a process survives the wait, so the
+/// session stays discoverable and reapable by a later pass rather than
+/// becoming an unreachable orphan (its socket gone, so nothing — not a
+/// browser, not `reconcile` itself — can ever find or attach to it again).
+///
+/// Shared by `reconcile`'s project-gone branch and `session::kill_project`
+/// (an explicit "Close Project" from the UI): both need to end whatever
+/// `dtach` *master* — and, through it, the user's shell — is still holding
+/// a socket, not merely the in-process *client* deadlight itself spawned.
+/// Killing only that client is just a detach: in `-A` mode `dtach` forks a
+/// master that immediately detaches and reparents to init, so the master
+/// and shell survive a client kill with a live socket, unreachable and
+/// (without this) invisibly still running. Both call sites need the
+/// identical confirm-before-unlink safety property, so they share this one
+/// implementation rather than two that can drift.
+///
+/// Returns `true` once the socket ends up fully cleaned up — no process
+/// left, file removed — including the vacuous case where nothing held it to
+/// begin with. Returns `false` if a kill failed or a process survived the
+/// wait.
+pub fn kill_and_unlink(sock_path: &std::path::Path) -> bool {
+    let pids = pids_holding(&process_snapshot(), sock_path);
+    for pid in &pids {
+        let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
+    }
+    // Bounded wait for the kill(s) to take effect rather than an instant
+    // recheck: SIGKILL is not synchronous. Bounded so a process that
+    // refuses to die can't hang the caller forever. When `pids` was empty
+    // this loop runs zero iterations, and `still_alive`'s first read is
+    // itself the fresh, immediately-before-delete recheck (see R8 in this
+    // module's history: a stale "nothing held it" from an earlier snapshot
+    // must never be trusted at delete time without re-verifying).
+    let mut still_alive = socket_has_process(sock_path);
+    for _ in 0..20 {
+        if !still_alive {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        still_alive = socket_has_process(sock_path);
+    }
+    if still_alive {
+        return false;
+    }
+    let _ = std::fs::remove_file(sock_path);
+    true
+}
+
 /// What to do with one socket file, given what's known about it. Kept as a
 /// pure function, separate from the `kill`/`pgrep`/`remove_file` calls that
 /// gather its inputs, so every combination — including "a kill attempt
@@ -219,6 +268,25 @@ pub fn reconcile(roots: &[PathBuf]) -> ReapReport {
         let key = entry.file_name().to_string_lossy().into_owned();
         let url = decode_key(&key);
         let project_gone = roots_ok && crate::projects::resolve_project(roots, &url).is_none();
+        // In-process sessions first, once per project rather than once per
+        // socket file below: `session::kill_project` now ends each session's
+        // dtach master too (via `kill_and_unlink`, the same helper the loop
+        // below uses), not just deadlight's own client, so any socket it
+        // fully cleans up is already gone by the time `read_dir` runs and
+        // simply won't appear in `inner` — only a genuine failure (or a
+        // session this process never knew about, e.g. one that outlived a
+        // restart) is left for the per-socket loop to handle. `ended` is
+        // only ever incremented for a session actually confirmed dead, so
+        // it's safe to fold straight into the report here.
+        if project_gone {
+            let in_process_ended = crate::session::kill_project(&url);
+            report.gone_projects += in_process_ended;
+            if in_process_ended > 0 {
+                eprintln!(
+                    "deadlight: reaped {in_process_ended} in-process session(s) for {key} — project directory is gone"
+                );
+            }
+        }
         let Ok(inner) = std::fs::read_dir(entry.path()) else { continue };
         for sock in inner.flatten() {
             let pids = pids_holding(&snapshot, &sock.path());
@@ -226,41 +294,18 @@ pub fn reconcile(roots: &[PathBuf]) -> ReapReport {
             let name = sock.file_name().to_string_lossy().into_owned();
 
             if held_before && project_gone {
-                // In-process first (handles a session created and orphaned
-                // within this same run), then the OS-level pids directly —
-                // that second step is what makes the startup case work,
-                // where the in-memory map is empty and kill_project alone
-                // is a no-op.
-                let in_process_ended = crate::session::kill_project(&url);
-                for pid in &pids {
-                    let _ =
-                        std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
-                }
-                // Bounded wait for the kill to take effect rather than an
-                // instant recheck: SIGKILL is not synchronous. Bounded so a
-                // process that refuses to die can't hang reconcile forever.
-                let mut still_alive = socket_has_process(&sock.path());
-                for _ in 0..20 {
-                    if !still_alive {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                    still_alive = socket_has_process(&sock.path());
-                }
-                match reap_decision(project_gone, held_before, still_alive) {
-                    ReapAction::RemoveKilled => {
-                        let _ = std::fs::remove_file(sock.path());
-                        report.gone_projects += 1;
-                        eprintln!(
-                            "deadlight: reaped session {key}/{name} — project directory is gone (killed pids {pids:?}, {in_process_ended} in-process)"
-                        );
-                    }
-                    ReapAction::Leave => {
-                        eprintln!(
-                            "deadlight: could not end session {key}/{name} for a missing project — pids {pids:?} did not die; socket left in place so it stays discoverable"
-                        );
-                    }
-                    ReapAction::RemoveDeadSocket => unreachable!("held_before is true here"),
+                // Covers a session this process never had in memory (one
+                // that outlived a restart) as well as a retry for one
+                // `kill_project` above tried and failed to fully end.
+                if kill_and_unlink(&sock.path()) {
+                    report.gone_projects += 1;
+                    eprintln!(
+                        "deadlight: reaped session {key}/{name} — project directory is gone (pids {pids:?})"
+                    );
+                } else {
+                    eprintln!(
+                        "deadlight: could not end session {key}/{name} for a missing project — pids {pids:?} did not fully die; socket left in place so it stays discoverable"
+                    );
                 }
                 continue;
             }

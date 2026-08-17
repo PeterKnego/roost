@@ -985,6 +985,76 @@ fn close_project_ends_sessions_and_isolates_other_projects() {
     std::env::remove_var("DEADLIGHT_CMD");
 }
 
+/// Minimal, test-only "is anything holding this path" check via `ps`.
+/// Deliberately not deadlight's own internal machinery (private to its
+/// `registry` module, and hardened for production against inputs this
+/// test's own known, plain tempdir paths don't need) — just enough to prove
+/// a real process is or isn't there.
+fn any_process_holds(path: &std::path::Path) -> bool {
+    let target = path.to_string_lossy();
+    let Ok(out) = std::process::Command::new("ps").args(["-Ao", "args="]).output() else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout).lines().any(|l| l.contains(target.as_ref()))
+}
+
+// The end-to-end reproduction of the bug this task exists to fix, over a
+// real WebSocket connection exactly like a browser's: closing a project
+// with `DEADLIGHT_CMD=cat` (every other close-project test, including the
+// one just above) cannot exercise this at all, because a `cat` child has no
+// detached dtach master to leave behind — that gap is exactly why the rest
+// of this suite never caught it. Real, unoverridden `dtach` forks a master
+// that immediately detaches and reparents to init; killing only the
+// in-process client (the whole of what CloseProject used to do) is then
+// just a *detach*, leaving that master and the user's shell running with a
+// live socket. This proves the fix at the OS level, not just the in-memory
+// session map the old, buggy code also lied through.
+#[test]
+fn close_project_ends_the_real_dtach_master_not_just_the_client() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    std::env::remove_var("DEADLIGHT_CMD");
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    let (_d, port) = fixture_named("realclose");
+
+    let mut term = ws_connect_path(port, "/ws/realclose/term/shell").unwrap();
+    let mut ws = ws_connect_path(port, "/ws/realclose/_workspace").unwrap();
+    let init = read_until(&mut ws, r#""t":"State""#);
+    let my_id = extract_origin(&init);
+    wait_for_live_session(&mut ws, &my_id, "shell");
+
+    let sock =
+        sd.path().join("sock").join(deadlight::projects::storage_key("realclose")).join("shell");
+    // Poll rather than a fixed sleep: dtach's own fork-and-detach takes an
+    // unpredictable, usually-small amount of wall time to complete.
+    let mut waited = 0;
+    while !(sock.exists() && any_process_holds(&sock)) && waited < 40 {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        waited += 1;
+    }
+    assert!(sock.exists(), "test setup: dtach must have created its socket");
+    assert!(
+        any_process_holds(&sock),
+        "test setup: a detached dtach master must be observable before CloseProject runs \
+         — otherwise this test would prove nothing"
+    );
+
+    ws.send(tungstenite::Message::Text(r#"{"t":"CloseProject"}"#.into())).unwrap();
+    let closed = read_until(&mut ws, r#""t":"ProjectClosed""#);
+    assert!(closed.contains(r#""ended":1"#), "expected the one session reported ended; got: {closed}");
+
+    assert!(
+        !any_process_holds(&sock),
+        "the dtach master — and, through it, the shell — must actually be dead, \
+         not merely the in-process client CloseProject used to kill alone"
+    );
+    assert!(!sock.exists(), "the socket must be removed only once the holding process is confirmed gone");
+
+    let _ = term.close(None);
+    let _ = ws.close(None);
+    std::env::remove_var("DEADLIGHT_STATE_DIR");
+}
+
 #[test]
 fn http_rejects_rebinding_host() {
     use std::io::{Read, Write};
