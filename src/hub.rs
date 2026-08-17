@@ -22,6 +22,11 @@ pub struct Hub {
     /// `for_project` starts at most one watcher per project even though it
     /// runs on every connection.
     pub watching: bool,
+    /// Set by the notice intents, drained by the socket layer after the hub
+    /// lock is released. `broadcast_all` locks every hub, including this one,
+    /// and `Mutex` is not reentrant — so the broadcast cannot happen inside
+    /// `handle`.
+    pub notices_dirty: bool,
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<Hub>>>>> = OnceLock::new();
@@ -40,6 +45,7 @@ impl Hub {
             next_id: 0,
             self_writes: HashMap::new(),
             watching: false,
+            notices_dirty: false,
         }
     }
 
@@ -165,6 +171,21 @@ impl Hub {
             Intent::RequestState => {
                 let ev = self.snapshot_event(from);
                 self.send_to(from, &ev);
+                return;
+            }
+            Intent::MarkNoticeRead { id } => {
+                crate::notify::mark_read(*id);
+                // Everyone, not just the caller: read state is global, so a
+                // second browser's badge must not keep counting it. The
+                // actual broadcast happens outside `handle` (see
+                // `notices_dirty`) because `broadcast_all` locks every hub,
+                // including this one, which is already locked here.
+                self.notices_dirty = true;
+                return;
+            }
+            Intent::ClearNotices => {
+                crate::notify::clear();
+                self.notices_dirty = true;
                 return;
             }
             Intent::EditBuffer { rel, text } => {
@@ -460,6 +481,32 @@ impl Hub {
                 self.send_to(from, &ev);
             }
         }
+    }
+}
+
+/// Send an event to every connected client of every project. Notices are
+/// machine-wide: a browser on one project must still learn that another one
+/// wants attention.
+///
+/// The registry lock is dropped before any hub lock is taken. `for_project`
+/// already established that order (registry, then hub); taking them the other
+/// way round here would deadlock against a connection racing in.
+pub fn broadcast_all(ev: &Event) {
+    let Some(reg) = REGISTRY.get() else { return };
+    let hubs: Vec<Arc<Mutex<Hub>>> = {
+        let map = reg.lock().unwrap_or_else(|e| e.into_inner());
+        map.values().cloned().collect()
+    };
+    for h in hubs {
+        Hub::lock(&h).broadcast(ev);
+    }
+}
+
+/// Record a parsed sequence and tell every client. Called from the PTY pump
+/// thread, which holds no lock at this point and must never panic.
+pub fn publish(project: &str, session: &str, p: crate::osc::Parsed) {
+    if let Some(notice) = crate::notify::record(project, session, p) {
+        broadcast_all(&Event::Notice { notice });
     }
 }
 
