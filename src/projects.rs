@@ -527,7 +527,7 @@ mod tests {
         for name in ["my\nproj", "a\tb", "x\r\ny", "trail\n", "\nlead", "bell\x07", "del\x7f", "nul\0x"] {
             let key = storage_key(name);
             assert!(
-                !key.bytes().any(|b| b.is_ascii_control() || b == 0x7F),
+                !key.bytes().any(|b| b.is_ascii_control()),
                 "storage_key({name:?}) = {key:?} still contains a control byte, so a live \
                  session's socket path would be unmatchable in `ps` output and get unlinked"
             );
