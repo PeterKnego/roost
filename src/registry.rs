@@ -48,38 +48,61 @@ fn sock_root() -> PathBuf {
     crate::wsstate::state_dir().join("sock")
 }
 
+/// Turns raw `ps -Ao pid=,args=` output into a snapshot, or `None` when the
+/// listing itself is not trustworthy: the process exited non-zero, or
+/// produced no output at all (a live host always has at least one process —
+/// pid 1, if nothing else — so empty stdout means the listing failed
+/// silently, not that the machine has no processes). Factored out from the
+/// subprocess spawn so this decision is directly unit-testable against real
+/// `Output` values without needing to actually break `ps` on the test host.
+///
+/// This distinction matters: before it existed, a failed or empty listing
+/// was indistinguishable from "nothing holds this socket", so a transient
+/// `ps` failure (fork/`EAGAIN` under memory or process-table pressure, a
+/// stripped container, a broken `PATH`) would make `kill_and_unlink` unlink
+/// a live session's socket — the seventh instance in this feature of one
+/// shape: a false "gone" verdict destroying a live session. "Could not
+/// determine" must be its own outcome, never silently folded into "empty".
+fn parse_ps_snapshot(out: &std::process::Output) -> Option<Vec<(u32, String)>> {
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim_start();
+                let (pid_str, args) = trimmed.split_once(char::is_whitespace)?;
+                let pid: u32 = pid_str.parse().ok()?;
+                Some((pid, args.trim_start().to_string()))
+            })
+            .collect(),
+    )
+}
+
 /// One snapshot of every process's pid and its raw command-line text, taken
-/// with a single `ps` call. Passed around so that sweeping every socket
-/// under `sock/` to see which are still held costs one subprocess total, not
-/// one per socket. Deliberately not `pgrep -f`: that treats its pattern as
-/// an extended regex matched anywhere in the command line, which is wrong
-/// two different ways for a filesystem path — (1) a project name may contain
-/// regex metacharacters (`valid_project` allows them; only *session* names
-/// are restricted to `[A-Za-z0-9_-]`), which can make the "pattern" an
-/// invalid ERE and silently match nothing, so a live socket's process looks
-/// dead; and (2) unanchored substring matching means session `claude`'s
-/// socket path matches inside session `claude-2`'s command line too, so an
-/// actually-dead `claude` socket is never reaped once `claude-2` exists.
-/// `pids_holding` matches each raw line as plain text (no regex ever built
-/// from untrusted input) and requires the match be a whole argument, which
-/// avoids both hazards without needing to split the line into words first —
-/// splitting on whitespace would break on a socket path that itself contains
-/// a space, which a project directory name may (`list_projects`,
-/// `resolve_project`, and `valid_project` all permit spaces; only *session*
-/// names are restricted).
-fn process_snapshot() -> Vec<(u32, String)> {
-    let Ok(out) = std::process::Command::new("ps").args(["-Ao", "pid=,args="]).output() else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim_start();
-            let (pid_str, args) = trimmed.split_once(char::is_whitespace)?;
-            let pid: u32 = pid_str.parse().ok()?;
-            Some((pid, args.trim_start().to_string()))
-        })
-        .collect()
+/// with a single `ps` call — or `None` when that listing could not be
+/// trusted (see `parse_ps_snapshot`). Passed around so that sweeping every
+/// socket under `sock/` to see which are still held costs one subprocess
+/// total, not one per socket. Deliberately not `pgrep -f`: that treats its
+/// pattern as an extended regex matched anywhere in the command line, which
+/// is wrong two different ways for a filesystem path — (1) a project name
+/// may contain regex metacharacters (`valid_project` allows them; only
+/// *session* names are restricted to `[A-Za-z0-9_-]`), which can make the
+/// "pattern" an invalid ERE and silently match nothing, so a live socket's
+/// process looks dead; and (2) unanchored substring matching means session
+/// `claude`'s socket path matches inside session `claude-2`'s command line
+/// too, so an actually-dead `claude` socket is never reaped once `claude-2`
+/// exists. `pids_holding` matches each raw line as plain text (no regex
+/// ever built from untrusted input) and requires the match be a whole
+/// argument, which avoids both hazards without needing to split the line
+/// into words first — splitting on whitespace would break on a socket path
+/// that itself contains a space, which a project directory name may
+/// (`list_projects`, `resolve_project`, and `valid_project` all permit
+/// spaces; only *session* names are restricted).
+fn process_snapshot() -> Option<Vec<(u32, String)>> {
+    let out = std::process::Command::new("ps").args(["-Ao", "pid=,args="]).output().ok()?;
+    parse_ps_snapshot(&out)
 }
 
 /// True when `target` appears in `line` as one whole command-line argument:
@@ -113,20 +136,51 @@ fn pids_holding(snapshot: &[(u32, String)], path: &std::path::Path) -> Vec<u32> 
     snapshot.iter().filter(|(_, line)| line_has_whole_arg(line, &target)).map(|(pid, _)| *pid).collect()
 }
 
-/// True when some live process holds this socket path right now. Takes its
-/// own fresh snapshot — used for one-off checks (tests, and re-polling after
-/// a kill to see whether it has taken effect yet), where the whole point is
-/// to observe current state rather than a sweep's frozen-in-time one.
+/// A source of process snapshots, injected rather than called directly, so
+/// the "the listing is unverifiable" path through `kill_and_unlink` and
+/// `reconcile` can be exercised deterministically in a test — no need to
+/// actually break `ps` on the test host, and no shared global state (an env
+/// var, say) to race other tests over.
+type SnapshotFn<'a> = &'a dyn Fn() -> Option<Vec<(u32, String)>>;
+
+/// True when some live process holds this socket path right now, or `None`
+/// could not be determined — treated conservatively as "yes, assume held":
+/// both of this function's uses (the post-kill confirmation poll, and the
+/// immediately-before-delete recheck in `reconcile`'s dead-socket branch)
+/// must never unlink a socket on a shrug. Takes its own fresh snapshot on
+/// every call — used for one-off checks (tests, and re-polling after a kill
+/// to see whether it has taken effect yet), where the whole point is to
+/// observe current state rather than a sweep's frozen-in-time one.
+fn socket_has_process_with(path: &std::path::Path, snapshot_fn: SnapshotFn) -> bool {
+    match snapshot_fn() {
+        None => true,
+        Some(s) => !pids_holding(&s, path).is_empty(),
+    }
+}
+
+// Production code now goes through `socket_has_process_with` directly (see
+// `kill_and_unlink_with`/`reconcile_with`) so the injected snapshot source
+// is threaded all the way through; this plain wrapper survives only as a
+// convenience for tests that don't need to inject anything.
+#[cfg(test)]
 fn socket_has_process(path: &std::path::Path) -> bool {
-    !pids_holding(&process_snapshot(), path).is_empty()
+    socket_has_process_with(path, &process_snapshot)
 }
 
 /// Kills every process currently holding `sock_path`, waits (bounded) for
 /// them to die, and removes the socket file only once none remain. Leaves
-/// the file in place if a kill fails or a process survives the wait, so the
-/// session stays discoverable and reapable by a later pass rather than
-/// becoming an unreachable orphan (its socket gone, so nothing — not a
-/// browser, not `reconcile` itself — can ever find or attach to it again).
+/// the file in place if a kill fails, a process survives the wait, **or the
+/// process listing itself could not be trusted** — so the session stays
+/// discoverable and reapable by a later pass rather than becoming an
+/// unreachable orphan (its socket gone, so nothing — not a browser, not
+/// `reconcile` itself — can ever find or attach to it again).
+///
+/// That last case is deliberate, not an oversight: a `None` snapshot means
+/// "we don't know what's out there", and proceeding as if nothing were —
+/// the bug this function's own history already shows up twice over (a
+/// `pgrep -f` regex hazard, a word-split that broke on a space) — must never
+/// happen a third time just because the underlying listing failed instead
+/// of merely mismatching.
 ///
 /// Shared by `reconcile`'s project-gone branch and `session::kill_project`
 /// (an explicit "Close Project" from the UI): both need to end whatever
@@ -141,11 +195,26 @@ fn socket_has_process(path: &std::path::Path) -> bool {
 ///
 /// Returns `true` once the socket ends up fully cleaned up — no process
 /// left, file removed — including the vacuous case where nothing held it to
-/// begin with. Returns `false` if a kill failed or a process survived the
-/// wait.
-pub fn kill_and_unlink(sock_path: &std::path::Path) -> bool {
-    let pids = pids_holding(&process_snapshot(), sock_path);
+/// begin with. Returns `false` if a kill failed, a process survived the
+/// wait, or the process listing was unverifiable.
+fn kill_and_unlink_with(sock_path: &std::path::Path, snapshot_fn: SnapshotFn) -> bool {
+    let Some(snapshot) = snapshot_fn() else {
+        eprintln!(
+            "deadlight: could not verify what holds {} (process listing unavailable) — leaving it in place",
+            sock_path.display()
+        );
+        return false;
+    };
+    let pids = pids_holding(&snapshot, sock_path);
     for pid in &pids {
+        // M6: pid 0 should be unreachable here in practice (pid 0 is the
+        // kernel/swapper, whose command line can never contain a socket
+        // path), but `kill -9 0` signals this whole process group — i.e.
+        // deadlight itself — so refuse it outright rather than trust that
+        // impossibility.
+        if *pid == 0 {
+            continue;
+        }
         let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
     }
     // Bounded wait for the kill(s) to take effect rather than an instant
@@ -155,19 +224,23 @@ pub fn kill_and_unlink(sock_path: &std::path::Path) -> bool {
     // itself the fresh, immediately-before-delete recheck (see R8 in this
     // module's history: a stale "nothing held it" from an earlier snapshot
     // must never be trusted at delete time without re-verifying).
-    let mut still_alive = socket_has_process(sock_path);
+    let mut still_alive = socket_has_process_with(sock_path, snapshot_fn);
     for _ in 0..20 {
         if !still_alive {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
-        still_alive = socket_has_process(sock_path);
+        still_alive = socket_has_process_with(sock_path, snapshot_fn);
     }
     if still_alive {
         return false;
     }
     let _ = std::fs::remove_file(sock_path);
     true
+}
+
+pub fn kill_and_unlink(sock_path: &std::path::Path) -> bool {
+    kill_and_unlink_with(sock_path, &process_snapshot)
 }
 
 /// What to do with one socket file, given what's known about it. Kept as a
@@ -244,7 +317,19 @@ fn reap_decision(project_gone: bool, held_before: bool, held_after_kill_attempt:
 /// the down root must not be declared gone just because the other root
 /// resolved fine) — otherwise every socket is left alone (dead-socket
 /// reaping, which needs no project information, still runs).
+///
+/// The identical "cannot verify" discipline applies to the process listing
+/// itself: if `process_snapshot` returns `None` (see its doc comment — a
+/// failed or empty `ps`), this function cannot safely tell a dead socket
+/// from a live one for *any* entry, so it does nothing at all this pass
+/// rather than guess. `kill_and_unlink` independently applies the same rule
+/// to its own snapshot, since it can also be reached directly from
+/// `session::kill_project` outside of a `reconcile` sweep.
 pub fn reconcile(roots: &[PathBuf]) -> ReapReport {
+    reconcile_with(roots, &process_snapshot)
+}
+
+fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
     let mut report = ReapReport { dead_sockets: 0, gone_projects: 0 };
     let roots_ok = !roots.is_empty() && roots.iter().all(|r| r.canonicalize().is_ok());
     if !roots_ok {
@@ -255,8 +340,18 @@ pub fn reconcile(roots: &[PathBuf]) -> ReapReport {
     }
     let Ok(rd) = std::fs::read_dir(sock_root()) else { return report };
     // One process listing for the whole sweep (see process_snapshot's doc
-    // comment) rather than one `ps` per socket file.
-    let snapshot = process_snapshot();
+    // comment) rather than one `ps` per socket file. `None` here means the
+    // listing itself could not be trusted, not that nothing is running —
+    // bail out of the entire pass rather than reap anything on a guess;
+    // the next pass (throttled, but not indefinitely deferred — see
+    // `known_projects`) gets another chance.
+    let Some(snapshot) = snapshot_fn() else {
+        eprintln!(
+            "deadlight: could not read the process list (ps failed, exited non-zero, or returned \
+             nothing) — reaping is suspended this pass"
+        );
+        return report;
+    };
     for entry in rd.flatten() {
         // Directory entry names under sock/ are storage keys (percent-encoded:
         // `karpie%2Fsrc`), not the raw project form. `session`'s functions
@@ -297,14 +392,14 @@ pub fn reconcile(roots: &[PathBuf]) -> ReapReport {
                 // Covers a session this process never had in memory (one
                 // that outlived a restart) as well as a retry for one
                 // `kill_project` above tried and failed to fully end.
-                if kill_and_unlink(&sock.path()) {
+                if kill_and_unlink_with(&sock.path(), snapshot_fn) {
                     report.gone_projects += 1;
                     eprintln!(
                         "deadlight: reaped session {key}/{name} — project directory is gone (pids {pids:?})"
                     );
                 } else {
                     eprintln!(
-                        "deadlight: could not end session {key}/{name} for a missing project — pids {pids:?} did not fully die; socket left in place so it stays discoverable"
+                        "deadlight: could not end session {key}/{name} for a missing project — pids {pids:?} did not fully die (or the process list was unverifiable); socket left in place so it stays discoverable"
                     );
                 }
                 continue;
@@ -324,7 +419,10 @@ pub fn reconcile(roots: &[PathBuf]) -> ReapReport {
                     // is unrecoverable. This matters once this runs on more
                     // than just startup — `known_projects` (below) already
                     // calls `reconcile` on every enumeration, by design.
-                    if !socket_has_process(&sock.path()) {
+                    // `socket_has_process_with` also treats an unverifiable
+                    // recheck as "assume held", so a `ps` that starts
+                    // failing mid-sweep can never cause a delete here either.
+                    if !socket_has_process_with(&sock.path(), snapshot_fn) {
                         let _ = std::fs::remove_file(sock.path());
                         report.dead_sockets += 1;
                         eprintln!("deadlight: reaped dead socket {}", sock.path().display());
@@ -610,6 +708,16 @@ mod tests {
         let out = f(d.path());
         std::env::remove_var("DEADLIGHT_STATE_DIR");
         out
+    }
+
+    /// Test-only cleanup helper: pids to kill off after a test that spawned
+    /// a real detached `dtach` process, so it doesn't linger past the test.
+    /// Unwraps `process_snapshot`'s `Option` with an empty-vec fallback —
+    /// fine here since this is best-effort teardown, not the behavior under
+    /// test (which is exactly why production code must never do this; see
+    /// `kill_and_unlink`/`reconcile`'s handling of a `None` snapshot).
+    fn test_cleanup_pids(sock_path: &std::path::Path) -> Vec<u32> {
+        pids_holding(&process_snapshot().unwrap_or_default(), sock_path)
     }
 
     #[test]
@@ -906,7 +1014,7 @@ mod tests {
 
             // Clean up: this process was never in any in-memory map, so
             // nothing else will ever end it.
-            for pid in pids_holding(&process_snapshot(), &sock_path) {
+            for pid in test_cleanup_pids(&sock_path) {
                 let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
             }
         });
@@ -935,7 +1043,7 @@ mod tests {
             assert!(sock_path.exists(), "a live session must survive when its project can't be checked");
             assert!(socket_has_process(&sock_path), "the process itself must survive");
 
-            for pid in pids_holding(&process_snapshot(), &sock_path) {
+            for pid in test_cleanup_pids(&sock_path) {
                 let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
             }
 
@@ -976,7 +1084,7 @@ mod tests {
                 "a process-backed socket with no in-memory record must still count as live, not idle"
             );
 
-            for pid in pids_holding(&process_snapshot(), &sock_path) {
+            for pid in test_cleanup_pids(&sock_path) {
                 let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
             }
         });
@@ -1006,7 +1114,7 @@ mod tests {
                 "a socket path containing a space must still be recognized as held"
             );
 
-            for pid in pids_holding(&process_snapshot(), &sock_path) {
+            for pid in test_cleanup_pids(&sock_path) {
                 let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
             }
         });
@@ -1038,7 +1146,7 @@ mod tests {
             assert!(sock_path.exists(), "the socket of a live session must survive");
             assert!(socket_has_process(&sock_path), "the process itself must survive");
 
-            for pid in pids_holding(&process_snapshot(), &sock_path) {
+            for pid in test_cleanup_pids(&sock_path) {
                 let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
             }
         });
@@ -1074,7 +1182,7 @@ mod tests {
             assert!(sock_path.exists());
             assert!(socket_has_process(&sock_path));
 
-            for pid in pids_holding(&process_snapshot(), &sock_path) {
+            for pid in test_cleanup_pids(&sock_path) {
                 let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
             }
         });
@@ -1109,9 +1217,81 @@ mod tests {
                 "a fresh check must observe a process that just attached, not a cached earlier answer"
             );
 
-            for pid in pids_holding(&process_snapshot(), &sock_path) {
+            for pid in test_cleanup_pids(&sock_path) {
                 let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
             }
+        });
+    }
+
+    // C1: the exact boundary parse_ps_snapshot must draw. Real subprocess
+    // `Output`s, not hand-built ones — `false` and `true` are genuine OS
+    // exit statuses, so this proves the check against what `ps` can
+    // actually report, not a synthetic stand-in.
+    #[test]
+    fn parse_ps_snapshot_treats_failure_and_empty_output_as_unverifiable() {
+        let failed = std::process::Command::new("false").output().unwrap();
+        assert!(
+            parse_ps_snapshot(&failed).is_none(),
+            "a nonzero exit must be unverifiable, not \"no processes\""
+        );
+
+        let empty = std::process::Command::new("true").output().unwrap();
+        assert!(
+            parse_ps_snapshot(&empty).is_none(),
+            "empty stdout must be unverifiable — a live host always lists something"
+        );
+
+        // The positive case, for contrast: real ps output must still parse.
+        let real = std::process::Command::new("ps").args(["-Ao", "pid=,args="]).output().unwrap();
+        assert!(parse_ps_snapshot(&real).is_some(), "real ps output must be treated as verifiable");
+    }
+
+    // C1, downstream: an unverifiable snapshot must never be treated as "no
+    // process holds this socket". Before the fix, `process_snapshot`
+    // returning an empty `Vec` on failure was indistinguishable from a
+    // genuinely dead socket, so `kill_and_unlink` unlinked a live session's
+    // socket on a `ps` hiccup. This injects `|| None` directly — no global
+    // env var, so no risk of racing any other test — and would fail exactly
+    // as the old code did if `None` were treated as `Some(vec![])`: the
+    // socket would be deleted outright instead of surviving.
+    #[test]
+    fn kill_and_unlink_never_unlinks_when_the_process_list_is_unverifiable() {
+        with_state(|state| {
+            let sock_dir = state.join("sock/unverifiable");
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            // A plain file stands in for a real socket; nothing needs to
+            // actually hold it — the point is that "can't tell" must never
+            // be treated as "safe to delete" regardless.
+            fs::write(&sock_path, "").unwrap();
+
+            let ok = kill_and_unlink_with(&sock_path, &|| None);
+
+            assert!(!ok, "an unverifiable process list must never report success");
+            assert!(sock_path.exists(), "the socket must survive when the process list can't be trusted");
+        });
+    }
+
+    // C1, through the whole sweep: the same guarantee, exercised via
+    // `reconcile_with` rather than `kill_and_unlink_with` directly, so the
+    // "bail out of the entire pass" behavior for an unverifiable top-level
+    // snapshot is proven too, not just the per-socket helper.
+    #[test]
+    fn reconcile_never_reaps_anything_when_the_process_list_is_unverifiable() {
+        with_state(|state| {
+            let sock_dir = state.join("sock/unverifiable-proj");
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            fs::write(&sock_path, "").unwrap();
+
+            let report = reconcile_with(&[PathBuf::from("/nonexistent-root")], &|| None);
+
+            assert_eq!(
+                report.dead_sockets, 0,
+                "an unverifiable process list must never be treated as \"nothing holds this socket\""
+            );
+            assert_eq!(report.gone_projects, 0);
+            assert!(sock_path.exists(), "the socket must survive when the process list is unverifiable");
         });
     }
 }

@@ -22,6 +22,16 @@ pub struct Hub {
     /// `for_project` starts at most one watcher per project even though it
     /// runs on every connection.
     pub watching: bool,
+    /// A handle back to this hub's own `Arc<Mutex<Hub>>`, set only by
+    /// `for_project` (see there) — lets `do_close_project` spawn a thread
+    /// that re-locks this same hub *later*, after the blocking work is
+    /// done, rather than doing that work with the lock held (CLAUDE.md's
+    /// hard "never hold a lock across blocking I/O" constraint). Left as
+    /// `Weak::new()` (never upgrades) for a bare `Hub::new()` built
+    /// directly, which this file's own unit tests do — those fall back to
+    /// running a close synchronously, matching their assumption that the
+    /// broadcast messages are ready immediately after `handle()` returns.
+    self_ref: std::sync::Weak<Mutex<Hub>>,
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<Hub>>>>> = OnceLock::new();
@@ -40,6 +50,7 @@ impl Hub {
             next_id: 0,
             self_writes: HashMap::new(),
             watching: false,
+            self_ref: std::sync::Weak::new(),
         };
         // A freshly loaded hub must report reality, not whatever the
         // persisted layout happened to say last time: sessions may have
@@ -58,7 +69,20 @@ impl Hub {
         let mut map = reg.lock().unwrap_or_else(|e| e.into_inner());
         let arc = map
             .entry(project.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(Hub::new(project, dir.clone()))))
+            .or_insert_with(|| {
+                // `new_cyclic` hands back a `Weak` to the not-yet-finished
+                // `Arc` while still constructing its contents, which is
+                // exactly what's needed to give the hub a handle to itself
+                // (see `self_ref`'s doc comment) without a chicken-and-egg
+                // problem — `Hub::new` itself stays untouched (and every
+                // other, non-`for_project` caller of it, chiefly this
+                // file's own unit tests, keeps getting an empty `self_ref`).
+                Arc::new_cyclic(|weak| {
+                    let mut hub = Hub::new(project, dir.clone());
+                    hub.self_ref = weak.clone();
+                    Mutex::new(hub)
+                })
+            })
             .clone();
         // The registry lock is dropped by the time we get here (this is
         // after the `entry` call completes, and `map` is not touched again),
@@ -549,6 +573,28 @@ impl Hub {
     /// never destroy it. `CloseRefused` goes only to the requesting client
     /// (`send_to`) — a conflict here is that client's business, not
     /// something every mirrored browser needs to hear about.
+    ///
+    /// The actual killing runs off this hub's own lock. `session::kill_project`
+    /// confirms every session's `dtach` master is really dead — a bounded
+    /// poll that can take up to ~500ms *per session*, times up to
+    /// `MAX_SESSIONS_PER_PROJECT` (16) — and shells out to `ps`/`kill` along
+    /// the way. `wsconn.rs` calls `handle` (and so this) with the hub
+    /// already locked, and every other websocket on this project (terminal
+    /// I/O in `term.rs`, the filesystem watcher) needs that same lock, so
+    /// running the kill inline would freeze all of them for the whole
+    /// duration — `CLAUDE.md` makes "never hold a lock across blocking I/O"
+    /// a hard constraint, and this project has already shipped one deadlock
+    /// of exactly this shape. So this spawns a thread that does the killing
+    /// unlocked, then re-locks only long enough to broadcast the result.
+    ///
+    /// That thread needs a handle back to this same hub, which only exists
+    /// when this `Hub` was built through `for_project` (`self_ref` upgrades)
+    /// — the real, production path, and what every integration test goes
+    /// through too. A bare `Hub::new()`, which this file's own unit tests
+    /// use directly, has no such handle; those tests assert on broadcast
+    /// messages immediately after `handle()` returns, so that path falls
+    /// back to running the close synchronously, preserving that assumption
+    /// exactly rather than turning dozens of unrelated tests into pollers.
     fn do_close_project(&mut self, from: &ConnId) {
         let dirty: Vec<String> =
             self.ws.buffers.iter().filter(|(_, b)| b.dirty).map(|(r, _)| r.clone()).collect();
@@ -556,12 +602,42 @@ impl Hub {
             let ev = Event::CloseRefused { dirty };
             return self.send_to(from, &ev);
         }
-        let ended = crate::session::kill_project(&self.project);
-        self.ws.version += 1;
-        self.broadcast(&Event::ProjectClosed { ended });
-        self.refresh_live_sessions();
-        let snap = self.snapshot_event(from);
-        self.broadcast(&snap);
+        let project = self.project.clone();
+        let from = from.clone();
+        match self.self_ref.upgrade() {
+            Some(hub_arc) => {
+                std::thread::spawn(move || {
+                    // No panic may escape a socket thread. One here (from
+                    // anything session::kill_project calls) must not strand
+                    // ProjectClosed/State unsent forever with the hub lock
+                    // never reacquired — that would leave the UI showing a
+                    // close that silently never finished.
+                    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::session::kill_project(&project)
+                    }))
+                    .unwrap_or_else(|_| {
+                        eprintln!(
+                            "deadlight: kill_project panicked while closing {project}; reporting 0 ended"
+                        );
+                        0
+                    });
+                    let mut h = Hub::lock(&hub_arc);
+                    h.ws.version += 1;
+                    h.broadcast(&Event::ProjectClosed { ended });
+                    h.refresh_live_sessions();
+                    let snap = h.snapshot_event(&from);
+                    h.broadcast(&snap);
+                });
+            }
+            None => {
+                let ended = crate::session::kill_project(&project);
+                self.ws.version += 1;
+                self.broadcast(&Event::ProjectClosed { ended });
+                self.refresh_live_sessions();
+                let snap = self.snapshot_event(&from);
+                self.broadcast(&snap);
+            }
+        }
     }
 }
 
@@ -1048,6 +1124,61 @@ mod tests {
             msgs_other.iter().any(|m| m.contains(r#""t":"ProjectClosed""#)),
             "ProjectClosed must be broadcast, not sent only to the requester"
         );
+        std::env::remove_var("DEADLIGHT_STATE_DIR");
+    }
+
+    // I2: `handle(CloseProject)` must return promptly, spawning the actual
+    // session-killing rather than doing it inline under the hub lock —
+    // `session::kill_project` confirms every session's dtach master is
+    // really dead, a bounded poll that shells out to `ps`/`kill` and can
+    // take real wall time even for one session. Built through `for_project`
+    // (not a bare `Hub::new()`, which deliberately takes the synchronous
+    // fallback — see `do_close_project`'s doc comment) so `self_ref`
+    // resolves and the code path under test is the one production and every
+    // WS-level test actually uses.
+    //
+    // Measures `handle`'s own elapsed time directly, rather than inferring
+    // it from client-visible WebSocket response ordering (tried first,
+    // rejected: each connection's outgoing messages are pipelined through
+    // their own writer path, so response arrival order isn't a reliable
+    // proxy for how long the hub lock was actually held — confirmed by
+    // reverting the fix and finding that version of the test still passed).
+    //
+    // The 50ms bound was chosen by measuring both sides directly: reverting
+    // to the pre-fix inline `kill_project` call (one real session) measured
+    // 100-125ms across five runs on this machine, since even a fast SIGKILL
+    // still pays for at least two `ps` subprocess spawns and one `kill`
+    // spawn; the fixed code's own work here (check dirty, clone two
+    // `String`s, spawn a thread) does no process I/O and measures well
+    // under 1ms. 50ms sits with wide margin on both sides of that gap.
+    #[test]
+    fn close_project_returns_promptly_without_blocking_on_session_killing() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("DEADLIGHT_CMD"); // real dtach: a `cat` client has no master to wait on
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let hub = Hub::for_project("closepromptly", project_dir.path().to_path_buf());
+        let (c, _rx) = Hub::lock(&hub).subscribe();
+
+        let Ok(_att) = crate::session::attach("closepromptly", "shell", project_dir.path()) else {
+            eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
+            std::env::remove_var("DEADLIGHT_STATE_DIR");
+            return;
+        };
+
+        let start = std::time::Instant::now();
+        Hub::lock(&hub).handle(&c, Intent::CloseProject);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "handle(CloseProject) must return promptly rather than kill sessions inline \
+             under the hub lock — took {elapsed:?}"
+        );
+
         std::env::remove_var("DEADLIGHT_STATE_DIR");
     }
 
