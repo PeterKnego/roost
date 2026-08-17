@@ -307,17 +307,49 @@ pub fn index_page(at: &str, entries: &[Entry], refused: bool, projects: &[crate:
 /// The header strip of known projects. ● means live sessions, ○ means a saved
 /// layout with nothing running — the distinction that answers "what did I
 /// leave running?" without opening anything.
+///
+/// `projects` arrives pre-ordered by `registry::known_projects` (a
+/// `parent: None` row immediately followed by its `parent: Some(that_key)`
+/// children), so this just renders in order and lets `parent.is_some()`
+/// decide indentation — it never re-sorts or groups on its own. A repo's own
+/// branch and a linked worktree's branch render the same way, via `branch`;
+/// a worktree git reports but that doesn't canonicalise under any ROOT
+/// (`reachable == false`) renders as inert text, never as a link, since
+/// opening it is exactly what confinement forbids — but it still renders, so
+/// the user isn't left wondering where a worktree they know exists went.
 pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectStatus]) -> String {
     let mut out = String::from("<span class=\"projstrip\">");
     for p in projects {
         let live = p.live > 0;
         let marker = if live { "●" } else { "○" };
+        let is_child = p.parent.is_some();
         let mut cls = String::from("proj");
+        if is_child {
+            cls.push_str(" child");
+        }
         if live {
             cls.push_str(" live");
         }
         if p.key == current_key {
             cls.push_str(" current");
+        }
+        let indent = if is_child { "<span class=\"indent\">└</span> " } else { "" };
+        let branch = if p.branch.is_empty() {
+            String::new()
+        } else {
+            format!(" <span class=\"branch\">⎇ {}</span>", esc(&p.branch))
+        };
+        if !p.reachable {
+            cls.push_str(" unreachable");
+            out.push_str(&format!(
+                "<span class=\"{}\" title=\"worktree outside deadlight's roots — cannot be opened\">{}{} {}{}</span>",
+                cls,
+                indent,
+                marker,
+                esc(&p.url),
+                branch
+            ));
+            continue;
         }
         let title = if live {
             format!("{} sessions · oldest {}", p.live, human_age(p.oldest_age_secs))
@@ -325,13 +357,15 @@ pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectSta
             "saved layout, nothing running".to_string()
         };
         out.push_str(&format!(
-            "<a class=\"{}\" href=\"/{}\" target=\"dl-{}\" title=\"{}\">{} {}</a>",
+            "<a class=\"{}\" href=\"/{}\" target=\"dl-{}\" title=\"{}\">{}{} {}{}</a>",
             cls,
             crate::http::percent_encode(&p.url),
             esc(&p.key),
             esc(&title),
+            indent,
             marker,
-            esc(&p.url)
+            esc(&p.url),
+            branch
         ));
     }
     out.push_str("</span>");
@@ -664,10 +698,12 @@ mod tests {
             crate::registry::ProjectStatus {
                 key: "karpie".into(), url: "karpie".into(),
                 live: 2, oldest_age_secs: 60, has_layout: true,
+                branch: String::new(), parent: None, reachable: true,
             },
             crate::registry::ProjectStatus {
                 key: "glow".into(), url: "glow".into(),
                 live: 0, oldest_age_secs: 0, has_layout: true,
+                branch: String::new(), parent: None, reachable: true,
             },
         ];
         let h = index_page("", &entries, false, &ps);
@@ -766,10 +802,12 @@ mod tests {
             crate::registry::ProjectStatus {
                 key: "karpie".into(), url: "karpie".into(),
                 live: 2, oldest_age_secs: 8 * 3600, has_layout: true,
+                branch: String::new(), parent: None, reachable: true,
             },
             crate::registry::ProjectStatus {
                 key: "glow".into(), url: "glow".into(),
                 live: 0, oldest_age_secs: 0, has_layout: true,
+                branch: String::new(), parent: None, reachable: true,
             },
         ];
         let h = projects_strip("karpie", &ps);
@@ -791,6 +829,7 @@ mod tests {
             crate::registry::ProjectStatus {
                 key: "a%3Cb".into(), url: "a<b".into(),
                 live: 0, oldest_age_secs: 0, has_layout: true,
+                branch: String::new(), parent: None, reachable: true,
             },
             // storage_key only escapes '/' and '%' — a raw '"' from a
             // filesystem name can reach `key` unescaped, so this must be
@@ -801,6 +840,7 @@ mod tests {
             crate::registry::ProjectStatus {
                 key: "a\" onmouseover=x".into(), url: "b".into(),
                 live: 0, oldest_age_secs: 0, has_layout: true,
+                branch: String::new(), parent: None, reachable: true,
             },
         ];
         let h = projects_strip("", &ps);
@@ -811,6 +851,80 @@ mod tests {
             "the target attribute must be escaped too, not just the visible text"
         );
         assert!(!h.contains("dl-a\" "), "a quote in the key must not break out of the target attribute");
+    }
+
+    // The header strip's grouping contract: `known_projects` hands
+    // `projects_strip` a parent immediately followed by its children, and
+    // this renders that order — a linked worktree's row is indented under
+    // its repo, and both the repo's own branch and the worktree's branch
+    // are shown (they differ only by branch, per the module's own reason
+    // for existing).
+    #[test]
+    fn strip_groups_worktrees_under_their_parent_labelled_by_branch() {
+        let ps = vec![
+            crate::registry::ProjectStatus {
+                key: "ultima_marketing".into(), url: "ultima_marketing".into(),
+                live: 2, oldest_age_secs: 60, has_layout: true,
+                branch: "main".into(), parent: None, reachable: true,
+            },
+            crate::registry::ProjectStatus {
+                key: "ultima_marketing%2F.claude%2Fworktrees%2Fsite-launch".into(),
+                url: "ultima_marketing/.claude/worktrees/site-launch".into(),
+                live: 0, oldest_age_secs: 0, has_layout: false,
+                branch: "site-launch".into(),
+                parent: Some("ultima_marketing".into()),
+                reachable: true,
+            },
+        ];
+        let h = projects_strip("", &ps);
+        // both branches are shown, not just the parent's
+        assert!(h.contains("⎇ main"), "the repo's own branch must be shown");
+        assert!(h.contains("⎇ site-launch"), "the worktree's branch must be shown");
+        // the child row is visually indented and carries a distinct class —
+        // not just "somewhere in the same string as the parent"
+        assert!(
+            h.contains("<span class=\"indent\">└</span>"),
+            "a worktree row must render indented under its parent"
+        );
+        assert!(
+            h.contains("class=\"proj child\""),
+            "a worktree row must carry a class distinguishing it from a top-level project"
+        );
+        // it's a real, reachable worktree: still a genuine link to its own
+        // workspace URL, not merely decorative text
+        assert!(h.contains("href=\"/ultima_marketing/.claude/worktrees/site-launch\""));
+    }
+
+    // Confinement (not the dot-segment allowlist) is what forbids opening a
+    // worktree outside ROOTS — but git still reports it exists, so it must
+    // render, dimmed and unclickable, rather than vanish and leave the user
+    // wondering where it went.
+    #[test]
+    fn strip_renders_an_unreachable_worktree_without_a_link() {
+        let ps = vec![
+            crate::registry::ProjectStatus {
+                key: "repo".into(), url: "repo".into(),
+                live: 0, oldest_age_secs: 0, has_layout: true,
+                branch: "main".into(), parent: None, reachable: true,
+            },
+            crate::registry::ProjectStatus {
+                key: "%2Felsewhere%2Fstray".into(), url: "/elsewhere/stray".into(),
+                live: 0, oldest_age_secs: 0, has_layout: false,
+                branch: "wip".into(), parent: Some("repo".into()), reachable: false,
+            },
+        ];
+        let h = projects_strip("", &ps);
+        // still shown — never silently omitted
+        assert!(h.contains("/elsewhere/stray"));
+        assert!(h.contains("⎇ wip"));
+        assert!(h.contains("unreachable"), "an unreachable worktree must carry a distinct, dimmable class");
+        // but never as a clickable link to a path opening it would refuse anyway
+        assert!(
+            !h.contains("href=\"/elsewhere/stray\""),
+            "an unreachable worktree must never render as a link"
+        );
+        // the reachable parent right beside it must be entirely unaffected
+        assert!(h.contains("href=\"/repo\""));
     }
 
     #[test]
