@@ -13,6 +13,7 @@ pub mod session;
 pub mod term;
 pub mod watch;
 pub mod workspace;
+pub mod worktree;
 pub mod wsconn;
 pub mod wsstate;
 
