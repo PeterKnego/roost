@@ -420,15 +420,21 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
 ///
 /// Deliberately narrow about when it pays the `git worktree list` subprocess
 /// cost: only entries already in `by_key` (i.e. already being displayed —
-/// has a saved layout or a live session) and only once `.git` (a cheap
-/// `Path::exists` check) confirms the directory is actually a repository.
-/// A plain project, or one that hasn't resolved, is skipped outright.
+/// has a saved layout or a live session) and only once `.git` confirms the
+/// directory is actually a repository. That check is `.is_dir()`, not merely
+/// `.exists()`: a *linked* worktree's `.git` is a file (a pointer back to the
+/// real repo's gitdir), not a directory, so `.exists()` alone would treat an
+/// already-known worktree as a repository in its own right, run `git
+/// worktree list` from inside it (reporting the same records, main first),
+/// and parent it to itself — `order_with_children` then can't find a
+/// matching parent row and strands it at the end of the strip. A plain
+/// project, or one that hasn't resolved, is skipped outright.
 fn group_worktrees(roots: &[PathBuf], by_key: &mut std::collections::BTreeMap<String, ProjectStatus>) {
     let parent_keys: Vec<String> = by_key.keys().cloned().collect();
     for key in parent_keys {
         let url = by_key[&key].url.clone();
         let Some(dir) = crate::projects::resolve_project(roots, &url) else { continue };
-        if !dir.join(".git").exists() {
+        if !dir.join(".git").is_dir() {
             continue;
         }
         for w in crate::worktree::list(&dir) {
@@ -443,6 +449,14 @@ fn group_worktrees(roots: &[PathBuf], by_key: &mut std::collections::BTreeMap<St
             match rel_under_roots(roots, &w.path) {
                 Some(child_url) => {
                     let child_key = crate::projects::storage_key(&child_url);
+                    // Belt-and-braces: the `.is_dir()` gate above should
+                    // already make a repo's own key impossible to reach here
+                    // as `child_key`, but a worktree can never sanely be its
+                    // own parent, so refuse it outright rather than trust
+                    // that gate alone.
+                    if child_key == key {
+                        continue;
+                    }
                     let slot = by_key.entry(child_key.clone()).or_insert(ProjectStatus {
                         key: child_key,
                         url: child_url,
@@ -623,18 +637,35 @@ mod tests {
             fs::create_dir_all(state).unwrap();
             fs::write(state.join("repo.json"), "{}").unwrap();
 
+            // The worktree ALSO already has its own saved layout — the
+            // normal state after someone opens it once. A linked worktree's
+            // `.git` is a *file* (a pointer back to the real repo's gitdir),
+            // so `.exists()` is true for it too; without gating on
+            // `.is_dir()`, `group_worktrees` treats the worktree itself as a
+            // second "repository", runs `git worktree list` from inside it
+            // (which reports the same two records, in the same order), and
+            // parents it to itself. Without this second state file the child
+            // never enters `group_worktrees`'s `parent_keys` snapshot at
+            // all, and the self-parenting bug never executes — this is
+            // exactly the "test passes for the wrong reason" trap.
+            let child_key = crate::projects::storage_key("repo/.claude/worktrees/feat");
+            fs::write(state.join(format!("{child_key}.json")), "{}").unwrap();
+
             let ps = known_projects(&[root.path().to_path_buf()]);
 
             let idx_parent = ps.iter().position(|p| p.key == "repo").expect("repo must be known");
             assert_eq!(ps[idx_parent].branch, "main", "the repo's own branch comes from the main worktree record");
             assert!(ps[idx_parent].parent.is_none());
 
-            let child_key = crate::projects::storage_key("repo/.claude/worktrees/feat");
             let idx_child = ps.iter().position(|p| p.key == child_key).expect(
                 "the worktree must appear even though nobody ever opened it or saved a layout for it",
             );
             assert_eq!(ps[idx_child].branch, "feat");
-            assert_eq!(ps[idx_child].parent.as_deref(), Some("repo"));
+            assert_eq!(
+                ps[idx_child].parent.as_deref(),
+                Some("repo"),
+                "the worktree's own saved layout must not make it parent itself"
+            );
             assert!(ps[idx_child].reachable);
             assert_eq!(idx_child, idx_parent + 1, "a child must be sorted immediately after its parent");
         });
