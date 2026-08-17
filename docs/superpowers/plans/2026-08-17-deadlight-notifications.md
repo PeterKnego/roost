@@ -431,7 +431,7 @@ pub mod osc;
 cd /Users/peter/Projects/deadlight/.claude/worktrees/notifications && cargo test osc
 ```
 
-Expected: PASS, 16 tests.
+Expected: PASS, 17 tests.
 
 - [ ] **Step 5: Commit**
 
