@@ -115,6 +115,14 @@ directory no longer exists is killed and its socket removed. Both are logged.
 Reaping runs at startup and whenever the registry is enumerated, so the mess
 observed above cannot re-accumulate silently.
 
+**Reaping is serialised and throttled.** Because enumeration happens on a
+request path, a mutex prevents interleaved sweeps and a minimum interval (a few
+seconds) skips redundant ones. The cost is a bounded staleness window: a project
+can show ● for up to that interval after its last process actually died. That
+replaces an *unbounded* window — previously freshness depended entirely on how
+often a page happened to load — and the UI refreshes on load or explicit
+refresh rather than polling, so the trade is worth it.
+
 **Session metadata** per session: name, age (from the process start time), and
 whether a browser is currently attached. Age is what makes an abandoned session
 recognisable at a glance.
