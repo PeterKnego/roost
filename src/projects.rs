@@ -2,7 +2,20 @@
 //! path confinement, size cap, binary sniffing.
 use std::path::{Path, PathBuf};
 
-pub const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", "__pycache__", ".venv"];
+/// Directory names the file tree never renders, the watcher never descends
+/// into, and the picker never offers. Mostly build and vendor output — but two
+/// entries hold a whole second copy of the repository. `.git` is the obvious
+/// one; `.claude` is the one that bites, because Claude Code checks worktrees
+/// out at `{repo}/.claude/worktrees/{name}`, a full working tree living
+/// *inside* the project directory. Nothing else hides dot-directories from the
+/// tree (`render::tree_level` filters on this list and the user's `hide` list,
+/// nothing more), so without this entry a project renders a duplicate of
+/// itself, spends the inotify budget watching a checkout nobody opened, and
+/// offers files whose git state belongs to a different branch than the status
+/// pane beside them. A worktree is its own project and is opened as one; it
+/// does not belong in its parent's tree.
+pub const SKIP_DIRS: &[&str] =
+    &[".git", ".claude", "target", "node_modules", "__pycache__", ".venv"];
 pub const RESERVED: &[&str] = &["static", "ws", "frag"];
 const MAX_FILE_BYTES: u64 = 2_000_000;
 const TEXT_EXTENSIONS: &[&str] = &[

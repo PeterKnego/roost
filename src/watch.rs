@@ -423,6 +423,23 @@ mod tests {
         assert!(matches!(classify("dist/bundle.js", &bufs(), &hide), Class::Ignore));
     }
 
+    // A Claude worktree at `.claude/worktrees/{name}` is a whole second
+    // checkout inside the project. Every file written in it would otherwise
+    // refresh the tree of the *parent* project, which is displaying an
+    // entirely different working copy.
+    #[test]
+    fn a_worktree_under_dot_claude_never_refreshes_its_parents_tree() {
+        assert!(matches!(
+            classify(".claude/worktrees/feat/src/main.rs", &bufs(), &[]),
+            Class::Ignore
+        ));
+        // The whole directory goes, not just `worktrees/` — so `.claude`'s own
+        // config files stop live-refreshing too. Accepted: they are Claude's
+        // state, not the project's source, and one skip list drives the tree,
+        // the watcher, and the picker alike.
+        assert!(matches!(classify(".claude/settings.json", &bufs(), &[]), Class::Ignore));
+    }
+
     #[test]
     fn self_writes_are_suppressed_once() {
         let mut seen = std::collections::HashMap::new();
