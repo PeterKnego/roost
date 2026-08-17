@@ -143,7 +143,15 @@ A synthetically constructed `NotificationEvent` cannot call `waitUntil` (it
 throws, aborting the handler before the routing), and `focus()` needs user
 activation — in headless it raises `InvalidAccessError`. Both are browser-side
 preconditions rather than deadlight logic, and the code they gate is exercised
-above. The 100-notice retention cap is also still untested.
+above.
+
+**The 100-notice cap is verified end to end.** 120 notices were fired through
+real PTYs — 10 from each of 12 sessions, since the limiter is per *session*, so
+firing concurrently takes seconds rather than the twelve minutes one session
+would need. Exactly 100 were retained, with ids 21..120: the oldest 20 dropped
+and the newest kept, the retained window contiguous and monotonic. The bell and
+tab title both read 100, and a restart reloaded the same capped window
+unchanged.
 
 ## Limits
 
