@@ -79,6 +79,38 @@ function onEvent(ev) {
     case "StatusChanged": refreshKind("Changes"); break;
     case "FileChanged": refreshKind("Diff"); break;
     case "SaveConflict": showConflict(ev); break;
+    case "TerminalStarted":
+      // The server only validated the name and notified everyone; opening
+      // this socket is what actually spawns the PTY (see ensureTerm).
+      ensureTerm(ev.session);
+      render();
+      // live_sessions itself arrives moments later in the State broadcast
+      // that follows this event, but the header strip (a separate htmx
+      // fragment, not part of `state`) won't refetch on its own — nudge it
+      // so ○ becomes ● without waiting for a manual refresh or reload.
+      document.body.dispatchEvent(new Event("refresh"));
+      break;
+    case "GitInit":
+      if (!ev.ok) showError("git init failed: " + ev.msg);
+      // On success, is_git flips in the State snapshot that follows this
+      // event; tabKey folds is_git into a placeholder's key (see tabKey),
+      // so that State's render() swaps the "not a git repo" offer for the
+      // normal start hint on its own — nothing else needed here.
+      break;
+    case "CloseRefused":
+      // Backstop only: the Close button's own handler already checks
+      // dirty buffers before ever sending CloseProject. This covers a
+      // buffer that went dirty in the gap between that check and the
+      // server processing the intent.
+      showError("Cannot close: unsaved changes in " + ev.dirty.join(", "));
+      break;
+    case "ProjectClosed":
+      showError(ev.ended + " terminal session(s) ended");
+      terms.forEach((e) => { try { e.sock.close(); } catch {} try { e.term.dispose(); } catch {} });
+      terms.clear();
+      render();
+      document.body.dispatchEvent(new Event("refresh")); // strip marker -> ○
+      break;
     case "Error":
       // Every server-side failure funnels through here (already-exists,
       // directory-not-empty, path-outside-project, too-many-buffers,
@@ -97,7 +129,18 @@ function tabKey(t) {
     // (fetched HTML vs. a live textarea), not be treated as "unchanged".
     case "File": return `File:${t.rel}:${t.mode}`;
     case "Diff": return `Diff:${t.rel || ""}`;
-    case "Terminal": return `Terminal:${t.session}`;
+    case "Terminal": {
+      // The placeholder and the attached terminal are two different DOM
+      // shapes for the same tab. Folding them into one key would make
+      // render()'s "already mounted, skip" fast path (below) never re-run
+      // mountTab once a session goes live, leaving the "press Enter" hint
+      // sitting there forever over a terminal that's actually running.
+      // Same reasoning for is_git: a successful InitGit must swap the
+      // "not a git repo" placeholder for the normal one without the user
+      // having to switch tabs and back.
+      const live = terms.has(t.session) || state.live_sessions.includes(t.session);
+      return live ? `Terminal:${t.session}:live` : `Terminal:${t.session}:placeholder:${state.is_git}`;
+    }
     default: return t.k;
   }
 }
@@ -210,6 +253,15 @@ function mountTab(content, t) {
   // must not clobber whatever is here now — see the dataset.url check below.
   delete content.dataset.url;
   if (t.k === "Terminal") {
+    const liveNow = state.live_sessions.includes(t.session);
+    // Only attach when a session already exists (state.live_sessions, or a
+    // pooled node we already spawned this page-load). Opening a project
+    // must never fork a shell on its own — that is how nine unused
+    // sessions accumulated on the production host before this gate existed.
+    if (!liveNow && !terms.has(t.session)) {
+      content.appendChild(terminalPlaceholder(t.session));
+      return;
+    }
     const e = ensureTerm(t.session);
     content.appendChild(e.node);   // MOVE, not rebuild — the socket survives
     requestAnimationFrame(() => {
@@ -237,6 +289,34 @@ function mountTab(content, t) {
     // explicit process() or every closed directory would be inert forever.
     if (t.k === "Tree") window.htmx && htmx.process(content);
   });
+}
+
+// A bare empty pane is not discoverable, and a plain button would train the
+// wrong muscle memory — people already press Enter in a fresh terminal to
+// check it's alive. So the hint itself *is* the control: Enter or a click
+// both start the session. Non-git directories get a different offer (init,
+// or a quieter escape to start anyway) so a scratch directory without a
+// repo doesn't become unusable.
+function terminalPlaceholder(session) {
+  const box = document.createElement("div");
+  box.className = "termstart";
+  box.tabIndex = 0;
+  const isGit = state.is_git;
+  box.innerHTML = isGit
+    ? `<p>Press <kbd>Enter</kbd> to start a terminal</p>`
+    : `<p>Not a git repository.</p>
+       <p><button class="initgit">Initialize git repo</button></p>
+       <p><a class="nogit" href="#">start without git</a></p>`;
+  const start = () => send({ t: "StartTerminal", session });
+  if (isGit) {
+    box.onclick = start;
+    box.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); start(); } };
+    requestAnimationFrame(() => box.focus());
+  } else {
+    box.querySelector(".initgit").onclick = () => send({ t: "InitGit" });
+    box.querySelector(".nogit").onclick = (e) => { e.preventDefault(); start(); };
+  }
+  return box;
 }
 
 // Stable identity for a tree <li>: a directory's own rel (render::tree_level
@@ -554,6 +634,28 @@ const refreshBtn = document.getElementById("refresh");
 if (refreshBtn) refreshBtn.onclick = () => {
   document.body.dispatchEvent(new Event("refresh")); // #gitinfo hx-trigger listens
   send({ t: "RequestState" });
+};
+
+// "3 sessions" isn't enough to judge whether one of them is a long-running
+// job worth checking on first — list them by name. Dirty buffers are
+// checked client-side too (not just left to the server's own CloseRefused)
+// so the intent is never even sent when it's certain to be refused: the
+// user gets one clear message instead of a round trip that undoes nothing.
+const closeBtn = document.getElementById("closeproj");
+if (closeBtn) closeBtn.onclick = () => {
+  const live = (state && state.live_sessions) || [];
+  const dirty = ((state && state.buffers) || []).filter((b) => b.dirty).map((b) => b.rel);
+  let msg = `Close ${PROJECT}?\n\n`;
+  msg += live.length
+    ? `${live.length} terminal session(s) will be ended:\n  ${live.join(", ")}\n`
+    : "No terminal sessions are running.\n";
+  if (dirty.length) {
+    // Mirrors the server's own refusal, but told before sending anything
+    // rather than after a round trip that would have changed nothing.
+    alert(msg + `\nUnsaved changes in:\n  ${dirty.join("\n  ")}\n\nSave or discard them first.`);
+    return;
+  }
+  if (confirm(msg + "\nEnd sessions?")) send({ t: "CloseProject" });
 };
 
 connectControl();
