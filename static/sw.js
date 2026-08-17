@@ -1,0 +1,51 @@
+// Shows OS notifications and routes clicks back to the right window.
+//
+// The page could call new Notification() directly and skip this file
+// entirely — the reason it does not is that a service worker is the only
+// thing that can later receive a Web Push message with no tab open. Doing it
+// here now means adding push is a `push` listener, not a rewrite.
+
+// Without claim(), a freshly registered worker does not control the page
+// until the next reload, and clients.matchAll would find nothing to focus.
+self.addEventListener("install", (e) => self.skipWaiting());
+self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
+
+self.addEventListener("message", (e) => {
+  const m = e.data;
+  if (!m || m.kind !== "notify") return;
+  const n = m.notice;
+  self.registration.showNotification(n.title, {
+    body: n.body,
+    // One notification per session: a chatty session replaces its own
+    // rather than stacking twenty.
+    tag: `${n.project}/${n.session}`,
+    data: { project: n.project, session: n.session },
+    renotify: true,
+  });
+});
+
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  const { project, session } = e.notification.data || {};
+  if (!project) return;
+  const target = `/${project}#session=${encodeURIComponent(session || "")}`;
+  e.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((wins) => {
+      // Prefer a window already on this project: focusing it needs no
+      // navigation, so nothing in that tab is disturbed.
+      const onProject = wins.find((c) => {
+        try { return new URL(c.url).pathname === `/${project}`; } catch { return false; }
+      });
+      if (onProject) {
+        return onProject.focus().then((c) => {
+          (c || onProject).postMessage({ kind: "focus", project, session });
+        });
+      }
+      // Otherwise reuse any deadlight window rather than opening a new tab.
+      if (wins.length) {
+        return wins[0].focus().then((c) => (c || wins[0]).navigate(target));
+      }
+      return self.clients.openWindow(target);
+    })
+  );
+});

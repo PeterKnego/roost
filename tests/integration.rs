@@ -34,6 +34,34 @@ fn fixture_named(project: &str) -> (tempfile::TempDir, u16) {
     (d, port)
 }
 
+/// Existing tests call `ureq::get(...)` inline and only need the body; this
+/// is for the cases that also need to assert on status and content-type.
+fn get_full(port: u16, path: &str) -> (u16, String, String) {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let resp = ureq::get(&url).call();
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let ctype = r.header("content-type").unwrap_or("").to_string();
+            (status, ctype, r.into_string().unwrap_or_default())
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let ctype = r.header("content-type").unwrap_or("").to_string();
+            (code, ctype, r.into_string().unwrap_or_default())
+        }
+        Err(e) => panic!("request failed: {e}"),
+    }
+}
+
+#[test]
+fn the_service_worker_is_served_from_the_root_scope() {
+    let (_d, port) = fixture();
+    let (status, ctype, body) = get_full(port, "/sw.js");
+    assert_eq!(status, 200, "sw.js must be at the root, or its scope cannot cover /{{project}}");
+    assert!(ctype.contains("javascript"), "wrong content-type: {ctype}");
+    assert!(body.contains("notificationclick"), "not the service worker: {body:.120}");
+}
+
 #[test]
 fn index_lists_projects() {
     let (_d, port) = fixture();
