@@ -1718,13 +1718,22 @@ self.addEventListener("notificationclick", (e) => {
   // Deliberate bail-out with no waitUntil: there is nothing to focus or
   // navigate to, and close() above already ran synchronously.
   if (!project) return;
-  const target = `/${project}#session=${encodeURIComponent(session || "")}`;
+  // Same segment-wise encoding as app.js's projectPath, and for the same
+  // reason: a project name is a directory name, so it may contain characters
+  // that are structural in a URL. `/` stays literal because a nested project
+  // like `karpie/src` really is a multi-segment path.
+  const target =
+    "/" + project.split("/").map(encodeURIComponent).join("/") +
+    "#session=" + encodeURIComponent(session || "");
   e.waitUntil(
     self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((wins) => {
       // Prefer a window already on this project: focusing it needs no
       // navigation, so nothing in that tab is disturbed.
       const onProject = wins.find((c) => {
-        try { return new URL(c.url).pathname === `/${project}`; } catch { return false; }
+        // Compare decoded: the browser hands back a percent-encoded pathname,
+        // so a raw `/${project}` would never match precisely those names that
+        // needed encoding in the first place.
+        try { return decodeURIComponent(new URL(c.url).pathname) === `/${project}`; } catch { return false; }
       });
       if (onProject) {
         return onProject.focus().then((c) => {
@@ -1945,10 +1954,18 @@ function setFavicon(badged) {
   link.href = "data:image/svg+xml," + encodeURIComponent(svg);
 }
 
+// Mirrors http::percent_encode on the Rust side: encode each segment but keep
+// the `/` separators, because a project may be a nested rel path like
+// `karpie/src` whose slashes are structural. Encoding the whole string breaks
+// nested projects; encoding none of it breaks any project whose directory name
+// contains a URL-significant character — a directory called `foo#bar` would
+// send the browser to `/foo` with the rest swallowed as a fragment.
+const projectPath = (p) => p.split("/").map(encodeURIComponent).join("/");
+
 function openNotice(x) {
   if (!x.read) send({ t: "MarkNoticeRead", id: x.id });
   if (x.project !== PROJECT) {
-    location.href = `/${x.project}#session=${encodeURIComponent(x.session)}`;
+    location.href = `/${projectPath(x.project)}#session=${encodeURIComponent(x.session)}`;
     return;
   }
   focusSession(x.session);
@@ -2020,7 +2037,13 @@ setFavicon(false);
 if (location.hash.startsWith("#session=")) {
   const want = decodeURIComponent(location.hash.slice("#session=".length));
   history.replaceState(null, "", location.pathname);
-  const tryFocus = () => { if (state) focusSession(want); else setTimeout(tryFocus, 100); };
+  // Bounded: if the socket never connects there is nothing to focus, and an
+  // uncapped poll would spin for the life of the page.
+  let tries = 0;
+  const tryFocus = () => {
+    if (state) focusSession(want);
+    else if (++tries < 50) setTimeout(tryFocus, 100);
+  };
   tryFocus();
 }
 ```
@@ -2056,7 +2079,7 @@ Append to `static/style.css`:
   font-size: 10px; line-height: 14px; text-align: center;
 }
 #noticepanel {
-  position: absolute; top: var(--header-h); right: 8px; z-index: 20;
+  position: absolute; top: var(--header-h, 36px); right: 8px; z-index: 20;
   width: 340px; max-height: 60vh; overflow-y: auto;
   background: var(--bg2); border: 1px solid var(--border);
   border-radius: 4px; padding: 4px;
