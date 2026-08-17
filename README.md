@@ -33,6 +33,12 @@ stale, never overwritten.
 configured roots and open it as a workspace — single click selects, double
 click descends, Enter opens, and git repos get a one-click shortcut.
 
+**Desktop notifications.** A process in a terminal — Claude finishing a task,
+a hook needing a decision — can raise a notification with one escape sequence
+or `deadlight notify`; it shows up as a bell across every project and, given a
+secure context, as an OS notification that clicks back to the terminal that
+raised it. See [`docs/notifications.md`](docs/notifications.md).
+
 ## Quick start
 
 ```bash
@@ -41,8 +47,10 @@ DEADLIGHT_ROOTS="$HOME/Projects" cargo run --quiet 8444
 ```
 
 Requires `dtach` (`brew install dtach` / `apt install dtach`) and `git`.
-The only CLI argument is the port; everything else is environment — see
-[`docs/deploy.md`](docs/deploy.md).
+Running the binary directly takes one CLI argument, the port; `deadlight
+notify <title> [body]` is the one other subcommand, for raising a
+notification from inside a deadlight terminal. Everything else is
+environment — see [`docs/deploy.md`](docs/deploy.md).
 
 ## URL surface
 
@@ -76,6 +84,8 @@ configurable.
 ## Documentation
 
 - [`docs/deploy.md`](docs/deploy.md) — running, environment, deployment traps
+- [`docs/notifications.md`](docs/notifications.md) — triggering, hooking up
+  Claude Code, limits
 - `docs/superpowers/specs/` — design documents
 - `docs/superpowers/plans/` — implementation plans
 - [`CLAUDE.md`](CLAUDE.md) — conventions and constraints for working in this repo
