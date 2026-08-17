@@ -8,6 +8,11 @@ use std::path::PathBuf;
 /// Tests mutate the process-global DEADLIGHT_STATE_DIR; cargo runs them in
 /// parallel threads. Every test that touches that variable — here and in
 /// `hub` — must hold this lock.
+///
+/// A test needing both this and `session::SESSION_ENV_LOCK` takes **this one
+/// first**; see that lock's doc comment for why the order has to be total
+/// (an inversion deadlocks, and a deadlock hangs rather than fails, so no
+/// number of green runs can rule it out).
 #[cfg(test)]
 pub static STATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

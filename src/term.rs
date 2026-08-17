@@ -62,6 +62,32 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
         let _ = ws_read.close(None);
         return;
     };
+    // A close in flight is SIGKILLing every one of this project's sessions on
+    // a background thread, and `kill_and_unlink` kills whatever holds a
+    // socket path — including a session spawned *after* it took its process
+    // snapshot. `hub::do_start_terminal` refuses the `StartTerminal` intent
+    // for that reason, but that only stops a browser that asks first: this
+    // connect is what actually spawns the PTY, and a mirrored tab already
+    // showing a terminal reconnects straight here with no intent at all. So
+    // the same guard has to exist on this path.
+    //
+    // Not airtight, and cannot be from here: a close starting in the moment
+    // between this check and `attach` below still races. Closing that
+    // properly would mean holding the hub lock across `attach` (a PTY spawn
+    // — blocking I/O under a lock, which CLAUDE.md forbids outright). What
+    // remains is a microsecond-scale window instead of the whole ~100ms+
+    // kill, and the losing case degrades to what it already was.
+    //
+    // Safe to touch a hub lock *here*, unlike the refresh block further down
+    // (see its placement comment): no subscriber exists until `attach`
+    // returns, so waiting on a busy hub can only delay this terminal's own
+    // start — there is no queue yet that could fill and get this tab dropped
+    // mid-connect.
+    if crate::hub::Hub::is_closing(&project) {
+        eprintln!("deadlight: term socket refused — project {project:?} is closing");
+        let _ = ws_read.close(None);
+        return;
+    }
     let att = match session::attach(&project, name, &dir) {
         Ok(a) => a,
         Err(e) => {

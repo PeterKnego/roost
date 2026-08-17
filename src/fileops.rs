@@ -99,7 +99,13 @@ pub fn delete(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
 pub fn rename(project_dir: &Path, from: &str, to: &str) -> Result<PathBuf, String> {
     let src = safe_resolve(project_dir, from)?;
     let dst = safe_resolve_parent(project_dir, to)?;
-    if dst.exists() {
+    // symlink_metadata, not exists(), for the same reason create_file and
+    // create_dir use it — plus one this file didn't state: `exists()` folds
+    // every error into `false`, so a dangling symlink (or a destination it
+    // simply could not stat) read as "nothing there" and `rename` then
+    // replaced it. Destroying something requires evidence it isn't there,
+    // and "I could not tell" is not that evidence.
+    if dst.symlink_metadata().is_ok() {
         return Err(format!("already exists: {to}"));
     }
     std::fs::rename(&src, &dst).map_err(|e| e.to_string())?;
@@ -219,6 +225,29 @@ mod tests {
             "real\n",
             "existing outside file must be untouched"
         );
+    }
+
+    // Same shape as `create_file`'s refusal above, on the destination of a
+    // rename: `exists()` follows the link, sees nothing, and returns false —
+    // so the old check read "nothing there" and `rename` then destroyed the
+    // symlink. Destroying anything needs evidence it isn't there, and a
+    // stat that answered nothing is not that evidence.
+    #[cfg(unix)]
+    #[test]
+    fn rename_refuses_a_destination_that_is_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let d = proj();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path().join("nope.txt"), d.path().join("dst")).unwrap();
+
+        let err = rename(d.path(), "a.txt", "dst").expect_err("must refuse, not clobber the link");
+        assert!(err.contains("already exists"), "unexpected reason: {err}");
+        assert!(
+            d.path().join("dst").symlink_metadata().unwrap().file_type().is_symlink(),
+            "the destination link itself must survive"
+        );
+        assert!(d.path().join("a.txt").exists(), "and the source must not have moved");
     }
 
     #[test]

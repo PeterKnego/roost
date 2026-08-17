@@ -159,6 +159,34 @@ impl Hub {
         h.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// True when this project has a live hub currently mid-`CloseProject`
+    /// (see `closing`). Exists for `term.rs`: refusing the `StartTerminal`
+    /// *intent* while a close is in flight only stops a browser that asks
+    /// first, and the actual PTY spawn happens when something connects to
+    /// `/ws/{project}/term/{name}` — which a mirrored tab already showing a
+    /// terminal does on reconnect, with no intent of its own.
+    ///
+    /// Deliberately does *not* create a hub the way `for_project` does: a
+    /// project with no hub at all cannot be closing, and building one here
+    /// would also start a filesystem watcher as a side effect of a mere
+    /// question. The registry guard is dropped before the hub is locked, for
+    /// the same reason `for_project` drops it: a thread holding a hub lock
+    /// may want the registry lock.
+    pub fn is_closing(project: &str) -> bool {
+        let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        let arc = {
+            let map = reg.lock().unwrap_or_else(|e| e.into_inner());
+            match map.get(project) {
+                Some(a) => a.clone(),
+                None => return false,
+            }
+        };
+        // Bound, not returned inline: as a tail expression the guard would
+        // outlive `arc` and this would not compile.
+        let closing = Hub::lock(&arc).closing;
+        closing
+    }
+
     pub fn subscribe(&mut self) -> (ConnId, Receiver<String>) {
         self.next_id += 1;
         let id = format!("c{}", self.next_id);
@@ -1283,6 +1311,29 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         Hub::lock(&hub).handle(&c, Intent::CloseProject);
+        // The same window, as `term.rs` sees it: refusing the intent only
+        // stops a browser that asks first, and it is the connect to
+        // /ws/{project}/term/{name} that actually spawns the PTY — a mirrored
+        // tab reconnects straight there with no intent at all. That path has
+        // nothing but this to check.
+        assert!(
+            Hub::is_closing("closeinflight"),
+            "term.rs's own guard must be able to observe the in-flight close"
+        );
+        assert!(
+            !Hub::is_closing("no-such-project-ever"),
+            "a project with no hub cannot be closing"
+        );
+        // Asking must not *create* a hub the way `for_project` does — that
+        // would start a filesystem watcher as a side effect of a question,
+        // for a directory nobody asked about.
+        let created = REGISTRY
+            .get()
+            .map(|r| {
+                r.lock().unwrap_or_else(|e| e.into_inner()).contains_key("no-such-project-ever")
+            })
+            .unwrap_or(false);
+        assert!(!created, "is_closing must not register a hub for a project it was merely asked about");
         Hub::lock(&hub).handle(&c, Intent::StartTerminal { session: "fresh".into() });
 
         let msgs: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();

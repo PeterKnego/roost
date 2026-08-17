@@ -215,7 +215,16 @@ fn kill_and_unlink_with(sock_path: &std::path::Path, snapshot_fn: SnapshotFn) ->
         if *pid == 0 {
             continue;
         }
-        let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
+        // stderr silenced: `snapshot` is a moment old, so a process that
+        // exited on its own in between makes `kill(1)` print
+        // "kill: <pid>: No such process" — noise about something that has
+        // already achieved exactly what was wanted, and noise that masks
+        // real output in the journal and the test suite alike.
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
     // Bounded wait for the kill(s) to take effect rather than an instant
     // recheck: SIGKILL is not synchronous. Bounded so a process that
@@ -253,21 +262,147 @@ fn origin_marker_path(key_dir: &std::path::Path) -> PathBuf {
     key_dir.join(".origin")
 }
 
+/// The marker holds a path's *raw bytes*, not text. `to_string_lossy` (what
+/// this used to write) turns a non-UTF8 project path into replacement
+/// characters — a path that can never exist — so every differently-rooted
+/// pass afterwards would read a false "gone" and reap a live session. These
+/// two helpers are the byte-exact round trip `String`/`read_to_string`
+/// cannot provide. The `not(unix)` halves exist only to keep the module
+/// compiling: deadlight is unix-only in practice (dtach, PTYs, `ps`).
+#[cfg(unix)]
+fn marker_bytes(dir: &std::path::Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    dir.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn marker_bytes(dir: &std::path::Path) -> Vec<u8> {
+    dir.to_string_lossy().as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn path_from_marker(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+}
+
+#[cfg(not(unix))]
+fn path_from_marker(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// The single writer of a `.origin` marker, shared by `record_origin` and
+/// `confirmed_gone` so the atomicity below can never be true of one and not
+/// the other.
+///
+/// Atomic — temp file, then `rename` — rather than `fs::write`, which is
+/// `O_TRUNC` followed by a write. The file being truncated is the *only*
+/// record of where this project lives, and the whole reason it exists is
+/// that a *second*, differently-rooted deadlight sharing this state dir
+/// reads it. That reader landing inside the truncate-then-write window would
+/// see `""` (or a prefix like `/home/pet`), conclude "gone", and SIGKILL the
+/// live session this mechanism was built to protect — a window reopened
+/// every few seconds, per project, forever. Worse, a crash or `ENOSPC`
+/// mid-write leaves the damage *permanent*. `rename` makes the marker only
+/// ever whole-or-untouched, and an interrupted `.origin.tmp` is a dotfile,
+/// which `reconcile` already skips.
+///
+/// Skips the write when the marker already holds these exact bytes — the
+/// common case, since `reconcile` reconfirms the same resolution on every
+/// pass — so steady-state reaping does no disk writes at all. A marker
+/// damaged by an older, non-atomic writer differs, so it gets repaired.
+///
+/// 0600 for the same reason `attach` chmods the socket directory 0700:
+/// nothing outside this user has any business reading it.
+///
+/// Best-effort throughout: a failure here just means a later pass falls back
+/// to "no marker, never reap" — the safe direction to fail in.
+fn write_origin(key_dir: &std::path::Path, dir: &std::path::Path) {
+    let bytes = marker_bytes(dir);
+    let marker = origin_marker_path(key_dir);
+    if std::fs::read(&marker).map(|cur| cur == bytes).unwrap_or(false) {
+        return;
+    }
+    // Pid in the temp name: two deadlight instances sharing this state dir
+    // is the whole premise of the marker, and a *shared* temp name would
+    // hand the truncate-then-write window straight back — one process's
+    // `rename` could publish the other's half-written file. A crash can
+    // strand one of these, but it is a dotfile (skipped by every enumeration
+    // of this directory) and the unchanged-content skip above means the
+    // write path runs at most once per changed resolution, not once per pass.
+    let tmp = key_dir.join(format!(".origin.tmp.{}", std::process::id()));
+    if std::fs::write(&tmp, &bytes).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    if std::fs::rename(&tmp, &marker).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 /// Records the resolved absolute directory a project maps to, so a *later*
 /// check for "is this project gone" can consult this exact path directly —
 /// independent of whatever `DEADLIGHT_ROOTS` the process performing that
 /// later check happens to be configured with. See `confirmed_gone`'s doc
 /// comment for why that independence matters.
 ///
-/// Called by `session::attach` (the moment a session's socket directory is
-/// created — its caller has already resolved `dir`) and by `reconcile`
-/// itself (to keep the marker fresh on every pass that reconfirms the same
-/// resolution). Best-effort: a write failure here just means a later pass
-/// falls back to "no marker, never reap" — the safe direction to fail in.
+/// Called by `session::attach` the moment a session's socket directory is
+/// created (its caller has already resolved `dir`). `reconcile` refreshes
+/// the same marker on every pass that reconfirms a resolution, but goes
+/// straight to `write_origin` — it already holds the key directory, so
+/// re-deriving it from a project string here would be a round trip through
+/// `decode_key`/`storage_key` for no gain.
 pub fn record_origin(project: &str, dir: &std::path::Path) {
     let key_dir = sock_root().join(crate::projects::storage_key(project));
     let _ = std::fs::create_dir_all(&key_dir);
-    let _ = std::fs::write(origin_marker_path(&key_dir), dir.to_string_lossy().as_bytes());
+    write_origin(&key_dir, dir);
+}
+
+/// Given a `.origin` marker's raw contents, is the directory it records
+/// *positively confirmed* to be gone?
+///
+/// Every answer other than "yes, confirmed" must be `false`, because the
+/// only thing a `true` here causes is SIGKILL plus unlink, which is
+/// unrecoverable. Two ways this used to get that backwards, both of them the
+/// same shape as the bug the marker was introduced to fix:
+///
+/// - `!Path::new("").is_dir()` is `true`, so an empty or truncated marker
+///   read as "gone" — the loudest possible absence of evidence.
+/// - `Path::is_dir()` swallows *every* error into `false`: `EACCES` on a
+///   parent after a `chmod`, an unmounted disk, a downed autofs/NFS mount,
+///   a path component that is no longer a directory. "I could not check"
+///   became "confirmed gone", which contradicts this module's own rule that
+///   an unreadable root suspends reaping.
+///
+/// So: only `NotFound` counts. `symlink_metadata`, not `metadata`, so a
+/// symlink standing where the recorded directory used to be is observed
+/// rather than followed (`resolve_project` records a canonicalised path, so
+/// a symlink appearing there is already unexpected). And `Ok(_) => false`
+/// even for a non-directory: something that is *there* is not evidence of
+/// gone, and being wrong in that direction cannot be undone.
+fn recorded_path_is_gone(recorded: &[u8]) -> bool {
+    // Only a trailing newline is stripped, never `trim()`: a project
+    // directory name may legally end in a space (see `process_snapshot` —
+    // only *session* names are restricted), and trimming that would look up
+    // a path that never existed and answer "gone".
+    let mut end = recorded.len();
+    while end > 0 && recorded[end - 1] == b'\n' {
+        end -= 1;
+    }
+    let trimmed = &recorded[..end];
+    if trimmed.is_empty() {
+        return false;
+    }
+    match std::fs::symlink_metadata(path_from_marker(trimmed)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+        Ok(_) => false,
+    }
 }
 
 /// True only when a project is *confirmed* to have existed before — a
@@ -302,15 +437,18 @@ pub fn record_origin(project: &str, dir: &std::path::Path) {
 /// treated as gone: it is left completely alone, neither killed nor
 /// unlinked (`known_projects` may still list it; that's a separate,
 /// unaffected concern from reaping).
+///
+/// An unreadable *or* damaged marker is the same as no marker: see
+/// `recorded_path_is_gone`, which is where "positive evidence only" is
+/// actually enforced.
 fn confirmed_gone(key_dir: &std::path::Path, roots: &[PathBuf], url: &str) -> bool {
-    let marker = origin_marker_path(key_dir);
     match crate::projects::resolve_project(roots, url) {
         Some(dir) => {
-            let _ = std::fs::write(&marker, dir.to_string_lossy().as_bytes());
+            write_origin(key_dir, &dir);
             false
         }
-        None => match std::fs::read_to_string(&marker) {
-            Ok(recorded) => !std::path::Path::new(recorded.trim()).is_dir(),
+        None => match std::fs::read(origin_marker_path(key_dir)) {
+            Ok(recorded) => recorded_path_is_gone(&recorded),
             Err(_) => false,
         },
     }
@@ -486,8 +624,9 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
         let Ok(inner) = std::fs::read_dir(entry.path()) else { continue };
         for sock in inner.flatten() {
             // `.origin` (this pass's own `confirmed_gone` may have just
-            // written or refreshed it, right above) is metadata about the
-            // project key, not a session socket — a real session name can
+            // written or refreshed it, right above) and any `.origin.tmp`
+            // left behind by an interrupted write are metadata about the
+            // project key, not session sockets — a real session name can
             // never start with `.` (`^[A-Za-z0-9_-]{1,32}$`), so this is an
             // unambiguous, safe skip. Without it, the marker — held by no
             // process — reads as a dead socket and gets reaped by this same
@@ -848,14 +987,23 @@ mod tests {
         out
     }
 
-    /// Test-only cleanup helper: pids to kill off after a test that spawned
-    /// a real detached `dtach` process, so it doesn't linger past the test.
+    /// Test-only cleanup helper: kills off whatever a test's real detached
+    /// `dtach` process left behind, so it doesn't linger past the test.
     /// Unwraps `process_snapshot`'s `Option` with an empty-vec fallback —
     /// fine here since this is best-effort teardown, not the behavior under
     /// test (which is exactly why production code must never do this; see
     /// `kill_and_unlink`/`reconcile`'s handling of a `None` snapshot).
-    fn test_cleanup_pids(sock_path: &std::path::Path) -> Vec<u32> {
-        pids_holding(&process_snapshot().unwrap_or_default(), sock_path)
+    /// stderr silenced for the same reason `kill_and_unlink` silences it: a
+    /// process that already exited makes `kill(1)` complain about a pid
+    /// nobody needed killed, and that noise masks real test output.
+    fn kill_test_pids(sock_path: &std::path::Path) {
+        for pid in pids_holding(&process_snapshot().unwrap_or_default(), sock_path) {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
     }
 
     #[test]
@@ -1201,9 +1349,7 @@ mod tests {
 
             // Clean up: this process was never in any in-memory map, so
             // nothing else will ever end it.
-            for pid in test_cleanup_pids(&sock_path) {
-                let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
-            }
+            kill_test_pids(&sock_path);
         });
     }
 
@@ -1230,9 +1376,7 @@ mod tests {
             assert!(sock_path.exists(), "a live session must survive when its project can't be checked");
             assert!(socket_has_process(&sock_path), "the process itself must survive");
 
-            for pid in test_cleanup_pids(&sock_path) {
-                let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
-            }
+            kill_test_pids(&sock_path);
 
             // Dead-socket reaping needs no project information at all, and
             // must still work even while gone-project reaping is suspended.
@@ -1271,9 +1415,7 @@ mod tests {
                 "a process-backed socket with no in-memory record must still count as live, not idle"
             );
 
-            for pid in test_cleanup_pids(&sock_path) {
-                let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
-            }
+            kill_test_pids(&sock_path);
         });
     }
 
@@ -1301,9 +1443,7 @@ mod tests {
                 "a socket path containing a space must still be recognized as held"
             );
 
-            for pid in test_cleanup_pids(&sock_path) {
-                let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
-            }
+            kill_test_pids(&sock_path);
         });
     }
 
@@ -1333,9 +1473,7 @@ mod tests {
             assert!(sock_path.exists(), "the socket of a live session must survive");
             assert!(socket_has_process(&sock_path), "the process itself must survive");
 
-            for pid in test_cleanup_pids(&sock_path) {
-                let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
-            }
+            kill_test_pids(&sock_path);
         });
     }
 
@@ -1369,9 +1507,7 @@ mod tests {
             assert!(sock_path.exists());
             assert!(socket_has_process(&sock_path));
 
-            for pid in test_cleanup_pids(&sock_path) {
-                let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
-            }
+            kill_test_pids(&sock_path);
         });
     }
 
@@ -1404,9 +1540,7 @@ mod tests {
                 "a fresh check must observe a process that just attached, not a cached earlier answer"
             );
 
-            for pid in test_cleanup_pids(&sock_path) {
-                let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
-            }
+            kill_test_pids(&sock_path);
         });
     }
 
@@ -1492,11 +1626,12 @@ mod tests {
     // directory is confirmed missing counts.
     //
     // Goes through the real `session::attach` (not a raw `dtach -n` spawn
-    // like the other tests in this file use), because it's specifically
-    // `attach`'s call to `record_origin` under test here — without it, this
-    // would be indistinguishable from "never confirmed at all", which
-    // reconcile also correctly leaves alone, and the test would prove
-    // nothing about the marker mechanism specifically.
+    // like the other tests in this file use) so the whole production path is
+    // exercised. It does *not*, on its own, prove `attach` records anything:
+    // survival is equally true with no marker at all, since a key never
+    // confirmed anywhere is also never reaped — a claim this comment used to
+    // make wrongly. `attach_records_an_origin_...` below is the test that
+    // actually pins that down, from the other side.
     #[test]
     fn a_session_outside_the_configured_roots_survives_reconcile() {
         with_state(|state| {
@@ -1535,9 +1670,252 @@ mod tests {
             assert!(sock_path.exists(), "its socket must survive");
             assert!(socket_has_process(&sock_path), "its process must survive");
 
-            for pid in test_cleanup_pids(&sock_path) {
-                let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
-            }
+            kill_test_pids(&sock_path);
         });
+    }
+
+    // The other half of C2's marker mechanism, and the one nothing covered:
+    // `session::attach`'s call to `record_origin`. Deleting that call left
+    // the entire suite green, because the cross-roots test above only asserts
+    // *survival* — which also holds with no marker at all. So this asserts
+    // from the opposite side: with the real roots, a project whose directory
+    // is genuinely deleted must still be reaped, and the only thing that can
+    // have recorded its origin is `attach` itself — this test deliberately
+    // never runs a `reconcile` pass while the directory still exists, so no
+    // pass can have written the marker on its behalf.
+    #[test]
+    fn attach_records_an_origin_that_lets_a_genuinely_deleted_project_be_reaped() {
+        with_state(|state| {
+            let _g = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("DEADLIGHT_CMD");
+            let root = tempfile::tempdir().unwrap();
+            let project_dir = root.path().join("attachreap");
+            fs::create_dir_all(&project_dir).unwrap();
+
+            let Ok(_att) = crate::session::attach("attachreap", "shell", &project_dir) else {
+                eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
+                return;
+            };
+            let sock_dir = state.join("sock/attachreap");
+            let sock_path = sock_dir.join("shell");
+            let mut waited = 0;
+            while !(sock_path.exists() && socket_has_process(&sock_path)) && waited < 200 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                waited += 1;
+            }
+            assert!(
+                socket_has_process(&sock_path),
+                "test setup: the session must be observable before reconcile runs"
+            );
+            assert_eq!(
+                fs::read(origin_marker_path(&sock_dir)).ok(),
+                Some(marker_bytes(&project_dir)),
+                "attach must record the exact resolved directory it spawned the session in"
+            );
+
+            fs::remove_dir_all(&project_dir).unwrap();
+            let report = reconcile(&[root.path().to_path_buf()]);
+
+            assert!(
+                report.gone_projects >= 1,
+                "a session whose project directory is genuinely deleted must be reaped"
+            );
+            assert!(
+                !socket_has_process(&sock_path),
+                "the dtach master must actually be killed, not merely forgotten"
+            );
+            assert!(!sock_path.exists(), "the socket goes only once the process is confirmed gone");
+        });
+    }
+
+    // C3 and I5 at their source. Both were one expression:
+    // `!Path::new(recorded.trim()).is_dir()`, which answers "gone" — the one
+    // verdict that causes SIGKILL and unlink — for an empty marker and for a
+    // path it merely failed to check. Every case below except the first must
+    // be `false`; the first is here so the rest cannot pass by the function
+    // having simply stopped ever returning `true`.
+    #[test]
+    fn only_a_confirmed_missing_recorded_path_counts_as_gone() {
+        let d = tempfile::tempdir().unwrap();
+
+        let deleted = d.path().join("deleted");
+        assert!(
+            recorded_path_is_gone(&marker_bytes(&deleted)),
+            "an absent recorded path is the one case that must reap — without this the \
+             rest of this test would prove nothing"
+        );
+
+        // C3: `Path::new("").is_dir()` is false, so this used to answer
+        // "gone". A truncated write (the old non-atomic `fs::write`, read by
+        // a second instance mid-truncate) and a crash or ENOSPC mid-write
+        // both produce exactly this.
+        assert!(!recorded_path_is_gone(b""), "an empty marker records nothing at all");
+        assert!(!recorded_path_is_gone(b"\n"), "nor does one holding only a newline");
+
+        let existing = d.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+        assert!(!recorded_path_is_gone(&marker_bytes(&existing)));
+        let mut with_newline = marker_bytes(&existing);
+        with_newline.push(b'\n');
+        assert!(
+            !recorded_path_is_gone(&with_newline),
+            "a trailing newline is not part of the path (older or hand-edited markers)"
+        );
+
+        // A directory name may legally end in a space here (only *session*
+        // names are restricted), so the old `.trim()` looked up a path that
+        // never existed and answered "gone" for a project sitting right there.
+        let spaced = d.path().join("trailing space ");
+        fs::create_dir(&spaced).unwrap();
+        assert!(
+            !recorded_path_is_gone(&marker_bytes(&spaced)),
+            "a legal trailing space must survive into the lookup"
+        );
+
+        // I5: cannot tell. Reproduced with a path under a regular file
+        // (ENOTDIR) rather than a chmod (EACCES) because it behaves
+        // identically for root and non-root and needs no cleanup — the
+        // branch is the same one an unmounted disk or a downed NFS mount
+        // reaches. Asserting on *why* it errors, per CLAUDE.md: if this were
+        // NotFound the case would be vacuous.
+        let not_a_dir = d.path().join("regular-file");
+        fs::write(&not_a_dir, "").unwrap();
+        let under_a_file = not_a_dir.join("inner");
+        let err = std::fs::symlink_metadata(&under_a_file)
+            .expect_err("a path under a regular file must not be stattable");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "this case only means something if the error is *other* than NotFound; got {err:?}"
+        );
+        assert!(
+            !recorded_path_is_gone(&marker_bytes(&under_a_file)),
+            "\"I could not check\" must never be treated as \"it is gone\""
+        );
+    }
+
+    /// The end-to-end shape the two damaged-marker regressions share: a real
+    /// `dtach` session, a `.origin` that is not positive evidence of
+    /// anything, and a `reconcile` under *foreign* roots — the multi-instance
+    /// setup the marker exists for, and the only situation in which the
+    /// marker is consulted at all. Nothing may be reaped.
+    ///
+    /// A plain file cannot stand in for the socket here (as it can in this
+    /// module's `ps`-failure tests): with no process holding it, `reconcile`
+    /// removes it via the dead-socket branch whatever the project verdict, so
+    /// the test would pass with or without the fix.
+    fn a_marker_proving_nothing_must_not_cause_a_reap(key: &str, marker: &[u8]) {
+        with_state(|state| {
+            let sock_dir = state.join("sock").join(key);
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+
+            if spawn_detached_dtach(&sock_path).is_none() {
+                eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
+                return;
+            }
+            assert!(
+                socket_has_process(&sock_path),
+                "test setup: the detached process must be observable before reconcile runs"
+            );
+            fs::write(origin_marker_path(&sock_dir), marker).unwrap();
+
+            let foreign_root = tempfile::tempdir().unwrap();
+            let report = reconcile(&[foreign_root.path().to_path_buf()]);
+
+            assert_eq!(
+                report.gone_projects, 0,
+                "a marker that proves nothing must never reap a live session"
+            );
+            assert!(sock_path.exists(), "its socket must survive");
+            assert!(socket_has_process(&sock_path), "its process must survive");
+
+            kill_test_pids(&sock_path);
+        });
+    }
+
+    // C3, end to end: this is what a second instance reads inside the old
+    // truncate-then-write window, and what a crash mid-write leaves behind
+    // permanently.
+    #[test]
+    fn a_zero_length_origin_marker_never_reaps_a_live_session() {
+        a_marker_proving_nothing_must_not_cause_a_reap("truncated-proj", b"");
+    }
+
+    // I5, end to end: the recorded path is there in the marker, but the
+    // filesystem cannot answer whether it exists.
+    #[test]
+    fn an_uncheckable_origin_marker_never_reaps_a_live_session() {
+        let d = tempfile::tempdir().unwrap();
+        let not_a_dir = d.path().join("regular-file");
+        fs::write(&not_a_dir, "").unwrap();
+        let recorded = not_a_dir.join("inner");
+        let err = std::fs::symlink_metadata(&recorded)
+            .expect_err("a path under a regular file must not be stattable");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "this test only means something if the error is *other* than NotFound; got {err:?}"
+        );
+        a_marker_proving_nothing_must_not_cause_a_reap("uncheckable-proj", &marker_bytes(&recorded));
+    }
+
+    // The marker is the only record of where a project lives, so its write
+    // must be all-or-nothing: no reader may ever observe it empty or
+    // half-written (that is C3's second, permanent form — a crash or ENOSPC
+    // mid-`fs::write`). Proven by the artifact the atomic path leaves: the
+    // content arrives by `rename`, so a temp file appears and disappears
+    // rather than the marker itself being truncated first. Also pins the
+    // byte-exactness a non-UTF8 path needs, and the 0600 mode.
+    #[test]
+    fn the_origin_marker_is_written_atomically_and_privately() {
+        let d = tempfile::tempdir().unwrap();
+        let key_dir = d.path().join("key");
+        fs::create_dir_all(&key_dir).unwrap();
+        let marker = origin_marker_path(&key_dir);
+
+        write_origin(&key_dir, std::path::Path::new("/some/where"));
+        assert_eq!(fs::read(&marker).unwrap(), b"/some/where");
+        let left_behind: Vec<String> = fs::read_dir(&key_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != ".origin")
+            .collect();
+        assert!(left_behind.is_empty(), "no temp file may be left behind; found {left_behind:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&marker).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the marker grants no access to anyone else");
+        }
+
+        // An identical rewrite is skipped entirely (reconcile reconfirms the
+        // same resolution every few seconds, forever), but a differing one —
+        // including repairing a marker some older, non-atomic writer
+        // truncated — must go through. Asserted on the inode rather than a
+        // timestamp: `rename` necessarily installs a *different* inode (the
+        // temp file is created while the old marker still exists, so it
+        // cannot have the same one), which makes this exact rather than
+        // dependent on filesystem timestamp granularity.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let ino = fs::metadata(&marker).unwrap().ino();
+            write_origin(&key_dir, std::path::Path::new("/some/where"));
+            assert_eq!(
+                fs::metadata(&marker).unwrap().ino(),
+                ino,
+                "an unchanged marker must not be rewritten at all"
+            );
+            fs::write(&marker, b"").unwrap(); // as a crash mid-write would leave it
+            write_origin(&key_dir, std::path::Path::new("/some/where"));
+            assert_eq!(fs::read(&marker).unwrap(), b"/some/where", "a damaged marker must be repaired");
+            assert_ne!(
+                fs::metadata(&marker).unwrap().ino(),
+                ino,
+                "the repair must arrive by rename, not by truncating the marker in place"
+            );
+        }
     }
 }
