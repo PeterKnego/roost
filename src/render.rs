@@ -352,7 +352,15 @@ pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectSta
             continue;
         }
         let title = if live {
-            format!("{} sessions · oldest {}", p.live, human_age(p.oldest_age_secs))
+            // An unknown age is stated as unknown, never as "0s": right after a
+            // restart every project's age is unknown (the socket-file floor
+            // supplies a count but no ages), and "oldest 0s" there reads as
+            // "everything just started" — the opposite of the truth, on the one
+            // question this tooltip exists to answer.
+            match p.oldest_age_secs {
+                Some(age) => format!("{} sessions · oldest {}", p.live, human_age(age)),
+                None => format!("{} sessions · age unknown until reattached", p.live),
+            }
         } else {
             "saved layout, nothing running".to_string()
         };
@@ -697,12 +705,12 @@ mod tests {
         let ps = vec![
             crate::registry::ProjectStatus {
                 key: "karpie".into(), url: "karpie".into(),
-                live: 2, oldest_age_secs: 60, has_layout: true,
+                live: 2, oldest_age_secs: Some(60), has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
             },
             crate::registry::ProjectStatus {
                 key: "glow".into(), url: "glow".into(),
-                live: 0, oldest_age_secs: 0, has_layout: true,
+                live: 0, oldest_age_secs: None, has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
             },
         ];
@@ -801,12 +809,12 @@ mod tests {
         let ps = vec![
             crate::registry::ProjectStatus {
                 key: "karpie".into(), url: "karpie".into(),
-                live: 2, oldest_age_secs: 8 * 3600, has_layout: true,
+                live: 2, oldest_age_secs: Some(8 * 3600), has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
             },
             crate::registry::ProjectStatus {
                 key: "glow".into(), url: "glow".into(),
-                live: 0, oldest_age_secs: 0, has_layout: true,
+                live: 0, oldest_age_secs: None, has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
             },
         ];
@@ -821,6 +829,32 @@ mod tests {
         // the two glyphs in projects_strip must fail this test.
         assert!(h.contains(">● karpie</a>"), "live project must be marked with the filled dot");
         assert!(h.contains(">○ glow</a>"), "idle project must be marked with the hollow dot");
+        assert!(h.contains("oldest 8h"), "a known age must be rendered, coarsely");
+    }
+
+    /// A live project whose age is unknown — the normal state right after a
+    /// restart, when the socket-file floor gives a count but no ages — must say
+    /// so. It used to render "oldest 0s", claiming every shell had just started
+    /// at precisely the moment "what did I leave running for days?" is the
+    /// question being asked. Asserting the *absence* of "0s" as well, so
+    /// reverting to the old formatting fails here rather than passing quietly.
+    #[test]
+    fn strip_says_unknown_rather_than_zero_when_no_age_is_available() {
+        let ps = vec![crate::registry::ProjectStatus {
+            key: "karpie".into(), url: "karpie".into(),
+            live: 3, oldest_age_secs: None, has_layout: false,
+            branch: String::new(), parent: None, reachable: true,
+        }];
+        let h = projects_strip("other", &ps);
+        assert!(h.contains("3 sessions"), "the count is known even when the age is not");
+        assert!(
+            h.contains("unknown"),
+            "an unavailable age must be stated as unknown: {h}"
+        );
+        assert!(
+            !h.contains("oldest 0s"),
+            "must never pass an unknown age off as a brand-new session: {h}"
+        );
     }
 
     #[test]
@@ -828,7 +862,7 @@ mod tests {
         let ps = vec![
             crate::registry::ProjectStatus {
                 key: "a%3Cb".into(), url: "a<b".into(),
-                live: 0, oldest_age_secs: 0, has_layout: true,
+                live: 0, oldest_age_secs: None, has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
             },
             // storage_key only escapes '/' and '%' — a raw '"' from a
@@ -839,7 +873,7 @@ mod tests {
             // deleted from that call site).
             crate::registry::ProjectStatus {
                 key: "a\" onmouseover=x".into(), url: "b".into(),
-                live: 0, oldest_age_secs: 0, has_layout: true,
+                live: 0, oldest_age_secs: None, has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
             },
         ];
@@ -864,13 +898,13 @@ mod tests {
         let ps = vec![
             crate::registry::ProjectStatus {
                 key: "ultima_marketing".into(), url: "ultima_marketing".into(),
-                live: 2, oldest_age_secs: 60, has_layout: true,
+                live: 2, oldest_age_secs: Some(60), has_layout: true,
                 branch: "main".into(), parent: None, reachable: true,
             },
             crate::registry::ProjectStatus {
                 key: "ultima_marketing%2F.claude%2Fworktrees%2Fsite-launch".into(),
                 url: "ultima_marketing/.claude/worktrees/site-launch".into(),
-                live: 0, oldest_age_secs: 0, has_layout: false,
+                live: 0, oldest_age_secs: None, has_layout: false,
                 branch: "site-launch".into(),
                 parent: Some("ultima_marketing".into()),
                 reachable: true,
@@ -904,12 +938,12 @@ mod tests {
         let ps = vec![
             crate::registry::ProjectStatus {
                 key: "repo".into(), url: "repo".into(),
-                live: 0, oldest_age_secs: 0, has_layout: true,
+                live: 0, oldest_age_secs: None, has_layout: true,
                 branch: "main".into(), parent: None, reachable: true,
             },
             crate::registry::ProjectStatus {
                 key: "%2Felsewhere%2Fstray".into(), url: "/elsewhere/stray".into(),
-                live: 0, oldest_age_secs: 0, has_layout: false,
+                live: 0, oldest_age_secs: None, has_layout: false,
                 branch: "wip".into(), parent: Some("repo".into()), reachable: false,
             },
         ];
