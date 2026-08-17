@@ -116,41 +116,67 @@ pub fn resolve_project(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
 /// because URLs want it readable; the two encoders solve opposite problems
 /// for the same string. `%` is escaped too, or a literal `%2F` inside a
 /// real directory name (e.g. one named `a%2Fb`) would collide with the
-/// encoding of the nested project `a/b`. The escaping is otherwise narrow
-/// on purpose: an ordinary top-level project name — every name that
-/// predates this feature — contains neither character and comes back
-/// unchanged, so existing state files and live sessions are unaffected.
+/// encoding of the nested project `a/b`.
+///
+/// Every byte outside 0x00..=0x7F (plain ASCII) is percent-encoded too, byte
+/// by byte — not char by char. A name with a non-ASCII character (`café`) is
+/// several UTF-8 *bytes*; naively casting each byte to `char` via `b as
+/// char` reinterprets every byte >= 0x80 as its own separate Latin-1 code
+/// point instead of leaving the multi-byte character it's part of intact
+/// (café's `é`, two UTF-8 bytes, would become two garbled characters), so
+/// the key would never decode back to the original name, `resolve_project`
+/// would fail to find the real, still-existing directory, and reconcile
+/// would treat a live project as deleted. Encoding is otherwise narrow on
+/// purpose: an ordinary ASCII project name — every name that predates this
+/// feature — contains none of the encoded bytes and comes back unchanged,
+/// so existing state files and live sessions are unaffected.
 pub fn storage_key(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for b in name.bytes() {
         match b {
             b'/' => out.push_str("%2F"),
             b'%' => out.push_str("%25"),
-            _ => out.push(b as char),
+            0x00..=0x7F => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
         }
     }
     out
 }
 
-/// The true inverse of `storage_key`: `karpie%2Fsrc` decodes back to
-/// `karpie/src`. Deliberately not `http::percent_decode` — that is a general
-/// *form* decoder (it also turns `+` into a space, among other rules meant
-/// for URL query strings), which is the wrong inverse here: a project
-/// literally named `gtk+` has storage key `gtk+` (storage_key never touches
-/// `+`), and `percent_decode("gtk+")` would wrongly turn it into `"gtk "`,
-/// making a live project look like it no longer exists.
+/// The true inverse of `storage_key`: a general percent-decoder over raw
+/// bytes, not `http::percent_decode` — that is a *form* decoder (it also
+/// turns `+` into a space, among other rules meant for URL query strings),
+/// which is the wrong inverse here: a project literally named `gtk+` has
+/// storage key `gtk+` (storage_key never touches `+`), and
+/// `percent_decode("gtk+")` would wrongly turn it into `"gtk "`, making a
+/// live project look like it no longer exists.
 ///
-/// `storage_key` only ever emits the two literal sequences `%2F` and `%25`,
-/// and — because every `%` in its output is the head of one of those two
-/// fixed-length blocks, never a lone literal `%` — those sequences can never
-/// appear by coincidence at a different offset. So a plain, unconditional
-/// `replace` of each correctly reverses it, *provided* `%2F` is replaced
-/// before `%25`: reversing that order would misdecode a project literally
-/// named `a%2Fb` (storage key `a%252Fb`) as `a/b` instead of back to
-/// `a%2Fb`, because the first pass would turn its `%25` into `%`, creating a
-/// new, spurious `%2F` for the second pass to wrongly consume.
+/// Decodes byte-for-byte (`%XX` -> that raw byte) rather than reversing only
+/// the two fixed sequences `%2F`/`%25`: `storage_key` now percent-encodes
+/// every non-ASCII byte too, so a name like `café` produces several distinct
+/// `%XX` sequences, not just those two. The decoded bytes are re-assembled
+/// with `from_utf8_lossy` rather than a strict parse, since a directory
+/// listing's entry name reaching this function isn't necessarily one
+/// `storage_key` ever produced — a malformed or hand-crafted `%` sequence
+/// must not panic, only decode as best-effort.
 pub fn decode_storage_key(key: &str) -> String {
-    key.replace("%2F", "/").replace("%25", "%")
+    let bytes = key.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// One row in the directory picker (see `render::index_page`): either a
@@ -424,13 +450,24 @@ mod tests {
 
     #[test]
     fn decode_storage_key_is_a_true_inverse_of_storage_key() {
-        // `gtk+` is the regression case: http::percent_decode (a form
+        // `gtk+` is a regression case: http::percent_decode (a form
         // decoder) would turn a literal `+` into a space, making a real
         // project named `gtk+` decode to `"gtk "` and look like it no
         // longer exists. decode_storage_key must leave `+` alone.
-        for name in ["karpie", "a/b", "a%2Fb", "gtk+", "karpie/src"] {
+        //
+        // `café`/`café/src` are another: storage_key used to cast bytes to
+        // `char` one at a time, which mangles any non-ASCII character (a
+        // multi-byte UTF-8 sequence) into garbage that never decodes back —
+        // the identical "looks deleted, gets killed" failure as `gtk+`, just
+        // for a different reason. `résumé/notes` covers a non-ASCII byte
+        // landing immediately next to an escaped `/`, so the two encodings
+        // can't be mistaken for each other.
+        for name in ["karpie", "a/b", "a%2Fb", "gtk+", "karpie/src", "café", "café/src", "résumé/notes"] {
             assert_eq!(decode_storage_key(&storage_key(name)), name, "round trip broke for {name:?}");
         }
+        // storage_key must actually escape the non-ASCII bytes, not merely
+        // happen to round-trip through some other quirk.
+        assert!(storage_key("café").is_ascii(), "a storage key must never contain a raw non-ASCII byte");
         assert_ne!(
             crate::http::percent_decode("gtk+"),
             "gtk+",
