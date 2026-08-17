@@ -79,6 +79,17 @@ function onEvent(ev) {
     case "StatusChanged": refreshKind("Changes"); break;
     case "FileChanged": refreshKind("Diff"); break;
     case "SaveConflict": showConflict(ev); break;
+    case "Notice": onNotice(ev.notice); break;
+    case "Notices":
+      notices = ev.list;
+      // Read state is global, so a notice someone else cleared must stop
+      // pulling at this client's attention too.
+      for (const s of [...attention]) {
+        if (!notices.some((n) => n.project === PROJECT && n.session === s && !n.read)) attention.delete(s);
+      }
+      renderNotices();
+      render();
+      break;
     case "Error":
       // Every server-side failure funnels through here (already-exists,
       // directory-not-empty, path-outside-project, too-many-buffers,
@@ -129,7 +140,10 @@ function render() {
     pane.tabs.forEach((t, ti) => {
       if (t.k === "Terminal") liveSessions.add(t.session);
       const b = document.createElement("span");
-      b.className = "tab" + (ti === pane.active ? " active" : "");
+      b.className =
+        "tab" +
+        (ti === pane.active ? " active" : "") +
+        (t.k === "Terminal" && attention.has(t.session) ? " attn" : "");
       const meta = t.k === "File" ? state.buffers.find((x) => x.rel === t.rel) : null;
       b.innerHTML =
         (meta && meta.dirty ? '<span class="dirty">●</span> ' : "") +
@@ -556,4 +570,171 @@ if (refreshBtn) refreshBtn.onclick = () => {
   send({ t: "RequestState" });
 };
 
+const bell = document.getElementById("bell");
+if (bell) {
+  bell.onclick = () => {
+    const p = document.getElementById("noticepanel");
+    p.hidden = !p.hidden;
+    renderNotices();
+  };
+}
+setFavicon(false);
+
+// A notification click can land on a cold load; consume the fragment once and
+// clear it so a later reload does not re-focus.
+if (location.hash.startsWith("#session=")) {
+  const want = decodeURIComponent(location.hash.slice("#session=".length));
+  history.replaceState(null, "", location.pathname);
+  const tryFocus = () => { if (state) focusSession(want); else setTimeout(tryFocus, 100); };
+  tryFocus();
+}
+
 connectControl();
+
+// ---- notifications ----------------------------------------------------
+// Notices are machine-wide, so this list spans projects; only the tab dot
+// below is scoped to what is on screen.
+let notices = [];
+let swReg = null;
+const baseTitle = document.title;
+
+// A secure context is required for both service workers and the Notification
+// API. localhost and `tailscale serve` HTTPS qualify; plain http:// to a
+// tailnet IP does not — there the panel still works and OS notifications
+// simply are not offered.
+const canNotify = () => window.isSecureContext && "Notification" in window;
+
+if (canNotify() && "serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").then(
+    (r) => { swReg = r; },
+    (e) => console.warn("deadlight: service worker registration failed", e)
+  );
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    if (e.data && e.data.kind === "focus") focusSession(e.data.session);
+  });
+}
+
+function unread() { return notices.filter((n) => !n.read).length; }
+
+function renderNotices() {
+  const n = unread();
+  const count = document.getElementById("bellcount");
+  if (count) count.textContent = n ? String(n) : "";
+  // The only cue that works from a background tab with no permission granted.
+  document.title = n ? `(${n}) ${baseTitle}` : baseTitle;
+  setFavicon(n > 0);
+
+  const panel = document.getElementById("noticepanel");
+  if (!panel || panel.hidden) return;
+  panel.replaceChildren();
+  if (!notices.length) {
+    const empty = document.createElement("div");
+    empty.className = "notice-empty";
+    empty.textContent = "no notifications";
+    panel.appendChild(empty);
+  }
+  for (const x of [...notices].reverse()) {
+    const row = document.createElement("div");
+    row.className = "notice" + (x.read ? " read" : "");
+    const who = document.createElement("span");
+    who.className = "notice-who";
+    // Attribution is server truth; the message text is not. Both go in as
+    // textContent regardless.
+    who.textContent = `${x.project} · ${x.session}`;
+    const title = document.createElement("span");
+    title.className = "notice-title";
+    title.textContent = x.title;
+    const body = document.createElement("span");
+    body.className = "notice-body";
+    body.textContent = x.body;
+    const when = document.createElement("span");
+    when.className = "notice-when";
+    when.textContent = ago(x.at);
+    row.append(who, title, body, when);
+    row.onclick = () => openNotice(x);
+    panel.appendChild(row);
+  }
+  const foot = document.createElement("div");
+  foot.className = "notice-foot";
+  if (canNotify() && Notification.permission !== "granted") {
+    const b = document.createElement("button");
+    b.textContent = "Enable OS notifications";
+    // Requested from a click, never on load: browsers penalise spontaneous
+    // permission prompts, and an unprompted one is worse than none.
+    b.onclick = (e) => { e.stopPropagation(); Notification.requestPermission().then(renderNotices); };
+    foot.appendChild(b);
+  } else if (!canNotify()) {
+    const s = document.createElement("span");
+    s.textContent = "OS notifications need a secure context (https or localhost)";
+    foot.appendChild(s);
+  }
+  const clear = document.createElement("button");
+  clear.textContent = "Clear";
+  clear.onclick = (e) => { e.stopPropagation(); send({ t: "ClearNotices" }); };
+  foot.appendChild(clear);
+  panel.appendChild(foot);
+}
+
+function ago(secs) {
+  const d = Math.max(0, Math.floor(Date.now() / 1000) - secs);
+  if (d < 60) return `${d}s`;
+  if (d < 3600) return `${Math.floor(d / 60)}m`;
+  if (d < 86400) return `${Math.floor(d / 3600)}h`;
+  return `${Math.floor(d / 86400)}d`;
+}
+
+// A badged favicon, drawn rather than shipped as a second asset so it follows
+// whatever the page's icon already is.
+function setFavicon(badged) {
+  let link = document.querySelector("link#dlfav");
+  if (!link) {
+    link = document.createElement("link");
+    link.id = "dlfav";
+    link.rel = "icon";
+    document.head.appendChild(link);
+  }
+  const svg = badged
+    ? `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><text y="13" font-size="13">◆</text><circle cx="12.5" cy="3.5" r="3.5" fill="#e5534b"/></svg>`
+    : `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><text y="13" font-size="13">◆</text></svg>`;
+  link.href = "data:image/svg+xml," + encodeURIComponent(svg);
+}
+
+function openNotice(x) {
+  if (!x.read) send({ t: "MarkNoticeRead", id: x.id });
+  if (x.project !== PROJECT) {
+    location.href = `/${x.project}#session=${encodeURIComponent(x.session)}`;
+    return;
+  }
+  focusSession(x.session);
+}
+
+// Activate the terminal tab for `session`, opening it if it is not on screen.
+// Both paths are ordinary intents, so every connected client follows.
+function focusSession(session) {
+  if (!session || !SESSION_RE.test(session) || !state) return;
+  for (let pi = 0; pi < state.panes.length; pi++) {
+    const ti = state.panes[pi].tabs.findIndex((t) => t.k === "Terminal" && t.session === session);
+    if (ti >= 0) {
+      send({ t: "ActivateTab", pane: pi, idx: ti });
+      attention.delete(session);
+      renderNotices();
+      return;
+    }
+  }
+  send({ t: "OpenTab", pane: 3, tab: { k: "Terminal", session } });
+}
+
+// Sessions in THIS project with unseen notices — the tab-strip dot. A session
+// in another project has no tab here; that is what the bell badge is for.
+const attention = new Set();
+
+function onNotice(n) {
+  notices.push(n);
+  if (n.project === PROJECT) attention.add(n.session);
+  if (canNotify() && Notification.permission === "granted") {
+    if (swReg) swReg.active && swReg.active.postMessage({ kind: "notify", notice: n });
+    else new Notification(n.title, { body: n.body, tag: `${n.project}/${n.session}` });
+  }
+  renderNotices();
+  render();
+}
