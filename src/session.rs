@@ -353,24 +353,40 @@ fn parse_etime(s: &str) -> Option<u64> {
 /// All sessions for one project. `project` is the raw form (see `key_for`);
 /// the prefix is built from its `storage_key` so nested projects match the
 /// keys `attach` actually inserted, rather than silently matching nothing.
+///
+/// The `ps` fork for each session's age happens **after** the registry guard
+/// is dropped, and this is load-bearing rather than tidy. This function runs
+/// on a request path — `registry::known_projects` calls it once per project on
+/// every picker load, workspace load and strip refresh — while the PTY pump
+/// re-takes this same `SESSIONS` mutex for every chunk of terminal output. Ages
+/// resolved under the guard meant one page load froze terminal output for every
+/// session in every project for as long as up to `MAX_SESSIONS_PER_PROJECT`
+/// subprocess spawns took. `live_names` below has always described this hazard;
+/// this function used to be the thing it was describing. See CLAUDE.md: never
+/// hold a lock across blocking I/O — this project has already shipped one
+/// deadlock of that shape.
 pub fn list_sessions(project: &str) -> Vec<SessionInfo> {
     let prefix = format!("{}/", crate::projects::storage_key(project));
-    let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
-    let mut out: Vec<SessionInfo> = map
-        .iter()
-        .filter_map(|(k, s)| {
-            let name = k.strip_prefix(&prefix)?;
-            let pid = s.child_pid;
-            Some(SessionInfo {
-                name: name.to_string(),
-                pid,
-                age_secs: process_age_secs(pid).unwrap_or(0),
-                attached: s.subs.len(),
+    // Everything needing the lock, and nothing else.
+    let mut found: Vec<(String, u32, usize)> = {
+        let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .filter_map(|(k, s)| {
+                let name = k.strip_prefix(&prefix)?;
+                Some((name.to_string(), s.child_pid, s.subs.len()))
             })
+            .collect()
+    }; // guard dropped here, before any `ps`
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+        .into_iter()
+        .map(|(name, pid, attached)| SessionInfo {
+            name,
+            pid,
+            age_secs: process_age_secs(pid).unwrap_or(0),
+            attached,
         })
-        .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+        .collect()
 }
 
 /// Just the names of a project's live sessions — no `ps` invocation, unlike
@@ -602,6 +618,65 @@ mod tests {
         assert_eq!(list_sessions("otherproj").len(), 1, "another project must be untouched");
 
         kill_project("otherproj");
+        std::env::remove_var("DEADLIGHT_CMD");
+    }
+
+    /// `list_sessions` forks `ps` once per session, and it runs on a request
+    /// path (`registry::known_projects`, on every picker load, workspace load
+    /// and strip refresh) while the PTY pump re-takes this same mutex for every
+    /// chunk of terminal output. Resolving ages under the guard therefore froze
+    /// terminal output for every session in every project for the duration of
+    /// those forks — the "never hold a lock across blocking I/O" constraint this
+    /// project has already shipped one deadlock against.
+    ///
+    /// Measured as a **ratio**, not against a fixed millisecond budget: how
+    /// long a competing thread waits to acquire the registry mutex, against how
+    /// long the whole `list_sessions` call takes. Under the fix the wait is a
+    /// map scan (near zero) while the call is dominated by forks; under the bug
+    /// the two are the same number, because the forks happen inside the
+    /// critical section. That self-calibrates to whatever the machine's fork
+    /// cost is, which a fixed threshold cannot — and a fixed threshold would
+    /// also have passed with the bug in place, since simply waiting out a
+    /// holder is not the behaviour under test.
+    #[test]
+    fn list_sessions_does_not_hold_the_registry_lock_across_its_ps_forks() {
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("DEADLIGHT_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        // Enough sessions that the forks dominate the call and the ratio has
+        // something to measure.
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        for name in names {
+            attach("lockproj", name, d.path()).unwrap();
+        }
+        // Warm up, so the measurement is not about first-fork cost.
+        assert_eq!(list_sessions("lockproj").len(), names.len());
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            started_rx.recv().unwrap();
+            let t = std::time::Instant::now();
+            let guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+            let waited = t.elapsed();
+            drop(guard);
+            waited
+        });
+
+        started_tx.send(()).unwrap();
+        let start = std::time::Instant::now();
+        let listed = list_sessions("lockproj");
+        let total = start.elapsed();
+        let waited = contender.join().unwrap();
+
+        assert_eq!(listed.len(), names.len(), "the listing itself must still be correct");
+        assert!(
+            waited * 2 < total,
+            "a competing thread waited {waited:?} for the registry lock out of a {total:?} \
+             list_sessions call — the forks are happening inside the critical section, which \
+             stalls every terminal's output on this process for their duration"
+        );
+
+        kill_project("lockproj");
         std::env::remove_var("DEADLIGHT_CMD");
     }
 
