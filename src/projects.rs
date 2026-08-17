@@ -146,17 +146,34 @@ pub fn resolve_project(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
 /// (café's `é`, two UTF-8 bytes, would become two garbled characters), so
 /// the key would never decode back to the original name, `resolve_project`
 /// would fail to find the real, still-existing directory, and reconcile
-/// would treat a live project as deleted. Encoding is otherwise narrow on
-/// purpose: an ordinary ASCII project name — every name that predates this
-/// feature — contains none of the encoded bytes and comes back unchanged,
-/// so existing state files and live sessions are unaffected.
+/// would treat a live project as deleted.
+///
+/// ASCII **control** bytes (`0x00..=0x1F`, plus `0x7F`) are encoded for a
+/// different reason: this key becomes a path component of a dtach socket
+/// path, and the only way to ask the OS who holds that socket is to read
+/// `ps` output. `ps` renders a process's argv space-joined onto one line, so
+/// a raw newline inside the key splits the socket path across two lines of
+/// that output, and the whole-argument match in `registry` can then never
+/// find it. The socket of a *running* shell reads as unheld, gets unlinked,
+/// and that shell is orphaned beyond any later reap. A directory named
+/// `my<newline>proj` is perfectly legal on unix and reachable as
+/// `GET /my%0Aproj`, so this is not hypothetical. It is the same failure as
+/// the earlier space-in-a-path bug, one delimiter along — see CLAUDE.md's
+/// "Absence of evidence is not evidence of absence".
+///
+/// Encoding is otherwise narrow on purpose: an ordinary project name — every
+/// name that predates this feature — contains none of the encoded bytes and
+/// comes back unchanged, so existing state files and live sessions are
+/// unaffected. That byte-for-byte stability is a hard constraint, not a nicety;
+/// `existing_ascii_keys_are_unchanged_byte_for_byte` pins it.
 pub fn storage_key(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for b in name.bytes() {
         match b {
             b'/' => out.push_str("%2F"),
             b'%' => out.push_str("%25"),
-            0x00..=0x7F => out.push(b as char),
+            0x00..=0x1F | 0x7F => out.push_str(&format!("%{b:02X}")),
+            0x20..=0x7E => out.push(b as char),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -494,6 +511,62 @@ mod tests {
             "percent_decode is a form decoder and is NOT storage_key's inverse — that's the bug this guards"
         );
         assert_eq!(decode_storage_key("gtk+"), "gtk+");
+    }
+
+    /// A control byte in a project name must not survive into the storage key,
+    /// because the key becomes a component of a dtach socket path and the only
+    /// way to learn who holds that socket is to parse line-oriented `ps`
+    /// output. A raw newline splits one process's argv across two lines there,
+    /// so the whole-argument match can never find the path, the socket of a
+    /// *running* shell reads as unheld, and it gets unlinked — orphaning that
+    /// shell permanently. `\n` is the one that actually breaks `ps`; the rest
+    /// are escaped with it because there is no reason to leave a class of bytes
+    /// half-handled, and `\x7F`/`\0` are included for the same reason.
+    #[test]
+    fn control_bytes_never_reach_a_storage_key() {
+        for name in ["my\nproj", "a\tb", "x\r\ny", "trail\n", "\nlead", "bell\x07", "del\x7f", "nul\0x"] {
+            let key = storage_key(name);
+            assert!(
+                !key.bytes().any(|b| b.is_ascii_control() || b == 0x7F),
+                "storage_key({name:?}) = {key:?} still contains a control byte, so a live \
+                 session's socket path would be unmatchable in `ps` output and get unlinked"
+            );
+            assert_eq!(decode_storage_key(&key), name, "round trip broke for {name:?}");
+        }
+        // The specific byte and case from the finding, pinned exactly.
+        assert_eq!(storage_key("my\nproj"), "my%0Aproj");
+    }
+
+    /// The hard constraint from CLAUDE.md: existing top-level storage keys stay
+    /// byte-for-byte identical. Real state files and live dtach sockets on the
+    /// deploy host are named by this function, so widening its escape set must
+    /// never rename an existing key — that would orphan both the saved workspace
+    /// and the running session behind it. These are the actual key shapes in use.
+    #[test]
+    fn existing_ascii_keys_are_unchanged_byte_for_byte() {
+        for name in [
+            "karpie",
+            "deadlight",
+            "ultima_db",
+            "ultima",
+            "ml",
+            "archive",
+            "claude_code_proxy",
+            "karpie-2",
+            "gtk+",
+            "my project",     // spaces are legal and must stay literal
+            "dot.name",       // as must dots
+            "a~b!c@d#e",      // and every other printable ASCII
+        ] {
+            assert_eq!(
+                storage_key(name), name,
+                "storage_key must leave plain printable ASCII untouched — {name:?} changed, \
+                 which would orphan its existing state file and dtach socket"
+            );
+        }
+        // The two deliberate exceptions, unchanged by this widening.
+        assert_eq!(storage_key("karpie/src"), "karpie%2Fsrc");
+        assert_eq!(storage_key("a%2Fb"), "a%252Fb");
     }
 
     #[test]

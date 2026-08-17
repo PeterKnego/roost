@@ -596,6 +596,24 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
         // decoded, raw form) is what every `session::*` call below must use.
         let key = entry.file_name().to_string_lossy().into_owned();
         let url = decode_key(&key);
+        // A key holding a control byte cannot be reasoned about safely here:
+        // `pids_holding` matches against line-oriented `ps` output, and a
+        // newline inside the socket path splits one process's argv across two
+        // lines, so a live holder is unfindable and its socket would be
+        // unlinked as an orphan. `storage_key` escapes those bytes now, so this
+        // is unreachable for anything deadlight wrote — it guards a key written
+        // by an older build, or one dropped in by hand. Skipping costs a stale
+        // row; reaping costs a running shell. `to_string_lossy` also means a
+        // non-UTF8 name arrives with replacement characters, i.e. as a name that
+        // can never resolve, which the `confirmed_gone` marker check already
+        // treats as "cannot tell" rather than "gone".
+        if key.bytes().any(|b| b.is_ascii_control() || b == 0x7F) {
+            eprintln!(
+                "deadlight: refusing to reap session key {key:?} — it contains a control byte, \
+                 so who holds its socket cannot be determined from `ps` output"
+            );
+            continue;
+        }
         // Not "resolve_project(...).is_none()" alone — see confirmed_gone's
         // doc comment. A key that doesn't resolve under *these* roots is
         // not evidence the directory is gone; only a key whose resolved
