@@ -157,6 +157,18 @@ pub fn mark_read(id: u64) {
     persist();
 }
 
+/// Marks every notice read in one pass, for the panel's "Mark all read"
+/// button — the per-id `mark_read` would need one round trip per notice.
+pub fn mark_all_read() {
+    {
+        let mut s = store().lock().unwrap_or_else(|e| e.into_inner());
+        for n in s.notices.iter_mut() {
+            n.read = true;
+        }
+    }
+    persist();
+}
+
 pub fn clear() {
     {
         let mut s = store().lock().unwrap_or_else(|e| e.into_inner());
@@ -349,6 +361,18 @@ mod tests {
             "total length must stay at the cap, not exceed it: {:?}",
             n.body
         );
+    }
+
+    #[test]
+    fn mark_all_read_clears_every_notice_not_just_one() {
+        let (_g, _d) = setup();
+        record("p", "s1", parsed("one"));
+        record("p", "s2", parsed("two"));
+        record("p", "s3", parsed("three"));
+        mark_all_read();
+        let all = list();
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().all(|n| n.read), "every notice must be marked, got {all:?}");
     }
 
     #[test]

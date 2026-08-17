@@ -56,6 +56,7 @@ pub enum Intent {
     RenamePath { from: String, to: String },
     RequestState,
     MarkNoticeRead { id: u64 },
+    MarkAllNoticesRead,
     ClearNotices,
 }
 
@@ -164,6 +165,8 @@ mod tests {
     fn decodes_the_notice_intents() {
         let i = decode(r#"{"t":"MarkNoticeRead","id":7}"#).unwrap();
         assert!(matches!(i, Intent::MarkNoticeRead { id: 7 }));
+        let i = decode(r#"{"t":"MarkAllNoticesRead"}"#).unwrap();
+        assert!(matches!(i, Intent::MarkAllNoticesRead));
         let i = decode(r#"{"t":"ClearNotices"}"#).unwrap();
         assert!(matches!(i, Intent::ClearNotices));
     }

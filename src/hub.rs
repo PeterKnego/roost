@@ -183,6 +183,13 @@ impl Hub {
                 self.notices_dirty = true;
                 return;
             }
+            Intent::MarkAllNoticesRead => {
+                crate::notify::mark_all_read();
+                // Same reasoning as MarkNoticeRead above: dirty-flag, don't
+                // broadcast_all from in here.
+                self.notices_dirty = true;
+                return;
+            }
             Intent::ClearNotices => {
                 crate::notify::clear();
                 self.notices_dirty = true;
@@ -918,6 +925,33 @@ mod tests {
         );
 
         std::env::remove_var("DEADLIGHT_STATE_DIR");
+    }
+
+    #[test]
+    fn mark_all_notices_read_flags_dirty_and_updates_the_store() {
+        // Regression for the missing "mark all read" plumbing: the panel
+        // needs a way to clear every notice at once without one round trip
+        // per id, and — like MarkNoticeRead — it must flag notices_dirty
+        // rather than call broadcast_all itself, since that would try to
+        // lock this very hub a second time.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        crate::notify::reset_for_test();
+        crate::notify::record("proj", "claude", crate::osc::Parsed { title: None, body: "one".into() });
+        crate::notify::record("proj", "shell", crate::osc::Parsed { title: None, body: "two".into() });
+
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        assert!(!h.notices_dirty);
+        h.handle(&c, Intent::MarkAllNoticesRead);
+        assert!(h.notices_dirty, "the socket layer relies on this flag to broadcast Notices");
+        assert!(
+            crate::notify::list().iter().all(|n| n.read),
+            "the store itself must be updated, not just the dirty flag"
+        );
     }
 
     #[test]
