@@ -169,6 +169,18 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                     let _ =
                         std::fs::set_permissions(sock_dir, std::fs::Permissions::from_mode(0o700));
                 }
+                // Records the resolved absolute directory this session was
+                // created under, so a *later* reconcile pass — possibly run
+                // by a differently-configured process sharing this same
+                // DEADLIGHT_STATE_DIR — can confirm "genuinely gone" against
+                // this exact path rather than guessing from whether it
+                // resolves under *its own* roots. `dir` is already the
+                // caller's resolved path (every caller resolves the project
+                // through `projects::resolve_project` before calling here),
+                // so no re-resolution is needed. See
+                // `registry::confirmed_gone`'s doc comment for why this
+                // matters.
+                crate::registry::record_origin(project, dir);
             }
         }
         let pty = native_pty_system();
@@ -590,9 +602,20 @@ mod tests {
     /// to prove a real process is or isn't there.
     fn any_process_holds(path: &std::path::Path) -> bool {
         let target = path.to_string_lossy();
-        let Ok(out) = std::process::Command::new("ps").args(["-Ao", "args="]).output() else {
-            return false;
-        };
+        let out = std::process::Command::new("ps")
+            .args(["-Ao", "args="])
+            .output()
+            .expect("ps must be runnable for this check to mean anything");
+        // C1's exact shape, inside the test that guards C1: treating a
+        // failed or empty `ps` as `false` ("nothing holds it") would let
+        // the central `assert!(!any_process_holds(&sock))` below pass
+        // vacuously on a broken `ps`, proving nothing. Panic instead — a
+        // test that can't verify what it's asserting must not report a
+        // pass.
+        assert!(
+            out.status.success() && !out.stdout.is_empty(),
+            "ps failed or returned nothing; this test cannot trust its own assertions right now"
+        );
         String::from_utf8_lossy(&out.stdout).lines().any(|l| l.contains(target.as_ref()))
     }
 
