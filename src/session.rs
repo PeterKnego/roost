@@ -441,13 +441,13 @@ pub fn kill_project(project: &str) -> usize {
             );
         }
     }
-    // Best-effort: fails silently (and correctly) if anything is left in
-    // this project's socket directory, e.g. a session whose kill above
-    // failed, or one this call never touched because a name didn't parse.
-    if !removed_names.is_empty() {
-        let sock_dir = crate::wsstate::state_dir().join("sock").join(crate::projects::storage_key(project));
-        let _ = std::fs::remove_dir(&sock_dir);
-    }
+    // Not removing the now-possibly-empty sock/<project>/ directory here:
+    // `registry::reconcile` already does that unconditionally on every
+    // pass, and it runs on every subsequent project listing or header-strip
+    // load (`known_projects` calls it, throttled but not indefinitely
+    // deferred), so a second removal here would be pure duplication, not a
+    // correctness requirement — the directory disappears on the very next
+    // such load regardless.
     ended
 }
 
