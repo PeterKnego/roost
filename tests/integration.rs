@@ -777,15 +777,25 @@ fn notices_are_replayed_on_connect_and_read_state_mirrors() {
     let replay = read_until(&mut a, r#""t":"Notices""#);
     assert!(replay.contains("waiting for you"), "connect replay missing it: {replay}");
     let id: u64 = {
+        // The notice store is process-global across the whole integration
+        // binary and never reset between tests, so the *first* "id": in the
+        // replay can belong to a notice some other test left behind, not
+        // this one — grabbing that id would still happen to make this test
+        // fail if mark_read broke (any id works for that), but it would not
+        // be testing the notice this test actually published. Anchor on the
+        // matched body instead: `id` is the first field on `Notice` (see
+        // proto.rs's struct field order), so the nearest `"id":` preceding
+        // this specific body belongs to this specific notice.
         let key = r#""id":"#;
-        let start = replay.find(key).expect("no id in replay") + key.len();
+        let body_pos = replay.find("waiting for you").expect("body missing from replay");
+        let start = replay[..body_pos].rfind(key).expect("no id preceding the matched body") + key.len();
         replay[start..].split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap()
     };
 
     // Read state is global: b marks read, a must be told.
     let mut b = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
     read_until(&mut b, r#""t":"Notices""#);
-    b.send(tungstenite::Message::Text(format!(r#"{{"t":"MarkNoticeRead","id":{id}}}"#).into())).unwrap();
+    b.send(tungstenite::Message::Text(format!(r#"{{"t":"MarkNoticeRead","id":{id}}}"#))).unwrap();
     let after = read_until(&mut a, r#""read":true"#);
     assert!(after.contains(r#""t":"Notices""#), "a was not re-sent the list: {after}");
 }
