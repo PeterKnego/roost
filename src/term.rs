@@ -61,25 +61,6 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
             return;
         }
     };
-    // `StartTerminal` (hub.rs) refreshes `live_sessions` before the PTY
-    // actually exists — the real spawn happens here, via `attach` — so
-    // without this, every mirrored browser (and the tab's own client, on
-    // its next `State`) would keep seeing "not live" until some unrelated
-    // intent happened to touch the hub. No later task wires attach back to
-    // the hub, so this connection does it directly: look the hub up (this
-    // does not spawn it — `for_project` walks the tree only for a truly
-    // fresh hub, off its own thread), lock it just long enough to refresh
-    // and broadcast, then release before entering the blocking read loop
-    // below. The lock is never held across `attach` itself (already
-    // returned above) or across any blocking socket I/O.
-    {
-        let hub = crate::hub::Hub::for_project(&project, dir.clone());
-        let mut h = crate::hub::Hub::lock(&hub);
-        h.refresh_live_sessions();
-        let ev = h.snapshot_event(&String::new());
-        h.broadcast(&ev);
-    }
-
     let Ok(write_half) = ws_read.get_ref().try_clone() else { return };
     let mut ws_write: WebSocket<TcpStream> =
         WebSocket::from_raw_socket(write_half, Role::Server, None);
@@ -93,6 +74,38 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
         let _ = ws_write.close(None);
         let _ = ws_write.get_ref().shutdown(std::net::Shutdown::Both);
     });
+
+    // `StartTerminal` (hub.rs) refreshes `live_sessions` before the PTY
+    // actually exists — the real spawn happens here, via `attach` — so
+    // without this, every mirrored browser (and the tab's own client, on
+    // its next `State`) would keep seeing "not live" until some unrelated
+    // intent happened to touch the hub. No later task wires attach back to
+    // the hub, so this connection does it directly: look the hub up
+    // (`for_project` does create the Hub and can start the project's
+    // filesystem watcher if this happens to be the first connection, but
+    // that setup runs off-thread, so it doesn't block here), lock it just
+    // long enough to refresh and broadcast, then release before entering
+    // the blocking read loop below.
+    //
+    // Placement matters: this must run *after* `out` is spawned, not
+    // before. `out` is what drains this connection's own subscriber
+    // channel (`att.rx`, a bounded 64-slot queue); a hub critical section
+    // can legitimately run for seconds (the `gitio` calls under the hub
+    // lock carry a 15s deadline), and nothing else reads that channel. If
+    // this block ran first, output arriving on a busy session (e.g. a
+    // build or Claude streaming) plus the scrollback replay could fill the
+    // queue while this waited on the hub mutex; the pump thread's
+    // `retain(|_, tx| tx.try_send(..).is_ok())` permanently drops any
+    // subscriber whose queue fills, killing this tab's socket before it
+    // ever started reading. With `out` already running first, the channel
+    // is being drained the whole time this contends for the hub lock.
+    {
+        let hub = crate::hub::Hub::for_project(&project, dir.clone());
+        let mut h = crate::hub::Hub::lock(&hub);
+        h.refresh_live_sessions();
+        let ev = h.snapshot_event(&String::new());
+        h.broadcast(&ev);
+    }
 
     loop {
         match ws_read.read() {
