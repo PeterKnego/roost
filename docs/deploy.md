@@ -80,11 +80,31 @@ pins it.
 
 Consequence for the first deploy of this version: a state dir written by the
 previous version has no markers, so its pre-existing sessions are never reaped
-automatically. That is the safe direction — stale rows, not dead shells — and
-they gain markers as soon as each project is opened again. Reaping is also
-suspended entirely when `ps` cannot be trusted (non-zero exit, or empty output,
-which on a live host means the listing failed rather than that nothing is
-running), for the same reason.
+automatically. That is the safe direction — stale rows, not dead shells — and a
+project still on disk gains its marker the next time it is opened.
+
+**But a project whose directory is already gone can never gain one**, because
+markers are written only when a path resolves successfully. So the orphans that
+motivated this whole feature — the 13 live shells found on this host, 9 of them
+belonging to deleted directories — survive the deploy and are permanently
+unreapable. Deploying does not clean them up; it stops new ones accruing. Clear
+them once, by hand:
+
+```bash
+# see what is holding sockets, and for which project keys
+ps -Aww -o pid=,args= | grep "$HOME/.local/state/deadlight/sock/"
+# for each key whose directory is genuinely gone: kill it, then drop the key dir
+kill -9 <pid>
+rm -rf "$HOME/.local/state/deadlight/sock/<key>"
+```
+
+Check each directory before killing — a key you do not recognise may be a
+project that still exists under different roots, which is exactly the case the
+`.origin` marker was added to protect.
+
+Reaping is also suspended entirely when `ps` cannot be trusted (non-zero exit,
+or empty output, which on a live host means the listing failed rather than that
+nothing is running), for the same reason.
 
 Both are logged, so `journalctl --user -u deadlight | grep -i reap` after a
 restart tells you what the startup sweep decided.
