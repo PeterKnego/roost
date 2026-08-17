@@ -701,3 +701,63 @@ fn http_rejects_rebinding_host() {
     s.read_to_string(&mut resp).unwrap();
     assert!(resp.starts_with("HTTP/1.1 403"), "got: {}", &resp[..resp.len().min(60)]);
 }
+
+#[test]
+fn a_notice_reaches_a_client_watching_a_different_project() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(d.path().join("alpha")).unwrap();
+    std::fs::create_dir_all(d.path().join("beta")).unwrap();
+    let port = start(vec![d.path().to_path_buf()]);
+
+    let mut a = ws_connect_path(port, "/ws/alpha/_workspace").unwrap();
+    let mut b = ws_connect_path(port, "/ws/beta/_workspace").unwrap();
+    read_until(&mut a, r#""t":"State""#);
+    read_until(&mut b, r#""t":"State""#);
+
+    // Published against alpha; beta's client must still see it.
+    deadlight::hub::publish(
+        "alpha",
+        "claude",
+        deadlight::osc::Parsed { title: Some("build".into()), body: "green".into() },
+    );
+
+    let seen_b = read_until(&mut b, r#""t":"Notice""#);
+    assert!(seen_b.contains(r#""project":"alpha""#), "beta got: {seen_b}");
+    assert!(seen_b.contains("green"), "beta got: {seen_b}");
+    let seen_a = read_until(&mut a, r#""t":"Notice""#);
+    assert!(seen_a.contains("green"), "alpha got: {seen_a}");
+}
+
+#[test]
+fn notices_are_replayed_on_connect_and_read_state_mirrors() {
+    let _g = WS_TEST_LOCK.lock().unwrap();
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    let (_d, port) = fixture();
+
+    deadlight::hub::publish(
+        "proj",
+        "claude",
+        deadlight::osc::Parsed { title: None, body: "waiting for you".into() },
+    );
+
+    // A client connecting *after* the fact still learns about it.
+    let mut a = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    let replay = read_until(&mut a, r#""t":"Notices""#);
+    assert!(replay.contains("waiting for you"), "connect replay missing it: {replay}");
+    let id: u64 = {
+        let key = r#""id":"#;
+        let start = replay.find(key).expect("no id in replay") + key.len();
+        replay[start..].split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap()
+    };
+
+    // Read state is global: b marks read, a must be told.
+    let mut b = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    read_until(&mut b, r#""t":"Notices""#);
+    b.send(tungstenite::Message::Text(format!(r#"{{"t":"MarkNoticeRead","id":{id}}}"#).into())).unwrap();
+    let after = read_until(&mut a, r#""read":true"#);
+    assert!(after.contains(r#""t":"Notices""#), "a was not re-sent the list: {after}");
+}
