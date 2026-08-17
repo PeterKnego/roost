@@ -81,8 +81,14 @@ function onEvent(ev) {
     case "SaveConflict": showConflict(ev); break;
     case "TerminalStarted":
       // The server only validated the name and notified everyone; opening
-      // this socket is what actually spawns the PTY (see ensureTerm).
-      ensureTerm(ev.session);
+      // this socket is what actually spawns the PTY (see ensureTerm). But
+      // TerminalStarted is broadcast to every client of this project, not
+      // just the one that asked — only attach if this client actually has
+      // a Terminal tab on that session, or every mirroring tab would open
+      // and immediately close a PTY socket for a session it never showed.
+      if (state && state.panes.some((p) => p.tabs.some((t) => t.k === "Terminal" && t.session === ev.session))) {
+        ensureTerm(ev.session);
+      }
       render();
       // live_sessions itself arrives moments later in the State broadcast
       // that follows this event, but the header strip (a separate htmx
@@ -105,8 +111,18 @@ function onEvent(ev) {
       showError("Cannot close: unsaved changes in " + ev.dirty.join(", "));
       break;
     case "ProjectClosed":
-      showError(ev.ended + " terminal session(s) ended");
-      terms.forEach((e) => { try { e.sock.close(); } catch {} try { e.term.dispose(); } catch {} });
+      // A successful close, not a failure — showBanner directly so this
+      // doesn't get the "Error:" prefix showError adds.
+      showBanner(ev.ended + " terminal session(s) ended");
+      terms.forEach((e) => {
+        try { e.sock.close(); } catch {}
+        try { e.term.dispose(); } catch {}
+        // terms.clear() below is the only chance to do this: unlike
+        // render()'s own teardown, nothing here will revisit this node
+        // later, so a missed remove() leaks a disposed .termhost into
+        // #termpool for the life of the page.
+        try { e.node.remove(); } catch {}
+      });
       terms.clear();
       render();
       document.body.dispatchEvent(new Event("refresh")); // strip marker -> ○
@@ -300,15 +316,27 @@ function mountTab(content, t) {
 function terminalPlaceholder(session) {
   const box = document.createElement("div");
   box.className = "termstart";
-  box.tabIndex = 0;
   const isGit = state.is_git;
   box.innerHTML = isGit
     ? `<p>Press <kbd>Enter</kbd> to start a terminal</p>`
     : `<p>Not a git repository.</p>
        <p><button class="initgit">Initialize git repo</button></p>
        <p><a class="nogit" href="#">start without git</a></p>`;
-  const start = () => send({ t: "StartTerminal", session });
+  // A held or double-tapped Enter must not fire several StartTerminal
+  // intents before the box is remounted away — the server already dedupes
+  // to one socket, but every extra intent is still a wasted broadcast.
+  const start = () => {
+    if (box.dataset.sent) return;
+    box.dataset.sent = "1";
+    send({ t: "StartTerminal", session });
+  };
   if (isGit) {
+    // Only this branch behaves like a control — tabIndex, the pointer
+    // cursor and the focus outline (.termstart-live in style.css) belong to
+    // it alone, or the non-git box looks clickable/focusable with no
+    // handler wired to the box itself.
+    box.classList.add("termstart-live");
+    box.tabIndex = 0;
     box.onclick = start;
     box.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); start(); } };
     requestAnimationFrame(() => box.focus());
@@ -561,18 +589,24 @@ function showConflict(ev) {
 
 // Transient, dismissible: reuses .conflict's border/padding/button styling
 // (positioned as a fixed overlay via .error-banner) rather than inventing a
-// new visual language just for this.
-function showError(msg) {
+// new visual language just for this. Takes the exact text to show — callers
+// that are reporting a failure prepend "Error: " themselves (see showError);
+// a success notice like ProjectClosed's session count should not look like one.
+function showBanner(text) {
   const box = document.createElement("div");
   box.className = "conflict error-banner";
-  const text = document.createElement("b");
-  text.textContent = `Error: ${msg}`;
+  const b = document.createElement("b");
+  b.textContent = text;
   const dismiss = document.createElement("button");
   dismiss.textContent = "dismiss";
   dismiss.onclick = () => box.remove();
-  box.append(text, dismiss);
+  box.append(b, dismiss);
   document.body.appendChild(box);
   setTimeout(() => box.remove(), 8000);
+}
+
+function showError(msg) {
+  showBanner(`Error: ${msg}`);
 }
 
 function closeTab(pi, ti, t) {

@@ -77,8 +77,12 @@ main { flex: 1; min-height: 0; }
    explicitly asks for a session (Enter or a click — see terminalPlaceholder
    in app.js). Centered like .editor/.termhost fill their pane. ---- */
 .termstart { display:flex; flex-direction:column; align-items:center; justify-content:center;
-             height:100%; gap:8px; opacity:.75; cursor:pointer; text-align:center; }
-.termstart:focus { outline:1px solid var(--accent); opacity:1; }
+             height:100%; gap:8px; opacity:.75; text-align:center; }
+/* Only the git branch (Enter/click starts a session) is actually a control;
+   the non-git offer's own buttons/links carry their own affordances, so the
+   box itself must not look interactive without a handler. */
+.termstart-live { cursor:pointer; }
+.termstart-live:focus { outline:1px solid var(--accent); opacity:1; }
 .termstart kbd { border:1px solid var(--border); border-radius:3px; padding:0 4px; }
 .termstart .initgit { font: inherit; padding: 4px 12px; border-radius: 6px; border: 1px solid var(--border);
                        background: var(--bg2); color: var(--fg); cursor: pointer; }
@@ -90,7 +94,10 @@ main { flex: 1; min-height: 0; }
    worktrees indented and labelled with their own branch under their repo
    (see render::projects_strip). ---- */
 .projstrip { display:inline-flex; gap:8px; margin:0 8px; }
-.projstrip .proj { text-decoration:none; opacity:.6; white-space:nowrap; }
+/* header .proj already sets font-weight:600 on every strip anchor (.projstrip
+   sits inside header), so without this reset .current's own 600 would
+   distinguish nothing — only the underline would. */
+.projstrip .proj { text-decoration:none; opacity:.6; white-space:nowrap; font-weight:400; }
 .projstrip .proj.live { opacity:1; }
 .projstrip .proj.current { font-weight:600; text-decoration:underline; }
 .projstrip .proj.child { margin-left: 2px; }
@@ -101,7 +108,10 @@ main { flex: 1; min-height: 0; }
    href — it renders as plain text so the user still knows it exists, but
    can't be clicked into. Style must make that non-interactivity visible,
    not just implicit in the missing link. */
-.projstrip .proj.unreachable { opacity:.35; cursor:default; pointer-events:none; }
+/* No href and no handler on this span — it's already inert without
+   pointer-events:none, which was also swallowing the title="" tooltip
+   (render::projects_strip) that is this row's only explanation. */
+.projstrip .proj.unreachable { opacity:.35; cursor:default; }
 /* ---- directory picker (index page) ---- */
 .crumbs { padding: 20px 24px 0; max-width: 700px; margin: 0 auto; width: 100%; color: var(--muted); font-family: ui-monospace, monospace; font-size: 13px; }
 .crumbs a { color: var(--accent); text-decoration: none; }
