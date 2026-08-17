@@ -62,6 +62,14 @@ the project resolved to. When a key no longer resolves under the current
 `DEADLIGHT_ROOTS`, reaping consults that recorded path rather than concluding the
 project vanished — and a key with **no** marker is never reaped at all.
 
+The same rule covers a marker that is present but says nothing usable: an empty
+or truncated one, or a recorded path the filesystem cannot answer for (an
+`EACCES` after a `chmod`, an unmounted disk, a downed autofs/NFS mount). Only a
+recorded path the OS positively reports as *absent* counts. The marker is
+written by rename (a transient `.origin.tmp.<pid>` may appear beside it) so no reader
+can ever see it half-written, and it is rewritten only when the recorded path
+actually changes.
+
 This matters because two deadlight instances, or one restarted with different
 roots, can share a state dir. Without the distinction, starting deadlight with
 different `DEADLIGHT_ROOTS` against the same `DEADLIGHT_STATE_DIR` SIGKILLed

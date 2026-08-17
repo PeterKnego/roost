@@ -469,6 +469,16 @@ pub fn kill_project(project: &str) -> usize {
 // the other's value mid-test (or after its cleanup already ran). This
 // project shipped exactly that flakiness once before; every test below that
 // touches DEADLIGHT_CMD takes this lock for its whole body.
+//
+// Lock order, whenever a test needs both this and `wsstate::STATE_ENV_LOCK`
+// (DEADLIGHT_STATE_DIR): **STATE_ENV_LOCK first, SESSION_ENV_LOCK second**,
+// everywhere, no exceptions. Two tests taking them in opposite orders can
+// deadlock under `cargo test`'s parallel threads, and a deadlock does not
+// fail — it *hangs*, so no number of green runs can rule it out. It would
+// present as stuck CI, never as a red test. The order itself is arbitrary;
+// what matters is that it is total, and the majority of call sites
+// (`registry`'s and `hub`'s tests, which acquire the state dir first because
+// their fixtures are built inside it) already used this one.
 #[cfg(test)]
 pub static SESSION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -630,8 +640,11 @@ mod tests {
     // alone is exactly what lied about this before the fix.
     #[test]
     fn kill_project_ends_the_detached_dtach_master_and_shell_not_just_the_client() {
-        let _g1 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _g2 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // STATE before SESSION — the one total order the whole suite uses;
+        // see SESSION_ENV_LOCK's doc comment. This site had them inverted,
+        // which no amount of green runs could have revealed.
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("DEADLIGHT_CMD");
         let state = tempfile::tempdir().unwrap();
         std::env::set_var("DEADLIGHT_STATE_DIR", state.path());
