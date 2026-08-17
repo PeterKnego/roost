@@ -66,10 +66,25 @@ permission prompt without watching the tab:
 }
 ```
 
-This has not been exercised against a real Claude Code `Stop` hook — the
-`/dev/tty` write is this design's one inferred assumption, and a subagent
-invocation has no controlling terminal to write to. Treat the hook config
-above as the intended usage, not a confirmed one.
+**The `/dev/tty` write is confirmed** (2026-08-17), including the shape a hook
+actually runs in: inside a deadlight terminal with stdout captured by a pipe,
+`deadlight notify` still reaches the terminal and the notice is delivered.
+
+**A process with no controlling terminal at all is still a silent no-op.** That
+is the subagent case. With no `/dev/tty` and stdout captured, the sequence is
+written to that captured stdout, nothing is delivered, and the exit status is
+**0**:
+
+```
+$ deadlight notify "Claude" "finished"     # no /dev/tty, stdout a pipe
+exit=0
+stdout=^[]777;notify;Claude;finished^G
+```
+
+This meets the rule stated below — a pipe *is* a usable stdout — but not its
+intent, since an escape sequence written into a pipe can never produce a
+notification, making failure indistinguishable from success. If you wire a hook
+that may run detached, verify it fires rather than trusting its exit status.
 
 ## In the browser
 
@@ -91,10 +106,20 @@ what stops a hostile payload (`cat` of a file containing a forged OSC
 sequence) from producing a banner that looks like it came from a different
 project.
 
-None of the browser-side behaviour — the OS notification actually appearing,
-click focusing the right tab and terminal, the badge clearing — has been
-exercised in a real browser yet. It is implemented against the design, not
-verified end to end.
+**Verified in a real browser** on 2026-08-17, driving input through the actual
+terminal websocket so the whole path — PTY, OSC parser, notice store, hub
+broadcast, client — ran for real: the unread count in the bell and the tab
+title, the favicon badge, the panel's `project · session` attribution, a
+spoofing payload being attributed to its true origin anyway, the iTerm2 `OSC 9`
+form defaulting its title to the session, a `;` inside a body surviving intact,
+the 10-per-minute limit and its `(N suppressed)` accounting, mark-all-read
+clearing the badges while keeping history, and 18 notices with 14 unread
+surviving a restart with badges and panel restored.
+
+**Two things remain unverified**: the OS banner actually rendering, and
+click-to-focus. Both sit behind a permission grant that needs a real gesture on
+the browser's own prompt — the code path feeding them is exercised, the OS-level
+render is not. The 100-notice retention cap is also untested.
 
 ## Limits
 
