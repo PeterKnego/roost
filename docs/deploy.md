@@ -8,9 +8,17 @@ silent failure at least once each.
 
 **The project was called `deadlight` until 2026-08-18.** Anything on disk from
 before then — `~/.local/state/deadlight/`, a `deadlight.service` unit, a
-`~/.local/bin/deadlight` binary — is from the old name and is not read by this
-build. The historical design documents under `docs/superpowers/` keep the old
-name deliberately: they record what was true when they were written.
+`~/.local/bin/deadlight` binary, `~/.config/deadlight/config.toml` — is from
+the old name and is not read by this build. The config file is the one that
+bites: `allowed_origins` is global-config-only (see *`allowed_origins` is
+global-config only*, below), so a host still carrying
+`~/.config/deadlight/config.toml` after the rename has resh read
+`~/.config/resh/config.toml` instead — which doesn't exist, so the allowlist
+is empty and every tailnet browser request 403s while loopback still works.
+That is the exact symptom the `allowed_origins` section tells you to check
+for; this rename is an undocumented cause of it. The historical design
+documents under `docs/superpowers/` keep the old name deliberately: they
+record what was true when they were written.
 
 **The per-project config and theme directory also moved**, from
 `{project}/.deadlight/` to `{project}/.resh/` (`config.toml` and
@@ -159,6 +167,24 @@ names: the unit is `deadlight.service`, the binary is
 before the cutover will `cd` into a path that doesn't exist and try to
 restart a unit that isn't there.
 
+The cutover is not just names — it also moves the global config and changes
+the tailnet address, and skipping either produces the same 403 by a
+different route:
+
+- `mv ~/.config/deadlight ~/.config/resh` — carry the config across, or
+  `allowed_origins` reads as unset after the rename (see *the project was
+  called `deadlight`*, above).
+- `tailscale set --hostname=resh` and moving `tailscale serve` to `:443` —
+  the host's tailnet address changes from
+  `<deploy-host>.<tailnet>.ts.net:8444` to
+  `resh.<tailnet>.ts.net` (no port). `allowed_origins` must be updated to
+  match, or the *new* address 403s even though the config file moved
+  correctly. See the `allowed_origins` section below for both values.
+
+Until all of the above has actually happened on the host, `allowed_origins`
+must still hold the pre-cutover value — updating it early just moves the
+403 earlier.
+
 **The unit runs `~/.local/bin/resh`, not `target/release/resh`** —
 and `~/.cargo/config.toml` redirects `target-dir` to `~/.cache/cargo-target`,
 so a plain `cargo build --release` updates neither path the service uses.
@@ -192,10 +218,19 @@ is still there afterwards.
 
 ## `allowed_origins` is global-config only
 
-It must list the tailnet origin or the browser gets 403 over tailscale:
+It must list the tailnet origin or the browser gets 403 over tailscale.
+Before the host cutover (see *TEMPORARY*, above) — current value on
+`<deploy-host>` today:
 
 ```toml
 allowed_origins = ["https://<deploy-host>.<tailnet>.ts.net:8444"]
+```
+
+After the cutover — new hostname, `tailscale serve` moved to `:443`, so no
+port in the origin:
+
+```toml
+allowed_origins = ["https://resh.<tailnet>.ts.net"]
 ```
 
 Loopback always passes unlisted. It is deliberately **not** readable from a

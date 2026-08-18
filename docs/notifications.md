@@ -67,6 +67,18 @@ permission prompt without watching the tab:
 }
 ```
 
+**Existing hooks and scripts must be updated by hand.** A
+`.claude/settings.json` written before 2026-08-18 still says
+`deadlight notify`, and a script gating on `$DEADLIGHT_NOTIFY` still checks
+that name. Once the old `deadlight` binary is removed, `deadlight notify`
+is just a missing command, and the terminal only ever exports
+`RESH_NOTIFY` now — so `$DEADLIGHT_NOTIFY` is always unset and the script's
+guard silently skips it. Either way the hook does nothing, and a hook that
+does nothing looks exactly like a hook that never fired — the same failure
+this command's loud-failure design exists to prevent. Update the command to
+`resh notify` and the variable check to `RESH_NOTIFY` in every hook and
+script written against the old name.
+
 **The `/dev/tty` write is confirmed** (2026-08-17), including the shape a hook
 actually runs in: inside a resh terminal with stdout captured by a pipe,
 `resh notify` still reaches the terminal and the notice is delivered.
