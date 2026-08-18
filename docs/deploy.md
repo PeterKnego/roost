@@ -186,4 +186,16 @@ by editing the file, not redeploying.
 `tailscale serve` and `tailscale set` work without sudo (the account is the
 tailscale operator); the account's sudo password is *not* its ssh password.
 
-code-server stays running as a fallback — don't restart it casually.
+**There is no editor fallback any more.** code-server was removed on
+2026-08-18 (service disabled, `~/.local/lib/code-server-*`,
+`~/.local/share/code-server` and its config deleted, and the `:8443` tailscale
+serve route dropped), so deadlight on `:8444` is the only web workspace on this
+host. If deadlight is down, the way in is ssh.
+
+Zellij went at the same time. It had been replaced by dtach back in v3 but its
+`--server` processes and a `zellij web --daemonize` had kept running for weeks —
+20 processes holding ~1.1 GB, all with sessions its own `list-sessions` reported
+as EXITED, so `kill-all-sessions` would not clean them up and they had to be
+killed by pid. Note the bare tailnet hostname (`https://…ts.net/`, no port)
+still proxies to `127.0.0.1:8082`, which was zellij web — that route now points
+at nothing.
