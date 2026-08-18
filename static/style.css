@@ -93,11 +93,27 @@ main { flex: 1; min-height: 0; }
 /* ---- header project strip: ● live / ○ idle, current project underlined,
    worktrees indented and labelled with their own branch under their repo
    (see render::projects_strip). ---- */
-.projstrip { display:inline-flex; gap:8px; margin:0 8px; }
+/* The panel behind #projbtn. Positioned like #noticepanel — same pattern, so
+   the two header popups behave identically. */
+#projpanel {
+  position: absolute; top: var(--header-h, 36px); right: 8px; z-index: 20;
+  min-width: 220px; max-width: 380px; max-height: 60vh; overflow-y: auto;
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 4px; padding: 4px;
+}
+/* A vertical list now, not a header strip: it no longer competes for header
+   width, so rows can breathe and long project names need not be clipped. */
+.projstrip { display:flex; flex-direction:column; gap:2px; }
+.projstrip .proj { display:block; padding:4px 8px; border-radius:3px; }
+.projstrip .proj:hover { background: var(--bg); }
+.projstrip:empty::after { content:"no projects have sessions running"; color: var(--muted); display:block; padding:6px 8px; font-size:12px; }
+#projbtn, #bell { background:none; border:1px solid transparent; border-radius:6px; color:var(--muted); padding:3px 8px; cursor:pointer; font:inherit; }
+#projbtn:hover, #bell:hover { color: var(--fg); }
+#projcount { margin-left:4px; }
 /* header .proj already sets font-weight:600 on every strip anchor (.projstrip
    sits inside header), so without this reset .current's own 600 would
    distinguish nothing — only the underline would. */
-.projstrip .proj { text-decoration:none; opacity:.6; white-space:nowrap; font-weight:400; }
+.projstrip .proj { text-decoration:none; opacity:.6; white-space:nowrap; font-weight:400; color:var(--fg); }
 .projstrip .proj.live { opacity:1; }
 .projstrip .proj.current { font-weight:600; text-decoration:underline; }
 .projstrip .proj.child { margin-left: 2px; }

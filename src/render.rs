@@ -319,10 +319,22 @@ pub fn index_page(at: &str, entries: &[Entry], refused: bool, projects: &[crate:
 /// the user isn't left wondering where a worktree they know exists went.
 pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectStatus]) -> String {
     let mut out = String::from("<span class=\"projstrip\">");
-    for p in projects {
+    // Only what is actually running. This panel answers "which projects have
+    // shells alive right now" — a question you ask to switch to one or to
+    // reclaim resources. "Which projects exist, opened or not" is the front
+    // page's job, and it already carries the same ●/○ markers, so listing idle
+    // ones here duplicated it for no gain.
+    let shown: Vec<&crate::registry::ProjectStatus> =
+        projects.iter().filter(|p| p.live > 0).collect();
+    // A live worktree whose parent is idle would otherwise render indented
+    // under a row that is no longer here, dangling off nothing. Indent only
+    // when the parent survived the filter.
+    let shown_keys: std::collections::HashSet<&str> =
+        shown.iter().map(|p| p.key.as_str()).collect();
+    for p in shown {
         let live = p.live > 0;
         let marker = if live { "●" } else { "○" };
-        let is_child = p.parent.is_some();
+        let is_child = p.parent.as_deref().is_some_and(|k| shown_keys.contains(k));
         let mut cls = String::from("proj");
         if is_child {
             cls.push_str(" child");
@@ -447,11 +459,12 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, has_theme_css: boo
   <a class="home" href="/">◆</a><span class="proj">{proj_txt}</span>
   <span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body"></span>
   {warn}
-  <span id="projstrip" hx-get="/frag/_projects?current={qkey}" hx-trigger="load, refresh from:body"></span>
+  <button id="projbtn" title="running projects">◆<span id="projcount"></span></button>
   <button id="closeproj" title="close project — ends all its terminal sessions">✕ Close</button>
   <button id="bell" title="notifications (n)">🔔<span id="bellcount"></span></button>
   <button id="refresh" title="refresh (r)">⟳</button>
 </header>
+<div id="projpanel" hidden><span id="projstrip" hx-get="/frag/_projects?current={qkey}" hx-trigger="load, refresh from:body"></span></div>
 <div id="noticepanel" hidden></div>
 <main id="grid">
   <section class="pane" data-pane="0"><div class="tabstrip"></div><div class="content"></div></section>
@@ -831,8 +844,13 @@ mod tests {
         assert!(!h.contains("class=\"hint\""));
     }
 
+    /// The panel lists what is RUNNING. An idle project — a saved layout with
+    /// no shells — belongs on the front page, which already carries the same
+    /// ●/○ markers; listing it here duplicated that at the cost of header
+    /// space. Asserts the idle one is absent, not merely that the live one is
+    /// present, since the latter alone would pass with the filter deleted.
     #[test]
-    fn strip_marks_live_and_idle_projects() {
+    fn strip_lists_only_projects_with_running_sessions() {
         let ps = vec![
             crate::registry::ProjectStatus {
                 key: "karpie".into(), url: "karpie".into(),
@@ -849,13 +867,17 @@ mod tests {
         assert!(h.contains("target=\"dl-karpie\""), "links reuse a named browsing context");
         assert!(h.contains("href=\"/karpie\""));
         assert!(h.contains("class=\"proj live current\"") || h.contains("current"));
-        assert!(h.contains("glow"));
+        assert!(
+            !h.contains("glow"),
+            "an idle project must not appear: this panel answers what is running, and the \
+             front page already lists everything else"
+        );
         assert!(h.contains("2 sessions"), "the tooltip must carry the session count");
         // The headline behaviour: ● pinned to the live project, ○ pinned to
         // the idle one — not just "a ● and a ○ appear somewhere". Swapping
         // the two glyphs in projects_strip must fail this test.
         assert!(h.contains(">● karpie</a>"), "live project must be marked with the filled dot");
-        assert!(h.contains(">○ glow</a>"), "idle project must be marked with the hollow dot");
+        assert!(!h.contains("○"), "with idle projects filtered out, no hollow dot can remain");
         assert!(h.contains("oldest 8h"), "a known age must be rendered, coarsely");
     }
 
@@ -914,7 +936,7 @@ mod tests {
         let ps = vec![
             crate::registry::ProjectStatus {
                 key: "a%3Cb".into(), url: "a<b".into(),
-                live: 0, oldest_age_secs: None, has_layout: true,
+                live: 1, oldest_age_secs: None, has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
             },
             // storage_key only escapes '/' and '%' — a raw '"' from a
@@ -925,7 +947,7 @@ mod tests {
             // deleted from that call site).
             crate::registry::ProjectStatus {
                 key: "a\" onmouseover=x".into(), url: "b".into(),
-                live: 0, oldest_age_secs: None, has_layout: true,
+                live: 1, oldest_age_secs: None, has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
             },
         ];
@@ -956,7 +978,7 @@ mod tests {
             crate::registry::ProjectStatus {
                 key: "ultima_marketing%2F.claude%2Fworktrees%2Fsite-launch".into(),
                 url: "ultima_marketing/.claude/worktrees/site-launch".into(),
-                live: 0, oldest_age_secs: None, has_layout: false,
+                live: 1, oldest_age_secs: None, has_layout: false,
                 branch: "site-launch".into(),
                 parent: Some("ultima_marketing".into()),
                 reachable: true,
@@ -973,7 +995,7 @@ mod tests {
             "a worktree row must render indented under its parent"
         );
         assert!(
-            h.contains("class=\"proj child\""),
+            h.contains("class=\"proj child live\""),
             "a worktree row must carry a class distinguishing it from a top-level project"
         );
         // it's a real, reachable worktree: still a genuine link to its own
@@ -990,12 +1012,18 @@ mod tests {
         let ps = vec![
             crate::registry::ProjectStatus {
                 key: "repo".into(), url: "repo".into(),
-                live: 0, oldest_age_secs: None, has_layout: true,
+                live: 1, oldest_age_secs: None, has_layout: true,
                 branch: "main".into(), parent: None, reachable: true,
             },
             crate::registry::ProjectStatus {
+                // Live *and* unreachable is not a contradiction: ROOTS can
+                // change after a session was started, leaving a running shell
+                // on a path this instance may no longer open. That is exactly
+                // when the user needs to see it, and the only case this panel
+                // renders an unreachable row at all now that it lists running
+                // projects only.
                 key: "%2Felsewhere%2Fstray".into(), url: "/elsewhere/stray".into(),
-                live: 0, oldest_age_secs: None, has_layout: false,
+                live: 1, oldest_age_secs: None, has_layout: false,
                 branch: "wip".into(), parent: Some("repo".into()), reachable: false,
             },
         ];
