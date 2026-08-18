@@ -148,6 +148,17 @@ unsaved changes, listing them by name.
 
 ## Deploying to <deploy-host>
 
+**TEMPORARY — delete this paragraph once the host cutover below has
+happened.** The commands in this section are written for the post-cutover
+state and are correct for every deploy from then on. But the host cutover
+is a separate task that runs *after this branch merges*, so until it has
+actually been done on `<deploy-host>`, the host still runs the old
+names: the unit is `deadlight.service`, the binary is
+`~/.local/bin/deadlight`, and the checkout is
+`/home/claude/projects/deadlight`. Following the commands below verbatim
+before the cutover will `cd` into a path that doesn't exist and try to
+restart a unit that isn't there.
+
 **The unit runs `~/.local/bin/resh`, not `target/release/resh`** —
 and `~/.cargo/config.toml` redirects `target-dir` to `~/.cache/cargo-target`,
 so a plain `cargo build --release` updates neither path the service uses.
