@@ -4,7 +4,7 @@ use std::path::PathBuf;
 fn start(roots: Vec<PathBuf>) -> u16 {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || deadlight::serve(listener, roots));
+    std::thread::spawn(move || resh::serve(listener, roots));
     port
 }
 
@@ -1095,7 +1095,7 @@ fn close_project_ends_the_real_dtach_master_not_just_the_client() {
     wait_for_live_session(&mut ws, &my_id, "shell");
 
     let sock =
-        sd.path().join("sock").join(deadlight::projects::storage_key("realclose")).join("shell");
+        sd.path().join("sock").join(resh::projects::storage_key("realclose")).join("shell");
     // Poll rather than a fixed sleep: dtach's own fork-and-detach takes an
     // unpredictable, usually-small amount of wall time to complete. The
     // budget is deliberately far larger than the ~50ms this normally needs,
@@ -1161,10 +1161,10 @@ fn a_notice_reaches_a_client_watching_a_different_project() {
     read_until(&mut b, r#""t":"State""#);
 
     // Published against alpha; beta's client must still see it.
-    deadlight::hub::publish(
+    resh::hub::publish(
         "alpha",
         "claude",
-        deadlight::osc::Parsed { title: Some("build".into()), body: "green".into() },
+        resh::osc::Parsed { title: Some("build".into()), body: "green".into() },
     );
 
     let seen_b = read_until(&mut b, r#""t":"Notice""#);
@@ -1181,10 +1181,10 @@ fn notices_are_replayed_on_connect_and_read_state_mirrors() {
     std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
     let (_d, port) = fixture();
 
-    deadlight::hub::publish(
+    resh::hub::publish(
         "proj",
         "claude",
-        deadlight::osc::Parsed { title: None, body: "waiting for you".into() },
+        resh::osc::Parsed { title: None, body: "waiting for you".into() },
     );
 
     // A client connecting *after* the fact still learns about it.
