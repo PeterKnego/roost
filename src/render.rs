@@ -179,15 +179,15 @@ pub fn status_fragment(st: &Status) -> String {
     )
 }
 
-/// Breadcrumb for the directory picker: "deadlight" always links back to the
+/// Breadcrumb for the directory picker: "resh" always links back to the
 /// top level (`at=""`), every segment but the last is a clickable link to
 /// browsing that prefix, and the last segment is plain text (you're already
 /// there — the picker doesn't render a `..` row, this is the way up).
 fn breadcrumb(at: &str) -> String {
     if at.is_empty() {
-        return "<nav class=\"crumbs\"><span class=\"crumb-current\">deadlight</span></nav>".to_string();
+        return "<nav class=\"crumbs\"><span class=\"crumb-current\">resh</span></nav>".to_string();
     }
-    let mut out = String::from("<nav class=\"crumbs\"><a href=\"/\">deadlight</a>");
+    let mut out = String::from("<nav class=\"crumbs\"><a href=\"/\">resh</a>");
     let segs: Vec<&str> = at.split('/').collect();
     let mut acc = String::new();
     for (i, seg) in segs.iter().enumerate() {
@@ -297,10 +297,10 @@ pub fn index_page(at: &str, entries: &[Entry], refused: bool, projects: &[crate:
     let rows_hint = if entries.is_empty() { hint("empty directory") } else { String::new() };
     let rows = if entries.is_empty() { String::new() } else { picker_rows(entries, projects) };
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>deadlight</title>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>resh</title>\
          <link rel=\"stylesheet\" href=\"/static/themes/dark.css\">\
          <link rel=\"stylesheet\" href=\"/static/style.css\">\
-         </head><body><header><span class=\"proj\">deadlight</span></header>\
+         </head><body><header><span class=\"proj\">resh</span></header>\
          <main>{notice}{crumbs}\
          <ul class=\"picker\" id=\"picker\" data-at=\"{at_attr}\" tabindex=\"0\">{rows}</ul>\
          {rows_hint}<div class=\"pickerbar\"><button id=\"openBtn\" type=\"button\">Open</button></div>\
@@ -362,7 +362,7 @@ pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectSta
         if !p.reachable {
             cls.push_str(" unreachable");
             out.push_str(&format!(
-                "<span class=\"{}\" title=\"worktree outside deadlight's roots — cannot be opened\">{}{} {}{}</span>",
+                "<span class=\"{}\" title=\"worktree outside resh's roots — cannot be opened\">{}{} {}{}</span>",
                 cls,
                 indent,
                 marker,
@@ -451,7 +451,7 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, has_theme_css: boo
     format!(
         r#"<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{proj_txt} — deadlight</title>
+<title>{proj_txt} — resh</title>
 <link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/vendor/hljs-github-dark.min.css">
 <link rel="stylesheet" href="/static/vendor/github-markdown.min.css">
@@ -723,7 +723,7 @@ mod tests {
         // beta is not a git repo: no shortcut anchor for it at all
         assert!(!h.contains("href=\"/beta\""));
         assert!(h.contains("id=\"openBtn\""));
-        assert!(h.contains("crumb-current\">deadlight"));
+        assert!(h.contains("crumb-current\">resh"));
         assert!(h.contains("/static/picker.js"));
 
         // browsing a subdirectory: breadcrumb links back up, files are
@@ -733,7 +733,7 @@ mod tests {
             Entry { name: "main.rs".into(), rel: "karpie/main.rs".into(), is_dir: false, git: false },
         ];
         let h2 = index_page("karpie", &sub, false, &[]);
-        assert!(h2.contains("<a href=\"/\">deadlight</a>"));
+        assert!(h2.contains("<a href=\"/\">resh</a>"));
         assert!(h2.contains("crumb-current\">karpie"));
         assert!(h2.contains("class=\"dir\" data-rel=\"karpie/sub\""));
         assert!(h2.contains("class=\"file\""));

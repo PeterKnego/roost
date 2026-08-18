@@ -1,5 +1,5 @@
-//! Settings cascade: global ~/.config/deadlight/config.toml, then
-//! {project}/.deadlight/config.toml. Re-read on every request — never cached.
+//! Settings cascade: global ~/.config/resh/config.toml, then
+//! {project}/.resh/config.toml. Re-read on every request — never cached.
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -33,7 +33,7 @@ impl Default for Settings {
 
 pub fn global_config_path() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".config/deadlight/config.toml")
+        .join(".config/resh/config.toml")
 }
 
 pub fn load(paths: &[&Path]) -> Settings {
@@ -67,7 +67,7 @@ pub fn load(paths: &[&Path]) -> Settings {
 /// Origins allowed to open a websocket or issue requests, from
 /// `RESH_ORIGINS` (comma-separated) or the global config's
 /// `allowed_origins`. Deliberately **not** part of [`Settings`]: a per-project
-/// `.deadlight/config.toml` must never be able to allowlist an origin, or a
+/// `.resh/config.toml` must never be able to allowlist an origin, or a
 /// hostile repo could allowlist itself. Loopback is always allowed without
 /// configuration — see [`crate::origin`].
 pub fn allowed_origins() -> Vec<String> {
@@ -91,7 +91,7 @@ pub fn allowed_origins() -> Vec<String> {
 pub fn for_project(project_dir: &Path) -> Settings {
     load(&[
         &global_config_path(),
-        &project_dir.join(".deadlight/config.toml"),
+        &project_dir.join(".resh/config.toml"),
     ])
 }
 

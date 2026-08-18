@@ -26,7 +26,7 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
             path = req.uri().path().to_string();
             let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
             if !crate::origin::origin_allowed(origin, &allowed) {
-                eprintln!("deadlight: rejected ws origin={origin:?} (set allowed_origins)");
+                eprintln!("resh: rejected ws origin={origin:?} (set allowed_origins)");
                 return Err(tungstenite::http::Response::builder()
                     .status(403)
                     .body(Some("origin not allowed".to_string()))
@@ -54,11 +54,11 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // terminal that never starts — no error text reaches the UI, because a
     // closed socket carries none. So each one must say why on the way out, or
     // a user whose terminal silently refuses to start (and whoever reads
-    // `journalctl --user -u deadlight` afterwards) has nothing at all to go
+    // `journalctl --user -u resh` afterwards) has nothing at all to go
     // on. Diagnosing an intermittent "live_sessions stayed empty" needed
     // exactly this and did not have it.
     let Some(dir) = crate::projects::resolve_project(roots, &project) else {
-        eprintln!("deadlight: term socket refused — project {project:?} does not resolve under the roots");
+        eprintln!("resh: term socket refused — project {project:?} does not resolve under the roots");
         let _ = ws_read.close(None);
         return;
     };
@@ -84,14 +84,14 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // start — there is no queue yet that could fill and get this tab dropped
     // mid-connect.
     if crate::hub::Hub::is_closing(&project) {
-        eprintln!("deadlight: term socket refused — project {project:?} is closing");
+        eprintln!("resh: term socket refused — project {project:?} is closing");
         let _ = ws_read.close(None);
         return;
     }
     let att = match session::attach(&project, name, &dir) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("deadlight: term socket refused — attach {project}/{name} failed: {e}");
+            eprintln!("resh: term socket refused — attach {project}/{name} failed: {e}");
             let _ = ws_read.close(None);
             return;
         }

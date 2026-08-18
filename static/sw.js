@@ -71,7 +71,7 @@ self.addEventListener("notificationclick", (e) => {
           (c || onProject).postMessage({ kind: "focus", project, session });
         });
       }
-      // Otherwise reuse any deadlight window rather than opening a new tab.
+      // Otherwise reuse any resh window rather than opening a new tab.
       if (wins.length) {
         return wins[0].focus().then((c) => (c || wins[0]).navigate(target));
       }

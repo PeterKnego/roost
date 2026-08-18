@@ -16,7 +16,7 @@ pub enum SaveOutcome {
 fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
     let dir = path.parent().ok_or("no parent directory")?;
     let tmp = dir.join(format!(
-        ".{}.deadlight.tmp",
+        ".{}.resh.tmp",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("buf")
     ));
     std::fs::write(&tmp, text).map_err(|e| e.to_string())?;

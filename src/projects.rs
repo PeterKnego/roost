@@ -546,7 +546,7 @@ mod tests {
     fn existing_ascii_keys_are_unchanged_byte_for_byte() {
         for name in [
             "karpie",
-            "deadlight",
+            "resh",
             "ultima_db",
             "ultima",
             "ml",
