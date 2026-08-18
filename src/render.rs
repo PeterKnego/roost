@@ -71,6 +71,29 @@ pub fn file_fragment(rel: &str, content: &str) -> String {
 // expanded inline; everything else renders closed and lazily fetches its
 // own children (see the `dir` query param on the `tree` fragment endpoint
 // in routes.rs) the first time the user expands it.
+/// The lowercased extension a row's icon is keyed on (`data-ext`, consumed by
+/// the `[data-ext=…]` rules in style.css). Empty for anything without a usable
+/// one, which the stylesheet then renders with its neutral file glyph: a name
+/// with no dot ("README"), or a suffix too long or too odd to be a real type.
+/// Deliberately permissive about what it gives up on — an unrecognised type
+/// costs only a generic icon.
+fn icon_ext(name: &str) -> String {
+    let ext = name.rsplit('.').next().unwrap_or("");
+    if ext == name || ext.is_empty() || ext.len() > 10 || !ext.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return String::new();
+    }
+    ext.to_ascii_lowercase()
+}
+
+/// How deep a row sits, from its own project-relative path. The stylesheet
+/// indents each row by `--d` and sizes its indent-guide band from it, rather
+/// than nesting padded `<ul>`s — that is what lets a hover or selection bar
+/// span the full pane width instead of starting at the indent.
+fn depth(rel: &str) -> usize {
+    rel.matches('/').count()
+}
+
 pub fn tree_fragment(project: &str, dir: &Path, open: &str, hide: &[String]) -> String {
     let mut out = String::from("<ul class=\"tree\">");
     tree_level(project, dir, "", open, hide, &mut out);
@@ -112,8 +135,9 @@ pub fn tree_level(project: &str, dir: &Path, rel: &str, open: &str, hide: &[Stri
                 // On the open file's path: expand inline, recursively, so
                 // the file is visible on load with no extra round trip.
                 out.push_str(&format!(
-                    "<li><details open data-rel=\"{}\"><summary>{}</summary><ul>",
+                    "<li><details open data-rel=\"{}\"><summary style=\"--d:{}\">{}</summary><ul>",
                     esc(&erel),
+                    depth(&erel),
                     esc(&name)
                 ));
                 tree_level(project, &e.path(), &erel, open, hide, out);
@@ -124,10 +148,11 @@ pub fn tree_level(project: &str, dir: &Path, rel: &str, open: &str, hide: &[Stri
                 // currently expanded), and the hx-get/hx-trigger pair fetches
                 // this directory's children exactly once, on first expand.
                 out.push_str(&format!(
-                    "<li><details data-rel=\"{rel}\" hx-get=\"/frag/{proj}/tree?dir={qrel}\" hx-trigger=\"toggle once\" hx-target=\"find ul\"><summary>{name}</summary><ul></ul></details></li>",
+                    "<li><details data-rel=\"{rel}\" hx-get=\"/frag/{proj}/tree?dir={qrel}\" hx-trigger=\"toggle once\" hx-target=\"find ul\"><summary style=\"--d:{d}\">{name}</summary><ul></ul></details></li>",
                     rel = esc(&erel),
                     proj = crate::http::percent_encode(project),
                     qrel = crate::http::percent_encode(&erel),
+                    d = depth(&erel),
                     name = esc(&name)
                 ));
             }
@@ -141,8 +166,10 @@ pub fn tree_level(project: &str, dir: &Path, rel: &str, open: &str, hide: &[Stri
             // doesn't exist in the four-pane layout.
             let sel = if open == erel { " sel" } else { "" };
             out.push_str(&format!(
-                "<li><a class=\"file{sel}\" data-rel=\"{}\">{}</a></li>",
+                "<li><a class=\"file{sel}\" data-rel=\"{}\" data-ext=\"{}\" style=\"--d:{}\">{}</a></li>",
                 esc(&erel),
+                icon_ext(&name),
+                depth(&erel),
                 esc(&name)
             ));
         }
@@ -155,12 +182,13 @@ pub fn changes_fragment(project: &str, st: &Status) -> String {
     }
     let project_url = crate::http::percent_encode(project);
     let mut out = format!(
-        "<ul class=\"changes\"><li><a class=\"file\" data-rel=\"\" hx-get=\"/frag/{project_url}/diff\" hx-target=\"#content\"><b>— full diff —</b></a></li>"
+        "<ul class=\"changes\"><li><a class=\"file\" data-kind=\"diff\" data-rel=\"\" hx-get=\"/frag/{project_url}/diff\" hx-target=\"#content\">full diff</a></li>"
     );
     for c in &st.changes {
         out.push_str(&format!(
-            "<li><a class=\"file\" data-rel=\"{}\" hx-get=\"/frag/{}/diff?path={}\" hx-target=\"#content\"><span class=\"xy\">{}</span> {}</a></li>",
+            "<li><a class=\"file\" data-rel=\"{}\" data-ext=\"{}\" hx-get=\"/frag/{}/diff?path={}\" hx-target=\"#content\"><span class=\"xy\">{}</span>{}</a></li>",
             esc(&c.path),
+            icon_ext(c.path.rsplit('/').next().unwrap_or(&c.path)),
             project_url,
             crate::http::percent_encode(&c.path),
             esc(&c.xy),
@@ -298,7 +326,7 @@ pub fn index_page(at: &str, entries: &[Entry], refused: bool, projects: &[crate:
     let rows = if entries.is_empty() { String::new() } else { picker_rows(entries, projects) };
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>resh</title>\
-         <link rel=\"stylesheet\" href=\"/static/themes/dark.css\">\
+         <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
          <link rel=\"stylesheet\" href=\"/static/style.css\">\
          </head><body><header><span class=\"proj\">resh</span></header>\
          <main>{notice}{crumbs}\
@@ -549,12 +577,12 @@ mod tests {
         fs::write(d.path().join("src/sub/x.rs"), "").unwrap();
         fs::write(d.path().join("README.md"), "").unwrap();
         let h = tree_fragment("proj", d.path(), "src/main.rs", &["dist".to_string()]);
-        assert!(h.contains("<details open data-rel=\"src\"><summary>src</summary>"));
+        assert!(h.contains("<details open data-rel=\"src\"><summary style=\"--d:0\">src</summary>"));
         assert!(h.contains("class=\"file sel\""));
         assert!(h.contains("data-rel=\"src/main.rs\""));
         assert!(h.contains("README.md"));
-        assert!(!h.contains("<summary>target</summary>"));
-        assert!(!h.contains("<summary>dist</summary>"));
+        assert!(!h.contains(">target</summary>"));
+        assert!(!h.contains(">dist</summary>"));
     }
 
     // Claude Code checks a worktree out at `{repo}/.claude/worktrees/{name}`:
@@ -589,7 +617,7 @@ mod tests {
         let h = tree_fragment("proj", d.path(), "src/main.rs", &[]);
         assert!(h.contains(
             "<details data-rel=\"src/sub\" hx-get=\"/frag/proj/tree?dir=src/sub\" \
-             hx-trigger=\"toggle once\" hx-target=\"find ul\"><summary>sub</summary><ul></ul></details>"
+             hx-trigger=\"toggle once\" hx-target=\"find ul\"><summary style=\"--d:1\">sub</summary><ul></ul></details>"
         ));
         assert!(!h.contains("x.rs")); // sub's child must not be inlined
     }
@@ -612,6 +640,41 @@ mod tests {
     // The lazy `?dir=` fetch (routes.rs) renders through the same one-level
     // machinery, just scoped to a subdirectory and without the outer <ul>
     // wrapper, so it slots straight into the parent <details>'s own <ul>.
+    // Every row carries the depth the stylesheet indents it by and the
+    // extension it keys the row's icon on. Both are pure functions of the
+    // row's own path, so a lazily-fetched subtree (tree_level with a non-empty
+    // `rel`) has to produce the same values the initial render would have.
+    #[test]
+    fn rows_carry_their_depth_and_icon_extension() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("src/sub")).unwrap();
+        fs::write(d.path().join("src/sub/x.rs"), "").unwrap();
+        fs::write(d.path().join("README"), "").unwrap();
+        fs::write(d.path().join("Cargo.toml"), "").unwrap();
+        let h = tree_fragment("proj", d.path(), "src/sub/x.rs", &[]);
+        assert!(h.contains("data-rel=\"src/sub/x.rs\" data-ext=\"rs\" style=\"--d:2\""));
+        assert!(h.contains("data-rel=\"Cargo.toml\" data-ext=\"toml\" style=\"--d:0\""));
+        // No dot at all: the stylesheet's neutral glyph, not a bogus type.
+        assert!(h.contains("data-rel=\"README\" data-ext=\"\" style=\"--d:0\""));
+
+        // The same row, reached through the lazy ?dir= path, agrees.
+        let mut lazy = String::new();
+        tree_level("proj", &d.path().join("src/sub"), "src/sub", "", &[], &mut lazy);
+        assert!(lazy.contains("data-rel=\"src/sub/x.rs\" data-ext=\"rs\" style=\"--d:2\""));
+    }
+
+    #[test]
+    fn icon_ext_gives_up_on_anything_that_is_not_a_plain_suffix() {
+        assert_eq!(icon_ext("main.rs"), "rs");
+        assert_eq!(icon_ext("README.MD"), "md"); // case-folded
+        assert_eq!(icon_ext(".gitignore"), "gitignore"); // dotfile, suffix is the type
+        assert_eq!(icon_ext("README"), ""); // no dot
+        assert_eq!(icon_ext("archive.tar.gz"), "gz"); // last suffix wins
+        assert_eq!(icon_ext("v1.0-final"), ""); // not alphanumeric
+        assert_eq!(icon_ext("x."), ""); // empty suffix
+        assert_eq!(icon_ext("notes.supercalifragilistic"), ""); // implausibly long
+    }
+
     #[test]
     fn tree_level_answers_a_lazy_dir_fetch() {
         let d = tempfile::tempdir().unwrap();
