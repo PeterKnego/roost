@@ -49,7 +49,7 @@ pub fn state_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state/deadlight")
 }
 
-fn path_for(project: &str) -> PathBuf {
+pub(crate) fn path_for(project: &str) -> PathBuf {
     // storage_key, not the raw project string: a nested project's `/`
     // would otherwise land literally in a filename (or, worse, get
     // interpreted as a directory separator by the OS). See its doc comment

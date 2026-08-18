@@ -69,7 +69,32 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// The notice store lives in its own subdirectory, **not** as a bare `.json`
+/// at the top of the state dir, because that top level is the project-workspace
+/// namespace: `wsstate::path_for` writes `{storage_key(project)}.json` there.
+///
+/// The old path was `notifications.json`, which collided with that namespace two
+/// ways. The visible one: `registry::known_projects` globs `*.json` to find
+/// saved workspaces, so the notice store was listed as a phantom project named
+/// "notifications" — ○ idle, "saved layout, nothing running", linking to a URL
+/// that resolves to nothing. The serious one: a project may legitimately *be*
+/// named `notifications`, and its layout would then be written to the notice
+/// store's own file — each overwriting the other, in both directions.
+///
+/// A subdirectory cannot collide: the scan only matches files ending `.json` at
+/// the top level, and `sock/` already establishes the pattern for state that is
+/// not a project workspace.
+fn dir() -> std::path::PathBuf {
+    crate::wsstate::state_dir().join("notify")
+}
+
 fn path() -> std::path::PathBuf {
+    dir().join("notices.json")
+}
+
+/// Where the store used to live, read once at startup so an upgrade keeps its
+/// history instead of silently starting empty. Not written to again.
+fn legacy_path() -> std::path::PathBuf {
     crate::wsstate::state_dir().join("notifications.json")
 }
 
@@ -187,7 +212,7 @@ fn persist() {
     // the store's own leaf lock must never be.
     let _guard = PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let snapshot: Vec<Notice> = list();
-    let dir = crate::wsstate::state_dir();
+    let dir = dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return eprintln!("deadlight: notifications dir: {e}");
     }
@@ -229,9 +254,23 @@ static RENAME_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 /// Called once at startup. A corrupt or absent file leaves an empty store —
 /// losing notification history is not worth failing a boot over.
 pub fn load() {
-    let Ok(text) = std::fs::read_to_string(path()) else { return };
+    // Fall back to the pre-subdirectory location so an upgrade does not appear
+    // to wipe the history. The old file is left where it is rather than deleted:
+    // the next `persist` writes the new path, and a stray 100-notice JSON is a
+    // far smaller problem than deleting something on a path this code no longer
+    // considers its own.
+    let text = match std::fs::read_to_string(path()) {
+        Ok(t) => t,
+        Err(_) => match std::fs::read_to_string(legacy_path()) {
+            Ok(t) => {
+                eprintln!("deadlight: migrating notices from the pre-subdirectory location");
+                t
+            }
+            Err(_) => return,
+        },
+    };
     let Ok(list) = serde_json::from_str::<Vec<Notice>>(&text) else {
-        return eprintln!("deadlight: notifications.json unreadable, starting empty");
+        return eprintln!("deadlight: notice store unreadable, starting empty");
     };
     let mut s = store().lock().unwrap_or_else(|e| e.into_inner());
     // Resume the counter past the highest persisted id, or a reboot would
@@ -407,10 +446,73 @@ mod tests {
         assert!(c.id > all[1].id, "id counter must resume past the loaded max");
     }
 
+    /// The notice store must not live in the project-workspace namespace.
+    ///
+    /// Two failures came from it doing so. The visible one: `known_projects`
+    /// globs `*.json` at the top of the state dir, so the store appeared as a
+    /// phantom ○ idle project named "notifications" whose link resolved to
+    /// nothing. The serious one, pinned here: a project may legitimately be
+    /// *named* `notifications`, and its saved layout would then be written to
+    /// the very file the notice store uses — clobbering it, and being clobbered
+    /// in turn on the next notice.
+    #[test]
+    fn the_store_cannot_collide_with_a_project_named_notifications() {
+        let (_g, d) = setup();
+        record("p", "s", parsed("a real notice")).unwrap();
+
+        // What a project literally named "notifications" writes.
+        let project_state = crate::wsstate::path_for("notifications");
+        assert_ne!(
+            project_state,
+            path(),
+            "a project named `notifications` must not share the notice store's file"
+        );
+        std::fs::write(&project_state, b"{\"sizes\":{}}").unwrap();
+
+        // The project's own state file must not have disturbed the notices...
+        load();
+        assert_eq!(list().len(), 1, "a same-named project's layout must not clobber the store");
+        assert_eq!(list()[0].body, "a real notice");
+
+        // ...and the store must not sit in the top-level `*.json` namespace at
+        // all, which is what produced the phantom project row.
+        let strays: Vec<String> = std::fs::read_dir(d.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".json") && n != "notifications.json")
+            .collect();
+        assert!(
+            !strays.iter().any(|n| n.contains("notice")),
+            "the notice store must not be a top-level *.json; found {strays:?}"
+        );
+    }
+
+    /// An upgrade must not appear to wipe the history: a store written at the
+    /// old top-level path is still read when the new one is absent.
+    #[test]
+    fn a_pre_subdirectory_store_is_still_loaded() {
+        let (_g, d) = setup();
+        let legacy = d.path().join("notifications.json");
+        std::fs::write(
+            &legacy,
+            br#"[{"id":7,"project":"p","session":"s","title":"t","body":"from the old path","at":1,"read":false}]"#,
+        )
+        .unwrap();
+        load();
+        let all = list();
+        assert_eq!(all.len(), 1, "history at the legacy path must survive the move");
+        assert_eq!(all[0].body, "from the old path");
+        // And the id counter must still resume past it.
+        let n = record("p", "s2", parsed("new")).unwrap();
+        assert!(n.id > 7, "id counter must resume past the migrated max");
+    }
+
     #[test]
     fn a_corrupt_state_file_is_ignored_rather_than_fatal() {
         let (_g, d) = setup();
-        std::fs::write(d.path().join("notifications.json"), b"{ not json").unwrap();
+        std::fs::create_dir_all(d.path().join("notify")).unwrap();
+        std::fs::write(d.path().join("notify/notices.json"), b"{ not json").unwrap();
         load(); // must not panic
         assert!(list().is_empty());
         assert!(record("p", "s", parsed("still works")).is_some());
@@ -444,10 +546,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let f = std::fs::metadata(d.path().join("notifications.json")).unwrap();
-            assert_eq!(f.permissions().mode() & 0o077, 0, "notifications.json is group/world readable");
-            let dir = std::fs::metadata(d.path()).unwrap();
-            assert_eq!(dir.permissions().mode() & 0o077, 0, "state dir is group/world readable");
+            let f = std::fs::metadata(d.path().join("notify/notices.json")).unwrap();
+            assert_eq!(f.permissions().mode() & 0o077, 0, "the notice store is group/world readable");
+            let dir = std::fs::metadata(d.path().join("notify")).unwrap();
+            assert_eq!(dir.permissions().mode() & 0o077, 0, "the notice dir is group/world readable");
         }
     }
 
