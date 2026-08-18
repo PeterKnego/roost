@@ -231,9 +231,17 @@ fn breadcrumb(at: &str) -> String {
 /// carries the same live/idle cue in the picker as it does in the header
 /// strip — without leaving the picker to open it.
 fn project_marker(rel: &str, projects: &[crate::registry::ProjectStatus]) -> &'static str {
+    // Wrapped in an element, not emitted as a bare glyph: unstyled it inherited
+    // the row's colour and rendered as a dim blob beside an accent-coloured
+    // `⎇`, so the louder mark was the less important one. Which projects are
+    // RUNNING is the question this page can answer that a plain directory
+    // listing cannot, so it gets the accent and the git icon steps back.
+    // Titles because a bare dot is not self-explanatory the first time.
     match projects.iter().find(|p| p.url == rel) {
-        Some(p) if p.live > 0 => " ●",
-        Some(_) => " ○",
+        Some(p) if p.live > 0 => {
+            " <span class=\"mark live\" title=\"terminal sessions running\">●</span>"
+        }
+        Some(_) => " <span class=\"mark idle\" title=\"saved layout, nothing running\">○</span>",
         None => "",
     }
 }
@@ -755,8 +763,20 @@ mod tests {
             },
         ];
         let h = index_page("", &entries, false, &ps);
-        assert!(h.contains("<span class=\"name\">karpie</span> ●"), "live project row carries ●");
-        assert!(h.contains("<span class=\"name\">glow</span> ○"), "idle-but-known project row carries ○");
+        // The marker must be an *element*, not a bare glyph: as plain text it
+        // inherited the row colour and was quieter than the accent-coloured git
+        // icon next to it, so the least important mark was the loudest. The
+        // class is what lets CSS put liveness first, so assert on it.
+        assert!(
+            h.contains("<span class=\"name\">karpie</span> <span class=\"mark live\""),
+            "a live project's marker must carry the live class, not just the glyph"
+        );
+        assert!(h.contains(">●</span>"), "live project row carries ●");
+        assert!(
+            h.contains("<span class=\"name\">glow</span> <span class=\"mark idle\""),
+            "an idle project's marker must carry the idle class"
+        );
+        assert!(h.contains(">○</span>"), "idle-but-known project row carries ○");
         assert!(h.contains("<span class=\"name\">plain</span></li>"), "unknown directory carries neither marker");
     }
 
