@@ -255,28 +255,49 @@ static RENAME_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 /// losing notification history is not worth failing a boot over.
 pub fn load() {
     // Fall back to the pre-subdirectory location so an upgrade does not appear
-    // to wipe the history. The old file is left where it is rather than deleted:
-    // the next `persist` writes the new path, and a stray 100-notice JSON is a
-    // far smaller problem than deleting something on a path this code no longer
-    // considers its own.
-    let text = match std::fs::read_to_string(path()) {
-        Ok(t) => t,
+    // to wipe the history.
+    let (text, from_legacy) = match std::fs::read_to_string(path()) {
+        Ok(t) => (t, false),
         Err(_) => match std::fs::read_to_string(legacy_path()) {
-            Ok(t) => {
-                eprintln!("deadlight: migrating notices from the pre-subdirectory location");
-                t
-            }
+            Ok(t) => (t, true),
             Err(_) => return,
         },
     };
     let Ok(list) = serde_json::from_str::<Vec<Notice>>(&text) else {
         return eprintln!("deadlight: notice store unreadable, starting empty");
     };
-    let mut s = store().lock().unwrap_or_else(|e| e.into_inner());
-    // Resume the counter past the highest persisted id, or a reboot would
-    // hand out ids that already name a different notice.
-    s.next_id = list.iter().map(|n| n.id).max().unwrap_or(0);
-    s.notices = list.into();
+    {
+        let mut s = store().lock().unwrap_or_else(|e| e.into_inner());
+        // Resume the counter past the highest persisted id, or a reboot would
+        // hand out ids that already name a different notice.
+        s.next_id = list.iter().map(|n| n.id).max().unwrap_or(0);
+        s.notices = list.into();
+    }
+    if from_legacy {
+        // Finish the move rather than merely reading through it. Leaving the old
+        // file in place is not neutral: `known_projects` globs `*.json` at the
+        // top of the state dir, so it keeps rendering as a phantom ○ idle
+        // project named "notifications" — which is the symptom that exposed this
+        // whole collision. The store has to actually leave that namespace.
+        //
+        // Deleted only on positive evidence, per CLAUDE.md: the bytes parsed as
+        // our own notice list (so this is not some unrelated project's saved
+        // layout that happens to sit at that name), and the new file is
+        // confirmed present after the write. Anything less and the old file
+        // stays — a stray JSON is recoverable, a deleted history is not.
+        persist();
+        if path().exists() {
+            match std::fs::remove_file(legacy_path()) {
+                Ok(()) => eprintln!(
+                    "deadlight: migrated notices to {} and removed the old file",
+                    path().display()
+                ),
+                Err(e) => eprintln!("deadlight: migrated notices, but the old file remains: {e}"),
+            }
+        } else {
+            eprintln!("deadlight: could not write the new notice store; leaving the old file");
+        }
+    }
 }
 
 /// Lets the eviction test observe the map that is supposed to stay bounded.
@@ -506,6 +527,32 @@ mod tests {
         // And the id counter must still resume past it.
         let n = record("p", "s2", parsed("new")).unwrap();
         assert!(n.id > 7, "id counter must resume past the migrated max");
+        // The move must actually complete: while the old file remains, it keeps
+        // rendering as a phantom project (known_projects globs top-level
+        // *.json), which is the symptom that exposed the collision.
+        assert!(path().exists(), "the store must now exist at the new path");
+        assert!(
+            !legacy.exists(),
+            "the old file must be gone once the new one is confirmed written"
+        );
+    }
+
+    /// The migration deletes only on positive evidence. A file at the legacy
+    /// name that is *not* a notice list — a real project named `notifications`
+    /// having saved its layout there before the move — must be left completely
+    /// alone, not mistaken for an old store and removed.
+    #[test]
+    fn a_foreign_file_at_the_legacy_name_is_never_deleted() {
+        let (_g, d) = setup();
+        let legacy = d.path().join("notifications.json");
+        // A workspace, not a notice array.
+        std::fs::write(&legacy, br#"{"sizes":{"left_w":260},"panes":[]}"#).unwrap();
+        load();
+        assert!(
+            legacy.exists(),
+            "a file that did not parse as a notice list must never be deleted by the migration"
+        );
+        assert!(list().is_empty(), "and it must not be loaded as notices either");
     }
 
     #[test]
