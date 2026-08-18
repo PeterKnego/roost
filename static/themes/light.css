@@ -3,4 +3,5 @@
   --accent: #0969da; --border: #d0d7de; --sel-bg: #0969da22;
   --add-bg: #dafbe1; --add-fg: #116329; --del-bg: #ffebe9; --del-fg: #cf222e;
   --hunk: #8250df;
+  --bg3: #eaeef2; --hairline: #d0d7de; --guide: #d8dee4; --sel-fg: #0a3069;
 }
