@@ -23,7 +23,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            theme: "dark".into(),
+            theme: "darcula".into(),
             default_tab: "terminal".into(),
             hide: vec![],
             warning: None,
@@ -127,7 +127,7 @@ mod tests {
         let bad = d.path().join("bad.toml");
         fs::write(&bad, "theme = [unclosed").unwrap();
         let s = load(&[&bad]);
-        assert_eq!(s.theme, "dark");
+        assert_eq!(s.theme, "darcula");
         assert!(s.warning.is_some());
     }
 

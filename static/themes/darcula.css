@@ -1,0 +1,10 @@
+/* JetBrains IDEA "New UI" dark. The four vars at the end (--bg3, --hairline,
+   --guide, --sel-fg) are new with this theme; style.css reads them through
+   var(x, fallback) so the older themes keep working without carrying them. */
+:root {
+  --bg: #1e1f22; --bg2: #2b2d30; --fg: #dfe1e5; --muted: #8c8c8c;
+  --accent: #548af7; --border: #393b40; --sel-bg: #2e436e;
+  --add-bg: #253d2c; --add-fg: #6fbf73; --del-bg: #4a2b2b; --del-fg: #e06c6c;
+  --hunk: #9876aa;
+  --bg3: #35373b; --hairline: #1e1f22; --guide: #4a4d54; --sel-fg: #ffffff;
+}
