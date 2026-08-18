@@ -12,8 +12,8 @@ fn fixture() -> (tempfile::TempDir, u16) {
     let d = tempfile::tempdir().unwrap();
     std::fs::create_dir(d.path().join("proj")).unwrap();
     std::fs::write(d.path().join("proj/hello.md"), "# Hello\n").unwrap();
-    std::fs::create_dir(d.path().join("proj/.deadlight")).unwrap();
-    std::fs::write(d.path().join("proj/.deadlight/config.toml"), "theme = \"light\"\n").unwrap();
+    std::fs::create_dir(d.path().join("proj/.resh")).unwrap();
+    std::fs::write(d.path().join("proj/.resh/config.toml"), "theme = \"light\"\n").unwrap();
     let port = start(vec![d.path().to_path_buf()]);
     (d, port)
 }
@@ -89,7 +89,7 @@ fn workspace_page_applies_project_settings() {
     let (_d, port) = fixture();
     let body = ureq::get(&format!("http://127.0.0.1:{port}/proj"))
         .call().unwrap().into_string().unwrap();
-    assert!(body.contains("/static/themes/light.css")); // .deadlight config read per request
+    assert!(body.contains("/static/themes/light.css")); // .resh config read per request
     assert!(body.contains("data-project=\"proj\""));
 }
 
@@ -175,7 +175,7 @@ fn picker_at_outside_the_roots_falls_back_to_the_top_level_not_a_leak() {
         let body = ureq::get(&format!("http://127.0.0.1:{port}/?at={at}"))
             .call().unwrap().into_string().unwrap();
         assert!(!body.contains("passwd"), "leaked for at={at}: {body}");
-        assert!(body.contains("crumb-current\">deadlight"), "did not fall back for at={at}");
+        assert!(body.contains("crumb-current\">resh"), "did not fall back for at={at}");
         assert!(body.contains("data-rel=\"karpie\""), "top level missing for at={at}");
         // The fallback is silent to the URL (still `at=""`) but must not be
         // silent to the reader — a notice explains why they landed at the
@@ -239,7 +239,7 @@ fn static_assets_served_with_type() {
 #[cfg(unix)]
 #[test]
 fn theme_css_symlink_escaping_the_project_is_refused() {
-    // A cloned repo controls .deadlight/theme.css. If the fragment handler
+    // A cloned repo controls .resh/theme.css. If the fragment handler
     // did a bare fs::read of that path, a symlink planted there pointing at
     // e.g. ~/.ssh/id_rsa would be served straight to the browser as
     // text/css. serve_frag must resolve it through safe_resolve like every
@@ -247,10 +247,10 @@ fn theme_css_symlink_escaping_the_project_is_refused() {
     // traversal already is.
     let d = tempfile::tempdir().unwrap();
     std::fs::create_dir(d.path().join("themeleak")).unwrap();
-    std::fs::create_dir(d.path().join("themeleak/.deadlight")).unwrap();
+    std::fs::create_dir(d.path().join("themeleak/.resh")).unwrap();
     let secret = d.path().join("secret.txt");
     std::fs::write(&secret, "top secret\n").unwrap();
-    std::os::unix::fs::symlink(&secret, d.path().join("themeleak/.deadlight/theme.css")).unwrap();
+    std::os::unix::fs::symlink(&secret, d.path().join("themeleak/.resh/theme.css")).unwrap();
     let port = start(vec![d.path().to_path_buf()]);
 
     match ureq::get(&format!("http://127.0.0.1:{port}/frag/themeleak/theme.css")).call() {
@@ -1047,7 +1047,7 @@ fn close_project_ends_sessions_and_isolates_other_projects() {
 }
 
 /// Minimal, test-only "is anything holding this path" check via `ps`.
-/// Deliberately not deadlight's own internal machinery (private to its
+/// Deliberately not resh's own internal machinery (private to its
 /// `registry` module, and hardened for production against inputs this
 /// test's own known, plain tempdir paths don't need) — just enough to prove
 /// a real process is or isn't there.

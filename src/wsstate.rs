@@ -46,7 +46,7 @@ pub fn state_dir() -> PathBuf {
             return PathBuf::from(d);
         }
     }
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state/deadlight")
+    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state/resh")
 }
 
 pub(crate) fn path_for(project: &str) -> PathBuf {
@@ -165,6 +165,21 @@ mod tests {
         let out = f();
         std::env::remove_var("RESH_STATE_DIR");
         out
+    }
+
+    #[test]
+    fn the_default_state_dir_is_named_for_the_product() {
+        let _g = STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("RESH_STATE_DIR");
+        let d = state_dir();
+        assert!(
+            d.ends_with(".local/state/resh"),
+            "default state dir must follow the product name, got {d:?}"
+        );
+        assert!(
+            !d.to_string_lossy().contains("deadlight"),
+            "the old name must not survive in a path users will find on disk: {d:?}"
+        );
     }
 
     #[test]

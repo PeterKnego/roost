@@ -1,5 +1,5 @@
-//! Terminal session registry. deadlight owns the PTY; dtach owns survival
-//! across a deadlight restart. Multiple attachments to one session mirror.
+//! Terminal session registry. resh owns the PTY; dtach owns survival
+//! across a resh restart. Multiple attachments to one session mirror.
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -343,7 +343,7 @@ pub struct SessionInfo {
 }
 
 /// Elapsed seconds for a pid, via `ps -o etime=`. Age is read from the OS
-/// rather than recorded in memory because dtach sessions outlive deadlight —
+/// rather than recorded in memory because dtach sessions outlive resh —
 /// an in-process timestamp would reset on every restart and report a
 /// days-old shell as brand new.
 ///
@@ -435,7 +435,7 @@ pub fn live_names(project: &str) -> Vec<String> {
         map.keys().filter_map(|k| k.strip_prefix(&prefix)).map(str::to_string).collect()
     };
     // The in-memory map is only what THIS process attached. dtach sessions
-    // outlive deadlight, so after a restart every surviving session is absent
+    // outlive resh, so after a restart every surviving session is absent
     // from it while its socket is still on disk and its shell still running.
     // Reporting only the map made the workspace claim "No terminal sessions are
     // running" for a project holding two, and — because `kill_project` walked
@@ -474,11 +474,11 @@ pub fn has_session(project: &str, name: &str) -> bool {
 /// Prefix built from `storage_key` for the same reason as `list_sessions`.
 ///
 /// Killing `s.child` alone — the whole of what this function used to do —
-/// only ends dtach's *client*, the process deadlight itself spawned. In
+/// only ends dtach's *client*, the process resh itself spawned. In
 /// `-A` mode `dtach` forks a *master* that immediately detaches and
 /// reparents to init; killing the client is therefore just a *detach*, not
 /// an end. The master and the user's shell survive with a live socket,
-/// unreachable through deadlight and invisibly still running — exactly the
+/// unreachable through resh and invisibly still running — exactly the
 /// failure "Close Project" exists to prevent, silently doing what closing a
 /// tab already does while telling the user the session ended. So this now
 /// also kills whatever still holds each session's socket path (the master
@@ -536,7 +536,7 @@ pub fn kill_project(project: &str) -> usize {
             ended += 1;
         } else {
             eprintln!(
-                "deadlight: Close Project could not fully end session {project}/{name} — a process survived the kill attempt; its socket was left in place so it stays discoverable"
+                "resh: Close Project could not fully end session {project}/{name} — a process survived the kill attempt; its socket was left in place so it stays discoverable"
             );
         }
     }
@@ -863,7 +863,7 @@ mod tests {
         std::env::remove_var("RESH_STATE_DIR");
     }
 
-    /// A session that outlived a deadlight restart: its dtach master and shell
+    /// A session that outlived a resh restart: its dtach master and shell
     /// are running and its socket is on disk, but this process never attached
     /// to it, so the in-memory map knows nothing about it.
     ///
@@ -871,7 +871,7 @@ mod tests {
     /// dtach exists to preserve, the workspace reported "No terminal sessions
     /// are running" and Close Project ended nothing — observed in production as
     /// a Close button that appeared dead. Simulated here by starting a real
-    /// dtach the way deadlight does and then clearing the map, which is what a
+    /// dtach the way resh does and then clearing the map, which is what a
     /// restart leaves behind.
     ///
     /// `RESH_CMD=cat` cannot express this at all: a `cat` child leaves no

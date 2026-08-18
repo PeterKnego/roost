@@ -155,7 +155,7 @@ function onEvent(ev) {
       // no-buffer-for-X, save I/O errors, malformed intents...) — without a
       // visible banner, e.g. deleting a non-empty directory looks like a
       // silent no-op. console.warn stays too, for anyone actually watching devtools.
-      console.warn("deadlight:", ev.msg);
+      console.warn("resh:", ev.msg);
       showError(ev.msg);
       break;
   }
@@ -433,7 +433,7 @@ function reconcileList(ul, html) {
 }
 
 // TreeChanged fires on every filesystem write — including every file Claude
-// edits from a terminal pane, which is deadlight's core use case — so this
+// edits from a terminal pane, which is resh's core use case — so this
 // must NOT do what refreshKind("Tree") does: a full re-fetch replaces the
 // whole tree with a fresh one-level render that only pre-expands the
 // currently open file's path, collapsing everything else the user had
@@ -799,7 +799,7 @@ const canNotify = () => window.isSecureContext && "Notification" in window;
 if (canNotify() && "serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").then(
     (r) => { swReg = r; },
-    (e) => console.warn("deadlight: service worker registration failed", e)
+    (e) => console.warn("resh: service worker registration failed", e)
   );
   navigator.serviceWorker.addEventListener("message", (e) => {
     if (e.data && e.data.kind === "focus") focusSession(e.data.session);

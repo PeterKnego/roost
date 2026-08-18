@@ -15,7 +15,7 @@ pub struct Hub {
     pub ws: Workspace,
     pub subs: HashMap<ConnId, Sender<String>>,
     next_id: u64,
-    /// Paths deadlight itself just wrote, with the resulting hash. The watcher
+    /// Paths resh itself just wrote, with the resulting hash. The watcher
     /// (Task 8) drops matching events so a save does not echo back.
     pub self_writes: HashMap<String, u64>,
     /// Set once a filesystem watcher has been spawned for this hub, so
@@ -56,7 +56,7 @@ impl Hub {
     pub fn new(project: &str, dir: std::path::PathBuf) -> Hub {
         let (ws, warn) = crate::wsstate::load(project);
         if let Some(w) = warn {
-            eprintln!("deadlight: {w}");
+            eprintln!("resh: {w}");
         }
         let mut hub = Hub {
             project: project.to_string(),
@@ -232,7 +232,7 @@ impl Hub {
 
     fn persist(&mut self) {
         if let Err(e) = crate::wsstate::save(&self.project.clone(), &self.ws) {
-            eprintln!("deadlight: state save failed: {e}");
+            eprintln!("resh: state save failed: {e}");
         }
     }
 
@@ -738,7 +738,7 @@ impl Hub {
                         }))
                         .unwrap_or_else(|_| {
                             eprintln!(
-                                "deadlight: kill_project panicked while closing {thread_project}; reporting 0 ended"
+                                "resh: kill_project panicked while closing {thread_project}; reporting 0 ended"
                             );
                             0
                         });
@@ -753,7 +753,7 @@ impl Hub {
                 );
                 if let Err(e) = spawned {
                     self.closing = false;
-                    eprintln!("deadlight: could not spawn close-project thread for {project}: {e}");
+                    eprintln!("resh: could not spawn close-project thread for {project}: {e}");
                     let ev = Event::Error { msg: "could not close the project; try again".into() };
                     self.send_to(from, &ev);
                 }

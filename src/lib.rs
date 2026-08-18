@@ -28,12 +28,12 @@ pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
     // Notices raised while no browser was connected are the point of the
     // store; load them before anything can connect.
     crate::notify::load();
-    // Sessions outlive deadlight, so the registry must be rebuilt from disk
+    // Sessions outlive resh, so the registry must be rebuilt from disk
     // and live processes rather than assumed empty.
     let report = registry::reconcile(&roots);
     if report.dead_sockets > 0 || report.gone_projects > 0 {
         eprintln!(
-            "deadlight: startup reap — {} dead sockets, {} sessions for missing projects",
+            "resh: startup reap — {} dead sockets, {} sessions for missing projects",
             report.dead_sockets, report.gone_projects
         );
     }

@@ -38,7 +38,7 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
         // Logged, not silent: behind a proxy the effective host is not obvious,
         // and a misconfigured allowlist otherwise looks like an outage.
         eprintln!(
-            "deadlight: rejected host={:?} x-forwarded-host={:?} (set allowed_origins)",
+            "resh: rejected host={:?} x-forwarded-host={:?} (set allowed_origins)",
             req.headers.get("host"),
             req.headers.get("x-forwarded-host")
         );
@@ -124,7 +124,7 @@ fn serve_workspace(w: &mut impl Write, roots: &[PathBuf], project: &str) {
         return http::not_found(w, "no such project");
     };
     let settings = config::for_project(&dir);
-    let has_theme_css = dir.join(".deadlight/theme.css").is_file();
+    let has_theme_css = dir.join(".resh/theme.css").is_file();
     let key = projects::storage_key(project);
     http::html(w, &render::workspace_page(project, &key, &settings, has_theme_css));
 }
@@ -222,11 +222,11 @@ fn serve_frag(
             }
         }
         // Resolved through `safe_resolve`, not a bare `fs::read`, so a
-        // `.deadlight/theme.css` that is a symlink pointing outside the
+        // `.resh/theme.css` that is a symlink pointing outside the
         // project (planted by a cloned repo) is refused rather than served
         // to the browser as text/css. Every other file read in this module
         // already goes through this confinement; this one predates it.
-        ["theme.css"] => match projects::safe_resolve(&dir, ".deadlight/theme.css")
+        ["theme.css"] => match projects::safe_resolve(&dir, ".resh/theme.css")
             .and_then(|p| std::fs::read(&p).map_err(|e| e.to_string()))
         {
             Ok(css) => http::respond(w, 200, "OK", "text/css; charset=utf-8", &css),

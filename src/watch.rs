@@ -1,4 +1,4 @@
-//! Filesystem watching. deadlight is for AI engineering: Claude edits files
+//! Filesystem watching. resh is for AI engineering: Claude edits files
 //! in the background, so a viewer that does not reflect that is showing
 //! something false. Classification is pure so the routing table is testable
 //! without an OS event or a sleep.
@@ -33,7 +33,7 @@ pub fn classify(rel: &str, open_buffers: &[String], hide: &[String]) -> Class {
     Class::Tree
 }
 
-/// True when this event was caused by deadlight's own save. Consumes the
+/// True when this event was caused by resh's own save. Consumes the
 /// record, so a later external edit that happens to reproduce the same
 /// content is not swallowed too.
 pub fn is_self_write(
@@ -62,7 +62,7 @@ pub fn is_self_write(
 const MAX_BATCH_EVENTS: usize = 10_000;
 
 /// inotify's default `max_user_watches` is commonly 8192–65536 depending on
-/// the distro (tunable via `fs.inotify.max_user_watches`, but deadlight
+/// the distro (tunable via `fs.inotify.max_user_watches`, but resh
 /// can't assume it was tuned). Once this many directories are watched, stop
 /// registering more instead of either erroring the walk out or silently
 /// eating the whole machine's inotify budget. VS Code's watcher backend and
@@ -142,14 +142,14 @@ fn watch_tree(watcher: &mut notify::RecommendedWatcher, project: &str, root: Pat
         // Only log the transition into degraded, not once per subsequent
         // directory discovered afterward — those all hit the same cap.
         eprintln!(
-            "deadlight: {project}: hit the {MAX_WATCHED_DIRS}-directory watch cap; \
+            "resh: {project}: hit the {MAX_WATCHED_DIRS}-directory watch cap; \
              file-change tracking is now incomplete for this project"
         );
     }
     let mut ok = !hit_cap;
     for d in dirs {
         if let Err(e) = watcher.watch(&d, RecursiveMode::NonRecursive) {
-            eprintln!("deadlight: {project}: failed to watch {}: {e}", d.display());
+            eprintln!("resh: {project}: failed to watch {}: {e}", d.display());
             ok = false;
             continue;
         }
@@ -164,7 +164,7 @@ fn watch_tree(watcher: &mut notify::RecommendedWatcher, project: &str, root: Pat
     match watcher.watch(&root, RecursiveMode::Recursive) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("deadlight: {project}: failed to watch {}: {e}", root.display());
+            eprintln!("resh: {project}: failed to watch {}: {e}", root.display());
             false
         }
     }
@@ -215,7 +215,7 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
     }) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("deadlight: watcher unavailable for {project}: {e}");
+            eprintln!("resh: watcher unavailable for {project}: {e}");
             return false;
         }
     };
@@ -263,14 +263,14 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
             match first {
                 Ok(ev) => events.push(ev),
                 Err(e) => {
-                    eprintln!("deadlight: {project_name}: watch error: {e}");
+                    eprintln!("resh: {project_name}: watch error: {e}");
                     continue;
                 }
             }
             while events.len() < MAX_BATCH_EVENTS {
                 match rx.recv_timeout(debounce) {
                     Ok(Ok(ev)) => events.push(ev),
-                    Ok(Err(e)) => eprintln!("deadlight: {project_name}: watch error: {e}"),
+                    Ok(Err(e)) => eprintln!("resh: {project_name}: watch error: {e}"),
                     // Quiet period reached (or sender gone, which the next
                     // outer `recv()` will notice and exit on) — either way,
                     // the batch collected so far is ready to process.
@@ -370,7 +370,7 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
             }));
             if let Err(payload) = outcome {
                 eprintln!(
-                    "deadlight: {project_name}: watcher batch panicked, continuing: {}",
+                    "resh: {project_name}: watcher batch panicked, continuing: {}",
                     panic_message(payload.as_ref())
                 );
             }
@@ -416,7 +416,7 @@ mod tests {
     #[test]
     fn skip_dirs_and_hide_are_ignored_entirely() {
         // a cargo build must not generate a storm of tree refreshes
-        assert!(matches!(classify("target/debug/deadlight", &bufs(), &[]), Class::Ignore));
+        assert!(matches!(classify("target/debug/resh", &bufs(), &[]), Class::Ignore));
         assert!(matches!(classify("node_modules/x/y.js", &bufs(), &[]), Class::Ignore));
         assert!(matches!(classify(".venv/lib/p.py", &bufs(), &[]), Class::Ignore));
         let hide = vec!["dist".to_string()];
@@ -444,7 +444,7 @@ mod tests {
     fn self_writes_are_suppressed_once() {
         let mut seen = std::collections::HashMap::new();
         seen.insert("a.rs".to_string(), 42u64);
-        // deadlight just wrote this content; the resulting event is ours
+        // resh just wrote this content; the resulting event is ours
         assert!(is_self_write(&mut seen, "a.rs", 42));
         // and only once — a later external edit with other content is real
         assert!(!is_self_write(&mut seen, "a.rs", 43));
