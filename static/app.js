@@ -729,6 +729,33 @@ if (closeBtn) closeBtn.onclick = () => {
   if (confirm(msg + "\nEnd sessions?")) send({ t: "CloseProject" });
 };
 
+// The projects popup, mirroring the bell/noticepanel pair below. It used to be
+// an always-visible header strip, which cost width in every workspace for a
+// question ("what else is running?") that is asked occasionally and is already
+// answered by the front page. The bell covers the one thing you do want
+// mid-task — what needs attention — so this became on-demand.
+const projBtn = document.getElementById("projbtn");
+const projPanel = document.getElementById("projpanel");
+if (projBtn && projPanel) {
+  projBtn.onclick = () => {
+    projPanel.hidden = !projPanel.hidden;
+    if (!projPanel.hidden && window.htmx) htmx.trigger(document.body, "refresh");
+  };
+  // Clicking through to a project should not leave the panel hanging open
+  // behind the tab switch.
+  projPanel.onclick = (e) => { if (e.target.closest("a")) projPanel.hidden = true; };
+  // The badge is the count of RUNNING projects — the panel's whole subject —
+  // recomputed whenever htmx swaps a fresh fragment in, since the fragment is
+  // server-rendered and the client never builds these rows itself.
+  document.body.addEventListener("htmx:afterSwap", (e) => {
+    if (e.target && e.target.id === "projstrip") {
+      const n = projPanel.querySelectorAll(".proj.live").length;
+      const badge = document.getElementById("projcount");
+      if (badge) badge.textContent = n ? String(n) : "";
+    }
+  });
+}
+
 const bell = document.getElementById("bell");
 if (bell) {
   bell.onclick = () => {
