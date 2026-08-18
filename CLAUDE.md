@@ -1,4 +1,4 @@
-# Working in deadlight
+# Working in resh
 
 Single Rust binary, no async runtime, thread per connection, hand-rolled
 GET-only HTTP plus websockets, server-rendered HTML, plain JS with no
@@ -127,7 +127,7 @@ substitute something simpler for the real thing. Expect this class:
 
 | Substitution | What it hid |
 |---|---|
-| `DEADLIGHT_CMD=cat` instead of `dtach` | The dtach socket directory was never created — terminals would have died at spawn in production |
+| `RESH_CMD=cat` instead of `dtach` | The dtach socket directory was never created — terminals would have died at spawn in production |
 | macOS FSEvents instead of Linux inotify | Directories created after startup were never watched |
 | No browser | Saving was completely broken (`base_hash` never initialised, so every save conflicted) |
 | No systemd | `KillMode=control-group` killed every dtach session on restart, defeating the reason dtach is used |

@@ -1,7 +1,7 @@
 # Backlog
 
 A collection point for deferred, future-work, and nice-to-have items scattered
-across deadlight's specs and plans. This is not a commitment or a roadmap —
+across resh's specs and plans. This is not a commitment or a roadmap —
 just everywhere "later" was said, gathered so it's findable. Pull items out
 when they're actually picked up.
 
