@@ -65,13 +65,13 @@ pub fn load(paths: &[&Path]) -> Settings {
 }
 
 /// Origins allowed to open a websocket or issue requests, from
-/// `DEADLIGHT_ORIGINS` (comma-separated) or the global config's
+/// `RESH_ORIGINS` (comma-separated) or the global config's
 /// `allowed_origins`. Deliberately **not** part of [`Settings`]: a per-project
 /// `.deadlight/config.toml` must never be able to allowlist an origin, or a
 /// hostile repo could allowlist itself. Loopback is always allowed without
 /// configuration — see [`crate::origin`].
 pub fn allowed_origins() -> Vec<String> {
-    let from_env: Vec<String> = std::env::var("DEADLIGHT_ORIGINS")
+    let from_env: Vec<String> = std::env::var("RESH_ORIGINS")
         .unwrap_or_default()
         .split(',')
         .map(str::trim)

@@ -339,11 +339,11 @@ mod tests {
     }
 
     /// Every test here mutates process-global state (the store and
-    /// DEADLIGHT_STATE_DIR); cargo runs tests in parallel threads.
+    /// RESH_STATE_DIR); cargo runs tests in parallel threads.
     fn setup() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
         let g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path());
+        std::env::set_var("RESH_STATE_DIR", d.path());
         reset_for_test();
         (g, d)
     }

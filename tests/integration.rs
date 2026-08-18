@@ -188,8 +188,8 @@ fn picker_at_outside_the_roots_falls_back_to_the_top_level_not_a_leak() {
 fn nested_project_websockets_connect() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
-    std::env::set_var("DEADLIGHT_CMD", "cat");
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("RESH_CMD", "cat");
     let (_d, port) = nested_fixture();
 
     // routes::route's `[project, rest @ ..]` change is only half the fix —
@@ -217,8 +217,8 @@ fn nested_project_websockets_connect() {
     assert!(seen.contains("hi"), "nested project's terminal must echo through the PTY");
     let _ = term.close(None);
 
-    std::env::remove_var("DEADLIGHT_STATE_DIR");
-    std::env::remove_var("DEADLIGHT_CMD");
+    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("RESH_CMD");
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn tree_dir_with_empty_rel_returns_the_root_listing() {
     assert!(root_dir.contains("data-rel=\"sub\""));
 }
 
-// DEADLIGHT_CMD is process-global; both ws tests set it, and if they ran in
+// RESH_CMD is process-global; both ws tests set it, and if they ran in
 // parallel one could overwrite the other's value mid-connect. Serialize them.
 static WS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -348,7 +348,7 @@ fn ws_connect(
 #[test]
 fn ws_rejects_foreign_and_missing_origin() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("DEADLIGHT_CMD", "cat");
+    std::env::set_var("RESH_CMD", "cat");
     let (_d, port) = fixture();
     // The drive-by attack: a page the user visits opens this socket for a shell.
     assert!(
@@ -364,7 +364,7 @@ fn ws_rejects_foreign_and_missing_origin() {
 #[test]
 fn terminal_ws_echoes_through_pty() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("DEADLIGHT_CMD", "cat");
+    std::env::set_var("RESH_CMD", "cat");
     let (_d, port) = fixture();
     let mut ws = ws_connect(port, Some("http://127.0.0.1:8444")).unwrap();
     ws.send(tungstenite::Message::Text("resize:100x30".into())).unwrap();
@@ -418,11 +418,11 @@ fn assert_ws_closes(
 #[test]
 fn ws_closes_when_child_exits_first() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("DEADLIGHT_CMD", "true"); // exits immediately
+    std::env::set_var("RESH_CMD", "true"); // exits immediately
     let (_d, port) = fixture();
     // Own session name: the process-global registry may already hold a live
     // "proj/shell" session from another test in this binary (e.g.
-    // terminal_ws_echoes_through_pty's `cat`), in which case DEADLIGHT_CMD
+    // terminal_ws_echoes_through_pty's `cat`), in which case RESH_CMD
     // would never be consulted for a fresh spawn and this test would prove
     // nothing about a child exiting first.
     let mut ws = ws_connect_path(port, "/ws/proj/term/exiter").unwrap();
@@ -433,9 +433,9 @@ fn ws_closes_when_child_exits_first() {
 #[test]
 fn two_terminal_clients_mirror_one_session() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("DEADLIGHT_CMD", "cat");
+    std::env::set_var("RESH_CMD", "cat");
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    std::env::set_var("RESH_STATE_DIR", sd.path());
     let (_d, port) = fixture();
     let mut a = ws_connect_path(port, "/ws/proj/term/shell").unwrap();
     let mut b = ws_connect_path(port, "/ws/proj/term/shell").unwrap();
@@ -457,13 +457,13 @@ fn two_terminal_clients_mirror_one_session() {
     }
     let _ = a.close(None);
     let _ = b.close(None);
-    std::env::remove_var("DEADLIGHT_STATE_DIR");
+    std::env::remove_var("RESH_STATE_DIR");
 }
 
 #[test]
 fn invalid_session_name_is_refused() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("DEADLIGHT_CMD", "cat");
+    std::env::set_var("RESH_CMD", "cat");
     let (_d, port) = fixture();
     // "bad%20name" is rejected because '%' is itself outside valid_name's
     // charset — req.uri().path() is never percent-decoded, so the server
@@ -550,7 +550,7 @@ fn extract_origin(json: &str) -> String {
 fn workspace_state_mirrors_between_two_clients() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    std::env::set_var("RESH_STATE_DIR", sd.path());
     let (_d, port) = fixture();
     let mut a = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
     // a's own initial snapshot carries a's connection id in `origin`; capture
@@ -584,7 +584,7 @@ fn workspace_state_mirrors_between_two_clients() {
     );
     let _ = a.close(None);
     let _ = b.close(None);
-    std::env::remove_var("DEADLIGHT_STATE_DIR");
+    std::env::remove_var("RESH_STATE_DIR");
 }
 
 #[test]
@@ -613,7 +613,7 @@ fn workspace_socket_rejects_missing_origin() {
 fn workspace_socket_malformed_json_is_reported_not_fatal() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    std::env::set_var("RESH_STATE_DIR", sd.path());
     let (_d, port) = fixture();
     let mut ws = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
     let _ = read_until(&mut ws, r#""t":"State""#); // the initial snapshot
@@ -628,15 +628,15 @@ fn workspace_socket_malformed_json_is_reported_not_fatal() {
     assert!(state.contains(r#""t":"State""#));
 
     let _ = ws.close(None);
-    std::env::remove_var("DEADLIGHT_STATE_DIR");
+    std::env::remove_var("RESH_STATE_DIR");
 }
 
 #[test]
 fn external_edit_updates_a_clean_buffer_live() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
-    std::env::set_var("DEADLIGHT_DEBOUNCE_MS", "10");
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("RESH_DEBOUNCE_MS", "10");
     // Its OWN project name, not the shared "proj". `Hub` is a process-global
     // registry keyed by project name, so a "proj" hub created by any earlier
     // test outlives that test's TempDir — and this test would then bind to it,
@@ -691,8 +691,8 @@ fn external_edit_updates_a_clean_buffer_live() {
     let _ = read_until(&mut a, r#""t":"State""#);
 
     let _ = a.close(None);
-    std::env::remove_var("DEADLIGHT_STATE_DIR");
-    std::env::remove_var("DEADLIGHT_DEBOUNCE_MS");
+    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("RESH_DEBOUNCE_MS");
 }
 
 #[test]
@@ -703,7 +703,7 @@ fn set_mode_edit_then_save_writes_the_file() {
     // and the file on disk never changes.
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    std::env::set_var("RESH_STATE_DIR", sd.path());
     let (d, port) = fixture_named("editproj1");
     let mut a = ws_connect_path(port, "/ws/editproj1/_workspace").unwrap();
     let _ = read_until(&mut a, r#""t":"State""#); // a's own initial snapshot
@@ -744,7 +744,7 @@ fn set_mode_edit_then_save_writes_the_file() {
     );
 
     let _ = a.close(None);
-    std::env::remove_var("DEADLIGHT_STATE_DIR");
+    std::env::remove_var("RESH_STATE_DIR");
 }
 
 #[test]
@@ -755,7 +755,7 @@ fn reconnect_replays_buffer_text_for_open_edit_buffers() {
     // the same file again.
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    std::env::set_var("RESH_STATE_DIR", sd.path());
     let (_d, port) = fixture_named("editproj2");
     let mut a = ws_connect_path(port, "/ws/editproj2/_workspace").unwrap();
     let _ = read_until(&mut a, r#""t":"State""#);
@@ -778,7 +778,7 @@ fn reconnect_replays_buffer_text_for_open_edit_buffers() {
 
     let _ = a.close(None);
     let _ = b.close(None);
-    std::env::remove_var("DEADLIGHT_STATE_DIR");
+    std::env::remove_var("RESH_STATE_DIR");
 }
 
 /// Reads and discards every frame currently queued on `ws`, using a short
@@ -917,9 +917,9 @@ fn wait_for_live_session(
 #[test]
 fn opening_a_project_spawns_no_terminal_session() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("DEADLIGHT_CMD", "cat");
+    std::env::set_var("RESH_CMD", "cat");
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    std::env::set_var("RESH_STATE_DIR", sd.path());
     // A name unique to this test: the session registry (session.rs's
     // `SESSIONS`) is a process-global map keyed by project name that
     // outlives any one test's TempDir, and several other tests in this
@@ -966,8 +966,8 @@ fn opening_a_project_spawns_no_terminal_session() {
 
     let _ = term.close(None);
     let _ = ws.close(None);
-    std::env::remove_var("DEADLIGHT_STATE_DIR");
-    std::env::remove_var("DEADLIGHT_CMD");
+    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("RESH_CMD");
 }
 
 // CloseProject must end *every* session belonging to one project, report
@@ -986,9 +986,9 @@ fn opening_a_project_spawns_no_terminal_session() {
 #[test]
 fn close_project_ends_sessions_and_isolates_other_projects() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("DEADLIGHT_CMD", "cat");
+    std::env::set_var("RESH_CMD", "cat");
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    std::env::set_var("RESH_STATE_DIR", sd.path());
     let (_d, port) = two_project_fixture("closealpha", "closebeta");
 
     // Starting a terminal is what creates a session: connect its socket.
@@ -1042,8 +1042,8 @@ fn close_project_ends_sessions_and_isolates_other_projects() {
     let _ = term_b.close(None);
     let _ = ws_a.close(None);
     let _ = ws_b.close(None);
-    std::env::remove_var("DEADLIGHT_STATE_DIR");
-    std::env::remove_var("DEADLIGHT_CMD");
+    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("RESH_CMD");
 }
 
 /// Minimal, test-only "is anything holding this path" check via `ps`.
@@ -1071,7 +1071,7 @@ fn any_process_holds(path: &std::path::Path) -> bool {
 
 // The end-to-end reproduction of the bug this task exists to fix, over a
 // real WebSocket connection exactly like a browser's: closing a project
-// with `DEADLIGHT_CMD=cat` (every other close-project test, including the
+// with `RESH_CMD=cat` (every other close-project test, including the
 // one just above) cannot exercise this at all, because a `cat` child has no
 // detached dtach master to leave behind — that gap is exactly why the rest
 // of this suite never caught it. Real, unoverridden `dtach` forks a master
@@ -1083,9 +1083,9 @@ fn any_process_holds(path: &std::path::Path) -> bool {
 #[test]
 fn close_project_ends_the_real_dtach_master_not_just_the_client() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("DEADLIGHT_CMD");
+    std::env::remove_var("RESH_CMD");
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    std::env::set_var("RESH_STATE_DIR", sd.path());
     let (_d, port) = fixture_named("realclose");
 
     let mut term = ws_connect_path(port, "/ws/realclose/term/shell").unwrap();
@@ -1128,7 +1128,7 @@ fn close_project_ends_the_real_dtach_master_not_just_the_client() {
 
     let _ = term.close(None);
     let _ = ws.close(None);
-    std::env::remove_var("DEADLIGHT_STATE_DIR");
+    std::env::remove_var("RESH_STATE_DIR");
 }
 
 #[test]
@@ -1149,7 +1149,7 @@ fn http_rejects_rebinding_host() {
 fn a_notice_reaches_a_client_watching_a_different_project() {
     let _g = WS_TEST_LOCK.lock().unwrap();
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    std::env::set_var("RESH_STATE_DIR", sd.path());
     let d = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(d.path().join("alpha")).unwrap();
     std::fs::create_dir_all(d.path().join("beta")).unwrap();
@@ -1178,7 +1178,7 @@ fn a_notice_reaches_a_client_watching_a_different_project() {
 fn notices_are_replayed_on_connect_and_read_state_mirrors() {
     let _g = WS_TEST_LOCK.lock().unwrap();
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    std::env::set_var("RESH_STATE_DIR", sd.path());
     let (_d, port) = fixture();
 
     resh::hub::publish(
@@ -1219,9 +1219,9 @@ fn notices_are_replayed_on_connect_and_read_state_mirrors() {
 fn an_escape_sequence_from_a_terminal_becomes_a_notice() {
     let _g = WS_TEST_LOCK.lock().unwrap();
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+    std::env::set_var("RESH_STATE_DIR", sd.path());
 
-    // A single-token command: DEADLIGHT_CMD splits on whitespace.
+    // A single-token command: RESH_CMD splits on whitespace.
     let bin = tempfile::tempdir().unwrap();
     let script = bin.path().join("emit.sh");
     std::fs::write(
@@ -1234,7 +1234,7 @@ fn an_escape_sequence_from_a_terminal_becomes_a_notice() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    std::env::set_var("DEADLIGHT_CMD", script.to_str().unwrap());
+    std::env::set_var("RESH_CMD", script.to_str().unwrap());
 
     let (_d, port) = fixture_named("notifyproj");
     let mut ctrl = ws_connect_path(port, "/ws/notifyproj/_workspace").unwrap();
@@ -1250,7 +1250,7 @@ fn an_escape_sequence_from_a_terminal_becomes_a_notice() {
     assert!(seen.contains(r#""project":"notifyproj""#), "project missing: {seen}");
 
     let _ = term.close(None);
-    std::env::remove_var("DEADLIGHT_CMD");
+    std::env::remove_var("RESH_CMD");
 }
 
 #[test]
@@ -1260,7 +1260,7 @@ fn a_terminal_child_can_discover_that_notifications_exist() {
     let script = bin.path().join("env.sh");
     std::fs::write(
         &script,
-        "#!/bin/sh\necho \"NOTIFY=$DEADLIGHT_NOTIFY PROJ=$DEADLIGHT_PROJECT SESS=$DEADLIGHT_SESSION\"\nsleep 5\n",
+        "#!/bin/sh\necho \"NOTIFY=$RESH_NOTIFY PROJ=$RESH_PROJECT SESS=$RESH_SESSION\"\nsleep 5\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -1268,7 +1268,7 @@ fn a_terminal_child_can_discover_that_notifications_exist() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    std::env::set_var("DEADLIGHT_CMD", script.to_str().unwrap());
+    std::env::set_var("RESH_CMD", script.to_str().unwrap());
 
     let (_d, port) = fixture_named("envproj");
     let mut term = ws_connect_path(port, "/ws/envproj/term/envprobe").unwrap();
@@ -1287,5 +1287,5 @@ fn a_terminal_child_can_discover_that_notifications_exist() {
     assert!(seen.contains("PROJ=envproj"), "project missing: {seen:?}");
     assert!(seen.contains("SESS=envprobe"), "session missing: {seen:?}");
     let _ = term.close(None);
-    std::env::remove_var("DEADLIGHT_CMD");
+    std::env::remove_var("RESH_CMD");
 }

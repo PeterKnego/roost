@@ -54,7 +54,7 @@ fn sock_path(project: &str, name: &str) -> PathBuf {
 }
 
 pub fn default_command(project: &str, name: &str) -> Vec<String> {
-    if let Ok(c) = std::env::var("DEADLIGHT_CMD") {
+    if let Ok(c) = std::env::var("RESH_CMD") {
         if !c.trim().is_empty() {
             return c.split_whitespace().map(String::from).collect();
         }
@@ -157,7 +157,7 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         // dtach -A refuses to create a socket in a directory that doesn't
         // exist yet; nothing else creates it. 0o700: this directory grants
         // shell access to whoever can connect to a socket in it. Gated on
-        // the command actually being dtach so DEADLIGHT_CMD-overridden test
+        // the command actually being dtach so RESH_CMD-overridden test
         // runs (which never touch sock_path) don't create directories under
         // a real, unconfigured $HOME.
         if cmd[0] == "dtach" {
@@ -172,7 +172,7 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                 // Records the resolved absolute directory this session was
                 // created under, so a *later* reconcile pass — possibly run
                 // by a differently-configured process sharing this same
-                // DEADLIGHT_STATE_DIR — can confirm "genuinely gone" against
+                // RESH_STATE_DIR — can confirm "genuinely gone" against
                 // this exact path rather than guessing from whether it
                 // resolves under *its own* roots. `dir` is already the
                 // caller's resolved path (every caller resolves the project
@@ -195,9 +195,9 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         // can raise a notification at all, and what to attribute it to. A
         // model can answer "can I notify?" from its own environment rather
         // than having to be told in a prompt.
-        cb.env("DEADLIGHT_NOTIFY", "1");
-        cb.env("DEADLIGHT_PROJECT", project);
-        cb.env("DEADLIGHT_SESSION", name);
+        cb.env("RESH_NOTIFY", "1");
+        cb.env("RESH_PROJECT", project);
+        cb.env("RESH_SESSION", name);
         let child = pair.slave.spawn_command(cb).map_err(|e| e.to_string())?;
         // Best-effort: some platforms/backends can decline to report a pid.
         // 0 degrades list_sessions' age lookup to "unknown" rather than
@@ -550,15 +550,15 @@ pub fn kill_project(project: &str) -> usize {
     ended
 }
 
-// Serializes tests that mutate the process-global DEADLIGHT_CMD env var.
+// Serializes tests that mutate the process-global RESH_CMD env var.
 // cargo runs a binary's tests in parallel threads by default, and an env var
 // is process-wide state, so two such tests interleaving would have one see
 // the other's value mid-test (or after its cleanup already ran). This
 // project shipped exactly that flakiness once before; every test below that
-// touches DEADLIGHT_CMD takes this lock for its whole body.
+// touches RESH_CMD takes this lock for its whole body.
 //
 // Lock order, whenever a test needs both this and `wsstate::STATE_ENV_LOCK`
-// (DEADLIGHT_STATE_DIR): **STATE_ENV_LOCK first, SESSION_ENV_LOCK second**,
+// (RESH_STATE_DIR): **STATE_ENV_LOCK first, SESSION_ENV_LOCK second**,
 // everywhere, no exceptions. Two tests taking them in opposite orders can
 // deadlock under `cargo test`'s parallel threads, and a deadlock does not
 // fail — it *hangs*, so no number of green runs can rule it out. It would
@@ -623,9 +623,9 @@ mod tests {
     #[test]
     fn env_override_replaces_the_command() {
         let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("DEADLIGHT_CMD", "cat");
+        std::env::set_var("RESH_CMD", "cat");
         assert_eq!(default_command("proj", "shell"), vec!["cat".to_string()]);
-        std::env::remove_var("DEADLIGHT_CMD");
+        std::env::remove_var("RESH_CMD");
     }
 
     #[test]
@@ -668,9 +668,9 @@ mod tests {
 
     #[test]
     fn listing_and_killing_are_scoped_to_one_project() {
-        // DEADLIGHT_CMD is process-global; hold the lock for the whole body.
+        // RESH_CMD is process-global; hold the lock for the whole body.
         let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("DEADLIGHT_CMD", "cat");
+        std::env::set_var("RESH_CMD", "cat");
         let d = tempfile::tempdir().unwrap();
         // Two projects, so we can prove kill_project does not spill over.
         attach("listproj", "shell", d.path()).unwrap();
@@ -689,7 +689,7 @@ mod tests {
         assert_eq!(list_sessions("otherproj").len(), 1, "another project must be untouched");
 
         kill_project("otherproj");
-        std::env::remove_var("DEADLIGHT_CMD");
+        std::env::remove_var("RESH_CMD");
     }
 
     /// `list_sessions` forks `ps` once per session, and it runs on a request
@@ -712,7 +712,7 @@ mod tests {
     #[test]
     fn list_sessions_does_not_hold_the_registry_lock_across_its_ps_forks() {
         let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("DEADLIGHT_CMD", "cat");
+        std::env::set_var("RESH_CMD", "cat");
         let d = tempfile::tempdir().unwrap();
         // Enough sessions that the forks dominate the call and the ratio has
         // something to measure.
@@ -776,7 +776,7 @@ mod tests {
         );
 
         kill_project("lockproj");
-        std::env::remove_var("DEADLIGHT_CMD");
+        std::env::remove_var("RESH_CMD");
     }
 
     /// Minimal, test-only "is anything holding this path" check via `ps`.
@@ -803,7 +803,7 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).lines().any(|l| l.contains(target.as_ref()))
     }
 
-    // The regression this whole task exists to fix. DEADLIGHT_CMD=cat (used
+    // The regression this whole task exists to fix. RESH_CMD=cat (used
     // everywhere else in this file, including the test just above) cannot
     // reproduce it at all: a `cat` child has no detached master to leave
     // behind, so killing it really does end the "session" outright — that
@@ -819,15 +819,15 @@ mod tests {
         // which no amount of green runs could have revealed.
         let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g2 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("DEADLIGHT_CMD");
+        std::env::remove_var("RESH_CMD");
         let state = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", state.path());
+        std::env::set_var("RESH_STATE_DIR", state.path());
         let dir = tempfile::tempdir().unwrap();
 
         let attach_result = attach("realdtach", "shell", dir.path());
         let Ok(_att) = attach_result else {
             eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
-            std::env::remove_var("DEADLIGHT_STATE_DIR");
+            std::env::remove_var("RESH_STATE_DIR");
             return;
         };
 
@@ -860,7 +860,7 @@ mod tests {
         );
         assert!(!sock.exists(), "the socket must be removed only once the holding process is confirmed gone");
 
-        std::env::remove_var("DEADLIGHT_STATE_DIR");
+        std::env::remove_var("RESH_STATE_DIR");
     }
 
     /// A session that outlived a deadlight restart: its dtach master and shell
@@ -874,20 +874,20 @@ mod tests {
     /// dtach the way deadlight does and then clearing the map, which is what a
     /// restart leaves behind.
     ///
-    /// `DEADLIGHT_CMD=cat` cannot express this at all: a `cat` child leaves no
+    /// `RESH_CMD=cat` cannot express this at all: a `cat` child leaves no
     /// detached master, so there is nothing to survive.
     #[test]
     fn a_session_that_outlived_a_restart_is_listed_and_can_be_closed() {
         let _g1 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g2 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("DEADLIGHT_CMD");
+        std::env::remove_var("RESH_CMD");
         let state = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", state.path());
+        std::env::set_var("RESH_STATE_DIR", state.path());
         let dir = tempfile::tempdir().unwrap();
 
         let Ok(att) = attach("survivor", "shell", dir.path()) else {
             eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
-            std::env::remove_var("DEADLIGHT_STATE_DIR");
+            std::env::remove_var("RESH_STATE_DIR");
             return;
         };
         let sock = sock_path("survivor", "shell");
@@ -922,7 +922,7 @@ mod tests {
         );
         assert!(!sock.exists(), "and its socket removed once the holder is confirmed gone");
 
-        std::env::remove_var("DEADLIGHT_STATE_DIR");
+        std::env::remove_var("RESH_STATE_DIR");
     }
 
     #[test]
@@ -935,7 +935,7 @@ mod tests {
         // name, so storage_key is the identity function and this bug is
         // invisible to them — that's exactly why this dedicated case exists.
         let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("DEADLIGHT_CMD", "cat");
+        std::env::set_var("RESH_CMD", "cat");
         let d = tempfile::tempdir().unwrap();
 
         attach("nest/sub", "shell", d.path()).unwrap();
@@ -960,6 +960,40 @@ mod tests {
         );
 
         kill_project("nest/sub");
-        std::env::remove_var("DEADLIGHT_CMD");
+        std::env::remove_var("RESH_CMD");
+    }
+
+    #[test]
+    fn a_terminal_carries_the_resh_environment_contract() {
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // `env` prints the child's environment to its stdout, which is the PTY —
+        // so it arrives back through this attachment's own subscriber channel.
+        std::env::set_var("RESH_CMD", "env");
+        let d = tempfile::tempdir().unwrap();
+        let att = attach("envproj", "shell", d.path()).expect("attach");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = String::new();
+        while std::time::Instant::now() < deadline {
+            match att.rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                Ok(chunk) => {
+                    seen.push_str(&String::from_utf8_lossy(&chunk));
+                    if seen.contains("RESH_SESSION") {
+                        break;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        kill_project("envproj");
+        std::env::remove_var("RESH_CMD");
+
+        assert!(seen.contains("RESH_NOTIFY=1"), "child env lacked RESH_NOTIFY: {seen:?}");
+        assert!(seen.contains("RESH_PROJECT=envproj"), "child env lacked RESH_PROJECT: {seen:?}");
+        assert!(seen.contains("RESH_SESSION=shell"), "child env lacked RESH_SESSION: {seen:?}");
+        assert!(
+            !seen.contains(concat!("DEADLIGHT", "_")),
+            "a terminal still exports the old prefix, so hooks would see both: {seen:?}"
+        );
     }
 }
