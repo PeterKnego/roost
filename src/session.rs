@@ -430,11 +430,38 @@ pub fn list_sessions(project: &str) -> Vec<SessionInfo> {
 /// `MAX_SESSIONS_PER_PROJECT` subprocess spawns.
 pub fn live_names(project: &str) -> Vec<String> {
     let prefix = format!("{}/", crate::projects::storage_key(project));
-    let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
-    let mut out: Vec<String> =
-        map.keys().filter_map(|k| k.strip_prefix(&prefix)).map(str::to_string).collect();
+    let mut out: Vec<String> = {
+        let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        map.keys().filter_map(|k| k.strip_prefix(&prefix)).map(str::to_string).collect()
+    };
+    // The in-memory map is only what THIS process attached. dtach sessions
+    // outlive deadlight, so after a restart every surviving session is absent
+    // from it while its socket is still on disk and its shell still running.
+    // Reporting only the map made the workspace claim "No terminal sessions are
+    // running" for a project holding two, and — because `kill_project` walked
+    // the same map — made Close Project silently end nothing. Observed in
+    // production: the dialog said nothing was running, accepting it changed
+    // nothing, and the button looked dead.
+    //
+    // A directory listing, not a `ps`: this is still called from `Hub::new`
+    // under the process-global hub-registry lock, so it must stay fork-free
+    // (see the caller's comment). `reconcile` guarantees a socket still present
+    // is process-backed, within its own bounded staleness window.
+    out.extend(socket_names(project));
     out.sort();
+    out.dedup();
     out
+}
+
+/// Session names with a socket on disk for this project. Dotfiles are skipped:
+/// `.origin` is metadata about the project key, not a session.
+fn socket_names(project: &str) -> Vec<String> {
+    let dir = crate::wsstate::state_dir().join("sock").join(crate::projects::storage_key(project));
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    rd.flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.starts_with('.'))
+        .collect()
 }
 
 pub fn has_session(project: &str, name: &str) -> bool {
@@ -490,8 +517,21 @@ pub fn kill_project(project: &str) -> usize {
         names
     }; // registry lock released here, before any blocking socket work
 
+    // Sessions that outlived a restart are not in the map above, but their
+    // sockets are on disk — and they are exactly the long-running shells a user
+    // reaches for Close Project to end. Walking only the map made this a no-op
+    // for them: the confirmation reported nothing running and nothing was
+    // killed. `kill_and_unlink` ends whatever holds each socket, which is the
+    // dtach master, so it works whether or not this process ever attached.
+    let mut all_names = removed_names;
+    for name in socket_names(project) {
+        if !all_names.contains(&name) {
+            all_names.push(name);
+        }
+    }
+
     let mut ended = 0;
-    for name in &removed_names {
+    for name in &all_names {
         if crate::registry::kill_and_unlink(&sock_path(project, name)) {
             ended += 1;
         } else {
@@ -819,6 +859,68 @@ mod tests {
              not merely the in-process client this function used to kill alone"
         );
         assert!(!sock.exists(), "the socket must be removed only once the holding process is confirmed gone");
+
+        std::env::remove_var("DEADLIGHT_STATE_DIR");
+    }
+
+    /// A session that outlived a deadlight restart: its dtach master and shell
+    /// are running and its socket is on disk, but this process never attached
+    /// to it, so the in-memory map knows nothing about it.
+    ///
+    /// Both halves used to walk that map alone, so for exactly the sessions
+    /// dtach exists to preserve, the workspace reported "No terminal sessions
+    /// are running" and Close Project ended nothing — observed in production as
+    /// a Close button that appeared dead. Simulated here by starting a real
+    /// dtach the way deadlight does and then clearing the map, which is what a
+    /// restart leaves behind.
+    ///
+    /// `DEADLIGHT_CMD=cat` cannot express this at all: a `cat` child leaves no
+    /// detached master, so there is nothing to survive.
+    #[test]
+    fn a_session_that_outlived_a_restart_is_listed_and_can_be_closed() {
+        let _g1 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("DEADLIGHT_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("DEADLIGHT_STATE_DIR", state.path());
+        let dir = tempfile::tempdir().unwrap();
+
+        let Ok(att) = attach("survivor", "shell", dir.path()) else {
+            eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
+            std::env::remove_var("DEADLIGHT_STATE_DIR");
+            return;
+        };
+        let sock = sock_path("survivor", "shell");
+        let mut waited = 0;
+        while !(sock.exists() && any_process_holds(&sock)) && waited < 200 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            waited += 1;
+        }
+        assert!(any_process_holds(&sock), "test setup: a detached master must exist");
+
+        // Forget it, exactly as a restart would: the socket and its master
+        // survive, the map does not.
+        drop(att);
+        sessions().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        assert!(
+            !has_session("survivor", "shell"),
+            "test setup: the map must be empty, or this is not the restart case"
+        );
+
+        assert_eq!(
+            live_names("survivor"),
+            vec!["shell".to_string()],
+            "a surviving session must still be listed, or the UI claims nothing is running \
+             and offers no way to end it"
+        );
+
+        let ended = kill_project("survivor");
+        assert_eq!(ended, 1, "Close Project must end a session it never attached to");
+        assert!(
+            !any_process_holds(&sock),
+            "the surviving master and its shell must actually be dead"
+        );
+        assert!(!sock.exists(), "and its socket removed once the holder is confirmed gone");
 
         std::env::remove_var("DEADLIGHT_STATE_DIR");
     }
