@@ -8,7 +8,7 @@ header .proj { font-weight: 600; }
 #gitinfo { color: var(--muted); }
 #gitinfo #badge { color: var(--accent); margin-left: 4px; }
 .warn { color: #d29922; cursor: help; }
-#refresh { margin-left: auto; background: none; border: 1px solid transparent; border-radius: 6px; color: var(--muted); padding: 3px 10px; cursor: pointer; font: inherit; }
+#refresh { background: none; border: 1px solid transparent; border-radius: 6px; color: var(--muted); padding: 3px 10px; cursor: pointer; font: inherit; }
 #refresh:hover { color: var(--fg); }
 main { flex: 1; min-height: 0; }
 
@@ -107,6 +107,13 @@ main { flex: 1; min-height: 0; }
 .projstrip .proj { display:block; padding:4px 8px; border-radius:3px; }
 .projstrip .proj:hover { background: var(--bg); }
 .projstrip:empty::after { content:"no projects have sessions running"; color: var(--muted); display:block; padding:6px 8px; font-size:12px; }
+/* The control group sits right. `margin-left:auto` used to live on #refresh
+   alone, which was invisible while the projects strip filled the middle of the
+   header — with the strip gone it left ◆/Close/bell bunched on the left and the
+   refresh icon stranded on the right. Putting it on the first control pushes
+   the whole group over, which also parks #projpanel (right-aligned) directly
+   under the button that opens it instead of across the header from it. */
+#projbtn { margin-left: auto; }
 #projbtn, #bell { background:none; border:1px solid transparent; border-radius:6px; color:var(--muted); padding:3px 8px; cursor:pointer; font:inherit; }
 #projbtn:hover, #bell:hover { color: var(--fg); }
 #projcount { margin-left:4px; }
