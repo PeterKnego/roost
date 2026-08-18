@@ -637,8 +637,18 @@ fn external_edit_updates_a_clean_buffer_live() {
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
     std::env::set_var("DEADLIGHT_DEBOUNCE_MS", "10");
-    let (d, port) = fixture();
-    let mut a = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    // Its OWN project name, not the shared "proj". `Hub` is a process-global
+    // registry keyed by project name, so a "proj" hub created by any earlier
+    // test outlives that test's TempDir — and this test would then bind to it,
+    // leaving the watcher registered on a deleted directory while the writer
+    // thread below rewrites a file in *this* test's fresh one. No event ever
+    // arrives and the wait times out. That is exactly what `fixture_named`'s
+    // doc comment warns about for "any test whose server-side code touches the
+    // filesystem", and it made this the first casualty of a ~1-in-6 whole-suite
+    // flake on Linux while passing 20/20 in isolation, where no other test is
+    // there to create the shared hub first.
+    let (d, port) = fixture_named("extedit");
+    let mut a = ws_connect_path(port, "/ws/extedit/_workspace").unwrap();
     a.send(tungstenite::Message::Text(
         "{\"t\":\"EditBuffer\",\"rel\":\"hello.md\",\"text\":\"# Hello\\n\"}".into(),
     ))
@@ -657,7 +667,7 @@ fn external_edit_updates_a_clean_buffer_live() {
     // watcher isn't live yet. Keep rewriting the file in the background
     // instead of writing once, so the test doesn't depend on winning that
     // race on the first try.
-    let hello_path = d.path().join("proj/hello.md");
+    let hello_path = d.path().join("extedit/hello.md");
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop2 = stop.clone();
     let writer = std::thread::spawn(move || {
@@ -673,12 +683,10 @@ fn external_edit_updates_a_clean_buffer_live() {
     let _ = writer.join();
     assert!(seen.contains(r#""t":"BufferText""#), "a clean buffer must follow the file");
 
-    // Hub is a process-global registry keyed by project name (see hub.rs),
-    // so "proj" outlives this test for the rest of the binary's run. Close
-    // the buffer we opened, or its leftover entry pollutes every later
-    // test's State snapshot for "proj" (see the comment in
-    // workspace_state_mirrors_between_two_clients, which already guards
-    // against exactly this class of cross-test leakage).
+    // The hub for "extedit" still outlives this test (Hub is process-global),
+    // but the name is now unique to this test, so nothing else can inherit it.
+    // Closing the buffer anyway keeps the hub's state tidy for a rerun within
+    // the same binary.
     a.send(tungstenite::Message::Text(r#"{"t":"CloseBuffer","rel":"hello.md"}"#.into())).unwrap();
     let _ = read_until(&mut a, r#""t":"State""#);
 
