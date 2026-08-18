@@ -827,34 +827,37 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
             // and the project shows idle while shells are actually running.
             let key = e.file_name().to_string_lossy().into_owned();
             let sessions = crate::session::list_sessions(&decode_key(&key));
-            // `reconcile` (just run, above) guarantees every socket file
-            // still here is process-backed: a socket with no process is
-            // reaped outright, and a live one for a since-deleted project is
-            // killed before its socket is removed. So right after a
-            // restart — when this process's in-memory session map is empty
-            // and `list_sessions` can only ever report 0 — the number of
-            // socket files under this key is a truthful floor for "how many
-            // are live", even though it can't yet supply real ages or
-            // attachment counts. Once something in this process actually
-            // attaches, the in-memory list becomes authoritative again.
-            let (live, oldest) = if !sessions.is_empty() {
-                (sessions.len(), oldest_age(&sessions))
-            } else {
-                // Excludes `.origin` (see reconcile's identical skip): it's
-                // metadata about the project key, not a session socket, and
-                // would otherwise inflate this floor by one for every
-                // project reconcile has ever positively confirmed.
-                let floor = std::fs::read_dir(e.path())
-                    .map(|rd| {
-                        rd.flatten()
-                            .filter(|f| !f.file_name().to_string_lossy().starts_with('.'))
-                            .count()
-                    })
-                    .unwrap_or(0);
-                // No age is available from a socket-file count — say so rather
-                // than passing 0 off as an answer.
-                (floor, None)
-            };
+            // `reconcile` (just run, above) guarantees every socket file still
+            // here is process-backed: a socket with no process is reaped
+            // outright, and a live one for a since-deleted project is killed
+            // before its socket is removed. So the number of socket files under
+            // this key is a truthful *lower bound* on how many sessions are
+            // live — including ones this process knows nothing about, because
+            // dtach sessions outlive deadlight and a restart leaves the
+            // in-memory map empty while the shells keep running.
+            //
+            // Excludes `.origin` (see reconcile's identical skip): it is
+            // metadata about the project key, not a session socket, and would
+            // otherwise inflate the floor by one for every project reconcile
+            // has ever positively confirmed.
+            let floor = std::fs::read_dir(e.path())
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|f| !f.file_name().to_string_lossy().starts_with('.'))
+                        .count()
+                })
+                .unwrap_or(0);
+            // The MAXIMUM of the two, not whichever branch happens to apply.
+            // Preferring the in-memory list whenever it is non-empty made a
+            // project's count *drop* to just the sessions this process started:
+            // observed in production as "1 session" for a project holding two
+            // live shells, because one predated the last restart. Those
+            // survivors are precisely what the strip exists to surface, so the
+            // count must never be smaller than the sockets on disk.
+            let live = sessions.len().max(floor);
+            // Age still comes only from sessions this process can inspect; a
+            // socket file supplies a count, never an age.
+            let oldest = oldest_age(&sessions);
             // Only ever *create* a listing here when there's an actual live
             // session. Since C2, `sock/<key>/` can contain nothing but a
             // `.origin` marker — deliberately persisted indefinitely (see
@@ -1278,6 +1281,77 @@ mod tests {
         let roots = vec![PathBuf::from("/definitely-not-a-real-root-xyz"), good.path().to_path_buf()];
         let rel = rel_under_roots(&roots, &nested).expect("must still resolve via the second, good root");
         assert_eq!(rel, "repo/.claude/worktrees/feat");
+    }
+
+    /// A session that survived a restart is not in this process's memory, but
+    /// its socket is on disk. Reported live count must therefore never be
+    /// *smaller* than the socket count.
+    ///
+    /// This regressed in production: preferring the in-memory list whenever it
+    /// was non-empty meant that starting one new session in a project made the
+    /// count drop to 1 even though two shells were running, hiding the older
+    /// survivor — exactly the long-running session the strip exists to surface.
+    #[test]
+    fn a_restart_survivor_still_counts_even_once_a_new_session_exists() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join("proj")).unwrap();
+            let sock = state.join("sock/proj");
+            fs::create_dir_all(&sock).unwrap();
+            // The sockets must be genuinely process-backed. `known_projects`
+            // runs `reconcile` first, whose job is to delete a socket no
+            // process holds — so empty files would be reaped before the count
+            // ever happened, and the fixture would prove nothing. Each holder
+            // just carries the socket path in its argv, which is precisely what
+            // `pids_holding` matches on.
+            let mut holders = Vec::new();
+            for name in ["shell", "claude"] {
+                let sp = sock.join(name);
+                fs::write(&sp, "").unwrap();
+                holders.push(
+                    std::process::Command::new("python3")
+                        .args(["-c", "import time; time.sleep(30)"])
+                        .arg(&sp)
+                        .spawn()
+                        .expect("spawn a socket holder"),
+                );
+            }
+            // The marker must not be counted as a session.
+            fs::write(sock.join(".origin"), root.path().join("proj").to_string_lossy().as_bytes())
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500)); // appear in `ps`
+
+            // The bug needs BOTH: something in this process's memory *and* more
+            // sockets than that on disk. With an empty map both the old and new
+            // logic fall through to the socket floor and agree — a fixture
+            // without this attach passes either way and proves nothing.
+            // `DEADLIGHT_CMD=cat` means this creates no socket of its own (that
+            // is gated on the command being dtach), which is exactly the shape
+            // wanted: one in memory, two on disk.
+            let _sg = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("DEADLIGHT_CMD", "cat");
+            let _att = crate::session::attach("proj", "shell", &root.path().join("proj")).unwrap();
+            assert_eq!(
+                crate::session::list_sessions("proj").len(),
+                1,
+                "fixture must have exactly one session in memory, or it tests nothing"
+            );
+
+            let ps = known_projects(&[root.path().to_path_buf()]);
+            let found = ps.iter().find(|p| p.key == "proj").map(|p| p.live);
+            for mut h in holders {
+                let _ = h.kill();
+                let _ = h.wait();
+            }
+            crate::session::kill_project("proj");
+            std::env::remove_var("DEADLIGHT_CMD");
+            assert_eq!(
+                found,
+                Some(2),
+                "both sockets must count: after a restart the in-memory map is a partial view, \
+                 not an authoritative one (and `.origin` must not inflate it)"
+            );
+        });
     }
 
     #[test]
