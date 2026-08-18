@@ -357,9 +357,13 @@ pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectSta
             // supplies a count but no ages), and "oldest 0s" there reads as
             // "everything just started" — the opposite of the truth, on the one
             // question this tooltip exists to answer.
+            // "1 sessions" is the common case, not an edge one: a project
+            // usually has exactly one shell, so the ungrammatical form was what
+            // most rows actually showed.
+            let n = plural(p.live, "session");
             match p.oldest_age_secs {
-                Some(age) => format!("{} sessions · oldest {}", p.live, human_age(age)),
-                None => format!("{} sessions · age unknown until reattached", p.live),
+                Some(age) => format!("{n} · oldest {}", human_age(age)),
+                None => format!("{n} · age unknown until reattached"),
             }
         } else {
             "saved layout, nothing running".to_string()
@@ -382,6 +386,15 @@ pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectSta
 
 /// Coarse, human-readable age. Precision beyond this is noise when the
 /// question is only "is this old enough that I have forgotten it?".
+/// `1 session` / `2 sessions`. English only, matching the rest of this file.
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("{n} {word}")
+    } else {
+        format!("{n} {word}s")
+    }
+}
+
 pub fn human_age(secs: u64) -> String {
     if secs >= 86_400 {
         format!("{}d", secs / 86_400)
@@ -852,6 +865,31 @@ mod tests {
     /// at precisely the moment "what did I leave running for days?" is the
     /// question being asked. Asserting the *absence* of "0s" as well, so
     /// reverting to the old formatting fails here rather than passing quietly.
+    /// "1 sessions" was what most rows actually showed, since a project usually
+    /// has exactly one shell — so the singular is the common case here, not an
+    /// edge one. Asserts the absence of the plural form too, or reverting the
+    /// fix would leave this green.
+    #[test]
+    fn a_single_session_is_not_described_in_the_plural() {
+        let one = vec![crate::registry::ProjectStatus {
+            key: "solo".into(), url: "solo".into(),
+            live: 1, oldest_age_secs: Some(3600), has_layout: true,
+            branch: String::new(), parent: None, reachable: true,
+        }];
+        let h = projects_strip("other", &one);
+        assert!(h.contains("1 session ·"), "expected the singular: {h}");
+        assert!(!h.contains("1 sessions"), "the plural must not survive: {h}");
+
+        // …and two must still be plural, so this cannot be "fixed" by dropping
+        // the s everywhere.
+        let two = vec![crate::registry::ProjectStatus {
+            key: "duo".into(), url: "duo".into(),
+            live: 2, oldest_age_secs: None, has_layout: true,
+            branch: String::new(), parent: None, reachable: true,
+        }];
+        assert!(projects_strip("other", &two).contains("2 sessions"), "two must stay plural");
+    }
+
     #[test]
     fn strip_says_unknown_rather_than_zero_when_no_age_is_available() {
         let ps = vec![crate::registry::ProjectStatus {
