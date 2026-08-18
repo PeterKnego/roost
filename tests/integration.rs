@@ -491,11 +491,28 @@ fn ws_connect_path(
     Ok(ws)
 }
 
+/// Waits for a frame containing `needle`, bounded by wall time rather than by a
+/// message count.
+///
+/// The read timeout set above is a *poll interval*, not a failure: `ws.read()`
+/// returning `TimedOut`/`WouldBlock` only means nothing has arrived yet. The
+/// previous version treated any `Err` as fatal (`Err(_) => break`) and panicked
+/// immediately, so a single transient timeout ended the wait even when the event
+/// was about to arrive. That made the filesystem-watch tests flaky on Linux
+/// specifically — inotify plus the watcher's own debounce can put the broadcast
+/// past the first poll, where macOS's FSEvents timing happened to land inside it
+/// (observed at ~1 run in 6 on the deploy host, always starting with
+/// `external_edit_updates_a_clean_buffer_live`).
+///
+/// A real socket error still fails, and now says so instead of being reported as
+/// "never saw ..." — the two are different diagnoses and were indistinguishable
+/// before. The bound still fails a genuinely absent event, just on a deadline.
 fn read_until(
     ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
     needle: &str,
 ) -> String {
-    for _ in 0..40 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
         match ws.read() {
             Ok(tungstenite::Message::Text(t)) => {
                 if t.contains(needle) {
@@ -503,10 +520,18 @@ fn read_until(
                 }
             }
             Ok(_) => {}
-            Err(_) => break,
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(e) => panic!("read_until({needle:?}): socket error rather than a timeout: {e:?}"),
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never saw {needle:?} within the deadline"
+        );
     }
-    panic!("never saw {needle:?}");
 }
 
 /// Pulls the `origin` field out of an `Event::State` frame's JSON: the
