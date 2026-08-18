@@ -183,12 +183,21 @@ function tabKey(t) {
   }
 }
 
+// Mirrors render::icon_ext — the stylesheet keys every file icon on data-ext,
+// and a tab must land on the same glyph as the tree row that opened it.
+function iconExt(rel) {
+  const name = rel.split("/").pop();
+  const ext = name.split(".").pop();
+  if (ext === name || !ext || ext.length > 10 || !/^[a-z0-9]+$/i.test(ext)) return "";
+  return ext.toLowerCase();
+}
+
 function tabLabel(t) {
   switch (t.k) {
     case "Tree": return "Files";
     case "Changes": return "Changes";
     case "File": return t.rel.split("/").pop();
-    case "Diff": return t.rel ? `± ${t.rel.split("/").pop()}` : "± full diff";
+    case "Diff": return t.rel ? t.rel.split("/").pop() : "full diff";
     case "Terminal": return t.session;
   }
 }
@@ -214,6 +223,10 @@ function render() {
         "tab" +
         (ti === pane.active ? " active" : "") +
         (t.k === "Terminal" && hasAttention(t.session) ? " attn" : "");
+      // data-kind/data-ext drive the tab's icon; see the [data-kind]/[data-ext]
+      // rules in style.css, which paint tree rows from the same attributes.
+      b.dataset.kind = t.k.toLowerCase();
+      if ((t.k === "File" || t.k === "Diff") && t.rel) b.dataset.ext = iconExt(t.rel);
       const meta = t.k === "File" ? state.buffers.find((x) => x.rel === t.rel) : null;
       b.innerHTML =
         (meta && meta.dirty ? '<span class="dirty">●</span> ' : "") +
@@ -555,7 +568,23 @@ function ensureTerm(session) {
   node.className = "termhost";
   node.dataset.session = session;
   pool().appendChild(node);
-  const term = new Terminal({ convertEol: false, fontSize: 13 });
+  // xterm's own defaults are black-on-white-ish and take no part in the theme
+  // cascade, so the active theme's variables are read off :root and handed to
+  // it — otherwise the terminal is a black rectangle inside a #1e1f22 pane.
+  const css = getComputedStyle(document.documentElement);
+  const v = (name, fallback) => css.getPropertyValue(name).trim() || fallback;
+  const term = new Terminal({
+    convertEol: false,
+    fontSize: 13,
+    fontFamily: v("--mono", "ui-monospace, Menlo, monospace"),
+    theme: {
+      background: v("--bg", "#1e1f22"),
+      foreground: v("--fg", "#dfe1e5"),
+      cursor: v("--accent", "#548af7"),
+      cursorAccent: v("--bg", "#1e1f22"),
+      selectionBackground: v("--sel-bg", "#2e436e"),
+    },
+  });
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(node);

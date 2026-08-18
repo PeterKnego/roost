@@ -1,10 +1,11 @@
 * { box-sizing: border-box; margin: 0; }
 html, body { height: 100%; }
-body { background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, sans-serif; display: flex; flex-direction: column; }
+body { background: var(--bg); color: var(--fg); font: 13px/1.5 system-ui, -apple-system, sans-serif;
+       -webkit-font-smoothing: antialiased; display: flex; flex-direction: column; }
 .hidden { display: none !important; }
-header { display: flex; align-items: center; gap: 12px; padding: 6px 12px; background: var(--bg2); border-bottom: 1px solid var(--border); flex: none; }
+header { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; background: var(--bg2); border-bottom: 1px solid var(--border); flex: none; }
 header .home { color: var(--accent); text-decoration: none; font-size: 16px; }
-header .proj { font-weight: 600; }
+header .proj { font-weight: 500; }
 #gitinfo { color: var(--muted); }
 #gitinfo #badge { color: var(--accent); margin-left: 4px; }
 .warn { color: #d29922; cursor: help; }
@@ -28,21 +29,49 @@ main { flex: 1; min-height: 0; }
 .divider[data-div="right-w"] { grid-column: 4; grid-row: 1 / -1; cursor: col-resize; }
 .pane[data-pane="3"] { grid-column: 5; grid-row: 1 / -1; }
 
-.pane { display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border); background: var(--bg); }
-.tabstrip { display: flex; overflow-x: auto; background: var(--bg2); flex: 0 0 auto; }
-.tabstrip .tab { padding: 4px 10px; cursor: pointer; white-space: nowrap; border-right: 1px solid var(--border); color: var(--fg); }
-.tabstrip .tab.active { background: var(--bg); font-weight: 600; }
+/* Borderless: an IDE separates tool windows with a single hairline, drawn by
+   .divider::after below, never with a box around each pane. */
+.pane { display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
+.pane[data-pane="0"], .pane[data-pane="1"] { background: var(--bg2); }
+/* Editor-style tabs: no separators between them, the active one carries the
+   pane background plus a 2px accent underline (the IDE's indicator) rather
+   than bold text, and inactive labels sit back at --muted. */
+.tabstrip { display: flex; align-items: stretch; height: 30px; overflow-x: auto; overflow-y: hidden;
+            background: var(--bg2); border-bottom: 1px solid var(--hairline, var(--border)); flex: 0 0 auto;
+            scrollbar-width: none; }
+.tabstrip::-webkit-scrollbar { display: none; }
+.tabstrip .tab { display: flex; align-items: center; gap: 4px; padding: 0 6px 0 9px;
+                 cursor: pointer; white-space: nowrap; color: var(--muted); position: relative; }
+.tabstrip .tab:hover { color: var(--fg); background: var(--bg3, var(--bg)); }
+/* inset shadow, not ::after: .tab.attn::after already claims this element's
+   one ::after for its attention dot. */
+.tabstrip .tab.active { background: var(--bg); color: var(--fg);
+                        box-shadow: inset 0 -2px 0 var(--accent); }
 .tabstrip .tab .dirty { color: var(--accent); }
 .tabstrip .tab .stale { color: var(--warn, #d79921); }
-.tabstrip .tab .x { opacity: .5; margin-left: 6px; }
-.tabstrip .tab .x:hover { opacity: 1; }
-.tabstrip .newterm { padding: 4px 10px; cursor: pointer; color: var(--muted); }
-.tabstrip .newterm:hover { color: var(--fg); }
+/* opacity, not display: the control keeps its box at all times, so revealing
+   it on hover never reflows the strip under the pointer. */
+.tabstrip .tab .x { opacity: 0; margin-left: 2px; padding: 0 2px; border-radius: 3px; transition: opacity .1s; }
+.tabstrip .tab:hover .x, .tabstrip .tab.active .x { opacity: .55; }
+.tabstrip .tab .x:hover { opacity: 1; background: var(--bg3, var(--bg2)); }
+.tabstrip .newterm { display: flex; align-items: center; padding: 0 9px; cursor: pointer; color: var(--muted); }
+.tabstrip .newterm:hover { color: var(--fg); background: var(--bg3, var(--bg)); }
 .content { flex: 1 1 auto; overflow: auto; position: relative; }
 .content .termhost { position: absolute; inset: 0; }
-.divider { background: var(--border); }
+/* The grid track stays 4px so dragging still has a forgiving target, but only
+   a centred hairline is painted — a fully-painted 4px bar reads as a gutter. */
+.divider { background: transparent; position: relative; }
+.divider::after { content: ""; position: absolute; background: var(--border); }
+.divider[data-div="left-w"]::after, .divider[data-div="right-w"]::after {
+  top: 0; bottom: 0; left: 50%; width: 1px; transform: translateX(-.5px);
+}
+.divider[data-div="left-split"]::after {
+  left: 0; right: 0; top: 50%; height: 1px; transform: translateY(-.5px);
+}
+.divider:hover::after { background: var(--accent); }
 #termpool { display: none; }
-.editor { width: 100%; height: 100%; border: 0; font: 13px/1.5 ui-monospace, monospace; resize: none; padding: 8px; background: var(--bg); color: var(--fg); }
+:root { --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+.editor { width: 100%; height: 100%; border: 0; font: 13px/1.55 var(--mono); resize: none; padding: 8px 10px; background: var(--bg); color: var(--fg); outline: none; }
 .conflict { border: 1px solid var(--warn, #d79921); padding: 8px; margin: 8px; background: var(--bg2); }
 .conflict button { margin: 8px 8px 0 0; font: inherit; cursor: pointer; }
 /* Error events aren't tied to any one pane (a delete or rename failure has
@@ -51,26 +80,111 @@ main { flex: 1; min-height: 0; }
 .conflict.error-banner { position: fixed; top: 12px; right: 12px; z-index: 1000; max-width: 420px; }
 
 /* ---- fragment content shared by tree/changes/file/diff (rendered server-side) ---- */
-.content ul.tree, .content ul.changes { padding: 8px; }
-.tree, .changes { list-style: none; padding-left: 14px; }
-.tree > ul, .changes { padding-left: 0; }
-.content a.file { color: var(--fg); text-decoration: none; display: block; padding: 1px 4px; border-radius: 4px; white-space: nowrap; cursor: pointer; }
-.content a.file:hover { background: var(--sel-bg); }
-.content a.file.sel { background: var(--sel-bg); color: var(--accent); }
-.content summary { cursor: pointer; color: var(--muted); padding: 1px 4px; white-space: nowrap; }
-.content summary:hover { color: var(--fg); }
-.xy { display: inline-block; min-width: 2.2em; color: var(--hunk); font-family: ui-monospace, monospace; font-size: 12px; }
+/* Indentation is a row property (--d, the depth render::tree_level stamps on
+   each row), not nested <ul> padding: the row can then start at the pane edge,
+   so its hover/selection bar spans the full width the way an IDE's does, and
+   the indent guides can be drawn as a background band sized to --d. */
+.content ul.tree, .content ul.changes { padding: 4px 0; }
+.tree, .changes { list-style: none; padding-left: 0; }
+.tree ul { padding-left: 0; }
+.content a.file, .content summary {
+  display: block; width: max-content; min-width: 100%;
+  line-height: 22px; white-space: nowrap; cursor: pointer; text-decoration: none;
+  padding-left: calc(6px + var(--d, 0) * 14px + 14px); padding-right: 8px;
+  /* The row background carries only the twisty; the indent guides are their
+     own pseudo-element. Both could ride as two layers of one background, but
+     then every guide tweak means editing three parallel comma-lists (image,
+     position, size) that must stay index-aligned with the twisty's. */
+  position: relative;
+  background-repeat: no-repeat;
+  background-position: calc(6px + var(--d, 0) * 14px) center;
+  background-size: 12px 12px;
+}
+.content a.file { color: var(--fg); }
+.content summary { color: var(--fg); background-image: var(--twisty-closed); }
+details[open] > summary { background-image: var(--twisty-open); }
+/* One 1px rule per level of --d, in the strip of padding left of the icon. */
+.content a.file::after, .content summary::after {
+  content: ""; position: absolute; left: 13px; top: 0; bottom: 0; pointer-events: none;
+  width: calc(var(--d, 0) * 14px);
+  background: repeating-linear-gradient(to right, var(--guide, transparent) 0 1px, transparent 1px 14px);
+}
+.content a.file:hover, .content summary:hover { background-color: var(--bg3, var(--sel-bg)); }
+/* Guides are dropped on the selected row: a 1px --guide rule crossing the
+   selection fill reads as an artefact rather than structure. */
+.content a.file.sel { background-color: var(--sel-bg); color: var(--sel-fg, var(--accent)); }
+.content a.file.sel::after { background: none; }
+.xy { display: inline-block; min-width: 2.2em; color: var(--muted); font-family: var(--mono); font-size: 11px; }
 .hint { color: var(--muted); padding: 16px; }
-.path { position: sticky; top: 0; background: var(--bg2); border-bottom: 1px solid var(--border); padding: 6px 12px; font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); }
-.codeview { padding: 12px; font: 13px/1.5 ui-monospace, monospace; overflow-x: auto; }
+.path { position: sticky; top: 0; background: var(--bg2); border-bottom: 1px solid var(--hairline, var(--border)); padding: 4px 10px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.codeview { padding: 10px; font: 13px/1.55 var(--mono); overflow-x: auto; background: var(--bg); }
 .codeview code { background: none; }
-.diffview { font: 12.5px/1.45 ui-monospace, monospace; padding: 8px 0; }
+.diffview { font: 12.5px/1.5 var(--mono); padding: 6px 0; }
 .dl { padding: 0 12px; white-space: pre-wrap; }
 .dl.add { background: var(--add-bg); color: var(--add-fg); }
 .dl.del { background: var(--del-bg); color: var(--del-fg); }
 .dl.hunk { color: var(--hunk); padding-top: 6px; }
 .dl.meta { color: var(--muted); }
-.markdown-body { max-width: 900px; margin: 0 auto; padding: 24px; }
+/* github-markdown.min.css hardcodes its own #0d1117 canvas, which shows up as
+   a differently-dark rectangle inside a pane painted by the active theme. */
+.markdown-body { max-width: 900px; margin: 0 auto; padding: 24px; background: transparent; color: var(--fg); }
+.markdown-body pre, .markdown-body code { background: var(--bg2) !important; }
+.markdown-body h1, .markdown-body h2 { border-bottom-color: var(--border) !important; }
+
+
+/* ---- IDE iconography -------------------------------------------------------
+   Every icon is an inline data: URI, so the whole set costs no extra requests
+   and no binary assets in the repo. Colour is baked into each URI (a
+   background-image cannot inherit currentColor), which is fine here: file-type
+   colour is the point of the icon, not a theme decision.
+
+   Rows carry data-ext / data-kind from render::tree_level and
+   render::changes_fragment; tab strips get the same attributes from app.js, so
+   one set of rules paints both.
+   -------------------------------------------------------------------------- */
+:root {
+  --twisty-closed: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%237a7d82' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6.2 4l4 4-4 4'/%3E%3C/svg%3E");
+  --twisty-open: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%237a7d82' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6.2l4 4 4-4'/%3E%3C/svg%3E");
+
+  --ic-folder: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%239aa0a6' stroke-width='1.15' stroke-linejoin='round'%3E%3Cpath d='M1.9 13.4V3.9h3.7l1.4 1.8h7.1v7.7z'/%3E%3C/svg%3E");
+  --ic-file: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%238c8c8c' stroke-width='1.15' stroke-linejoin='round'%3E%3Cpath d='M4.4 1.9h4.1l3.1 3.1v9.1H4.4z'/%3E%3Cpath d='M8.5 1.9v3.1h3.1'/%3E%3C/svg%3E");
+  --ic-rs: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23dea584' stroke-width='1.15' stroke-linejoin='round'%3E%3Cpath d='M4.4 1.9h4.1l3.1 3.1v9.1H4.4z'/%3E%3Cpath d='M8.5 1.9v3.1h3.1'/%3E%3C/svg%3E");
+  --ic-md: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23519aba' stroke-width='1.15' stroke-linejoin='round'%3E%3Cpath d='M4.4 1.9h4.1l3.1 3.1v9.1H4.4z'/%3E%3Cpath d='M8.5 1.9v3.1h3.1'/%3E%3C/svg%3E");
+  --ic-cfg: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%238f9aa6' stroke-width='1.15' stroke-linejoin='round'%3E%3Cpath d='M4.4 1.9h4.1l3.1 3.1v9.1H4.4z'/%3E%3Cpath d='M8.5 1.9v3.1h3.1'/%3E%3C/svg%3E");
+  --ic-data: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23cbcb41' stroke-width='1.15' stroke-linejoin='round'%3E%3Cpath d='M4.4 1.9h4.1l3.1 3.1v9.1H4.4z'/%3E%3Cpath d='M8.5 1.9v3.1h3.1'/%3E%3C/svg%3E");
+  --ic-web: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23e37933' stroke-width='1.15' stroke-linejoin='round'%3E%3Cpath d='M4.4 1.9h4.1l3.1 3.1v9.1H4.4z'/%3E%3Cpath d='M8.5 1.9v3.1h3.1'/%3E%3C/svg%3E");
+  --ic-sh: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%2389e051' stroke-width='1.15' stroke-linejoin='round'%3E%3Cpath d='M4.4 1.9h4.1l3.1 3.1v9.1H4.4z'/%3E%3Cpath d='M8.5 1.9v3.1h3.1'/%3E%3C/svg%3E");
+  --ic-git: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23f14e32' stroke-width='1.15' stroke-linejoin='round'%3E%3Cpath d='M4.4 1.9h4.1l3.1 3.1v9.1H4.4z'/%3E%3Cpath d='M8.5 1.9v3.1h3.1'/%3E%3C/svg%3E");
+
+  --ic-branch: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%238c8c8c' stroke-width='1.2'%3E%3Ccircle cx='5' cy='3.6' r='1.7'/%3E%3Ccircle cx='5' cy='12.4' r='1.7'/%3E%3Ccircle cx='11.4' cy='3.6' r='1.7'/%3E%3Cpath d='M5 5.3v5.4M11.4 5.3v1.5a2.6 2.6 0 0 1-2.6 2.6H6.6'/%3E%3C/svg%3E");
+  --ic-term: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%238c8c8c' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='2' y='3' width='12' height='10' rx='1.2'/%3E%3Cpath d='M4.8 6.4l1.9 1.7-1.9 1.7M8.9 10.3h3'/%3E%3C/svg%3E");
+  --ic-diff: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke-width='1.4' stroke-linecap='round'%3E%3Cg stroke='%236fbf73'%3E%3Cpath d='M8 3v4.6M5.7 5.3h4.6'/%3E%3C/g%3E%3Cg stroke='%23e06c6c'%3E%3Cpath d='M5.7 11.6h4.6'/%3E%3C/g%3E%3C/svg%3E");
+}
+
+.content a.file::before, .content summary::before, .tabstrip .tab::before {
+  content: ""; display: inline-block; flex: none;
+  width: 16px; height: 16px; margin-right: 5px; vertical-align: -3.5px;
+  background: center / 15px 15px no-repeat var(--ic, var(--ic-file));
+}
+.content summary::before { --ic: var(--ic-folder); }
+
+/* File-type colours. Anything unlisted keeps the neutral --ic-file above. */
+[data-ext="rs"]      { --ic: var(--ic-rs); }
+[data-ext="md"], [data-ext="markdown"] { --ic: var(--ic-md); }
+[data-ext="toml"], [data-ext="lock"], [data-ext="yml"], [data-ext="yaml"],
+[data-ext="ini"], [data-ext="cfg"], [data-ext="conf"] { --ic: var(--ic-cfg); }
+[data-ext="json"], [data-ext="js"], [data-ext="mjs"], [data-ext="ts"] { --ic: var(--ic-data); }
+[data-ext="css"], [data-ext="scss"], [data-ext="py"] { --ic: var(--ic-md); }
+[data-ext="html"], [data-ext="htm"], [data-ext="xml"], [data-ext="svg"] { --ic: var(--ic-web); }
+[data-ext="sh"], [data-ext="bash"], [data-ext="zsh"] { --ic: var(--ic-sh); }
+[data-ext="gitignore"], [data-ext="gitmodules"] { --ic: var(--ic-git); }
+
+/* Tab kinds. File/Diff tabs also carry data-ext, so the rules above refine
+   them; the three chrome tabs have no extension and are keyed on kind alone. */
+.tabstrip .tab[data-kind="tree"]     { --ic: var(--ic-folder); }
+.tabstrip .tab[data-kind="changes"]  { --ic: var(--ic-branch); }
+.tabstrip .tab[data-kind="terminal"] { --ic: var(--ic-term); }
+.tabstrip .tab[data-kind="diff"], .changes a.file[data-kind="diff"] { --ic: var(--ic-diff); }
 
 /* ---- terminal start placeholder: opening a project must never spawn a
    shell on its own, so a Terminal tab shows this hint until the user
