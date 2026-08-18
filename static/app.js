@@ -133,6 +133,12 @@ function onEvent(ev) {
       if (state) state.live_sessions = [];
       render();
       document.body.dispatchEvent(new Event("refresh")); // strip marker -> ○
+      // Leave the workspace: with its sessions ended there is nothing left here
+      // to act on, and staying puts the user in a project they just closed.
+      // Delayed so the banner above is readable first — the count is the only
+      // confirmation of what actually happened, and the server has already
+      // acted, so nothing here depends on the delay completing.
+      setTimeout(() => { location.href = "/"; }, 1200);
       break;
     case "Notice": onNotice(ev.notice); break;
     case "Notices":
