@@ -1,11 +1,11 @@
-//! Workspace persistence. Lives in $DEADLIGHT_STATE_DIR, never inside a
+//! Workspace persistence. Lives in $RESH_STATE_DIR, never inside a
 //! project — following zellij, so pane drags never show up in git status.
 use crate::proto::{Sizes, Tab};
 use crate::workspace::{Buffer, Pane, Workspace};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Tests mutate the process-global DEADLIGHT_STATE_DIR; cargo runs them in
+/// Tests mutate the process-global RESH_STATE_DIR; cargo runs them in
 /// parallel threads. Every test that touches that variable — here and in
 /// `hub` — must hold this lock.
 ///
@@ -38,10 +38,10 @@ struct Disk {
     buffers: std::collections::HashMap<String, BufferDisk>,
 }
 
-/// Honours `DEADLIGHT_STATE_DIR` for tests and operators who want state
+/// Honours `RESH_STATE_DIR` for tests and operators who want state
 /// elsewhere; otherwise the XDG-ish default, never inside the project tree.
 pub fn state_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("DEADLIGHT_STATE_DIR") {
+    if let Ok(d) = std::env::var("RESH_STATE_DIR") {
         if !d.is_empty() {
             return PathBuf::from(d);
         }
@@ -161,9 +161,9 @@ mod tests {
     fn with_state_dir<T>(f: impl FnOnce() -> T) -> T {
         let _g = STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path());
+        std::env::set_var("RESH_STATE_DIR", d.path());
         let out = f();
-        std::env::remove_var("DEADLIGHT_STATE_DIR");
+        std::env::remove_var("RESH_STATE_DIR");
         out
     }
 

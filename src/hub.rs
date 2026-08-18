@@ -127,7 +127,7 @@ impl Hub {
             }
         };
         if need_watcher {
-            let ms: u64 = std::env::var("DEADLIGHT_DEBOUNCE_MS")
+            let ms: u64 = std::env::var("RESH_DEBOUNCE_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300);
@@ -838,7 +838,7 @@ mod tests {
     fn a_mutation_reaches_every_subscriber() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         let mut h = Hub::new("proj", d.path().to_path_buf());
         let (_a, rx_a) = h.subscribe();
         let (b, rx_b) = h.subscribe();
@@ -861,7 +861,7 @@ mod tests {
     fn buffer_text_is_not_echoed_to_its_author() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         let mut h = Hub::new("proj", d.path().to_path_buf());
         let (a, rx_a) = h.subscribe();
         let (_b, rx_b) = h.subscribe();
@@ -891,7 +891,7 @@ mod tests {
     fn version_advances_on_change_only() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         let mut h = Hub::new("proj", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
         let (_other, rx_other) = h.subscribe();
@@ -914,7 +914,7 @@ mod tests {
     fn save_conflict_is_reported_and_the_file_is_untouched() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         std::fs::write(d.path().join("a.txt"), "on disk\n").unwrap();
         let mut h = Hub::new("proj", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
@@ -942,7 +942,7 @@ mod tests {
         // conflict and the file was never written.
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         std::fs::write(d.path().join("a.txt"), "on disk\n").unwrap();
         let mut h = Hub::new("proj", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
@@ -979,7 +979,7 @@ mod tests {
         // re-reading the file out from under it.
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         std::fs::write(d.path().join("a.txt"), "on disk\n").unwrap();
         let mut h = Hub::new("proj", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
@@ -1012,7 +1012,7 @@ mod tests {
         // like a .env opened once.
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         std::fs::write(d.path().join("clean.txt"), "on disk\n").unwrap();
         std::fs::write(d.path().join("dirty.txt"), "on disk\n").unwrap();
         let mut h = Hub::new("a1_close_buffer", d.path().to_path_buf());
@@ -1055,7 +1055,7 @@ mod tests {
     fn closing_a_tab_still_referenced_elsewhere_keeps_the_buffer() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         std::fs::write(d.path().join("shared.txt"), "on disk\n").unwrap();
         let mut h = Hub::new("a1_shared_buffer", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
@@ -1087,7 +1087,7 @@ mod tests {
         // silently (per A2), and unsaved text became permanently unsaveable.
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         std::fs::write(d.path().join("old.txt"), "on disk\n").unwrap();
         let mut h = Hub::new("a3_rename_file", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
@@ -1131,7 +1131,7 @@ mod tests {
     fn renaming_a_directory_rewrites_buffers_and_tabs_for_the_whole_subtree() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         std::fs::create_dir(d.path().join("src")).unwrap();
         std::fs::write(d.path().join("src/a.rs"), "fn a() {}\n").unwrap();
         // A sibling that merely starts with the same characters must not be
@@ -1185,7 +1185,7 @@ mod tests {
         // immediately no matter how large the tree is.
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let sd = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+        std::env::set_var("RESH_STATE_DIR", sd.path());
 
         let d = tempfile::tempdir().unwrap();
         // A few thousand directories is enough to make the old synchronous
@@ -1203,7 +1203,7 @@ mod tests {
             "for_project must return promptly regardless of project size; took {elapsed:?}"
         );
 
-        std::env::remove_var("DEADLIGHT_STATE_DIR");
+        std::env::remove_var("RESH_STATE_DIR");
     }
 
     #[test]
@@ -1215,7 +1215,7 @@ mod tests {
         // lock this very hub a second time.
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         crate::notify::reset_for_test();
         crate::notify::record("proj", "claude", crate::osc::Parsed { title: None, body: "one".into() });
         crate::notify::record("proj", "shell", crate::osc::Parsed { title: None, body: "two".into() });
@@ -1237,7 +1237,7 @@ mod tests {
     fn dropped_subscribers_are_pruned() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         let mut h = Hub::new("proj", d.path().to_path_buf());
         let (a, rx_a) = h.subscribe();
         let (_b, rx_b) = h.subscribe();
@@ -1251,7 +1251,7 @@ mod tests {
     fn close_project_is_refused_while_a_buffer_is_dirty() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         std::fs::write(d.path().join("a.txt"), "disk\n").unwrap();
         let mut h = Hub::new("closeproj", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
@@ -1281,14 +1281,14 @@ mod tests {
             !msgs_other.iter().any(|m| m.contains(r#""t":"CloseRefused""#)),
             "a close conflict is the requester's business, not every mirrored browser's"
         );
-        std::env::remove_var("DEADLIGHT_STATE_DIR");
+        std::env::remove_var("RESH_STATE_DIR");
     }
 
     #[test]
     fn close_project_with_clean_buffers_reports_what_it_ended() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         let mut h = Hub::new("closeclean", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
         // A second subscriber must also learn the project closed — this is
@@ -1306,7 +1306,7 @@ mod tests {
             msgs_other.iter().any(|m| m.contains(r#""t":"ProjectClosed""#)),
             "ProjectClosed must be broadcast, not sent only to the requester"
         );
-        std::env::remove_var("DEADLIGHT_STATE_DIR");
+        std::env::remove_var("RESH_STATE_DIR");
     }
 
     // I2: `handle(CloseProject)` must return promptly, spawning the actual
@@ -1337,9 +1337,9 @@ mod tests {
     fn close_project_returns_promptly_without_blocking_on_session_killing() {
         let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("DEADLIGHT_CMD"); // real dtach: a `cat` client has no master to wait on
+        std::env::remove_var("RESH_CMD"); // real dtach: a `cat` client has no master to wait on
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         let project_dir = tempfile::tempdir().unwrap();
 
         let hub = Hub::for_project("closepromptly", project_dir.path().to_path_buf());
@@ -1347,7 +1347,7 @@ mod tests {
 
         let Ok(_att) = crate::session::attach("closepromptly", "shell", project_dir.path()) else {
             eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
-            std::env::remove_var("DEADLIGHT_STATE_DIR");
+            std::env::remove_var("RESH_STATE_DIR");
             return;
         };
 
@@ -1361,7 +1361,7 @@ mod tests {
              under the hub lock — took {elapsed:?}"
         );
 
-        std::env::remove_var("DEADLIGHT_STATE_DIR");
+        std::env::remove_var("RESH_STATE_DIR");
     }
 
     // I4: without a guard, the window between do_close_project spawning its
@@ -1380,9 +1380,9 @@ mod tests {
     fn start_terminal_is_refused_while_a_close_is_in_flight() {
         let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("DEADLIGHT_CMD"); // real dtach: needs a kill that takes real wall time
+        std::env::remove_var("RESH_CMD"); // real dtach: needs a kill that takes real wall time
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         let project_dir = tempfile::tempdir().unwrap();
 
         let hub = Hub::for_project("closeinflight", project_dir.path().to_path_buf());
@@ -1390,7 +1390,7 @@ mod tests {
 
         let Ok(_att) = crate::session::attach("closeinflight", "shell", project_dir.path()) else {
             eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
-            std::env::remove_var("DEADLIGHT_STATE_DIR");
+            std::env::remove_var("RESH_STATE_DIR");
             return;
         };
         while rx.try_recv().is_ok() {}
@@ -1431,14 +1431,14 @@ mod tests {
             "a refused StartTerminal must not also announce the tab as started; got: {msgs:?}"
         );
 
-        std::env::remove_var("DEADLIGHT_STATE_DIR");
+        std::env::remove_var("RESH_STATE_DIR");
     }
 
     #[test]
     fn start_terminal_rejects_an_invalid_session_name() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         let mut h = Hub::new("startproj", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
         // A second, mirrored client must never see this client's own Error.
@@ -1454,7 +1454,7 @@ mod tests {
             !msgs_other.iter().any(|m| m.contains(r#""t":"Error""#)),
             "an invalid session name is the requester's business, not every mirrored browser's"
         );
-        std::env::remove_var("DEADLIGHT_STATE_DIR");
+        std::env::remove_var("RESH_STATE_DIR");
     }
 
     #[test]
@@ -1465,7 +1465,7 @@ mod tests {
         // client depends on to know a repo now exists.
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", d.path().join("state"));
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
         let mut h = Hub::new("initgit", d.path().to_path_buf());
         assert!(!h.ws.is_git, "a fresh project must not already look like a git repo");
         let (c, rx) = h.subscribe();
@@ -1486,6 +1486,6 @@ mod tests {
         );
         assert!(d.path().join(".git").exists(), "git init must actually create the repo on disk");
         assert!(h.ws.is_git, "refresh_live_sessions must flip is_git once .git exists");
-        std::env::remove_var("DEADLIGHT_STATE_DIR");
+        std::env::remove_var("RESH_STATE_DIR");
     }
 }

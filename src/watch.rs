@@ -459,7 +459,7 @@ mod tests {
     fn symlink_loop_does_not_hang_the_walk() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let sd = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+        std::env::set_var("RESH_STATE_DIR", sd.path());
 
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "hi").unwrap();
@@ -479,7 +479,7 @@ mod tests {
             .expect("spawn must return promptly even with a symlink loop in the tree");
         assert!(ok);
 
-        std::env::remove_var("DEADLIGHT_STATE_DIR");
+        std::env::remove_var("RESH_STATE_DIR");
     }
 
     // The per-directory (Linux) watch path must stop growing once it hits
@@ -554,7 +554,7 @@ mod tests {
     fn deleted_files_reach_the_ui_same_as_created_ones() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let sd = tempfile::tempdir().unwrap();
-        std::env::set_var("DEADLIGHT_STATE_DIR", sd.path());
+        std::env::set_var("RESH_STATE_DIR", sd.path());
 
         let d = tempfile::tempdir().unwrap();
         let hub = Arc::new(Mutex::new(Hub::new("watch-delete-regression", d.path().to_path_buf())));
@@ -581,6 +581,6 @@ mod tests {
             "a deleted file must be observed too — this is the debouncer's dropped Remove event"
         );
 
-        std::env::remove_var("DEADLIGHT_STATE_DIR");
+        std::env::remove_var("RESH_STATE_DIR");
     }
 }
