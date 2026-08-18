@@ -156,35 +156,6 @@ unsaved changes, listing them by name.
 
 ## Deploying to <deploy-host>
 
-**TEMPORARY — delete this paragraph once the host cutover below has
-happened.** The commands in this section are written for the post-cutover
-state and are correct for every deploy from then on. But the host cutover
-is a separate task that runs *after this branch merges*, so until it has
-actually been done on `<deploy-host>`, the host still runs the old
-names: the unit is `deadlight.service`, the binary is
-`~/.local/bin/deadlight`, and the checkout is
-`/home/claude/projects/deadlight`. Following the commands below verbatim
-before the cutover will `cd` into a path that doesn't exist and try to
-restart a unit that isn't there.
-
-The cutover is not just names — it also moves the global config and changes
-the tailnet address, and skipping either produces the same 403 by a
-different route:
-
-- `mv ~/.config/deadlight ~/.config/resh` — carry the config across, or
-  `allowed_origins` reads as unset after the rename (see *the project was
-  called `deadlight`*, above).
-- `tailscale set --hostname=resh` and moving `tailscale serve` to `:443` —
-  the host's tailnet address changes from
-  `<deploy-host>.<tailnet>.ts.net:8444` to
-  `resh.<tailnet>.ts.net` (no port). `allowed_origins` must be updated to
-  match, or the *new* address 403s even though the config file moved
-  correctly. See the `allowed_origins` section below for both values.
-
-Until all of the above has actually happened on the host, `allowed_origins`
-must still hold the pre-cutover value — updating it early just moves the
-403 earlier.
-
 **The unit runs `~/.local/bin/resh`, not `target/release/resh`** —
 and `~/.cargo/config.toml` redirects `target-dir` to `~/.cache/cargo-target`,
 so a plain `cargo build --release` updates neither path the service uses.
@@ -192,7 +163,7 @@ Building without the install step leaves the old binary running and looks
 exactly like a successful deploy that changed nothing.
 
 ```bash
-tailscale ssh claude@<deploy-host>      # Tailscale SSH is enabled
+ssh claude@<deploy-host-ip>                       # see the ssh note above
 cd /home/claude/projects/resh
 git checkout master && git pull --ff-only
 cargo build --release
@@ -218,20 +189,19 @@ is still there afterwards.
 
 ## `allowed_origins` is global-config only
 
-It must list the tailnet origin or the browser gets 403 over tailscale.
-Before the host cutover (see *TEMPORARY*, above) — current value on
-`<deploy-host>` today:
-
-```toml
-allowed_origins = ["https://<deploy-host>.<tailnet>.ts.net:8444"]
-```
-
-After the cutover — new hostname, `tailscale serve` moved to `:443`, so no
-port in the origin:
+It must list the tailnet origin or the browser gets 403 over tailscale. The
+node is `resh` and `tailscale serve` maps `:443`, so the origin carries no
+port:
 
 ```toml
 allowed_origins = ["https://resh.<tailnet>.ts.net"]
 ```
+
+This file lives at `~/.config/resh/config.toml`. It is the *only* place an
+origin can be allowlisted — a project's own `.resh/config.toml` never can, so
+a repo you clone cannot allowlist its own domain. Moving or losing this file
+empties the allowlist, which 403s every tailnet browser request while loopback
+keeps working: a confusing symptom whose cause is not in the logs.
 
 Loopback always passes unlisted. It is deliberately **not** readable from a
 project's `.resh/config.toml`, so a repo you clone cannot allowlist its
