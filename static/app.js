@@ -10,7 +10,7 @@ const wsUrl = (p) => `${location.protocol === "https:" ? "wss" : "ws"}://${locat
 let state = null;
 let myOrigin = null;
 let ctrl = null;
-const terms = new Map();   // session -> {node, term, fit, sock, stale}
+const terms = new Map();   // session -> {node, term, fit, sock, ...} (see ensureTerm)
 const editors = new Map(); // rel -> textarea (the currently mounted one, if any)
 const texts = new Map();   // rel -> latest known buffer text (server-authoritative)
 
@@ -287,7 +287,14 @@ function render() {
   // leaking a live PTY reader for the rest of the page's life.
   terms.forEach((e, session) => {
     if (liveSessions.has(session)) return;
-    try { e.sock.close(); } catch {}
+    // Disarm the reconnect before closing: this teardown is deliberate (no
+    // pane references the session any more), and both a pending timer and
+    // the close() below firing onclose would otherwise reattach — which,
+    // since attach creates when absent, would respawn the shell the user
+    // just ended, into a disposed xterm.
+    e.gone = true;
+    clearTimeout(e.timer);
+    try { if (e.sock) e.sock.close(); } catch {}
     try { e.term.dispose(); } catch {}
     e.node.remove();
     terms.delete(session);
@@ -554,15 +561,14 @@ function refreshKind(kind) {
 }
 
 function ensureTerm(session) {
+  // No "the socket died, rebuild it" branch any more: an entry now heals its
+  // own socket (see connectTerm), so a caller cannot find a dead one here.
+  // Rebuilding on the way past was also what made recovery depend on the
+  // user happening to switch tabs — render() skips remounting a tab that is
+  // still active, so a terminal whose socket died under it stayed dead for
+  // exactly as long as the user kept looking at it.
   const existing = terms.get(session);
-  if (existing && !existing.stale) return existing;
-  if (existing) {
-    // The socket died (server restart, network blip) — the pooled node is
-    // just as dead, so replace it rather than reattach to a closed xterm.
-    try { existing.term.dispose(); } catch {}
-    existing.node.remove();
-    terms.delete(session);
-  }
+  if (existing) return existing;
   const node = document.createElement("div");
   node.className = "termhost";
   node.dataset.session = session;
@@ -587,19 +593,76 @@ function ensureTerm(session) {
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(node);
-  const sock = new WebSocket(wsUrl(`/ws/${PROJECT}/term/${session}`));
-  sock.binaryType = "arraybuffer";
-  sock.onmessage = (e) => term.write(new Uint8Array(e.data));
-  term.onData((d) => { if (sock.readyState === 1) sock.send(new TextEncoder().encode(d)); });
-  const entry = { node, term, fit, sock, stale: false };
-  sock.onclose = () => { entry.stale = true; };
-  sock.onerror = () => { entry.stale = true; };
+  const entry = { node, term, fit, sock: null, tries: 0, timer: null, attached: false, gone: false };
+  term.onData((d) => {
+    // Reads entry.sock rather than closing over one socket: a reconnect
+    // swaps it, and a closure over the original would spend the rest of the
+    // page's life writing into the dead one.
+    const s = entry.sock;
+    if (s && s.readyState === 1) s.send(new TextEncoder().encode(d));
+  });
   terms.set(session, entry);
+  connectTerm(entry, session);
   return entry;
 }
 
+// The terminal socket is the only one carrying a shell, and it used to be the
+// only one that never came back: connectControl retries, this did not. So a
+// laptop waking from sleep left every terminal silently swallowing keystrokes
+// — onData drops them when the socket isn't OPEN, with no error, no banner
+// and no visible difference from a live idle shell — until the user happened
+// to switch tabs and back, which is what rebuilt the socket.
+function connectTerm(entry, session) {
+  const sock = new WebSocket(wsUrl(`/ws/${PROJECT}/term/${session}`));
+  sock.binaryType = "arraybuffer";
+  entry.sock = sock;
+  sock.onmessage = (e) => entry.term.write(new Uint8Array(e.data));
+  sock.onopen = () => {
+    entry.tries = 0;
+    // Every attachment gets the session's whole scrollback replayed
+    // (session.rs `attach`) — right for a fresh xterm, wrong for this one,
+    // which is already showing that text. Clearing first makes the replay
+    // repaint the screen instead of appending up to 1 MB of it twice.
+    if (entry.attached) entry.term.reset();
+    entry.attached = true;
+    // A new attachment carries no geometry server-side and the PTY takes the
+    // smallest attached client's, so say ours before anything prints.
+    sendResize(entry);
+    termStatus(entry, "");
+  };
+  sock.onclose = (ev) => {
+    entry.sock = null;
+    if (entry.gone) return; // torn down deliberately; see render()
+    // wasClean is the whole discriminator here, and it is load-bearing:
+    //   clean   — the server closed this on purpose: the shell exited, or
+    //             the handshake was refused. Reconnecting would call
+    //             session::attach again, and attach *creates* when absent —
+    //             so typing `exit` would silently fork a fresh shell.
+    //   unclean — the connection died under us: laptop slept, resh
+    //             restarted, network blip. Nothing is wrong with the
+    //             session; dtach still holds it. This is the case to heal.
+    // The two are otherwise indistinguishable from here — both just stop.
+    // Verified against the server rather than assumed: on child exit term.rs
+    // delivers a real Close frame, not a bare EOF. integration.rs's
+    // child_exit_delivers_a_close_frame_not_a_bare_eof pins that, because if
+    // it ever regressed this handler would start respawning killed shells.
+    if (ev.wasClean) { termStatus(entry, "session ended"); return; }
+    termStatus(entry, "reconnecting…");
+    // Capped backoff, and deliberately never gives up: a laptop asleep for
+    // eight hours must still find its terminal alive on wake.
+    const wait = Math.min(500 * 2 ** entry.tries++, 8000);
+    entry.timer = setTimeout(() => connectTerm(entry, session), wait);
+  };
+}
+
+// Without this a disconnected terminal looks exactly like a live idle one —
+// which is how "it stopped taking input" went unexplained for so long.
+function termStatus(entry, text) {
+  entry.node.dataset.status = text;
+}
+
 function sendResize(e) {
-  if (e.sock.readyState === 1) e.sock.send(`resize:${e.term.cols}x${e.term.rows}`);
+  if (e.sock && e.sock.readyState === 1) e.sock.send(`resize:${e.term.cols}x${e.term.rows}`);
 }
 
 function mountEditor(content, rel) {

@@ -492,6 +492,43 @@ fn ws_closes_when_child_exits_first() {
 }
 
 #[test]
+fn child_exit_delivers_a_close_frame_not_a_bare_eof() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("RESH_CMD", "true"); // exits immediately
+    let (_d, port) = fixture_named("closeproj");
+    let mut ws = ws_connect_path(port, "/ws/closeproj/term/exiter").unwrap();
+
+    // Deliberately stricter than assert_ws_closes, which also accepts a bare
+    // EOF. The browser turns that distinction into `wasClean`, and app.js's
+    // connectTerm reconnects on an unclean close *only* — because a terminal
+    // socket that dies with the laptop must heal itself, while one the server
+    // closed on purpose must not, since session::attach creates the session
+    // when it is absent. If this close frame were ever lost, every `exit`
+    // would look like a network drop and silently fork a fresh shell.
+    let mut saw = Vec::new();
+    for _ in 0..50 {
+        match ws.read() {
+            Ok(tungstenite::Message::Close(_)) => {
+                std::env::remove_var("RESH_STATE_DIR");
+                return;
+            }
+            Ok(m) => saw.push(format!("{m:?}")),
+            Err(e) => {
+                std::env::remove_var("RESH_STATE_DIR");
+                panic!(
+                    "child exit must close the socket with a Close frame, not {e:?}; \
+                     frames seen first: {saw:?}"
+                );
+            }
+        }
+    }
+    std::env::remove_var("RESH_STATE_DIR");
+    panic!("no Close frame within the read budget; frames seen: {saw:?}");
+}
+
+#[test]
 fn two_terminal_clients_mirror_one_session() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("RESH_CMD", "cat");

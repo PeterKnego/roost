@@ -58,6 +58,17 @@ main { flex: 1; min-height: 0; }
 .tabstrip .newterm:hover { color: var(--fg); background: var(--bg3, var(--bg)); }
 .content { flex: 1 1 auto; overflow: auto; position: relative; }
 .content .termhost { position: absolute; inset: 0; }
+/* A terminal whose socket has died is otherwise pixel-identical to a live idle
+   one, and keystrokes into it vanish silently — so say so on the terminal
+   itself. Driven by data-status (app.js's termStatus); the empty value is the
+   live state, hence the :not() rather than merely unsetting the attribute. */
+.content .termhost[data-status]:not([data-status=""])::after {
+  content: attr(data-status);
+  position: absolute; top: 6px; right: 8px; z-index: 2;
+  padding: 2px 7px; border-radius: 3px; pointer-events: none;
+  font: 11px/1.6 var(--mono); color: var(--bg);
+  background: var(--warn, #d79921);
+}
 /* The grid track stays 4px so dragging still has a forgiving target, but only
    a centred hairline is painted — a fully-painted 4px bar reads as a gutter. */
 .divider { background: transparent; position: relative; }
