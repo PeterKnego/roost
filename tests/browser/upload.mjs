@@ -121,7 +121,60 @@ try {
   })()`);
   ok(paneDrop === "", `empty space in the Files pane resolves to the project root (got ${JSON.stringify(paneDrop)})`);
 
-  // ---- 7. A collision is reported per file, not as a blanket error ---------
+  // ---- 7. A screenshot pasted on a terminal reaches /paste -----------------
+  // The bug this pins, found by hand: xterm's own paste handler calls
+  // stopPropagation() on every paste over a terminal and reads only
+  // text/plain, so a bubble-phase listener never runs where it matters most.
+  // The stand-in below reproduces that exactly — a listener on the inner
+  // element that stops propagation — so this test fails if the capture flag is
+  // ever dropped, which is the whole point of it existing.
+  await evalIn(`(() => {
+    const host = document.createElement("div");
+    host.className = "termhost";
+    host.dataset.session = "faketerm";
+    const ta = document.createElement("textarea");
+    host.appendChild(ta);
+    document.body.appendChild(host);
+    ta.addEventListener("paste", (e) => e.stopPropagation()); // xterm's behaviour
+    ta.focus();
+    window.__ta = ta;
+  })()`);
+
+  await evalIn(`window.__pasteUrl = null;
+    const __open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (m, u, ...r) { window.__pasteUrl = u; return __open.call(this, m, u, ...r); };`);
+
+  await evalIn(`(() => {
+    const dt = new DataTransfer();
+    dt.items.add(new File([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])], "shot.png", { type: "image/png" }));
+    window.__ta.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: dt }));
+  })()`);
+
+  await until(() => evalIn("window.__pasteUrl !== null"), 10, "a paste request");
+  const pasteUrl = await evalIn("window.__pasteUrl");
+  ok(
+    /\/paste\/[^/]+\/faketerm$/.test(pasteUrl),
+    `a pasted image posts to that terminal's session even though xterm stops propagation (${pasteUrl})`,
+  );
+
+  // ---- 8. An image dropped on a terminal goes to that terminal -------------
+  await evalIn(`window.__pasteUrl = null;
+    (() => {
+      const dt = new DataTransfer();
+      dt.items.add(new File([new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])], "shot.png", { type: "image/png" }));
+      document.querySelector(".termhost").dispatchEvent(
+        new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: dt }));
+    })()`);
+  await until(() => evalIn("window.__pasteUrl !== null"), 10, "a drop-to-paste request");
+  const dropUrl = await evalIn("window.__pasteUrl");
+  ok(
+    /\/paste\/[^/]+\/faketerm$/.test(dropUrl),
+    `an image dropped on a terminal posts to that session (${dropUrl})`,
+  );
+
+  await evalIn(`document.querySelector(".termhost").remove()`);
+
+  // ---- 9. A collision is reported per file, not as a blanket error ---------
   await evalIn(`window.__errors = [];
     uploadFiles([__file("dropped.txt", "second attempt")], "")`);
   await until(() => evalIn("window.__errors.length > 0"), 20, "per-file error");

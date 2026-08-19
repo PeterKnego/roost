@@ -1115,6 +1115,17 @@ function focusedSession() {
   return host ? host.dataset.session : null;
 }
 
+// The session a drag is over, so an image can be dropped straight onto the
+// terminal it is meant for rather than routed through the file tree.
+function sessionUnder(target) {
+  const host = target && target.closest && target.closest(".termhost");
+  return host ? host.dataset.session : null;
+}
+
+function firstImage(files) {
+  return [...files].find((f) => f.type.startsWith("image/")) || null;
+}
+
 // One reusable banner rather than showBanner's transient ones, because progress
 // has to be updated in place and then cleared.
 function setUploadProgress(label, fraction) {
@@ -1195,6 +1206,21 @@ document.addEventListener("dragover", (e) => {
 document.addEventListener("drop", (e) => {
   if (!dragHasFiles(e.dataTransfer)) return;
   e.preventDefault();
+
+  // An image dropped on a terminal goes to that terminal, the same as pasting
+  // one there. Dragging a screenshot straight onto the shell that needs it is
+  // the obvious gesture, and routing it through the tree instead would leave a
+  // file the user then has to mention by hand.
+  const session = sessionUnder(e.target);
+  if (session) {
+    const img = e.dataTransfer.files.length ? firstImage(e.dataTransfer.files) : null;
+    if (img) {
+      postFiles(`/paste/${PROJECT}/${session}`, [img], "paste");
+      return;
+    }
+    return showError("only images can be dropped on a terminal — drop other files on the Files pane");
+  }
+
   const dir = uploadTargetDir(e.target);
   if (dir === null) {
     return showError("drop files on the Files pane to upload them");
@@ -1206,19 +1232,26 @@ document.addEventListener("drop", (e) => {
   if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files, dir);
 });
 
+// Capture phase, and this is not optional. xterm's own paste handler calls
+// stopPropagation() on every paste over a terminal and then reads only
+// text/plain — so a bubble-phase listener never runs when a terminal has focus,
+// which is exactly where pasting a screenshot needs to work. Capture puts this
+// ahead of xterm; anything that is not an image is left completely untouched
+// and reaches xterm as before.
 document.addEventListener("paste", (e) => {
   const files = e.clipboardData && e.clipboardData.files;
   if (!files || !files.length) return;
   const session = focusedSession();
   if (session) {
-    const img = [...files].find((f) => f.type.startsWith("image/"));
-    if (!img) return; // fall through to xterm's own text handling
+    const img = firstImage(files);
+    if (!img) return; // not an image: xterm's text paste, untouched
     e.preventDefault();
+    e.stopPropagation(); // xterm must not also act on this one
     postFiles(`/paste/${PROJECT}/${session}`, [img], "paste");
     return;
   }
-  const dir = dropDir(document.activeElement) ?? dropDir(e.target);
+  const dir = uploadTargetDir(document.activeElement) ?? uploadTargetDir(e.target);
   if (dir === null) return;
   e.preventDefault();
   uploadFiles(files, dir);
-});
+}, true);
