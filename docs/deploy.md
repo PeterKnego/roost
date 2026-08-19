@@ -216,6 +216,51 @@ selected with `theme = "{name}"`, which resolves to
 the user directory nor a project may supply JavaScript or HTML — only
 `$RESH_STATIC` can, and only whoever starts the process can set it.
 
+## The development instance
+
+Because the deployed binary ignores the checkout, iterating on the UI needs a
+*second* resh whose assets come from a working tree. That instance already
+exists on this host and is reachable over the tailnet:
+
+| URL | proxies to | serves assets from |
+|---|---|---|
+| `https://resh.<tailnet>.ts.net` | `127.0.0.1:8444` | embedded (the deployed binary) |
+| `https://resh.<tailnet>.ts.net:8445` | `127.0.0.1:8555` | `/home/claude/projects/resh/static` |
+| `https://resh.<tailnet>.ts.net:8443` | `127.0.0.1:8082` | zellij web, unrelated |
+
+Start it — it is a *transient* unit, so it does not survive a reboot and has to
+be recreated with the same line:
+
+```bash
+systemd-run --user --unit=resh-dev \
+  --setenv=RESH_ROOTS=/home/claude/ultima:/home/claude/projects \
+  --setenv=RESH_STATE_DIR=/home/claude/.local/state/resh-dev \
+  --setenv=RESH_STATIC=/home/claude/projects/resh/static \
+  /home/claude/.local/bin/resh 8555
+```
+
+`systemctl --user stop resh-dev` to stop it, `journalctl --user -u resh-dev -f`
+for its log. Edits to `static/` are live on :8445 on the next reload; the
+deployed service on :443 will not see them until a rebuild and reinstall.
+
+**It needs its own `RESH_STATE_DIR`.** Two instances sharing one show each
+other's projects in the header strip and each other's sessions in the socket
+directory, which is rarely what you want from a throwaway dev server.
+
+**Its origin must be allowlisted separately, port included.** The `Origin`
+header a browser sends for `:8445` is
+`https://resh.<tailnet>.ts.net:8445`, which the unqualified entry does not
+cover, so `allowed_origins` in `~/.config/resh/config.toml` lists both. Miss
+the second one and the failure is confusing rather than obvious: pages load
+over plain HTTP while every websocket 403s, so the workspace renders with no
+tabs and no terminals. That file is the only place an origin can be allowed
+(see *`allowed_origins` is global-config only*), and a backup of the
+pre-dev-route version sits beside it as `config.toml.bak-predevroute`.
+
+Adding this route widened what can open a websocket — and a websocket spawns a
+shell — by exactly one origin. Both are tailnet-only; neither is exposed by
+`tailscale funnel`.
+
 ## `KillMode=process` is load-bearing
 
 resh spawns its `dtach` sessions as child processes. systemd's default
