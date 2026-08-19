@@ -38,6 +38,18 @@ pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
             report.dead_sockets, report.gone_projects
         );
     }
+    // An explicit operator setting, so silence here would look like "my edits
+    // do nothing". The optional user directory is different: absent is normal
+    // and says nothing, so it warns about neither.
+    if let Some(d) = std::env::var_os("RESH_STATIC") {
+        let p = std::path::Path::new(&d);
+        if !p.is_dir() {
+            eprintln!(
+                "resh: RESH_STATIC={} is not a readable directory; serving embedded assets",
+                p.display()
+            );
+        }
+    }
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let roots = roots.clone();

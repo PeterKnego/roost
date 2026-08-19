@@ -2,6 +2,11 @@
 name = "resh"
 version = "0.2.0"
 edition = "2021"
+# Explicit, because `include_bytes!` failing on a published crate would be
+# discovered from a user's bug report rather than from our own build. static/
+# is not gitignored so it packages by default today; this stops that being an
+# accident.
+include = ["src/**/*", "static/**/*", "build.rs", "Cargo.toml", "README.md", "docs/deploy.md"]
 
 [dependencies]
 tungstenite = "0.24"

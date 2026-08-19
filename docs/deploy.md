@@ -41,6 +41,7 @@ Tests: `cargo test` (never `--release`). Everything else is environment:
 | `RESH_ORIGINS` | Comma-separated origin allowlist | global config, else loopback only |
 | `RESH_CMD` | Terminal command override — **test hook, never set in production** | `dtach -A … -E -r winch -z $SHELL -l` |
 | `RESH_DEBOUNCE_MS` | Filesystem-watch debounce | 300 |
+| `RESH_STATIC` | Serve web assets from this directory instead of the embedded copies (development) | unset — assets are compiled in |
 
 Running anywhere other than the deploy host needs at least `RESH_ROOTS`,
 since the defaults are that host's paths. Give a second instance its own
@@ -192,6 +193,18 @@ systemctl --user restart resh
 branch, where `git pull --ff-only` cheerfully reported "Already up to date"
 while sitting seven commits behind. Verify the resulting commit, not the pull
 output.
+
+The binary is self-contained: `static/` is compiled in, so the installed
+`~/.local/bin/resh` no longer reads the checkout at runtime. Editing
+`static/` on this host therefore does *not* change what the running service
+serves — that needs a rebuild and reinstall. To iterate on the UI live, run a
+second instance with `RESH_STATIC` pointed at a checkout.
+
+A user theme goes in `~/.config/resh/static/themes/{name}.css` and is selected
+with `theme = "{name}"`. A project theme goes in `{project}/.resh/theme/`,
+entered through `style.css`; the older single `.resh/theme.css` still works and
+the directory wins where both exist. Neither may supply JavaScript or HTML —
+only `$RESH_STATIC` can, and only whoever starts the process can set it.
 
 ## `KillMode=process` is load-bearing
 
