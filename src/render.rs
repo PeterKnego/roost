@@ -455,7 +455,7 @@ pub fn human_age(secs: u64) -> String {
     }
 }
 
-pub fn workspace_page(project: &str, key: &str, s: &Settings, has_theme_css: bool) -> String {
+pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<&str>) -> String {
     let warn = s
         .warning
         .as_deref()
@@ -471,10 +471,9 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, has_theme_css: boo
     // already contains, and it happens to be HTML-attribute-safe too, since
     // percent_encode's output is restricted to plain ASCII.
     let qkey = crate::http::percent_encode(key);
-    let theme_css = if has_theme_css {
-        format!("<link rel=\"stylesheet\" href=\"/frag/{proj_url}/theme.css\">")
-    } else {
-        String::new()
+    let theme_css = match theme_rel {
+        Some(rel) => format!("<link rel=\"stylesheet\" href=\"/frag/{proj_url}/{rel}\">"),
+        None => String::new(),
     };
     format!(
         r#"<!doctype html>
@@ -732,7 +731,7 @@ mod tests {
     #[test]
     fn workspace_page_wires_everything() {
         let s = Settings { theme: "gruvbox".into(), ..Settings::default() };
-        let h = workspace_page("proj", "proj", &s, true);
+        let h = workspace_page("proj", "proj", &s, Some("theme.css"));
         assert!(h.contains("/static/themes/gruvbox.css"));
         assert!(h.contains("/frag/proj/theme.css")); // has_theme_css
         assert!(h.contains("data-project=\"proj\""));
@@ -743,8 +742,23 @@ mod tests {
         assert!(h.contains("hx-get=\"/frag/_projects?current=proj\""));
         assert!(h.contains("id=\"projstrip\""));
         assert!(h.contains("id=\"closeproj\""));
-        let no_custom = workspace_page("proj", "proj", &s, false);
+        let no_custom = workspace_page("proj", "proj", &s, None);
         assert!(!no_custom.contains("theme.css\">"));
+    }
+
+    #[test]
+    fn the_workspace_links_exactly_one_theme_stylesheet() {
+        let s = Settings::default();
+        let dir_themed = workspace_page("proj", "proj", &s, Some("theme/style.css"));
+        assert!(dir_themed.contains("/frag/proj/theme/style.css"));
+        assert_eq!(dir_themed.matches("theme.css\"").count(), 0, "never both links");
+
+        let file_themed = workspace_page("proj", "proj", &s, Some("theme.css"));
+        assert!(file_themed.contains("/frag/proj/theme.css"));
+        assert!(!file_themed.contains("/frag/proj/theme/style.css"));
+
+        let bare = workspace_page("proj", "proj", &s, None);
+        assert!(!bare.contains("/frag/proj/theme"));
     }
 
     // The strip's `?current=` value is the storage key, not the URL form —
@@ -755,14 +769,14 @@ mod tests {
     #[test]
     fn workspace_page_percent_encodes_the_current_key_for_the_query_string() {
         let s = Settings::default();
-        let h = workspace_page("karpie/src", "karpie%2Fsrc", &s, false);
+        let h = workspace_page("karpie/src", "karpie%2Fsrc", &s, None);
         assert!(h.contains("hx-get=\"/frag/_projects?current=karpie%252Fsrc\""));
     }
 
     #[test]
     fn the_workspace_page_carries_the_notification_centre() {
         let s = crate::config::Settings::default();
-        let html = workspace_page("proj", "proj", &s, false);
+        let html = workspace_page("proj", "proj", &s, None);
         assert!(html.contains(r#"id="bell""#), "no bell button");
         assert!(html.contains(r#"id="bellcount""#), "no unread badge");
         assert!(html.contains(r#"id="noticepanel""#), "no panel container");
@@ -880,7 +894,7 @@ mod tests {
     #[test]
     fn project_name_is_escaped_everywhere() {
         let s = Settings::default();
-        let h = workspace_page("a\"><script>", "a\"><script>", &s, false);
+        let h = workspace_page("a\"><script>", "a\"><script>", &s, None);
         assert!(!h.contains("a\"><script>"));
         let c = changes_fragment("a\"><script>", &Status { branch: String::new(), changes: vec![crate::gitio::Change { xy: "??".into(), path: "x".into() }] });
         assert!(!c.contains("\"><script>"));

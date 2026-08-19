@@ -122,9 +122,9 @@ fn serve_workspace(w: &mut impl Write, roots: &[PathBuf], project: &str) {
         return http::not_found(w, "no such project");
     };
     let settings = config::for_project(&dir);
-    let has_theme_css = dir.join(".resh/theme.css").is_file();
+    let theme_rel = theme_link_for(&dir);
     let key = projects::storage_key(project);
-    http::html(w, &render::workspace_page(project, &key, &settings, has_theme_css));
+    http::html(w, &render::workspace_page(project, &key, &settings, theme_rel));
 }
 
 /// Serialises the tests that set the process-global `RESH_STATIC`/`HOME`.
@@ -286,6 +286,7 @@ fn serve_frag(
                 Err(e) => http::html(w, &render::hint(&e)),
             }
         }
+        ["theme", rest @ ..] if !rest.is_empty() => serve_project_theme(w, &dir, &rest.join("/")),
         // Resolved through `safe_resolve`, not a bare `fs::read`, so a
         // `.resh/theme.css` that is a symlink pointing outside the
         // project (planted by a cloned repo) is refused rather than served
@@ -298,6 +299,53 @@ fn serve_frag(
             Err(_) => http::not_found(w, "no theme.css"),
         },
         _ => http::not_found(w, "no such fragment"),
+    }
+}
+
+/// A project's own theme directory, `{project}/.resh/theme/`.
+///
+/// Not part of the `/static` overlay: `/static` carries no project context,
+/// and threading one through it would be the larger change. This route
+/// already resolves a project and already refuses symlinks escaping it.
+///
+/// A code-class path 404s rather than falling through to the embedded copy —
+/// serving embedded bytes under a project URL would imply the project
+/// supplied bytes it did not.
+fn serve_project_theme(w: &mut impl Write, dir: &Path, rel: &str) {
+    let Some(rel) = crate::assets::normalize(rel) else {
+        return http::not_found(w, "no such asset");
+    };
+    if crate::assets::class_of(rel) != crate::assets::Class::Theme {
+        return http::not_found(w, "no such asset");
+    }
+    match projects::safe_resolve(dir, &format!(".resh/theme/{rel}"))
+        .and_then(|p| std::fs::read(&p).map_err(|e| e.to_string()))
+    {
+        Ok(body) => {
+            http::respond_with(w, 200, "OK", content_type(rel), &[NOSNIFF, SANDBOX], &body)
+        }
+        Err(_) => http::not_found(w, "no such asset"),
+    }
+}
+
+/// Which single theme stylesheet this project's page should link, as a
+/// fragment-relative path.
+///
+/// The directory wins over the legacy single file, and only ever one is
+/// returned: emitting both would style the project twice, with the winner
+/// decided by link order rather than by intent.
+///
+/// `is_file()` folds "absent" and "cannot look" together, which this project
+/// treats as a defect where the answer gates destruction. Here it gates only
+/// whether a stylesheet is linked, so the worst case is an unstyled page —
+/// recoverable, and not worth a `symlink_metadata` dance.
+fn theme_link_for(dir: &Path) -> Option<&'static str> {
+    if dir.join(".resh/theme/style.css").is_file() {
+        Some("theme/style.css")
+    } else if dir.join(".resh/theme.css").is_file() {
+        Some("theme.css")
+    } else {
+        None
     }
 }
 
@@ -439,5 +487,54 @@ mod tests {
             assert!(without[i].starts_with("HTTP/1.1 404"), "{p} must 404");
             assert_eq!(without[i], with[i], "{p}: responses must be byte-identical");
         }
+    }
+
+    fn serve_theme(dir: &Path, rel: &str) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        serve_project_theme(&mut buf, dir, rel);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[test]
+    fn a_project_theme_serves_presentation_and_refuses_code() {
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join(".resh/theme");
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(t.join("style.css"), "body{color:red}").unwrap();
+        std::fs::write(t.join("logo.png"), [0x89, 0x50, 0x4e, 0x47]).unwrap();
+        std::fs::write(t.join("app.js"), "alert('pwned')").unwrap();
+
+        let css = serve_theme(d.path(), "style.css");
+        assert!(css.contains("body{color:red}"));
+        assert!(css.contains("Content-Security-Policy: sandbox"), "project assets are untrusted");
+        assert!(css.contains("Content-Type: text/css"));
+
+        assert!(serve_theme(d.path(), "logo.png").contains("Content-Type: image/png"));
+
+        let js = serve_theme(d.path(), "app.js");
+        assert!(js.starts_with("HTTP/1.1 404"), "a project may never serve code");
+        assert!(!js.contains("pwned"));
+
+        assert!(serve_theme(d.path(), "../../Cargo.toml").starts_with("HTTP/1.1 404"));
+    }
+
+    /// The selection itself, which decides which single link the page emits.
+    /// Without this the precedence lives only in the route and nothing would
+    /// catch it regressing to "both" or to the wrong one.
+    #[test]
+    fn a_theme_directory_wins_over_the_single_stylesheet() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".resh/theme")).unwrap();
+        assert_eq!(theme_link_for(d.path()), None, "neither present");
+
+        std::fs::write(d.path().join(".resh/theme.css"), "a{}").unwrap();
+        assert_eq!(theme_link_for(d.path()), Some("theme.css"), "the legacy file still works");
+
+        std::fs::write(d.path().join(".resh/theme/style.css"), "b{}").unwrap();
+        assert_eq!(
+            theme_link_for(d.path()),
+            Some("theme/style.css"),
+            "the directory wins where both exist — and only one link is ever emitted"
+        );
     }
 }
