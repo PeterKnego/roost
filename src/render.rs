@@ -150,10 +150,12 @@ fn link_open(dest: &str, from_rel: &str) -> String {
 }
 
 pub fn markdown_html(md: &str, project: &str, rel: &str) -> String {
-    // TagEnd is not imported yet — the image arm in Task 4 adds it. Importing
-    // it here would warn.
-    use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag};
+    use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag, TagEnd};
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    // Set while an image whose Start was dropped is still open, so its End is
+    // dropped too. Images cannot nest, so one flag suffices. Dropping only the
+    // Start would leave push_html emitting a stray `" />` into the document.
+    let mut dropped_image = false;
     let events = Parser::new_ext(md, opts).filter_map(|ev| match ev {
         // raw HTML from repo content must never reach the page: render it as
         // text. This arm and the link arm below match disjoint Event
@@ -169,11 +171,44 @@ pub fn markdown_html(md: &str, project: &str, rel: &str) -> String {
             Some(Event::Html(CowStr::from(link_open(dest_url, rel))))
         }
 
+        // Rewritten by editing the tag rather than by emitting raw HTML: the
+        // alt text lives in the events BETWEEN Start and End, and only
+        // push_html's own image handling collects them into the attribute.
+        Event::Start(Tag::Image { link_type, dest_url, title, id }) => {
+            match resolve_dest(&dest_url, rel) {
+                Dest::Local(p) => {
+                    let url = format!(
+                        "/frag/{}/raw?path={}",
+                        crate::http::percent_encode(project),
+                        crate::http::percent_encode(&p)
+                    );
+                    Some(Event::Start(Tag::Image {
+                        link_type,
+                        dest_url: CowStr::from(url),
+                        title,
+                        id,
+                    }))
+                }
+                Dest::Data => Some(Event::Start(Tag::Image { link_type, dest_url, title, id })),
+                // Remote, Passthrough, Broken. Dropping the tag leaves the
+                // events between it and its End to render as ordinary inline
+                // markdown — so the fallback is the alt text with its
+                // emphasis intact, and no placeholder markup is needed.
+                _ => {
+                    dropped_image = true;
+                    None
+                }
+            }
+        }
+        Event::End(TagEnd::Image) if dropped_image => {
+            dropped_image = false;
+            None
+        }
+
         other => Some(other),
     });
     let mut out = String::new();
     html::push_html(&mut out, events);
-    let _ = project; // used by the image arm in the next task
     format!("<article class=\"markdown-body\">{out}</article>")
 }
 
@@ -758,6 +793,55 @@ mod tests {
     fn rewriting_links_did_not_reopen_the_raw_html_hole() {
         let h = markdown_html("hello <script>alert(1)</script>\n", "proj", "a.md");
         assert!(!h.contains("<script>"), "{h}");
+    }
+
+    #[test]
+    fn a_local_image_points_at_the_raw_route() {
+        let h = markdown_html("![a cat](cat.png)\n", "proj", "docs/a.md");
+        assert!(h.contains(r#"src="/frag/proj/raw?path=docs/cat.png""#), "{h}");
+        assert!(h.contains(r#"alt="a cat""#), "{h}");
+    }
+
+    /// Both halves are asserted. "No <img" alone passes if the image vanished
+    /// entirely; "alt text present" alone passes if the <img> is still there with
+    /// its alt attribute.
+    ///
+    /// Verified this can fail: reverting the catch-all image arm to keep
+    /// emitting `Event::Start(Tag::Image { .. })` for Remote/Passthrough/Broken
+    /// made this fail on the first assertion — `!h.contains("<img")` — because
+    /// the tag survived with `src="https://e.com/b.png"` intact.
+    #[test]
+    fn a_remote_image_is_dropped_to_its_alt_text() {
+        let h = markdown_html("text ![a *fancy* cat](https://e.com/b.png) after\n", "proj", "a.md");
+        assert!(!h.contains("<img"), "{h}");
+        assert!(!h.contains("e.com"), "{h}");
+        assert!(h.contains("a <em>fancy</em> cat"), "alt renders as inline markdown: {h}");
+    }
+
+    #[test]
+    fn a_data_image_survives_untouched() {
+        let h = markdown_html("![d](data:image/gif;base64,R0lGOD)\n", "proj", "a.md");
+        assert!(h.contains("src=\"data:image/gif;base64,R0lGOD\""), "{h}");
+    }
+
+    /// CLAUDE.md's defect #1 in miniature: an encoder that leaves `+` alone pairs
+    /// with a decoder that reads `+` as a space, and the file silently "does not
+    /// exist". The round-trip is the only assertion that catches a plausible-
+    /// looking encoder swapped in for `percent_encode`.
+    ///
+    /// Verified this can fail: replacing `crate::http::percent_encode(&p)` with
+    /// `p.replace(' ', "+")` made this fail with a left/right mismatch —
+    /// decoding produced "my notes drafts.png" (the `+` read back as a space)
+    /// instead of the original "my notes+drafts.png".
+    #[test]
+    fn an_image_path_with_a_plus_and_a_space_round_trips() {
+        // Angle brackets are required: CommonMark does not allow a bare space in a
+        // destination, and `![x](my notes+drafts.png)` parses as no image at all —
+        // verified before this plan was written.
+        let h = markdown_html("![x](<my notes+drafts.png>)\n", "proj", "a.md");
+        let start = h.find("path=").unwrap() + "path=".len();
+        let end = h[start..].find('"').unwrap() + start;
+        assert_eq!(crate::http::percent_decode(&h[start..end]), "my notes+drafts.png");
     }
 
     #[test]
