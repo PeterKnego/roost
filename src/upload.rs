@@ -47,6 +47,13 @@ pub fn handle_post(
         ["upload", project @ ..] if !project.is_empty() => {
             do_upload(w, reader, req, roots, &project.join("/"))
         }
+        // The session is the *last* segment, because a project identifier may
+        // itself be multi-segment (/paste/karpie/src/term) — the same
+        // split-from-the-right rule the frag route uses.
+        ["paste", rest @ ..] if rest.len() >= 2 => {
+            let (session, project) = rest.split_last().expect("rest.len() >= 2");
+            do_paste(w, reader, req, roots, &project.join("/"), session)
+        }
         _ => crate::http::respond(w, 404, "Not Found", "text/plain; charset=utf-8", b"no such endpoint"),
     }
 }
@@ -198,5 +205,134 @@ fn receive(
             }
         }
         Ok(results)
+    })
+}
+
+fn do_paste(
+    w: &mut impl Write,
+    reader: &mut (impl BufRead + Send),
+    req: &crate::http::Request,
+    roots: &[PathBuf],
+    project: &str,
+    session: &str,
+) {
+    if !crate::session::valid_name(session) {
+        return crate::http::respond(w, 400, "Bad Request", "text/plain; charset=utf-8", b"invalid session name");
+    }
+    if crate::projects::resolve_project(roots, project).is_none() {
+        return crate::http::respond(w, 404, "Not Found", "text/plain; charset=utf-8", b"no such project");
+    }
+    // Checked before any bytes are accepted. Writing markers into a dead PTY is
+    // not destructive, but reporting success for a paste nobody will ever see is
+    // worse than an error.
+    if !crate::session::has_session(project, session) {
+        let msg = format!("no such session: {session}");
+        return crate::http::respond(w, 404, "Not Found", "text/plain; charset=utf-8", msg.as_bytes());
+    }
+
+    let dir = crate::paste::scratch_dir(project);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        let msg = format!("cannot create paste directory: {e}");
+        return crate::http::respond(w, 500, "Internal Server Error", "text/plain; charset=utf-8", msg.as_bytes());
+    }
+
+    let ctype = req.headers.get("content-type").cloned().unwrap_or_default();
+    let Ok(boundary) = multer::parse_boundary(&ctype) else {
+        return crate::http::respond(
+            w,
+            400,
+            "Bad Request",
+            "text/plain; charset=utf-8",
+            b"expected multipart/form-data",
+        );
+    };
+    let len: u64 = req.headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let cap = crate::config::max_upload_bytes();
+
+    match receive_image(reader, len, &boundary, &dir, cap) {
+        Ok(path) => {
+            // The bracketed-paste markers are load-bearing: the same path
+            // arriving as raw characters is inserted as literal text instead of
+            // being read as an image. See the spec's evidence appendix.
+            let mut payload = Vec::with_capacity(path.as_os_str().len() + 12);
+            payload.extend_from_slice(b"\x1b[200~");
+            payload.extend_from_slice(path.to_string_lossy().as_bytes());
+            payload.extend_from_slice(b"\x1b[201~");
+            // On this thread, with no lock held: the hub is not involved in an
+            // upload at all, which is what makes a blocking PTY write safe here.
+            let key = crate::session::key_for(project, session);
+            match crate::session::write_input(&key, &payload) {
+                Ok(()) => crate::http::respond(w, 200, "OK", "application/json", b"{\"ok\":true}"),
+                Err(e) => {
+                    let msg = format!("paste failed: {e}");
+                    crate::http::respond(w, 500, "Internal Server Error", "text/plain; charset=utf-8", msg.as_bytes())
+                }
+            }
+        }
+        Err(Halt::TooLarge) => {
+            let msg = format!("pasted image too large (limit {cap} bytes)");
+            crate::http::respond(w, 413, "Payload Too Large", "text/plain; charset=utf-8", msg.as_bytes())
+        }
+        Err(Halt::TooManyParts) => crate::http::respond(
+            w,
+            400,
+            "Bad Request",
+            "text/plain; charset=utf-8",
+            b"a paste carries one image",
+        ),
+        Err(Halt::Malformed(e)) => {
+            crate::http::respond(w, 400, "Bad Request", "text/plain; charset=utf-8", e.as_bytes())
+        }
+    }
+}
+
+/// `receive`'s sibling, differing in one thing: the format is decided from the
+/// *first chunk* rather than by buffering the whole image to inspect it, which
+/// keeps this streaming like every other part. The extension it picks is what
+/// makes the paste readable at the other end, so an unrecognised format is
+/// refused rather than guessed at.
+fn receive_image(
+    reader: &mut (impl BufRead + Send),
+    len: u64,
+    boundary: &str,
+    dir: &Path,
+    cap: u64,
+) -> Result<PathBuf, Halt> {
+    let mut mp = multer::Multipart::new(body_stream(reader, len), boundary);
+
+    futures_executor::block_on(async move {
+        let mut field = mp
+            .next_field()
+            .await
+            .map_err(|e| Halt::Malformed(e.to_string()))?
+            .ok_or_else(|| Halt::Malformed("no image in the request".into()))?;
+
+        let first = field
+            .chunk()
+            .await
+            .map_err(|e| Halt::Malformed(e.to_string()))?
+            .ok_or_else(|| Halt::Malformed("pasted image is empty".into()))?;
+
+        let ext = crate::paste::extension_of(&first).ok_or_else(|| {
+            Halt::Malformed("clipboard image is not a PNG, JPEG, GIF or WebP".into())
+        })?;
+
+        let name = crate::paste::free_name(dir, ext).map_err(Halt::Malformed)?;
+        let mut sink = UploadTemp::create(dir, "", &name).map_err(Halt::Malformed)?;
+
+        let mut total = first.len() as u64;
+        if total > cap {
+            return Err(Halt::TooLarge);
+        }
+        sink.write(&first).map_err(Halt::Malformed)?;
+
+        while let Some(chunk) = field.chunk().await.map_err(|e| Halt::Malformed(e.to_string()))? {
+            total += chunk.len() as u64;
+            if total > cap {
+                return Err(Halt::TooLarge); // `sink` drops, removing the partial file
+            }
+            sink.write(&chunk).map_err(Halt::Malformed)?;
+        }
+        sink.commit().map_err(Halt::Malformed)
     })
 }
