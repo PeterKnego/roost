@@ -328,22 +328,30 @@ function buildPaneIcons(host, pi, pane, active, content) {
       content.querySelectorAll("details[open]").forEach((d) => { d.open = false; });
     });
   }
-  // Hidden rather than disabled on an empty pane: there is no tab to move, and
-  // a control that never does anything is worse than one that isn't there.
-  if (pane.tabs.length) {
-    icon("⇄", "move this tab to the next pane (shift-click: previous)", (e) => {
-      const to = (pi + (e.shiftKey ? PANES - 1 : 1)) % PANES;
+  // Only between the two content panes, and only when there is a tab to move.
+  // The left column holds narrow tool windows — the tree and the changes list,
+  // 260px by default — so moving a terminal or an editor into one is not a
+  // move anyone wants, and offering it makes the control read as general when
+  // it is not. A control that never does anything useful is worse than one
+  // that isn't there.
+  const swap = MOVE_BETWEEN[pi];
+  if (pane.tabs.length && swap !== undefined) {
+    icon("⇄", `move this tab to the ${swap === RIGHT ? "right" : "middle"} pane`, () => {
       // Append, and let the server clamp: `at` is checked against the
       // destination's real length in workspace.rs, which is the authority on
       // a layout this client may already be a broadcast behind on.
-      send({ t: "MoveTab", from: pi, idx: pane.active, to, at: state.panes[to].tabs.length });
+      send({ t: "MoveTab", from: pi, idx: pane.active, to: swap, at: state.panes[swap].tabs.length });
     });
   }
   const on = maxState.pane === pi;
   icon(on ? "⤡" : "⤢", on ? "restore pane sizes" : "maximize pane", () => toggleMaximized(pi));
 }
 
-const PANES = 4;
+// Pane ids, matching proto.rs's LEFT_TOP / LEFT_BOTTOM / MIDDLE / RIGHT.
+const MIDDLE = 2;
+const RIGHT = 3;
+// The only pair a tab is worth moving between; see buildPaneIcons.
+const MOVE_BETWEEN = { [MIDDLE]: RIGHT, [RIGHT]: MIDDLE };
 // Which pane is maximized, and the sizes to put back. Client-local on purpose:
 // the maximized layout itself is just sizes, which the server already stores
 // and mirrors, so nothing here needs a new field in the workspace. The cost is

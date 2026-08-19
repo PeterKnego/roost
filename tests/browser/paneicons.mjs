@@ -32,18 +32,24 @@ try {
       b.dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey: ${shift} })); return true; })()`);
   const tabs = (pane) => evalIn(`JSON.stringify(state.panes[${pane}].tabs.map((t) => t.k))`);
 
-  console.log("A. move a tab to the next pane");
-  const before0 = JSON.parse(await tabs(0));
-  ok(before0.includes("Tree"), `pane 0 starts with the tree (${before0})`);
-  ok(await icon(0, "move"), "the move control exists");
-  ok(await until(async () => JSON.parse(await tabs(1)).includes("Tree"), 10, "tree in pane 1"),
-     "the tab landed in the next pane");
-  ok(!JSON.parse(await tabs(0)).includes("Tree"), "and left the one it came from");
+  console.log("A. move a tab between the two content panes");
+  await evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: "hello.md", mode: "Preview" } })`);
+  ok(await until(async () => JSON.parse(await tabs(2)).includes("File"), 10, "a file in the middle pane"),
+     "a file tab is open in the middle pane");
+  ok(await icon(2, "move"), "the move control exists on the middle pane");
+  ok(await until(async () => JSON.parse(await tabs(3)).includes("File"), 10, "file in pane 3"),
+     "it moved to the right pane");
+  ok(!JSON.parse(await tabs(2)).includes("File"), "and left the middle pane");
 
-  console.log("\nB. shift-click sends it back the other way");
-  ok(await icon(1, "move", true), "the control is there in its new home");
-  ok(await until(async () => JSON.parse(await tabs(0)).includes("Tree"), 10, "tree back in pane 0"),
-     "shift-click moves it to the *previous* pane, not the next");
+  console.log("\nB. and back the other way");
+  ok(await icon(3, "move"), "the right pane offers the reverse move");
+  ok(await until(async () => JSON.parse(await tabs(2)).includes("File"), 10, "file back in pane 2"),
+     "it came back to the middle pane");
+  // The left column is 260px of tool window; moving a terminal or an editor
+  // into it is not a move anyone wants, so the control must not be offered
+  // there at all — this asserts the restriction, not merely the happy path.
+  ok(!(await icon(0, "move")), "the tree pane offers no move control");
+  ok(!(await icon(1, "move")), "the changes pane offers none either");
 
   console.log("\nC. maximize and restore");
   const before = JSON.parse(await evalIn("JSON.stringify(state.sizes)"));
