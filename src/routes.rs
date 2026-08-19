@@ -13,8 +13,6 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const STATIC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
-
 pub fn handle(stream: TcpStream, roots: &[PathBuf]) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let Ok(read_half) = stream.try_clone() else { return };
@@ -129,24 +127,91 @@ fn serve_workspace(w: &mut impl Write, roots: &[PathBuf], project: &str) {
     http::html(w, &render::workspace_page(project, &key, &settings, has_theme_css));
 }
 
-fn serve_static(w: &mut impl Write, rel: &str) {
-    let base = Path::new(STATIC_DIR);
-    let (Ok(f), Ok(basec)) = (base.join(rel).canonicalize(), base.canonicalize()) else {
-        return http::not_found(w, "no such asset");
-    };
-    if !f.starts_with(&basec) || !f.is_file() {
-        return http::not_found(w, "no such asset");
-    }
-    let ctype = match f.extension().and_then(|e| e.to_str()).unwrap_or("") {
+/// Serialises the tests that set the process-global `RESH_STATIC`/`HOME`.
+/// cargo runs a binary's tests in parallel threads, so without this two of
+/// them interleave and one sees the other's environment mid-body — a
+/// flakiness this project has shipped once before (see SESSION_ENV_LOCK).
+#[cfg(test)]
+pub static ASSET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn content_type(rel: &str) -> &'static str {
+    match Path::new(rel).extension().and_then(|e| e.to_str()).unwrap_or("") {
         "css" => "text/css; charset=utf-8",
         "js" => "text/javascript; charset=utf-8",
         "html" => "text/html; charset=utf-8",
         "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
         _ => "application/octet-stream",
+    }
+}
+
+const NOSNIFF: (&str, &str) = ("X-Content-Type-Options", "nosniff");
+const SANDBOX: (&str, &str) = ("Content-Security-Policy", "sandbox");
+
+/// `~/.config/resh/static`, the optional user overlay. Absent on a fresh
+/// install, which is not an error — the layer is simply skipped.
+fn user_static_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join(".config/resh/static"))
+}
+
+/// Reads `rel` under `base`, confined. Returns `None` for "not there" and
+/// for "cannot look" alike: this is a read path, so falling through to the
+/// next layer is the safe response to both — the codebase-wide rule that
+/// absence of evidence is not evidence of absence applies to a missing
+/// overlay file too, and the safe action here is identical either way
+/// (try the next layer), unlike a destructive path where the two must
+/// never be conflated.
+fn read_confined(base: &Path, rel: &str) -> Option<Vec<u8>> {
+    let basec = base.canonicalize().ok()?;
+    let f = basec.join(rel).canonicalize().ok()?;
+    if !f.starts_with(&basec) || !f.is_file() {
+        return None;
+    }
+    std::fs::read(&f).ok()
+}
+
+/// Layered lookup — see docs/superpowers/specs/2026-08-19-embedded-assets-design.md.
+///
+///   1. $RESH_STATIC        any class   (operator runtime switch)
+///   2. ~/.config/resh/static  theme class only
+///   3. embedded            any class   (always present)
+///
+/// The class restriction on layer 2 is the enforcement mechanism, not a
+/// check that could be forgotten: a code-class path never consults it.
+fn serve_static(w: &mut impl Write, rel: &str) {
+    // Before any layer, so a traversal attempt cannot reveal which layers exist.
+    let Some(rel) = crate::assets::normalize(rel) else {
+        return http::not_found(w, "no such asset");
     };
-    match std::fs::read(&f) {
-        Ok(body) => http::respond(w, 200, "OK", ctype, &body),
-        Err(_) => http::not_found(w, "unreadable"),
+    let ctype = content_type(rel);
+
+    if let Some(dir) = std::env::var_os("RESH_STATIC") {
+        if let Some(body) = read_confined(Path::new(&dir), rel) {
+            return http::respond_with(w, 200, "OK", ctype, &[NOSNIFF], &body);
+        }
+    }
+
+    if crate::assets::class_of(rel) == crate::assets::Class::Theme {
+        if let Some(body) = user_static_dir().and_then(|d| read_confined(&d, rel)) {
+            return http::respond_with(w, 200, "OK", ctype, &[NOSNIFF, SANDBOX], &body);
+        }
+    }
+
+    match crate::assets::get(rel) {
+        Some(body) => http::respond_with(w, 200, "OK", ctype, &[NOSNIFF], body),
+        None => http::not_found(w, "no such asset"),
     }
 }
 
@@ -238,4 +303,114 @@ fn serve_frag(
 
 fn path_is_suspicious(p: &str) -> bool {
     p.starts_with('/') || std::path::Path::new(p).components().any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `HOME` is process-global, and cargo runs a binary's tests in parallel
+    /// threads. `ASSET_ENV_LOCK` keeps these tests from interleaving with
+    /// each other, but each still has to leave `HOME` exactly as it found
+    /// it — otherwise a later test in the same binary run inherits a `HOME`
+    /// pointed at a `tempfile::TempDir` that has already been deleted.
+    /// Restoring on `Drop` (rather than a manual statement at the end of
+    /// each test body) also covers a panicking assertion, which a plain
+    /// "restore at the bottom" would miss.
+    struct HomeGuard(Option<std::ffi::OsString>);
+    impl HomeGuard {
+        fn set(path: &Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", path);
+            HomeGuard(prev)
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    fn serve(rel: &str) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        serve_static(&mut buf, rel);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[test]
+    fn an_absent_overlay_serves_the_embedded_copy() {
+        let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("RESH_STATIC");
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let out = serve("style.css");
+        assert!(out.starts_with("HTTP/1.1 200 OK"));
+        assert!(out.contains("X-Content-Type-Options: nosniff"));
+        assert!(!out.contains("Content-Security-Policy"), "embedded assets are not untrusted");
+    }
+
+    #[test]
+    fn resh_static_overrides_one_file_and_the_rest_fall_through() {
+        let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("style.css"), "/*OVERRIDDEN*/").unwrap();
+        std::env::set_var("RESH_STATIC", d.path());
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+
+        assert!(serve("style.css").contains("/*OVERRIDDEN*/"));
+        // Not present in the overlay dir, so it must still resolve.
+        assert!(serve("app.js").starts_with("HTTP/1.1 200 OK"));
+
+        std::env::remove_var("RESH_STATIC");
+    }
+
+    /// The rule the whole class split exists for. A .js in the user dir must
+    /// not merely be "blocked" — the layer is never consulted for it, so the
+    /// embedded copy is what comes back.
+    #[test]
+    fn the_user_directory_may_not_replace_code() {
+        let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("RESH_STATIC");
+        let home = tempfile::tempdir().unwrap();
+        let userdir = home.path().join(".config/resh/static");
+        std::fs::create_dir_all(&userdir).unwrap();
+        std::fs::write(userdir.join("app.js"), "alert('pwned')").unwrap();
+        std::fs::write(userdir.join("style.css"), "/*MINE*/").unwrap();
+        let _home = HomeGuard::set(home.path());
+
+        let js = serve("app.js");
+        assert!(!js.contains("pwned"), "a user-dir .js must never be served");
+        assert!(js.starts_with("HTTP/1.1 200 OK"), "it falls through to embedded, not 404");
+
+        let css = serve("style.css");
+        assert!(css.contains("/*MINE*/"), "but theme-class assets DO come from there");
+        assert!(css.contains("Content-Security-Policy: sandbox"), "and are sandboxed");
+    }
+
+    /// Identical 404 either way: a difference here would let a caller probe
+    /// which layers are configured.
+    #[test]
+    fn traversal_is_refused_the_same_with_and_without_an_overlay() {
+        let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let probes = ["../Cargo.toml", "/etc/passwd", "themes/../../Cargo.toml", "a\\..\\b"];
+
+        std::env::remove_var("RESH_STATIC");
+        let without: Vec<String> = probes.iter().map(|p| serve(p)).collect();
+
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATIC", d.path());
+        let with: Vec<String> = probes.iter().map(|p| serve(p)).collect();
+        std::env::remove_var("RESH_STATIC");
+
+        for (i, p) in probes.iter().enumerate() {
+            assert!(without[i].starts_with("HTTP/1.1 404"), "{p} must 404");
+            assert_eq!(without[i], with[i], "{p}: responses must be byte-identical");
+        }
+    }
 }
