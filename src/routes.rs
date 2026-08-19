@@ -75,24 +75,36 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
         // existing single-segment call (`/frag/proj/tree`) unchanged.
         //
         // The theme route is the one exception: `/frag/{project}/theme/{rel}`
-        // carries a path of its own after "theme", so it cannot be found by
-        // taking the last segment — that would misparse "style.css" as the
-        // kind and "proj/theme" as the project. It is dispatched here,
-        // before the split-from-the-right rule, by finding the *last*
-        // "theme" segment (a project may itself be named `.../theme`) with
-        // at least one project segment before it and one path segment after.
+        // carries a path of its own after "theme", so it cannot always be
+        // found by taking the last segment — that would misparse
+        // "style.css" as the kind and "proj/theme" as the project.
+        //
+        // A first version of this dispatched on the *last* "theme" segment
+        // whenever the split-last kind wasn't literally "theme" — but a
+        // project is legitimately multi-segment (`resolve_project` accepts
+        // nested rels), so a project named e.g. "a/theme" made every one of
+        // its ordinary fragments ("tree", "theme.css", …) match the theme
+        // rule instead and 404 as "no such asset". The rule has to be keyed
+        // on whether the *last* segment is a real fragment kind, not on
+        // whether some earlier segment happens to say "theme": if it is,
+        // this is an ordinary fragment (even one whose project path
+        // contains "theme"); only otherwise does the "last theme segment"
+        // rule apply, to reach into `.resh/theme/{rel}`.
         ["frag", rest @ ..] if rest.len() >= 2 => {
-            match rest.iter().rposition(|s| *s == "theme") {
-                Some(i) if i >= 1 && i + 1 < rest.len() => {
-                    let Some(dir) = projects::resolve_project(roots, &rest[..i].join("/")) else {
-                        return http::not_found(w, "no such project");
-                    };
-                    serve_project_theme(w, &dir, &rest[i + 1..].join("/"))
-                }
-                _ => {
-                    let (what, proj_segs) =
-                        rest.split_last().expect("len >= 2 guarantees a last element");
-                    serve_frag(w, req, roots, &proj_segs.join("/"), std::slice::from_ref(what))
+            let (what, proj_segs) =
+                rest.split_last().expect("len >= 2 guarantees a last element");
+            if FRAGMENT_KINDS.contains(what) {
+                serve_frag(w, req, roots, &proj_segs.join("/"), std::slice::from_ref(what))
+            } else {
+                match rest.iter().rposition(|s| *s == "theme") {
+                    Some(i) if i >= 1 && i + 1 < rest.len() => {
+                        let Some(dir) = projects::resolve_project(roots, &rest[..i].join("/"))
+                        else {
+                            return http::not_found(w, "no such project");
+                        };
+                        serve_project_theme(w, &dir, &rest[i + 1..].join("/"))
+                    }
+                    _ => serve_frag(w, req, roots, &proj_segs.join("/"), std::slice::from_ref(what)),
                 }
             }
         }
@@ -236,6 +248,18 @@ fn serve_static(w: &mut impl Write, rel: &str) {
         None => http::not_found(w, "no such asset"),
     }
 }
+
+/// Every fragment kind `serve_frag` matches on — the closed set `route()`
+/// consults to tell an ordinary fragment request from a `.resh/theme/{rel}`
+/// request when the project path itself contains a "theme" segment.
+///
+/// This list must be kept in sync with `serve_frag`'s match arms by hand:
+/// adding a new fragment kind there and forgetting to add it here makes
+/// `route()` treat it as a theme-asset path instead (or vice versa if one
+/// is removed from serve_frag but left here). There is no compiler check
+/// for that — it's the one hazard this dispatch-by-kind approach carries
+/// that a fully generic parse wouldn't.
+const FRAGMENT_KINDS: &[&str] = &["tree", "file", "changes", "status", "diff", "theme.css"];
 
 fn serve_frag(
     w: &mut impl Write,
@@ -620,5 +644,110 @@ mod tests {
             Some("theme/style.css"),
             "the directory wins where both exist — and only one link is ever emitted"
         );
+    }
+
+    /// Sends a raw request through `http::parse` and the real `route()`
+    /// dispatch — not a hand-built `Request` and not a direct call to
+    /// `serve_frag`/`serve_project_theme` — so this exercises the exact
+    /// code path `handle()` uses. The first round of this feature had
+    /// tests that called `serve_project_theme` directly and stayed green
+    /// while the router itself could never reach it; this is the fix for
+    /// that class of gap, short of opening a real socket.
+    fn frag_route(roots: &[PathBuf], path: &str) -> String {
+        let raw = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        let req = http::parse(&mut std::io::Cursor::new(raw.as_bytes())).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        route(&mut buf, &req, roots);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// A project is legitimately multi-segment (`resolve_project` accepts
+    /// nested rels), so a project whose own path contains a "theme" segment
+    /// must not have every one of its ordinary fragments hijacked by the
+    /// theme-asset rule. This is the regression an earlier version of the
+    /// dispatch introduced: it keyed off "does any segment say theme"
+    /// instead of "is the last segment a real fragment kind", so
+    /// `/frag/a/theme/tree` resolved project "a" (wrong — should be
+    /// "a/theme") and 404'd every pane of that project's workspace.
+    #[test]
+    fn frag_route_dispatches_theme_paths_by_last_segment_not_by_containing_theme() {
+        let root = tempfile::tempdir().unwrap();
+
+        // Project "a": an ordinary project with its own theme directory.
+        let a = root.path().join("a");
+        std::fs::create_dir_all(a.join(".resh/theme")).unwrap();
+        std::fs::write(a.join(".resh/theme/style.css"), "css-a-style").unwrap();
+
+        // Project "a/theme": a nested project whose own name contains
+        // "theme" — the case the regression broke.
+        let a_theme = root.path().join("a/theme");
+        std::fs::create_dir_all(a_theme.join(".resh/theme")).unwrap();
+        std::fs::write(a_theme.join("inner.rs"), "fn main() {}").unwrap();
+        std::fs::write(a_theme.join(".resh/theme.css"), "css-a-theme-legacy").unwrap();
+        std::fs::write(a_theme.join(".resh/theme/style.css"), "css-a-theme-style").unwrap();
+
+        // Project "theme": a top-level project literally named "theme".
+        let theme_proj = root.path().join("theme");
+        std::fs::create_dir_all(&theme_proj).unwrap();
+        std::fs::write(theme_proj.join("hello.txt"), "hello").unwrap();
+
+        // Project "proj": no theme assets and no "theme"-named segment at
+        // all, so `/frag/proj/theme` has nothing to fall back to.
+        let proj = root.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("hello.txt"), "hello").unwrap();
+
+        // karpie/sub: the plain nested-project regression case (also
+        // covered over real HTTP by
+        // frag_route_resolves_a_nested_projects_fragment_kind in
+        // tests/integration.rs) — asserted here too since it exercises
+        // the very same match arm this test is about.
+        let sub = root.path().join("karpie/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("inner.rs"), "fn main() {}").unwrap();
+
+        let roots = vec![root.path().to_path_buf()];
+
+        // Last segment "tree" IS a fragment kind: project is "a/theme"
+        // wholesale, never truncated at its "theme" segment.
+        let out = frag_route(&roots, "/frag/a/theme/tree");
+        assert!(out.contains("inner.rs"), "must list project a/theme's own tree, not 404: {out}");
+
+        // Last segment "theme.css" IS a fragment kind: project "a/theme",
+        // its own legacy stylesheet fragment.
+        let out = frag_route(&roots, "/frag/a/theme/theme.css");
+        assert!(out.contains("css-a-theme-legacy"), "must resolve project a/theme, kind theme.css");
+
+        // Last segment "style.css" is NOT a fragment kind: falls to the
+        // theme-asset rule, reading project "a"'s .resh/theme/style.css —
+        // not project "a/theme"'s.
+        let out = frag_route(&roots, "/frag/a/theme/style.css");
+        assert!(out.contains("css-a-style"), "must resolve project a, theme asset style.css: {out}");
+        assert!(!out.contains("css-a-theme-style"), "must not read project a/theme's asset instead");
+
+        // Last segment "style.css" is again not a kind; the *last* "theme"
+        // segment is the second one, giving project "a/theme" and asset
+        // "style.css" inside it.
+        let out = frag_route(&roots, "/frag/a/theme/theme/style.css");
+        assert!(out.contains("css-a-theme-style"), "must resolve project a/theme, theme asset style.css: {out}");
+
+        // Last segment "tree" IS a kind, so the whole first segment is the
+        // project name — a project literally named "theme" still works.
+        let out = frag_route(&roots, "/frag/theme/tree");
+        assert!(out.contains("hello.txt"), "must resolve project theme, kind tree: {out}");
+
+        // Last segment "theme" is not a fragment kind, and there is no
+        // earlier "theme" segment for the theme-asset rule to use (the
+        // rule requires at least one project segment before it) — falls
+        // back to serve_frag's own catch-all, a 404, not a theme-asset
+        // lookup with an empty project name.
+        let out = frag_route(&roots, "/frag/proj/theme");
+        assert!(out.starts_with("HTTP/1.1 404"), "no fallback project for a bare theme kind: {out}");
+        assert!(out.contains("no such fragment"));
+
+        // Plain nested-project regression: an ordinary kind under a
+        // multi-segment project with no "theme" segment anywhere.
+        let out = frag_route(&roots, "/frag/karpie/sub/tree");
+        assert!(out.contains("inner.rs"), "must still resolve an ordinary nested project: {out}");
     }
 }

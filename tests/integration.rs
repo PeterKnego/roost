@@ -296,6 +296,34 @@ fn frag_theme_directory_serves_presentation_and_refuses_code_over_http() {
     }
 }
 
+/// A first version of the theme-directory router dispatch keyed off "does
+/// any path segment say theme" rather than "is the last segment a real
+/// fragment kind". A project is legitimately multi-segment
+/// (`resolve_project` accepts nested rels, see
+/// `multi_segment_workspace_url_resolves_the_nested_directory` /
+/// `frag_route_resolves_a_nested_projects_fragment_kind`), so a project
+/// literally named ".../theme" made that version hijack every one of its
+/// ordinary fragments into a theme-asset lookup under its *parent*
+/// project instead — the workspace page would render, and every pane
+/// would 404. This has to go over real HTTP: a test that reaches
+/// `serve_frag`/`serve_project_theme` directly, bypassing `route()`'s
+/// dispatch, is exactly what let the dead-route bug and this one both
+/// ship green.
+#[test]
+fn nested_project_named_theme_still_serves_ordinary_fragments_over_http() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(d.path().join("a/theme")).unwrap();
+    std::fs::write(d.path().join("a/theme/inner.rs"), "fn main() {}").unwrap();
+    let port = start(vec![d.path().to_path_buf()]);
+
+    let body = ureq::get(&format!("http://127.0.0.1:{port}/frag/a/theme/tree"))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(body.contains("inner.rs"), "project a/theme's own tree, not a 404: {body}");
+}
+
 #[test]
 fn diff_traversal_path_is_rejected_with_hint() {
     let (_d, port) = fixture();
