@@ -348,8 +348,17 @@ impl Hub {
                 // conflict against content it never compared against.
                 match &intent {
                     Intent::SetMode { rel, mode: Mode::Edit } => self.open_for_edit(from, rel),
-                    Intent::OpenTab { tab: Tab::File { rel, mode: Mode::Edit }, .. } => {
-                        self.open_for_edit(from, rel)
+                    // Dispatched off the COERCED tab, not off the intent:
+                    // apply_layout may have forced Edit to Preview, and
+                    // reading the file anyway would seed a buffer for a tab
+                    // that has no editor. That buffer is not harmless — the
+                    // read stores String::from_utf8_lossy, so its text is not
+                    // the file's bytes, and a later save would write U+FFFD
+                    // over the original.
+                    Intent::OpenTab { tab, .. } => {
+                        if let Tab::File { rel, mode: Mode::Edit } = workspace::coerce_tab(tab) {
+                            self.open_for_edit(from, &rel)
+                        }
                     }
                     // Closing a File tab is the only way a buffer is ever
                     // freed short of the conflict banner's "discard mine" —
@@ -1076,6 +1085,61 @@ mod tests {
         // on disk.
         h.handle(&c, Intent::SaveBuffer { rel: "a.txt".into(), force: false });
         assert!(drain(&rx).iter().any(|m| m.contains(r#""t":"SaveOk""#)));
+    }
+
+    /// The Edit-mode disk read has to follow the tab that actually landed.
+    /// `apply_layout` coerces `OpenTab{mode:Edit}` on a PNG to Preview, but
+    /// this dispatch used to match the *intent*, so the read still ran and
+    /// seeded a buffer for a tab with no editor. Not cosmetic: the read
+    /// stores `String::from_utf8_lossy`, so that buffer's text is not the
+    /// file's bytes — every non-UTF-8 byte has become U+FFFD — and a save
+    /// against it rewrites the image with the replacement characters.
+    ///
+    /// The .txt half is the discriminating half: without it this passes with
+    /// the dispatch deleted outright.
+    ///
+    /// Confirmed by restoring the pre-fix arm
+    /// `Intent::OpenTab { tab: Tab::File { rel, mode: Mode::Edit }, .. } =>
+    /// self.open_for_edit(from, rel)` and running this test: it failed at
+    /// "a coerced tab must not get a buffer" — the buffer was there, holding
+    /// the lossy text of the PNG.
+    #[test]
+    fn a_coerced_open_does_not_read_the_file_it_could_not_edit() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        // Real PNG magic: bytes that are not valid UTF-8, so from_utf8_lossy
+        // would visibly corrupt them.
+        std::fs::write(d.path().join("shot.png"), [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+            .unwrap();
+        std::fs::write(d.path().join("a.txt"), "on disk\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "shot.png".into(), mode: Mode::Edit },
+            },
+        );
+        assert!(
+            !h.ws.buffers.contains_key("shot.png"),
+            "a coerced tab must not get a buffer: {:?}",
+            h.ws.buffers.keys().collect::<Vec<_>>()
+        );
+
+        // A tab that really did open in Edit must still be read, or this test
+        // would pass with the dispatch removed altogether.
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "a.txt".into(), mode: Mode::Edit },
+            },
+        );
+        assert_eq!(h.ws.buffers["a.txt"].text, "on disk\n");
     }
 
     #[test]
