@@ -70,7 +70,7 @@ impl Workspace {
         let mut panes = vec![Pane::default(); PANE_COUNT];
         panes[proto::LEFT_TOP as usize].tabs = vec![Tab::Tree];
         panes[proto::LEFT_BOTTOM as usize].tabs = vec![Tab::Changes];
-        panes[proto::RIGHT as usize].tabs = vec![Tab::Terminal { session: "shell".into() }];
+        panes[proto::RIGHT as usize].tabs = vec![Tab::Terminal { session: "term".into() }];
         Workspace {
             version: 0,
             sizes: Sizes::default(),
@@ -157,6 +157,23 @@ pub fn apply_layout(w: &mut Workspace, intent: &Intent) -> Result<bool, String> 
             p.active = p.active.min(p.tabs.len().saturating_sub(1));
             Ok(true)
         }
+        // Not addressed by (pane, idx) like CloseTab: a session can be open in
+        // several panes at once, and in other browsers' layouts too. Ending the
+        // shell must clear every one of those tabs — leaving a stray one behind
+        // would offer a click that silently starts a *new* shell under a name
+        // the user thought they had just closed.
+        Intent::EndSession { session } => {
+            let mut changed = false;
+            for p in w.panes.iter_mut() {
+                let before = p.tabs.len();
+                p.tabs.retain(|t| !matches!(t, Tab::Terminal { session: s } if s == session));
+                if p.tabs.len() != before {
+                    p.active = p.active.min(p.tabs.len().saturating_sub(1));
+                    changed = true;
+                }
+            }
+            Ok(changed)
+        }
         Intent::ActivateTab { pane, idx } => {
             let p = pane_mut(w, *pane)?;
             if *idx >= p.tabs.len() {
@@ -239,8 +256,46 @@ mod tests {
         assert!(w.panes[proto::MIDDLE as usize].tabs.is_empty());
         assert_eq!(
             w.panes[proto::RIGHT as usize].tabs,
-            vec![Tab::Terminal { session: "shell".into() }]
+            vec![Tab::Terminal { session: "term".into() }]
         );
+    }
+
+    /// A session can be open in more than one pane — and in another browser's
+    /// layout. Ending the shell must clear every one of those tabs; a survivor
+    /// would be a click that silently starts a *new* shell under the name the
+    /// user just ended.
+    #[test]
+    fn ending_a_session_clears_its_tabs_from_every_pane() {
+        let mut w = Workspace::default_layout();
+        let term = |n: &str| Tab::Terminal { session: n.to_string() };
+        // default_layout seeds RIGHT with a Terminal tab of its own; clear it
+        // so the only sessions in play are the ones under test.
+        for p in w.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+            p.active = 0;
+        }
+        apply_layout(&mut w, &Intent::OpenTab { pane: proto::MIDDLE, tab: term("term") }).unwrap();
+        apply_layout(&mut w, &Intent::OpenTab { pane: proto::RIGHT, tab: term("term") }).unwrap();
+        apply_layout(&mut w, &Intent::OpenTab { pane: proto::RIGHT, tab: term("term1") }).unwrap();
+
+        let changed = apply_layout(&mut w, &Intent::EndSession { session: "term".into() }).unwrap();
+
+        assert!(changed);
+        let live: Vec<&Tab> = w.panes.iter().flat_map(|p| p.tabs.iter()).collect();
+        assert!(
+            !live.iter().any(|t| matches!(t, Tab::Terminal { session } if session == "term")),
+            "no pane may keep a tab for the ended session"
+        );
+        assert!(
+            live.iter().any(|t| matches!(t, Tab::Terminal { session } if session == "term1")),
+            "a sibling session must survive"
+        );
+        for p in &w.panes {
+            assert!(p.active < p.tabs.len().max(1), "active index must stay addressable");
+        }
+
+        // Nothing to remove is not a change — it must not bump the version.
+        assert!(!apply_layout(&mut w, &Intent::EndSession { session: "gone".into() }).unwrap());
     }
 
     #[test]

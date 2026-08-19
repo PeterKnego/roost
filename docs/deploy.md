@@ -147,12 +147,29 @@ nothing is running), for the same reason.
 Both are logged, so `journalctl --user -u resh | grep -i reap` after a
 restart tells you what the startup sweep decided.
 
-**Close Project** is the only way to end sessions from the UI. It ends all of a
-project's sessions — including each `dtach` **master**, which is the part that
-matters: in `-A` mode dtach forks a master that reparents to init, so killing
-only resh's own client is a *detach*, not an end. It keeps the saved
+**Closing a terminal tab ends that session.** Its × kills the shell and its
+`dtach` **master** — the part that matters: in `-A` mode dtach forks a master
+that reparents to init, so killing only resh's own client is a *detach*, not an
+end. **Alt-click the × to detach instead**, dropping the tab and leaving the
+shell running.
+
+Survival is unaffected by this, because it only ever mattered for the
+*involuntary* cases: a dropped browser tab, a closed laptop and a resh restart
+send no intent at all, so those sessions live on and are re-attached by name.
+
+**Close Project** ends all of a project's sessions at once. It keeps the saved
 layout (reopening restores panes and tabs) and refuses while any buffer has
-unsaved changes, listing them by name.
+unsaved changes, listing them by name. It remains the only way to reach a
+session with no tab — one orphaned by a browser dying mid-session, or by a
+resh version predating per-tab ending. Nothing lists sessions by name in the
+UI, and the per-project cap is `MAX_SESSIONS_PER_PROJECT` (16), so such
+orphans are invisible and still occupy slots.
+
+New terminals are named by the server — `term`, `term1`, `term2` — from
+`session::live_names`, which sees detached sessions too. The client must never
+choose: it knows only the sessions it has tabs for, and attaching *creates only
+when absent*, so a client-chosen name would eventually reattach the user to an
+old shell, scrollback and all, instead of giving them a new one.
 
 ## Deploying to <deploy-host>
 
