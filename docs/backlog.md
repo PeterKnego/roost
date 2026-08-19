@@ -153,9 +153,10 @@ feature list — is what a spec for this needs to resolve.
   process-global in-memory notice store with whatever it just read off disk
   (`s.notices = list.into()`), and `lib.rs` calls `notify::load()` on every
   `serve()`. `tests/integration.rs`'s `start()` spawns `serve()` on a thread
-  and returns immediately, and there are roughly 49 `start()` call sites in
-  this one test binary. `WS_TEST_LOCK` serialises the websocket tests against
-  each other, but not against the ~20 tests that do not take it, which freely
+  and returns immediately, and this one binary stands up 31 servers — 7 direct
+  `start(...)` calls plus 24 through `fixture()`, which calls it too (counted
+  at `098478e`). `WS_TEST_LOCK` serialises the websocket tests against each
+  other, but not against the 28 of 54 tests that do not take it, which freely
   `start()` servers of their own and set/remove `RESH_STATE_DIR` as they go.
   So one test's `load()` can read a *different* test's state dir — including,
   if the timing lines up wrong, the developer's real `~/.local/state/resh/` — and
@@ -167,9 +168,9 @@ feature list — is what a spec for this needs to resolve.
   replacing the store wholesale), or gate it behind a `OnceLock` so it only
   ever runs once per process; either way, the integration binary also wants
   one shared env lock covering every `start()` call, not just the websocket
-  ones. This predates the embedded-assets branch, but that branch adds two
-  more `start()` call sites to the same binary, which makes the race
-  marginally more likely to trigger, not less.
+  ones. This predates embedded assets, which has since merged to master and
+  brought two more `start()` call sites into the same binary — so the race is
+  marginally more likely to trigger now, not less.
 
 ## Already shipped (found listed as future/nice-to-have in an earlier doc)
 
