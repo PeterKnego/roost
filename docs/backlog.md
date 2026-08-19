@@ -146,10 +146,10 @@ feature list — is what a spec for this needs to resolve.
   `serve()`. `tests/integration.rs`'s `start()` spawns `serve()` on a thread
   and returns immediately, and there are roughly 49 `start()` call sites in
   this one test binary. `WS_TEST_LOCK` serialises the websocket tests against
-  each other, but not against the ~30 HTTP tests, which freely `start()`
-  servers of their own and set/remove `RESH_STATE_DIR` as they go. So one
-  test's `load()` can read a *different* test's state dir — including, if the
-  timing lines up wrong, the developer's real `~/.local/state/resh/` — and
+  each other, but not against the ~20 tests that do not take it, which freely
+  `start()` servers of their own and set/remove `RESH_STATE_DIR` as they go.
+  So one test's `load()` can read a *different* test's state dir — including,
+  if the timing lines up wrong, the developer's real `~/.local/state/resh/` — and
   evict the notice another test just published out from under it. When that
   happens, `MarkNoticeRead` finds no such id, and `hub.rs` rebroadcasts
   unconditionally with a notice list in which nothing ended up marked read,
@@ -158,7 +158,7 @@ feature list — is what a spec for this needs to resolve.
   replacing the store wholesale), or gate it behind a `OnceLock` so it only
   ever runs once per process; either way, the integration binary also wants
   one shared env lock covering every `start()` call, not just the websocket
-  ones. This predates the embedded-assets branch, but that branch adds three
+  ones. This predates the embedded-assets branch, but that branch adds two
   more `start()` call sites to the same binary, which makes the race
   marginally more likely to trigger, not less.
 

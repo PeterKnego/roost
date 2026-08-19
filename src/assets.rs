@@ -66,9 +66,11 @@ pub fn ext_of(rel: &str) -> String {
 }
 
 pub fn class_of(rel: &str) -> Class {
-    // An empty extension covers both "no dot at all" (README) and "the dot
-    // is the whole name" (.gitignore) — `ext_of` returns "" for both, and
-    // "" is not in THEME_EXT, so both land in Code, as intended.
+    // Both deny-by-default cases land in Code, by different routes: "README"
+    // has no dot at all, so `ext_of` returns "", which is not in THEME_EXT;
+    // ".gitignore" splits as ("", "gitignore"), so `ext_of` returns
+    // "gitignore" — a real extension, just not a theme one. Neither is
+    // special-cased, and neither needs to be.
     if THEME_EXT.contains(&ext_of(rel).as_str()) {
         Class::Theme
     } else {
