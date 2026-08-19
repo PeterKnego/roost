@@ -580,7 +580,13 @@ function refreshTree() {
 // container handler wireFragment sets once, at the pane's outer `.content`
 // mount, already catches blank clicks anywhere inside via bubbling.
 function wireFileLinks(root) {
-  root.querySelectorAll("a.file[data-rel]").forEach((a) => {
+  // Any anchor carrying data-rel, not just tree rows: markdown previews emit
+  // <a class="mdlink" data-rel> for links to project files, and they want the
+  // identical open-as-tab and context-menu behaviour. A no-op for existing
+  // markup — every data-rel anchor rendered today already has class="file"
+  // (render.rs tree_level, changes_fragment) — and tree <details data-rel>
+  // stays excluded because the selector still requires an `a`.
+  root.querySelectorAll("a[data-rel]").forEach((a) => {
     a.onclick = (e) => {
       e.preventDefault();
       // These anchors still carry hx-get/hx-target="#content" from the

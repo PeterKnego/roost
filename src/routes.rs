@@ -358,7 +358,7 @@ fn serve_frag(
             Some(rel) => match projects::safe_resolve(&dir, rel)
                 .and_then(|p| projects::read_text_file(&p))
             {
-                Ok(content) => http::html(w, &render::file_fragment(rel, &content)),
+                Ok(content) => http::html(w, &render::file_fragment(project, rel, &content)),
                 Err(e) => http::html(w, &render::hint(&e)),
             },
         },

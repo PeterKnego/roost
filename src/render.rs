@@ -53,7 +53,7 @@ pub enum Dest {
     /// Project-relative and lexically normalized. **Not confined** — the
     /// server confines on use, and this must not be mistaken for the boundary.
     Local(String),
-    /// `mailto:`, `#anchor`, empty. Not ours to rewrite.
+    /// `mailto:`, `tel:`, `#anchor`, empty. Not ours to rewrite.
     Passthrough,
     /// A relative path that climbs out of the project. A dead reference.
     Broken,
@@ -122,24 +122,66 @@ pub fn resolve_dest(dest: &str, from_rel: &str) -> Dest {
     }
 }
 
-pub fn markdown_html(md: &str) -> String {
-    use pulldown_cmark::{html, Event, Options, Parser};
+/// The opening tag for a markdown link, by where it points.
+///
+/// Raw HTML is required here rather than rewriting the tag's `dest_url`,
+/// because `data-rel` and `target` are attributes `Tag::Link` cannot carry.
+/// Everything interpolated is escaped; the closing `</a>` comes from
+/// `push_html`'s own handling of `TagEnd::Link`, which runs whether or not the
+/// opening tag was ours.
+fn link_open(dest: &str, from_rel: &str) -> String {
+    match resolve_dest(dest, from_rel) {
+        // Deliberately no href — `wireFileLinks` opens it as a tab, and an
+        // href would race that handler by navigating the workspace away.
+        Dest::Local(p) => format!("<a class=\"mdlink\" data-rel=\"{}\">", esc(&p)),
+        // Kept, because a link is a deliberate click that shows its target,
+        // unlike an image's automatic fetch. `_blank` stops it replacing the
+        // workspace; `noopener` denies it `window.opener`; `noreferrer` keeps
+        // the workspace URL out of the request.
+        Dest::Remote => format!(
+            "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">",
+            esc(dest)
+        ),
+        Dest::Data | Dest::Passthrough => format!("<a href=\"{}\">", esc(dest)),
+        // Inert: no href, no data-rel, so neither the browser nor the client
+        // will follow it.
+        Dest::Broken => "<a class=\"mdbroken\">".to_string(),
+    }
+}
+
+pub fn markdown_html(md: &str, project: &str, rel: &str) -> String {
+    // TagEnd is not imported yet — the image arm in Task 4 adds it. Importing
+    // it here would warn.
+    use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag};
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    let events = Parser::new_ext(md, opts).map(|ev| match ev {
-        // raw HTML from repo content must never reach the page: render it as text
-        Event::Html(h) => Event::Text(h),
-        Event::InlineHtml(h) => Event::Text(h),
-        other => other,
+    let events = Parser::new_ext(md, opts).filter_map(|ev| match ev {
+        // raw HTML from repo content must never reach the page: render it as
+        // text. This arm must stay FIRST — the arms below emit Event::Html we
+        // built ourselves from escaped values, and they are not re-examined
+        // only because nothing downstream looks at them again.
+        Event::Html(h) => Some(Event::Text(h)),
+        Event::InlineHtml(h) => Some(Event::Text(h)),
+
+        Event::Start(Tag::Link { ref dest_url, .. }) => {
+            Some(Event::Html(CowStr::from(link_open(dest_url, rel))))
+        }
+
+        other => Some(other),
     });
     let mut out = String::new();
     html::push_html(&mut out, events);
+    let _ = project; // used by the image arm in the next task
     format!("<article class=\"markdown-body\">{out}</article>")
 }
 
-pub fn file_fragment(rel: &str, content: &str) -> String {
+pub fn file_fragment(project: &str, rel: &str, content: &str) -> String {
     let ext = rel.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     if ext == "md" || ext == "markdown" {
-        format!("<div class=\"path\">{}</div>{}", esc(rel), markdown_html(content))
+        format!(
+            "<div class=\"path\">{}</div>{}",
+            esc(rel),
+            markdown_html(content, project, rel)
+        )
     } else {
         format!(
             "<div class=\"path\">{}</div><pre class=\"codeview\"><code class=\"language-{}\">{}</code></pre>",
@@ -644,7 +686,7 @@ mod tests {
 
     #[test]
     fn markdown_renders_wrapped() {
-        let h = markdown_html("# Hi\n\n- a\n");
+        let h = markdown_html("# Hi\n\n- a\n", "proj", "a.md");
         assert!(h.starts_with("<article class=\"markdown-body\">"));
         assert!(h.contains("<h1>Hi</h1>"));
         assert!(h.contains("<li>a</li>"));
@@ -652,7 +694,11 @@ mod tests {
 
     #[test]
     fn markdown_raw_html_is_neutralized() {
-        let h = markdown_html("hello <script>alert(1)</script>\n\n<iframe src=x></iframe>\n");
+        let h = markdown_html(
+            "hello <script>alert(1)</script>\n\n<iframe src=x></iframe>\n",
+            "proj",
+            "a.md",
+        );
         assert!(!h.contains("<script>"));
         assert!(!h.contains("<iframe"));
         assert!(h.contains("&lt;script&gt;"));
@@ -660,11 +706,55 @@ mod tests {
 
     #[test]
     fn file_fragment_md_vs_code() {
-        let md = file_fragment("readme.md", "# T");
+        let md = file_fragment("proj", "readme.md", "# T");
         assert!(md.contains("markdown-body"));
-        let code = file_fragment("main.rs", "fn x() -> Vec<u8> {}");
+        let code = file_fragment("proj", "main.rs", "fn x() -> Vec<u8> {}");
         assert!(code.contains("language-rs"));
         assert!(code.contains("Vec&lt;u8&gt;")); // escaped, hljs runs client-side
+    }
+
+    #[test]
+    fn a_local_link_becomes_a_tab_opening_anchor() {
+        let h = markdown_html("see [the plan](plan.md)\n", "proj", "docs/a.md");
+        assert!(h.contains(r#"<a class="mdlink" data-rel="docs/plan.md">"#), "{h}");
+        assert!(h.contains("the plan</a>"), "the link text must survive: {h}");
+        // No href at all: an href would let a click navigate the SPA away before
+        // the handler ran, which is the bug this fixes.
+        // Verified this assertion can fail: adding `href="{}"` back to the
+        // Dest::Local arm made this panic with the anchor rendered as
+        // `<a href="plan.md" class="mdlink" data-rel="docs/plan.md">` —
+        // i.e. `!h.contains(r#"href="plan.md""#)` failed because the href
+        // was right there.
+        assert!(!h.contains(r#"href="plan.md""#), "{h}");
+        // class="file" would style an inline reference as a tree row (icon,
+        // indent guides, full-width hover). Asserting the absence, because a test
+        // that only greps data-rel passes either way.
+        assert!(!h.contains(r#"class="file""#), "{h}");
+    }
+
+    #[test]
+    fn a_remote_link_survives_but_cannot_replace_the_workspace() {
+        let h = markdown_html("[docs](https://example.com/x)\n", "proj", "a.md");
+        assert!(h.contains(r#"href="https://example.com/x""#), "{h}");
+        assert!(h.contains(r#"target="_blank""#), "{h}");
+        assert!(h.contains(r#"rel="noopener noreferrer""#), "{h}");
+    }
+
+    #[test]
+    fn an_anchor_link_is_left_alone_and_a_broken_one_is_inert() {
+        let h = markdown_html("[top](#top) and [gone](../../../etc/passwd)\n", "proj", "a.md");
+        assert!(h.contains(r##"href="#top""##), "{h}");
+        assert!(h.contains(r#"<a class="mdbroken">"#), "{h}");
+        assert!(!h.contains("etc/passwd"), "a dead reference must not stay clickable: {h}");
+    }
+
+    /// The link arm emits Event::Html, which sits in the same match as the arm
+    /// that turns repo-authored Html into text. If those are ever reordered, repo
+    /// HTML reaches the page.
+    #[test]
+    fn rewriting_links_did_not_reopen_the_raw_html_hole() {
+        let h = markdown_html("hello <script>alert(1)</script>\n", "proj", "a.md");
+        assert!(!h.contains("<script>"), "{h}");
     }
 
     #[test]
