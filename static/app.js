@@ -1070,3 +1070,188 @@ function onNotice(n) {
   renderNotices();
   render();
 }
+
+// ---------------------------------------------------------------------------
+// Uploads: files dropped or pasted onto the tree, and images pasted onto a
+// terminal. Delegated at document level, not bound per row: the tree is an htmx
+// fragment replaced wholesale on TreeChanged, and an upload triggers exactly
+// that — per-row listeners would not survive their own first success.
+const MAX_UPLOAD_PARTS = 16; // must match config::MAX_UPLOAD_PARTS
+
+// The destination for a drop: the nearest row carrying a data-rel. A directory
+// row contributes itself, a file row its parent. Null means the drop was not on
+// the tree at all, which is what keeps the destination unambiguous and is why
+// this needs no confirmation dialog.
+function dropDir(target) {
+  const el = target && target.closest && target.closest("[data-rel]");
+  if (!el) return null;
+  const rel = el.dataset.rel;
+  if (el.tagName === "DETAILS") return rel;
+  return rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "";
+}
+
+// Where a drop should land, widened from the row to the whole Files pane.
+// Rows are a small target and the gaps between them are large, so resolving
+// only on `[data-rel]` meant most of the pane silently fell through to the
+// browser, which navigates to file:/// and throws the workspace away. Pane
+// whitespace is the project root — the same thing the tree's own top level is.
+function uploadTargetDir(target) {
+  const row = dropDir(target);
+  if (row !== null) return row;
+  const pane = target && target.closest && target.closest(".pane");
+  if (pane && pane.querySelector("ul.tree")) return "";
+  return null;
+}
+
+// True when the drag carries files, as opposed to text being moved inside the
+// editor's textarea. Only file drags are intercepted, or dragging a selection
+// within a buffer would stop working.
+function dragHasFiles(dt) {
+  return !!dt && Array.prototype.includes.call(dt.types || [], "Files");
+}
+
+function focusedSession() {
+  const host = document.activeElement && document.activeElement.closest(".termhost");
+  return host ? host.dataset.session : null;
+}
+
+// The session a drag is over, so an image can be dropped straight onto the
+// terminal it is meant for rather than routed through the file tree.
+function sessionUnder(target) {
+  const host = target && target.closest && target.closest(".termhost");
+  return host ? host.dataset.session : null;
+}
+
+function firstImage(files) {
+  return [...files].find((f) => f.type.startsWith("image/")) || null;
+}
+
+// One reusable banner rather than showBanner's transient ones, because progress
+// has to be updated in place and then cleared.
+function setUploadProgress(label, fraction) {
+  let box = document.getElementById("uploadprogress");
+  if (fraction === null) {
+    if (box) box.remove();
+    return;
+  }
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "uploadprogress";
+    box.className = "conflict";
+    document.body.appendChild(box);
+  }
+  box.textContent = `${label} — ${Math.round(fraction * 100)}%`;
+}
+
+function postFiles(url, files, label) {
+  const form = new FormData();
+  for (const f of files) form.append("file", f, f.name);
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", url);
+  // XHR rather than fetch: fetch exposes no upload progress, and a 100 MB send
+  // with no feedback is indistinguishable from a hang.
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable) setUploadProgress(label, e.loaded / e.total);
+  };
+  xhr.onload = () => {
+    setUploadProgress(label, null);
+    if (xhr.status !== 200) return showError(`${label}: ${xhr.responseText || xhr.status}`);
+    let body = {};
+    try { body = JSON.parse(xhr.responseText); } catch { return; }
+    for (const r of body.results || []) if (!r.ok) showError(`${r.name}: ${r.error}`);
+  };
+  xhr.onerror = () => { setUploadProgress(label, null); showError(`${label}: upload failed`); };
+  xhr.send(form);
+}
+
+// File.size and FileList.length come from the OS and are readable before a byte
+// is sent, so the part cap is checked at drop time. A courtesy, not the
+// enforcement — the server applies both caps while streaming regardless.
+function tooManyFiles(files) {
+  if (files.length > MAX_UPLOAD_PARTS) {
+    return `${files.length} files at once (limit ${MAX_UPLOAD_PARTS}) — use git or scp to move a project`;
+  }
+  return null;
+}
+
+function uploadFiles(files, dir) {
+  const refusal = tooManyFiles(files);
+  if (refusal) return showError(refusal);
+  const q = dir ? `?dir=${dir.split("/").map(encodeURIComponent).join("/")}` : "";
+  postFiles(`/upload/${PROJECT}${q}`, files, `upload to ${dir || "project root"}`);
+}
+
+// A dropped directory arrives as a zero-length entry that fails on read, so a
+// size check would send a mystery empty part and surface a confusing server
+// error. webkitGetAsEntry is the reliable test; directories are a non-goal, so
+// say so at the drop, by name.
+function droppedDirectories(dt) {
+  const dirs = [];
+  for (const item of dt.items || []) {
+    const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
+    if (entry && entry.isDirectory) dirs.push(entry.name);
+  }
+  return dirs;
+}
+
+// preventDefault on *every* file drag, not just ones over a valid target.
+// Without it the browser handles the drop itself and navigates to file:///,
+// which throws away the workspace — and it did so for every pixel that was not
+// exactly a tree row, which is most of the window. Refusing a misplaced drop
+// out loud is the whole point; navigating away is never the right answer.
+document.addEventListener("dragover", (e) => {
+  if (dragHasFiles(e.dataTransfer)) e.preventDefault();
+});
+
+document.addEventListener("drop", (e) => {
+  if (!dragHasFiles(e.dataTransfer)) return;
+  e.preventDefault();
+
+  // An image dropped on a terminal goes to that terminal, the same as pasting
+  // one there. Dragging a screenshot straight onto the shell that needs it is
+  // the obvious gesture, and routing it through the tree instead would leave a
+  // file the user then has to mention by hand.
+  const session = sessionUnder(e.target);
+  if (session) {
+    const img = e.dataTransfer.files.length ? firstImage(e.dataTransfer.files) : null;
+    if (img) {
+      postFiles(`/paste/${PROJECT}/${session}`, [img], "paste");
+      return;
+    }
+    return showError("only images can be dropped on a terminal — drop other files on the Files pane");
+  }
+
+  const dir = uploadTargetDir(e.target);
+  if (dir === null) {
+    return showError("drop files on the Files pane to upload them");
+  }
+  const dirs = droppedDirectories(e.dataTransfer);
+  if (dirs.length) {
+    return showError(`folders are not uploaded (${dirs.join(", ")}) — use git or scp for a directory`);
+  }
+  if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files, dir);
+});
+
+// Capture phase, and this is not optional. xterm's own paste handler calls
+// stopPropagation() on every paste over a terminal and then reads only
+// text/plain — so a bubble-phase listener never runs when a terminal has focus,
+// which is exactly where pasting a screenshot needs to work. Capture puts this
+// ahead of xterm; anything that is not an image is left completely untouched
+// and reaches xterm as before.
+document.addEventListener("paste", (e) => {
+  const files = e.clipboardData && e.clipboardData.files;
+  if (!files || !files.length) return;
+  const session = focusedSession();
+  if (session) {
+    const img = firstImage(files);
+    if (!img) return; // not an image: xterm's text paste, untouched
+    e.preventDefault();
+    e.stopPropagation(); // xterm must not also act on this one
+    postFiles(`/paste/${PROJECT}/${session}`, [img], "paste");
+    return;
+  }
+  const dir = uploadTargetDir(document.activeElement) ?? uploadTargetDir(e.target);
+  if (dir === null) return;
+  e.preventDefault();
+  uploadFiles(files, dir);
+}, true);

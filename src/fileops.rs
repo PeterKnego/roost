@@ -97,6 +97,114 @@ pub fn create_dir(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     Ok(abs)
 }
 
+/// Rejects what `safe_resolve_parent` does not. That function validates the
+/// final component for traversal, but a part's filename arrives from the
+/// browser's `DataTransfer` and is attacker-influenced even though the endpoint
+/// checks `Origin`. Separators are refused rather than flattened, which is how
+/// directory upload stays a non-goal instead of arriving by accident.
+fn valid_upload_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(format!("invalid filename: {name:?}"));
+    }
+    if name.len() > 255 {
+        return Err(format!("invalid filename: {} bytes is too long", name.len()));
+    }
+    if name.contains('/') || name.contains('\\') || name.chars().any(|c| c.is_control()) {
+        return Err(format!("invalid filename: {name:?}"));
+    }
+    Ok(())
+}
+
+/// Refuses destinations the file tree never renders.
+///
+/// Not a path-safety rule — these paths are legal and inside the project, which
+/// is exactly why nothing else refuses them — but a *visibility* one. A file
+/// written into `.git` or `.claude` cannot be seen, opened, or deleted from the
+/// UI that wrote it, and the next upload of the same name is refused as
+/// "already exists" against a file the user has no way to find. Inside `.git`
+/// it is worse than confusing: a write into an object or ref directory can
+/// corrupt the repository.
+///
+/// Keyed on `SKIP_DIRS`, deliberately not on a leading dot. The tree hides a
+/// fixed list of directories, so `.gitignore` is visible and uploading one is
+/// honest.
+fn visible_in_tree(rel: &str) -> Result<(), String> {
+    for segment in rel.split('/').filter(|s| !s.is_empty()) {
+        if crate::projects::SKIP_DIRS.contains(&segment) {
+            return Err(format!(
+                "{segment} is not visible in the tree; refusing to upload into it"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Distinguishes concurrent temp files within one process. The pid alone is not
+/// enough: one request may carry two parts with the same filename, and they are
+/// open at overlapping times, so a pid-only name would have the second part
+/// writing through the first's temp before either committed.
+static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A part being streamed to disk.
+///
+/// Writes to a temp file in the *destination* directory so the final step is a
+/// rename on the same filesystem — atomic, so a watcher never sees a partial
+/// file under the real name — and removes that temp on drop, so an abandoned
+/// upload leaves nothing behind.
+#[derive(Debug)]
+pub struct UploadTemp {
+    /// `None` once committed, which is also what stops `Drop` deleting the
+    /// file we just renamed into place.
+    tmp: Option<PathBuf>,
+    dest: PathBuf,
+    rel: String,
+    file: std::fs::File,
+}
+
+impl UploadTemp {
+    pub fn create(project_dir: &Path, dir_rel: &str, name: &str) -> Result<Self, String> {
+        valid_upload_name(name)?;
+        let rel =
+            if dir_rel.is_empty() { name.to_string() } else { format!("{dir_rel}/{name}") };
+        visible_in_tree(&rel)?;
+        let dest = safe_resolve_parent(project_dir, &rel)?;
+        // Checked here so an upload that cannot land is refused before its bytes
+        // are accepted, and again in `commit` because a streamed part takes long
+        // enough for the answer to change under it.
+        must_not_exist(&dest, &rel)?;
+        let parent = dest.parent().ok_or("no parent directory")?;
+        let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = parent.join(format!(".{name}.{}-{seq}.resh.tmp", std::process::id()));
+        let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        Ok(UploadTemp { tmp: Some(tmp), dest, rel, file })
+    }
+
+    pub fn write(&mut self, chunk: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        self.file.write_all(chunk).map_err(|e| e.to_string())
+    }
+
+    pub fn commit(mut self) -> Result<PathBuf, String> {
+        use std::io::Write;
+        self.file.flush().map_err(|e| e.to_string())?;
+        must_not_exist(&self.dest, &self.rel)?;
+        let tmp = self.tmp.take().ok_or("upload already committed")?;
+        std::fs::rename(&tmp, &self.dest).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e.to_string()
+        })?;
+        Ok(self.dest.clone())
+    }
+}
+
+impl Drop for UploadTemp {
+    fn drop(&mut self) {
+        if let Some(tmp) = self.tmp.take() {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+}
+
 /// Non-recursive by design: files and empty directories only. Not because
 /// recursive delete is an escalation — the terminal is right there — but so a
 /// misclick in a tree cannot remove `target/` or `.git`.
@@ -344,5 +452,165 @@ mod tests {
             "precious\n",
             "and nothing may have been written through it"
         );
+    }
+
+    fn put(project: &Path, dir: &str, name: &str, data: &[u8]) -> Result<PathBuf, String> {
+        let mut t = UploadTemp::create(project, dir, name)?;
+        t.write(data)?;
+        t.commit()
+    }
+
+    fn leftover_temps(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("resh.tmp"))
+            .collect()
+    }
+
+    fn running_as_root() -> bool {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false)
+    }
+
+    /// Reaches the confinement check rather than failing earlier for an
+    /// unrelated reason: `..` exists, so this cannot pass on ENOENT. That hole
+    /// is why a symlink escape once survived review here.
+    #[test]
+    fn upload_refuses_a_traversal_and_says_why() {
+        let d = tempfile::tempdir().unwrap();
+        let project = d.path().join("proj");
+        fs::create_dir(&project).unwrap();
+        let e = put(&project, "..", "escape.png", b"x").unwrap_err();
+        assert!(e.contains("path outside project"), "unexpected message: {e}");
+        assert!(!d.path().join("escape.png").exists(), "a refused upload escaped the project");
+    }
+
+    /// The test that keeps directory upload from arriving by accident: a
+    /// separator in a part's filename is an error, never silently flattened.
+    #[test]
+    fn a_separator_in_the_filename_is_refused_not_flattened() {
+        let d = tempfile::tempdir().unwrap();
+        for name in ["sub/a.png", "sub\\a.png"] {
+            let e = put(d.path(), "", name, b"x").unwrap_err();
+            assert!(e.contains("invalid filename"), "unexpected message for {name}: {e}");
+        }
+        assert!(!d.path().join("a.png").exists(), "a flattened file was written");
+    }
+
+    /// Pins the *early* check specifically. `commit` re-checks, so the
+    /// collision test below still passes with this one deleted — which is how
+    /// the early check came to have no coverage at all. What it buys is that a
+    /// doomed part is refused before a single byte is accepted, rather than
+    /// after a caller has streamed 100 MB into a temp file for nothing.
+    #[test]
+    fn a_colliding_part_is_refused_before_any_bytes_are_accepted() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("a.png"), b"original").unwrap();
+        let e = UploadTemp::create(d.path(), "", "a.png").unwrap_err();
+        assert!(e.contains("already exists"), "unexpected message: {e}");
+        assert!(
+            leftover_temps(d.path()).is_empty(),
+            "a refused part still opened a temp file to stream into"
+        );
+    }
+
+    /// Asserting an error alone would also pass against an implementation that
+    /// truncated the file and *then* failed — the outcome this forbids.
+    #[test]
+    fn upload_refuses_a_collision_and_leaves_the_original_intact() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("a.png"), b"original").unwrap();
+        let e = put(d.path(), "", "a.png", b"replacement").unwrap_err();
+        assert!(e.contains("already exists"), "unexpected message: {e}");
+        assert_eq!(fs::read(d.path().join("a.png")).unwrap(), b"original");
+    }
+
+    /// A skipped directory is never rendered in the tree, so a file written
+    /// there is invisible in the UI that wrote it — and inside `.git` it can
+    /// corrupt the repository. The path is legal and inside the project, which
+    /// is exactly why nothing else refuses it.
+    #[test]
+    fn upload_refuses_a_destination_the_tree_never_shows() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir(d.path().join(".git")).unwrap();
+        let e = put(d.path(), ".git", "config", b"x").unwrap_err();
+        assert!(e.contains("not visible in the tree"), "unexpected message: {e}");
+        assert!(!d.path().join(".git/config").exists());
+    }
+
+    /// The complement, and what stops the rule being written as "refuse a
+    /// leading dot": the tree hides a fixed list of *directories*, not
+    /// dotfiles, so `.gitignore` is visible and uploading it is honest.
+    #[test]
+    fn upload_allows_an_ordinary_dotfile() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(put(d.path(), "", ".gitignore", b"target\n").is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn upload_refuses_when_it_cannot_tell_whether_the_target_exists() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            return; // mode bits do not bind root; the fixture cannot enter its own precondition
+        }
+        let d = tempfile::tempdir().unwrap();
+        let locked = d.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let r = put(d.path(), "locked", "a.png", b"x");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let e = r.unwrap_err();
+        assert!(
+            e.contains("no such directory") || e.contains("cannot check"),
+            "an unreadable parent must be refused as unknown, not read as absent: {e}"
+        );
+    }
+
+    #[test]
+    fn a_part_written_in_chunks_lands_whole_and_leaves_no_temp() {
+        let d = tempfile::tempdir().unwrap();
+        let mut t = UploadTemp::create(d.path(), "", "a.bin").unwrap();
+        t.write(&[0x89, 0x50]).unwrap();
+        t.write(&[0x4e, 0x47]).unwrap();
+        let p = t.commit().unwrap();
+        assert_eq!(fs::read(&p).unwrap(), [0x89, 0x50, 0x4e, 0x47]);
+        assert!(leftover_temps(d.path()).is_empty());
+    }
+
+    /// An abandoned upload — a cap breach, a dropped connection — must leave
+    /// nothing behind. Dropping without committing is the common path here, not
+    /// an edge case.
+    #[test]
+    fn an_abandoned_part_removes_its_temp_file() {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let mut t = UploadTemp::create(d.path(), "", "a.bin").unwrap();
+            t.write(b"partial").unwrap();
+        }
+        assert!(leftover_temps(d.path()).is_empty(), "a dropped upload left its temp behind");
+        assert!(!d.path().join("a.bin").exists(), "an uncommitted upload became visible");
+    }
+
+    /// Two uploads of the same name in one request must not share a temp path,
+    /// or the second clobbers the first's bytes before either commits.
+    #[test]
+    fn two_concurrent_parts_do_not_share_a_temp_file() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = UploadTemp::create(d.path(), "", "same.bin").unwrap();
+        let mut b = UploadTemp::create(d.path(), "", "same.bin").unwrap();
+        a.write(b"aaaa").unwrap();
+        b.write(b"bbbb").unwrap();
+        let pa = a.commit().unwrap();
+        assert_eq!(fs::read(&pa).unwrap(), b"aaaa", "the second part overwrote the first's temp");
+        // The loser is refused rather than silently replacing what just landed.
+        assert!(b.commit().unwrap_err().contains("already exists"));
     }
 }

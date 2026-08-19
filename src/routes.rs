@@ -22,6 +22,17 @@ pub fn handle(stream: TcpStream, roots: &[PathBuf]) {
     let mut reader = BufReader::new(read_half);
     let mut w = stream;
     match http::parse(&mut reader) {
+        // POST is the upload surface and nothing else. It deliberately does not
+        // reach `route`, so no existing route can be invoked with a body — the
+        // property the old `rejects_non_get` parser test used to guarantee.
+        Ok(req) if req.method == "POST" => {
+            // The 10s read timeout above is an inactivity timer sized for a
+            // request that arrives in one packet. A 100 MB body over a tailnet
+            // hiccup exceeds it while making perfectly good progress, and the
+            // upload would die mid-stream with no error the user can act on.
+            let _ = w.set_read_timeout(Some(Duration::from_secs(60)));
+            crate::upload::handle_post(&mut w, &mut reader, &req, roots);
+        }
         Ok(req) => route(&mut w, &req, roots),
         Err(e) => http::respond(&mut w, 400, "Bad Request", "text/plain", e.as_bytes()),
     }
