@@ -41,6 +41,7 @@ Tests: `cargo test` (never `--release`). Everything else is environment:
 | `RESH_ORIGINS` | Comma-separated origin allowlist | global config, else loopback only |
 | `RESH_CMD` | Terminal command override — **test hook, never set in production** | `dtach -A … -E -r winch -z $SHELL -l` |
 | `RESH_DEBOUNCE_MS` | Filesystem-watch debounce | 300 |
+| `RESH_PING_SECS` | Websocket keepalive ping interval — lower it only to test that path | 30 |
 | `RESH_STATIC` | Serve web assets from this directory instead of the embedded copies (development) | unset — assets are compiled in |
 
 Running anywhere other than the deploy host needs at least `RESH_ROOTS`,

@@ -106,9 +106,22 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     // Drains the subscriber channel outside any hub lock: the channel recv
     // blocks indefinitely between events, and blocking while holding the hub
     // lock would stall every other connection to this project.
+    // recv_timeout rather than recv, for the reason term.rs's writer gives:
+    // without a periodic write nothing ever discovers a peer that vanished
+    // without TCP noticing. It matters more here than there — `subscribe`
+    // hands out an *unbounded* channel, so a subscriber nobody drains
+    // accumulates every broadcast this project makes for the life of the
+    // process, where a terminal subscriber's bounded queue at least fills and
+    // drops itself once the session produces output.
+    let ping_every = crate::config::ping_interval();
     let writer = std::thread::spawn(move || {
-        while let Ok(msg) = rx.recv() {
-            if ws_write.send(Message::Text(msg.into())).is_err() {
+        loop {
+            let out = match rx.recv_timeout(ping_every) {
+                Ok(msg) => Message::Text(msg.into()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Message::Ping(Vec::new().into()),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            if ws_write.send(out).is_err() {
                 break;
             }
         }

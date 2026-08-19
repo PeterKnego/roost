@@ -528,6 +528,64 @@ fn child_exit_delivers_a_close_frame_not_a_bare_eof() {
     panic!("no Close frame within the read budget; frames seen: {saw:?}");
 }
 
+/// Reads until a Ping arrives, or fails saying what came instead.
+///
+/// Deliberately specific: a socket that merely stays *open* proves nothing
+/// here, because an idle socket stays open on its own. The whole point of the
+/// ping is that bytes are periodically pushed at a peer that may no longer
+/// exist, so only an actual Ping frame is evidence.
+fn expect_ping(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    context: &str,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut seen: Vec<String> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        match ws.read() {
+            Ok(tungstenite::Message::Ping(_)) => return,
+            Ok(m) => seen.push(format!("{m:?}").chars().take(40).collect()),
+            // The read timeout is a poll interval, not a failure: nothing has
+            // arrived yet, and the ping is on a wall-clock schedule.
+            Err(tungstenite::Error::Io(e))
+                if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {}
+            Err(e) => panic!("{context}: socket died before any ping: {e:?} (saw {seen:?})"),
+        }
+    }
+    panic!("{context}: no ping within the deadline; frames seen: {seen:?}");
+}
+
+#[test]
+fn an_idle_terminal_socket_is_pinged() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("RESH_CMD", "cat"); // reads stdin, writes nothing unprompted
+    std::env::set_var("RESH_PING_SECS", "1");
+    let (_d, port) = fixture_named("pingterm");
+    let mut ws = ws_connect_path(port, "/ws/pingterm/term/idle").unwrap();
+    // Nothing is sent from either side after the handshake. Without the
+    // ping this socket would sit silent forever, which is exactly how a
+    // dead peer's attachment goes on holding a `sizes` entry — and the PTY
+    // takes the *minimum* geometry across attachments, so a stale one
+    // clamps the terminal for every live client.
+    expect_ping(&mut ws, "idle terminal socket");
+    std::env::remove_var("RESH_PING_SECS");
+    std::env::remove_var("RESH_STATE_DIR");
+}
+
+#[test]
+fn an_idle_workspace_socket_is_pinged() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("RESH_PING_SECS", "1");
+    let (_d, port) = fixture_named("pingws");
+    let mut ws = ws_connect_path(port, "/ws/pingws/_workspace").unwrap();
+    // This socket matters more than the terminal one: hub::subscribe hands
+    // out an *unbounded* channel, so a subscriber nobody drains accumulates
+    // every broadcast in memory for as long as the process lives.
+    expect_ping(&mut ws, "idle workspace socket");
+    std::env::remove_var("RESH_PING_SECS");
+}
+
 #[test]
 fn two_terminal_clients_mirror_one_session() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

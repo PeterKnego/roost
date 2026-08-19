@@ -88,6 +88,28 @@ pub fn allowed_origins() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// How often an otherwise silent websocket sends a Ping.
+///
+/// Both socket threads block on a channel between events, and a websocket
+/// read blocks forever against a peer that stopped existing without TCP
+/// noticing — a laptop that slept and woke on another network, say. Nothing
+/// else in this process would ever discover that: there is no read deadline
+/// on an upgraded socket, and an idle shell produces no output to fail on.
+/// Writing something periodically is what turns that silence into an error
+/// the existing teardown path already handles.
+///
+/// Thirty seconds is chosen to sit far below any NAT or tunnel idle timeout
+/// while costing nothing measurable. `RESH_PING_SECS` exists so a test need
+/// not wait that long; one second is its practical floor.
+pub fn ping_interval() -> std::time::Duration {
+    let secs = std::env::var("RESH_PING_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(30);
+    std::time::Duration::from_secs(secs)
+}
+
 pub fn for_project(project_dir: &Path) -> Settings {
     load(&[
         &global_config_path(),
@@ -139,5 +161,28 @@ mod tests {
         let s = load(&[&f]);
         assert_eq!(s.theme, "light");
         assert!(s.warning.is_none());
+    }
+
+    /// A zero or garbage `RESH_PING_SECS` must fall back to the default, not
+    /// be taken literally: `recv_timeout(0)` would turn both writer threads
+    /// into busy loops flooding their sockets with Pings, which is worse than
+    /// the leak the ping exists to bound. Verified by deleting the guard and
+    /// watching the "0" case fail.
+    #[test]
+    fn ping_interval_defaults_and_rejects_a_useless_value() {
+        // No other test reads this var, so setting it here races nothing.
+        std::env::remove_var("RESH_PING_SECS");
+        assert_eq!(ping_interval(), std::time::Duration::from_secs(30), "unset");
+        std::env::set_var("RESH_PING_SECS", "5");
+        assert_eq!(ping_interval(), std::time::Duration::from_secs(5), "explicit override");
+        for bad in ["0", "-1", "", "soon"] {
+            std::env::set_var("RESH_PING_SECS", bad);
+            assert_eq!(
+                ping_interval(),
+                std::time::Duration::from_secs(30),
+                "{bad:?} must fall back to the default rather than disabling or busy-looping"
+            );
+        }
+        std::env::remove_var("RESH_PING_SECS");
     }
 }

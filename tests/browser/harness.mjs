@@ -143,6 +143,10 @@ export async function startResh({ repoRoot, stateDir, roots, port }) {
       RESH_ROOTS: roots,
       RESH_STATE_DIR: stateDir,
       RESH_STATIC: `${repoRoot}/static`,
+      // The one knob deliberately let through the clearEnv above: setting it
+      // low turns a run into a soak test for the keepalive ping, so a browser
+      // meets hundreds of them instead of two.
+      ...(Deno.env.get("RESH_PING_SECS") ? { RESH_PING_SECS: Deno.env.get("RESH_PING_SECS") } : {}),
     },
     stdout: "null", stderr: "null",
   }).spawn();

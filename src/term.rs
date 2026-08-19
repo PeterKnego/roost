@@ -100,9 +100,27 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     let mut ws_write: WebSocket<TcpStream> =
         WebSocket::from_raw_socket(write_half, Role::Server, None);
     let rx = att.rx;
+    // recv_timeout rather than recv: a session can be silent for hours, and
+    // this thread is the only one that ever writes to this socket. Without a
+    // periodic write, a peer that vanished without TCP noticing (a slept
+    // laptop, a moved network) is never discovered — the read loop below
+    // blocks forever, and the attachment goes on holding a `sizes` entry that
+    // clamps the PTY to its dead geometry for every live client, since
+    // `min_geometry` takes the smallest attachment. A failed write is
+    // positive evidence the peer is gone; silence is evidence of nothing,
+    // which is why nothing here times an attachment out on suspicion.
+    let ping_every = crate::config::ping_interval();
     let out = std::thread::spawn(move || {
-        while let Ok(chunk) = rx.recv() {
-            if ws_write.send(Message::Binary(chunk.into())).is_err() {
+        loop {
+            let msg = match rx.recv_timeout(ping_every) {
+                Ok(chunk) => Message::Binary(chunk.into()),
+                // Browsers answer a Ping without involving page JavaScript,
+                // and the reply lands in the read loop below, which already
+                // ignores frames it has no use for.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Message::Ping(Vec::new().into()),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            if ws_write.send(msg).is_err() {
                 break;
             }
         }
