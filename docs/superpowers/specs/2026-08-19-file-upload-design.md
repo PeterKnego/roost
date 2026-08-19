@@ -312,17 +312,36 @@ file `<a>`):
 
 - `e.target.closest("[data-rel]")`, then `<details>` → that directory,
   file `<a>` → its parent directory.
-- No `[data-rel]` ancestor → the drop is outside the tree; ignore it. Tree-only
-  scoping is what makes the destination unambiguous, and it is what makes this
-  safe to ship without a confirmation dialog.
+- Otherwise, anywhere in the pane holding the tree → the project root. Rows are
+  a small target with large gaps between them, and resolving only on
+  `[data-rel]` left most of the pane falling through.
+- Anywhere else → no destination; say where files go.
 
-`dragover` must call `preventDefault()`, or the browser navigates to the file
-instead of delivering a drop.
+**`preventDefault()` must run for every file drag, not only ones over a valid
+target.** Without it the browser handles the drop itself and navigates to
+`file:///`, discarding the workspace — and it did exactly that for every pixel
+that was not a tree row, which is most of the window. A misplaced drop is
+refused out loud; navigating away is never the right answer. The gate is
+`dataTransfer.types` containing `Files`, so dragging a text selection inside the
+editor's textarea still works.
 
-A paste is routed by focus: a terminal tab with an image on the clipboard goes
-to `/paste`; otherwise files on the clipboard go to `/upload`. The per-file
-results are rendered through the existing `showError` path, one line per failed
-file.
+An image dropped on a **terminal** goes to `/paste` for that session rather than
+to the tree. Dragging a screenshot onto the shell that needs it is the obvious
+gesture, and routing it through the tree would leave a file the user then has to
+mention by hand.
+
+**The paste listener must be registered in the capture phase.** xterm's own
+handler calls `stopPropagation()` on every paste over a terminal and reads only
+`text/plain`, so a bubble-phase listener never runs where this feature matters
+most — pasting a screenshot into the terminal running Claude. Capture puts resh
+ahead of xterm; anything that is not an image is left untouched and reaches
+xterm exactly as before. This is not a detail of the implementation, it is the
+difference between the feature working and silently doing nothing.
+
+A paste is otherwise routed by focus: files on the clipboard with the tree
+focused go to `/upload`. Per-file results are rendered through the existing
+`showError` path, one line per failed file — a placement the backlog records as
+needing a design pass.
 
 ## Testing
 
