@@ -1,8 +1,8 @@
 # Working in resh
 
 Single Rust binary, no async runtime, thread per connection, hand-rolled
-GET-only HTTP plus websockets, server-rendered HTML, plain JS with no
-framework. See [README.md](README.md) for what it does and
+HTTP (GET, plus two upload POSTs) with websockets, server-rendered HTML,
+plain JS with no framework. See [README.md](README.md) for what it does and
 [docs/deploy.md](docs/deploy.md) for running and deploying it.
 
 ## Hard constraints
@@ -11,8 +11,12 @@ These are load-bearing. Breaking one is a defect, not a style choice.
 
 - **Bind `127.0.0.1` only.** The websocket spawns a shell; the loopback bind is
   the security boundary.
-- **HTTP stays GET-only.** Every state change is a websocket intent. This is
-  why there is no CSRF surface — keep it that way.
+- **HTTP is GET-only apart from `POST /upload` and `POST /paste`.** Every other
+  state change is a websocket intent. Those two endpoints are the entire CSRF
+  surface, and the only thing closing it is that they check `Origin` exactly as
+  the websocket handshakes do — *including refusing a request that carries
+  none*, because a `multipart/form-data` POST is a CORS simple request that any
+  page can submit cross-origin with no preflight. Keep the surface at two.
 - **Every websocket checks `Origin`** in its handshake. Handshakes bypass the
   same-origin policy, so a socket without this check is drive-by RCE.
 - **Every filesystem path is confined** before use: `projects::safe_resolve`
@@ -30,7 +34,10 @@ These are load-bearing. Breaking one is a defect, not a style choice.
 - **Destruction requires positive evidence.** See below — this is the constraint
   this codebase breaks most often.
 - Caps: ≤16 sessions per project, ≤50 open buffers, 1 MB scrollback, 2 MB file
-  cap for reads *and* writes.
+  cap for reads *and* buffer writes. Uploads are bounded per **request**, not
+  per file: ≤16 parts and `config::max_upload_bytes` (100 MB default, global
+  config or `RESH_MAX_UPLOAD` only — never per-project, or a cloned repo could
+  raise its own disk ceiling).
 
 ## Absence of evidence is not evidence of absence
 
@@ -137,8 +144,8 @@ So: **run the suite on the Linux host too** (`ssh` in and `cargo test`), and
 caught defects that 100+ passing tests did not.
 
 Some of that browser check is now automated: `deno run -A
-tests/browser/reconnect.mjs` drives a real Chromium against a real resh with
-real dtach. It is deliberately outside `cargo test` (it needs a browser and
+tests/browser/reconnect.mjs` and `upload.mjs` drive a real Chromium against a
+real resh with real dtach. It is deliberately outside `cargo test` (it needs a browser and
 takes tens of seconds) and it skips when no browser is present. Anything
 touching `static/app.js` should be checked there, since no Rust test can reach
 that file. See [tests/browser/README.md](tests/browser/README.md) — especially

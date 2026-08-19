@@ -19,6 +19,13 @@ and it opens in every connected browser, the way two clients attached to one
 terminal multiplexer mirror each other. Layout and unsaved buffers persist
 across restarts, outside the repo, so pane drags never appear in `git status`.
 
+**Files go in through the browser.** Drag files from the desktop onto the file
+tree, or copy and paste them there, and they land in that directory. Paste a
+screenshot onto a terminal and it reaches the program running there as an
+actual image, not as a path — which is how you show Claude the thing you are
+looking at. Folders are refused on purpose: `git`, `rsync` and `scp` are what
+move a project, and an upload is capped per request rather than per file.
+
 **Terminals survive.** Each terminal is a PTY owned by resh and wrapped in
 `dtach`, so sessions outlive both a dropped browser tab and a resh
 restart. resh keeps a 1 MB scrollback ring per session and fans output out

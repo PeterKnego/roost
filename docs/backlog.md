@@ -24,12 +24,12 @@ when they're actually picked up.
 - Drag-and-drop tab reordering — speculative idea in the v3 spec, noted as
   partly moot since v3 already ships a "move to pane" command as the
   mechanism for relocating tabs (`2026-08-16-deadlight-v3-workspace-design.md`).
-- Drag-n-drop upload of local files into the remote fs pane — speculative idea,
-  v3 spec (`2026-08-16-deadlight-v3-workspace-design.md`).
-- Copy-paste file content — speculative idea, v3 spec
-  (`2026-08-16-deadlight-v3-workspace-design.md`).
-- Paste images into the claude terminal (ctrl+v) — speculative idea, v3 spec
-  (`2026-08-16-deadlight-v3-workspace-design.md`).
+- Drag-n-drop upload, copy-paste of files into the tree, and pasting images into
+  the claude terminal — **shipped**, see
+  `docs/superpowers/specs/2026-08-19-file-upload-design.md`. Directory upload,
+  archive extraction, download/drag-out and a host clipboard bridge are the
+  recorded non-goals; scratch retention (nothing prunes `state_dir()/pasted/`)
+  and the 16-part limit are the questions left open.
 - Notification centre on the picker page (`/`) as well as the workspace
   page — the notice store is already global, only the markup is missing
   (`2026-08-17-deadlight-notifications-design.md`).
