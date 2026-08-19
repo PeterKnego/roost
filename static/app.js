@@ -9,8 +9,11 @@ const DIVIDER_PX = 8; // keep in step with --divider in style.css
 const wsUrl = (p) => `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${p}`;
 
 // Mirrors routes.rs IMAGE_EXT. Nothing checks the two agree; a mismatch hides
-// or shows the ✎ toggle wrongly, but never loses data, because workspace.rs
-// refuses the intent regardless.
+// or shows the ✎ toggle wrongly, but never loses data: workspace.rs refuses
+// or coerces every path to Edit on an image server-side too (SetMode refuses
+// it, OpenTab coerces a raw Edit request to Preview, and EditBuffer — the
+// actual save chokepoint — refuses to create a buffer at all), so no client
+// bug here can make a save truncate an image.
 const IMAGE_EXT = ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico"];
 const isImage = (rel) => IMAGE_EXT.includes((rel || "").split(".").pop().toLowerCase());
 
