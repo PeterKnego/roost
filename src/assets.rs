@@ -30,6 +30,40 @@ pub fn get(rel: &str) -> Option<&'static [u8]> {
     ASSETS.binary_search_by(|(k, _)| (*k).cmp(rel)).ok().map(|i| ASSETS[i].1)
 }
 
+/// What authority a layer needs to serve a path.
+///
+/// JavaScript served from `/static/` runs same-origin with every terminal
+/// websocket this server owns, so whoever can replace it can drive every
+/// shell. CSS and images cannot. That asymmetry — not file type as such —
+/// is what this enum encodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    /// Replaceable by a project or by the user directory.
+    Theme,
+    /// Replaceable only by the operator, via `$RESH_STATIC`.
+    Code,
+}
+
+const THEME_EXT: &[&str] = &[
+    "css", "svg", "png", "jpg", "jpeg", "gif", "webp", "ico", "woff", "woff2", "ttf", "otf",
+];
+
+pub fn class_of(rel: &str) -> Class {
+    let name = rel.rsplit('/').next().unwrap_or("");
+    // `rsplit_once`, so only the final extension counts: "evil.css.js" is js.
+    // A leading dot yields an empty stem (".gitignore" -> ("", "gitignore")),
+    // which is not in THEME_EXT and so lands in Code, as intended.
+    let ext = match name.rsplit_once('.') {
+        Some((_, e)) => e.to_ascii_lowercase(),
+        None => return Class::Code,
+    };
+    if THEME_EXT.contains(&ext.as_str()) {
+        Class::Theme
+    } else {
+        Class::Code
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +100,29 @@ mod tests {
         assert_eq!(normalize("a\\..\\b"), None);
         // and the same guard covers `get`
         assert!(get("../Cargo.toml").is_none());
+    }
+
+    /// Class decides which layers may answer for a path, so an unrecognised
+    /// extension MUST land in Code. Deny-by-default means widening the
+    /// overridable set is an edit to THEME_EXT, never a side effect of
+    /// someone dropping an unfamiliar file into a theme directory.
+    #[test]
+    fn unknown_and_executable_extensions_are_code() {
+        assert_eq!(class_of("style.css"), Class::Theme);
+        assert_eq!(class_of("themes/darcula.css"), Class::Theme);
+        assert_eq!(class_of("logo.PNG"), Class::Theme, "extension match is case-insensitive");
+        assert_eq!(class_of("Inter.woff2"), Class::Theme);
+        assert_eq!(class_of("icons.svg"), Class::Theme);
+
+        assert_eq!(class_of("app.js"), Class::Code);
+        assert_eq!(class_of("vendor/xterm.js"), Class::Code);
+        assert_eq!(class_of("index.html"), Class::Code);
+        assert_eq!(class_of("thing.wasm"), Class::Code);
+        // the deny-by-default cases
+        assert_eq!(class_of("README"), Class::Code, "no extension is not a theme asset");
+        assert_eq!(class_of(".gitignore"), Class::Code, "a dotfile's name is not an extension");
+        assert_eq!(class_of("data.json"), Class::Code, "unrecognised extension defaults to code");
+        assert_eq!(class_of("evil.js.css.js"), Class::Code, "only the LAST extension counts");
+        assert_eq!(class_of("css"), Class::Code, "a bare word is not an extension");
     }
 }
