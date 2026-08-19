@@ -175,10 +175,19 @@ try {
   await evalIn(`document.querySelector(".termhost").remove()`);
 
   // ---- 9. A collision is reported per file, not as a blanket error ---------
+  // Waits for the error *about this file* rather than for any error at all.
+  // The fake-terminal posts above are answered asynchronously with "no such
+  // session", and one of those landed here instead — a race this test lost only
+  // once the surrounding timing changed, which is the kind of flake that reads
+  // as a merge breaking something.
   await evalIn(`window.__errors = [];
     uploadFiles([__file("dropped.txt", "second attempt")], "")`);
-  await until(() => evalIn("window.__errors.length > 0"), 20, "per-file error");
-  const collideMsg = await evalIn("window.__errors.join(' | ')");
+  await until(
+    () => evalIn(`window.__errors.some((m) => m.includes("dropped.txt"))`),
+    20,
+    "the per-file error for dropped.txt",
+  );
+  const collideMsg = await evalIn(`window.__errors.filter((m) => m.includes("dropped.txt")).join(' | ')`);
   ok(/dropped\.txt.*already exists/.test(collideMsg), `the collision names the file: ${collideMsg}`);
   ok(
     (await Deno.readTextFile(landed)) === "hello from the browser",
