@@ -110,6 +110,118 @@ fn post(port: u16, path: &str, origin: Option<&str>, ctype: &str, body: &[u8]) -
     (status, text)
 }
 
+/// The check the whole GET-only amendment is traded against, so it gets the
+/// treatment `ws_rejects_foreign_and_missing_origin` already gives the socket.
+/// It asserts the *file was not written*, not merely the status: a 403 returned
+/// after the write would still be a drive-by write.
+#[test]
+fn upload_refuses_a_foreign_or_absent_origin_without_writing() {
+    let (d, port) = fixture_named("up_origin");
+    let (ct, body) = multipart(&[("evil.txt", b"x")]);
+
+    let (s1, _) = post(port, "/upload/up_origin", Some("https://evil.example.com"), &ct, &body);
+    assert_eq!(s1, 403, "a foreign origin must not reach the upload endpoint");
+
+    let (s2, _) = post(port, "/upload/up_origin", None, &ct, &body);
+    assert_eq!(s2, 403, "a request with no Origin must be refused");
+
+    assert!(
+        !d.path().join("up_origin/evil.txt").exists(),
+        "a refused upload must not have written the file"
+    );
+}
+
+#[test]
+fn upload_writes_every_part_and_reports_per_file() {
+    let (d, port) = fixture_named("up_multi");
+    let origin = format!("http://127.0.0.1:{port}");
+    std::fs::write(d.path().join("up_multi/taken.txt"), b"original").unwrap();
+    let (ct, body) = multipart(&[("a.txt", b"AAA"), ("taken.txt", b"BBB"), ("c.txt", b"CCC")]);
+
+    let (status, resp) = post(port, "/upload/up_multi", Some(&origin), &ct, &body);
+    assert_eq!(status, 200, "a partial failure is still a well-formed request");
+
+    assert_eq!(std::fs::read(d.path().join("up_multi/a.txt")).unwrap(), b"AAA");
+    assert_eq!(std::fs::read(d.path().join("up_multi/c.txt")).unwrap(), b"CCC");
+    assert_eq!(
+        std::fs::read(d.path().join("up_multi/taken.txt")).unwrap(),
+        b"original",
+        "the colliding part must not have overwritten anything"
+    );
+    assert!(resp.contains("taken.txt") && resp.contains("already exists"), "response: {resp}");
+    // The neighbours must be reported as successes, or a caller cannot tell
+    // which of the three failed — and this is what pins that a rejected part is
+    // still drained, since c.txt comes after the failure.
+    assert!(resp.contains(r#"{"name":"a.txt","ok":true}"#), "response: {resp}");
+    assert!(resp.contains(r#"{"name":"c.txt","ok":true}"#), "response: {resp}");
+}
+
+#[test]
+fn upload_refuses_more_parts_than_the_limit() {
+    let (d, port) = fixture_named("up_parts");
+    let origin = format!("http://127.0.0.1:{port}");
+    let names: Vec<String> = (0..20).map(|i| format!("f{i}.txt")).collect();
+    let parts: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), b"x" as &[u8])).collect();
+    let (ct, body) = multipart(&parts);
+
+    let (status, resp) = post(port, "/upload/up_parts", Some(&origin), &ct, &body);
+    assert_eq!(status, 413);
+    assert!(resp.contains("too many files"), "the parts cap must name itself: {resp}");
+    assert!(!d.path().join("up_parts/f19.txt").exists());
+}
+
+/// A different cap with a different message. Two tests that both passed because
+/// the same limit fired would say nothing about the other.
+#[test]
+fn upload_refuses_a_body_past_the_aggregate_limit() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("RESH_MAX_UPLOAD", "4096");
+    let (d, port) = fixture_named("up_bytes");
+    let origin = format!("http://127.0.0.1:{port}");
+    let big = vec![b'x'; 8192];
+    let (ct, body) = multipart(&[("big.bin", &big)]);
+
+    let (status, resp) = post(port, "/upload/up_bytes", Some(&origin), &ct, &body);
+    std::env::remove_var("RESH_MAX_UPLOAD");
+
+    assert_eq!(status, 413);
+    assert!(resp.contains("too large"), "the size cap must name itself: {resp}");
+    assert!(!d.path().join("up_bytes/big.bin").exists());
+    let leftovers: Vec<String> = std::fs::read_dir(d.path().join("up_bytes"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains("resh.tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "a cap breach left a partial file: {leftovers:?}");
+}
+
+#[test]
+fn upload_refuses_a_hidden_destination() {
+    let (d, port) = fixture_named("up_hidden");
+    let origin = format!("http://127.0.0.1:{port}");
+    std::fs::create_dir_all(d.path().join("up_hidden/.git")).unwrap();
+    let (ct, body) = multipart(&[("config", b"[core]")]);
+    let (status, resp) = post(port, "/upload/up_hidden?dir=.git", Some(&origin), &ct, &body);
+    assert_eq!(status, 200);
+    assert!(resp.contains("not visible in the tree"), "response: {resp}");
+    assert!(!d.path().join("up_hidden/.git/config").exists());
+}
+
+#[test]
+fn upload_lands_in_the_named_subdirectory() {
+    let (d, port) = fixture_named("up_sub");
+    let origin = format!("http://127.0.0.1:{port}");
+    std::fs::create_dir_all(d.path().join("up_sub/src")).unwrap();
+    let (ct, body) = multipart(&[("logo.png", b"PNG")]);
+    let (status, resp) = post(port, "/upload/up_sub?dir=src", Some(&origin), &ct, &body);
+    assert_eq!(status, 200, "response: {resp}");
+    assert_eq!(std::fs::read(d.path().join("up_sub/src/logo.png")).unwrap(), b"PNG");
+}
+
+/// `RESH_MAX_UPLOAD` is process-global, so any test that writes it serialises.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The property the old `http::tests::rejects_non_get` used to guarantee at the
 /// parser: a request carrying a body must not reach the fragment routes. POST is
 /// now parsed, so this is what stands in its place — and it asserts on the
@@ -118,8 +230,11 @@ fn post(port: u16, path: &str, origin: Option<&str>, ctype: &str, body: &[u8]) -
 #[test]
 fn post_to_an_ordinary_path_does_not_reach_the_router() {
     let (_d, port) = fixture_named("post_router");
+    let origin = format!("http://127.0.0.1:{port}");
     let (ct, body) = multipart(&[("x.txt", b"x")]);
-    let (status, text) = post(port, "/frag/post_router/tree", None, &ct, &body);
+    // A *valid* Origin, so this tests routing rather than tripping the origin
+    // gate first — otherwise it would pass for a reason unrelated to its name.
+    let (status, text) = post(port, "/frag/post_router/tree", Some(&origin), &ct, &body);
     assert_eq!(status, 404, "an ordinary path must not answer a POST");
     assert!(
         !text.contains("<ul class=\"tree\""),
