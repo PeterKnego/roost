@@ -232,15 +232,29 @@ Start it — it is a *transient* unit, so it does not survive a reboot and has t
 be recreated with the same line:
 
 ```bash
-systemd-run --user --unit=resh-dev \
+systemd-run --user --unit=resh-dev --property=KillMode=process \
   --setenv=RESH_ROOTS=/home/claude/ultima:/home/claude/projects \
   --setenv=RESH_STATE_DIR=/home/claude/.local/state/resh-dev \
   --setenv=RESH_STATIC=/home/claude/projects/resh/static \
   /home/claude/.local/bin/resh 8555
 ```
 
+**`KillMode=process` is not optional.** `systemd-run` defaults to
+`control-group`, which SIGKILLs everything in the unit's cgroup on stop — the
+dtach masters and their shells included. That is the same defect `resh.service`
+was fixed for (see the "no systemd" row of CLAUDE.md's dev/prod substitution
+table), and without this property the development instance still has it: every
+`systemctl --user restart resh-dev` silently destroys the shells running under
+it. The loss is the smaller half of the cost. The larger half is that it looks
+like a resh bug — a terminal that comes back empty, with a shell that has
+forgotten everything, reads exactly like a reconnect respawning the session
+rather than reattaching to it. That misdiagnosis has already cost time once.
+
 `systemctl --user stop resh-dev` to stop it, `journalctl --user -u resh-dev -f`
-for its log. Edits to `static/` are live on :8445 on the next reload; the
+for its log. With `KillMode=process`, stopping it leaves its dtach sessions
+running and systemd says so ("Unit process ... remains running after unit
+stopped"); the deployed service behaves the same way, and that is the intended
+direction — a stale shell is recoverable, a killed one is not. Edits to `static/` are live on :8445 on the next reload; the
 deployed service on :443 will not see them until a rebuild and reinstall.
 
 **It needs its own `RESH_STATE_DIR`.** Two instances sharing one show each
