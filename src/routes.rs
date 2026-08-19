@@ -393,17 +393,44 @@ mod tests {
 
     /// Identical 404 either way: a difference here would let a caller probe
     /// which layers are configured.
+    ///
+    /// The first four probes are Code class, so a bug that deleted the
+    /// `normalize` call outright would still pass them — `assets::get`
+    /// normalizes internally, and layer 2 is skipped for Code regardless.
+    /// `./style.css` and `themes/../style.css` close that hole: both are
+    /// Theme class, and both overlay directories hold a `style.css` with a
+    /// distinct marker, so if `normalize` ran *after* a layer instead of
+    /// before it, that layer's `canonicalize()` would lexically collapse the
+    /// `.`/`..` and hand back the marker instead of 404 — turning the
+    /// byte-equality assertion below into one that can actually fail.
     #[test]
     fn traversal_is_refused_the_same_with_and_without_an_overlay() {
         let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
+        let userdir = home.path().join(".config/resh/static");
+        // The empty `themes` dir is load-bearing, not decoration:
+        // `canonicalize()` is realpath, which must walk into `themes` to
+        // resolve back out of it — on a directory that doesn't exist on
+        // disk, `themes/../style.css` fails to canonicalize regardless of
+        // ordering, which would silently defeat this probe.
+        std::fs::create_dir_all(userdir.join("themes")).unwrap();
+        std::fs::write(userdir.join("style.css"), "/*LAYER2*/").unwrap();
         let _home = HomeGuard::set(home.path());
-        let probes = ["../Cargo.toml", "/etc/passwd", "themes/../../Cargo.toml", "a\\..\\b"];
+        let probes = [
+            "../Cargo.toml",
+            "/etc/passwd",
+            "themes/../../Cargo.toml",
+            "a\\..\\b",
+            "./style.css",
+            "themes/../style.css",
+        ];
 
         std::env::remove_var("RESH_STATIC");
         let without: Vec<String> = probes.iter().map(|p| serve(p)).collect();
 
         let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("themes")).unwrap();
+        std::fs::write(d.path().join("style.css"), "/*LAYER1*/").unwrap();
         std::env::set_var("RESH_STATIC", d.path());
         let with: Vec<String> = probes.iter().map(|p| serve(p)).collect();
         std::env::remove_var("RESH_STATIC");
