@@ -8,6 +8,12 @@ const DIVIDER_PX = 8; // keep in step with --divider in style.css
 
 const wsUrl = (p) => `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${p}`;
 
+// Mirrors routes.rs IMAGE_EXT. Nothing checks the two agree; a mismatch hides
+// or shows the ✎ toggle wrongly, but never loses data, because workspace.rs
+// refuses the intent regardless.
+const IMAGE_EXT = ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico"];
+const isImage = (rel) => IMAGE_EXT.includes((rel || "").split(".").pop().toLowerCase());
+
 let state = null;
 let myOrigin = null;
 let ctrl = null;
@@ -238,7 +244,7 @@ function render() {
       // — see hasAttention/focusSession below.
       b.onclick = () =>
         t.k === "Terminal" ? focusSession(t.session) : send({ t: "ActivateTab", pane: pi, idx: ti });
-      if (t.k === "File") {
+      if (t.k === "File" && !isImage(t.rel)) {
         const e = document.createElement("span");
         e.className = "x";
         e.title = t.mode === "Edit" ? "switch to preview" : "switch to edit";

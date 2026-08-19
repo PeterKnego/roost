@@ -230,6 +230,19 @@ pub fn file_fragment(project: &str, rel: &str, content: &str) -> String {
     }
 }
 
+/// An image opened as a tab. Not `file_fragment`'s business, because that
+/// function's whole contract is that it has already been handed the file's
+/// text — which for an image does not exist.
+pub fn image_fragment(project: &str, rel: &str) -> String {
+    format!(
+        "<div class=\"path\">{}</div><img class=\"imgview\" src=\"/frag/{}/raw?path={}\" alt=\"{}\">",
+        esc(rel),
+        crate::http::percent_encode(project),
+        crate::http::percent_encode(rel),
+        esc(rel)
+    )
+}
+
 // Whole-tree eager rendering (the old design) is what made this slow: a
 // 41k-entry project produced 895 KB of HTML and still hit the 4,000-entry
 // budget with ~90% of the tree missing. Instead we render one level at a

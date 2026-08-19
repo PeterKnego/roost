@@ -355,6 +355,14 @@ fn serve_frag(
         }
         ["file"] => match req.query.get("path") {
             None => http::html(w, &render::hint("missing path")),
+            // Branch BEFORE read_text_file: it sniffs for NUL bytes and returns
+            // "binary file" for every image, which is what made a .png in the tree
+            // unopenable. safe_resolve still runs, so a path leaving the project
+            // gets the standard hint rather than an <img> that would 404.
+            Some(rel) if is_image(rel) => match projects::safe_resolve(&dir, rel) {
+                Ok(_) => http::html(w, &render::image_fragment(project, rel)),
+                Err(e) => http::html(w, &render::hint(&e)),
+            },
             Some(rel) => match projects::safe_resolve(&dir, rel)
                 .and_then(|p| projects::read_text_file(&p))
             {
@@ -722,6 +730,22 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         route(&mut buf, &req, roots);
         String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// The tree lists every file, so a .png can be clicked. Before this, the file
+    /// fragment read through read_text_file and answered "binary file" — the tree
+    /// offered a file it then refused to open.
+    #[test]
+    fn clicking_an_image_shows_a_picture_not_a_binary_error() {
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("shot.png"), b"\x89PNG\x00\x01\x02").unwrap();
+        let roots = vec![d.path().to_path_buf()];
+
+        let out = frag_route(&roots, "/frag/p/file?path=shot.png");
+        assert!(out.contains(r#"src="/frag/p/raw?path=shot.png""#), "{out}");
+        assert!(!out.contains("binary file"), "{out}");
     }
 
     /// The escape target must EXIST. A test pointing `path` at a file that is not

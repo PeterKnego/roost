@@ -200,6 +200,11 @@ pub fn apply_layout(w: &mut Workspace, intent: &Intent) -> Result<bool, String> 
             Ok(true)
         }
         Intent::SetMode { rel, mode } => {
+            // See the test: Edit over an image is a data-loss path, not a display
+            // glitch. app.js hides the toggle; this is what actually stops it.
+            if *mode == proto::Mode::Edit && crate::routes::is_image(rel) {
+                return Ok(false);
+            }
             let mut hit = false;
             for p in w.panes.iter_mut() {
                 for t in p.tabs.iter_mut() {
@@ -375,6 +380,40 @@ mod tests {
         apply_layout(&mut w, &Intent::SetMode { rel: "a.rs".into(), mode: Mode::Edit }).unwrap();
         assert_eq!(
             w.panes[proto::MIDDLE as usize].tabs[0],
+            Tab::File { rel: "a.rs".into(), mode: Mode::Edit }
+        );
+    }
+
+    /// Edit mounts a <textarea> seeded from `texts`, which the server cannot fill
+    /// for a binary file — so an image in Edit shows an empty editor over a real
+    /// file, and a save truncates it. app.js hides the toggle; this is the guard,
+    /// because the client is not a boundary and another browser may hold a tab
+    /// strip rendered before this shipped.
+    ///
+    /// Confirmed by deleting the guard in the `Intent::SetMode` arm and running
+    /// this test: it failed with
+    /// `left: File { rel: "shot.png", mode: Edit }` /
+    /// `right: File { rel: "shot.png", mode: Preview }` at the "must stay in
+    /// Preview" assertion — the image tab really did flip to Edit, exactly the
+    /// data-loss path this guard exists to close.
+    #[test]
+    fn an_image_tab_cannot_be_switched_to_edit() {
+        let mut w = Workspace::default_layout();
+        apply_layout(&mut w, &Intent::OpenTab { pane: proto::MIDDLE, tab: file("shot.png") }).unwrap();
+        apply_layout(&mut w, &Intent::SetMode { rel: "shot.png".into(), mode: Mode::Edit }).unwrap();
+        assert_eq!(
+            w.panes[proto::MIDDLE as usize].tabs[0],
+            Tab::File { rel: "shot.png".into(), mode: Mode::Preview },
+            "an image must stay in Preview"
+        );
+        // The same intent on a text file must still work, or this test would pass
+        // just as well with SetMode broken outright — which is the failure mode
+        // `set_mode_rewrites_the_matching_file_tab` would not catch either, since
+        // it never opens an image.
+        apply_layout(&mut w, &Intent::OpenTab { pane: proto::MIDDLE, tab: file("a.rs") }).unwrap();
+        apply_layout(&mut w, &Intent::SetMode { rel: "a.rs".into(), mode: Mode::Edit }).unwrap();
+        assert_eq!(
+            w.panes[proto::MIDDLE as usize].tabs[1],
             Tab::File { rel: "a.rs".into(), mode: Mode::Edit }
         );
     }
