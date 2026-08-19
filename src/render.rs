@@ -156,9 +156,12 @@ pub fn markdown_html(md: &str, project: &str, rel: &str) -> String {
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let events = Parser::new_ext(md, opts).filter_map(|ev| match ev {
         // raw HTML from repo content must never reach the page: render it as
-        // text. This arm must stay FIRST — the arms below emit Event::Html we
-        // built ourselves from escaped values, and they are not re-examined
-        // only because nothing downstream looks at them again.
+        // text. This arm and the link arm below match disjoint Event
+        // variants (Html/InlineHtml vs. Start(Tag::Link)), so their relative
+        // order does not matter for correctness. What matters: the
+        // Event::Html this function itself emits below is already built from
+        // escaped values via link_open, so it needs no neutralizing and
+        // nothing downstream re-examines it.
         Event::Html(h) => Some(Event::Text(h)),
         Event::InlineHtml(h) => Some(Event::Text(h)),
 

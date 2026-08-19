@@ -611,7 +611,7 @@ function wireFragment(content) {
   wireFileLinks(content);
   // right-clicking blank space in a tree targets the project root
   content.oncontextmenu = (e) => {
-    if (e.target.closest("a.file")) return;
+    if (e.target.closest("a[data-rel]")) return;
     e.preventDefault();
     fileMenu(e, "");
   };
