@@ -4,6 +4,7 @@
 // rebuilding a xterm instance drops its websocket and detaches the shell.
 const PROJECT = document.body.dataset.project;
 const SESSION_RE = /^[A-Za-z0-9_-]{1,32}$/; // must match session::valid_name server-side
+const DIVIDER_PX = 8; // keep in step with --divider in style.css
 
 const wsUrl = (p) => `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${p}`;
 
@@ -266,6 +267,11 @@ function render() {
 
     const active = pane.tabs[pane.active];
     const activeKey = active ? tabKey(active) : "";
+    // Built here rather than after the mountedKey guard below: the guard
+    // returns whenever the active tab is unchanged, but these depend on the
+    // pane's tab *count* too, which another pane's move can change without
+    // touching this one's active tab.
+    buildPaneIcons(el.querySelector(".paneicons"), pi, pane, active, content);
     if (content.dataset.mountedKey === activeKey) {
       // The same tab is still active in this pane. A State snapshot fires
       // on every EditBuffer — including ones caused by the user's own
@@ -299,6 +305,79 @@ function render() {
     e.node.remove();
     terms.delete(session);
   });
+}
+
+// Per-pane header controls. Everything here drives an existing intent, so the
+// result mirrors to other browsers and survives a restart exactly like a drag
+// of a divider does — collapse-all is the one exception, being view state that
+// no other client has an opinion about.
+function buildPaneIcons(host, pi, pane, active, content) {
+  if (!host) return;
+  host.innerHTML = "";
+  const icon = (glyph, title, fn) => {
+    const b = document.createElement("span");
+    b.className = "paneicon";
+    b.title = title;
+    b.textContent = glyph;
+    b.onclick = fn;
+    host.appendChild(b);
+    return b;
+  };
+  if (active && active.k === "Tree") {
+    icon("⌃", "collapse all", () => {
+      content.querySelectorAll("details[open]").forEach((d) => { d.open = false; });
+    });
+  }
+  // Hidden rather than disabled on an empty pane: there is no tab to move, and
+  // a control that never does anything is worse than one that isn't there.
+  if (pane.tabs.length) {
+    icon("⇄", "move this tab to the next pane (shift-click: previous)", (e) => {
+      const to = (pi + (e.shiftKey ? PANES - 1 : 1)) % PANES;
+      // Append, and let the server clamp: `at` is checked against the
+      // destination's real length in workspace.rs, which is the authority on
+      // a layout this client may already be a broadcast behind on.
+      send({ t: "MoveTab", from: pi, idx: pane.active, to, at: state.panes[to].tabs.length });
+    });
+  }
+  const on = maxState.pane === pi;
+  icon(on ? "⤡" : "⤢", on ? "restore pane sizes" : "maximize pane", () => toggleMaximized(pi));
+}
+
+const PANES = 4;
+// Which pane is maximized, and the sizes to put back. Client-local on purpose:
+// the maximized layout itself is just sizes, which the server already stores
+// and mirrors, so nothing here needs a new field in the workspace. The cost is
+// that a *different* browser resizing while this one is maximized leaves this
+// restore stale — recoverable by dragging, and not worth a protocol change.
+let maxState = { pane: null, prev: null };
+
+function toggleMaximized(pi) {
+  if (maxState.pane === pi) {
+    send({ t: "Resize", sizes: maxState.prev });
+    maxState = { pane: null, prev: null };
+    return;
+  }
+  // Keep the *original* sizes when maximizing straight from one maximized pane
+  // to another, or restore would put back a maximized layout.
+  const prev = maxState.prev ?? { ...state.sizes };
+  send({ t: "Resize", sizes: maximizedSizes(pi) });
+  maxState = { pane: pi, prev };
+}
+
+// The grid is `left_w | divider | 1fr | divider | right_w`, with the left
+// column split by percentage. Zeroing a track is what collapses a pane, and
+// the surviving one takes the width; the middle pane needs no width of its own
+// because 1fr absorbs whatever the other two give up.
+function maximizedSizes(pi) {
+  const grid = document.getElementById("grid");
+  const full = Math.max(0, Math.round(grid.clientWidth - 2 * DIVIDER_PX));
+  const split = state.sizes.left_split;
+  switch (pi) {
+    case 0: return { left_w: full, right_w: 0, left_split: 100 };
+    case 1: return { left_w: full, right_w: 0, left_split: 0 };
+    case 3: return { left_w: 0, right_w: full, left_split: split };
+    default: return { left_w: 0, right_w: 0, left_split: split };
+  }
 }
 
 function pool() { return document.getElementById("termpool"); }

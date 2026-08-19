@@ -76,6 +76,9 @@ main { flex: 1; min-height: 0; }
 .paneicons { display: flex; align-items: center; gap: 2px; padding: 0 6px; flex: 0 0 auto;
              color: var(--muted); }
 .paneicons:empty { padding: 0; }
+.paneicon { display: flex; align-items: center; justify-content: center; width: 20px; height: 20px;
+            border-radius: 5px; cursor: pointer; user-select: none; line-height: 1; }
+.paneicon:hover { color: var(--fg); background: var(--tab-hover); }
 .tabstrip { display: flex; align-items: center; flex: 1 1 auto; min-width: 0;
             padding: 0 4px; gap: 2px; overflow-x: auto; overflow-y: hidden;
             scrollbar-width: none; }

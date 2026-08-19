@@ -13,8 +13,13 @@ resh with real `dtach`.
 ## Running
 
 ```bash
-deno run -A tests/browser/reconnect.mjs
+deno run -A tests/browser/reconnect.mjs   # terminal survives a dead connection
+deno run -A tests/browser/upload.mjs      # file upload and image paste
+deno run -A tests/browser/paneicons.mjs   # the per-pane header controls
 ```
+
+Each scenario is its own file and its own resh, so they can be run in any
+order or on their own.
 
 Needs `deno`, `dtach`, a Rust toolchain, and a Chromium. The browser is found,
 never installed: `$CHROME`, else `chromium` / `chromium-browser` /
