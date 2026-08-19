@@ -511,14 +511,20 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<
 <div id="projpanel" hidden><span id="projstrip" hx-get="/frag/_projects?current={qkey}" hx-trigger="load, refresh from:body"></span></div>
 <div id="noticepanel" hidden></div>
 <main id="grid">
-  <section class="pane" data-pane="0"><div class="tabstrip"></div><div class="content"></div></section>
+  <section class="pane" data-pane="0"><div class="panehead"><div class="tabstrip"></div><div class="paneicons"></div></div><div class="content"></div></section>
   <div class="divider" data-div="left-split"></div>
-  <section class="pane" data-pane="1"><div class="tabstrip"></div><div class="content"></div></section>
+  <section class="pane" data-pane="1"><div class="panehead"><div class="tabstrip"></div><div class="paneicons"></div></div><div class="content"></div></section>
   <div class="divider" data-div="left-w"></div>
-  <section class="pane" data-pane="2"><div class="tabstrip"></div><div class="content"></div></section>
+  <section class="pane" data-pane="2"><div class="panehead"><div class="tabstrip"></div><div class="paneicons"></div></div><div class="content"></div></section>
   <div class="divider" data-div="right-w"></div>
-  <section class="pane" data-pane="3"><div class="tabstrip"></div><div class="content"></div></section>
+  <section class="pane" data-pane="3"><div class="panehead"><div class="tabstrip"></div><div class="paneicons"></div></div><div class="content"></div></section>
 </main>
+<!-- Empty by default and hidden: the slots exist so a future per-pane control
+     (a split, a kebab, a pane menu) has somewhere to land without reopening
+     the header's layout. app.js rebuilds .tabstrip wholesale on every render,
+     which is why .paneicons is its sibling rather than its child — anything
+     put inside the strip would be wiped on the next state broadcast. -->
+<footer id="statusbar" class="hidden"><span class="left"></span><span class="right"></span></footer>
 <div id="termpool" hidden></div>
 <script src="/static/app.js"></script>
 </body></html>"#,

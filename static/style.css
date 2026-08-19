@@ -1,9 +1,22 @@
 * { box-sizing: border-box; margin: 0; }
 html, body { height: 100%; }
-body { background: var(--bg); color: var(--fg); font: 13px/1.5 system-ui, -apple-system, sans-serif;
+/* Derived rather than added to all five theme files, so a theme keeps working
+   untouched and can still override any of these by defining them itself.
+   color-mix against --fg (not a literal white/black) is what makes the two tab
+   surfaces lift in a dark theme and darken in a light one from one rule. */
+:root {
+  --window: color-mix(in oklab, var(--bg) 86%, black);
+  --tab-on: color-mix(in oklab, var(--fg) 10%, var(--bg2));
+  --tab-hover: color-mix(in oklab, var(--fg) 5%, var(--bg2));
+  --pane-radius: 8px;
+}
+body { background: var(--window); color: var(--fg); font: 13px/1.5 system-ui, -apple-system, sans-serif;
        -webkit-font-smoothing: antialiased; display: flex; flex-direction: column; }
 .hidden { display: none !important; }
-header { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; background: var(--bg2); border-bottom: 1px solid var(--border); flex: none; }
+/* Sits on the window surface with no rule under it: the gap between it and the
+   pane cards below is what separates them now, and a border as well would read
+   as a third seam on one edge. */
+header { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; background: var(--window); flex: none; }
 header .home { color: var(--accent); text-decoration: none; font-size: 16px; }
 header .proj { font-weight: 500; }
 #gitinfo { color: var(--muted); }
@@ -14,9 +27,13 @@ header .proj { font-weight: 500; }
 main { flex: 1; min-height: 0; }
 
 /* ---- four-pane grid: left column stacks tree/changes, middle and right span both rows ---- */
-:root { --divider: 4px; }
+/* 8px, not the old 4px: the track is now the visible gap between two cards as
+   well as the drag target, and 4px of window showing between rounded corners
+   reads as a rendering artefact rather than as breathing room. */
+:root { --divider: 8px; }
 #grid {
   display: grid;
+  padding: 6px;
   height: calc(100vh - var(--header-h, 36px));
   grid-template-columns: var(--left-w, 260px) var(--divider) 1fr var(--divider) var(--right-w, 520px);
   grid-template-rows: var(--left-split, 60%) var(--divider) 1fr;
@@ -29,24 +46,40 @@ main { flex: 1; min-height: 0; }
 .divider[data-div="right-w"] { grid-column: 4; grid-row: 1 / -1; cursor: col-resize; }
 .pane[data-pane="3"] { grid-column: 5; grid-row: 1 / -1; }
 
-/* Borderless: an IDE separates tool windows with a single hairline, drawn by
-   .divider::after below, never with a box around each pane. */
-.pane { display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
+/* Cards, not hairlines. This reverses an earlier decision here — that an IDE
+   separates tool windows with a single line and never boxes them — because the
+   IDE being matched stopped doing that: current JetBrains floats each tool
+   window as a rounded panel on a darker window surface. Restoring the hairline
+   look is therefore a design change, not a bug fix. overflow:hidden is load
+   bearing: it is what clips the tab strip and the xterm canvas to the radius. */
+.pane { display: flex; flex-direction: column; overflow: hidden; background: var(--bg);
+        border: 1px solid var(--border); border-radius: var(--pane-radius); }
 .pane[data-pane="0"], .pane[data-pane="1"] { background: var(--bg2); }
 /* Editor-style tabs: no separators between them, the active one carries the
    pane background plus a 2px accent underline (the IDE's indicator) rather
    than bold text, and inactive labels sit back at --muted. */
-.tabstrip { display: flex; align-items: stretch; height: 30px; overflow-x: auto; overflow-y: hidden;
-            background: var(--bg2); border-bottom: 1px solid var(--hairline, var(--border)); flex: 0 0 auto;
+/* The header row is the strip plus a slot for per-pane controls. The slot is a
+   sibling of .tabstrip, never a child: app.js rebuilds the strip's innerHTML on
+   every state broadcast, so anything inside it would be destroyed seconds
+   later. min-width:0 lets the strip scroll instead of shoving the slot out. */
+.panehead { display: flex; align-items: stretch; height: 32px; flex: 0 0 auto;
+            background: var(--bg2); border-bottom: 1px solid var(--hairline, var(--border)); }
+.paneicons { display: flex; align-items: center; gap: 2px; padding: 0 6px; flex: 0 0 auto;
+             color: var(--muted); }
+.paneicons:empty { padding: 0; }
+.tabstrip { display: flex; align-items: center; flex: 1 1 auto; min-width: 0;
+            padding: 0 4px; gap: 2px; overflow-x: auto; overflow-y: hidden;
             scrollbar-width: none; }
 .tabstrip::-webkit-scrollbar { display: none; }
-.tabstrip .tab { display: flex; align-items: center; gap: 4px; padding: 0 6px 0 9px;
-                 cursor: pointer; white-space: nowrap; color: var(--muted); position: relative; }
-.tabstrip .tab:hover { color: var(--fg); background: var(--bg3, var(--bg)); }
-/* inset shadow, not ::after: .tab.attn::after already claims this element's
-   one ::after for its attention dot. */
-.tabstrip .tab.active { background: var(--bg); color: var(--fg);
-                        box-shadow: inset 0 -2px 0 var(--accent); }
+.tabstrip .tab { display: flex; align-items: center; gap: 4px; height: 24px; padding: 0 6px 0 9px;
+                 border-radius: 6px; cursor: pointer; white-space: nowrap; color: var(--muted);
+                 position: relative; }
+.tabstrip .tab:hover { color: var(--fg); background: var(--tab-hover); }
+/* A filled pill rather than the accent underline this used to draw. The
+   underline had to be an inset box-shadow because .tab.attn::after already
+   claims the element's one ::after for its attention dot; the pill needs no
+   pseudo-element at all, so that constraint is gone. */
+.tabstrip .tab.active { background: var(--tab-on); color: var(--fg); }
 .tabstrip .tab .dirty { color: var(--accent); }
 .tabstrip .tab .stale { color: var(--warn, #d79921); }
 /* opacity, not display: the control keeps its box at all times, so revealing
@@ -57,7 +90,20 @@ main { flex: 1; min-height: 0; }
 .tabstrip .newterm { display: flex; align-items: center; padding: 0 9px; cursor: pointer; color: var(--muted); }
 .tabstrip .newterm:hover { color: var(--fg); background: var(--bg3, var(--bg)); }
 .content { flex: 1 1 auto; overflow: auto; position: relative; }
-.content .termhost { position: absolute; inset: 0; }
+/* Inset from the card edge rather than bleeding into it: the fit addon sizes
+   the grid from the host's *inner* box, so padding costs a column, not a
+   clipped one. Left is roomier than right because the right edge is where the
+   viewport's scrollbar sits. */
+.content .termhost { position: absolute; inset: 0; padding: 4px 2px 2px 7px; }
+/* xterm ships an unstyled viewport, so the browser's default scrollbar lands
+   directly on the card's border — a bright bar against every dark theme. */
+.termhost .xterm-viewport { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.termhost .xterm-viewport::-webkit-scrollbar { width: 9px; }
+.termhost .xterm-viewport::-webkit-scrollbar-track { background: transparent; }
+.termhost .xterm-viewport::-webkit-scrollbar-thumb {
+  background: var(--border); border-radius: 5px; border: 2px solid transparent; background-clip: content-box;
+}
+.termhost .xterm-viewport::-webkit-scrollbar-thumb:hover { background: var(--muted); background-clip: content-box; }
 /* A terminal whose socket has died is otherwise pixel-identical to a live idle
    one, and keystrokes into it vanish silently — so say so on the terminal
    itself. Driven by data-status (app.js's termStatus); the empty value is the
@@ -69,18 +115,28 @@ main { flex: 1; min-height: 0; }
   font: 11px/1.6 var(--mono); color: var(--bg);
   background: var(--warn, #d79921);
 }
-/* The grid track stays 4px so dragging still has a forgiving target, but only
-   a centred hairline is painted — a fully-painted 4px bar reads as a gutter. */
+/* Nothing is painted at rest any more: the gap plus the two card borders it
+   sits between already separate the panes, and a line down the middle of that
+   gap makes three seams out of one. The track keeps its full width as a drag
+   target, and lights up on hover so the affordance survives. */
 .divider { background: transparent; position: relative; }
-.divider::after { content: ""; position: absolute; background: var(--border); }
+.divider::after { content: ""; position: absolute; background: transparent; border-radius: 2px; }
 .divider[data-div="left-w"]::after, .divider[data-div="right-w"]::after {
-  top: 0; bottom: 0; left: 50%; width: 1px; transform: translateX(-.5px);
+  top: 0; bottom: 0; left: 50%; width: 2px; transform: translateX(-1px);
 }
 .divider[data-div="left-split"]::after {
-  left: 0; right: 0; top: 50%; height: 1px; transform: translateY(-.5px);
+  left: 0; right: 0; top: 50%; height: 2px; transform: translateY(-1px);
 }
 .divider:hover::after { background: var(--accent); }
 #termpool { display: none; }
+/* Built but not shown (render.rs gives it .hidden). It exists so the layout
+   below the grid is already reserved and styled; unhiding it is one class
+   away, and until something has a reason to fill the slots it costs a rule
+   and no pixels. */
+#statusbar { display: flex; align-items: center; justify-content: space-between;
+             gap: 10px; height: 22px; padding: 0 10px; flex: none;
+             background: var(--window); color: var(--muted); font-size: 11px; }
+#statusbar .right { margin-left: auto; }
 :root { --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
 .editor { width: 100%; height: 100%; border: 0; font: 13px/1.55 var(--mono); resize: none; padding: 8px 10px; background: var(--bg); color: var(--fg); outline: none; }
 .conflict { border: 1px solid var(--warn, #d79921); padding: 8px; margin: 8px; background: var(--bg2); }
