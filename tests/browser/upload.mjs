@@ -67,18 +67,61 @@ try {
   // isDirectory the same way a real one does, which is the branch under test.
   const sendsBeforeDrop = await evalIn("window.__sends");
   await evalIn(`window.__errors = [];
+    (() => {
     const row = document.querySelector('[data-rel]');
-    const ev = new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: new DataTransfer() });
+    const dt = new DataTransfer();
+    // A real folder drag carries a zero-length File *and* sets types to
+    // include "Files"; only webkitGetAsEntry distinguishes it. Synthesising
+    // just the entry made this test miss that the handler now gates on types.
+    dt.items.add(new File([], "src", { type: "" }));
+    const ev = new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: dt });
     Object.defineProperty(ev.dataTransfer, "items", {
       value: [{ webkitGetAsEntry: () => ({ isDirectory: true, name: "src" }) }],
     });
-    row.dispatchEvent(ev);`);
+    row.dispatchEvent(ev);
+    })();`);
   const dropMsg = await evalIn("window.__errors.join(' | ')");
   const sendsAfterDrop = await evalIn("window.__sends");
   ok(sendsAfterDrop === sendsBeforeDrop, "a dropped folder sent no request");
   ok(/folders are not uploaded \(src\)/.test(dropMsg), `the refusal names the folder: ${dropMsg}`);
 
-  // ---- 5. A collision is reported per file, not as a blanket error ---------
+  // ---- 5. A misplaced file drag never reaches the browser ------------------
+  // Found by hand, not by this file: dragover only called preventDefault over a
+  // [data-rel] row, so every other pixel fell through to the browser, which
+  // navigates to file:/// and throws the workspace away. Asserting
+  // defaultPrevented is the only way to see that from inside the page — the
+  // navigation itself would just destroy the test's own context.
+  const outside = await evalIn(`(() => {
+    const dt = new DataTransfer();
+    dt.items.add(new File(["x"], "stray.txt", { type: "text/plain" }));
+    const ev = new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: dt });
+    document.body.dispatchEvent(ev);
+    return ev.defaultPrevented;
+  })()`);
+  ok(outside === true, "a file dragged outside the tree is still intercepted, not left to the browser");
+
+  const sendsBeforeStray = await evalIn("window.__sends");
+  await evalIn(`window.__errors = [];
+    (() => {
+      const dt = new DataTransfer();
+      dt.items.add(new File(["x"], "stray.txt", { type: "text/plain" }));
+      document.body.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: dt }));
+    })();`);
+  const strayMsg = await evalIn("window.__errors.join(' | ')");
+  ok(
+    (await evalIn("window.__sends")) === sendsBeforeStray,
+    "a drop outside the tree uploaded nothing",
+  );
+  ok(/Files pane/.test(strayMsg), `it says where files go instead: ${strayMsg}`);
+
+  // ---- 6. Pane whitespace counts as the project root -----------------------
+  const paneDrop = await evalIn(`(() => {
+    const pane = [...document.querySelectorAll(".pane")].find((p) => p.querySelector("ul.tree"));
+    return pane ? uploadTargetDir(pane.querySelector(".content")) : null;
+  })()`);
+  ok(paneDrop === "", `empty space in the Files pane resolves to the project root (got ${JSON.stringify(paneDrop)})`);
+
+  // ---- 7. A collision is reported per file, not as a blanket error ---------
   await evalIn(`window.__errors = [];
     uploadFiles([__file("dropped.txt", "second attempt")], "")`);
   await until(() => evalIn("window.__errors.length > 0"), 20, "per-file error");

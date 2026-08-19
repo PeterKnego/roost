@@ -1090,6 +1090,26 @@ function dropDir(target) {
   return rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "";
 }
 
+// Where a drop should land, widened from the row to the whole Files pane.
+// Rows are a small target and the gaps between them are large, so resolving
+// only on `[data-rel]` meant most of the pane silently fell through to the
+// browser, which navigates to file:/// and throws the workspace away. Pane
+// whitespace is the project root — the same thing the tree's own top level is.
+function uploadTargetDir(target) {
+  const row = dropDir(target);
+  if (row !== null) return row;
+  const pane = target && target.closest && target.closest(".pane");
+  if (pane && pane.querySelector("ul.tree")) return "";
+  return null;
+}
+
+// True when the drag carries files, as opposed to text being moved inside the
+// editor's textarea. Only file drags are intercepted, or dragging a selection
+// within a buffer would stop working.
+function dragHasFiles(dt) {
+  return !!dt && Array.prototype.includes.call(dt.types || [], "Files");
+}
+
 function focusedSession() {
   const host = document.activeElement && document.activeElement.closest(".termhost");
   return host ? host.dataset.session : null;
@@ -1163,16 +1183,22 @@ function droppedDirectories(dt) {
   return dirs;
 }
 
-// Without preventDefault on dragover the browser navigates to the dropped file
-// instead of delivering a drop event.
+// preventDefault on *every* file drag, not just ones over a valid target.
+// Without it the browser handles the drop itself and navigates to file:///,
+// which throws away the workspace — and it did so for every pixel that was not
+// exactly a tree row, which is most of the window. Refusing a misplaced drop
+// out loud is the whole point; navigating away is never the right answer.
 document.addEventListener("dragover", (e) => {
-  if (dropDir(e.target) !== null) e.preventDefault();
+  if (dragHasFiles(e.dataTransfer)) e.preventDefault();
 });
 
 document.addEventListener("drop", (e) => {
-  const dir = dropDir(e.target);
-  if (dir === null || !e.dataTransfer) return;
+  if (!dragHasFiles(e.dataTransfer)) return;
   e.preventDefault();
+  const dir = uploadTargetDir(e.target);
+  if (dir === null) {
+    return showError("drop files on the Files pane to upload them");
+  }
   const dirs = droppedDirectories(e.dataTransfer);
   if (dirs.length) {
     return showError(`folders are not uploaded (${dirs.join(", ")}) — use git or scp for a directory`);
