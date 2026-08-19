@@ -200,11 +200,21 @@ The binary is self-contained: `static/` is compiled in, so the installed
 serves — that needs a rebuild and reinstall. To iterate on the UI live, run a
 second instance with `RESH_STATIC` pointed at a checkout.
 
-A user theme goes in `~/.config/resh/static/themes/{name}.css` and is selected
-with `theme = "{name}"`. A project theme goes in `{project}/.resh/theme/`,
-entered through `style.css`; the older single `.resh/theme.css` still works and
-the directory wins where both exist. Neither may supply JavaScript or HTML —
-only `$RESH_STATIC` can, and only whoever starts the process can set it.
+Asset lookup is three layers, checked in this order: `$RESH_STATIC` first, then
+`~/.config/resh/static/`, then the embedded copy. That order means a stale
+`RESH_STATIC` left set on a real deployment silently wins over anything in the
+user directory — it is meant for one developer's own instance, not to be left
+exported on a shared host. The user directory is not limited to
+`themes/{name}.css`: it mirrors `static/`'s own layout, so any path under it —
+an overridden `style.css`, a custom font, a logo — is picked up in place of the
+embedded file, restricted only by extension (`css`, `svg`, `png`, `jpg`,
+`jpeg`, `gif`, `webp`, `ico`, `woff`, `woff2`, `ttf`, `otf`); a theme is
+selected with `theme = "{name}"`, which resolves to
+`~/.config/resh/static/themes/{name}.css`. A project theme goes in
+`{project}/.resh/theme/`, entered through `style.css`; the older single
+`.resh/theme.css` still works and the directory wins where both exist. Neither
+the user directory nor a project may supply JavaScript or HTML — only
+`$RESH_STATIC` can, and only whoever starts the process can set it.
 
 ## `KillMode=process` is load-bearing
 

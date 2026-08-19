@@ -5,8 +5,19 @@ edition = "2021"
 # Explicit, because `include_bytes!` failing on a published crate would be
 # discovered from a user's bug report rather than from our own build. static/
 # is not gitignored so it packages by default today; this stops that being an
-# accident.
-include = ["src/**/*", "static/**/*", "build.rs", "Cargo.toml", "README.md", "docs/deploy.md"]
+# accident. `tests/` is deliberately left out — `cargo test` is not expected
+# to work against a `cargo install`-fetched source tree, and `cargo package`
+# already warns about the omission.
+include = [
+    "src/**/*",
+    "static/**/*",
+    "build.rs",
+    "Cargo.toml",
+    "README.md",
+    "CLAUDE.md",
+    "docs/deploy.md",
+    "docs/notifications.md",
+]
 
 [dependencies]
 tungstenite = "0.24"
