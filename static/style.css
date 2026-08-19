@@ -6,8 +6,17 @@ html, body { height: 100%; }
    surfaces lift in a dark theme and darken in a light one from one rule. */
 :root {
   --window: color-mix(in oklab, var(--bg) 86%, black);
-  --tab-on: color-mix(in oklab, var(--fg) 10%, var(--bg2));
-  --tab-hover: color-mix(in oklab, var(--fg) 5%, var(--bg2));
+  /* Tool panes and every pane's tab strip share one tone that sits just
+     below the editor surface, which is what the IDE being matched does —
+     measured off it: tool window and tab strip both (25,26,28) against an
+     editor at (28,29,34). Deliberately not --bg2: themes set that *lighter*
+     than --bg, which put the file tree 18 RGB units above where it belongs.
+     Mixing toward black rather than toward --fg is right for both polarities
+     here, since a light theme's tool windows also sit below its white
+     editor. */
+  --tool: color-mix(in oklab, var(--bg) 90%, black);
+  --tab-on: color-mix(in oklab, var(--fg) 10%, var(--tool));
+  --tab-hover: color-mix(in oklab, var(--fg) 5%, var(--tool));
   --pane-radius: 8px;
 }
 body { background: var(--window); color: var(--fg); font: 13px/1.5 system-ui, -apple-system, sans-serif;
@@ -54,7 +63,7 @@ main { flex: 1; min-height: 0; }
    bearing: it is what clips the tab strip and the xterm canvas to the radius. */
 .pane { display: flex; flex-direction: column; overflow: hidden; background: var(--bg);
         border: 1px solid var(--border); border-radius: var(--pane-radius); }
-.pane[data-pane="0"], .pane[data-pane="1"] { background: var(--bg2); }
+.pane[data-pane="0"], .pane[data-pane="1"] { background: var(--tool); }
 /* Editor-style tabs: no separators between them, the active one carries the
    pane background plus a 2px accent underline (the IDE's indicator) rather
    than bold text, and inactive labels sit back at --muted. */
@@ -63,7 +72,7 @@ main { flex: 1; min-height: 0; }
    every state broadcast, so anything inside it would be destroyed seconds
    later. min-width:0 lets the strip scroll instead of shoving the slot out. */
 .panehead { display: flex; align-items: stretch; height: 32px; flex: 0 0 auto;
-            background: var(--bg2); border-bottom: 1px solid var(--hairline, var(--border)); }
+            background: var(--tool); border-bottom: 1px solid var(--hairline, var(--border)); }
 .paneicons { display: flex; align-items: center; gap: 2px; padding: 0 6px; flex: 0 0 auto;
              color: var(--muted); }
 .paneicons:empty { padding: 0; }
