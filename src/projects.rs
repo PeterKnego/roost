@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 pub const SKIP_DIRS: &[&str] =
     &[".git", ".claude", "target", "node_modules", "__pycache__", ".venv"];
 pub const RESERVED: &[&str] = &["static", "ws", "frag"];
-const MAX_FILE_BYTES: u64 = 2_000_000;
+pub const MAX_FILE_BYTES: u64 = 2_000_000;
 const TEXT_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "py", "js", "ts", "json", "yaml", "yml", "sh", "html", "css",
     "sql", "qnt", "tla", "lock", "xml", "c", "h", "cpp", "go", "java", "rb", "proto", "cfg",

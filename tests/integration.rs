@@ -263,6 +263,39 @@ fn theme_css_symlink_escaping_the_project_is_refused() {
     }
 }
 
+/// The `serve_theme` unit-test helper in routes.rs calls `serve_project_theme`
+/// directly, which never proves the URL actually reaches it — the fragment
+/// router splits on the *last* path segment for every other fragment kind,
+/// and a first cut of this route's dispatch arm required two-or-more
+/// segments after "theme" and so could never match, 404ing every request as
+/// "no such project" while every direct-call unit test stayed green. This
+/// test goes over real HTTP through the router, the only way to catch that.
+#[test]
+fn frag_theme_directory_serves_presentation_and_refuses_code_over_http() {
+    let (d, port) = fixture_named("themedir");
+    let t = d.path().join("themedir/.resh/theme");
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(t.join("style.css"), "body{color:red}").unwrap();
+    std::fs::write(t.join("app.js"), "alert('pwned')").unwrap();
+
+    let css = ureq::get(&format!("http://127.0.0.1:{port}/frag/themedir/theme/style.css"))
+        .call()
+        .unwrap();
+    assert_eq!(css.status(), 200);
+    assert_eq!(css.header("Content-Security-Policy"), Some("sandbox"));
+    let body = css.into_string().unwrap();
+    assert!(body.contains("body{color:red}"));
+
+    match ureq::get(&format!("http://127.0.0.1:{port}/frag/themedir/theme/app.js")).call() {
+        Err(ureq::Error::Status(code, r)) => {
+            assert_eq!(code, 404);
+            assert!(!r.into_string().unwrap().contains("pwned"));
+        }
+        Ok(r) => panic!("a project may never serve code; got {:?}", r.into_string()),
+        Err(e) => panic!("unexpected error: {e:?}"),
+    }
+}
+
 #[test]
 fn diff_traversal_path_is_rejected_with_hint() {
     let (_d, port) = fixture();

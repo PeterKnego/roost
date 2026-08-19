@@ -4,8 +4,11 @@
 //!                        e.g. /karpie/src, naming a nested directory
 //!   /static/*            assets
 //!   /frag/{project}/*    htmx fragments — {project} may likewise be
-//!                        multi-segment; the *last* segment is always the
-//!                        fragment kind (tree/file/changes/status/diff/theme.css)
+//!                        multi-segment; the *last* segment is normally the
+//!                        fragment kind (tree/file/changes/status/diff/theme.css),
+//!                        except /frag/{project}/theme/{rel}, whose {rel}
+//!                        after the last "theme" segment is itself a path
+//!                        into the project's `.resh/theme/` directory
 //! Fragment errors render as 200 + hint (htmx ignores 4xx bodies).
 use crate::{config, gitio, http, projects, registry, render};
 use std::io::{BufReader, Write};
@@ -64,15 +67,34 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
         // URLs under its own path, and this one has to focus and navigate
         // workspace tabs at /{project}.
         ["sw.js"] => serve_static(w, "sw.js"),
-        // The fragment *kind* (tree/file/…) is always exactly the last
-        // segment (routes.rs's fragment endpoints never take path segments
-        // of their own — `dir=`/`path=` arrive as query params, see
-        // serve_frag below), so splitting from the right rather than
-        // assuming `project` is a single segment is unambiguous and leaves
-        // every existing single-segment call (`/frag/proj/tree`) unchanged.
+        // The fragment *kind* (tree/file/…) is normally exactly the last
+        // segment (every other fragment endpoint takes no path segments of
+        // its own — `dir=`/`path=` arrive as query params, see serve_frag
+        // below), so splitting from the right rather than assuming
+        // `project` is a single segment is unambiguous and leaves every
+        // existing single-segment call (`/frag/proj/tree`) unchanged.
+        //
+        // The theme route is the one exception: `/frag/{project}/theme/{rel}`
+        // carries a path of its own after "theme", so it cannot be found by
+        // taking the last segment — that would misparse "style.css" as the
+        // kind and "proj/theme" as the project. It is dispatched here,
+        // before the split-from-the-right rule, by finding the *last*
+        // "theme" segment (a project may itself be named `.../theme`) with
+        // at least one project segment before it and one path segment after.
         ["frag", rest @ ..] if rest.len() >= 2 => {
-            let (what, proj_segs) = rest.split_last().expect("len >= 2 guarantees a last element");
-            serve_frag(w, req, roots, &proj_segs.join("/"), std::slice::from_ref(what))
+            match rest.iter().rposition(|s| *s == "theme") {
+                Some(i) if i >= 1 && i + 1 < rest.len() => {
+                    let Some(dir) = projects::resolve_project(roots, &rest[..i].join("/")) else {
+                        return http::not_found(w, "no such project");
+                    };
+                    serve_project_theme(w, &dir, &rest[i + 1..].join("/"))
+                }
+                _ => {
+                    let (what, proj_segs) =
+                        rest.split_last().expect("len >= 2 guarantees a last element");
+                    serve_frag(w, req, roots, &proj_segs.join("/"), std::slice::from_ref(what))
+                }
+            }
         }
         // `[project, rest @ ..]` accepts one or more segments; they're
         // rejoined into a single nested rel path below rather than treating
@@ -286,16 +308,27 @@ fn serve_frag(
                 Err(e) => http::html(w, &render::hint(&e)),
             }
         }
-        ["theme", rest @ ..] if !rest.is_empty() => serve_project_theme(w, &dir, &rest.join("/")),
         // Resolved through `safe_resolve`, not a bare `fs::read`, so a
         // `.resh/theme.css` that is a symlink pointing outside the
         // project (planted by a cloned repo) is refused rather than served
         // to the browser as text/css. Every other file read in this module
         // already goes through this confinement; this one predates it.
+        //
+        // Same untrusted-content policy as the theme directory route
+        // (NOSNIFF + SANDBOX): this is project-controlled CSS too, and an
+        // attacker doesn't care which of the two theme routes they're
+        // abusing.
         ["theme.css"] => match projects::safe_resolve(&dir, ".resh/theme.css")
             .and_then(|p| std::fs::read(&p).map_err(|e| e.to_string()))
         {
-            Ok(css) => http::respond(w, 200, "OK", "text/css; charset=utf-8", &css),
+            Ok(css) => http::respond_with(
+                w,
+                200,
+                "OK",
+                "text/css; charset=utf-8",
+                &[NOSNIFF, SANDBOX],
+                &css,
+            ),
             Err(_) => http::not_found(w, "no theme.css"),
         },
         _ => http::not_found(w, "no such fragment"),
@@ -318,12 +351,22 @@ fn serve_project_theme(w: &mut impl Write, dir: &Path, rel: &str) {
     if crate::assets::class_of(rel) != crate::assets::Class::Theme {
         return http::not_found(w, "no such asset");
     }
-    match projects::safe_resolve(dir, &format!(".resh/theme/{rel}"))
-        .and_then(|p| std::fs::read(&p).map_err(|e| e.to_string()))
-    {
-        Ok(body) => {
-            http::respond_with(w, 200, "OK", content_type(rel), &[NOSNIFF, SANDBOX], &body)
-        }
+    let Ok(path) = projects::safe_resolve(dir, &format!(".resh/theme/{rel}")) else {
+        return http::not_found(w, "no such asset");
+    };
+    // Stat before reading: a project directory is untrusted, and a bare
+    // `fs::read` would allocate the whole file — attacker-controlled, up to
+    // however big a cloned repo can make it — on this connection's thread
+    // before the cap could reject it. CLAUDE.md's 2 MB cap applies to every
+    // project-controlled read, not just `read_text_file`'s.
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > projects::MAX_FILE_BYTES => http::not_found(w, "asset too large"),
+        Ok(_) => match std::fs::read(&path) {
+            Ok(body) => {
+                http::respond_with(w, 200, "OK", content_type(rel), &[NOSNIFF, SANDBOX], &body)
+            }
+            Err(_) => http::not_found(w, "no such asset"),
+        },
         Err(_) => http::not_found(w, "no such asset"),
     }
 }
@@ -516,6 +559,47 @@ mod tests {
         assert!(!js.contains("pwned"));
 
         assert!(serve_theme(d.path(), "../../Cargo.toml").starts_with("HTTP/1.1 404"));
+    }
+
+    /// `../../Cargo.toml` above is caught by `assets::normalize` before
+    /// `safe_resolve` is ever reached, so on its own it cannot tell a real
+    /// confinement check from a missing one (swap `safe_resolve` for a bare
+    /// `fs::read` and every assertion up there still passes). A symlink
+    /// *inside* the theme directory pointing outside the project is the
+    /// probe that only a real canonicalize-and-`starts_with` check catches —
+    /// `normalize` has no opinion on it, since the path it sees never
+    /// contains `..` at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_theme_symlink_escaping_the_project_is_refused() {
+        let secret_dir = tempfile::tempdir().unwrap();
+        std::fs::write(secret_dir.path().join("secret.css"), "body{SECRET}").unwrap();
+
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join(".resh/theme");
+        std::fs::create_dir_all(&t).unwrap();
+        std::os::unix::fs::symlink(secret_dir.path().join("secret.css"), t.join("leak.css"))
+            .unwrap();
+
+        let out = serve_theme(d.path(), "leak.css");
+        assert!(out.starts_with("HTTP/1.1 404"), "a symlink escaping the project must be refused");
+        assert!(!out.contains("SECRET"), "the outside file's content must never reach the response");
+    }
+
+    /// A project directory is untrusted, and CLAUDE.md's 2 MB cap applies to
+    /// every project-controlled read — not just `projects::read_text_file`'s.
+    /// Without the cap this route would allocate an attacker-sized file on a
+    /// per-connection thread before ever inspecting it.
+    #[test]
+    fn an_oversize_theme_asset_is_refused_before_being_read_fully() {
+        let d = tempfile::tempdir().unwrap();
+        let t = d.path().join(".resh/theme");
+        std::fs::create_dir_all(&t).unwrap();
+        let oversize = vec![b'a'; (projects::MAX_FILE_BYTES + 1) as usize];
+        std::fs::write(t.join("big.css"), &oversize).unwrap();
+
+        let out = serve_theme(d.path(), "big.css");
+        assert!(out.starts_with("HTTP/1.1 404"), "an oversize project asset must be refused");
     }
 
     /// The selection itself, which decides which single link the page emits.
