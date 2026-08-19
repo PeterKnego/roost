@@ -250,9 +250,10 @@ function render() {
       }
       const x = document.createElement("span");
       x.className = "x";
-      x.title = "close";
+      x.title =
+        t.k === "Terminal" ? "end session (alt-click to detach, leaving it running)" : "close";
       x.textContent = "×";
-      x.onclick = (e) => { e.stopPropagation(); closeTab(pi, ti, t); };
+      x.onclick = (e) => { e.stopPropagation(); closeTab(pi, ti, t, e.altKey); };
       b.appendChild(x);
       strip.appendChild(b);
     });
@@ -296,13 +297,11 @@ function render() {
 function pool() { return document.getElementById("termpool"); }
 
 function newTerminal(pane) {
-  const name = prompt("Terminal name (letters, digits, _ and - only, max 32 chars):", "shell");
-  if (name === null) return;
-  if (!SESSION_RE.test(name)) {
-    alert("invalid session name — use only letters, digits, _ and -, up to 32 characters");
-    return;
-  }
-  send({ t: "OpenTab", pane, tab: { k: "Terminal", session: name } });
+  // No prompt: the server allocates term/term1/term2… from `live_names`, which
+  // sees detached sessions the client has no tabs for. A name picked here could
+  // collide with one of those, and since attaching creates only when absent,
+  // "new terminal" would silently reattach to an old shell instead.
+  send({ t: "NewTerminal", pane });
 }
 
 function mountTab(content, t) {
@@ -675,9 +674,18 @@ function showError(msg) {
   showBanner(`Error: ${msg}`);
 }
 
-function closeTab(pi, ti, t) {
+// `detach` (alt-click) keeps the old meaning: drop the tab, leave the shell
+// running. A plain close ends the session, because a tab that quietly outlives
+// its × is how a project accumulates shells nothing can reach — there is no
+// session list, and the per-project cap is 16.
+function closeTab(pi, ti, t, detach) {
   const meta = t.k === "File" ? state.buffers.find((x) => x.rel === t.rel) : null;
   if (meta && meta.dirty && !confirm(`${t.rel} has unsaved changes. Close it?`)) return;
+  if (t.k === "Terminal" && !detach) {
+    if (!confirm(`End session "${t.session}"? This kills the shell and anything running in it.`)) return;
+    send({ t: "EndSession", session: t.session });
+    return;
+  }
   send({ t: "CloseTab", pane: pi, idx: ti });
 }
 

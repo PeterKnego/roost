@@ -546,6 +546,54 @@ fn extract_origin(json: &str) -> String {
     rest[..end].to_string()
 }
 
+/// The + button sends no name at all now, so allocation is entirely the
+/// server's. Driven over the real socket because the client half — dropping
+/// the `prompt()` — is not reachable from a unit test.
+#[test]
+fn new_terminal_names_itself_and_ending_one_clears_only_its_own_tab() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    // Its own project, not the shared "proj": Hub is a process-global registry
+    // keyed by project name, so a sibling test's tabs would otherwise show up
+    // here and the seeded-`term` baseline below would be reading their state.
+    let (_d, port) = fixture_named("newterm");
+    let mut a = ws_connect_path(port, "/ws/newterm/_workspace").unwrap();
+    // default_layout already seeds a `term` tab, so the first click must skip
+    // to `term1` — the case that proves names on tabs are treated as taken
+    // even before any PTY exists for them.
+    let init = read_until(&mut a, r#""t":"State""#);
+    assert!(init.contains(r#""session":"term""#), "the seeded terminal is the baseline");
+
+    a.send(tungstenite::Message::Text(r#"{"t":"NewTerminal","pane":3}"#.into())).unwrap();
+    let seen = read_until(&mut a, r#""session":"term1""#);
+    assert!(seen.contains(r#""session":"term1""#));
+
+    a.send(tungstenite::Message::Text(r#"{"t":"NewTerminal","pane":3}"#.into())).unwrap();
+    let seen = read_until(&mut a, r#""session":"term2""#);
+    assert!(
+        seen.contains(r#""session":"term2""#),
+        "a second click must not hand out a name it already gave away"
+    );
+
+    a.send(tungstenite::Message::Text(r#"{"t":"EndSession","session":"term1"}"#.into())).unwrap();
+    // Read until a snapshot that no longer mentions term1; the ending itself
+    // happens on a background thread, so more than one State can arrive.
+    let mut cleared = String::new();
+    for _ in 0..20 {
+        let msg = read_until(&mut a, r#""t":"State""#);
+        if !msg.contains(r#""session":"term1""#) {
+            cleared = msg;
+            break;
+        }
+    }
+    assert!(!cleared.is_empty(), "a snapshot without the ended session must arrive");
+    assert!(cleared.contains(r#""session":"term2""#), "siblings must survive");
+    assert!(cleared.contains(r#""session":"term""#), "siblings must survive");
+
+    std::env::remove_var("RESH_STATE_DIR");
+}
+
 #[test]
 fn workspace_state_mirrors_between_two_clients() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

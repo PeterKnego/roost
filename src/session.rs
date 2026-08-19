@@ -499,6 +499,71 @@ pub fn has_session(project: &str, name: &str) -> bool {
 /// other project's terminal traffic (any operation needing this same lock)
 /// for the duration, the identical hazard `write_input`'s doc comment
 /// already describes for a blocking write.
+/// Ends whatever still holds `project/name`'s socket — the dtach master
+/// included — and unlinks it. Shared by [`end_session`] and [`kill_project`]
+/// so the two cannot drift: both need the same "kill, confirm, then unlink,
+/// but leave the socket in place if something survived" handling, and a
+/// survivor must stay discoverable rather than be silently forgotten.
+fn end_socket(project: &str, name: &str, who: &str) -> bool {
+    if crate::registry::kill_and_unlink(&sock_path(project, name)) {
+        return true;
+    }
+    eprintln!(
+        "resh: {who} could not fully end session {project}/{name} — a process survived the kill attempt; its socket was left in place so it stays discoverable"
+    );
+    false
+}
+
+/// Ends one session: the narrow case of [`kill_project`], for a user closing
+/// a single terminal tab.
+///
+/// Killing this process's own client is only a *detach* — in `-A` mode dtach
+/// forks a master that reparents to init — so the socket work below is what
+/// actually ends the shell, and it runs whether or not this process ever
+/// attached. That second part is why a session which outlived a restart (on
+/// disk, absent from the in-memory map) is still endable.
+///
+/// Returns whether the session is confirmed gone.
+pub fn end_session(project: &str, name: &str) -> bool {
+    if !valid_name(name) || !valid_project(project) {
+        return false;
+    }
+    let key = format!("{}/{}", crate::projects::storage_key(project), name);
+    {
+        let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut s) = map.remove(&key) {
+            let _ = s.child.kill();
+            let _ = s.child.wait();
+        }
+    } // lock released before any blocking socket work — see `attach`
+    end_socket(project, name, "End session")
+}
+
+/// The first unused `term`, `term1`, `term2`, … for this project, or `None`
+/// once [`MAX_SESSIONS_PER_PROJECT`] names are live.
+///
+/// Allocation is deliberately server-side. A client can only see the sessions
+/// it has tabs for, while `live_names` also sees detached ones and those that
+/// outlived a restart; picking a name from the tab strip alone would sooner or
+/// later choose a name that is still alive, and since attaching creates only
+/// when absent, "new terminal" would silently drop the user into an old shell
+/// with its scrollback replayed.
+///
+/// `also_taken` covers the gap between opening the tab and the browser's
+/// follow-up connect to `/ws/{project}/term/{name}`, which is what actually
+/// spawns the PTY (see `term.rs`): until that lands the name is in no
+/// registry, so two quick clicks would otherwise both be handed `term`.
+pub fn next_free_name(project: &str, also_taken: &[String]) -> Option<String> {
+    let live = live_names(project);
+    let taken = |n: &str| live.iter().any(|l| l == n) || also_taken.iter().any(|l| l == n);
+    // One more candidate than the cap: with MAX names taken, every candidate
+    // below is taken and the cap is what refuses — not an exhausted range.
+    (0..=MAX_SESSIONS_PER_PROJECT)
+        .map(|i| if i == 0 { "term".to_string() } else { format!("term{i}") })
+        .find(|n| !taken(n))
+        .filter(|_| live.len() < MAX_SESSIONS_PER_PROJECT)
+}
+
 pub fn kill_project(project: &str) -> usize {
     let prefix = format!("{}/", crate::projects::storage_key(project));
     let removed_names: Vec<String> = {
@@ -532,12 +597,8 @@ pub fn kill_project(project: &str) -> usize {
 
     let mut ended = 0;
     for name in &all_names {
-        if crate::registry::kill_and_unlink(&sock_path(project, name)) {
+        if end_socket(project, name, "Close Project") {
             ended += 1;
-        } else {
-            eprintln!(
-                "resh: Close Project could not fully end session {project}/{name} — a process survived the kill attempt; its socket was left in place so it stays discoverable"
-            );
         }
     }
     // Not removing the now-possibly-empty sock/<project>/ directory here:
@@ -664,6 +725,93 @@ mod tests {
         assert!(age < 60 * 60, "own process age looked wrong: {age}");
         // A pid that cannot exist yields None rather than panicking.
         assert!(process_age_secs(0).is_none() || process_age_secs(4_294_967_294).is_none());
+    }
+
+    #[test]
+    fn end_session_ends_one_and_leaves_its_siblings_alone() {
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        attach("endproj", "term", d.path()).unwrap();
+        attach("endproj", "term1", d.path()).unwrap();
+        attach("otherend", "term", d.path()).unwrap();
+
+        assert!(end_session("endproj", "term"));
+
+        let names: Vec<String> = list_sessions("endproj").into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["term1"], "only the named session may end");
+        assert_eq!(list_sessions("otherend").len(), 1, "another project must be untouched");
+
+        kill_project("endproj");
+        kill_project("otherend");
+        std::env::remove_var("RESH_CMD");
+    }
+
+    /// The whole point of ending by name: a rubbish name must not be able to
+    /// escape its project, and must not report success for work it never did.
+    #[test]
+    fn end_session_refuses_an_invalid_name_rather_than_reporting_success() {
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!end_session("endproj", "../../etc/passwd"));
+        assert!(!end_session("endproj", ""));
+    }
+
+    /// Counting is over `live_names`, which sees sessions this process never
+    /// attached to — so a name that is merely *detached* is still taken, and
+    /// handing it out would silently reattach the user to an old shell rather
+    /// than giving them a new one.
+    #[test]
+    fn next_free_name_counts_up_and_skips_names_already_live() {
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+
+        assert_eq!(next_free_name("nameproj", &[]).as_deref(), Some("term"));
+
+        attach("nameproj", "term", d.path()).unwrap();
+        assert_eq!(next_free_name("nameproj", &[]).as_deref(), Some("term1"));
+
+        attach("nameproj", "term1", d.path()).unwrap();
+        assert_eq!(next_free_name("nameproj", &[]).as_deref(), Some("term2"));
+
+        // A gap is reused: term1 ending frees the name below term2.
+        end_session("nameproj", "term1");
+        assert_eq!(next_free_name("nameproj", &[]).as_deref(), Some("term1"));
+
+        // `also_taken` covers the tab-opened-but-not-yet-connected window,
+        // where a name is in no registry yet — two quick clicks must not both
+        // be handed the same one.
+        assert_eq!(
+            next_free_name("nameproj", &["term1".to_string()]).as_deref(),
+            Some("term2"),
+            "a name already claimed by an open tab is not free"
+        );
+
+        kill_project("nameproj");
+        std::env::remove_var("RESH_CMD");
+    }
+
+    #[test]
+    fn next_free_name_gives_up_at_the_session_cap() {
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..MAX_SESSIONS_PER_PROJECT {
+            let n = if i == 0 { "term".to_string() } else { format!("term{i}") };
+            attach("capproj", &n, d.path()).unwrap();
+        }
+        assert_eq!(live_names("capproj").len(), MAX_SESSIONS_PER_PROJECT);
+        assert_eq!(next_free_name("capproj", &[]), None, "the cap refuses, it does not wrap");
+
+        end_session("capproj", "term");
+        assert_eq!(
+            next_free_name("capproj", &[]).as_deref(),
+            Some("term"),
+            "ending one must free a slot — otherwise closing tabs can never escape the cap"
+        );
+
+        kill_project("capproj");
+        std::env::remove_var("RESH_CMD");
     }
 
     #[test]

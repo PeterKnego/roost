@@ -318,6 +318,8 @@ impl Hub {
             Intent::StartTerminal { session } => return self.do_start_terminal(from, session.clone()),
             Intent::InitGit => return self.do_init_git(from),
             Intent::CloseProject => return self.do_close_project(from),
+            Intent::EndSession { session } => return self.do_end_session(from, session.clone()),
+            Intent::NewTerminal { pane } => return self.do_new_terminal(from, *pane),
             _ => {}
         }
         // CloseTab removes the tab from `self.ws` inside `apply_layout`
@@ -697,6 +699,110 @@ impl Hub {
     /// otherwise mistake it for the answer to its own request (see
     /// `tests/integration.rs`'s `fresh_state` doc comment, which already
     /// documents this as the invariant).
+    /// Ends one terminal session and clears its tabs everywhere.
+    ///
+    /// The layout change is applied and broadcast *now*, while the kill runs on
+    /// a background thread: `session::end_session` confirms the dtach master is
+    /// really dead, a bounded poll that shells out to `ps`/`kill`. Doing that
+    /// inline would hold the hub lock across it and freeze terminal output for
+    /// every session in the project — the same constraint `do_close_project`
+    /// already spawns a thread for.
+    fn do_end_session(&mut self, from: &ConnId, session: String) {
+        if !crate::session::valid_name(&session) {
+            let ev = Event::Error { msg: format!("invalid session name: {session}") };
+            return self.send_to(from, &ev);
+        }
+        // A close in flight is already killing every session here. Racing it
+        // would report an end for a session `kill_project` is also ending.
+        if self.closing {
+            let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
+            return self.send_to(from, &ev);
+        }
+        let intent = Intent::EndSession { session: session.clone() };
+        if let Ok(true) = workspace::apply_layout(&mut self.ws, &intent) {
+            self.ws.version += 1;
+        }
+        let project = self.project.clone();
+        match self.self_ref.upgrade() {
+            Some(hub_arc) => {
+                let thread_project = project.clone();
+                let thread_session = session.clone();
+                let spawned =
+                    std::thread::Builder::new().name("end-session".into()).spawn(move || {
+                        // No panic may escape a socket thread; one here must not
+                        // strand the hub lock and leave every later intent stuck.
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            crate::session::end_session(&thread_project, &thread_session)
+                        }))
+                        .unwrap_or_else(|_| {
+                            eprintln!(
+                                "resh: end_session panicked ending {thread_project}/{thread_session}"
+                            );
+                            false
+                        });
+                        let mut h = Hub::lock(&hub_arc);
+                        h.refresh_live_sessions();
+                        let snap = h.snapshot_event(&String::new());
+                        h.broadcast(&snap);
+                    });
+                if let Err(e) = spawned {
+                    eprintln!("resh: could not spawn end-session thread for {project}: {e}");
+                    crate::session::end_session(&project, &session);
+                    self.refresh_live_sessions();
+                }
+            }
+            None => {
+                crate::session::end_session(&project, &session);
+                self.refresh_live_sessions();
+            }
+        }
+        let snap = self.snapshot_event(from);
+        self.broadcast(&snap);
+        self.persist();
+    }
+
+    /// Opens a terminal on a server-allocated name. See
+    /// `session::next_free_name` for why the client must not choose it.
+    fn do_new_terminal(&mut self, from: &ConnId, pane: crate::proto::PaneId) {
+        if self.closing {
+            let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
+            return self.send_to(from, &ev);
+        }
+        // Names already on a tab but not yet connected are in no registry —
+        // `next_free_name`'s `also_taken` is what stops two quick clicks from
+        // both being handed `term`.
+        let on_tabs: Vec<String> = self
+            .ws
+            .panes
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .filter_map(|t| match t {
+                Tab::Terminal { session } => Some(session.clone()),
+                _ => None,
+            })
+            .collect();
+        let Some(name) = crate::session::next_free_name(&self.project, &on_tabs) else {
+            let ev = Event::Error { msg: "too many terminal sessions".into() };
+            return self.send_to(from, &ev);
+        };
+        let intent = Intent::OpenTab { pane, tab: Tab::Terminal { session: name.clone() } };
+        match workspace::apply_layout(&mut self.ws, &intent) {
+            Ok(true) => {
+                self.ws.version += 1;
+                self.broadcast(&Event::TerminalStarted { session: name });
+                self.refresh_live_sessions();
+                let snap = self.snapshot_event(from);
+                self.broadcast(&snap);
+                self.persist();
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let ev = Event::Error { msg: e };
+                self.send_to(from, &ev);
+            }
+        }
+    }
+
     fn do_close_project(&mut self, from: &ConnId) {
         let dirty: Vec<String> =
             self.ws.buffers.iter().filter(|(_, b)| b.dirty).map(|(r, _)| r.clone()).collect();
@@ -1245,6 +1351,81 @@ mod tests {
         h.handle(&a, Intent::Resize { sizes: proto::Sizes::default() });
         assert_eq!(h.subs.len(), 1, "a closed socket must not accumulate");
         drop(rx_a);
+    }
+
+    /// The + button no longer asks for a name, so the server must hand out an
+    /// unused one. `term` then `term1`: without the `also_taken` check, the
+    /// second click sees no *live* session yet (the PTY only spawns when the
+    /// browser connects to /ws/.../term/<name>) and hands out `term` twice.
+    #[test]
+    fn new_terminal_allocates_successive_unused_names() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("newterm_names", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        // default_layout seeds RIGHT with a Terminal tab; clear it so the
+        // names under test are the only ones in play.
+        for p in h.ws.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+            p.active = 0;
+        }
+        drain(&rx);
+
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT });
+        drain(&rx);
+
+        let names: Vec<String> = h.ws.panes[proto::RIGHT as usize]
+            .tabs
+            .iter()
+            .filter_map(|t| match t {
+                Tab::Terminal { session } => Some(session.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["term", "term1"], "each click must get its own shell");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// Ending a session is what makes closing a tab reclaim a slot; the tab
+    /// must go from every pane, and every mirrored browser must be told.
+    #[test]
+    fn end_session_clears_the_tab_everywhere_and_broadcasts() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("endsession_hub", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        let (_c2, rx_other) = h.subscribe();
+        for p in h.ws.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+            p.active = 0;
+        }
+        h.handle(
+            &c,
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::Terminal { session: "term".into() } },
+        );
+        h.handle(
+            &c,
+            Intent::OpenTab { pane: proto::RIGHT, tab: Tab::Terminal { session: "term".into() } },
+        );
+        drain(&rx);
+        drain(&rx_other);
+
+        h.handle(&c, Intent::EndSession { session: "term".into() });
+
+        let remaining: Vec<&Tab> = h.ws.panes.iter().flat_map(|p| p.tabs.iter()).collect();
+        assert!(
+            !remaining.iter().any(|t| matches!(t, Tab::Terminal { session } if session == "term")),
+            "the ended session must not keep a tab in any pane"
+        );
+        let msgs_other: Vec<String> = std::iter::from_fn(|| rx_other.try_recv().ok()).collect();
+        assert!(
+            msgs_other.iter().any(|m| m.contains(r#""t":"State""#)),
+            "a second browser must be told its terminal tab is gone"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
     }
 
     #[test]

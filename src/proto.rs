@@ -56,6 +56,18 @@ pub enum Intent {
     RenamePath { from: String, to: String },
     RequestState,
     StartTerminal { session: String },
+    /// Ends one session outright — the shell and its dtach master, not just
+    /// this browser's view of it. Deliberately *not* a flag on `CloseTab`:
+    /// closing a tab rearranges layout and is reversible, while this destroys
+    /// a running shell, and the two must not be reachable by the same message
+    /// shape. `CloseTab` on a terminal remains the detach path.
+    EndSession { session: String },
+    /// Opens a terminal on a server-allocated name (`term`, `term1`, …).
+    /// Separate from `OpenTab` because only the server can choose safely: a
+    /// client sees the sessions it has tabs for, never the detached ones, and
+    /// attaching creates only when absent — so a client-chosen name would
+    /// eventually drop the user into somebody else's old shell.
+    NewTerminal { pane: PaneId },
     InitGit,
     CloseProject,
     MarkNoticeRead { id: u64 },
@@ -182,6 +194,14 @@ mod tests {
         ));
         assert!(matches!(decode(r#"{"t":"InitGit"}"#).unwrap(), Intent::InitGit));
         assert!(matches!(decode(r#"{"t":"CloseProject"}"#).unwrap(), Intent::CloseProject));
+        assert!(matches!(
+            decode(r#"{"t":"EndSession","session":"term1"}"#).unwrap(),
+            Intent::EndSession { session } if session == "term1"
+        ));
+        assert!(matches!(
+            decode(r#"{"t":"NewTerminal","pane":2}"#).unwrap(),
+            Intent::NewTerminal { pane } if pane == 2
+        ));
     }
 
     #[test]
