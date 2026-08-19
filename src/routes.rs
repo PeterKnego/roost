@@ -204,6 +204,50 @@ pub fn content_type(rel: &str) -> &'static str {
 const NOSNIFF: (&str, &str) = ("X-Content-Type-Options", "nosniff");
 const SANDBOX: (&str, &str) = ("Content-Security-Policy", "sandbox");
 
+/// Extensions the raw route serves, the `file` fragment renders as a picture,
+/// and `SetMode { Edit }` refuses.
+///
+/// Deny-by-default, for the reason `assets::class_of` gives: an unrecognised
+/// extension must fall outside this list, so widening it is an edit here and
+/// never a side effect of an unfamiliar file appearing in a cloned repo.
+///
+/// `static/app.js` keeps a copy, for the ✎ toggle. Nothing checks the two
+/// agree — the design doc records why neither direction of mismatch loses
+/// data, because `workspace.rs` is the actual guard.
+pub const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "ico"];
+
+pub fn is_image(rel: &str) -> bool {
+    IMAGE_EXT.contains(&crate::assets::ext_of(rel).as_str())
+}
+
+/// Image bytes out of a project, for `<img>` in a markdown preview and for an
+/// image tab.
+///
+/// `metadata` before `read` is not a style preference: a bare `fs::read`
+/// allocates the whole file — a size a cloned repo controls — on this
+/// connection's thread before any cap could reject it.
+fn serve_raw(w: &mut impl Write, dir: &Path, rel: &str) {
+    let Some(rel) = crate::assets::normalize(rel) else {
+        return http::not_found(w, "no such asset");
+    };
+    if !is_image(rel) {
+        return http::not_found(w, "not an image");
+    }
+    let Ok(path) = projects::safe_resolve(dir, rel) else {
+        return http::not_found(w, "no such asset");
+    };
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > projects::MAX_FILE_BYTES => http::not_found(w, "asset too large"),
+        Ok(_) => match std::fs::read(&path) {
+            Ok(body) => {
+                http::respond_with(w, 200, "OK", content_type(rel), &[NOSNIFF, SANDBOX], &body)
+            }
+            Err(_) => http::not_found(w, "no such asset"),
+        },
+        Err(_) => http::not_found(w, "no such asset"),
+    }
+}
+
 /// `~/.config/resh/static`, the optional user overlay. Absent on a fresh
 /// install, which is not an error — the layer is simply skipped.
 fn user_static_dir() -> Option<PathBuf> {
@@ -273,7 +317,8 @@ fn serve_static(w: &mut impl Write, rel: &str) {
 /// is removed from serve_frag but left here). There is no compiler check
 /// for that — it's the one hazard this dispatch-by-kind approach carries
 /// that a fully generic parse wouldn't.
-const FRAGMENT_KINDS: &[&str] = &["tree", "file", "changes", "status", "diff", "theme.css"];
+const FRAGMENT_KINDS: &[&str] =
+    &["tree", "file", "raw", "changes", "status", "diff", "theme.css"];
 
 fn serve_frag(
     w: &mut impl Write,
@@ -316,6 +361,10 @@ fn serve_frag(
                 Ok(content) => http::html(w, &render::file_fragment(rel, &content)),
                 Err(e) => http::html(w, &render::hint(&e)),
             },
+        },
+        ["raw"] => match req.query.get("path") {
+            None => http::not_found(w, "missing path"),
+            Some(rel) => serve_raw(w, &dir, rel),
         },
         ["changes"] => match gitio::status(&dir) {
             Ok(st) => http::html(w, &render::changes_fragment(project, &st)),
@@ -673,6 +722,69 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         route(&mut buf, &req, roots);
         String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// The escape target must EXIST. A test pointing `path` at a file that is not
+    /// there passes on ENOENT without ever reaching the confinement check — the
+    /// exact hole that let a symlink escape survive review once already.
+    #[test]
+    fn raw_serves_an_image_and_refuses_everything_else() {
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join("p");
+        std::fs::create_dir_all(proj.join("docs")).unwrap();
+        // A one-pixel PNG: real bytes, so a content-type assertion means something.
+        let png: &[u8] = &[
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, b'I', b'H', b'D', b'R',
+        ];
+        std::fs::write(proj.join("docs/cat.png"), png).unwrap();
+        std::fs::write(proj.join("secret.rs"), "fn main() {}").unwrap();
+        let roots = vec![d.path().to_path_buf()];
+
+        let ok = frag_route(&roots, "/frag/p/raw?path=docs/cat.png");
+        assert!(ok.starts_with("HTTP/1.1 200 OK"), "{ok}");
+        assert!(ok.contains("Content-Type: image/png"), "{ok}");
+        assert!(ok.contains("X-Content-Type-Options: nosniff"), "{ok}");
+        assert!(ok.contains("Content-Security-Policy: sandbox"), "{ok}");
+
+        // Deny-by-default: the file exists and is readable, and is still refused.
+        // Confirmed by reverting the `is_image` guard: the assertion below
+        // failed with the response "HTTP/1.1 200 OK ... fn main() {}" — the
+        // secret file's own text was served back verbatim.
+        let code = frag_route(&roots, "/frag/p/raw?path=secret.rs");
+        assert!(code.starts_with("HTTP/1.1 404"), "{code}");
+        assert!(code.contains("not an image"), "must refuse on class, not absence: {code}");
+
+        let up = frag_route(&roots, "/frag/p/raw?path=../p/docs/cat.png");
+        assert!(up.starts_with("HTTP/1.1 404"), "{up}");
+    }
+
+    #[test]
+    fn raw_refuses_an_oversize_image_and_a_symlink_out() {
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("big.png"), vec![0u8; (crate::projects::MAX_FILE_BYTES + 1) as usize])
+            .unwrap();
+        // Outside the project, and REAL — see the comment on the test above.
+        std::fs::write(d.path().join("outside.png"), b"not yours").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(d.path().join("outside.png"), proj.join("escape.png")).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+
+        let big = frag_route(&roots, "/frag/p/raw?path=big.png");
+        assert!(big.starts_with("HTTP/1.1 404"), "{big}");
+        assert!(big.contains("asset too large"), "must refuse on size, not absence: {big}");
+
+        // Confirmed by reverting `safe_resolve` to a bare `dir.join(rel)`:
+        // the assertion below failed with the response "HTTP/1.1 200 OK ...
+        // not yours" — the symlink target's content, from outside the
+        // project, served straight through.
+        #[cfg(unix)]
+        {
+            let esc = frag_route(&roots, "/frag/p/raw?path=escape.png");
+            assert!(esc.starts_with("HTTP/1.1 404"), "a symlink leaving the project: {esc}");
+            assert!(!esc.contains("not yours"), "and its bytes must not appear: {esc}");
+        }
     }
 
     /// A project is legitimately multi-segment (`resolve_project` accepts
