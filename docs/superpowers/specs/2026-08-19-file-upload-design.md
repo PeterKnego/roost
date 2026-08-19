@@ -127,30 +127,59 @@ Separate endpoints rather than one with a mode flag: they differ in destination
 validation (any bytes versus a sniffed image). Folding them together would mean
 one handler branching on all three.
 
-## Three caps, because one does not answer the question
-
-A per-file limit alone does not constrain bulk at all — a thousand files of
-100 KB each sails past it. So:
+## Two caps, and one that was dropped
 
 | Cap | Value | What it stops |
 |---|---|---|
-| Per file | 8 MB | A single oversized file; sized for a 4K screenshot, which runs 3–5 MB |
 | Parts per request | 16 | A directory's worth of files in one go |
-| Aggregate per request | 32 MB | Sixteen large files adding up |
+| Aggregate bytes per request | 100 MB, configurable | A mis-dragged VM image or `target/` artifact |
 
-These are the mechanism by which "this is not a project transfer tool" is
-enforced, rather than merely documented. Someone dragging a source tree onto
-the tree gets a clear `413` early, not a slow melt — and because parsing is
-streamed, both request-level caps are enforced while reading, so the refusal
-happens before the bytes are accepted rather than after.
+**There is deliberately no per-file cap.** An earlier draft had one at 8 MB, and
+it was inherited rather than reasoned: under base64-over-websocket, file size
+*was* memory, so the limit was the only thing bounding resident bytes. Streaming
+to disk severs that link — memory is the chunk buffer whether the file is 1 MB
+or 1 GB — and the justification died with the transport. A per-file limit also
+does nothing about bulk, which is the misuse actually worth guarding: a thousand
+100 KB source files sail past any per-file number. The aggregate cap bounds a
+single file for free, since one part's bytes *are* the aggregate, so the
+separate limit bought nothing but an extra concept, message and test.
 
-`MAX_TEXT_BYTES` and `MAX_FRAME_BYTES` are untouched. Nothing about this design
-goes near the websocket, so the frame ceiling has no reason to move — an
-earlier draft that shipped uploads over the socket had to raise it, and that
-whole entanglement disappears with the transport.
+What the caps are *not* for is worth stating, because it prevents them being
+mistaken for a security control later. They do not defend against the user:
+anyone who can reach this endpoint already has a shell in that project and can
+fill the disk with `dd` far faster. They do not defend against CSRF either —
+`Origin` does that, and if it ever failed, a capped arbitrary write is already
+destructive. **The caps guard against slips**, one accidental drag turning into
+a full disk, which matters because disk-full on this host breaks dtach socket
+creation, state writes, and git. That is an honest and sufficient reason; it is
+just a different one from security.
+
+### Where the limit may be set
+
+`max_upload_bytes` is read from the **global** config only —
+`~/.config/resh/config.toml`, overridable by a `RESH_MAX_UPLOAD` environment
+variable, exactly as `allowed_origins` and `RESH_ORIGINS` already work.
+
+It must **not** join `Settings` and must not be readable from
+`{project}/.resh/config.toml`. That file lives inside the repository, so a
+cloned hostile repo could otherwise raise its own ceiling to whatever it liked
+and turn a mis-drag into a disk-fill. `config.rs:69-72` already states this
+principle for origins ("a per-project `.resh/config.toml` must never be able to
+allowlist an origin, or a hostile repo could allowlist itself"); a resource
+ceiling belongs in the same tier for the same reason.
+
+The part count stays a constant. It exists to express a product decision — this
+is not a project transfer tool — rather than to fit a machine, so making it
+tunable would just invite the decision to be configured away.
+
+`MAX_TEXT_BYTES` and `MAX_FRAME_BYTES` are untouched. Nothing here goes near the
+websocket, so the frame ceiling has no reason to move — an earlier draft that
+shipped uploads over the socket had to raise it, and that entanglement
+disappears with the transport.
 
 `CLAUDE.md`'s cap line ("2 MB file cap for reads *and* writes") becomes wrong
-when this ships and must be amended in the same change.
+when this ships and must be amended in the same change: reads and buffer writes
+stay at 2 MB, uploads are bounded per request rather than per file.
 
 ## Receiving a part
 
@@ -254,6 +283,24 @@ Both entry points produce a `FileList`, become one `FormData`, and go out on one
 `XMLHttpRequest` — chosen over `fetch` for `upload.onprogress`, which a
 multi-file send needs and `fetch` does not expose.
 
+**The client checks the size before sending anything.** `File.size` and
+`FileList.length` are populated from the OS and readable synchronously off the
+`DataTransfer`, so both caps can be evaluated at drop time. That turns "upload
+100 MB, then get a 413" into an immediate, specific refusal naming the file and
+its size — the difference between a feature that feels careless and one that
+feels considered. The same sum is the denominator for the progress bar.
+
+This is UX, not enforcement: the server still applies both caps while streaming,
+because a client-side check is a courtesy to the honest case and no obstacle to
+anything else. Neither check may be removed on the strength of the other.
+
+The client also refuses a dropped **directory** here, and does it properly:
+`DataTransfer.items[i].webkitGetAsEntry().isDirectory` is the reliable test,
+where `File.size` is not — a dropped directory arrives as a zero-length entry
+that fails on read, so a size check alone would send a mystery empty part and
+surface a confusing server error. Directories are a non-goal, so the honest
+outcome is to say so at the drop, by name.
+
 Listeners are **delegated at document level**, not bound per row. The tree is an
 htmx fragment replaced wholesale on `TreeChanged` — which an upload itself
 triggers via the watcher — so per-row listeners would die on the first refresh
@@ -305,10 +352,18 @@ deleted the code it covers?** For the negative cases, assert on *why*.
   refused, distinguished from the absent case. Skip when running as root, where
   the mode has no effect — a test that silently passes because the fixture never
   entered its own precondition is a documented past failure here.
-- **Each cap, separately.** One 9 MB file; seventeen small files; sixteen files
-  summing past 32 MB. Each must be refused by *its own* limit, so the messages
-  must differ — three tests that all pass because one cap fires would tell us
-  nothing about the other two.
+- **Each cap, separately.** Seventeen small files; and files summing past the
+  aggregate limit. Each must be refused by *its own* limit with a different
+  message — two tests that both pass because the same cap fired would tell us
+  nothing about the other.
+- **The cap is enforced server-side with no client involved.** Post past the
+  limit directly, bypassing the browser entirely. Without this, both cap tests
+  could pass on the client check alone while the server enforced nothing.
+- **A project config cannot raise the cap.** Write `max_upload_bytes` into
+  `{project}/.resh/config.toml`, then post past the global limit and confirm it
+  is still refused. This is the test that fails the moment someone "helpfully"
+  moves the key into `Settings`, which is exactly how a hostile repo would get
+  to raise its own ceiling.
 - **A cap breach does not leave a partial file.** After a 413, the destination
   directory contains no temp files and no truncated upload.
 - **Partial failure.** Three parts where the middle one collides: the first and
@@ -358,9 +413,11 @@ Linux host, per the dev/prod substitution table.
    to relax later.
 2. **Scratch retention.** Nothing prunes `pasted/`. Age-based sweep, count cap,
    or leave it to the user.
-3. **The three cap values.** 8 MB / 16 parts / 32 MB are proposed, not derived.
-   They are the enforcement of the directories decision, so they are worth an
-   opinion rather than a shrug.
+3. **The part count.** 16 is proposed, not derived. It is the enforcement of
+   the no-directories decision, so it is worth an opinion rather than a shrug —
+   low enough to refuse a source tree, high enough that dragging a folder's
+   worth of screenshots still works. The aggregate limit is settled at 100 MB
+   with a global config key.
 
 ## Appendix: evidence
 
