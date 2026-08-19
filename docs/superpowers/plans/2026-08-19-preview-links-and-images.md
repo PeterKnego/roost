@@ -124,7 +124,7 @@ fn a_colon_is_a_scheme_only_where_a_browser_would_read_one() {
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test resolve_dest a_colon_is_a_scheme`
+Run: `cargo test -- resolve_dest a_colon_is_a_scheme`
 Expected: FAIL to compile — `cannot find function resolve_dest`.
 
 - [ ] **Step 3: Implement**
@@ -221,7 +221,7 @@ pub fn resolve_dest(dest: &str, from_rel: &str) -> Dest {
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
-Run: `cargo test resolve_dest a_colon_is_a_scheme`
+Run: `cargo test -- resolve_dest a_colon_is_a_scheme`
 Expected: PASS.
 
 - [ ] **Step 5: Prove the colon test can fail**
@@ -321,7 +321,7 @@ fn raw_refuses_an_oversize_image_and_a_symlink_out() {
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test raw_serves_an_image raw_refuses_an_oversize`
+Run: `cargo test -- raw_serves_an_image raw_refuses_an_oversize`
 Expected: FAIL — the `raw` path is not a fragment kind, so the response is a
 404 without the asserted body, or a theme-asset 404.
 
@@ -393,7 +393,7 @@ Add the arm in `serve_frag`, next to `["file"]`:
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
-Run: `cargo test raw_serves_an_image raw_refuses_an_oversize`
+Run: `cargo test -- raw_serves_an_image raw_refuses_an_oversize`
 Expected: PASS.
 
 - [ ] **Step 5: Prove the deny-by-default and symlink tests can fail**
@@ -688,7 +688,7 @@ fn an_html_page_blocks_off_origin_images() {
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test a_local_image a_remote_image a_data_image an_image_path_with an_html_page_blocks`
+Run: `cargo test -- a_local_image a_remote_image a_data_image an_image_path_with an_html_page_blocks`
 Expected: FAIL — images still emit their original `src`, and no CSP header is
 sent.
 
@@ -864,7 +864,7 @@ fn an_image_tab_cannot_be_switched_to_edit() {
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test clicking_an_image an_image_tab_cannot`
+Run: `cargo test -- clicking_an_image an_image_tab_cannot`
 Expected: FAIL — the file fragment answers `binary file`, and `SetMode` flips
 the image tab to `Edit`.
 
