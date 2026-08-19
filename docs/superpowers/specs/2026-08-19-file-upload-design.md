@@ -63,7 +63,7 @@ route propagates to other browsers without hub coupling.
 The actual reason is simpler. **Multipart exists to pack several files into one
 body; a websocket has message boundaries natively.** N files is N messages, and
 the boundary parser is a problem already solved. The socket is also already
-`Origin`-checked in its handshake, already capped (`MAX_FRAME_BYTES`, 8 MB), and
+`Origin`-checked in its handshake, already capped (`MAX_FRAME_BYTES`), and
 already carries a typed JSON envelope with a decoder.
 
 ## The intents
@@ -81,20 +81,55 @@ UploadFile { rel: String, data_b64: String },
 PasteImage { session: String, data_b64: String },
 ```
 
-Base64 rather than a binary frame. A 2 MB payload expands to ~2.7 MB, well
-inside the 8 MB frame cap, so the only cost is bytes on a loopback or tailnet
-socket. The alternative — an intent announcing a length, followed by a raw
-binary frame — saves the expansion but adds per-connection "expecting bytes"
-state to `wsconn.rs`, which currently ignores binary frames entirely. The
-decoder is ~20 lines and testable in isolation; the state machine is neither.
+Base64 rather than a binary frame. The alternative — an intent announcing a
+length, followed by a raw binary frame — saves the 33% expansion but adds
+per-connection "expecting bytes" state to `wsconn.rs`, which currently ignores
+binary frames entirely. The decoder is ~20 lines and testable in isolation; the
+state machine is neither, and a half-delivered upload becomes a state a
+reconnect has to reason about.
 
 Decode order matters for the cap: check `data_b64.len()` against the encoded
 ceiling *before* allocating the decode buffer, not after.
 
+## Three caps, deliberately decoupled
+
+The upload cap is **8 MB**, which is four times the existing file cap and needs
+saying out loud rather than deriving:
+
+```rust
+pub const MAX_UPLOAD_BYTES: usize = 8_000_000;   // new: opaque bytes in
+pub const MAX_TEXT_BYTES:   usize = 2_000_000;   // unchanged: editor buffers
+const MAX_FRAME_BYTES:      usize = 12_000_000;  // was MAX_TEXT_BYTES * 4
+```
+
+Today `MAX_FRAME_BYTES` is written as `MAX_TEXT_BYTES * 4` — headroom for JSON
+escaping around a text buffer. That derivation cannot survive this change: an
+8 MB upload base64s to ~10.7 MB, so raising the frame ceiling *through*
+`MAX_TEXT_BYTES` would quadruple the editor's text cap as a side effect of
+allowing large uploads. The two limits answer different questions and must stop
+sharing an expression.
+
+**A test must assert the relationship**, not just the values: the frame ceiling
+has to exceed the encoded upload ceiling plus envelope, or an upload that passes
+its own size check dies at the frame layer instead — refused by tungstenite
+before any code of ours runs, and therefore with no error a user can act on.
+That is the drift these three constants invite, and the only thing that catches
+it is an assertion that fails when someone edits one number.
+
+The editor stays at 2 MB in both directions. An 8 MB upload that lands is
+therefore a file the browser can accept but not open, which is the right
+asymmetry: an upload is opaque bytes passing through, while a buffer is text the
+server must hold, diff, and mirror to every client on every keystroke.
+
+`CLAUDE.md` lists "2 MB file cap for reads *and* writes" among the hard
+constraints. That line becomes wrong when this ships and must be amended in the
+same change — the caps are load-bearing precisely because they are written
+down, and a stale constraint is worse than an undocumented one.
+
 ## Writing bytes safely
 
-A new `fileops::write_bytes(project_dir, rel, bytes)`, beside `save`, sharing
-its cap:
+A new `fileops::write_bytes(project_dir, rel, bytes)`, beside `save`, under
+`MAX_UPLOAD_BYTES` rather than `save`'s text cap:
 
 1. `projects::safe_resolve_parent` for the destination — the file does not
    exist yet, so `safe_resolve` is the wrong one. This is the existing rule,
@@ -202,6 +237,14 @@ deleted the code it covers?** For the negative cases, assert on *why*.
   failure here.
 - **Bad base64.** Malformed padding is rejected and leaves no temp file behind.
 - **Oversize.** Refused on the encoded length, before the decode allocates.
+- **Cap coherence.** A unit assertion that `MAX_FRAME_BYTES` exceeds
+  `MAX_UPLOAD_BYTES` base64-encoded plus envelope. Without it the failure mode
+  is an upload inside its own limit being dropped at the frame layer, which
+  surfaces as a socket that simply closes — no error event, nothing in the UI.
+- **A largest-legal upload survives end to end**, at `MAX_UPLOAD_BYTES` exactly,
+  through a real socket rather than by calling `write_bytes` directly. Only the
+  full path exercises the frame ceiling, and this is the test that would have
+  caught the derived-constant mistake had the cap been raised carelessly.
 - **Extension refusal.** A valid PNG offered as `.dat` is refused by
   `PasteImage`; a `.txt` holding PNG bytes is refused. This is the control that
   proves the sniffing runs, since both differ from the accepted case only in
@@ -237,17 +280,16 @@ on the Linux host, per the dev/prod substitution table.
 
 ## Open questions for review
 
-1. **The 2 MB cap versus real screenshots.** A 4K PNG screenshot is routinely
-   3–5 MB, so the headline use case may not fit. The frame ceiling is 8 MB, so
-   ~4 MB is mechanically available — but the cap is a documented hard
-   constraint, and raising it is a deliberate change, not an implementation
-   detail. Downscaling server-side is the alternative and is worse: it makes
-   resh lossy about the user's data.
-2. **Collision policy.** Refuse (proposed) versus auto-suffix `name-1.png`.
+1. **Collision policy.** Refuse (proposed) versus auto-suffix `name-1.png`.
    Auto-suffix never destroys either, and is friendlier for repeated drops.
-3. **Scratch retention.** Nothing prunes `pasted/` as specified. Age-based
+2. **Scratch retention.** Nothing prunes `pasted/` as specified, and at an 8 MB
+   ceiling the directory grows four times faster than first drafted. Age-based
    sweep, count cap, or leave it to the user.
-4. **Dotfiles.** Whether `.env` may be uploaded at all.
+3. **Dotfiles.** Whether `.env` may be uploaded at all.
+
+The upload cap was the fourth question here and is settled at 8 MB — what a 4K
+screenshot actually needs. Downscaling server-side was the alternative and was
+rejected: it would make resh lossy about the user's data without being asked.
 
 ## Appendix: evidence
 
