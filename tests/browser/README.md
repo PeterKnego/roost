@@ -16,6 +16,7 @@ resh with real `dtach`.
 deno run -A tests/browser/reconnect.mjs   # terminal survives a dead connection
 deno run -A tests/browser/upload.mjs      # file upload and image paste
 deno run -A tests/browser/paneicons.mjs   # the per-pane header controls
+deno run -A tests/browser/mdlinks.mjs     # markdown preview links/images, and the image-tab edit refusal
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -50,13 +51,19 @@ temp dir, because snap-packaged Chromium is confined to non-hidden paths under
 
 Ask the question CLAUDE.md asks of every test here: **would this fail if I
 deleted the code it covers?** Then answer it for real — apply the broken
-version, run it, read the failure, restore. Both existing scenarios were
-verified that way, and it is not ceremony: it caught two assertions in this
-very file that passed while asserting nothing.
+version, run it, read the failure, restore. Every scenario here was verified
+that way, and it is not ceremony: it caught two assertions in `reconnect.mjs`
+and one in `mdlinks.mjs` that passed while asserting nothing.
 
 - Reverting the reconnect to its pre-fix behaviour (mark the entry stale, never
   retry) fails 7 assertions in `reconnect.mjs`.
 - Deleting the `term.reset()` before the replay fails 1, on copy count.
+- Disabling the `raw` fragment route (`src/routes.rs`) fails the naturalWidth
+  assertions in `mdlinks.mjs` (`naturalWidth === 0`, not DOM presence);
+  restoring `if (t.k === "File")`'s dropped `!isImage(t.rel)` fails the
+  no-edit-toggle assertion; narrowing the double-contextmenu guard back to
+  `closest("a.file")` fails the markdown-link right-click assertion with
+  `got 2`.
 
 Four things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
