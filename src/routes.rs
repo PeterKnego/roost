@@ -377,9 +377,17 @@ fn serve_frag(
             // "binary file" for every image, which is what made a .png in the tree
             // unopenable. safe_resolve still runs, so a path leaving the project
             // gets the standard hint rather than an <img> that would 404.
-            Some(rel) if is_image(rel) => match projects::safe_resolve(&dir, rel) {
-                Ok(_) => http::html(w, &render::image_fragment(project, rel)),
-                Err(e) => http::html(w, &render::hint(&e)),
+            // `normalize` first, exactly as the raw route does. The fragment
+            // this returns is nothing but an <img> pointed at that route, and
+            // it rejects `..` outright — so without this, `docs/../shot.png`
+            // renders a fragment whose picture then 404s, which reads to the
+            // user as a corrupt file rather than a bad path.
+            Some(rel) if is_image(rel) => match crate::assets::normalize(rel) {
+                None => http::html(w, &render::hint("path outside project")),
+                Some(rel) => match projects::safe_resolve(&dir, rel) {
+                    Ok(_) => http::html(w, &render::image_fragment(project, rel)),
+                    Err(e) => http::html(w, &render::hint(&e)),
+                },
             },
             Some(rel) => match projects::safe_resolve(&dir, rel)
                 .and_then(|p| projects::read_text_file(&p))
@@ -764,6 +772,20 @@ mod tests {
         let out = frag_route(&roots, "/frag/p/file?path=shot.png");
         assert!(out.contains(r#"src="/frag/p/raw?path=shot.png""#), "{out}");
         assert!(!out.contains("binary file"), "{out}");
+
+        // The fragment is nothing but an <img> pointed at the raw route, and
+        // that route runs `assets::normalize`, which rejects `..` rather than
+        // collapsing it. A rel this branch accepts but the raw route will not
+        // must therefore be refused HERE, or the user gets a fragment whose
+        // picture 404s — indistinguishable from a corrupt file.
+        //
+        // The target really exists (`p/shot.png`, written above) and
+        // `safe_resolve` resolves `docs/../shot.png` inside the project
+        // happily, so this cannot pass on ENOENT or on confinement.
+        std::fs::create_dir_all(proj.join("docs")).unwrap();
+        let dotted = frag_route(&roots, "/frag/p/file?path=docs/../shot.png");
+        assert!(!dotted.contains("<img"), "an un-normalized rel must not yield an <img>: {dotted}");
+        assert!(dotted.contains("path outside project"), "{dotted}");
     }
 
     /// The escape target must EXIST. A test pointing `path` at a file that is not
