@@ -136,6 +136,14 @@ So: **run the suite on the Linux host too** (`ssh` in and `cargo test`), and
 **verify UI behavior in a real browser** before believing it works. Both have
 caught defects that 100+ passing tests did not.
 
+Some of that browser check is now automated: `deno run -A
+tests/browser/reconnect.mjs` drives a real Chromium against a real resh with
+real dtach. It is deliberately outside `cargo test` (it needs a browser and
+takes tens of seconds) and it skips when no browser is present. Anything
+touching `static/app.js` should be checked there, since no Rust test can reach
+that file. See [tests/browser/README.md](tests/browser/README.md) — especially
+the four traps that make a browser test pass while asserting nothing.
+
 ## Verify, don't trust
 
 - Check `git log` and `git status` against what a report claims. A commit has

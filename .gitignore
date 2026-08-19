@@ -2,3 +2,4 @@
 /.idea/
 /.superpowers/
 /.claude/worktrees/
+/tests/browser/tmp/
