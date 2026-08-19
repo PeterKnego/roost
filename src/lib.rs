@@ -15,6 +15,7 @@ pub mod render;
 pub mod routes;
 pub mod session;
 pub mod term;
+pub mod upload;
 pub mod watch;
 pub mod workspace;
 pub mod worktree;

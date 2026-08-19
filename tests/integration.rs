@@ -67,6 +67,66 @@ fn get_full(port: u16, path: &str) -> (u16, String, String) {
     }
 }
 
+/// Builds a `multipart/form-data` body by hand. Each part is a file part named
+/// `file`, which is what the client sends.
+fn multipart(parts: &[(&str, &[u8])]) -> (String, Vec<u8>) {
+    let boundary = "----reshtestboundary";
+    let mut body = Vec::new();
+    for (name, data) in parts {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(data);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+/// A raw socket rather than `ureq`: these tests must control the `Origin`
+/// header exactly, *including omitting it*, which a client library will not let
+/// you do reliably. Returns (status, whole response text).
+fn post(port: u16, path: &str, origin: Option<&str>, ctype: &str, body: &[u8]) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+    let mut head = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: {ctype}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    if let Some(o) = origin {
+        head.push_str(&format!("Origin: {o}\r\n"));
+    }
+    head.push_str("\r\n");
+    s.write_all(head.as_bytes()).unwrap();
+    s.write_all(body).unwrap();
+    let mut resp = Vec::new();
+    let _ = s.read_to_end(&mut resp);
+    let text = String::from_utf8_lossy(&resp).to_string();
+    let status = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    (status, text)
+}
+
+/// The property the old `http::tests::rejects_non_get` used to guarantee at the
+/// parser: a request carrying a body must not reach the fragment routes. POST is
+/// now parsed, so this is what stands in its place — and it asserts on the
+/// *fragment content* rather than the status, because a route that ran and then
+/// returned an error status would still have run.
+#[test]
+fn post_to_an_ordinary_path_does_not_reach_the_router() {
+    let (_d, port) = fixture_named("post_router");
+    let (ct, body) = multipart(&[("x.txt", b"x")]);
+    let (status, text) = post(port, "/frag/post_router/tree", None, &ct, &body);
+    assert_eq!(status, 404, "an ordinary path must not answer a POST");
+    assert!(
+        !text.contains("<ul class=\"tree\""),
+        "the tree fragment was rendered for a POST: {text}"
+    );
+}
+
 #[test]
 fn the_service_worker_is_served_from_the_root_scope() {
     let (_d, port) = fixture();

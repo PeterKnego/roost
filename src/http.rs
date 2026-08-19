@@ -3,7 +3,13 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 
+#[derive(Debug)]
 pub struct Request {
+    /// Uppercase, as sent. GET everywhere except the two upload endpoints —
+    /// see CLAUDE.md's amended GET-only constraint. Carried rather than
+    /// discarded so `routes::handle` can dispatch a body-bearing request away
+    /// from `route()`, which must never see one.
+    pub method: String,
     pub path: String,
     pub query: HashMap<String, String>,
     /// Header names lowercased. Only Host / X-Forwarded-Host are consulted.
@@ -14,9 +20,12 @@ pub fn parse<R: BufRead>(r: &mut R) -> Result<Request, String> {
     let mut line = String::new();
     r.read_line(&mut line).map_err(|e| e.to_string())?;
     let mut parts = line.split_whitespace();
-    let method = parts.next().ok_or("empty request")?;
+    let method = parts.next().ok_or("empty request")?.to_string();
     let target = parts.next().ok_or("no path")?.to_string();
-    if method != "GET" {
+    // POST is admitted only so `routes::handle` can hand it to the upload
+    // endpoints; nothing below this layer treats it as reachable, and the
+    // parser deliberately stops at the blank line without touching the body.
+    if method != "GET" && method != "POST" {
         return Err(format!("method {method} not allowed"));
     }
     let mut headers = HashMap::new();
@@ -40,7 +49,7 @@ pub fn parse<R: BufRead>(r: &mut R) -> Result<Request, String> {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         query.insert(percent_decode(k), percent_decode(v));
     }
-    Ok(Request { path: percent_decode(&path), query, headers })
+    Ok(Request { method, path: percent_decode(&path), query, headers })
 }
 
 pub fn percent_decode(s: &str) -> String {
@@ -136,6 +145,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_keeps_the_method_and_accepts_post() {
+        let r = parse_str("POST /upload/proj?dir=src HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc")
+            .unwrap();
+        assert_eq!(r.method, "POST");
+        assert_eq!(r.path, "/upload/proj");
+        assert_eq!(r.query.get("dir").map(String::as_str), Some("src"));
+    }
+
+    /// The body must still be readable after parsing: `routes::handle` wraps the
+    /// socket in a BufReader, so the first bytes of a body are frequently
+    /// sitting in that buffer already. A body reader that goes back to the raw
+    /// TcpStream silently loses them — the upload arrives with a hole at the
+    /// front and multer reports a malformed boundary, which reads as a client
+    /// bug rather than as ours.
+    #[test]
+    fn the_body_survives_header_parsing() {
+        let raw = "POST /upload/proj HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello";
+        let mut r = std::io::BufReader::new(Cursor::new(raw.as_bytes()));
+        let req = parse(&mut r).unwrap();
+        assert_eq!(req.headers.get("content-length").map(String::as_str), Some("5"));
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut r, &mut rest).unwrap();
+        assert_eq!(rest, "hello", "the body was consumed or lost by header parsing");
+    }
+
+    #[test]
+    fn other_methods_are_still_refused() {
+        let e = parse_str("DELETE /x HTTP/1.1\r\n\r\n").unwrap_err();
+        assert!(e.contains("not allowed"), "unexpected message: {e}");
+    }
+
+    #[test]
     fn parses_path_and_query() {
         let r = parse_str("GET /frag/proj/file?path=src%2Fmain.rs&x=a+b HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
         assert_eq!(r.path, "/frag/proj/file");
@@ -150,9 +191,17 @@ mod tests {
         assert!(r.query.is_empty());
     }
 
+    /// Was `rejects_non_get`, which asserted POST was refused here. POST is now
+    /// admitted at this layer for the two upload endpoints, so the property
+    /// this test protected — that a body-bearing request cannot reach the
+    /// fragment routes — moved to `routes::handle`'s dispatch, and is pinned by
+    /// `post_to_an_ordinary_path_does_not_reach_the_router` in the integration
+    /// suite. What stays here is that everything *else* is still refused.
     #[test]
-    fn rejects_non_get() {
-        assert!(parse_str("POST / HTTP/1.1\r\n\r\n").is_err());
+    fn rejects_methods_other_than_get_and_post() {
+        for raw in ["PUT / HTTP/1.1\r\n\r\n", "DELETE / HTTP/1.1\r\n\r\n", "PATCH / HTTP/1.1\r\n\r\n"] {
+            assert!(parse_str(raw).is_err(), "should have been refused: {raw}");
+        }
         assert!(parse_str("").is_err());
     }
 
