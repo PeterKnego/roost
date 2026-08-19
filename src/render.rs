@@ -79,6 +79,25 @@ fn normalize_rel(p: &str) -> Option<String> {
     Some(out.join("/"))
 }
 
+/// The destination's URL scheme, lowercased, or `None` if it carries none.
+///
+/// A URL scheme is `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`. Testing
+/// for a bare ':' would misread `notes:1.md` — a legal filename — as a scheme
+/// and stop rewriting it. Only the FIRST segment can carry one: `a/b:c.md` is
+/// an ordinary relative path.
+///
+/// `resolve_dest` and `link_open` both need this answer, and they must not
+/// disagree: `resolve_dest` decides whether a destination is ours to rewrite,
+/// while `link_open` decides whether it may carry a live `href` at all.
+fn scheme_of(dest: &str) -> Option<String> {
+    let first_seg = dest.split('/').next().unwrap_or(dest);
+    let i = first_seg.find(':')?;
+    let scheme = &first_seg[..i];
+    let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    is_scheme.then(|| scheme.to_ascii_lowercase())
+}
+
 pub fn resolve_dest(dest: &str, from_rel: &str) -> Dest {
     if dest.is_empty() || dest.starts_with('#') {
         return Dest::Passthrough;
@@ -86,26 +105,12 @@ pub fn resolve_dest(dest: &str, from_rel: &str) -> Dest {
     if dest.starts_with("//") {
         return Dest::Remote;
     }
-    // A URL scheme is `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`.
-    // Testing for a bare ':' would misread `notes:1.md` — a legal filename —
-    // as a scheme and stop rewriting it.
-    // Only the FIRST segment can carry a scheme: `a/b:c.md` is an ordinary
-    // relative path, and treating its colon as a scheme would stop it being
-    // rewritten.
-    let first_seg = dest.split('/').next().unwrap_or(dest);
-    if let Some(i) = first_seg.find(':') {
-        let scheme = &first_seg[..i];
-        let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-        if is_scheme {
-            return if scheme.eq_ignore_ascii_case("data") {
-                Dest::Data
-            } else if scheme.eq_ignore_ascii_case("mailto") || scheme.eq_ignore_ascii_case("tel") {
-                Dest::Passthrough
-            } else {
-                Dest::Remote
-            };
-        }
+    if let Some(scheme) = scheme_of(dest) {
+        return match scheme.as_str() {
+            "data" => Dest::Data,
+            "mailto" | "tel" => Dest::Passthrough,
+            _ => Dest::Remote,
+        };
     }
     // Query and fragment are not part of the path on disk.
     let path = dest.split(['?', '#']).next().unwrap_or(dest);
@@ -129,23 +134,49 @@ pub fn resolve_dest(dest: &str, from_rel: &str) -> Dest {
 /// Everything interpolated is escaped; the closing `</a>` comes from
 /// `push_html`'s own handling of `TagEnd::Link`, which runs whether or not the
 /// opening tag was ours.
+/// The only schemes a markdown link may carry a live `href` for.
+///
+/// Deny-by-default, the posture `assets::class_of` and `IMAGE_EXT` already
+/// take. Blacklisting `javascript:` would be the wrong shape: `vbscript:` and
+/// `data:text/html` hand over control the same way, and so will whatever a
+/// browser adds next. Clicking a link in a cloned repo's README runs in the
+/// workspace origin — the origin that drives every terminal websocket — so
+/// anything not on this list renders inert instead.
+///
+/// A `data:` IMAGE is deliberately not held to this: it is self-contained and
+/// renders with no user action, while a link is a click that hands control to
+/// whatever the scheme names.
+const HREF_SCHEMES: &[&str] = &["http", "https", "mailto", "tel"];
+
 fn link_open(dest: &str, from_rel: &str) -> String {
-    match resolve_dest(dest, from_rel) {
-        // Deliberately no href — `wireFileLinks` opens it as a tab, and an
-        // href would race that handler by navigating the workspace away.
-        Dest::Local(p) => format!("<a class=\"mdlink\" data-rel=\"{}\">", esc(&p)),
+    // Inert: no href, no data-rel, nothing derived from the destination, so
+    // neither the browser nor the client will follow it.
+    const INERT: &str = "<a class=\"mdbroken\">";
+    let resolved = resolve_dest(dest, from_rel);
+    // Deliberately no href — `wireFileLinks` opens it as a tab, and an href
+    // would race that handler by navigating the workspace away.
+    if let Dest::Local(p) = &resolved {
+        return format!("<a class=\"mdlink\" data-rel=\"{}\">", esc(p));
+    }
+    if let Some(scheme) = scheme_of(dest) {
+        if !HREF_SCHEMES.contains(&scheme.as_str()) {
+            return INERT.to_string();
+        }
+    }
+    match resolved {
         // Kept, because a link is a deliberate click that shows its target,
         // unlike an image's automatic fetch. `_blank` stops it replacing the
         // workspace; `noopener` denies it `window.opener`; `noreferrer` keeps
         // the workspace URL out of the request.
-        Dest::Remote => format!(
-            "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">",
-            esc(dest)
-        ),
-        Dest::Data | Dest::Passthrough => format!("<a href=\"{}\">", esc(dest)),
-        // Inert: no href, no data-rel, so neither the browser nor the client
-        // will follow it.
-        Dest::Broken => "<a class=\"mdbroken\">".to_string(),
+        Dest::Remote => {
+            format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">", esc(dest))
+        }
+        // `mailto:`, `tel:` and in-page `#anchor`s — the only href-bearing
+        // forms left, since every other scheme was rejected above.
+        Dest::Passthrough => format!("<a href=\"{}\">", esc(dest)),
+        // `Dest::Data` (already refused by the allowlist, since "data" is not
+        // on it) and `Dest::Broken`. `Dest::Local` returned above.
+        _ => INERT.to_string(),
     }
 }
 
@@ -797,6 +828,74 @@ mod tests {
         assert!(h.contains(r##"href="#top""##), "{h}");
         assert!(h.contains(r#"<a class="mdbroken">"#), "{h}");
         assert!(!h.contains("etc/passwd"), "a dead reference must not stay clickable: {h}");
+    }
+
+    /// A `javascript:` href in a preview is script execution in the workspace
+    /// origin — the origin that drives every terminal websocket — one click
+    /// after opening a cloned repo's README. The page sends no `script-src`,
+    /// so nothing else would stop it.
+    ///
+    /// Mixed case is asserted because a scheme is case-insensitive to the
+    /// browser: a check that compared the raw string would let `JaVaScRiPt:`
+    /// straight through.
+    ///
+    /// Verified this can fail: with `HREF_SCHEMES` widened to also contain
+    /// "javascript", the first assertion panicked with
+    /// `<a href="javascript:alert(document.domain)" target="_blank"
+    /// rel="noopener noreferrer">click</a>` — the live href right there in the
+    /// output. The mixed-case case failed identically.
+    #[test]
+    fn a_javascript_link_is_inert_in_any_casing() {
+        for md in [
+            "[click](javascript:alert(document.domain))\n",
+            "[click](JaVaScRiPt:alert(document.domain))\n",
+        ] {
+            let h = markdown_html(md, "proj", "a.md");
+            assert!(!h.contains("href="), "no href may survive: {h}");
+            // Not just "no href": the scheme must not reach the page in any
+            // attribute or as text, or a later change that reintroduced it
+            // somewhere else would still pass.
+            assert!(!h.to_ascii_lowercase().contains("javascript"), "{h}");
+            assert!(h.contains(r#"<a class="mdbroken">"#), "{h}");
+            assert!(h.contains("click</a>"), "the link text must survive: {h}");
+        }
+    }
+
+    /// The allowlist is what makes this work: `data:text/html` was never
+    /// spelled out anywhere as dangerous, and a blacklist of `javascript:`
+    /// would have shipped it as a live href.
+    ///
+    /// The `data:` IMAGE assertion belongs in the same test as the `data:`
+    /// LINK one. The asymmetry is deliberate — an image renders with no user
+    /// action and is self-contained, a link is a click that hands control to
+    /// the scheme — and without the image half, a change that made the image
+    /// arm inert too would leave this test green.
+    ///
+    /// Verified this can fail: restoring the pre-fix arm
+    /// `Dest::Data | Dest::Passthrough => format!("<a href=\"{}\">", ...)`
+    /// made the first assertion panic with
+    /// `<a href="data:text/html,&lt;script&gt;alert(1)&lt;/script&gt;">x</a>`.
+    #[test]
+    fn a_data_link_is_inert_but_a_data_image_still_renders() {
+        let h = markdown_html("[x](data:text/html,<script>alert(1)</script>)\n", "proj", "a.md");
+        assert!(!h.contains("href="), "{h}");
+        assert!(h.contains(r#"<a class="mdbroken">"#), "{h}");
+
+        let img = markdown_html("![d](data:image/gif;base64,R0lGOD)\n", "proj", "a.md");
+        assert!(img.contains(r#"src="data:image/gif;base64,R0lGOD""#), "{img}");
+    }
+
+    /// The other side of the allowlist: the schemes that must keep working.
+    #[test]
+    fn allowed_schemes_keep_their_href() {
+        let h = markdown_html("[m](mailto:p@example.com) [t](tel:+15551234)\n", "proj", "a.md");
+        assert!(h.contains(r#"href="mailto:p@example.com""#), "{h}");
+        assert!(h.contains(r#"href="tel:+15551234""#), "{h}");
+
+        let s = markdown_html("[s](https://example.com/x)\n", "proj", "a.md");
+        assert!(s.contains(r#"href="https://example.com/x""#), "{s}");
+        assert!(s.contains(r#"target="_blank""#), "{s}");
+        assert!(s.contains(r#"rel="noopener noreferrer""#), "{s}");
     }
 
     /// The link arm emits Event::Html, which sits in the same match as the arm
