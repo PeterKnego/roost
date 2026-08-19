@@ -148,7 +148,19 @@ pub fn resolve_dest(dest: &str, from_rel: &str) -> Dest {
 /// whatever the scheme names.
 const HREF_SCHEMES: &[&str] = &["http", "https", "mailto", "tel"];
 
-fn link_open(dest: &str, from_rel: &str) -> String {
+/// A markdown link's title (`[t](b.md "my title")`) as an attribute, or
+/// nothing. Every link form that survives keeps it: it is the tooltip the
+/// author wrote, and dropping it silently was a regression from before
+/// `link_open` started building the tag itself.
+fn title_attr(title: &str) -> String {
+    if title.is_empty() {
+        String::new()
+    } else {
+        format!(" title=\"{}\"", esc(title))
+    }
+}
+
+fn link_open(dest: &str, title: &str, from_rel: &str) -> String {
     // Inert: no href, no data-rel, nothing derived from the destination, so
     // neither the browser nor the client will follow it.
     const INERT: &str = "<a class=\"mdbroken\">";
@@ -156,7 +168,11 @@ fn link_open(dest: &str, from_rel: &str) -> String {
     // Deliberately no href — `wireFileLinks` opens it as a tab, and an href
     // would race that handler by navigating the workspace away.
     if let Dest::Local(p) = &resolved {
-        return format!("<a class=\"mdlink\" data-rel=\"{}\">", esc(p));
+        return format!(
+            "<a class=\"mdlink\" data-rel=\"{}\"{}>",
+            esc(p),
+            title_attr(title)
+        );
     }
     if let Some(scheme) = scheme_of(dest) {
         if !HREF_SCHEMES.contains(&scheme.as_str()) {
@@ -168,12 +184,14 @@ fn link_open(dest: &str, from_rel: &str) -> String {
         // unlike an image's automatic fetch. `_blank` stops it replacing the
         // workspace; `noopener` denies it `window.opener`; `noreferrer` keeps
         // the workspace URL out of the request.
-        Dest::Remote => {
-            format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">", esc(dest))
-        }
+        Dest::Remote => format!(
+            "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"{}>",
+            esc(dest),
+            title_attr(title)
+        ),
         // `mailto:`, `tel:` and in-page `#anchor`s — the only href-bearing
         // forms left, since every other scheme was rejected above.
-        Dest::Passthrough => format!("<a href=\"{}\">", esc(dest)),
+        Dest::Passthrough => format!("<a href=\"{}\"{}>", esc(dest), title_attr(title)),
         // `Dest::Data` (already refused by the allowlist, since "data" is not
         // on it) and `Dest::Broken`. `Dest::Local` returned above.
         _ => INERT.to_string(),
@@ -198,8 +216,8 @@ pub fn markdown_html(md: &str, project: &str, rel: &str) -> String {
         Event::Html(h) => Some(Event::Text(h)),
         Event::InlineHtml(h) => Some(Event::Text(h)),
 
-        Event::Start(Tag::Link { ref dest_url, .. }) => {
-            Some(Event::Html(CowStr::from(link_open(dest_url, rel))))
+        Event::Start(Tag::Link { ref dest_url, ref title, .. }) => {
+            Some(Event::Html(CowStr::from(link_open(dest_url, title, rel))))
         }
 
         // Rewritten by editing the tag rather than by emitting raw HTML: the
@@ -898,13 +916,51 @@ mod tests {
         assert!(s.contains(r#"rel="noopener noreferrer""#), "{s}");
     }
 
-    /// The link arm emits Event::Html, which sits in the same match as the arm
-    /// that turns repo-authored Html into text. If those are ever reordered, repo
-    /// HTML reaches the page.
+    /// `link_open` builds its opening tag by hand and hands it to push_html
+    /// as `Event::Html`, which push_html copies out verbatim — so this anchor
+    /// is the one place in the document whose attributes nothing escapes for
+    /// us. A destination or a title carrying a quote would otherwise close the
+    /// attribute and open one the repo author chose.
+    ///
+    /// This replaces `rewriting_links_did_not_reopen_the_raw_html_hole`, whose
+    /// stated reason (reordering the match arms reopens the raw-HTML hole) was
+    /// false — the arms match disjoint Event variants, as markdown_html's own
+    /// comment says — and whose assertions were a strict subset of
+    /// `markdown_raw_html_is_neutralized`'s.
+    ///
+    /// Verified this can fail: dropping the `esc()` around the `data-rel`
+    /// value made the first assertion panic on
+    /// `<a class="mdlink" data-rel="a" onerror="x.md">` — the quote out of the
+    /// filename closing the attribute, and an author-named one opening.
+    /// Dropping it around the title panicked on the title assertion the same
+    /// way.
     #[test]
-    fn rewriting_links_did_not_reopen_the_raw_html_hole() {
-        let h = markdown_html("hello <script>alert(1)</script>\n", "proj", "a.md");
-        assert!(!h.contains("<script>"), "{h}");
+    fn a_hand_built_anchor_escapes_what_it_interpolates() {
+        let h = markdown_html("[x](<a\" onerror=\"x.md>)\n", "proj", "a.md");
+        assert!(h.contains(r#"data-rel="a&quot; onerror=&quot;x.md""#), "{h}");
+
+        let t = markdown_html("[x](b.md \"a\\\" onerror=\\\"y\")\n", "proj", "a.md");
+        assert!(t.contains(r#"title="a&quot; onerror=&quot;y""#), "{t}");
+    }
+
+    /// The titles themselves: `[t](b.md "my title")` rendered `title="my
+    /// title"` before `link_open` started building the tag by hand, and every
+    /// form that survives has to keep doing so.
+    #[test]
+    fn a_link_keeps_its_title() {
+        let l = markdown_html("[t](b.md \"my title\")\n", "proj", "docs/a.md");
+        assert!(l.contains(r#"data-rel="docs/b.md" title="my title""#), "{l}");
+
+        let r = markdown_html("[t](https://e.com/x \"my title\")\n", "proj", "a.md");
+        assert!(r.contains(r#"title="my title""#), "{r}");
+        assert!(r.contains(r#"target="_blank""#), "the title must not displace the rest: {r}");
+
+        let m = markdown_html("[t](mailto:p@example.com \"my title\")\n", "proj", "a.md");
+        assert!(m.contains(r#"title="my title""#), "{m}");
+
+        // A link with no title must not grow an empty attribute.
+        let n = markdown_html("[t](b.md)\n", "proj", "a.md");
+        assert!(!n.contains("title="), "{n}");
     }
 
     #[test]
