@@ -108,8 +108,17 @@ pub fn load(project: &str) -> (Workspace, Option<String>) {
                     .panes
                     .into_iter()
                     .map(|p| {
+                        // This path assigns tabs verbatim: restored state
+                        // never passes through `apply_layout`, so none of the
+                        // guards enforced there apply to it. Without this
+                        // coercion, a tab left in Edit on a file the editor
+                        // now refuses comes back as a textarea whose every
+                        // keystroke is rejected — and app.js hides the ✎
+                        // toggle that would switch it back, so there is no
+                        // way out of it.
+                        let tabs = p.tabs.iter().map(crate::workspace::coerce_tab).collect();
                         let active = p.active.min(p.tabs.len().saturating_sub(1));
-                        Pane { tabs: p.tabs, active }
+                        Pane { tabs, active }
                     })
                     .collect();
             }
@@ -201,6 +210,44 @@ mod tests {
             assert_eq!(got.panes[proto::MIDDLE as usize].tabs.len(), 1);
             assert_eq!(got.buffers["a.rs"].text, "unsaved", "unsaved text is crash-safe");
             assert!(got.buffers["a.rs"].dirty);
+        });
+    }
+
+    /// State written before the Edit guards existed (or by an older build, or
+    /// by hand) can name a tab this server would now never create. `load`
+    /// assigns `p.tabs` verbatim — restored state never passes through
+    /// `apply_layout` — so every guard enforced there has to be reapplied
+    /// here or the upgrade leaves a textarea over a PNG whose keystrokes are
+    /// all refused, with the ✎ toggle that would escape it hidden.
+    ///
+    /// The `.rs` half is the discriminating half: without it this test passes
+    /// with the coercion applied unconditionally, which would silently
+    /// downgrade every restored Edit-mode tab in the workspace.
+    ///
+    /// Confirmed by removing the `coerce_tab` call from `load` and running
+    /// this test: it failed with
+    /// `left: File { rel: "shot.png", mode: Edit }` /
+    /// `right: File { rel: "shot.png", mode: Preview }` — the dead editor
+    /// restored intact.
+    #[test]
+    fn a_restored_tab_gets_the_edit_guards_apply_layout_would_have_applied() {
+        with_state_dir(|| {
+            let mut w = Workspace::default_layout();
+            // Built by hand rather than through apply_layout: the point is
+            // state that could only have come from outside those guards.
+            w.panes[proto::MIDDLE as usize].tabs = vec![
+                Tab::File { rel: "shot.png".into(), mode: Mode::Edit },
+                Tab::File { rel: "a.rs".into(), mode: Mode::Edit },
+                Tab::File { rel: "logo.svg".into(), mode: Mode::Edit },
+            ];
+            save("proj", &w).unwrap();
+
+            let (got, _) = load("proj");
+            let tabs = &got.panes[proto::MIDDLE as usize].tabs;
+            assert_eq!(tabs[0], Tab::File { rel: "shot.png".into(), mode: Mode::Preview });
+            assert_eq!(tabs[1], Tab::File { rel: "a.rs".into(), mode: Mode::Edit });
+            // SVG is text and stays editable — see NO_TEXT_EDIT_EXT.
+            assert_eq!(tabs[2], Tab::File { rel: "logo.svg".into(), mode: Mode::Edit });
         });
     }
 

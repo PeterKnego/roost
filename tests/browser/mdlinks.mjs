@@ -16,7 +16,7 @@
 //!      bytes never arrived, which is exactly the trap this file's own
 //!      header comment warns about).
 //!   2. Restored the pre-fix `if (t.k === "File")` tab-icon gate at
-//!      static/app.js (dropping `&& !isImage(t.rel)`), so an image tab grew
+//!      static/app.js (dropping `&& !refusesTextEdit(t.rel)`), so an image tab grew
 //!      the ✎ toggle again. The last assertion failed with:
 //!        FAIL  an image tab offers no edit toggle
 //!   3. Widened the double-contextmenu guard in wireFragment back down to
@@ -24,7 +24,7 @@
 //!      has no `file` class). The new assertion failed with:
 //!        FAIL  right-clicking a markdown link opened the file menu exactly
 //!        once (got 2)
-//!   4. Disabled the is_image coercion arm in apply_layout's OpenTab
+//!   4. Disabled the coerce_tab arm in apply_layout's OpenTab
 //!      (src/workspace.rs) so a raw Edit request on an image passed through
 //!      unmodified. Both coercion assertions failed:
 //!        FAIL  an OpenTab intent requesting mode:"Edit" on a
@@ -39,6 +39,23 @@
 //!      existing Preview tab and never built a new Tab::File to coerce.
 //! All four restored afterwards; `deno run -A tests/browser/mdlinks.mjs`
 //! passes clean again (see task-6-report.md for the exact terminal output).
+//!
+//! Later reverts, for the fixes added after the branch review:
+//!   5. Put "svg" back on NO_TEXT_EDIT_EXT in static/app.js and pointed the
+//!      workspace.rs guards back at `is_image`. Both svg assertions failed:
+//!        FAIL  an svg tab offers the edit toggle
+//!        FAIL  clicking it mounts a textarea holding the svg's real text
+//!      (the second timed out waiting for the editor, since the toggle that
+//!      would have mounted it was never drawn).
+//!   6. Added "javascript" to HREF_SCHEMES (src/render.rs). One assertion
+//!      failed:
+//!        FAIL  no javascript: href reached the page
+//!      — and, importantly, "clicking it executed nothing" still printed ok,
+//!      because that variant carries target="_blank" and Chromium blocks the
+//!      popup. Classifying javascript: as Passthrough instead (plain href,
+//!      no target) failed both. The CONTROL assertion exists because of
+//!      this: without it, "clicking it executed nothing" would be
+//!      indistinguishable from a browser that never runs javascript: hrefs.
 //!
 //! Run: deno run -A tests/browser/mdlinks.mjs
 import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
@@ -62,9 +79,15 @@ await Deno.writeFile(`${fx.roots}/${fx.project}/docs/shot.png`, PNG);
 // against docs/shot.png pass even with the coercion arm deleted.
 await Deno.writeFile(`${fx.roots}/${fx.project}/docs/raw-open.png`, PNG);
 await Deno.writeTextFile(`${fx.roots}/${fx.project}/docs/other.md`, "# other\n");
+// SVG is on IMAGE_EXT (it renders as a picture) but NOT on NO_TEXT_EDIT_EXT
+// (it is text, and read_text_file has always served it), so it must keep its
+// ✎ toggle. The two lists differing by exactly this one entry is the point.
+await Deno.writeTextFile(`${fx.roots}/${fx.project}/docs/logo.svg`,
+  `<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>\n`);
 await Deno.writeTextFile(
   `${fx.roots}/${fx.project}/docs/index.md`,
-  "# index\n\n![local](shot.png)\n\n![remote](https://example.invalid/x.png)\n\n[to other](other.md)\n",
+  "# index\n\n![local](shot.png)\n\n![remote](https://example.invalid/x.png)\n\n" +
+    "[to other](other.md)\n\n[danger](javascript:window.__xss=1)\n",
 );
 
 const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
@@ -160,7 +183,7 @@ try {
   await evalIn(`window.prompt = window.__realPrompt;`);
 
   // ---- 6. A raw OpenTab{mode:"Edit"} on an image is coerced to Preview -----
-  // IMAGE_EXT only gates the client's own ✎ toggle; a handcrafted intent
+  // NO_TEXT_EDIT_EXT only gates the client's own ✎ toggle; a handcrafted intent
   // skips the UI entirely and is the actual data-loss path — a textarea
   // mounting empty over a real PNG, whose save truncates the file to
   // whatever the empty textarea held. Sent over the real websocket, so this
@@ -185,6 +208,66 @@ try {
   ok(await evalIn(
     `(() => { const i = document.querySelector("img.imgview"); return !!i && i.naturalWidth === 1; })()`),
     "the pane rendered the picture (bytes loaded), not a textarea, after the coerced open");
+  // ---- 7. An SVG is text: it keeps the ✎ toggle and really opens ----------
+  // A .svg previews as a picture like any image, but it is text on disk, so
+  // gating Edit on "renders as a picture" silently made every SVG in every
+  // project read-only — with no toggle left to get back out of a tab already
+  // in Edit. Driven through the real ✎ click, not a handcrafted intent, so
+  // this covers the client list and the server guard together.
+  await evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: "docs/logo.svg", mode: "Preview" } })`);
+  await until(() => evalIn(
+    `[...document.querySelectorAll(".tabstrip .tab")].some(b => b.textContent.includes("logo.svg"))`),
+    15, "svg tab");
+  const svgToggle = await evalIn(
+    `(() => { const b = [...document.querySelectorAll(".tabstrip .tab")]
+        .find(x => x.textContent.includes("logo.svg"));
+      const e = b && b.querySelector("span.x[title*='edit']");
+      if (e) e.click();
+      return !!e; })()`);
+  ok(svgToggle, "an svg tab offers the edit toggle");
+  const svgEdits = await until(() => evalIn(
+    `(() => { const t = document.querySelector("textarea");
+       return !!t && t.value.includes("<svg"); })()`), 15, "svg editor");
+  ok(svgEdits, "clicking it mounts a textarea holding the svg's real text");
+
+  // ---- 8. A javascript: link cannot run --------------------------------
+  // One click on a cloned repo's README, in the origin that drives every
+  // terminal websocket. Clicking for real, not just grepping the HTML: an
+  // href the browser would execute is the only thing that matters here, and
+  // window.__xss is set by the payload itself if it ever runs.
+  await evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: "docs/index.md", mode: "Preview" } })`);
+  await until(() => evalIn(`!!document.querySelector(".markdown-body a.mdlink")`), 15, "preview reopened");
+  ok(await evalIn(
+    `![...document.querySelectorAll(".markdown-body a")]
+       .some(a => (a.getAttribute("href") || "").toLowerCase().startsWith("javascript"))`),
+    "no javascript: href reached the page");
+  const urlBeforeClick = await evalIn("location.href");
+  // CONTROL: prove this browser really does execute a javascript: href on a
+  // synthetic click, so the assertion below means "it was refused" and not
+  // "clicks do not run javascript: URLs here anyway".
+  await evalIn(`(() => { const a = document.createElement("a");
+      a.href = "javascript:window.__ctrl=1"; a.textContent = "c";
+      document.body.appendChild(a); a.click(); })()`);
+  const ctrl_ran = await until(() => evalIn(`window.__ctrl === 1`), 3, "control javascript: href");
+  ok(ctrl_ran, "CONTROL: a javascript: href does execute on click in this browser");
+  await evalIn(`(() => { const a = [...document.querySelectorAll(".markdown-body a")]
+      .find(x => x.textContent === "danger"); if (a) a.click(); return !!a; })()`);
+  // A javascript: URL is queued as a navigation, not run synchronously by
+  // click(), so reading window.__xss on the next line passes even when the
+  // href really did execute — verified by putting "javascript" back on
+  // HREF_SCHEMES and watching the immediate form print ok. Poll instead, and
+  // require that it never appears (no label: the timeout is the pass).
+  //
+  // What this assertion does and does not catch: the exact pre-fix output
+  // routed javascript: through the Remote arm, which adds target="_blank",
+  // and Chromium blocks that as a popup — so this line printed ok even with
+  // the hole wide open. The href assertion above is what catches that
+  // variant; this one catches the plain-href variant (javascript: classified
+  // as Passthrough), verified to fail. Both are kept for that reason.
+  const ran = await until(() => evalIn(`typeof window.__xss !== "undefined"`), 2);
+  ok(!ran, "clicking it executed nothing");
+  ok(await evalIn("location.href") === urlBeforeClick,
+    "and it did not navigate the workspace");
 } finally {
   try { await page?.close?.(); } catch {}
   try { browser.close(); } catch {}

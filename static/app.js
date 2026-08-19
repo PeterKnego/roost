@@ -8,14 +8,25 @@ const DIVIDER_PX = 8; // keep in step with --divider in style.css
 
 const wsUrl = (p) => `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${p}`;
 
-// Mirrors routes.rs IMAGE_EXT. Nothing checks the two agree; a mismatch hides
-// or shows the ✎ toggle wrongly, but never loses data: workspace.rs refuses
-// or coerces every path to Edit on an image server-side too (SetMode refuses
-// it, OpenTab coerces a raw Edit request to Preview, and EditBuffer — the
-// actual save chokepoint — refuses to create a buffer at all), so no client
-// bug here can make a save truncate an image.
-const IMAGE_EXT = ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico"];
-const isImage = (rel) => IMAGE_EXT.includes((rel || "").split(".").pop().toLowerCase());
+// Mirrors routes.rs NO_TEXT_EDIT_EXT — NOT IMAGE_EXT, which is a wider list
+// answering a different question. svg is absent on purpose: it renders as a
+// picture but is text, and has always been editable. Nothing checks the two
+// lists agree; a mismatch hides or shows the ✎ toggle wrongly, but never
+// loses data: workspace.rs refuses or coerces every path to Edit
+// server-side too (SetMode refuses it, OpenTab coerces a raw Edit request to
+// Preview, and EditBuffer — the actual save chokepoint — refuses to create a
+// buffer at all), so no client bug here can make a save truncate a file.
+const NO_TEXT_EDIT_EXT = ["png", "jpg", "jpeg", "gif", "webp", "ico"];
+// Must extract the extension exactly as assets::ext_of does, or syncing the
+// lists would not sync the behaviour: take the LAST path segment (so
+// `img.d/README` has no extension rather than inheriting `d`) and require a
+// dot in it.
+const extOf = (rel) => {
+  const name = (rel || "").split("/").pop();
+  const i = name.lastIndexOf(".");
+  return i < 0 ? "" : name.slice(i + 1).toLowerCase();
+};
+const refusesTextEdit = (rel) => NO_TEXT_EDIT_EXT.includes(extOf(rel));
 
 let state = null;
 let myOrigin = null;
@@ -247,7 +258,7 @@ function render() {
       // — see hasAttention/focusSession below.
       b.onclick = () =>
         t.k === "Terminal" ? focusSession(t.session) : send({ t: "ActivateTab", pane: pi, idx: ti });
-      if (t.k === "File" && !isImage(t.rel)) {
+      if (t.k === "File" && !refusesTextEdit(t.rel)) {
         const e = document.createElement("span");
         e.className = "x";
         e.title = t.mode === "Edit" ? "switch to preview" : "switch to edit";

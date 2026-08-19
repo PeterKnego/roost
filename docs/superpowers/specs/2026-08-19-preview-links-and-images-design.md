@@ -92,6 +92,15 @@ read as making the resolver a boundary.
 | `Remote` | `<a href="…" target="_blank" rel="noopener noreferrer">` | Kept, but cannot destroy the workspace |
 | `Data`, `Other` | Unchanged | `mailto:` and in-page anchors are not ours to rewrite |
 
+**Correction (post-review).** "Unchanged" was wrong, and shipped an XSS: a
+`javascript:` (or `data:text/html`, or `vbscript:`) destination kept a live
+`href` in the origin that drives every terminal websocket. Only `http`,
+`https`, `mailto` and `tel` may carry an `href`; every other scheme renders
+with the inert `Dest::Broken` presentation. Deny-by-default, not a blacklist —
+`javascript:` is merely the one everybody names. The image arm's `data:`
+handling is deliberately unchanged: an image renders with no user action and
+is self-contained, while a link is a click that hands control to the scheme.
+
 A remote link is deliberately **not** blocked the way a remote image is. The two
 are different kinds of event: an image issues a request with no user involvement,
 while a link requires a deliberate click and shows its destination first. What a
@@ -258,8 +267,23 @@ and saving would truncate the image to nothing.
 
 Closed in **both** places:
 
-- `app.js` omits the toggle when the rel is an image extension.
-- `workspace.rs` refuses `Intent::SetMode { mode: Edit }` for an image rel.
+- `app.js` omits the toggle when the rel is on `NO_TEXT_EDIT_EXT`.
+- `workspace.rs` refuses `Intent::SetMode { mode: Edit }` for such a rel.
+
+**Correction (post-review).** The rationale above is false for SVG, and this
+spec's single `IMAGE_EXT` cost users something. An SVG contains no NUL bytes,
+so `read_text_file` has always served it and editing one worked before this
+change; gating Edit on `is_image` silently made every SVG in every project
+read-only. The list is therefore split in two, because these are two questions:
+`IMAGE_EXT` ("can this be served as a picture?", SVG included, used by the raw
+route and the image-tab fragment) and `NO_TEXT_EDIT_EXT` ("would a `<textarea>`
+over this destroy it?", SVG excluded, used by all three edit guards and by
+`app.js`).
+
+`wsstate::load` assigns restored tabs verbatim, bypassing `apply_layout`
+entirely, so it applies the same coercion itself — otherwise a user who had an
+image open in Edit when they upgraded got a textarea whose keystrokes were all
+refused, with the toggle that would escape it hidden.
 
 The server-side half is not redundant. The client is not a security boundary, and
 mirroring means another browser can hold a tab strip rendered before this change

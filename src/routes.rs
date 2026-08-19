@@ -204,20 +204,38 @@ pub fn content_type(rel: &str) -> &'static str {
 const NOSNIFF: (&str, &str) = ("X-Content-Type-Options", "nosniff");
 const SANDBOX: (&str, &str) = ("Content-Security-Policy", "sandbox");
 
-/// Extensions the raw route serves, the `file` fragment renders as a picture,
-/// and `SetMode { Edit }` refuses.
+/// Extensions the raw route serves and the `file` fragment renders as a
+/// picture. The question it answers: **can these bytes be handed to the
+/// browser as a picture?**
 ///
 /// Deny-by-default, for the reason `assets::class_of` gives: an unrecognised
 /// extension must fall outside this list, so widening it is an edit here and
 /// never a side effect of an unfamiliar file appearing in a cloned repo.
-///
-/// `static/app.js` keeps a copy, for the ✎ toggle. Nothing checks the two
-/// agree — the design doc records why neither direction of mismatch loses
-/// data, because `workspace.rs` is the actual guard.
 pub const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "ico"];
+
+/// Extensions the text editor must refuse. A different question from
+/// `IMAGE_EXT`: **would a `<textarea>` over this file destroy it?**
+///
+/// The two lists differ by exactly one entry, and the difference is the
+/// point. SVG renders as a picture (so it is on `IMAGE_EXT`) *and* is text
+/// (so it is not here): `projects::read_text_file` sniffs for NUL bytes,
+/// finds none in an SVG, and has always served it — editing one worked before
+/// image tabs existed. Gating Edit on `is_image` silently removed that.
+///
+/// Keep them separate. Merging them back either strands SVG in a read-only
+/// tab again, or lets a PNG into a textarea whose first save truncates it.
+///
+/// `static/app.js` keeps a copy of THIS list, for the ✎ toggle. Nothing
+/// checks the two agree — the design doc records why neither direction of
+/// mismatch loses data, because `workspace.rs` is the actual guard.
+pub const NO_TEXT_EDIT_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "ico"];
 
 pub fn is_image(rel: &str) -> bool {
     IMAGE_EXT.contains(&crate::assets::ext_of(rel).as_str())
+}
+
+pub fn refuses_text_edit(rel: &str) -> bool {
+    NO_TEXT_EDIT_EXT.contains(&crate::assets::ext_of(rel).as_str())
 }
 
 /// Image bytes out of a project, for `<img>` in a markdown preview and for an
