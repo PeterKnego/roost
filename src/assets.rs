@@ -48,16 +48,28 @@ const THEME_EXT: &[&str] = &[
     "css", "svg", "png", "jpg", "jpeg", "gif", "webp", "ico", "woff", "woff2", "ttf", "otf",
 ];
 
+/// The single answer to "what is this path's extension?", lowercased.
+///
+/// `class_of` (below) and `routes::content_type` both have to answer that
+/// question about the same `rel`, and they used to do it two different ways
+/// — `class_of` split on the final `.` in the last path segment, while
+/// `content_type` used `Path::extension()`, which is case-preserving and
+/// returns `None` for a leading-dot name like `".css"`. The two disagreeing
+/// is not a security hole (nothing here grants script-executing authority on
+/// a mismatch), but it is a functional one: this branch also sends
+/// `X-Content-Type-Options: nosniff` on every 200, and a stylesheet served
+/// with the wrong MIME type is outright blocked by Fetch's nosniff rule
+/// rather than sniffed and recovered. Routing both functions through one
+/// helper makes that class of drift impossible to reintroduce.
+pub fn ext_of(rel: &str) -> String {
+    rel.rsplit('/').next().unwrap_or("").rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default()
+}
+
 pub fn class_of(rel: &str) -> Class {
-    let name = rel.rsplit('/').next().unwrap_or("");
-    // `rsplit_once`, so only the final extension counts: "evil.css.js" is js.
-    // A leading dot yields an empty stem (".gitignore" -> ("", "gitignore")),
-    // which is not in THEME_EXT and so lands in Code, as intended.
-    let ext = match name.rsplit_once('.') {
-        Some((_, e)) => e.to_ascii_lowercase(),
-        None => return Class::Code,
-    };
-    if THEME_EXT.contains(&ext.as_str()) {
+    // An empty extension covers both "no dot at all" (README) and "the dot
+    // is the whole name" (.gitignore) — `ext_of` returns "" for both, and
+    // "" is not in THEME_EXT, so both land in Code, as intended.
+    if THEME_EXT.contains(&ext_of(rel).as_str()) {
         Class::Theme
     } else {
         Class::Code
@@ -77,6 +89,45 @@ mod tests {
         assert!(get("themes/darcula.css").is_some(), "nested paths must be reachable");
         assert!(get("vendor/xterm.js").is_some());
         assert!(get("nope.js").is_none());
+    }
+
+    /// Walks `static/` on disk at test time and checks every file it finds
+    /// is in `ASSETS` with byte-identical content, and that the counts
+    /// match too (so a file present on disk but silently dropped by
+    /// build.rs — the failure mode `.flatten()` used to hide, see build.rs
+    /// — cannot pass by merely being unmentioned). This subsumes the four
+    /// hand-named files in `the_table_carries_the_real_files` above; kept
+    /// separate from it because that test also exercises `get`'s normal
+    /// lookup path, not just table completeness.
+    #[test]
+    fn every_file_on_disk_is_embedded_byte_identical() {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+                let e = e.unwrap_or_else(|e| panic!("read entry in {}: {e}", dir.display()));
+                let p = e.path();
+                if p.is_dir() {
+                    walk(root, &p, out);
+                } else {
+                    out.push(p.strip_prefix(root).expect("under root").to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        let root = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/static"));
+        let mut on_disk = Vec::new();
+        walk(&root, &root, &mut on_disk);
+
+        assert_eq!(
+            on_disk.len(),
+            ASSETS.len(),
+            "static/ has {} files but ASSETS has {} entries — build.rs dropped or duplicated one",
+            on_disk.len(),
+            ASSETS.len()
+        );
+        for rel in &on_disk {
+            let disk = std::fs::read(root.join(rel)).unwrap();
+            let embedded = get(rel).unwrap_or_else(|| panic!("{rel} is on disk but missing from ASSETS"));
+            assert_eq!(embedded, &disk[..], "{rel}: embedded bytes must match the file on disk");
+        }
     }
 
     #[test]

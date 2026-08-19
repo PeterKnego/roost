@@ -455,7 +455,16 @@ pub fn human_age(secs: u64) -> String {
     }
 }
 
-pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<&str>) -> String {
+// `theme_rel` is interpolated into an `href` below without `esc` or
+// `percent_encode`, unlike every other value this function interpolates.
+// Nothing is injectable today — `routes::theme_link_for` only ever returns
+// one of two `'static` literals — but the `'static` bound is what keeps
+// that safe: it rules out a future caller deriving `rel` from a filesystem
+// name (which would reintroduce attribute-break XSS in the same origin as
+// every terminal websocket) without the compiler catching it. Any producer
+// still has only literals to reach for, so this is not a call-site change,
+// just a tighter promise on the type.
+pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<&'static str>) -> String {
     let warn = s
         .warning
         .as_deref()

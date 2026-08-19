@@ -27,7 +27,12 @@ fn main() {
 
 fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
     let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
-    for e in entries.flatten() {
+    // `.flatten()` here would silently discard any entry that comes back
+    // `Err` — an asset omitted from ASSETS with the build still green,
+    // exactly the failure Cargo.toml's rationale for embedding says should
+    // instead show up as a build break, not a bug report.
+    for e in entries {
+        let e = e.unwrap_or_else(|e| panic!("read entry in {}: {e}", dir.display()));
         let p = e.path();
         if p.is_dir() {
             walk(root, &p, out);

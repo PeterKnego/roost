@@ -168,8 +168,11 @@ fn serve_workspace(w: &mut impl Write, roots: &[PathBuf], project: &str) {
 #[cfg(test)]
 pub static ASSET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// Must classify the same way `assets::class_of` does — see `ext_of`'s doc
+// comment for why: the two functions disagreeing about one string is the
+// defect, not any individual choice either makes.
 pub fn content_type(rel: &str) -> &'static str {
-    match Path::new(rel).extension().and_then(|e| e.to_str()).unwrap_or("") {
+    match crate::assets::ext_of(rel).as_str() {
         "css" => "text/css; charset=utf-8",
         "js" => "text/javascript; charset=utf-8",
         "html" => "text/html; charset=utf-8",
@@ -749,5 +752,28 @@ mod tests {
         // multi-segment project with no "theme" segment anywhere.
         let out = frag_route(&roots, "/frag/karpie/sub/tree");
         assert!(out.contains("inner.rs"), "must still resolve an ordinary nested project: {out}");
+    }
+
+    /// `content_type` must classify the same way `assets::class_of` does —
+    /// case-insensitively, and treating a leading-dot name as having no
+    /// extension. Before the shared `ext_of` helper, `content_type` used
+    /// `Path::extension()` (case-preserving, `None` on ".css"), so an
+    /// uppercase or dotfile-shaped Theme path would 200 with
+    /// `application/octet-stream` and then get blocked outright by the
+    /// nosniff header this branch adds to every response — "my theme
+    /// silently does nothing".
+    #[test]
+    fn content_type_agrees_with_class_of_on_the_same_string() {
+        assert_eq!(content_type("logo.PNG"), "image/png", "extension match must be case-insensitive");
+        assert_eq!(content_type(".css"), "text/css; charset=utf-8", "a leading dot is still an extension here");
+
+        for rel in ["logo.PNG", ".css", "Inter.WOFF2", "theme/Solarized.CSS"] {
+            let is_theme_type = content_type(rel) != "application/octet-stream";
+            let is_theme_class = crate::assets::class_of(rel) == crate::assets::Class::Theme;
+            assert_eq!(
+                is_theme_type, is_theme_class,
+                "content_type and class_of disagree about {rel:?}"
+            );
+        }
     }
 }
