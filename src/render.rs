@@ -36,6 +36,92 @@ pub fn diff_html(diff: &str) -> String {
         .collect()
 }
 
+/// Where a markdown link or image destination points, once resolved against
+/// the file it appeared in.
+///
+/// Links and images ask this question identically and differ only in what they
+/// emit, so it is answered once. Two copies of this logic would drift, and the
+/// drift would be silent: a link and an image to the same file would resolve
+/// to different places with nothing to flag it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Dest {
+    /// Off-origin: an `http`/`https` (or other non-`data`) scheme, or
+    /// protocol-relative `//host/x`.
+    Remote,
+    /// A `data:` URI. Self-contained, and issues no request.
+    Data,
+    /// Project-relative and lexically normalized. **Not confined** — the
+    /// server confines on use, and this must not be mistaken for the boundary.
+    Local(String),
+    /// `mailto:`, `#anchor`, empty. Not ours to rewrite.
+    Passthrough,
+    /// A relative path that climbs out of the project. A dead reference.
+    Broken,
+}
+
+/// Collapses `.` and `..` lexically. Returns `None` if the path climbs above
+/// the project root — clamping instead would silently retarget an escaping
+/// reference at some unrelated file that happens to exist.
+fn normalize_rel(p: &str) -> Option<String> {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop()?;
+            }
+            s => out.push(s),
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out.join("/"))
+}
+
+pub fn resolve_dest(dest: &str, from_rel: &str) -> Dest {
+    if dest.is_empty() || dest.starts_with('#') {
+        return Dest::Passthrough;
+    }
+    if dest.starts_with("//") {
+        return Dest::Remote;
+    }
+    // A URL scheme is `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`.
+    // Testing for a bare ':' would misread `notes:1.md` — a legal filename —
+    // as a scheme and stop rewriting it.
+    // Only the FIRST segment can carry a scheme: `a/b:c.md` is an ordinary
+    // relative path, and treating its colon as a scheme would stop it being
+    // rewritten.
+    let first_seg = dest.split('/').next().unwrap_or(dest);
+    if let Some(i) = first_seg.find(':') {
+        let scheme = &first_seg[..i];
+        let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if is_scheme {
+            return if scheme.eq_ignore_ascii_case("data") {
+                Dest::Data
+            } else if scheme.eq_ignore_ascii_case("mailto") || scheme.eq_ignore_ascii_case("tel") {
+                Dest::Passthrough
+            } else {
+                Dest::Remote
+            };
+        }
+    }
+    // Query and fragment are not part of the path on disk.
+    let path = dest.split(['?', '#']).next().unwrap_or(dest);
+    let joined = match path.strip_prefix('/') {
+        Some(abs) => abs.to_string(),
+        None => match from_rel.rsplit_once('/') {
+            Some((dir, _)) => format!("{dir}/{path}"),
+            None => path.to_string(),
+        },
+    };
+    match normalize_rel(&joined) {
+        Some(p) => Dest::Local(p),
+        None => Dest::Broken,
+    }
+}
+
 pub fn markdown_html(md: &str) -> String {
     use pulldown_cmark::{html, Event, Options, Parser};
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
@@ -1162,5 +1248,51 @@ mod tests {
         assert_eq!(human_age(3600), "1h");
         assert_eq!(human_age(86399), "23h");
         assert_eq!(human_age(86400), "1d");
+    }
+
+    #[test]
+    fn resolve_dest_classifies_every_destination_shape() {
+        use Dest::*;
+        // Relative resolves against the *file's* directory, which is the whole bug.
+        assert_eq!(resolve_dest("cat.png", "docs/a.md"), Local("docs/cat.png".into()));
+        assert_eq!(resolve_dest("../img/x.png", "docs/a.md"), Local("img/x.png".into()));
+        assert_eq!(resolve_dest("./b.md", "docs/a.md"), Local("docs/b.md".into()));
+        // A file at the root has no directory to prepend.
+        assert_eq!(resolve_dest("b.md", "a.md"), Local("b.md".into()));
+        // Absolute means project-root-relative, which is what repo authors mean.
+        assert_eq!(resolve_dest("/x.png", "docs/a.md"), Local("x.png".into()));
+        // Query and fragment are not part of the path.
+        assert_eq!(resolve_dest("b.md#heading", "a.md"), Local("b.md".into()));
+
+        assert_eq!(resolve_dest("https://e.com/x.png", "a.md"), Remote);
+        assert_eq!(resolve_dest("http://e.com/x.png", "a.md"), Remote);
+        assert_eq!(resolve_dest("//e.com/x.png", "a.md"), Remote);
+        assert_eq!(resolve_dest("data:image/svg+xml,%3Csvg/%3E", "a.md"), Data);
+        assert_eq!(resolve_dest("mailto:p@example.com", "a.md"), Passthrough);
+        assert_eq!(resolve_dest("#section", "a.md"), Passthrough);
+        assert_eq!(resolve_dest("", "a.md"), Passthrough);
+
+        // Escaping the project is a broken reference, not a path to follow.
+        assert_eq!(resolve_dest("../../../etc/passwd", "docs/a.md"), Broken);
+        assert_eq!(resolve_dest("..", "a.md"), Broken);
+    }
+
+    /// `find(':')` alone would classify `a/b:c.md` — a colon in a LATER segment,
+    /// which is a perfectly ordinary relative path — as a scheme and stop
+    /// rewriting it. A colon in the FIRST segment is genuinely ambiguous, and
+    /// resolves as a scheme here for the same reason a browser resolves it that
+    /// way: a Remote or Passthrough destination is handed to the browser verbatim,
+    /// so our classification has to agree with the browser's or the two disagree
+    /// about the same string. `./` is the standard escape hatch.
+    ///
+    /// Revert-the-fix check: replacing the scheme guard with a bare
+    /// `dest.contains(':')` made this fail with
+    /// `left: Remote, right: Local("notes/v:1.md")` on the first assertion —
+    /// the colon in the second path segment was misread as a scheme.
+    #[test]
+    fn a_colon_is_a_scheme_only_where_a_browser_would_read_one() {
+        assert_eq!(resolve_dest("notes/v:1.md", "a.md"), Dest::Local("notes/v:1.md".into()));
+        assert_eq!(resolve_dest("./notes:1.md", "a.md"), Dest::Local("notes:1.md".into()));
+        assert_eq!(resolve_dest("notes:1.md", "a.md"), Dest::Remote);
     }
 }
