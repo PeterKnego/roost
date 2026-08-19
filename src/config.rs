@@ -10,6 +10,7 @@ struct RawConfig {
     default_tab: Option<String>,
     hide: Option<Vec<String>>,
     allowed_origins: Option<Vec<String>>,
+    max_upload_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +111,46 @@ pub fn ping_interval() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// 100 MB. Screenshots run 3–5 MB and a short screen recording 50–100 MB, so
+/// this clears the real cases with room; past it is a mis-drag, and a mis-drag
+/// that fills the disk breaks dtach socket creation, state writes and git at
+/// once.
+pub const DEFAULT_MAX_UPLOAD: u64 = 100_000_000;
+
+/// Not configurable, deliberately. This expresses a product decision — resh is
+/// not a project transfer tool, `git` and `scp` are — rather than fitting a
+/// machine, and a tunable would only invite the decision to be configured away.
+pub const MAX_UPLOAD_PARTS: usize = 16;
+
+/// Aggregate bytes one upload request may carry.
+///
+/// Global-only, exactly like [`allowed_origins`] and for the same reason: a
+/// per-project `.resh/config.toml` ships inside the repository, so a cloned
+/// hostile repo could otherwise raise its own disk ceiling. Deliberately **not**
+/// part of [`Settings`], which is the only thing a project file can reach.
+pub fn max_upload_bytes() -> u64 {
+    max_upload_from(&global_config_path())
+}
+
+/// Split from [`max_upload_bytes`] so tests can point at a real file instead of
+/// rewriting `HOME`, which `state_dir` and `global_config_path` both read and
+/// which other tests are running against concurrently.
+fn max_upload_from(global: &Path) -> u64 {
+    // A zero or unparseable value falls back rather than disabling the limit:
+    // the failure mode of reading a typo as "unlimited" is a full disk.
+    if let Ok(v) = std::env::var("RESH_MAX_UPLOAD") {
+        if let Some(n) = v.trim().parse::<u64>().ok().filter(|n| *n > 0) {
+            return n;
+        }
+    }
+    std::fs::read_to_string(global)
+        .ok()
+        .and_then(|s| toml::from_str::<RawConfig>(&s).ok())
+        .and_then(|r| r.max_upload_bytes)
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_UPLOAD)
+}
+
 pub fn for_project(project_dir: &Path) -> Settings {
     load(&[
         &global_config_path(),
@@ -184,5 +225,81 @@ mod tests {
             );
         }
         std::env::remove_var("RESH_PING_SECS");
+    }
+
+    /// `RESH_MAX_UPLOAD` is process-global and these tests write it, so they
+    /// serialise. Without this they interleave and each sees another's value.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The test that fails the moment someone "helpfully" moves this key into
+    /// `Settings`. A project's `.resh/config.toml` ships inside the repository,
+    /// so a cloned hostile repo could otherwise raise its own disk ceiling and
+    /// turn a mis-drag into a disk-fill — the same argument `allowed_origins`
+    /// already makes for itself.
+    ///
+    /// Asserts through `load`, which is the only path a project file has: if
+    /// the key were in `Settings`, the returned value would differ from the
+    /// default and this fails.
+    #[test]
+    fn a_project_config_cannot_carry_an_upload_ceiling() {
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join("project.toml");
+        fs::write(&proj, "max_upload_bytes = 999999999\ntheme = \"light\"\n").unwrap();
+        let s = load(&[&proj]);
+        // The keys a project *may* set still work, so this is not passing
+        // because the file failed to parse.
+        assert_eq!(s.theme, "light", "the project file must still be read");
+        assert_eq!(
+            s,
+            Settings { theme: "light".into(), ..Settings::default() },
+            "a project config must not be able to carry an upload ceiling"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_comes_from_the_global_file_and_defaults_without_one() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("RESH_MAX_UPLOAD");
+        let d = tempfile::tempdir().unwrap();
+        let missing = d.path().join("nope.toml");
+        assert_eq!(max_upload_from(&missing), DEFAULT_MAX_UPLOAD);
+
+        let global = d.path().join("config.toml");
+        fs::write(&global, "max_upload_bytes = 5000\n").unwrap();
+        assert_eq!(max_upload_from(&global), 5000);
+    }
+
+    #[test]
+    fn the_env_var_overrides_the_global_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        let global = d.path().join("config.toml");
+        fs::write(&global, "max_upload_bytes = 5000\n").unwrap();
+        std::env::set_var("RESH_MAX_UPLOAD", "1234");
+        assert_eq!(max_upload_from(&global), 1234);
+        std::env::remove_var("RESH_MAX_UPLOAD");
+    }
+
+    /// A typo must not read as "no limit". Zero and garbage both fall back to
+    /// the default rather than disabling the ceiling, because the failure mode
+    /// of getting this wrong is a full disk.
+    #[test]
+    fn a_bad_value_falls_back_rather_than_disabling_the_ceiling() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        let global = d.path().join("config.toml");
+        fs::write(&global, "max_upload_bytes = 0\n").unwrap();
+        std::env::remove_var("RESH_MAX_UPLOAD");
+        assert_eq!(max_upload_from(&global), DEFAULT_MAX_UPLOAD, "0 must not mean unlimited");
+
+        for bad in ["banana", "0", "-5"] {
+            std::env::set_var("RESH_MAX_UPLOAD", bad);
+            assert_eq!(
+                max_upload_from(&global),
+                DEFAULT_MAX_UPLOAD,
+                "RESH_MAX_UPLOAD={bad} must fall back, not disable the ceiling"
+            );
+        }
+        std::env::remove_var("RESH_MAX_UPLOAD");
     }
 }
