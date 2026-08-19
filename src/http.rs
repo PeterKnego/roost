@@ -91,11 +91,29 @@ pub fn percent_encode(s: &str) -> String {
 }
 
 pub fn respond(w: &mut impl Write, status: u16, reason: &str, ctype: &str, body: &[u8]) {
+    respond_with(w, status, reason, ctype, &[], body);
+}
+
+/// `respond` plus caller-supplied headers, for the security headers static
+/// assets carry. Kept as a separate entry point so the dozens of existing
+/// `respond` call sites need no change.
+pub fn respond_with(
+    w: &mut impl Write,
+    status: u16,
+    reason: &str,
+    ctype: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) {
     let _ = write!(
         w,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
+    for (k, v) in extra {
+        let _ = write!(w, "{k}: {v}\r\n");
+    }
+    let _ = write!(w, "\r\n");
     let _ = w.write_all(body);
     let _ = w.flush();
 }
@@ -154,5 +172,34 @@ mod tests {
         assert!(s.starts_with("HTTP/1.1 404 Not Found\r\n"));
         assert!(s.contains("Content-Length: 4\r\n"));
         assert!(s.ends_with("\r\n\r\nnope"));
+    }
+
+    #[test]
+    fn extra_headers_are_emitted_once_before_the_body() {
+        let mut buf = Cursor::new(Vec::new());
+        respond_with(
+            &mut buf,
+            200,
+            "OK",
+            "text/css; charset=utf-8",
+            &[("X-Content-Type-Options", "nosniff"), ("Content-Security-Policy", "sandbox")],
+            b"body{}",
+        );
+        let out = String::from_utf8(buf.into_inner()).unwrap();
+        let (head, body) = out.split_once("\r\n\r\n").expect("headers end exactly once");
+        assert!(head.contains("X-Content-Type-Options: nosniff"));
+        assert!(head.contains("Content-Security-Policy: sandbox"));
+        assert!(head.contains("Content-Length: 6"));
+        assert_eq!(body, "body{}", "the body must follow the blank line, not precede it");
+        assert_eq!(head.matches("Content-Type:").count(), 1, "no duplicated headers");
+    }
+
+    #[test]
+    fn respond_still_emits_no_extra_headers() {
+        let mut buf = Cursor::new(Vec::new());
+        respond(&mut buf, 200, "OK", "text/plain", b"hi");
+        let out = String::from_utf8(buf.into_inner()).unwrap();
+        assert!(!out.contains("Content-Security-Policy"));
+        assert!(out.ends_with("\r\n\r\nhi"));
     }
 }
