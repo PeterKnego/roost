@@ -1070,3 +1070,129 @@ function onNotice(n) {
   renderNotices();
   render();
 }
+
+// ---------------------------------------------------------------------------
+// Uploads: files dropped or pasted onto the tree, and images pasted onto a
+// terminal. Delegated at document level, not bound per row: the tree is an htmx
+// fragment replaced wholesale on TreeChanged, and an upload triggers exactly
+// that — per-row listeners would not survive their own first success.
+const MAX_UPLOAD_PARTS = 16; // must match config::MAX_UPLOAD_PARTS
+
+// The destination for a drop: the nearest row carrying a data-rel. A directory
+// row contributes itself, a file row its parent. Null means the drop was not on
+// the tree at all, which is what keeps the destination unambiguous and is why
+// this needs no confirmation dialog.
+function dropDir(target) {
+  const el = target && target.closest && target.closest("[data-rel]");
+  if (!el) return null;
+  const rel = el.dataset.rel;
+  if (el.tagName === "DETAILS") return rel;
+  return rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "";
+}
+
+function focusedSession() {
+  const host = document.activeElement && document.activeElement.closest(".termhost");
+  return host ? host.dataset.session : null;
+}
+
+// One reusable banner rather than showBanner's transient ones, because progress
+// has to be updated in place and then cleared.
+function setUploadProgress(label, fraction) {
+  let box = document.getElementById("uploadprogress");
+  if (fraction === null) {
+    if (box) box.remove();
+    return;
+  }
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "uploadprogress";
+    box.className = "conflict";
+    document.body.appendChild(box);
+  }
+  box.textContent = `${label} — ${Math.round(fraction * 100)}%`;
+}
+
+function postFiles(url, files, label) {
+  const form = new FormData();
+  for (const f of files) form.append("file", f, f.name);
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", url);
+  // XHR rather than fetch: fetch exposes no upload progress, and a 100 MB send
+  // with no feedback is indistinguishable from a hang.
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable) setUploadProgress(label, e.loaded / e.total);
+  };
+  xhr.onload = () => {
+    setUploadProgress(label, null);
+    if (xhr.status !== 200) return showError(`${label}: ${xhr.responseText || xhr.status}`);
+    let body = {};
+    try { body = JSON.parse(xhr.responseText); } catch { return; }
+    for (const r of body.results || []) if (!r.ok) showError(`${r.name}: ${r.error}`);
+  };
+  xhr.onerror = () => { setUploadProgress(label, null); showError(`${label}: upload failed`); };
+  xhr.send(form);
+}
+
+// File.size and FileList.length come from the OS and are readable before a byte
+// is sent, so the part cap is checked at drop time. A courtesy, not the
+// enforcement — the server applies both caps while streaming regardless.
+function tooManyFiles(files) {
+  if (files.length > MAX_UPLOAD_PARTS) {
+    return `${files.length} files at once (limit ${MAX_UPLOAD_PARTS}) — use git or scp to move a project`;
+  }
+  return null;
+}
+
+function uploadFiles(files, dir) {
+  const refusal = tooManyFiles(files);
+  if (refusal) return showError(refusal);
+  const q = dir ? `?dir=${dir.split("/").map(encodeURIComponent).join("/")}` : "";
+  postFiles(`/upload/${PROJECT}${q}`, files, `upload to ${dir || "project root"}`);
+}
+
+// A dropped directory arrives as a zero-length entry that fails on read, so a
+// size check would send a mystery empty part and surface a confusing server
+// error. webkitGetAsEntry is the reliable test; directories are a non-goal, so
+// say so at the drop, by name.
+function droppedDirectories(dt) {
+  const dirs = [];
+  for (const item of dt.items || []) {
+    const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
+    if (entry && entry.isDirectory) dirs.push(entry.name);
+  }
+  return dirs;
+}
+
+// Without preventDefault on dragover the browser navigates to the dropped file
+// instead of delivering a drop event.
+document.addEventListener("dragover", (e) => {
+  if (dropDir(e.target) !== null) e.preventDefault();
+});
+
+document.addEventListener("drop", (e) => {
+  const dir = dropDir(e.target);
+  if (dir === null || !e.dataTransfer) return;
+  e.preventDefault();
+  const dirs = droppedDirectories(e.dataTransfer);
+  if (dirs.length) {
+    return showError(`folders are not uploaded (${dirs.join(", ")}) — use git or scp for a directory`);
+  }
+  if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files, dir);
+});
+
+document.addEventListener("paste", (e) => {
+  const files = e.clipboardData && e.clipboardData.files;
+  if (!files || !files.length) return;
+  const session = focusedSession();
+  if (session) {
+    const img = [...files].find((f) => f.type.startsWith("image/"));
+    if (!img) return; // fall through to xterm's own text handling
+    e.preventDefault();
+    postFiles(`/paste/${PROJECT}/${session}`, [img], "paste");
+    return;
+  }
+  const dir = dropDir(document.activeElement) ?? dropDir(e.target);
+  if (dir === null) return;
+  e.preventDefault();
+  uploadFiles(files, dir);
+});
