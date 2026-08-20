@@ -127,6 +127,19 @@ main { flex: 1; min-height: 0; }
   font: 11px/1.6 var(--mono); color: var(--bg);
   background: var(--warn, #d79921);
 }
+/* Copy-on-select has to announce itself. The clipboard is invisible, and a
+   copy that silently does nothing is precisely the failure this replaced — so
+   the terminal says what happened, failures included. Bottom right and
+   ::before, so it can never land on the socket-status badge above, which owns
+   the top right and ::after. */
+.content .termhost[data-flash]::before {
+  content: attr(data-flash);
+  position: absolute; bottom: 8px; right: 10px; z-index: 3;
+  padding: 2px 7px; border-radius: 3px; pointer-events: none;
+  font: 11px/1.6 var(--mono); color: var(--bg); background: var(--accent, #548af7);
+  animation: termflash 1.6s ease-out forwards;
+}
+@keyframes termflash { 0%, 55% { opacity: 1; } 100% { opacity: 0; } }
 /* Nothing is painted at rest any more: the gap plus the two card borders it
    sits between already separate the panes, and a line down the middle of that
    gap makes three seams out of one. The track keeps its full width as a drag

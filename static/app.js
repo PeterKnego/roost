@@ -728,7 +728,25 @@ function ensureTerm(session) {
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(node);
-  const entry = { node, term, fit, sock: null, tries: 0, timer: null, attached: false, gone: false };
+  const entry = { node, term, fit, sock: null, tries: 0, timer: null, attached: false, gone: false,
+                  selTimer: null, flashTimer: null };
+  // Copy on select. xterm's rows are `user-select: none`, so a browser
+  // selection over terminal text is impossible and xterm's own selection is
+  // the only route to the clipboard — reached, until now, only by the
+  // browser's own copy command (Cmd+C, right-click → Copy). A full-screen app
+  // takes that away the moment it turns on mouse reporting: the right button
+  // goes to the app, context menu and all. Selecting in a terminal running
+  // Claude Code therefore copied nothing, silently, and the next paste
+  // inserted whatever the clipboard still held from before — an image, if that
+  // is what was last copied, which resh's own paste route then dutifully typed
+  // into the app.
+  //
+  // Debounced because onSelectionChange fires continuously while a drag grows;
+  // only where it settles is worth writing to the clipboard.
+  term.onSelectionChange(() => {
+    clearTimeout(entry.selTimer);
+    entry.selTimer = setTimeout(() => copySelection(entry), 200);
+  });
   term.onData((d) => {
     // Reads entry.sock rather than closing over one socket: a reconnect
     // swaps it, and a closure over the original would spend the rest of the
@@ -788,6 +806,31 @@ function connectTerm(entry, session) {
     const wait = Math.min(500 * 2 ** entry.tries++, 8000);
     entry.timer = setTimeout(() => connectTerm(entry, session), wait);
   };
+}
+
+function copySelection(entry) {
+  const text = entry.term.getSelection();
+  if (!text) return; // clearing a selection must never clobber the clipboard
+  // `navigator.clipboard` exists only in a secure context, so a tailnet IP
+  // over plain http has none. That has to become a message rather than an
+  // exception thrown inside a selection handler.
+  if (!navigator.clipboard) return termFlash(entry, "copy needs https");
+  navigator.clipboard.writeText(text).then(
+    () => termFlash(entry, `copied ${text.length}`),
+    () => termFlash(entry, "copy blocked"),
+  );
+}
+
+// Feedback is not decoration here. A copy that silently does nothing is the
+// exact failure copy-on-select was added to fix, and the clipboard is
+// invisible — so every outcome says which one it was, including the failures.
+function termFlash(entry, text) {
+  const el = entry.node;
+  el.removeAttribute("data-flash");
+  void el.offsetWidth; // restart the fade rather than let the old one finish
+  el.dataset.flash = text;
+  clearTimeout(entry.flashTimer);
+  entry.flashTimer = setTimeout(() => el.removeAttribute("data-flash"), 1600);
 }
 
 // Without this a disconnected terminal looks exactly like a live idle one —
