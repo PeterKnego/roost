@@ -179,6 +179,28 @@ fn watch_tree(watcher: &mut notify::RecommendedWatcher, project: &str, root: Pat
     }
 }
 
+/// Reads are not changes. inotify reports them — `IN_OPEN` and `IN_ACCESS`
+/// arrive as `EventKind::Access` — and resh reads the directories it watches
+/// constantly, because rendering the tree is a `read_dir` of exactly the
+/// directory the watcher is watching.
+///
+/// Letting those through was a self-sustaining loop, not merely noise. The
+/// batch handler re-registers a watch on any directory an event names, and
+/// registering walks that directory, and walking it opens it, which produced
+/// the next event. One tree render lit it and it never went out: ~3 batches a
+/// second forever, each one broadcasting `TreeChanged` (the project root
+/// strips to an empty rel, which classifies as `Class::Tree`), so every
+/// browser on the project re-fetched the tree three times a second for as
+/// long as the project stayed open. It survived with the client's re-fetch
+/// disabled, because by then the watcher was feeding itself.
+///
+/// Nothing is lost by dropping these: a write that matters arrives as
+/// `Modify`/`Create`/`Remove` too, and an `Access(Close(Write))` with no
+/// accompanying modification means the file was opened and closed unchanged.
+fn is_access(ev: &notify::Event) -> bool {
+    matches!(ev.kind, notify::EventKind::Access(_))
+}
+
 /// True when a panic anywhere in one debounced batch's handling should not
 /// be allowed to end watching for the rest of the process's life. Stringify
 /// the payload defensively: `Any` panic payloads are almost always `&str`
@@ -270,6 +292,10 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
             };
             let mut events: Vec<notify::Event> = Vec::new();
             match first {
+                // Dropped here rather than later so an access never starts a
+                // batch, never counts toward MAX_BATCH_EVENTS, and above all
+                // never reaches the re-registration below — see `is_access`.
+                Ok(ev) if is_access(&ev) => continue,
                 Ok(ev) => events.push(ev),
                 Err(e) => {
                     eprintln!("resh: {project_name}: watch error: {e}");
@@ -278,6 +304,7 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
             }
             while events.len() < MAX_BATCH_EVENTS {
                 match rx.recv_timeout(debounce) {
+                    Ok(Ok(ev)) if is_access(&ev) => continue,
                     Ok(Ok(ev)) => events.push(ev),
                     Ok(Err(e)) => eprintln!("resh: {project_name}: watch error: {e}"),
                     // Quiet period reached (or sender gone, which the next
@@ -636,6 +663,68 @@ mod tests {
             }
         }
         false
+    }
+
+    // The storm, as a test. Rendering the tree is a `read_dir` of the watched
+    // directory, and inotify reports reads — so before `is_access`, one tree
+    // render started a loop that re-registered the watch, which re-walked the
+    // directory, which read it again, ~3 times a second for as long as the
+    // project stayed open.
+    //
+    // Both halves matter and neither works alone. The first read must produce
+    // nothing, and the *quiet must hold*: the defect was self-sustaining, so a
+    // test that only checked the first second would pass against a loop that
+    // had merely not started yet. The control write at the end is what makes
+    // the silence mean something — without it this passes just as well with
+    // the watcher dead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reading_a_watched_directory_is_not_a_change() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::create_dir(d.path().join("src")).unwrap();
+        std::fs::write(d.path().join("src/main.rs"), "").unwrap();
+        std::fs::write(d.path().join("seed.txt"), "").unwrap();
+
+        let hub = Arc::new(Mutex::new(Hub::new("watch_no_access", d.path().to_path_buf())));
+        assert!(spawn("watch_no_access", d.path().to_path_buf(), hub.clone(), Duration::from_millis(20)));
+        let rx = Hub::lock(&hub).subscribe().1;
+
+        // Exactly what serving a tree fragment does, subdirectory included.
+        for dir in [d.path().to_path_buf(), d.path().join("src")] {
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let _ = e.unwrap().file_name();
+            }
+        }
+
+        let quiet_for = |secs: u64| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+            let mut seen = Vec::new();
+            while let Ok(m) = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                seen.push(m);
+            }
+            seen
+        };
+        let first = quiet_for(1);
+        assert!(first.is_empty(), "a directory read must broadcast nothing; got {first:?}");
+        // The loop ran at ~3/s, so a second of silence here would have held
+        // dozens of events if it were still alive.
+        let later = quiet_for(2);
+        assert!(later.is_empty(), "and the quiet must hold, not merely start; got {later:?}");
+
+        std::fs::write(d.path().join("real.txt"), "hi\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut saw_write = false;
+        while let Ok(m) = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            if m.contains(r#""t":"TreeChanged""#) {
+                saw_write = true;
+                break;
+            }
+        }
+        assert!(saw_write, "the watcher must still report a real write; silence above meant nothing otherwise");
+
+        std::env::remove_var("RESH_STATE_DIR");
     }
 
     // The per-directory (Linux) watch path must stop growing once it hits

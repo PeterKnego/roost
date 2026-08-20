@@ -58,23 +58,12 @@ const wire = (page) => {
         .find((x) => /dotfiles/.test(x.title));
       if (!b) return false; b.click(); return true; })()`,
   );
-  // Pins TreeChanged shut for the rest of the run. Not cosmetic: a watcher
-  // event storm (measured at ~3/s on an idle project, on this commit and on
-  // the one before this feature — a pre-existing defect, not this toggle's)
-  // re-fetches the tree several times a second all by itself. Left alone, it
-  // refreshes the listing for us and every assertion below passes with the
-  // toggle's own refresh path deleted — verified by deleting it. Muting the
-  // unrelated stimulus is what makes the click the only thing that can put a
-  // dot row on screen.
-  const muteTreeChanged = () => evalIn(
-    `(() => { const oe = onEvent; window.onEvent = (e) => { if (e.t === "TreeChanged") return; return oe(e); }; })()`,
-  );
   const ready = () => until(
     () => evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state && !!document.querySelector('ul.tree')"),
     30, "app",
   );
   const has = async (rel) => (await rows()).includes(rel);
-  return { evalIn, pane, rows, toggle, click, ready, has, muteTreeChanged, close: page.close };
+  return { evalIn, pane, rows, toggle, click, ready, has, close: page.close };
 };
 
 try {
@@ -82,8 +71,6 @@ try {
   two = wire(await openPage(browser.port, url));
   ok(await one.ready(), "page one is up");
   ok(await two.ready(), "page two is up on the same project");
-  await one.muteTreeChanged();
-  await two.muteTreeChanged();
 
   console.log("A. hidden by default, and the control says so");
   ok(await one.has("hello.md"), "an ordinary file renders");
@@ -120,7 +107,6 @@ try {
   console.log("\nD. a page opened afterwards renders it from the snapshot");
   three = wire(await openPage(browser.port, url));
   ok(await three.ready(), "page three is up");
-  await three.muteTreeChanged();
   // Distinct path: this page never saw a SetShowHidden event, only the State
   // it connected with. A client that applied the value on events alone would
   // pass B and C and fail here.
