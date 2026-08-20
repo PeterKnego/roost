@@ -18,9 +18,13 @@ when they're actually picked up.
 - Per-theme favicon — nice-to-have in both the v2 and v3 specs, no stated
   reason (`2026-08-16-deadlight-v2-design.md`,
   `2026-08-16-deadlight-v3-workspace-design.md`).
-- Images in markdown preview — nice-to-have in both the v2 and v3 specs, no
-  stated reason (`2026-08-16-deadlight-v2-design.md`,
-  `2026-08-16-deadlight-v3-workspace-design.md`).
+- Images in markdown preview — **shipped**, see
+  `2026-08-19-preview-links-and-images-design.md`. Grew in scope on the way:
+  the same missing piece (no route served raw project bytes) was also why a
+  `.png` in the tree answered "binary file", and rewriting image `src` was
+  half a job without rewriting link `href` too — a link to another file used
+  to navigate the browser clean out of the workspace. Heading anchors are the
+  recorded non-goal; see below.
 - Drag-and-drop tab reordering — speculative idea in the v3 spec, noted as
   partly moot since v3 already ships a "move to pane" command as the
   mechanism for relocating tabs (`2026-08-16-deadlight-v3-workspace-design.md`).
@@ -39,6 +43,13 @@ when they're actually picked up.
   currently rendered as one, and progress in particular should probably sit in
   the pane it belongs to rather than floating over the layout
   (`docs/superpowers/specs/2026-08-19-file-upload-design.md`).
+- Heading anchors in markdown preview. `#section` links are inert because
+  pulldown-cmark emits no heading ids, and this was the stated non-goal of the
+  preview-links work — a README's table of contents is the single most common
+  thing a markdown link points at, so it is the obvious next request now that
+  links work at all. Needs slug generation, reconciliation with ids already on
+  the workspace page, and a decision about what a hash does to the URL of a
+  single-page app (`2026-08-19-preview-links-and-images-design.md`).
 - Notification centre on the picker page (`/`) as well as the workspace
   page — the notice store is already global, only the markup is missing
   (`2026-08-17-deadlight-notifications-design.md`).
@@ -145,8 +156,29 @@ feature list — is what a spec for this needs to resolve.
   (`2026-08-16-deadlight-v2-design.md`); `docs/deploy.md` still lists
   code-server as a kept fallback, so this remains open.
 
+## Code structure
+
+- Move `IMAGE_EXT` / `is_image` / `NO_TEXT_EDIT_EXT` / `refuses_text_edit` out
+  of `routes.rs` and into `assets.rs`, where `ext_of` and `THEME_EXT` already
+  live. `workspace.rs` is pure state logic and now reaches into the HTTP layer
+  for three predicates, which is backwards
+  (`2026-08-19-preview-links-and-images-design.md`).
+- `IMAGE_EXT` and `NO_TEXT_EDIT_EXT` are each hand-mirrored in
+  `static/app.js` with nothing checking the copies agree. Divergence costs a
+  wrongly shown or hidden ✎ toggle, never data — `workspace.rs` is the real
+  guard — but it is the same unchecked-sync hazard `FRAGMENT_KINDS` carries,
+  and a build-time check could close both.
+
 ## Testing
 
+- `tests/browser/mdlinks.mjs`'s `javascript:` step evaluates `!!a` to prove the
+  danger anchor was found, then discards the result — so if that anchor ever
+  vanished from the preview, the two assertions after it would pass vacuously.
+  The `no javascript: href reached the page` assertion beside them is
+  independently discriminating, so the security property stays covered, but
+  this is the same defect class that produced three vacuous tests during that
+  branch's own execution and it is a one-line fix
+  (`2026-08-19-preview-links-and-images-design.md`).
 - `tests/integration.rs`'s `notices_are_replayed_on_connect_and_read_state_mirrors`
   fails intermittently, timing out waiting for `"read":true`. Diagnosed
   mechanism: `notify::load()` ends by *destructively* replacing the
@@ -178,3 +210,6 @@ feature list — is what a spec for this needs to resolve.
   workspace.
 - File editing (implicit in v2's "viewer is stateless and read-only" framing)
   → shipped in v3 as the Preview/Edit toggle with conflict-guarded save.
+- Images in markdown preview (v2 and v3 nice-to-have) → shipped 2026-08-20,
+  along with link rewriting and image tabs, which were never listed here
+  because nobody had noticed a preview could not follow its own references.
