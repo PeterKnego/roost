@@ -33,7 +33,15 @@ These are load-bearing. Breaking one is a defect, not a style choice.
 - **No panics may escape a socket or watcher thread.**
 - **Destruction requires positive evidence.** See below — this is the constraint
   this codebase breaks most often.
-- Caps: ≤16 sessions per project, ≤50 open buffers, 1 MB scrollback, 2 MB file
+- **A replay is not a byte log.** An attaching client is sent
+  `screen::Screens::replay()`, not the raw ring. A full-screen app declares the
+  alternate screen exactly once, so that declaration ages out of any bounded
+  log and is tracked and re-emitted at attach time instead. Anything that
+  changes what the pump stores has to keep that property, or exiting Claude
+  paints over its own leftover frame again.
+- Caps: ≤16 sessions per project, ≤50 open buffers, 1 MB scrollback *per screen
+  buffer* (normal and alternate are kept apart, so an app cannot evict the
+  scrollback it hands back), 2 MB file
   cap for reads *and* buffer writes. Uploads are bounded per **request**, not
   per file: ≤16 parts and `config::max_upload_bytes` (100 MB default, global
   config or `RESH_MAX_UPLOAD` only — never per-project, or a cloned repo could
@@ -157,6 +165,17 @@ the four traps that make a browser test pass while asserting nothing.
   been reported that was never created.
 - After deploying, confirm the *running* binary changed — `cargo build` alone
   updates neither path the service uses (see `docs/deploy.md`).
+- **Build from one checkout.** This host points every cargo workspace at a
+  single shared `target-dir`, and `build.rs` bakes *absolute* asset paths into
+  its generated table. A `cargo build` from a second checkout of this repo — a
+  git worktree, say — therefore rewrites that table with the other checkout's
+  paths and leaves the shared binary built from the other checkout's source.
+  Nothing announces this: cargo reports `Fresh resh`, the browser tests go on
+  passing, and they are testing the wrong tree. Recover with
+  `cargo clean -p resh`, and confirm with
+  `grep -o '/home/[^\"]*static' $(cargo metadata --format-version 1 --no-deps |
+  python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/build/resh-*/out/assets_table.rs | head -1`.
+  To compare against another branch, check it out in *this* directory.
 - Check which branch the deploy host is on. `git pull --ff-only` will report
   "Already up to date" while sitting on a stale feature branch.
 
