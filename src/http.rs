@@ -127,8 +127,25 @@ pub fn respond_with(
     let _ = w.flush();
 }
 
+/// Every HTML response, page or fragment.
+///
+/// The `img-src` policy is a backstop, not the mechanism: `render::markdown_html`
+/// already drops off-origin images, which is precise, unit-testable without a
+/// browser, and leaves readable alt text where CSP would leave a broken icon.
+/// This catches what that misses. Only `img-src` is set — a fuller policy would
+/// have to reason about the inline script and style this page serves.
+///
+/// It rides on every HTML response rather than only on the page, so a new page
+/// cannot be added without it. A fragment response simply ignores it.
 pub fn html(w: &mut impl Write, body: &str) {
-    respond(w, 200, "OK", "text/html; charset=utf-8", body.as_bytes());
+    respond_with(
+        w,
+        200,
+        "OK",
+        "text/html; charset=utf-8",
+        &[("Content-Security-Policy", "img-src 'self' data:")],
+        body.as_bytes(),
+    );
 }
 
 pub fn not_found(w: &mut impl Write, msg: &str) {
@@ -250,5 +267,15 @@ mod tests {
         let out = String::from_utf8(buf.into_inner()).unwrap();
         assert!(!out.contains("Content-Security-Policy"));
         assert!(out.ends_with("\r\n\r\nhi"));
+    }
+
+    #[test]
+    fn an_html_page_blocks_off_origin_images() {
+        let mut out = Vec::new();
+        html(&mut out, "<p>hi</p>");
+        let s = String::from_utf8(out).unwrap();
+        // 'self' stops a remote image the render-side rewrite missed; data: is
+        // required because the favicon is a data URI (app.js, faviconFor).
+        assert!(s.contains("Content-Security-Policy: img-src 'self' data:"), "{s}");
     }
 }

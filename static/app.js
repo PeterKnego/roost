@@ -8,6 +8,26 @@ const DIVIDER_PX = 8; // keep in step with --divider in style.css
 
 const wsUrl = (p) => `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${p}`;
 
+// Mirrors routes.rs NO_TEXT_EDIT_EXT — NOT IMAGE_EXT, which is a wider list
+// answering a different question. svg is absent on purpose: it renders as a
+// picture but is text, and has always been editable. Nothing checks the two
+// lists agree; a mismatch hides or shows the ✎ toggle wrongly, but never
+// loses data: workspace.rs refuses or coerces every path to Edit
+// server-side too (SetMode refuses it, OpenTab coerces a raw Edit request to
+// Preview, and EditBuffer — the actual save chokepoint — refuses to create a
+// buffer at all), so no client bug here can make a save truncate a file.
+const NO_TEXT_EDIT_EXT = ["png", "jpg", "jpeg", "gif", "webp", "ico"];
+// Must extract the extension exactly as assets::ext_of does, or syncing the
+// lists would not sync the behaviour: take the LAST path segment (so
+// `img.d/README` has no extension rather than inheriting `d`) and require a
+// dot in it.
+const extOf = (rel) => {
+  const name = (rel || "").split("/").pop();
+  const i = name.lastIndexOf(".");
+  return i < 0 ? "" : name.slice(i + 1).toLowerCase();
+};
+const refusesTextEdit = (rel) => NO_TEXT_EDIT_EXT.includes(extOf(rel));
+
 let state = null;
 let myOrigin = null;
 let ctrl = null;
@@ -238,7 +258,7 @@ function render() {
       // — see hasAttention/focusSession below.
       b.onclick = () =>
         t.k === "Terminal" ? focusSession(t.session) : send({ t: "ActivateTab", pane: pi, idx: ti });
-      if (t.k === "File") {
+      if (t.k === "File" && !refusesTextEdit(t.rel)) {
         const e = document.createElement("span");
         e.className = "x";
         e.title = t.mode === "Edit" ? "switch to preview" : "switch to edit";
@@ -580,7 +600,13 @@ function refreshTree() {
 // container handler wireFragment sets once, at the pane's outer `.content`
 // mount, already catches blank clicks anywhere inside via bubbling.
 function wireFileLinks(root) {
-  root.querySelectorAll("a.file[data-rel]").forEach((a) => {
+  // Any anchor carrying data-rel, not just tree rows: markdown previews emit
+  // <a class="mdlink" data-rel> for links to project files, and they want the
+  // identical open-as-tab and context-menu behaviour. A no-op for existing
+  // markup — every data-rel anchor rendered today already has class="file"
+  // (render.rs tree_level, changes_fragment) — and tree <details data-rel>
+  // stays excluded because the selector still requires an `a`.
+  root.querySelectorAll("a[data-rel]").forEach((a) => {
     a.onclick = (e) => {
       e.preventDefault();
       // These anchors still carry hx-get/hx-target="#content" from the
@@ -605,7 +631,7 @@ function wireFragment(content) {
   wireFileLinks(content);
   // right-clicking blank space in a tree targets the project root
   content.oncontextmenu = (e) => {
-    if (e.target.closest("a.file")) return;
+    if (e.target.closest("a[data-rel]")) return;
     e.preventDefault();
     fileMenu(e, "");
   };

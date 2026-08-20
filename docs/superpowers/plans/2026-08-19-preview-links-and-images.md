@@ -107,18 +107,24 @@ fn resolve_dest_classifies_every_destination_shape() {
     assert_eq!(resolve_dest("..", "a.md"), Broken);
 }
 
-/// A relative path containing a colon must not be read as a URL scheme.
-/// `find(':')` alone would classify `notes:1.md` as Remote and silently stop
-/// rewriting it.
+/// `find(':')` alone would classify `a/b:c.md` — a colon in a LATER segment,
+/// which is a perfectly ordinary relative path — as a scheme and stop
+/// rewriting it. A colon in the FIRST segment is genuinely ambiguous, and
+/// resolves as a scheme here for the same reason a browser resolves it that
+/// way: a Remote or Passthrough destination is handed to the browser verbatim,
+/// so our classification has to agree with the browser's or the two disagree
+/// about the same string. `./` is the standard escape hatch.
 #[test]
-fn a_colon_in_a_filename_is_not_a_scheme() {
-    assert_eq!(resolve_dest("notes:1.md", "a.md"), Dest::Local("notes:1.md".into()));
+fn a_colon_is_a_scheme_only_where_a_browser_would_read_one() {
+    assert_eq!(resolve_dest("notes/v:1.md", "a.md"), Dest::Local("notes/v:1.md".into()));
+    assert_eq!(resolve_dest("./notes:1.md", "a.md"), Dest::Local("notes:1.md".into()));
+    assert_eq!(resolve_dest("notes:1.md", "a.md"), Dest::Remote);
 }
 ```
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test resolve_dest a_colon_in_a_filename`
+Run: `cargo test -- resolve_dest a_colon_is_a_scheme`
 Expected: FAIL to compile — `cannot find function resolve_dest`.
 
 - [ ] **Step 3: Implement**
@@ -179,8 +185,12 @@ pub fn resolve_dest(dest: &str, from_rel: &str) -> Dest {
     // A URL scheme is `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`.
     // Testing for a bare ':' would misread `notes:1.md` — a legal filename —
     // as a scheme and stop rewriting it.
-    if let Some(i) = dest.find(':') {
-        let scheme = &dest[..i];
+    // Only the FIRST segment can carry a scheme: `a/b:c.md` is an ordinary
+    // relative path, and treating its colon as a scheme would stop it being
+    // rewritten.
+    let first_seg = dest.split('/').next().unwrap_or(dest);
+    if let Some(i) = first_seg.find(':') {
+        let scheme = &first_seg[..i];
         let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
             && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
         if is_scheme {
@@ -211,15 +221,16 @@ pub fn resolve_dest(dest: &str, from_rel: &str) -> Dest {
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
-Run: `cargo test resolve_dest a_colon_in_a_filename`
+Run: `cargo test -- resolve_dest a_colon_is_a_scheme`
 Expected: PASS.
 
 - [ ] **Step 5: Prove the colon test can fail**
 
-Replace the `is_scheme` computation with `let is_scheme = true;`, run
-`cargo test a_colon_in_a_filename`, confirm it FAILS with
-`Remote != Local("notes:1.md")`, then restore. Record the failure mode in the
-test's comment.
+Replace the whole `if let Some(i) = dest.find(':')` block's guard with a bare
+`if dest.contains(':')` returning `Dest::Remote`, run
+`cargo test a_colon_is_a_scheme`, confirm it FAILS on `notes/v:1.md` coming back
+`Remote` instead of `Local`, then restore. Record the failure mode in the test's
+comment.
 
 - [ ] **Step 6: Commit**
 
@@ -310,7 +321,7 @@ fn raw_refuses_an_oversize_image_and_a_symlink_out() {
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test raw_serves_an_image raw_refuses_an_oversize`
+Run: `cargo test -- raw_serves_an_image raw_refuses_an_oversize`
 Expected: FAIL — the `raw` path is not a fragment kind, so the response is a
 404 without the asserted body, or a theme-asset 404.
 
@@ -382,7 +393,7 @@ Add the arm in `serve_frag`, next to `["file"]`:
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
-Run: `cargo test raw_serves_an_image raw_refuses_an_oversize`
+Run: `cargo test -- raw_serves_an_image raw_refuses_an_oversize`
 Expected: PASS.
 
 - [ ] **Step 5: Prove the deny-by-default and symlink tests can fail**
@@ -677,7 +688,7 @@ fn an_html_page_blocks_off_origin_images() {
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test a_local_image a_remote_image a_data_image an_image_path_with an_html_page_blocks`
+Run: `cargo test -- a_local_image a_remote_image a_data_image an_image_path_with an_html_page_blocks`
 Expected: FAIL — images still emit their original `src`, and no CSP header is
 sent.
 
@@ -853,7 +864,7 @@ fn an_image_tab_cannot_be_switched_to_edit() {
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test clicking_an_image an_image_tab_cannot`
+Run: `cargo test -- clicking_an_image an_image_tab_cannot`
 Expected: FAIL — the file fragment answers `binary file`, and `SetMode` flips
 the image tab to `Edit`.
 

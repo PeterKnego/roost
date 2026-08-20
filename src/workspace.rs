@@ -134,17 +134,40 @@ fn pane_mut(w: &mut Workspace, id: PaneId) -> Result<&mut Pane, String> {
     w.panes.get_mut(id as usize).ok_or_else(|| format!("no pane {id}"))
 }
 
+/// The tab an `OpenTab` actually produces.
+///
+/// A raw OpenTab (unlike the app.js client, which never asks for Edit here)
+/// can name Edit directly, bypassing SetMode's guard below. Coerce rather
+/// than reject: the user's intent was "open this file", so they should get it
+/// — just in Preview, since `read_text_file` cannot fill a `<textarea>` for a
+/// file `refuses_text_edit` names, and a save would truncate it. Coercing also
+/// means a stale client's request still does something sensible instead of
+/// erroring.
+///
+/// Public because the hub must dispatch its Edit-mode disk read off the
+/// COERCED tab, not off the intent it was handed — otherwise it reads a file
+/// this function just forced to Preview.
+pub fn coerce_tab(tab: &Tab) -> Tab {
+    match tab {
+        Tab::File { rel, mode: proto::Mode::Edit } if crate::routes::refuses_text_edit(rel) => {
+            Tab::File { rel: rel.clone(), mode: proto::Mode::Preview }
+        }
+        _ => tab.clone(),
+    }
+}
+
 /// Apply a pure (no-I/O) intent. `Ok(true)` means state changed and the hub
 /// should bump the version and broadcast. I/O intents are the hub's job.
 pub fn apply_layout(w: &mut Workspace, intent: &Intent) -> Result<bool, String> {
     match intent {
         Intent::OpenTab { pane, tab } => {
-            if let Some((pi, ti)) = w.find_tab(tab) {
+            let tab = coerce_tab(tab);
+            if let Some((pi, ti)) = w.find_tab(&tab) {
                 pane_mut(w, pi)?.active = ti;
                 return Ok(true);
             }
             let p = pane_mut(w, *pane)?;
-            p.tabs.push(tab.clone());
+            p.tabs.push(tab);
             p.active = p.tabs.len() - 1;
             Ok(true)
         }
@@ -200,6 +223,11 @@ pub fn apply_layout(w: &mut Workspace, intent: &Intent) -> Result<bool, String> 
             Ok(true)
         }
         Intent::SetMode { rel, mode } => {
+            // See the test: Edit over an image is a data-loss path, not a display
+            // glitch. app.js hides the toggle; this is what actually stops it.
+            if *mode == proto::Mode::Edit && crate::routes::refuses_text_edit(rel) {
+                return Ok(false);
+            }
             let mut hit = false;
             for p in w.panes.iter_mut() {
                 for t in p.tabs.iter_mut() {
@@ -218,6 +246,13 @@ pub fn apply_layout(w: &mut Workspace, intent: &Intent) -> Result<bool, String> 
             }
         }
         Intent::EditBuffer { rel, text } => {
+            // The actual chokepoint: SaveBuffer writes from w.buffers, so if no
+            // buffer can ever exist for an image, the truncating save this task
+            // exists to prevent is structurally impossible, not merely hard to
+            // reach through the UI or through OpenTab's coercion above.
+            if crate::routes::refuses_text_edit(rel) {
+                return Err(format!("{rel} is an image; edits are refused"));
+            }
             if text.len() > MAX_TEXT_BYTES {
                 return Err(format!("buffer too large ({} bytes)", text.len()));
             }
@@ -377,6 +412,165 @@ mod tests {
             w.panes[proto::MIDDLE as usize].tabs[0],
             Tab::File { rel: "a.rs".into(), mode: Mode::Edit }
         );
+    }
+
+    /// Edit mounts a <textarea> seeded from `texts`, which the server cannot fill
+    /// for a binary file — so an image in Edit shows an empty editor over a real
+    /// file, and a save truncates it. app.js hides the toggle; this is the guard,
+    /// because the client is not a boundary and another browser may hold a tab
+    /// strip rendered before this shipped.
+    ///
+    /// Confirmed by deleting the guard in the `Intent::SetMode` arm and running
+    /// this test: it failed with
+    /// `left: File { rel: "shot.png", mode: Edit }` /
+    /// `right: File { rel: "shot.png", mode: Preview }` at the "must stay in
+    /// Preview" assertion — the image tab really did flip to Edit, exactly the
+    /// data-loss path this guard exists to close.
+    #[test]
+    fn an_image_tab_cannot_be_switched_to_edit() {
+        let mut w = Workspace::default_layout();
+        apply_layout(&mut w, &Intent::OpenTab { pane: proto::MIDDLE, tab: file("shot.png") }).unwrap();
+        apply_layout(&mut w, &Intent::SetMode { rel: "shot.png".into(), mode: Mode::Edit }).unwrap();
+        assert_eq!(
+            w.panes[proto::MIDDLE as usize].tabs[0],
+            Tab::File { rel: "shot.png".into(), mode: Mode::Preview },
+            "an image must stay in Preview"
+        );
+        // The same intent on a text file must still work, or this test would pass
+        // just as well with SetMode broken outright — which is the failure mode
+        // `set_mode_rewrites_the_matching_file_tab` would not catch either, since
+        // it never opens an image.
+        apply_layout(&mut w, &Intent::OpenTab { pane: proto::MIDDLE, tab: file("a.rs") }).unwrap();
+        apply_layout(&mut w, &Intent::SetMode { rel: "a.rs".into(), mode: Mode::Edit }).unwrap();
+        assert_eq!(
+            w.panes[proto::MIDDLE as usize].tabs[1],
+            Tab::File { rel: "a.rs".into(), mode: Mode::Edit }
+        );
+    }
+
+    /// SVG is on `IMAGE_EXT` but not on `NO_TEXT_EDIT_EXT`, and this test is
+    /// what keeps the two lists from being merged back together. An SVG is
+    /// text: `read_text_file` finds no NUL bytes in it and has always served
+    /// it, so editing one worked before image tabs existed, and gating Edit
+    /// on `is_image` silently took that away — leaving a tab whose keystrokes
+    /// were all refused and whose ✎ toggle app.js had hidden.
+    ///
+    /// The `.png` half is not decoration: without it this test passes just as
+    /// well with the guard removed altogether.
+    ///
+    /// Confirmed by pointing all three guards back at `crate::routes::is_image`
+    /// and running this test: it failed at the first assertion with
+    /// `left: File { rel: "logo.svg", mode: Preview }` /
+    /// `right: File { rel: "logo.svg", mode: Edit }` — the SVG refusing to
+    /// enter Edit at all.
+    #[test]
+    fn an_svg_is_text_and_stays_editable() {
+        let mut w = Workspace::default_layout();
+        apply_layout(&mut w, &Intent::OpenTab { pane: proto::MIDDLE, tab: file("logo.svg") })
+            .unwrap();
+        apply_layout(&mut w, &Intent::SetMode { rel: "logo.svg".into(), mode: Mode::Edit }).unwrap();
+        assert_eq!(
+            w.panes[proto::MIDDLE as usize].tabs[0],
+            Tab::File { rel: "logo.svg".into(), mode: Mode::Edit }
+        );
+        apply_layout(&mut w, &Intent::EditBuffer { rel: "logo.svg".into(), text: "<svg/>".into() })
+            .unwrap();
+        assert_eq!(w.buffers["logo.svg"].text, "<svg/>");
+
+        // OpenTab must not coerce it either — the path a raw frame takes.
+        apply_layout(
+            &mut w,
+            &Intent::OpenTab {
+                pane: proto::RIGHT,
+                tab: Tab::File { rel: "icon.svg".into(), mode: Mode::Edit },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            w.panes[proto::RIGHT as usize].tabs.last().unwrap(),
+            &Tab::File { rel: "icon.svg".into(), mode: Mode::Edit }
+        );
+
+        // A real binary image must still be refused everywhere, or the split
+        // above would have been a way to remove the guard rather than narrow it.
+        assert!(apply_layout(
+            &mut w,
+            &Intent::EditBuffer { rel: "shot.png".into(), text: "x".into() }
+        )
+        .is_err());
+    }
+
+    /// A raw websocket frame can name Edit directly in OpenTab, skipping the
+    /// ✎ toggle and SetMode's guard entirely — nothing about the wire format
+    /// stops `{"t":"OpenTab","tab":{"k":"File","rel":"shot.png","mode":"Edit"}}`.
+    /// The tab must still land, because the user asked to open the file and
+    /// should get it, but coerced to Preview rather than the empty-textarea
+    /// state that would let a save truncate the image.
+    ///
+    /// Confirmed by deleting the coercion in the `Intent::OpenTab` arm and
+    /// running this test: it failed with
+    /// `left: File { rel: "shot.png", mode: Edit }` /
+    /// `right: File { rel: "shot.png", mode: Preview }` — the raw Edit request
+    /// landed in workspace state and would have broadcast to every client.
+    #[test]
+    fn open_tab_coerces_an_image_requested_in_edit_to_preview() {
+        let mut w = Workspace::default_layout();
+        apply_layout(
+            &mut w,
+            &Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "shot.png".into(), mode: Mode::Edit },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            w.panes[proto::MIDDLE as usize].tabs[0],
+            Tab::File { rel: "shot.png".into(), mode: Mode::Preview },
+            "an image opened straight into Edit must still land, just coerced"
+        );
+
+        // A text file requested in Edit must still open in Edit, or this test
+        // would pass just as well with the coercion applied unconditionally —
+        // which would silently downgrade every ordinary Edit-mode open.
+        apply_layout(
+            &mut w,
+            &Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "a.rs".into(), mode: Mode::Edit },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            w.panes[proto::MIDDLE as usize].tabs[1],
+            Tab::File { rel: "a.rs".into(), mode: Mode::Edit }
+        );
+    }
+
+    /// The actual chokepoint: SaveBuffer writes whatever text `w.buffers`
+    /// holds, so as long as EditBuffer refuses to create a buffer for an
+    /// image, the truncating save is structurally impossible — regardless of
+    /// what OpenTab or SetMode let through.
+    ///
+    /// Confirmed by deleting the `refuses_text_edit` check in the `Intent::EditBuffer`
+    /// arm and running this test: it panicked at the `.unwrap_err()` with
+    /// `called Result::unwrap_err() on an Ok value: true` — the call
+    /// succeeded and created a "shot.png" buffer with the image-truncating
+    /// text, exactly what SaveBuffer would then have written over the file.
+    #[test]
+    fn edit_buffer_refuses_an_image() {
+        let mut w = Workspace::default_layout();
+        let err = apply_layout(
+            &mut w,
+            &Intent::EditBuffer { rel: "shot.png".into(), text: "not really a png".into() },
+        )
+        .unwrap_err();
+        assert!(err.contains("shot.png") && err.contains("image"), "unexpected error: {err}");
+        assert!(!w.buffers.contains_key("shot.png"), "a refused edit must not create a buffer");
+
+        // A text file must still be editable, or this test would pass just as
+        // well with EditBuffer broken outright.
+        apply_layout(&mut w, &Intent::EditBuffer { rel: "a.rs".into(), text: "hi".into() }).unwrap();
+        assert_eq!(w.buffers["a.rs"].text, "hi");
     }
 
     #[test]

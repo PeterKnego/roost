@@ -209,6 +209,13 @@ details[open] > summary { background-image: var(--twisty-open); }
 .markdown-body { max-width: 900px; margin: 0 auto; padding: 24px; background: transparent; color: var(--fg); }
 .markdown-body pre, .markdown-body code { background: var(--bg2) !important; }
 .markdown-body h1, .markdown-body h2 { border-bottom-color: var(--border) !important; }
+/* A markdown link is inline text. .content a.file styles a *tree row* — block
+   padding scaled by --d, a file icon, indent guides, a full-width hover band —
+   which is why these links carry their own class instead of reusing it. */
+.markdown-body a.mdlink { color: var(--accent); cursor: pointer; text-decoration: underline; }
+.markdown-body a.mdlink:hover { text-decoration: none; }
+.markdown-body a.mdbroken { color: var(--muted); text-decoration: line-through; cursor: default; }
+.markdown-body img { max-width: 100%; height: auto; }
 
 
 /* ---- IDE iconography -------------------------------------------------------

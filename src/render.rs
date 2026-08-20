@@ -36,24 +36,239 @@ pub fn diff_html(diff: &str) -> String {
         .collect()
 }
 
-pub fn markdown_html(md: &str) -> String {
-    use pulldown_cmark::{html, Event, Options, Parser};
+/// Where a markdown link or image destination points, once resolved against
+/// the file it appeared in.
+///
+/// Links and images ask this question identically and differ only in what they
+/// emit, so it is answered once. Two copies of this logic would drift, and the
+/// drift would be silent: a link and an image to the same file would resolve
+/// to different places with nothing to flag it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Dest {
+    /// Off-origin: an `http`/`https` (or other non-`data`) scheme, or
+    /// protocol-relative `//host/x`.
+    Remote,
+    /// A `data:` URI. Self-contained, and issues no request.
+    Data,
+    /// Project-relative and lexically normalized. **Not confined** — the
+    /// server confines on use, and this must not be mistaken for the boundary.
+    Local(String),
+    /// `mailto:`, `tel:`, `#anchor`, empty. Not ours to rewrite.
+    Passthrough,
+    /// A relative path that climbs out of the project. A dead reference.
+    Broken,
+}
+
+/// Collapses `.` and `..` lexically. Returns `None` if the path climbs above
+/// the project root — clamping instead would silently retarget an escaping
+/// reference at some unrelated file that happens to exist.
+fn normalize_rel(p: &str) -> Option<String> {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop()?;
+            }
+            s => out.push(s),
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out.join("/"))
+}
+
+/// The destination's URL scheme, lowercased, or `None` if it carries none.
+///
+/// A URL scheme is `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`. Testing
+/// for a bare ':' would misread `notes:1.md` — a legal filename — as a scheme
+/// and stop rewriting it. Only the FIRST segment can carry one: `a/b:c.md` is
+/// an ordinary relative path.
+///
+/// `resolve_dest` and `link_open` both need this answer, and they must not
+/// disagree: `resolve_dest` decides whether a destination is ours to rewrite,
+/// while `link_open` decides whether it may carry a live `href` at all.
+fn scheme_of(dest: &str) -> Option<String> {
+    let first_seg = dest.split('/').next().unwrap_or(dest);
+    let i = first_seg.find(':')?;
+    let scheme = &first_seg[..i];
+    let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    is_scheme.then(|| scheme.to_ascii_lowercase())
+}
+
+pub fn resolve_dest(dest: &str, from_rel: &str) -> Dest {
+    if dest.is_empty() || dest.starts_with('#') {
+        return Dest::Passthrough;
+    }
+    if dest.starts_with("//") {
+        return Dest::Remote;
+    }
+    if let Some(scheme) = scheme_of(dest) {
+        return match scheme.as_str() {
+            "data" => Dest::Data,
+            "mailto" | "tel" => Dest::Passthrough,
+            _ => Dest::Remote,
+        };
+    }
+    // Query and fragment are not part of the path on disk.
+    let path = dest.split(['?', '#']).next().unwrap_or(dest);
+    let joined = match path.strip_prefix('/') {
+        Some(abs) => abs.to_string(),
+        None => match from_rel.rsplit_once('/') {
+            Some((dir, _)) => format!("{dir}/{path}"),
+            None => path.to_string(),
+        },
+    };
+    match normalize_rel(&joined) {
+        Some(p) => Dest::Local(p),
+        None => Dest::Broken,
+    }
+}
+
+/// The opening tag for a markdown link, by where it points.
+///
+/// Raw HTML is required here rather than rewriting the tag's `dest_url`,
+/// because `data-rel` and `target` are attributes `Tag::Link` cannot carry.
+/// Everything interpolated is escaped; the closing `</a>` comes from
+/// `push_html`'s own handling of `TagEnd::Link`, which runs whether or not the
+/// opening tag was ours.
+/// The only schemes a markdown link may carry a live `href` for.
+///
+/// Deny-by-default, the posture `assets::class_of` and `IMAGE_EXT` already
+/// take. Blacklisting `javascript:` would be the wrong shape: `vbscript:` and
+/// `data:text/html` hand over control the same way, and so will whatever a
+/// browser adds next. Clicking a link in a cloned repo's README runs in the
+/// workspace origin — the origin that drives every terminal websocket — so
+/// anything not on this list renders inert instead.
+///
+/// A `data:` IMAGE is deliberately not held to this: it is self-contained and
+/// renders with no user action, while a link is a click that hands control to
+/// whatever the scheme names.
+const HREF_SCHEMES: &[&str] = &["http", "https", "mailto", "tel"];
+
+/// A markdown link's title (`[t](b.md "my title")`) as an attribute, or
+/// nothing. Every link form that survives keeps it: it is the tooltip the
+/// author wrote, and dropping it silently was a regression from before
+/// `link_open` started building the tag itself.
+fn title_attr(title: &str) -> String {
+    if title.is_empty() {
+        String::new()
+    } else {
+        format!(" title=\"{}\"", esc(title))
+    }
+}
+
+fn link_open(dest: &str, title: &str, from_rel: &str) -> String {
+    // Inert: no href, no data-rel, nothing derived from the destination, so
+    // neither the browser nor the client will follow it.
+    const INERT: &str = "<a class=\"mdbroken\">";
+    let resolved = resolve_dest(dest, from_rel);
+    // Deliberately no href — `wireFileLinks` opens it as a tab, and an href
+    // would race that handler by navigating the workspace away.
+    if let Dest::Local(p) = &resolved {
+        return format!(
+            "<a class=\"mdlink\" data-rel=\"{}\"{}>",
+            esc(p),
+            title_attr(title)
+        );
+    }
+    if let Some(scheme) = scheme_of(dest) {
+        if !HREF_SCHEMES.contains(&scheme.as_str()) {
+            return INERT.to_string();
+        }
+    }
+    match resolved {
+        // Kept, because a link is a deliberate click that shows its target,
+        // unlike an image's automatic fetch. `_blank` stops it replacing the
+        // workspace; `noopener` denies it `window.opener`; `noreferrer` keeps
+        // the workspace URL out of the request.
+        Dest::Remote => format!(
+            "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\"{}>",
+            esc(dest),
+            title_attr(title)
+        ),
+        // `mailto:`, `tel:` and in-page `#anchor`s — the only href-bearing
+        // forms left, since every other scheme was rejected above.
+        Dest::Passthrough => format!("<a href=\"{}\"{}>", esc(dest), title_attr(title)),
+        // `Dest::Data` (already refused by the allowlist, since "data" is not
+        // on it) and `Dest::Broken`. `Dest::Local` returned above.
+        _ => INERT.to_string(),
+    }
+}
+
+pub fn markdown_html(md: &str, project: &str, rel: &str) -> String {
+    use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag, TagEnd};
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    let events = Parser::new_ext(md, opts).map(|ev| match ev {
-        // raw HTML from repo content must never reach the page: render it as text
-        Event::Html(h) => Event::Text(h),
-        Event::InlineHtml(h) => Event::Text(h),
-        other => other,
+    // Set while an image whose Start was dropped is still open, so its End is
+    // dropped too. Images cannot nest, so one flag suffices. Dropping only the
+    // Start would leave push_html emitting a stray `" />` into the document.
+    let mut dropped_image = false;
+    let events = Parser::new_ext(md, opts).filter_map(|ev| match ev {
+        // raw HTML from repo content must never reach the page: render it as
+        // text. This arm and the link arm below match disjoint Event
+        // variants (Html/InlineHtml vs. Start(Tag::Link)), so their relative
+        // order does not matter for correctness. What matters: the
+        // Event::Html this function itself emits below is already built from
+        // escaped values via link_open, so it needs no neutralizing and
+        // nothing downstream re-examines it.
+        Event::Html(h) => Some(Event::Text(h)),
+        Event::InlineHtml(h) => Some(Event::Text(h)),
+
+        Event::Start(Tag::Link { ref dest_url, ref title, .. }) => {
+            Some(Event::Html(CowStr::from(link_open(dest_url, title, rel))))
+        }
+
+        // Rewritten by editing the tag rather than by emitting raw HTML: the
+        // alt text lives in the events BETWEEN Start and End, and only
+        // push_html's own image handling collects them into the attribute.
+        Event::Start(Tag::Image { link_type, dest_url, title, id }) => {
+            match resolve_dest(&dest_url, rel) {
+                Dest::Local(p) => {
+                    let url = format!(
+                        "/frag/{}/raw?path={}",
+                        crate::http::percent_encode(project),
+                        crate::http::percent_encode(&p)
+                    );
+                    Some(Event::Start(Tag::Image {
+                        link_type,
+                        dest_url: CowStr::from(url),
+                        title,
+                        id,
+                    }))
+                }
+                Dest::Data => Some(Event::Start(Tag::Image { link_type, dest_url, title, id })),
+                // Remote, Passthrough, Broken. Dropping the tag leaves the
+                // events between it and its End to render as ordinary inline
+                // markdown — so the fallback is the alt text with its
+                // emphasis intact, and no placeholder markup is needed.
+                _ => {
+                    dropped_image = true;
+                    None
+                }
+            }
+        }
+        Event::End(TagEnd::Image) if dropped_image => {
+            dropped_image = false;
+            None
+        }
+
+        other => Some(other),
     });
     let mut out = String::new();
     html::push_html(&mut out, events);
     format!("<article class=\"markdown-body\">{out}</article>")
 }
 
-pub fn file_fragment(rel: &str, content: &str) -> String {
+pub fn file_fragment(project: &str, rel: &str, content: &str) -> String {
     let ext = rel.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     if ext == "md" || ext == "markdown" {
-        format!("<div class=\"path\">{}</div>{}", esc(rel), markdown_html(content))
+        format!(
+            "<div class=\"path\">{}</div>{}",
+            esc(rel),
+            markdown_html(content, project, rel)
+        )
     } else {
         format!(
             "<div class=\"path\">{}</div><pre class=\"codeview\"><code class=\"language-{}\">{}</code></pre>",
@@ -62,6 +277,19 @@ pub fn file_fragment(rel: &str, content: &str) -> String {
             esc(content)
         )
     }
+}
+
+/// An image opened as a tab. Not `file_fragment`'s business, because that
+/// function's whole contract is that it has already been handed the file's
+/// text — which for an image does not exist.
+pub fn image_fragment(project: &str, rel: &str) -> String {
+    format!(
+        "<div class=\"path\">{}</div><img class=\"imgview\" src=\"/frag/{}/raw?path={}\" alt=\"{}\">",
+        esc(rel),
+        crate::http::percent_encode(project),
+        crate::http::percent_encode(rel),
+        esc(rel)
+    )
 }
 
 // Whole-tree eager rendering (the old design) is what made this slow: a
@@ -558,7 +786,7 @@ mod tests {
 
     #[test]
     fn markdown_renders_wrapped() {
-        let h = markdown_html("# Hi\n\n- a\n");
+        let h = markdown_html("# Hi\n\n- a\n", "proj", "a.md");
         assert!(h.starts_with("<article class=\"markdown-body\">"));
         assert!(h.contains("<h1>Hi</h1>"));
         assert!(h.contains("<li>a</li>"));
@@ -566,7 +794,11 @@ mod tests {
 
     #[test]
     fn markdown_raw_html_is_neutralized() {
-        let h = markdown_html("hello <script>alert(1)</script>\n\n<iframe src=x></iframe>\n");
+        let h = markdown_html(
+            "hello <script>alert(1)</script>\n\n<iframe src=x></iframe>\n",
+            "proj",
+            "a.md",
+        );
         assert!(!h.contains("<script>"));
         assert!(!h.contains("<iframe"));
         assert!(h.contains("&lt;script&gt;"));
@@ -574,11 +806,210 @@ mod tests {
 
     #[test]
     fn file_fragment_md_vs_code() {
-        let md = file_fragment("readme.md", "# T");
+        let md = file_fragment("proj", "readme.md", "# T");
         assert!(md.contains("markdown-body"));
-        let code = file_fragment("main.rs", "fn x() -> Vec<u8> {}");
+        let code = file_fragment("proj", "main.rs", "fn x() -> Vec<u8> {}");
         assert!(code.contains("language-rs"));
         assert!(code.contains("Vec&lt;u8&gt;")); // escaped, hljs runs client-side
+    }
+
+    #[test]
+    fn a_local_link_becomes_a_tab_opening_anchor() {
+        let h = markdown_html("see [the plan](plan.md)\n", "proj", "docs/a.md");
+        assert!(h.contains(r#"<a class="mdlink" data-rel="docs/plan.md">"#), "{h}");
+        assert!(h.contains("the plan</a>"), "the link text must survive: {h}");
+        // No href at all: an href would let a click navigate the SPA away before
+        // the handler ran, which is the bug this fixes.
+        // Verified this assertion can fail: adding `href="{}"` back to the
+        // Dest::Local arm made this panic with the anchor rendered as
+        // `<a href="plan.md" class="mdlink" data-rel="docs/plan.md">` —
+        // i.e. `!h.contains(r#"href="plan.md""#)` failed because the href
+        // was right there.
+        assert!(!h.contains(r#"href="plan.md""#), "{h}");
+        // class="file" would style an inline reference as a tree row (icon,
+        // indent guides, full-width hover). Asserting the absence, because a test
+        // that only greps data-rel passes either way.
+        assert!(!h.contains(r#"class="file""#), "{h}");
+    }
+
+    #[test]
+    fn a_remote_link_survives_but_cannot_replace_the_workspace() {
+        let h = markdown_html("[docs](https://example.com/x)\n", "proj", "a.md");
+        assert!(h.contains(r#"href="https://example.com/x""#), "{h}");
+        assert!(h.contains(r#"target="_blank""#), "{h}");
+        assert!(h.contains(r#"rel="noopener noreferrer""#), "{h}");
+    }
+
+    #[test]
+    fn an_anchor_link_is_left_alone_and_a_broken_one_is_inert() {
+        let h = markdown_html("[top](#top) and [gone](../../../etc/passwd)\n", "proj", "a.md");
+        assert!(h.contains(r##"href="#top""##), "{h}");
+        assert!(h.contains(r#"<a class="mdbroken">"#), "{h}");
+        assert!(!h.contains("etc/passwd"), "a dead reference must not stay clickable: {h}");
+    }
+
+    /// A `javascript:` href in a preview is script execution in the workspace
+    /// origin — the origin that drives every terminal websocket — one click
+    /// after opening a cloned repo's README. The page sends no `script-src`,
+    /// so nothing else would stop it.
+    ///
+    /// Mixed case is asserted because a scheme is case-insensitive to the
+    /// browser: a check that compared the raw string would let `JaVaScRiPt:`
+    /// straight through.
+    ///
+    /// Verified this can fail: with `HREF_SCHEMES` widened to also contain
+    /// "javascript", the first assertion panicked with
+    /// `<a href="javascript:alert(document.domain)" target="_blank"
+    /// rel="noopener noreferrer">click</a>` — the live href right there in the
+    /// output. The mixed-case case failed identically.
+    #[test]
+    fn a_javascript_link_is_inert_in_any_casing() {
+        for md in [
+            "[click](javascript:alert(document.domain))\n",
+            "[click](JaVaScRiPt:alert(document.domain))\n",
+        ] {
+            let h = markdown_html(md, "proj", "a.md");
+            assert!(!h.contains("href="), "no href may survive: {h}");
+            // Not just "no href": the scheme must not reach the page in any
+            // attribute or as text, or a later change that reintroduced it
+            // somewhere else would still pass.
+            assert!(!h.to_ascii_lowercase().contains("javascript"), "{h}");
+            assert!(h.contains(r#"<a class="mdbroken">"#), "{h}");
+            assert!(h.contains("click</a>"), "the link text must survive: {h}");
+        }
+    }
+
+    /// The allowlist is what makes this work: `data:text/html` was never
+    /// spelled out anywhere as dangerous, and a blacklist of `javascript:`
+    /// would have shipped it as a live href.
+    ///
+    /// The `data:` IMAGE assertion belongs in the same test as the `data:`
+    /// LINK one. The asymmetry is deliberate — an image renders with no user
+    /// action and is self-contained, a link is a click that hands control to
+    /// the scheme — and without the image half, a change that made the image
+    /// arm inert too would leave this test green.
+    ///
+    /// Verified this can fail: restoring the pre-fix arm
+    /// `Dest::Data | Dest::Passthrough => format!("<a href=\"{}\">", ...)`
+    /// made the first assertion panic with
+    /// `<a href="data:text/html,&lt;script&gt;alert(1)&lt;/script&gt;">x</a>`.
+    #[test]
+    fn a_data_link_is_inert_but_a_data_image_still_renders() {
+        let h = markdown_html("[x](data:text/html,<script>alert(1)</script>)\n", "proj", "a.md");
+        assert!(!h.contains("href="), "{h}");
+        assert!(h.contains(r#"<a class="mdbroken">"#), "{h}");
+
+        let img = markdown_html("![d](data:image/gif;base64,R0lGOD)\n", "proj", "a.md");
+        assert!(img.contains(r#"src="data:image/gif;base64,R0lGOD""#), "{img}");
+    }
+
+    /// The other side of the allowlist: the schemes that must keep working.
+    #[test]
+    fn allowed_schemes_keep_their_href() {
+        let h = markdown_html("[m](mailto:p@example.com) [t](tel:+15551234)\n", "proj", "a.md");
+        assert!(h.contains(r#"href="mailto:p@example.com""#), "{h}");
+        assert!(h.contains(r#"href="tel:+15551234""#), "{h}");
+
+        let s = markdown_html("[s](https://example.com/x)\n", "proj", "a.md");
+        assert!(s.contains(r#"href="https://example.com/x""#), "{s}");
+        assert!(s.contains(r#"target="_blank""#), "{s}");
+        assert!(s.contains(r#"rel="noopener noreferrer""#), "{s}");
+    }
+
+    /// `link_open` builds its opening tag by hand and hands it to push_html
+    /// as `Event::Html`, which push_html copies out verbatim — so this anchor
+    /// is the one place in the document whose attributes nothing escapes for
+    /// us. A destination or a title carrying a quote would otherwise close the
+    /// attribute and open one the repo author chose.
+    ///
+    /// This replaces `rewriting_links_did_not_reopen_the_raw_html_hole`, whose
+    /// stated reason (reordering the match arms reopens the raw-HTML hole) was
+    /// false — the arms match disjoint Event variants, as markdown_html's own
+    /// comment says — and whose assertions were a strict subset of
+    /// `markdown_raw_html_is_neutralized`'s.
+    ///
+    /// Verified this can fail: dropping the `esc()` around the `data-rel`
+    /// value made the first assertion panic on
+    /// `<a class="mdlink" data-rel="a" onerror="x.md">` — the quote out of the
+    /// filename closing the attribute, and an author-named one opening.
+    /// Dropping it around the title panicked on the title assertion the same
+    /// way.
+    #[test]
+    fn a_hand_built_anchor_escapes_what_it_interpolates() {
+        let h = markdown_html("[x](<a\" onerror=\"x.md>)\n", "proj", "a.md");
+        assert!(h.contains(r#"data-rel="a&quot; onerror=&quot;x.md""#), "{h}");
+
+        let t = markdown_html("[x](b.md \"a\\\" onerror=\\\"y\")\n", "proj", "a.md");
+        assert!(t.contains(r#"title="a&quot; onerror=&quot;y""#), "{t}");
+    }
+
+    /// The titles themselves: `[t](b.md "my title")` rendered `title="my
+    /// title"` before `link_open` started building the tag by hand, and every
+    /// form that survives has to keep doing so.
+    #[test]
+    fn a_link_keeps_its_title() {
+        let l = markdown_html("[t](b.md \"my title\")\n", "proj", "docs/a.md");
+        assert!(l.contains(r#"data-rel="docs/b.md" title="my title""#), "{l}");
+
+        let r = markdown_html("[t](https://e.com/x \"my title\")\n", "proj", "a.md");
+        assert!(r.contains(r#"title="my title""#), "{r}");
+        assert!(r.contains(r#"target="_blank""#), "the title must not displace the rest: {r}");
+
+        let m = markdown_html("[t](mailto:p@example.com \"my title\")\n", "proj", "a.md");
+        assert!(m.contains(r#"title="my title""#), "{m}");
+
+        // A link with no title must not grow an empty attribute.
+        let n = markdown_html("[t](b.md)\n", "proj", "a.md");
+        assert!(!n.contains("title="), "{n}");
+    }
+
+    #[test]
+    fn a_local_image_points_at_the_raw_route() {
+        let h = markdown_html("![a cat](cat.png)\n", "proj", "docs/a.md");
+        assert!(h.contains(r#"src="/frag/proj/raw?path=docs/cat.png""#), "{h}");
+        assert!(h.contains(r#"alt="a cat""#), "{h}");
+    }
+
+    /// Both halves are asserted. "No <img" alone passes if the image vanished
+    /// entirely; "alt text present" alone passes if the <img> is still there with
+    /// its alt attribute.
+    ///
+    /// Verified this can fail: reverting the catch-all image arm to keep
+    /// emitting `Event::Start(Tag::Image { .. })` for Remote/Passthrough/Broken
+    /// made this fail on the first assertion — `!h.contains("<img")` — because
+    /// the tag survived with `src="https://e.com/b.png"` intact.
+    #[test]
+    fn a_remote_image_is_dropped_to_its_alt_text() {
+        let h = markdown_html("text ![a *fancy* cat](https://e.com/b.png) after\n", "proj", "a.md");
+        assert!(!h.contains("<img"), "{h}");
+        assert!(!h.contains("e.com"), "{h}");
+        assert!(h.contains("a <em>fancy</em> cat"), "alt renders as inline markdown: {h}");
+    }
+
+    #[test]
+    fn a_data_image_survives_untouched() {
+        let h = markdown_html("![d](data:image/gif;base64,R0lGOD)\n", "proj", "a.md");
+        assert!(h.contains("src=\"data:image/gif;base64,R0lGOD\""), "{h}");
+    }
+
+    /// CLAUDE.md's defect #1 in miniature: an encoder that leaves `+` alone pairs
+    /// with a decoder that reads `+` as a space, and the file silently "does not
+    /// exist". The round-trip is the only assertion that catches a plausible-
+    /// looking encoder swapped in for `percent_encode`.
+    ///
+    /// Verified this can fail: replacing `crate::http::percent_encode(&p)` with
+    /// `p.replace(' ', "+")` made this fail with a left/right mismatch —
+    /// decoding produced "my notes drafts.png" (the `+` read back as a space)
+    /// instead of the original "my notes+drafts.png".
+    #[test]
+    fn an_image_path_with_a_plus_and_a_space_round_trips() {
+        // Angle brackets are required: CommonMark does not allow a bare space in a
+        // destination, and `![x](my notes+drafts.png)` parses as no image at all —
+        // verified before this plan was written.
+        let h = markdown_html("![x](<my notes+drafts.png>)\n", "proj", "a.md");
+        let start = h.find("path=").unwrap() + "path=".len();
+        let end = h[start..].find('"').unwrap() + start;
+        assert_eq!(crate::http::percent_decode(&h[start..end]), "my notes+drafts.png");
     }
 
     #[test]
@@ -1162,5 +1593,51 @@ mod tests {
         assert_eq!(human_age(3600), "1h");
         assert_eq!(human_age(86399), "23h");
         assert_eq!(human_age(86400), "1d");
+    }
+
+    #[test]
+    fn resolve_dest_classifies_every_destination_shape() {
+        use Dest::*;
+        // Relative resolves against the *file's* directory, which is the whole bug.
+        assert_eq!(resolve_dest("cat.png", "docs/a.md"), Local("docs/cat.png".into()));
+        assert_eq!(resolve_dest("../img/x.png", "docs/a.md"), Local("img/x.png".into()));
+        assert_eq!(resolve_dest("./b.md", "docs/a.md"), Local("docs/b.md".into()));
+        // A file at the root has no directory to prepend.
+        assert_eq!(resolve_dest("b.md", "a.md"), Local("b.md".into()));
+        // Absolute means project-root-relative, which is what repo authors mean.
+        assert_eq!(resolve_dest("/x.png", "docs/a.md"), Local("x.png".into()));
+        // Query and fragment are not part of the path.
+        assert_eq!(resolve_dest("b.md#heading", "a.md"), Local("b.md".into()));
+
+        assert_eq!(resolve_dest("https://e.com/x.png", "a.md"), Remote);
+        assert_eq!(resolve_dest("http://e.com/x.png", "a.md"), Remote);
+        assert_eq!(resolve_dest("//e.com/x.png", "a.md"), Remote);
+        assert_eq!(resolve_dest("data:image/svg+xml,%3Csvg/%3E", "a.md"), Data);
+        assert_eq!(resolve_dest("mailto:p@example.com", "a.md"), Passthrough);
+        assert_eq!(resolve_dest("#section", "a.md"), Passthrough);
+        assert_eq!(resolve_dest("", "a.md"), Passthrough);
+
+        // Escaping the project is a broken reference, not a path to follow.
+        assert_eq!(resolve_dest("../../../etc/passwd", "docs/a.md"), Broken);
+        assert_eq!(resolve_dest("..", "a.md"), Broken);
+    }
+
+    /// `find(':')` alone would classify `a/b:c.md` — a colon in a LATER segment,
+    /// which is a perfectly ordinary relative path — as a scheme and stop
+    /// rewriting it. A colon in the FIRST segment is genuinely ambiguous, and
+    /// resolves as a scheme here for the same reason a browser resolves it that
+    /// way: a Remote or Passthrough destination is handed to the browser verbatim,
+    /// so our classification has to agree with the browser's or the two disagree
+    /// about the same string. `./` is the standard escape hatch.
+    ///
+    /// Revert-the-fix check: replacing the scheme guard with a bare
+    /// `dest.contains(':')` made this fail with
+    /// `left: Remote, right: Local("notes/v:1.md")` on the first assertion —
+    /// the colon in the second path segment was misread as a scheme.
+    #[test]
+    fn a_colon_is_a_scheme_only_where_a_browser_would_read_one() {
+        assert_eq!(resolve_dest("notes/v:1.md", "a.md"), Dest::Local("notes/v:1.md".into()));
+        assert_eq!(resolve_dest("./notes:1.md", "a.md"), Dest::Local("notes:1.md".into()));
+        assert_eq!(resolve_dest("notes:1.md", "a.md"), Dest::Remote);
     }
 }
