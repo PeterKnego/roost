@@ -165,6 +165,17 @@ the four traps that make a browser test pass while asserting nothing.
   been reported that was never created.
 - After deploying, confirm the *running* binary changed — `cargo build` alone
   updates neither path the service uses (see `docs/deploy.md`).
+- **Build from one checkout.** This host points every cargo workspace at a
+  single shared `target-dir`, and `build.rs` bakes *absolute* asset paths into
+  its generated table. A `cargo build` from a second checkout of this repo — a
+  git worktree, say — therefore rewrites that table with the other checkout's
+  paths and leaves the shared binary built from the other checkout's source.
+  Nothing announces this: cargo reports `Fresh resh`, the browser tests go on
+  passing, and they are testing the wrong tree. Recover with
+  `cargo clean -p resh`, and confirm with
+  `grep -o '/home/[^\"]*static' $(cargo metadata --format-version 1 --no-deps |
+  python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/build/resh-*/out/assets_table.rs | head -1`.
+  To compare against another branch, check it out in *this* directory.
 - Check which branch the deploy host is on. `git pull --ff-only` will report
   "Already up to date" while sitting on a stale feature branch.
 
