@@ -910,15 +910,46 @@ function mountEditor(content, rel) {
     clearTimeout(timer);
     timer = setTimeout(() => send({ t: "EditBuffer", rel, text: ta.value }), 200);
   };
-  ta.onkeydown = (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "s") {
-      e.preventDefault();
-      send({ t: "EditBuffer", rel, text: ta.value });
-      send({ t: "SaveBuffer", rel, force: false });
-    }
-  };
   content.appendChild(ta);
 }
+
+/// Which file a save keystroke means. The focused textarea when there is one,
+/// and otherwise the file the workspace is actually showing — MIDDLE then
+/// RIGHT, the only two panes that hold file tabs (see MOVE_BETWEEN).
+///
+/// Returns null when nothing editable is open, which is the signal to leave
+/// the keystroke to the browser rather than swallow it.
+function saveTarget() {
+  const el = document.activeElement;
+  if (el && el.classList && el.classList.contains("editor")) {
+    for (const [rel, ta] of editors) if (ta === el) return rel;
+  }
+  for (const p of [MIDDLE, RIGHT]) {
+    const pane = state && state.panes && state.panes[p];
+    const tab = pane && pane.tabs[pane.active];
+    if (tab && tab.k === "File" && tab.mode === "Edit" && editors.has(tab.rel)) return tab.rel;
+  }
+  return null;
+}
+
+// Bound on the document, not on the textarea: Cmd/Ctrl-S belongs to the
+// browser unless something takes it, so an editor that is merely *open* —
+// rather than focused — used to lose the keystroke to Chrome's own save
+// dialog. That is not an edge case here: every reconnect and every deploy
+// reloads the page and leaves focus on the body, so the first save after one
+// silently left the app. Reported twice.
+document.addEventListener("keydown", (e) => {
+  if (e.altKey || !(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "s") return;
+  const rel = saveTarget();
+  if (rel === null) return;
+  e.preventDefault();
+  // The 200ms input debounce may still be pending, so push the text this
+  // save is meant to write before asking for the write — otherwise a save
+  // typed quickly enough saves the *previous* keystroke's text.
+  const ta = editors.get(rel);
+  if (ta) send({ t: "EditBuffer", rel, text: ta.value });
+  send({ t: "SaveBuffer", rel, force: false });
+});
 
 function showConflict(ev) {
   const box = document.createElement("div");

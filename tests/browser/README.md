@@ -21,6 +21,7 @@ deno run -A tests/browser/dotfiles.mjs    # the tree pane's dotfile toggle
 deno run -A tests/browser/altscreen.mjs  # a full-screen app's screen survives an attachment
 deno run -A tests/browser/modes.mjs      # and so do the modes it declared once
 deno run -A tests/browser/copyselect.mjs # selecting copies, and OSC 52 copies too
+deno run -A tests/browser/save.mjs       # cmd/ctrl-s saves whether or not the editor has focus
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -69,6 +70,10 @@ performed.
 - Deleting the `refreshTree()` call app.js makes when a State flips
   `show_hidden` fails 4 assertions in `dotfiles.mjs`; pinning its glyph to a
   constant fails 3.
+- Rebinding the save shortcut to the textarea (`ta.onkeydown`, its shape before
+  the document-level handler) fails 2 assertions in `save.mjs` — both unfocused
+  cases time out with the file unchanged on disk — while the focused case goes
+  on passing, which is what says the test is testing focus and not saving.
 - Disabling the `raw` fragment route (`src/routes.rs`) fails the naturalWidth
   assertions in `mdlinks.mjs` (`naturalWidth === 0`, not DOM presence);
   restoring `if (t.k === "File")`'s dropped `!isImage(t.rel)` fails the
