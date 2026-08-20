@@ -33,7 +33,15 @@ These are load-bearing. Breaking one is a defect, not a style choice.
 - **No panics may escape a socket or watcher thread.**
 - **Destruction requires positive evidence.** See below — this is the constraint
   this codebase breaks most often.
-- Caps: ≤16 sessions per project, ≤50 open buffers, 1 MB scrollback, 2 MB file
+- **A replay is not a byte log.** An attaching client is sent
+  `screen::Screens::replay()`, not the raw ring. A full-screen app declares the
+  alternate screen exactly once, so that declaration ages out of any bounded
+  log and is tracked and re-emitted at attach time instead. Anything that
+  changes what the pump stores has to keep that property, or exiting Claude
+  paints over its own leftover frame again.
+- Caps: ≤16 sessions per project, ≤50 open buffers, 1 MB scrollback *per screen
+  buffer* (normal and alternate are kept apart, so an app cannot evict the
+  scrollback it hands back), 2 MB file
   cap for reads *and* buffer writes. Uploads are bounded per **request**, not
   per file: ≤16 parts and `config::max_upload_bytes` (100 MB default, global
   config or `RESH_MAX_UPLOAD` only — never per-project, or a cloned repo could

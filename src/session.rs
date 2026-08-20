@@ -1,13 +1,12 @@
 //! Terminal session registry. resh owns the PTY; dtach owns survival
 //! across a resh restart. Multiple attachments to one session mirror.
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const MAX_SCROLLBACK: usize = 1_000_000;
 pub const MAX_SESSIONS_PER_PROJECT: usize = 16;
 // Bound on queued-but-unread chunks per subscriber. A client that falls this
 // far behind its own terminal (frozen tab, dead socket the kernel hasn't
@@ -80,13 +79,6 @@ pub fn min_geometry(sizes: &HashMap<u64, (u16, u16)>) -> Option<(u16, u16)> {
     Some((cols, rows))
 }
 
-pub fn push_scrollback(ring: &mut VecDeque<u8>, data: &[u8]) {
-    ring.extend(data.iter().copied());
-    while ring.len() > MAX_SCROLLBACK {
-        ring.pop_front();
-    }
-}
-
 struct Session {
     // Arc<Mutex<..>> rather than a bare writer: write_input must be able to
     // release the *registry* lock before doing a blocking write to the
@@ -99,7 +91,11 @@ struct Session {
     // does that). 0 is a legitimate "unknown" sentinel, not a real pid, so
     // callers must treat a 0 age as "unknown" rather than "brand new".
     child_pid: u32,
-    scrollback: VecDeque<u8>,
+    /// Output, filed under the screen it was written on, plus which screen
+    /// that is. Not a plain byte log: a client attaching mid-app has to be
+    /// told which buffer the frames belong in, and the app said so once,
+    /// hours ago. See `screen`.
+    screens: crate::screen::Screens,
     subs: HashMap<u64, SyncSender<Vec<u8>>>,
     sizes: HashMap<u64, (u16, u16)>,
     next_id: u64,
@@ -118,7 +114,9 @@ fn sessions() -> &'static Mutex<HashMap<String, Session>> {
 }
 
 /// Attach to a session, creating it if needed. The new subscriber is sent the
-/// scrollback immediately so a reconnecting browser sees where it was.
+/// session's screen immediately — its scrollback, and the switch that says
+/// which buffer a running full-screen app is painting on — so a reconnecting
+/// browser sees where it was rather than a log it cannot place.
 ///
 /// Locking discipline: the registry mutex is held only for the short,
 /// non-blocking bookkeeping steps (map lookups, inserting a new Session,
@@ -213,7 +211,7 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                 master: pair.master,
                 child,
                 child_pid,
-                scrollback: VecDeque::new(),
+                screens: crate::screen::Screens::new(),
                 subs: HashMap::new(),
                 sizes: HashMap::new(),
                 next_id: 0,
@@ -228,6 +226,7 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
             // no lock at all, and a sequence split across two reads still
             // parses.
             let mut osc = crate::osc::Parser::new();
+            let mut screen = crate::screen::Scanner::new();
             loop {
                 // The blocking read happens with the lock released: only the
                 // fan-out after a chunk arrives needs the registry.
@@ -240,11 +239,14 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                         // across that would invert a lock order and risk the
                         // deadlock this project has already shipped once.
                         let notices = osc.feed(&buf[..n]);
+                        let switches = screen.feed(&buf[..n]);
                         {
                             let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
                             let Some(s) = map.get_mut(&pump_key) else { break };
-                            push_scrollback(&mut s.scrollback, &buf[..n]);
-                            let chunk = buf[..n].to_vec();
+                            // What goes out is what `ingest` returns, not the
+                            // raw read: it is the same bytes except for the
+                            // one case it has to reconcile (see its doc).
+                            let chunk = s.screens.ingest(&buf[..n], &switches);
                             // try_send, not send: a subscriber whose queue is
                             // full (frozen tab, dead socket) is dropped rather
                             // than backing up the whole fan-out (I4).
@@ -269,7 +271,7 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
     s.next_id += 1;
     let id = s.next_id;
     let (tx, rx) = sync_channel(SUB_CHANNEL_CAP);
-    let replay: Vec<u8> = s.scrollback.iter().copied().collect();
+    let replay = s.screens.replay();
     if !replay.is_empty() {
         let _ = tx.try_send(replay);
     }
@@ -697,15 +699,6 @@ mod tests {
         sizes.insert(3u64, (120u16, 50u16));
         assert_eq!(min_geometry(&sizes), Some((80, 24)), "nobody may see clipped output");
         assert_eq!(min_geometry(&HashMap::new()), None);
-    }
-
-    #[test]
-    fn scrollback_ring_is_bounded() {
-        let mut ring = VecDeque::new();
-        for _ in 0..(MAX_SCROLLBACK / 10 + 100) {
-            push_scrollback(&mut ring, &[b'x'; 10]);
-        }
-        assert!(ring.len() <= MAX_SCROLLBACK);
     }
 
     #[test]
