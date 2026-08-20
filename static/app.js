@@ -728,7 +728,61 @@ function ensureTerm(session) {
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(node);
-  const entry = { node, term, fit, sock: null, tries: 0, timer: null, attached: false, gone: false };
+  const entry = { node, term, fit, sock: null, tries: 0, timer: null, attached: false, gone: false,
+                  selTimer: null, flashTimer: null };
+  // Copy on select. xterm's rows are `user-select: none`, so a browser
+  // selection over terminal text is impossible and xterm's own selection is
+  // the only route to the clipboard — reached, until now, only by the
+  // browser's own copy command (Cmd+C, right-click → Copy). A full-screen app
+  // takes that away the moment it turns on mouse reporting: the right button
+  // goes to the app, context menu and all. Selecting in a terminal running
+  // Claude Code therefore copied nothing, silently, and the next paste
+  // inserted whatever the clipboard still held from before — an image, if that
+  // is what was last copied, which resh's own paste route then dutifully typed
+  // into the app.
+  //
+  // Debounced because onSelectionChange fires continuously while a drag grows;
+  // only where it settles is worth writing to the clipboard.
+  term.onSelectionChange(() => {
+    clearTimeout(entry.selTimer);
+    entry.selTimer = setTimeout(() => copySelection(entry), 200);
+  });
+  // OSC 52 is how an application copies on the user's behalf, and it is the
+  // half of copying that a selection handler cannot reach: when a full-screen
+  // app owns the mouse, the drag never reaches xterm at all, so the app makes
+  // the selection itself and sends the text out as `ESC ] 52 ; c ; <base64>`.
+  // Claude Code does exactly this — it even says "sent 13 chars via OSC 52" —
+  // and xterm.js registers no handler for 52, so until now those bytes went
+  // nowhere and the clipboard silently kept whatever it held.
+  //
+  // Writes only. The query form (`ESC ] 52 ; c ; ?`) asks the terminal to send
+  // the clipboard *back* to the application, which would let anything with a
+  // shell — or any file someone cats — read what the user last copied. There
+  // is no version of that this wants.
+  term.parser.registerOscHandler(52, (payload) => {
+    const body = payload.slice(payload.indexOf(";") + 1);
+    // Refused explicitly rather than left to fall through the base64 decode
+    // below, which would also reject it. Something this consequential should
+    // be unmistakable at the point a reader looks for it.
+    if (body === "?") return true;
+    if (body.length > MAX_OSC52_B64) {
+      termFlash(entry, "copy too large");
+      return true;
+    }
+    let text;
+    try {
+      text = new TextDecoder().decode(Uint8Array.from(atob(body), (c) => c.charCodeAt(0)));
+    } catch {
+      return true; // not base64: not ours to guess at
+    }
+    if (!text) return true;
+    if (!navigator.clipboard) { termFlash(entry, "copy needs https"); return true; }
+    navigator.clipboard.writeText(text).then(
+      () => termFlash(entry, `copied ${text.length}`),
+      () => termFlash(entry, "copy blocked"),
+    );
+    return true;
+  });
   term.onData((d) => {
     // Reads entry.sock rather than closing over one socket: a reconnect
     // swaps it, and a closure over the original would spend the rest of the
@@ -788,6 +842,37 @@ function connectTerm(entry, session) {
     const wait = Math.min(500 * 2 ** entry.tries++, 8000);
     entry.timer = setTimeout(() => connectTerm(entry, session), wait);
   };
+}
+
+// A clipboard write is the one thing terminal *output* can do to the machine
+// outside the terminal, so it is bounded like everything else that is fed
+// attacker-influenced bytes. 100 KB of base64 is far more than any copy a
+// person makes and far less than a payload worth worrying about.
+const MAX_OSC52_B64 = 100_000;
+
+function copySelection(entry) {
+  const text = entry.term.getSelection();
+  if (!text) return; // clearing a selection must never clobber the clipboard
+  // `navigator.clipboard` exists only in a secure context, so a tailnet IP
+  // over plain http has none. That has to become a message rather than an
+  // exception thrown inside a selection handler.
+  if (!navigator.clipboard) return termFlash(entry, "copy needs https");
+  navigator.clipboard.writeText(text).then(
+    () => termFlash(entry, `copied ${text.length}`),
+    () => termFlash(entry, "copy blocked"),
+  );
+}
+
+// Feedback is not decoration here. A copy that silently does nothing is the
+// exact failure copy-on-select was added to fix, and the clipboard is
+// invisible — so every outcome says which one it was, including the failures.
+function termFlash(entry, text) {
+  const el = entry.node;
+  el.removeAttribute("data-flash");
+  void el.offsetWidth; // restart the fade rather than let the old one finish
+  el.dataset.flash = text;
+  clearTimeout(entry.flashTimer);
+  entry.flashTimer = setTimeout(() => el.removeAttribute("data-flash"), 1600);
 }
 
 // Without this a disconnected terminal looks exactly like a live idle one —
