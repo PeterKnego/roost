@@ -219,6 +219,29 @@ feature list — is what a spec for this needs to resolve.
   exactly the kind of thing per-process visibility surfaces. That is an argument
   for the feature, though not one the original entry made.
 
+- Persisting a session's mode table across a resh restart — the one case
+  `2026-08-20-sticky-modes-design.md` deliberately does not fix. Modes are
+  tracked in memory (`screen::Screens`), so a restart leaves an already-running
+  full-screen app holding a contract the new process never saw, and the app
+  never repeats itself: a `SIGWINCH` repaint re-declares nothing (measured —
+  `?1049h` after a winch: 0). The spec rejects persistence for the *screen*
+  bit, and that rejection stands: a stale "on the alternate screen" marker
+  leaves a blank buffer with the shell's output going somewhere invisible.
+  Modes are the cheap half — a wrongly-asserted mouse mode shows up as visible
+  junk on the command line and clears on the next Ctrl-C — which is the whole
+  argument for treating them differently.
+  **Evidence (2026-08-20): this fires on every deploy, and today there were
+  nine.** `journalctl --user -u resh` records 9 restarts today, and **4 of the
+  7** live sessions on this host are running Claude Code right now — so each
+  restart desynchronised four terminals. Measured after one: a reattached
+  browser reads `bracketedPaste: false, mouse: "none", focus: false`, and a
+  paste goes on the wire as `"one\rtwo"` rather than
+  `"\e[200~one\rtwo\e[201~"`, so a pasted three-line prompt submits its first
+  line on its own. **A page reload does not fix it** — a reload is the same
+  attach, replaying a table that is empty. Restarting the app does, and Claude
+  re-asserts its *mouse* modes on interaction so that half tends to heal by
+  itself; `?2004h` it emits once at startup only, so paste does not.
+
 ## Git
 
 - Enforcing project == git repo more strongly than the current soft gate
