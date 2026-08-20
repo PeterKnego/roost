@@ -44,12 +44,29 @@ when they're actually picked up.
   the pane it belongs to rather than floating over the layout
   (`docs/superpowers/specs/2026-08-19-file-upload-design.md`).
 - Heading anchors in markdown preview. `#section` links are inert because
-  pulldown-cmark emits no heading ids, and this was the stated non-goal of the
-  preview-links work — a README's table of contents is the single most common
-  thing a markdown link points at, so it is the obvious next request now that
-  links work at all. Needs slug generation, reconciliation with ids already on
-  the workspace page, and a decision about what a hash does to the URL of a
-  single-page app (`2026-08-19-preview-links-and-images-design.md`).
+  pulldown-cmark emits no heading ids, so a link to a heading in the same
+  document lands on nothing. The stated non-goal of the preview-links work
+  (`2026-08-19-preview-links-and-images-design.md`).
+
+  **Real but unused here — do not prioritise it on the strength of the
+  argument it was first filed with.** That argument was "a README's table of
+  contents is the most common thing a markdown link points at, so this is the
+  obvious next request", which reasoned from how markdown is used in general
+  rather than from this corpus. Surveyed 2026-08-20: **0 of 137 markdown files
+  under `/home/claude/projects` contain a single `](#anchor)` link**, and the
+  only match anywhere in this repo is a test fixture inside the
+  preview-links plan. Every link that does appear in these docs is
+  file-to-file, and those work now.
+
+  If it is ever picked up, three things need deciding, none obvious: slug
+  generation must match GitHub's algorithm or links copied out of a
+  GitHub-rendered doc will not resolve; generated ids must not collide with
+  the workspace page's own (a heading called "Content" would collide with the
+  pane's `#content`), since the preview is a fragment injected into a live
+  page rather than a document of its own; and letting a fragment link change
+  `location.hash` interacts with a single-page app whose URL already encodes
+  the project.
+
 - Notification centre on the picker page (`/`) as well as the workspace
   page — the notice store is already global, only the markup is missing
   (`2026-08-17-deadlight-notifications-design.md`).
