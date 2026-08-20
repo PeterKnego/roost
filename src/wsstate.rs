@@ -29,6 +29,24 @@ struct PaneDisk {
 struct BufferDisk {
     text: String,
     dirty: bool,
+    /// What this buffer's text was based on when it was opened — the one
+    /// piece of buffer state that genuinely cannot be recomputed on load.
+    /// For a dirty buffer `text` is the user's unsaved edit, so hashing it
+    /// invents a base the edit was never made against, and every save then
+    /// conflicts against content nobody wrote. That wedges the file for
+    /// good: the save never lands, so the buffer stays dirty and is
+    /// persisted again next time.
+    ///
+    /// Trusting a number out of the state file is not the exception to this
+    /// module's "recompute derived fields" rule, because it is not derived:
+    /// it is a fact about the past, exactly like `text` and `dirty`, which
+    /// come from the same file. A wrong value's failure mode is a mismatch,
+    /// which is a conflict — the safe direction, and one the banner's
+    /// overwrite can be forced past.
+    ///
+    /// `Option` so every state file written before this existed still loads.
+    #[serde(default)]
+    base_hash: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,7 +103,16 @@ pub fn save(project: &str, w: &Workspace) -> Result<(), String> {
         buffers: w
             .buffers
             .iter()
-            .map(|(k, b)| (k.clone(), BufferDisk { text: b.text.clone(), dirty: b.dirty }))
+            .map(|(k, b)| {
+                (
+                    k.clone(),
+                    BufferDisk {
+                        text: b.text.clone(),
+                        dirty: b.dirty,
+                        base_hash: Some(b.base_hash),
+                    },
+                )
+            })
             .collect(),
     };
     let json = serde_json::to_string(&disk).map_err(|e| e.to_string())?;
@@ -159,7 +186,15 @@ pub fn load(project: &str) -> (Workspace, Option<String>) {
                     w.buffers.insert(
                         k,
                         Buffer {
-                            base_hash: crate::workspace::hash_text(&b.text),
+                            // Falling back to the text's own hash is only
+                            // right for a clean buffer, whose text *is* what
+                            // was on disk; it is what pre-`base_hash` files
+                            // leave us with, and for a dirty one it means a
+                            // conflict the user has to force past rather
+                            // than a silent overwrite of whatever is there.
+                            base_hash: b
+                                .base_hash
+                                .unwrap_or_else(|| crate::workspace::hash_text(&b.text)),
                             text: b.text,
                             dirty: b.dirty,
                             ..Buffer::default()
@@ -258,6 +293,77 @@ mod tests {
             assert_eq!(got.panes[proto::MIDDLE as usize].tabs.len(), 1);
             assert_eq!(got.buffers["a.rs"].text, "unsaved", "unsaved text is crash-safe");
             assert!(got.buffers["a.rs"].dirty);
+        });
+    }
+
+    /// A dirty buffer's `base_hash` is the one thing in a state file that
+    /// cannot be recomputed from the rest of it: its `text` is the user's
+    /// unsaved edit, not what is on disk, so hashing the text manufactures a
+    /// base the edit was never made against and `fileops::save` then reports
+    /// a conflict against content nobody edited. Hence it is written down.
+    ///
+    /// Both halves matter. The first says the real base survives; the second
+    /// is what fails when it is recomputed from the text instead, which is
+    /// exactly the shipped bug.
+    #[test]
+    fn a_dirty_buffer_keeps_the_base_it_was_edited_from() {
+        with_state_dir(|| {
+            let mut w = Workspace::default_layout();
+            w.buffers.insert(
+                "a.rs".into(),
+                Buffer {
+                    text: "mine".into(),
+                    dirty: true,
+                    base_hash: crate::workspace::hash_text("on disk"),
+                    ..Buffer::default()
+                },
+            );
+            save("base_probe", &w).unwrap();
+
+            let (got, _) = load("base_probe");
+            assert_eq!(
+                got.buffers["a.rs"].base_hash,
+                crate::workspace::hash_text("on disk"),
+                "the base a save is checked against must survive the round trip"
+            );
+            assert_ne!(
+                got.buffers["a.rs"].base_hash,
+                crate::workspace::hash_text("mine"),
+                "hashing the buffer's own text is the bug: it makes every save conflict"
+            );
+        });
+    }
+
+    /// Every state file written before the base was recorded lacks the key,
+    /// including the one sitting in a user's state dir at upgrade time. Those
+    /// must still load — falling back to the old behaviour, which is right
+    /// for a clean buffer (its text *is* the disk) and merely leaves a dirty
+    /// one reporting a conflict it can be forced past, as it did before.
+    #[test]
+    fn a_state_file_written_before_base_hash_still_loads() {
+        with_state_dir(|| {
+            let mut w = Workspace::default_layout();
+            w.buffers.insert(
+                "a.rs".into(),
+                Buffer { text: "saved".into(), base_hash: 999, ..Buffer::default() },
+            );
+            save("old_base_probe", &w).unwrap();
+            let text = std::fs::read_to_string(path_for("old_base_probe")).unwrap();
+            assert!(text.contains("base_hash"), "the key must be written at all");
+
+            // Strip it back out, the way an older resh would have left it.
+            let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            json["buffers"]["a.rs"].as_object_mut().unwrap().remove("base_hash");
+            std::fs::write(path_for("old_base_probe"), json.to_string()).unwrap();
+
+            let (got, warn) = load("old_base_probe");
+            assert!(warn.is_none(), "an old file is not a corrupt one");
+            assert_eq!(got.buffers["a.rs"].text, "saved", "the rest of it still loaded");
+            assert_eq!(
+                got.buffers["a.rs"].base_hash,
+                crate::workspace::hash_text("saved"),
+                "with nothing recorded, the text is the best available base"
+            );
         });
     }
 

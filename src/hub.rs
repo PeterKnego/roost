@@ -1066,6 +1066,59 @@ mod tests {
         );
     }
 
+    /// Regression for the bug reported live: a buffer with unsaved text came
+    /// back from the state file with `base_hash` recomputed from *its own
+    /// text*, so the save path compared the disk against the user's edit
+    /// instead of against the content that edit was based on. Every save then
+    /// reported a conflict, the file was never written, and the still-dirty
+    /// buffer was persisted again — wedging that file permanently: the user
+    /// saw their edits survive restarts while the file on disk never changed.
+    ///
+    /// The disk is deliberately left untouched across the restart here: with
+    /// nothing having changed, a save has nothing to conflict *with*, so a
+    /// conflict can only come from a manufactured base.
+    #[test]
+    fn a_dirty_buffer_still_saves_after_a_restart() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.txt"), "on disk\n").unwrap();
+
+        let mut h = Hub::new("restart_probe", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "a.txt".into(), mode: Mode::Edit },
+            },
+        );
+        h.handle(&c, Intent::EditBuffer { rel: "a.txt".into(), text: "mine\n".into() });
+        assert!(h.ws.buffers["a.txt"].dirty, "the edit must have landed as unsaved text");
+        drop(rx);
+        drop(h);
+
+        // The restart. Same project name and state dir, so this is the same
+        // workspace coming back off disk.
+        let mut h2 = Hub::new("restart_probe", d.path().to_path_buf());
+        let (c2, rx2) = h2.subscribe();
+        drain(&rx2);
+        assert_eq!(h2.ws.buffers["a.txt"].text, "mine\n", "unsaved text is crash-safe");
+        assert_eq!(
+            h2.ws.buffers["a.txt"].base_hash,
+            workspace::hash_text("on disk\n"),
+            "the restored base must be what the edit was made against, not the edit itself"
+        );
+
+        h2.handle(&c2, Intent::SaveBuffer { rel: "a.txt".into(), force: false });
+        let msgs = drain(&rx2);
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"SaveOk""#)),
+            "an untouched disk cannot conflict with anything; got {msgs:?}"
+        );
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "mine\n");
+    }
+
     #[test]
     fn set_mode_edit_reads_the_file_so_the_first_save_does_not_conflict() {
         // Regression for the bug reported live: switching to Edit used to
