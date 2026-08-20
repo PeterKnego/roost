@@ -5,6 +5,17 @@ across resh's specs and plans. This is not a commitment or a roadmap —
 just everywhere "later" was said, gathered so it's findable. Pull items out
 when they're actually picked up.
 
+**Measured vs assumed.** Most entries arrived here as a spec's "nice-to-have"
+with no stated reason, which means their *demand* was never established — only
+that someone once imagined the feature. An entry that overstates its own demand
+is worse than no entry, because it spends attention and nothing in the text
+tells you which claims were checked. Entries carrying an **Evidence** line were
+measured against this host on the date given; entries without one have not
+been, and should be read as "someone wanted this once", not as a signal.
+
+Some things are not measurable from here at all, and say so. That is a third
+answer, not a quiet vote for "unused".
+
 ## UI / UX
 
 - Split terminal/viewer layout — listed as a v2 nice-to-have ("post-v1, only
@@ -13,11 +24,24 @@ when they're actually picked up.
 - Git log view — nice-to-have in both the v2 and v3 specs; no stated reason,
   just unprioritized (`2026-08-16-deadlight-v2-design.md`,
   `2026-08-16-deadlight-v3-workspace-design.md`).
+  **Evidence (2026-08-20): none either way.** `gitio.rs` has no log function, so
+  nothing is half-built; Changes and Diff tabs already cover the "what did I
+  just do" case a log view is usually reached for. Demand unmeasured.
 - Mobile layout — nice-to-have in both the v2 and v3 specs, no stated reason
   (`2026-08-16-deadlight-v2-design.md`, `2026-08-16-deadlight-v3-workspace-design.md`).
+  **Evidence (2026-08-20): unmeasurable, not unused.** resh never reads
+  `User-Agent` anywhere in `src/`, and nothing logs it, so this host cannot say
+  whether anyone has ever opened the workspace on a phone. Establishing demand
+  would mean adding that logging first — which is itself a decision.
 - Per-theme favicon — nice-to-have in both the v2 and v3 specs, no stated
   reason (`2026-08-16-deadlight-v2-design.md`,
   `2026-08-16-deadlight-v3-workspace-design.md`).
+  **Evidence (2026-08-20): the feature it decorates is itself unused.** Five
+  themes ship (`darcula`, `dark`, `gruvbox`, `light`, `solarized-dark`), but
+  there are **0 user themes** in `~/.config/resh/static/themes/`, **0 project
+  themes** in any `.resh/theme/`, and no `theme =` set in the global config —
+  so every window is on the default. A favicon that varies by theme has nothing
+  to vary with yet.
 - Images in markdown preview — **shipped**, see
   `2026-08-19-preview-links-and-images-design.md`. Grew in scope on the way:
   the same missing piece (no route served raw project bytes) was also why a
@@ -34,6 +58,12 @@ when they're actually picked up.
   archive extraction, download/drag-out and a host clipboard bridge are the
   recorded non-goals; scratch retention (nothing prunes `state_dir()/pasted/`)
   and the 16-part limit are the questions left open.
+  **Evidence (2026-08-20): both open questions are unexercised.**
+  `state_dir()/pasted/` **does not exist** in either the deployed or the dev
+  state directory — no image has ever been pasted into a terminal on this host,
+  so the unpruned-scratch worry has accumulated exactly nothing. The 16-part
+  request limit has likewise never been approached. Real questions, zero
+  pressure.
 - **Redesign the transient message UI.** Upload errors and the upload progress
   indicator both borrow `showBanner`'s `.conflict` styling, which was designed
   for the save-conflict box and is wrong here: ugly, and positioned where a
@@ -43,6 +73,9 @@ when they're actually picked up.
   currently rendered as one, and progress in particular should probably sit in
   the pane it belongs to rather than floating over the layout
   (`docs/superpowers/specs/2026-08-19-file-upload-design.md`).
+  **Evidence: provenance, which is the strongest kind in this file.** This is
+  the only UI/UX entry that came from someone hitting it in real use rather
+  than from a spec's nice-to-have list. Nothing further to measure.
 - Heading anchors in markdown preview. `#section` links are inert because
   pulldown-cmark emits no heading ids, so a link to a heading in the same
   document lands on nothing. The stated non-goal of the preview-links work
@@ -70,16 +103,28 @@ when they're actually picked up.
 - Notification centre on the picker page (`/`) as well as the workspace
   page — the notice store is already global, only the markup is missing
   (`2026-08-17-deadlight-notifications-design.md`).
+  **Evidence (2026-08-20): the notification feature has never stored a notice.**
+  `notifications.json` **does not exist** in `~/.local/state/resh/` or in the
+  dev state dir. This applies to the next three entries as well — the picker
+  centre, per-project mute and quiet hours, Web Push, and a relay sink are four
+  entries resting on a feature with no recorded use on this host. Web Push in
+  particular is the most expensive item in this file (VAPID signing, payload
+  encryption, subscription storage); it should not be reached for until
+  something is actually publishing notices worth chasing to a phone.
 - Per-project notification mute and a quiet-hours window — deferred out of
   v1 alongside sound (`2026-08-17-deadlight-notifications-design.md`).
+  **Evidence: see the notice-store finding above** — nothing to mute yet.
 - Web Push for notifications. The service worker gains a `push` handler; the
   server gains VAPID signing, payload encryption, and subscription storage —
   the step that reaches a phone with no tab open, and the reason the client
   already uses a service worker
   (`2026-08-17-deadlight-notifications-design.md`).
+  **Evidence: see the notice-store finding above.** The most expensive item in
+  this file, resting on a feature with no recorded use.
 - A relay sink (ntfy/Pushover) for notifications: a configured webhook POSTed
   on publish, a cheaper route to a phone than Web Push at the cost of a third
   party and a token to store (`2026-08-17-deadlight-notifications-design.md`).
+  **Evidence: see the notice-store finding above.**
 
 ## Editing
 
@@ -109,6 +154,13 @@ value, a line to delete. That distinction, not a feature list, is the limit on
 Edit mode is currently a bare `<textarea>` (`static/app.js`, `mountEditor`).
 Preview mode highlights and Edit mode does not, so switching to Edit makes a
 file *harder* to read — the first item exists mainly to fix that inversion.
+
+**Evidence (2026-08-20): this is the one section with measured demand behind
+it.** Across the five saved workspaces on this host there are 29 tabs, of which
+**9 are File tabs** and 2 carry persisted buffers — so the viewer and editor are
+genuinely in use, unlike most of the UI/UX list above. That does not rank the
+five items below against each other, but it does mean the section is not
+speculative.
 
 1. Syntax highlighting while editing. highlight.js is already vendored, so
    this costs almost no new bytes.
@@ -154,10 +206,18 @@ feature list — is what a spec for this needs to resolve.
   proves worth the immaturity — deferred with a stated reason (dtach is stable,
   retach is not) in the v3 spec's nice-to-haves
   (`2026-08-16-deadlight-v3-workspace-design.md`).
+  **Evidence (2026-08-20): not measurable from this host.** Whether retach has
+  matured is a question about retach's upstream, not about anything here. What
+  *is* visible locally: dtach is carrying 16 live sessions across restarts
+  without complaint, so the incumbent is not under pressure.
 - Per-session CPU and memory sampling, shown next to session age — deferred
   with a stated reason in the projects spec's "Future work": needs a sampling
   cadence and per-platform code (`/proc` on Linux, `ps` on macOS), and nothing
   else in that design depends on it (`2026-08-17-deadlight-projects-design.md`).
+  **Evidence (2026-08-20): demand unmeasured, but note the adjacent finding.**
+  The zellij leftovers below went unnoticed for weeks while holding ~342 MB —
+  exactly the kind of thing per-process visibility surfaces. That is an argument
+  for the feature, though not one the original entry made.
 
 ## Git
 
@@ -165,6 +225,12 @@ feature list — is what a spec for this needs to resolve.
   ("start without git" escape hatch) — speculative, conditional on the soft
   gate proving too soft in practice; projects spec's "Future work"
   (`2026-08-17-deadlight-projects-design.md`).
+  **Evidence (2026-08-20): argues against doing this.** **6 of 23** project
+  directories under the configured roots are not git repositories —
+  `karpie-validation`, `aeneas-btree`, `bench-parity`, `leanstral-demo`,
+  `rings-bench`, `uc-bench-data`. Enforcing project == git repo would lock out
+  a quarter of what is actually on this host. The soft gate is not proving too
+  soft; it is carrying real load.
 
 ## Platform / deployment
 
@@ -172,6 +238,21 @@ feature list — is what a spec for this needs to resolve.
   deferred deliberately in the v2 spec until deadlight "has earned trust"
   (`2026-08-16-deadlight-v2-design.md`); `docs/deploy.md` still lists
   code-server as a kept fallback, so this remains open.
+  **Evidence (2026-08-20): half done, and the other half is live — this is the
+  one entry the measurement made MORE urgent, not less.** code-server is
+  genuinely gone (binary absent, no unit). Zellij is not: **five processes,
+  ~342 MB RSS, ~22 h uptime** — a `zellij web --start --daemonize` listening on
+  `127.0.0.1:8082` plus four `--server` instances — and `tailscale serve` still
+  maps `:8443` to it. Zellij was replaced by dtach back in v3, so all of that is
+  leftovers holding a third of a gigabyte and a tailnet route into a shell
+  spawner nothing uses.
+
+  Note the deploy notes were **wrong** about this until corrected: they recorded
+  zellij as having been killed on 2026-08-18 and the `:8443` route as dropped,
+  and both claims were false. Its sessions have previously reported themselves
+  EXITED while the processes lived on, so `kill-all-sessions` will not clear
+  them — they go by pid, with the route dropped separately. The host-specific
+  commands are in `~/.config/resh/deploy-host.md`.
 
 ## Code structure
 
