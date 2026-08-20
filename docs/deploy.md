@@ -4,6 +4,12 @@ Design lives in `docs/superpowers/specs/`. This file is only the operational
 knowledge that is not derivable from the code, and that has already caused a
 silent failure at least once each.
 
+**Host-specific values live outside this repository**, in
+`~/.config/resh/deploy-host.md` on the machine itself: addresses, tailnet
+names, ports, roots, and the deploy command with those values filled in. They
+describe one machine, they change without the code changing, and a checkout is
+the wrong place to keep them. This file stays true of any deployment.
+
 ## Running
 
 **The project was called `deadlight` until 2026-08-18.** Anything on disk from
@@ -36,7 +42,7 @@ Tests: `cargo test` (never `--release`). Everything else is environment:
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `RESH_ROOTS` | Colon-separated project roots | `/home/claude/ultima:/home/claude/projects` |
+| `RESH_ROOTS` | Colon-separated project roots | **required** — no built-in default |
 | `RESH_STATE_DIR` | Workspace state + dtach sockets | `~/.local/state/resh/` |
 | `RESH_ORIGINS` | Comma-separated origin allowlist | global config, else loopback only |
 | `RESH_CMD` | Terminal command override — **test hook, never set in production** | `dtach -A … -E -r winch -z $SHELL -l` |
@@ -44,8 +50,11 @@ Tests: `cargo test` (never `--release`). Everything else is environment:
 | `RESH_PING_SECS` | Websocket keepalive ping interval — lower it only to test that path | 30 |
 | `RESH_STATIC` | Serve web assets from this directory instead of the embedded copies (development) | unset — assets are compiled in |
 
-Running anywhere other than the deploy host needs at least `RESH_ROOTS`,
-since the defaults are that host's paths. Give a second instance its own
+`RESH_ROOTS` is required: the binary carries no compiled-in default, and
+starting without it exits 2 with a message rather than serving an empty
+project list — which would come up healthy and look exactly like every project
+had vanished. One host's paths used to be the default, which put that machine's
+layout into every binary. Give a second instance its own
 `RESH_STATE_DIR` too — sharing one is safe as of the `.origin` marker (see
 *Projects and sessions*), but two instances sharing a state dir will still show
 each other's projects in the strip, which is rarely what you want.
@@ -173,31 +182,41 @@ choose: it knows only the sessions it has tabs for, and attaching *creates only
 when absent*, so a client-chosen name would eventually reattach the user to an
 old shell, scrollback and all, instead of giving them a new one.
 
-## Deploying to <deploy-host>
+## Deploying
 
 **The unit runs `~/.local/bin/resh`, not `target/release/resh`** —
-and `~/.cargo/config.toml` redirects `target-dir` to `~/.cache/cargo-target`,
-so a plain `cargo build --release` updates neither path the service uses.
-Building without the install step leaves the old binary running and looks
-exactly like a successful deploy that changed nothing.
+and `~/.cargo/config.toml` redirects `target-dir`, so a plain
+`cargo build --release` updates neither path the service uses. Building
+without the install step leaves the old binary running and looks exactly like
+a successful deploy that changed nothing.
 
 ```bash
-ssh claude@<deploy-host-ip>                       # see the ssh note above
-cd /home/claude/projects/resh
+cd <checkout>
 git checkout master && git pull --ff-only
 cargo build --release
-install -m 755 ~/.cache/cargo-target/release/resh ~/.local/bin/resh
+install -m 755 <target-dir>/release/resh ~/.local/bin/resh
 systemctl --user restart resh
 ```
 
-**Check the branch before pulling.** The box was once left on a feature
+The concrete host, checkout path and target-dir are in
+`~/.config/resh/deploy-host.md` on the machine.
+
+**Check the branch before pulling.** The deploy box was once left on a feature
 branch, where `git pull --ff-only` cheerfully reported "Already up to date"
 while sitting seven commits behind. Verify the resulting commit, not the pull
 output.
 
+**Confirm the *running* binary changed**, not just the built one — the install
+trap above makes a no-op deploy indistinguishable from a real one otherwise:
+
+```bash
+sha256sum ~/.local/bin/resh
+systemctl --user show resh -p MainPID --value | xargs -I{} sha256sum /proc/{}/exe
+```
+
 The binary is self-contained: `static/` is compiled in, so the installed
 `~/.local/bin/resh` no longer reads the checkout at runtime. Editing
-`static/` on this host therefore does *not* change what the running service
+`static/` on the host therefore does *not* change what the running service
 serves — that needs a rebuild and reinstall. To iterate on the UI live, run a
 second instance with `RESH_STATIC` pointed at a checkout.
 
@@ -220,61 +239,40 @@ the user directory nor a project may supply JavaScript or HTML — only
 ## The development instance
 
 Because the deployed binary ignores the checkout, iterating on the UI needs a
-*second* resh whose assets come from a working tree. That instance already
-exists on this host and is reachable over the tailnet:
+*second* resh whose assets come from a working tree — a transient unit with its
+own port, state dir and `RESH_STATIC`. The exact invocation, ports and tailnet
+routes for this host are in `~/.config/resh/deploy-host.md`.
 
-| URL | proxies to | serves assets from |
-|---|---|---|
-| `https://resh.<tailnet>.ts.net` | `127.0.0.1:8444` | embedded (the deployed binary) |
-| `https://resh.<tailnet>.ts.net:8445` | `127.0.0.1:8555` | `/home/claude/projects/resh/static` |
-| `https://resh.<tailnet>.ts.net:8443` | `127.0.0.1:8082` | zellij web, unrelated |
-
-Start it — it is a *transient* unit, so it does not survive a reboot and has to
-be recreated with the same line:
-
-```bash
-systemd-run --user --unit=resh-dev --property=KillMode=process \
-  --setenv=RESH_ROOTS=/home/claude/ultima:/home/claude/projects \
-  --setenv=RESH_STATE_DIR=/home/claude/.local/state/resh-dev \
-  --setenv=RESH_STATIC=/home/claude/projects/resh/static \
-  /home/claude/.local/bin/resh 8555
-```
-
-**`KillMode=process` is not optional.** `systemd-run` defaults to
+**`KillMode=process` is not optional** on that unit. `systemd-run` defaults to
 `control-group`, which SIGKILLs everything in the unit's cgroup on stop — the
 dtach masters and their shells included. That is the same defect `resh.service`
 was fixed for (see the "no systemd" row of CLAUDE.md's dev/prod substitution
 table), and without this property the development instance still has it: every
-`systemctl --user restart resh-dev` silently destroys the shells running under
-it. The loss is the smaller half of the cost. The larger half is that it looks
-like a resh bug — a terminal that comes back empty, with a shell that has
-forgotten everything, reads exactly like a reconnect respawning the session
-rather than reattaching to it. That misdiagnosis has already cost time once.
+restart silently destroys the shells running under it. The loss is the smaller
+half of the cost. The larger half is that it looks like a resh bug — a terminal
+that comes back empty, with a shell that has forgotten everything, reads
+exactly like a reconnect respawning the session rather than reattaching to it.
+That misdiagnosis has already cost time once.
 
-`systemctl --user stop resh-dev` to stop it, `journalctl --user -u resh-dev -f`
-for its log. With `KillMode=process`, stopping it leaves its dtach sessions
-running and systemd says so ("Unit process ... remains running after unit
-stopped"); the deployed service behaves the same way, and that is the intended
-direction — a stale shell is recoverable, a killed one is not. Edits to `static/` are live on :8445 on the next reload; the
-deployed service on :443 will not see them until a rebuild and reinstall.
+With `KillMode=process`, stopping the unit leaves its dtach sessions running
+and systemd says so ("Unit process ... remains running after unit stopped");
+the deployed service behaves the same way, and that is the intended direction —
+a stale shell is recoverable, a killed one is not.
 
 **It needs its own `RESH_STATE_DIR`.** Two instances sharing one show each
 other's projects in the header strip and each other's sessions in the socket
 directory, which is rarely what you want from a throwaway dev server.
 
 **Its origin must be allowlisted separately, port included.** The `Origin`
-header a browser sends for `:8445` is
-`https://resh.<tailnet>.ts.net:8445`, which the unqualified entry does not
-cover, so `allowed_origins` in `~/.config/resh/config.toml` lists both. Miss
-the second one and the failure is confusing rather than obvious: pages load
-over plain HTTP while every websocket 403s, so the workspace renders with no
-tabs and no terminals. That file is the only place an origin can be allowed
-(see *`allowed_origins` is global-config only*), and a backup of the
-pre-dev-route version sits beside it as `config.toml.bak-predevroute`.
+header a browser sends for a non-default port carries that port, which the
+unqualified entry does not cover, so `allowed_origins` must list both. Miss the
+second one and the failure is confusing rather than obvious: pages load over
+plain HTTP while every websocket 403s, so the workspace renders with no tabs
+and no terminals.
 
-Adding this route widened what can open a websocket — and a websocket spawns a
-shell — by exactly one origin. Both are tailnet-only; neither is exposed by
-`tailscale funnel`.
+Adding a dev route widens what can open a websocket — and a websocket spawns a
+shell — by exactly one origin. Keep both tailnet-only; do not `tailscale
+funnel` them.
 
 ## `KillMode=process` is load-bearing
 
@@ -289,13 +287,15 @@ is still there afterwards.
 
 ## `allowed_origins` is global-config only
 
-It must list the tailnet origin or the browser gets 403 over tailscale. The
-node is `resh` and `tailscale serve` maps `:443`, so the origin carries no
-port:
+It must list the tailnet origin or the browser gets 403 over tailscale. Where
+`tailscale serve` maps `:443` the origin carries no port; any other port must
+be listed with it (see the dev-instance note above):
 
 ```toml
-allowed_origins = ["https://resh.<tailnet>.ts.net"]
+allowed_origins = ["https://<node>.<tailnet>.ts.net"]
 ```
+
+This host's actual entries are in `~/.config/resh/deploy-host.md`.
 
 This file lives at `~/.config/resh/config.toml`. It is the *only* place an
 origin can be allowlisted — a project's own `.resh/config.toml` never can, so
@@ -311,22 +311,3 @@ own domain. Rejections are logged with the offending values — check
 Config is re-read every request (`~/.config/resh/config.toml`, then
 `{project}/.resh/config.toml` for theme/hide), so a wrong value is fixed
 by editing the file, not redeploying.
-
-## Host notes
-
-`tailscale serve` and `tailscale set` work without sudo (the account is the
-tailscale operator); the account's sudo password is *not* its ssh password.
-
-**There is no editor fallback any more.** code-server was removed on
-2026-08-18 (service disabled, `~/.local/lib/code-server-*`,
-`~/.local/share/code-server` and its config deleted, and the `:8443` tailscale
-serve route dropped), so resh on `:8444` is the only web workspace on this
-host. If resh is down, the way in is ssh.
-
-Zellij went at the same time. It had been replaced by dtach back in v3 but its
-`--server` processes and a `zellij web --daemonize` had kept running for weeks —
-20 processes holding ~1.1 GB, all with sessions its own `list-sessions` reported
-as EXITED, so `kill-all-sessions` would not clean them up and they had to be
-killed by pid. Note the bare tailnet hostname (`https://…ts.net/`, no port)
-still proxies to `127.0.0.1:8082`, which was zellij web — that route now points
-at nothing.

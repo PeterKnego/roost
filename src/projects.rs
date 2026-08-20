@@ -24,29 +24,21 @@ const TEXT_EXTENSIONS: &[&str] = &[
     "ini", "service", "env", "gitignore", "dockerignore",
 ];
 
-/// The deploy host's roots. Used unless `RESH_ROOTS` overrides them.
-pub fn default_roots() -> Vec<PathBuf> {
-    vec![
-        PathBuf::from("/home/claude/ultima"),
-        PathBuf::from("/home/claude/projects"),
-    ]
-}
-
 /// Roots to scan for projects: `RESH_ROOTS` (colon-separated) when set
-/// and non-empty, otherwise [`default_roots`]. Lets the binary run on a
-/// machine that isn't the deploy host.
+/// and non-empty. Empty when it is unset; `main` refuses to start on that
+/// rather than guessing.
+///
+/// There is deliberately no compiled-in default. One machine's paths used to
+/// live here, which put that host's layout into every binary and into the
+/// repository. Where a deployment keeps its projects is configuration, and it
+/// belongs on the host — in the unit file that starts the process.
 pub fn roots() -> Vec<PathBuf> {
-    let from_env: Vec<PathBuf> = std::env::var("RESH_ROOTS")
+    std::env::var("RESH_ROOTS")
         .unwrap_or_default()
         .split(':')
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .collect();
-    if from_env.is_empty() {
-        default_roots()
-    } else {
-        from_env
-    }
+        .collect()
 }
 
 pub struct Project {
@@ -426,15 +418,19 @@ mod tests {
         assert!(read_text_file(&bin).unwrap_err().contains("binary"));
     }
 
+    /// Reverting this to a compiled-in fallback makes the last two assertions
+    /// fail with the old host paths in the `left` value — which is exactly the
+    /// leak: those paths were readable in the binary and in the repository.
     #[test]
-    fn roots_env_overrides_defaults() {
+    fn roots_come_only_from_the_environment() {
         std::env::set_var("RESH_ROOTS", "/one:/two");
         assert_eq!(roots(), vec![PathBuf::from("/one"), PathBuf::from("/two")]);
-        // empty or unset falls back to the built-in roots
+        // No built-in fallback. Unset means empty, and `main` exits rather
+        // than serving some guessed directory.
         std::env::set_var("RESH_ROOTS", "");
-        assert_eq!(roots(), default_roots());
+        assert!(roots().is_empty(), "empty RESH_ROOTS must not fall back");
         std::env::remove_var("RESH_ROOTS");
-        assert_eq!(roots(), default_roots());
+        assert!(roots().is_empty(), "unset RESH_ROOTS must not fall back");
     }
 
     #[test]

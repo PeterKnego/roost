@@ -58,7 +58,7 @@ mod tests {
     use super::*;
 
     fn allowed() -> Vec<String> {
-        vec!["https://box.<tailnet>.ts.net:8444".to_string()]
+        vec!["https://box.example.com:8444".to_string()]
     }
 
     #[test]
@@ -72,10 +72,10 @@ mod tests {
 
     #[test]
     fn configured_origin_passes_exactly() {
-        assert!(origin_allowed(Some("https://box.<tailnet>.ts.net:8444"), &allowed()));
+        assert!(origin_allowed(Some("https://box.example.com:8444"), &allowed()));
         // scheme and port are part of the origin; near-misses are not matches
-        assert!(!origin_allowed(Some("http://box.<tailnet>.ts.net:8444"), &allowed()));
-        assert!(!origin_allowed(Some("https://box.<tailnet>.ts.net:9999"), &allowed()));
+        assert!(!origin_allowed(Some("http://box.example.com:8444"), &allowed()));
+        assert!(!origin_allowed(Some("https://box.example.com:9999"), &allowed()));
     }
 
     #[test]
@@ -86,7 +86,7 @@ mod tests {
         // the attack that motivates this module
         assert!(!origin_allowed(Some("https://drive-by.example"), &[]));
         // a subdomain of an allowed host is a different origin
-        assert!(!origin_allowed(Some("https://evil.box.<tailnet>.ts.net:8444"), &allowed()));
+        assert!(!origin_allowed(Some("https://evil.box.example.com:8444"), &allowed()));
     }
 
     #[test]
@@ -94,7 +94,7 @@ mod tests {
         // behind tailscale serve: Host is rewritten, X-Forwarded-Host is real
         assert!(host_allowed(
             Some("127.0.0.1:8444"),
-            Some("box.<tailnet>.ts.net:8444"),
+            Some("box.example.com:8444"),
             &allowed()
         ));
         // direct loopback browsing, no proxy
