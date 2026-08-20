@@ -107,6 +107,37 @@ try {
   ok(two.includes(MARKER.slice(0, 8)) || two.includes("echo"),
      `the selection reached the clipboard with the app holding the mouse (${JSON.stringify(two.slice(0, 40))})`);
   ok(/copied/.test(await evalIn("__flash()")), "and the terminal said so there too");
+
+  console.log("\nE. and the app copying on the user's behalf, via OSC 52");
+  // What Claude Code sends when it made the selection itself, because the app
+  // owns the mouse and the drag never reached the browser at all.
+  const b64 = await evalIn(`btoa("OSC52-PAYLOAD-xyz")`);
+  await seed();
+  await evalIn(`__t().term.write("\\u001b]52;c;${b64}\\u0007")`);
+  await sleep(1200);
+  const three = await clip();
+  ok(three === "OSC52-PAYLOAD-xyz", `the app's own copy reached the clipboard (${JSON.stringify(three)})`);
+  ok(/copied/.test(await evalIn("__flash()")), "and the terminal said so");
+
+  console.log("\nF. but the query form must never answer");
+  // `ESC ] 52 ; c ; ?` asks the terminal to send the clipboard back to the
+  // application. Anything with a shell — or any file someone cats — could then
+  // read what the user last copied.
+  //
+  // Honest about what this one is: it does NOT fail against a resh without the
+  // refusal, because an unhandled OSC 52 is ignored and a handled one throws on
+  // `atob("?")` before it could answer. It is a property guard, not a proof —
+  // it turns red the day someone adds a reply path, which is the only way this
+  // can go wrong. Checked by reverting: it stayed green, as expected.
+  await evalIn(`__t().__sent = ""; if (!__t().__hooked) { __t().__hooked = 1;
+    __t().term.onData((d) => { __t().__sent += d; }); }`);
+  await evalIn(`__t().term.write("\\u001b]52;c;?\\u0007")`);
+  await sleep(1200);
+  const replied = await evalIn(`__t().__sent`);
+  ok(!/52;/.test(replied) && !/OSC52-PAYLOAD/.test(replied),
+     `the terminal sent no clipboard back (${JSON.stringify(replied.slice(0, 40))})`);
+  ok(await clip() === "OSC52-PAYLOAD-xyz", "and the clipboard is untouched by the query");
+
 } finally {
   page?.close();
   browser.close();

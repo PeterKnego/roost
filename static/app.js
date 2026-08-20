@@ -747,6 +747,42 @@ function ensureTerm(session) {
     clearTimeout(entry.selTimer);
     entry.selTimer = setTimeout(() => copySelection(entry), 200);
   });
+  // OSC 52 is how an application copies on the user's behalf, and it is the
+  // half of copying that a selection handler cannot reach: when a full-screen
+  // app owns the mouse, the drag never reaches xterm at all, so the app makes
+  // the selection itself and sends the text out as `ESC ] 52 ; c ; <base64>`.
+  // Claude Code does exactly this — it even says "sent 13 chars via OSC 52" —
+  // and xterm.js registers no handler for 52, so until now those bytes went
+  // nowhere and the clipboard silently kept whatever it held.
+  //
+  // Writes only. The query form (`ESC ] 52 ; c ; ?`) asks the terminal to send
+  // the clipboard *back* to the application, which would let anything with a
+  // shell — or any file someone cats — read what the user last copied. There
+  // is no version of that this wants.
+  term.parser.registerOscHandler(52, (payload) => {
+    const body = payload.slice(payload.indexOf(";") + 1);
+    // Refused explicitly rather than left to fall through the base64 decode
+    // below, which would also reject it. Something this consequential should
+    // be unmistakable at the point a reader looks for it.
+    if (body === "?") return true;
+    if (body.length > MAX_OSC52_B64) {
+      termFlash(entry, "copy too large");
+      return true;
+    }
+    let text;
+    try {
+      text = new TextDecoder().decode(Uint8Array.from(atob(body), (c) => c.charCodeAt(0)));
+    } catch {
+      return true; // not base64: not ours to guess at
+    }
+    if (!text) return true;
+    if (!navigator.clipboard) { termFlash(entry, "copy needs https"); return true; }
+    navigator.clipboard.writeText(text).then(
+      () => termFlash(entry, `copied ${text.length}`),
+      () => termFlash(entry, "copy blocked"),
+    );
+    return true;
+  });
   term.onData((d) => {
     // Reads entry.sock rather than closing over one socket: a reconnect
     // swaps it, and a closure over the original would spend the rest of the
@@ -807,6 +843,12 @@ function connectTerm(entry, session) {
     entry.timer = setTimeout(() => connectTerm(entry, session), wait);
   };
 }
+
+// A clipboard write is the one thing terminal *output* can do to the machine
+// outside the terminal, so it is bounded like everything else that is fed
+// attacker-influenced bytes. 100 KB of base64 is far more than any copy a
+// person makes and far less than a payload worth worrying about.
+const MAX_OSC52_B64 = 100_000;
 
 function copySelection(entry) {
   const text = entry.term.getSelection();

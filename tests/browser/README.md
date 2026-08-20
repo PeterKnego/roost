@@ -20,6 +20,7 @@ deno run -A tests/browser/mdlinks.mjs     # markdown preview links/images, and t
 deno run -A tests/browser/dotfiles.mjs    # the tree pane's dotfile toggle
 deno run -A tests/browser/altscreen.mjs  # a full-screen app's screen survives an attachment
 deno run -A tests/browser/modes.mjs      # and so do the modes it declared once
+deno run -A tests/browser/copyselect.mjs # selecting copies, and OSC 52 copies too
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
