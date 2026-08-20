@@ -52,6 +52,12 @@ pub struct Workspace {
     /// Whether the project root is a git repository, cached here so the
     /// hub doesn't re-stat the filesystem on every view.
     pub is_git: bool,
+    /// Tree visibility, `None` while the workspace still follows the config
+    /// file's `show_hidden`. Three states on purpose: `Some(false)` is a user
+    /// who turned dot entries *off* here, which must survive a global
+    /// `show_hidden = true`, and collapsing it into a bare bool would make
+    /// that indistinguishable from "never asked".
+    pub show_hidden: Option<bool>,
 }
 
 /// Stable content hash used as the conflict guard. FNV-1a: no dependency,
@@ -79,6 +85,7 @@ impl Workspace {
             watch_degraded: false,
             live_sessions: vec![],
             is_git: false,
+            show_hidden: None,
         }
     }
 
@@ -113,6 +120,7 @@ impl Workspace {
             watch_degraded: self.watch_degraded,
             live_sessions: self.live_sessions.clone(),
             is_git: self.is_git,
+            show_hidden: self.show_hidden,
         }
     }
 }
@@ -222,6 +230,14 @@ pub fn apply_layout(w: &mut Workspace, intent: &Intent) -> Result<bool, String> 
             w.sizes = *sizes;
             Ok(true)
         }
+        Intent::SetShowHidden { on } => {
+            // Always `Some`, never back to `None`: the header toggle has two
+            // positions, and there is no gesture in the UI that means "go
+            // back to following the config file". Deleting the state file is
+            // that gesture, and it is not one a button should perform.
+            w.show_hidden = Some(*on);
+            Ok(true)
+        }
         Intent::SetMode { rel, mode } => {
             // See the test: Edit over an image is a data-loss path, not a display
             // glitch. app.js hides the toggle; this is what actually stops it.
@@ -280,6 +296,31 @@ mod tests {
 
     fn file(rel: &str) -> Tab {
         Tab::File { rel: rel.into(), mode: Mode::Preview }
+    }
+
+    // Three states, and the third one is the point: `Some(false)` is a user
+    // who turned dot entries off in a project whose config file turns them
+    // on, and it has to be storable as something other than "never asked".
+    #[test]
+    fn set_show_hidden_records_a_decision_in_both_directions() {
+        let mut w = Workspace::default_layout();
+        assert_eq!(w.show_hidden, None, "a fresh workspace follows the config file");
+        assert_eq!(apply_layout(&mut w, &Intent::SetShowHidden { on: true }), Ok(true));
+        assert_eq!(w.show_hidden, Some(true));
+        assert_eq!(apply_layout(&mut w, &Intent::SetShowHidden { on: false }), Ok(true));
+        assert_eq!(w.show_hidden, Some(false), "off is a decision, not a reset to None");
+    }
+
+    // The view is what reaches the browser, and it carries the override
+    // unresolved — the page supplies the config default. A view that dropped
+    // the field would leave every client showing the config value with the
+    // toggle apparently doing nothing.
+    #[test]
+    fn the_view_carries_the_override_unresolved() {
+        let mut w = Workspace::default_layout();
+        assert_eq!(w.view().show_hidden, None);
+        apply_layout(&mut w, &Intent::SetShowHidden { on: true }).unwrap();
+        assert_eq!(w.view().show_hidden, Some(true));
     }
 
     #[test]

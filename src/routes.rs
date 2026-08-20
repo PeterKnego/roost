@@ -349,12 +349,15 @@ fn serve_frag(
         return http::not_found(w, "no such project");
     };
     let settings = config::for_project(&dir);
+    // The header toggle beats the config file; a project with no hub has no
+    // toggle, and asking must not create one (see `Hub::show_hidden`).
+    let filter = settings.tree_filter_with(crate::hub::Hub::show_hidden(project));
     match what {
         ["tree"] => {
             let open = req.query.get("open").map(String::as_str).unwrap_or("");
             match req.query.get("dir") {
                 None => {
-                    http::html(w, &render::tree_fragment(project, &dir, open, &settings.tree_filter()))
+                    http::html(w, &render::tree_fragment(project, &dir, open, &filter))
                 }
                 // `dir` names a subtree the client wants to lazily expand —
                 // it arrives from the network, so it must be confined
@@ -370,7 +373,7 @@ fn serve_frag(
                             &sub,
                             rel,
                             open,
-                            &settings.tree_filter(),
+                            &filter,
                             &mut out,
                         );
                         http::html(w, &out);

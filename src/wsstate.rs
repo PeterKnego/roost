@@ -36,6 +36,15 @@ struct Disk {
     sizes: Sizes,
     panes: Vec<PaneDisk>,
     buffers: std::collections::HashMap<String, BufferDisk>,
+    /// Absent in every state file written before the header toggle existed,
+    /// and `None` is exactly right for those: they were written by a
+    /// workspace that had never expressed an opinion, so it keeps following
+    /// the config file. `#[serde(default)]` is belt and braces — serde
+    /// already defaults a missing `Option` to `None`, verified by removing
+    /// it — and is here so that changing this to a bare `bool` fails loudly
+    /// at the test rather than silently rejecting every old file.
+    #[serde(default)]
+    show_hidden: Option<bool>,
 }
 
 /// Honours `RESH_STATE_DIR` for tests and operators who want state
@@ -66,6 +75,7 @@ pub fn save(project: &str, w: &Workspace) -> Result<(), String> {
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
     let disk = Disk {
+        show_hidden: w.show_hidden,
         sizes: w.sizes,
         panes: w
             .panes
@@ -103,6 +113,7 @@ pub fn load(project: &str) -> (Workspace, Option<String>) {
     match serde_json::from_str::<Disk>(&text) {
         Ok(d) => {
             w.sizes = d.sizes;
+            w.show_hidden = d.show_hidden;
             if d.panes.len() == w.panes.len() {
                 w.panes = d
                     .panes
@@ -174,6 +185,43 @@ mod tests {
         let out = f();
         std::env::remove_var("RESH_STATE_DIR");
         out
+    }
+
+    // Every state file written before the header toggle existed lacks this
+    // key. It must load as None — "this workspace never expressed an
+    // opinion" — and keep following the config file, rather than serde
+    // refusing the whole file and silently resetting someone's layout.
+    #[test]
+    fn a_state_file_written_before_the_toggle_still_loads() {
+        with_state_dir(|| {
+            let mut w = Workspace::default_layout();
+            w.show_hidden = Some(true);
+            save("legacy_probe", &w).unwrap();
+            let text = std::fs::read_to_string(path_for("legacy_probe")).unwrap();
+            assert!(text.contains("show_hidden"), "the key must be written at all");
+
+            // Strip it back out, the way a pre-toggle resh would have left it.
+            let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            json.as_object_mut().unwrap().remove("show_hidden");
+            std::fs::write(path_for("legacy_probe"), json.to_string()).unwrap();
+
+            let (loaded, warn) = load("legacy_probe");
+            assert_eq!(loaded.show_hidden, None, "absent means following the config");
+            assert!(warn.is_none(), "an old file is not a corrupt one");
+            assert_eq!(loaded.panes.len(), w.panes.len(), "the rest of it still loaded");
+        });
+    }
+
+    #[test]
+    fn the_toggle_round_trips_through_disk() {
+        with_state_dir(|| {
+            for want in [Some(true), Some(false), None] {
+                let mut w = Workspace::default_layout();
+                w.show_hidden = want;
+                save("roundtrip_probe", &w).unwrap();
+                assert_eq!(load("roundtrip_probe").0.show_hidden, want);
+            }
+        });
     }
 
     #[test]

@@ -17,6 +17,7 @@ deno run -A tests/browser/reconnect.mjs   # terminal survives a dead connection
 deno run -A tests/browser/upload.mjs      # file upload and image paste
 deno run -A tests/browser/paneicons.mjs   # the per-pane header controls
 deno run -A tests/browser/mdlinks.mjs     # markdown preview links/images, and the image-tab edit refusal
+deno run -A tests/browser/dotfiles.mjs    # the tree pane's dotfile toggle
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -58,6 +59,10 @@ and one in `mdlinks.mjs` that passed while asserting nothing.
 - Reverting the reconnect to its pre-fix behaviour (mark the entry stale, never
   retry) fails 7 assertions in `reconnect.mjs`.
 - Deleting the `term.reset()` before the replay fails 1, on copy count.
+- Deleting the `refreshTree()` call app.js makes when a State flips
+  `show_hidden` fails 4 assertions in `dotfiles.mjs`; pinning its glyph to a
+  constant fails 3. Both were checked, and the first one is why that file mutes
+  TreeChanged — see the table below.
 - Disabling the `raw` fragment route (`src/routes.rs`) fails the naturalWidth
   assertions in `mdlinks.mjs` (`naturalWidth === 0`, not DOM presence);
   restoring `if (t.k === "File")`'s dropped `!isImage(t.rel)` fails the
@@ -65,7 +70,7 @@ and one in `mdlinks.mjs` that passed while asserting nothing.
   `closest("a.file")` fails the markdown-link right-click assertion with
   `got 2`.
 
-Four things will make a browser test lie to you here. Each is commented at its
+Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
 
 | Trap | What it does to a naive test |
@@ -73,6 +78,7 @@ site; do not "simplify" them away:
 | `Network.emulateNetworkConditions {offline:true}` | Blocks *new* requests, leaves established sockets open. The test asserts a reconnect while nothing ever disconnected. Cut TCP at the proxy instead. |
 | `term.paste()` | bash enables bracketed paste, so a pasted newline is inserted literally instead of submitting. The command sits on the prompt and every later wait times out. Use `term.input()` with `\r`. |
 | Typing before the prompt | readline discards typeahead while initialising, so the first command silently vanishes. Wait for a prompt. |
+| A watcher event storm | An idle project emits ~3 TreeChanged/s (measured on this commit and on the one before the dotfile toggle, on a plain non-git project, with the client's own re-fetch disabled — so it is neither git nor a fetch loop). It re-fetches the tree for you, so any assertion of the form "the tree updated after X" passes with X's implementation deleted. `dotfiles.mjs` mutes TreeChanged in the page for exactly this reason. |
 | Content that fits one screen | `dtach`'s redraw opens with `\e[H\e[J`, which hides duplicated output all by itself — the no-duplication assertion passes with the reset deleted. Scroll past one screen first. |
 
 ## What these cannot prove

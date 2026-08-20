@@ -193,6 +193,23 @@ impl Hub {
         closing
     }
 
+    /// This workspace's tree-visibility override, or `None` when it is still
+    /// following the config file. Answers from the registry without creating
+    /// a hub, exactly like [`Hub::is_closing`] and for the same reason: a
+    /// project nobody has opened has no override, and building a hub to ask
+    /// would start a filesystem watcher as a side effect of a question the
+    /// tree fragment asks on every render.
+    pub fn show_hidden(project: &str) -> Option<bool> {
+        let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        let arc = {
+            let map = reg.lock().unwrap_or_else(|e| e.into_inner());
+            map.get(project)?.clone()
+        };
+        // Bound rather than returned inline, so the guard drops before `arc`.
+        let over = Hub::lock(&arc).ws.show_hidden;
+        over
+    }
+
     pub fn subscribe(&mut self) -> (ConnId, Receiver<String>) {
         self.next_id += 1;
         let id = format!("c{}", self.next_id);
@@ -1421,6 +1438,52 @@ mod tests {
     /// unused one. `term` then `term1`: without the `also_taken` check, the
     /// second click sees no *live* session yet (the PTY only spawns when the
     /// browser connects to /ws/.../term/<name>) and hands out `term` twice.
+    // Two subscribers, deliberately: with one, `broadcast` and `send_to` are
+    // indistinguishable, and a toggle that reached only the clicking browser
+    // would look correct in every single-client test while the other tab sat
+    // showing a tree that no longer matches what the server renders.
+    #[test]
+    fn toggling_hidden_files_reaches_every_client_and_survives_a_reload() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("show_hidden_mirror", d.path().to_path_buf());
+        let (_a, rx_a) = h.subscribe();
+        let (b, rx_b) = h.subscribe();
+        drain(&rx_a);
+        drain(&rx_b);
+        let before = h.ws.version;
+
+        h.handle(&b, Intent::SetShowHidden { on: true });
+
+        assert_eq!(h.ws.show_hidden, Some(true));
+        assert!(h.ws.version > before, "a mirrored change must bump the version");
+        for (who, msgs) in [("the other client", drain(&rx_a)), ("the clicking client", drain(&rx_b))] {
+            assert!(
+                msgs.iter().any(|m| m.contains(r#""show_hidden":true"#)),
+                "{who} must receive the new value; got {msgs:?}"
+            );
+        }
+
+        // Persisted, not just held in memory: a reload builds a fresh hub.
+        let (reloaded, _) = crate::wsstate::load("show_hidden_mirror");
+        assert_eq!(reloaded.show_hidden, Some(true), "the toggle must survive a restart");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    // The tree fragment asks this on every render, including for projects
+    // nobody has opened. Answering must not build a hub — that would start a
+    // filesystem watcher as a side effect of a question.
+    #[test]
+    fn asking_for_the_override_never_creates_a_hub() {
+        assert_eq!(Hub::show_hidden("no_such_project_asked_about"), None);
+        let registered = REGISTRY
+            .get()
+            .map(|r| r.lock().unwrap_or_else(|e| e.into_inner()).contains_key("no_such_project_asked_about"))
+            .unwrap_or(false);
+        assert!(!registered, "asking must not have registered a hub");
+    }
+
     #[test]
     fn new_terminal_allocates_successive_unused_names() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

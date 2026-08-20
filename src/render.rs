@@ -719,6 +719,12 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<
     // already contains, and it happens to be HTML-attribute-safe too, since
     // percent_encode's output is restricted to plain ASCII.
     let qkey = crate::http::percent_encode(key);
+    // The config file's value, embedded once per page load rather than
+    // resolved into every State snapshot — those go out on each debounced
+    // keystroke, and this changes only when someone edits a config file,
+    // which already needs a reload to be seen. app.js resolves the workspace
+    // override against it: `ws.show_hidden ?? SHOW_HIDDEN_DEFAULT`.
+    let sh = if s.show_hidden { "1" } else { "0" };
     let theme_css = match theme_rel {
         Some(rel) => format!("<link rel=\"stylesheet\" href=\"/frag/{proj_url}/{rel}\">"),
         None => String::new(),
@@ -737,7 +743,7 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
-</head><body data-project="{proj_txt}" data-default-tab="{tab}">
+</head><body data-project="{proj_txt}" data-default-tab="{tab}" data-show-hidden="{sh}">
 <header>
   <a class="home" href="/">◆</a><span class="proj">{proj_txt}</span>
   <span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body"></span>
@@ -1252,6 +1258,20 @@ mod tests {
         assert!(s.contains("(1)"));
         let clean = changes_fragment("proj", &Status { branch: "main".into(), changes: vec![] });
         assert!(clean.contains("working tree clean"));
+    }
+
+    // app.js resolves `ws.show_hidden ?? SHOW_HIDDEN_DEFAULT`, and this
+    // attribute is the whole of that default — without it every page would
+    // start by claiming dotfiles are hidden, so a project with
+    // `show_hidden = true` would render its dot rows under a toggle drawn in
+    // the off position.
+    #[test]
+    fn the_page_carries_the_configured_default_for_the_toggle() {
+        let off = workspace_page("proj", "proj", &Settings::default(), None);
+        assert!(off.contains(r#"data-show-hidden="0""#), "the default is off");
+        let on = Settings { show_hidden: true, ..Settings::default() };
+        let h = workspace_page("proj", "proj", &on, None);
+        assert!(h.contains(r#"data-show-hidden="1""#), "and a configured true reaches the page");
     }
 
     #[test]

@@ -326,6 +326,13 @@ Globally or per project, and it takes effect on the next tree render, no
 restart. It reveals dot entries only: build and vendor directories stay hidden
 either way, as does anything you listed in `hide`, which outranks it.
 
+This file sets what a workspace *starts out* doing. The ◌/◍ control in the tree
+pane's header overrides it per workspace — mirrored to every browser on that
+project and persisted in the workspace state file — and overrides it in both
+directions, so a workspace can be toggled off under a global
+`show_hidden = true`. Once toggled, the config value no longer moves that
+workspace; deleting its state file is what restores "follow the config".
+
 Two things it deliberately does not change. `.git`'s *contents* still do not
 refresh the tree as they change (a single git command writes enough inside it
 to turn every command into a burst of refreshes), so an expanded `.git` goes

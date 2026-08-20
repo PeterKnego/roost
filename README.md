@@ -49,8 +49,10 @@ click descends, Enter opens, and git repos get a one-click shortcut.
 
 **Dot entries are hidden, until you say otherwise.** The tree leaves out
 `.git`, `.claude` and every other dot entry by default, along with build and
-vendor directories. `show_hidden = true` in a global or per-project
-`.resh/config.toml` brings the dot entries back — see
+vendor directories. The ◌ control in the tree pane's header brings them back —
+it mirrors to your other browsers and survives a restart, like any other
+workspace change. `show_hidden = true` in a global or per-project
+`.resh/config.toml` sets what a workspace starts out doing — see
 [`docs/deploy.md`](docs/deploy.md#hidden-files-in-the-tree).
 
 **Desktop notifications.** A process in a terminal — Claude finishing a task,

@@ -343,8 +343,10 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                 // change instead of at the next restart, matching the
                 // request path.
                 let settings = crate::config::for_project(&base);
-                let filter = settings.tree_filter();
                 let mut h = Hub::lock(&hub);
+                // The workspace's own override comes from the hub already
+                // locked here — no registry lookup and no I/O under the lock.
+                let filter = settings.tree_filter_with(h.ws.show_hidden);
                 let open: Vec<String> = h.ws.buffers.keys().cloned().collect();
                 let mut tree = false;
                 let mut status = false;
@@ -558,22 +560,40 @@ mod tests {
     #[test]
     fn the_watcher_reads_show_hidden_from_the_project_it_is_watching() {
         assert!(
-            !dotfile_refreshes_the_tree(None),
+            !dotfile_refreshes_the_tree(None, None),
             "with the default settings a dotfile is not a visible row, so it must not refresh"
         );
         assert!(
-            dotfile_refreshes_the_tree(Some("show_hidden = true")),
+            dotfile_refreshes_the_tree(Some("show_hidden = true"), None),
             "with show_hidden on the dotfile IS a visible row and must refresh"
         );
     }
 
-    /// Spawns a real watcher over a fresh project containing `config`, writes
-    /// `.gitignore`, and reports whether a TreeChanged followed. Panics rather
-    /// than returning false if the control write (an ordinary file, always a
-    /// visible row) fails to produce one — that means the harness itself was
-    /// not working, which is not the same answer as "filtered out".
+    // And the header toggle, which is the value the *tree* renders against
+    // once someone has used it. Without the watcher reading the same source,
+    // turning dotfiles on from the UI would show rows that then froze — the
+    // failure would look like a broken watcher, not a missed override.
     #[cfg(target_os = "linux")]
-    fn dotfile_refreshes_the_tree(config: Option<&str>) -> bool {
+    #[test]
+    fn the_watcher_follows_the_header_toggle_over_the_config_file() {
+        assert!(
+            dotfile_refreshes_the_tree(None, Some(true)),
+            "toggled on against a silent config: the row is visible, so it must refresh"
+        );
+        assert!(
+            !dotfile_refreshes_the_tree(Some("show_hidden = true"), Some(false)),
+            "toggled off against show_hidden = true: the row is gone, so it must not"
+        );
+    }
+
+    /// Spawns a real watcher over a fresh project containing `config`, with
+    /// `toggle` as the workspace's header setting, writes `.gitignore`, and
+    /// reports whether a TreeChanged followed. Panics rather than returning
+    /// false if the control write (an ordinary file, always a visible row)
+    /// fails to produce one — that means the harness itself was not working,
+    /// which is not the same answer as "filtered out".
+    #[cfg(target_os = "linux")]
+    fn dotfile_refreshes_the_tree(config: Option<&str>, toggle: Option<bool>) -> bool {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
         std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
@@ -584,6 +604,7 @@ mod tests {
         }
 
         let hub = Arc::new(Mutex::new(Hub::new("watch_show_hidden", d.path().to_path_buf())));
+        Hub::lock(&hub).ws.show_hidden = toggle;
         assert!(spawn("watch_show_hidden", d.path().to_path_buf(), hub.clone(), Duration::from_millis(20)));
         let rx = Hub::lock(&hub).subscribe().1;
 

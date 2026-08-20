@@ -70,6 +70,11 @@ pub enum Intent {
     NewTerminal { pane: PaneId },
     InitGit,
     CloseProject,
+    /// Tree visibility for this workspace, overriding the config file's
+    /// `show_hidden` for everyone looking at this project. A workspace that
+    /// has never been toggled carries `None` and follows the config instead —
+    /// see `WorkspaceView::show_hidden`.
+    SetShowHidden { on: bool },
     MarkNoticeRead { id: u64 },
     MarkAllNoticesRead,
     ClearNotices,
@@ -103,6 +108,13 @@ pub struct WorkspaceView {
     /// Whether the project directory is a git repository — drives the
     /// initialise-git offer on the placeholder.
     pub is_git: bool,
+    /// `None` until someone uses the header toggle: the workspace is
+    /// following the config file's `show_hidden`. Deliberately sent
+    /// unresolved. Resolving it here would mean reading a config file on
+    /// every snapshot, and a snapshot goes out on every `EditBuffer` — i.e.
+    /// on every debounced keystroke. The page embeds the config value once,
+    /// and the client resolves `show_hidden ?? SHOW_HIDDEN_DEFAULT`.
+    pub show_hidden: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

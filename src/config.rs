@@ -29,6 +29,18 @@ impl Settings {
     pub fn tree_filter(&self) -> crate::projects::TreeFilter<'_> {
         crate::projects::TreeFilter { hide: &self.hide, show_hidden: self.show_hidden }
     }
+
+    /// The same rule with the workspace's header toggle applied. `None` means
+    /// the workspace has never been toggled and this file is still the
+    /// answer; `Some` is a decision a person made in the UI and outranks the
+    /// file in both directions, including a `Some(false)` against a global
+    /// `show_hidden = true`.
+    pub fn tree_filter_with(&self, over: Option<bool>) -> crate::projects::TreeFilter<'_> {
+        crate::projects::TreeFilter {
+            hide: &self.hide,
+            show_hidden: over.unwrap_or(self.show_hidden),
+        }
+    }
 }
 
 impl Default for Settings {

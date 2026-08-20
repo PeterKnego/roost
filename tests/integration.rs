@@ -639,6 +639,50 @@ fn tree_dir_lazily_returns_a_subdirectorys_children() {
     assert!(sub.contains("inner.txt"));
 }
 
+// The header toggle has to beat the config file in *both* directions, or the
+// control is one-way: a project with `show_hidden = true` in its config must
+// still be able to turn dot entries off from the UI. Driven end to end — the
+// intent over the websocket, the listing over HTTP — because the two reach the
+// filter by different routes (hub state vs. registry peek) and a wiring that
+// only worked one way would still pass a unit test of either half.
+//
+// Own project name: this test writes into the project directory and mutates
+// hub state (see `fixture_named`).
+#[test]
+fn the_header_toggle_overrides_the_config_file_in_both_directions() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    let (d, port) = fixture_named("toggleproj");
+    let proj = d.path().join("toggleproj");
+    std::fs::write(proj.join(".gitignore"), "target\n").unwrap();
+    let url = format!("http://127.0.0.1:{port}/frag/toggleproj/tree");
+    let tree = || ureq::get(&url).call().unwrap().into_string().unwrap();
+
+    // Config says hide (it says nothing, which is the same thing).
+    assert!(!tree().contains(".gitignore"), "hidden by default");
+
+    let mut c = ws_connect_path(port, "/ws/toggleproj/_workspace").unwrap();
+    read_until(&mut c, r#""t":"State""#);
+    c.send(tungstenite::Message::Text(r#"{"t":"SetShowHidden","on":true}"#.into())).unwrap();
+    read_until(&mut c, r#""show_hidden":true"#);
+    let shown = tree();
+    assert!(shown.contains(r#"data-rel=".gitignore""#), "the toggle must beat the config file");
+    assert!(shown.contains(r#"data-rel="hello.md""#), "ordinary rows are unaffected");
+
+    // Now the other direction: config on, toggle off.
+    std::fs::create_dir(proj.join(".resh")).unwrap();
+    std::fs::write(proj.join(".resh/config.toml"), "show_hidden = true").unwrap();
+    c.send(tungstenite::Message::Text(r#"{"t":"SetShowHidden","on":false}"#.into())).unwrap();
+    read_until(&mut c, r#""show_hidden":false"#);
+    let hidden = tree();
+    assert!(!hidden.contains(".gitignore"), "an explicit off must beat show_hidden = true");
+    assert!(hidden.contains(r#"data-rel="hello.md""#), "and must not empty the tree instead");
+
+    let _ = c.close(None);
+    std::env::remove_var("RESH_STATE_DIR");
+}
+
 // The setting has to survive the whole request path — config cascade, route,
 // renderer — and it is per project, so the test asserts the same server serves
 // the hidden row only once that project's `.resh/config.toml` asks for it. A

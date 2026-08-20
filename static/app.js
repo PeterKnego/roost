@@ -3,6 +3,15 @@
 // DOM nodes that are MOVED between panes with appendChild, never rebuilt —
 // rebuilding a xterm instance drops its websocket and detaches the shell.
 const PROJECT = document.body.dataset.project;
+// The config file's `show_hidden`, embedded by render.rs at page load. The
+// workspace's own toggle (state.show_hidden) overrides it when set; null
+// means nobody has touched the header button, so the file still decides.
+const SHOW_HIDDEN_DEFAULT = document.body.dataset.showHidden === "1";
+const showHidden = () => (state && state.show_hidden != null ? state.show_hidden : SHOW_HIDDEN_DEFAULT);
+// What the tree was last rendered with, so a State that flips the setting
+// re-fetches. Fragments are server-rendered against the workspace value, so
+// nothing in the DOM would otherwise change until the next filesystem event.
+let treeShownHidden = null;
 const SESSION_RE = /^[A-Za-z0-9_-]{1,32}$/; // must match session::valid_name server-side
 const DIVIDER_PX = 8; // keep in step with --divider in style.css
 
@@ -64,6 +73,12 @@ function onEvent(ev) {
         for (const rel of editors.keys()) if (!openRels.has(rel)) editors.delete(rel);
       }
       render();
+      // Toggling visibility changes what the *server* renders, not how the
+      // client draws it, so the State that carries the new value has to be
+      // followed by a re-fetch. refreshTree (not a remount) keeps whatever
+      // the user had expanded.
+      if (treeShownHidden !== null && treeShownHidden !== showHidden()) refreshTree();
+      treeShownHidden = showHidden();
       break;
     case "BufferText": {
       // Skip our own text or the cursor jumps; empty origin = external change
@@ -344,6 +359,13 @@ function buildPaneIcons(host, pi, pane, active, content) {
     return b;
   };
   if (active && active.k === "Tree") {
+    const hidden = showHidden();
+    // Filled ring = dot entries are showing. This drives an intent rather
+    // than filtering client-side: the rows do not exist in the fragment the
+    // server sent, so there is nothing here to un-hide.
+    icon(hidden ? "◍" : "◌", hidden ? "hide dotfiles" : "show dotfiles", () => {
+      send({ t: "SetShowHidden", on: !showHidden() });
+    });
     icon("⌃", "collapse all", () => {
       content.querySelectorAll("details[open]").forEach((d) => { d.open = false; });
     });
