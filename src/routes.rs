@@ -353,7 +353,9 @@ fn serve_frag(
         ["tree"] => {
             let open = req.query.get("open").map(String::as_str).unwrap_or("");
             match req.query.get("dir") {
-                None => http::html(w, &render::tree_fragment(project, &dir, open, &settings.hide)),
+                None => {
+                    http::html(w, &render::tree_fragment(project, &dir, open, &settings.tree_filter()))
+                }
                 // `dir` names a subtree the client wants to lazily expand —
                 // it arrives from the network, so it must be confined
                 // through `safe_resolve` before any read, exactly like
@@ -363,7 +365,14 @@ fn serve_frag(
                 Some(rel) => match projects::safe_resolve(&dir, rel) {
                     Ok(sub) if sub.is_dir() => {
                         let mut out = String::new();
-                        render::tree_level(project, &sub, rel, open, &settings.hide, &mut out);
+                        render::tree_level(
+                            project,
+                            &sub,
+                            rel,
+                            open,
+                            &settings.tree_filter(),
+                            &mut out,
+                        );
                         http::html(w, &out);
                     }
                     Ok(_) => http::html(w, &render::hint("not a directory")),

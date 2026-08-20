@@ -16,7 +16,16 @@ pub enum Class {
 }
 
 /// Pure. `rel` is project-relative with `/` separators.
-pub fn classify(rel: &str, open_buffers: &[String], hide: &[String]) -> Class {
+///
+/// `filter` is the tree's own visibility rule, so what refreshes the listing
+/// and what appears in it stay the same set: with `show_hidden` off a touched
+/// dotfile is not a tree change, and with it on it is.
+///
+/// `.git` is the exception, deliberately ahead of the filter: even when
+/// `show_hidden` renders it, a single `git status` writes enough inside it to
+/// turn every command into a burst of tree refreshes. Its rows go stale until
+/// the directory is re-expanded, which is the recoverable side of that trade.
+pub fn classify(rel: &str, open_buffers: &[String], filter: &crate::projects::TreeFilter) -> Class {
     let first = rel.split('/').next().unwrap_or("");
     if first == ".git" {
         return match rel {
@@ -24,7 +33,7 @@ pub fn classify(rel: &str, open_buffers: &[String], hide: &[String]) -> Class {
             _ => Class::Ignore,
         };
     }
-    if crate::projects::SKIP_DIRS.contains(&first) || hide.iter().any(|h| h == first) {
+    if filter.skips(first) {
         return Class::Ignore;
     }
     if open_buffers.iter().any(|b| b == rel) {
@@ -327,6 +336,14 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                 // I/O either way, since `file_changed_externally`'s read is
                 // a small local filesystem read, not a network or PTY
                 // write.
+                // Read before locking, never after: this is a filesystem
+                // read, and the Hub lock is not held across blocking I/O.
+                // Re-read per batch rather than captured at spawn, so
+                // editing `.resh/config.toml` takes effect on the next
+                // change instead of at the next restart, matching the
+                // request path.
+                let settings = crate::config::for_project(&base);
+                let filter = settings.tree_filter();
                 let mut h = Hub::lock(&hub);
                 let open: Vec<String> = h.ws.buffers.keys().cloned().collect();
                 let mut tree = false;
@@ -343,7 +360,7 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                 // self-write suppression exists to prevent.
                 let mut buffer_rels = std::collections::HashSet::new();
                 for rel in &rels {
-                    match classify(rel, &open, &[]) {
+                    match classify(rel, &open, &filter) {
                         Class::Tree => tree = true,
                         Class::Status => status = true,
                         Class::Buffer(r) => {
@@ -382,6 +399,7 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::projects::TreeFilter;
 
     fn bufs() -> Vec<String> {
         vec!["src/main.rs".to_string()]
@@ -389,55 +407,99 @@ mod tests {
 
     #[test]
     fn git_index_and_head_drive_the_status_pane() {
-        assert!(matches!(classify(".git/index", &bufs(), &[]), Class::Status));
-        assert!(matches!(classify(".git/HEAD", &bufs(), &[]), Class::Status));
+        assert!(matches!(classify(".git/index", &bufs(), &TreeFilter::default()), Class::Status));
+        assert!(matches!(classify(".git/HEAD", &bufs(), &TreeFilter::default()), Class::Status));
     }
 
     #[test]
     fn other_git_internals_are_ignored() {
-        assert!(matches!(classify(".git/objects/ab/cdef", &bufs(), &[]), Class::Ignore));
-        assert!(matches!(classify(".git/logs/HEAD", &bufs(), &[]), Class::Ignore));
+        assert!(matches!(classify(".git/objects/ab/cdef", &bufs(), &TreeFilter::default()), Class::Ignore));
+        assert!(matches!(classify(".git/logs/HEAD", &bufs(), &TreeFilter::default()), Class::Ignore));
     }
 
     #[test]
     fn open_buffers_beat_the_generic_tree_class() {
-        match classify("src/main.rs", &bufs(), &[]) {
+        match classify("src/main.rs", &bufs(), &TreeFilter::default()) {
             Class::Buffer(rel) => assert_eq!(rel, "src/main.rs"),
             other => panic!("expected Buffer, got {other:?}"),
         }
     }
 
+    // The classifier and the tree must agree about which rows exist: a change
+    // the listing would never show is not a reason to re-render it, and one it
+    // does show is. Each case asserts both settings, so a classifier that
+    // ignored the filter fails one half.
+    #[test]
+    fn a_dotfile_is_a_tree_change_only_when_the_tree_shows_it() {
+        let on = TreeFilter { show_hidden: true, ..Default::default() };
+        for rel in [".gitignore", ".claude/worktrees/feat/src/main.rs", ".venv/lib/p.py"] {
+            assert!(
+                matches!(classify(rel, &bufs(), &TreeFilter::default()), Class::Ignore),
+                "{rel} is not in the default listing, so it cannot change it"
+            );
+            assert!(
+                matches!(classify(rel, &bufs(), &on), Class::Tree),
+                "{rel} is a visible row under show_hidden and must refresh"
+            );
+        }
+    }
+
+    // `.git` is the deliberate exception, ahead of the filter: `show_hidden`
+    // renders it, but a single git command writes enough inside it to turn
+    // every command into a burst of refreshes. Its rows go stale until the
+    // directory is re-expanded; the two files the status pane reads still get
+    // through, or the pane would stop tracking the branch.
+    #[test]
+    fn git_internals_stay_quiet_even_with_show_hidden_on() {
+        let on = TreeFilter { show_hidden: true, ..Default::default() };
+        assert!(matches!(classify(".git/objects/ab/cdef", &bufs(), &on), Class::Ignore));
+        assert!(matches!(classify(".git/logs/HEAD", &bufs(), &on), Class::Ignore));
+        assert!(matches!(classify(".git/index", &bufs(), &on), Class::Status));
+        assert!(matches!(classify(".git/HEAD", &bufs(), &on), Class::Status));
+    }
+
+    // Build output is not a hidden file: revealing dot entries must not let a
+    // cargo build resume storming the tree.
+    #[test]
+    fn show_hidden_does_not_reopen_the_build_output_storm() {
+        let on = TreeFilter { show_hidden: true, ..Default::default() };
+        assert!(matches!(classify("target/debug/resh", &bufs(), &on), Class::Ignore));
+        assert!(matches!(classify("node_modules/x/y.js", &bufs(), &on), Class::Ignore));
+    }
+
     #[test]
     fn ordinary_files_refresh_the_tree() {
-        assert!(matches!(classify("src/other.rs", &bufs(), &[]), Class::Tree));
-        assert!(matches!(classify("README.md", &bufs(), &[]), Class::Tree));
+        assert!(matches!(classify("src/other.rs", &bufs(), &TreeFilter::default()), Class::Tree));
+        assert!(matches!(classify("README.md", &bufs(), &TreeFilter::default()), Class::Tree));
     }
 
     #[test]
     fn skip_dirs_and_hide_are_ignored_entirely() {
         // a cargo build must not generate a storm of tree refreshes
-        assert!(matches!(classify("target/debug/resh", &bufs(), &[]), Class::Ignore));
-        assert!(matches!(classify("node_modules/x/y.js", &bufs(), &[]), Class::Ignore));
-        assert!(matches!(classify(".venv/lib/p.py", &bufs(), &[]), Class::Ignore));
+        assert!(matches!(classify("target/debug/resh", &bufs(), &TreeFilter::default()), Class::Ignore));
+        assert!(matches!(classify("node_modules/x/y.js", &bufs(), &TreeFilter::default()), Class::Ignore));
+        assert!(matches!(classify(".venv/lib/p.py", &bufs(), &TreeFilter::default()), Class::Ignore));
         let hide = vec!["dist".to_string()];
-        assert!(matches!(classify("dist/bundle.js", &bufs(), &hide), Class::Ignore));
+        assert!(matches!(classify("dist/bundle.js", &bufs(), &TreeFilter { hide: &hide, ..Default::default() }), Class::Ignore));
     }
 
     // A Claude worktree at `.claude/worktrees/{name}` is a whole second
     // checkout inside the project. Every file written in it would otherwise
     // refresh the tree of the *parent* project, which is displaying an
-    // entirely different working copy.
+    // entirely different working copy — unless `show_hidden` is on, in which
+    // case the parent's tree really is displaying those rows and has to keep
+    // them current.
     #[test]
     fn a_worktree_under_dot_claude_never_refreshes_its_parents_tree() {
         assert!(matches!(
-            classify(".claude/worktrees/feat/src/main.rs", &bufs(), &[]),
+            classify(".claude/worktrees/feat/src/main.rs", &bufs(), &TreeFilter::default()),
             Class::Ignore
         ));
         // The whole directory goes, not just `worktrees/` — so `.claude`'s own
         // config files stop live-refreshing too. Accepted: they are Claude's
         // state, not the project's source, and one skip list drives the tree,
         // the watcher, and the picker alike.
-        assert!(matches!(classify(".claude/settings.json", &bufs(), &[]), Class::Ignore));
+        assert!(matches!(classify(".claude/settings.json", &bufs(), &TreeFilter::default()), Class::Ignore));
     }
 
     #[test]
@@ -480,6 +542,79 @@ mod tests {
         assert!(ok);
 
         std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    // The watcher reads the project's settings itself, per batch of events —
+    // nothing hands it a filter at spawn time. Without that, `show_hidden`
+    // would render dot rows that then never refreshed, and the tree would show
+    // a `.gitignore` frozen at whatever it said when the pane loaded.
+    //
+    // Both halves run against a live watcher, and each one waits for a
+    // *positive* event before drawing its conclusion: the "must not refresh"
+    // case ends by touching an ordinary file and requiring the refresh that
+    // proves the watcher was alive and listening the whole time. A test that
+    // only waited out a timeout would pass just as well with the watcher dead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_watcher_reads_show_hidden_from_the_project_it_is_watching() {
+        assert!(
+            !dotfile_refreshes_the_tree(None),
+            "with the default settings a dotfile is not a visible row, so it must not refresh"
+        );
+        assert!(
+            dotfile_refreshes_the_tree(Some("show_hidden = true")),
+            "with show_hidden on the dotfile IS a visible row and must refresh"
+        );
+    }
+
+    /// Spawns a real watcher over a fresh project containing `config`, writes
+    /// `.gitignore`, and reports whether a TreeChanged followed. Panics rather
+    /// than returning false if the control write (an ordinary file, always a
+    /// visible row) fails to produce one — that means the harness itself was
+    /// not working, which is not the same answer as "filtered out".
+    #[cfg(target_os = "linux")]
+    fn dotfile_refreshes_the_tree(config: Option<&str>) -> bool {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("seed.txt"), "").unwrap();
+        if let Some(text) = config {
+            std::fs::create_dir(d.path().join(".resh")).unwrap();
+            std::fs::write(d.path().join(".resh/config.toml"), text).unwrap();
+        }
+
+        let hub = Arc::new(Mutex::new(Hub::new("watch_show_hidden", d.path().to_path_buf())));
+        assert!(spawn("watch_show_hidden", d.path().to_path_buf(), hub.clone(), Duration::from_millis(20)));
+        let rx = Hub::lock(&hub).subscribe().1;
+
+        std::fs::write(d.path().join(".gitignore"), "target\n").unwrap();
+        let saw_dotfile = waits_for_tree_changed(&rx);
+        // Control: an ordinary write must always be seen, whatever the
+        // settings say. If this fails the watcher was not delivering at all
+        // and `saw_dotfile` means nothing.
+        std::fs::write(d.path().join("ordinary.txt"), "hi\n").unwrap();
+        assert!(
+            waits_for_tree_changed(&rx),
+            "the watcher must deliver an ordinary file's change; without that the \
+             dotfile result is meaningless"
+        );
+
+        std::env::remove_var("RESH_STATE_DIR");
+        saw_dotfile
+    }
+
+    /// True if a TreeChanged arrives within the window. The window only has to
+    /// outrun the 20ms debounce; it is generous because a slow CI box delaying
+    /// an event must not read as "the event was filtered".
+    #[cfg(target_os = "linux")]
+    fn waits_for_tree_changed(rx: &std::sync::mpsc::Receiver<String>) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while let Ok(m) = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            if m.contains(r#""t":"TreeChanged""#) {
+                return true;
+            }
+        }
+        false
     }
 
     // The per-directory (Linux) watch path must stop growing once it hits

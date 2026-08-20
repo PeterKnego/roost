@@ -322,9 +322,14 @@ fn depth(rel: &str) -> usize {
     rel.matches('/').count()
 }
 
-pub fn tree_fragment(project: &str, dir: &Path, open: &str, hide: &[String]) -> String {
+pub fn tree_fragment(
+    project: &str,
+    dir: &Path,
+    open: &str,
+    filter: &crate::projects::TreeFilter,
+) -> String {
     let mut out = String::from("<ul class=\"tree\">");
-    tree_level(project, dir, "", open, hide, &mut out);
+    tree_level(project, dir, "", open, filter, &mut out);
     out.push_str("</ul>");
     out
 }
@@ -340,7 +345,14 @@ pub fn tree_fragment(project: &str, dir: &Path, open: &str, hide: &[String]) -> 
 /// level rather than to the whole recursive walk: an ordinary large project
 /// (many modest directories) never trips it, while one pathological
 /// directory with thousands of direct entries still gets capped.
-pub fn tree_level(project: &str, dir: &Path, rel: &str, open: &str, hide: &[String], out: &mut String) {
+pub fn tree_level(
+    project: &str,
+    dir: &Path,
+    rel: &str,
+    open: &str,
+    filter: &crate::projects::TreeFilter,
+    out: &mut String,
+) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut entries: Vec<_> = rd.flatten().collect();
     entries.sort_by_key(|e| (e.path().is_file(), e.file_name().to_ascii_lowercase()));
@@ -351,8 +363,7 @@ pub fn tree_level(project: &str, dir: &Path, rel: &str, open: &str, hide: &[Stri
             break;
         }
         let name = e.file_name().to_string_lossy().into_owned();
-        if crate::projects::SKIP_DIRS.contains(&name.as_str()) || hide.iter().any(|h| h == &name)
-        {
+        if filter.skips(&name) {
             continue;
         }
         budget -= 1;
@@ -368,7 +379,7 @@ pub fn tree_level(project: &str, dir: &Path, rel: &str, open: &str, hide: &[Stri
                     depth(&erel),
                     esc(&name)
                 ));
-                tree_level(project, &e.path(), &erel, open, hide, out);
+                tree_level(project, &e.path(), &erel, open, filter, out);
                 out.push_str("</ul></details></li>");
             } else {
                 // Closed, with an empty <ul>: `data-rel` lets the client find
@@ -765,6 +776,7 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::projects::TreeFilter;
     use std::fs;
 
     #[test]
@@ -1015,13 +1027,14 @@ mod tests {
     #[test]
     fn tree_marks_open_path_and_skips_hidden() {
         let d = tempfile::tempdir().unwrap();
+        let hide = vec!["dist".to_string()];
         fs::create_dir_all(d.path().join("src/sub")).unwrap();
         fs::create_dir(d.path().join("target")).unwrap();
         fs::create_dir(d.path().join("dist")).unwrap();
         fs::write(d.path().join("src/main.rs"), "").unwrap();
         fs::write(d.path().join("src/sub/x.rs"), "").unwrap();
         fs::write(d.path().join("README.md"), "").unwrap();
-        let h = tree_fragment("proj", d.path(), "src/main.rs", &["dist".to_string()]);
+        let h = tree_fragment("proj", d.path(), "src/main.rs", &TreeFilter { hide: &hide, ..Default::default() });
         assert!(h.contains("<details open data-rel=\"src\"><summary style=\"--d:0\">src</summary>"));
         assert!(h.contains("class=\"file sel\""));
         assert!(h.contains("data-rel=\"src/main.rs\""));
@@ -1031,10 +1044,10 @@ mod tests {
     }
 
     // Claude Code checks a worktree out at `{repo}/.claude/worktrees/{name}`:
-    // a second, full copy of the repository inside the project directory. The
-    // tree hides dot-directories nowhere else — it filters on SKIP_DIRS and
-    // `hide` and nothing more — so without `.claude` on that list a project
-    // renders a duplicate of itself under its own tree.
+    // a second, full copy of the repository inside the project directory.
+    // `.claude` is a dot entry, so the default filter keeps that duplicate out
+    // of the parent's tree — a user who turns `show_hidden` on has asked to
+    // see it and gets it (see the pair of tests below).
     #[test]
     fn a_worktree_checked_out_under_dot_claude_stays_out_of_its_parents_tree() {
         let d = tempfile::tempdir().unwrap();
@@ -1042,11 +1055,78 @@ mod tests {
         fs::write(d.path().join("src/main.rs"), "").unwrap();
         fs::create_dir_all(d.path().join(".claude/worktrees/feat/src")).unwrap();
         fs::write(d.path().join(".claude/worktrees/feat/src/main.rs"), "").unwrap();
-        let h = tree_fragment("proj", d.path(), "src/main.rs", &[]);
+        let h = tree_fragment("proj", d.path(), "src/main.rs", &TreeFilter::default());
         // the project's own tree is unaffected
         assert!(h.contains("data-rel=\"src/main.rs\""));
         assert!(!h.contains(".claude"), "the worktree's parent directory must not appear");
         assert!(!h.contains("worktrees"), "nor anything beneath it");
+    }
+
+    // The default and the opt-in asserted against one fixture, so neither can
+    // pass by rendering nothing: every case names a row that must be present
+    // alongside the rows that must not be.
+    #[test]
+    fn dot_entries_are_hidden_by_default() {
+        let d = dot_fixture();
+        let h = tree_fragment("proj", d.path(), "", &TreeFilter::default());
+        assert!(h.contains(">README.md<"), "the ordinary file must still render");
+        assert!(h.contains(">src</summary>"), "and so must the ordinary directory");
+        assert!(!h.contains(".gitignore"), "a dotfile is hidden");
+        assert!(!h.contains(".claude"), "and so is a dot-directory");
+        assert!(!h.contains(".git<"), "and so is .git");
+        assert!(!h.contains(">target</summary>"), "build output stays hidden");
+    }
+
+    #[test]
+    fn show_hidden_renders_every_dot_entry_but_no_build_output() {
+        let d = dot_fixture();
+        let filter = TreeFilter { show_hidden: true, ..Default::default() };
+        let h = tree_fragment("proj", d.path(), "", &filter);
+        assert!(h.contains(">README.md<"), "ordinary rows are unaffected");
+        assert!(h.contains(r#"data-rel=".gitignore""#), "the dotfile is a real row");
+        assert!(h.contains(">.claude</summary>"), "the dot-directory is expandable");
+        assert!(h.contains(">.git</summary>"), "including .git");
+        assert!(!h.contains(">target</summary>"), "but target/ is not a hidden file");
+    }
+
+    // `hide` is the user's own list, so it survives the opt-in that reveals
+    // everything else — otherwise `show_hidden` would silently undo it.
+    #[test]
+    fn the_hide_list_still_applies_when_show_hidden_is_on() {
+        let d = dot_fixture();
+        let hide = vec![".gitignore".to_string()];
+        let h = tree_fragment("proj", d.path(), "", &TreeFilter { hide: &hide, show_hidden: true });
+        assert!(h.contains(">.claude</summary>"), "the unlisted dot entry is revealed");
+        assert!(!h.contains(".gitignore"), "the listed one is not");
+    }
+
+    // A lazily-fetched subtree renders through the same filter as the initial
+    // load: a `.claude` visible at the root that fetched an unfiltered listing
+    // when expanded would leak rows the root render had refused.
+    #[test]
+    fn a_lazy_fetch_applies_the_same_filter_as_the_first_render() {
+        let d = dot_fixture();
+        fs::write(d.path().join("src/.secret"), "").unwrap();
+        let mut off = String::new();
+        tree_level("proj", &d.path().join("src"), "src", "", &TreeFilter::default(), &mut off);
+        assert!(off.contains("src/main.rs"), "the ordinary child renders");
+        assert!(!off.contains(".secret"));
+        let mut on = String::new();
+        let filter = TreeFilter { show_hidden: true, ..Default::default() };
+        tree_level("proj", &d.path().join("src"), "src", "", &filter, &mut on);
+        assert!(on.contains(r#"data-rel="src/.secret""#));
+    }
+
+    fn dot_fixture() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir(d.path().join("src")).unwrap();
+        fs::create_dir(d.path().join("target")).unwrap();
+        fs::create_dir(d.path().join(".git")).unwrap();
+        fs::create_dir_all(d.path().join(".claude/worktrees/feat")).unwrap();
+        fs::write(d.path().join("src/main.rs"), "").unwrap();
+        fs::write(d.path().join("README.md"), "").unwrap();
+        fs::write(d.path().join(".gitignore"), "").unwrap();
+        d
     }
 
     // `sub` sits under `src`, which is on the open path, but `sub` itself is
@@ -1059,7 +1139,7 @@ mod tests {
         fs::create_dir_all(d.path().join("src/sub")).unwrap();
         fs::write(d.path().join("src/main.rs"), "").unwrap();
         fs::write(d.path().join("src/sub/x.rs"), "").unwrap();
-        let h = tree_fragment("proj", d.path(), "src/main.rs", &[]);
+        let h = tree_fragment("proj", d.path(), "src/main.rs", &TreeFilter::default());
         assert!(h.contains(
             "<details data-rel=\"src/sub\" hx-get=\"/frag/proj/tree?dir=src/sub\" \
              hx-trigger=\"toggle once\" hx-target=\"find ul\"><summary style=\"--d:1\">sub</summary><ul></ul></details>"
@@ -1075,7 +1155,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         fs::create_dir_all(d.path().join("a/b/c")).unwrap();
         fs::write(d.path().join("a/b/c/main.rs"), "").unwrap();
-        let h = tree_fragment("proj", d.path(), "a/b/c/main.rs", &[]);
+        let h = tree_fragment("proj", d.path(), "a/b/c/main.rs", &TreeFilter::default());
         assert!(h.contains("<details open data-rel=\"a\">"));
         assert!(h.contains("<details open data-rel=\"a/b\">"));
         assert!(h.contains("<details open data-rel=\"a/b/c\">"));
@@ -1096,7 +1176,7 @@ mod tests {
         fs::write(d.path().join("src/sub/x.rs"), "").unwrap();
         fs::write(d.path().join("README"), "").unwrap();
         fs::write(d.path().join("Cargo.toml"), "").unwrap();
-        let h = tree_fragment("proj", d.path(), "src/sub/x.rs", &[]);
+        let h = tree_fragment("proj", d.path(), "src/sub/x.rs", &TreeFilter::default());
         assert!(h.contains("data-rel=\"src/sub/x.rs\" data-ext=\"rs\" style=\"--d:2\""));
         assert!(h.contains("data-rel=\"Cargo.toml\" data-ext=\"toml\" style=\"--d:0\""));
         // No dot at all: the stylesheet's neutral glyph, not a bogus type.
@@ -1104,7 +1184,7 @@ mod tests {
 
         // The same row, reached through the lazy ?dir= path, agrees.
         let mut lazy = String::new();
-        tree_level("proj", &d.path().join("src/sub"), "src/sub", "", &[], &mut lazy);
+        tree_level("proj", &d.path().join("src/sub"), "src/sub", "", &TreeFilter::default(), &mut lazy);
         assert!(lazy.contains("data-rel=\"src/sub/x.rs\" data-ext=\"rs\" style=\"--d:2\""));
     }
 
@@ -1127,7 +1207,7 @@ mod tests {
         fs::write(d.path().join("src/main.rs"), "").unwrap();
         fs::write(d.path().join("src/sub/x.rs"), "").unwrap();
         let mut out = String::new();
-        tree_level("proj", &d.path().join("src"), "src", "", &[], &mut out);
+        tree_level("proj", &d.path().join("src"), "src", "", &TreeFilter::default(), &mut out);
         assert!(!out.starts_with("<ul"));
         assert!(out.contains("data-rel=\"src/main.rs\""));
         assert!(out.contains("data-rel=\"src/sub\"")); // closed stub, not expanded
@@ -1146,13 +1226,13 @@ mod tests {
         fs::create_dir(d.path().join("src")).unwrap();
         fs::write(d.path().join("README.md"), "").unwrap();
         let mut out = String::new();
-        tree_level("proj", d.path(), "", "", &[], &mut out);
+        tree_level("proj", d.path(), "", "", &TreeFilter::default(), &mut out);
         assert!(!out.starts_with("<ul"));
         assert!(out.contains("data-rel=\"src\""));
         assert!(out.contains("data-rel=\"README.md\""));
         // must match the identity render::tree_fragment assigns those same
         // entries at the top level, since the client keys reconciliation on it
-        let full = tree_fragment("proj", d.path(), "", &[]);
+        let full = tree_fragment("proj", d.path(), "", &TreeFilter::default());
         assert!(full.contains("data-rel=\"src\""));
         assert!(full.contains("data-rel=\"README.md\""));
     }

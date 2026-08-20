@@ -639,6 +639,33 @@ fn tree_dir_lazily_returns_a_subdirectorys_children() {
     assert!(sub.contains("inner.txt"));
 }
 
+// The setting has to survive the whole request path — config cascade, route,
+// renderer — and it is per project, so the test asserts the same server serves
+// the hidden row only once that project's `.resh/config.toml` asks for it. A
+// filter wired to a constant would pass one half and fail the other.
+// Own project name: this test writes into the project directory (see
+// `fixture_named`).
+#[test]
+fn show_hidden_is_read_per_project_on_every_tree_request() {
+    let (d, port) = fixture_named("hiddenproj");
+    let proj = d.path().join("hiddenproj");
+    std::fs::write(proj.join(".gitignore"), "target\n").unwrap();
+    let url = format!("http://127.0.0.1:{port}/frag/hiddenproj/tree");
+    let before = ureq::get(&url).call().unwrap().into_string().unwrap();
+    assert!(before.contains("data-rel=\"hello.md\""), "ordinary rows render");
+    assert!(!before.contains(".gitignore"), "hidden by default");
+
+    // Settings are re-read per request, so no restart between these two.
+    std::fs::create_dir(proj.join(".resh")).unwrap();
+    std::fs::write(proj.join(".resh/config.toml"), "show_hidden = true").unwrap();
+    let after = ureq::get(&url).call().unwrap().into_string().unwrap();
+    assert!(after.contains("data-rel=\".gitignore\""), "the setting took effect");
+    assert!(after.contains("data-rel=\".resh\""), "including the config dir itself");
+    // The lazy-expand endpoint reads the same setting, not a cached one.
+    let lazy = ureq::get(&format!("{url}?dir=")).call().unwrap().into_string().unwrap();
+    assert!(lazy.contains("data-rel=\".gitignore\""));
+}
+
 #[test]
 fn tree_dir_with_empty_rel_returns_the_root_listing() {
     // app.js reconciles the root level of the tree in place on every

@@ -309,5 +309,25 @@ own domain. Rejections are logged with the offending values — check
 `journalctl --user -u resh` when access mysteriously 403s.
 
 Config is re-read every request (`~/.config/resh/config.toml`, then
-`{project}/.resh/config.toml` for theme/hide), so a wrong value is fixed
-by editing the file, not redeploying.
+`{project}/.resh/config.toml` for theme/hide/show_hidden), so a wrong value is
+fixed by editing the file, not redeploying.
+
+### Hidden files in the tree
+
+The file tree hides every entry beginning with a dot — `.git`, `.claude`,
+`.gitignore` — along with `target`, `node_modules`, `__pycache__` and anything
+in `hide`. To see the dot entries:
+
+```toml
+show_hidden = true
+```
+
+Globally or per project, and it takes effect on the next tree render, no
+restart. It reveals dot entries only: build and vendor directories stay hidden
+either way, as does anything you listed in `hide`, which outranks it.
+
+Two things it deliberately does not change. `.git`'s *contents* still do not
+refresh the tree as they change (a single git command writes enough inside it
+to turn every command into a burst of refreshes), so an expanded `.git` goes
+stale until you re-expand it. And uploads into `.git` or `.claude` stay refused
+whatever the setting says — those hold a second copy of the repository.

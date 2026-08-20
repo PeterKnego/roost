@@ -47,6 +47,12 @@ stale, never overwritten.
 configured roots and open it as a workspace — single click selects, double
 click descends, Enter opens, and git repos get a one-click shortcut.
 
+**Dot entries are hidden, until you say otherwise.** The tree leaves out
+`.git`, `.claude` and every other dot entry by default, along with build and
+vendor directories. `show_hidden = true` in a global or per-project
+`.resh/config.toml` brings the dot entries back — see
+[`docs/deploy.md`](docs/deploy.md#hidden-files-in-the-tree).
+
 **Desktop notifications.** A process in a terminal — Claude finishing a task,
 a hook needing a decision — can raise a notification with one escape sequence
 or `resh notify`; it shows up as a bell across every project and, given a

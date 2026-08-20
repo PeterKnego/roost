@@ -2,20 +2,52 @@
 //! path confinement, size cap, binary sniffing.
 use std::path::{Path, PathBuf};
 
-/// Directory names the file tree never renders, the watcher never descends
-/// into, and the picker never offers. Mostly build and vendor output — but two
+/// Directory names that are never a project, never walked by the watcher, and
+/// never offered by the picker. Mostly build and vendor output — but two
 /// entries hold a whole second copy of the repository. `.git` is the obvious
 /// one; `.claude` is the one that bites, because Claude Code checks worktrees
 /// out at `{repo}/.claude/worktrees/{name}`, a full working tree living
-/// *inside* the project directory. Nothing else hides dot-directories from the
-/// tree (`render::tree_level` filters on this list and the user's `hide` list,
-/// nothing more), so without this entry a project renders a duplicate of
-/// itself, spends the inotify budget watching a checkout nobody opened, and
-/// offers files whose git state belongs to a different branch than the status
-/// pane beside them. A worktree is its own project and is opened as one; it
-/// does not belong in its parent's tree.
+/// *inside* the project directory. Without that entry the watcher spends its
+/// inotify budget on a checkout nobody opened and the picker offers a worktree
+/// as if it were part of its own parent, with git state belonging to a
+/// different branch than the status pane beside it. A worktree is its own
+/// project and is opened as one.
+///
+/// The file tree filters through [`TreeFilter`] instead, which hides *every*
+/// dot entry by default and consults this list only for the names that do not
+/// begin with a dot.
 pub const SKIP_DIRS: &[&str] =
     &[".git", ".claude", "target", "node_modules", "__pycache__", ".venv"];
+
+/// What the file tree renders and what the watcher considers a tree change —
+/// one rule, so the two cannot disagree about which rows exist.
+///
+/// Dot entries are hidden by default and revealed together by `show_hidden`
+/// (`show_hidden = true` in a config file), including `.git` and `.claude`:
+/// hiding them is a decluttering default, not a safety boundary, and a user
+/// who asks to see hidden files means all of them. The user's `hide` list is
+/// an explicit instruction and outranks both.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TreeFilter<'a> {
+    pub hide: &'a [String],
+    pub show_hidden: bool,
+}
+
+impl TreeFilter<'_> {
+    /// `name` is a single path component, never a path.
+    pub fn skips(&self, name: &str) -> bool {
+        if self.hide.iter().any(|h| h == name) {
+            return true;
+        }
+        if let Some(rest) = name.strip_prefix('.') {
+            // `.` and `..` never come out of `read_dir`, but `rel` segments
+            // arriving from the network do reach the watcher's classifier.
+            return !self.show_hidden || rest.is_empty() || rest == ".";
+        }
+        SKIP_DIRS.contains(&name)
+    }
+}
+
 pub const RESERVED: &[&str] = &["static", "ws", "frag"];
 pub const MAX_FILE_BYTES: u64 = 2_000_000;
 const TEXT_EXTENSIONS: &[&str] = &[
@@ -321,6 +353,58 @@ pub fn read_text_file(path: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    // The whole rule in one place. Each assertion pairs the two settings so a
+    // filter that ignored `show_hidden` entirely (returning a constant) fails
+    // one half of every pair.
+    #[test]
+    fn tree_filter_hides_every_dot_entry_until_show_hidden_reveals_them() {
+        let off = TreeFilter::default();
+        let on = TreeFilter { show_hidden: true, ..Default::default() };
+        for name in [".gitignore", ".claude", ".git", ".venv", ".hidden"] {
+            assert!(off.skips(name), "{name} must be hidden by default");
+            assert!(!on.skips(name), "show_hidden must reveal {name}");
+        }
+        // Ordinary entries are never touched by either.
+        for name in ["src", "README.md", "Cargo.toml"] {
+            assert!(!off.skips(name));
+            assert!(!on.skips(name));
+        }
+    }
+
+    // `show_hidden` is about clutter, not about build output: revealing dot
+    // entries must not drag `target/` into a Rust project's tree.
+    #[test]
+    fn show_hidden_does_not_reveal_the_non_dot_build_dirs() {
+        let on = TreeFilter { show_hidden: true, ..Default::default() };
+        for name in ["target", "node_modules", "__pycache__"] {
+            assert!(TreeFilter::default().skips(name));
+            assert!(on.skips(name), "{name} is build output, not a hidden file");
+        }
+    }
+
+    // The user's list is an explicit instruction, so it outranks `show_hidden`
+    // in both directions: it hides a plain directory, and it keeps hiding a
+    // dot entry that `show_hidden` would otherwise have revealed.
+    #[test]
+    fn the_hide_list_outranks_show_hidden() {
+        let hide = vec!["dist".to_string(), ".gitignore".to_string()];
+        let on = TreeFilter { hide: &hide, show_hidden: true };
+        assert!(on.skips("dist"));
+        assert!(on.skips(".gitignore"));
+        assert!(!on.skips(".git")); // an unlisted dot entry is still revealed
+        assert!(!on.skips("src"));
+    }
+
+    // `read_dir` never yields these, but a `rel` from the network reaches the
+    // watcher's classifier, and "show me hidden files" is not consent to treat
+    // a traversal segment as an ordinary name.
+    #[test]
+    fn show_hidden_never_reveals_the_traversal_segments() {
+        let on = TreeFilter { show_hidden: true, ..Default::default() };
+        assert!(on.skips("."));
+        assert!(on.skips(".."));
+    }
 
     fn root_fixture() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();

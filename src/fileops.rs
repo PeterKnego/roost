@@ -125,9 +125,14 @@ fn valid_upload_name(name: &str) -> Result<(), String> {
 /// it is worse than confusing: a write into an object or ref directory can
 /// corrupt the repository.
 ///
-/// Keyed on `SKIP_DIRS`, deliberately not on a leading dot. The tree hides a
-/// fixed list of directories, so `.gitignore` is visible and uploading one is
-/// honest.
+/// Keyed on `SKIP_DIRS`, deliberately not on a leading dot, even though the
+/// tree itself now hides every dot entry by default. The two rules differ on
+/// purpose: tree visibility is a per-project *setting* a user flips at will,
+/// and an upload that succeeded or failed depending on when the config was
+/// last edited would be worse than one that is simply always refused for the
+/// same six names. So uploading a `.gitignore` stays honest — it may land in a
+/// row `show_hidden` is currently hiding, which the user can reveal — while a
+/// write into `.git` or `.claude` is refused no matter what the setting says.
 fn visible_in_tree(rel: &str) -> Result<(), String> {
     for segment in rel.split('/').filter(|s| !s.is_empty()) {
         if crate::projects::SKIP_DIRS.contains(&segment) {

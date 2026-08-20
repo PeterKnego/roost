@@ -9,6 +9,7 @@ struct RawConfig {
     theme: Option<String>,
     default_tab: Option<String>,
     hide: Option<Vec<String>>,
+    show_hidden: Option<bool>,
     allowed_origins: Option<Vec<String>>,
     max_upload_bytes: Option<u64>,
 }
@@ -18,7 +19,16 @@ pub struct Settings {
     pub theme: String,
     pub default_tab: String,
     pub hide: Vec<String>,
+    pub show_hidden: bool,
     pub warning: Option<String>,
+}
+
+impl Settings {
+    /// The tree's visibility rule, borrowed rather than cloned: the caller
+    /// holds the `Settings` for the length of the render.
+    pub fn tree_filter(&self) -> crate::projects::TreeFilter<'_> {
+        crate::projects::TreeFilter { hide: &self.hide, show_hidden: self.show_hidden }
+    }
 }
 
 impl Default for Settings {
@@ -27,6 +37,7 @@ impl Default for Settings {
             theme: "darcula".into(),
             default_tab: "terminal".into(),
             hide: vec![],
+            show_hidden: false,
             warning: None,
         }
     }
@@ -54,6 +65,9 @@ pub fn load(paths: &[&Path]) -> Settings {
                 }
                 if let Some(v) = raw.hide {
                     s.hide = v;
+                }
+                if let Some(v) = raw.show_hidden {
+                    s.show_hidden = v;
                 }
             }
             Err(e) => warnings.push(format!("{}: {}", path.display(), e.message())),
@@ -182,6 +196,37 @@ mod tests {
         assert_eq!(s.hide, vec!["dist"]); // untouched key survives from global
         assert_eq!(s.default_tab, "terminal"); // default fills the rest
         assert!(s.warning.is_none());
+    }
+
+    // `show_hidden` is off unless a file turns it on, and a project may turn
+    // it on for itself without the global file mentioning it — the tree's
+    // visibility is a display preference, not a boundary any config could
+    // widen.
+    #[test]
+    fn show_hidden_defaults_off_and_a_project_can_turn_it_on() {
+        let d = tempfile::tempdir().unwrap();
+        let g = d.path().join("global.toml");
+        let p = d.path().join("project.toml");
+        fs::write(&g, "hide = [\"dist\"]").unwrap();
+        assert!(!load(&[&g]).show_hidden);
+        fs::write(&p, "show_hidden = true").unwrap();
+        let s = load(&[&g, &p]);
+        assert!(s.show_hidden);
+        assert_eq!(s.hide, vec!["dist"]); // and the global key still survives
+        assert!(s.warning.is_none());
+    }
+
+    // The reverse direction: a global `true` is what a per-project `false`
+    // has to be able to override, or the setting is one-way.
+    #[test]
+    fn a_project_can_turn_show_hidden_back_off() {
+        let d = tempfile::tempdir().unwrap();
+        let g = d.path().join("global.toml");
+        let p = d.path().join("project.toml");
+        fs::write(&g, "show_hidden = true").unwrap();
+        fs::write(&p, "show_hidden = false").unwrap();
+        assert!(load(&[&g]).show_hidden);
+        assert!(!load(&[&g, &p]).show_hidden);
     }
 
     #[test]
