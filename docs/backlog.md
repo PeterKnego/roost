@@ -187,7 +187,7 @@ feature list — is what a spec for this needs to resolve.
   `serve()`. `tests/integration.rs`'s `start()` spawns `serve()` on a thread
   and returns immediately, and this one binary stands up 31 servers — 7 direct
   `start(...)` calls plus 24 through `fixture()`, which calls it too (counted
-  at `098478e`). `WS_TEST_LOCK` serialises the websocket tests against each
+  at `76b22c8`). `WS_TEST_LOCK` serialises the websocket tests against each
   other, but not against the 28 of 54 tests that do not take it, which freely
   `start()` servers of their own and set/remove `RESH_STATE_DIR` as they go.
   So one test's `load()` can read a *different* test's state dir — including,
