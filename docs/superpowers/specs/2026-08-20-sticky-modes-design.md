@@ -43,6 +43,27 @@ line submits on its own**, with the remaining two landing in whatever comes
 next. Mouse reporting fails the same way and more quietly: clicks and drags
 never reach the app, and the wheel scrolls the browser's own scrollback instead.
 
+**Corrected while building this.** The paragraph above is what a *restart*
+produces, and a restart is what the measurement used. It is not what a reload
+produces, because one ring per screen — landed with the alternate-screen fix —
+changed the picture: an app declares bracketed paste and focus reporting
+*before* it enters the alternate screen (`?2004h`, `?1004h`, then `?1049h`), so
+those land in the normal ring, which stops growing the moment the app switches
+and therefore never evicts them. They are already durable across a reload.
+
+What a reload still loses is everything declared *after* the switch — mouse
+reporting and cursor visibility — because that lives in the alternate ring,
+which the app's own repaints turn over within minutes. Reverting this change
+and reattaching reads `bracketedPaste: true, mouse: none, focus: true`: two
+carried by the normal ring, one gone.
+
+So the honest scope is **mouse reporting and cursor visibility on a reload**,
+plus everything on a restart, which this does not fix. Paste survives a reload
+today and breaks only across a restart. The browser test asserts the mouse mode
+for exactly that reason: a paste assertion there passes with the whole change
+reverted, which is how this correction was found.
+
+
 Nothing about this is Claude-specific. `vim`, `less`, `htop` and anything else
 that wants a mouse declares it the same way, once.
 
