@@ -53,8 +53,41 @@ pub struct Switch {
     /// not interchangeable: only 1049 saves and restores the cursor, so
     /// re-declaring a `less` with 1049 would move its cursor when it exits.
     pub mode: u16,
-    pub enter: bool,
+    /// `h` rather than `l`: onto the alternate screen rather than off it.
+    pub set: bool,
 }
+
+/// Everything the scanner reports. A screen switch has to be *placed* in the
+/// byte stream — `Screens` splits its rings around it — while a sticky mode
+/// only has to be remembered, so it carries no offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    Screen(Switch),
+    Mode { mode: u16, set: bool },
+}
+
+/// The modes worth replaying to a client that attached after the app declared
+/// them: application cursor keys and keypad (1, 66), wraparound (7), cursor
+/// visibility (25), mouse reporting and its coordinate encodings
+/// (1000/1002/1003, 1005/1006/1015/1016), focus reporting (1004) and bracketed
+/// paste (2004).
+///
+/// An allowlist rather than "everything private", because replaying a mode has
+/// to be inert — the point is to restore state, and several modes *do* things:
+///
+/// - **3** (DECCOLM) clears the screen in this emulator. A replay that
+///   destroys the state it is restoring is worse than no replay.
+/// - **47, 1047, 1049** are the screen's, and `Screens` owns their ordering
+///   and their cursor semantics.
+/// - **1048** saves and restores the cursor, so replaying it moves it.
+/// - **6** (origin mode) means nothing without the scroll region, which
+///   nothing here tracks. Half of a pair is worse than neither.
+/// - **2031** (OS colour-scheme notifications) this emulator ignores outright,
+///   so tracking it would buy nothing today.
+///
+/// Adding to this list means answering one question about the new entry: what
+/// does its *reset* do?
+const TRACKED: [u16; 13] = [1, 7, 25, 66, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 2004];
 
 #[derive(Default, PartialEq, Eq, Clone, Copy)]
 enum State {
@@ -92,7 +125,7 @@ impl Scanner {
         self.params.len()
     }
 
-    pub fn feed(&mut self, chunk: &[u8]) -> Vec<Switch> {
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<Event> {
         let mut out = Vec::new();
         // A sequence already in flight began before this chunk, so everything
         // in this chunk up to its end belongs to the screen it is leaving.
@@ -120,9 +153,7 @@ impl Scanner {
                     // An intermediate byte. No mode set or reset has one.
                     0x20..=0x2f => self.unusable = true,
                     0x40..=0x7e => {
-                        if let Some(sw) = self.dispatch(b, i) {
-                            out.push(sw);
-                        }
+                        self.dispatch(b, i, &mut out);
                         self.state = State::Ground;
                     }
                     // A bare ESC abandons the sequence and starts a new one,
@@ -158,23 +189,28 @@ impl Scanner {
         }
     }
 
-    fn dispatch(&self, final_byte: u8, i: usize) -> Option<Switch> {
+    fn dispatch(&self, final_byte: u8, i: usize, out: &mut Vec<Event>) {
         if self.unusable {
-            return None;
+            return;
         }
-        let enter = match final_byte {
+        let set = match final_byte {
             b'h' => true,
             b'l' => false,
-            _ => return None,
+            _ => return,
         };
         // Private modes only: `ESC[?1049h` switches screens, `ESC[1049h`
         // (no `?`) is a different, unrelated mode space.
-        let rest = self.params.strip_prefix(b"?".as_slice())?;
-        let mode = rest
-            .split(|&c| c == b';')
-            .filter_map(|p| std::str::from_utf8(p).ok()?.parse::<u16>().ok())
-            .find(|m| matches!(*m, 47 | 1047 | 1049))?;
-        Some(Switch { start: self.start, end: i + 1, mode, enter })
+        let Some(rest) = self.params.strip_prefix(b"?".as_slice()) else { return };
+        // One sequence may carry several — `ESC[?1049;1006h` is legal — so
+        // every parameter is answered, not just the first one recognised.
+        for m in rest.split(|&c| c == b';').filter_map(|p| std::str::from_utf8(p).ok()?.parse::<u16>().ok())
+        {
+            if matches!(m, 47 | 1047 | 1049) {
+                out.push(Event::Screen(Switch { start: self.start, end: i + 1, mode: m, set }));
+            } else if TRACKED.contains(&m) {
+                out.push(Event::Mode { mode: m, set });
+            }
+        }
     }
 }
 
@@ -194,6 +230,14 @@ pub struct Screens {
     normal: VecDeque<u8>,
     alt: VecDeque<u8>,
     at: At,
+    /// Last value seen for each of `TRACKED`, in that order; `None` for a mode
+    /// the app has never mentioned, which is not the same as one it turned off
+    /// — 7 defaults to *on*, so a reset of it has to be replayed as one.
+    ///
+    /// One table, not one per screen: this emulator holds these globally, and
+    /// modelling them per buffer would be modelling a terminal that is not the
+    /// one on the other end.
+    modes: [Option<bool>; TRACKED.len()],
 }
 
 impl Default for Screens {
@@ -204,7 +248,12 @@ impl Default for Screens {
 
 impl Screens {
     pub fn new() -> Screens {
-        Screens { normal: VecDeque::new(), alt: VecDeque::new(), at: At::Unknown }
+        Screens {
+            normal: VecDeque::new(),
+            alt: VecDeque::new(),
+            at: At::Unknown,
+            modes: [None; TRACKED.len()],
+        }
     }
 
     /// Files a chunk of PTY output under the screen it was written on, and
@@ -221,10 +270,22 @@ impl Screens {
     /// moment any switch is observed, which is why it is keyed on `Unknown`
     /// rather than on "not currently on the alternate screen" — an app that
     /// leaves and re-enters must never have its screen cleared under it.
-    pub fn ingest(&mut self, chunk: &[u8], switches: &[Switch]) -> Vec<u8> {
+    pub fn ingest(&mut self, chunk: &[u8], events: &[Event]) -> Vec<u8> {
         let mut out = Vec::with_capacity(chunk.len());
         let mut cursor = 0;
-        for sw in switches {
+        for ev in events {
+            let sw = match ev {
+                // A mode needs no place in the stream: it stays in the bytes
+                // the client is about to receive, and `replay` re-states it
+                // for whoever attaches later.
+                Event::Mode { mode, set } => {
+                    if let Some(i) = TRACKED.iter().position(|m| m == mode) {
+                        self.modes[i] = Some(*set);
+                    }
+                    continue;
+                }
+                Event::Screen(sw) => sw,
+            };
             let end = sw.end.min(chunk.len());
             if end < cursor {
                 continue;
@@ -233,7 +294,7 @@ impl Screens {
             let head = &chunk[cursor..start];
             self.push(head);
             out.extend_from_slice(head);
-            if !sw.enter && self.at == At::Unknown {
+            if !sw.set && self.at == At::Unknown {
                 self.push(RECONCILE);
                 out.extend_from_slice(RECONCILE);
             } else {
@@ -249,7 +310,7 @@ impl Screens {
             // run; keeping a dead app's frame to hand to the next one is not
             // worth a second ring.)
             self.alt.clear();
-            self.at = if sw.enter { At::Alt(sw.mode) } else { At::Normal };
+            self.at = if sw.set { At::Alt(sw.mode) } else { At::Normal };
         }
         let tail = &chunk[cursor..];
         self.push(tail);
@@ -265,6 +326,17 @@ impl Screens {
         if let At::Alt(mode) = self.at {
             out.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
             out.extend(self.alt.iter().copied());
+        }
+        // Last, deliberately: the rings hold whatever the app happened to say
+        // on its way here, including modes it has since changed. Emitting the
+        // tracked state after them makes last-write-wins settle on the truth
+        // instead of on whichever stale copy survived the ring.
+        for (i, mode) in TRACKED.iter().enumerate() {
+            if let Some(set) = self.modes[i] {
+                out.extend_from_slice(
+                    format!("\x1b[?{mode}{}", if set { 'h' } else { 'l' }).as_bytes(),
+                );
+            }
         }
         out
     }
@@ -313,6 +385,21 @@ mod tests {
         }
     }
 
+    /// Just the screen switches, so the assertions about them stay about them.
+    fn screens_of(events: &[Event]) -> Vec<Switch> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Screen(sw) => Some(*sw),
+                Event::Mode { .. } => None,
+            })
+            .collect()
+    }
+
+    fn switches(s: &mut Scanner, chunk: &[u8]) -> Vec<Switch> {
+        screens_of(&s.feed(chunk))
+    }
+
     fn has(hay: &[u8], needle: &[u8]) -> bool {
         hay.windows(needle.len()).any(|w| w == needle)
     }
@@ -320,14 +407,14 @@ mod tests {
     #[test]
     fn an_enter_and_an_exit_are_both_seen() {
         let mut s = Scanner::new();
-        let sw = s.feed(b"before\x1b[?1049hafter");
+        let sw = switches(&mut s, b"before\x1b[?1049hafter");
         assert_eq!(sw.len(), 1);
-        assert!(sw[0].enter);
+        assert!(sw[0].set);
         assert_eq!(sw[0].mode, 1049);
         assert_eq!((sw[0].start, sw[0].end), (6, 14));
-        let sw = s.feed(b"\x1b[?1049l");
+        let sw = switches(&mut s, b"\x1b[?1049l");
         assert_eq!(sw.len(), 1);
-        assert!(!sw[0].enter);
+        assert!(!sw[0].set);
     }
 
     #[test]
@@ -335,10 +422,10 @@ mod tests {
         // The pump reads 8 KiB at a time and a switch is under no obligation
         // to arrive whole. This is the case that makes the scanner stateful.
         let mut s = Scanner::new();
-        assert!(s.feed(b"\x1b[?10").is_empty());
-        let sw = s.feed(b"49hframe");
+        assert!(switches(&mut s, b"\x1b[?10").is_empty());
+        let sw = switches(&mut s, b"49hframe");
         assert_eq!(sw.len(), 1);
-        assert!(sw[0].enter);
+        assert!(sw[0].set);
         assert_eq!((sw[0].start, sw[0].end), (0, 3));
     }
 
@@ -347,27 +434,27 @@ mod tests {
         // DECRQM. Reading it as a set would move a client onto the alternate
         // screen because something asked whether it was there.
         let mut s = Scanner::new();
-        assert!(s.feed(b"\x1b[?1049$p").is_empty());
-        assert_eq!(s.feed(b"\x1b[?1049h").len(), 1, "and the parser is not wedged");
+        assert!(switches(&mut s, b"\x1b[?1049$p").is_empty());
+        assert_eq!(switches(&mut s, b"\x1b[?1049h").len(), 1, "and the parser is not wedged");
     }
 
     #[test]
     fn a_mode_riding_along_with_others_is_still_seen() {
-        let sw = Scanner::new().feed(b"\x1b[?1049;1000h");
+        let sw = switches(&mut Scanner::new(), b"\x1b[?1049;1000h");
         assert_eq!(sw.len(), 1);
         assert_eq!(sw[0].mode, 1049);
-        assert!(sw[0].enter);
+        assert!(sw[0].set);
     }
 
     #[test]
     fn the_same_number_without_the_private_marker_is_a_different_mode() {
-        assert!(Scanner::new().feed(b"\x1b[1049h").is_empty());
+        assert!(switches(&mut Scanner::new(), b"\x1b[1049h").is_empty());
     }
 
     #[test]
     fn the_older_spellings_are_seen_and_kept_apart() {
         for (bytes, mode) in [(&b"\x1b[?47h"[..], 47u16), (&b"\x1b[?1047h"[..], 1047)] {
-            let sw = Scanner::new().feed(bytes);
+            let sw = switches(&mut Scanner::new(), bytes);
             assert_eq!(sw.len(), 1, "{bytes:?}");
             assert_eq!(sw[0].mode, mode, "the spelling the app used must survive");
         }
@@ -380,8 +467,8 @@ mod tests {
         // which is a claim about this scanner that a substring search for
         // `[?1049h` would quietly break.
         let mut s = Scanner::new();
-        assert!(s.feed(b"\x1b]0;[?1049h\x07").is_empty());
-        assert_eq!(s.feed(b"\x1b[?1049h").len(), 1, "and a real one right after still lands");
+        assert!(switches(&mut s, b"\x1b]0;[?1049h\x07").is_empty());
+        assert_eq!(switches(&mut s, b"\x1b[?1049h").len(), 1, "and a real one right after still lands");
     }
 
     #[test]
@@ -390,20 +477,20 @@ mod tests {
         // here and in the browser's emulator alike. A scanner that swallowed
         // string payloads whole would miss a switch xterm.js is about to act
         // on — and the two disagreeing is the entire bug this module exists for.
-        assert_eq!(Scanner::new().feed(b"\x1b]0;title\x1b[?1049h").len(), 1);
+        assert_eq!(switches(&mut Scanner::new(), b"\x1b]0;title\x1b[?1049h").len(), 1);
     }
 
     #[test]
     fn a_private_sequence_that_is_neither_set_nor_reset_is_not_a_switch() {
         // Only `h` (set) and `l` (reset) say the screen moved. Anything else
         // ending a `?1049` sequence is asking or reporting, not switching.
-        assert!(Scanner::new().feed(b"\x1b[?1049n").is_empty());
+        assert!(switches(&mut Scanner::new(), b"\x1b[?1049n").is_empty());
     }
 
     #[test]
     fn a_sequence_carrying_an_intermediate_byte_is_not_a_mode_set() {
         // `CSI ? 1049 SP h` is some other sequence that happens to end in `h`.
-        assert!(Scanner::new().feed(b"\x1b[?1049 h").is_empty());
+        assert!(switches(&mut Scanner::new(), b"\x1b[?1049 h").is_empty());
     }
 
     #[test]
@@ -414,7 +501,7 @@ mod tests {
         let mut junk = b"\x1b[?1049;".to_vec();
         junk.extend(std::iter::repeat(b'9').take(MAX_PARAMS * 2));
         junk.push(b'h');
-        assert!(Scanner::new().feed(&junk).is_empty());
+        assert!(switches(&mut Scanner::new(), &junk).is_empty());
     }
 
     #[test]
@@ -422,10 +509,10 @@ mod tests {
         let mut s = Scanner::new();
         let mut junk = vec![0x1b, b'[', b'?'];
         junk.extend(std::iter::repeat(b'1').take(100_000));
-        assert!(s.feed(&junk).is_empty());
+        assert!(switches(&mut s, &junk).is_empty());
         assert!(s.buffered_len() <= MAX_PARAMS, "buffered {}", s.buffered_len());
-        assert!(s.feed(b"h").is_empty(), "an over-long sequence stays dropped");
-        assert_eq!(s.feed(b"\x1b[?1049h").len(), 1, "and the next real one is seen");
+        assert!(switches(&mut s, b"h").is_empty(), "an over-long sequence stays dropped");
+        assert_eq!(switches(&mut s, b"\x1b[?1049h").len(), 1, "and the next real one is seen");
     }
 
     #[test]
@@ -527,6 +614,133 @@ mod tests {
         p.feed(b"\x1b[?1049h");
         let out = p.feed(b"\x1b[?1049lback");
         assert_eq!(out, b"\x1b[?1049lback".to_vec());
+    }
+
+    #[test]
+    fn a_mode_the_app_declared_once_is_re_stated_to_whoever_attaches_later() {
+        // The measured symptom this exists for: without `?2004h` the browser
+        // sends a pasted block unwrapped, so the newline inside it arrives as
+        // Enter and a three-line prompt submits its first line on its own.
+        let mut p = Pump::new();
+        p.feed(b"\x1b[?2004h\x1b[?1000h\x1b[?1006h");
+        for _ in 0..(MAX_SCROLLBACK / 10_000 + 10) {
+            p.feed(&vec![b'x'; 10_000]);
+        }
+        let replay = p.replay();
+        for seq in [&b"\x1b[?2004h"[..], b"\x1b[?1000h", b"\x1b[?1006h"] {
+            assert!(has(&replay, seq), "{seq:?} must survive a ring that turned over");
+        }
+    }
+
+    #[test]
+    fn the_mode_state_is_re_stated_last_so_a_stale_copy_cannot_win() {
+        // The rings hold whatever the app said on the way here, including modes
+        // it has since changed. Order is what makes the tracked value the one
+        // the emulator ends on.
+        let mut p = Pump::new();
+        p.feed(b"\x1b[?2004h");
+        p.feed(b"\x1b[?2004l");
+        let replay = p.replay();
+        // windows(8), the sequence's real length: a window one byte too wide
+        // matches nothing, which would have made this pass by finding neither.
+        let last_set = replay.windows(8).rposition(|w| w == b"\x1b[?2004h");
+        let last_reset = replay.windows(8).rposition(|w| w == b"\x1b[?2004l");
+        assert!(last_set.is_some() && last_reset.is_some(), "both must be present: {replay:?}");
+        assert!(last_reset > last_set, "the reset must be the last word: {replay:?}");
+    }
+
+    #[test]
+    fn the_tracked_state_outranks_what_the_surviving_ring_still_says() {
+        // The case that makes the ordering load-bearing, and the shape a real
+        // app produces: a mode is set on the normal screen, changed while on
+        // the alternate one, and the alternate ring is then thrown away with
+        // the app. The normal ring still carries the *old* value, so a replay
+        // that states the tracked value before the rings leaves the client
+        // holding the stale one.
+        let mut p = Pump::new();
+        p.feed(b"\x1b[?2004h");
+        p.feed(b"\x1b[?1049h");
+        p.feed(b"\x1b[?2004l");
+        p.feed(b"\x1b[?1049l");
+        let replay = p.replay();
+        let last_set = replay.windows(8).rposition(|w| w == b"\x1b[?2004h");
+        let last_reset = replay.windows(8).rposition(|w| w == b"\x1b[?2004l");
+        assert!(last_set.is_some(), "the ring still carries the old value: {replay:?}");
+        assert!(last_reset > last_set, "the tracked value must be the last word: {replay:?}");
+    }
+
+    #[test]
+    fn a_mode_never_mentioned_is_never_re_stated() {
+        // Silence is not a value. Bracketed paste defaults off and wraparound
+        // defaults on; asserting either onto a fresh emulator would be resh
+        // inventing state rather than restoring it.
+        let mut p = Pump::new();
+        p.feed(b"plain output\n");
+        assert!(!has(&p.replay(), b"\x1b[?"), "nothing to say: {:?}", p.replay());
+    }
+
+    #[test]
+    fn one_sequence_may_carry_several_modes_and_all_of_them_count() {
+        let mut p = Pump::new();
+        p.feed(b"\x1b[?1000;1006;2004h");
+        let replay = p.replay();
+        for seq in [&b"\x1b[?1000h"[..], b"\x1b[?1006h", b"\x1b[?2004h"] {
+            assert!(has(&replay, seq), "{seq:?}");
+        }
+    }
+
+    #[test]
+    fn a_sequence_carrying_both_a_screen_and_a_mode_does_both() {
+        let mut p = Pump::new();
+        p.feed(b"\x1b[?1049;2004hframe");
+        let replay = p.replay();
+        assert!(has(&replay, b"\x1b[?1049h"), "the screen moved");
+        assert!(has(&replay, b"\x1b[?2004h"), "and the mode was kept");
+        assert!(replay.windows(5).any(|w| w == b"frame"));
+    }
+
+    #[test]
+    fn a_mode_split_across_reads_is_still_tracked() {
+        let mut p = Pump::new();
+        p.feed(b"\x1b[?20");
+        p.feed(b"04h");
+        assert!(has(&p.replay(), b"\x1b[?2004h"));
+    }
+
+    #[test]
+    fn modes_that_do_something_are_never_re_stated() {
+        // The allowlist's real job. `?3h` clears the screen in this emulator
+        // and `?1048h` moves the cursor: re-stating either in order to restore
+        // state would destroy the state being restored.
+        //
+        // Measured after the ring has turned over, because until then the
+        // app's own copy is still in the replay — as it should be, it is
+        // output. What is under test is what resh *re-states* on top.
+        let mut p = Pump::new();
+        p.feed(b"\x1b[?3h\x1b[?1048h\x1b[?6h\x1b[?2031h\x1b[?2004h");
+        for _ in 0..(MAX_SCROLLBACK / 10_000 + 10) {
+            p.feed(&vec![b'x'; 10_000]);
+        }
+        let replay = p.replay();
+        for seq in [&b"\x1b[?3h"[..], b"\x1b[?1048h", b"\x1b[?6h", b"\x1b[?2031h"] {
+            assert!(!has(&replay, seq), "{seq:?} must never be re-stated");
+        }
+        // The pair that stops the above from passing merely because everything
+        // was evicted: an allowlisted mode fed alongside them does come back.
+        assert!(has(&replay, b"\x1b[?2004h"), "and the allowlisted one survived");
+    }
+
+    #[test]
+    fn the_screen_switch_is_stated_once_not_twice() {
+        // If 1049 were also tracked as a mode, the replay would carry it twice
+        // — once placed before the alternate ring, once appended after it —
+        // and the second one would clear the screen the first one just filled.
+        let mut p = Pump::new();
+        p.feed(b"\x1b[?1049hframe");
+        let replay = p.replay();
+        assert_eq!(replay.windows(8).filter(|w| *w == b"\x1b[?1049h").count(), 1, "{replay:?}");
+        let at = replay.windows(8).position(|w| w == b"\x1b[?1049h").unwrap();
+        assert!(has(&replay[at..], b"frame"), "and it comes before the frame it belongs to");
     }
 
     #[test]
