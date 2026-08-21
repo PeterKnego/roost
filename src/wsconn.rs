@@ -64,7 +64,7 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     // never hold a hub lock while acquiring the registry lock, or two threads
     // opening different projects could deadlock on each other's locks.
     let hub: Arc<Mutex<Hub>> = Hub::for_project(project, dir);
-    let (id, rx) = {
+    let (id, rx, dir, open_buffers) = {
         let mut h = Hub::lock(&hub);
         let (id, rx) = h.subscribe();
         // Subscribing and sending this connection's own initial snapshot
@@ -88,23 +88,30 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         // client reconnecting onto a layout with open Edit buffers would
         // otherwise render them blank forever: nothing else re-sends
         // BufferText for a buffer that isn't actively being typed into.
-        // TASK-7: a clean buffer holds nothing of its own, so its half of
-        // this replay has to come from disk instead — done here rather than
-        // stubbed to "", because a reconnecting client onto an unedited Edit
-        // buffer is exactly the case `reconnect_replays_buffer_text_for_open_edit_buffers`
-        // covers, and stubbing it would silently reopen the "editor renders
-        // blank forever" bug this replay exists to fix. Reading under the
-        // hub's own lock matches `open_for_edit` and `reconcile_buffers_with_disk`
-        // just above — bounded by MAX_BUFFERS small local reads, not the
-        // indefinite blocking (a PTY write) CLAUDE.md's lock rule is about.
+        // A clean buffer holds nothing of its own, so its half of this
+        // replay has to come from disk — but not under this lock: a project
+        // can have up to MAX_BUFFERS open buffers, and `replay_text`'s disk
+        // read is up to 2 MB each, which would stall the watcher thread and
+        // every other connection to this project for the whole scan. Only
+        // the rels and their `Buffer`s are collected here (cheap — a clean
+        // one holds nothing and an edited one is the String this same
+        // replay would clone anyway); the disk reads happen after the lock
+        // below is dropped.
         let dir = h.dir.clone();
-        let open_buffers: Vec<(String, Option<String>)> = h
-            .ws
-            .buffers
-            .iter()
-            .map(|(rel, b)| (rel.clone(), replay_text(b, &dir, rel)))
-            .collect();
-        for (rel, text) in open_buffers {
+        let open_buffers: Vec<(String, Buffer)> =
+            h.ws.buffers.iter().map(|(rel, b)| (rel.clone(), b.clone())).collect();
+        (id, rx, dir, open_buffers)
+    };
+    // Disk reads happen with the hub lock already dropped: replay_text only
+    // touches disk for a clean buffer (an edited one returns its own text
+    // with no I/O), but a project can have up to MAX_BUFFERS of them.
+    let resolved: Vec<(String, Option<String>)> = open_buffers
+        .iter()
+        .map(|(rel, b)| (rel.clone(), replay_text(b, &dir, rel)))
+        .collect();
+    {
+        let mut h = Hub::lock(&hub);
+        for (rel, text) in resolved {
             // A failed read (too large, binary, or a transient I/O error —
             // read_text_file refuses those as policy, not just on real I/O
             // failure) must not become "the file is empty": that text would
@@ -113,11 +120,17 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
             // Sending nothing here is recoverable — the next SetMode/OpenTab
             // re-reads the file — where a blanked editor is not.
             let Some(text) = text else { continue };
+            // The buffer may have closed (or the connection itself gone)
+            // while its file was being read with no lock held; resending its
+            // text now would resurrect a buffer the client already closed
+            // instead of leaving it gone.
+            if !h.ws.buffers.contains_key(&rel) {
+                continue;
+            }
             let ev = proto::Event::BufferText { rel, text, origin: String::new() };
             h.send_to(&id, &ev);
         }
-        (id, rx)
-    };
+    }
     // Guards the subscription from here on: if we return early (the
     // try_clone below fails) or the read loop below panics, this still runs.
     let unsub = UnsubGuard { hub: hub.clone(), id: id.clone() };

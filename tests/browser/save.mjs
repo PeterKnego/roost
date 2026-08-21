@@ -121,6 +121,36 @@ try {
   await until(() => evalIn(`!document.querySelector("textarea.editor")`), 5, "preview");
   ok(await evalIn(`saveTarget() === null`),
      "with no editor open the keystroke is left to the browser");
+
+  // --- 6. A second browser onto the same workspace sees the file, not a
+  // blank editor. Its text comes from disk now that a clean buffer holds
+  // none, so this is the assertion that the disk read happens at all.
+  //
+  // Section 5 left every editor in Preview, so note.md is reopened in Edit
+  // here first — `open_for_edit` re-reads the file and resets its buffer to
+  // Content::Clean (see hub.rs), which is exactly the case the second
+  // browser's connect-time replay has to serve from disk rather than from
+  // an in-memory edit.
+  await evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: "note.md", mode: "Edit" } })`);
+  await evalIn(`send({ t: "SetMode", rel: "note.md", mode: "Edit" })`);
+  ok(await until(async () =>
+    ((await evalIn(`(document.querySelector("textarea.editor") || {}).value`)) || "").includes("focused edit"),
+    10, "note.md reopened in Edit"),
+    "note.md is back in Edit mode with its saved text, ready for the second browser");
+
+  const second = await openPage(browser.port, `http://127.0.0.1:${resh.port}/proj`);
+  try {
+    // Same override as the first page and for the same reason (see the
+    // README's traps): the default 800x600 window collapses the middle
+    // pane, and this assertion depends on that pane's editor existing.
+    await second.cmd("Emulation.setDeviceMetricsOverride",
+      { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
+    await until(() => second.evalIn(`typeof state !== "undefined" && !!(state && state.panes)`), 15, "state");
+    ok(await until(async () =>
+      ((await second.evalIn(`(document.querySelector("textarea.editor") || {}).value`)) || "").includes("focused edit"),
+      10, "the second browser's editor"),
+      "a second browser onto an open editor is served its text");
+  } finally { second.close(); }
 } finally {
   try { page?.close(); } catch {}
   browser.close();
