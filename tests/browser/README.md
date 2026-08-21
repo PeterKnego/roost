@@ -23,6 +23,7 @@ deno run -A tests/browser/modes.mjs      # and so do the modes it declared once
 deno run -A tests/browser/copyselect.mjs # selecting copies, and OSC 52 copies too
 deno run -A tests/browser/save.mjs       # cmd/ctrl-s saves whether or not the editor has focus
 deno run -A tests/browser/autosave.mjs   # the editor writes itself out, and stops when the file diverges
+deno run -A tests/browser/tabwrap.mjs    # the tab strip wraps, and re-fits the terminal under it
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -85,6 +86,11 @@ performed.
   the document-level handler) fails 2 assertions in `save.mjs` — both unfocused
   cases time out with the file unchanged on disk — while the focused case goes
   on passing, which is what says the test is testing focus and not saving.
+- Restoring the tab strip's single scrolling row (`overflow-x: auto` with a
+  hidden scrollbar, `height: 32px` on `.panehead`) fails 11 assertions in
+  `tabwrap.mjs`; keeping the wrap but deleting render()'s re-fit of a terminal
+  under a header that changed height fails exactly 1 — the terminal's row
+  count, which is the only thing that says the PTY was told.
 - Disabling the `raw` fragment route (`src/routes.rs`) fails the naturalWidth
   assertions in `mdlinks.mjs` (`naturalWidth === 0`, not DOM presence);
   restoring `if (t.k === "File")`'s dropped `!isImage(t.rel)` fails the
@@ -92,7 +98,7 @@ performed.
   `closest("a.file")` fails the markdown-link right-click assertion with
   `got 2`.
 
-Four things will make a browser test lie to you here. Each is commented at its
+Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
 
 | Trap | What it does to a naive test |
@@ -101,6 +107,7 @@ site; do not "simplify" them away:
 | `term.paste()` | bash enables bracketed paste, so a pasted newline is inserted literally instead of submitting. The command sits on the prompt and every later wait times out. Use `term.input()` with `\r`. |
 | Typing before the prompt | readline discards typeahead while initialising, so the first command silently vanishes. Wait for a prompt. |
 | Content that fits one screen | `dtach`'s redraw opens with `\e[H\e[J`, which hides duplicated output all by itself — the no-duplication assertion passes with the reset deleted. Scroll past one screen first. |
+| The default 800x600 headless window | Narrower than the default left (260px) and right (520px) panes together: the middle column collapses and the right pane hangs off the viewport. A layout assertion then measures *that*, and `elementFromPoint` returns null off-screen, so a reachability test fails (or passes) for the wrong reason. Override the metrics — see `tabwrap.mjs`. |
 
 ## What these cannot prove
 

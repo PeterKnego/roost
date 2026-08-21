@@ -347,6 +347,23 @@ function render() {
     // pane's tab *count* too, which another pane's move can change without
     // touching this one's active tab.
     buildPaneIcons(el.querySelector(".paneicons"), pi, pane, active, content);
+    // The tab strip wraps, so opening or closing a tab can add or drop a row
+    // and change the header's height — which resizes .content under a
+    // terminal that is still the active tab, and so is never remounted or
+    // re-fit by anything below. Reading offsetHeight here forces the layout
+    // the innerHTML above invalidated, so this sees the new height. Left
+    // stale, the PTY would keep the old geometry, and since it takes the
+    // *smallest* attached client's size, that clips output for every other
+    // client mirroring the session too.
+    const head = el.querySelector(".panehead");
+    const headH = String(head.offsetHeight);
+    if (head.dataset.h !== headH) {
+      head.dataset.h = headH;
+      content.querySelectorAll(".termhost").forEach((n) => {
+        const e = terms.get(n.dataset.session);
+        if (e) { try { e.fit.fit(); sendResize(e); } catch {} }
+      });
+    }
     if (content.dataset.mountedKey === activeKey) {
       // The same tab is still active in this pane. A State snapshot fires
       // on every EditBuffer — including ones caused by the user's own

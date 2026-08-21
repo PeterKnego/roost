@@ -18,6 +18,10 @@ html, body { height: 100%; }
   --tab-on: color-mix(in oklab, var(--fg) 10%, var(--tool));
   --tab-hover: color-mix(in oklab, var(--fg) 5%, var(--tool));
   --pane-radius: 8px;
+  /* How many rows of tabs a pane header may grow to before the strip starts
+     scrolling instead. Four is roughly 16 tabs in the middle pane and 12 in
+     the narrower right one, at about an eighth of a full-height pane. */
+  --tab-rows: 4;
 }
 body { background: var(--window); color: var(--fg); font: 13px/1.5 system-ui, -apple-system, sans-serif;
        -webkit-font-smoothing: antialiased; display: flex; flex-direction: column; }
@@ -71,7 +75,7 @@ main { flex: 1; min-height: 0; }
    sibling of .tabstrip, never a child: app.js rebuilds the strip's innerHTML on
    every state broadcast, so anything inside it would be destroyed seconds
    later. min-width:0 lets the strip scroll instead of shoving the slot out. */
-.panehead { display: flex; align-items: stretch; height: 32px; flex: 0 0 auto;
+.panehead { display: flex; align-items: stretch; min-height: 32px; flex: 0 0 auto;
             background: var(--tool); border-bottom: 1px solid var(--hairline, var(--border)); }
 .paneicons { display: flex; align-items: center; gap: 2px; padding: 0 6px; flex: 0 0 auto;
              color: var(--muted); }
@@ -79,10 +83,27 @@ main { flex: 1; min-height: 0; }
 .paneicon { display: flex; align-items: center; justify-content: center; width: 20px; height: 20px;
             border-radius: 5px; cursor: pointer; user-select: none; line-height: 1; }
 .paneicon:hover { color: var(--fg); background: var(--tab-hover); }
-.tabstrip { display: flex; align-items: center; flex: 1 1 auto; min-width: 0;
-            padding: 0 4px; gap: 2px; overflow-x: auto; overflow-y: hidden;
-            scrollbar-width: none; }
-.tabstrip::-webkit-scrollbar { display: none; }
+/* Tabs wrap onto further rows rather than scrolling off to the right. The
+   strip used to be a single row that scrolled horizontally with its scrollbar
+   hidden, so once a pane held more tabs than fit across it — four or five in
+   the 520px right column — the rest were reachable only by a trackpad's
+   horizontal gesture, and with a mouse not at all.
+   Wrapping is bounded at --tab-rows, because this header sits above a
+   terminal and an unbounded strip would eat the pane. Past that bound the
+   strip scrolls vertically, and unlike the old horizontal scroll it says so:
+   the scrollbar below is deliberately visible, since a hidden one is what
+   made tabs unreachable in the first place. It only appears when there is
+   something to reach.
+   overflow stays `auto` on both axes so a single tab wider than the pane (a
+   long filename in the narrow left column) can still be scrolled to. */
+.tabstrip { display: flex; align-items: center; flex-wrap: wrap; align-content: flex-start;
+            flex: 1 1 auto; min-width: 0;
+            padding: 4px; gap: 2px; overflow: auto;
+            max-height: calc(var(--tab-rows, 4) * 26px + 6px);
+            scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.tabstrip::-webkit-scrollbar { width: 6px; height: 6px; }
+.tabstrip::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+.tabstrip::-webkit-scrollbar-track { background: transparent; }
 .tabstrip .tab { display: flex; align-items: center; gap: 4px; height: 24px; padding: 0 6px 0 9px;
                  border-radius: 6px; cursor: pointer; white-space: nowrap; color: var(--muted);
                  position: relative; }
