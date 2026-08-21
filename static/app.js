@@ -169,7 +169,7 @@ function onEvent(ev) {
     }
     case "TreeChanged": refreshTree(); break;
     case "StatusChanged": refreshKind("Changes"); break;
-    case "FileChanged": refreshKind("Diff"); break;
+    case "FileChanged": refreshKind("Diff"); refreshFile(ev.rel); break;
     case "SaveConflict":
       // Without this an autosaving client re-raises the banner every second.
       autosavePaused.add(ev.rel);
@@ -777,6 +777,23 @@ function refreshKind(kind) {
     if (active && active.k === kind) {
       const content = document.querySelector(`.pane[data-pane="${pi}"] .content`);
       mountTab(content, active);
+    }
+  });
+}
+
+/// Re-mounts a previewed file after it changed on disk.
+///
+/// By `rel`, not by kind like `refreshKind`: several panes can show several
+/// files, and re-fetching all of them because one changed would throw away
+/// the scroll position of panes that did not. Edit mode is deliberately not
+/// here — an editor follows the file through `BufferText`, which preserves
+/// the buffer's own state machine around dirty and stale.
+function refreshFile(rel) {
+  if (!state) return;
+  state.panes.forEach((pane, pi) => {
+    const active = pane.tabs[pane.active];
+    if (active && active.k === "File" && active.mode === "Preview" && active.rel === rel) {
+      mountTab(document.querySelector(`.pane[data-pane="${pi}"] .content`), active);
     }
   });
 }

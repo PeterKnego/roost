@@ -26,6 +26,7 @@ deno run -A tests/browser/autosave.mjs   # the editor writes itself out, and sto
 deno run -A tests/browser/tabwrap.mjs    # the tab strip wraps, and re-fits the terminal under it
 deno run -A tests/browser/shiftenter.mjs # shift+enter sends LF, so Claude inserts a newline
 deno run -A tests/browser/hledit.mjs     # a code file stays highlighted while you edit it
+deno run -A tests/browser/preview-follows.mjs # a previewed file follows the file on disk
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -128,6 +129,11 @@ performed.
   no-edit-toggle assertion; narrowing the double-contextmenu guard back to
   `closest("a.file")` fails the markdown-link right-click assertion with
   `got 2`.
+- Removing the `refreshFile(ev.rel)` call from `FileChanged`'s handler fails 2
+  assertions in `preview-follows.mjs` — the update times out and the stale
+  text is still on screen — while the initial fetch (the file opening with
+  its unchanged content) goes on passing, which is what says the test is
+  testing the refresh and not the open.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
