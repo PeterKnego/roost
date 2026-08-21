@@ -24,6 +24,7 @@ deno run -A tests/browser/copyselect.mjs # selecting copies, and OSC 52 copies t
 deno run -A tests/browser/save.mjs       # cmd/ctrl-s saves whether or not the editor has focus
 deno run -A tests/browser/autosave.mjs   # the editor writes itself out, and stops when the file diverges
 deno run -A tests/browser/tabwrap.mjs    # the tab strip wraps, and re-fits the terminal under it
+deno run -A tests/browser/shiftenter.mjs # shift+enter sends LF, so Claude inserts a newline
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -86,6 +87,12 @@ performed.
   the document-level handler) fails 2 assertions in `save.mjs` — both unfocused
   cases time out with the file unchanged on disk — while the focused case goes
   on passing, which is what says the test is testing focus and not saving.
+- Deleting the Shift+Enter handler fails 1 assertion in `shiftenter.mjs` (the
+  pty sees 13, not 10) while the plain-Enter assertion goes on passing;
+  dropping its `!e.shiftKey` guard so every Enter sends LF flips exactly which
+  of the two fails. Both halves were watched failing — the plain-Enter half
+  first passed for the wrong reason, reading the *previous* probe's number out
+  of the scrollback, which only agreed while both answers were 13.
 - Restoring the tab strip's single scrolling row (`overflow-x: auto` with a
   hidden scrollbar, `height: 32px` on `.panehead`) fails 11 assertions in
   `tabwrap.mjs`; keeping the wrap but deleting render()'s re-fit of a terminal
