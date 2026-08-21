@@ -396,3 +396,9 @@ ul.picker li .git:hover { text-decoration: underline; }
 .notice-body { grid-column: 1 / -1; font-size: 12px; color: var(--fg); white-space: pre-wrap; word-break: break-word; }
 .notice-empty, .notice-foot { padding: 8px; font-size: 12px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
 .tabstrip .tab.attn::after { content: "●"; color: var(--accent); margin-left: 4px; font-size: 9px; vertical-align: middle; }
+
+/* Save state for the file a pane is showing — muted, because it is ambient
+   information; the warn state is not, because it means a write is being
+   withheld. */
+.savestate { font-size: 11px; opacity: .55; margin-right: 10px; white-space: nowrap; }
+.savestate.warn { color: var(--warn, #d79921); opacity: 1; }

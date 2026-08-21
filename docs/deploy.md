@@ -312,6 +312,30 @@ Config is re-read every request (`~/.config/resh/config.toml`, then
 `{project}/.resh/config.toml` for theme/hide/show_hidden), so a wrong value is
 fixed by editing the file, not redeploying.
 
+### Autosave
+
+The editor writes a buffer out a second after the last keystroke, and
+immediately when it loses focus. To turn that off:
+
+```toml
+autosave = false
+```
+
+Globally or per project, read on the next page load — this one is embedded in
+the page (`data-autosave`), not resolved per request, so an open tab keeps the
+value it loaded with until it is reloaded.
+
+It is a per-project setting on purpose, unlike `allowed_origins` and
+`max_upload_bytes` above: nothing a hostile checkout could put here widens a
+boundary. It only decides whether the person editing that project's own files
+has to press ⌘S.
+
+Autosave never forces. It goes through the same conflict-guarded save, so a
+file that changed underneath the buffer is not overwritten — and once that has
+happened, autosave stops for that buffer instead of re-raising the conflict
+banner every second. An explicit ⌘S is what resolves it, and a save that
+actually lands is what starts autosave again.
+
 ### Hidden files in the tree
 
 The file tree hides every entry beginning with a dot — `.git`, `.claude`,
