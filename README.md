@@ -39,9 +39,12 @@ a restart are rediscovered at startup; sockets with no process, and shells whose
 directory is gone, are reaped.
 
 **Editing is conflict-guarded.** Save refuses if the file changed on disk since
-your buffer was opened, showing a diff of yours versus disk. A clean buffer
-follows external writes live; a buffer with unsaved changes is only flagged
-stale, never overwritten.
+your buffer was opened, showing a diff of what differs — the changed hunks
+with their line numbers, not both files whole. A clean buffer follows external
+writes live; a buffer with unsaved changes is only flagged stale, never
+overwritten. Discarding yours reloads the file, and a restart re-checks every
+open buffer against the disk, so a file that moved while resh was down comes
+back flagged rather than looking current.
 
 **Autosave, and it knows when to stop.** A buffer is written out a second after
 you stop typing, and the moment the editor loses focus. It saves through the
