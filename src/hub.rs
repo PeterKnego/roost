@@ -517,8 +517,8 @@ impl Hub {
         }
     }
 
-    /// Establishes a buffer's base — reads the file, records its hash and
-    /// mtime — the moment a File tab opens, in either mode, and tells every
+    /// Establishes a buffer's base — reads the file, records its hash — the
+    /// moment a File tab opens, in either mode, and tells every
     /// client what's in it. Not just an Edit-mode thing despite the old name:
     /// a previewed file needs a base too, since that is what lets it flip to
     /// Edit later without a fresh disk read, and it is what the watcher's
