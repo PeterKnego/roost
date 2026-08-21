@@ -74,11 +74,37 @@ read `open_for_edit` does now: hash the contents, record the mtime, keep both,
 discard the text. Call this a *stub*. It costs a `u64`, an `Option<SystemTime>`
 and two bools — call it ~100 bytes against the 2 MB it replaces.
 
-**Text appears on the first edit and not before.** `EditBuffer` already carries
-the client's full text, so the first keystroke fills `text` and sets `dirty`,
-exactly as it does today. A buffer therefore has text if and only if it is
-dirty, which makes `text: Option<String>` the honest representation: the type
-stops the "clean buffer with stale text" state from being expressible.
+**Text appears when the content actually differs, and not before.** Not "on the
+first keystroke": the client sends `EditBuffer` from its `input` listener, and
+`input` fires only when the textarea's *value* changes. Arrow keys, Home/End,
+PageUp, Ctrl+A, clicking, scrolling and focus do not fire it, so navigating a
+file never materialises anything.
+
+That covers one of the two senders. The other is `pushEdit` (`app.js:1137`),
+which sends unconditionally and is called by `saveNow` before every save — so
+⌘S on a file you had only looked at would push its whole text, mark it dirty
+and write it back to disk identically. Typing a character and deleting it again
+has the same shape: two `input` events, and the second leaves text equal to the
+file.
+
+Both are fixed in one place, and deliberately not in the client: **the server
+decides dirtiness by hashing the incoming text against `base_hash`.** Equal
+means the buffer stays `Clean` and keeps no text, whatever the client sent;
+different means it becomes `Edited`. `hash_text` is already computed on every
+save, so this costs one hash per edit and makes every path idempotent — ⌘S on
+an untouched file becomes a no-op, an undone edit collapses back to clean, and
+no client-side discipline is load-bearing.
+
+That in turn decides the type. Not `text: Option<String>` beside a `dirty`
+bool, which leaves `dirty: true, text: None` expressible — a state whose only
+possible reading at `do_save` is "write an empty file over the user's work".
+An enum makes it unrepresentable:
+
+    enum Content { Clean, Edited(String) }
+
+`dirty` becomes the discriminant rather than a flag anyone can set. `stale`
+stays a separate bool and only ever applies to `Edited`, which is already true
+today — `file_changed_externally` sets it in the dirty branch only.
 
 **The watcher sees every open file, because every open file now has a buffer.**
 `classify`'s existing `open_buffers` list grows to include previewed files with
@@ -161,6 +187,11 @@ Rust, in `hub.rs`/`workspace.rs`/`wsstate.rs`:
 - A dirty buffer still round-trips its text through a restart (the existing
   test must keep passing unchanged).
 - A save against a text-less buffer errors and leaves the file byte-identical.
+- ⌘S on a file that was opened and never edited leaves it `Clean`, holds no
+  text, and does not write — asserted on the file's mtime, not just its bytes,
+  since an identical rewrite is still a write.
+- An `EditBuffer` whose text hashes equal to `base_hash` leaves the buffer
+  `Clean`, so typing a character and deleting it returns to text-less.
 - The cap: 50 *dirty* buffers is refused; 50 open clean tabs is not.
 
 Browser, since none of the propagation is visible to `cargo test`:
@@ -171,6 +202,10 @@ Browser, since none of the propagation is visible to `cargo test`:
 - A file open in Edit *with* unsaved changes still shows the conflict banner
   rather than adopting the change — the property `autosave.mjs` already covers,
   which must not regress.
+- Navigating an open editor — arrows, Home/End, PageUp, Ctrl+A, a click — leaves
+  the server holding no text for it. This is the one assertion that has to be
+  driven by real key events rather than by `send()`, because what it is really
+  testing is which browser event the client listens on.
 
 ## Risks
 
