@@ -98,7 +98,7 @@ function onEvent(ev) {
       // A rel missing from the fresh buffer list is gone server-side (the
       // last tab on it closed clean, or its edits were explicitly
       // discarded) — prune it here rather than let texts/editors grow for
-      // the life of the session. This is safe because hub::open_for_edit
+      // the life of the session. This is safe because hub::open_buffer_for
       // always re-broadcasts a fresh BufferText the moment a rel re-enters
       // Edit mode, even for a buffer it kept around dirty; nothing here can
       // be the last copy of unsaved text.
@@ -134,7 +134,7 @@ function onEvent(ev) {
       // NOT gated on the buffer being dirty: EditBuffer's handler (hub.rs)
       // broadcasts BufferText to every *other* client on every keystroke,
       // dirty or not — that's how a second client watching the same file
-      // live-syncs with the one typing — and open_for_edit re-broadcasts
+      // live-syncs with the one typing — and open_buffer_for re-broadcasts
       // the current text on reopen even when already dirty, so a freshly
       // opened tab picks up in-progress edits instead of stale disk
       // content. The one case that must never reach here (a dirty buffer's
@@ -169,7 +169,7 @@ function onEvent(ev) {
     }
     case "TreeChanged": refreshTree(); break;
     case "StatusChanged": refreshKind("Changes"); break;
-    case "FileChanged": refreshKind("Diff"); break;
+    case "FileChanged": refreshKind("Diff"); refreshFile(ev.rel); break;
     case "SaveConflict":
       // Without this an autosaving client re-raises the banner every second.
       autosavePaused.add(ev.rel);
@@ -777,6 +777,23 @@ function refreshKind(kind) {
     if (active && active.k === kind) {
       const content = document.querySelector(`.pane[data-pane="${pi}"] .content`);
       mountTab(content, active);
+    }
+  });
+}
+
+/// Re-mounts a previewed file after it changed on disk.
+///
+/// By `rel`, not by kind like `refreshKind`: several panes can show several
+/// files, and re-fetching all of them because one changed would throw away
+/// the scroll position of panes that did not. Edit mode is deliberately not
+/// here — an editor follows the file through `BufferText`, which preserves
+/// the buffer's own state machine around dirty and stale.
+function refreshFile(rel) {
+  if (!state) return;
+  state.panes.forEach((pane, pi) => {
+    const active = pane.tabs[pane.active];
+    if (active && active.k === "File" && active.mode === "Preview" && active.rel === rel) {
+      mountTab(document.querySelector(`.pane[data-pane="${pi}"] .content`), active);
     }
   });
 }

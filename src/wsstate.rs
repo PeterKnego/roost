@@ -1,7 +1,7 @@
 //! Workspace persistence. Lives in $RESH_STATE_DIR, never inside a
 //! project — following zellij, so pane drags never show up in git status.
 use crate::proto::{Sizes, Tab};
-use crate::workspace::{Buffer, Pane, Workspace};
+use crate::workspace::{Buffer, Content, Pane, Workspace};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 pub static STATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// On-disk shape is deliberately narrower than `Workspace`: derived fields
-/// (`version`, per-buffer `base_mtime`/`base_hash`/`stale`) are recomputed on
+/// (`version`, per-buffer `base_hash`/`stale`) are recomputed on
 /// load rather than trusted from a file that may be stale or hand-edited.
 #[derive(Serialize, Deserialize)]
 struct PaneDisk {
@@ -27,7 +27,14 @@ struct PaneDisk {
 
 #[derive(Serialize, Deserialize)]
 struct BufferDisk {
-    text: String,
+    /// Absent for a clean buffer: its text is whatever the file says, and
+    /// writing it here regardless is how a `.env` opened once ended up in
+    /// this file for as long as its tab stayed open (see hub.rs). `default`
+    /// so a state file written before this change — where `text` was a bare
+    /// string — still loads: serde deserializes a present string value into
+    /// `Some`, and a missing key into `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
     dirty: bool,
     /// What this buffer's text was based on when it was opened — the one
     /// piece of buffer state that genuinely cannot be recomputed on load.
@@ -107,8 +114,13 @@ pub fn save(project: &str, w: &Workspace) -> Result<(), String> {
                 (
                     k.clone(),
                     BufferDisk {
-                        text: b.text.clone(),
-                        dirty: b.dirty,
+                        // A clean buffer's text is just the file's own,
+                        // redundantly duplicated — and the case named in the
+                        // module comment above (and in hub.rs's own comment)
+                        // that this stops: a `.env` opened once must not sit
+                        // in this file for as long as its tab stays open.
+                        text: b.edited_text().map(|t| t.to_string()),
+                        dirty: b.dirty(),
                         base_hash: Some(b.base_hash),
                     },
                 )
@@ -160,26 +172,44 @@ pub fn load(project: &str) -> (Workspace, Option<String>) {
                     })
                     .collect();
             }
-            // MAX_BUFFERS is enforced on the live insert path (apply_layout);
-            // without a matching cap here, a corrupt or hand-edited state
-            // file restores unboundedly. HashMap iteration order is
-            // unspecified, so sort the keys before truncating: otherwise
-            // which buffers survive a too-big file would differ from one
-            // load to the next, which would make this untestable and the
-            // dropped-buffer set effectively random.
-            let mut keys: Vec<String> = d.buffers.keys().cloned().collect();
-            keys.sort();
-            let warn = if keys.len() > crate::workspace::MAX_BUFFERS {
-                let dropped = keys.len() - crate::workspace::MAX_BUFFERS;
-                keys.truncate(crate::workspace::MAX_BUFFERS);
+            // MAX_BUFFERS is enforced on the live insert path (apply_layout /
+            // hub::open_buffer_for), but only against *dirty* buffers, since
+            // a merely-opened or previewed file must never trip a cap meant
+            // to bound unsaved text — so a corrupt or hand-edited state file
+            // can still name more buffers than that live cap would ever let
+            // accumulate, and truncating without regard for which are dirty
+            // could drop unsaved text exactly as readily as it drops a
+            // buffer holding nothing. Discarding someone's edit because its
+            // rel happened to sort late is the failure this whole module
+            // exists to prevent, so dirty buffers are never truncated here —
+            // only the clean tail is capped, and only once every dirty one
+            // is already kept. Sorted within each group before truncating,
+            // for the same determinism reason as before: HashMap iteration
+            // order is unspecified, so an unsorted truncation would make the
+            // dropped set differ from one load to the next.
+            let mut dirty_keys: Vec<String> =
+                d.buffers.iter().filter(|(_, b)| b.dirty).map(|(k, _)| k.clone()).collect();
+            let mut clean_keys: Vec<String> =
+                d.buffers.iter().filter(|(_, b)| !b.dirty).map(|(k, _)| k.clone()).collect();
+            dirty_keys.sort();
+            clean_keys.sort();
+            let total = dirty_keys.len() + clean_keys.len();
+            let clean_room = crate::workspace::MAX_BUFFERS.saturating_sub(dirty_keys.len());
+            let dropped = clean_keys.len().saturating_sub(clean_room);
+            clean_keys.truncate(clean_room);
+            let warn = if dropped > 0 {
                 Some(format!(
-                    "workspace state had {} buffers, kept {} (dropped {dropped})",
-                    keys.len() + dropped,
-                    crate::workspace::MAX_BUFFERS,
+                    "workspace state had {total} buffers, kept {} unsaved and {} of {} clean \
+                     (dropped {dropped})",
+                    dirty_keys.len(),
+                    clean_keys.len(),
+                    clean_keys.len() + dropped,
                 ))
             } else {
                 None
             };
+            let mut keys = dirty_keys;
+            keys.extend(clean_keys);
             let mut buffers = d.buffers;
             for k in keys {
                 if let Some(b) = buffers.remove(&k) {
@@ -192,11 +222,25 @@ pub fn load(project: &str) -> (Workspace, Option<String>) {
                             // leave us with, and for a dirty one it means a
                             // conflict the user has to force past rather
                             // than a silent overwrite of whatever is there.
-                            base_hash: b
-                                .base_hash
-                                .unwrap_or_else(|| crate::workspace::hash_text(&b.text)),
-                            text: b.text,
-                            dirty: b.dirty,
+                            // A clean buffer no longer carries text at all,
+                            // so an absent value falls back to "" — the same
+                            // answer a clean buffer's own (redundant) text
+                            // would have hashed to.
+                            base_hash: b.base_hash.unwrap_or_else(|| {
+                                crate::workspace::hash_text(b.text.as_deref().unwrap_or(""))
+                            }),
+                            // A restored dirty buffer's saved text becomes
+                            // its held edit. `dirty: true` with no text is a
+                            // corrupt or hand-edited file — trusting it would
+                            // write an empty file over the user's own on the
+                            // next save — so it loads as clean rather than
+                            // as an empty edit; that is also the case for an
+                            // ordinary clean buffer, whose text was always
+                            // just a redundant copy of the file.
+                            content: match (b.dirty, b.text) {
+                                (true, Some(t)) => Content::Edited(t),
+                                (_, _) => Content::Clean,
+                            },
                             ..Buffer::default()
                         },
                     );
@@ -283,7 +327,7 @@ mod tests {
                 vec![Tab::File { rel: "a.rs".into(), mode: Mode::Edit }];
             w.buffers.insert(
                 "a.rs".into(),
-                Buffer { text: "unsaved".into(), dirty: true, ..Buffer::default() },
+                Buffer { content: Content::Edited("unsaved".into()), ..Buffer::default() },
             );
             save("proj", &w).unwrap();
 
@@ -291,8 +335,59 @@ mod tests {
             assert!(warn.is_none());
             assert_eq!(got.sizes.left_w, 111);
             assert_eq!(got.panes[proto::MIDDLE as usize].tabs.len(), 1);
-            assert_eq!(got.buffers["a.rs"].text, "unsaved", "unsaved text is crash-safe");
-            assert!(got.buffers["a.rs"].dirty);
+            assert_eq!(got.buffers["a.rs"].edited_text(), Some("unsaved"), "unsaved text is crash-safe");
+            assert!(got.buffers["a.rs"].dirty());
+        });
+    }
+
+    /// The .env case from hub.rs's own comment: a file opened and never typed
+    /// into must leave nothing behind. Searched for as a literal in the whole
+    /// serialised file rather than by key, so it fails if the text is stored
+    /// anywhere under any name.
+    #[test]
+    fn a_clean_buffer_puts_no_file_content_in_the_state_file() {
+        with_state_dir(|| {
+            let mut w = Workspace::default_layout();
+            w.buffers.insert(
+                ".env".into(),
+                Buffer {
+                    base_hash: crate::workspace::hash_text("SECRET=hunter2\n"),
+                    ..Buffer::default()
+                },
+            );
+            save("proj", &w).unwrap();
+            let raw = std::fs::read_to_string(path_for("proj")).unwrap();
+            assert!(!raw.contains("hunter2"), "an unedited file's contents must not be persisted: {raw}");
+            assert!(raw.contains(".env"), "the buffer itself is still recorded");
+            // The two assertions above hold even for the pre-fix shape (a
+            // clean `Buffer` never carries text in memory post Task 4, so
+            // there is nothing for a naive revert to leak as "hunter2"
+            // regardless of the on-disk shape) — confirmed by reverting
+            // `BufferDisk.text` to a bare `String` written unconditionally:
+            // both assertions above still passed, but the JSON gained a
+            // `"text":""` key. This assertion is what actually catches that
+            // revert.
+            assert!(!raw.contains("\"text\""), "a clean buffer must carry no text key at all: {raw}");
+        });
+    }
+
+    /// The other direction, and the existing guarantee: unsaved work survives
+    /// a restart. This is the assertion that stops the fix above from being
+    /// implemented by simply not persisting buffers.
+    #[test]
+    fn an_edited_buffer_still_round_trips_its_text() {
+        with_state_dir(|| {
+            let mut w = Workspace::default_layout();
+            let mut b = Buffer {
+                base_hash: crate::workspace::hash_text("on disk\n"),
+                ..Buffer::default()
+            };
+            b.set_text("unsaved\n".into());
+            w.buffers.insert("a.rs".into(), b);
+            save("proj", &w).unwrap();
+            let (got, _) = load("proj");
+            assert_eq!(got.buffers["a.rs"].edited_text(), Some("unsaved\n"));
+            assert!(got.buffers["a.rs"].dirty());
         });
     }
 
@@ -312,8 +407,7 @@ mod tests {
             w.buffers.insert(
                 "a.rs".into(),
                 Buffer {
-                    text: "mine".into(),
-                    dirty: true,
+                    content: Content::Edited("mine".into()),
                     base_hash: crate::workspace::hash_text("on disk"),
                     ..Buffer::default()
                 },
@@ -342,28 +436,62 @@ mod tests {
     #[test]
     fn a_state_file_written_before_base_hash_still_loads() {
         with_state_dir(|| {
-            let mut w = Workspace::default_layout();
-            w.buffers.insert(
-                "a.rs".into(),
-                Buffer { text: "saved".into(), base_hash: 999, ..Buffer::default() },
-            );
-            save("old_base_probe", &w).unwrap();
-            let text = std::fs::read_to_string(path_for("old_base_probe")).unwrap();
-            assert!(text.contains("base_hash"), "the key must be written at all");
-
-            // Strip it back out, the way an older resh would have left it.
-            let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
-            json["buffers"]["a.rs"].as_object_mut().unwrap().remove("base_hash");
-            std::fs::write(path_for("old_base_probe"), json.to_string()).unwrap();
+            // Written by hand rather than round-tripped through
+            // `save()`. The scenario is a *clean* buffer from a pre-base_hash
+            // file — `{"text": "saved", "dirty": false}`, no base_hash key at
+            // all — and `Content::Clean` can no longer represent "clean, but
+            // holding this text" in memory to hand to `save()`, so the fixture
+            // has to be the on-disk bytes an old resh actually wrote instead.
+            std::fs::create_dir_all(state_dir()).unwrap();
+            let raw = serde_json::json!({
+                "sizes": {"left_w": 260, "right_w": 520, "left_split": 60},
+                "panes": [
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0},
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0}
+                ],
+                "buffers": {"a.rs": {"text": "saved", "dirty": false}},
+            });
+            std::fs::write(state_dir().join("old_base_probe.json"), raw.to_string()).unwrap();
 
             let (got, warn) = load("old_base_probe");
             assert!(warn.is_none(), "an old file is not a corrupt one");
-            assert_eq!(got.buffers["a.rs"].text, "saved", "the rest of it still loaded");
+            // A clean buffer holds nothing of its own; the base_hash fallback
+            // below is what actually exercises the behaviour this test covers.
+            assert_eq!(got.buffers["a.rs"].edited_text(), None, "dirty:false loads clean");
             assert_eq!(
                 got.buffers["a.rs"].base_hash,
                 crate::workspace::hash_text("saved"),
                 "with nothing recorded, the text is the best available base"
             );
+        });
+    }
+
+    /// `dirty: true` with the `text` key entirely absent: a corrupt or
+    /// hand-edited state file, not a real save (`save()` never omits `text`
+    /// for a dirty buffer). The dangerous misreading is `if b.dirty {
+    /// Edited(b.text.unwrap_or_default()) }` — the exact file-destroying
+    /// shape this branch already shipped once in `wsconn` — which would
+    /// hand back `Edited("")` and let the next save overwrite the user's
+    /// real file with nothing. Loading this as `Clean` instead means any
+    /// later save has to go through the ordinary dirty-buffer path again,
+    /// which requires the user to have actually typed something.
+    #[test]
+    fn dirty_with_no_text_loads_clean_not_as_an_empty_edit() {
+        with_state_dir(|| {
+            std::fs::create_dir_all(state_dir()).unwrap();
+            let raw = serde_json::json!({
+                "sizes": {"left_w": 260, "right_w": 520, "left_split": 60},
+                "panes": [
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0},
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0}
+                ],
+                "buffers": {"a.rs": {"dirty": true}},
+            });
+            std::fs::write(state_dir().join("dirty_no_text_probe.json"), raw.to_string()).unwrap();
+
+            let (got, _) = load("dirty_no_text_probe");
+            assert_eq!(got.buffers["a.rs"].edited_text(), None, "no text to hold an edit");
+            assert!(!got.buffers["a.rs"].dirty(), "must come back Clean, so no later save can write from it");
         });
     }
 
@@ -508,6 +636,56 @@ mod tests {
             let mut got: Vec<String> = w.buffers.keys().cloned().collect();
             got.sort();
             assert_eq!(got, expected);
+        });
+    }
+
+    /// The bug the dirty-first partition fixes: plain lexical sort-then-
+    /// truncate treats a dirty buffer exactly like a clean one, so unsaved
+    /// text whose rel happens to sort after `MAX_BUFFERS` clean ones was
+    /// silently dropped on restart. These names are chosen to be exactly
+    /// that case — every `z*` buffer sorts after all `MAX_BUFFERS` `a*`
+    /// ones — and must survive anyway, in full, with their text intact.
+    #[test]
+    fn load_never_drops_a_dirty_buffer_to_make_room_for_the_clean_cap() {
+        with_state_dir(|| {
+            std::fs::create_dir_all(state_dir()).unwrap();
+            let mut buffers = serde_json::Map::new();
+            for i in 0..crate::workspace::MAX_BUFFERS {
+                buffers.insert(
+                    format!("a{i:03}.txt"),
+                    serde_json::json!({"text": "x", "dirty": false}),
+                );
+            }
+            for i in 0..3 {
+                buffers.insert(
+                    format!("z{i}.txt"),
+                    serde_json::json!({
+                        "text": format!("unsaved {i}"), "dirty": true, "base_hash": 1
+                    }),
+                );
+            }
+            let raw = serde_json::json!({
+                "sizes": {"left_w": 260, "right_w": 520, "left_split": 60},
+                "panes": [
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0},
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0}
+                ],
+                "buffers": buffers,
+            });
+            std::fs::write(state_dir().join("dirty_late.json"), raw.to_string()).unwrap();
+
+            let (w, warn) = load("dirty_late");
+            for i in 0..3 {
+                let rel = format!("z{i}.txt");
+                let want = format!("unsaved {i}");
+                let b = w.buffers.get(&rel).unwrap_or_else(|| panic!("{rel} was dropped"));
+                assert!(b.dirty(), "{rel} must still be dirty");
+                assert_eq!(b.edited_text(), Some(want.as_str()), "and keep its text");
+            }
+            // The clean tail still has to give ground somewhere, or the
+            // total count is unbounded again — just not at a dirty buffer's
+            // expense.
+            assert!(warn.is_some(), "dropping the clean tail to make room must still be visible");
         });
     }
 

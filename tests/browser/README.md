@@ -26,6 +26,8 @@ deno run -A tests/browser/autosave.mjs   # the editor writes itself out, and sto
 deno run -A tests/browser/tabwrap.mjs    # the tab strip wraps, and re-fits the terminal under it
 deno run -A tests/browser/shiftenter.mjs # shift+enter sends LF, so Claude inserts a newline
 deno run -A tests/browser/hledit.mjs     # a code file stays highlighted while you edit it
+deno run -A tests/browser/preview-follows.mjs # a previewed file follows the file on disk
+deno run -A tests/browser/buffer-lifecycle.mjs # navigating a file is not an edit; undoing one comes back clean
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -128,6 +130,28 @@ performed.
   no-edit-toggle assertion; narrowing the double-contextmenu guard back to
   `closest("a.file")` fails the markdown-link right-click assertion with
   `got 2`.
+- Removing the `refreshFile(ev.rel)` call from `FileChanged`'s handler fails 2
+  assertions in `preview-follows.mjs` — the update times out and the stale
+  text is still on screen — while the initial fetch (the file opening with
+  its unchanged content) goes on passing, which is what says the test is
+  testing the refresh and not the open.
+- Reverting `Buffer::set_text` (`workspace.rs`) to an unconditional
+  `Content::Edited(text)` — dropping the hash comparison against the base —
+  fails 2 assertions in `buffer-lifecycle.mjs`: ⌘S on an untouched file now
+  writes it (mtime changes), and undoing a typed character no longer comes
+  back clean. Section A, on arrow/End/PageDown keys, keeps passing unchanged —
+  those never reach `EditBuffer` at all, so they cannot discriminate the hash
+  rule; that is why B and C exist. Section C runs against a second project
+  with autosave off rather than racing a timing window against `AUTOSAVE_MS`
+  on the autosave-on one: `do_save` resets any successfully-saved buffer to
+  `Content::Clean` regardless of why it was dirty, so with autosave on, a
+  window wide enough to be reliable is also wide enough for autosave to fire
+  and clean up a wrongly-dirtied buffer itself — masking a broken hash rule
+  with the write that comes after it, the same shape of trap as the
+  conflict-pause one above, where the wrong property was being measured. With
+  autosave off nothing but the hash rule can clean that buffer, so the check
+  can use as generous a window as any other assertion here and still fail
+  correctly when the rule is gone.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:

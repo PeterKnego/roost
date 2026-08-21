@@ -39,7 +39,9 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   log and is tracked and re-emitted at attach time instead. Anything that
   changes what the pump stores has to keep that property, or exiting Claude
   paints over its own leftover frame again.
-- Caps: ≤16 sessions per project, ≤50 open buffers, 1 MB scrollback *per screen
+- Caps: ≤16 sessions per project, ≤50 buffers with unsaved changes (a buffer
+  holds no text at all until it actually differs from its file, so this bounds
+  dirty files, not open ones), 1 MB scrollback *per screen
   buffer* (normal and alternate are kept apart, so an app cannot evict the
   scrollback it hands back), 2 MB file
   cap for reads *and* buffer writes. Uploads are bounded per **request**, not

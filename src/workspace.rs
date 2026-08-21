@@ -2,7 +2,6 @@
 //! exactly what makes the transition table cheap to test.
 use crate::proto::{self, Intent, PaneId, Sizes, Tab, PANE_COUNT};
 use std::collections::HashMap;
-use std::time::SystemTime;
 
 pub const MAX_BUFFERS: usize = 50;
 
@@ -16,18 +15,58 @@ pub const MAX_BUFFERS: usize = 50;
 /// module yet.
 pub const MAX_TEXT_BYTES: usize = 2_000_000;
 
+/// What a buffer holds, which is *nothing* until the content actually differs
+/// from the file.
+///
+/// An enum rather than `Option<String>` beside a `dirty` flag, because that
+/// pair leaves `dirty: true` with no text expressible, and the only reading
+/// of that state at save time is "write an empty file over the user's work".
+/// Here `dirty` is the discriminant and cannot disagree with what is held.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Content {
+    Clean,
+    Edited(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct Buffer {
-    pub text: String,
-    pub base_mtime: Option<SystemTime>,
+    pub content: Content,
+    /// What the content was based on when the file was opened. The one piece
+    /// of a buffer that cannot be rebuilt later: derived at first edit
+    /// instead, it would be the hash of whatever is on disk *then*, silently
+    /// swallowing the change it exists to detect.
     pub base_hash: u64,
-    pub dirty: bool,
     pub stale: bool,
 }
 
 impl Default for Buffer {
     fn default() -> Self {
-        Buffer { text: String::new(), base_mtime: None, base_hash: 0, dirty: false, stale: false }
+        Buffer { content: Content::Clean, base_hash: 0, stale: false }
+    }
+}
+
+impl Buffer {
+    pub fn dirty(&self) -> bool {
+        matches!(self.content, Content::Edited(_))
+    }
+
+    pub fn edited_text(&self) -> Option<&str> {
+        match &self.content {
+            Content::Edited(t) => Some(t),
+            Content::Clean => None,
+        }
+    }
+
+    /// The one place content becomes dirty. Compares against the base rather
+    /// than trusting the caller: `pushEdit` in app.js sends the whole text
+    /// before every save, including a ⌘S on a file nobody typed into, and
+    /// an undone edit arrives the same way.
+    pub fn set_text(&mut self, text: String) {
+        self.content = if hash_text(&text) == self.base_hash {
+            Content::Clean
+        } else {
+            Content::Edited(text)
+        };
     }
 }
 
@@ -98,13 +137,33 @@ impl Workspace {
         None
     }
 
+    /// Every file a tab currently shows, in either mode.
+    ///
+    /// Separate from `buffers.keys()` on purpose: the watcher used that, so a
+    /// file open in Preview — which has no buffer — was classified as a
+    /// generic tree change and its pane never heard that it had changed. A
+    /// tab is the thing that means "somebody is looking at this file", which
+    /// is the question the watcher is actually asking.
+    pub fn open_file_rels(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.panes
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .filter_map(|t| match t {
+                Tab::File { rel, .. } => Some(rel.clone()),
+                _ => None,
+            })
+            .filter(|rel| seen.insert(rel.clone()))
+            .collect()
+    }
+
     pub fn view(&self) -> proto::WorkspaceView {
         let mut buffers: Vec<proto::BufferMeta> = self
             .buffers
             .iter()
             .map(|(rel, b)| proto::BufferMeta {
                 rel: rel.clone(),
-                dirty: b.dirty,
+                dirty: b.dirty(),
                 stale: b.stale,
             })
             .collect();
@@ -272,12 +331,17 @@ pub fn apply_layout(w: &mut Workspace, intent: &Intent) -> Result<bool, String> 
             if text.len() > MAX_TEXT_BYTES {
                 return Err(format!("buffer too large ({} bytes)", text.len()));
             }
-            if !w.buffers.contains_key(rel) && w.buffers.len() >= MAX_BUFFERS {
-                return Err("too many open buffers".into());
+            // The cap follows unsaved edits, not how many files have ever
+            // been looked at: a buffer created merely by previewing or
+            // opening a file (Content::Clean) must never itself count
+            // against it or trip it. Mirrored in hub.rs's open_buffer_for.
+            if !w.buffers.get(rel).map(|b| b.dirty()).unwrap_or(false)
+                && w.buffers.values().filter(|b| b.dirty()).count() >= MAX_BUFFERS
+            {
+                return Err("too many unsaved files".into());
             }
             let b = w.buffers.entry(rel.clone()).or_default();
-            b.text = text.clone();
-            b.dirty = true;
+            b.set_text(text.clone());
             Ok(true)
         }
         Intent::CloseBuffer { rel } => {
@@ -516,7 +580,7 @@ mod tests {
         );
         apply_layout(&mut w, &Intent::EditBuffer { rel: "logo.svg".into(), text: "<svg/>".into() })
             .unwrap();
-        assert_eq!(w.buffers["logo.svg"].text, "<svg/>");
+        assert_eq!(w.buffers["logo.svg"].edited_text(), Some("<svg/>"));
 
         // OpenTab must not coerce it either — the path a raw frame takes.
         apply_layout(
@@ -611,15 +675,15 @@ mod tests {
         // A text file must still be editable, or this test would pass just as
         // well with EditBuffer broken outright.
         apply_layout(&mut w, &Intent::EditBuffer { rel: "a.rs".into(), text: "hi".into() }).unwrap();
-        assert_eq!(w.buffers["a.rs"].text, "hi");
+        assert_eq!(w.buffers["a.rs"].edited_text(), Some("hi"));
     }
 
     #[test]
     fn edit_buffer_marks_dirty_and_caps_buffer_count() {
         let mut w = Workspace::default_layout();
         apply_layout(&mut w, &Intent::EditBuffer { rel: "a.rs".into(), text: "hi".into() }).unwrap();
-        assert!(w.buffers["a.rs"].dirty);
-        assert_eq!(w.buffers["a.rs"].text, "hi");
+        assert!(w.buffers["a.rs"].dirty());
+        assert_eq!(w.buffers["a.rs"].edited_text(), Some("hi"));
         for i in 0..MAX_BUFFERS + 5 {
             let _ = apply_layout(
                 &mut w,
@@ -627,6 +691,31 @@ mod tests {
             );
         }
         assert!(w.buffers.len() <= MAX_BUFFERS, "buffer count must stay capped");
+    }
+
+    /// The cap bounds memory, and memory is text. Fifty open files is
+    /// browsing; fifty unsaved edits is the thing worth refusing.
+    #[test]
+    fn the_cap_counts_edits_not_open_files() {
+        let mut w = Workspace::default_layout();
+        for i in 0..MAX_BUFFERS + 5 {
+            w.buffers.insert(format!("f{i}.rs"), Buffer::default());
+        }
+        // Clean buffers past the cap are fine — a rel with no existing
+        // buffer, not one already in the map, or the old `!contains_key`
+        // guard would let this through too and this assertion would prove
+        // nothing about the fix.
+        assert!(apply_layout(&mut w, &Intent::EditBuffer {
+            rel: "new.rs".into(), text: "typed\n".into(),
+        }).is_ok());
+        // …until that many of them hold edits.
+        for i in 1..MAX_BUFFERS {
+            w.buffers.get_mut(&format!("f{i}.rs")).unwrap().set_text(format!("edit {i}\n"));
+        }
+        let err = apply_layout(&mut w, &Intent::EditBuffer {
+            rel: format!("f{}.rs", MAX_BUFFERS + 1), text: "one too many\n".into(),
+        }).unwrap_err();
+        assert!(err.contains("too many"), "got {err}");
     }
 
     #[test]
@@ -667,5 +756,63 @@ mod tests {
         // Default is neither: a fresh workspace has spawned nothing.
         let fresh = Workspace::default_layout().view();
         assert!(fresh.live_sessions.is_empty(), "opening a project must not imply a session");
+    }
+
+    #[test]
+    fn open_file_rels_lists_previewed_files_not_just_edited_ones() {
+        let mut w = Workspace::default_layout();
+        apply_layout(&mut w, &Intent::OpenTab {
+            pane: proto::MIDDLE,
+            tab: Tab::File { rel: "read.md".into(), mode: Mode::Preview },
+        }).unwrap();
+        apply_layout(&mut w, &Intent::OpenTab {
+            pane: proto::RIGHT,
+            tab: Tab::File { rel: "write.rs".into(), mode: Mode::Edit },
+        }).unwrap();
+        let mut got = w.open_file_rels();
+        got.sort();
+        // The Preview entry is the whole point: it has no buffer, so the old
+        // buffers-only list could not contain it.
+        assert_eq!(got, vec!["read.md".to_string(), "write.rs".to_string()]);
+        assert!(w.buffers.is_empty(), "no buffer exists yet — that is why this list is needed");
+    }
+
+    /// The load-bearing half of the type: a save writes whatever the buffer
+    /// holds, so "edited, but holding nothing" must not be expressible. This
+    /// asserts the behaviour that replaces it — an edit that matches the base
+    /// leaves the buffer clean and holding nothing at all.
+    #[test]
+    fn an_edit_that_matches_the_base_leaves_the_buffer_clean() {
+        let mut w = Workspace::default_layout();
+        let base = hash_text("on disk\n");
+        w.buffers.insert(
+            "a.rs".into(),
+            Buffer { base_hash: base, ..Buffer::default() },
+        );
+        apply_layout(&mut w, &Intent::EditBuffer {
+            rel: "a.rs".into(),
+            text: "on disk\n".into(),
+        }).unwrap();
+        let b = &w.buffers["a.rs"];
+        assert!(!b.dirty(), "text equal to the base is not an edit");
+        assert_eq!(b.edited_text(), None, "and nothing is held for it");
+    }
+
+    /// ⌘S on a file that was only looked at goes through pushEdit, which
+    /// sends the whole text unconditionally. Without the hash rule above that
+    /// would mark the buffer dirty and rewrite the file identically.
+    #[test]
+    fn a_real_edit_is_held_and_an_undone_one_is_dropped_again() {
+        let mut w = Workspace::default_layout();
+        let base = hash_text("on disk\n");
+        w.buffers.insert("a.rs".into(), Buffer { base_hash: base, ..Buffer::default() });
+
+        apply_layout(&mut w, &Intent::EditBuffer { rel: "a.rs".into(), text: "typed\n".into() }).unwrap();
+        assert!(w.buffers["a.rs"].dirty());
+        assert_eq!(w.buffers["a.rs"].edited_text(), Some("typed\n"));
+
+        apply_layout(&mut w, &Intent::EditBuffer { rel: "a.rs".into(), text: "on disk\n".into() }).unwrap();
+        assert!(!w.buffers["a.rs"].dirty(), "typing a character and deleting it is not an edit");
+        assert_eq!(w.buffers["a.rs"].edited_text(), None);
     }
 }
