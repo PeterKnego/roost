@@ -448,6 +448,35 @@ mod tests {
         });
     }
 
+    /// `dirty: true` with the `text` key entirely absent: a corrupt or
+    /// hand-edited state file, not a real save (`save()` never omits `text`
+    /// for a dirty buffer). The dangerous misreading is `if b.dirty {
+    /// Edited(b.text.unwrap_or_default()) }` — the exact file-destroying
+    /// shape this branch already shipped once in `wsconn` — which would
+    /// hand back `Edited("")` and let the next save overwrite the user's
+    /// real file with nothing. Loading this as `Clean` instead means any
+    /// later save has to go through the ordinary dirty-buffer path again,
+    /// which requires the user to have actually typed something.
+    #[test]
+    fn dirty_with_no_text_loads_clean_not_as_an_empty_edit() {
+        with_state_dir(|| {
+            std::fs::create_dir_all(state_dir()).unwrap();
+            let raw = serde_json::json!({
+                "sizes": {"left_w": 260, "right_w": 520, "left_split": 60},
+                "panes": [
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0},
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0}
+                ],
+                "buffers": {"a.rs": {"dirty": true}},
+            });
+            std::fs::write(state_dir().join("dirty_no_text_probe.json"), raw.to_string()).unwrap();
+
+            let (got, _) = load("dirty_no_text_probe");
+            assert_eq!(got.buffers["a.rs"].edited_text(), None, "no text to hold an edit");
+            assert!(!got.buffers["a.rs"].dirty(), "must come back Clean, so no later save can write from it");
+        });
+    }
+
     /// State written before the Edit guards existed (or by an older build, or
     /// by hand) can name a tab this server would now never create. `load`
     /// assigns `p.tabs` verbatim — restored state never passes through
