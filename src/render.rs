@@ -737,6 +737,7 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<
 <link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/vendor/hljs-github-dark.min.css">
 <link rel="stylesheet" href="/static/vendor/github-markdown.min.css">
+<link rel="stylesheet" href="/static/vendor/code-input.min.css">
 <link rel="stylesheet" href="/static/themes/{theme}.css">
 <link rel="stylesheet" href="/static/style.css">
 {theme_css}
@@ -744,6 +745,7 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
+<script src="/static/vendor/code-input.min.js"></script>
 </head><body data-project="{proj_txt}" data-default-tab="{tab}" data-show-hidden="{sh}" data-autosave="{autosave}">
 <header>
   <a class="home" href="/">◆</a><span class="proj">{proj_txt}</span>

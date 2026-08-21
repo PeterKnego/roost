@@ -14,6 +14,22 @@ const AUTOSAVE = document.body.dataset.autosave === "1";
 // How long after the last keystroke an autosave fires. VS Code's default,
 // and comfortably longer than the 200ms EditBuffer debounce it depends on.
 const AUTOSAVE_MS = 1000;
+// Highlighting an editor is worth it up to a point and then it is not: the
+// buffer cap is 2 MB, and hljs re-runs over the whole text on every pause in
+// typing. Past this the editor stays a plain textarea rather than becoming a
+// laggy one. Chosen as roughly the largest source file anyone edits by hand;
+// resh's own biggest is a quarter of it.
+const MAX_HIGHLIGHT_BYTES = 100_000;
+// Known to hljs but deliberately left plain — see codeLanguage.
+const PLAIN_EXTS = new Set(["md", "markdown", "txt", "text"]);
+// code-input wraps a real <textarea> and paints a highlighted <pre> under it,
+// which is why it can be dropped in here at all: everything downstream —
+// `editors`, the edit debounce, autosave, ⌘S, the conflict patch, blur flush
+// — goes on talking to the same textarea it always did. Registered once; the
+// element carries template="hl" to select it.
+if (window.codeInput && window.hljs) {
+  codeInput.registerTemplate("hl", codeInput.templates.hljs(hljs, []));
+}
 const showHidden = () => (state && state.show_hidden != null ? state.show_hidden : SHOW_HIDDEN_DEFAULT);
 // What the tree was last rendered with, so a State that flips the setting
 // re-fetches. Fragments are server-rendered against the workspace value, so
@@ -129,7 +145,15 @@ function onEvent(ev) {
       if (ev.origin && ev.origin === myOrigin) break;
       texts.set(ev.rel, ev.text);
       const ta = editors.get(ev.rel);
-      if (ta && ta.value !== ev.text) ta.value = ev.text;
+      // Through the <code-input> where there is one: assigning the textarea's
+      // value directly changes no attribute and fires no input event, so the
+      // highlighted layer under it would keep painting the old text. The
+      // element's own value setter writes the textarea *and* schedules the
+      // repaint.
+      if (ta && ta.value !== ev.text) {
+        const host = ta.closest("code-input");
+        if (host) host.value = ev.text; else ta.value = ev.text;
+      }
       break;
     }
     case "BufferStale": {
@@ -972,18 +996,37 @@ function sendResize(e) {
   if (e.sock && e.sock.readyState === 1) e.sock.send(`resize:${e.term.cols}x${e.term.rows}`);
 }
 
-function mountEditor(content, rel) {
-  const ta = document.createElement("textarea");
-  ta.className = "editor";
-  ta.spellcheck = false;
-  // The server reads the file itself the moment this rel enters Edit mode
-  // (SetMode/OpenTab, see hub.rs) and pushes the content as a BufferText
-  // with an empty origin, landing in `texts` — there is no client-side
-  // fetch here. If that push hasn't arrived yet, the textarea starts empty
-  // and the BufferText handler in onEvent fills it in as soon as it does.
-  ta.value = texts.has(rel) ? texts.get(rel) : "";
+/// The extension to highlight this file as, or null to leave it a plain
+/// textarea. Code files only: markdown has its own rendered preview and its
+/// own reason to be edited as plain text, and plaintext has nothing to colour.
+/// The check is hljs's own — an extension it does not know would produce an
+/// unhighlighted overlay, which is all cost and no colour.
+function codeLanguage(rel, text) {
+  if (!window.codeInput || !window.hljs) return null;
+  if (text.length > MAX_HIGHLIGHT_BYTES) return null;
+  const ext = rel.includes(".") ? rel.split(".").pop().toLowerCase() : "";
+  // hljs's own answer, so an extension it cannot highlight never gets an
+  // overlay that would paint nothing. Markdown and plaintext are excluded
+  // even though hljs knows both: markdown has a rendered preview and is
+  // edited as prose, and plaintext has nothing to colour — this is the "code
+  // files only" line.
+  if (!ext || PLAIN_EXTS.has(ext) || !hljs.getLanguage(ext)) return null;
+  return ext;
+}
+
+/// Attaches resh's editing behaviour to whichever textarea ends up on screen.
+/// Which one that is depends on the file: a plain editor makes its own, while
+/// a code editor gets the one <code-input> builds for itself. Registering the
+/// wrong one is silent and total — the text still types and still highlights,
+/// but no edit is ever sent, nothing autosaves, and ⌘S saves an empty buffer.
+///
+/// addEventListener, not the `oninput` property, for the same reason:
+/// code-input listens on its own textarea, and two `.oninput` assignments
+/// would leave whichever ran second holding the only handler.
+function wireEditor(ta, rel) {
   editors.set(rel, ta);
-  ta.oninput = () => {
+  ta.spellcheck = false;
+  ta.addEventListener("input", () => {
     // texts must reflect what's on screen the instant it changes, not 200ms
     // later when the debounced EditBuffer actually goes out: render() can
     // re-mount this same rel (a pane switch and back, a BufferStale patch,
@@ -1002,11 +1045,21 @@ function mountEditor(content, rel) {
     // rather than the age of the edit.
     clearTimeout(autosaveTimers.get(rel));
     autosaveTimers.set(rel, setTimeout(() => autosaveNow(rel), AUTOSAVE_MS));
-  };
+  });
   // Clicking a tab, the tree, or a terminal blurs the textarea, so this is
   // what covers "moved on within the page" — the timer covers pauses, and
   // window blur covers leaving the browser.
-  ta.onblur = () => autosaveNow(rel);
+  ta.addEventListener("blur", () => autosaveNow(rel));
+  return ta;
+}
+
+function mountEditor(content, rel) {
+  // The server reads the file itself the moment this rel enters Edit mode
+  // (SetMode/OpenTab, see hub.rs) and pushes the content as a BufferText
+  // with an empty origin, landing in `texts` — there is no client-side
+  // fetch here. If that push hasn't arrived yet, the editor starts empty
+  // and the BufferText handler in onEvent fills it in as soon as it does.
+  const text = texts.has(rel) ? texts.get(rel) : "";
   // The same breadcrumb the preview fragments carry, so a file looks like the
   // same file in both modes. Built here rather than in render.rs because edit
   // mode has no server fragment at all: the textarea is client-built and
@@ -1026,8 +1079,29 @@ function mountEditor(content, rel) {
   btn.title = "write this file out (⌘S / ctrl-S)";
   btn.onclick = () => saveNow(rel);
   bar.append(name, st, btn);
-  wrap.append(bar, ta);
-  content.appendChild(wrap);
+  const lang = codeLanguage(rel, text);
+  if (lang) {
+    const host = document.createElement("code-input");
+    host.setAttribute("template", "hl");
+    host.setAttribute("language", lang);
+    wrap.append(bar, host);
+    content.appendChild(wrap);
+    // Set after connecting, never before: with no textarea built yet,
+    // code-input's value setter falls back to assigning innerHTML, which
+    // would parse a file's own angle brackets as markup and lose them. Once
+    // connected it writes the textarea and schedules the first highlight.
+    host.value = text;
+    const ta = wireEditor(host.querySelector("textarea"), rel);
+    // Its own textarea, so it carries none of this app's classes until told.
+    ta.classList.add("editor");
+  } else {
+    const ta = document.createElement("textarea");
+    ta.className = "editor";
+    ta.value = text;
+    wireEditor(ta, rel);
+    wrap.append(bar, ta);
+    content.appendChild(wrap);
+  }
   paintSaveState(content, rel);
 }
 

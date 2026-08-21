@@ -25,6 +25,7 @@ deno run -A tests/browser/save.mjs       # cmd/ctrl-s saves whether or not the e
 deno run -A tests/browser/autosave.mjs   # the editor writes itself out, and stops when the file diverges
 deno run -A tests/browser/tabwrap.mjs    # the tab strip wraps, and re-fits the terminal under it
 deno run -A tests/browser/shiftenter.mjs # shift+enter sends LF, so Claude inserts a newline
+deno run -A tests/browser/hledit.mjs     # a code file stays highlighted while you edit it
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -87,6 +88,23 @@ performed.
   the document-level handler) fails 2 assertions in `save.mjs` — both unfocused
   cases time out with the file unchanged on disk — while the focused case goes
   on passing, which is what says the test is testing focus and not saving.
+- In `hledit.mjs`: making every file plain fails 3; setting the wrong
+  `language` attribute fails 3 different ones (spans still exist, but not
+  Rust's); wiring a textarea other than the one `<code-input>` builds fails
+  exactly 1 — the disk assertion — which is the whole point of that assertion,
+  since the text still types and still highlights. Dropping the vendored
+  `code-input.min.css` link puts the two layers 153px apart and fails the
+  geometry pair; dropping this app's font override fails the font assertion
+  alone. Note that overriding the textarea's `font-size` does *not* fail the
+  metrics assertion — code-input forces `font-size: inherit !important` on both
+  layers, so that pair covers the stylesheet being loaded, not the override.
+  On the wrapping half: removing `white-space: pre-wrap` fails 1, letting the
+  highlighted layer keep code-input's `width: max-content` fails 1 (the editor
+  grows to 4739px inside a 590px pane rather than wrapping), and letting the
+  highlight.js theme keep its own background fails 1. The fixture carries an
+  unbreakable 420-character token on purpose — the library pins
+  `word-wrap: normal` on both layers, so that line scrolls rather than wraps,
+  and asserting "nothing overflows" would have been asserting the wrong thing.
 - Mounting the editor without its breadcrumb fails 2 assertions in `save.mjs`;
   keeping it but dropping the `.editwrap` flex rules fails 1 more — the
   textarea ends 26px below the pane, hiding its own last lines. Forcing the
