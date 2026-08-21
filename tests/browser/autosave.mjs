@@ -55,6 +55,10 @@ const wire = async (project, rel) => {
     blur: () => p.evalIn(`document.activeElement.blur(); document.body.focus()`),
     dirty: () => p.evalIn(`!!(state.buffers.find((b) => b.rel === ${JSON.stringify(rel)}) || {}).dirty`),
     banners: () => p.evalIn(`document.querySelectorAll('.pane[data-pane="2"] .conflict').length`),
+    editorText: () => p.evalIn(`(document.querySelector("textarea.editor") || {}).value`),
+    discard: () => p.evalIn(
+      `(() => { const b = [...document.querySelectorAll('.conflict button')]
+          .find((x) => /discard/i.test(x.textContent)); if (!b) return false; b.click(); return true; })()`),
     savestate: () => p.evalIn(`(document.querySelector('.pane[data-pane="2"] .savestate') || {}).textContent || ""`),
     press: async (modifiers) => {
       for (const type of ["rawKeyDown", "keyUp"]) {
@@ -115,6 +119,26 @@ try {
   await page.press(2); // ctrl-s: the person, not the timer
   ok(await until(async () => (await page.banners()) === 1, 3, "banner"),
      `⌘S raises the conflict banner exactly once (got ${await page.banners()})`);
+
+  console.log("\nD3. discarding shows the file, not an empty editor");
+  ok(await page.discard(), "the banner offers a discard button");
+  ok(await until(async () => (await page.editorText()) === "written by somebody else\n", 5, "reload"),
+     `the editor now shows what is on disk (got ${JSON.stringify(await page.editorText())})`);
+  ok(await until(async () => (await page.savestate()) === "saved", 3, "saved"),
+     "and the header agrees there is nothing outstanding");
+  // The bug this replaced left no buffer at all, which only *looked* fine
+  // until a reload — so reload and check the editor is not blank.
+  const reloaded = await wire("proj", "note.md");
+  try {
+    ok(await until(async () => (await reloaded.editorText()) === "written by somebody else\n", 10, "reloaded"),
+       `a fresh page shows the file too (got ${JSON.stringify(await reloaded.editorText())})`);
+  } finally { try { reloaded.close(); } catch {} }
+  // The header wording is one symptom; this is the behaviour behind it. A
+  // buffer that stayed paused would never autosave again for the rest of the
+  // session, and nothing else in this file would notice.
+  await page.type("typing again after the discard\n");
+  ok(await until(async () => (await Deno.readTextFile(file)).includes("typing again"), 5, "resumed"),
+     "autosave works again once the divergence is resolved");
 
   console.log("\nE. a project can turn it off");
   manualPage = await wire("noauto", "manual.md");

@@ -388,6 +388,28 @@ impl Hub {
                             self.maybe_drop_buffer(rel);
                         }
                     }
+                    // Discarding means "show me what is on disk", not "show me
+                    // nothing". The tab stays open in Edit, and a tab in Edit
+                    // whose buffer is gone renders an empty textarea — for
+                    // certain on the next reload, since a connecting client is
+                    // only sent text for buffers that exist (see wsconn). Until
+                    // then it would go on showing the very text just discarded.
+                    //
+                    // Only when a tab still points at it: CloseBuffer is also
+                    // how a buffer is freed outright, and re-reading there
+                    // would resurrect every buffer forever, defeating both the
+                    // MAX_BUFFERS cap and the reason a once-opened .env should
+                    // not stay in the state file.
+                    Intent::CloseBuffer { rel } => {
+                        let still_open = self.ws.panes.iter().any(|p| {
+                            p.tabs.iter().any(
+                                |t| matches!(t, Tab::File { rel: r, mode: Mode::Edit } if r == rel),
+                            )
+                        });
+                        if still_open {
+                            self.open_for_edit(from, rel);
+                        }
+                    }
                     _ => {}
                 }
                 let snap = self.snapshot_event(from);
@@ -1062,6 +1084,66 @@ mod tests {
     /// The disk is deliberately left untouched across the restart here: with
     /// nothing having changed, a save has nothing to conflict *with*, so a
     /// conflict can only come from a manufactured base.
+    /// "discard mine" on the conflict banner sends CloseBuffer, which dropped
+    /// the buffer and stopped there — while the tab stayed open in Edit. The
+    /// text a client is holding is only re-sent for buffers that *exist*
+    /// (wsconn's connect path), so the discarded editor came back blank on
+    /// the next reload, and until then went on showing the text that was
+    /// supposedly discarded.
+    ///
+    /// Discarding means "show me what is on disk", so the file is re-read.
+    #[test]
+    fn discarding_a_buffer_reloads_the_file_rather_than_leaving_nothing() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.txt"), "on disk\n").unwrap();
+        let mut h = Hub::new("discard_probe", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "a.txt".into(), mode: Mode::Edit },
+            },
+        );
+        h.handle(&c, Intent::EditBuffer { rel: "a.txt".into(), text: "mine\n".into() });
+        drain(&rx);
+
+        h.handle(&c, Intent::CloseBuffer { rel: "a.txt".into() });
+
+        let b = h.ws.buffers.get("a.txt").expect("the tab is still open in Edit, so it needs text");
+        assert_eq!(b.text, "on disk\n", "discarding shows the file, not the discarded edit");
+        assert!(!b.dirty, "a freshly read buffer is not dirty");
+        assert_eq!(b.base_hash, workspace::hash_text("on disk\n"), "and it knows its base");
+        // The client that clicked must see it now, not on its next reload.
+        let msgs = drain(&rx);
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"BufferText""#) && m.contains("on disk")),
+            "the reload has to reach the browser that discarded; got {msgs:?}"
+        );
+    }
+
+    /// The other half: closing a buffer whose tab is gone must still free it.
+    /// Without this the fix above would resurrect every buffer forever, and
+    /// the MAX_BUFFERS cap along with the "a .env opened once is persisted
+    /// with its contents" problem would both come back.
+    #[test]
+    fn discarding_a_buffer_with_no_tab_left_frees_it() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.txt"), "on disk\n").unwrap();
+        let mut h = Hub::new("discard_notab_probe", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        h.handle(&c, Intent::EditBuffer { rel: "a.txt".into(), text: "mine\n".into() });
+        assert!(h.ws.buffers.contains_key("a.txt"));
+        drain(&rx);
+
+        h.handle(&c, Intent::CloseBuffer { rel: "a.txt".into() });
+        assert!(!h.ws.buffers.contains_key("a.txt"), "no tab points at it, so it must go");
+    }
+
     #[test]
     fn a_dirty_buffer_still_saves_after_a_restart() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

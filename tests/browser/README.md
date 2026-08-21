@@ -78,6 +78,9 @@ performed.
   ⌘S). The obvious assertion, that the diverged file is not overwritten, passes
   with the pause deleted: that property comes from the server's `force: false`,
   not from the client, and asserting it proves nothing about the pause.
+- Dropping the State-driven unpause in `autosave.mjs`'s D3 fails 2: the header
+  goes on claiming the file changed underneath a buffer that was just
+  discarded, and autosave never resumes for it again.
 - Rebinding the save shortcut to the textarea (`ta.onkeydown`, its shape before
   the document-level handler) fails 2 assertions in `save.mjs` — both unfocused
   cases time out with the file unchanged on disk — while the focused case goes

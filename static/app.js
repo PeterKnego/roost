@@ -90,6 +90,16 @@ function onEvent(ev) {
         const openRels = new Set(state.buffers.map((b) => b.rel));
         for (const rel of texts.keys()) if (!openRels.has(rel)) texts.delete(rel);
         for (const rel of editors.keys()) if (!openRels.has(rel)) editors.delete(rel);
+        // Autosave resumes as soon as the server says this buffer has nothing
+        // outstanding — saved, discarded, or gone. SaveOk is the common route
+        // and clears it sooner, but not the only one: the banner's "discard
+        // mine" resolves the divergence without any write happening, and
+        // without this that buffer stayed paused for the rest of the session
+        // with the header still claiming the file had changed underneath it.
+        for (const rel of autosavePaused) {
+          const b = state.buffers.find((x) => x.rel === rel);
+          if (!b || (!b.dirty && !b.stale)) autosavePaused.delete(rel);
+        }
       }
       render();
       // Toggling visibility changes what the *server* renders, not how the
