@@ -96,9 +96,15 @@ impl Hub {
     /// discard unsaved work.
     ///
     /// Called from `new`, which runs under the process-global registry lock,
-    /// so the I/O here is deliberately bounded: at most `MAX_BUFFERS` files,
-    /// whose contents the state file this call just parsed already carried —
-    /// so it at most doubles reading that `new` was doing anyway.
+    /// so the I/O here has to stay bounded — but not by `MAX_BUFFERS` itself:
+    /// that cap only ever applies to *dirty* buffers on the live insert path
+    /// (`open_buffer_for`), so nothing stops a session from accumulating far
+    /// more clean ones by previewing files. What actually bounds `self.ws.buffers`
+    /// here is `wsstate::load`, which this hub was just built from: every
+    /// dirty buffer it restored, plus at most `MAX_BUFFERS` clean ones. Every
+    /// one of those files' contents the state file this call just parsed
+    /// already carried, so this at most doubles the reading `new` was doing
+    /// anyway — it does not, on its own, bound the *count*.
     fn reconcile_buffers_with_disk(&mut self) {
         let dir = &self.dir;
         for (rel, b) in self.ws.buffers.iter_mut() {
@@ -425,7 +431,33 @@ impl Hub {
                     // without a fresh disk read).
                     Intent::OpenTab { tab, .. } => {
                         if let Tab::File { rel, .. } = workspace::coerce_tab(tab) {
-                            if !crate::routes::refuses_text_edit(&rel) {
+                            // apply_layout also returns Ok(true) for OpenTab
+                            // on a tab that was already open — find_tab hit,
+                            // so this is a bare activation, not a new tab.
+                            // Re-running open_buffer_for there would be a
+                            // fresh disk read (up to 2 MB, under the hub
+                            // lock) plus a whole-file broadcast every time a
+                            // user clicks back to a tab, for a pane whose
+                            // content Preview doesn't even read from the
+                            // buffer (it's fetched over HTTP). A clean,
+                            // non-stale buffer's base still agrees with the
+                            // file, so there is nothing to learn and nothing
+                            // new to tell anyone — every subscriber already
+                            // has this text, either from the read that first
+                            // created the buffer or from wsconn's
+                            // connect-time replay for anyone who joined
+                            // since. A dirty or stale buffer still needs the
+                            // real call: dirty because a second browser
+                            // reopening an in-progress edit needs its own
+                            // re-broadcast, stale because "the file moved
+                            // under this" is exactly a reason to look again.
+                            let reactivating_a_settled_buffer = self
+                                .ws
+                                .buffers
+                                .get(&rel)
+                                .is_some_and(|b| !b.dirty() && !b.stale);
+                            if !reactivating_a_settled_buffer && !crate::routes::refuses_text_edit(&rel)
+                            {
                                 self.open_buffer_for(from, &rel)
                             }
                         }
@@ -1502,6 +1534,36 @@ mod tests {
         assert!(!h.ws.buffers["a.txt"].dirty());
     }
 
+    /// The sibling of the coercion case above: an image requested directly in
+    /// Preview (no coercion involved — Preview is already what it gets) must
+    /// still get no buffer. `refuses_text_edit` gates the OpenTab dispatch on
+    /// the *rel*, not the mode, precisely so this holds; a buffer for an
+    /// image is the shape an earlier defect used to truncate files.
+    #[test]
+    fn a_directly_previewed_image_gets_no_buffer() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("shot.png"), [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+            .unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "shot.png".into(), mode: Mode::Preview },
+            },
+        );
+        assert!(
+            !h.ws.buffers.contains_key("shot.png"),
+            "a previewed image must not get a buffer: {:?}",
+            h.ws.buffers.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// Every open file has a buffer, which is what puts a previewed file in
     /// the watcher's list — and it holds nothing until it is edited.
     #[test]
@@ -1525,6 +1587,46 @@ mod tests {
         let b = h.ws.buffers.get("read.md").expect("a previewed file has a buffer");
         assert_eq!(b.edited_text(), None, "and holds nothing");
         assert_eq!(b.base_hash, workspace::hash_text("hello\n"), "with a base taken at open time");
+    }
+
+    /// Clicking back to a tab that is already open still runs through
+    /// `apply_layout`'s `OpenTab` arm and still returns `Ok(true)` (it just
+    /// moves `active`), so without a guard this would re-read the file and
+    /// re-broadcast its text to everyone on every activation — a 2 MB read
+    /// under the hub lock for a pane whose content a browser fetches over
+    /// HTTP, not from this broadcast.
+    #[test]
+    fn reactivating_an_already_open_clean_tab_does_not_reread_or_rebroadcast() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("read.md"), "hello\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "read.md".into(), mode: Mode::Preview },
+            },
+        );
+        drain(&rx);
+
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "read.md".into(), mode: Mode::Preview },
+            },
+        );
+        let msgs = drain(&rx);
+        assert!(
+            !msgs.iter().any(|m| m.contains(r#""t":"BufferText""#)),
+            "reactivating an unchanged, already-open tab must not resend its text; got {msgs:?}"
+        );
+        // The activation itself must still land, or this would pass with
+        // OpenTab's whole dispatch arm deleted.
+        assert!(msgs.iter().any(|m| m.contains(r#""t":"State""#)), "got {msgs:?}");
     }
 
     #[test]

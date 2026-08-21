@@ -98,7 +98,7 @@ function onEvent(ev) {
       // A rel missing from the fresh buffer list is gone server-side (the
       // last tab on it closed clean, or its edits were explicitly
       // discarded) — prune it here rather than let texts/editors grow for
-      // the life of the session. This is safe because hub::open_for_edit
+      // the life of the session. This is safe because hub::open_buffer_for
       // always re-broadcasts a fresh BufferText the moment a rel re-enters
       // Edit mode, even for a buffer it kept around dirty; nothing here can
       // be the last copy of unsaved text.
@@ -134,7 +134,7 @@ function onEvent(ev) {
       // NOT gated on the buffer being dirty: EditBuffer's handler (hub.rs)
       // broadcasts BufferText to every *other* client on every keystroke,
       // dirty or not — that's how a second client watching the same file
-      // live-syncs with the one typing — and open_for_edit re-broadcasts
+      // live-syncs with the one typing — and open_buffer_for re-broadcasts
       // the current text on reopen even when already dirty, so a freshly
       // opened tab picks up in-progress edits instead of stale disk
       // content. The one case that must never reach here (a dirty buffer's

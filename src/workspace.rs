@@ -703,9 +703,12 @@ mod tests {
         for i in 0..MAX_BUFFERS + 5 {
             w.buffers.insert(format!("f{i}.rs"), Buffer::default());
         }
-        // Clean buffers past the cap are fine…
+        // Clean buffers past the cap are fine — a rel with no existing
+        // buffer, not one already in the map, or the old `!contains_key`
+        // guard would let this through too and this assertion would prove
+        // nothing about the fix.
         assert!(apply_layout(&mut w, &Intent::EditBuffer {
-            rel: "f0.rs".into(), text: "typed\n".into(),
+            rel: "new.rs".into(), text: "typed\n".into(),
         }).is_ok());
         // …until that many of them hold edits.
         for i in 1..MAX_BUFFERS {

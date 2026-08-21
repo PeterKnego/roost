@@ -172,26 +172,44 @@ pub fn load(project: &str) -> (Workspace, Option<String>) {
                     })
                     .collect();
             }
-            // MAX_BUFFERS is enforced on the live insert path (apply_layout);
-            // without a matching cap here, a corrupt or hand-edited state
-            // file restores unboundedly. HashMap iteration order is
-            // unspecified, so sort the keys before truncating: otherwise
-            // which buffers survive a too-big file would differ from one
-            // load to the next, which would make this untestable and the
-            // dropped-buffer set effectively random.
-            let mut keys: Vec<String> = d.buffers.keys().cloned().collect();
-            keys.sort();
-            let warn = if keys.len() > crate::workspace::MAX_BUFFERS {
-                let dropped = keys.len() - crate::workspace::MAX_BUFFERS;
-                keys.truncate(crate::workspace::MAX_BUFFERS);
+            // MAX_BUFFERS is enforced on the live insert path (apply_layout /
+            // hub::open_buffer_for), but only against *dirty* buffers, since
+            // a merely-opened or previewed file must never trip a cap meant
+            // to bound unsaved text — so a corrupt or hand-edited state file
+            // can still name more buffers than that live cap would ever let
+            // accumulate, and truncating without regard for which are dirty
+            // could drop unsaved text exactly as readily as it drops a
+            // buffer holding nothing. Discarding someone's edit because its
+            // rel happened to sort late is the failure this whole module
+            // exists to prevent, so dirty buffers are never truncated here —
+            // only the clean tail is capped, and only once every dirty one
+            // is already kept. Sorted within each group before truncating,
+            // for the same determinism reason as before: HashMap iteration
+            // order is unspecified, so an unsorted truncation would make the
+            // dropped set differ from one load to the next.
+            let mut dirty_keys: Vec<String> =
+                d.buffers.iter().filter(|(_, b)| b.dirty).map(|(k, _)| k.clone()).collect();
+            let mut clean_keys: Vec<String> =
+                d.buffers.iter().filter(|(_, b)| !b.dirty).map(|(k, _)| k.clone()).collect();
+            dirty_keys.sort();
+            clean_keys.sort();
+            let total = dirty_keys.len() + clean_keys.len();
+            let clean_room = crate::workspace::MAX_BUFFERS.saturating_sub(dirty_keys.len());
+            let dropped = clean_keys.len().saturating_sub(clean_room);
+            clean_keys.truncate(clean_room);
+            let warn = if dropped > 0 {
                 Some(format!(
-                    "workspace state had {} buffers, kept {} (dropped {dropped})",
-                    keys.len() + dropped,
-                    crate::workspace::MAX_BUFFERS,
+                    "workspace state had {total} buffers, kept {} unsaved and {} of {} clean \
+                     (dropped {dropped})",
+                    dirty_keys.len(),
+                    clean_keys.len(),
+                    clean_keys.len() + dropped,
                 ))
             } else {
                 None
             };
+            let mut keys = dirty_keys;
+            keys.extend(clean_keys);
             let mut buffers = d.buffers;
             for k in keys {
                 if let Some(b) = buffers.remove(&k) {
@@ -618,6 +636,56 @@ mod tests {
             let mut got: Vec<String> = w.buffers.keys().cloned().collect();
             got.sort();
             assert_eq!(got, expected);
+        });
+    }
+
+    /// The bug the dirty-first partition fixes: plain lexical sort-then-
+    /// truncate treats a dirty buffer exactly like a clean one, so unsaved
+    /// text whose rel happens to sort after `MAX_BUFFERS` clean ones was
+    /// silently dropped on restart. These names are chosen to be exactly
+    /// that case — every `z*` buffer sorts after all `MAX_BUFFERS` `a*`
+    /// ones — and must survive anyway, in full, with their text intact.
+    #[test]
+    fn load_never_drops_a_dirty_buffer_to_make_room_for_the_clean_cap() {
+        with_state_dir(|| {
+            std::fs::create_dir_all(state_dir()).unwrap();
+            let mut buffers = serde_json::Map::new();
+            for i in 0..crate::workspace::MAX_BUFFERS {
+                buffers.insert(
+                    format!("a{i:03}.txt"),
+                    serde_json::json!({"text": "x", "dirty": false}),
+                );
+            }
+            for i in 0..3 {
+                buffers.insert(
+                    format!("z{i}.txt"),
+                    serde_json::json!({
+                        "text": format!("unsaved {i}"), "dirty": true, "base_hash": 1
+                    }),
+                );
+            }
+            let raw = serde_json::json!({
+                "sizes": {"left_w": 260, "right_w": 520, "left_split": 60},
+                "panes": [
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0},
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0}
+                ],
+                "buffers": buffers,
+            });
+            std::fs::write(state_dir().join("dirty_late.json"), raw.to_string()).unwrap();
+
+            let (w, warn) = load("dirty_late");
+            for i in 0..3 {
+                let rel = format!("z{i}.txt");
+                let want = format!("unsaved {i}");
+                let b = w.buffers.get(&rel).unwrap_or_else(|| panic!("{rel} was dropped"));
+                assert!(b.dirty(), "{rel} must still be dirty");
+                assert_eq!(b.edited_text(), Some(want.as_str()), "and keep its text");
+            }
+            // The clean tail still has to give ground somewhere, or the
+            // total count is unbounded again — just not at a dirty buffer's
+            // expense.
+            assert!(warn.is_some(), "dropping the clean tail to make room must still be visible");
         });
     }
 

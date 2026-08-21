@@ -127,7 +127,7 @@ try {
   // none, so this is the assertion that the disk read happens at all.
   //
   // Section 5 left every editor in Preview, so note.md is reopened in Edit
-  // here first — `open_for_edit` re-reads the file and resets its buffer to
+  // here first — `open_buffer_for` re-reads the file and resets its buffer to
   // Content::Clean (see hub.rs), which is exactly the case the second
   // browser's connect-time replay has to serve from disk rather than from
   // an in-memory edit.

@@ -89,10 +89,14 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         // otherwise render them blank forever: nothing else re-sends
         // BufferText for a buffer that isn't actively being typed into.
         // A clean buffer holds nothing of its own, so its half of this
-        // replay has to come from disk — but not under this lock: a project
-        // can have up to MAX_BUFFERS open buffers, and a disk read is up to
-        // 2 MB each, which would stall the watcher thread and every other
-        // connection to this project for the whole scan.
+        // replay has to come from disk — but not under this lock: a disk
+        // read is up to 2 MB each, which would stall the watcher thread and
+        // every other connection to this project for the whole scan. Note
+        // this is *not* bounded by MAX_BUFFERS: that cap only ever applies
+        // to dirty buffers on the live insert path (hub::open_buffer_for),
+        // so a session that has previewed many files can hold arbitrarily
+        // more clean ones than that — every one of them gets a disk read
+        // here on every reconnect.
         //
         // Only the rel, its base_hash, and (if dirty) its own edited text are
         // collected here. For a dirty buffer this still clones its text
