@@ -60,6 +60,11 @@ const wire = async (project, rel) => {
       `(() => { const b = [...document.querySelectorAll('.conflict button')]
           .find((x) => /discard/i.test(x.textContent)); if (!b) return false; b.click(); return true; })()`),
     savestate: () => p.evalIn(`(document.querySelector('.pane[data-pane="2"] .savestate') || {}).textContent || ""`),
+    saveButtonShown: () => p.evalIn(
+      `(() => { const b = document.querySelector('.pane[data-pane="2"] .savebtn'); return !!b && !b.hidden; })()`),
+    clickSave: () => p.evalIn(
+      `(() => { const b = document.querySelector('.pane[data-pane="2"] .savebtn');
+         if (!b || b.hidden) return false; b.click(); return true; })()`),
     press: async (modifiers) => {
       for (const type of ["rawKeyDown", "keyUp"]) {
         await p.cmd("Input.dispatchKeyEvent",
@@ -146,9 +151,19 @@ try {
   await sleep(2000);
   ok((await Deno.readTextFile(manualFile)) === "start\n", "nothing is written on its own");
   ok((await manualPage.savestate()).includes("⌘S"),
-     `and the header advertises the shortcut (got ${JSON.stringify(await manualPage.savestate())})`);
+     `and the breadcrumb advertises the shortcut (got ${JSON.stringify(await manualPage.savestate())})`);
+  // The button exists only where it is the thing that writes the file. With
+  // autosave on it is hidden — asserted in save.mjs, on the other config, so
+  // neither half can pass by the button simply never being built.
+  ok(await manualPage.saveButtonShown(), "the breadcrumb offers a Save button");
+  ok(await manualPage.clickSave(), "the button is clickable");
+  ok(await until(async () => (await Deno.readTextFile(manualFile)).includes("not to be autosaved"), 5, "button save"),
+     "clicking it writes the file");
+  // Distinct text, so this is the keystroke's own evidence rather than the
+  // button's write still sitting on disk.
+  await manualPage.type("and by keystroke\n");
   await manualPage.press(2); // ctrl-s
-  ok(await until(async () => (await Deno.readTextFile(manualFile)).includes("not to be autosaved"), 5, "manual save"),
+  ok(await until(async () => (await Deno.readTextFile(manualFile)).includes("and by keystroke"), 5, "manual save"),
      "an explicit save still works there");
 } finally {
   try { page?.close(); } catch {}

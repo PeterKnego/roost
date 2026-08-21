@@ -24,6 +24,11 @@ const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) 
 const fx = await fixture();
 const file = `${fx.roots}/proj/note.md`;
 await Deno.writeTextFile(file, "on disk\n");
+// Nested, so the breadcrumb below has a directory to show that the tab —
+// which carries the basename alone — cannot.
+const NESTED = "docs/deep/nested.md";
+await Deno.mkdir(`${fx.roots}/proj/docs/deep`, { recursive: true });
+await Deno.writeTextFile(`${fx.roots}/proj/${NESTED}`, "nested\n");
 
 const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
@@ -32,6 +37,11 @@ let page;
 try {
   page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/proj`);
   const { cmd, evalIn } = page;
+  // The default headless window is 800x600, which is narrower than the left
+  // (260px) and right (520px) panes together: the middle pane — the one every
+  // assertion below looks at — collapses to nothing, and the layout assertion
+  // in section 4 measures that instead of the editor. See the README's traps.
+  await cmd("Emulation.setDeviceMetricsOverride", { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
   await until(() => evalIn(`typeof state !== "undefined" && !!(state && state.panes)`), 15, "workspace state");
 
   // Setup only — opening a tab is not what this file is testing.
@@ -80,8 +90,33 @@ try {
   ok(await until(async () => (await onDisk()).includes("focused edit"), 5, "focused save"),
      "ctrl-s still saves from inside the editor");
 
-  // --- 4. And the key is only taken when there is something to save, or the
+  // --- 4. The editor carries the breadcrumb a preview does, so a file looks
+  // like the same file in both modes.
+  await evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: ${JSON.stringify(NESTED)}, mode: "Edit" } })`);
+  ok(await until(async () => (await evalIn(
+    `(document.querySelector('.pane[data-pane="2"] .editwrap .path .rel') || {}).textContent || ""`)) === NESTED,
+    10, "the breadcrumb"), `the editor names the file by its full path (${NESTED})`);
+  // The half the breadcrumb can break: .editor is height:100%, so without the
+  // flex wrapper above it the textarea keeps the pane's full height, starts
+  // below the breadcrumb, and pushes its own last lines out through the
+  // bottom (measured: 26px past, with .content grown a scrollbar).
+  const box = JSON.parse(await evalIn(`JSON.stringify((() => {
+    const c = document.querySelector('.pane[data-pane="2"] .content');
+    const p = c.querySelector('.path'), t = c.querySelector("textarea.editor");
+    const b = (e) => e.getBoundingClientRect();
+    return { over: Math.round(b(t).bottom - b(c).bottom), gap: Math.round(b(t).top - b(p).bottom) };
+  })())`));
+  // Both ends: overshooting hides the last lines, undershooting would mean the
+  // wrapper had swallowed the height instead of sharing it.
+  ok(box.over === 0 && box.gap === 0,
+     `and the textarea fills exactly the space under it (${box.over}px past the pane, ${box.gap}px gap)`);
+  ok(await evalIn(`(() => { const b = document.querySelector('.pane[data-pane="2"] .savebtn');
+       return !!b && b.hidden; })()`),
+     "with autosave on there is no Save button, only the state");
+
+  // --- 5. And the key is only taken when there is something to save, or the
   // workspace would swallow the browser's own shortcut on every other tab.
+  await evalIn(`send({ t: "SetMode", rel: ${JSON.stringify(NESTED)}, mode: "Preview" })`);
   await evalIn(`send({ t: "SetMode", rel: "note.md", mode: "Preview" })`);
   await until(() => evalIn(`!document.querySelector("textarea.editor")`), 5, "preview");
   ok(await evalIn(`saveTarget() === null`),

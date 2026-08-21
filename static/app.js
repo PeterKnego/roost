@@ -364,6 +364,11 @@ function render() {
         if (e) { try { e.fit.fit(); sendResize(e); } catch {} }
       });
     }
+    // Repainted on every State, not built once at mount: a buffer goes dirty
+    // and clean while the editor stays exactly where it is — the guard below
+    // deliberately leaves a mounted textarea alone so typing is not torn out
+    // from under the cursor — so nothing else would ever update this.
+    if (active && active.k === "File" && active.mode === "Edit") paintSaveState(content, active.rel);
     if (content.dataset.mountedKey === activeKey) {
       // The same tab is still active in this pane. A State snapshot fires
       // on every EditBuffer — including ones caused by the user's own
@@ -406,27 +411,6 @@ function render() {
 function buildPaneIcons(host, pi, pane, active, content) {
   if (!host) return;
   host.innerHTML = "";
-  // The save state of the file this pane is showing. With autosave on this is
-  // the only feedback that anything is being written at all; with it off it is
-  // where ⌘S gets advertised, which nothing in the UI did before — the dirty
-  // ● said "something is unsaved" without ever saying what to do about it.
-  if (active && active.k === "File" && active.mode === "Edit") {
-    const meta = state && state.buffers.find((x) => x.rel === active.rel);
-    const st = document.createElement("span");
-    st.className = "savestate";
-    if (meta && (meta.stale || autosavePaused.has(active.rel))) {
-      st.className += " warn";
-      st.textContent = "not saved · changed on disk";
-      st.title = "this file changed underneath your buffer — ⌘S to see what differs";
-    } else if (meta && meta.dirty) {
-      st.textContent = AUTOSAVE ? "saving…" : "unsaved · ⌘S";
-      st.title = AUTOSAVE ? "writing this out" : "press ⌘S (ctrl-S) to save";
-    } else {
-      st.textContent = "saved";
-      st.title = AUTOSAVE ? "saved automatically" : "no unsaved changes";
-    }
-    host.appendChild(st);
-  }
   const icon = (glyph, title, fn) => {
     const b = document.createElement("span");
     b.className = "paneicon";
@@ -1023,7 +1007,54 @@ function mountEditor(content, rel) {
   // what covers "moved on within the page" — the timer covers pauses, and
   // window blur covers leaving the browser.
   ta.onblur = () => autosaveNow(rel);
-  content.appendChild(ta);
+  // The same breadcrumb the preview fragments carry, so a file looks like the
+  // same file in both modes. Built here rather than in render.rs because edit
+  // mode has no server fragment at all: the textarea is client-built and
+  // seeded from `texts`.
+  const wrap = document.createElement("div");
+  wrap.className = "editwrap";
+  const bar = document.createElement("div");
+  bar.className = "path";
+  const name = document.createElement("span");
+  name.className = "rel";
+  name.textContent = rel; // textContent, not innerHTML: a path is user data
+  const st = document.createElement("span");
+  st.className = "savestate";
+  const btn = document.createElement("button");
+  btn.className = "savebtn";
+  btn.textContent = "Save";
+  btn.title = "write this file out (⌘S / ctrl-S)";
+  btn.onclick = () => saveNow(rel);
+  bar.append(name, st, btn);
+  wrap.append(bar, ta);
+  content.appendChild(wrap);
+  paintSaveState(content, rel);
+}
+
+/// The breadcrumb's right-hand side: what state this buffer is in, and — only
+/// where it is the thing that writes the file — a Save button.
+function paintSaveState(content, rel) {
+  const st = content.querySelector(".savestate");
+  const btn = content.querySelector(".savebtn");
+  if (!st || !btn) return;
+  const meta = state && state.buffers.find((x) => x.rel === rel);
+  const paused = !!(meta && (meta.stale || autosavePaused.has(rel)));
+  st.className = "savestate" + (paused ? " warn" : "");
+  if (paused) {
+    st.textContent = "not saved · changed on disk";
+    st.title = "this file changed underneath your buffer — save to see what differs";
+  } else if (meta && meta.dirty) {
+    st.textContent = AUTOSAVE ? "saving…" : "unsaved · ⌘S";
+    st.title = AUTOSAVE ? "writing this out" : "press ⌘S (ctrl-S) to save";
+  } else {
+    st.textContent = "saved";
+    st.title = AUTOSAVE ? "saved automatically" : "no unsaved changes";
+  }
+  // No button where autosave is already writing the file — there the state
+  // readout is the whole story. The exception is a buffer autosave has
+  // *stopped* writing because the file changed underneath it: saving is then
+  // the only route to the conflict diff, and until now only ⌘S reached it.
+  btn.hidden = AUTOSAVE && !paused;
 }
 
 /// Sends this client's current text for `rel` and cancels the debounce it
@@ -1096,12 +1127,19 @@ document.addEventListener("keydown", (e) => {
   const rel = saveTarget();
   if (rel === null) return;
   e.preventDefault();
-  // The 200ms input debounce may still be pending, so push the text this
-  // save is meant to write before asking for the write — otherwise a save
-  // typed quickly enough saves the *previous* keystroke's text.
+  saveNow(rel);
+});
+
+/// The one save path. The shortcut above and the breadcrumb's Save button both
+/// come through here, so a save started either way pre-empts the same debounce
+/// and surfaces the same conflict.
+function saveNow(rel) {
+  // The 200ms input debounce may still be pending, so push the text this save
+  // is meant to write before asking for the write — otherwise a save typed
+  // quickly enough saves the *previous* keystroke's text.
   pushEdit(rel);
   send({ t: "SaveBuffer", rel, force: false });
-});
+}
 
 function showConflict(ev) {
   const box = document.createElement("div");

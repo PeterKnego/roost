@@ -185,6 +185,16 @@ main { flex: 1; min-height: 0; }
 #statusbar .right { margin-left: auto; }
 :root { --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
 .editor { width: 100%; height: 100%; border: 0; font: 13px/1.55 var(--mono); resize: none; padding: 8px 10px; background: var(--bg); color: var(--fg); outline: none; }
+/* Edit mode carries the same .path breadcrumb a preview does. The wrapper is
+   what makes room for it: .editor is height:100%, so without a flex column
+   above it the textarea would push its own last lines out of the pane. */
+.editwrap { display: flex; flex-direction: column; height: 100%; }
+.editwrap .path { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.editwrap .path .rel { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.editwrap .editor { flex: 1 1 auto; height: auto; min-height: 0; }
+.savebtn { font: inherit; font-size: 11px; line-height: 1.4; padding: 1px 8px; border-radius: 5px;
+           cursor: pointer; border: 1px solid var(--border); background: none; color: var(--muted); }
+.savebtn:hover { color: var(--fg); background: var(--tab-hover); }
 .conflict { border: 1px solid var(--warn, #d79921); padding: 8px; margin: 8px; background: var(--bg2); }
 .conflict button { margin: 8px 8px 0 0; font: inherit; cursor: pointer; }
 /* Error events aren't tied to any one pane (a delete or rename failure has
@@ -421,5 +431,5 @@ ul.picker li .git:hover { text-decoration: underline; }
 /* Save state for the file a pane is showing — muted, because it is ambient
    information; the warn state is not, because it means a write is being
    withheld. */
-.savestate { font-size: 11px; opacity: .55; margin-right: 10px; white-space: nowrap; }
+.savestate { font-size: 11px; opacity: .55; white-space: nowrap; }
 .savestate.warn { color: var(--warn, #d79921); opacity: 1; }
