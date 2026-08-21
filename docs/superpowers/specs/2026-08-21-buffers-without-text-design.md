@@ -235,3 +235,15 @@ into a browsing limit — are consequences of buffers holding text, and stop
 existing here. PDF rendering is also out of scope; `pdf` belongs on
 `NO_TEXT_EDIT_EXT` so a binary never reaches a textarea, which is a one-line
 change independent of all of this.
+
+## As built
+
+**`base_mtime` was dropped.** The prose above describes a base of `base_hash`
+*and* `base_mtime`; the field survived the rewrite as a write-only remnant —
+set in three places, read in none. Deleting it also removed the only
+unconfined `dir.join(rel)` on the buffer path (`open_buffer_for` already held
+the `safe_resolve`d path) and the asymmetry between the startup and live clean
+paths, which set it from different sources. The base is `base_hash` alone: a
+hash answers "did the file move under this buffer" without trusting a
+timestamp that a cloned repo, a restore, or a coarse filesystem clock can make
+agree by accident.

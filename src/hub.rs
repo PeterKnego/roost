@@ -119,11 +119,9 @@ impl Hub {
             } else if hash != b.base_hash {
                 // The file moved under a clean buffer, which holds nothing to
                 // update — the new content just is the disk, so the buffer
-                // only needs its base (hash and mtime) to agree with it.
+                // only needs its base hash to agree with it.
                 b.content = workspace::Content::Clean;
                 b.base_hash = hash;
-                b.base_mtime =
-                    std::fs::metadata(dir.join(rel)).ok().and_then(|m| m.modified().ok());
                 b.stale = false;
             }
         }
@@ -409,8 +407,8 @@ impl Hub {
             Ok(true) => {
                 self.ws.version += 1;
                 // Entering Edit mode is the server's cue to become this
-                // buffer's owner: read the file now, so base_hash/base_mtime
-                // reflect what's actually on disk. Without this, a buffer
+                // buffer's owner: read the file now, so base_hash
+                // reflects what's actually on disk. Without this, a buffer
                 // opened purely client-side (the old /frag/raw flow) never
                 // got a real base_hash and every first save reported a
                 // conflict against content it never compared against.
@@ -465,7 +463,7 @@ impl Hub {
                     // Closing a File tab is the only way a buffer is ever
                     // freed short of the conflict banner's "discard mine" —
                     // without this, every file a user so much as previews
-                    // would keep a buffer (and its base_hash/mtime) around
+                    // would keep a buffer (and its base_hash) around
                     // forever. Harmless for a clean one — wsstate::save skips
                     // its text — but still worth reclaiming: it's what a .env
                     // opened once in Edit would otherwise persist its full
@@ -549,12 +547,9 @@ impl Hub {
             {
                 Ok(text) => {
                     let hash = workspace::hash_text(&text);
-                    let mtime =
-                        std::fs::metadata(self.dir.join(rel)).ok().and_then(|m| m.modified().ok());
                     let b = self.ws.buffers.entry(rel.to_string()).or_default();
                     b.content = workspace::Content::Clean;
                     b.base_hash = hash;
-                    b.base_mtime = mtime;
                     b.stale = false;
                     freshly_read = Some(text);
                 }
@@ -730,7 +725,6 @@ impl Hub {
                     b.content = workspace::Content::Clean;
                     b.stale = false;
                     b.base_hash = hash;
-                    b.base_mtime = std::fs::metadata(dir.join(&rel)).ok().and_then(|m| m.modified().ok());
                 }
                 self.self_writes.insert(rel.clone(), hash);
                 self.ws.version += 1;

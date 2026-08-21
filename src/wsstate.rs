@@ -17,7 +17,7 @@ use std::path::PathBuf;
 pub static STATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// On-disk shape is deliberately narrower than `Workspace`: derived fields
-/// (`version`, per-buffer `base_mtime`/`base_hash`/`stale`) are recomputed on
+/// (`version`, per-buffer `base_hash`/`stale`) are recomputed on
 /// load rather than trusted from a file that may be stale or hand-edited.
 #[derive(Serialize, Deserialize)]
 struct PaneDisk {

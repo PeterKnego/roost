@@ -2,7 +2,6 @@
 //! exactly what makes the transition table cheap to test.
 use crate::proto::{self, Intent, PaneId, Sizes, Tab, PANE_COUNT};
 use std::collections::HashMap;
-use std::time::SystemTime;
 
 pub const MAX_BUFFERS: usize = 50;
 
@@ -32,7 +31,6 @@ pub enum Content {
 #[derive(Debug, Clone)]
 pub struct Buffer {
     pub content: Content,
-    pub base_mtime: Option<SystemTime>,
     /// What the content was based on when the file was opened. The one piece
     /// of a buffer that cannot be rebuilt later: derived at first edit
     /// instead, it would be the hash of whatever is on disk *then*, silently
@@ -43,7 +41,7 @@ pub struct Buffer {
 
 impl Default for Buffer {
     fn default() -> Self {
-        Buffer { content: Content::Clean, base_mtime: None, base_hash: 0, stale: false }
+        Buffer { content: Content::Clean, base_hash: 0, stale: false }
     }
 }
 
