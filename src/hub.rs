@@ -409,25 +409,35 @@ impl Hub {
                 // got a real base_hash and every first save reported a
                 // conflict against content it never compared against.
                 match &intent {
-                    Intent::SetMode { rel, mode: Mode::Edit } => self.open_for_edit(from, rel),
+                    Intent::SetMode { rel, mode: Mode::Edit } => self.open_buffer_for(from, rel),
                     // Dispatched off the COERCED tab, not off the intent:
                     // apply_layout may have forced Edit to Preview, and
-                    // reading the file anyway would seed a buffer for a tab
-                    // that has no editor. That buffer is not harmless — the
-                    // read stores String::from_utf8_lossy, so its text is not
-                    // the file's bytes, and a later save would write U+FFFD
-                    // over the original.
+                    // reading an image anyway would seed a buffer for it. That
+                    // buffer is not harmless — the read stores
+                    // String::from_utf8_lossy, so its text is not the file's
+                    // bytes, and a later save (however unreachable through the
+                    // UI) would write U+FFFD over the original. A File tab in
+                    // either mode otherwise gets a buffer: it is what records
+                    // the base a previewed file was opened against, and what
+                    // makes the watcher find it (Workspace::open_file_rels is
+                    // keyed off tabs, not buffers, so this is not what shows a
+                    // preview — only what lets one later become an edit
+                    // without a fresh disk read).
                     Intent::OpenTab { tab, .. } => {
-                        if let Tab::File { rel, mode: Mode::Edit } = workspace::coerce_tab(tab) {
-                            self.open_for_edit(from, &rel)
+                        if let Tab::File { rel, .. } = workspace::coerce_tab(tab) {
+                            if !crate::routes::refuses_text_edit(&rel) {
+                                self.open_buffer_for(from, &rel)
+                            }
                         }
                     }
                     // Closing a File tab is the only way a buffer is ever
                     // freed short of the conflict banner's "discard mine" —
-                    // without this, every buffer a user opens accumulates
-                    // (up to MAX_BUFFERS) and is persisted with its full
-                    // text to disk forever, including secrets like a .env
-                    // opened once in Edit.
+                    // without this, every file a user so much as previews
+                    // would keep a buffer (and its base_hash/mtime) around
+                    // forever. Harmless for a clean one — wsstate::save skips
+                    // its text — but still worth reclaiming: it's what a .env
+                    // opened once in Edit would otherwise persist its full
+                    // text under for as long as the tab stayed open.
                     Intent::CloseTab { .. } => {
                         if let Some(rel) = &closing_rel {
                             self.maybe_drop_buffer(rel);
@@ -452,7 +462,7 @@ impl Hub {
                             )
                         });
                         if still_open {
-                            self.open_for_edit(from, rel);
+                            self.open_buffer_for(from, rel);
                         }
                     }
                     _ => {}
@@ -469,12 +479,20 @@ impl Hub {
         }
     }
 
-    /// Reads a file into its buffer the moment a tab enters Edit mode, and
-    /// tells every client what's in it. Skips the disk read when the buffer
+    /// Establishes a buffer's base — reads the file, records its hash and
+    /// mtime — the moment a File tab opens, in either mode, and tells every
+    /// client what's in it. Not just an Edit-mode thing despite the old name:
+    /// a previewed file needs a base too, since that is what lets it flip to
+    /// Edit later without a fresh disk read, and it is what the watcher's
+    /// stale/conflict tracking keys off. Skips the disk read when the buffer
     /// is already dirty: reactivating an in-progress edit (the tab getting
     /// reopened, e.g. by a second browser) must never clobber unsaved text
     /// with what's on disk — only `SaveBuffer`/`CloseBuffer` may do that.
-    fn open_for_edit(&mut self, from: &ConnId, rel: &str) {
+    ///
+    /// Callers keep images out: hashing `read_text_file`'s lossy-UTF-8 bytes
+    /// would be meaningless, and the watcher reaches them through
+    /// `Workspace::open_file_rels`, which is keyed off tabs, not buffers.
+    fn open_buffer_for(&mut self, from: &ConnId, rel: &str) {
         let already_dirty = self.ws.buffers.get(rel).map(|b| b.dirty()).unwrap_or(false);
         // The text to broadcast below. A freshly-read buffer holds nothing
         // (Content::Clean), so it cannot be read back out of the buffer the
@@ -484,8 +502,14 @@ impl Hub {
         // the buffer's own unsaved edit.
         let mut freshly_read: Option<String> = None;
         if !already_dirty {
-            if !self.ws.buffers.contains_key(rel) && self.ws.buffers.len() >= workspace::MAX_BUFFERS {
-                self.send_to(from, &Event::Error { msg: "too many open buffers".into() });
+            // Mirrors workspace.rs's EditBuffer cap: the ceiling is on unsaved
+            // edits, not on how many files have ever been looked at. A clean
+            // buffer here (previewed, or read but never typed into) must
+            // never itself trip the cap or count against it.
+            if !self.ws.buffers.get(rel).map(|b| b.dirty()).unwrap_or(false)
+                && self.ws.buffers.values().filter(|b| b.dirty()).count() >= workspace::MAX_BUFFERS
+            {
+                self.send_to(from, &Event::Error { msg: "too many unsaved files".into() });
                 return;
             }
             match crate::projects::safe_resolve(&self.dir, rel)
@@ -1433,7 +1457,7 @@ mod tests {
     ///
     /// Confirmed by restoring the pre-fix arm
     /// `Intent::OpenTab { tab: Tab::File { rel, mode: Mode::Edit }, .. } =>
-    /// self.open_for_edit(from, rel)` and running this test: it failed at
+    /// self.open_buffer_for(from, rel)` and running this test: it failed at
     /// "a coerced tab must not get a buffer" — the buffer was there, holding
     /// the lossy text of the PNG.
     #[test]
@@ -1476,6 +1500,31 @@ mod tests {
         // base_hash and !dirty() are what prove the read actually happened.
         assert_eq!(h.ws.buffers["a.txt"].base_hash, workspace::hash_text("on disk\n"));
         assert!(!h.ws.buffers["a.txt"].dirty());
+    }
+
+    /// Every open file has a buffer, which is what puts a previewed file in
+    /// the watcher's list — and it holds nothing until it is edited.
+    #[test]
+    fn opening_a_file_in_preview_creates_a_buffer_holding_nothing() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("read.md"), "hello\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "read.md".into(), mode: Mode::Preview },
+            },
+        );
+
+        let b = h.ws.buffers.get("read.md").expect("a previewed file has a buffer");
+        assert_eq!(b.edited_text(), None, "and holds nothing");
+        assert_eq!(b.base_hash, workspace::hash_text("hello\n"), "with a base taken at open time");
     }
 
     #[test]

@@ -285,14 +285,14 @@ fn resolve_replay(
         // More than one thing produces exactly this shape — not only
         // `do_save` after an edit, but also a *discard*: `CloseBuffer` while
         // the tab is still open drops the buffer (hub.rs's CloseBuffer arm),
-        // and `open_for_edit` reinserts it Clean, freshly read from disk,
+        // and `open_buffer_for` reinserts it Clean, freshly read from disk,
         // with a new base_hash (see the discard test at hub.rs ~1196). And a
         // peer can edit *further* before saving, all within this window, so
         // even a genuine save does not guarantee `snapshot_edited`'s text is
         // what actually landed on disk.
         //
         // Every one of those producers already re-broadcasts BufferText
-        // itself — `open_for_edit` unconditionally, `EditBuffer` to every
+        // itself — `open_buffer_for` unconditionally, `EditBuffer` to every
         // other subscriber, both already queued on this connection's own
         // channel — so `None` is the safe default: a fresher BufferText is
         // on its way regardless. The one case worth resurrecting without
@@ -408,7 +408,7 @@ mod tests {
 
     /// The Critical round 2 found in round 1's own fix: a discard during the
     /// unlocked window. `CloseBuffer` with the tab still open (hub.rs) drops
-    /// the buffer and `open_for_edit` reinserts it Clean, freshly re-read
+    /// the buffer and `open_buffer_for` reinserts it Clean, freshly re-read
     /// from disk — a base_hash that has no reason to match the hash of the
     /// text that was just discarded. The old "dirty at snapshot, Clean now"
     /// branch treated that as "must be a save" and replayed the discarded

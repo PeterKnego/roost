@@ -333,8 +333,14 @@ pub fn apply_layout(w: &mut Workspace, intent: &Intent) -> Result<bool, String> 
             if text.len() > MAX_TEXT_BYTES {
                 return Err(format!("buffer too large ({} bytes)", text.len()));
             }
-            if !w.buffers.contains_key(rel) && w.buffers.len() >= MAX_BUFFERS {
-                return Err("too many open buffers".into());
+            // The cap follows unsaved edits, not how many files have ever
+            // been looked at: a buffer created merely by previewing or
+            // opening a file (Content::Clean) must never itself count
+            // against it or trip it. Mirrored in hub.rs's open_buffer_for.
+            if !w.buffers.get(rel).map(|b| b.dirty()).unwrap_or(false)
+                && w.buffers.values().filter(|b| b.dirty()).count() >= MAX_BUFFERS
+            {
+                return Err("too many unsaved files".into());
             }
             let b = w.buffers.entry(rel.clone()).or_default();
             b.set_text(text.clone());
@@ -687,6 +693,28 @@ mod tests {
             );
         }
         assert!(w.buffers.len() <= MAX_BUFFERS, "buffer count must stay capped");
+    }
+
+    /// The cap bounds memory, and memory is text. Fifty open files is
+    /// browsing; fifty unsaved edits is the thing worth refusing.
+    #[test]
+    fn the_cap_counts_edits_not_open_files() {
+        let mut w = Workspace::default_layout();
+        for i in 0..MAX_BUFFERS + 5 {
+            w.buffers.insert(format!("f{i}.rs"), Buffer::default());
+        }
+        // Clean buffers past the cap are fine…
+        assert!(apply_layout(&mut w, &Intent::EditBuffer {
+            rel: "f0.rs".into(), text: "typed\n".into(),
+        }).is_ok());
+        // …until that many of them hold edits.
+        for i in 1..MAX_BUFFERS {
+            w.buffers.get_mut(&format!("f{i}.rs")).unwrap().set_text(format!("edit {i}\n"));
+        }
+        let err = apply_layout(&mut w, &Intent::EditBuffer {
+            rel: format!("f{}.rs", MAX_BUFFERS + 1), text: "one too many\n".into(),
+        }).unwrap_err();
+        assert!(err.contains("too many"), "got {err}");
     }
 
     #[test]
