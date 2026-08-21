@@ -87,6 +87,12 @@ performed.
   the document-level handler) fails 2 assertions in `save.mjs` — both unfocused
   cases time out with the file unchanged on disk — while the focused case goes
   on passing, which is what says the test is testing focus and not saving.
+- Mounting the editor without its breadcrumb fails 2 assertions in `save.mjs`;
+  keeping it but dropping the `.editwrap` flex rules fails 1 more — the
+  textarea ends 26px below the pane, hiding its own last lines. Forcing the
+  Save button always-hidden fails 3 in `autosave.mjs`, always-shown fails 1 in
+  `save.mjs`; the two configs are asserted from opposite directions so neither
+  can pass by the button simply never being built.
 - Deleting the Shift+Enter handler fails 1 assertion in `shiftenter.mjs` (the
   pty sees 13, not 10) while the plain-Enter assertion goes on passing;
   dropping its `!e.shiftKey` guard so every Enter sends LF flips exactly which
@@ -114,7 +120,7 @@ site; do not "simplify" them away:
 | `term.paste()` | bash enables bracketed paste, so a pasted newline is inserted literally instead of submitting. The command sits on the prompt and every later wait times out. Use `term.input()` with `\r`. |
 | Typing before the prompt | readline discards typeahead while initialising, so the first command silently vanishes. Wait for a prompt. |
 | Content that fits one screen | `dtach`'s redraw opens with `\e[H\e[J`, which hides duplicated output all by itself — the no-duplication assertion passes with the reset deleted. Scroll past one screen first. |
-| The default 800x600 headless window | Narrower than the default left (260px) and right (520px) panes together: the middle column collapses and the right pane hangs off the viewport. A layout assertion then measures *that*, and `elementFromPoint` returns null off-screen, so a reachability test fails (or passes) for the wrong reason. Override the metrics — see `tabwrap.mjs`. |
+| The default 800x600 headless window | Narrower than the default left (260px) and right (520px) panes together: the middle column collapses and the right pane hangs off the viewport. A layout assertion then measures *that*, and `elementFromPoint` returns null off-screen, so a reachability test fails (or passes) for the wrong reason. Override the metrics — see `tabwrap.mjs` and `save.mjs`, where a layout assertion measured 1px of overshoot instead of the real 26px until the viewport was widened. |
 
 ## What these cannot prove
 
