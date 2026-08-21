@@ -282,12 +282,16 @@ pub fn file_fragment(project: &str, rel: &str, content: &str) -> String {
 /// An image opened as a tab. Not `file_fragment`'s business, because that
 /// function's whole contract is that it has already been handed the file's
 /// text — which for an image does not exist.
-pub fn image_fragment(project: &str, rel: &str) -> String {
+pub fn image_fragment(project: &str, rel: &str, mtime_secs: u64) -> String {
     format!(
-        "<div class=\"path\">{}</div><img class=\"imgview\" src=\"/frag/{}/raw?path={}\" alt=\"{}\">",
+        // `v` is a cache key, not a parameter the route reads: an <img> whose
+        // src is unchanged is served from the browser's cache, so a re-mount
+        // after the file changed would repaint the old picture.
+        "<div class=\"path\">{}</div><img class=\"imgview\" src=\"/frag/{}/raw?path={}&v={}\" alt=\"{}\">",
         esc(rel),
         crate::http::percent_encode(project),
         crate::http::percent_encode(rel),
+        mtime_secs,
         esc(rel)
     )
 }
@@ -1755,5 +1759,18 @@ mod tests {
         assert_eq!(resolve_dest("notes/v:1.md", "a.md"), Dest::Local("notes/v:1.md".into()));
         assert_eq!(resolve_dest("./notes:1.md", "a.md"), Dest::Local("notes:1.md".into()));
         assert_eq!(resolve_dest("notes:1.md", "a.md"), Dest::Remote);
+    }
+
+    /// Without a cache key the img src is byte-identical before and after the
+    /// file changes, so the browser is free to reuse what it already has and
+    /// the re-mount shows the old picture. Deleting the `&v=` fails this.
+    #[test]
+    fn an_image_fragment_carries_a_cache_key_that_tracks_the_file() {
+        let a = image_fragment("proj", "shot.png", 1_000);
+        let b = image_fragment("proj", "shot.png", 2_000);
+        assert!(a.contains("v=1000"), "{a}");
+        assert!(a != b, "the same file at a different mtime must not reuse one URL");
+        // The path is still the path: the key is additional, not a rewrite.
+        assert!(a.contains("path=shot.png"), "{a}");
     }
 }

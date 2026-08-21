@@ -397,7 +397,17 @@ fn serve_frag(
             Some(rel) if is_image(rel) => match crate::assets::normalize(rel) {
                 None => http::html(w, &render::hint("path outside project")),
                 Some(rel) => match projects::safe_resolve(&dir, rel) {
-                    Ok(_) => http::html(w, &render::image_fragment(project, rel)),
+                    Ok(path) => {
+                        let mtime_secs = std::fs::metadata(&path)
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            // Not a failure worth refusing the page for: an unreadable mtime only
+                            // costs the cache key, and 0 is a legitimate "I could not tell".
+                            .unwrap_or(0);
+                        http::html(w, &render::image_fragment(project, rel, mtime_secs))
+                    },
                     Err(e) => http::html(w, &render::hint(&e)),
                 },
             },
@@ -782,7 +792,7 @@ mod tests {
         let roots = vec![d.path().to_path_buf()];
 
         let out = frag_route(&roots, "/frag/p/file?path=shot.png");
-        assert!(out.contains(r#"src="/frag/p/raw?path=shot.png""#), "{out}");
+        assert!(out.contains(r#"src="/frag/p/raw?path=shot.png&v="#), "{out}");
         assert!(!out.contains("binary file"), "{out}");
 
         // The fragment is nothing but an <img> pointed at the raw route, and
