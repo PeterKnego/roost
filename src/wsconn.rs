@@ -3,7 +3,7 @@
 //! hub's channel, this thread reads intents.
 use crate::hub::{ConnId, Hub};
 use crate::proto;
-use crate::workspace::{Buffer, Content};
+use crate::workspace::{hash_text, Buffer, Content};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -95,10 +95,17 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         // connection to this project for the whole scan.
         //
         // Only the rel, its base_hash, and (if dirty) its own edited text are
-        // collected here — one clone of the text at most, not the two a full
-        // `Buffer` clone followed by `.to_string()` would cost. base_hash is
-        // what lets the second lock below tell whether this rel's state
-        // moved while the lock was down, which it must: this connection is
+        // collected here. For a dirty buffer this still clones its text
+        // twice before it reaches the client — once here, once more where
+        // `resolve_replay` hands back the *current* live text below — but
+        // that second copy is the point: it is what lets phase 3 send the
+        // buffer's state as of the second lock instead of the one collected
+        // here, which is what closes the stale-overwrite bug this whole
+        // restructuring is about. What this avoids is the *third* copy the
+        // original version paid: cloning a whole `Buffer` here and then
+        // `.to_string()`-ing its text again downstream. base_hash is what
+        // lets the second lock below tell whether this rel's state moved
+        // while the lock was down, which it must: this connection is
         // already subscribed (see `subscribe` above), so a peer's `EditBuffer`
         // in that window reaches it too, queued on its channel behind
         // whatever this replay sends. Sending stale disk text after that
@@ -124,16 +131,7 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     {
         let mut h = Hub::lock(&hub);
         for ((rel, base_hash, edited), disk_text) in snapshot.into_iter().zip(disk_reads) {
-            // Resolved against the hub's *current* state, not the snapshot:
-            // see `resolve_replay` for why an existence check alone is not
-            // enough, and what it costs (nothing — the paths that matter
-            // here read live data already in memory, not the disk).
-            let current = h.ws.buffers.get(&rel);
-            let Some(text) = resolve_replay(base_hash, &edited, &disk_text, current) else {
-                continue;
-            };
-            let ev = proto::Event::BufferText { rel, text, origin: String::new() };
-            h.send_to(&id, &ev);
+            replay_buffer(&mut h, &id, rel, base_hash, edited, disk_text);
         }
     }
     // Guards the subscription from here on: if we return early (the
@@ -224,6 +222,21 @@ fn read_disk_text(dir: &Path, rel: &str) -> Option<String> {
     crate::projects::safe_resolve(dir, rel).and_then(|p| crate::projects::read_text_file(&p)).ok()
 }
 
+/// Phase 3's resolve-and-send for one rel, pulled out of `handle`'s loop so
+/// a test can exercise the actual wiring: `hub.ws.buffers.get(&rel)` reads
+/// the hub's state *now*, under this second lock, not a reconstruction of
+/// what phase 1 collected. `resolve_replay`'s own tests only ever see
+/// hand-built `current` values, so they would stay green even if this call
+/// site regressed to pass the phase-1 snapshot back in here instead — which
+/// would silently defeat the whole fix. See
+/// `replay_buffer_reads_the_hubs_current_state_not_the_snapshot` below.
+fn replay_buffer(hub: &mut Hub, id: &ConnId, rel: String, base_hash: u64, edited: Option<String>, disk_text: Option<String>) {
+    let current = hub.ws.buffers.get(&rel);
+    let Some(text) = resolve_replay(base_hash, &edited, &disk_text, current) else { return };
+    let ev = proto::Event::BufferText { rel, text, origin: String::new() };
+    hub.send_to(id, &ev);
+}
+
 /// What a rel should replay, resolved against the hub's *current* state
 /// rather than trusted from the snapshot phase 1 took before the lock was
 /// dropped for disk I/O.
@@ -268,27 +281,33 @@ fn resolve_replay(
             // scheduled for that case, so there is nothing to forward.
             disk_text.clone()
         }
+        // base_hash moved since the snapshot, and the buffer is Clean now.
+        // More than one thing produces exactly this shape — not only
+        // `do_save` after an edit, but also a *discard*: `CloseBuffer` while
+        // the tab is still open drops the buffer (hub.rs's CloseBuffer arm),
+        // and `open_for_edit` reinserts it Clean, freshly read from disk,
+        // with a new base_hash (see the discard test at hub.rs ~1196). And a
+        // peer can edit *further* before saving, all within this window, so
+        // even a genuine save does not guarantee `snapshot_edited`'s text is
+        // what actually landed on disk.
+        //
+        // Every one of those producers already re-broadcasts BufferText
+        // itself — `open_for_edit` unconditionally, `EditBuffer` to every
+        // other subscriber, both already queued on this connection's own
+        // channel — so `None` is the safe default: a fresher BufferText is
+        // on its way regardless. The one case worth resurrecting without
+        // waiting for that broadcast, and without another disk read, is when
+        // the snapshot's edited text hashes to exactly `current.base_hash`:
+        // that is what "saved unchanged" looks like, byte for byte, and
+        // nothing else does. Anything looser reproduces the two bugs review
+        // caught here — replaying a just-discarded edit on top of the
+        // reload that discarded it, or replaying a pre-save snapshot that a
+        // real save's own conflict check would not have stopped, because
+        // `do_save` (hub.rs) checks the write against the *server's*
+        // base_hash, not against any text a client happens to be showing.
         Content::Clean => match snapshot_edited {
-            // Dirty at snapshot time, Clean now, with base_hash moved: the
-            // only path that produces exactly this is `do_save` (hub.rs) —
-            // it updates base_hash but, unlike `EditBuffer` and
-            // `file_changed_externally`, never re-broadcasts BufferText, so
-            // skipping here (the naive "any change is stale" rule) would
-            // blank the editor on every save a peer makes during this
-            // window. The snapshot's own edited text is what was almost
-            // certainly just written; even where a further edit slipped in
-            // between phase 1 and the save, this can never overwrite
-            // anything silently — a save from this connection is checked
-            // against the server's *current* base_hash, not against this
-            // text, so a mismatch conflicts instead of clobbering.
-            Some(t) => Some(t.clone()),
-            // Clean at snapshot time too, with base_hash moved: the only
-            // path that changes base_hash on an already-Clean buffer is
-            // `file_changed_externally`, which broadcasts the new
-            // BufferText itself (already queued on this connection's
-            // channel). The phase-2 read reflects the disk from *before*
-            // that change, so forwarding it here would be stale on arrival.
-            None => None,
+            Some(t) if hash_text(t) == current.base_hash => Some(t.clone()),
+            _ => None,
         },
     }
 }
@@ -368,20 +387,63 @@ mod tests {
         );
     }
 
-    /// The Important this fix also closes: a peer's `SaveBuffer` landed
-    /// while the lock was down. `do_save` moves the buffer from Edited to
-    /// Clean and bumps base_hash, but — unlike `EditBuffer` and
-    /// `file_changed_externally` — never re-broadcasts BufferText, so a
+    /// The Important round 1 closed: a peer's `SaveBuffer` landed while the
+    /// lock was down and saved the snapshot's own text unchanged. `do_save`
+    /// moves the buffer from Edited to Clean and bumps base_hash to match
+    /// exactly what got written — unlike `EditBuffer` and
+    /// `file_changed_externally`, it never re-broadcasts BufferText, so a
     /// blanket "base_hash changed means skip" would blank this editor.
     #[test]
-    fn a_buffer_saved_while_unlocked_replays_the_snapshots_edited_text() {
+    fn a_buffer_saved_unchanged_while_unlocked_replays_the_snapshots_edited_text() {
         let edited = Some("about to be saved\n".to_string());
-        // base_hash moved from 7 (what phase 1 saw) to 9 (post-save).
-        let current = buf(Content::Clean, 9);
+        // What do_save leaves behind when it saves exactly this text: Clean,
+        // base_hash set to that text's own hash.
+        let current = buf(Content::Clean, hash_text("about to be saved\n"));
         assert_eq!(
             resolve_replay(7, &edited, &None, Some(&current)),
             Some("about to be saved\n".to_string()),
-            "a save during the unlocked window must not blank the editor"
+            "a save-unchanged during the unlocked window must not blank the editor"
+        );
+    }
+
+    /// The Critical round 2 found in round 1's own fix: a discard during the
+    /// unlocked window. `CloseBuffer` with the tab still open (hub.rs) drops
+    /// the buffer and `open_for_edit` reinserts it Clean, freshly re-read
+    /// from disk — a base_hash that has no reason to match the hash of the
+    /// text that was just discarded. The old "dirty at snapshot, Clean now"
+    /// branch treated that as "must be a save" and replayed the discarded
+    /// edit right on top of the reload that discarded it.
+    #[test]
+    fn a_buffer_discarded_while_unlocked_replays_nothing() {
+        let edited = Some("the edit that got discarded\n".to_string());
+        // What the discard reloaded from disk — unrelated to the discarded
+        // text, so its hash does not match.
+        let current = buf(Content::Clean, hash_text("on disk all along\n"));
+        assert_eq!(
+            resolve_replay(7, &edited, &None, Some(&current)),
+            None,
+            "a discard must not resurrect the text it just discarded"
+        );
+    }
+
+    /// The other half of round 2's Critical: a peer edits *further* and
+    /// *then* saves, all within the unlocked window. The snapshot's edited
+    /// text is not what ended up on disk, and — unlike the Critical
+    /// `a_buffer_edited_while_unlocked_...` test above — the buffer is Clean
+    /// by the time this connection looks again, so the "now Edited" branch
+    /// does not catch it. Replaying the snapshot here is exactly the case
+    /// the round-2 review flagged: a later save from *this* connection would
+    /// be checked against the server's live base_hash, which already
+    /// matches the peer's save, so it would go through silently and
+    /// overwrite the peer's actual work.
+    #[test]
+    fn a_buffer_edited_further_then_saved_while_unlocked_replays_nothing() {
+        let edited = Some("first draft\n".to_string());
+        let current = buf(Content::Clean, hash_text("first draft, then more, then saved\n"));
+        assert_eq!(
+            resolve_replay(7, &edited, &None, Some(&current)),
+            None,
+            "the snapshot's text is not what was actually saved, so it must not be replayed"
         );
     }
 
@@ -399,5 +461,40 @@ mod tests {
     #[test]
     fn a_buffer_closed_while_unlocked_is_not_resurrected() {
         assert_eq!(resolve_replay(7, &Some("text\n".to_string()), &None, None), None);
+    }
+
+    /// Regression for the exact gap round 2 named: every test above calls
+    /// `resolve_replay` with a hand-built `current`, so none of them would
+    /// notice if the real call site stopped passing the hub's live buffer
+    /// and passed a reconstruction of the phase-1 snapshot instead — a
+    /// change that would defeat this whole fix while every test above
+    /// stayed green. This drives `replay_buffer` itself against a real
+    /// `Hub`, mutating its buffer *after* the "snapshot" to stand in for the
+    /// unlocked window, the way `handle`'s phase 2 actually works.
+    #[test]
+    fn replay_buffer_reads_the_hubs_current_state_not_the_snapshot() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let mut h = crate::hub::Hub::new("replay_wiring_probe", d.path().to_path_buf());
+        let (id, rx) = h.subscribe();
+
+        // What phase 1 would have collected: this rel was dirty, holding
+        // "stale". Then, standing in for a peer's `EditBuffer` landing while
+        // phase 2's disk reads were in flight, the hub's *real* buffer moves
+        // on to different text — `replay_buffer` is handed the same stale
+        // snapshot values phase 1 would have passed regardless.
+        h.ws.buffers.insert(
+            "a.txt".into(),
+            Buffer { content: Content::Edited("fresher\n".into()), base_hash: 1, ..Buffer::default() },
+        );
+
+        replay_buffer(&mut h, &id, "a.txt".into(), 1, Some("stale\n".to_string()), None);
+
+        let msgs: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("fresher") && !m.contains("stale")),
+            "replay_buffer must read the hub's current buffer, not resend the stale snapshot it was handed; got {msgs:?}"
+        );
     }
 }
