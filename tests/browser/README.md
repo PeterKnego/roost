@@ -141,12 +141,17 @@ performed.
   writes it (mtime changes), and undoing a typed character no longer comes
   back clean. Section A, on arrow/End/PageDown keys, keeps passing unchanged —
   those never reach `EditBuffer` at all, so they cannot discriminate the hash
-  rule; that is why B and C exist. The "undoing it comes back clean" check
-  is deliberately bounded well under `AUTOSAVE_MS` (0.7s, not the naive 5s):
-  `do_save` resets any successfully-saved buffer to `Content::Clean`, so a
-  long enough window lets autosave itself clean up the wrongly-dirtied buffer
-  a second later and mask the broken hash rule — the same shape of trap as
-  the conflict-pause one above, where the wrong property was being measured.
+  rule; that is why B and C exist. Section C runs against a second project
+  with autosave off rather than racing a timing window against `AUTOSAVE_MS`
+  on the autosave-on one: `do_save` resets any successfully-saved buffer to
+  `Content::Clean` regardless of why it was dirty, so with autosave on, a
+  window wide enough to be reliable is also wide enough for autosave to fire
+  and clean up a wrongly-dirtied buffer itself — masking a broken hash rule
+  with the write that comes after it, the same shape of trap as the
+  conflict-pause one above, where the wrong property was being measured. With
+  autosave off nothing but the hash rule can clean that buffer, so the check
+  can use as generous a window as any other assertion here and still fail
+  correctly when the rule is gone.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
