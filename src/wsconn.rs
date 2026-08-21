@@ -128,9 +128,12 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     // Disk reads happen with the hub lock already dropped. Only a rel that
     // was Clean at snapshot time needs one — an edited buffer's text is
     // already in hand and reading its file too would be pure waste.
-    let disk_reads: Vec<Option<String>> = snapshot
+    // `None` means no read was even attempted (the buffer was dirty, so its
+    // own text replays); `Some(Err(..))` is a read that ran and failed, which
+    // the client has to be told about.
+    let disk_reads: Vec<Option<Result<String, String>>> = snapshot
         .iter()
-        .map(|(rel, _, edited)| if edited.is_some() { None } else { read_disk_text(&dir, rel) })
+        .map(|(rel, _, edited)| if edited.is_some() { None } else { Some(read_disk_text(&dir, rel)) })
         .collect();
     {
         let mut h = Hub::lock(&hub);
@@ -208,22 +211,29 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     let _ = writer.join();
 }
 
-/// Phase 2's actual I/O: one Clean buffer's file, or `None` on a refused or
-/// failed read. Never called for a buffer that was dirty at snapshot time —
-/// its text is already in hand and reading its file too would be pure waste.
+/// Phase 2's actual I/O: one Clean buffer's file, or the reason it could not
+/// be read. Never called for a buffer that was dirty at snapshot time — its
+/// text is already in hand and reading its file too would be pure waste.
 ///
-/// `None` here is deliberate, not an oversight: `read_text_file` refuses a
-/// file as *policy* — too large, or a NUL byte marking it binary — not only
-/// on genuine I/O failure, and a clean buffer's file can cross either
-/// threshold after the buffer was already opened. Collapsing that into
-/// `Some(String::new())` would hand the browser an empty-but-editable
-/// textarea for a file that was never actually empty; the next keystroke or
-/// an unconditional `pushEdit` save would then write "" over it, straight
-/// past `do_save`'s clean-buffer guard, because the buffer really is dirty
-/// by then. Sending nothing for this `rel` is recoverable — the next
-/// `SetMode`/`OpenTab` re-reads the file — where a blanked editor is not.
-fn read_disk_text(dir: &Path, rel: &str) -> Option<String> {
-    crate::projects::safe_resolve(dir, rel).and_then(|p| crate::projects::read_text_file(&p)).ok()
+/// Returning `Err` rather than an empty string is deliberate:
+/// `read_text_file` refuses a file as *policy* — too large, or a NUL byte
+/// marking it binary — not only on genuine I/O failure, and a clean buffer's
+/// file can cross either threshold after the buffer was already opened.
+/// Collapsing that into `Ok(String::new())` would hand the browser an
+/// empty-but-editable textarea for a file that was never actually empty; the
+/// next keystroke or an unconditional `pushEdit` save would then write "" over
+/// it, straight past `do_save`'s clean-buffer guard, because the buffer really
+/// is dirty by then.
+///
+/// The error message is carried rather than dropped because nothing else will
+/// tell the user: the tab still renders, in Edit, over a file this connection
+/// has no text for, and no later event re-reads it on its own — `OpenTab` on
+/// an already-open tab whose buffer is clean and settled deliberately skips
+/// the read (hub.rs's reactivation guard), and `SetMode` only fires if the
+/// user happens to toggle modes. `replay_buffer` turns it into an `Error`
+/// event naming the file.
+fn read_disk_text(dir: &Path, rel: &str) -> Result<String, String> {
+    crate::projects::safe_resolve(dir, rel).and_then(|p| crate::projects::read_text_file(&p))
 }
 
 /// Phase 3's resolve-and-send for one rel, pulled out of `handle`'s loop so
@@ -234,11 +244,42 @@ fn read_disk_text(dir: &Path, rel: &str) -> Option<String> {
 /// site regressed to pass the phase-1 snapshot back in here instead — which
 /// would silently defeat the whole fix. See
 /// `replay_buffer_reads_the_hubs_current_state_not_the_snapshot` below.
-fn replay_buffer(hub: &mut Hub, id: &ConnId, rel: String, base_hash: u64, edited: Option<String>, disk_text: Option<String>) {
-    let current = hub.ws.buffers.get(&rel);
-    let Some(text) = resolve_replay(base_hash, &edited, &disk_text, current) else { return };
-    let ev = proto::Event::BufferText { rel, text, origin: String::new() };
-    hub.send_to(id, &ev);
+fn replay_buffer(hub: &mut Hub, id: &ConnId, rel: String, base_hash: u64, edited: Option<String>, disk: Option<Result<String, String>>) {
+    let read_err = match &disk {
+        Some(Err(e)) => Some(e.clone()),
+        _ => None,
+    };
+    let disk_text = match disk {
+        Some(Ok(t)) => Some(t),
+        _ => None,
+    };
+    let (resolved, still_clean) = {
+        let current = hub.ws.buffers.get(&rel);
+        // Only a buffer that is still clean is at risk here: one that turned
+        // dirty while the lock was down replays its own live text below, and
+        // one that vanished has no tab left to be wrong about.
+        let still_clean = current.is_some_and(|b| !b.dirty());
+        (resolve_replay(base_hash, &edited, &disk_text, current), still_clean)
+    };
+    match resolved {
+        Some(text) => {
+            let ev = proto::Event::BufferText { rel, text, origin: String::new() };
+            hub.send_to(id, &ev);
+        }
+        // Silence would leave `mountEditor` seeding from a `texts` map with
+        // no entry for this rel: an empty textarea over a file that is not
+        // empty, whose base_hash still matches the untouched disk, so the
+        // first keystroke saves the blank straight over it. Say so instead,
+        // to this connection only — every other subscriber has its own copy
+        // and its own read.
+        None if still_clean => {
+            if let Some(e) = read_err {
+                let ev = proto::Event::Error { msg: format!("{rel}: {e}") };
+                hub.send_to(id, &ev);
+            }
+        }
+        None => {}
+    }
 }
 
 /// What a rel should replay, resolved against the hub's *current* state
@@ -328,7 +369,7 @@ mod tests {
     fn read_disk_text_returns_the_files_contents() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "on disk\n").unwrap();
-        assert_eq!(read_disk_text(d.path(), "a.rs"), Some("on disk\n".to_string()));
+        assert_eq!(read_disk_text(d.path(), "a.rs"), Ok("on disk\n".to_string()));
     }
 
     /// The case the review that added this replay path called out: a clean
@@ -347,9 +388,12 @@ mod tests {
         // read_text_file is skipped and this fixture would not actually
         // exercise the refusal this test is about.
         std::fs::write(d.path().join("a.bin"), b"a\0b").unwrap();
+        // On the message, not just `is_err`: a refusal that arrived for some
+        // other reason (a bad resolve, say) would prove nothing about the
+        // policy this test is here to pin.
         assert_eq!(
             read_disk_text(d.path(), "a.bin"),
-            None,
+            Err("binary file".to_string()),
             "a refused read must not become an empty, editable buffer"
         );
     }
@@ -500,5 +544,48 @@ mod tests {
             msgs.iter().any(|m| m.contains("fresher") && !m.contains("stale")),
             "replay_buffer must read the hub's current buffer, not resend the stale snapshot it was handed; got {msgs:?}"
         );
+    }
+
+    /// The failed-read case, from the other end: sending nothing at all is
+    /// what leaves `mountEditor` seeding an empty textarea from a `texts` map
+    /// with no entry for this rel — over a file that is not empty, and whose
+    /// base_hash still matches the untouched disk, so the first keystroke
+    /// saves the blank over it. Nothing else re-reads on its own either: the
+    /// reactivation guard in hub.rs skips the read for exactly this buffer
+    /// (clean, not stale).
+    ///
+    /// Two subscribers, because with one, `send_to` and `broadcast` are
+    /// indistinguishable and a regression to a project-wide error banner for
+    /// one connection's failed read would pass unnoticed. Deleting the
+    /// `None if still_clean` arm fails this test.
+    #[test]
+    fn a_clean_buffers_failed_replay_read_is_reported_to_that_connection() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        // Binary by the NUL sniff, so the read really is refused as policy —
+        // the way a file that turned binary under an open clean buffer looks.
+        std::fs::write(d.path().join("a.bin"), b"a\0b").unwrap();
+        let mut h = crate::hub::Hub::new("replay_failed_read_probe", d.path().to_path_buf());
+        let (id, rx) = h.subscribe();
+        let (_other, rx_other) = h.subscribe();
+        h.ws.buffers.insert("a.bin".into(), buf(Content::Clean, 7));
+
+        let read = read_disk_text(&d.path().to_path_buf(), "a.bin");
+        assert!(read.is_err(), "fixture is void unless the read actually fails");
+        replay_buffer(&mut h, &id, "a.bin".into(), 7, None, Some(read));
+
+        let msgs: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("a.bin")),
+            "a replay read that failed must name the file it failed on; got {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains(r#""t":"BufferText""#)),
+            "and must not invent text for it; got {msgs:?}"
+        );
+        let other: Vec<String> = std::iter::from_fn(|| rx_other.try_recv().ok()).collect();
+        assert!(other.is_empty(), "one connection's failed read is not everyone's; got {other:?}");
+        std::env::remove_var("RESH_STATE_DIR");
     }
 }
