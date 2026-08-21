@@ -108,10 +108,13 @@ impl Hub {
                 continue;
             };
             let hash = workspace::hash_text(&disk);
-            if b.dirty {
+            if b.dirty() {
                 b.stale = hash != b.base_hash;
             } else if hash != b.base_hash {
-                b.text = disk;
+                // TASK-5: the file moved under a clean buffer, which now
+                // holds nothing to update — the new content just is the
+                // disk, so the buffer only needs its base to agree with it.
+                b.content = workspace::Content::Clean;
                 b.base_hash = hash;
                 b.stale = false;
             }
@@ -470,7 +473,14 @@ impl Hub {
     /// reopened, e.g. by a second browser) must never clobber unsaved text
     /// with what's on disk — only `SaveBuffer`/`CloseBuffer` may do that.
     fn open_for_edit(&mut self, from: &ConnId, rel: &str) {
-        let already_dirty = self.ws.buffers.get(rel).map(|b| b.dirty).unwrap_or(false);
+        let already_dirty = self.ws.buffers.get(rel).map(|b| b.dirty()).unwrap_or(false);
+        // TASK-5: the text to broadcast below. A freshly-read buffer holds
+        // nothing (Content::Clean), so it cannot be read back out of the
+        // buffer the way the old `text` field allowed — the disk read's own
+        // local `text` is threaded through directly instead. `None` here
+        // means already_dirty was true, so the fallback after the `if` picks
+        // up the buffer's own unsaved edit.
+        let mut freshly_read: Option<String> = None;
         if !already_dirty {
             if !self.ws.buffers.contains_key(rel) && self.ws.buffers.len() >= workspace::MAX_BUFFERS {
                 self.send_to(from, &Event::Error { msg: "too many open buffers".into() });
@@ -484,11 +494,11 @@ impl Hub {
                     let mtime =
                         std::fs::metadata(self.dir.join(rel)).ok().and_then(|m| m.modified().ok());
                     let b = self.ws.buffers.entry(rel.to_string()).or_default();
-                    b.text = text;
+                    b.content = workspace::Content::Clean;
                     b.base_hash = hash;
                     b.base_mtime = mtime;
-                    b.dirty = false;
                     b.stale = false;
+                    freshly_read = Some(text);
                 }
                 Err(e) => {
                     self.send_to(from, &Event::Error { msg: e });
@@ -496,7 +506,10 @@ impl Hub {
                 }
             }
         }
-        let text = self.ws.buffers.get(rel).map(|b| b.text.clone()).unwrap_or_default();
+        let text = freshly_read.unwrap_or_else(|| {
+            // TASK-5
+            self.ws.buffers.get(rel).and_then(|b| b.edited_text()).unwrap_or_default().to_string()
+        });
         // No author: everyone applies it, including the client that just
         // switched to Edit — otherwise its own echo-suppression rule would
         // drop this and the editor would open blank (the bug this fixes).
@@ -525,12 +538,16 @@ impl Hub {
         // below update what a *buffer* holds; the broadcast at the end is
         // what every open tab needs either way.
         if let Some(b) = self.ws.buffers.get_mut(rel) {
-            if b.dirty {
+            if b.dirty() {
                 b.stale = true;
                 let ev = Event::BufferStale { rel: rel.to_string() };
                 self.broadcast(&ev);
             } else {
-                b.text = disk.clone();
+                // TASK-5: a clean buffer now holds nothing, so following the
+                // file is just staying Clean — the disk text goes straight
+                // into the broadcast below via the `disk` local, not through
+                // the buffer.
+                b.content = workspace::Content::Clean;
                 b.base_hash = disk_hash;
                 b.stale = false;
                 let ev = Event::BufferText {
@@ -627,7 +644,7 @@ impl Hub {
         if still_open {
             return;
         }
-        if self.ws.buffers.get(rel).is_some_and(|b| !b.dirty) {
+        if self.ws.buffers.get(rel).is_some_and(|b| !b.dirty()) {
             self.ws.buffers.remove(rel);
         }
     }
@@ -637,12 +654,28 @@ impl Hub {
             let ev = Event::Error { msg: format!("no buffer for {rel}") };
             return self.send_to(from, &ev);
         };
+        // Nothing to write is not an error the user caused: ⌘S on a file that
+        // was opened and never edited is a reasonable thing to press, and the
+        // answer is that it is already saved. Landed ahead of Task 5's read
+        // sites: `buf.text` no longer exists, and the alternative —
+        // `edited_text().unwrap_or_default()` — would happily write an empty
+        // string over the file for exactly this case.
+        // Nothing to write is not an error the user caused: ⌘S on a file that
+        // was opened and never edited is a reasonable thing to press, and the
+        // answer is that it is already saved. Landed ahead of Task 5's read
+        // sites: `buf.text` no longer exists, and the alternative —
+        // `edited_text().unwrap_or_default()` — would happily write an empty
+        // string over the file for exactly this case.
+        let Some(text) = buf.edited_text().map(|t| t.to_string()) else {
+            self.send_to(from, &Event::SaveOk { rel: rel.clone() });
+            return;
+        };
         let dir = self.dir.clone();
-        match crate::fileops::save(&dir, &rel, &buf.text, buf.base_hash, force) {
+        match crate::fileops::save(&dir, &rel, &text, buf.base_hash, force) {
             Ok(crate::fileops::SaveOutcome::Written) => {
-                let hash = workspace::hash_text(&buf.text);
+                let hash = workspace::hash_text(&text);
                 if let Some(b) = self.ws.buffers.get_mut(&rel) {
-                    b.dirty = false;
+                    b.content = workspace::Content::Clean;
                     b.stale = false;
                     b.base_hash = hash;
                     b.base_mtime = std::fs::metadata(dir.join(&rel)).ok().and_then(|m| m.modified().ok());
@@ -656,7 +689,7 @@ impl Hub {
                 self.persist();
             }
             Ok(crate::fileops::SaveOutcome::Conflict { disk_text }) => {
-                let diff_html = crate::render::diff_html(&crate::textdiff::unified(&disk_text, &buf.text));
+                let diff_html = crate::render::diff_html(&crate::textdiff::unified(&disk_text, &text));
                 let ev = Event::SaveConflict { rel, diff_html };
                 self.send_to(from, &ev);
             }
@@ -898,7 +931,7 @@ impl Hub {
 
     fn do_close_project(&mut self, from: &ConnId) {
         let dirty: Vec<String> =
-            self.ws.buffers.iter().filter(|(_, b)| b.dirty).map(|(r, _)| r.clone()).collect();
+            self.ws.buffers.iter().filter(|(_, b)| b.dirty()).map(|(r, _)| r.clone()).collect();
         if !dirty.is_empty() {
             let ev = Event::CloseRefused { dirty };
             return self.send_to(from, &ev);
@@ -1158,8 +1191,11 @@ mod tests {
         h.handle(&c, Intent::CloseBuffer { rel: "a.txt".into() });
 
         let b = h.ws.buffers.get("a.txt").expect("the tab is still open in Edit, so it needs text");
-        assert_eq!(b.text, "on disk\n", "discarding shows the file, not the discarded edit");
-        assert!(!b.dirty, "a freshly read buffer is not dirty");
+        // TASK-5: a clean buffer holds nothing of its own to compare against
+        // "on disk\n" here; the BufferText assertion below is what actually
+        // proves the reload happened, by checking what reached the browser.
+        assert_eq!(b.edited_text(), None, "discarding shows the file, not the discarded edit");
+        assert!(!b.dirty(), "a freshly read buffer is not dirty");
         assert_eq!(b.base_hash, workspace::hash_text("on disk\n"), "and it knows its base");
         // The client that clicked must see it now, not on its next reload.
         let msgs = drain(&rx);
@@ -1225,20 +1261,24 @@ mod tests {
         let h2 = Hub::new("reconcile_probe", d.path().to_path_buf());
         let dirty = &h2.ws.buffers["dirty.txt"];
         assert!(dirty.stale, "an unsaved buffer whose file moved must come back flagged");
-        assert_eq!(dirty.text, "mine\n", "and must keep the unsaved text, never adopt the file");
+        assert_eq!(dirty.edited_text(), Some("mine\n"), "and must keep the unsaved text, never adopt the file");
 
         // The live rule for a *clean* buffer is that it follows the file
         // (file_changed_externally); a restart must not be the one case where
         // it silently shows content the file no longer has.
         let clean = &h2.ws.buffers["clean.txt"];
-        assert_eq!(clean.text, "somebody else\n", "a saved buffer follows the file");
+        // TASK-5: a clean buffer holds nothing of its own — base_hash and
+        // !stale below are what prove reconcile actually caught up with the
+        // new disk content on the clean path, distinct from the dirty path
+        // above.
+        assert_eq!(clean.edited_text(), None, "a clean buffer holds no text of its own");
         assert_eq!(clean.base_hash, workspace::hash_text("somebody else\n"));
         assert!(!clean.stale, "following the file is not staleness");
 
         // The discriminating case: flagging everything would pass both of the
         // assertions above.
         assert!(!h2.ws.buffers["quiet.txt"].stale, "a file nobody touched is not stale");
-        assert_eq!(h2.ws.buffers["quiet.txt"].text, "mine\n");
+        assert_eq!(h2.ws.buffers["quiet.txt"].edited_text(), Some("mine\n"));
     }
 
     /// "I could not read the file" is not "the file changed". A buffer whose
@@ -1265,7 +1305,7 @@ mod tests {
 
         let h2 = Hub::new("unreadable_probe", d.path().to_path_buf());
         let b = &h2.ws.buffers["gone.txt"];
-        assert_eq!(b.text, "mine\n", "unsaved work survives a file we cannot read");
+        assert_eq!(b.edited_text(), Some("mine\n"), "unsaved work survives a file we cannot read");
         assert!(!b.stale, "cannot tell is not the same as changed");
     }
 
@@ -1286,7 +1326,7 @@ mod tests {
             },
         );
         h.handle(&c, Intent::EditBuffer { rel: "a.txt".into(), text: "mine\n".into() });
-        assert!(h.ws.buffers["a.txt"].dirty, "the edit must have landed as unsaved text");
+        assert!(h.ws.buffers["a.txt"].dirty(), "the edit must have landed as unsaved text");
         drop(rx);
         drop(h);
 
@@ -1295,7 +1335,7 @@ mod tests {
         let mut h2 = Hub::new("restart_probe", d.path().to_path_buf());
         let (c2, rx2) = h2.subscribe();
         drain(&rx2);
-        assert_eq!(h2.ws.buffers["a.txt"].text, "mine\n", "unsaved text is crash-safe");
+        assert_eq!(h2.ws.buffers["a.txt"].edited_text(), Some("mine\n"), "unsaved text is crash-safe");
         assert_eq!(
             h2.ws.buffers["a.txt"].base_hash,
             workspace::hash_text("on disk\n"),
@@ -1340,7 +1380,7 @@ mod tests {
              requester's own echo rule drops it and the editor opens blank; got {msgs:?}"
         );
         assert_eq!(h.ws.buffers["a.txt"].base_hash, workspace::hash_text("on disk\n"));
-        assert!(!h.ws.buffers["a.txt"].dirty, "a freshly-read buffer must not be marked dirty");
+        assert!(!h.ws.buffers["a.txt"].dirty(), "a freshly-read buffer must not be marked dirty");
 
         // The whole point: an unmodified save against a real base_hash must
         // succeed, not conflict, now that the buffer actually knows what's
@@ -1401,7 +1441,10 @@ mod tests {
                 tab: Tab::File { rel: "a.txt".into(), mode: Mode::Edit },
             },
         );
-        assert_eq!(h.ws.buffers["a.txt"].text, "on disk\n");
+        // TASK-5: a freshly-opened, unedited buffer holds nothing of its own;
+        // base_hash and !dirty() are what prove the read actually happened.
+        assert_eq!(h.ws.buffers["a.txt"].base_hash, workspace::hash_text("on disk\n"));
+        assert!(!h.ws.buffers["a.txt"].dirty());
     }
 
     #[test]
@@ -1424,12 +1467,12 @@ mod tests {
         drain(&rx);
         h.handle(&c, Intent::EditBuffer { rel: "a.txt".into(), text: "unsaved work".into() });
         drain(&rx);
-        assert!(h.ws.buffers["a.txt"].dirty);
+        assert!(h.ws.buffers["a.txt"].dirty());
 
         h.handle(&c, Intent::SetMode { rel: "a.txt".into(), mode: Mode::Edit });
         let msgs = drain(&rx);
-        assert_eq!(h.ws.buffers["a.txt"].text, "unsaved work", "dirty text must survive");
-        assert!(h.ws.buffers["a.txt"].dirty, "SetMode must not clear dirty for unsaved work");
+        assert_eq!(h.ws.buffers["a.txt"].edited_text(), Some("unsaved work"), "dirty text must survive");
+        assert!(h.ws.buffers["a.txt"].dirty(), "SetMode must not clear dirty for unsaved work");
         assert!(
             msgs.iter().any(|m| m.contains(r#""t":"BufferText""#) && m.contains("unsaved work")),
             "the requester must still get the current (unsaved) text, not blank; got {msgs:?}"
@@ -1465,7 +1508,7 @@ mod tests {
 
         h.handle(&c, Intent::EditBuffer { rel: "dirty.txt".into(), text: "unsaved".into() });
         drain(&rx);
-        assert!(h.ws.buffers["dirty.txt"].dirty);
+        assert!(h.ws.buffers["dirty.txt"].dirty());
 
         // Tabs are [clean.txt, dirty.txt] in that pane; close index 0.
         h.handle(&c, Intent::CloseTab { pane: proto::MIDDLE, idx: 0 });
@@ -1532,7 +1575,7 @@ mod tests {
         drain(&rx);
         h.handle(&c, Intent::EditBuffer { rel: "old.txt".into(), text: "unsaved work".into() });
         drain(&rx);
-        assert!(h.ws.buffers["old.txt"].dirty);
+        assert!(h.ws.buffers["old.txt"].dirty());
 
         h.handle(&c, Intent::RenamePath { from: "old.txt".into(), to: "new.txt".into() });
         let msgs = drain(&rx);
@@ -1543,8 +1586,8 @@ mod tests {
         );
 
         assert!(!h.ws.buffers.contains_key("old.txt"), "the old key must not linger");
-        assert_eq!(h.ws.buffers["new.txt"].text, "unsaved work", "unsaved text must survive the rename");
-        assert!(h.ws.buffers["new.txt"].dirty);
+        assert_eq!(h.ws.buffers["new.txt"].edited_text(), Some("unsaved work"), "unsaved text must survive the rename");
+        assert!(h.ws.buffers["new.txt"].dirty());
         assert_eq!(
             h.ws.panes[proto::MIDDLE as usize].tabs[0],
             Tab::File { rel: "new.txt".into(), mode: Mode::Edit },
@@ -1591,7 +1634,7 @@ mod tests {
         drain(&rx);
 
         assert!(!h.ws.buffers.contains_key("src/a.rs"));
-        assert_eq!(h.ws.buffers["lib/a.rs"].text, "unsaved a");
+        assert_eq!(h.ws.buffers["lib/a.rs"].edited_text(), Some("unsaved a"));
         assert_eq!(
             h.ws.panes[proto::MIDDLE as usize].tabs[0],
             Tab::File { rel: "lib/a.rs".into(), mode: Mode::Edit }

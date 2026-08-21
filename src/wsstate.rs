@@ -1,7 +1,7 @@
 //! Workspace persistence. Lives in $RESH_STATE_DIR, never inside a
 //! project — following zellij, so pane drags never show up in git status.
 use crate::proto::{Sizes, Tab};
-use crate::workspace::{Buffer, Pane, Workspace};
+use crate::workspace::{Buffer, Content, Pane, Workspace};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -107,8 +107,13 @@ pub fn save(project: &str, w: &Workspace) -> Result<(), String> {
                 (
                     k.clone(),
                     BufferDisk {
-                        text: b.text.clone(),
-                        dirty: b.dirty,
+                        // TASK-6: a clean buffer holds nothing, so it writes
+                        // "" here — nothing is lost, since a clean buffer's
+                        // text was always just the disk's own, redundantly
+                        // duplicated. Once Task 6 lands, a clean buffer need
+                        // not carry a `text` key at all.
+                        text: b.edited_text().unwrap_or_default().to_string(),
+                        dirty: b.dirty(),
                         base_hash: Some(b.base_hash),
                     },
                 )
@@ -195,8 +200,15 @@ pub fn load(project: &str) -> (Workspace, Option<String>) {
                             base_hash: b
                                 .base_hash
                                 .unwrap_or_else(|| crate::workspace::hash_text(&b.text)),
-                            text: b.text,
-                            dirty: b.dirty,
+                            // TASK-6: a restored dirty buffer's saved text
+                            // becomes its held edit; a clean one holds
+                            // nothing — its `text` on disk was always just a
+                            // redundant copy of the file.
+                            content: if b.dirty {
+                                Content::Edited(b.text)
+                            } else {
+                                Content::Clean
+                            },
                             ..Buffer::default()
                         },
                     );
@@ -283,7 +295,7 @@ mod tests {
                 vec![Tab::File { rel: "a.rs".into(), mode: Mode::Edit }];
             w.buffers.insert(
                 "a.rs".into(),
-                Buffer { text: "unsaved".into(), dirty: true, ..Buffer::default() },
+                Buffer { content: Content::Edited("unsaved".into()), ..Buffer::default() },
             );
             save("proj", &w).unwrap();
 
@@ -291,8 +303,8 @@ mod tests {
             assert!(warn.is_none());
             assert_eq!(got.sizes.left_w, 111);
             assert_eq!(got.panes[proto::MIDDLE as usize].tabs.len(), 1);
-            assert_eq!(got.buffers["a.rs"].text, "unsaved", "unsaved text is crash-safe");
-            assert!(got.buffers["a.rs"].dirty);
+            assert_eq!(got.buffers["a.rs"].edited_text(), Some("unsaved"), "unsaved text is crash-safe");
+            assert!(got.buffers["a.rs"].dirty());
         });
     }
 
@@ -312,8 +324,7 @@ mod tests {
             w.buffers.insert(
                 "a.rs".into(),
                 Buffer {
-                    text: "mine".into(),
-                    dirty: true,
+                    content: Content::Edited("mine".into()),
                     base_hash: crate::workspace::hash_text("on disk"),
                     ..Buffer::default()
                 },
@@ -342,23 +353,28 @@ mod tests {
     #[test]
     fn a_state_file_written_before_base_hash_still_loads() {
         with_state_dir(|| {
-            let mut w = Workspace::default_layout();
-            w.buffers.insert(
-                "a.rs".into(),
-                Buffer { text: "saved".into(), base_hash: 999, ..Buffer::default() },
-            );
-            save("old_base_probe", &w).unwrap();
-            let text = std::fs::read_to_string(path_for("old_base_probe")).unwrap();
-            assert!(text.contains("base_hash"), "the key must be written at all");
-
-            // Strip it back out, the way an older resh would have left it.
-            let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
-            json["buffers"]["a.rs"].as_object_mut().unwrap().remove("base_hash");
-            std::fs::write(path_for("old_base_probe"), json.to_string()).unwrap();
+            // TASK-6: written by hand rather than round-tripped through
+            // `save()`. The scenario is a *clean* buffer from a pre-base_hash
+            // file — `{"text": "saved", "dirty": false}`, no base_hash key at
+            // all — and `Content::Clean` can no longer represent "clean, but
+            // holding this text" in memory to hand to `save()`, so the fixture
+            // has to be the on-disk bytes an old resh actually wrote instead.
+            std::fs::create_dir_all(state_dir()).unwrap();
+            let raw = serde_json::json!({
+                "sizes": {"left_w": 260, "right_w": 520, "left_split": 60},
+                "panes": [
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0},
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0}
+                ],
+                "buffers": {"a.rs": {"text": "saved", "dirty": false}},
+            });
+            std::fs::write(state_dir().join("old_base_probe.json"), raw.to_string()).unwrap();
 
             let (got, warn) = load("old_base_probe");
             assert!(warn.is_none(), "an old file is not a corrupt one");
-            assert_eq!(got.buffers["a.rs"].text, "saved", "the rest of it still loaded");
+            // A clean buffer holds nothing of its own; the base_hash fallback
+            // below is what actually exercises the behaviour this test covers.
+            assert_eq!(got.buffers["a.rs"].edited_text(), None, "dirty:false loads clean");
             assert_eq!(
                 got.buffers["a.rs"].base_hash,
                 crate::workspace::hash_text("saved"),

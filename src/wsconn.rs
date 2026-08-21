@@ -87,8 +87,30 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         // client reconnecting onto a layout with open Edit buffers would
         // otherwise render them blank forever: nothing else re-sends
         // BufferText for a buffer that isn't actively being typed into.
-        let open_buffers: Vec<(String, String)> =
-            h.ws.buffers.iter().map(|(rel, b)| (rel.clone(), b.text.clone())).collect();
+        // TASK-7: a clean buffer holds nothing of its own, so its half of
+        // this replay has to come from disk instead — done here rather than
+        // stubbed to "", because a reconnecting client onto an unedited Edit
+        // buffer is exactly the case `reconnect_replays_buffer_text_for_open_edit_buffers`
+        // covers, and stubbing it would silently reopen the "editor renders
+        // blank forever" bug this replay exists to fix. Reading under the
+        // hub's own lock matches `open_for_edit` and `reconcile_buffers_with_disk`
+        // just above — bounded by MAX_BUFFERS small local reads, not the
+        // indefinite blocking (a PTY write) CLAUDE.md's lock rule is about.
+        let dir = h.dir.clone();
+        let open_buffers: Vec<(String, String)> = h
+            .ws
+            .buffers
+            .iter()
+            .map(|(rel, b)| {
+                let text = match b.edited_text() {
+                    Some(t) => t.to_string(),
+                    None => crate::projects::safe_resolve(&dir, rel)
+                        .and_then(|p| crate::projects::read_text_file(&p))
+                        .unwrap_or_default(),
+                };
+                (rel.clone(), text)
+            })
+            .collect();
         for (rel, text) in open_buffers {
             let ev = proto::Event::BufferText { rel, text, origin: String::new() };
             h.send_to(&id, &ev);
