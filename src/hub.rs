@@ -75,7 +75,47 @@ impl Hub {
         // died (or kept running under dtach) since the last save, and
         // `.git` may have appeared or vanished on disk in the meantime.
         hub.refresh_live_sessions();
+        hub.reconcile_buffers_with_disk();
         hub
+    }
+
+    /// Restored buffers describe what was true when resh last wrote the state
+    /// file; the disk may have moved since, and nothing records that — the
+    /// state file cannot, because staleness is a fact about the file, not
+    /// about the buffer. Left unanswered, a buffer whose file changed during
+    /// a restart comes back looking current, and the first sign of trouble is
+    /// a conflict banner at save time.
+    ///
+    /// The two cases follow the live rules exactly (`file_changed_externally`):
+    /// a buffer with unsaved text is *flagged*, never overwritten, and a saved
+    /// one follows the file.
+    ///
+    /// A file that cannot be read is a third outcome and is left alone. "I
+    /// could not look" is not "it changed" — flagging on a failed read would
+    /// put a warning on a file nobody touched, and adopting on one would
+    /// discard unsaved work.
+    ///
+    /// Called from `new`, which runs under the process-global registry lock,
+    /// so the I/O here is deliberately bounded: at most `MAX_BUFFERS` files,
+    /// whose contents the state file this call just parsed already carried —
+    /// so it at most doubles reading that `new` was doing anyway.
+    fn reconcile_buffers_with_disk(&mut self) {
+        let dir = &self.dir;
+        for (rel, b) in self.ws.buffers.iter_mut() {
+            let Ok(disk) = crate::projects::safe_resolve(dir, rel)
+                .and_then(|p| crate::projects::read_text_file(&p))
+            else {
+                continue;
+            };
+            let hash = workspace::hash_text(&disk);
+            if b.dirty {
+                b.stale = hash != b.base_hash;
+            } else if hash != b.base_hash {
+                b.text = disk;
+                b.base_hash = hash;
+                b.stale = false;
+            }
+        }
     }
 
     /// One hub per project, shared by every connection to it. Also the place
@@ -386,6 +426,28 @@ impl Hub {
                     Intent::CloseTab { .. } => {
                         if let Some(rel) = &closing_rel {
                             self.maybe_drop_buffer(rel);
+                        }
+                    }
+                    // Discarding means "show me what is on disk", not "show me
+                    // nothing". The tab stays open in Edit, and a tab in Edit
+                    // whose buffer is gone renders an empty textarea — for
+                    // certain on the next reload, since a connecting client is
+                    // only sent text for buffers that exist (see wsconn). Until
+                    // then it would go on showing the very text just discarded.
+                    //
+                    // Only when a tab still points at it: CloseBuffer is also
+                    // how a buffer is freed outright, and re-reading there
+                    // would resurrect every buffer forever, defeating both the
+                    // MAX_BUFFERS cap and the reason a once-opened .env should
+                    // not stay in the state file.
+                    Intent::CloseBuffer { rel } => {
+                        let still_open = self.ws.panes.iter().any(|p| {
+                            p.tabs.iter().any(
+                                |t| matches!(t, Tab::File { rel: r, mode: Mode::Edit } if r == rel),
+                            )
+                        });
+                        if still_open {
+                            self.open_for_edit(from, rel);
                         }
                     }
                     _ => {}
@@ -1062,6 +1124,146 @@ mod tests {
     /// The disk is deliberately left untouched across the restart here: with
     /// nothing having changed, a save has nothing to conflict *with*, so a
     /// conflict can only come from a manufactured base.
+    /// "discard mine" on the conflict banner sends CloseBuffer, which dropped
+    /// the buffer and stopped there — while the tab stayed open in Edit. The
+    /// text a client is holding is only re-sent for buffers that *exist*
+    /// (wsconn's connect path), so the discarded editor came back blank on
+    /// the next reload, and until then went on showing the text that was
+    /// supposedly discarded.
+    ///
+    /// Discarding means "show me what is on disk", so the file is re-read.
+    #[test]
+    fn discarding_a_buffer_reloads_the_file_rather_than_leaving_nothing() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.txt"), "on disk\n").unwrap();
+        let mut h = Hub::new("discard_probe", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "a.txt".into(), mode: Mode::Edit },
+            },
+        );
+        h.handle(&c, Intent::EditBuffer { rel: "a.txt".into(), text: "mine\n".into() });
+        drain(&rx);
+
+        h.handle(&c, Intent::CloseBuffer { rel: "a.txt".into() });
+
+        let b = h.ws.buffers.get("a.txt").expect("the tab is still open in Edit, so it needs text");
+        assert_eq!(b.text, "on disk\n", "discarding shows the file, not the discarded edit");
+        assert!(!b.dirty, "a freshly read buffer is not dirty");
+        assert_eq!(b.base_hash, workspace::hash_text("on disk\n"), "and it knows its base");
+        // The client that clicked must see it now, not on its next reload.
+        let msgs = drain(&rx);
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"BufferText""#) && m.contains("on disk")),
+            "the reload has to reach the browser that discarded; got {msgs:?}"
+        );
+    }
+
+    /// The other half: closing a buffer whose tab is gone must still free it.
+    /// Without this the fix above would resurrect every buffer forever, and
+    /// the MAX_BUFFERS cap along with the "a .env opened once is persisted
+    /// with its contents" problem would both come back.
+    #[test]
+    fn discarding_a_buffer_with_no_tab_left_frees_it() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.txt"), "on disk\n").unwrap();
+        let mut h = Hub::new("discard_notab_probe", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        h.handle(&c, Intent::EditBuffer { rel: "a.txt".into(), text: "mine\n".into() });
+        assert!(h.ws.buffers.contains_key("a.txt"));
+        drain(&rx);
+
+        h.handle(&c, Intent::CloseBuffer { rel: "a.txt".into() });
+        assert!(!h.ws.buffers.contains_key("a.txt"), "no tab points at it, so it must go");
+    }
+
+    /// A restart reloads buffers from the state file, which records no
+    /// staleness — it is a fact about the disk, not about the buffer. So the
+    /// hub has to work it out at startup, or a buffer whose file changed
+    /// while resh was down comes back looking clean and current, and the
+    /// first warning is a conflict banner at save time.
+    #[test]
+    fn a_restart_notices_a_file_that_changed_while_it_was_down() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("dirty.txt"), "on disk\n").unwrap();
+        std::fs::write(d.path().join("clean.txt"), "on disk\n").unwrap();
+        std::fs::write(d.path().join("quiet.txt"), "on disk\n").unwrap();
+        let mut h = Hub::new("reconcile_probe", d.path().to_path_buf());
+        let (c, _rx) = h.subscribe();
+        for rel in ["dirty.txt", "clean.txt", "quiet.txt"] {
+            h.handle(
+                &c,
+                Intent::OpenTab {
+                    pane: proto::MIDDLE,
+                    tab: Tab::File { rel: rel.into(), mode: Mode::Edit },
+                },
+            );
+        }
+        h.handle(&c, Intent::EditBuffer { rel: "dirty.txt".into(), text: "mine\n".into() });
+        h.handle(&c, Intent::EditBuffer { rel: "quiet.txt".into(), text: "mine\n".into() });
+        drop(h);
+
+        // While it is "down": one file moves under an unsaved buffer, one
+        // moves under a saved one, and one does not move at all.
+        std::fs::write(d.path().join("dirty.txt"), "somebody else\n").unwrap();
+        std::fs::write(d.path().join("clean.txt"), "somebody else\n").unwrap();
+
+        let h2 = Hub::new("reconcile_probe", d.path().to_path_buf());
+        let dirty = &h2.ws.buffers["dirty.txt"];
+        assert!(dirty.stale, "an unsaved buffer whose file moved must come back flagged");
+        assert_eq!(dirty.text, "mine\n", "and must keep the unsaved text, never adopt the file");
+
+        // The live rule for a *clean* buffer is that it follows the file
+        // (file_changed_externally); a restart must not be the one case where
+        // it silently shows content the file no longer has.
+        let clean = &h2.ws.buffers["clean.txt"];
+        assert_eq!(clean.text, "somebody else\n", "a saved buffer follows the file");
+        assert_eq!(clean.base_hash, workspace::hash_text("somebody else\n"));
+        assert!(!clean.stale, "following the file is not staleness");
+
+        // The discriminating case: flagging everything would pass both of the
+        // assertions above.
+        assert!(!h2.ws.buffers["quiet.txt"].stale, "a file nobody touched is not stale");
+        assert_eq!(h2.ws.buffers["quiet.txt"].text, "mine\n");
+    }
+
+    /// "I could not read the file" is not "the file changed". A buffer whose
+    /// file cannot be read must come back untouched rather than flagged on a
+    /// guess — and must not take the hub's startup down with it.
+    #[test]
+    fn a_file_that_cannot_be_read_leaves_its_buffer_alone() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("gone.txt"), "on disk\n").unwrap();
+        let mut h = Hub::new("unreadable_probe", d.path().to_path_buf());
+        let (c, _rx) = h.subscribe();
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "gone.txt".into(), mode: Mode::Edit },
+            },
+        );
+        h.handle(&c, Intent::EditBuffer { rel: "gone.txt".into(), text: "mine\n".into() });
+        drop(h);
+        std::fs::remove_file(d.path().join("gone.txt")).unwrap();
+
+        let h2 = Hub::new("unreadable_probe", d.path().to_path_buf());
+        let b = &h2.ws.buffers["gone.txt"];
+        assert_eq!(b.text, "mine\n", "unsaved work survives a file we cannot read");
+        assert!(!b.stale, "cannot tell is not the same as changed");
+    }
+
     #[test]
     fn a_dirty_buffer_still_saves_after_a_restart() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
