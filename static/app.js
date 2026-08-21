@@ -861,6 +861,31 @@ function ensureTerm(session) {
     );
     return true;
   });
+  // Shift+Enter writes a newline instead of submitting. xterm sends a bare
+  // \r for Enter and for Shift+Enter alike, so an application cannot tell
+  // the two apart — which is why Claude Code submits on Shift+Enter here and
+  // `\` + Enter was the only way to write a second line.
+  //
+  // LF, not the ESC CR that a terminal's own Shift+Enter binding usually
+  // sends (iTerm2's, via Claude's /terminal-setup). Claude binds its
+  // chat:newline action to Ctrl+J, and Ctrl+J *is* LF, so this needs no
+  // knowledge of what is running: everything that does not deliberately
+  // distinguish LF from CR treats them alike — readline runs the line either
+  // way, so Shift+Enter still submits at a shell prompt, vim breaks the line,
+  // a pager scrolls. ESC CR would have made Shift+Enter a no-op in bash.
+  //
+  // Routed through term.input so it takes the same onData path as every
+  // other keystroke, including its dead-socket guard.
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type !== "keydown" || e.key !== "Enter") return true;
+    if (!e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return true;
+    // Both: returning false only stops xterm from handling the event, and
+    // without preventDefault the browser still delivers it to xterm's hidden
+    // textarea, which would insert a line there for the IME path to find.
+    e.preventDefault();
+    term.input("\n");
+    return false;
+  });
   term.onData((d) => {
     // Reads entry.sock rather than closing over one socket: a reconnect
     // swaps it, and a closure over the original would spend the rest of the
