@@ -374,7 +374,15 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                 // The workspace's own override comes from the hub already
                 // locked here — no registry lookup and no I/O under the lock.
                 let filter = settings.tree_filter_with(h.ws.show_hidden);
-                let open: Vec<String> = h.ws.buffers.keys().cloned().collect();
+                // Tabs, not just buffers: a previewed file has no buffer, and
+                // classifying it as a generic tree change is why its pane
+                // never refreshed. Buffers are still unioned in because one
+                // can outlive its tab for as long as it takes a close to be
+                // processed.
+                let mut open: Vec<String> = h.ws.open_file_rels();
+                open.extend(h.ws.buffers.keys().cloned());
+                open.sort();
+                open.dedup();
                 let mut tree = false;
                 let mut status = false;
                 // A single save (temp file + rename) fires several raw

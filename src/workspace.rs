@@ -98,6 +98,26 @@ impl Workspace {
         None
     }
 
+    /// Every file a tab currently shows, in either mode.
+    ///
+    /// Separate from `buffers.keys()` on purpose: the watcher used that, so a
+    /// file open in Preview — which has no buffer — was classified as a
+    /// generic tree change and its pane never heard that it had changed. A
+    /// tab is the thing that means "somebody is looking at this file", which
+    /// is the question the watcher is actually asking.
+    pub fn open_file_rels(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        self.panes
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .filter_map(|t| match t {
+                Tab::File { rel, .. } => Some(rel.clone()),
+                _ => None,
+            })
+            .filter(|rel| seen.insert(rel.clone()))
+            .collect()
+    }
+
     pub fn view(&self) -> proto::WorkspaceView {
         let mut buffers: Vec<proto::BufferMeta> = self
             .buffers
@@ -667,5 +687,24 @@ mod tests {
         // Default is neither: a fresh workspace has spawned nothing.
         let fresh = Workspace::default_layout().view();
         assert!(fresh.live_sessions.is_empty(), "opening a project must not imply a session");
+    }
+
+    #[test]
+    fn open_file_rels_lists_previewed_files_not_just_edited_ones() {
+        let mut w = Workspace::default_layout();
+        apply_layout(&mut w, &Intent::OpenTab {
+            pane: proto::MIDDLE,
+            tab: Tab::File { rel: "read.md".into(), mode: Mode::Preview },
+        }).unwrap();
+        apply_layout(&mut w, &Intent::OpenTab {
+            pane: proto::RIGHT,
+            tab: Tab::File { rel: "write.rs".into(), mode: Mode::Edit },
+        }).unwrap();
+        let mut got = w.open_file_rels();
+        got.sort();
+        // The Preview entry is the whole point: it has no buffer, so the old
+        // buffers-only list could not contain it.
+        assert_eq!(got, vec!["read.md".to_string(), "write.rs".to_string()]);
+        assert!(w.buffers.is_empty(), "no buffer exists yet — that is why this list is needed");
     }
 }

@@ -520,21 +520,26 @@ impl Hub {
         if crate::watch::is_self_write(&mut self.self_writes, rel, disk_hash) {
             return true; // our own save; broadcasting it would echo back at the author
         }
-        let Some(b) = self.ws.buffers.get_mut(rel) else { return true };
-        if b.dirty {
-            b.stale = true;
-            let ev = Event::BufferStale { rel: rel.to_string() };
-            self.broadcast(&ev);
-        } else {
-            b.text = disk.clone();
-            b.base_hash = disk_hash;
-            b.stale = false;
-            let ev = Event::BufferText {
-                rel: rel.to_string(),
-                text: disk,
-                origin: String::new(), // no author: everyone applies it
-            };
-            self.broadcast(&ev);
+        // No buffer is not "nothing to tell anyone": a file open in Preview
+        // has no buffer and still has a pane showing it. The buffer branches
+        // below update what a *buffer* holds; the broadcast at the end is
+        // what every open tab needs either way.
+        if let Some(b) = self.ws.buffers.get_mut(rel) {
+            if b.dirty {
+                b.stale = true;
+                let ev = Event::BufferStale { rel: rel.to_string() };
+                self.broadcast(&ev);
+            } else {
+                b.text = disk.clone();
+                b.base_hash = disk_hash;
+                b.stale = false;
+                let ev = Event::BufferText {
+                    rel: rel.to_string(),
+                    text: disk,
+                    origin: String::new(), // no author: everyone applies it
+                };
+                self.broadcast(&ev);
+            }
         }
         self.ws.version += 1;
         self.broadcast(&Event::FileChanged { rel: rel.to_string() });
@@ -2034,6 +2039,40 @@ mod tests {
         );
         assert!(d.path().join(".git").exists(), "git init must actually create the repo on disk");
         assert!(h.ws.is_git, "refresh_live_sessions must flip is_git once .git exists");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// A previewed file has no buffer, and `file_changed_externally` used to
+    /// return before its broadcast in exactly that case:
+    ///
+    ///     let Some(b) = self.ws.buffers.get_mut(rel) else { return true };
+    ///
+    /// so nothing downstream ever heard that the file on screen had changed.
+    /// Reverting that line to the early return fails this test.
+    #[test]
+    fn an_external_change_to_a_previewed_file_is_broadcast() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("read.md"), "before\n").unwrap();
+        let mut h = Hub::new("previewproj", d.path().to_path_buf());
+        let (a, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(&a, Intent::OpenTab {
+            pane: proto::MIDDLE,
+            tab: Tab::File { rel: "read.md".into(), mode: Mode::Preview },
+        });
+        drain(&rx);
+
+        std::fs::write(d.path().join("read.md"), "after\n").unwrap();
+        assert!(h.file_changed_externally(d.path(), "read.md"));
+
+        let msgs = drain(&rx);
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"FileChanged""#) && m.contains("read.md")),
+            "a previewed file's change must reach the browser, got {msgs:?}"
+        );
         std::env::remove_var("RESH_STATE_DIR");
     }
 }
