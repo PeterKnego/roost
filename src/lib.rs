@@ -17,6 +17,7 @@ pub mod routes;
 pub mod screen;
 pub mod session;
 pub mod term;
+pub mod textdiff;
 pub mod upload;
 pub mod watch;
 pub mod workspace;

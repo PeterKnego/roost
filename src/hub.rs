@@ -589,7 +589,7 @@ impl Hub {
                 self.persist();
             }
             Ok(crate::fileops::SaveOutcome::Conflict { disk_text }) => {
-                let diff_html = crate::render::diff_html(&conflict_diff(&disk_text, &buf.text));
+                let diff_html = crate::render::diff_html(&crate::textdiff::unified(&disk_text, &buf.text));
                 let ev = Event::SaveConflict { rel, diff_html };
                 self.send_to(from, &ev);
             }
@@ -937,21 +937,6 @@ fn has_prefix_boundary(path: &str, prefix: &str) -> bool {
 
 /// A minimal unified-diff rendering of disk vs buffer. Uses the existing
 /// classifier in `render`, so the conflict view looks like every other diff.
-fn conflict_diff(disk: &str, buf: &str) -> String {
-    let mut out = String::from("--- a/disk\n+++ b/your buffer\n@@ conflict @@\n");
-    for l in disk.lines() {
-        out.push('-');
-        out.push_str(l);
-        out.push('\n');
-    }
-    for l in buf.lines() {
-        out.push('+');
-        out.push_str(l);
-        out.push('\n');
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
