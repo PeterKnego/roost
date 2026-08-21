@@ -7,6 +7,13 @@ const PROJECT = document.body.dataset.project;
 // workspace's own toggle (state.show_hidden) overrides it when set; null
 // means nobody has touched the header button, so the file still decides.
 const SHOW_HIDDEN_DEFAULT = document.body.dataset.showHidden === "1";
+// Whether the editor writes a buffer out by itself. Read once per page load,
+// like SHOW_HIDDEN_DEFAULT: it changes only when someone edits a config file,
+// which already needs a reload to take effect.
+const AUTOSAVE = document.body.dataset.autosave === "1";
+// How long after the last keystroke an autosave fires. VS Code's default,
+// and comfortably longer than the 200ms EditBuffer debounce it depends on.
+const AUTOSAVE_MS = 1000;
 const showHidden = () => (state && state.show_hidden != null ? state.show_hidden : SHOW_HIDDEN_DEFAULT);
 // What the tree was last rendered with, so a State that flips the setting
 // re-fetches. Fragments are server-rendered against the workspace value, so
@@ -43,6 +50,18 @@ let ctrl = null;
 const terms = new Map();   // session -> {node, term, fit, sock, ...} (see ensureTerm)
 const editors = new Map(); // rel -> textarea (the currently mounted one, if any)
 const texts = new Map();   // rel -> latest known buffer text (server-authoritative)
+const autosaveTimers = new Map(); // rel -> pending autosave timeout
+// rel -> pending EditBuffer debounce. Presence means "this client has typed
+// something the server has not been told about yet", which is the *only*
+// accurate local dirty signal: `state`'s own dirty flag lags by the debounce,
+// so a save triggered inside that window (blur, ⌘S) would decide there was
+// nothing to save and quietly do nothing.
+const pendingEdits = new Map();
+// Buffers autosave has taken its hands off: the file diverged from what this
+// buffer was based on, so writing it would be a decision, not a save. Left to
+// ⌘S (and the banner's overwrite), which is also what clears this — via
+// SaveOk, so it reopens only on a write that actually landed.
+const autosavePaused = new Set();
 
 function send(intent) {
   if (ctrl && ctrl.readyState === 1) ctrl.send(JSON.stringify(intent));
@@ -108,13 +127,24 @@ function onEvent(ev) {
       // file changed underneath it) — patch it locally rather than wait
       // for an unrelated event to bring a fresh State snapshot.
       const b = state && state.buffers.find((x) => x.rel === ev.rel);
+      // Stale means someone else wrote the file this buffer came from.
+      // Autosave stops here rather than racing them.
+      autosavePaused.add(ev.rel);
       if (b) { b.stale = true; render(); }
       break;
     }
     case "TreeChanged": refreshTree(); break;
     case "StatusChanged": refreshKind("Changes"); break;
     case "FileChanged": refreshKind("Diff"); break;
-    case "SaveConflict": showConflict(ev); break;
+    case "SaveConflict":
+      // Without this an autosaving client re-raises the banner every second.
+      autosavePaused.add(ev.rel);
+      showConflict(ev);
+      render();
+      break;
+    // A write that landed is the only thing that resumes autosave: the
+    // divergence it paused for is resolved, whether by ⌘S or by overwrite.
+    case "SaveOk": autosavePaused.delete(ev.rel); break;
     case "TerminalStarted":
       // The server only validated the name and notified everyone; opening
       // this socket is what actually spawns the PTY (see ensureTerm). But
@@ -349,6 +379,27 @@ function render() {
 function buildPaneIcons(host, pi, pane, active, content) {
   if (!host) return;
   host.innerHTML = "";
+  // The save state of the file this pane is showing. With autosave on this is
+  // the only feedback that anything is being written at all; with it off it is
+  // where ⌘S gets advertised, which nothing in the UI did before — the dirty
+  // ● said "something is unsaved" without ever saying what to do about it.
+  if (active && active.k === "File" && active.mode === "Edit") {
+    const meta = state && state.buffers.find((x) => x.rel === active.rel);
+    const st = document.createElement("span");
+    st.className = "savestate";
+    if (meta && (meta.stale || autosavePaused.has(active.rel))) {
+      st.className += " warn";
+      st.textContent = "not saved · changed on disk";
+      st.title = "this file changed underneath your buffer — ⌘S to see what differs";
+    } else if (meta && meta.dirty) {
+      st.textContent = AUTOSAVE ? "saving…" : "unsaved · ⌘S";
+      st.title = AUTOSAVE ? "writing this out" : "press ⌘S (ctrl-S) to save";
+    } else {
+      st.textContent = "saved";
+      st.title = AUTOSAVE ? "saved automatically" : "no unsaved changes";
+    }
+    host.appendChild(st);
+  }
   const icon = (glyph, title, fn) => {
     const b = document.createElement("span");
     b.className = "paneicon";
@@ -896,7 +947,6 @@ function mountEditor(content, rel) {
   // and the BufferText handler in onEvent fills it in as soon as it does.
   ta.value = texts.has(rel) ? texts.get(rel) : "";
   editors.set(rel, ta);
-  let timer = null;
   ta.oninput = () => {
     // texts must reflect what's on screen the instant it changes, not 200ms
     // later when the debounced EditBuffer actually goes out: render() can
@@ -907,11 +957,62 @@ function mountEditor(content, rel) {
     // what makes texts an accurate record of the user's current text
     // instead of the last thing the server confirmed.
     texts.set(rel, ta.value);
-    clearTimeout(timer);
-    timer = setTimeout(() => send({ t: "EditBuffer", rel, text: ta.value }), 200);
+    clearTimeout(pendingEdits.get(rel));
+    pendingEdits.set(rel, setTimeout(() => {
+      pendingEdits.delete(rel);
+      send({ t: "EditBuffer", rel, text: ta.value });
+    }, 200));
+    // Restarted on every keystroke, so it measures the pause in typing
+    // rather than the age of the edit.
+    clearTimeout(autosaveTimers.get(rel));
+    autosaveTimers.set(rel, setTimeout(() => autosaveNow(rel), AUTOSAVE_MS));
   };
+  // Clicking a tab, the tree, or a terminal blurs the textarea, so this is
+  // what covers "moved on within the page" — the timer covers pauses, and
+  // window blur covers leaving the browser.
+  ta.onblur = () => autosaveNow(rel);
   content.appendChild(ta);
 }
+
+/// Sends this client's current text for `rel` and cancels the debounce it
+/// pre-empts. Without that cancellation the debounced copy lands *after* the
+/// save, re-marking the buffer dirty and starting the whole cycle again.
+function pushEdit(rel) {
+  clearTimeout(pendingEdits.get(rel));
+  pendingEdits.delete(rel);
+  const ta = editors.get(rel);
+  if (ta) send({ t: "EditBuffer", rel, text: ta.value });
+}
+
+/// Writes `rel` out now, if autosave is on and this buffer is still its own
+/// business. Deliberately `force: false` — the conflict guard is the whole
+/// safety property here, and an autosave that could force is an autosave that
+/// can silently overwrite an agent's edit mid-keystroke.
+///
+/// The dirty check is what keeps a second browser window from re-writing what
+/// the first one just saved: the server clears `dirty` in the State it
+/// broadcasts after a save, so every other client's timer finds nothing to do.
+function autosaveNow(rel) {
+  clearTimeout(autosaveTimers.get(rel));
+  autosaveTimers.delete(rel);
+  if (!AUTOSAVE || autosavePaused.has(rel)) return;
+  const meta = state && state.buffers.find((x) => x.rel === rel);
+  if (meta && meta.stale) return;
+  if (!pendingEdits.has(rel) && !(meta && meta.dirty)) return;
+  pushEdit(rel);
+  send({ t: "SaveBuffer", rel, force: false });
+}
+
+/// Every mounted editor, written out now. Bound to the events that mean "I am
+/// done with this for the moment" — losing focus, switching browser tab,
+/// hiding the window — which is the half of autosave a delay alone cannot
+/// cover: a timer that has not fired yet loses the last keystrokes of an edit
+/// the user has visibly walked away from.
+function autosaveAll() {
+  for (const rel of editors.keys()) autosaveNow(rel);
+}
+window.addEventListener("blur", autosaveAll);
+document.addEventListener("visibilitychange", () => { if (document.hidden) autosaveAll(); });
 
 /// Which file a save keystroke means. The focused textarea when there is one,
 /// and otherwise the file the workspace is actually showing — MIDDLE then
@@ -946,8 +1047,7 @@ document.addEventListener("keydown", (e) => {
   // The 200ms input debounce may still be pending, so push the text this
   // save is meant to write before asking for the write — otherwise a save
   // typed quickly enough saves the *previous* keystroke's text.
-  const ta = editors.get(rel);
-  if (ta) send({ t: "EditBuffer", rel, text: ta.value });
+  pushEdit(rel);
   send({ t: "SaveBuffer", rel, force: false });
 });
 

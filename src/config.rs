@@ -10,6 +10,7 @@ struct RawConfig {
     default_tab: Option<String>,
     hide: Option<Vec<String>>,
     show_hidden: Option<bool>,
+    autosave: Option<bool>,
     allowed_origins: Option<Vec<String>>,
     max_upload_bytes: Option<u64>,
 }
@@ -20,6 +21,12 @@ pub struct Settings {
     pub default_tab: String,
     pub hide: Vec<String>,
     pub show_hidden: bool,
+    /// Whether the editor writes a buffer out on its own — a display-level
+    /// preference like `show_hidden`, so a project may set it either way for
+    /// itself. Unlike `allowed_origins` and `max_upload_bytes`, nothing a
+    /// hostile checkout could set here widens a boundary: it only decides
+    /// whether the person editing that project's own files has to press ⌘S.
+    pub autosave: bool,
     pub warning: Option<String>,
 }
 
@@ -50,6 +57,7 @@ impl Default for Settings {
             default_tab: "terminal".into(),
             hide: vec![],
             show_hidden: false,
+            autosave: true,
             warning: None,
         }
     }
@@ -80,6 +88,9 @@ pub fn load(paths: &[&Path]) -> Settings {
                 }
                 if let Some(v) = raw.show_hidden {
                     s.show_hidden = v;
+                }
+                if let Some(v) = raw.autosave {
+                    s.autosave = v;
                 }
             }
             Err(e) => warnings.push(format!("{}: {}", path.display(), e.message())),
@@ -226,6 +237,31 @@ mod tests {
         assert!(s.show_hidden);
         assert_eq!(s.hide, vec!["dist"]); // and the global key still survives
         assert!(s.warning.is_none());
+    }
+
+    // Autosave is on unless a file turns it off, and both layers can move it
+    // in both directions. Asserting only the default would pass with the
+    // cascade never reading the key at all.
+    #[test]
+    fn autosave_defaults_on_and_either_layer_can_turn_it_off() {
+        let d = tempfile::tempdir().unwrap();
+        let g = d.path().join("global.toml");
+        let p = d.path().join("project.toml");
+        fs::write(&g, "hide = [\"dist\"]").unwrap();
+        assert!(load(&[&g]).autosave, "on unless something says otherwise");
+
+        fs::write(&p, "autosave = false").unwrap();
+        let s = load(&[&g, &p]);
+        assert!(!s.autosave, "a project can turn it off for itself");
+        assert_eq!(s.hide, vec!["dist"], "and the global key still survives");
+
+        // The other direction: a global `false` that a project overrides back
+        // on. Without this the cascade could be a one-way latch.
+        fs::write(&g, "autosave = false").unwrap();
+        assert!(!load(&[&g]).autosave);
+        fs::write(&p, "autosave = true").unwrap();
+        assert!(load(&[&g, &p]).autosave, "a project can turn it back on");
+        assert!(load(&[&g, &p]).warning.is_none());
     }
 
     // The reverse direction: a global `true` is what a per-project `false`

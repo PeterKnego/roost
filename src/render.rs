@@ -725,6 +725,7 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<
     // which already needs a reload to be seen. app.js resolves the workspace
     // override against it: `ws.show_hidden ?? SHOW_HIDDEN_DEFAULT`.
     let sh = if s.show_hidden { "1" } else { "0" };
+    let autosave = if s.autosave { "1" } else { "0" };
     let theme_css = match theme_rel {
         Some(rel) => format!("<link rel=\"stylesheet\" href=\"/frag/{proj_url}/{rel}\">"),
         None => String::new(),
@@ -743,7 +744,7 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
-</head><body data-project="{proj_txt}" data-default-tab="{tab}" data-show-hidden="{sh}">
+</head><body data-project="{proj_txt}" data-default-tab="{tab}" data-show-hidden="{sh}" data-autosave="{autosave}">
 <header>
   <a class="home" href="/">◆</a><span class="proj">{proj_txt}</span>
   <span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body"></span>
@@ -1272,6 +1273,19 @@ mod tests {
         let on = Settings { show_hidden: true, ..Settings::default() };
         let h = workspace_page("proj", "proj", &on, None);
         assert!(h.contains(r#"data-show-hidden="1""#), "and a configured true reaches the page");
+    }
+
+    // The client reads this once per page load to decide whether to run its
+    // autosave timer at all. Both directions asserted: a constant "1" would
+    // otherwise pass, and would silently autosave in a project that turned
+    // it off.
+    #[test]
+    fn the_page_carries_the_autosave_setting() {
+        let on = workspace_page("proj", "proj", &Settings::default(), None);
+        assert!(on.contains(r#"data-autosave="1""#), "autosave is on by default");
+        let off = Settings { autosave: false, ..Settings::default() };
+        let h = workspace_page("proj", "proj", &off, None);
+        assert!(h.contains(r#"data-autosave="0""#), "and a configured false reaches the page");
     }
 
     #[test]

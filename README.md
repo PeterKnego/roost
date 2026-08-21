@@ -43,6 +43,15 @@ your buffer was opened, showing a diff of yours versus disk. A clean buffer
 follows external writes live; a buffer with unsaved changes is only flagged
 stale, never overwritten.
 
+**Autosave, and it knows when to stop.** A buffer is written out a second after
+you stop typing, and the moment the editor loses focus. It saves through the
+same conflict guard as ⌘S — never forcing — and takes its hands off a file
+that has diverged, rather than re-raising a banner every second; ⌘S is how you
+resolve that one. The pane header carries the state (`saved`, `saving…`, `not
+saved · changed on disk`), which is also where ⌘S is advertised when autosave
+is off. Turn it off with `autosave = false` in a global or per-project
+`.resh/config.toml` — see [`docs/deploy.md`](docs/deploy.md#autosave).
+
 **A directory picker, not a fixed list.** Browse into any directory under the
 configured roots and open it as a workspace — single click selects, double
 click descends, Enter opens, and git repos get a one-click shortcut.

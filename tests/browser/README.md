@@ -22,6 +22,7 @@ deno run -A tests/browser/altscreen.mjs  # a full-screen app's screen survives a
 deno run -A tests/browser/modes.mjs      # and so do the modes it declared once
 deno run -A tests/browser/copyselect.mjs # selecting copies, and OSC 52 copies too
 deno run -A tests/browser/save.mjs       # cmd/ctrl-s saves whether or not the editor has focus
+deno run -A tests/browser/autosave.mjs   # the editor writes itself out, and stops when the file diverges
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -70,6 +71,13 @@ performed.
 - Deleting the `refreshTree()` call app.js makes when a State flips
   `show_hidden` fails 4 assertions in `dotfiles.mjs`; pinning its glyph to a
   constant fails 3.
+- In `autosave.mjs`: deleting the input timer fails 2 assertions, the blur
+  flush 1, and reading `AUTOSAVE` as a constant instead of from `data-autosave`
+  fails 2. Deleting the conflict *pause* fails 3 — but only after those
+  assertions were rewritten to count conflict banners (0 from autosave, 1 from
+  ⌘S). The obvious assertion, that the diverged file is not overwritten, passes
+  with the pause deleted: that property comes from the server's `force: false`,
+  not from the client, and asserting it proves nothing about the pause.
 - Rebinding the save shortcut to the textarea (`ta.onkeydown`, its shape before
   the document-level handler) fails 2 assertions in `save.mjs` — both unfocused
   cases time out with the file unchanged on disk — while the focused case goes
