@@ -79,14 +79,27 @@ pub struct Project {
     pub git: bool,
 }
 
+/// Ordering key shared by both listings the picker renders, so a directory's
+/// children are not ordered by a different rule than the level above them.
+///
+/// Case-insensitive: raw `OsString` byte order puts every capitalised name
+/// ahead of every lowercase one, so `Karpie` jumped to the top of the list
+/// instead of sitting beside `karpie`.
+///
+/// Beyond ASCII this is code-point order, not alphabetical — `Ärger` sorts
+/// after `zulu`. Real collation needs a locale and a Unicode table; this is a
+/// dependency-free binary and a misfiled accented directory name is a cosmetic
+/// cost, so the limit is accepted rather than half-solved.
+fn sort_key(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
 pub fn list_projects(roots: &[PathBuf]) -> Vec<Project> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for root in roots {
         let Ok(rd) = std::fs::read_dir(root) else { continue };
-        let mut entries: Vec<_> = rd.flatten().collect();
-        entries.sort_by_key(|e| e.file_name());
-        for e in entries {
+        for e in rd.flatten() {
             let p = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
             if p.is_dir()
@@ -98,6 +111,13 @@ pub fn list_projects(roots: &[PathBuf]) -> Vec<Project> {
             }
         }
     }
+    // Sorted once over the *merged* list, not per root: the picker's top level
+    // presents one alphabetical list, and sorting each root separately made the
+    // concatenation order — an operator's `RESH_ROOTS` ordering, invisible in
+    // the UI — the dominant sort, so a second root's `alpha` landed below the
+    // first root's `zeta`. Which root a duplicate name comes from is settled
+    // above by `seen`, so ordering here cannot disturb that precedence.
+    out.sort_by(|a, b| sort_key(&a.name).cmp(&sort_key(&b.name)).then_with(|| a.name.cmp(&b.name)));
     out
 }
 
@@ -270,7 +290,10 @@ pub fn list_dir(roots: &[PathBuf], at: &str) -> Option<Vec<Entry>> {
     let dir = resolve_project(roots, at)?;
     let rd = std::fs::read_dir(&dir).ok()?;
     let mut entries: Vec<_> = rd.flatten().collect();
-    entries.sort_by_key(|e| (e.path().is_file(), e.file_name().to_ascii_lowercase()));
+    // Directories before files, then the same case-insensitive key the top
+    // level uses, so one listing does not order names by a different rule than
+    // the listing one click above it.
+    entries.sort_by_key(|e| (e.path().is_file(), sort_key(&e.file_name().to_string_lossy())));
     let mut out = Vec::new();
     for e in entries {
         let name = e.file_name().to_string_lossy().into_owned();
@@ -435,6 +458,59 @@ mod tests {
         let ps = list_projects(&[d1.path().to_path_buf(), d2.path().to_path_buf()]);
         assert_eq!(ps.iter().filter(|p| p.name == "alpha").count(), 1);
         assert!(ps.iter().find(|p| p.name == "alpha").unwrap().path.starts_with(d1.path()));
+    }
+
+    // Both assertions here are ones the pre-sort code failed, in different
+    // ways: `Zeta` sorted ahead of `beta` under raw OsString byte order, and
+    // `Alpha` — living in the second root — was appended after the whole of
+    // the first root regardless of its name. Reverting either half of
+    // list_projects' sort turns this red.
+    #[test]
+    fn top_level_is_one_alphabetical_list_across_roots_and_ignores_case() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        fs::create_dir(d1.path().join("Zeta")).unwrap();
+        fs::create_dir(d1.path().join("beta")).unwrap();
+        fs::create_dir(d2.path().join("Alpha")).unwrap();
+        let ps = list_projects(&[d1.path().to_path_buf(), d2.path().to_path_buf()]);
+        let names: Vec<_> = ps.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["Alpha", "beta", "Zeta"]);
+    }
+
+    // Ordering must not become a back door around root precedence: `alpha`
+    // exists under both roots, and the first root still owns it however the
+    // merged list is later sorted.
+    #[test]
+    fn alphabetical_order_does_not_disturb_first_root_precedence() {
+        let d1 = root_fixture();
+        let d2 = tempfile::tempdir().unwrap();
+        fs::create_dir(d2.path().join("alpha")).unwrap();
+        fs::create_dir(d2.path().join("Aardvark")).unwrap(); // sorts first, different root
+        let ps = list_projects(&[d1.path().to_path_buf(), d2.path().to_path_buf()]);
+        let names: Vec<_> = ps.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["Aardvark", "alpha", "beta"]);
+        assert!(ps.iter().find(|p| p.name == "alpha").unwrap().path.starts_with(d1.path()));
+    }
+
+    // Not a test of the top-level fix — list_dir already folded case — but of
+    // the invariant the two listings now share via `sort_key`: this is what
+    // stops the sub-level from drifting back to byte order while the top level
+    // stays folded, which is exactly the split the fix removed. Reverting
+    // list_dir's key to a raw `e.file_name()` turns this red.
+    #[test]
+    fn subdirectory_listing_folds_case_the_same_way_as_the_top_level() {
+        let d = root_fixture();
+        fs::create_dir(d.path().join("alpha/zulu")).unwrap();
+        fs::create_dir(d.path().join("alpha/Mike")).unwrap();
+        fs::create_dir(d.path().join("alpha/charlie")).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let entries = list_dir(&roots, "alpha").unwrap();
+        let dirs: Vec<_> = entries.iter().filter(|e| e.is_dir).map(|e| e.name.as_str()).collect();
+        assert_eq!(dirs, vec!["charlie", "Mike", "zulu"]);
+        // directories still precede files
+        let first_file = entries.iter().position(|e| !e.is_dir).unwrap();
+        assert!(entries[..first_file].iter().all(|e| e.is_dir));
+        assert!(entries[first_file..].iter().all(|e| !e.is_dir));
     }
 
     #[test]
