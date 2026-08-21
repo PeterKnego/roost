@@ -27,6 +27,7 @@ deno run -A tests/browser/tabwrap.mjs    # the tab strip wraps, and re-fits the 
 deno run -A tests/browser/shiftenter.mjs # shift+enter sends LF, so Claude inserts a newline
 deno run -A tests/browser/hledit.mjs     # a code file stays highlighted while you edit it
 deno run -A tests/browser/preview-follows.mjs # a previewed file follows the file on disk
+deno run -A tests/browser/buffer-lifecycle.mjs # navigating a file is not an edit; undoing one comes back clean
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -134,6 +135,18 @@ performed.
   text is still on screen — while the initial fetch (the file opening with
   its unchanged content) goes on passing, which is what says the test is
   testing the refresh and not the open.
+- Reverting `Buffer::set_text` (`workspace.rs`) to an unconditional
+  `Content::Edited(text)` — dropping the hash comparison against the base —
+  fails 2 assertions in `buffer-lifecycle.mjs`: ⌘S on an untouched file now
+  writes it (mtime changes), and undoing a typed character no longer comes
+  back clean. Section A, on arrow/End/PageDown keys, keeps passing unchanged —
+  those never reach `EditBuffer` at all, so they cannot discriminate the hash
+  rule; that is why B and C exist. The "undoing it comes back clean" check
+  is deliberately bounded well under `AUTOSAVE_MS` (0.7s, not the naive 5s):
+  `do_save` resets any successfully-saved buffer to `Content::Clean`, so a
+  long enough window lets autosave itself clean up the wrongly-dirtied buffer
+  a second later and mask the broken hash rule — the same shape of trap as
+  the conflict-pause one above, where the wrong property was being measured.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
