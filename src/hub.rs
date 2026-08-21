@@ -111,11 +111,13 @@ impl Hub {
             if b.dirty() {
                 b.stale = hash != b.base_hash;
             } else if hash != b.base_hash {
-                // TASK-5: the file moved under a clean buffer, which now
-                // holds nothing to update — the new content just is the
-                // disk, so the buffer only needs its base to agree with it.
+                // The file moved under a clean buffer, which holds nothing to
+                // update — the new content just is the disk, so the buffer
+                // only needs its base (hash and mtime) to agree with it.
                 b.content = workspace::Content::Clean;
                 b.base_hash = hash;
+                b.base_mtime =
+                    std::fs::metadata(dir.join(rel)).ok().and_then(|m| m.modified().ok());
                 b.stale = false;
             }
         }
@@ -474,12 +476,12 @@ impl Hub {
     /// with what's on disk — only `SaveBuffer`/`CloseBuffer` may do that.
     fn open_for_edit(&mut self, from: &ConnId, rel: &str) {
         let already_dirty = self.ws.buffers.get(rel).map(|b| b.dirty()).unwrap_or(false);
-        // TASK-5: the text to broadcast below. A freshly-read buffer holds
-        // nothing (Content::Clean), so it cannot be read back out of the
-        // buffer the way the old `text` field allowed — the disk read's own
-        // local `text` is threaded through directly instead. `None` here
-        // means already_dirty was true, so the fallback after the `if` picks
-        // up the buffer's own unsaved edit.
+        // The text to broadcast below. A freshly-read buffer holds nothing
+        // (Content::Clean), so it cannot be read back out of the buffer the
+        // way a stored `text` field would allow — the disk read's own local
+        // `text` is threaded through directly instead. `None` here means
+        // already_dirty was true, so the fallback after the `if` picks up
+        // the buffer's own unsaved edit.
         let mut freshly_read: Option<String> = None;
         if !already_dirty {
             if !self.ws.buffers.contains_key(rel) && self.ws.buffers.len() >= workspace::MAX_BUFFERS {
@@ -507,7 +509,8 @@ impl Hub {
             }
         }
         let text = freshly_read.unwrap_or_else(|| {
-            // TASK-5
+            // already_dirty was true: no disk read happened above, so the
+            // text to re-broadcast is whatever unsaved edit the buffer holds.
             self.ws.buffers.get(rel).and_then(|b| b.edited_text()).unwrap_or_default().to_string()
         });
         // No author: everyone applies it, including the client that just
@@ -543,10 +546,10 @@ impl Hub {
                 let ev = Event::BufferStale { rel: rel.to_string() };
                 self.broadcast(&ev);
             } else {
-                // TASK-5: a clean buffer now holds nothing, so following the
-                // file is just staying Clean — the disk text goes straight
-                // into the broadcast below via the `disk` local, not through
-                // the buffer.
+                // A clean buffer holds nothing, so following the file is
+                // just staying Clean — the disk text goes straight into the
+                // broadcast below via the `disk` local, not through the
+                // buffer.
                 b.content = workspace::Content::Clean;
                 b.base_hash = disk_hash;
                 b.stale = false;
@@ -656,16 +659,9 @@ impl Hub {
         };
         // Nothing to write is not an error the user caused: ⌘S on a file that
         // was opened and never edited is a reasonable thing to press, and the
-        // answer is that it is already saved. Landed ahead of Task 5's read
-        // sites: `buf.text` no longer exists, and the alternative —
-        // `edited_text().unwrap_or_default()` — would happily write an empty
-        // string over the file for exactly this case.
-        // Nothing to write is not an error the user caused: ⌘S on a file that
-        // was opened and never edited is a reasonable thing to press, and the
-        // answer is that it is already saved. Landed ahead of Task 5's read
-        // sites: `buf.text` no longer exists, and the alternative —
-        // `edited_text().unwrap_or_default()` — would happily write an empty
-        // string over the file for exactly this case.
+        // answer is that it is already saved. `edited_text().unwrap_or_default()`
+        // would happily write an empty string over the file for exactly this
+        // case, which is the shape this guard exists to close.
         let Some(text) = buf.edited_text().map(|t| t.to_string()) else {
             self.send_to(from, &Event::SaveOk { rel: rel.clone() });
             return;
@@ -1151,6 +1147,41 @@ mod tests {
         );
     }
 
+    /// A clean buffer holds no text, so a save that read one would write an
+    /// empty string over the file. Cmd-S on an untouched file reaches here
+    /// via pushEdit, so this is a real path and not a hypothetical one.
+    #[test]
+    fn saving_a_clean_buffer_writes_nothing() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let path = d.path().join("a.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        h.handle(
+            &c,
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::File { rel: "a.rs".into(), mode: Mode::Edit } },
+        );
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        drain(&rx);
+
+        h.handle(&c, Intent::SaveBuffer { rel: "a.rs".into(), force: false });
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fn main() {}\n");
+        // mtime too: an identical rewrite is still a write, and it would make
+        // the watcher fire and every other client re-fetch.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "an unedited save must not touch the file at all"
+        );
+        assert!(
+            drain(&rx).iter().any(|m| m.contains(r#""t":"SaveOk""#)),
+            "the client still needs to hear it was saved"
+        );
+    }
+
     /// Regression for the bug reported live: a buffer with unsaved text came
     /// back from the state file with `base_hash` recomputed from *its own
     /// text*, so the save path compared the disk against the user's edit
@@ -1191,7 +1222,7 @@ mod tests {
         h.handle(&c, Intent::CloseBuffer { rel: "a.txt".into() });
 
         let b = h.ws.buffers.get("a.txt").expect("the tab is still open in Edit, so it needs text");
-        // TASK-5: a clean buffer holds nothing of its own to compare against
+        // A clean buffer holds nothing of its own to compare against
         // "on disk\n" here; the BufferText assertion below is what actually
         // proves the reload happened, by checking what reached the browser.
         assert_eq!(b.edited_text(), None, "discarding shows the file, not the discarded edit");
@@ -1267,7 +1298,7 @@ mod tests {
         // (file_changed_externally); a restart must not be the one case where
         // it silently shows content the file no longer has.
         let clean = &h2.ws.buffers["clean.txt"];
-        // TASK-5: a clean buffer holds nothing of its own — base_hash and
+        // A clean buffer holds nothing of its own — base_hash and
         // !stale below are what prove reconcile actually caught up with the
         // new disk content on the clean path, distinct from the dirty path
         // above.
@@ -1441,7 +1472,7 @@ mod tests {
                 tab: Tab::File { rel: "a.txt".into(), mode: Mode::Edit },
             },
         );
-        // TASK-5: a freshly-opened, unedited buffer holds nothing of its own;
+        // A freshly-opened, unedited buffer holds nothing of its own;
         // base_hash and !dirty() are what prove the read actually happened.
         assert_eq!(h.ws.buffers["a.txt"].base_hash, workspace::hash_text("on disk\n"));
         assert!(!h.ws.buffers["a.txt"].dirty());
