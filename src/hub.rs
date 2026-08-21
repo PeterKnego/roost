@@ -413,7 +413,9 @@ impl Hub {
                 // got a real base_hash and every first save reported a
                 // conflict against content it never compared against.
                 match &intent {
-                    Intent::SetMode { rel, mode: Mode::Edit } => self.open_buffer_for(from, rel),
+                    Intent::SetMode { rel, mode: Mode::Edit } => {
+                        self.open_buffer_for(from, rel, Mode::Edit)
+                    }
                     // Dispatched off the COERCED tab, not off the intent:
                     // apply_layout may have forced Edit to Preview, and
                     // reading an image anyway would seed a buffer for it. That
@@ -428,27 +430,33 @@ impl Hub {
                     // preview — only what lets one later become an edit
                     // without a fresh disk read).
                     Intent::OpenTab { tab, .. } => {
-                        if let Tab::File { rel, .. } = workspace::coerce_tab(tab) {
-                            // apply_layout also returns Ok(true) for OpenTab
-                            // on a tab that was already open — find_tab hit,
-                            // so this is a bare activation, not a new tab.
-                            // Re-running open_buffer_for there would be a
-                            // fresh disk read (up to 2 MB, under the hub
-                            // lock) plus a whole-file broadcast every time a
-                            // user clicks back to a tab, for a pane whose
-                            // content Preview doesn't even read from the
-                            // buffer (it's fetched over HTTP). A clean,
-                            // non-stale buffer's base still agrees with the
-                            // file, so there is nothing to learn and nothing
-                            // new to tell anyone — every subscriber already
-                            // has this text, either from the read that first
-                            // created the buffer or from wsconn's
-                            // connect-time replay for anyone who joined
-                            // since. A dirty or stale buffer still needs the
-                            // real call: dirty because a second browser
-                            // reopening an in-progress edit needs its own
-                            // re-broadcast, stale because "the file moved
-                            // under this" is exactly a reason to look again.
+                        if let Tab::File { rel, mode } = workspace::coerce_tab(tab) {
+                            // The buffer decides, not the tab. apply_layout
+                            // returns Ok(true) both for a new tab and for a
+                            // bare activation of one already open (find_tab
+                            // hit), and this guard does not tell those apart:
+                            // whenever a clean, non-stale buffer already
+                            // exists for this rel, the read is skipped — a
+                            // genuinely new tab on a rel some other pane
+                            // already has open included. That is the intended
+                            // reading, because what the read would produce is
+                            // a function of the rel, not of the tab: the
+                            // buffer's base still agrees with the file, so
+                            // there is nothing to learn and nothing new to
+                            // tell anyone — every subscriber already has this
+                            // text, from the read that first created the
+                            // buffer or from wsconn's connect-time replay for
+                            // anyone who joined since. Without the guard,
+                            // clicking back to a tab costs a fresh disk read
+                            // (up to 2 MB, under the hub lock) plus a
+                            // whole-file broadcast, for a pane whose content
+                            // Preview doesn't even take from the buffer (it's
+                            // fetched over HTTP). A dirty or stale buffer
+                            // still needs the real call: dirty because a
+                            // second browser reopening an in-progress edit
+                            // needs its own re-broadcast, stale because "the
+                            // file moved under this" is exactly a reason to
+                            // look again.
                             let reactivating_a_settled_buffer = self
                                 .ws
                                 .buffers
@@ -456,7 +464,7 @@ impl Hub {
                                 .is_some_and(|b| !b.dirty() && !b.stale);
                             if !reactivating_a_settled_buffer && !crate::routes::refuses_text_edit(&rel)
                             {
-                                self.open_buffer_for(from, &rel)
+                                self.open_buffer_for(from, &rel, mode)
                             }
                         }
                     }
@@ -492,7 +500,7 @@ impl Hub {
                             )
                         });
                         if still_open {
-                            self.open_buffer_for(from, rel);
+                            self.open_buffer_for(from, rel, Mode::Edit);
                         }
                     }
                     _ => {}
@@ -522,7 +530,16 @@ impl Hub {
     /// Callers keep images out: hashing `read_text_file`'s lossy-UTF-8 bytes
     /// would be meaningless, and the watcher reaches them through
     /// `Workspace::open_file_rels`, which is keyed off tabs, not buffers.
-    fn open_buffer_for(&mut self, from: &ConnId, rel: &str) {
+    ///
+    /// `mode` decides only what a *failed* read is worth saying. In Edit the
+    /// read is the editor's whole content, so a refusal has to be reported or
+    /// the user gets a blank textarea with no explanation. In Preview the read
+    /// only records a base for a later edit — the pane itself is painted from
+    /// `/frag/raw` over HTTP — so a `.pdf`, a `.zip` or a 3 MB log previews
+    /// perfectly well with no buffer at all, and a banner on that everyday
+    /// tree click would be reporting a failure the user neither caused nor
+    /// can act on.
+    fn open_buffer_for(&mut self, from: &ConnId, rel: &str, mode: Mode) {
         let already_dirty = self.ws.buffers.get(rel).map(|b| b.dirty()).unwrap_or(false);
         // The text to broadcast below. A freshly-read buffer holds nothing
         // (Content::Clean), so it cannot be read back out of the buffer the
@@ -554,7 +571,9 @@ impl Hub {
                     freshly_read = Some(text);
                 }
                 Err(e) => {
-                    self.send_to(from, &Event::Error { msg: e });
+                    if mode == Mode::Edit {
+                        self.send_to(from, &Event::Error { msg: e });
+                    }
                     return;
                 }
             }
@@ -575,14 +594,51 @@ impl Hub {
     /// flagged stale, so unsaved work is never overwritten by a background
     /// writer.
     ///
-    /// Returns false when the file could not be read — almost always because
-    /// it was deleted. `classify` routes an open buffer's path to `Buffer`,
-    /// not `Tree`, so without this the caller's tree pane would keep listing
-    /// a file that no longer exists until some unrelated event happened to
-    /// arrive and trigger a refresh. Callers must treat `false` as a tree
-    /// change too.
+    /// Three outcomes, not two, because a failed `read_to_string` is not
+    /// evidence the file is gone (CLAUDE.md):
+    ///
+    /// - readable as text: the buffer follows it (or is flagged stale) and
+    ///   every tab hears `FileChanged`;
+    /// - *there* but not readable as text — a PNG, a 3 MB log, a permissions
+    ///   failure, anything `read_to_string` refuses: no buffer's content can
+    ///   be touched, but the file on screen still changed, so `FileChanged`
+    ///   goes out anyway. That event is what re-fetches a previewed image's
+    ///   fragment and with it the cache key on its `<img src>`; folding this
+    ///   case into "deleted" left the browser showing the old picture forever.
+    /// - genuinely absent (`symlink_metadata` says `NotFound`): returns
+    ///   false. `classify` routes an open buffer's path to `Buffer`, not
+    ///   `Tree`, so without this the caller's tree pane would keep listing a
+    ///   file that no longer exists until some unrelated event happened to
+    ///   arrive and trigger a refresh. Callers must treat `false` as a tree
+    ///   change too.
     pub fn file_changed_externally(&mut self, base: &std::path::Path, rel: &str) -> bool {
-        let Ok(disk) = std::fs::read_to_string(base.join(rel)) else { return false };
+        let path = base.join(rel);
+        let disk = match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            // Ask separately whether the path is there at all, and take only
+            // `NotFound` as "gone" — `symlink_metadata` so a dangling symlink
+            // answers about the link, not its missing target. Any other
+            // metadata error means we could not look, which is not the same
+            // as absence, so it lands on the "still there" side: a spurious
+            // re-mount costs a repaint, a spurious "deleted" costs the tab.
+            Err(_) => match std::fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+                _ => None,
+            },
+        };
+        let Some(disk) = disk else {
+            // Present, but nothing here can read it as text. No buffer's
+            // content is touched — there is nothing trustworthy to put in one
+            // — and `FileChanged` is what makes app.js re-fetch the fragment
+            // for every tab showing this rel; the image tab's cache key rides
+            // in that fragment (`render::image_fragment`, keyed on the file's
+            // mtime), so the re-fetch is the whole mechanism. The version bump
+            // keeps the workspace counter honest about a change having
+            // happened, exactly as the readable path below does.
+            self.ws.version += 1;
+            self.broadcast(&Event::FileChanged { rel: rel.to_string() });
+            return true;
+        };
         let disk_hash = workspace::hash_text(&disk);
         if crate::watch::is_self_write(&mut self.self_writes, rel, disk_hash) {
             return true; // our own save; broadcasting it would echo back at the author
@@ -1618,8 +1674,12 @@ mod tests {
             !msgs.iter().any(|m| m.contains(r#""t":"BufferText""#)),
             "reactivating an unchanged, already-open tab must not resend its text; got {msgs:?}"
         );
-        // The activation itself must still land, or this would pass with
-        // OpenTab's whole dispatch arm deleted.
+        // What this test discriminates is the guard, not the arm: delete
+        // `reactivating_a_settled_buffer` and the assertion above fails on a
+        // resent BufferText. Deleting the whole OpenTab arm would leave the
+        // test green — the State broadcast asserted here comes from
+        // apply_layout, not from that arm — so read this second assertion as
+        // nothing more than proof the intent was dispatched at all.
         assert!(msgs.iter().any(|m| m.contains(r#""t":"State""#)), "got {msgs:?}");
     }
 
@@ -2261,36 +2321,177 @@ mod tests {
         std::env::remove_var("RESH_STATE_DIR");
     }
 
-    /// A previewed file has no buffer, and `file_changed_externally` used to
-    /// return before its broadcast in exactly that case:
+    /// `file_changed_externally` used to return before its broadcast whenever
+    /// the rel had no buffer:
     ///
     ///     let Some(b) = self.ws.buffers.get_mut(rel) else { return true };
     ///
     /// so nothing downstream ever heard that the file on screen had changed.
-    /// Reverting that line to the early return fails this test.
+    ///
+    /// The fixture has to be a tab that really has no buffer *and* whose file
+    /// `read_to_string` can read, or the early return is never reached and
+    /// this test pins nothing. An ordinary previewed `.md` is no longer such a
+    /// case — a Preview open creates a clean buffer now — so this uses the
+    /// case that survives it: a text file past `MAX_FILE_BYTES`, which
+    /// `read_text_file` refuses (no buffer) and plain `read_to_string` reads
+    /// happily. A tailed 3 MB log in the preview pane is exactly that file.
+    /// Reverting the `if let Some(b)` back to the early return fails this
+    /// test.
     #[test]
-    fn an_external_change_to_a_previewed_file_is_broadcast() {
+    fn an_external_change_to_a_bufferless_previewed_file_is_broadcast() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
         std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
-        std::fs::write(d.path().join("read.md"), "before\n").unwrap();
+        let big = "before\n".repeat(400_000); // > 2 MB: read_text_file refuses it
+        std::fs::write(d.path().join("huge.log"), &big).unwrap();
         let mut h = Hub::new("previewproj", d.path().to_path_buf());
         let (a, rx) = h.subscribe();
         drain(&rx);
 
         h.handle(&a, Intent::OpenTab {
             pane: proto::MIDDLE,
-            tab: Tab::File { rel: "read.md".into(), mode: Mode::Preview },
+            tab: Tab::File { rel: "huge.log".into(), mode: Mode::Preview },
         });
         drain(&rx);
+        assert!(
+            !h.ws.buffers.contains_key("huge.log"),
+            "fixture is void unless the oversize file really has no buffer"
+        );
 
-        std::fs::write(d.path().join("read.md"), "after\n").unwrap();
-        assert!(h.file_changed_externally(d.path(), "read.md"));
+        std::fs::write(d.path().join("huge.log"), big.replace("before", "after")).unwrap();
+        assert!(h.file_changed_externally(d.path(), "huge.log"));
 
         let msgs = drain(&rx);
         assert!(
-            msgs.iter().any(|m| m.contains(r#""t":"FileChanged""#) && m.contains("read.md")),
+            msgs.iter().any(|m| m.contains(r#""t":"FileChanged""#) && m.contains("huge.log")),
             "a previewed file's change must reach the browser, got {msgs:?}"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// The image case, which is the one the cache-busting URL was built for:
+    /// `read_to_string` fails on a PNG *every* time, so folding that failure
+    /// into "the file was deleted" meant `FileChanged` never went out, the
+    /// client never re-fetched the fragment, and the browser went on showing
+    /// the picture that was replaced.
+    /// Reverting to `let Ok(disk) = read_to_string(..) else { return false }`
+    /// fails this test.
+    #[test]
+    fn an_external_change_to_an_unreadable_file_still_broadcasts_filechanged() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        // Real PNG magic: not valid UTF-8, so read_to_string genuinely fails
+        // here rather than the test relying on the extension.
+        std::fs::write(d.path().join("pic.png"), b"\x89PNG\r\n\x1a\nfirst").unwrap();
+        let mut h = Hub::new("imgproj", d.path().to_path_buf());
+        let (a, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(&a, Intent::OpenTab {
+            pane: proto::MIDDLE,
+            tab: Tab::File { rel: "pic.png".into(), mode: Mode::Preview },
+        });
+        drain(&rx);
+        let version_before = h.ws.version;
+
+        std::fs::write(d.path().join("pic.png"), b"\x89PNG\r\n\x1a\nsecond bytes").unwrap();
+        assert!(
+            h.file_changed_externally(d.path(), "pic.png"),
+            "a file that is still there must not be reported as deleted"
+        );
+
+        let msgs = drain(&rx);
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"FileChanged""#) && m.contains("pic.png")),
+            "a changed image must reach the browser, got {msgs:?}"
+        );
+        // The re-mount itself rides on FileChanged (the img's cache key lives
+        // in the fragment, keyed on mtime); this pins the other half — a real
+        // change still moves the workspace version, as the readable path does.
+        assert!(h.ws.version > version_before, "a real change must move the version");
+        assert!(
+            !msgs.iter().any(|m| m.contains(r#""t":"BufferText""#)),
+            "nothing readable came back, so no buffer text may be invented, got {msgs:?}"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// A genuinely deleted file is the third outcome and must still say so:
+    /// the watcher turns `false` into the tree refresh that drops the row.
+    #[test]
+    fn a_deleted_file_still_reports_false() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("gone.md"), "here\n").unwrap();
+        let mut h = Hub::new("delproj", d.path().to_path_buf());
+        std::fs::remove_file(d.path().join("gone.md")).unwrap();
+        assert!(!h.file_changed_externally(d.path(), "gone.md"));
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// Clicking a `.pdf`, a `.zip` or a 3 MB log in the tree sends
+    /// `OpenTab{mode: Preview}`, whose read `read_text_file` refuses. The
+    /// preview pane renders anyway (it fetches over HTTP), so the refusal is
+    /// not something the user did or can act on — an error banner there is
+    /// pure noise on an everyday click. Dropping the `mode == Mode::Edit`
+    /// guard in `open_buffer_for` fails this test.
+    #[test]
+    fn a_preview_open_of_an_unreadable_file_is_silent() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        // .bin is off TEXT_EXTENSIONS, so the NUL sniff really refuses it, and
+        // off NO_TEXT_EDIT_EXT, so nothing coerces the mode out from under the
+        // Edit half of this pair below.
+        std::fs::write(d.path().join("blob.bin"), b"\x00\x01binary").unwrap();
+        let mut h = Hub::new("binproj", d.path().to_path_buf());
+        let (a, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(&a, Intent::OpenTab {
+            pane: proto::MIDDLE,
+            tab: Tab::File { rel: "blob.bin".into(), mode: Mode::Preview },
+        });
+
+        let msgs = drain(&rx);
+        assert!(
+            !msgs.iter().any(|m| m.contains(r#""t":"Error""#)),
+            "previewing a binary file must not raise a banner, got {msgs:?}"
+        );
+        assert!(
+            !h.ws.buffers.contains_key("blob.bin"),
+            "a file that could not be read must leave no buffer behind"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// The other direction, and the reason the guard is on the mode rather
+    /// than on `open_buffer_for` as a whole: in Edit the same refusal means
+    /// the editor cannot work, and saying nothing would leave an empty
+    /// textarea over a file that is not empty. Making the Err arm
+    /// unconditionally silent fails this test.
+    #[test]
+    fn an_edit_open_of_an_unreadable_file_reports_the_reason() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("blob.bin"), b"\x00\x01binary").unwrap();
+        let mut h = Hub::new("binproj2", d.path().to_path_buf());
+        let (a, rx) = h.subscribe();
+        h.handle(&a, Intent::OpenTab {
+            pane: proto::MIDDLE,
+            tab: Tab::File { rel: "blob.bin".into(), mode: Mode::Preview },
+        });
+        drain(&rx);
+
+        h.handle(&a, Intent::SetMode { rel: "blob.bin".into(), mode: Mode::Edit });
+
+        let msgs = drain(&rx);
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("binary file")),
+            "switching to Edit on an unreadable file must say why, got {msgs:?}"
         );
         std::env::remove_var("RESH_STATE_DIR");
     }
