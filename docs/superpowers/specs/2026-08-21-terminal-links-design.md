@@ -170,21 +170,21 @@ That is the whole client-side contract. The handler:
    both "is this inside the project" and "is this really there".
 5. Refuses a directory. Opening one would mean a second behaviour — reveal it in
    the tree — and that is a different feature.
-6. On success, applies exactly the layout change
-   `OpenTab { pane: MIDDLE, tab: File { rel, mode: Preview } }` makes, through
-   `workspace::coerce_tab` and `open_buffer_for`, so a `.png` matched in
-   terminal output coerces to an image tab identically to one clicked in the
-   tree. Reusing that path rather than duplicating it is what keeps the two from
-   drifting.
+6. On success, builds `OpenTab { pane: MIDDLE, tab: File { rel, mode: Preview } }`
+   and hands **that** to `workspace::apply_layout`, rather than reaching into
+   the panes itself. A `.png` matched in terminal output then coerces exactly as
+   one clicked in the tree does, tab de-duplication via `find_tab` comes free,
+   and the two paths cannot drift.
 
 ### Why the check cannot be skipped, given "optimistic" marking
 
 Marking is optimistic: a path is underlined without first proving it resolves.
 Opening is not, and the asymmetry is deliberate. A wrong underline costs the
 person who pressed the modifier one click. A wrong tab costs **everyone** —
-`Intent::OpenTab` does not confine (`hub.rs`, which hands the rel straight to
-`open_buffer_for`; confinement happens later, when the fragment is fetched), and
-the layout is shared across every connected browser. Firing `OpenTab`
+`Intent::OpenTab` does not validate the rel at all. `workspace::apply_layout`
+pushes the tab straight into the shared layout, and the only thing that ever
+looks at the path is the fragment fetch afterwards, which is far too late to
+refuse. The layout is then broadcast to every connected browser. Firing `OpenTab`
 optimistically on a false positive would open a dead tab in every window in the
 project, which each of those people then has to close.
 
