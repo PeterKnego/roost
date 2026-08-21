@@ -192,6 +192,54 @@ main { flex: 1; min-height: 0; }
 .editwrap .path { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .editwrap .path .rel { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .editwrap .editor { flex: 1 1 auto; height: auto; min-height: 0; }
+/* A code file's editor is a <code-input>: the same textarea, with a
+   highlighted <pre> painted under it (static/vendor/code-input.min.css does
+   the stacking and the scroll sync). Everything here is undoing that
+   stylesheet's standalone defaults — an 8px margin, a 250px height, a white
+   background, 16px padding and `monospace` — so the editor sits in the pane
+   exactly where the plain textarea did, with the same metrics. Font and
+   padding have to match on both layers or the colours drift off the caret;
+   code-input inherits both to its pre, so setting them here is enough. */
+.editwrap code-input { flex: 1 1 auto; min-height: 0; height: auto; margin: 0;
+                       background-color: var(--bg); color: var(--fg);
+                       font: 13px/1.55 var(--mono); tab-size: 4;
+                       /* Wrapping, as the plain textarea did — long lines are
+                          not worth a horizontal scroll in a 600px pane. Set
+                          on the element and nowhere else on purpose: both
+                          layers take `white-space: inherit` from here, so
+                          this is the one place that can change it without
+                          the two wrapping differently and walking the
+                          colours off the caret. Wrapping is at spaces only:
+                          the library pins `word-wrap: normal` on both layers,
+                          so an unbroken 400-character token scrolls instead —
+                          measured, and both layers scroll together. */
+                       white-space: pre-wrap;
+                       --padding-top: 8px; --padding-bottom: 8px;
+                       --padding-left: 10px; --padding-right: 10px;
+                       --code-input_default-caret-color: var(--fg); }
+/* The textarea inside carries .editor too, so the app's own selectors still
+   find it — but .editor paints an opaque background, which over a highlighted
+   layer would hide exactly what this is for. */
+/* code-input sizes the highlighted layer to its content (`width: max-content`),
+   which is right when nothing wraps and wrong the moment something does: the
+   longest line then sets the element's width and the whole editor grows to it
+   — measured at 4739px inside a 590px pane, taking the pane's layout with it —
+   instead of wrapping at the pane's edge. */
+.editwrap code-input pre code { width: auto; max-width: 100%; }
+/* A highlight.js theme paints its own background, which would sit over this
+   app's in a slightly different shade and stop where the text stops. The
+   library's docs call this out: beat the theme on specificity and let the
+   element's own background through. */
+.editwrap code-input pre code.hljs { background: none; }
+.editwrap code-input .editor { background: none; width: auto; height: auto; outline: none; }
+/* The textarea's own glyphs are transparent — the colour comes from the layer
+   underneath — so an opaque selection would erase the text it selects.
+   Translucent, and the highlighted glyphs stay readable through it. */
+.editwrap code-input textarea::selection { background: color-mix(in oklab, var(--accent) 40%, transparent); }
+/* code-input outlines itself 2px on keyboard focus. Kept, because it is the
+   only focus feedback an editor with a transparent caret layer has, but drawn
+   in this app's accent rather than the browser's default. */
+.editwrap code-input:has(textarea:focus):not(.code-input_mouse-focused) { outline: 1px solid var(--accent); }
 .savebtn { font: inherit; font-size: 11px; line-height: 1.4; padding: 1px 8px; border-radius: 5px;
            cursor: pointer; border: 1px solid var(--border); background: none; color: var(--muted); }
 .savebtn:hover { color: var(--fg); background: var(--tab-hover); }
