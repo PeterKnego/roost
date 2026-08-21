@@ -3,8 +3,9 @@
 //! hub's channel, this thread reads intents.
 use crate::hub::{ConnId, Hub};
 use crate::proto;
+use crate::workspace::Buffer;
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tungstenite::handshake::server::{Request as WsRequest, Response as WsResponse};
 use tungstenite::protocol::{Role, WebSocketConfig};
@@ -97,21 +98,21 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         // just above — bounded by MAX_BUFFERS small local reads, not the
         // indefinite blocking (a PTY write) CLAUDE.md's lock rule is about.
         let dir = h.dir.clone();
-        let open_buffers: Vec<(String, String)> = h
+        let open_buffers: Vec<(String, Option<String>)> = h
             .ws
             .buffers
             .iter()
-            .map(|(rel, b)| {
-                let text = match b.edited_text() {
-                    Some(t) => t.to_string(),
-                    None => crate::projects::safe_resolve(&dir, rel)
-                        .and_then(|p| crate::projects::read_text_file(&p))
-                        .unwrap_or_default(),
-                };
-                (rel.clone(), text)
-            })
+            .map(|(rel, b)| (rel.clone(), replay_text(b, &dir, rel)))
             .collect();
         for (rel, text) in open_buffers {
+            // A failed read (too large, binary, or a transient I/O error —
+            // read_text_file refuses those as policy, not just on real I/O
+            // failure) must not become "the file is empty": that text would
+            // reach the browser as a real, editable buffer, and a save from
+            // it would write "" over a file that was never actually empty.
+            // Sending nothing here is recoverable — the next SetMode/OpenTab
+            // re-reads the file — where a blanked editor is not.
+            let Some(text) = text else { continue };
             let ev = proto::Event::BufferText { rel, text, origin: String::new() };
             h.send_to(&id, &ev);
         }
@@ -185,4 +186,73 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     // for a thread that is itself waiting on us.
     drop(unsub);
     let _ = writer.join();
+}
+
+/// What to replay for one open buffer on connect/reconnect, or nothing.
+///
+/// `None` on a failed read is deliberate, not an oversight: `read_text_file`
+/// refuses a file as *policy* — too large, or a NUL byte marking it binary —
+/// not only on genuine I/O failure, and a clean buffer's file can cross
+/// either threshold after the buffer was already opened. Collapsing that
+/// into `Some(String::new())` would hand the browser an empty-but-editable
+/// textarea for a file that was never actually empty; the next keystroke or
+/// an unconditional `pushEdit` save would then write "" over it, straight
+/// past `do_save`'s clean-buffer guard, because the buffer really is dirty
+/// by then. Sending nothing for this `rel` is recoverable — the next
+/// `SetMode`/`OpenTab` re-reads the file — where a blanked editor is not.
+fn replay_text(b: &Buffer, dir: &Path, rel: &str) -> Option<String> {
+    match b.edited_text() {
+        Some(t) => Some(t.to_string()),
+        None => crate::projects::safe_resolve(dir, rel)
+            .and_then(|p| crate::projects::read_text_file(&p))
+            .ok(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::Content;
+
+    #[test]
+    fn an_edited_buffer_replays_its_own_text_without_touching_disk() {
+        let b = Buffer { content: Content::Edited("unsaved\n".into()), ..Buffer::default() };
+        // A directory that does not exist as a project root: if this read
+        // disk at all, safe_resolve would fail on it and the test would
+        // still (accidentally) pass with None — the assertion on Some below
+        // is what actually catches that regression.
+        let dir = PathBuf::from("/nonexistent/does-not-exist");
+        assert_eq!(replay_text(&b, &dir, "a.rs"), Some("unsaved\n".to_string()));
+    }
+
+    #[test]
+    fn a_clean_buffer_whose_file_reads_fine_replays_the_disk_text() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "on disk\n").unwrap();
+        let b = Buffer::default(); // Content::Clean
+        assert_eq!(replay_text(&b, d.path(), "a.rs"), Some("on disk\n".to_string()));
+    }
+
+    /// The case the reviewer's Critical was about: a clean buffer whose file
+    /// `read_text_file` refuses. Constructed the way that refusal is really
+    /// reached in production — a NUL byte, which read_text_file treats as
+    /// "this is binary" — not a permissions trick, since that path is
+    /// equally real but this one is the one `file_changed_externally` can
+    /// actually leave behind (it keeps a buffer clean and updates base_hash
+    /// using plain `read_to_string`, so a later binary write is invisible to
+    /// it until this replay tries to read the file back).
+    #[test]
+    fn a_clean_buffer_whose_file_is_refused_replays_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        // Not on TEXT_EXTENSIONS's allow-list, or the NUL-byte sniff in
+        // read_text_file is skipped and this fixture would not actually
+        // exercise the refusal this test is about.
+        std::fs::write(d.path().join("a.bin"), b"a\0b").unwrap();
+        let b = Buffer::default(); // Content::Clean
+        assert_eq!(
+            replay_text(&b, d.path(), "a.bin"),
+            None,
+            "a refused read must not become an empty, editable buffer"
+        );
+    }
 }
