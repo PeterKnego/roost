@@ -131,21 +131,27 @@ performed.
   no-edit-toggle assertion; narrowing the double-contextmenu guard back to
   `closest("a.file")` fails the markdown-link right-click assertion with
   `got 2`.
-- In `termlinks.mjs`: deleting `ensureTerm`'s `registerTermLinks` call fails 4
-  assertions, deleting the `linksArmed` gate inside the provider fails 1
-  (a link is offered with the modifier up), registering the path provider
-  ahead of the URL one fails 1 (the link's text is `/example.com/a/b`, the
-  URL's tail, instead of the whole URL), and letting `PATH_RE` match zero
-  directory segments fails 1 (a bare `backlog.md` becomes a link). The two
-  "no link is offered" assertions pass with the whole feature deleted — zero
-  links is also what no providers, and an off-screen row, produce — so that
-  file carries a provider-count guard and a row-was-found guard beside each
-  of them.
-  Section F covers the other half — that arming re-marks the link under a
-  pointer that never moved. Dispatching its synthetic mousemove on `.termhost`
-  rather than on `.xterm-screen` fails 1, and so does making the detour a
-  sideways one within the same line; sections B-E stay green through both,
-  since they ask the providers directly and never touch xterm's hover path.
+- In `termlinks.mjs`: deleting `ensureTerm`'s `registerTermLinks` call fails 8
+  assertions, deleting the `linksArmed` gate inside the provider fails 3,
+  registering the path provider ahead of the URL one fails 2 (the marked text
+  is `/example.com/a/b`, the URL's tail, instead of the whole URL), and
+  letting `PATH_RE` match zero directory segments fails 1 (a bare
+  `backlog.md` becomes a link). The two "no link is offered" assertions pass
+  with the whole feature deleted — zero links is also what no providers, and
+  an off-screen row, produce — so that file carries a provider-count guard
+  and a row-was-found guard beside each of them.
+  Sections F and G cover what the provider-level assertions cannot: that
+  arming re-marks the link under a pointer that never moved, and that it does
+  so without the application noticing. Dispatching the synthetic mousemove on
+  `.termhost` rather than on `.xterm-screen` fails 3, and so does making the
+  detour a sideways one within the same line; letting those events bubble
+  fails 1, because xterm's own `bindMouse` listener sits on `.xterm` and
+  forwards any buttons-less motion to the PTY once an app is in mode 1003 —
+  four phantom reports per Ctrl chord. Sections B-E stay green through all
+  three, since they ask the providers directly and never touch xterm's hover
+  path. Section F's precedence assertion hovers a cell **both** matchers
+  claim and asserts that it does: at its first seat, inside `https:`, only
+  the URL matcher reached and it passed with the registration order reverted.
 - Removing the `refreshFile(ev.rel)` call from `FileChanged`'s handler fails 2
   assertions in `preview-follows.mjs` — the update times out and the stale
   text is still on screen — while the initial fetch (the file opening with

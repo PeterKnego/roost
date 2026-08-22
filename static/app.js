@@ -852,36 +852,49 @@ function openTermPath(entry, raw) {
 // xterm's own OscLinkProvider is registered at construction, ahead of both,
 // which is the ordering this wants for free: a link an application declared
 // beats anything resh would have guessed over the same cells.
+let warnedProvider = false;
+
 function matchProvider(term, re, activate) {
   return {
     provideLinks(y, cb) {
-      // The gate. No link exists to hover, so nothing underlines and nothing
-      // can be clicked — rather than a link that exists and refuses.
-      if (!linksArmed) return cb(undefined);
-      // y is 1-based and absolute: xterm adds buffer.ydisp to the hovered row
-      // before asking, so this indexes the scrollback too, not the viewport.
-      const line = term.buffer.active.getLine(y - 1);
-      if (!line) return cb(undefined);
-      const text = line.translateToString(true);
-      const out = [];
-      re.lastIndex = 0;
-      for (let m; (m = re.exec(text)); ) {
-        const raw = m[0];
-        out.push({
-          range: {
-            start: { x: m.index + 1, y },
-            end: { x: m.index + raw.length, y },
-          },
-          text: raw,
-          // Re-checked at click time: an underline left stale by a missed
-          // keyup — alt-tabbing away while holding the key — must not open
-          // anything.
-          activate: (ev) => {
-            if (linkModifier(ev)) activate(raw, ev);
-          },
-        });
+      // Nothing may escape here. _askForLink runs the providers in a loop
+      // straight out of the mousemove listener, so a throw from this one
+      // skips every provider after it for that event — the same shape as the
+      // panic-in-a-socket-thread rule this project holds server-side. Warned
+      // once, not per pointer move, or a broken matcher floods the console.
+      try {
+        // The gate. No link exists to hover, so nothing underlines and
+        // nothing can be clicked — rather than a link that exists and refuses.
+        if (!linksArmed) return cb(undefined);
+        // y is 1-based and absolute: xterm adds buffer.ydisp to the hovered
+        // row before asking, so this indexes the scrollback too, not the
+        // viewport.
+        const line = term.buffer.active.getLine(y - 1);
+        if (!line) return cb(undefined);
+        const text = line.translateToString(true);
+        const out = [];
+        re.lastIndex = 0;
+        for (let m; (m = re.exec(text)); ) {
+          const raw = m[0];
+          out.push({
+            range: {
+              start: { x: m.index + 1, y },
+              end: { x: m.index + raw.length, y },
+            },
+            text: raw,
+            // Re-checked at click time: an underline left stale by a missed
+            // keyup — alt-tabbing away while holding the key — must not open
+            // anything.
+            activate: (ev) => {
+              if (linkModifier(ev)) activate(raw, ev);
+            },
+          });
+        }
+        cb(out.length ? out : undefined);
+      } catch (e) {
+        if (!warnedProvider) { warnedProvider = true; console.warn("resh: link provider failed:", e); }
+        cb(undefined);
       }
-      cb(out.length ? out : undefined);
     },
   };
 }
@@ -942,8 +955,22 @@ function nudgeLinks() {
     y: lastPointer.y - r.top > rowH ? r.top + rowH / 2 : r.top + rowH * 1.5,
   };
   for (const p of [away, lastPointer]) {
+    // bubbles: false, and this is load-bearing rather than tidiness. When an
+    // application turns on mouse motion reporting (mode 1003), xterm's own
+    // bindMouse attaches a mousemove listener to `.xterm` — the PARENT of the
+    // element below — which forwards any event with no buttons held to the
+    // PTY. A synthetic MouseEvent has buttons === 0, so a bubbling nudge
+    // reports four phantom motions per Ctrl chord, two of them at the detour
+    // row, and a TUI's hover highlight jumps away and back every time the
+    // user reaches for the modifier. It also keeps the nudge away from the
+    // selection service's document-level listeners.
+    //
+    // The Linkifier still sees it: its listener is bound directly on
+    // .xterm-screen, and composedPath() still returns the full ancestor chain
+    // for a non-bubbling event, so its .xterm-hover guard keeps working. So
+    // does the window-level capture listener that maintains lastPointer.
     screen.dispatchEvent(
-      new MouseEvent("mousemove", { clientX: p.x, clientY: p.y, bubbles: true }),
+      new MouseEvent("mousemove", { clientX: p.x, clientY: p.y, bubbles: false }),
     );
   }
 }
@@ -992,7 +1019,7 @@ function ensureTerm(session) {
   term.loadAddon(fit);
   term.open(node);
   const entry = { node, term, fit, sock: null, tries: 0, timer: null, attached: false, gone: false,
-                  selTimer: null, flashTimer: null };
+                  selTimer: null, flashTimer: null, linkProviders: null };
   registerTermLinks(term, entry);
   // Copy on select. xterm's rows are `user-select: none`, so a browser
   // selection over terminal text is impossible and xterm's own selection is

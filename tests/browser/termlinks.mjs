@@ -22,45 +22,60 @@
 //! substring search finds the command line, so the assertions would be made
 //! against a row that also contains `printf`, quotes and other paths.
 //!
-//! Revert-the-fix, each one applied, run, watched fail, then restored:
+//! Revert-the-fix, each one applied, run, watched fail, then restored. Counts
+//! re-measured after sections F and G were added, so they are what this file
+//! does today, not what an earlier draft of it did:
 //!   0. Deleted the `registerTermLinks(term, entry)` call in ensureTerm —
-//!      the state of the tree before this task. Four failed:
+//!      the state of the tree before this task. Eight failed, among them:
 //!        FAIL  two link providers are registered on the terminal (got 0)
 //!        FAIL  a path is offered as a link while the modifier is held (got 0: [])
-//!        FAIL  both matchers do claim these cells, so ordering is what
-//!        resolves it ([])
-//!        FAIL  https://example.com/a/b is one whole-URL link, not a path
-//!        link over its tail (got [])
+//!        FAIL  arming alone marked the path under the resting pointer (got null)
+//!        FAIL  the link is still marked with the application holding the mouse
 //!      Both "no link offered" assertions (1 and 4) went on passing, since
 //!      no providers and a closed gate look identical from outside. That is
 //!      exactly why the registration guard and the row-on-screen guards are
 //!      here: without them this whole file would be green against a tree
 //!      with the feature deleted.
 //!   1. Deleted `if (!linksArmed) return cb(undefined);` from matchProvider.
-//!      Assertion 1 alone failed with:
+//!      Three failed — the direct one plus both of section F's disarmed
+//!      states, which is the same property seen through xterm:
 //!        FAIL  no link is offered with the modifier up (got 1: ["docs/backlog.md"])
+//!        FAIL  resting on the path marks nothing while disarmed
+//!        FAIL  and releasing unmarked it, again with no mouse movement
 //!   2. Swapped the two entries of the `providers` array in
-//!      registerTermLinks, so the path provider registers first. Assertion 3
-//!      alone failed with:
+//!      registerTermLinks, so the path provider registers first. Two failed,
+//!      one from each precedence assertion:
 //!        FAIL  https://example.com/a/b is one whole-URL link, not a path
 //!        link over its tail (got ["/example.com/a/b"])
-//!      — and the control above it printed
-//!      `[["/example.com/a/b"],["https://example.com/a/b"]]`, i.e. both
-//!      matchers still claimed the cells and only precedence had changed.
+//!        FAIL  xterm's own precedence marks the whole URL, not the path in
+//!        its tail (got "/example.com/a/b")
+//!      The first version of that second assertion did NOT fail here — it
+//!      hovered column 4, inside `https:`, which only the URL matcher
+//!      reaches, so xterm marked the URL either way. Hence URL_COL and the
+//!      both-matchers-claim-this-cell guard beside it.
 //!   3. Changed PATH_RE's `(?:[\w.@+-]+\/)+` to `(?:[\w.@+-]+\/)*`, allowing
-//!      zero directory segments. Assertion 4 alone failed with:
+//!      zero directory segments. One failed:
 //!        FAIL  a bare filename with no directory offers no link (got 1: ["backlog.md"])
 //!   4. Put nudgeLinks' synthetic mousemove back on the `.termhost` element
-//!      instead of `.xterm-screen`. Section F alone failed with:
+//!      instead of `.xterm-screen`. Three failed, all of them hover-path:
 //!        FAIL  arming alone marked the path under the resting pointer (got null)
+//!        FAIL  xterm's own precedence marks the whole URL, not the path in
+//!        its tail (got null)
+//!        FAIL  the link is still marked with the application holding the mouse
 //!   5. Put nudgeLinks' detour back to a sideways one — a different column on
-//!      the same line, off the real `cols` — instead of a different row.
-//!      Section F alone failed the same way:
-//!        FAIL  arming alone marked the path under the resting pointer (got null)
+//!      the same line, off the real `cols` — instead of a different row. The
+//!      same three failed, identically.
 //!      4 and 5 are both bugs this task shipped and then measured out; see
-//!      task-4-report.md. Sections B–E stay green through both, because they
+//!      task-4-report.md. Sections B-E stay green through both, because they
 //!      ask the providers directly and never go near the hover path — which
 //!      is exactly why F is here.
+//!   6. Made nudgeLinks' events `bubbles: true` again. Section G alone failed,
+//!      with the phantom motion reports spelled out:
+//!        FAIL  arming and disarming sent nothing to the PTY
+//!        ("\u001b[<35;4;1M\u001b[<35;4;4M\u001b[<35;4;1M\u001b[<35;4;4M";
+//!        after arming alone: "\u001b[<35;4;1M\u001b[<35;4;4M")
+//!      Four reports per chord, two at the detour row (;1) and two back at
+//!      the resting row (;4) — exactly the jump a 1003-mode TUI would show.
 //! All restored afterwards; the run passes clean again (see task-4-report.md
 //! for the exact terminal output).
 //!
@@ -128,6 +143,17 @@ try {
       ps.forEach((p, i) => p.provideLinks(y, (ls) => {
         replies[i] = ls || [];
         if (replies.filter((r) => r !== undefined).length === ps.length) done();
+      }));
+    });
+    // Does each provider claim this 1-based column on this row? Section F's
+    // precedence assertion is only meaningful over cells both of them want.
+    window.__claimsCol = (needle, col) => new Promise((res) => {
+      const y = __rowY(needle); const ps = __t().linkProviders || [];
+      if (y < 0 || !ps.length) return res([]);
+      const hits = new Array(ps.length).fill(false); let n = 0;
+      ps.forEach((p, i) => p.provideLinks(y, (ls) => {
+        hits[i] = (ls || []).some((l) => l.range.start.x <= col && col <= l.range.end.x);
+        if (++n === ps.length) res(hits);
       }));
     });
     // Is ctrlKey set on the Control keydown itself? Recorded rather than
@@ -215,13 +241,22 @@ try {
   // what the renderer draws the underline from, and xterm publishes no way to
   // ask "what link is hovered right now". The alternative — reading underline
   // styling out of the DOM — would bind this to one of two renderers.
-  const seat = await evalIn(`(() => {
+  // col is 0-based and matters: section D's overlap only exists over part of
+  // the URL row, so a seat picked by eyeballing pixels can land outside it and
+  // quietly stop testing precedence at all. Derived from the screen element's
+  // real width over the terminal's real cols, never a guessed glyph width.
+  const seatOf = (needle, col) => evalIn(`(() => {
     const rows = [...document.querySelectorAll(".xterm-rows div")];
-    const n = rows.filter((x) => x.textContent.trim() === ${JSON.stringify(PATH)}).pop();
-    if (!n) return null; const b = n.getBoundingClientRect();
-    return { x: Math.round(b.left + 30), y: Math.round(b.top + b.height / 2) }; })()`);
-  ok(!!seat, `the path row is rendered and hoverable (${JSON.stringify(seat)})`);
+    const n = rows.filter((x) => x.textContent.trim() === ${JSON.stringify(needle)}).pop();
+    if (!n) return null;
+    const b = n.getBoundingClientRect();
+    const scr = __t().node.querySelector(".xterm-screen").getBoundingClientRect();
+    const cell = scr.width / __t().term.cols;
+    return { x: Math.round(scr.left + (${col} + 0.5) * cell), y: Math.round(b.top + b.height / 2), col: ${col} };
+  })()`);
   const hovered = `(() => { const l = __t().term._core.linkifier.currentLink; return l ? l.link.text : null; })()`;
+  const seat = await seatOf(PATH, 4);
+  ok(!!seat, `the path row is rendered and hoverable (${JSON.stringify(seat)})`);
   if (seat) {
     await cmd("Input.dispatchMouseEvent", { type: "mouseMoved", x: seat.x, y: seat.y, buttons: 0 });
     await sleep(300);
@@ -236,6 +271,70 @@ try {
     await sleep(400);
     ok(await evalIn(hovered) === null, "and releasing unmarked it, again with no mouse movement");
   }
+
+  // Section D applies the precedence rule itself, on the providers' raw
+  // answers. This asks xterm to apply its own — _removeIntersectingLinks,
+  // whose algorithm is not the one __resolve reimplements — over the same
+  // cells, so the ordering claim rests on the real thing and not only on a
+  // model of it.
+  //
+  // Column 12 (0-based) is inside `example.com`, which BOTH matchers claim —
+  // the URL over cells 1..23, the path over 8..23. That is not a detail: at
+  // the seat this section first used (column 4, in `https:`) only the URL
+  // matcher reaches, so xterm marks the URL whichever order the providers
+  // were registered in and the assertion proves nothing. Measured, not
+  // reasoned: with the registration order reverted it passed anyway. The
+  // guard below is what stops that returning.
+  const URL_COL = 12;
+  const urlSeat = await seatOf(URL_, URL_COL);
+  ok(!!urlSeat, `the URL row is rendered and hoverable (${JSON.stringify(urlSeat)})`);
+  if (urlSeat) {
+    await cmd("Input.dispatchMouseEvent", { type: "mouseMoved", x: urlSeat.x, y: urlSeat.y, buttons: 0 });
+    await sleep(200);
+    await key("rawKeyDown", 2);
+    await sleep(400);
+    const claims = await evalIn(`__claimsCol(${JSON.stringify(URL_)}, ${URL_COL + 1})`);
+    ok(claims.length === 2 && claims.every(Boolean),
+       `the hovered cell is claimed by both matchers, so precedence is what decides it (${JSON.stringify(claims)})`);
+    const gotUrl = await evalIn(hovered);
+    ok(gotUrl === URL_,
+       `xterm's own precedence marks the whole URL, not the path in its tail (got ${JSON.stringify(gotUrl)})`);
+    await key("keyUp", 0);
+    await sleep(300);
+  }
+
+  console.log("\nG. and arming must stay invisible to the application");
+  // The nudge is a synthetic mousemove, and a synthetic MouseEvent has
+  // buttons === 0 — exactly what xterm's own bindMouse forwards to the PTY
+  // once an app turns on motion reporting (mode 1003). Bubbling, it reached
+  // that listener on `.xterm` and reported four phantom motions per chord,
+  // two of them at the detour row, so a TUI's hover highlight jumped away and
+  // came back every time the user reached for the modifier.
+  //
+  // Asserted on the PTY bytes themselves via term.onData, which is what
+  // xterm hands the socket — the same probe copyselect.mjs uses for OSC 52.
+  await evalIn(`__t().__sent = ""; if (!__t().__hooked) { __t().__hooked = 1;
+    __t().term.onData((d) => { __t().__sent += d; }); }`);
+  await evalIn(`__t().term.input("printf '\\\\033[?1000h\\\\033[?1002h\\\\033[?1003h\\\\033[?1006h'; sleep 300\\r")`);
+  await sleep(2000);
+  ok(await evalIn("__t().term.modes.mouseTrackingMode") === "any",
+     "mouse motion reporting is on, as a full-screen TUI leaves it");
+  const reseat = await seatOf(PATH, 4) || seat;
+  await cmd("Input.dispatchMouseEvent", { type: "mouseMoved", x: reseat.x, y: reseat.y, buttons: 0 });
+  await sleep(300);
+  // Cleared AFTER parking the pointer: that real move legitimately reports,
+  // and it is the synthetic ones that must not.
+  await evalIn(`__t().__sent = ""`);
+  await key("rawKeyDown", 2);
+  await sleep(400);
+  const armSent = await evalIn(`__t().__sent`);
+  ok(await evalIn(hovered) === PATH,
+     "the link is still marked with the application holding the mouse");
+  await key("keyUp", 0);
+  await sleep(400);
+  const bothSent = await evalIn(`__t().__sent`);
+  ok(bothSent === "",
+     `arming and disarming sent nothing to the PTY (${JSON.stringify(bothSent.slice(0, 60))}; after arming alone: ${JSON.stringify(armSent.slice(0, 60))})`);
 
 } finally {
   page?.close();
