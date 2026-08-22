@@ -9,6 +9,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub type ConnId = String;
 
+/// The two sides of one open proposal. Kept whole rather than as a rendered
+/// diff: the client owns the rendering, and the accepting path has to be able
+/// to send back text the user edited, which a rendered diff cannot supply.
+pub struct ProposalSides {
+    pub rel: String,
+    pub old_text: String,
+    pub new_text: String,
+}
+
 pub struct Hub {
     pub project: String,
     pub dir: std::path::PathBuf,
@@ -43,6 +52,21 @@ pub struct Hub {
     /// `CloseProject` into the first attempt rather than spawning a second,
     /// redundant thread whose `ended: 0` would overwrite the true count.
     closing: bool,
+    /// Both sides of every proposal whose tab is currently open, keyed by the
+    /// same id as the tab.
+    ///
+    /// This is what a browser that connects *after* a proposal opened is
+    /// shown. Without it, `Event::Proposal` goes out exactly once, to whoever
+    /// happened to be connected, and a second browser renders a
+    /// `Tab::Proposal` it has no content for — and can still click Accept,
+    /// which is agreeing to a change nobody was shown. This project's whole
+    /// conflict-guard stance is that a human sees what they are agreeing to.
+    ///
+    /// Deliberately on the `Hub` and not in `Workspace`: it is not layout, and
+    /// it must never reach the state file — a proposal does not survive a
+    /// restart (see `workspace::drop_dead_tabs`). Bounded by `ide::MAX_PENDING`
+    /// per project, since an entry exists only while a pending request does.
+    pub proposals: HashMap<String, ProposalSides>,
     /// Set by the notice intents, drained by the socket layer after the hub
     /// lock is released. `broadcast_all` locks every hub, including this one,
     /// and `Mutex` is not reentrant — so the broadcast cannot happen inside
@@ -69,6 +93,7 @@ impl Hub {
             self_ref: std::sync::Weak::new(),
             closing: false,
             notices_dirty: false,
+            proposals: HashMap::new(),
         };
         // A freshly loaded hub must report reality, not whatever the
         // persisted layout happened to say last time: sessions may have
@@ -530,6 +555,9 @@ impl Hub {
                             {
                                 eprintln!("resh: closing proposal {id}: {e}");
                             }
+                            // `apply_layout` removed the tab, not the content
+                            // behind it.
+                            self.proposals.remove(id);
                         }
                     }
                     // Discarding means "show me what is on disk", not "show me
@@ -1257,6 +1285,14 @@ impl Hub {
         };
         p.tabs.push(Tab::Proposal { id: id.to_string() });
         p.active = p.tabs.len() - 1;
+        self.proposals.insert(
+            id.to_string(),
+            ProposalSides {
+                rel: rel.to_string(),
+                old_text: old_text.to_string(),
+                new_text: new_text.to_string(),
+            },
+        );
         self.ws.version += 1;
         // Content before the tab that renders it: a client that learned about
         // the tab first would have a frame with nothing to draw in it.
@@ -1269,6 +1305,27 @@ impl Hub {
         self.broadcast(&ev);
         let snap = self.snapshot_event(&String::new());
         self.broadcast(&snap);
+    }
+
+    /// Every open proposal, as the events that draw it. Sent to a connection
+    /// as it subscribes, for the same reason `BufferText` is: `State` carries
+    /// tabs but no content, so without this a reconnecting browser renders an
+    /// unanswerable blank.
+    ///
+    /// Note the order is the inverse of the live path's, which sends the
+    /// content *before* the tab: on connect the snapshot has to go first, or
+    /// the client latches a foreign connection's origin (see `wsconn`). The
+    /// two arrive back-to-back inside one lock acquisition either way.
+    pub fn proposal_replay(&self) -> Vec<Event> {
+        self.proposals
+            .iter()
+            .map(|(id, p)| Event::Proposal {
+                id: id.clone(),
+                rel: p.rel.clone(),
+                old_text: p.old_text.clone(),
+                new_text: p.new_text.clone(),
+            })
+            .collect()
     }
 
     /// Drops one proposal's tab from every pane. A proposal is a single
@@ -1292,6 +1349,10 @@ impl Hub {
                 removed = true;
             }
         }
+        // Removed whether or not a tab was found: the content has no reason
+        // to outlive the question, and a leaked entry would be replayed to
+        // every later connection as a proposal with no tab.
+        self.proposals.remove(id);
         if !removed {
             return;
         }
@@ -3144,7 +3205,7 @@ mod tests {
             .filter(|t| matches!(t, Tab::File { rel, .. } if rel == "src/a.rs"))
             .count();
         assert_eq!(hits, 1, "opening the same path twice stacked tabs: {:?}", pane.tabs);
-         assert!(
+        assert!(
             matches!(pane.tabs.get(pane.active), Some(Tab::File { rel, .. }) if rel == "src/a.rs"),
             "the second open did not activate the existing tab: {pane:?}"
         );

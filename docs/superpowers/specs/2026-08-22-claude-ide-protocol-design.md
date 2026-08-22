@@ -238,11 +238,30 @@ relearn:
 1. **Resolve the pid's cwd on `ide_connected`**, and treat that as the
    connection's working directory for the life of the socket. Re-resolve rather
    than cache if a path arrives that does not confine under it.
-2. **Confine against that directory, not the project root.** `openDiff` sends
-   absolute paths; they go through `safe_resolve` against the resolved cwd, and
-   a path that escapes it is refused. A worktree under the project root confines
-   naturally; a worktree in a sibling directory does not, and that is a refusal,
-   not a silent widening of the root.
+2. **Confine against the project root, and never widen it to the cwd.**
+   *(Amended after Task 7, which found the original wording unimplementable —
+   see `task-7-report.md`.)* `openDiff` sends absolute paths, and they are
+   confined against the project workspace. Confining against the resolved cwd
+   instead cannot work in either direction: the rel a confinement produces is
+   what the hub opens a tab for, and the hub's paths are relative to the
+   project root, so `safe_resolve(cwd, rel)` double-joins the prefix and
+   refuses *every* `openDiff` from a Claude started in a subdirectory
+   (`base=<ws>/src` with `rel="src/a.rs"` canonicalises `<ws>/src/src/a.rs`
+   → `ENOENT`); and a cwd *outside* the project would confine paths resh
+   cannot render into a tab at all. The original bullet's stated intent still
+   holds exactly as written — a worktree under the project root confines
+   naturally, a worktree in a sibling directory does not, and that is a
+   refusal rather than a silent widening of the root. Confining against the
+   root is what delivers it.
+
+   One thing the cwd cannot be traded for: `abs_to_rel` canonicalises its
+   target, so it cannot confine a file that does not exist yet — and an
+   `openDiff` for a missing file is Claude *creating* one. The parent is
+   confined instead (`safe_resolve_parent`, which exists for this split), and
+   the final component validated separately.
+
+   The cwd resolution in rule 1 stays: it is how a connection is matched to
+   its project, and it is still right.
 3. **`readlink` failing is a third outcome.** `ESRCH` means the process is gone;
    `EACCES` or a missing `/proc` means resh cannot tell. Only the first justifies
    dropping the connection. "I could not read `/proc/<pid>/cwd`" must not be read

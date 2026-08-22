@@ -280,13 +280,50 @@ struct ConnGuard {
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        let mut map = conns().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(v) = map.get_mut(&self.project) {
-            v.retain(|(id, _)| *id != self.id);
-            if v.is_empty() {
-                map.remove(&self.project);
+        {
+            let mut map = conns().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(v) = map.get_mut(&self.project) {
+                v.retain(|(id, _)| *id != self.id);
+                if v.is_empty() {
+                    map.remove(&self.project);
+                }
             }
         }
+        // Scoped so the `CONNS` lock is released before the pending one is
+        // taken, and the hub lock after that: conns -> pending -> hub, one
+        // way only, which is the order `open_diff` and `do_answer_proposal`
+        // already establish between the last two.
+        reclaim_pending_for(&self.project, self.id);
+    }
+}
+
+/// Drops every proposal parked by a connection that has gone away.
+///
+/// Without this the click path still self-heals — `answer` finds a dead
+/// channel and says so, and the hub closes the tab — but only if a human
+/// ever clicks. A tab that is simply ignored holds its `PENDING` row for the
+/// life of the process, so a few CLI restarts silently exhaust the project's
+/// `MAX_PENDING` slots and every later `openDiff` is refused with no visible
+/// cause. That is the worst kind of failure this codebase collects.
+///
+/// The requests themselves are dropped unanswered rather than replied to:
+/// the socket they came in on is gone, so there is nothing to answer to.
+fn reclaim_pending_for(project: &str, conn_id: u64) {
+    let orphaned: Vec<String> = {
+        let mut map = pending().lock().unwrap_or_else(|e| e.into_inner());
+        let ids: Vec<String> = map
+            .iter()
+            .filter(|(_, p)| p.project == project && p.conn_id == conn_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &ids {
+            map.remove(k);
+        }
+        ids
+    };
+    // Outside the lock: this takes a hub lock and mirrors to every browser.
+    for k in &orphaned {
+        crate::hub::close_proposal(project, k);
     }
 }
 
@@ -321,6 +358,9 @@ pub fn mention(project: &str, abs: &Path, lines: Option<(u32, u32)>) -> Result<(
 }
 
 pub struct Conn {
+    /// This connection's id in `CONNS`. Carried so a proposal parked from
+    /// here can be reclaimed when this connection dies — see `ConnGuard`.
+    pub id: u64,
     /// Claude's working directory, learned from `ide_connected`'s pid. `None`
     /// until it connects, or when resh could not read it — those are different
     /// situations with the same representation here only because both mean
@@ -339,16 +379,26 @@ pub struct Conn {
 }
 
 impl Conn {
-    pub fn new(project: &str, workspace: PathBuf, reply: std::sync::mpsc::Sender<String>) -> Self {
-        Conn { cwd: None, workspace, project: project.to_string(), reply, closed: false }
+    pub fn new(
+        project: &str,
+        workspace: PathBuf,
+        reply: std::sync::mpsc::Sender<String>,
+        id: u64,
+    ) -> Self {
+        Conn { id, cwd: None, workspace, project: project.to_string(), reply, closed: false }
     }
 }
 
 /// Enough for any real review session, and in the spirit of the existing
-/// ≤16-session and ≤50-buffer caps. Over it, refuse rather than queue: a
-/// queued proposal holds a whole file in resh's memory for as long as the
-/// human takes to look at it, and `DIFF_REJECTED` is a refusal Claude is
-/// already required to handle.
+/// ≤16-session and ≤50-buffer caps.
+///
+/// It is a memory bound as well as a sanity one: a parked proposal keeps both
+/// sides of its diff alive in the hub (`Hub::proposals`, which is what lets a
+/// browser connecting later see what it is being asked to approve), and the
+/// hub's map only ever holds an entry per live pending row. Two file bodies
+/// per proposal, sixteen proposals per project. Over the cap, refuse rather
+/// than queue: `DIFF_REJECTED` is a refusal Claude is already required to
+/// handle.
 pub(crate) const MAX_PENDING: usize = 16;
 
 /// What a human said about one proposal. The three arms are not three
@@ -373,6 +423,11 @@ struct Pending {
     /// Answers are scoped to the project that parked them: an id is a map key
     /// within one process, and nothing else must be able to name it.
     project: String,
+    /// The `CONNS` id of the connection that asked. A parked request outlives
+    /// nothing: when that connection dies the question is unanswerable, and
+    /// leaving the row behind would silently consume one of this project's
+    /// `MAX_PENDING` slots forever (see `ConnGuard::drop`).
+    conn_id: u64,
     /// The id from Claude's request, echoed back verbatim. Kept as a `Value`
     /// because JSON-RPC allows a string or a number and the reply must be the
     /// same shape it arrived as.
@@ -453,6 +508,10 @@ pub(crate) fn park_for_test(
         id.clone(),
         Pending {
             project: project.to_string(),
+            // No real connection behind it, and 0 is never handed out by
+            // `NEXT_CONN_ID` (which starts at 1), so this can never be
+            // reclaimed by a live connection's guard.
+            conn_id: 0,
             rpc_id: serde_json::json!(1),
             tab_name: tab.to_string(),
             reply,
@@ -579,6 +638,7 @@ fn open_diff(
             pid.clone(),
             Pending {
                 project: conn.project.clone(),
+                conn_id: conn.id,
                 rpc_id: id.clone(),
                 tab_name,
                 reply: conn.reply.clone(),
@@ -823,7 +883,7 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
         eprintln!("resh: could not set a read timeout on an ide connection; mentions to it may be delayed");
     }
 
-    let mut conn = Conn::new(project, workspace.to_path_buf(), reply_tx.clone());
+    let mut conn = Conn::new(project, workspace.to_path_buf(), reply_tx.clone(), conn_id);
     // Only conn's and the registry's own clones should keep the channel
     // open from here — this one has done its job.
     drop(reply_tx);
@@ -1036,7 +1096,7 @@ mod tests {
     // failed / left: String("BROKEN") / right: "resh"` — then restored.
     fn initialize_answers_with_resh_as_the_server_name() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx, 1);
         let out = dispatch(&rpc(1, "initialize", serde_json::json!({})), &mut c).unwrap();
         assert_eq!(out["id"], 1);
         assert_eq!(out["result"]["serverInfo"]["name"], "resh");
@@ -1049,7 +1109,7 @@ mod tests {
         // model, and it is arbitrary code execution reachable from this
         // socket. Adding it to the list is the defect this asserts against.
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx, 1);
         let out = dispatch(&rpc(2, "tools/list", serde_json::json!({})), &mut c).unwrap();
         let names: Vec<String> = out["result"]["tools"]
             .as_array()
@@ -1070,7 +1130,7 @@ mod tests {
     // vacuously. Then restored.
     fn calling_execute_code_is_a_method_error_not_an_empty_success() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx, 1);
         let out = dispatch(
             &rpc(3, "tools/call", serde_json::json!({"name": "executeCode", "arguments": {"code": "1"}})),
             &mut c,
@@ -1090,7 +1150,7 @@ mod tests {
     // `left: String("[{\"bogus\":true}]") / right: "[]"` — then restored.
     fn diagnostics_answers_empty_rather_than_failing() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx, 1);
         let out = dispatch(
             &rpc(4, "tools/call", serde_json::json!({"name": "getDiagnostics", "arguments": {}})),
             &mut c,
@@ -1112,7 +1172,7 @@ mod tests {
     fn ide_connected_resolves_the_senders_directory_and_is_not_answered() {
         // A notification has no id, so a reply would be a protocol error.
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut c = Conn::new("t", std::env::current_dir().unwrap(), tx);
+        let mut c = Conn::new("t", std::env::current_dir().unwrap(), tx, 1);
         let note = serde_json::json!({
             "jsonrpc": "2.0", "method": "ide_connected",
             "params": {"pid": std::process::id()}
@@ -1133,7 +1193,7 @@ mod tests {
         // Cwd::Unknown must not disconnect. Folding it into "gone" would kill
         // a live Claude because a check failed.
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx, 1);
         let note = serde_json::json!({
             "jsonrpc": "2.0", "method": "ide_connected", "params": {"pid": u32::MAX}
         });
@@ -1148,7 +1208,7 @@ mod tests {
     // `left: Null / right: 9` on `out["id"]` — then restored.
     fn an_unknown_method_is_a_method_error_carrying_the_request_id() {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx, 1);
         let out = dispatch(&rpc(9, "nonsense/method", serde_json::json!({})), &mut c).unwrap();
         assert_eq!(out["id"], 9);
         assert_eq!(out["error"]["code"], -32601);
@@ -1260,12 +1320,20 @@ mod tests {
     // every fake client it connects) gets a project name unique to it — the
     // same discipline Task 5's tests already established.
 
+    /// What a test asks its fake client's socket thread to do. `Close` exists
+    /// because "Claude went away" is a case with its own cleanup path, and the
+    /// only honest way to reach it is to actually drop the socket.
+    enum ClientCmd {
+        Text(String),
+        Close,
+    }
+
     /// Test-only: the send half of each fake client's socket, so a test can
     /// speak as Claude without owning the socket itself.
-    static SENDERS: OnceLock<Mutex<HashMap<String, std::sync::mpsc::Sender<String>>>> =
+    static SENDERS: OnceLock<Mutex<HashMap<String, std::sync::mpsc::Sender<ClientCmd>>>> =
         OnceLock::new();
 
-    fn senders() -> &'static Mutex<HashMap<String, std::sync::mpsc::Sender<String>>> {
+    fn senders() -> &'static Mutex<HashMap<String, std::sync::mpsc::Sender<ClientCmd>>> {
         SENDERS.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
@@ -1321,11 +1389,18 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         // The test drives sends through this channel too, so one thread owns
         // the socket and the test never races itself.
-        let (send_tx, send_rx) = std::sync::mpsc::channel::<String>();
+        let (send_tx, send_rx) = std::sync::mpsc::channel::<ClientCmd>();
         std::thread::spawn(move || loop {
             while let Ok(out) = send_rx.try_recv() {
-                if sock.send(tungstenite::Message::Text(out)).is_err() {
-                    return;
+                match out {
+                    ClientCmd::Text(t) => {
+                        if sock.send(tungstenite::Message::Text(t)).is_err() {
+                            return;
+                        }
+                    }
+                    // Returning drops `sock`, which closes the TCP connection
+                    // — the same thing a `claude` that exited does.
+                    ClientCmd::Close => return,
                 }
             }
             match sock.read() {
@@ -1359,7 +1434,18 @@ mod tests {
             let map = senders().lock().unwrap_or_else(|e| e.into_inner());
             map.get(project).cloned().expect("connect a fake client for this project first")
         };
-        tx.send(v.to_string()).expect("the fake client's socket thread must still be alive");
+        tx.send(ClientCmd::Text(v.to_string()))
+            .expect("the fake client's socket thread must still be alive");
+    }
+
+    /// Hangs up a fake client's socket, the way a `claude` process exiting
+    /// does. The server notices on its own read loop and drops its `ConnGuard`.
+    fn disconnect_fake_client(project: &str) {
+        let tx = {
+            let map = senders().lock().unwrap_or_else(|e| e.into_inner());
+            map.get(project).cloned().expect("connect a fake client for this project first")
+        };
+        let _ = tx.send(ClientCmd::Close);
     }
 
     /// Distinct ids per request, so a test that sends several can tell the
@@ -1656,6 +1742,65 @@ mod tests {
         );
     }
 
+    /// A proposal nobody answers must not outlive the socket that asked for
+    /// it. The click path already self-heals (`answer` finds a dead channel),
+    /// but only if a human clicks: an ignored tab would hold its slot for the
+    /// life of the process, and a few CLI restarts would then leave every
+    /// `openDiff` refused with nothing visible to explain it.
+    ///
+    /// Goes through a real hub, not just the pending map, because the tab is
+    /// half of what leaks — and through a real socket close, because the id
+    /// carried in `Pending` has to be the one the guard was built with. A test
+    /// that parked its own row with a hand-picked id would pass even if
+    /// `open_diff` recorded the wrong connection entirely.
+    ///
+    /// Revert-checked: removing the `reclaim_pending_for` call from
+    /// `ConnGuard::drop` failed this test — `panicked ... "a dead
+    /// connection's proposal still holds its slot"` after the full 5s
+    /// deadline. Separately, keeping the call but dropping its
+    /// `hub::close_proposal` loop failed the last assertion — `panicked ...
+    /// "the tab outlived the connection that asked"`. Then restored.
+    #[test]
+    fn a_dead_connection_reclaims_its_pending_proposals_and_their_tabs() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let proj = "diff-orphan";
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let lockdir = tempfile::tempdir().unwrap();
+        idelock::set_ide_dir_for_test(lockdir.path().to_path_buf());
+        // The hub first: it is what creates this project's ide listener, so
+        // the fake client below joins that one rather than a second.
+        let hub = crate::hub::Hub::for_project(proj, d.path().to_path_buf());
+        let (_rx, _ide, _l, _w) = connected_fake_client_for(proj);
+        let f = d.path().join("a.rs");
+        std::fs::write(&f, "on disk").unwrap();
+
+        let id = open_diff_from_claude(proj, f.to_str().unwrap(), "proposed", "p1");
+        assert!(
+            crate::hub::Hub::lock(&hub).proposals.contains_key(&id),
+            "the proposal must be open before this test can say anything about it going away"
+        );
+
+        disconnect_fake_client(proj);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pending_id_for_tab(proj, "p1").is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a dead connection's proposal still holds its slot"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let h = crate::hub::Hub::lock(&hub);
+        assert!(
+            !h.ws.panes.iter().any(|p| p.tabs.iter().any(|t| matches!(t, crate::proto::Tab::Proposal { .. }))),
+            "the tab outlived the connection that asked"
+        );
+        assert!(h.proposals.is_empty(), "and so did the content behind it");
+        drop(h);
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
     // --- confinement, which `openDiff` cannot express over the wire ---
     //
     // Every one of these creates a real file at the target, so a failure is
@@ -1720,7 +1865,16 @@ mod tests {
             outside.path().file_name().unwrap().to_str().unwrap()
         );
         assert!(std::fs::read_to_string(&sneaky).is_ok(), "the escape target must be reachable");
-        assert!(confined_target(ws.path(), &sneaky).is_err(), "traversal must not escape");
+        // The message, not just `is_err()`: this path exists on disk and is
+        // readable, so an `Err` here could still be a bug elsewhere in
+        // `confined_target` rather than the confinement doing its job.
+        //
+        // Revert-checked: changing `abs_to_rel`'s outside-the-project message
+        // to a bare "refused" failed this assertion — `the refusal must say
+        // why: refused` — while `is_err()` alone would have stayed green.
+        // Then restored.
+        let e = confined_target(ws.path(), &sneaky).expect_err("traversal must not escape");
+        assert!(e.contains("outside"), "the refusal must say why: {e}");
     }
 
     #[test]
@@ -1729,9 +1883,23 @@ mod tests {
         // not understand, and guessing at a base for it is how a confinement
         // check gets skipped.
         let ws = tempfile::tempdir().unwrap();
+        // The file exists and the rel is the one that *would* work, so the
+        // refusal below can only be about the path not being absolute.
+        //
+        // Revert-checked: deleting the `is_absolute` guard failed this
+        // assertion — `the refusal must say why, and must not be an
+        // incidental ENOENT: no such file` — which is the exact trap
+        // CLAUDE.md names: the bare `is_err()` this replaced was passing on
+        // an ENOENT that never reached a confinement check. Then restored.
         std::fs::write(ws.path().join("a.rs"), "hi").unwrap();
-        assert!(confined_target(ws.path(), "a.rs").is_err());
-        assert!(confined_target(ws.path(), "").is_err());
+        for bad in ["a.rs", "./a.rs", ""] {
+            let e = confined_target(ws.path(), bad)
+                .expect_err("a relative path must be refused, not joined onto the project");
+            assert!(
+                e.contains("not an absolute path"),
+                "the refusal must say why, and must not be an incidental ENOENT: {e}"
+            );
+        }
     }
 
     /// Revert-checked: adding `"id": 1` to `mention`'s constructed message

@@ -82,6 +82,14 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         // inside the same lock acquisition as the snapshot, for the reason
         // the existing comment above gives — releasing in between lets a
         // foreign broadcast land first.
+        // Before Notices and inside the same lock acquisition, for the
+        // reason the comment above gives. `State` names the proposal tabs but
+        // carries neither side of the diff, so a browser that connected after
+        // a proposal opened would otherwise draw an empty tab it could still
+        // click Accept on — approving a change it never showed anyone.
+        for ev in h.proposal_replay() {
+            h.send_to(&id, &ev);
+        }
         let ev = proto::Event::Notices { list: crate::notify::list() };
         h.send_to(&id, &ev);
         // State is metadata-only — it never carries buffer text — so a

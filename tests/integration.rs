@@ -1005,6 +1005,52 @@ fn two_terminal_clients_mirror_one_session() {
     std::env::remove_var("RESH_STATE_DIR");
 }
 
+/// A browser that connects *after* a proposal opened must be shown what it is
+/// being asked to approve. `Event::Proposal` goes out once, live; `State`
+/// names the tab but carries neither side of the diff. Without the connect-time
+/// replay, the second browser draws an empty proposal tab it can still click
+/// Accept on — agreeing to a change nobody showed it.
+///
+/// The assertion is on the *text*, not on the tab: a test that only checked
+/// for `"k":"Proposal"` in the snapshot cannot tell a rendered proposal from
+/// a blank one, which is the whole defect.
+///
+/// Revert-checked twice. Removing the `proposal_replay` loop from `wsconn`'s
+/// connect path failed this test — `never saw "\"t\":\"Proposal\"" within
+/// the deadline`, after genuinely waiting out `read_until`'s full 15s rather
+/// than passing vacuously. Separately, keeping the loop but making
+/// `open_proposal_tab` store nothing failed the same way. The hub-level unit
+/// test for `proposal_replay` kept passing through both, which is exactly why
+/// this one exists. Then restored.
+#[test]
+fn a_browser_that_connects_after_a_proposal_is_shown_both_sides_of_it() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    let (_d, port) = fixture();
+    // The first connection is what builds the hub this proposal is opened on.
+    let mut a = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    let _ = read_until(&mut a, r#""t":"State""#);
+
+    resh::hub::open_proposal("proj", "late-1", "hello.md", "what is there", "what claude wants");
+
+    let mut b = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    let seen = read_until(&mut b, r#""t":"Proposal""#);
+    assert!(
+        seen.contains("what is there") && seen.contains("what claude wants"),
+        "the late browser was shown a proposal tab with no content: {seen}"
+    );
+    assert!(seen.contains(r#""rel":"hello.md""#), "and it must name the file: {seen}");
+
+    // The hub registry is process-global and keyed by project name, so this
+    // proposal would otherwise sit in "proj"'s layout for every later test in
+    // this binary.
+    resh::hub::close_proposal("proj", "late-1");
+    let _ = a.close(None);
+    let _ = b.close(None);
+    std::env::remove_var("RESH_STATE_DIR");
+}
+
 #[test]
 fn invalid_session_name_is_refused() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
