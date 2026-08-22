@@ -1051,6 +1051,62 @@ fn a_browser_that_connects_after_a_proposal_is_shown_both_sides_of_it() {
     std::env::remove_var("RESH_STATE_DIR");
 }
 
+/// The connect path must emit content before the tab that renders it, the
+/// same order the live path already used (`Hub::open_proposal_tab` broadcasts
+/// `Event::Proposal` before the `State` that follows it). Before this task,
+/// `wsconn::handle` sent the connect-time snapshot (`State`, which names
+/// every open `Tab::Proposal`) *before* replaying `proposal_replay`'s
+/// `Event::Proposal`s — so a client had to handle both orders, and a
+/// straightforward implementation of the client's "keyed by id" map (see
+/// static/app.js's `proposals`/`tabKey`) would draw an accept-able blank tab
+/// for exactly one frame.
+///
+/// This only checks the very first frame after connecting — not merely that
+/// both eventually arrive (`a_browser_that_connects_after_a_proposal_is_
+/// shown_both_sides_of_it`, above, already covers that) — because ordering
+/// is exactly what a "did both arrive" assertion cannot see.
+///
+/// Revert-checked: swapping wsconn's two `send_to` calls back (`State` before
+/// the `proposal_replay` loop) fails this test — `the first frame after
+/// connecting must be the proposal's content, not "State": {"t":"State",...`
+/// — while `a_browser_that_connects_after_a_proposal_is_shown_both_sides_of_it`
+/// keeps passing, which is exactly why this test exists alongside it.
+/// Restored.
+#[test]
+fn a_late_browsers_first_frame_is_the_proposals_content_not_its_tab() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    let (_d, port) = fixture_named("proposal-order");
+    let mut a = ws_connect_path(port, "/ws/proposal-order/_workspace").unwrap();
+    let _ = read_until(&mut a, r#""t":"State""#);
+
+    resh::hub::open_proposal(
+        "proposal-order",
+        "order-1",
+        "hello.md",
+        "what is there",
+        "what claude wants",
+    );
+
+    let mut b = ws_connect_path(port, "/ws/proposal-order/_workspace").unwrap();
+    let first = loop {
+        match b.read().unwrap() {
+            tungstenite::Message::Text(t) => break t.to_string(),
+            _ => continue,
+        }
+    };
+    assert!(
+        first.contains(r#""t":"Proposal""#),
+        "the first frame after connecting must be the proposal's content, not \"State\": {first}"
+    );
+
+    resh::hub::close_proposal("proposal-order", "order-1");
+    let _ = a.close(None);
+    let _ = b.close(None);
+    std::env::remove_var("RESH_STATE_DIR");
+}
+
 #[test]
 fn invalid_session_name_is_refused() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

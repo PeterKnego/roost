@@ -75,6 +75,20 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         // order, not send order). A client that received a foreign
         // connection's State first would latch that id as its own origin
         // and then silently drop that peer's own BufferText forever.
+        // Before the snapshot, and inside the same lock acquisition as
+        // subscribing above (releasing in between would let a foreign
+        // broadcast land first — see the comment on that lock acquisition).
+        // `State` names the proposal tabs but carries neither side of the
+        // diff, so a browser that connected after a proposal opened would
+        // otherwise draw an empty tab it could still click Accept on —
+        // approving a change it never showed anyone. Content before the tab
+        // that renders it, exactly as the live path in
+        // `Hub::open_proposal_tab` sends it: `Event::Proposal` carries no
+        // `origin` field, so unlike `State` below, nothing here depends on
+        // this being the *first* thing sent.
+        for ev in h.proposal_replay() {
+            h.send_to(&id, &ev);
+        }
         let ev = h.snapshot_event(&id);
         h.send_to(&id, &ev);
         // Replay the whole store to a fresh client: a notice raised while no
@@ -82,14 +96,6 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         // inside the same lock acquisition as the snapshot, for the reason
         // the existing comment above gives — releasing in between lets a
         // foreign broadcast land first.
-        // Before Notices and inside the same lock acquisition, for the
-        // reason the comment above gives. `State` names the proposal tabs but
-        // carries neither side of the diff, so a browser that connected after
-        // a proposal opened would otherwise draw an empty tab it could still
-        // click Accept on — approving a change it never showed anyone.
-        for ev in h.proposal_replay() {
-            h.send_to(&id, &ev);
-        }
         let ev = proto::Event::Notices { list: crate::notify::list() };
         h.send_to(&id, &ev);
         // State is metadata-only — it never carries buffer text — so a

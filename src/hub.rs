@@ -1312,10 +1312,12 @@ impl Hub {
     /// tabs but no content, so without this a reconnecting browser renders an
     /// unanswerable blank.
     ///
-    /// Note the order is the inverse of the live path's, which sends the
-    /// content *before* the tab: on connect the snapshot has to go first, or
-    /// the client latches a foreign connection's origin (see `wsconn`). The
-    /// two arrive back-to-back inside one lock acquisition either way.
+    /// `wsconn` sends these *before* the snapshot's `State`, matching the
+    /// live path in `open_proposal_tab` (content before the tab that renders
+    /// it), so a client only ever has to handle one order. This is safe
+    /// because `Event::Proposal` carries no `origin` field — the
+    /// origin-latching rule that forces `State` to go out inside the same
+    /// lock acquisition as `subscribe` does not apply to it.
     pub fn proposal_replay(&self) -> Vec<Event> {
         self.proposals
             .iter()

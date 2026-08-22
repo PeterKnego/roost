@@ -244,7 +244,10 @@ main { flex: 1; min-height: 0; }
            cursor: pointer; border: 1px solid var(--border); background: none; color: var(--muted); }
 .savebtn:hover { color: var(--fg); background: var(--tab-hover); }
 .conflict { border: 1px solid var(--warn, #d79921); padding: 8px; margin: 8px; background: var(--bg2); }
-.conflict button { margin: 8px 8px 0 0; font: inherit; cursor: pointer; }
+/* .proposal-actions (the Accept/Reject bar under a proposal's hunk view,
+   app.js's renderProposal) reuses this rule rather than a parallel one —
+   same buttons, same treatment. */
+.conflict button, .proposal-actions button { margin: 8px 8px 0 0; font: inherit; cursor: pointer; }
 /* Error events aren't tied to any one pane (a delete or rename failure has
    no "content" to prepend into), so this variant floats above everything
    instead of the .conflict base's normal in-flow placement. */

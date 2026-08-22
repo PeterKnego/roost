@@ -30,6 +30,7 @@ deno run -A tests/browser/edit-by-default.mjs # clicking a text file opens an ed
 deno run -A tests/browser/preview-follows.mjs # a previewed file follows the file on disk
 deno run -A tests/browser/buffer-lifecycle.mjs # navigating a file is not an edit; undoing one comes back clean
 deno run -A tests/browser/termlinks.mjs # a printed path or URL is a link only while the modifier is held
+deno run -A tests/browser/ide.mjs       # openDiff's proposal tab (Accept/Reject) and the Alt+K mention keybinding
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -181,6 +182,28 @@ performed.
   autosave off nothing but the hash rule can clean that buffer, so the check
   can use as generous a window as any other assertion here and still fail
   correctly when the rule is gone.
+- In `ide.mjs`: dropping `mountTab`'s `Tab::Proposal` branch fails 6
+  assertions across sections B and C (no hunk, no Accept/Reject button, no
+  reply, tab never closes); deleting only the Accept/Reject button-append in
+  `renderProposal` fails 6 different ones — the two hunk-visibility
+  assertions keep passing, which is what says those two are testing the
+  buttons and not the diff view. Deleting the Alt+K `keydown` listener fails
+  the 3 mention assertions in section E and nothing else. Folding `tabKey`'s
+  `"Proposal"` case down to `` `Proposal:${t.id}` `` (dropping the
+  content/pending distinction) passes sections B/C/D unchanged — this task's
+  own `wsconn.rs` fix makes content arrive before the tab in every ordinary
+  run, so nothing timing-based here can tell the fold apart from the real
+  code — which is why section D also calls `tabKey` directly and asserts its
+  output changes once `state.proposals` gains an entry; that direct
+  assertion is the one that fails (`"before":"Proposal:...","after":"Proposal:..."`,
+  identical) with the fold in place. Neutering `renderProposal`'s `if (!p)`
+  guard (`if (false) {`) fails section D's other two assertions — not with
+  "a button appeared" but with an *uncaught exception* reading `.rel` off
+  `undefined`, an even more direct demonstration that nothing downstream of
+  that guard is safe to reach without it. Emptying `renderHunks` to
+  `return frag` unconditionally fails exactly the two hunk-visibility
+  assertions (B and C) and nothing else — proving those two, and only those
+  two, depend on it.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
