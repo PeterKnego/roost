@@ -17,8 +17,25 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   the websocket handshakes do — *including refusing a request that carries
   none*, because a `multipart/form-data` POST is a CORS simple request that any
   page can submit cross-origin with no preflight. Keep the surface at two.
-- **Every websocket checks `Origin`** in its handshake. Handshakes bypass the
-  same-origin policy, so a socket without this check is drive-by RCE.
+- **Every browser-facing websocket checks `Origin`** in its handshake, and
+  refuses a handshake that carries none. Handshakes bypass the same-origin
+  policy, so a socket without this check is drive-by RCE; and every browser
+  sends an `Origin`, so its absence means a non-browser client, which has no
+  business on a socket that spawns a shell. `src/origin.rs` is the check.
+- **The IDE socket inverts that rule on purpose.** `src/ide.rs` refuses any
+  handshake that *carries* an `Origin` and authenticates by constant-time
+  comparison against the lock-file token instead. Its client is a Bun process,
+  which sends no `Origin`, so on that socket a browser is the only thing that
+  sends one — and a browser has no business there. Both rules are right, and
+  they are opposites because their clients are.
+
+  **Reconciling the two is the vulnerability, not the cleanup.** Claude Code's
+  own extensions shipped exactly this socket Origin-blind *and* unauthenticated
+  through 1.0.23: any page the user visited could scan localhost, connect, and
+  read files with no user interaction. That is CVE-2025-52882, fixed in 1.0.24
+  by the lock-file token `src/ide.rs` implements. Making `ide.rs` "consistent"
+  with the bullet above — or dropping its token check because the Origin check
+  above looks like it already covers it — reintroduces it.
 - **Every filesystem path is confined** before use: `projects::safe_resolve`
   for existing targets, `projects::safe_resolve_parent` for creation and rename
   destinations (it canonicalises the parent and validates the final component,
@@ -53,7 +70,14 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   cap for reads *and* buffer writes. Uploads are bounded per **request**, not
   per file: ≤16 parts and `config::max_upload_bytes` (100 MB default, global
   config or `RESH_MAX_UPLOAD` only — never per-project, or a cloned repo could
-  raise its own disk ceiling).
+  raise its own disk ceiling). On the IDE socket: ≤16 proposals parked per
+  project (`ide::MAX_PENDING`) — per project, not global, so one Claude in a
+  loop cannot starve every other project — and 8 MB per websocket frame
+  (`ide::MAX_FRAME_BYTES`), a coarse backstop against buffering an oversized
+  frame at all. It is not the real limit: *both* sides of an `openDiff` are
+  bounded by the same 2 MB `MAX_FILE_BYTES` as any other file, since a
+  proposal is retained for the tab's life and broadcast whole to every
+  connected browser.
 
 ## Absence of evidence is not evidence of absence
 
