@@ -811,6 +811,71 @@ fn ws_rejects_foreign_and_missing_origin() {
     assert!(ws_connect(port, Some("http://127.0.0.1:8444")).is_ok());
 }
 
+/// The reader half of these sockets can no longer write, so the `Pong` that
+/// tungstenite queues on it is discarded — the read loop has to forward the
+/// reply through the one writer instead. If that forwarding is dropped, the
+/// structural fix silently turns resh into a server that never answers a
+/// ping, and nothing else in the suite notices.
+///
+/// Revert-checked: deleting the `Ok(Message::Ping(p))` arm in `term.rs` makes
+/// this fail on the 5s read timeout with "no Pong came back"; deleting the
+/// same arm in `wsconn.rs` fails its sibling below the same way.
+#[test]
+fn a_terminal_socket_still_answers_a_ping_after_the_reader_stops_writing() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("RESH_CMD", "cat");
+    let (_d, port) = fixture();
+    let mut ws = ws_connect(port, Some("http://127.0.0.1:8444")).unwrap();
+    ws.send(tungstenite::Message::Ping(b"marco".to_vec().into())).unwrap();
+    // The socket also carries PTY output and the server's own pings, so read
+    // past whatever else arrives rather than assuming the Pong is first.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut got = None;
+    while std::time::Instant::now() < deadline {
+        match ws.read() {
+            Ok(tungstenite::Message::Pong(p)) => {
+                got = Some(p.to_vec());
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        got.as_deref(),
+        Some(&b"marco"[..]),
+        "no Pong came back: the reader cannot write and nothing forwarded the reply"
+    );
+}
+
+#[test]
+fn a_workspace_socket_still_answers_a_ping_after_the_reader_stops_writing() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("RESH_CMD", "cat");
+    let (_d, port) = fixture();
+    let mut ws = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    ws.send(tungstenite::Message::Ping(b"polo".to_vec().into())).unwrap();
+    // State and Notices arrive first on this socket, so the Pong is never
+    // the first frame.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut got = None;
+    while std::time::Instant::now() < deadline {
+        match ws.read() {
+            Ok(tungstenite::Message::Pong(p)) => {
+                got = Some(p.to_vec());
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        got.as_deref(),
+        Some(&b"polo"[..]),
+        "no Pong came back: the reader cannot write and nothing forwarded the reply"
+    );
+}
+
 #[test]
 fn terminal_ws_echoes_through_pty() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
