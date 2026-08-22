@@ -522,9 +522,10 @@ mod tests {
     use super::*;
     use tungstenite::client::IntoClientRequest;
 
-    /// Verified against tungstenite 0.24: a built `http::Request` keeps its
-    /// custom headers through `into_client_request`, and the handshake key,
-    /// version and Host are added by the client afterwards.
+    /// A hand-built request must carry the RFC6455 handshake headers itself:
+    /// `IntoClientRequest for http::Request<()>` is a pass-through, and
+    /// `generate_request` errors without Sec-WebSocket-Key (tungstenite 0.24,
+    /// handshake/client.rs:111-135). Custom headers do survive it.
     fn connect(port: u16, token: Option<&str>, origin: Option<&str>) -> Result<(), String> {
         let mut b = tungstenite::http::Request::builder()
             .uri(format!("ws://127.0.0.1:{port}/"))
@@ -1330,8 +1331,18 @@ handshake and the framing are part of what is being tested.
         let dir = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
         let ide = for_project_in(dir.path(), project, ws.path().to_path_buf()).unwrap();
+        // `IntoClientRequest for http::Request<()>` is a pass-through: it adds
+        // nothing. `generate_request` requires Host, Connection, Upgrade,
+        // Sec-WebSocket-Version and Sec-WebSocket-Key to be present already and
+        // errors without the key (tungstenite 0.24 handshake/client.rs:111-135),
+        // so a hand-built request must carry all five itself.
         let req = tungstenite::http::Request::builder()
             .uri(format!("ws://127.0.0.1:{}/", ide.port))
+            .header("Host", format!("127.0.0.1:{}", ide.port))
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", tungstenite::handshake::client::generate_key())
             .header("Sec-WebSocket-Protocol", "mcp")
             .header("X-Claude-Code-Ide-Authorization", &ide.token)
             .body(())
