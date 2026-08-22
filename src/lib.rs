@@ -26,6 +26,7 @@ pub mod watch;
 pub mod workspace;
 pub mod worktree;
 pub mod wsconn;
+pub mod wsio;
 pub mod wsstate;
 
 use std::net::{TcpListener, TcpStream};

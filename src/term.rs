@@ -1,8 +1,20 @@
 //! Terminal websocket: one connection = one attachment to a session in
 //! `session`. The session owns the PTY and outlives this connection.
+//!
+//! Only the writer thread ever writes. tungstenite answers an inbound `Ping`
+//! or `Close` from the object that *read* it, which would splice a reply into
+//! whatever frame the writer is part-way through — and this writer is pumping
+//! PTY output continuously, so it is nearly always part-way through one.
+//! `wsio::Gate` takes writing away from the reader once the writer exists,
+//! and the reader forwards the reply instead. Collapsing to a single thread,
+//! as `ide.rs` does, is not an option here: a poll interval would land on
+//! every keystroke echo. See
+//! `docs/superpowers/specs/2026-08-22-one-writer-per-socket-design.md`.
 use crate::session;
+use crate::wsio::{Gate, GatedStream};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tungstenite::handshake::server::{Request as WsRequest, Response as WsResponse};
 use tungstenite::protocol::{Role, WebSocketConfig};
 use tungstenite::{accept_hdr_with_config, Message, WebSocket};
@@ -20,8 +32,12 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // page the user visits can open this socket and get a shell. See spec §Security.
     let allowed = crate::config::allowed_origins();
     let config = WebSocketConfig { max_message_size: Some(MAX_FRAME_BYTES), ..Default::default() };
+    // Open through the handshake and through every refusal below — each of
+    // those closes this object itself, before any writer thread exists — and
+    // closed at the one point a second writer appears.
+    let gate = Gate::open();
     let accepted = accept_hdr_with_config(
-        stream,
+        GatedStream::new(stream, gate.clone()),
         |req: &WsRequest, resp: WsResponse| {
             path = req.uri().path().to_string();
             let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
@@ -138,9 +154,24 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
             return;
         }
     };
-    let Ok(write_half) = ws_read.get_ref().try_clone() else { return };
-    let mut ws_write: WebSocket<TcpStream> =
-        WebSocket::from_raw_socket(write_half, Role::Server, None);
+    let Ok(write_half) = ws_read.get_ref().try_clone_inner() else { return };
+    // From here on this connection has two threads and exactly one writer.
+    gate.close();
+    // Shared so the read thread can send the control replies it no longer
+    // writes itself. The lock is held across a whole `send` deliberately:
+    // these sockets are blocking, so `send` queues and flushes one frame
+    // before returning, and nothing can be spliced into it. Locking the
+    // stream per `write` call would not do — a frame can drain in several
+    // calls and a splice fits between them.
+    //
+    // CLAUDE.md forbids holding a lock across blocking I/O, and that rule is
+    // about a *shared* lock stalling unrelated work — the session registry
+    // held across a PTY write wedged every session in every project. This
+    // lock guards the socket being written, its only contenders are this
+    // connection's own two threads, and the wait is one frame long.
+    let ws_write: Arc<Mutex<WebSocket<TcpStream>>> =
+        Arc::new(Mutex::new(WebSocket::from_raw_socket(write_half, Role::Server, None)));
+    let ws_ctl = ws_write.clone();
     let rx = att.rx;
     // recv_timeout rather than recv: a session can be silent for hours, and
     // this thread is the only one that ever writes to this socket. Without a
@@ -162,12 +193,13 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Message::Ping(Vec::new().into()),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             };
-            if ws_write.send(msg).is_err() {
+            if ws_write.lock().unwrap_or_else(|e| e.into_inner()).send(msg).is_err() {
                 break;
             }
         }
-        let _ = ws_write.close(None);
-        let _ = ws_write.get_ref().shutdown(std::net::Shutdown::Both);
+        let mut w = ws_write.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = w.close(None);
+        let _ = w.get_ref().shutdown(std::net::Shutdown::Both);
     });
 
     // `StartTerminal` (hub.rs) refreshes `live_sessions` before the PTY
@@ -218,7 +250,19 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
                     }
                 }
             }
-            Ok(Message::Close(_)) | Err(_) => break,
+            // Sent by the one writer, because the reply tungstenite queued
+            // on this object went into the gate's bit bucket. The existing
+            // comment on the writer's ping tick notes browsers answer a Ping
+            // without page JavaScript; this is the other direction, for a
+            // peer that pings us.
+            Ok(Message::Ping(p)) => {
+                let _ = ws_ctl.lock().unwrap_or_else(|e| e.into_inner()).send(Message::Pong(p));
+            }
+            Ok(Message::Close(c)) => {
+                let _ = ws_ctl.lock().unwrap_or_else(|e| e.into_inner()).send(Message::Close(c));
+                break;
+            }
+            Err(_) => break,
             Ok(_) => {}
         }
     }
