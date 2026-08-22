@@ -2572,12 +2572,36 @@ mod tests {
     /// which is on CLAUDE.md's own list of tests that passed for the wrong
     /// reason.
     ///
+    /// A refusal must be *inert* to everyone but the asker, not just silent
+    /// about `PathRefused` specifically: the other subscriber must receive
+    /// nothing at all, and `ws.version` must not move. Checking only for the
+    /// literal string `"PathRefused"` in the other subscriber's inbox would
+    /// let a leaked no-op `State` bump (version++, snapshot, broadcast,
+    /// persist — exactly what a refusal must never trigger) sail straight
+    /// through, since that event contains no such string. See Revert 4 below.
+    ///
     /// Revert 1 (Step 5): changing the `Err` arm's `self.send_to(from, &ev)`
     /// to `self.broadcast(&ev)` failed this test on the second assertion, with
     /// the actual panic message:
     /// `a refusal leaked to a second browser: ["{\"t\":\"PathRefused\",
     ///  \"text\":\"src/gone.rs\",\"msg\":\"not found: No such file or
     ///  directory (os error 2)\"}"]`
+    ///
+    /// Revert 4 (fix round 1): injecting, at the top of the `Err` arm before
+    /// the early return —
+    /// ```ignore
+    /// self.ws.version += 1;
+    /// let snap = self.snapshot_event(from);
+    /// self.broadcast(&snap);
+    /// self.persist();
+    /// ```
+    /// — failed this test on the "nothing at all" assertion, with the actual
+    /// panic message:
+    /// `a refusal must leave the other subscriber's inbox empty, got:
+    ///  ["{\"t\":\"State\",\"version\":1,\"origin\":\"c1\",\"ws\":{...}}"]`
+    /// (the version-unchanged assertion below it would also have caught this
+    /// independently, since the injection bumps `ws.version` — but the inbox
+    /// check runs first and fires first).
     #[test]
     fn open_path_refusal_reaches_only_the_client_that_asked() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2586,6 +2610,7 @@ mod tests {
         let mut h = Hub::new("linkrefuse", dir.path().to_path_buf());
         let (asker, rx_asker) = h.subscribe();
         let (_other, rx_other) = h.subscribe();
+        let version_before = h.ws.version;
 
         h.handle(&asker, Intent::OpenPath { text: "src/gone.rs".into() });
 
@@ -2594,10 +2619,16 @@ mod tests {
             got.iter().any(|m| m.contains("PathRefused")),
             "the asking client got no refusal: {got:?}"
         );
+        // Not just "no PathRefused": nothing at all. A leaked `State` bump
+        // contains no literal "PathRefused" and would pass a substring check.
         let others: Vec<String> = rx_other.try_iter().collect();
         assert!(
-            !others.iter().any(|m| m.contains("PathRefused")),
-            "a refusal leaked to a second browser: {others:?}"
+            others.is_empty(),
+            "a refusal must leave the other subscriber's inbox empty, got: {others:?}"
+        );
+        assert_eq!(
+            h.ws.version, version_before,
+            "a refusal must not bump ws.version — that's what gates a broadcasted snapshot"
         );
         std::env::remove_var("RESH_STATE_DIR");
     }
