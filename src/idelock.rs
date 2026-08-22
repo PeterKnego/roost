@@ -50,6 +50,23 @@ pub fn ide_dir() -> PathBuf {
     if let Some(d) = TEST_IDE_DIR.get() {
         return d.clone();
     }
+    // A test that forgets to call `set_ide_dir_for_test` must not silently
+    // write into the developer's real `~/.claude/ide` — a directory shared
+    // with every other IDE on the host. That already happened once on this
+    // branch and left 17 stale lock files behind. `cfg!(test)` only covers
+    // this crate's own `cargo test` (the lib-test binary); `tests/integration.rs`
+    // links this crate as an ordinary dependency with no `cfg(test)`, so an
+    // integration test that forgot the same call still falls through to the
+    // real directory below — that gap is closed separately, by
+    // `tests/integration.rs` calling `set_ide_dir_for_test` itself, not by
+    // this check.
+    if cfg!(test) {
+        panic!(
+            "ide_dir() called with no override set — call \
+             idelock::set_ide_dir_for_test(tempdir) first, or this test would \
+             write real lock files into ~/.claude/ide"
+        );
+    }
     if let Ok(d) = std::env::var("CLAUDE_CONFIG_DIR") {
         if !d.is_empty() {
             return PathBuf::from(d).join("ide");
