@@ -328,9 +328,12 @@ pub struct Conn {
     pub cwd: Option<PathBuf>,
     pub workspace: PathBuf,
     pub project: String,
-    /// This connection's writer channel. Unused until Task 6 gives the
-    /// connection a writer thread, and carried from the start because the
-    /// connection owns its identity and its output from the moment it exists.
+    /// This connection's outbound channel, drained by its own read loop (see
+    /// `serve_conn`: there is no writer thread — two writers over one fd let
+    /// tungstenite's auto-Pong interleave mid-frame). Cloning it is how a
+    /// *different* thread gets a frame onto this socket, which is exactly
+    /// what a parked `openDiff` needs: the answer is written minutes later,
+    /// from whichever browser thread the human happened to click in.
     pub reply: std::sync::mpsc::Sender<String>,
     pub closed: bool,
 }
@@ -339,6 +342,291 @@ impl Conn {
     pub fn new(project: &str, workspace: PathBuf, reply: std::sync::mpsc::Sender<String>) -> Self {
         Conn { cwd: None, workspace, project: project.to_string(), reply, closed: false }
     }
+}
+
+/// Enough for any real review session, and in the spirit of the existing
+/// ≤16-session and ≤50-buffer caps. Over it, refuse rather than queue: a
+/// queued proposal holds a whole file in resh's memory for as long as the
+/// human takes to look at it, and `DIFF_REJECTED` is a refusal Claude is
+/// already required to handle.
+pub(crate) const MAX_PENDING: usize = 16;
+
+/// What a human said about one proposal. The three arms are not three
+/// shades of the same thing: they map onto the three responses the CLI
+/// accepts, and it treats them as different instructions.
+pub enum Answer {
+    Accepted,
+    /// The user rewrote the proposal before accepting it. The text travels
+    /// back so Claude writes *this*, not what it proposed.
+    AcceptedEdited(String),
+    Rejected,
+}
+
+/// An `openDiff` that has been asked and not yet answered.
+///
+/// The whole point of this struct is that the request is *parked*: `dispatch`
+/// returns `None` for an `openDiff` and this holds everything needed to
+/// answer it later, from another thread. Blocking the read loop instead would
+/// mean Claude could not send `close_tab` to withdraw the proposal, and a
+/// user who walked away would wedge the socket for good.
+struct Pending {
+    /// Answers are scoped to the project that parked them: an id is a map key
+    /// within one process, and nothing else must be able to name it.
+    project: String,
+    /// The id from Claude's request, echoed back verbatim. Kept as a `Value`
+    /// because JSON-RPC allows a string or a number and the reply must be the
+    /// same shape it arrived as.
+    rpc_id: serde_json::Value,
+    /// Claude's own name for the tab, which is what `close_tab` addresses.
+    /// Deliberately not the map key — see `new_pending_id`.
+    tab_name: String,
+    /// A clone of the connection's outbound channel (`Conn::reply`), which is
+    /// how a browser thread writes onto a socket owned by a connection thread.
+    reply: std::sync::mpsc::Sender<String>,
+}
+
+static PENDING: OnceLock<Mutex<HashMap<String, Pending>>> = OnceLock::new();
+
+fn pending() -> &'static Mutex<HashMap<String, Pending>> {
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A map key within one process — never persisted, never security-relevant.
+/// A counter rather than randomness so test assertions are deterministic; a
+/// collision after a restart is impossible because pending proposals do not
+/// survive one.
+///
+/// Deliberately not Claude's `tab_name`: that is chosen by the client, and
+/// two connections to the same project would collide on it.
+fn new_pending_id(project: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{project}-{n}")
+}
+
+/// Answer a parked `openDiff`. This is what a browser's Accept/Reject
+/// actually does — the click *is* the permission answer.
+pub fn answer(project: &str, id: &str, a: Answer) -> Result<(), String> {
+    // Removed, not read: the removal *is* the "first answer wins" rule, and
+    // doing it under the lock means two browsers cannot both win. A
+    // read-then-remove would let both pass the check and both send.
+    let p = {
+        let mut map = pending().lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(id) {
+            Some(p) if p.project == project => map.remove(id).ok_or("just matched")?,
+            Some(_) => return Err("proposal belongs to another project".into()),
+            None => return Err("no such proposal — it was already answered or withdrawn".into()),
+        }
+    };
+    let content = match a {
+        // Not `FILE_SAVED`: an unedited acceptance leaves Claude's own tool
+        // input correct, and resh must not write the file (see `open_diff`).
+        // These three strings are the CLI's whole vocabulary here — anything
+        // else raises `Not accepted` on its side.
+        Answer::Accepted => serde_json::json!([{"type": "text", "text": "TAB_CLOSED"}]),
+        Answer::Rejected => serde_json::json!([{"type": "text", "text": "DIFF_REJECTED"}]),
+        Answer::AcceptedEdited(text) => serde_json::json!([
+            {"type": "text", "text": "FILE_SAVED"},
+            {"type": "text", "text": text},
+        ]),
+    };
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0", "id": p.rpc_id, "result": {"content": content}
+    })
+    .to_string();
+    // Outside the lock: this is a channel send feeding a socket write, and a
+    // proposal's lock must never be held across anything that touches I/O.
+    p.reply.send(msg).map_err(|_| "Claude disconnected before answering".to_string())
+}
+
+/// Parks a proposal with no socket behind it, so `hub`'s own tests can drive
+/// the intent that answers one without standing up a listener and a fake
+/// client. The `reply` channel stands in for the connection's.
+#[cfg(test)]
+pub(crate) fn park_for_test(
+    project: &str,
+    tab: &str,
+    reply: std::sync::mpsc::Sender<String>,
+) -> String {
+    let id = new_pending_id(project);
+    pending().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        id.clone(),
+        Pending {
+            project: project.to_string(),
+            rpc_id: serde_json::json!(1),
+            tab_name: tab.to_string(),
+            reply,
+        },
+    );
+    id
+}
+
+/// The pending id for a project's tab name, for tests that need to answer a
+/// proposal they parked over a real socket.
+#[cfg(test)]
+fn pending_id_for_tab(project: &str, tab: &str) -> Option<String> {
+    let map = pending().lock().unwrap_or_else(|e| e.into_inner());
+    map.iter()
+        .find(|(_, p)| p.project == project && p.tab_name == tab)
+        .map(|(k, _)| k.clone())
+}
+
+/// Confine an absolute path Claude sent, which may name a file that does not
+/// exist yet.
+///
+/// `openDiff` carries `old_file_path` off the wire, so it is a hint and never
+/// a boundary. Two things make this harder than `resolve_terminal_path`'s
+/// single `safe_resolve` call: the target may legitimately not exist (Claude
+/// proposing a *new* file), and `projects::abs_to_rel` needs it to exist,
+/// because `canonicalize` is what resolves the symlinks the comparison rests
+/// on. So the *parent* — which does exist either way — is what gets
+/// canonicalised and confined, and the final component is validated
+/// separately. That is exactly the split `safe_resolve_parent` already
+/// exists for.
+///
+/// Returns the project-relative path and, when it is there, its real
+/// location on disk.
+fn confined_target(workspace: &Path, path: &str) -> Result<(String, Option<PathBuf>), String> {
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return Err(format!("not an absolute path: {path}"));
+    }
+    let name = p.file_name().and_then(|n| n.to_str()).ok_or("that is a directory, not a file")?;
+    let parent = p.parent().ok_or("that is the filesystem root, not a file")?;
+    // The parent, canonicalised against the project root. A symlinked
+    // directory that leaves the project is refused here.
+    let parent_rel = crate::projects::abs_to_rel(workspace, parent)?;
+    let rel = if parent_rel.is_empty() { name.to_string() } else { format!("{parent_rel}/{name}") };
+    // Re-confined through the project's own boundary rather than trusting the
+    // string just built: this re-canonicalises the parent and rejects a final
+    // component that is empty, `.`, `..` or contains a separator.
+    let target = crate::projects::safe_resolve_parent(workspace, &rel)?;
+    // Three outcomes, not two. "I could not look" must not be read as "it is
+    // not there": that would show a whole-file rewrite as a *creation*, with
+    // an empty left-hand side, to the human being asked to approve it.
+    match std::fs::symlink_metadata(&target) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((rel, None)),
+        Err(e) => Err(format!("cannot tell whether {rel} exists: {e}")),
+        Ok(m) if m.file_type().is_symlink() => {
+            // Only the final component can still be a symlink at this point,
+            // and a symlink inside the project pointing out of it is not the
+            // project's file — `safe_resolve` is what refuses it.
+            let real = crate::projects::safe_resolve(workspace, &rel)?;
+            Ok((rel, Some(real)))
+        }
+        Ok(_) => Ok((rel, Some(target))),
+    }
+}
+
+/// Park a change Claude is asking permission to make, and answer nothing yet.
+///
+/// **resh must not write the file.** On acceptance the CLI continues its own
+/// tool call with the content this answer returns; a write here would be a
+/// second write, and would leave `hub.self_writes` hashing content that never
+/// reached disk.
+fn open_diff(
+    id: &serde_json::Value,
+    args: &serde_json::Value,
+    conn: &Conn,
+) -> Option<serde_json::Value> {
+    let path = args["old_file_path"].as_str().unwrap_or("");
+    let new_text = args["new_file_contents"].as_str().unwrap_or("").to_string();
+    let tab_name = args["tab_name"].as_str().unwrap_or("proposal").to_string();
+
+    // Confined against the project, never against `conn.cwd`. The cwd is the
+    // directory Claude is *in*, which may be a subdirectory of the project (or
+    // a worktree outside it entirely); resolving against it would either
+    // produce a rel the hub cannot open — the hub's paths are relative to the
+    // project root — or widen the boundary past the project resh is serving.
+    // It stays useful for what it was learned for (knowing which project a
+    // connection belongs to), not for confinement.
+    let (rel, abs) = match confined_target(&conn.workspace, path) {
+        Ok(v) => v,
+        Err(e) => return Some(err(id, -32602, format!("path outside project: {e}"))),
+    };
+
+    // A missing file is not an error: an `openDiff` for a file that does not
+    // exist yet is Claude creating one, and the left-hand side is simply
+    // empty. A file that exists but cannot be read is a different answer —
+    // `confined_target` has already refused the case where resh could not
+    // even tell, and an unreadable or oversized one is refused here rather
+    // than drawn as an empty original.
+    let old_text = match &abs {
+        None => String::new(),
+        Some(p) => match crate::projects::read_text_file(p) {
+            Ok(t) => t,
+            Err(e) => return Some(err(id, -32603, format!("cannot show a diff of {rel}: {e}"))),
+        },
+    };
+
+    // resh may be holding unsaved edits to this very file. Accepting would
+    // discard them silently, which is the one thing the whole conflict-guard
+    // exists to prevent.
+    if crate::hub::has_dirty_buffer(&conn.project, &rel) {
+        return Some(err(id, -32002, format!("{rel} has unsaved changes in resh")));
+    }
+
+    let pid = new_pending_id(&conn.project);
+    {
+        let mut map = pending().lock().unwrap_or_else(|e| e.into_inner());
+        // Per project, not global: `PENDING` is process-wide, and a Claude in
+        // a loop in one project must not be able to make every other
+        // project's proposals start bouncing.
+        if map.values().filter(|p| p.project == conn.project).count() >= MAX_PENDING {
+            return Some(ok(id, text_result("DIFF_REJECTED")));
+        }
+        map.insert(
+            pid.clone(),
+            Pending {
+                project: conn.project.clone(),
+                rpc_id: id.clone(),
+                tab_name,
+                reply: conn.reply.clone(),
+            },
+        );
+    }
+
+    // Outside the lock: this opens a tab and mirrors it to every browser, and
+    // a pending proposal's lock is held for minutes if it is held at all.
+    // Taking the hub lock only *after* releasing the pending one is also what
+    // keeps the lock order total — see `Hub::do_answer_proposal`.
+    crate::hub::open_proposal(&conn.project, &pid, &rel, &old_text, &new_text);
+
+    // No reply yet, and crucially the read loop is not blocked: Claude must
+    // still be able to send `close_tab`, and a user who walked away must not
+    // wedge the socket.
+    None
+}
+
+/// Claude withdrawing a proposal it no longer needs an answer to — the user
+/// answered the permission prompt in the terminal instead, say.
+///
+/// The parked request is dropped without a reply on purpose: the side that
+/// asked to close the tab is the side that was waiting, and it has already
+/// stopped waiting.
+fn close_tab(
+    id: &serde_json::Value,
+    args: &serde_json::Value,
+    conn: &Conn,
+) -> Option<serde_json::Value> {
+    let name = args["tab_name"].as_str().unwrap_or("");
+    let withdrawn: Vec<String> = {
+        let mut map = pending().lock().unwrap_or_else(|e| e.into_inner());
+        let ids: Vec<String> = map
+            .iter()
+            .filter(|(_, p)| p.project == conn.project && p.tab_name == name)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &ids {
+            map.remove(k);
+        }
+        ids
+    };
+    // Outside the lock, for the same reason `open_diff` is.
+    for k in &withdrawn {
+        crate::hub::close_proposal(&conn.project, k);
+    }
+    Some(ok(id, text_result("TAB_CLOSED")))
 }
 
 fn err(id: &serde_json::Value, code: i64, message: String) -> serde_json::Value {
@@ -401,6 +689,10 @@ fn dispatch(msg: &serde_json::Value, conn: &mut Conn) -> Option<serde_json::Valu
                 // answer and is what Claude sees when nothing is wrong — so
                 // if a `cargo check` bridge ever lands, it lands here.
                 "getDiagnostics" => Some(ok(&id, text_result("[]"))),
+                // Returns `None`: the answer comes from a browser thread,
+                // minutes from now. See `open_diff`.
+                "openDiff" => open_diff(&id, &msg["params"]["arguments"], conn),
+                "close_tab" => close_tab(&id, &msg["params"]["arguments"], conn),
                 other => Some(err(&id, -32601, format!("resh does not implement {other}"))),
             }
         }
@@ -1013,6 +1305,19 @@ mod tests {
             .into_client_request()
             .unwrap();
         let (mut sock, _) = tungstenite::connect(req).expect("the fake client must connect");
+        // A read timeout, for the same reason `serve_conn` sets one: this
+        // thread is the only owner of the socket, so it can only notice
+        // something queued for sending between reads. Without it the loop
+        // below parks in `read()` on the very first pass and every send a
+        // test makes sits in the channel forever — which is exactly what
+        // happened when Task 7's tests became the first ones to send
+        // anything at all (Task 6's only ever received).
+        if let tungstenite::stream::MaybeTlsStream::Plain(s) = sock.get_ref() {
+            s.set_read_timeout(Some(std::time::Duration::from_millis(20)))
+                .expect("a fake client must be able to poll its own socket");
+        } else {
+            panic!("the fake client must be on a plain loopback socket");
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         // The test drives sends through this channel too, so one thread owns
         // the socket and the test never races itself.
@@ -1030,11 +1335,403 @@ mod tests {
                     }
                 }
                 Ok(_) => {}
+                // The poll expiring with nothing to read: loop back around to
+                // drain `send_rx`, rather than treating it as a dead socket.
+                // Both kinds are checked because which one a timed-out read
+                // surfaces as is platform-dependent.
+                Err(tungstenite::Error::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue
+                }
                 Err(_) => return,
             }
         });
         senders().lock().unwrap().insert(project.to_string(), send_tx);
         (rx, ide, dir, ws)
+    }
+
+    /// Speaks as Claude on a fake client's socket. The client thread owns the
+    /// socket, so a test never races itself on it.
+    fn send_from_claude(project: &str, v: &serde_json::Value) {
+        let tx = {
+            let map = senders().lock().unwrap_or_else(|e| e.into_inner());
+            map.get(project).cloned().expect("connect a fake client for this project first")
+        };
+        tx.send(v.to_string()).expect("the fake client's socket thread must still be alive");
+    }
+
+    /// Distinct ids per request, so a test that sends several can tell the
+    /// answers apart.
+    fn next_rpc_id() -> i64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
+        NEXT.fetch_add(1, Ordering::Relaxed) as i64
+    }
+
+    fn send_open_diff(project: &str, path: &str, contents: &str, tab: &str) {
+        send_from_claude(
+            project,
+            &rpc(
+                next_rpc_id(),
+                "tools/call",
+                serde_json::json!({
+                    "name": "openDiff",
+                    "arguments": {
+                        "old_file_path": path,
+                        "new_file_path": path,
+                        "new_file_contents": contents,
+                        "tab_name": tab,
+                    }
+                }),
+            ),
+        );
+    }
+
+    /// Sends an `openDiff` and waits for it to be *parked* — which is the
+    /// thing under test everywhere below: a request that produced a pending
+    /// entry and no reply. Polls rather than sleeping a fixed amount, and
+    /// fails loudly rather than returning a made-up id.
+    fn open_diff_from_claude(project: &str, path: &str, contents: &str, tab: &str) -> String {
+        send_open_diff(project, path, contents, tab);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(id) = pending_id_for_tab(project, tab) {
+                return id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "openDiff for {tab:?} never parked a pending request"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    // Revert-checked: making `Answer::Accepted` emit `DIFF_REJECTED` failed
+    // only this test — `left: String("DIFF_REJECTED") / right: "TAB_CLOSED"`
+    // — then restored. These three strings are the CLI's entire vocabulary
+    // for this call and it treats them as opposite instructions, so each
+    // needs its own assertion.
+    fn accepting_unchanged_answers_tab_closed() {
+        let proj = "diff-1";
+        let (rx, _ide, _d, ws) = connected_fake_client_for(proj);
+        let f = ws.path().join("a.rs");
+        std::fs::write(&f, "original").unwrap();
+        let pending = open_diff_from_claude(proj, f.to_str().unwrap(), "new contents", "proposal-1");
+        answer(proj, &pending, Answer::Accepted).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert_eq!(v["result"]["content"][0]["text"], "TAB_CLOSED");
+        assert!(v["result"]["content"].get(1).is_none(), "an unedited accept carries no content");
+    }
+
+    #[test]
+    // The second element is how "the user changed my proposal before
+    // accepting" reaches Claude. Dropping it makes Claude write the text the
+    // user rejected.
+    //
+    // Revert-checked: making `Answer::AcceptedEdited` emit only the
+    // `FILE_SAVED` element failed this test — `left: Null / right: "the
+    // human's version"` on `content[1]["text"]` — and its hub-level sibling
+    // `accepting_an_edited_proposal_sends_the_users_own_text_back_...` for
+    // the same reason. Then restored.
+    fn accepting_an_edited_proposal_answers_file_saved_and_the_edited_text() {
+        let proj = "diff-2";
+        let (rx, _ide, _d, ws) = connected_fake_client_for(proj);
+        let f = ws.path().join("a.rs");
+        let pending =
+            open_diff_from_claude(proj, f.to_str().unwrap(), "claude's version", "proposal-1");
+        answer(proj, &pending, Answer::AcceptedEdited("the human's version".into())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert_eq!(v["result"]["content"][0]["text"], "FILE_SAVED");
+        assert_eq!(v["result"]["content"][1]["text"], "the human's version");
+    }
+
+    #[test]
+    // Revert-checked: making `Answer::Rejected` emit `TAB_CLOSED` failed this
+    // test — `left: String("TAB_CLOSED") / right: "DIFF_REJECTED"` — along
+    // with the two hub tests that reach the same arm. Then restored. Accept
+    // and reject are opposite instructions to the CLI, so a test that only
+    // checked "an answer arrived" would be worthless.
+    fn rejecting_answers_diff_rejected_and_is_not_the_same_as_accepting() {
+        let proj = "diff-3";
+        let (rx, _ide, _d, ws) = connected_fake_client_for(proj);
+        let f = ws.path().join("a.rs");
+        let pending = open_diff_from_claude(proj, f.to_str().unwrap(), "x", "proposal-1");
+        answer(proj, &pending, Answer::Rejected).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert_eq!(v["result"]["content"][0]["text"], "DIFF_REJECTED");
+    }
+
+    #[test]
+    // The CLI applies the edit with the content this answer returns
+    // (`updatedInput`). A write here would be a second write, and would leave
+    // hub.self_writes hashing content that never reached disk.
+    //
+    // Revert-checked: adding `if let Some(p) = &abs { let _ =
+    // std::fs::write(p, &new_text); }` to `open_diff` — the natural place a
+    // second write would creep in — failed only this test — `left:
+    // "proposed" / right: "original"` — then restored.
+    fn resh_never_writes_the_file_itself() {
+        let proj = "diff-4";
+        let (_rx, _ide, _d, ws) = connected_fake_client_for(proj);
+        let f = ws.path().join("a.rs");
+        std::fs::write(&f, "original").unwrap();
+        let pending = open_diff_from_claude(proj, f.to_str().unwrap(), "proposed", "p1");
+        answer(proj, &pending, Answer::Accepted).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "original");
+    }
+
+    #[test]
+    // If openDiff blocked the read loop, Claude could not send close_tab to
+    // withdraw it, and a user who walked away would wedge the socket.
+    //
+    // Revert-checked: making `open_diff` block on a channel receive
+    // (`let (_t, r) = std::sync::mpsc::channel::<()>(); let _ = r.recv();`)
+    // instead of returning `None` failed this test — `called
+    // Result::unwrap() on an Err value: Timeout` on the `recv_timeout` —
+    // then restored. Worth knowing for whoever repeats it: that break also
+    // *hangs* the rest of this module's tests rather than failing them,
+    // because the blocked read loop is also the only thing that drains this
+    // connection's reply channel, so `cargo test --lib ide::` never
+    // terminates and has to be run against this one test alone. That is the
+    // shape CLAUDE.md warns about — a defect that hangs instead of failing —
+    // and it is why this test asserts against a bounded `recv_timeout`
+    // rather than a bare `recv`.
+    fn the_read_loop_is_not_blocked_while_a_proposal_is_pending() {
+        let proj = "diff-5";
+        let (rx, _ide, _d, ws) = connected_fake_client_for(proj);
+        let f = ws.path().join("a.rs");
+        let _pending = open_diff_from_claude(proj, f.to_str().unwrap(), "x", "p1");
+        send_from_claude(proj, &rpc(77, "ping", serde_json::json!({})));
+        let v: serde_json::Value =
+            serde_json::from_str(&rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap())
+                .unwrap();
+        assert_eq!(v["id"], 77, "a later request must be answered while a proposal is open");
+    }
+
+    #[test]
+    // Two browsers mirror this state; both can click.
+    //
+    // Revert-checked: making `answer` read the entry without removing it
+    // (cloning the `Sender` and the id out under the lock and leaving the map
+    // untouched) failed only this test — `panicked ... "first answer wins"` —
+    // then restored.
+    fn a_second_answer_to_one_proposal_is_refused() {
+        let proj = "diff-6";
+        let (_rx, _ide, _d, ws) = connected_fake_client_for(proj);
+        let f = ws.path().join("a.rs");
+        let pending = open_diff_from_claude(proj, f.to_str().unwrap(), "x", "p1");
+        answer(proj, &pending, Answer::Accepted).unwrap();
+        let e = answer(proj, &pending, Answer::Rejected).expect_err("first answer wins");
+        assert!(e.contains("already answered"), "the refusal must say why: {e}");
+    }
+
+    #[test]
+    // An id is only meaningful inside the project that parked it. Without the
+    // project check, one project's browser could answer another's proposal by
+    // guessing a counter value.
+    //
+    // Revert-checked: dropping the `p.project == project` guard (matching on
+    // `Some(_)` alone) failed only this test — `panicked ... "an id from
+    // another project must not be answerable"` — then restored.
+    fn a_proposal_cannot_be_answered_from_another_project() {
+        let (_rx, _ide, _d, ws) = connected_fake_client_for("diff-scope-a");
+        let (_rx2, _ide2, _d2, _ws2) = connected_fake_client_for("diff-scope-b");
+        let f = ws.path().join("a.rs");
+        let pending = open_diff_from_claude("diff-scope-a", f.to_str().unwrap(), "x", "p1");
+        let e = answer("diff-scope-b", &pending, Answer::Accepted)
+            .expect_err("an id from another project must not be answerable");
+        assert!(e.contains("another project"), "the refusal must say why: {e}");
+        // And the real owner can still answer it: the refusal must not have
+        // consumed the proposal on its way out.
+        answer("diff-scope-a", &pending, Answer::Accepted).unwrap();
+    }
+
+    #[test]
+    // The spec's cap, in the spirit of the existing <=16-session and
+    // <=50-buffer caps. Queueing would let a Claude in a loop hold unbounded
+    // content in resh's memory; DIFF_REJECTED is a refusal Claude already
+    // knows how to handle.
+    //
+    // Revert-checked twice, because the cap has two halves. Making the check
+    // never trip (`if false`) failed this test — `no answer at all: Timeout`,
+    // after genuinely waiting out the 10s `recv_timeout` rather than passing
+    // vacuously — since a queued 17th proposal answers nothing at all.
+    // Separately, keeping the refusal but parking the request alongside it
+    // failed the second assertion — `a refused proposal must not also be
+    // parked`. Then restored.
+    fn pending_proposals_are_capped_and_the_overflow_is_refused_not_queued() {
+        let proj = "diff-cap";
+        let (rx, _ide, _d, ws) = connected_fake_client_for(proj);
+        let f = ws.path().join("a.rs");
+        let path = f.to_str().unwrap().to_string();
+        for i in 0..MAX_PENDING {
+            open_diff_from_claude(proj, &path, "x", &format!("tab-{i}"));
+        }
+        send_from_claude(
+            proj,
+            &rpc(
+                999,
+                "tools/call",
+                serde_json::json!({
+                    "name": "openDiff",
+                    "arguments": {
+                        "old_file_path": path, "new_file_path": path,
+                        "new_file_contents": "one too many", "tab_name": "overflow",
+                    }
+                }),
+            ),
+        );
+        let v = loop {
+            let v: serde_json::Value = serde_json::from_str(
+                &rx.recv_timeout(std::time::Duration::from_secs(10)).expect("no answer at all"),
+            )
+            .unwrap();
+            if v["id"] == 999 {
+                break v;
+            }
+        };
+        assert_eq!(
+            v["result"]["content"][0]["text"], "DIFF_REJECTED",
+            "over the cap, answer immediately rather than parking the request"
+        );
+        assert!(
+            pending_id_for_tab(proj, "overflow").is_none(),
+            "a refused proposal must not also be parked"
+        );
+    }
+
+    #[test]
+    // Create a real file at the escape target, or this errors with ENOENT
+    // before reaching the confinement check and proves nothing.
+    //
+    // Revert-checked: replacing `confined_target`'s body with a bare
+    // `Ok((path.trim_start_matches('/').to_string(), None))` failed this test
+    // — `called Result::unwrap() on an Err value: Timeout`, because the
+    // escape was parked instead of refused and so answered nothing — along
+    // with all five `confined_target` unit tests below. Then restored.
+    fn a_path_outside_the_project_is_refused_without_opening_a_tab() {
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("secret.txt");
+        std::fs::write(&victim, "not yours").unwrap();
+        let proj = "diff-7";
+        let (rx, _ide, _d, _ws) = connected_fake_client_for(proj);
+        send_open_diff(proj, victim.to_str().unwrap(), "x", "p1");
+        let v: serde_json::Value =
+            serde_json::from_str(&rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap())
+                .unwrap();
+        assert!(v["error"].is_object(), "expected a refusal, got {v}");
+        assert!(pending_id_for_tab(proj, "p1").is_none(), "and nothing may be parked");
+    }
+
+    #[test]
+    // Revert-checked: making `close_tab` answer `TAB_CLOSED` without removing
+    // anything from the pending map failed only this test — `panicked ...
+    // "close_tab never withdrew the proposal"`, after waiting out its full 5s
+    // deadline — then restored.
+    fn close_tab_withdraws_a_pending_proposal() {
+        let proj = "diff-8";
+        let (_rx, _ide, _d, ws) = connected_fake_client_for(proj);
+        let f = ws.path().join("a.rs");
+        let pending = open_diff_from_claude(proj, f.to_str().unwrap(), "x", "proposal-1");
+        send_from_claude(
+            proj,
+            &rpc(
+                5,
+                "tools/call",
+                serde_json::json!({"name": "close_tab", "arguments": {"tab_name": "proposal-1"}}),
+            ),
+        );
+        // The withdrawal happens on the connection thread, so wait for it
+        // rather than assuming this thread lost the race.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pending_id_for_tab(proj, "proposal-1").is_some() {
+            assert!(std::time::Instant::now() < deadline, "close_tab never withdrew the proposal");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            answer(proj, &pending, Answer::Accepted).is_err(),
+            "a withdrawn proposal cannot be answered"
+        );
+    }
+
+    // --- confinement, which `openDiff` cannot express over the wire ---
+    //
+    // Every one of these creates a real file at the target, so a failure is
+    // the confinement check refusing and never an ENOENT on the way to it —
+    // the trap CLAUDE.md records as the reason a symlink escape once survived
+    // review.
+
+    #[test]
+    fn an_existing_file_inside_the_project_resolves_to_its_rel_and_its_real_path() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir(ws.path().join("src")).unwrap();
+        let f = ws.path().join("src/a.rs");
+        std::fs::write(&f, "hi").unwrap();
+        let (rel, abs) = confined_target(ws.path(), f.to_str().unwrap()).unwrap();
+        assert_eq!(rel, "src/a.rs");
+        assert_eq!(abs.unwrap().canonicalize().unwrap(), f.canonicalize().unwrap());
+    }
+
+    #[test]
+    // An openDiff for a file that does not exist yet is Claude creating one.
+    // Refusing it would make "write a new file" the one edit resh cannot
+    // show, and the left-hand side of the diff is simply empty.
+    fn a_file_that_does_not_exist_yet_is_confined_but_has_no_disk_side() {
+        let ws = tempfile::tempdir().unwrap();
+        let (rel, abs) =
+            confined_target(ws.path(), ws.path().join("new.rs").to_str().unwrap()).unwrap();
+        assert_eq!(rel, "new.rs");
+        assert!(abs.is_none(), "nothing on disk to diff against yet");
+    }
+
+    #[test]
+    // A symlink inside the project pointing out of it is not the project's
+    // file. `Path::exists()` following it is the eleventh defect in
+    // CLAUDE.md's table, in a different module.
+    fn a_symlink_out_of_the_project_is_refused_even_though_its_target_exists() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("secret.txt");
+        // The target really exists: without this the refusal below could be a
+        // plain ENOENT and would prove nothing about confinement.
+        std::fs::write(&victim, "not yours").unwrap();
+        let link = ws.path().join("link.txt");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(std::fs::read_to_string(&link).is_ok(), "the escape target must be reachable");
+        let e = confined_target(ws.path(), link.to_str().unwrap())
+            .expect_err("a symlink out of the project must be refused");
+        assert!(e.contains("outside"), "the refusal must say why: {e}");
+    }
+
+    #[test]
+    fn a_traversal_through_a_real_directory_outside_the_project_is_refused() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("secret.txt");
+        std::fs::write(&victim, "not yours").unwrap();
+        // `<ws>/../<outside-dir-name>/secret.txt` — a real, readable file,
+        // reached by a path that starts inside the project. Both temp dirs
+        // share a parent, which is what makes one `..` enough.
+        let sneaky = format!(
+            "{}/../{}/secret.txt",
+            ws.path().display(),
+            outside.path().file_name().unwrap().to_str().unwrap()
+        );
+        assert!(std::fs::read_to_string(&sneaky).is_ok(), "the escape target must be reachable");
+        assert!(confined_target(ws.path(), &sneaky).is_err(), "traversal must not escape");
+    }
+
+    #[test]
+    fn a_relative_path_is_refused_rather_than_joined_onto_the_project() {
+        // openDiff sends absolute paths. A relative one is a client resh does
+        // not understand, and guessing at a base for it is how a confinement
+        // check gets skipped.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.rs"), "hi").unwrap();
+        assert!(confined_target(ws.path(), "a.rs").is_err());
+        assert!(confined_target(ws.path(), "").is_err());
     }
 
     /// Revert-checked: adding `"id": 1` to `mention`'s constructed message

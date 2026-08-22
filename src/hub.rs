@@ -407,6 +407,9 @@ impl Hub {
             Intent::MentionPath { rel, line_start, line_end } => {
                 return self.do_mention_path(from, rel.clone(), *line_start, *line_end)
             }
+            Intent::AnswerProposal { id, accept, text } => {
+                return self.do_answer_proposal(from, id.clone(), *accept, text.clone())
+            }
             _ => {}
         }
         // CloseTab removes the tab from `self.ws` inside `apply_layout`
@@ -420,6 +423,21 @@ impl Hub {
                 .and_then(|p| p.tabs.get(*idx))
                 .and_then(|t| match t {
                     Tab::File { rel, .. } => Some(rel.clone()),
+                    _ => None,
+                }),
+            _ => None,
+        };
+        // Same reason as `closing_rel` above: `apply_layout` has removed the
+        // tab by the time the answer has to be sent, so the id it carried has
+        // to be read out first.
+        let closing_proposal: Option<String> = match &intent {
+            Intent::CloseTab { pane, idx } => self
+                .ws
+                .panes
+                .get(*pane as usize)
+                .and_then(|p| p.tabs.get(*idx))
+                .and_then(|t| match t {
+                    Tab::Proposal { id } => Some(id.clone()),
                     _ => None,
                 }),
             _ => None,
@@ -500,6 +518,18 @@ impl Hub {
                     Intent::CloseTab { .. } => {
                         if let Some(rel) = &closing_rel {
                             self.maybe_drop_buffer(rel);
+                        }
+                        // Closing the tab *is* an answer — the spec's third
+                        // row, "reject, or close the tab". Without this, the
+                        // tab vanishes and Claude stays blocked on a request
+                        // with nothing left in the UI that could ever answer
+                        // it.
+                        if let Some(id) = &closing_proposal {
+                            if let Err(e) =
+                                crate::ide::answer(&self.project, id, crate::ide::Answer::Rejected)
+                            {
+                                eprintln!("resh: closing proposal {id}: {e}");
+                            }
                         }
                     }
                     // Discarding means "show me what is on disk", not "show me
@@ -1180,6 +1210,96 @@ impl Hub {
         }
     }
 
+    /// The human's Accept/Reject, which **is** the permission answer Claude
+    /// is blocked on.
+    ///
+    /// Lock order, and it only goes one way: this runs with the hub lock
+    /// held and takes `ide`'s pending lock inside it. `ide::open_diff` takes
+    /// the pending lock and *releases* it before it ever asks for a hub lock
+    /// (see `ide::open_proposal`'s caller), so there is no cycle to close.
+    /// Both directions must stay that way.
+    fn do_answer_proposal(&mut self, from: &ConnId, id: String, accept: bool, text: Option<String>) {
+        let a = match (accept, text) {
+            // A rejection carrying text is still a rejection: the text is
+            // only ever read on the accepting path, so there is no way for a
+            // client to smuggle content past a "no".
+            (false, _) => crate::ide::Answer::Rejected,
+            (true, Some(t)) => crate::ide::Answer::AcceptedEdited(t),
+            (true, None) => crate::ide::Answer::Accepted,
+        };
+        // Answer first, then close the tab: the removal from the pending map
+        // inside `answer` is what decides which of two browsers won, and the
+        // loser must find the proposal already gone rather than be told it
+        // succeeded because its tab was still on screen.
+        let failed = crate::ide::answer(&self.project, &id, a).err();
+        self.close_proposal_tab(&id);
+        if let Some(e) = failed {
+            // To the clicker only. Every other browser's tab simply
+            // disappears, which is the truth — the proposal was answered.
+            let ev = Event::Error { msg: format!("that proposal is no longer open: {e}") };
+            self.send_to(from, &ev);
+        }
+    }
+
+    /// Opens the tab and hands both sides of the diff to every browser on
+    /// this project. Called from an `ide` connection thread, which holds no
+    /// lock of its own by this point.
+    ///
+    /// The proposal is deliberately not persisted (`persist` is not called):
+    /// it would only be dropped again by `workspace::drop_dead_tabs` on the
+    /// next load, and a whole file body has no business in the state file.
+    pub fn open_proposal_tab(&mut self, id: &str, rel: &str, old_text: &str, new_text: &str) {
+        let Some(p) = self.ws.panes.get_mut(crate::proto::MIDDLE as usize) else {
+            // A hand-edited state file could in principle leave fewer panes
+            // than the layout has. Never index blind from a socket thread.
+            eprintln!("resh: no middle pane to open a proposal in");
+            return;
+        };
+        p.tabs.push(Tab::Proposal { id: id.to_string() });
+        p.active = p.tabs.len() - 1;
+        self.ws.version += 1;
+        // Content before the tab that renders it: a client that learned about
+        // the tab first would have a frame with nothing to draw in it.
+        let ev = Event::Proposal {
+            id: id.to_string(),
+            rel: rel.to_string(),
+            old_text: old_text.to_string(),
+            new_text: new_text.to_string(),
+        };
+        self.broadcast(&ev);
+        let snap = self.snapshot_event(&String::new());
+        self.broadcast(&snap);
+    }
+
+    /// Drops one proposal's tab from every pane. A proposal is a single
+    /// question, so a second browser showing the same tab must lose it too —
+    /// the same reasoning `EndSession` gives for clearing a terminal's tabs
+    /// everywhere rather than by (pane, idx).
+    pub fn close_proposal_tab(&mut self, id: &str) {
+        let mut removed = false;
+        for p in self.ws.panes.iter_mut() {
+            while let Some(i) =
+                p.tabs.iter().position(|t| matches!(t, Tab::Proposal { id: x } if x == id))
+            {
+                p.tabs.remove(i);
+                // Not `min(len-1)` alone: closing a tab to the *left* of the
+                // active one shifts the active tab down by one, and clamping
+                // without that shift silently activates a different tab.
+                if p.active > i {
+                    p.active -= 1;
+                }
+                p.active = p.active.min(p.tabs.len().saturating_sub(1));
+                removed = true;
+            }
+        }
+        if !removed {
+            return;
+        }
+        self.ws.version += 1;
+        let snap = self.snapshot_event(&String::new());
+        self.broadcast(&snap);
+    }
+
     fn do_close_project(&mut self, from: &ConnId) {
         let dirty: Vec<String> =
             self.ws.buffers.iter().filter(|(_, b)| b.dirty()).map(|(r, _)| r.clone()).collect();
@@ -1258,6 +1378,59 @@ impl Hub {
                 self.broadcast(&snap);
             }
         }
+    }
+}
+
+/// The hub for a project that is already open, without creating one.
+///
+/// `REGISTRY.get()`, not `get_or_init`: everything below is a question asked
+/// from an `ide` connection thread, and building a hub as a side effect of a
+/// question would start a filesystem watcher for a project nobody opened —
+/// the same reasoning `Hub::is_closing` and `Hub::show_hidden` give.
+///
+/// The registry guard is dropped before the caller ever locks the hub, so the
+/// registry-then-hub order `for_project` established is preserved.
+fn open_hub(project: &str) -> Option<Arc<Mutex<Hub>>> {
+    let reg = REGISTRY.get()?;
+    let map = reg.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(project).cloned()
+}
+
+/// Whether resh is holding unsaved edits to `rel`.
+///
+/// `openDiff` asks this before parking a proposal: accepting one would let
+/// Claude write over text the user has typed and not saved, which is the one
+/// thing the whole conflict guard exists to prevent.
+///
+/// `false` for a project with no hub is a fact, not a failed check — a
+/// project nobody has opened holds no buffers at all, so there is nothing
+/// here to be uncertain about.
+pub fn has_dirty_buffer(project: &str, rel: &str) -> bool {
+    let Some(arc) = open_hub(project) else { return false };
+    let dirty = Hub::lock(&arc).ws.buffers.get(rel).is_some_and(|b| b.dirty());
+    dirty
+}
+
+/// Opens a proposal tab for a change Claude has asked permission to make.
+/// The free-function half of `Hub::open_proposal_tab`, so `ide.rs` never
+/// takes a hub lock itself.
+///
+/// Silently does nothing when the project has no hub. That is not a case
+/// production reaches: the `ide` listener a proposal arrives on is created
+/// by `Hub::for_project`, which puts the hub in the registry first and never
+/// removes it. `ide.rs`'s own unit tests do build a listener with no hub, and
+/// they assert on the parked request rather than on the tab.
+pub fn open_proposal(project: &str, id: &str, rel: &str, old_text: &str, new_text: &str) {
+    if let Some(arc) = open_hub(project) {
+        Hub::lock(&arc).open_proposal_tab(id, rel, old_text, new_text);
+    }
+}
+
+/// Withdraws a proposal's tab — Claude sent `close_tab`, so the question is
+/// gone whether or not anyone was looking at it.
+pub fn close_proposal(project: &str, id: &str) {
+    if let Some(arc) = open_hub(project) {
+        Hub::lock(&arc).close_proposal_tab(id);
     }
 }
 
@@ -2971,10 +3144,289 @@ mod tests {
             .filter(|t| matches!(t, Tab::File { rel, .. } if rel == "src/a.rs"))
             .count();
         assert_eq!(hits, 1, "opening the same path twice stacked tabs: {:?}", pane.tabs);
-        assert!(
+         assert!(
             matches!(pane.tabs.get(pane.active), Some(Tab::File { rel, .. }) if rel == "src/a.rs"),
             "the second open did not activate the existing tab: {pane:?}"
         );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    // --- Task 7: proposal tabs ---
+
+    /// A `Hub` with a private state directory, for the proposal tests below.
+    /// They all persist on some path or other, and none of them should write
+    /// into this host's real state directory.
+    fn proposal_hub(project: &str) -> (Hub, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", dir.path().join("state"));
+        (Hub::new(project, dir.path().to_path_buf()), dir)
+    }
+
+    /// Two subscribers, deliberately: with one, `broadcast` and `send_to` are
+    /// indistinguishable, and a proposal that reached only the browser that
+    /// happened to be first would leave the other one showing a tab it has no
+    /// content for.
+    ///
+    /// Revert-checked: broadcasting the `State` snapshot *before* the
+    /// `Proposal` event failed this test — `panicked ... "the content must
+    /// arrive before the tab that draws it"` — then restored. Also checked by
+    /// dropping the `Proposal` broadcast entirely, which failed on "no
+    /// Proposal event reached ...".
+    #[test]
+    fn a_proposal_sends_both_sides_to_every_browser_before_the_tab_that_draws_them() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut h, _d) = proposal_hub("proposal-broadcast");
+        let (_a, rx_a) = h.subscribe();
+        let (_b, rx_b) = h.subscribe();
+
+        h.open_proposal_tab("p-1", "src/a.rs", "on disk", "proposed");
+
+        for (who, rx) in [("a", &rx_a), ("b", &rx_b)] {
+            let got: Vec<String> = rx.try_iter().collect();
+            let at_proposal = got.iter().position(|m| m.contains(r#""t":"Proposal""#));
+            let at_state = got.iter().position(|m| m.contains(r#""t":"State""#));
+            let at_proposal =
+                at_proposal.unwrap_or_else(|| panic!("no Proposal event reached {who}: {got:?}"));
+            let at_state =
+                at_state.unwrap_or_else(|| panic!("no State event reached {who}: {got:?}"));
+            assert!(at_proposal < at_state, "the content must arrive before the tab that draws it");
+            let ev = &got[at_proposal];
+            // Both sides, or there is nothing to diff: the new side has never
+            // been written anywhere, and the old side is what makes an
+            // overwrite distinguishable from a creation.
+            assert!(ev.contains(r#""old_text":"on disk""#), "{who} got {ev}");
+            assert!(ev.contains(r#""new_text":"proposed""#), "{who} got {ev}");
+            assert!(ev.contains(r#""rel":"src/a.rs""#), "{who} got {ev}");
+        }
+        assert!(
+            h.ws.panes[proto::MIDDLE as usize]
+                .tabs
+                .iter()
+                .any(|t| matches!(t, Tab::Proposal { id } if id == "p-1")),
+            "the tab itself must exist too"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// One proposal is one question, so its tab has to go everywhere it was
+    /// drawn — the same reasoning `EndSession` gives for terminal tabs.
+    ///
+    /// Revert-checked: restricting `close_proposal_tab`'s loop to the middle
+    /// pane failed this test — `panicked ... "a proposal tab survived in
+    /// another pane: [Terminal { session: \"term\" }, Proposal { id: \"p-1\" }]
+    /// (pane 3)"` — then restored. Separately, deleting the `if p.active > i`
+    /// shift failed the last assertion — `left: Some(Changes) / right:
+    /// Some(Tree)`.
+    #[test]
+    fn closing_a_proposal_clears_it_from_every_pane_and_keeps_the_active_tab() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut h, _d) = proposal_hub("proposal-close");
+        let mid = proto::MIDDLE as usize;
+        let right = proto::RIGHT as usize;
+        // Three tabs, with the active one *between* the proposal and the
+        // end: with only two, clamping to `len - 1` lands on the right tab
+        // by accident and the index shift below cannot be observed at all.
+        // Checked — the two-tab version of this test passed with the shift
+        // deleted.
+        h.ws.panes[mid].tabs =
+            vec![Tab::Proposal { id: "p-1".into() }, Tab::Tree, Tab::Changes];
+        h.ws.panes[mid].active = 1;
+        h.ws.panes[right].tabs.push(Tab::Proposal { id: "p-1".into() });
+
+        h.close_proposal_tab("p-1");
+
+        for (i, p) in h.ws.panes.iter().enumerate() {
+            assert!(
+                !p.tabs.iter().any(|t| matches!(t, Tab::Proposal { .. })),
+                "a proposal tab survived in another pane: {:?} (pane {i})",
+                p.tabs
+            );
+        }
+        assert_eq!(
+            h.ws.panes[mid].tabs.get(h.ws.panes[mid].active),
+            Some(&Tab::Tree),
+            "closing the tab to the left of the active one must not activate a different tab"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// The whole point of the feature: the click **is** the permission
+    /// answer, and a proposal the user rewrote before accepting must travel
+    /// back as the content Claude writes.
+    ///
+    /// Revert-checked: making the `(true, Some(t))` arm produce
+    /// `Answer::Accepted` (dropping the user's text) failed this test —
+    /// `left: String("TAB_CLOSED") / right: "FILE_SAVED"` — then restored.
+    /// That is the defect that would make Claude write the version the user
+    /// rejected.
+    #[test]
+    fn accepting_an_edited_proposal_sends_the_users_own_text_back_and_closes_the_tab() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut h, _d) = proposal_hub("proposal-accept");
+        let (tx, rx) = channel();
+        let id = crate::ide::park_for_test("proposal-accept", "p1", tx);
+        h.open_proposal_tab(&id, "a.rs", "old", "claude's version");
+        let (conn, _crx) = h.subscribe();
+
+        h.handle(
+            &conn,
+            Intent::AnswerProposal {
+                id: id.clone(),
+                accept: true,
+                text: Some("the human's version".into()),
+            },
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert_eq!(v["result"]["content"][0]["text"], "FILE_SAVED");
+        assert_eq!(v["result"]["content"][1]["text"], "the human's version");
+        assert!(
+            !h.ws.panes.iter().any(|p| p.tabs.iter().any(|t| matches!(t, Tab::Proposal { .. }))),
+            "an answered proposal's tab must not linger"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// A rejection carrying text is still a rejection. Without this, a client
+    /// could get content past a "no" simply by sending it alongside.
+    ///
+    /// Revert-checked: reordering the match so `(_, Some(t))` produced
+    /// `AcceptedEdited` regardless of `accept` failed this test — `left:
+    /// String("FILE_SAVED") / right: "DIFF_REJECTED"` — then restored.
+    #[test]
+    fn rejecting_ignores_any_text_that_came_with_it() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut h, _d) = proposal_hub("proposal-reject");
+        let (tx, rx) = channel();
+        let id = crate::ide::park_for_test("proposal-reject", "p1", tx);
+        h.open_proposal_tab(&id, "a.rs", "old", "new");
+        let (conn, _crx) = h.subscribe();
+
+        h.handle(
+            &conn,
+            Intent::AnswerProposal {
+                id: id.clone(),
+                accept: false,
+                text: Some("smuggled".into()),
+            },
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert_eq!(v["result"]["content"][0]["text"], "DIFF_REJECTED");
+        assert!(v["result"]["content"].get(1).is_none(), "a rejection carries no content: {v}");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// The spec's third row: "reject, or close the tab". Without it the tab
+    /// vanishes and Claude stays blocked on a request nothing left in the UI
+    /// could ever answer.
+    ///
+    /// Revert-checked: deleting the `closing_proposal` arm from `CloseTab`
+    /// failed this test — `called Result::unwrap() on an Err value: Timeout`,
+    /// after waiting out the full 2s budget — i.e. Claude was never answered
+    /// at all. Then restored.
+    #[test]
+    fn closing_a_proposal_tab_by_hand_rejects_it_rather_than_stranding_claude() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut h, _d) = proposal_hub("proposal-closetab");
+        let (tx, rx) = channel();
+        let id = crate::ide::park_for_test("proposal-closetab", "p1", tx);
+        h.open_proposal_tab(&id, "a.rs", "old", "new");
+        let (conn, _crx) = h.subscribe();
+        let mid = proto::MIDDLE as usize;
+        let idx = h.ws.panes[mid]
+            .tabs
+            .iter()
+            .position(|t| matches!(t, Tab::Proposal { .. }))
+            .expect("the proposal tab must be there to close");
+
+        h.handle(&conn, Intent::CloseTab { pane: proto::MIDDLE, idx });
+
+        let v: serde_json::Value = serde_json::from_str(
+            &rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["result"]["content"][0]["text"], "DIFF_REJECTED");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// `openDiff` asks this before parking anything: accepting a proposal for
+    /// a file the user has unsaved edits to would discard them silently.
+    ///
+    /// Goes through `Hub::for_project`, not `Hub::new`, because the registry
+    /// lookup is half of what is under test — `ide.rs` has no hub of its own
+    /// to ask.
+    ///
+    /// Revert-checked: making `has_dirty_buffer` return
+    /// `buffers.contains_key(rel)` instead of testing `dirty()` failed this
+    /// test — `panicked ... "a clean buffer is not unsaved work"` — then
+    /// restored.
+    #[test]
+    fn has_dirty_buffer_is_about_unsaved_text_and_about_this_project_only() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        isolate_ide_dir_for_tests();
+        let hub = Hub::for_project("dirtyprobe", d.path().to_path_buf());
+        assert!(!has_dirty_buffer("dirtyprobe", "a.rs"), "no buffer at all is not unsaved work");
+        {
+            let mut h = Hub::lock(&hub);
+            h.ws.buffers.insert("a.rs".into(), workspace::Buffer::default());
+        }
+        assert!(!has_dirty_buffer("dirtyprobe", "a.rs"), "a clean buffer is not unsaved work");
+        {
+            let mut h = Hub::lock(&hub);
+            h.ws.buffers.insert(
+                "a.rs".into(),
+                workspace::Buffer {
+                    content: workspace::Content::Edited("typed".into()),
+                    ..workspace::Buffer::default()
+                },
+            );
+        }
+        assert!(has_dirty_buffer("dirtyprobe", "a.rs"));
+        assert!(!has_dirty_buffer("dirtyprobe", "b.rs"), "and only about the file asked about");
+        assert!(
+            !has_dirty_buffer("dirtyprobe-not-open", "a.rs"),
+            "a project with no hub holds no buffers, which is a fact and not a failed check"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// The free functions `ide.rs` actually calls, exercised through the
+    /// registry they look their hub up in — `open_proposal_tab` being right
+    /// is worth nothing if `open_proposal` routes to the wrong project.
+    ///
+    /// Two projects, deliberately: with one, "opened it in the project that
+    /// asked" and "opened it in whatever hub was handy" are the same
+    /// observation.
+    ///
+    /// Revert-checked: making `open_hub` ignore the key it was given (taking
+    /// the highest-sorting registry entry instead, which is deterministically
+    /// the *other* project here) failed this test — `panicked ... "the
+    /// proposal never reached the project that asked"` — then restored.
+    #[test]
+    fn open_and_close_proposal_act_on_the_project_that_asked() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        isolate_ide_dir_for_tests();
+        let a = Hub::for_project("proposal-route-a", d.path().to_path_buf());
+        let b = Hub::for_project("proposal-route-b", d.path().to_path_buf());
+        let has_tab = |h: &Arc<Mutex<Hub>>| {
+            Hub::lock(h)
+                .ws
+                .panes
+                .iter()
+                .any(|p| p.tabs.iter().any(|t| matches!(t, Tab::Proposal { id } if id == "p-7")))
+        };
+
+        open_proposal("proposal-route-a", "p-7", "a.rs", "old", "new");
+        assert!(has_tab(&a), "the proposal never reached the project that asked");
+        assert!(!has_tab(&b), "a proposal opened in the wrong project");
+
+        close_proposal("proposal-route-a", "p-7");
+        assert!(!has_tab(&a), "close_proposal left the tab behind");
         std::env::remove_var("RESH_STATE_DIR");
     }
 }

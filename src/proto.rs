@@ -23,6 +23,11 @@ pub enum Tab {
     File { rel: String, mode: Mode },
     Diff { rel: Option<String> },
     Terminal { session: String },
+    /// A change Claude has proposed and nobody has answered yet. Deliberately
+    /// not `Tab::Diff`, which is a git diff of a tracked path: a proposal
+    /// compares disk against content that has never been written, and it is
+    /// keyed by a pending request rather than by a file.
+    Proposal { id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +98,14 @@ pub enum Intent {
     /// a paste lands in whatever state the terminal is in and competes with
     /// whatever Claude is doing at that instant.
     MentionPath { rel: String, line_start: Option<u32>, line_end: Option<u32> },
+    /// The human's answer to an `openDiff` Claude is still blocked on. This
+    /// intent **is** the permission answer, which is why `text` exists: a
+    /// proposal the user edited before accepting must travel back as the
+    /// content Claude writes, or Claude writes the version the user rejected.
+    ///
+    /// `accept: false` with a `text` is still a rejection — the text is only
+    /// ever read on the accepting path.
+    AnswerProposal { id: String, accept: bool, text: Option<String> },
 }
 
 /// Snapshot sent as `Event::State`. Deliberately carries buffer *metadata*
@@ -161,6 +174,11 @@ pub enum Event {
     /// snapshot goes out on every workspace change, and history does not
     /// belong on that path.
     Notice { notice: crate::notify::Notice },
+    /// The two sides of a proposal tab, sent when the tab opens rather than
+    /// carried in `WorkspaceView`: that snapshot goes out on every workspace
+    /// change (every debounced keystroke, via `EditBuffer`), and two whole
+    /// file bodies have no business on that path.
+    Proposal { id: String, rel: String, old_text: String, new_text: String },
     /// The whole store — every project's notices, not just this client's —
     /// sent on connect and after any read-state change, so no two browsers
     /// disagree about the badge count.
@@ -305,6 +323,55 @@ mod tests {
             Intent::OpenPath { text } => assert_eq!(text, "~/p/resh/src/a.rs:42"),
             other => panic!("decoded to {other:?}"),
         }
+    }
+
+    /// Revert-checked: marking `text` `#[serde(skip)]` — the shape a
+    /// hand-written decoder would most plausibly land in — failed this test
+    /// on the `Some(t)` arm, then restored.
+    #[test]
+    fn decodes_an_answer_with_and_without_edited_text() {
+        // The `text` arm is how "the user changed my proposal before
+        // accepting" reaches Claude. Decoding it as `None` would make Claude
+        // write the text the user rejected.
+        let i = decode(r#"{"t":"AnswerProposal","id":"p-1","accept":true,"text":"mine"}"#).unwrap();
+        assert!(matches!(
+            i,
+            Intent::AnswerProposal { id, accept: true, text: Some(t) } if id == "p-1" && t == "mine"
+        ));
+        let i = decode(r#"{"t":"AnswerProposal","id":"p-1","accept":false,"text":null}"#).unwrap();
+        assert!(matches!(i, Intent::AnswerProposal { accept: false, text: None, .. }));
+    }
+
+    #[test]
+    fn a_proposal_tab_round_trips_by_id() {
+        // The id, not a path: two proposals for the same file are two tabs,
+        // and the id is the only thing that can tell them apart.
+        let i = decode(r#"{"t":"OpenTab","pane":2,"tab":{"k":"Proposal","id":"diff-1-7"}}"#).unwrap();
+        match i {
+            Intent::OpenTab { tab, .. } => assert_eq!(tab, Tab::Proposal { id: "diff-1-7".into() }),
+            other => panic!("decoded to {other:?}"),
+        }
+    }
+
+    /// Revert-checked: renaming `old_text` on the wire (`#[serde(rename =
+    /// "was")]`) failed this test — `got {"t":"Proposal","id":"p-1",
+    /// "rel":"src/a.rs","was":"before","new_text":"after"}` — then restored.
+    /// Removing the field outright does not compile, which is the other half
+    /// of the guarantee.
+    #[test]
+    fn encodes_a_proposal_with_both_sides() {
+        // Both sides on the wire, or the client has nothing to diff against:
+        // the old side is disk, the new side has never been written anywhere.
+        let s = encode(&Event::Proposal {
+            id: "p-1".into(),
+            rel: "src/a.rs".into(),
+            old_text: "before".into(),
+            new_text: "after".into(),
+        });
+        assert!(s.contains(r#""t":"Proposal""#), "got {s}");
+        assert!(s.contains(r#""rel":"src/a.rs""#), "got {s}");
+        assert!(s.contains(r#""old_text":"before""#), "got {s}");
+        assert!(s.contains(r#""new_text":"after""#), "got {s}");
     }
 
     #[test]
