@@ -651,7 +651,7 @@ mod tests {
     //      terminal_path_refuses_a_real_file_outside_the_project:
     //        panicked at src/projects.rs:699:9:
     //        expected a confinement refusal naming the reason, got "path outside project: /tmp/.tmp0xSRIq/secret.txt"
-    //      terminal_path_resolves_relative_absolute_and_tilde:
+    //      terminal_path_resolves_relative_and_absolute:
     //        panicked at src/projects.rs:670:9:
     //        assertion `left == right` failed
     //          left: "/tmp/.tmpRc9oVQ/src/a.rs"
@@ -668,10 +668,20 @@ mod tests {
     //      terminal_path_strips_line_and_column:
     //        panicked at src/projects.rs:675:70:
     //        called `Result::unwrap()` on an `Err` value: "not found: No such file or directory (os error 2)"
-    // All three restored; full `terminal_path` suite passes again (5/5).
+    // 4. (Fix round 1) The `if let Some(rest) = bare.strip_prefix("~/")` arm
+    //    removed from `resolve_terminal_path`, so `~/...` falls into the
+    //    plain-relative arm unchanged.
+    //      terminal_path_resolves_a_tilde_path:
+    //        panicked at src/projects.rs:707:63:
+    //        called `Result::unwrap()` on an `Err` value: "not found: No such file or directory (os error 2)"
+    //    (`safe_resolve` looked for a literal directory named `~`, which does
+    //    not exist, and refused before reaching the assertion — same shape as
+    //    revert 3 above: the missing-branch failure surfaces one layer down,
+    //    inside `safe_resolve`, not at the equality check.)
+    // All four restored; full `terminal_path` suite passes again (7/7).
 
     #[test]
-    fn terminal_path_resolves_relative_absolute_and_tilde() {
+    fn terminal_path_resolves_relative_and_absolute() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("src")).unwrap();
         std::fs::write(root.path().join("src/a.rs"), b"fn main() {}").unwrap();
@@ -684,6 +694,47 @@ mod tests {
             resolve_terminal_path(root.path(), abs.to_str().unwrap()).unwrap(),
             "src/a.rs"
         );
+    }
+
+    /// Building the fixture under the real `$HOME` (rather than mutating
+    /// `HOME` itself) is deliberate: env vars are process-global and `cargo
+    /// test` runs tests in parallel, so `set_var` here would corrupt
+    /// whichever other test happened to read `HOME` concurrently.
+    #[test]
+    fn terminal_path_resolves_a_tilde_path() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return; // no HOME on this machine: a legitimate state, not a failure
+        };
+        let home = PathBuf::from(home);
+        match std::fs::metadata(&home) {
+            Ok(m) if m.is_dir() => {}
+            _ => return, // HOME missing, unreadable, or not a directory: skip, don't fail
+        }
+
+        let root = tempfile::tempdir_in(&home).unwrap();
+        std::fs::write(root.path().join("a.rs"), b"fn main() {}").unwrap();
+
+        let rel_to_home = root.path().strip_prefix(&home).unwrap().to_str().unwrap();
+        let input = format!("~/{rel_to_home}/a.rs");
+
+        assert_eq!(resolve_terminal_path(root.path(), &input).unwrap(), "a.rs");
+    }
+
+    /// Verifies the claim in `abs_to_rel`'s doc comment: a symlinked project
+    /// root still matches its own files rather than refusing them, because
+    /// both sides are canonicalised before the `strip_prefix` comparison.
+    #[test]
+    fn terminal_path_resolves_through_a_symlinked_project_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("a.rs"), b"fn main() {}").unwrap();
+
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let abs = link.join("a.rs");
+        assert_eq!(resolve_terminal_path(&link, abs.to_str().unwrap()).unwrap(), "a.rs");
     }
 
     #[test]
