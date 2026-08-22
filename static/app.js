@@ -246,6 +246,11 @@ function onEvent(ev) {
         try { e.node.remove(); } catch {}
       });
       terms.clear();
+      // Every one of pendingLink's possible entries just had its node
+      // removed and its xterm disposed above — drop the stale reference so a
+      // later, unrelated PathRefused (a duplicate delivery, say) cannot
+      // termFlash a detached node instead of silently finding nothing.
+      pendingLink = null;
       // Every node above is gone, but `state.live_sessions` is still the
       // stale pre-close list until the trailing State broadcast lands —
       // tabKey would keep reading ":live" from it, render()'s mountedKey
@@ -282,14 +287,20 @@ function onEvent(ev) {
       break;
     case "PathRefused":
       // Not showError: that funnels to the workspace banner, which is the
-      // wrong shape here and — as the Error case below notes — carries no way
+      // wrong shape here and — as the Error case above notes — carries no way
       // back to the terminal that was clicked. This does, via the click still
       // in flight.
       console.warn("resh:", ev.msg);
       if (pendingLink && pendingLink.text === ev.text) {
         termFlash(pendingLink.entry, ev.msg);
+        // Cleared only on a match. A mismatch means a DIFFERENT click is
+        // still in flight (PATH_RE marks ordinary prose, so a user arming
+        // links over a paragraph and clicking twice before the first reply
+        // lands is the common case, not an edge case) — clearing here would
+        // strand that click's own refusal, which would then find an empty
+        // slot and drop silently to console.warn instead of flashing.
+        pendingLink = null;
       }
-      pendingLink = null;
       break;
   }
 }
@@ -458,6 +469,9 @@ function render() {
     try { e.term.dispose(); } catch {}
     e.node.remove();
     terms.delete(session);
+    // Same reasoning as ProjectClosed's teardown: this entry's node is gone,
+    // so a pendingLink still pointing at it must not outlive it.
+    if (pendingLink && pendingLink.entry === e) pendingLink = null;
   });
 }
 

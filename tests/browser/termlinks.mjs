@@ -23,16 +23,18 @@
 //! against a row that also contains `printf`, quotes and other paths.
 //!
 //! Revert-the-fix, each one applied, run, watched fail, then restored. Counts
-//! re-measured after section H (task 5's own additions) was added, so they
-//! are what this file does today, not what an earlier draft of it did:
+//! re-measured after sections I and J (fix round 1's own additions) were
+//! added, so they are what this file does today, not what an earlier draft
+//! of it did:
 //!   0. Deleted the `registerTermLinks(term, entry)` call in ensureTerm —
-//!      the state of the tree before this task. Ten failed (was eight before
-//!      section H existed — see below), among them:
+//!      the state of the tree before this task. Eleven failed (ten before I
+//!      and J existed, eight before that — see below), among them:
 //!        FAIL  two link providers are registered on the terminal (got 0)
 //!        FAIL  a path is offered as a link while the modifier is held (got 0: [])
 //!        FAIL  arming alone marked the path under the resting pointer (got null)
 //!        FAIL  the link is still marked with the application holding the mouse
 //!        FAIL  modifier+click on a real path opened docs/backlog.md
+//!        FAIL  the refusal flashed on the terminal that was actually clicked
 //!      Both "no link offered" assertions (1 and 4) went on passing, since
 //!      no providers and a closed gate look identical from outside. That is
 //!      exactly why the registration guard and the row-on-screen guards are
@@ -42,14 +44,19 @@
 //!      openTermPath is never called and pendingLink stays null, so
 //!      flashText() staying "" satisfies nothing rather than exposing this.
 //!      That is what the tab-count and modifier+click assertions are for.
+//!      Section I's second terminal has no providers either, so its click
+//!      never activates and its own refusal-flash assertion fails the same
+//!      way — but "and not on the other terminal" still passes, vacuously:
+//!      neither terminal ever flashes anything. Section J is unaffected: it
+//!      calls openTermPath directly, never through a provider.
 //!   1. Deleted `if (!linksArmed) return cb(undefined);` from matchProvider.
 //!      Three failed — the direct one plus both of section F's disarmed
 //!      states, which is the same property seen through xterm:
 //!        FAIL  no link is offered with the modifier up (got 1: ["docs/backlog.md"])
 //!        FAIL  resting on the path marks nothing while disarmed
 //!        FAIL  and releasing unmarked it, again with no mouse movement
-//!      Section H is unaffected: every click there already holds the
-//!      modifier, so a gate that fails open changes nothing it clicks.
+//!      Sections H, I and J are unaffected: every click there already holds
+//!      the modifier, so a gate that fails open changes nothing it clicks.
 //!   2. Swapped the two entries of the `providers` array in
 //!      registerTermLinks, so the path provider registers first. Two failed,
 //!      one from each precedence assertion:
@@ -65,18 +72,18 @@
 //!      zero directory segments. One failed:
 //!        FAIL  a bare filename with no directory offers no link (got 1: ["backlog.md"])
 //!   4. Put nudgeLinks' synthetic mousemove back on the `.termhost` element
-//!      instead of `.xterm-screen`. Four failed (was three before section H
-//!      — see below), all of them hover-path:
+//!      instead of `.xterm-screen`. Four failed, unchanged by I and J, all
+//!      of them hover-path:
 //!        FAIL  arming alone marked the path under the resting pointer (got null)
 //!        FAIL  xterm's own precedence marks the whole URL, not the path in
 //!        its tail (got null)
 //!        FAIL  the link is still marked with the application holding the mouse
 //!        FAIL  modifier+click on a real path opened docs/backlog.md
-//!      The fourth one — new with section H — was not obvious in advance:
-//!      clickLink's own mouseMoved is a real CDP event dispatched straight at
-//!      xterm's screen element, so it looked independent of nudgeLinks
-//!      entirely. Measured instead of assumed, with logging added and then
-//!      removed: xterm's Linkifier caches its answer per line
+//!      That fourth one — new when section H was added — was not obvious in
+//!      advance: clickLink's own mouseMoved is a real CDP event dispatched
+//!      straight at xterm's screen element, so it looked independent of
+//!      nudgeLinks entirely. Measured instead of assumed, with logging added
+//!      and then removed: xterm's Linkifier caches its answer per line
 //!      (`_askForLink`'s useLinkCache branch — see the comment above `away`
 //!      below), and PATH's row was last queried, stale and unarmed, back in
 //!      section G. A move that lands on the *same line* — which clickLink's
@@ -87,7 +94,10 @@
 //!      off-line-then-back detour is what invalidates that cache before a
 //!      click's own move ever runs, and section H's click depends on it
 //!      exactly as much as F's pure-hover assertions do — this revert is
-//!      what proved that, not the design intent going in.
+//!      what proved that, not the design intent going in. Section I stays at
+//!      four rather than growing a fifth: ALSO_MISSING's row on terminal 2
+//!      was never queried unarmed the way PATH's was, so there is no stale
+//!      cache entry for clickLink's move to inherit there.
 //!   5. Put nudgeLinks' detour back to a sideways one — a different column on
 //!      the same line, off the real `cols` — instead of a different row. The
 //!      same four failed, identically, for the same reason as 4: a same-line
@@ -100,8 +110,8 @@
 //!   6. Made nudgeLinks' events `bubbles: true` again. Section G alone failed
 //!      (still just the one — section H disables mouse tracking mode before
 //!      it runs, so a bubbling nudge has no listener downstream to leak to
-//!      by the time H's clicks happen), with the phantom motion reports
-//!      spelled out:
+//!      by the time H, I or J run), with the phantom motion reports spelled
+//!      out:
 //!        FAIL  arming and disarming sent nothing to the PTY
 //!        ("[<35;5;1M[<35;5;4M[<35;5;1M[<35;5;4M";
 //!        after arming alone: "[<35;5;1M[<35;5;4M")
@@ -114,21 +124,28 @@
 //! for the exact terminal output).
 //!
 //! Section H (task 5: what a click does) has its own two reverts, each
-//! applied, run, watched fail, then restored:
+//! applied, run, watched fail, then restored. Both counts grew once sections
+//! I and J existed, since openTermPath and the PathRefused handler are the
+//! same code every one of those sections exercises:
 //!   1. Changed the `PathRefused` case in onEvent to call `showError(ev.msg)`
-//!      instead of `termFlash(pendingLink.entry, ev.msg)`. One failed:
-//!        (timed out waiting for the refusal flash)
+//!      instead of `termFlash(pendingLink.entry, ev.msg)`. Three failed (one
+//!      before I and J existed):
 //!        FAIL  and flashed the refusal in the terminal that was clicked
+//!        FAIL  the refusal flashed on the terminal that was actually clicked
+//!        FAIL  a mismatched refusal in between did not swallow the next
+//!        click's own reply
 //!      showError still ran — the refusal itself was not lost — but it went
 //!      to the workspace banner, not the terminal, which is exactly the
 //!      wrong-shape failure this design exists to avoid: a refusal with no
 //!      way back to which terminal, or which click, produced it.
 //!   2. Had openTermPath send `{ t: "OpenTab", pane: 2, tab: { k: "File",
 //!      rel: raw, mode: "Preview" } }` directly instead of `{ t: "OpenPath",
-//!      text: raw }`. Two failed:
-//!        (timed out waiting for the refusal flash)
+//!      text: raw }`. Four failed (two before I and J existed):
 //!        FAIL  a path that does not resolve added no tab
 //!        FAIL  and flashed the refusal in the terminal that was clicked
+//!        FAIL  the refusal flashed on the terminal that was actually clicked
+//!        FAIL  a mismatched refusal in between did not swallow the next
+//!        click's own reply
 //!      The first is the whole reason `do_open_path` resolves before
 //!      touching the layout (see hub.rs): a raw, optimistic OpenTab for
 //!      nope/missing.rs landed in pane 2 as a dead tab, in every connected
@@ -139,7 +156,55 @@
 //! or directory (os error 2)" (capital N, confirmed by printing it), so the
 //! assertion below matches case-insensitively (/i) — a case-sensitive
 //! /cannot read|no such file/ never matches that string and would fail
-//! against a correct implementation, not just a broken one.
+//! against a correct implementation, not just a broken one. It also does not
+//! include the path itself: two different refused paths refuse with the
+//! *identical* string, which is exactly why section I settles terminal 1's
+//! flash to a known "" baseline before taking one, rather than comparing
+//! against whatever it happened to be showing.
+//!
+//! Fix round 1 added sections I and J and fixed pendingLink being cleared
+//! unconditionally on a refusal, whether or not it matched the click still
+//! in flight — a defect in the original brief's own code, not introduced by
+//! task 5. Two reverts, each applied, run, watched fail, then restored:
+//!   1. Restored the unconditional clear (moved `pendingLink = null;` back
+//!      outside the `if (pendingLink && pendingLink.text === ev.text)`
+//!      block, so it runs on every PathRefused, matched or not). Section J
+//!      exists for exactly this case — a mismatched refusal arriving while a
+//!      different click is still in flight — and it failed:
+//!        (timed out waiting for the real click's own refusal flash)
+//!        FAIL  a mismatched refusal in between did not swallow the next
+//!        click's own reply
+//!      The mismatched refusal cleared pendingLink before the real click's
+//!      own reply ever arrived, so that reply found an empty slot and
+//!      dropped silently to console.warn — the exact silent failure the fix
+//!      exists to prevent, and precisely the common case PATH_RE creates: it
+//!      marks ordinary prose, so arming links over a paragraph and clicking
+//!      two different, both-refusing spans before the first reply lands is
+//!      not an edge case.
+//!   2. Made openTermPath capture the wrong entry — `pendingLink = { entry:
+//!      [...terms.values()][0], text: raw }`, always terminal 1, regardless
+//!      of which terminal's provider actually called it. Two of section I's
+//!      three assertions failed, plus one collateral failure in J (the same
+//!      wrong-entry bug corrupts everything downstream of it, not a second,
+//!      independent defect):
+//!        (timed out waiting for a refusal flash on either terminal)
+//!        FAIL  the refusal flashed on the terminal that was actually clicked
+//!        FAIL  and not on the other terminal, which was never clicked
+//!        FAIL  terminal 1 starts this section with no flash pending
+//!      Clicking the refused path in terminal 2 flashed terminal 1 instead.
+//!      The first version of section I's "not on the other terminal" check
+//!      compared against a `before1` snapshot taken right after section H's
+//!      own click, without settling it first — since resolve_terminal_path's
+//!      refusal text carries no path (see above), section H's leftover
+//!      flash and a genuinely misrouted one are textually identical, and a
+//!      20-second wait on terminal 2 alone let a misrouted flash on terminal
+//!      1 fade (termFlash: 1600ms) before that check ever looked — so this
+//!      revert's second assertion passed even with the bug live, measured
+//!      rather than assumed. Fixed by settling terminal 1 to a known ""
+//!      baseline first, and by polling *both* terminals together on a short
+//!      timeout so a misrouted flash is caught before it can decay.
+//! Both restored afterwards; the run passes clean again (see
+//! task-5-report.md's fix-round-1 addendum for the exact terminal output).
 //!
 //! Run: deno run -A tests/browser/termlinks.mjs
 import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
@@ -174,13 +239,17 @@ async function openTabRels(page, pane) {
        .filter((t) => t.k === "File").map((t) => t.rel))`));
 }
 
-// What the clicked terminal is currently flashing, "" if nothing. Reads
-// __t()'s own node, the same entry openTermPath flashes into — so a
+// What one terminal is currently flashing, "" if nothing. `session` targets
+// a specific terminal (section I, where two are on screen at once and
+// __t() — first-inserted-into-the-Map — cannot tell them apart); omitted, it
+// reads __t()'s own node, matching every section before I where only one
+// terminal exists. This is the same entry openTermPath flashes into, so a
 // refusal that landed on a *different* terminal's element (a wrong `entry`
-// captured in pendingLink, say) would show up here as "" or stale text,
-// not as a false pass.
-async function flashText(page) {
-  return await page.evalIn(`__t().node.dataset.flash || ""`);
+// captured in pendingLink, say) shows up here as "" or stale text, not as a
+// false pass — proved, not assumed, by section I's revert below.
+async function flashText(page, session) {
+  const termExpr = session ? `terms.get(${JSON.stringify(session)})` : "__t()";
+  return await page.evalIn(`(() => { const e = ${termExpr}; return e ? (e.node.dataset.flash || "") : ""; })()`);
 }
 
 // Clicks the way a user actually does it: hover with the modifier held so
@@ -189,16 +258,24 @@ async function flashText(page) {
 // own _handleMouseUp gates activation on (static/vendor/xterm.js), not a
 // direct call into the provider's activate callback. Driving it through real
 // CDP mouse events, not __resolve, is what actually exercises openTermPath
-// and the PathRefused round trip end to end.
-async function clickLink(page, needle, { modifier = false } = {}) {
+// and the PathRefused round trip end to end. `session` targets a specific
+// terminal, as with flashText above; omitted, it defaults to __t().
+async function clickLink(page, needle, { modifier = false, session } = {}) {
   const { evalIn, cmd } = page;
+  const termExpr = session ? `terms.get(${JSON.stringify(session)})` : "__t()";
   const seat = await evalIn(`(() => {
-    const rows = [...document.querySelectorAll(".xterm-rows div")];
+    const entry = ${termExpr};
+    if (!entry) return null;
+    // Scoped to this terminal's own subtree: with two terminals mounted at
+    // once (section I), an unscoped search could resolve to the wrong one
+    // if their printed text ever collided.
+    const rows = [...document.querySelectorAll(".xterm-rows div")]
+      .filter((x) => entry.node.contains(x));
     const n = rows.filter((x) => x.textContent.trim() === ${JSON.stringify(needle)}).pop();
     if (!n) return null;
     const b = n.getBoundingClientRect();
-    const scr = __t().node.querySelector(".xterm-screen").getBoundingClientRect();
-    const cell = scr.width / __t().term.cols;
+    const scr = entry.node.querySelector(".xterm-screen").getBoundingClientRect();
+    const cell = scr.width / entry.term.cols;
     return { x: Math.round(scr.left + 4.5 * cell), y: Math.round(b.top + b.height / 2) };
   })()`);
   if (!seat) return false;
@@ -245,6 +322,18 @@ try {
     // Bottom-up, whole-row equality: see this file's header on why a
     // substring search would find the echoed command line instead.
     window.__rowY = (needle) => { const b = __t().term.buffer.active;
+      for (let i = b.length - 1; i >= 0; i--) { const l = b.getLine(i);
+        if (l && l.translateToString(true).trim() === needle) return i + 1; }
+      return -1; };
+    // Session-scoped twins of __last/__rowY, for section I, where a second
+    // terminal exists and __t() (first-inserted-into-the-Map) cannot tell
+    // the two apart.
+    window.__lastIn = (session) => { const e = terms.get(session); if (!e) return "";
+      const b = e.term.buffer.active; let s = "";
+      for (let i = 0; i < b.length; i++) s += b.getLine(i).translateToString(true) + "\\n";
+      return s.split("\\n").filter((l) => l.trim()).pop() || ""; };
+    window.__rowYIn = (session, needle) => { const e = terms.get(session); if (!e) return -1;
+      const b = e.term.buffer.active;
       for (let i = b.length - 1; i >= 0; i--) { const l = b.getLine(i);
         if (l && l.translateToString(true).trim() === needle) return i + 1; }
       return -1; };
@@ -470,11 +559,13 @@ try {
   // and turn mouse tracking back off, or the printf below sits queued
   // forever and every assertion in this section reads a stale screen.
   await evalIn(`__t().term.input("\\x03")`);
-  await until(async () => (await evalIn("__last()")).trimEnd().endsWith("$"), 20, "the prompt back after ^C");
+  ok(await until(async () => (await evalIn("__last()")).trimEnd().endsWith("$"), 20, "the prompt back after ^C"),
+     "the shell prompt returned after ^C reclaimed it from section G's sleep 300");
   await evalIn(`__t().term.input("printf '\\\\033[?1000l\\\\033[?1002l\\\\033[?1003l\\\\033[?1006l'\\r")`);
   await sleep(200);
   await evalIn(`__t().term.input("printf '%s\\\\n' '${MISSING}'\\r")`);
-  await until(() => evalIn(`__rowY(${JSON.stringify(MISSING)}) > 0`), 20, "the seeded refusal row");
+  ok(await until(() => evalIn(`__rowY(${JSON.stringify(MISSING)}) > 0`), 20, "the seeded refusal row"),
+     "the refused path's row is on screen — guards the assertions below");
 
   await clickLink(page, PATH, { modifier: true });
   // OpenPath is a websocket round trip; poll for the State broadcast it
@@ -489,6 +580,11 @@ try {
   // Asserting the tab count is unchanged, so "opened the wrong file" cannot
   // pass as "correctly refused".
   const before = (await openTabRels(page, 2)).length;
+  // Makes the dependency the `until` below relies on explicit: a stale flash
+  // left over from the click above would let that `until` latch onto old
+  // text and return immediately, without ever having observed *this*
+  // click's own refusal.
+  ok(await flashText(page) === "", "no flash pending before clicking the refused path");
   await clickLink(page, MISSING, { modifier: true });
   // openTermPath only flashes before send() when the raw text carries a
   // `:line` suffix (see strip_line_suffix in projects.rs) — MISSING has
@@ -502,6 +598,94 @@ try {
   await assert(
     "and flashed the refusal in the terminal that was clicked",
     async () => /cannot read|no such file/i.test(await flashText(page)),
+  );
+
+  console.log("\nI. a refusal reaches only the terminal that was clicked");
+  // The same single-subscriber trap CLAUDE.md names for send_to vs.
+  // broadcast: with exactly one terminal in the fixture, section H's own
+  // "in the terminal that was clicked" assertion could not actually tell
+  // "the right terminal" apart from "some terminal, any terminal" — there
+  // was only ever one to check. A second, independent terminal is what
+  // discriminates them: both still share the one page-wide `ctrl` websocket
+  // (see connectControl), so pendingLink.entry is the only thing routing a
+  // PathRefused back to the DOM node the click actually came from.
+  //
+  // resolve_terminal_path's ENOENT text does not include the path at all
+  // (confirmed in the report) — MISSING and ALSO_MISSING refuse with the
+  // *identical* string. So a stale flash from section H's own click could
+  // not be told apart from a wrongly-routed one by content; it has to be
+  // told apart by settling first. termFlash's fade is 1600ms — wait it out
+  // before taking the baseline below, rather than race it.
+  ok(await until(async () => (await flashText(page, loc.session)) === "", 5, "section H's flash to fade"),
+     "terminal 1's own flash from section H settled before section I begins");
+  const ALSO_MISSING = "also/missing.ts";
+  await evalIn(`send({ t: "NewTerminal", pane: 0 })`);
+  // Not the section-A `find`: that returns the *first* Terminal tab it
+  // finds, which is still terminal 1. This wants whichever one is not that.
+  const find2 = `(() => { for (let pi = 0; pi < state.panes.length; pi++) {
+      for (let ti = 0; ti < state.panes[pi].tabs.length; ti++) {
+        const t = state.panes[pi].tabs[ti];
+        if (t.k === "Terminal" && t.session !== ${JSON.stringify(loc.session)}) return { pi, ti, session: t.session };
+      } } return null; })()`;
+  let loc2 = null;
+  ok(await until(async () => !!(loc2 = await evalIn(find2)), 15, "a second terminal tab"),
+     "a second, distinct terminal tab was created");
+  await evalIn(`send({ t: "ActivateTab", pane: ${loc2.pi}, idx: ${loc2.ti} })`);
+  await sleep(500);
+  await evalIn(`send({ t: "StartTerminal", session: ${JSON.stringify(loc2.session)} })`);
+  ok(await until(() => evalIn(
+      `(() => { const e = terms.get(${JSON.stringify(loc2.session)}); return !!e && !!e.sock && e.sock.readyState === 1; })()`),
+      30, "second socket"),
+     "second terminal socket open");
+  // Same readline-typeahead trap section A guards against: the prompt must
+  // be up before anything is typed at it.
+  ok(await until(async () => (await evalIn(`__lastIn(${JSON.stringify(loc2.session)})`)).trimEnd().endsWith("$"), 30, "second shell prompt"),
+     "second terminal's shell prompt came up");
+  await evalIn(`terms.get(${JSON.stringify(loc2.session)}).term.input("printf '%s\\\\n' '${ALSO_MISSING}'\\r")`);
+  ok(await until(() => evalIn(`__rowYIn(${JSON.stringify(loc2.session)}, ${JSON.stringify(ALSO_MISSING)}) > 0`), 20, "second terminal's refusal row"),
+     "the second terminal's own row is on screen");
+
+  await clickLink(page, ALSO_MISSING, { modifier: true, session: loc2.session });
+  // Whichever entry actually gets the flash — never assumed to be terminal
+  // 2, since that assumption is exactly what a misrouted pendingLink would
+  // violate. Polled together, on a short timeout, so a misroute is caught
+  // before its own flash can auto-decay (termFlash fades in 1600ms) and
+  // erase the evidence the very next assertion below is looking for; a
+  // 20-second wait on terminal 2 alone would let a flash that landed on
+  // terminal 1 instead fade to "" long before this file ever looked there.
+  await until(async () => (await flashText(page, loc2.session)) !== "" || (await flashText(page, loc.session)) !== "",
+    10, "a refusal flash on either terminal");
+  await assert(
+    "the refusal flashed on the terminal that was actually clicked",
+    async () => /cannot read|no such file/i.test(await flashText(page, loc2.session)),
+  );
+  await assert(
+    "and not on the other terminal, which was never clicked",
+    async () => (await flashText(page, loc.session)) === "",
+  );
+
+  console.log("\nJ. a mismatched refusal in flight does not swallow the next one");
+  // PATH_RE marks ordinary prose, so a user arming links over a paragraph
+  // and clicking two different, both-refusing spans before the first reply
+  // lands is the common case here, not an edge case. pendingLink is a single
+  // slot: this proves a refusal for a click that is no longer pending — text
+  // that does not match — leaves the slot alone rather than stranding it, so
+  // the click that IS still in flight still gets its own reply flashed
+  // rather than silently dropped to console.warn.
+  //
+  // Injected via onEvent directly rather than raced over the real socket:
+  // openTermPath and the injected PathRefused run in the same synchronous
+  // tick, before any real websocket message can arrive, which is
+  // deterministic where a real second click's timing would not be.
+  const STRAY = "stray/unrelated.rs";
+  const REAL_TEXT = "second/real-click.rs";
+  ok(await flashText(page, loc.session) === "", "terminal 1 starts this section with no flash pending");
+  await evalIn(`openTermPath(__t(), ${JSON.stringify(REAL_TEXT)});
+    onEvent({ t: "PathRefused", text: ${JSON.stringify(STRAY)}, msg: "unrelated" });`);
+  await until(async () => (await flashText(page, loc.session)) !== "", 20, "the real click's own refusal flash");
+  await assert(
+    "a mismatched refusal in between did not swallow the next click's own reply",
+    async () => /cannot read|no such file/i.test(await flashText(page, loc.session)),
   );
 
 } finally {
