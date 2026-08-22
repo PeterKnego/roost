@@ -851,18 +851,33 @@ function openUrl(u) {
   window.open(u, "_blank", "noopener,noreferrer");
 }
 
-// A URL at the end of a sentence, or inside prose parentheses, must not
-// swallow the punctuation. A parenthesised segment *within* the URL survives,
+// A link at the end of a sentence, or inside prose parentheses, must not
+// swallow the punctuation. A parenthesised segment *within* the link survives,
 // which is why the bracket trim counts rather than strips.
-function trimUrl(u) {
-  u = u.replace(/[.,;:!?'"]+$/, "");
+//
+// Applied to BOTH matchers, and at match time rather than at activate time.
+// It began as a URL-only helper called from `activate`, which was wrong twice
+// over: `PATH_RE`'s last segment is `[\w.@+-]+` and `.` is in that class, so a
+// path written at the end of a sentence absorbed the full stop and then failed
+// to resolve — reported from real use, as `couldn't open …design.md.` — and
+// because the trim ran after matching, the underline covered the punctuation
+// even for the URLs it did handle. Trimming here fixes the range and the text
+// together, for both.
+//
+// Only `.` can actually reach this from `PATH_RE` (a comma, semicolon or
+// bracket is outside its character class and was never matched), so for paths
+// this is precisely a full-stop trim. The cost is that a file genuinely named
+// `foo.` cannot be opened by clicking it; sentence-final paths are constant
+// and filenames ending in a dot are pathological, so that trade is not close.
+function trimTail(s) {
+  s = s.replace(/[.,;:!?'"]+$/, "");
   while (
-    u.endsWith(")") &&
-    (u.match(/\(/g) || []).length < (u.match(/\)/g) || []).length
+    s.endsWith(")") &&
+    (s.match(/\(/g) || []).length < (s.match(/\)/g) || []).length
   ) {
-    u = u.slice(0, -1);
+    s = s.slice(0, -1);
   }
-  return u;
+  return s;
 }
 
 // The click that was sent, so a refusal can be shown in the terminal it came
@@ -911,7 +926,13 @@ function matchProvider(term, re, activate) {
         const out = [];
         re.lastIndex = 0;
         for (let m; (m = re.exec(text)); ) {
-          const raw = m[0];
+          // Trimmed here, not in `activate`, so the range shrinks with the
+          // text — otherwise the underline reaches over the sentence's own
+          // punctuation. `re.lastIndex` deliberately still points past the
+          // untrimmed match, so the loop advances exactly as before and a
+          // trim can never re-feed its own tail.
+          const raw = trimTail(m[0]);
+          if (!raw) continue;
           out.push({
             range: {
               start: { x: m.index + 1, y },
@@ -939,7 +960,7 @@ function registerTermLinks(term, entry) {
   // Built as one ordered list and registered from it, so the order xterm sees
   // and the order a reader (or a test) sees cannot drift apart.
   const providers = [
-    matchProvider(term, URL_RE, (raw) => openUrl(trimUrl(raw))),
+    matchProvider(term, URL_RE, (raw) => openUrl(raw)),
     matchProvider(term, PATH_RE, (raw) => openTermPath(entry, raw)),
   ];
   for (const p of providers) term.registerLinkProvider(p);

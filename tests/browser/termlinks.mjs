@@ -323,6 +323,20 @@
 //!        crediting one for the other's work.
 //! Both restored afterwards; the run passes clean again.
 //!
+//! Section M's own revert, run for real and restored:
+//!   Put `const raw = m[0]` back in matchProvider, dropping the trimTail call.
+//!   Four of M's assertions failed:
+//!     FAIL  the marked link is the path itself (got ["docs/dotend.md."])
+//!     FAIL  and it stops before the full stop (got ["docs/dotend.md."])
+//!     FAIL  modifier+click on a sentence-ending path opened the file, not a refusal
+//!     FAIL  and opened exactly one tab, not a second wrong one
+//!   — the second and third are the ones that matter: the first shows the full
+//!   stop inside the matched text, the third shows the click then resolving
+//!   nothing, which is the defect exactly as it was reported from real use.
+//!   The two guards above them stayed green, which is the point of having
+//!   them: they prove the row was seeded and clicked, so the failures below
+//!   cannot be a wedged terminal misreading as a matcher bug.
+//!
 //! Run: deno run -A tests/browser/termlinks.mjs
 import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
   from "./harness.mjs";
@@ -353,6 +367,17 @@ const PATH2 = "docs/notes.md";
 // A third one, for the missed-keyup case: a link that is still marked when a
 // click arrives without the modifier on it. See section L's own comment.
 const PATH3 = "docs/todo.md";
+// A fourth, opened by nothing before section M, because M's whole subject is
+// whether a path that ENDS A SENTENCE still resolves. Reported from real use:
+// clicking a path with a full stop after it flashed "couldn't open", because
+// PATH_RE's last segment is [\w.@+-]+ and `.` is in that class, so the
+// sentence's own punctuation was swallowed into the filename.
+const PATH4 = "docs/dotend.md";
+// The row as it is seeded, and the needle both __rowY and clickLink match on:
+// they compare the WHOLE row, and clickLink seats its click at column 4.5, so
+// a row with anything before the path would be clicked outside the link. The
+// full stop is the entire point — it is what used to be swallowed.
+const PATH4_DOT = `${PATH4}.`;
 
 // The rels currently open as File tabs in one pane, read straight off the
 // State snapshot rather than the DOM — the tab strip renders asynchronously
@@ -461,6 +486,7 @@ await Deno.mkdir(`${fx.base}/roots/proj/docs`, { recursive: true });
 await Deno.writeTextFile(`${fx.base}/roots/proj/${PATH}`, "# backlog\n");
 await Deno.writeTextFile(`${fx.base}/roots/proj/${PATH2}`, "# notes\n");
 await Deno.writeTextFile(`${fx.base}/roots/proj/${PATH3}`, "# todo\n");
+await Deno.writeTextFile(`${fx.base}/roots/proj/${PATH4}`, "# dotend\n");
 
 const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
@@ -1193,6 +1219,50 @@ try {
   await until(async () => (await evalIn("__last()")).trimEnd().endsWith("$"), 20, "the prompt back after ^C");
   await evalIn(`__t().term.input("printf '\\\\033[?1000l\\\\033[?1002l\\\\033[?1003l\\\\033[?1006l'\\r")`);
   await sleep(200);
+
+  console.log("\nM. a path that ends a sentence is not the sentence's full stop");
+  // Reported from real use, not from a test: cmd-clicking a path written at
+  // the end of a sentence flashed "couldn't open". trimUrl already solved
+  // this for URLs and was applied to nothing else, so the path matcher had
+  // no trim at all — and because trimUrl ran at activate time rather than at
+  // match time, even a URL drew its underline over the punctuation.
+  ok(!(await openTabRels(page, 2)).includes(PATH4),
+     `${PATH4} is not open yet, so the click assertion below has something to prove`);
+  // README trap 3: readline discards typeahead while it is initialising, so a
+  // command typed before the prompt is back vanishes silently and every
+  // assertion below then reads a stale screen — which fails this section for
+  // a reason that has nothing to do with its subject. Section L's tail leaves
+  // the shell mid-`sleep 300`, so wait for the prompt rather than assume it.
+  ok(await until(async () => (await evalIn("__last()")).trimEnd().endsWith("$"), 20, "the prompt before M seeds"),
+     "the shell prompt is back before this section types");
+  await evalIn(`__t().term.input("printf '%s\\\\n' '${PATH4_DOT}'\\r")`);
+  ok(await until(() => evalIn(`__rowY(${JSON.stringify(PATH4_DOT)}) > 0`), 20, "the sentence row"),
+     "the sentence-ending path's row is on screen — guards the assertions below");
+
+  const rEol = await armed(() => resolve(PATH4_DOT));
+  ok(rEol.links.includes(PATH4),
+     `the marked link is the path itself (got ${JSON.stringify(rEol.links)})`);
+  // The discriminating half. Without it the assertion above would pass on a
+  // matcher that marked `docs/dotend.md.` — `includes` would still be false,
+  // but only because the string differs; naming the wrong value is what
+  // makes the failure legible instead of a bare "expected true".
+  ok(!rEol.links.some((l) => l.endsWith(".")),
+     `and it stops before the full stop (got ${JSON.stringify(rEol.links)})`);
+
+  const beforeEol = (await openTabRels(page, 2)).length;
+  ok(await clickLink(page, PATH4_DOT, { modifier: true }), "the sentence row was found and modifier-clicked");
+  await until(() => evalIn(`state.panes[2].tabs.some((t) => t.rel === ${JSON.stringify(PATH4)})`),
+    20, `${PATH4} opened as a tab`);
+  await assert(
+    "modifier+click on a sentence-ending path opened the file, not a refusal",
+    async () => (await openTabRels(page, 2)).includes(PATH4),
+  );
+  // "A tab appeared" is not enough: a matcher that trimmed too eagerly could
+  // open some *other* file. Both the rel and the count are checked.
+  await assert(
+    "and opened exactly one tab, not a second wrong one",
+    async () => (await openTabRels(page, 2)).length === beforeEol + 1,
+  );
 
 } finally {
   page?.close();
