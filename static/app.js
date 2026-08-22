@@ -60,6 +60,28 @@ const extOf = (rel) => {
 };
 const refusesTextEdit = (rel) => NO_TEXT_EDIT_EXT.includes(extOf(rel));
 
+// --- terminal links ------------------------------------------------------
+// Cmd on macOS, Ctrl everywhere else. Not a preference: Ctrl+click on a Mac is
+// right-click emulation, so binding there would pop a context menu and open a
+// link at once. This is the same platform split xterm itself makes in
+// shouldForceSelection (alt on Mac, shift elsewhere).
+const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+const linkModifier = (e) => (IS_MAC ? e.metaKey : e.ctrlKey);
+
+// Tracked rather than read off the event, because provideLinks is never handed
+// one. Cleared on blur: a user who switches apps with the key down would
+// otherwise come back to a terminal that is silently armed.
+let linksArmed = false;
+
+// http and https only. `javascript:`, `data:` and `file:` never become a link
+// at all — not a refused one, one that was never offered.
+const SAFE_URL = /^https?:\/\//i;
+const URL_RE = /\bhttps?:\/\/[^\s"'<>`]+/gi;
+// A slash is the evidence. Bare `main.rs` is deliberately not a path: a repo
+// has many, so resolution would have to guess, and the same shape matches a
+// version string and the `foo.bar` in an error message.
+const PATH_RE = /(?:~\/|\.{1,2}\/|\/)?(?:[\w.@+-]+\/)+[\w.@+-]+(?::\d+(?::\d+)?)?/g;
+
 let state = null;
 let myOrigin = null;
 let ctrl = null;
@@ -798,6 +820,144 @@ function refreshFile(rel) {
   });
 }
 
+function openUrl(u) {
+  if (!SAFE_URL.test(u)) return;
+  // noopener,noreferrer: an opened page gets no handle back to the workspace.
+  window.open(u, "_blank", "noopener,noreferrer");
+}
+
+// A URL at the end of a sentence, or inside prose parentheses, must not
+// swallow the punctuation. A parenthesised segment *within* the URL survives,
+// which is why the bracket trim counts rather than strips.
+function trimUrl(u) {
+  u = u.replace(/[.,;:!?'"]+$/, "");
+  while (
+    u.endsWith(")") &&
+    (u.match(/\(/g) || []).length < (u.match(/\)/g) || []).length
+  ) {
+    u = u.slice(0, -1);
+  }
+  return u;
+}
+
+// Replaced in Task 5. Loud rather than silent: a link that underlines and then
+// does nothing at all is indistinguishable from a broken one.
+function openTermPath(entry, raw) {
+  console.warn("resh: terminal path link not wired yet:", raw);
+}
+
+// One provider per pattern, URL registered first. Where the two overlap — the
+// path-looking tail of a URL — xterm resolves it by provider index in
+// _removeIntersectingLinks, so registration order is the entire mechanism.
+// xterm's own OscLinkProvider is registered at construction, ahead of both,
+// which is the ordering this wants for free: a link an application declared
+// beats anything resh would have guessed over the same cells.
+function matchProvider(term, re, activate) {
+  return {
+    provideLinks(y, cb) {
+      // The gate. No link exists to hover, so nothing underlines and nothing
+      // can be clicked — rather than a link that exists and refuses.
+      if (!linksArmed) return cb(undefined);
+      // y is 1-based and absolute: xterm adds buffer.ydisp to the hovered row
+      // before asking, so this indexes the scrollback too, not the viewport.
+      const line = term.buffer.active.getLine(y - 1);
+      if (!line) return cb(undefined);
+      const text = line.translateToString(true);
+      const out = [];
+      re.lastIndex = 0;
+      for (let m; (m = re.exec(text)); ) {
+        const raw = m[0];
+        out.push({
+          range: {
+            start: { x: m.index + 1, y },
+            end: { x: m.index + raw.length, y },
+          },
+          text: raw,
+          // Re-checked at click time: an underline left stale by a missed
+          // keyup — alt-tabbing away while holding the key — must not open
+          // anything.
+          activate: (ev) => {
+            if (linkModifier(ev)) activate(raw, ev);
+          },
+        });
+      }
+      cb(out.length ? out : undefined);
+    },
+  };
+}
+
+function registerTermLinks(term, entry) {
+  // Built as one ordered list and registered from it, so the order xterm sees
+  // and the order a reader (or a test) sees cannot drift apart.
+  const providers = [
+    matchProvider(term, URL_RE, (raw) => openUrl(trimUrl(raw))),
+    matchProvider(term, PATH_RE, (raw) => openTermPath(entry, raw)),
+  ];
+  for (const p of providers) term.registerLinkProvider(p);
+  // Kept on the entry for tests/browser/termlinks.mjs, which has no other way
+  // in: xterm exposes no API for enumerating registered link providers, and
+  // the alternative — asserting on rendered underline styling — would couple
+  // the test to renderer internals that differ between the DOM and canvas
+  // renderers. Not dead code; deleting it blinds the only test of the gate.
+  entry.linkProviders = providers;
+}
+
+// Arming has to nudge xterm to ask again: the Linkifier caches the last cell
+// it resolved (_lastBufferCell) and will not re-ask for the same position, so
+// a bare re-dispatch at the current spot is ignored. Moving the pointer
+// through somewhere else first invalidates that cache using nothing but
+// public events.
+//
+// If this proves unreliable, the graceful degradation is that arming takes
+// effect on the next real pointer movement, which is what a user holding a
+// modifier is about to do anyway.
+let lastPointer = null;
+addEventListener("mousemove", (e) => { lastPointer = { x: e.clientX, y: e.clientY }; }, true);
+
+function nudgeLinks() {
+  if (!lastPointer) return;
+  const el = document.elementFromPoint(lastPointer.x, lastPointer.y);
+  const host = el && el.closest && el.closest(".termhost");
+  if (!host) return;
+  // Dispatched on .xterm-screen rather than on the host, because that is the
+  // element xterm hands its Linkifier and therefore the only one carrying the
+  // mousemove listener. It is a *descendant* of the host, so a bubbling event
+  // dispatched on the host travels the other way and never arrives: measured,
+  // and the provider call count did not move at all.
+  const screen = host.querySelector(".xterm-screen");
+  if (!screen) return;
+  const r = screen.getBoundingClientRect();
+  // A different *cell* is not enough, and this was measured rather than
+  // assumed: within one line the Linkifier answers from its cached provider
+  // replies (_askForLink's useLinkCache branch, taken whenever _activeLine
+  // still matches), so a sideways nudge asks nobody anything. Only a change of
+  // line makes it re-ask. Hence the row height, derived from the terminal's
+  // real row count rather than a guessed constant — a wrong height can land
+  // the synthetic move back on the same line and quietly do nothing.
+  const entry = terms.get(host.dataset.session);
+  const rows = (entry && entry.term.rows) || 24;
+  const rowH = Math.max(1, r.height / rows);
+  const away = {
+    x: lastPointer.x,
+    y: lastPointer.y - r.top > rowH ? r.top + rowH / 2 : r.top + rowH * 1.5,
+  };
+  for (const p of [away, lastPointer]) {
+    screen.dispatchEvent(
+      new MouseEvent("mousemove", { clientX: p.x, clientY: p.y, bubbles: true }),
+    );
+  }
+}
+
+function setArmed(on) {
+  if (linksArmed === on) return;
+  linksArmed = on;
+  nudgeLinks();
+}
+
+addEventListener("keydown", (e) => { if (linkModifier(e)) setArmed(true); });
+addEventListener("keyup", (e) => { if (!linkModifier(e)) setArmed(false); });
+addEventListener("blur", () => setArmed(false));
+
 function ensureTerm(session) {
   // No "the socket died, rebuild it" branch any more: an entry now heals its
   // own socket (see connectTerm), so a caller cannot find a dead one here.
@@ -833,6 +993,7 @@ function ensureTerm(session) {
   term.open(node);
   const entry = { node, term, fit, sock: null, tries: 0, timer: null, attached: false, gone: false,
                   selTimer: null, flashTimer: null };
+  registerTermLinks(term, entry);
   // Copy on select. xterm's rows are `user-select: none`, so a browser
   // selection over terminal text is impossible and xterm's own selection is
   // the only route to the clipboard — reached, until now, only by the

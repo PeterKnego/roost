@@ -28,6 +28,7 @@ deno run -A tests/browser/shiftenter.mjs # shift+enter sends LF, so Claude inser
 deno run -A tests/browser/hledit.mjs     # a code file stays highlighted while you edit it
 deno run -A tests/browser/preview-follows.mjs # a previewed file follows the file on disk
 deno run -A tests/browser/buffer-lifecycle.mjs # navigating a file is not an edit; undoing one comes back clean
+deno run -A tests/browser/termlinks.mjs # a printed path or URL is a link only while the modifier is held
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -130,6 +131,21 @@ performed.
   no-edit-toggle assertion; narrowing the double-contextmenu guard back to
   `closest("a.file")` fails the markdown-link right-click assertion with
   `got 2`.
+- In `termlinks.mjs`: deleting `ensureTerm`'s `registerTermLinks` call fails 4
+  assertions, deleting the `linksArmed` gate inside the provider fails 1
+  (a link is offered with the modifier up), registering the path provider
+  ahead of the URL one fails 1 (the link's text is `/example.com/a/b`, the
+  URL's tail, instead of the whole URL), and letting `PATH_RE` match zero
+  directory segments fails 1 (a bare `backlog.md` becomes a link). The two
+  "no link is offered" assertions pass with the whole feature deleted — zero
+  links is also what no providers, and an off-screen row, produce — so that
+  file carries a provider-count guard and a row-was-found guard beside each
+  of them.
+  Section F covers the other half — that arming re-marks the link under a
+  pointer that never moved. Dispatching its synthetic mousemove on `.termhost`
+  rather than on `.xterm-screen` fails 1, and so does making the detour a
+  sideways one within the same line; sections B-E stay green through both,
+  since they ask the providers directly and never touch xterm's hover path.
 - Removing the `refreshFile(ev.rel)` call from `FileChanged`'s handler fails 2
   assertions in `preview-follows.mjs` — the update times out and the stale
   text is still on screen — while the initial fetch (the file opening with
