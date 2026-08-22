@@ -377,6 +377,9 @@ mod tests {
     }
 
     #[test]
+    // Revert-checked: changing `"resh"` to `"BROKEN"` in dispatch's
+    // "initialize" arm failed only this test — `assertion `left == right`
+    // failed / left: String("BROKEN") / right: "resh"` — then restored.
     fn initialize_answers_with_resh_as_the_server_name() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
@@ -404,8 +407,14 @@ mod tests {
     }
 
     #[test]
+    // An empty success would read to Claude as "ran, produced nothing".
+    // Revert-checked: adding an `"executeCode" => Some(ok(&id,
+    // text_result("")))` arm ahead of the error fallthrough failed only this
+    // test — `left: Null / right: -32601` on `out["error"]["code"]`, i.e. the
+    // error object was simply absent — proving this test actually
+    // distinguishes a refusal from an empty success rather than passing
+    // vacuously. Then restored.
     fn calling_execute_code_is_a_method_error_not_an_empty_success() {
-        // An empty success would read to Claude as "ran, produced nothing".
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
         let out = dispatch(
@@ -422,6 +431,9 @@ mod tests {
     }
 
     #[test]
+    // Revert-checked: changing the "getDiagnostics" arm's `text_result("[]")`
+    // to `text_result("[{\"bogus\":true}]")` failed only this test —
+    // `left: String("[{\"bogus\":true}]") / right: "[]"` — then restored.
     fn diagnostics_answers_empty_rather_than_failing() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
@@ -435,6 +447,14 @@ mod tests {
     }
 
     #[test]
+    // Revert-checked: making the notification branch `return
+    // Some(ok(&Value::Null, json!({})))` instead of `return None` failed
+    // this test — `panicked ... "notifications get no response"` — exercising
+    // the `is_none()` assertion. The sibling pid test below shares the same
+    // notification branch and failed alongside it for the same reason
+    // (`assertion failed: dispatch(&note, &mut c).is_none()`); both are
+    // legitimate hits on the one break, not evidence of a false positive.
+    // Then restored.
     fn ide_connected_resolves_the_senders_directory_and_is_not_answered() {
         // A notification has no id, so a reply would be a protocol error.
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -451,6 +471,10 @@ mod tests {
     }
 
     #[test]
+    // Revert-checked: changing the `Cwd::Gone | Cwd::Unknown => {}` arm to
+    // `=> conn.closed = true` failed only this test — `panicked ... "but the
+    // connection stays open"` — proving the tri-state is load-bearing, not
+    // decorative. Then restored.
     fn ide_connected_from_an_unreadable_pid_leaves_the_connection_usable() {
         // Cwd::Unknown must not disconnect. Folding it into "gone" would kill
         // a live Claude because a check failed.
@@ -465,6 +489,9 @@ mod tests {
     }
 
     #[test]
+    // Revert-checked: changing the unknown-method arm to `err(&Value::Null,
+    // ...)` instead of `err(&id, ...)` failed only this test —
+    // `left: Null / right: 9` on `out["id"]` — then restored.
     fn an_unknown_method_is_a_method_error_carrying_the_request_id() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
