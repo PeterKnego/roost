@@ -280,6 +280,17 @@ function onEvent(ev) {
       console.warn("resh:", ev.msg);
       showError(ev.msg);
       break;
+    case "PathRefused":
+      // Not showError: that funnels to the workspace banner, which is the
+      // wrong shape here and — as the Error case below notes — carries no way
+      // back to the terminal that was clicked. This does, via the click still
+      // in flight.
+      console.warn("resh:", ev.msg);
+      if (pendingLink && pendingLink.text === ev.text) {
+        termFlash(pendingLink.entry, ev.msg);
+      }
+      pendingLink = null;
+      break;
   }
 }
 
@@ -840,10 +851,21 @@ function trimUrl(u) {
   return u;
 }
 
-// Replaced in Task 5. Loud rather than silent: a link that underlines and then
-// does nothing at all is indistinguishable from a broken one.
+// The click that was sent, so a refusal can be shown in the terminal it came
+// from. A single slot, not a map: only one link can be clicked at a time, and
+// a map keyed by text would grow for the life of the page.
+let pendingLink = null;
+
 function openTermPath(entry, raw) {
-  console.warn("resh: terminal path link not wired yet:", raw);
+  pendingLink = { entry, text: raw };
+  // The line number is matched so the whole reference underlines, then dropped
+  // — the viewer has no line addressing to spend it on. Saying so is the only
+  // thing between "we ignored part of what you clicked" and silence.
+  const line = raw.match(/:(\d+)(?::\d+)?$/);
+  if (line) termFlash(entry, `line ${line[1]} — opening file`);
+  // Verbatim. The client does no parsing; resolution and confinement are one
+  // function in projects.rs.
+  send({ t: "OpenPath", text: raw });
 }
 
 // One provider per pattern, URL registered first. Where the two overlap — the
