@@ -35,6 +35,10 @@ header .proj { font-weight: 500; }
 #gitinfo { color: var(--muted); }
 #gitinfo #badge { color: var(--accent); margin-left: 4px; }
 .warn { color: #d29922; cursor: help; }
+/* Deliberately loud, not decorative: this is the only thing on the page that
+   says a highlighted selection is leaving the machine, and it must not read
+   as just more chrome next to #gitinfo and .warn. */
+#sharing { color: #d29922; cursor: help; font-weight: 500; }
 #refresh { background: none; border: 1px solid transparent; border-radius: 6px; color: var(--muted); padding: 3px 10px; cursor: pointer; font: inherit; }
 #refresh:hover { color: var(--fg); }
 main { flex: 1; min-height: 0; }

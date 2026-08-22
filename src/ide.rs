@@ -327,23 +327,18 @@ fn reclaim_pending_for(project: &str, conn_id: u64) {
     }
 }
 
-/// Tells every Claude connected to `project` that the user pointed at `abs`
-/// (and optionally a line range within it). A notification, not a request —
-/// see `dispatch`'s id handling: an `at_mentioned` carrying an `id` would
-/// make the CLI wait for a response that will never come.
-pub fn mention(project: &str, abs: &Path, lines: Option<(u32, u32)>) -> Result<(), String> {
-    let mut params = serde_json::json!({"filePath": abs.to_string_lossy()});
-    if let Some((a, b)) = lines {
-        params["lineStart"] = serde_json::json!(a);
-        params["lineEnd"] = serde_json::json!(b);
-    }
-    let msg = serde_json::json!({"jsonrpc": "2.0", "method": "at_mentioned", "params": params})
-        .to_string();
-    // Cloned out under the lock, sent outside it: CLAUDE.md's "never hold a
-    // lock across blocking I/O" — a channel send only blocks if the writer
-    // thread's queue capacity is exceeded (it is unbounded here, so it never
-    // does), but the principle is the same one that bit `stop`, so this
-    // follows the same shape regardless.
+/// Sends `msg` — a complete JSON-RPC notification, never a request — to every
+/// Claude connected to `project`. Factored out of `mention`, and shared with
+/// `selection_changed`: both are one-way, fire-and-forget notices that differ
+/// only in payload shape, and both need the identical fan-out.
+///
+/// Cloned out under the lock, sent outside it: CLAUDE.md's "never hold a lock
+/// across blocking I/O" — a channel send only blocks if the writer thread's
+/// queue capacity is exceeded (it is unbounded here, so it never does), but
+/// the principle is the same one that bit `stop`, so this follows the same
+/// shape regardless.
+fn notify_all(project: &str, msg: &serde_json::Value) -> Result<(), String> {
+    let msg = msg.to_string();
     let targets: Vec<_> = {
         let map = conns().lock().unwrap_or_else(|e| e.into_inner());
         map.get(project).cloned().unwrap_or_default()
@@ -355,6 +350,59 @@ pub fn mention(project: &str, abs: &Path, lines: Option<(u32, u32)>) -> Result<(
         let _ = t.send(msg.clone());
     }
     Ok(())
+}
+
+/// Tells every Claude connected to `project` that the user pointed at `abs`
+/// (and optionally a line range within it). A notification, not a request —
+/// see `dispatch`'s id handling: an `at_mentioned` carrying an `id` would
+/// make the CLI wait for a response that will never come.
+pub fn mention(project: &str, abs: &Path, lines: Option<(u32, u32)>) -> Result<(), String> {
+    let mut params = serde_json::json!({"filePath": abs.to_string_lossy()});
+    if let Some((a, b)) = lines {
+        params["lineStart"] = serde_json::json!(a);
+        params["lineEnd"] = serde_json::json!(b);
+    }
+    let msg = serde_json::json!({"jsonrpc": "2.0", "method": "at_mentioned", "params": params});
+    notify_all(project, &msg)
+}
+
+/// Ships the editor's current selection to Claude as ambient context — the
+/// one notification in this module that carries file *contents* with no
+/// explicit user gesture behind it. `mention` and `openDiff` both require a
+/// deliberate act (Alt+K, or Claude itself proposing a change); a selection
+/// changes on its own as someone reads a file. That is exactly why this
+/// checks `Settings::share_selection` on every call rather than once at
+/// connect time: a project can turn sharing off mid-session, and the very
+/// next selection must honor that, not the one that was true when Claude
+/// connected.
+///
+/// `project_dir` is the project's own directory — what `config::for_project`
+/// needs to find `.resh/config.toml` — not the ide lock directory `Ide`
+/// itself is keyed by; the hub already holds it as `Hub::dir`.
+pub fn selection_changed(
+    project: &str,
+    project_dir: &Path,
+    abs: &Path,
+    text: &str,
+    start: (u32, u32),
+    end: (u32, u32),
+) -> Result<(), String> {
+    if !crate::config::for_project(project_dir).share_selection {
+        return Err("selection sharing is off for this project".into());
+    }
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "selection_changed",
+        "params": {
+            "filePath": abs.to_string_lossy(),
+            "text": text,
+            "selection": {
+                "start": {"line": start.0, "character": start.1},
+                "end":   {"line": end.0,   "character": end.1},
+            },
+        },
+    });
+    notify_all(project, &msg)
 }
 
 pub struct Conn {
@@ -1999,4 +2047,140 @@ mod tests {
         assert!(err.contains("no Claude"), "the registry entry must be gone once the guard drops: {err}");
     }
 
+    /// The struct is `Settings`, not `Config`. The default must be off, or a
+    /// highlighted line of `.env` leaves the host the moment someone selects
+    /// it, with no config file ever written.
+    ///
+    /// Revert-checked: flipping `Settings::default()`'s `share_selection` to
+    /// `true` failed this test (`assertion failed: !cfg.share_selection`) —
+    /// and, for the same reason, also failed
+    /// `config::tests::share_selection_defaults_off_and_either_layer_can_
+    /// turn_it_on` and `render::tests::share_selection_is_off_by_default_
+    /// and_the_indicator_appears_only_when_it_is_on`, three legitimate hits
+    /// on the one default. Then restored.
+    #[test]
+    fn selection_sharing_is_off_unless_a_project_opts_in() {
+        let cfg = crate::config::Settings::default();
+        assert!(!cfg.share_selection, "a highlighted line of .env must not leave the host by default");
+    }
+
+    /// Writes `share_selection = true` into the fake client's own project
+    /// directory (`connected_fake_client_for`'s `ws`, which is what
+    /// `Hub::dir` — and so this call's `project_dir` — actually is) so the
+    /// opt-in check inside `selection_changed` passes.
+    fn opt_in(ws: &Path) {
+        std::fs::create_dir_all(ws.join(".resh")).unwrap();
+        std::fs::write(ws.join(".resh/config.toml"), "share_selection = true\n").unwrap();
+    }
+
+    #[test]
+    // Revert-checked: constructing `selection_changed`'s message with
+    // `"method": "at_mentioned"` (the neighboring notification's method name,
+    // a plausible copy-paste) failed only this test's first assertion —
+    // `left: "at_mentioned" / right: "selection_changed"` — then restored.
+    fn a_shared_selection_is_the_notification_the_cli_expects() {
+        let proj = "selection-shape";
+        let (rx, _ide, _d, ws) = connected_fake_client_for(proj);
+        opt_in(ws.path());
+        selection_changed(proj, ws.path(), Path::new("/w/a.rs"), "let x = 1;", (10, 4), (10, 14))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert_eq!(v["method"], "selection_changed");
+        assert_eq!(v["params"]["text"], "let x = 1;");
+        assert_eq!(v["params"]["selection"]["start"]["line"], 10);
+        assert_eq!(v["params"]["selection"]["start"]["character"], 4);
+        assert_eq!(v["params"]["selection"]["end"]["line"], 10);
+        assert_eq!(v["params"]["selection"]["end"]["character"], 14);
+        assert!(v.get("id").is_none(), "a notification must carry no id or the CLI will wait for a reply it never gets");
+    }
+
+    /// Both halves matter: an assertion that only checks the return value
+    /// cannot tell "refused" from "refused after sending" — a bug that sent
+    /// the text and *then* returned an error would still look green with
+    /// only the `is_err()` half.
+    ///
+    /// Revert-checked: moving the `share_selection` check to *after*
+    /// `notify_all` (so the notification goes out before the refusal is
+    /// noticed) failed only the second assertion here — `rx.try_recv()`
+    /// returned `Ok("secret"...)` instead of the expected `Err` — while the
+    /// first assertion (`is_err()`) stayed green throughout, which is exactly
+    /// the false-confidence this test exists to catch. Then restored.
+    #[test]
+    fn nothing_is_sent_when_the_project_has_not_opted_in() {
+        let proj = "selection-optout";
+        let (rx, _ide, _d, ws) = connected_fake_client_for(proj);
+        // No .resh/config.toml written: share_selection defaults to false.
+        let err = selection_changed(proj, ws.path(), Path::new("/w/a.rs"), "secret", (1, 0), (1, 6))
+            .unwrap_err();
+        assert!(err.contains("off"), "the refusal must say sharing is off: {err}");
+        // A bounded `recv_timeout`, not `try_recv`: the frame travels over a
+        // real loopback socket to a background reader thread before it ever
+        // reaches `rx` (see `connected_fake_client_for`), so a bug that sends
+        // before checking the opt-in flag would not necessarily have
+        // delivered yet at the instant a non-blocking `try_recv` ran —
+        // confirmed by hand: with the check moved to run *after* `notify_all`
+        // (so a refusal no longer prevents the send), a bare
+        // `rx.try_recv().is_err()` here still passed every time, while this
+        // `recv_timeout` version correctly failed with `Ok("{\"jsonrpc\":...
+        // \"method\":\"selection_changed\"...}")`. Restored.
+        let got = rx.recv_timeout(std::time::Duration::from_millis(300));
+        assert!(got.is_err(), "the socket must stay silent, got: {got:?}");
+    }
+
+    #[test]
+    // Revert-checked: reusing `mention`'s `no Claude` message text for
+    // `selection_changed`'s not-opted-in refusal (so both errors read "no
+    // Claude is connected to this project") failed this test — it asserts on
+    // the *reason*, not just that an error occurred, so a caller cannot
+    // mistake "nobody is listening" for "this project has not opted in" (the
+    // two have different remedies: attach a Claude, versus edit a config
+    // file). It also failed the sibling `nothing_is_sent_when_the_project_
+    // has_not_opted_in` test above, which checks the same "off" wording for
+    // its own reason (proving the refusal happened for the right cause, not
+    // just that one happened) — both are legitimate hits on the one break,
+    // not evidence either test is redundant. Then restored.
+    fn selection_sharing_off_is_a_different_refusal_than_no_claude_connected() {
+        let proj = "selection-optout-reason";
+        let (_rx, _ide, _d, ws) = connected_fake_client_for(proj);
+        let err = selection_changed(proj, ws.path(), Path::new("/w/a.rs"), "x", (0, 0), (0, 1))
+            .unwrap_err();
+        assert!(err.contains("off") && !err.contains("no Claude"), "got: {err}");
+    }
+
+    #[test]
+    // Revert-checked: deleting `notify_all`'s `targets.is_empty()` check (so
+    // an empty target list falls through to `Ok(())`) failed this test along
+    // with the three pre-existing tests over the same shared function —
+    // `mentioning_with_no_claude_connected_is_an_error_not_a_panic`,
+    // `a_dropped_connection_deregisters_so_a_later_mention_reports_no_claude`,
+    // and hub.rs's `mention_path_refusal_reaches_only_the_client_that_asked`
+    // — all legitimate hits on the one break in shared code, not evidence of
+    // a false positive (see CLAUDE.md's note on this exact pattern). Restored.
+    fn selection_sharing_with_no_claude_connected_is_an_error_not_a_panic() {
+        let d = tempfile::tempdir().unwrap();
+        opt_in(d.path());
+        let err = selection_changed("selection-nobody-here", d.path(), Path::new("/w/x.rs"), "x", (0, 0), (0, 1))
+            .unwrap_err();
+        assert!(err.contains("no Claude"), "the message must say what is missing: {err}");
+    }
+
+    #[test]
+    // Same fanout guarantee `mention` already has, and the same reason it
+    // needs two subscribers to prove: with one, "send to all" and "send to
+    // the first" are indistinguishable.
+    //
+    // Revert-checked: changing `notify_all`'s `for (_, t) in &targets` to
+    // `targets.first()` failed this test alongside the pre-existing
+    // `a_mention_reaches_every_connected_claude_not_just_the_first` — both
+    // legitimate hits on the one break in the now-shared fan-out loop.
+    // Restored.
+    fn a_shared_selection_reaches_every_connected_claude_not_just_the_first() {
+        let proj = "selection-fanout";
+        let (rx1, _a, _d1, w1) = connected_fake_client_for(proj);
+        opt_in(w1.path());
+        let (rx2, _b, _d2, _w2) = connected_fake_client_for(proj);
+        selection_changed(proj, w1.path(), Path::new("/w/x.rs"), "x", (0, 0), (0, 1)).unwrap();
+        assert!(rx1.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
+        assert!(rx2.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
+    }
 }

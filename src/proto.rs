@@ -106,6 +106,22 @@ pub enum Intent {
     /// `accept: false` with a `text` is still a rejection — the text is only
     /// ever read on the accepting path.
     AnswerProposal { id: String, accept: bool, text: Option<String> },
+    /// The editor's current selection, sent as ambient context on a debounce
+    /// from `static/app.js` — not a deliberate gesture like `MentionPath`'s
+    /// Alt+K. `rel` is resolved and confined server-side exactly like
+    /// `MentionPath`'s, never trusted as an absolute path; `text` is the
+    /// selection's own content, which is the reason this whole intent exists
+    /// behind `Settings::share_selection` — everything else on this enum
+    /// either moves data Claude already had or data the user explicitly
+    /// pointed at, and this ships file contents with neither.
+    ShareSelection {
+        rel: String,
+        text: String,
+        start_line: u32,
+        start_col: u32,
+        end_line: u32,
+        end_col: u32,
+    },
 }
 
 /// Snapshot sent as `Event::State`. Deliberately carries buffer *metadata*
@@ -340,6 +356,25 @@ mod tests {
         ));
         let i = decode(r#"{"t":"AnswerProposal","id":"p-1","accept":false,"text":null}"#).unwrap();
         assert!(matches!(i, Intent::AnswerProposal { accept: false, text: None, .. }));
+    }
+
+    /// Revert-checked: adding `#[serde(rename = "path")]` to the `rel` field
+    /// (a plausible name mismatch between this decoder and the JS sender)
+    /// failed this test — `decode(...)` returned
+    /// `Err("missing field \`path\` ...")` on the `.unwrap()` — since the
+    /// wire JSON here still carries `"rel"`, matching what `static/app.js`
+    /// actually sends. Then restored.
+    #[test]
+    fn decodes_share_selection() {
+        let i = decode(
+            r#"{"t":"ShareSelection","rel":"src/a.rs","text":"let x = 1;","start_line":10,"start_col":4,"end_line":10,"end_col":14}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            i,
+            Intent::ShareSelection { rel, text, start_line: 10, start_col: 4, end_line: 10, end_col: 14 }
+                if rel == "src/a.rs" && text == "let x = 1;"
+        ));
     }
 
     #[test]

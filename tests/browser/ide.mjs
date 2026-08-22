@@ -1,12 +1,15 @@
-//! The `openDiff` proposal tab and the Alt+K mention keybinding.
+//! The `openDiff` proposal tab, the Alt+K mention keybinding, and selection
+//! sharing.
 //!
 //! Everything under test lives in static/app.js: the client-side map keyed
-//! by proposal id (renderProposal, tabKey's "content"/"pending" split), the
-//! hand-built hunk view (renderHunks — a client-side port of
-//! textdiff.rs::unified, since a proposal's content arrives once over the
-//! socket with no server-rendered fragment to fetch), and the Alt+K handler
-//! that turns an editor selection into a MentionPath intent. No Rust test
-//! can reach any of it.
+//! by proposal id (renderProposal, tabKey's "content"/"pending" split) and
+//! how it renders a proposal's hunks — a fetch to `/frag/{project}/proposal`
+//! (routes.rs), server-rendered from `textdiff.rs::unified` the same way
+//! every other diff fragment in this app is, not built client-side — the
+//! Alt+K handler that turns an editor selection into a MentionPath intent,
+//! and the debounced `selectionchange` listener that turns one into a
+//! ShareSelection intent when the project has opted in. No Rust test can
+//! reach any of it.
 //!
 //! This drives a real resh, a real dtach-backed terminal (which is what
 //! actually provisions the ide listener — see term.rs's `ide::for_project`
@@ -194,6 +197,13 @@ const rejectNew = rejectOld.replace("three\n", "THREE CHANGED\n");
 await Deno.writeTextFile(`${projectDir}/${ACCEPT_FILE}`, acceptOld);
 await Deno.writeTextFile(`${projectDir}/${REJECT_FILE}`, rejectOld);
 await Deno.writeTextFile(`${projectDir}/${MENTION_FILE}`, "aaa\nbbb\nccc\nddd\neee\n");
+// Opts this project into selection sharing before the page ever loads: it is
+// embedded once per page load (render.rs's data-share-selection), so writing
+// this after openPage would not be seen without a reload. Off is the default
+// for every other browser-tested project in this repo — this is the one file
+// in the suite that deliberately turns it on, to exercise the wiring.
+await Deno.mkdir(`${projectDir}/.resh`, { recursive: true });
+await Deno.writeTextFile(`${projectDir}/.resh/config.toml`, "share_selection = true\n");
 
 const resh = await startResh({
   repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(),
@@ -399,6 +409,47 @@ try {
   ok(mentioned?.params?.lineStart === 2 && mentioned?.params?.lineEnd === 3,
      `it carries the selected line range (2-3), got ${JSON.stringify(mentioned?.params)}`);
   ok(mentioned && !("id" in mentioned), "at_mentioned is a notification (no id), not something resh expects an answer to");
+
+  console.log("\nF. selection sharing: the header says so, and a selection reaches Claude as selection_changed");
+  // The visible half of the "off by default, visible when on" contract —
+  // this project opted in before the page ever loaded (see the config.toml
+  // written above), so the indicator render.rs renders from
+  // Settings::share_selection must be on the page from the start.
+  const sharingBadge = await evalIn(`(() => ({
+    dataset: document.body.dataset.shareSelection,
+    text: (document.querySelector("#sharing") || {}).textContent || "",
+  }))()`);
+  ok(sharingBadge.dataset === "1", `the page embeds share_selection as on, got ${JSON.stringify(sharingBadge)}`);
+  ok(sharingBadge.text.includes("sharing selection"),
+     `the header shows the sharing indicator whenever the key is on, got ${JSON.stringify(sharingBadge)}`);
+
+  // Reuses the editor MENTION_FILE opened for section E. A selection that
+  // does not overlap what Alt+K selected there (bbb/ccc) keeps this
+  // section's claude.log match unambiguous.
+  await evalIn(`(() => {
+    const ta = document.querySelector("textarea.editor");
+    const start = ta.value.indexOf("ccc");
+    ta.focus();
+    ta.setSelectionRange(start, start + 3); // selects "ccc", no trailing newline
+    document.dispatchEvent(new Event("selectionchange"));
+  })()`);
+  const shared = await poll(
+    () => claude.log.find((m) => m.method === "selection_changed" && m.params?.text === "ccc"),
+    10, "the selection_changed notification",
+  );
+  ok(!!shared, "Claude's ide socket receives a selection_changed notification for the selection");
+  ok((shared?.params?.filePath || "").endsWith(MENTION_FILE), `it names the right file, got ${JSON.stringify(shared?.params)}`);
+  // 0-based line/character (LSP-style), unlike at_mentioned's 1-based
+  // lineStart/lineEnd asserted in section E — "ccc" is the third line (index
+  // 2) of "aaa\nbbb\nccc\nddd\neee\n", starting at column 0 and ending at 3.
+  ok(
+    shared?.params?.selection?.start?.line === 2 &&
+    shared?.params?.selection?.start?.character === 0 &&
+    shared?.params?.selection?.end?.line === 2 &&
+    shared?.params?.selection?.end?.character === 3,
+    `it carries 0-based line/character bounds, got ${JSON.stringify(shared?.params?.selection)}`,
+  );
+  ok(shared && !("id" in shared), "selection_changed is a notification (no id), not something resh expects an answer to");
 } finally {
   try { claude?.close(); } catch {}
   try { page?.close(); } catch {}

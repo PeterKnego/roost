@@ -13,6 +13,7 @@ struct RawConfig {
     autosave: Option<bool>,
     allowed_origins: Option<Vec<String>>,
     max_upload_bytes: Option<u64>,
+    share_selection: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +28,14 @@ pub struct Settings {
     /// hostile checkout could set here widens a boundary: it only decides
     /// whether the person editing that project's own files has to press ⌘S.
     pub autosave: bool,
+    /// Off unless a project asks for it. This ships file contents to Claude
+    /// with no explicit user action, and resh has no permission system to
+    /// scope it the way Claude Code's own `Read` deny rules do. Unlike
+    /// `allowed_origins` and `max_upload_bytes`, this *is* allowed per
+    /// project: sharing your own selection with your own Claude cannot raise
+    /// a ceiling on anything, so a project opting itself in is a decision
+    /// only that project's own files are exposed by.
+    pub share_selection: bool,
     pub warning: Option<String>,
 }
 
@@ -58,6 +67,7 @@ impl Default for Settings {
             hide: vec![],
             show_hidden: false,
             autosave: true,
+            share_selection: false,
             warning: None,
         }
     }
@@ -91,6 +101,9 @@ pub fn load(paths: &[&Path]) -> Settings {
                 }
                 if let Some(v) = raw.autosave {
                     s.autosave = v;
+                }
+                if let Some(v) = raw.share_selection {
+                    s.share_selection = v;
                 }
             }
             Err(e) => warnings.push(format!("{}: {}", path.display(), e.message())),
@@ -261,6 +274,42 @@ mod tests {
         assert!(!load(&[&g]).autosave);
         fs::write(&p, "autosave = true").unwrap();
         assert!(load(&[&g, &p]).autosave, "a project can turn it back on");
+        assert!(load(&[&g, &p]).warning.is_none());
+    }
+
+    // Off unless a file turns it on — the opposite default from autosave,
+    // because this key ships file contents to Claude with no explicit user
+    // action. Both layers can still move it in both directions, same as
+    // autosave and show_hidden: asserting only the default would pass with
+    // the cascade never reading the key at all.
+    //
+    // Revert-checked: flipping `Settings::default()`'s `share_selection` to
+    // `true` failed the first assertion here (`!load(&[&g]).share_selection`)
+    // — `assertion failed: !load(...)` — leaving the rest of this test (which
+    // never re-checks the off state) green. The same break also failed
+    // `ide::tests::selection_sharing_is_off_unless_a_project_opts_in` and
+    // `render::tests::share_selection_is_off_by_default_and_the_indicator_
+    // appears_only_when_it_is_on` — three legitimate hits on the one default,
+    // not evidence any of the three is redundant. Then restored.
+    #[test]
+    fn share_selection_defaults_off_and_either_layer_can_turn_it_on() {
+        let d = tempfile::tempdir().unwrap();
+        let g = d.path().join("global.toml");
+        let p = d.path().join("project.toml");
+        fs::write(&g, "hide = [\"dist\"]").unwrap();
+        assert!(!load(&[&g]).share_selection, "off unless something says otherwise");
+
+        fs::write(&p, "share_selection = true").unwrap();
+        let s = load(&[&g, &p]);
+        assert!(s.share_selection, "a project can turn it on for itself");
+        assert_eq!(s.hide, vec!["dist"], "and the global key still survives");
+
+        // The other direction: a project can turn a global `true` back off,
+        // or the setting is a one-way latch.
+        fs::write(&g, "share_selection = true").unwrap();
+        assert!(load(&[&g]).share_selection);
+        fs::write(&p, "share_selection = false").unwrap();
+        assert!(!load(&[&g, &p]).share_selection, "a project can turn it back off");
         assert!(load(&[&g, &p]).warning.is_none());
     }
 

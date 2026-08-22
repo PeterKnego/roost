@@ -11,6 +11,14 @@ const SHOW_HIDDEN_DEFAULT = document.body.dataset.showHidden === "1";
 // like SHOW_HIDDEN_DEFAULT: it changes only when someone edits a config file,
 // which already needs a reload to take effect.
 const AUTOSAVE = document.body.dataset.autosave === "1";
+// Whether the editor's current selection is sent to Claude as ambient
+// context, embedded once per page load like AUTOSAVE and SHOW_HIDDEN_DEFAULT.
+// Off unless the project's config opted in (Settings::share_selection); the
+// server checks this again on every ShareSelection it receives (see
+// ide::selection_changed), so this client-side gate is a courtesy that saves
+// a wasted round trip, not the actual boundary — the boundary is the server
+// re-checking a config file it, not this client, controls.
+const SHARE_SELECTION = document.body.dataset.shareSelection === "1";
 // How long after the last keystroke an autosave fires. VS Code's default,
 // and comfortably longer than the 200ms EditBuffer debounce it depends on.
 const AUTOSAVE_MS = 1000;
@@ -1683,6 +1691,47 @@ document.addEventListener("keydown", (e) => {
   e.preventDefault();
   const sel = mentionSelection(rel);
   send({ t: "MentionPath", rel, line_start: sel.startLine, line_end: sel.endLine });
+});
+
+// --- selection sharing (opt-in, off by default — see SHARE_SELECTION) ------
+//
+// 0-based line and character offsets, unlike mentionSelection's 1-based line
+// numbers above: this feeds `ShareSelection`, which the server turns straight
+// into the LSP-style `{line, character}` pairs selection_changed puts on the
+// wire (src/ide.rs), not MentionPath's 1-based lineStart/lineEnd.
+function shareSelectionSnapshot(rel) {
+  const ta = editors.get(rel);
+  if (!ta || ta.selectionStart === ta.selectionEnd) return null;
+  const before = ta.value.slice(0, ta.selectionStart);
+  const text = ta.value.slice(ta.selectionStart, ta.selectionEnd);
+  const beforeLines = before.split("\n");
+  const startLine = beforeLines.length - 1;
+  const startCol = beforeLines[beforeLines.length - 1].length;
+  const selLines = text.split("\n");
+  const endLine = startLine + selLines.length - 1;
+  const endCol = selLines.length === 1 ? startCol + selLines[0].length : selLines[selLines.length - 1].length;
+  return { rel, text, startLine, startCol, endLine, endCol };
+}
+
+// Debounced in the browser, not the socket thread: a debounce there would
+// hold per-connection state (a timer, a pending send) for no reason, since
+// this client is the only one that ever needs to coalesce its own rapid
+// selection changes.
+let shareSelectionTimer = null;
+document.addEventListener("selectionchange", () => {
+  if (!SHARE_SELECTION) return; // cheapest possible no-op for the common case
+  clearTimeout(shareSelectionTimer);
+  shareSelectionTimer = setTimeout(() => {
+    const rel = mentionTarget(); // same "which editor" rule Alt+K uses
+    if (rel === null) return;
+    const sel = shareSelectionSnapshot(rel);
+    if (!sel) return;
+    send({
+      t: "ShareSelection", rel: sel.rel, text: sel.text,
+      start_line: sel.startLine, start_col: sel.startCol,
+      end_line: sel.endLine, end_col: sel.endCol,
+    });
+  }, 200);
 });
 
 /// The one save path. The shortcut above and the breadcrumb's Save button both

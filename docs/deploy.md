@@ -336,6 +336,38 @@ happened, autosave stops for that buffer instead of re-raising the conflict
 banner every second. An explicit ⌘S is what resolves it, and a save that
 actually lands is what starts autosave again.
 
+### Sharing the editor selection with Claude
+
+Off by default. When on, resh sends whatever text is currently highlighted in
+the editor to every Claude connected over the ide socket, as ambient context,
+on a 200ms debounce after the selection stops changing — not only when you
+press a key that means "share this." That is a different posture than every
+other IDE integration in this file: `allowed_origins` and the Origin checks
+guard who can *reach* resh, and `@`-mentioning a file (Alt+K) is a deliberate
+act; this ships file contents with no explicit gesture at all, the moment
+someone selects a line. A highlighted line of `.env` leaves the host exactly
+the same way a highlighted line of anything else does. To turn it on:
+
+```toml
+share_selection = true
+```
+
+Per project only, unlike `allowed_origins` and `max_upload_bytes` — a project
+opting itself in only exposes that project's own files, so there is no ceiling
+to widen. There is deliberately no global switch: turning this on for one
+project must never be a way to turn it on for every project a hostile checkout
+did not ask for.
+
+Read once per page load like `autosave`, not resolved per request: an open tab
+keeps the value it loaded with until reloaded. Whenever it is on, the header
+shows `⧉ sharing selection` for as long as the tab is open — that indicator is
+the whole visibility half of the contract (resh has no permission system to
+scope this the way Claude Code's own `Read` deny rules do), so its absence is
+the only thing standing between a stale `share_selection = true` and a
+never-again-noticed cross-project accident. Checked again on the server for
+every selection resh receives, so flipping the key back off during a session
+takes effect on the very next selection change, not on the next reload.
+
 ### Hidden files in the tree
 
 The file tree hides every entry beginning with a dot — `.git`, `.claude`,

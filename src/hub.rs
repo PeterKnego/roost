@@ -436,6 +436,15 @@ impl Hub {
             Intent::MentionPath { rel, line_start, line_end } => {
                 return self.do_mention_path(from, rel.clone(), *line_start, *line_end)
             }
+            Intent::ShareSelection { rel, text, start_line, start_col, end_line, end_col } => {
+                return self.do_share_selection(
+                    from,
+                    rel.clone(),
+                    text.clone(),
+                    (*start_line, *start_col),
+                    (*end_line, *end_col),
+                )
+            }
             Intent::AnswerProposal { id, accept, text } => {
                 return self.do_answer_proposal(from, id.clone(), *accept, text.clone())
             }
@@ -1240,6 +1249,40 @@ impl Hub {
             let ev = Event::Error { msg: e };
             self.send_to(from, &ev);
         }
+    }
+
+    /// The editor's current selection, arriving on a 200ms debounce from
+    /// `static/app.js` rather than a deliberate keystroke like
+    /// `MentionPath`'s Alt+K. Resolved and confined against the project the
+    /// same way `do_mention_path` resolves `rel` — a path off the wire is
+    /// never trusted past `safe_resolve` — and a confinement failure is
+    /// surfaced to the asking client exactly like `do_mention_path`'s: it is
+    /// not routine, and is worth knowing about.
+    ///
+    /// What is *not* surfaced is `ide::selection_changed`'s own refusal:
+    /// sharing being off (the ordinary state for almost every project, since
+    /// the default is off) and no Claude being attached are both routine,
+    /// expected outcomes on a signal that fires on every debounced selection
+    /// change — flashing the error banner for either would train users to
+    /// ignore it. The visible signal that sharing is on is the header
+    /// indicator `render.rs` renders from `Settings::share_selection`, not a
+    /// banner here.
+    fn do_share_selection(
+        &mut self,
+        from: &ConnId,
+        rel: String,
+        text: String,
+        start: (u32, u32),
+        end: (u32, u32),
+    ) {
+        let abs = match crate::projects::safe_resolve(&self.dir, &rel) {
+            Ok(p) => p,
+            Err(e) => {
+                let ev = Event::Error { msg: e };
+                return self.send_to(from, &ev);
+            }
+        };
+        let _ = crate::ide::selection_changed(&self.project, &self.dir, &abs, &text, start, end);
     }
 
     /// The human's Accept/Reject, which **is** the permission answer Claude
@@ -3158,6 +3201,130 @@ mod tests {
             got.iter().any(|m| m.contains("line_start") && m.contains("line_end")),
             "a half-specified range must be refused by name, not silently degraded: {got:?}"
         );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// Confinement runs before `do_share_selection` ever reaches
+    /// `ide::selection_changed`, mirroring `mention_path_outside_the_project_
+    /// is_refused_before_reaching_claude` above — with one extra wrinkle this
+    /// intent has and `MentionPath` does not: `do_share_selection` swallows
+    /// `ide::selection_changed`'s own refusal (sharing off, no Claude
+    /// attached — both routine on a signal that fires on every debounced
+    /// selection change), so an escaping path silently passing confinement
+    /// would look *identical* to the routine case: no `Error` reaches
+    /// anyone either way. Only a confinement failure is surfaced, which is
+    /// exactly what makes it possible to tell "refused before reaching ide"
+    /// apart from "reached ide and ide stayed quiet" from outside the hub.
+    ///
+    /// Revert-checked: replacing the `safe_resolve` match (and its
+    /// `Event::Error` arm) with a bare `self.dir.join(&rel)` — the same
+    /// "skip confinement, build the path anyway" shape
+    /// `mention_path_outside_the_project_is_refused_before_reaching_claude`'s
+    /// own revert uses — failed both this test and the sibling
+    /// `share_selection_refusal_reaches_only_the_client_that_asked` below:
+    /// the asker's inbox went from one `Error` containing "outside project"
+    /// to empty, since the un-confined path (this test's project has no
+    /// Claude attached and has not opted in) then fails silently inside
+    /// `ide::selection_changed` itself, which `do_share_selection` swallows
+    /// on purpose. Restored.
+    #[test]
+    fn share_selection_outside_the_project_is_refused_before_reaching_ide() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", dir.path().join("state"));
+        let mut h = Hub::new("shareselectionescape", dir.path().to_path_buf());
+        let (asker, rx) = h.subscribe();
+
+        h.handle(&asker, Intent::ShareSelection {
+            rel: "../../etc/passwd".into(),
+            text: "root:x:0:0".into(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 10,
+        });
+
+        let got: Vec<String> = rx.try_iter().collect();
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("outside project")),
+            "an escaping path must be refused by safe_resolve before ide::selection_changed \
+             ever sees it: {got:?}"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// Two subscribers, for the reason CLAUDE.md records: with one, a leak to
+    /// every subscriber and a reply to only the asker are indistinguishable.
+    /// This is the privacy property that matters most for this intent in
+    /// particular — a selection is file content, and it must never reach a
+    /// browser that did not select it.
+    ///
+    /// Revert-checked: changing the confinement failure's `self.send_to(from,
+    /// &ev)` to `self.broadcast(&ev)` failed this test — `others` held the
+    /// same `Error` the asker got — then restored.
+    #[test]
+    fn share_selection_refusal_reaches_only_the_client_that_asked() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", dir.path().join("state"));
+        let mut h = Hub::new("shareselectionrefuse", dir.path().to_path_buf());
+        let (asker, rx_asker) = h.subscribe();
+        let (_other, rx_other) = h.subscribe();
+
+        h.handle(&asker, Intent::ShareSelection {
+            rel: "../../etc/passwd".into(),
+            text: "secret".into(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 1,
+        });
+
+        let got: Vec<String> = rx_asker.try_iter().collect();
+        assert!(got.iter().any(|m| m.contains("outside project")), "the asking client got no refusal: {got:?}");
+        let others: Vec<String> = rx_other.try_iter().collect();
+        assert!(others.is_empty(), "a refusal must leave the other subscriber's inbox empty, got: {others:?}");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// The ordinary case — a project that has not opted in, which is every
+    /// project by default — must produce no visible effect at all: no
+    /// `Error` (see `do_share_selection`'s doc comment for why that noise is
+    /// deliberately swallowed), no broadcast to any subscriber, and no
+    /// `ws.version` bump (nothing here should ever cause a `State` to go
+    /// out). Without this a future edit that starts broadcasting the
+    /// selection to every browser in the project — the exact silent
+    /// exfiltration this whole feature exists to prevent — would slip past
+    /// every other test in this file, none of which inspect `rx_other` on the
+    /// success path.
+    ///
+    /// Revert-checked: changing the final line to `self.broadcast(&Event::
+    /// Error { msg: "test".into() })` unconditionally after the
+    /// `ide::selection_changed` call failed this test on the `others.is_
+    /// empty()` assertion — then restored.
+    #[test]
+    fn a_selection_change_on_an_unopted_in_project_reaches_nobody() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", dir.path().join("state"));
+        std::fs::write(dir.path().join("a.rs"), b"fn main() {}").unwrap();
+        let mut h = Hub::new("shareselectionoff", dir.path().to_path_buf());
+        let (asker, rx_asker) = h.subscribe();
+        let (_other, rx_other) = h.subscribe();
+        let version_before = h.ws.version;
+
+        h.handle(&asker, Intent::ShareSelection {
+            rel: "a.rs".into(),
+            text: "fn main".into(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 7,
+        });
+
+        assert!(rx_asker.try_iter().collect::<Vec<_>>().is_empty(), "an opted-out project must stay silent to the asker too");
+        assert!(rx_other.try_iter().collect::<Vec<_>>().is_empty(), "and to every other subscriber");
+        assert_eq!(h.ws.version, version_before, "nothing here should ever bump ws.version");
         std::env::remove_var("RESH_STATE_DIR");
     }
 
