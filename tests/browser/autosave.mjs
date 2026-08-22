@@ -35,6 +35,10 @@ await Deno.mkdir(`${fx.roots}/noauto/.resh`, { recursive: true });
 await Deno.writeTextFile(`${fx.roots}/noauto/.resh/config.toml`, "autosave = false\n");
 const manualFile = `${fx.roots}/noauto/manual.md`;
 await Deno.writeTextFile(manualFile, "start\n");
+// Its own file, so section F's forced race cannot disturb the buffer D3 is
+// still asserting about.
+const slowFile = `${fx.roots}/proj/slowstate.md`;
+await Deno.writeTextFile(slowFile, "start\n");
 
 const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
@@ -46,11 +50,39 @@ const wire = async (project, rel) => {
   await until(() => p.evalIn(`typeof state !== "undefined" && !!(state && state.panes)`), 15, "state");
   await p.evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: ${JSON.stringify(rel)}, mode: "Edit" } })`);
   await until(() => p.evalIn(`!!document.querySelector("textarea.editor")`), 10, "editor");
+  // A textarea existing is not the same as the file being in it. Entering Edit
+  // makes the server read the file and push a BufferText with an empty origin,
+  // and that push lands whenever it lands — on a loaded host, possibly after
+  // the caller has already typed, in which case it overwrites what they typed
+  // with the file's original content and every later assertion waits on an
+  // edit that no longer exists. Measured: the editor came back holding its
+  // original bytes, in a run where the keystrokes had demonstrably arrived.
+  // `texts` is written by that same handler, so agreement between the two is
+  // the signal that the push has been applied.
+  await until(() => p.evalIn(
+    `texts.has(${JSON.stringify(rel)}) && (document.querySelector("textarea.editor") || {}).value === texts.get(${JSON.stringify(rel)})`),
+    10, "the editor to settle on the file");
   return {
     ...p,
+    /// Types into the mounted editor, and confirms the keystrokes arrived.
+    ///
+    /// The confirmation is not ceremony. `Input.insertText` requires the
+    /// textarea to be focused, and focusing it is a *separate* CDP round
+    /// trip: on a loaded host the insert can land before the focus does, and
+    /// the text then goes nowhere at all. Every assertion downstream — the
+    /// file on disk, the dirty flag, the header — is then waiting on an edit
+    /// that was never made, which reads as a slow autosave and was written
+    /// off as one for a long time. Measured: the editor still held its
+    /// original 6 bytes in every failing run.
     type: async (text) => {
-      await p.evalIn(`document.querySelector("textarea.editor").focus()`);
-      await p.cmd("Input.insertText", { text });
+      for (let i = 0; i < 3; i++) {
+        await p.evalIn(`document.querySelector("textarea.editor").focus()`);
+        await p.cmd("Input.insertText", { text });
+        if (await until(async () =>
+          ((await p.evalIn(`(document.querySelector("textarea.editor") || {}).value`)) || "").includes(text.trim()),
+          3, i ? `the keystrokes to land (retry ${i})` : null)) return;
+      }
+      throw new Error(`typing never reached the editor: ${JSON.stringify(text)}`);
     },
     blur: () => p.evalIn(`document.activeElement.blur(); document.body.focus()`),
     dirty: () => p.evalIn(`!!(state.buffers.find((b) => b.rel === ${JSON.stringify(rel)}) || {}).dirty`),
@@ -142,20 +174,54 @@ try {
   // buffer that stayed paused would never autosave again for the rest of the
   // session, and nothing else in this file would notice.
   await page.type("typing again after the discard\n");
-  // 20s, not the 5s the rest of this file uses for a post-save wait. This is
-  // the one assertion that waits on a *debounce* rather than on a save it
-  // just triggered: autosave fires a second after the last keystroke, and
-  // only then makes the round trip. Five seconds is ample on an idle box and
-  // not ample on a loaded one.
+  // 20s is generous rather than necessary. An earlier round read this
+  // assertion's failures as a slow host and raised the budget from 5s, but
+  // its own measurement said otherwise: still 1 failure in 12 at *30s*. A
+  // write that has not landed in thirty seconds is not a slow write.
   //
-  // Measured on this 4-core host rather than guessed, because it had been
-  // written off as a flake: idle it passes 10/10 either way, but with every
-  // core saturated it failed 2 of 6 at 5s and 1 of 12 at 30s. The write does
-  // land — it lands late — so the budget was the defect, not the behaviour.
+  // The two real causes are fixed above, in `wire`. Under load the keystrokes
+  // could miss the textarea entirely (`Input.insertText` needs focus, and
+  // focusing is a separate round trip), or land and then be overwritten by
+  // the initial BufferText the server pushes when a tab enters Edit. Either
+  // way this waited on an edit that did not exist. With both closed, five
+  // consecutive fully-saturated runs pass; the budget stays wide because
+  // nothing is bought by tightening it.
   // A genuine failure to resume still fails here; it just has to be a real
   // one rather than a slow machine.
   ok(await until(async () => (await Deno.readTextFile(file)).includes("typing again"), 20, "resumed"),
      "autosave works again once the divergence is resolved");
+
+  console.log("\nF. a slow State does not cost the edit that was typed under it");
+  // The defect this pins: autosaveNow's third guard asks "is there anything to
+  // save?" by looking at `pendingEdits` (cleared when the 200ms debounce
+  // fires) and at the server's `dirty` flag (true only once its State has
+  // arrived). Between those two moments the honest answer is "I cannot tell
+  // yet" — and the guard read it as "nothing to do", returned, and left no
+  // timer behind, so the edit was never written at all. Not late: never,
+  // until the user happened to type again or blur the window.
+  //
+  // Forced rather than waited for. On an idle box the State beats the 1s
+  // timer and the gap is invisible; on a loaded one it does not, which is why
+  // this looked like a flake in D3 for a long time and why raising that
+  // budget could not fix it — the write does not land late, it does not land.
+  const slow = await wire("proj", "slowstate.md");
+  try {
+    await slow.evalIn(`(() => {
+      const real = window.onEvent;
+      window.onEvent = (ev) => {
+        if (ev.t === "State") { setTimeout(() => real(ev), 1500); return; }
+        real(ev);
+      };
+    })()`);
+    await slow.type("typed under a slow State\n");
+    ok(await until(async () => (await Deno.readTextFile(slowFile)).includes("typed under a slow State"), 15, "the write"),
+       "an edit typed while State is in flight is still autosaved");
+    // The buffer really was dirty and really did have no timer left: without
+    // that, the assertion above could pass for the boring reason that the
+    // race never happened in this run.
+    ok(await slow.evalIn(`autosaveTimers.size === 0`),
+       "and it did not simply get rescued by a still-pending timer");
+  } finally { try { slow.close(); } catch {} }
 
   console.log("\nE. a project can turn it off");
   manualPage = await wire("noauto", "manual.md");
