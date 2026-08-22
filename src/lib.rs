@@ -5,6 +5,7 @@ pub mod fileops;
 pub mod gitio;
 pub mod hub;
 pub mod http;
+pub mod idelock;
 pub mod notify;
 pub mod origin;
 pub mod osc;
