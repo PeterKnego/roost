@@ -27,14 +27,18 @@
 //! added, so they are what this file does today, not what an earlier draft
 //! of it did:
 //!   0. Deleted the `registerTermLinks(term, entry)` call in ensureTerm —
-//!      the state of the tree before this task. Eleven failed (ten before I
-//!      and J existed, eight before that — see below), among them:
+//!      the state of the tree before this task. Fourteen failed (eleven
+//!      before section L existed, ten before I and J, eight before that —
+//!      see below), among them:
 //!        FAIL  two link providers are registered on the terminal (got 0)
 //!        FAIL  a path is offered as a link while the modifier is held (got 0: [])
 //!        FAIL  arming alone marked the path under the resting pointer (got null)
 //!        FAIL  the link is still marked with the application holding the mouse
 //!        FAIL  modifier+click on a real path opened docs/backlog.md
 //!        FAIL  the refusal flashed on the terminal that was actually clicked
+//!        FAIL  modifier+click opened the file even with mouse reporting on
+//!        FAIL  CONTROL: the very same click, with the modifier on the
+//!        event, does open it
 //!      Both "no link offered" assertions (1 and 4) went on passing, since
 //!      no providers and a closed gate look identical from outside. That is
 //!      exactly why the registration guard and the row-on-screen guards are
@@ -44,6 +48,13 @@
 //!      openTermPath is never called and pendingLink stays null, so
 //!      flashText() staying "" satisfies nothing rather than exposing this.
 //!      That is what the tab-count and modifier+click assertions are for.
+//!      Section L behaves the same way and is guarded the same way: with no
+//!      providers, "a plain click stayed with the application" is true
+//!      because nothing could ever have been offered, and "the modifier
+//!      click is reported to the application" is true because that report is
+//!      xterm's own and owes resh nothing. Its two modifier-click
+//!      assertions are what fail, and the mouse-report CONTROL beside them
+//!      goes on passing legitimately — the click really did land on the row.
 //!      Section I's second terminal has no providers either, so its click
 //!      never activates and its own refusal-flash assertion fails the same
 //!      way — but "and not on the other terminal" still passes, vacuously:
@@ -72,13 +83,14 @@
 //!      zero directory segments. One failed:
 //!        FAIL  a bare filename with no directory offers no link (got 1: ["backlog.md"])
 //!   4. Put nudgeLinks' synthetic mousemove back on the `.termhost` element
-//!      instead of `.xterm-screen`. Four failed, unchanged by I and J, all
+//!      instead of `.xterm-screen`. Five failed, unchanged by I and J, all
 //!      of them hover-path:
 //!        FAIL  arming alone marked the path under the resting pointer (got null)
 //!        FAIL  xterm's own precedence marks the whole URL, not the path in
 //!        its tail (got null)
 //!        FAIL  the link is still marked with the application holding the mouse
 //!        FAIL  modifier+click on a real path opened docs/backlog.md
+//!        FAIL  modifier+click opened the file even with mouse reporting on
 //!      That fourth one — new when section H was added — was not obvious in
 //!      advance: clickLink's own mouseMoved is a real CDP event dispatched
 //!      straight at xterm's screen element, so it looked independent of
@@ -95,23 +107,30 @@
 //!      click's own move ever runs, and section H's click depends on it
 //!      exactly as much as F's pure-hover assertions do — this revert is
 //!      what proved that, not the design intent going in. Section I stays at
-//!      four rather than growing a fifth: ALSO_MISSING's row on terminal 2
+//!      four rather than growing a sixth: ALSO_MISSING's row on terminal 2
 //!      was never queried unarmed the way PATH's was, so there is no stale
-//!      cache entry for clickLink's move to inherit there.
+//!      cache entry for clickLink's move to inherit there. Section L splits
+//!      along the same line: its PATH2 click inherits section G's stale
+//!      cache and fails, while its PATH3 hover further down lands on a row
+//!      nothing ever queried unarmed and goes on passing.
 //!   5. Put nudgeLinks' detour back to a sideways one — a different column on
 //!      the same line, off the real `cols` — instead of a different row. The
-//!      same four failed, identically, for the same reason as 4: a same-line
+//!      same five failed, identically, for the same reason as 4: a same-line
 //!      detour does not change `_activeLine` either, so the cache is never
 //!      invalidated and clickLink's own move inherits the stale answer.
 //!      4 and 5 are both bugs this task shipped and then measured out; see
 //!      task-4-report.md. Sections B-E stay green through both, because they
 //!      ask the providers directly and never go near the hover path — which
 //!      is exactly why F is here.
-//!   6. Made nudgeLinks' events `bubbles: true` again. Section G alone failed
-//!      (still just the one — section H disables mouse tracking mode before
-//!      it runs, so a bubbling nudge has no listener downstream to leak to
-//!      by the time H, I or J run), with the phantom motion reports spelled
-//!      out:
+//!   6. Made nudgeLinks' events `bubbles: true` again. Section G alone
+//!      failed — still just the one after section L, which was re-measured
+//!      rather than assumed, since L is the one place after G that turns
+//!      mouse reporting back on. Section H disables it before H, I, J and K
+//!      run, so a bubbling nudge has no listener downstream to leak to
+//!      there; and L's own two PTY assertions look for a *button* report
+//!      (SGR button 0, and 0|16 for the modifier), which a phantom motion
+//!      report (button 35) neither satisfies nor spoils. The phantom motion
+//!      reports spelled out:
 //!        FAIL  arming and disarming sent nothing to the PTY
 //!        ("[<35;5;1M[<35;5;4M[<35;5;1M[<35;5;4M";
 //!        after arming alone: "[<35;5;1M[<35;5;4M")
@@ -248,6 +267,57 @@
 //!        FAIL  and any other scheme off the allowlist, not just javascript:
 //! Both restored afterwards; the run passes clean again.
 //!
+//! Section L (task 7) is the one the design was written around and could
+//! not answer on paper: does a link survive an application that has taken
+//! the mouse? Measured, and the answer is yes — a modifier+click opens the
+//! file with mode 1003 live, so nothing needed implementing and the brief's
+//! capture-phase fallback stayed unwritten. Two independent reasons, both
+//! read out of static/vendor/xterm.js after the measurement, not before:
+//! the Linkifier binds its mousedown/mouseup to `screenElement`
+//! (`.xterm-screen`), while the core's mouse-reporting handler binds to
+//! `element` (`.xterm`) — an ancestor, so the Linkifier fires first no
+//! matter what the core then does; and the core's `cancel(e)` is
+//! `if (this.options.cancelEvents || t) ...`, so with the default
+//! `cancelEvents: !1` and no second argument it never calls stopPropagation
+//! at all. Its unconditional `e.preventDefault()` does not stop listeners.
+//!
+//! What the same measurement also showed, and what no amount of reading
+//! would have: the application gets the click *too*. A modifier+click emits
+//! `CSI < 16 ; col ; row M` (left button | the control bit) and its release,
+//! alongside opening the file. Whether an application does anything visible
+//! with a ctrl+click is the by-hand half, left open deliberately — see
+//! task-7-report.md's checklist. If it ever proves to be a problem, the
+//! brief's capture-phase fallback is also the remedy: stopping the event
+//! ahead of both handlers suppresses the report as well.
+//!
+//! Section L's own two reverts, each applied, run, watched fail, restored.
+//! They exist because the gate has two halves and the first version of this
+//! section could only reach one of them:
+//!   L1a. Deleted the modifier re-check inside matchProvider's activate
+//!        callback (`activate: (ev) => { if (linkModifier(ev)) ... }`),
+//!        leaving the provideLinks gate intact. Against the first draft of
+//!        section L this changed NOTHING — the whole file stayed green,
+//!        because with the gate intact there is never a link under an
+//!        unmodified click to activate, so the re-check is unreachable
+//!        through any ordinary click. The missed-keyup assertions at the end
+//!        of section L were added for exactly that, and now one fails:
+//!          FAIL  a click with no modifier on a still-marked link opens nothing
+//!   L1b. Deleted both halves — the provideLinks gate and the activate
+//!        re-check — which is the modifier gate gone entirely, and the state
+//!        in which resh would steal a plain click from a running
+//!        application. Five failed:
+//!          FAIL  no link is offered with the modifier up (got 1: ["docs/backlog.md"])
+//!          FAIL  resting on the path marks nothing while disarmed
+//!          FAIL  and releasing unmarked it, again with no mouse movement
+//!          FAIL  a plain click on a path stayed with the application and opened nothing
+//!          FAIL  a click with no modifier on a still-marked link opens nothing
+//!        Note which one is missing from revert 1's own list above: deleting
+//!        the provideLinks gate alone does NOT fail assertion 10, because
+//!        the activate re-check still refuses the click. Two independent
+//!        guards, and the file now names them separately rather than
+//!        crediting one for the other's work.
+//! Both restored afterwards; the run passes clean again.
+//!
 //! Run: deno run -A tests/browser/termlinks.mjs
 import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
   from "./harness.mjs";
@@ -270,6 +340,14 @@ const BARE = "backlog.md";
 // what it matches in ordinary prose (and/or, w/o, 24/7...) resolves to
 // nothing on disk.
 const MISSING = "nope/missing.rs";
+// A second file that really exists and that nothing above ever opens. Section
+// L needs one: it clicks the same path twice, plain then with the modifier,
+// and PATH is already an open tab by then — so "the modifier click opened it"
+// would be true before section L ran a single event.
+const PATH2 = "docs/notes.md";
+// A third one, for the missed-keyup case: a link that is still marked when a
+// click arrives without the modifier on it. See section L's own comment.
+const PATH3 = "docs/todo.md";
 
 // The rels currently open as File tabs in one pane, read straight off the
 // State snapshot rather than the DOM — the tab strip renders asynchronously
@@ -376,6 +454,8 @@ const fx = await fixture();
 // actually exists — seeded before the server starts, so its tree is right.
 await Deno.mkdir(`${fx.base}/roots/proj/docs`, { recursive: true });
 await Deno.writeTextFile(`${fx.base}/roots/proj/${PATH}`, "# backlog\n");
+await Deno.writeTextFile(`${fx.base}/roots/proj/${PATH2}`, "# notes\n");
+await Deno.writeTextFile(`${fx.base}/roots/proj/${PATH3}`, "# todo\n");
 
 const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
@@ -954,6 +1034,151 @@ try {
     "and any other scheme off the allowlist, not just javascript:",
     async () => (await windowOpenCalls(page)).length === 0,
   );
+
+  console.log("\nL. an application that owns the mouse keeps a plain click and yields a modifier one");
+  // The question the whole design was written around, and the one thing
+  // reading the vendored bundle could not settle: xterm's Linkifier binds its
+  // own mousedown to `.xterm-screen` with no mouse-mode check at all, while
+  // the core's handler on `.xterm` calls cancel(e) as soon as
+  // coreMouseService.areMouseEventsActive. Which of those two an activation
+  // survives is a property of two listeners' targets and order, not something
+  // resh can assert about itself — so it is measured here, against a terminal
+  // that really has mouse reporting on and a path that really exists.
+  ok(!(await openTabRels(page, 2)).includes(PATH2),
+     `${PATH2} is not open yet, so assertion 11 below has something left to prove`);
+  const scr = await evalIn(`(() => {
+    const r = __t().node.querySelector(".xterm-screen").getBoundingClientRect();
+    return { w: Math.round(r.width), h: Math.round(r.height) }; })()`);
+  ok(scr.w > 0 && scr.h > 0,
+     `terminal 1 is mounted with a real rect, so a seat means something (${JSON.stringify(scr)})`);
+  // Both rows are printed before mouse reporting goes on: from there the
+  // shell is inside a foreground `sleep` and anything typed at it is buffered
+  // by the pty rather than run.
+  await evalIn(`__t().term.input("printf '%s\\\\n' '${PATH2}' '${PATH3}'\\r")`);
+  ok(await until(() => evalIn(`__rowY(${JSON.stringify(PATH3)}) > 0`), 20, "the second real path's row"),
+     "two real, never-opened paths are on screen — guards every assertion below");
+  await sleep(250);
+  // Mouse reporting on, and held on by a foreground process. The `sleep` is
+  // not padding: at a bash prompt readline reads the click reports below as
+  // input and echoes garbage over the very rows this section clicks. Same
+  // incantation copyselect.mjs section D uses, and the state Claude Code
+  // leaves a terminal in.
+  await evalIn(`__t().term.input("printf '\\\\033[?1000h\\\\033[?1002h\\\\033[?1003h\\\\033[?1006h'; sleep 300\\r")`);
+  await sleep(2000);
+  ok(await evalIn("__t().term.modes.mouseTrackingMode") === "any",
+     "the application really holds the mouse before either click");
+  await evalIn(`__t().__sent = ""; if (!__t().__hooked) { __t().__hooked = 1;
+    __t().term.onData((d) => { __t().__sent += d; }); }`);
+
+  // 10. a plain click still belongs to the running application
+  const tabsBefore = (await openTabRels(page, 2)).length;
+  ok(await clickLink(page, PATH2, { modifier: false }), "the path row was found and plain-clicked");
+  // An SGR press report — CSI < 0 ; col ; row M — is button 0 going *down*;
+  // motion under mode 1003 reports button 35, so this cannot be satisfied by
+  // the pointer merely crossing the row. Without it, "no tab was added" is
+  // equally true of a click that landed on nothing, of a terminal that was
+  // never mounted, and of the whole feature deleted — the trap CLAUDE.md
+  // names, and the reason this control sits between the click and its
+  // assertion rather than being left to the reader's confidence.
+  const plainSent = await evalIn(`__t().__sent`);
+  ok(/\x1b\[<0;\d+;\d+M/.test(plainSent),
+     `CONTROL: the plain click reached the application as a mouse report (${JSON.stringify(plainSent.slice(-40))})`);
+  // An absence cannot be polled for. A round trip that was going to open a
+  // tab has landed well inside this window — section H's own OpenPath is
+  // observed in tens of milliseconds.
+  await sleep(1500);
+  await assert(
+    "a plain click on a path stayed with the application and opened nothing",
+    async () => {
+      const rels = await openTabRels(page, 2);
+      return rels.length === tabsBefore && !rels.includes(PATH2);
+    },
+  );
+
+  // 11. and a modifier+click still opens, with the app holding the mouse
+  ok(await evalIn("__t().term.modes.mouseTrackingMode") === "any",
+     "and still holds it for the modifier click — not a mode the shell dropped in between");
+  await evalIn(`__t().__sent = ""`);
+  ok(await clickLink(page, PATH2, { modifier: true }), "the same path row was modifier-clicked");
+  await until(() => evalIn(`state.panes[2].tabs.some((t) => t.rel === ${JSON.stringify(PATH2)})`),
+    20, `${PATH2} opened as a tab`);
+  await assert(
+    "modifier+click opened the file even with mouse reporting on",
+    async () => (await openTabRels(page, 2)).includes(PATH2),
+  );
+  // The half of "does the application also react?" that automation can
+  // answer: the bytes leave. Recorded as an assertion rather than left
+  // implicit, because it is a measurement and not a design choice — xterm
+  // reports the click to the application *and* activates the link, and a
+  // future xterm that stopped doing one of those should break a test here
+  // rather than quietly change what a click means. SGR button 16 is
+  // left-button-with-control (0 | 16); on macOS the modifier is Meta, which
+  // this bundle reports as its own bit, so this number is Linux's.
+  //
+  // Whether an application then does anything visible with a ctrl+click is
+  // the part no test can settle — see this file's header, and the by-hand
+  // checklist in task-7-report.md.
+  const modSent = await evalIn(`__t().__sent`);
+  ok(/\x1b\[<16;\d+;\d+M/.test(modSent),
+     `the modifier click is reported to the application as well as opening the file (${JSON.stringify(modSent)})`);
+
+  // The gate has two halves, and only one of them was reachable until now:
+  // matchProvider refuses to *offer* a link while disarmed, and its activate
+  // callback re-checks the modifier on the event itself. Deleting the second
+  // alone leaves every other assertion in this file green (measured — see the
+  // header's revert L1a), because with the first intact there is never a link
+  // under an unmodified click to activate. The state that separates them is
+  // the one the re-check was written for: a stale underline left by a keyup
+  // that never arrived — alt-tabbing away with the key down — where the link
+  // is marked but the click carries no modifier.
+  //
+  // Reproduced by holding the key for the hover and clearing it on the mouse
+  // event alone, which CDP can express and a real user cannot. Mouse
+  // reporting is still on, so this doubles as the case that matters most: a
+  // stale underline over an application that would otherwise have had the
+  // click.
+  await key("rawKeyDown", 2);
+  await sleep(200);
+  const seat3 = await seatOf(PATH3, 4);
+  ok(!!seat3, `the third path's row is rendered and hoverable (${JSON.stringify(seat3)})`);
+  await cmd("Input.dispatchMouseEvent",
+    { type: "mouseMoved", x: seat3.x, y: seat3.y, buttons: 0, modifiers: 2 });
+  await sleep(400);
+  ok(await evalIn(hovered) === PATH3,
+     "CONTROL: the link really is marked when the unmodified click below arrives");
+  const before3 = (await openTabRels(page, 2)).length;
+  const clickAt = async (s, modifiers) => {
+    await cmd("Input.dispatchMouseEvent",
+      { type: "mousePressed", x: s.x, y: s.y, button: "left", buttons: 1, clickCount: 1, modifiers });
+    await cmd("Input.dispatchMouseEvent",
+      { type: "mouseReleased", x: s.x, y: s.y, button: "left", buttons: 0, clickCount: 1, modifiers });
+  };
+  await clickAt(seat3, 0);
+  await sleep(1500);
+  await assert(
+    "a click with no modifier on a still-marked link opens nothing",
+    async () => {
+      const rels = await openTabRels(page, 2);
+      return rels.length === before3 && !rels.includes(PATH3);
+    },
+  );
+  // Same seat, same armed state, same marked link — only the event's own
+  // modifier differs. Without this, the assertion above is also satisfied by
+  // a seat that missed the row entirely.
+  await clickAt(seat3, 2);
+  await until(() => evalIn(`state.panes[2].tabs.some((t) => t.rel === ${JSON.stringify(PATH3)})`),
+    20, `${PATH3} opened as a tab`);
+  await assert(
+    "CONTROL: the very same click, with the modifier on the event, does open it",
+    async () => (await openTabRels(page, 2)).includes(PATH3),
+  );
+  await key("keyUp", 0);
+  await sleep(200);
+
+  // Leaves the shell the way section H found it, so anything appended after
+  // this section starts from a prompt rather than a wedged `sleep`.
+  await evalIn(`__t().term.input("\\x03")`);
+  await until(async () => (await evalIn("__last()")).trimEnd().endsWith("$"), 20, "the prompt back after ^C");
 
 } finally {
   page?.close();

@@ -91,22 +91,47 @@ re-checks the modifier at click time, so an underline left stale by a missed
 A `blur` on the window disarms. Otherwise a user who switches apps with the
 modifier down comes back to a terminal that is silently armed.
 
-## The risk this design cannot resolve on paper
+## The risk this design could not resolve on paper, and what measuring it found
 
-**Whether xterm delivers link events at all while an application owns the
-mouse.** The `Linkifier` registers its own `mousemove`/`mousedown`/`mouseup` on
-the screen element and checks nothing about mouse mode. The core's own
-`mousedown` on that same element calls `cancel(e)` when
-`coreMouseService.areMouseEventsActive`. Both are listeners on one element, so
-`stopPropagation` does not settle it, and reading further into minified source
-would produce a conclusion rather than an answer.
+The open question was **whether xterm delivers link events at all while an
+application owns the mouse**. It is settled: **it does.** With modes 1000, 1002,
+1003 and 1006 all live and `term.modes.mouseTrackingMode === "any"`, a
+modifier+click opens the file and a plain click does not. Measured in
+`tests/browser/termlinks.mjs` section L, against a real shell that really turned
+mouse reporting on, on a file that no earlier assertion had already opened. The
+capture-phase fallback sketched here was therefore never written, and
+`static/app.js` needed no change for this.
 
-This is decided in a browser, against a real Claude session, or not at all — no
-`cargo test` reaches `static/app.js`. If links do not fire under mouse
-reporting, the fallback is a capture-phase `mousedown` on the `.termhost` node
-doing its own hit-testing via `term.buffer` and skipping the `Linkifier`
-entirely. That fallback is more code, not different behaviour, so it does not
-change anything else in this design.
+Two independent mechanisms decide it, both read out of `static/vendor/xterm.js`
+*after* the measurement rather than in place of it:
+
+- **The two handlers are on different elements, not one.** The `Linkifier` is
+  constructed as `createInstance(Linkifier, this.screenElement)` and binds its
+  `mousemove`/`mousedown`/`mouseup` to `.xterm-screen`. The core's
+  mouse-reporting handler binds to `this.element` — `.xterm`, an *ancestor*. In
+  the bubble phase the `Linkifier` therefore runs first, whatever the core then
+  does. The original reading here, that both sat on one element, was wrong.
+- **`cancel(e)` is a no-op in this configuration anyway.** It is
+  `cancel(e, t) { if (this.options.cancelEvents || t) return e.preventDefault(),
+  e.stopPropagation(), !1 }`, the default is `cancelEvents: false`, and resh
+  does not set it. The mousedown path passes no second argument, so nothing is
+  cancelled. The handler's own unconditional `e.preventDefault()` suppresses the
+  browser default, not other listeners.
+
+**What the same measurement also showed, and what no amount of reading would
+have: the application gets the click too.** A modifier+click emits
+`CSI < 16 ; col ; row M` — left button with the control bit — and its release,
+to the PTY, *as well as* opening the file. Nothing in xterm couples the two
+paths, so both run. Asserted in section L rather than left as a footnote,
+because it is a measurement about a click's meaning and a future xterm that
+changed it should break a test.
+
+Whether an application then does anything visible with a ctrl+click is the one
+part no automated test can answer, and it is left as an explicit by-hand check
+(see `task-7-report.md`). If it ever proves to be a problem, the fallback
+sketched in the original brief — a capture-phase `mousedown` on `.termhost`,
+ahead of both handlers, doing its own hit-testing — is also the remedy:
+stopping the event there suppresses the report as well as taking the click.
 
 ## What matches
 
@@ -121,9 +146,19 @@ declaration beats anything resh would have guessed over the same cells.
 trailing `)` trimmed only when unbalanced, so a URL inside parentheses in prose
 does not swallow the closing bracket. **http and https only.** `javascript:`,
 `data:`, `file:`, `vbscript:` and everything else never produce a link — not a
-refused one, not one at all. The same allowlist is applied again at `activate`,
-and applied to OSC 8 destinations, which are chosen by the application and are
-no more trustworthy than plain text.
+refused one, not one at all. The same allowlist is applied again in `openUrl`,
+which every route into `window.open` ends at — the heuristic matcher's clicks
+and an application's own OSC 8 activation alike.
+
+For OSC 8 specifically that check is the second of two, and not the one doing
+the work: the vendored `OscLinkProvider.provideLinks` runs `new URL(uri)` itself
+and drops any link whose protocol is not `http:`/`https:` unless
+`allowNonHttpProtocols` is set, which resh does not set. A `javascript:` OSC 8
+destination is therefore never *offered* as a link at all — there is nothing
+under the pointer to activate, and `openUrl` is never reached. Proved against
+the bundle and in the browser in Task 6: deleting resh's allowlist leaves the
+OSC 8 `javascript:` case green, which is why the allowlist has its own direct
+test driving `openUrl`.
 
 **Paths**, in two forms:
 
@@ -228,8 +263,9 @@ recoverable by pressing the key again.
   re-checked at this point rather than trusted from match time.
 - **Path** — `send({ t: "OpenPath", text })`.
 - **OSC 8** — the destination goes through the URL branch, including the scheme
-  allowlist. A `file://` OSC 8 pointing into the project is not specially
-  handled in v1.
+  allowlist, though for OSC 8 xterm's own provider has already refused anything
+  but `http:`/`https:` before the link exists (see *What matches*). A `file://`
+  OSC 8 pointing into the project is not specially handled in v1.
 
 ## Security
 
@@ -241,9 +277,15 @@ The three things carrying weight:
 
 - **`safe_resolve` is the boundary**, not the matcher. The regex is a
   convenience; a crafted path that gets past it still cannot escape the project.
-- **Scheme allowlist on every URL**, from a heuristic match and from an
-  application's own OSC 8 alike. An OSC 8 destination is attacker-chosen in
-  exactly the way plain text is.
+- **Scheme allowlist on every URL**, in `openUrl`, where every route into
+  `window.open` converges. It is the *sole* defence for the heuristic matcher,
+  whose input is whatever printed to the terminal. For OSC 8 it is
+  defence-in-depth behind xterm's own refusal — the vendored `OscLinkProvider`
+  will not offer a non-`http(s)` URI in the first place — and it is worth
+  keeping there precisely because that refusal belongs to a vendored dependency
+  and could change under an upgrade, while this one is resh's own. Stating it
+  the other way round, as this spec first did, would credit resh for a check it
+  does not make.
 - **`noopener,noreferrer`** on every `window.open`, so an opened page gets no
   handle back to the workspace.
 
@@ -282,7 +324,10 @@ No Rust test reaches `static/app.js`, and this feature is mostly in
   class, not that a mouse event was accepted.
 - **A plain click while an app has mouse reporting on reaches the app and not
   resh.** This is the one that answers the open risk above, and it needs a real
-  mouse-reporting program, not a shell prompt.
+  mouse-reporting program, not a shell prompt. Delivered as section L, with the
+  modifier+click that opens under the same mouse-reporting state as its
+  control, and an SGR button report read off the PTY proving the plain click
+  landed somewhere at all.
 - Modifier+click on a real path opens the tab — asserting which rel.
 - Modifier+click on a false positive flashes and opens no tab. Asserting the
   tab count did not change, so "opened the wrong thing" cannot pass as
@@ -322,7 +367,8 @@ between.
   per-user today except themes and `show_hidden`, and adding a setting for this
   would land before the settings system the backlog already wants. Assumed no.
 - **Should a `file://` OSC 8 that points inside the project open as a tab?**
-  Treated as a URL and refused by the scheme allowlist in v1. Real, but nothing
-  observed emits one.
+  Refused in v1 — and refused by xterm's own provider, which never offers a
+  non-`http(s)` OSC 8 URI, before resh's allowlist is consulted. Real, but
+  nothing observed emits one.
 - **Does `:42` want to be preserved anywhere** — a flash saying "opened
   src/main.rs (line 42)" — so the discarded information is at least visible?
