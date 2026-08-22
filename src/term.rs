@@ -114,6 +114,21 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // narrow enough not to lose in practice. `Hub::new`'s I/O was enough
     // extra width to lose it routinely under load; `ide::for_project`
     // alone (TCP bind, token, one small file write) was not.
+    //
+    // **Not redundant with `Hub::for_project`, and deleting it silently kills
+    // IDE integration for every reopened project.** The comment above frames
+    // this as a first-terminal race, which reads like something the hub's own
+    // call already covers once a `_workspace` socket exists. It does not, past
+    // the first close: `CloseProject` calls `ide::stop`, which removes the
+    // *ide* registry entry, but nothing ever removes the project from
+    // `hub::REGISTRY` — so `Hub::for_project`'s `or_insert_with` closure, the
+    // only other caller of `ide::for_project`, can never run again for that
+    // project for the life of the process. After one close this line is the
+    // *only* path that can rebuild the listener, and the failure is invisible:
+    // shells still spawn, they just spawn with no `CLAUDE_CODE_SSE_PORT` and
+    // no lock file, so `claude` silently comes up with no IDE at all.
+    // `tests/integration.rs::reopening_a_closed_project_rebuilds_its_ide_listener`
+    // is what fails if this goes.
     crate::ide::for_project(&project, dir.clone());
     let att = match session::attach(&project, name, &dir) {
         Ok(a) => a,

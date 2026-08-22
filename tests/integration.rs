@@ -1880,6 +1880,131 @@ fn close_project_ends_the_real_dtach_master_not_just_the_client() {
     std::env::remove_var("RESH_STATE_DIR");
 }
 
+/// After a `CloseProject`, `term.rs`'s direct `ide::for_project` call is the
+/// *only* thing left that can rebuild the project's IDE listener.
+///
+/// `ide::stop` removes the project from `ide`'s registry, but nothing ever
+/// removes it from `hub::REGISTRY` — so `Hub::for_project`'s `or_insert_with`
+/// closure, the only other caller of `ide::for_project`, can never run again
+/// for that project. `term.rs`'s comment describes that line as a
+/// first-terminal race fix, which reads like something the hub already covers;
+/// deleting it as redundant would leave every reopened project with no lock
+/// file, no `CLAUDE_CODE_SSE_PORT`, and a `claude` that silently comes up with
+/// no IDE — while every other test in this suite stays green.
+///
+/// Reconnecting the `_workspace` socket after the close is the control, and it
+/// is what makes this discriminating: it proves the listener is *not* coming
+/// back through the hub, so the assertion that follows can only be satisfied
+/// by `term.rs`. Asserting on the lock file rather than only on
+/// `ide::port_for` is deliberate too — the lock file is what `claude` actually
+/// scans, and a registry entry whose lock file was never rewritten would
+/// advertise nothing to anyone.
+///
+/// Revert-checked twice, and the second one is the one that matters.
+///
+/// Deleting `crate::ide::for_project(&project, dir.clone());` from `term.rs`
+/// outright failed this test — `reopening the project must rebuild its ide
+/// listener: term.rs's ide::for_project call is the only path left that can,
+/// and nothing else does`, after genuinely waiting out the full 5s poll — but
+/// it also failed five *existing* integration tests, so that break was already
+/// covered and says nothing about why this test needs to exist.
+///
+/// The break that isolates it is the actual mistake the comment in `term.rs`
+/// guards against: replacing that line with
+/// `crate::hub::Hub::for_project(&project, dir.clone())` — "the hub already
+/// does this, so this call is redundant". A fresh project still gets its
+/// listener (`or_insert_with` runs), so
+/// `a_fresh_projects_first_terminal_already_carries_the_ide_port` and all 59
+/// other integration tests stay green; a *reopened* one never does, and this
+/// test was the only failure in the suite, with the message above. Then
+/// restored.
+#[test]
+fn reopening_a_closed_project_rebuilds_its_ide_listener() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("RESH_CMD", "cat");
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    let (_d, port) = fixture_named("idereopen");
+    let ide_dir = resh::idelock::ide_dir();
+
+    // Opening the workspace socket is what builds the hub, and the hub's
+    // `or_insert_with` is what starts the listener the first time.
+    let mut ws = ws_connect_path(port, "/ws/idereopen/_workspace").unwrap();
+    let _ = read_until(&mut ws, r#""t":"State""#);
+    let first_port = wait_for_ide_port("idereopen").expect("test setup: no ide listener was ever started");
+    let first_lock = ide_dir.join(format!("{first_port}.lock"));
+    assert!(first_lock.exists(), "test setup: the first listener must have written a lock file");
+
+    ws.send(tungstenite::Message::Text(r#"{"t":"CloseProject"}"#.into())).unwrap();
+    let _ = read_until(&mut ws, r#""t":"ProjectClosed""#);
+    // `ide::stop` runs before `ProjectClosed` is broadcast, so this is ordered,
+    // not raced.
+    assert!(
+        resh::ide::port_for("idereopen").is_none(),
+        "CloseProject must have stopped the ide listener, or the rest of this test proves nothing"
+    );
+    assert!(!first_lock.exists(), "and removed exactly the lock file it wrote");
+
+    // The control: the hub entry survived the close, so this reconnect takes
+    // `for_project`'s hit path and its `or_insert_with` never runs again.
+    let mut ws2 = ws_connect_path(port, "/ws/idereopen/_workspace").unwrap();
+    let _ = read_until(&mut ws2, r#""t":"State""#);
+    assert!(
+        resh::ide::port_for("idereopen").is_none(),
+        "a reconnected _workspace socket must NOT be what brings the listener back — \
+         if it is, this test has stopped covering term.rs and the comment there is wrong"
+    );
+
+    // Reopening a terminal is the path that must rebuild it.
+    let mut term = ws_connect_path(port, "/ws/idereopen/term/shell").unwrap();
+    let second_port = wait_for_ide_port("idereopen").expect(
+        "reopening the project must rebuild its ide listener: term.rs's ide::for_project \
+         call is the only path left that can, and nothing else does",
+    );
+    let second_lock = ide_dir.join(format!("{second_port}.lock"));
+    assert!(
+        wait_for_path(&second_lock),
+        "the rebuilt listener must advertise itself in a lock file — that file is what \
+         `claude` scans, and a registry entry alone reaches nobody"
+    );
+
+    let _ = term.close(None);
+    let _ = ws.close(None);
+    let _ = ws2.close(None);
+    resh::ide::stop("idereopen");
+    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("RESH_CMD");
+}
+
+/// The ide listener is built on the connection thread, after the handshake has
+/// already returned to the client, so every check of it has to be a bounded
+/// poll rather than an immediate read.
+fn wait_for_ide_port(project: &str) -> Option<u16> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(p) = resh::ide::port_for(project) {
+            return Some(p);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn wait_for_path(p: &std::path::Path) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if p.exists() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn http_rejects_rebinding_host() {
     use std::io::{Read, Write};
