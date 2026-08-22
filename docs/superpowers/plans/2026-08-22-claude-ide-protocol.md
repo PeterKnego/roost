@@ -795,7 +795,8 @@ End state: `claude` runs `/ide`, says `Connected to resh.`, and
 
     #[test]
     fn initialize_answers_with_resh_as_the_server_name() {
-        let mut c = Conn::new(PathBuf::from("/tmp"));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
         let out = dispatch(&rpc(1, "initialize", serde_json::json!({})), &mut c).unwrap();
         assert_eq!(out["id"], 1);
         assert_eq!(out["result"]["serverInfo"]["name"], "resh");
@@ -807,7 +808,8 @@ End state: `claude` runs `/ide`, says `Connected to resh.`, and
         // executeCode is one of only two tools the CLI makes visible to the
         // model, and it is arbitrary code execution reachable from this
         // socket. Adding it to the list is the defect this asserts against.
-        let mut c = Conn::new(PathBuf::from("/tmp"));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
         let out = dispatch(&rpc(2, "tools/list", serde_json::json!({})), &mut c).unwrap();
         let names: Vec<String> = out["result"]["tools"]
             .as_array()
@@ -821,7 +823,8 @@ End state: `claude` runs `/ide`, says `Connected to resh.`, and
     #[test]
     fn calling_execute_code_is_a_method_error_not_an_empty_success() {
         // An empty success would read to Claude as "ran, produced nothing".
-        let mut c = Conn::new(PathBuf::from("/tmp"));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
         let out = dispatch(
             &rpc(3, "tools/call", serde_json::json!({"name": "executeCode", "arguments": {"code": "1"}})),
             &mut c,
@@ -837,7 +840,8 @@ End state: `claude` runs `/ide`, says `Connected to resh.`, and
 
     #[test]
     fn diagnostics_answers_empty_rather_than_failing() {
-        let mut c = Conn::new(PathBuf::from("/tmp"));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
         let out = dispatch(
             &rpc(4, "tools/call", serde_json::json!({"name": "getDiagnostics", "arguments": {}})),
             &mut c,
@@ -850,7 +854,8 @@ End state: `claude` runs `/ide`, says `Connected to resh.`, and
     #[test]
     fn ide_connected_resolves_the_senders_directory_and_is_not_answered() {
         // A notification has no id, so a reply would be a protocol error.
-        let mut c = Conn::new(std::env::current_dir().unwrap());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut c = Conn::new("t", std::env::current_dir().unwrap(), tx);
         let note = serde_json::json!({
             "jsonrpc": "2.0", "method": "ide_connected",
             "params": {"pid": std::process::id()}
@@ -866,7 +871,8 @@ End state: `claude` runs `/ide`, says `Connected to resh.`, and
     fn ide_connected_from_an_unreadable_pid_leaves_the_connection_usable() {
         // Cwd::Unknown must not disconnect. Folding it into "gone" would kill
         // a live Claude because a check failed.
-        let mut c = Conn::new(PathBuf::from("/tmp"));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
         let note = serde_json::json!({
             "jsonrpc": "2.0", "method": "ide_connected", "params": {"pid": u32::MAX}
         });
@@ -877,7 +883,8 @@ End state: `claude` runs `/ide`, says `Connected to resh.`, and
 
     #[test]
     fn an_unknown_method_is_a_method_error_carrying_the_request_id() {
-        let mut c = Conn::new(PathBuf::from("/tmp"));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
         let out = dispatch(&rpc(9, "nonsense/method", serde_json::json!({})), &mut c).unwrap();
         assert_eq!(out["id"], 9);
         assert_eq!(out["error"]["code"], -32601);
@@ -903,12 +910,17 @@ pub struct Conn {
     /// "do not trust a path against it yet".
     pub cwd: Option<PathBuf>,
     pub workspace: PathBuf,
+    pub project: String,
+    /// This connection's writer channel. Unused until Task 6 gives the
+    /// connection a writer thread, and carried from the start because the
+    /// connection owns its identity and its output from the moment it exists.
+    pub reply: std::sync::mpsc::Sender<String>,
     pub closed: bool,
 }
 
 impl Conn {
-    pub fn new(workspace: PathBuf) -> Self {
-        Conn { cwd: None, workspace, closed: false }
+    pub fn new(project: &str, workspace: PathBuf, reply: std::sync::mpsc::Sender<String>) -> Self {
+        Conn { cwd: None, workspace, project: project.to_string(), reply, closed: false }
     }
 }
 
@@ -984,7 +996,9 @@ fn dispatch(msg: &serde_json::Value, conn: &mut Conn) -> Option<serde_json::Valu
 Replace the stub loop in `serve_conn` with:
 
 ```rust
-    let mut conn = Conn::new(_workspace.to_path_buf());
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    let mut conn = Conn::new(project, workspace.to_path_buf(), reply_tx);
+    let _ = reply_rx; // drained by the writer thread from Task 6 onward
     loop {
         let Ok(msg) = ws.read() else { break };
         let text = match msg {
@@ -1057,7 +1071,6 @@ git commit -m "ide: answer the handshake Claude actually sends"
 - Consumes: `ide::start`.
 - Produces:
   - `pub fn for_project(project: &str, workspace: PathBuf) -> Option<Arc<Ide>>` in `ide.rs`
-  - `pub(crate) fn clear_registry_for_tests()`
 
 **A trap this task must avoid:** the registry is process-global, so two tests
 that both use the project name `"alpha"` will hand each other a listener and
@@ -1301,6 +1314,15 @@ land in a channel the test can read. Real rather than a stub, because the
 handshake and the framing are part of what is being tested.
 
 ```rust
+    /// Test-only: the send half of each fake client's socket, so a test can
+    /// speak as Claude without owning the socket itself.
+    static SENDERS: OnceLock<Mutex<HashMap<String, std::sync::mpsc::Sender<String>>>> =
+        OnceLock::new();
+
+    fn senders() -> &'static Mutex<HashMap<String, std::sync::mpsc::Sender<String>>> {
+        SENDERS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
     /// Connects a client the way the CLI does and returns (frames it
     /// receives, the live Ide). Holding the returned `Arc<Ide>` matters: it
     /// owns the lock file, and dropping it unregisters the project.
@@ -1337,7 +1359,7 @@ handshake and the framing are part of what is being tested.
                 Err(_) => return,
             }
         });
-        SENDERS.lock().unwrap().insert(project.to_string(), send_tx);
+        senders().lock().unwrap().insert(project.to_string(), send_tx);
         (rx, ide, dir)
     }
 ```
@@ -1347,7 +1369,7 @@ Two callers-side helpers, used by Task 7:
 ```rust
     /// Sends a raw JSON-RPC message as Claude would.
     fn send_from_claude(project: &str, msg: &serde_json::Value) {
-        SENDERS.lock().unwrap()[project].send(msg.to_string()).unwrap();
+        senders().lock().unwrap()[project].send(msg.to_string()).unwrap();
     }
 
     /// Sends an `openDiff` and returns the pending id resh assigned, read off
@@ -1729,6 +1751,16 @@ In `dispatch`, `tools/call` gains `openDiff` and `close_tab`:
 /// required to handle DIFF_REJECTED.
 pub(crate) const MAX_PENDING: usize = 16;
 
+/// A map key within one process — never persisted, never security-relevant.
+/// A counter rather than randomness so test assertions are deterministic; a
+/// collision after a restart is impossible because pending proposals do not
+/// survive one.
+fn new_pending_id(project: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{project}-{n}")
+}
+
 fn open_diff(
     id: &serde_json::Value,
     args: &serde_json::Value,
@@ -1765,7 +1797,7 @@ fn open_diff(
         return Some(err(id, -32002, format!("{rel} has unsaved changes in resh")));
     }
 
-    let pid = new_pending_id();
+    let pid = new_pending_id(&conn.project);
     {
         let mut map = pending().lock().unwrap_or_else(|e| e.into_inner());
         if map.len() >= MAX_PENDING {
@@ -1978,6 +2010,13 @@ git commit -m "ide: accept or reject where you can actually read it"
 - Modify: `src/ide.rs`, `src/proto.rs`, `src/hub.rs`, `static/app.js`
 - Modify: `docs/deploy.md` (document the config key)
 
+**Interfaces:**
+- Consumes: `notify_all`, factored out of Task 6's `mention`.
+- Produces:
+  - `pub fn selection_changed(project: &str, project_dir: &Path, abs: &Path, text: &str, start: (u32,u32), end: (u32,u32)) -> Result<(), String>`
+  - `Settings::share_selection: bool` (default `false`)
+  - `Intent::ShareSelection { rel: String, text: String, start_line: u32, start_col: u32, end_line: u32, end_col: u32 }`
+
 This ships file contents to Claude without an explicit user action, which is a
 change in resh's posture. Claude Code's own answer is `Read` deny rules; resh
 has no permission system to hang that off, so it is off unless a project opts
@@ -1988,9 +2027,9 @@ in and visible whenever it is on.
 ```rust
     #[test]
     fn selection_sharing_is_off_unless_a_project_opts_in() {
-        // The default must be off. A test that only checks the on-path would
+        // The struct is `Settings`, not `Config`. The default must be off. A test that only checks the on-path would
         // pass with the default flipped.
-        let cfg = Config::default();
+        let cfg = Settings::default();
         assert!(!cfg.share_selection, "a highlighted line of .env must not leave the host by default");
     }
 
@@ -1998,7 +2037,7 @@ in and visible whenever it is on.
     fn a_shared_selection_is_the_notification_the_cli_expects() {
         let proj = "diff-9";
         let (rx, _c, _d) = connected_fake_client_for(proj);
-        selection_changed("alpha", Path::new("/w/a.rs"), "let x = 1;", (10, 4), (10, 14)).unwrap();
+        selection_changed("alpha", d.path(), Path::new("/w/a.rs"), "let x = 1;", (10, 4), (10, 14)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
         assert_eq!(v["method"], "selection_changed");
         assert_eq!(v["params"]["text"], "let x = 1;");
@@ -2010,7 +2049,7 @@ in and visible whenever it is on.
     #[test]
     fn nothing_is_sent_when_the_project_has_not_opted_in() {
         let (rx, _c, _d) = connected_fake_client_without_optin();
-        assert!(selection_changed("alpha", Path::new("/w/a.rs"), "secret", (1, 0), (1, 6)).is_err());
+        assert!(selection_changed("alpha", d.path(), Path::new("/w/a.rs"), "secret", (1, 0), (1, 6)).is_err());
         assert!(rx.try_recv().is_err(), "the socket must stay silent");
     }
 ```
@@ -2022,9 +2061,10 @@ Expected: FAIL — `no field share_selection`.
 
 - [ ] **Step 3: Implement**
 
-In `src/config.rs`, add the key with an explicit `false` default (per-project
+In `src/config.rs`, add the key to the existing `Settings` struct (beside
+`autosave`, `src/config.rs:29`) with an explicit `false` default. Per-project
 is allowed here, unlike `max_upload_bytes`: sharing your own selection with
-your own Claude cannot raise a ceiling on anything):
+your own Claude cannot raise a ceiling on anything.
 
 ```rust
     /// Off unless a project asks for it. This ships file contents to Claude
@@ -2039,12 +2079,15 @@ In `src/ide.rs`:
 ```rust
 pub fn selection_changed(
     project: &str,
+    project_dir: &Path,
     abs: &Path,
     text: &str,
     start: (u32, u32),
     end: (u32, u32),
 ) -> Result<(), String> {
-    if !crate::config::for_project(project).share_selection {
+    // `config::for_project` takes the project *directory* (src/config.rs:191),
+    // which the hub already holds — not the project name.
+    if !crate::config::for_project(project_dir).share_selection {
         return Err("selection sharing is off for this project".into());
     }
     notify_all(project, &serde_json::json!({
