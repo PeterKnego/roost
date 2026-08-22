@@ -206,6 +206,41 @@
 //! Both restored afterwards; the run passes clean again (see
 //! task-5-report.md's fix-round-1 addendum for the exact terminal output).
 //!
+//! Section K (task 6: OSC 8) has its own two reverts. Neither shifted any
+//! count above: revert 0 was re-measured with K present and is still eleven,
+//! and K stays green under it, because an OSC 8 link comes from xterm's own
+//! OscLinkProvider, which is registered at construction and owes nothing to
+//! registerTermLinks. Both of K's own reverts, though, first passed:
+//!   1. Set `linkHandler` back to `null`. The count assertion the task was
+//!      written around — "an OSC 8 link is offered with no modifier held" —
+//!      went on passing, because OscLinkProvider returns its ranges either
+//!      way; the option only decides who is told about an activation. Worse,
+//!      the run then *hung* rather than failing: xterm's fallback activate
+//!      calls `confirm()`, and a native dialog with no CDP dialog handler
+//!      wedges the renderer, so Input.dispatchMouseEvent never returned.
+//!      Both are fixed here — confirm() is stubbed in the initial block, and
+//!      the assertions that carry this revert are the click's, not the
+//!      count's. Three then failed:
+//!        FAIL  CONTROL: clicking a plain https OSC 8 link actually reached
+//!        window.open
+//!        FAIL  window.open was asked for the URL the application declared
+//!        (got [])
+//!        FAIL  resh's own handler took the activation, not xterm's
+//!        confirm() fallback
+//!   2. Deleted `if (!SAFE_URL.test(u)) return;` from openUrl. The obvious
+//!      assertion — "a javascript: OSC 8 destination opened nothing" — also
+//!      went on passing, and would have shipped as this project's third
+//!      vacuous javascript: check (mdlinks.mjs note 6 was the first). The
+//!      reason is two layers away from resh: the vendored OscLinkProvider
+//!      itself runs `new URL(uri)` and refuses to *offer* any link whose
+//!      protocol is not http(s), so no OSC 8 payload can carry a hostile
+//!      scheme as far as openUrl at all. That assertion is kept, and paired
+//!      with one naming who actually refuses it; the allowlist gets its own
+//!      reachable test by driving openUrl directly. Two failed:
+//!        FAIL  openUrl refuses a javascript: destination outright
+//!        FAIL  and any other scheme off the allowlist, not just javascript:
+//! Both restored afterwards; the run passes clean again.
+//!
 //! Run: deno run -A tests/browser/termlinks.mjs
 import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
   from "./harness.mjs";
@@ -296,6 +331,37 @@ async function clickLink(page, needle, { modifier = false, session } = {}) {
   return true;
 }
 
+// Types a command as pty input — the same route __t().term.input(...) calls
+// elsewhere in this file use to seed a prompt — and presses Enter. Pulled
+// into its own helper only for section K, whose OSC 8 payloads are full of
+// literal backslash-escapes (\e, \\) that bash's own printf must see intact;
+// JSON.stringify is what carries those through this template without a
+// second round of JS string-escaping mangling them, which plain command
+// text elsewhere in this file never has to worry about.
+async function typeInTerm(page, cmd) {
+  await page.evalIn(`__t().term.input(${JSON.stringify(cmd + "\r")})`);
+}
+
+// How many links xterm's own OscLinkProvider (plus resh's two) offer over
+// the row holding `needle` — see the __oscLinksAt comment above for why this
+// has to reach past entry.linkProviders to ask.
+async function linksAt(page, needle) {
+  return await page.evalIn(`__oscLinksAt(${JSON.stringify(needle)})`);
+}
+
+// What window.open has been asked for since the stub was installed (or
+// since the caller last cleared window.__opens) — see the stub's own
+// comment in the initial evalIn block for why arguments, not a popup, are
+// the thing worth reading.
+async function windowOpenCalls(page) {
+  return await page.evalIn("window.__opens");
+}
+
+// Clears both stubs' logs, so the next assertion reads only what it caused.
+async function clearOpens(page) {
+  await page.evalIn("window.__opens = []; window.__confirms = []; 0");
+}
+
 const fx = await fixture();
 // The fixture project holds only hello.md. Task 5 resolves a clicked path
 // against the real project, so the path this file prints is a file that
@@ -315,7 +381,29 @@ try {
   await cmd("Emulation.setDeviceMetricsOverride",
             { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
   await until(() => evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "app.js");
-  await evalIn(`window.__t = () => [...terms.values()][0];
+  await evalIn(`// Stubbed once, here, before any section runs — so section K's click
+    // is never the first thing to touch window.open, and nothing added later
+    // in this file gets a chance to redefine it out from under that section.
+    // Records arguments rather than blocking the call: asserting on what was
+    // *asked for* is what tells a correctly-refused javascript: destination
+    // apart from one Chromium's own popup blocker silently ate regardless —
+    // mdlinks.mjs's header note 6 hit the same trap one layer up, with
+    // target="_blank" anchors instead of window.open.
+    window.__opens = [];
+    window.open = (...args) => { window.__opens.push(args); return null; };
+    // confirm() is stubbed for two reasons, one of them load-bearing.
+    // xterm's OscLinkProvider gives every OSC 8 link a *fallback* activate
+    // when no linkHandler is configured, and that fallback calls confirm().
+    // A native dialog in headless Chromium with no Page.javascriptDialog
+    // handler wedges the renderer, so CDP's own dispatchMouseEvent never
+    // returns: with linkHandler removed, section K hung forever instead of
+    // failing. Recording the call and returning false turns that hang into
+    // an assertion — "resh's handler ran, not xterm's fallback" — which is
+    // the one thing in this section that actually discriminates linkHandler.
+    // (It also stops app.js's own delete/close confirms from wedging a run.)
+    window.__confirms = [];
+    window.confirm = (...args) => { window.__confirms.push(args); return false; };
+    window.__t = () => [...terms.values()][0];
     window.__txt = () => { const b = __t().term.buffer.active; let s = "";
       for (let i = 0; i < b.length; i++) s += b.getLine(i).translateToString(true) + "\\n"; return s; };
     window.__last = () => __txt().split("\\n").filter((l) => l.trim()).pop() || "";
@@ -371,6 +459,27 @@ try {
       ps.forEach((p, i) => p.provideLinks(y, (ls) => {
         hits[i] = (ls || []).some((l) => l.range.start.x <= col && col <= l.range.end.x);
         if (++n === ps.length) res(hits);
+      }));
+    });
+    // __resolve above only asks entry.linkProviders — resh's own URL and
+    // path matchers — because that is the pair section B-E's modifier gate
+    // is about. Section K is about the *other* provider: xterm registers its
+    // own OscLinkProvider on the terminal's private link-provider list ahead
+    // of either of resh's, so an OSC 8 answer has to be read from there, not
+    // from entry.linkProviders (which stays length 2 whether or not
+    // linkHandler exists at all — that list is undiscriminating for this
+    // section, which is exactly why this asks the terminal's full list
+    // instead). No precedence merge is needed here the way __resolve needs
+    // one for D: PATH_RE and URL_RE do not match plain link text like
+    // "click me" or "bad", so there is nothing for them to contest.
+    window.__oscLinksAt = (needle) => new Promise((res) => {
+      const y = __rowY(needle);
+      const ps = (__t().term._core?._linkProviderService || {}).linkProviders || [];
+      if (y < 0 || !ps.length) return res(0);
+      let n = 0, count = 0;
+      ps.forEach((p) => p.provideLinks(y, (ls) => {
+        count += (ls || []).length;
+        if (++n === ps.length) res(count);
       }));
     });
     // Is ctrlKey set on the Control keydown itself? Recorded rather than
@@ -686,6 +795,139 @@ try {
   await assert(
     "a mismatched refusal in between did not swallow the next click's own reply",
     async () => /cannot read|no such file/i.test(await flashText(page, loc.session)),
+  );
+
+  console.log("\nK. an application's own hyperlink needs no modifier");
+  // OSC 8: ESC ] 8 ; params ; URI ESC \ text ESC ] 8 ; ; ESC \. Written into
+  // the real shell with printf, so xterm's own OSC parser handles it exactly
+  // as it would from a real application (Claude Code prints these for file
+  // paths and URLs alike) — never synthesised by calling a provider's
+  // activate() directly, the way __resolve does for sections B-E, because
+  // the whole point of this section is that no modifier gate sits in front
+  // of it, and there is no gate to bypass by construction if the test skips
+  // the real mouse event.
+  const OSC_URL = "https://example.com/osc";
+  await typeInTerm(page, String.raw`printf '\e]8;;${OSC_URL}\e\\click me\e]8;;\e\\\n'`);
+  ok(await until(() => evalIn(`__rowY("click me") > 0`), 20, "the OSC 8 link's row"),
+     "the hyperlinked row is on screen — guards the assertion below");
+  // __rowY reads the buffer directly and is ahead of the DOM by up to a
+  // render tick; seatOf below queries the rendered .xterm-rows divs, so it
+  // needs the render to have actually landed, not just the buffer write.
+  await sleep(250);
+  await assert(
+    "an OSC 8 link is offered with no modifier held",
+    async () => (await linksAt(page, "click me")) === 1,
+  );
+
+  // Clicks land at the row's own middle character rather than clickLink's
+  // fixed column 4 (picked for longer PATH/URL fixtures): "bad" below is
+  // only 3 columns wide, and a fixed offset lands past the word entirely,
+  // missing the link outright — which would make the javascript: assertion
+  // below pass for the wrong reason (nothing was under the pointer to click)
+  // rather than the right one (something was, and got refused). No modifier:
+  // that asymmetry with clickLink's modifier-gated clicks is this section's
+  // whole point.
+  //
+  // Row lookup normalises U+00A0 back to a plain space before comparing:
+  // xterm renders the space *inside* "click me" as U+00A0 in the DOM (found
+  // by dumping codePoints off a failed match — the buffer itself, which
+  // __rowY reads via translateToString, keeps a real space), so a literal
+  // needle with a plain space never matches textContent as-is. Same trap
+  // this file's own header names for substring search, just a different
+  // character than a reader would guess.
+  const seatAt = (needle) => evalIn(`(() => {
+    const norm = (s) => s.replace(/\\u00a0/g, " ").trim();
+    const rows = [...document.querySelectorAll(".xterm-rows div")];
+    const n = rows.filter((x) => norm(x.textContent) === ${JSON.stringify(needle)}).pop();
+    if (!n) return null;
+    const b = n.getBoundingClientRect();
+    const scr = __t().node.querySelector(".xterm-screen").getBoundingClientRect();
+    const cell = scr.width / __t().term.cols;
+    const col = Math.floor(${JSON.stringify(needle)}.length / 2);
+    return { x: Math.round(scr.left + (col + 0.5) * cell), y: Math.round(b.top + b.height / 2) };
+  })()`);
+  const clickWord = async (needle) => {
+    const s = await seatAt(needle);
+    if (!s) return false;
+    await cmd("Input.dispatchMouseEvent", { type: "mouseMoved", x: s.x, y: s.y, buttons: 0 });
+    await sleep(200);
+    await cmd("Input.dispatchMouseEvent", { type: "mousePressed", x: s.x, y: s.y, button: "left", buttons: 1, clickCount: 1 });
+    await cmd("Input.dispatchMouseEvent", { type: "mouseReleased", x: s.x, y: s.y, button: "left", buttons: 0, clickCount: 1 });
+    await sleep(200);
+    return true;
+  };
+
+  // Control for the stub: without this, "zero recorded calls" below would be
+  // indistinguishable from "the stub never captured anything", which is
+  // exactly the trap mdlinks.mjs's header note 6 names for the same
+  // javascript: case one layer up (there, Chromium's popup blocker was the
+  // thing standing in for a deleted guard).
+  //
+  // This click, not the link count above, is what covers `linkHandler`.
+  // Measured, not assumed: with linkHandler set back to null the count
+  // assertion above stayed green, because OscLinkProvider hands back its
+  // ranges either way — the option only decides who gets told about the
+  // activation. So the pair below is the discriminating half of section K.
+  ok(await clickWord("click me"), "the OSC 8 link's row was clicked");
+  ok(await until(async () => (await windowOpenCalls(page)).length > 0, 10, "window.open recorded a call"),
+     "CONTROL: clicking a plain https OSC 8 link actually reached window.open");
+  const legit = await windowOpenCalls(page);
+  ok(legit.length === 1 && legit[0][0] === OSC_URL,
+     `window.open was asked for the URL the application declared (got ${JSON.stringify(legit)})`);
+  // xterm's no-linkHandler fallback asks the user "do you want to navigate
+  // to …?" through a native confirm(). Its silence is the positive evidence
+  // that resh's own handler took the activation, rather than resh merely
+  // benefiting from a default that happens to open the same URL.
+  ok((await evalIn("window.__confirms")).length === 0,
+     "resh's own handler took the activation, not xterm's confirm() fallback");
+
+  await clearOpens(page);
+  await typeInTerm(page, String.raw`printf '\e]8;;javascript:alert(1)\e\\bad\e]8;;\e\\\n'`);
+  ok(await until(() => evalIn(`__rowY("bad") > 0`), 20, "the javascript: link's row"),
+     "the javascript:-hyperlinked row is on screen — guards the assertion below");
+  ok(await clickWord("bad"), "the javascript: link's row was clicked");
+  // No further click here to wait on: with the click already dispatched,
+  // this just gives openUrl's synchronous check time to run (or not) before
+  // reading window.__opens.
+  await sleep(300);
+  await assert(
+    "a javascript: OSC 8 destination opened nothing",
+    async () => (await windowOpenCalls(page)).length === 0,
+  );
+  // …but not because of anything resh does. Read the vendored provider: it
+  // runs `new URL(uri)` and drops any link whose protocol is not http(s)
+  // before it is ever offered, so there is nothing under the pointer to
+  // activate and openUrl is never reached. Asserted rather than left
+  // implicit, because the assertion above would otherwise be the third
+  // variant of the same vacuous javascript: check this project has written
+  // (mdlinks.mjs note 6 was the first) — passing on a refusal made two
+  // layers away from the guard it claims to cover. Deleting SAFE_URL from
+  // openUrl leaves both green.
+  ok(await linksAt(page, "bad") === 0,
+     "xterm's own provider never even offered the non-http destination");
+
+  // So the scheme allowlist gets its own, reachable, test. openUrl is what
+  // every other link route in this file ends at — the matchers' clicks, the
+  // OSC 8 handler above — and it is the only thing standing between a URL
+  // chosen by whatever is running and window.open. Driven directly because
+  // no OSC 8 payload can reach it with a hostile scheme; the control below
+  // is what keeps "nothing recorded" from meaning "nothing ran".
+  await clearOpens(page);
+  await evalIn(`openUrl("https://example.com/direct")`);
+  const direct = await windowOpenCalls(page);
+  ok(direct.length === 1 && direct[0][0] === "https://example.com/direct",
+     `CONTROL: openUrl passes an https destination through (got ${JSON.stringify(direct)})`);
+  await clearOpens(page);
+  await evalIn(`openUrl("javascript:alert(1)")`);
+  await assert(
+    "openUrl refuses a javascript: destination outright",
+    async () => (await windowOpenCalls(page)).length === 0,
+  );
+  await clearOpens(page);
+  await evalIn(`openUrl("file:///etc/passwd")`);
+  await assert(
+    "and any other scheme off the allowlist, not just javascript:",
+    async () => (await windowOpenCalls(page)).length === 0,
   );
 
 } finally {

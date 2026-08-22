@@ -1050,6 +1050,21 @@ function ensureTerm(session) {
       cursorAccent: v("--bg", "#1e1f22"),
       selectionBackground: v("--sel-bg", "#2e436e"),
     },
+    // xterm already registers an OscLinkProvider, so OSC 8 sequences are
+    // parsed and their ranges tracked; this option is the only thing missing,
+    // and it defaults to null. Not gated on the modifier, unlike the matchers:
+    // the application said in a control sequence that these cells are a link,
+    // so there is no guess to protect the user from.
+    //
+    // The destination is still scheme-checked in openUrl. What is running
+    // chooses it, which makes it exactly as trustworthy as plain text.
+    // This vendored OscLinkProvider happens to drop non-http(s) URIs before
+    // offering them, so today that check is the second of two — but it is
+    // the only one resh owns, and it is what covers every other link route
+    // in this file as well.
+    linkHandler: {
+      activate: (ev, uri) => openUrl(uri),
+    },
   });
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
