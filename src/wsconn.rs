@@ -139,6 +139,21 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
             .collect();
         (id, rx, dir, snapshot)
     };
+    // Built here — the first statement after the lock is released — not below
+    // the replay, so it covers everything between the subscription and the
+    // read loop: the disk reads, `replay_buffer`, and the `try_clone` early
+    // return. It used to sit after all of that, and this branch widened the
+    // unguarded window by inserting the `proposal_replay` send into it.
+    // `ide.rs` builds its `ConnGuard` ahead of the handshake for the same
+    // reason.
+    //
+    // It cannot go one statement earlier, *inside* the block above:
+    // `UnsubGuard::drop` calls `Hub::lock`, locals unwind in reverse
+    // declaration order, so a panic in there would drop the guard while that
+    // block's own `MutexGuard` is still alive and re-lock the same mutex on
+    // the same thread. A leaked subscriber is recoverable; a socket thread
+    // wedged holding the hub lock takes the whole project with it.
+    let unsub = UnsubGuard { hub: hub.clone(), id: id.clone() };
     // Disk reads happen with the hub lock already dropped. Only a rel that
     // was Clean at snapshot time needs one — an edited buffer's text is
     // already in hand and reading its file too would be pure waste.
@@ -155,9 +170,6 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
             replay_buffer(&mut h, &id, rel, base_hash, edited, disk_text);
         }
     }
-    // Guards the subscription from here on: if we return early (the
-    // try_clone below fails) or the read loop below panics, this still runs.
-    let unsub = UnsubGuard { hub: hub.clone(), id: id.clone() };
 
     let Ok(write_half) = ws_read.get_ref().try_clone() else { return };
     let mut ws_write: WebSocket<TcpStream> =
