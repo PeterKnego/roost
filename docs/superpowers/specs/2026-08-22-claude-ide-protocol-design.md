@@ -320,6 +320,25 @@ Three responses, matching the three the CLI accepts:
 | Accept after editing the proposal | `FILE_SAVED` + the edited text |
 | Reject, or close the tab | `DIFF_REJECTED` |
 
+*(Amended after the final whole-branch review, which found the middle row
+unreachable from the UI — the same way rule 2 under "Which directory Claude is
+actually in" was amended after Task 7.)* **Two of the three are reachable
+today; the third is wired everywhere except the UI.** Accept and Reject on the
+proposal tab produce `TAB_CLOSED` and `DIFF_REJECTED` end to end. `FILE_SAVED`
+does not happen: nothing in `static/app.js` ever builds the `.proposal-edit`
+box, so the client's `edited()` always returns `null`, and `Answer::
+AcceptedEdited` — which does exist, and does answer `FILE_SAVED` with the
+edited text — is exercised only by Rust tests.
+
+The table stays as written, because it is the *wire contract* and the wire
+contract is fully implemented: the protocol handling, the answer type, the
+reply shape and their tests are all in place. What is missing is one editable
+box in `static/app.js` and nothing behind it. That box is the next increment,
+deliberately deferred rather than dropped: adding a new UI affordance during a
+final pre-merge review would ship it without a review cycle of its own. Until
+it lands, "the proposal side editable" in the paragraph above describes the
+intended end state, not what a user can do.
+
 **resh must not write the file.** On acceptance the CLI continues its own tool
 call with the (possibly edited) content as updated input — `l({behavior:"allow",
 updatedInput:C, ...})`. If resh also wrote, the file would be written twice and
@@ -400,12 +419,31 @@ The traps here are this codebase's two known ones, both live.
 
 **The substitution trap is unusually sharp.** A mock client that sends what this
 spec says the CLI sends will pass against an implementation that is wrong about
-what the CLI *actually* sends — and the spec was derived from minified code. The
-suite must include at least one test that drives a **real `claude` binary**
-against a real resh listener and asserts it connects and reports the workspace.
-That is the analogue of `RESH_CMD=cat` hiding the missing dtach socket
-directory: everything else in this feature is testable in isolation and still
-capable of being uniformly wrong.
+what the CLI *actually* sends — and the spec was derived from minified code.
+Every mock in this feature is testable in isolation and still capable of being
+uniformly wrong, exactly the way `RESH_CMD=cat` hid the missing dtach socket
+directory. So a **real `claude` binary** has to be driven against a real resh
+listener.
+
+*(Amended after the final whole-branch review.)* This originally read "the suite
+must include at least one test that drives a real `claude` binary". **It does
+not, and what happened instead was manual.** A real `claude` was driven against
+a real resh four times over the branch:
+
+- Task 4 — a real `claude` connects, authenticates with the lock-file token,
+  and reports the workspace.
+- Task 5 — a fresh project's first terminal carries `CLAUDE_CODE_SSE_PORT`.
+  This is how the missing-port defect was found at all; no Rust test had it.
+- Task 8, twice — including a full `openDiff` → Accept → the CLI writes the
+  file loop.
+
+Nothing automated does any of that. `claude` is not installed on the test host,
+its version is not pinned, and a test that skips when the binary is absent
+would go green for the wrong reason on precisely the machine that runs the
+suite — this codebase's own dominant failure mode. The honest statement of the
+state: the substitution trap is held off by a manual step recorded in the task
+reports, not by `cargo test`. Automating it (pinned binary, a fixture that
+fails rather than skips when it is missing) is worth doing and is not done.
 
 **Would the test fail if the code were deleted?**
 
