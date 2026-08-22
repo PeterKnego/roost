@@ -336,7 +336,7 @@ fn serve_static(w: &mut impl Write, rel: &str) {
 /// for that — it's the one hazard this dispatch-by-kind approach carries
 /// that a fully generic parse wouldn't.
 const FRAGMENT_KINDS: &[&str] =
-    &["tree", "file", "raw", "changes", "status", "diff", "theme.css"];
+    &["tree", "file", "raw", "changes", "status", "diff", "proposal", "theme.css"];
 
 fn serve_frag(
     w: &mut impl Write,
@@ -451,6 +451,20 @@ fn serve_frag(
                 Err(e) => http::html(w, &render::hint(&e)),
             }
         }
+        // An `openDiff` proposal Claude is still blocked on. `id` is
+        // resh's own opaque key (`ide::new_pending_id`), not a path — there
+        // is nothing here to confine, only a hub lookup that can miss (the
+        // proposal was already answered or withdrawn by the time this
+        // browser's fetch lands, or the id was never valid to begin with).
+        // Both misses render the same fragment; there is no reason to tell
+        // a browser which one happened.
+        ["proposal"] => match req.query.get("id") {
+            None => http::html(w, &render::hint("missing id")),
+            Some(id) => match crate::hub::proposal_by_id(project, id) {
+                Some(p) => http::html(w, &render::proposal_fragment(&p.rel, &p.old_text, &p.new_text)),
+                None => http::html(w, &render::hint("this proposal is no longer open")),
+            },
+        },
         // Resolved through `safe_resolve`, not a bare `fs::read`, so a
         // `.resh/theme.css` that is a symlink pointing outside the
         // project (planted by a cloned repo) is refused rather than served

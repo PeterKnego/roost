@@ -707,133 +707,21 @@ function mountTab(content, t) {
 
 // --- proposal tabs (openDiff) ---------------------------------------------
 //
-// A proposal renders through the same hunk view as the save-conflict
-// banner (showConflict, below): the divergence is the thing to read, and
-// showing both files whole is what server-side textdiff.rs exists to avoid
-// for that banner. There is no server-rendered fragment to fetch here the
-// way Tree/Changes/File/Diff tabs have one — a proposal's content arrives
-// once, over the socket, as Event::Proposal — so this is the same
-// trim-common-ends + LCS-align + group-with-context algorithm as
-// textdiff.rs::unified, ported to the client.
-const HUNK_CONTEXT = 3;
-// Mirrors textdiff.rs's MAX_DIVERGENT_LINES: the alignment below is
-// quadratic in the divergent middle, and a proposal can carry a whole file
-// (openDiff's new_file_contents has no size limit of its own on the wire).
-const HUNK_MAX_DIVERGENT_LINES = 1000;
-
-function diffLine(cls, text) {
-  const d = document.createElement("div");
-  d.className = "dl " + cls;
-  // textContent, never innerHTML: old_text/new_text are Claude's file
-  // content, arbitrary and unescaped off the wire.
-  d.textContent = text === "" ? " " : text;
-  return d;
-}
-
-function renderHunks(oldText, newText) {
-  const frag = document.createDocumentFragment();
-  const a = oldText.split("\n");
-  const b = newText.split("\n");
-  // A trailing "" from split()-ing on a final newline is not a real extra
-  // line — Rust's str::lines() drops it too, and keeping it here would show
-  // a phantom empty-line change on every proposal to a file that ends in \n.
-  if (a.length > 1 && a[a.length - 1] === "") a.pop();
-  if (b.length > 1 && b[b.length - 1] === "") b.pop();
-
-  let pre = 0;
-  while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
-  let suf = 0;
-  while (
-    suf < a.length - pre &&
-    suf < b.length - pre &&
-    a[a.length - 1 - suf] === b[b.length - 1 - suf]
-  ) suf++;
-  const midA = a.slice(pre, a.length - suf);
-  const midB = b.slice(pre, b.length - suf);
-
-  if (midA.length === 0 && midB.length === 0) {
-    frag.appendChild(diffLine("meta", "the two versions are identical line for line"));
-    return frag;
-  }
-  if (midA.length > HUNK_MAX_DIVERGENT_LINES || midB.length > HUNK_MAX_DIVERGENT_LINES) {
-    frag.appendChild(diffLine("meta", "the two versions are too different to show as a diff"));
-    frag.appendChild(diffLine("meta", `original: ${a.length} lines · proposed: ${b.length} lines`));
-    return frag;
-  }
-
-  // Longest common subsequence over the divergent middle only, walked back
-  // into an op per line — textdiff.rs::align, same shape.
-  const n = midA.length, m = midB.length;
-  const dp = new Array((n + 1) * (m + 1)).fill(0);
-  const at = (i, j) => i * (m + 1) + j;
-  for (let i = n - 1; i >= 0; i--) {
-    for (let j = m - 1; j >= 0; j--) {
-      dp[at(i, j)] = midA[i] === midB[j]
-        ? dp[at(i + 1, j + 1)] + 1
-        : Math.max(dp[at(i + 1, j)], dp[at(i, j + 1)]);
-    }
-  }
-  const ops = []; // {op: "eq"|"del"|"ins", a?: idx into `a`, b?: idx into `b`}
-  let i = 0, j = 0;
-  while (i < n && j < m) {
-    if (midA[i] === midB[j]) { ops.push({ op: "eq", a: pre + i, b: pre + j }); i++; j++; }
-    else if (dp[at(i + 1, j)] >= dp[at(i, j + 1)]) { ops.push({ op: "del", a: pre + i }); i++; }
-    else { ops.push({ op: "ins", b: pre + j }); j++; }
-  }
-  // Deletions before insertions in the tail, so a replaced block reads as
-  // the old lines then the new ones rather than interleaved — same as
-  // textdiff.rs::align.
-  while (i < n) { ops.push({ op: "del", a: pre + i }); i++; }
-  while (j < m) { ops.push({ op: "ins", b: pre + j }); j++; }
-
-  // Context can come from the trimmed prefix/suffix, so hunk assembly works
-  // over the whole file rather than just the aligned middle.
-  const all = [];
-  for (let k = 0; k < pre; k++) all.push({ op: "eq", a: k, b: k });
-  all.push(...ops);
-  const ta = a.length - suf, tb = b.length - suf;
-  for (let k = 0; k < suf; k++) all.push({ op: "eq", a: ta + k, b: tb + k });
-
-  // Ranges of `all` worth printing: every change, plus CONTEXT lines around
-  // it, with neighbours merged when their context would overlap — same
-  // shape as textdiff.rs::hunks.
-  const ranges = [];
-  all.forEach((op, idx) => {
-    if (op.op === "eq") return;
-    const from = Math.max(0, idx - HUNK_CONTEXT);
-    const to = Math.min(all.length, idx + HUNK_CONTEXT + 1);
-    const last = ranges[ranges.length - 1];
-    if (last && from <= last[1]) last[1] = to;
-    else ranges.push([from, to]);
-  });
-
-  for (const [from, to] of ranges) {
-    let sa = Infinity, sb = Infinity, ca = 0, cb = 0;
-    for (let idx = from; idx < to; idx++) {
-      const op = all[idx];
-      if (op.op === "eq") { sa = Math.min(sa, op.a); sb = Math.min(sb, op.b); ca++; cb++; }
-      else if (op.op === "del") { sa = Math.min(sa, op.a); ca++; }
-      else { sb = Math.min(sb, op.b); cb++; }
-    }
-    frag.appendChild(diffLine("hunk", `@@ -${sa + 1},${ca} +${sb + 1},${cb} @@`));
-    for (let idx = from; idx < to; idx++) {
-      const op = all[idx];
-      if (op.op === "eq") frag.appendChild(diffLine("ctx", " " + a[op.a]));
-      else if (op.op === "del") frag.appendChild(diffLine("del", "-" + a[op.a]));
-      else frag.appendChild(diffLine("add", "+" + b[op.b]));
-    }
-  }
-  return frag;
-}
-
-// A `Tab::Proposal` carries only an id (proto.rs) — its content arrives
-// separately as `Event::Proposal` and is kept client-side in the
-// `proposals` map keyed by that id (see the "State" case in onEvent). This
-// always re-renders from that map rather than mutating an existing tab's
-// DOM in place, so it draws correctly regardless of whether the content or
-// the tab arrived first — both the live path and the connect replay now
-// send content before the tab (see hub.rs/wsconn.rs), but nothing here
-// assumes that ordering.
+// The hunk view itself is server-rendered (`/frag/{project}/proposal?id=`,
+// render::proposal_fragment — reusing textdiff.rs::unified + diff_html, the
+// same pair the save-conflict banner's diff_html comes from) rather than
+// built here: CLAUDE.md is explicit that HTML is built in Rust, and a
+// hand-ported second copy of textdiff.rs's trim/LCS/cap algorithm already
+// drifted from it once (an empty old_text produced a phantom "-" line here
+// that Rust's `.lines()` never would) before this was caught in review.
+//
+// What stays client-side is only `state.proposals` — the map keyed by
+// proposal id that says whether `Event::Proposal`'s content has arrived yet
+// — because that presence check, and the `tabKey` fold built on it below,
+// are the safety property: a `Tab::Proposal` carries only an id (proto.rs),
+// and the placeholder branch below is what guarantees nothing can be
+// accepted or rejected before this client has independently confirmed the
+// content exists, not merely trusted that the fragment fetch will succeed.
 function renderProposal(el, tab) {
   const p = state.proposals && state.proposals[tab.id];
   if (!p) {
@@ -842,41 +730,48 @@ function renderProposal(el, tab) {
     // tabKey folds "has content" into itself, so this is remounted the
     // instant that event lands and is never the tab's steady state.
     //
-    // No Accept/Reject button anywhere below this branch: answering a
-    // proposal nobody can read is answering a permission prompt blind,
-    // which is exactly what this codebase's conflict-guard exists to
-    // prevent (see CLAUDE.md).
+    // No Accept/Reject button anywhere below this branch, and no fetch
+    // either: answering a proposal nobody can read is answering a
+    // permission prompt blind, which is exactly what this codebase's
+    // conflict-guard exists to prevent (see CLAUDE.md).
     el.textContent = "Waiting for the proposed change to arrive…";
     return;
   }
   el.innerHTML = "";
-  const header = document.createElement("div");
-  header.className = "dl meta";
-  header.textContent = p.rel;
-  el.appendChild(header);
-  el.appendChild(renderHunks(p.old_text, p.new_text));
-  const bar = document.createElement("div");
-  // Reuses .conflict's own button styling (see style.css's
-  // ".conflict button, .proposal-actions button" rule) rather than
-  // duplicating it under a parallel class.
-  bar.className = "proposal-actions";
-  const edited = () => {
-    const box = el.querySelector(".proposal-edit");
-    return box && box.value !== p.new_text ? box.value : null;
-  };
-  const answer = (accept) => send({
-    t: "AnswerProposal", id: tab.id, accept, text: accept ? edited() : null,
+  const url = `/frag/${PROJECT}/proposal?id=${encodeURIComponent(tab.id)}`;
+  // Same in-flight-fetch guard mountTab's generic branch below uses: a
+  // proposal answered (or this pane moved on to a different tab entirely)
+  // while this fetch was in the air must not have its response land and
+  // clobber whatever is showing now.
+  el.dataset.url = url;
+  fetch(url).then((r) => r.text()).then((html) => {
+    if (el.dataset.url !== url) return;
+    el.innerHTML = html;
+    const bar = document.createElement("div");
+    // Reuses .conflict's own button styling (see style.css's
+    // ".conflict button, .proposal-actions button" rule) rather than
+    // duplicating it under a parallel class.
+    bar.className = "proposal-actions";
+    // Task 9: the opt-in hook for editing a proposal before accepting.
+    // Nothing here ever builds a `.proposal-edit` box, so `edited()` always
+    // returns null (an unedited accept) until that task adds one.
+    const edited = () => {
+      const box = el.querySelector(".proposal-edit");
+      return box && box.value !== p.new_text ? box.value : null;
+    };
+    const answer = (accept) => send({
+      t: "AnswerProposal", id: tab.id, accept, text: accept ? edited() : null,
+    });
+    const mkButton = (label, fn) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.onclick = fn;
+      return b;
+    };
+    bar.append(mkButton("Accept", () => answer(true)), mkButton("Reject", () => answer(false)));
+    el.appendChild(bar);
   });
-  const mkButton = (label, fn) => {
-    const b = document.createElement("button");
-    b.textContent = label;
-    b.onclick = fn;
-    return b;
-  };
-  bar.append(mkButton("Accept", () => answer(true)), mkButton("Reject", () => answer(false)));
-  el.appendChild(bar);
 }
-
 // A bare empty pane is not discoverable, and a plain button would train the
 // wrong muscle memory — people already press Enter in a fresh terminal to
 // check it's alive. So the hint itself *is* the control: Enter or a click

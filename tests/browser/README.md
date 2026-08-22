@@ -185,25 +185,37 @@ performed.
 - In `ide.mjs`: dropping `mountTab`'s `Tab::Proposal` branch fails 6
   assertions across sections B and C (no hunk, no Accept/Reject button, no
   reply, tab never closes); deleting only the Accept/Reject button-append in
-  `renderProposal` fails 6 different ones — the two hunk-visibility
-  assertions keep passing, which is what says those two are testing the
-  buttons and not the diff view. Deleting the Alt+K `keydown` listener fails
-  the 3 mention assertions in section E and nothing else. Folding `tabKey`'s
-  `"Proposal"` case down to `` `Proposal:${t.id}` `` (dropping the
-  content/pending distinction) passes sections B/C/D unchanged — this task's
-  own `wsconn.rs` fix makes content arrive before the tab in every ordinary
-  run, so nothing timing-based here can tell the fold apart from the real
-  code — which is why section D also calls `tabKey` directly and asserts its
+  `renderProposal` fails 6 different ones — **the two hunk-visibility
+  assertions keep passing**, which is what says those two are testing the
+  diff view and not the buttons (if button-removal had failed them too, they
+  would not be discriminating between "the diff is broken" and "the buttons
+  are broken"). Deleting the Alt+K `keydown` listener fails the 3 mention
+  assertions in section E and nothing else. Folding `tabKey`'s `"Proposal"`
+  case down to `` `Proposal:${t.id}` `` (dropping the content/pending
+  distinction) passes sections B/C/D unchanged — this task's own
+  `wsconn.rs` fix makes content arrive before the tab in every ordinary run,
+  so nothing timing-based here can tell the fold apart from the real code —
+  which is why section D also calls `tabKey` directly and asserts its
   output changes once `state.proposals` gains an entry; that direct
   assertion is the one that fails (`"before":"Proposal:...","after":"Proposal:..."`,
   identical) with the fold in place. Neutering `renderProposal`'s `if (!p)`
-  guard (`if (false) {`) fails section D's other two assertions — not with
-  "a button appeared" but with an *uncaught exception* reading `.rel` off
-  `undefined`, an even more direct demonstration that nothing downstream of
-  that guard is safe to reach without it. Emptying `renderHunks` to
-  `return frag` unconditionally fails exactly the two hunk-visibility
-  assertions (B and C) and nothing else — proving those two, and only those
-  two, depend on it.
+  guard (`if (false) {`) is the one that needed a second look: with the
+  hunk view still built client-side, this failed on an uncaught exception
+  before a button could ever be built. After review moved the hunk view to
+  a server fragment (`renderProposal`'s content branch now does its own
+  `fetch`), the same break instead let a wrongly-issued fetch for the
+  bogus id return "this proposal is no longer open" and **append real
+  Accept/Reject buttons a moment later** — which a synchronous check right
+  after calling `renderProposal` missed entirely (the fetch hadn't resolved
+  yet), passing for the wrong reason. Section D now waits ~1.5s after
+  calling `renderProposal` before reading the result, specifically so a
+  regression that removes the guard is still caught even though it manifests
+  asynchronously rather than as an immediate throw. The equivalent check for
+  the diff view itself — emptying `render::proposal_fragment` down to just
+  the file name — now lives in `src/render.rs`'s own tests
+  (`proposal_fragment_reports_distant_changes_as_separate_hunks` and its
+  siblings), since the hunk view is Rust now, not a second implementation in
+  `app.js`.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:

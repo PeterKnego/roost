@@ -10,8 +10,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub type ConnId = String;
 
 /// The two sides of one open proposal. Kept whole rather than as a rendered
-/// diff: the client owns the rendering, and the accepting path has to be able
-/// to send back text the user edited, which a rendered diff cannot supply.
+/// diff: `routes.rs`'s `/frag/{project}/proposal` fragment renders from this
+/// on every fetch (so a browser's Accept edit-box, once Task 9 adds one,
+/// always compares against the same text the diff was built from), and the
+/// accepting path has to be able to send back text the user edited, which a
+/// rendered diff cannot supply either way.
+#[derive(Clone)]
 pub struct ProposalSides {
     pub rel: String,
     pub old_text: String,
@@ -1495,6 +1499,21 @@ pub fn close_proposal(project: &str, id: &str) {
     if let Some(arc) = open_hub(project) {
         Hub::lock(&arc).close_proposal_tab(id);
     }
+}
+
+/// Reads out one open proposal's content by id, for `routes.rs`'s
+/// `/frag/{project}/proposal` fragment — the free-function half, so that
+/// route never takes a hub lock itself, matching `has_dirty_buffer`/
+/// `open_proposal` above.
+///
+/// `None` covers two different situations the caller does not need to tell
+/// apart: a project with no hub yet, and an id that has already been
+/// answered or withdrawn by the time this browser's fetch lands — both
+/// render the same "this proposal is no longer open" fragment.
+pub fn proposal_by_id(project: &str, id: &str) -> Option<ProposalSides> {
+    let arc = open_hub(project)?;
+    let sides = Hub::lock(&arc).proposals.get(id).cloned();
+    sides
 }
 
 /// Send an event to every connected client of every project. Notices are

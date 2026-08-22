@@ -231,10 +231,17 @@ try {
     return null;
   }, 15, "an ide lock file");
   ok(!!lockFile, "an ide lock file appears once a terminal has attached");
+  if (!lockFile) {
+    // Nothing below this point can proceed without a real port/token to
+    // connect to — throw with a clear reason rather than let
+    // Deno.readTextFile(null) fail on an unrelated-looking message and skip
+    // the pass/fail summary at the bottom of this file.
+    throw new Error("no ide lock file appeared — cannot continue");
+  }
   const lockJson = JSON.parse(await Deno.readTextFile(lockFile));
   const idePort = Number(lockFile.match(/(\d+)\.lock$/)[1]);
   claude = await connectFakeClaude(idePort, lockJson.authToken);
-  ok(true, `fake Claude connected on ide port ${idePort}`);
+  console.log(`    fake Claude connected on ide port ${idePort}`);
 
   console.log("\nB. Claude proposes an edit, resh shows the changed hunk, and Accept resolves it");
   const acceptAbs = `${projectDir}/${ACCEPT_FILE}`;
@@ -265,11 +272,14 @@ try {
   );
   ok(acceptReply?.result?.content?.[0]?.text === "TAB_CLOSED",
      `accepting an unedited proposal reports TAB_CLOSED over the ide socket, got ${JSON.stringify(acceptReply?.result)}`);
-  // The discriminating assertion for this whole section: resh must not write
-  // the file itself (the CLI applies the edit with the content this answer
-  // returns) — a browser test driven by a fake Claude can never see the file
-  // change, and asserting that it does not is what proves this test is
-  // checking the right half of the exchange.
+  // A useful negative guard, not the discriminator for this section: this
+  // passes just as well with the whole Accept feature deleted (no button,
+  // no reply — the file was never going to change either way). The
+  // TAB_CLOSED assertion just above is what actually proves resh answered
+  // the accept; this one proves resh did not additionally do the CLI's own
+  // job of writing the file (the CLI applies the edit with the content
+  // this answer returns — a browser test driven by a fake Claude can never
+  // see the file change, since no CLI is running to make that write).
   ok((await Deno.readTextFile(acceptAbs)) === acceptOld,
      "resh itself never wrote the file — only the reply above says the proposal was accepted");
   ok(await until(() => evalIn(`!state.panes.some((p) => p.tabs.some((t) => t.k === "Proposal"))`), 10, "tab closed"),
@@ -310,15 +320,30 @@ try {
   // `state.proposals` has never heard of, which is exactly the shape that
   // window produces, and is the only way to make this deterministic instead
   // of a flake that happens to pass.
-  const placeholder = JSON.parse(await evalIn(`(() => {
-    const el = document.createElement("div");
-    let threw = false;
-    try { renderProposal(el, { k: "Proposal", id: "no-such-proposal-id" }); }
-    catch (e) { threw = true; }
-    return JSON.stringify({ hasButton: !!el.querySelector("button"), text: el.textContent, threw });
-  })()`));
+  //
+  // renderProposal's content branch now fetches `/frag/.../proposal` (it
+  // used to build the hunk view synchronously in-line), so the correct
+  // guard — the `if (!p)` early return, before any fetch is ever issued —
+  // has to be checked *after* giving a wrongly-issued fetch time to land,
+  // or a regression that removes the guard would still read as "no button"
+  // simply because this check ran before that fetch's response arrived.
+  // Stashed on `window` because each `evalIn` call is its own isolated
+  // `Runtime.evaluate` — a plain `const` here would not survive to the
+  // second call below.
+  await evalIn(`(() => {
+    window.__placeholderEl = document.createElement("div");
+    window.__placeholderThrew = false;
+    try { renderProposal(window.__placeholderEl, { k: "Proposal", id: "no-such-proposal-id" }); }
+    catch (e) { window.__placeholderThrew = true; }
+  })()`);
+  await sleep(1500); // headroom for a wrongly-issued fetch to a real local server to land
+  const placeholder = JSON.parse(await evalIn(`JSON.stringify({
+    hasButton: !!window.__placeholderEl.querySelector("button"),
+    text: window.__placeholderEl.textContent,
+    threw: window.__placeholderThrew,
+  })`));
   ok(!placeholder.hasButton,
-     `a content-less proposal renders no Accept/Reject button (rendered text: ${JSON.stringify(placeholder.text)})`);
+     `a content-less proposal renders no Accept/Reject button even after waiting out a possible fetch (rendered text: ${JSON.stringify(placeholder.text)})`);
   ok(!placeholder.threw, "and rendering it does not throw");
   ok(placeholder.text.length > 0, "it shows placeholder text rather than a blank pane");
   // The mechanism that closes the race in real use: render()'s mountedKey

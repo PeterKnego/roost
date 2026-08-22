@@ -36,6 +36,28 @@ pub fn diff_html(diff: &str) -> String {
         .collect()
 }
 
+/// The hunk view for an `openDiff` proposal Claude is still waiting on an
+/// answer for. Same shape as the `diff` fragment's own output (a `.path`
+/// breadcrumb over a `.diffview` of `diff_html`-classified lines) — reusing
+/// `textdiff::unified` rather than a second diff implementation, the same
+/// way the save-conflict banner does: a proposal compares disk against
+/// content that has never been written, exactly the case `textdiff.rs`
+/// exists for.
+///
+/// Was a client-side port of `textdiff::unified` in `static/app.js` (a
+/// second implementation of the trim/LCS/context-cap algorithm in a second
+/// language); review caught it had already drifted — an empty `old_text`
+/// produced a phantom `-` line there that Rust's `str::lines()` never
+/// would. This is the one implementation both the conflict banner and a
+/// proposal now render through.
+pub fn proposal_fragment(rel: &str, old_text: &str, new_text: &str) -> String {
+    format!(
+        "<div class=\"path\">{}</div><div class=\"diffview\">{}</div>",
+        esc(rel),
+        diff_html(&crate::textdiff::unified(old_text, new_text)),
+    )
+}
+
 /// Where a markdown link or image destination points, once resolved against
 /// the file it appeared in.
 ///
@@ -807,6 +829,60 @@ mod tests {
         assert!(h.contains("dl add"));
         assert!(h.contains("dl ctx"));
         assert!(h.contains("-old &lt;")); // escaped
+    }
+
+    /// The property the JS port had no test for at all before it was
+    /// deleted: two distant single-line changes must render as two
+    /// separate `@@` hunks, with the untouched middle omitted — proving
+    /// `unified`'s own multi-hunk behavior actually reaches the browser
+    /// through this fragment, not just through textdiff.rs's own suite.
+    #[test]
+    fn proposal_fragment_reports_distant_changes_as_separate_hunks() {
+        let numbered = |n: usize| (1..=n).map(|i| format!("line {i}\n")).collect::<String>();
+        let old = numbered(60);
+        let new = old.replace("line 10\n", "line 10 edited\n").replace("line 50\n", "line 50 edited\n");
+        let h = proposal_fragment("a.rs", &old, &new);
+        let hunks = h.matches("dl hunk").count();
+        assert_eq!(hunks, 2, "one header per hunk, two hunks: {h}");
+        assert!(!h.contains("line 30<"), "the untouched middle must not be included: {h}");
+    }
+
+    /// Two changes close enough that their context windows overlap must
+    /// merge into one hunk, not render as two with a redundant context
+    /// line printed twice between them.
+    #[test]
+    fn proposal_fragment_merges_nearby_changes_into_one_hunk() {
+        let numbered = |n: usize| (1..=n).map(|i| format!("line {i}\n")).collect::<String>();
+        let old = numbered(20);
+        // Two edits four lines apart — within CONTEXT (3) of each other's window.
+        let new = old.replace("line 10\n", "line 10 edited\n").replace("line 14\n", "line 14 edited\n");
+        let h = proposal_fragment("a.rs", &old, &new);
+        let hunks = h.matches("dl hunk").count();
+        assert_eq!(hunks, 1, "close changes must merge into one hunk, got: {h}");
+    }
+
+    /// textdiff.rs's MAX_DIVERGENT_LINES fallback (a wholly divergent pair
+    /// is quadratic to align and useless to read) has to survive the trip
+    /// through this fragment too, or a huge proposal would park the socket
+    /// thread the way the save-conflict banner used to.
+    #[test]
+    fn proposal_fragment_falls_back_to_a_summary_for_a_wholly_divergent_pair() {
+        let old: String = (0..1100).map(|i| format!("disk {i}\n")).collect();
+        let new: String = (0..1100).map(|i| format!("proposed {i}\n")).collect();
+        let h = proposal_fragment("a.rs", &old, &new);
+        assert!(h.contains("too different to show"), "must say why, not dump either file: {h}");
+        assert!(h.matches("<div").count() < 20, "and must not dump either file: {h}");
+    }
+
+    /// The breadcrumb names the file, and — since a proposal's `rel` and
+    /// content both arrive off a socket — everything interpolated has to be
+    /// escaped, per CLAUDE.md.
+    #[test]
+    fn proposal_fragment_escapes_the_path_and_the_content() {
+        let h = proposal_fragment("<script>.rs", "a", "a<b");
+        assert!(!h.contains("<script>"), "the path must be escaped: {h}");
+        assert!(h.contains("&lt;script&gt;"), "{h}");
+        assert!(h.contains("a&lt;b"), "the proposed content must be escaped too: {h}");
     }
 
     #[test]

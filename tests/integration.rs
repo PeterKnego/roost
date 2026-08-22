@@ -1107,6 +1107,60 @@ fn a_late_browsers_first_frame_is_the_proposals_content_not_its_tab() {
     std::env::remove_var("RESH_STATE_DIR");
 }
 
+/// The `/frag/{project}/proposal` route (added in review, replacing a
+/// client-side port of textdiff.rs::unified in static/app.js): a real HTTP
+/// fetch against a real open proposal must show the changed hunk, and an id
+/// that is not (or no longer) open must render the "no longer open"
+/// fragment rather than a 500 or an empty body — a browser fetch racing an
+/// answer is the ordinary case, not an edge case (see `Hub::do_answer_proposal`,
+/// which closes the tab and answers in that order).
+#[test]
+fn proposal_fragment_route_shows_the_hunk_and_handles_a_missing_id() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    let (_d, port) = fixture_named("proposal-frag");
+    // The first connection is what builds the hub this proposal opens on —
+    // same reasoning as the other proposal tests above.
+    let mut a = ws_connect_path(port, "/ws/proposal-frag/_workspace").unwrap();
+    let _ = read_until(&mut a, r#""t":"State""#);
+
+    resh::hub::open_proposal(
+        "proposal-frag",
+        "frag-1",
+        "hello.md",
+        "line one
+line two
+line three
+",
+        "line one
+CHANGED
+line three
+",
+    );
+
+    let body = ureq::get(&format!("http://127.0.0.1:{port}/frag/proposal-frag/proposal?id=frag-1"))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(body.contains("hello.md"), "must name the file: {body}");
+    assert!(body.contains("-line two") && body.contains("+CHANGED"), "must show the changed hunk: {body}");
+
+    // A withdrawn/answered/unknown id: the fragment must say so, not 500 or
+    // silently render nothing.
+    let gone = ureq::get(&format!("http://127.0.0.1:{port}/frag/proposal-frag/proposal?id=no-such-id"))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(gone.contains("no longer open"), "got {gone}");
+
+    resh::hub::close_proposal("proposal-frag", "frag-1");
+    let _ = a.close(None);
+    std::env::remove_var("RESH_STATE_DIR");
+}
+
 #[test]
 fn invalid_session_name_is_refused() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
