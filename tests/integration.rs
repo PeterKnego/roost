@@ -110,6 +110,37 @@ fn post(port: u16, path: &str, origin: Option<&str>, ctype: &str, body: &[u8]) -
     (status, text)
 }
 
+/// `POST /paste/{project}/{session}` needs a session that is already in
+/// `session::sessions()`, but connecting the terminal websocket only
+/// *starts* `attach` — the WS handshake completes (and so the client's
+/// `ws_connect` call returns) before the server has necessarily called it,
+/// let alone had it finish spawning the PTY. That gap has always existed;
+/// it only became wide enough to lose routinely once opening a terminal
+/// started guaranteeing the project's ide listener exists first (real
+/// I/O — a TCP bind, a token, a lock file — genuinely ahead of the spawn,
+/// not merely slow test scheduling). Retrying is safe: a "no such session"
+/// 404 is refused before any paste content is touched, so it leaves nothing
+/// behind to double up on the next attempt. Poll rather than sleep-once,
+/// per this file's own idiom elsewhere (see `any_process_holds`'s callers):
+/// bounded, and exits the moment the condition holds.
+fn post_when_session_ready(
+    port: u16,
+    path: &str,
+    origin: Option<&str>,
+    ctype: &str,
+    body: &[u8],
+) -> (u16, String) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (status, resp) = post(port, path, origin, ctype, body);
+        let session_not_ready_yet = status == 404 && resp.contains("no such session");
+        if !session_not_ready_yet || std::time::Instant::now() >= deadline {
+            return (status, resp);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// The check the whole GET-only amendment is traded against, so it gets the
 /// treatment `ws_rejects_foreign_and_missing_origin` already gives the socket.
 /// It asserts the *file was not written*, not merely the status: a 403 returned
@@ -240,7 +271,7 @@ fn a_pasted_image_injects_a_bracketed_path_into_the_pty() {
 
     let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0];
     let (ct, body) = multipart(&[("clip.png", &png)]);
-    let (status, resp) = post(port, "/paste/proj/shell", Some(&origin), &ct, &body);
+    let (status, resp) = post_when_session_ready(port, "/paste/proj/shell", Some(&origin), &ct, &body);
     assert_eq!(status, 200, "response: {resp}");
 
     let mut seen = String::new();
@@ -290,7 +321,7 @@ fn a_paste_of_a_non_image_is_refused() {
     // A BMP: a real image the *clipboard* route would take, refused here
     // because the receiver cannot read `.bmp` from a path.
     let (ct, body) = multipart(&[("clip.png", b"BM\0\0\0\0\0\0\0\0\0\0")]);
-    let (status, resp) = post(port, "/paste/proj/shell", Some(&origin), &ct, &body);
+    let (status, resp) = post_when_session_ready(port, "/paste/proj/shell", Some(&origin), &ct, &body);
     assert_eq!(status, 400, "response: {resp}");
     assert!(resp.contains("PNG"), "the error must name what is accepted: {resp}");
     assert!(
@@ -1837,4 +1868,64 @@ fn a_terminal_child_can_discover_that_notifications_exist() {
     assert!(seen.contains("SESS=envprobe"), "session missing: {seen:?}");
     let _ = term.close(None);
     std::env::remove_var("RESH_CMD");
+}
+
+/// Connects the terminal socket directly, with **no** prior `_workspace`
+/// connection — the one thing a real browser always does first (loading the
+/// project page), but a reconnecting client or a raw client is not
+/// guaranteed to. That ordering is exactly what exposed a real bug while
+/// implementing this: `term.rs` used to call `session::attach` (which reads
+/// `ide::port_for`) *before* anything had ever started this project's ide
+/// listener, so the very first terminal in a brand-new project came up with
+/// no `CLAUDE_CODE_SSE_PORT` at all. Revert-checked: reverting `term.rs`'s
+/// `ide::for_project` call back out (so only the pre-existing, later
+/// `Hub::for_project` call remains) reproduces exactly this — see this
+/// task's report for the observed failure.
+#[test]
+fn a_fresh_projects_first_terminal_already_carries_the_ide_port() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let bin = tempfile::tempdir().unwrap();
+    let script = bin.path().join("sseport.sh");
+    std::fs::write(&script, "#!/bin/sh\necho \"SSEPORT=$CLAUDE_CODE_SSE_PORT\"\nsleep 5\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::env::set_var("RESH_CMD", script.to_str().unwrap());
+
+    let (_d, port) = fixture_named("sseportproj");
+    // No `_workspace` connection anywhere above this line: this project's
+    // hub, and so its ide listener, has never been touched before.
+    let mut term = ws_connect_path(port, "/ws/sseportproj/term/sseprobe").unwrap();
+    let mut seen = String::new();
+    for _ in 0..100 {
+        match term.read() {
+            Ok(tungstenite::Message::Binary(b)) => seen.push_str(&String::from_utf8_lossy(&b)),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if seen.contains("SSEPORT=") {
+            break;
+        }
+    }
+    let ide_port: Option<u16> = seen
+        .split("SSEPORT=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|p| p.trim().parse().ok());
+    assert!(
+        matches!(ide_port, Some(p) if p != 0),
+        "expected a nonzero CLAUDE_CODE_SSE_PORT in the spawned shell's env; got: {seen:?}"
+    );
+    let _ = term.close(None);
+    std::env::remove_var("RESH_CMD");
+    // Best-effort cleanup: this test necessarily writes a real lock file to
+    // the real `~/.claude/ide` (the ide registry has no per-test override —
+    // see this task's report), and nothing else ever closes "sseportproj"'s
+    // project to remove it. `remove_file`, never a directory scan, matching
+    // the same rule `idelock::Lock`'s own `Drop` follows.
+    if let Some(p) = ide_port {
+        let _ = std::fs::remove_file(resh::idelock::ide_dir().join(format!("{p}.lock")));
+    }
 }

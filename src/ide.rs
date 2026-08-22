@@ -19,9 +19,11 @@
 //! lock-file token this module implements.
 use crate::idecwd::{self, Cwd};
 use crate::idelock;
+use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tungstenite::handshake::server::{Request as WsRequest, Response as WsResponse};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::accept_hdr_with_config;
@@ -35,6 +37,37 @@ pub struct Ide {
     pub token: String,
     /// Removed on drop, and only ever the path we wrote.
     _lock: idelock::Lock,
+    /// Set by `request_shutdown` (called from `stop`), and checked by the
+    /// accept loop between connections. A flag alone cannot wake a thread
+    /// already parked in `accept(2)` inside `TcpListener::incoming()` — see
+    /// `request_shutdown` for how it actually gets observed.
+    stopped: Arc<AtomicBool>,
+}
+
+impl Ide {
+    /// Task 3's review flagged that dropping the `Arc<Ide>` removed the lock
+    /// file but left the accept loop running forever, authenticating against
+    /// a token no longer advertised anywhere. Not exploitable (the token
+    /// stays unguessable), but `stop` is where a real shutdown belongs.
+    ///
+    /// `TcpListener::incoming()` blocks in the kernel until a connection
+    /// arrives, so setting `stopped` by itself would not be noticed until
+    /// some *other* client happened to connect next — which might be never.
+    /// A loopback self-connect delivers exactly one more item to
+    /// `incoming()`, which is what lets the loop actually observe the flag
+    /// and exit. That self-connection is never served: the loop checks
+    /// `stopped` before it ever matches on the accepted stream, so it just
+    /// gets dropped. Once the loop breaks, `listener` (moved into the
+    /// thread's closure) drops too, which is what actually closes the port.
+    fn request_shutdown(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        // Best-effort: if this connect fails (e.g. the listener already
+        // closed for some other reason) the accept loop still exits on the
+        // next real connection or at process exit. Never panic here — this
+        // runs on the CloseProject path and must not take a browser socket
+        // down with it.
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+    }
 }
 
 /// Length is not secret — the token is a fixed 32 hex chars — but the bytes
@@ -57,10 +90,17 @@ pub fn start_in(dir: &Path, project: &str, workspace: PathBuf) -> Result<Arc<Ide
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let token = idelock::new_token()?;
     let lock = idelock::write_in(dir, port, &token, &workspace)?;
-    let ide = Arc::new(Ide { port, token: token.clone(), _lock: lock });
+    let stopped = Arc::new(AtomicBool::new(false));
+    let ide = Arc::new(Ide { port, token: token.clone(), _lock: lock, stopped: stopped.clone() });
     let project = project.to_string();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
+            // Checked before the stream is even matched on: the self-connect
+            // `request_shutdown` makes to wake this loop must never be
+            // handed to `serve_conn`, only used to get back here and exit.
+            if stopped.load(Ordering::SeqCst) {
+                break;
+            }
             let Ok(stream) = stream else { continue };
             let token = token.clone();
             let project = project.clone();
@@ -79,6 +119,94 @@ pub fn start_in(dir: &Path, project: &str, workspace: PathBuf) -> Result<Arc<Ide
 
 pub fn start(project: &str, workspace: PathBuf) -> Result<Arc<Ide>, String> {
     start_in(&idelock::ide_dir(), project, workspace)
+}
+
+/// One listener per project, not one per connection to it — mirrors
+/// `Hub::for_project`'s registry, and is deliberately a *separate* map: a
+/// `claude` reconnecting to a project resh already has open must not be
+/// handed a second listener (a second port, a second lock file, and a stale
+/// one left behind that Claude Code would just as happily match against).
+static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Ide>>>> = OnceLock::new();
+
+fn registry() -> &'static Mutex<HashMap<String, Arc<Ide>>> {
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `dir`-parameterised for tests (see `Task 4`'s `start_in`); production
+/// code should call `for_project`.
+pub fn for_project_in(dir: &Path, project: &str, workspace: PathBuf) -> Option<Arc<Ide>> {
+    // Fast path only touches the map: no I/O, so the lock is held for a
+    // lookup and a clone, nothing more.
+    {
+        let map = registry().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = map.get(project) {
+            return Some(existing.clone());
+        }
+    }
+    // The registry lock is released before `start_in`'s blocking I/O (a TCP
+    // bind, a urandom read, a file write, a thread spawn) — CLAUDE.md's
+    // "never hold a lock across blocking I/O" is not a style preference
+    // here: this call sits directly ahead of `session::attach` on the
+    // terminal-open path (see `term.rs`), which every project opened during
+    // a test run — or in production, every terminal in every project —
+    // passes through. Holding one process-global mutex across that I/O
+    // would serialize every concurrent "first terminal in a new project"
+    // in the whole process behind whichever one happened to go first;
+    // dropping the lock here lets unrelated projects build their listeners
+    // in parallel, which is exactly what fixed a real, reproducible
+    // regression this task introduced (five integration tests started
+    // failing "no such session" once this call sat, lock held, ahead of
+    // `attach` — see this task's report).
+    let built = start_in(dir, project, workspace);
+    let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = map.get(project) {
+        // Another caller for the same project won the race while this one
+        // was building its own listener. Its own `Ide` (dropped here) is
+        // never accepted into the map — that drop removes the lock file it
+        // wrote, but its accept thread has no signal to stop, so it leaks
+        // until the process exits. Losing this race requires two callers
+        // opening the very same never-yet-registered project at the same
+        // instant, which the product's own flow (open project, then start a
+        // terminal) does not do concurrently; accepted as a known, narrow
+        // gap rather than adding a second synchronization mechanism to
+        // close it.
+        return Some(existing.clone());
+    }
+    match built {
+        Ok(ide) => {
+            map.insert(project.to_string(), ide.clone());
+            Some(ide)
+        }
+        Err(e) => {
+            // Degraded, never fatal: IDE integration is a convenience, and a
+            // read-only home directory (or any other reason the lock file
+            // could not be written) must not stop a project from opening.
+            eprintln!("resh: IDE integration unavailable for {project}: {e}");
+            None
+        }
+    }
+}
+
+pub fn for_project(project: &str, workspace: PathBuf) -> Option<Arc<Ide>> {
+    for_project_in(&idelock::ide_dir(), project, workspace)
+}
+
+pub fn port_for(project: &str) -> Option<u16> {
+    let map = registry().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(project).map(|i| i.port)
+}
+
+/// Removing the project's entry drops the last `Arc<Ide>` this module holds,
+/// which drops the `Lock` inside it — removing exactly the lock file this
+/// listener wrote, never a directory scan. `request_shutdown` (below) is
+/// what stops the *listener*; without it the accept loop would keep running,
+/// unadvertised, until the process exits. Must not disturb any other
+/// project's entry: removed by key, never by clearing the map.
+pub fn stop(project: &str) {
+    let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ide) = map.remove(project) {
+        ide.request_shutdown();
+    }
 }
 
 pub struct Conn {
@@ -498,5 +626,105 @@ mod tests {
         let out = dispatch(&rpc(9, "nonsense/method", serde_json::json!({})), &mut c).unwrap();
         assert_eq!(out["id"], 9);
         assert_eq!(out["error"]["code"], -32601);
+    }
+
+    // --- Task 5: the per-project registry ---
+    //
+    // `REGISTRY` is process-global, so a project name shared across two
+    // tests hands them the same listener and their pass/fail depends on
+    // which one runs first — CLAUDE.md records exactly this shape of flake.
+    // Every test below therefore gets a project name unique to it.
+
+    /// Each test gets its own lock directory, so tests that run concurrently
+    /// cannot see each other's lock files. Deliberately not an env var:
+    /// `CLAUDE_CONFIG_DIR` is process-global, and CLAUDE.md records a
+    /// "~1-in-8 flake" that was one test reaping another's state.
+    fn dirs() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
+        (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
+    }
+
+    #[test]
+    fn one_listener_per_project_not_one_per_connection() {
+        let (dir, ws, _) = dirs();
+        let a = for_project_in(dir.path(), "reuse-alpha", ws.path().to_path_buf()).unwrap();
+        let again = for_project_in(dir.path(), "reuse-alpha", ws.path().to_path_buf()).unwrap();
+        assert_eq!(a.port, again.port, "a second call must reuse the listener");
+    }
+
+    #[test]
+    fn two_projects_get_two_ports_and_two_lock_files() {
+        let (dir, wa, wb) = dirs();
+        // One listener listing both roots would let a claude in beta be
+        // handed alpha's socket: the CLI takes the first workspaceFolder that
+        // contains its cwd.
+        let a = for_project_in(dir.path(), "twoports-alpha", wa.path().to_path_buf()).unwrap();
+        let b = for_project_in(dir.path(), "twoports-beta", wb.path().to_path_buf()).unwrap();
+        assert_ne!(a.port, b.port);
+        assert!(dir.path().join(format!("{}.lock", a.port)).exists());
+        assert!(dir.path().join(format!("{}.lock", b.port)).exists());
+    }
+
+    #[test]
+    fn stopping_a_project_removes_its_lock_and_leaves_the_others() {
+        let (dir, wa, wb) = dirs();
+        let a = for_project_in(dir.path(), "stop-alpha", wa.path().to_path_buf()).unwrap();
+        let b = for_project_in(dir.path(), "stop-beta", wb.path().to_path_buf()).unwrap();
+        let (a_port, b_port) = (a.port, b.port);
+        // `for_project_in` hands back its own `Arc` clone, separate from the
+        // one the registry map holds; `stop` can only drop the map's clone.
+        // Production code (`hub.rs`) never keeps one of these around past
+        // the initial call, so dropping it here is what makes this test
+        // match how `stop` is actually used, rather than asserting against
+        // a reference this test itself is still pinning alive.
+        drop(a);
+        drop(b);
+        stop("stop-alpha");
+        assert!(!dir.path().join(format!("{a_port}.lock")).exists());
+        assert!(
+            dir.path().join(format!("{b_port}.lock")).exists(),
+            "closing one project must not unregister another"
+        );
+    }
+
+    #[test]
+    fn a_failure_to_write_the_lock_file_does_not_fail_the_project() {
+        let (dir, ws, _) = dirs();
+        // IDE integration is a convenience. A read-only home directory must
+        // degrade it, never stop a project opening.
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, "").unwrap();
+        assert!(for_project_in(&blocked, "lockfail-alpha", ws.path().to_path_buf()).is_none());
+    }
+
+    #[test]
+    // Task 3's review: dropping the `Arc<Ide>` removed the lock file but
+    // left the accept loop running, authenticating against a token nothing
+    // advertises any more. `stop` must actually terminate the listener, not
+    // just forget about it.
+    //
+    // Revert-checked: emptying `request_shutdown`'s body (so `stop` still
+    // removes the lock file and the registry entry, but never signals the
+    // accept thread) failed this test — `panicked ... "port {port} is still
+    // accepting connections after stop()"`, after genuinely waiting out the
+    // 5s poll deadline rather than passing vacuously — then restored.
+    fn stop_actually_closes_the_listening_socket() {
+        let (dir, ws, _) = dirs();
+        let ide = for_project_in(dir.path(), "stopclose-alpha", ws.path().to_path_buf()).unwrap();
+        let port = ide.port;
+        drop(ide); // the registry still holds its own Arc; this must not matter
+        stop("stopclose-alpha");
+        // The accept thread only observes the shutdown once it loops back
+        // around `incoming()` and drops the listener — not synchronously
+        // inside `stop` — so poll rather than assert immediately.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Err(_) => return, // refused: the listener is gone
+                Ok(_) if std::time::Instant::now() >= deadline => {
+                    panic!("port {port} is still accepting connections after stop()")
+                }
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
     }
 }

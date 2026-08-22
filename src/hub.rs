@@ -147,6 +147,23 @@ impl Hub {
                 Arc::new_cyclic(|weak| {
                     let mut hub = Hub::new(project, dir.clone());
                     hub.self_ref = weak.clone();
+                    // Started here, inside the "only on a fresh entry" arm,
+                    // rather than on first connection: the lock file must
+                    // exist before a terminal is spawned, since the spawn
+                    // reads the port out of the ide registry
+                    // (session::session_env). This runs exactly once per
+                    // project — a reconnecting browser or a second terminal
+                    // takes the `entry` hit path above and never reaches
+                    // this closure at all — so it never hands out a second
+                    // listener. It runs with the hub *registry* lock held,
+                    // same as `Hub::new` just above it on this same line:
+                    // that call already does blocking file I/O (wsstate,
+                    // buffer reconciliation) under this same lock for the
+                    // same one-time-setup reason, so this does not introduce
+                    // a new class of hold. Degrades silently on failure (see
+                    // `ide::for_project_in`): IDE integration is a
+                    // convenience, never a reason to fail opening a project.
+                    crate::ide::for_project(project, dir.clone());
                     Mutex::new(hub)
                 })
             })
@@ -1165,6 +1182,13 @@ impl Hub {
                             );
                             0
                         });
+                        // Outside the catch_unwind above, not inside it: a
+                        // panic in kill_project must not skip stopping the
+                        // ide listener, or a closed project keeps
+                        // authenticating connections against a token no
+                        // longer advertised in any lock file. stop() itself
+                        // cannot panic (no unwrap, no I/O it doesn't guard).
+                        crate::ide::stop(&thread_project);
                         let mut h = Hub::lock(&hub_arc);
                         h.closing = false;
                         h.ws.version += 1;
@@ -1183,6 +1207,7 @@ impl Hub {
             }
             None => {
                 let ended = crate::session::kill_project(&project);
+                crate::ide::stop(&project);
                 self.ws.version += 1;
                 self.broadcast(&Event::ProjectClosed { ended });
                 self.refresh_live_sessions();
