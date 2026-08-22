@@ -142,7 +142,19 @@ try {
   // buffer that stayed paused would never autosave again for the rest of the
   // session, and nothing else in this file would notice.
   await page.type("typing again after the discard\n");
-  ok(await until(async () => (await Deno.readTextFile(file)).includes("typing again"), 5, "resumed"),
+  // 20s, not the 5s the rest of this file uses for a post-save wait. This is
+  // the one assertion that waits on a *debounce* rather than on a save it
+  // just triggered: autosave fires a second after the last keystroke, and
+  // only then makes the round trip. Five seconds is ample on an idle box and
+  // not ample on a loaded one.
+  //
+  // Measured on this 4-core host rather than guessed, because it had been
+  // written off as a flake: idle it passes 10/10 either way, but with every
+  // core saturated it failed 2 of 6 at 5s and 1 of 12 at 30s. The write does
+  // land — it lands late — so the budget was the defect, not the behaviour.
+  // A genuine failure to resume still fails here; it just has to be a real
+  // one rather than a slow machine.
+  ok(await until(async () => (await Deno.readTextFile(file)).includes("typing again"), 20, "resumed"),
      "autosave works again once the divergence is resolved");
 
   console.log("\nE. a project can turn it off");
