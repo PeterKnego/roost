@@ -1258,6 +1258,18 @@ mod tests {
     use super::*;
     use crate::proto::{self, Mode, Tab};
 
+    /// The three tests below that call `Hub::for_project` directly (not a
+    /// bare `Hub::new()`) reach `ide::for_project` -> `idelock::ide_dir()`
+    /// through it. Without this, `cargo test --lib` would write real lock
+    /// files into the developer's actual `~/.claude/ide` (Task 5 review,
+    /// finding 2) — the same isolation `tests/integration.rs` applies for
+    /// the same reason, via its own `isolate_ide_dir_for_tests`.
+    fn isolate_ide_dir_for_tests() {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let d = DIR.get_or_init(|| tempfile::tempdir().unwrap());
+        crate::idelock::set_ide_dir_for_test(d.path().to_path_buf());
+    }
+
     // Helper: drain whatever a receiver has without blocking.
     fn drain(rx: &Receiver<String>) -> Vec<String> {
         let mut out = Vec::new();
@@ -2044,6 +2056,7 @@ mod tests {
 
     #[test]
     fn for_project_returns_promptly_on_a_large_tree() {
+        isolate_ide_dir_for_tests();
         // The bug reported live: `for_project` used to walk the entire
         // project tree, registering an OS watch per directory, on the
         // connection thread — before the client's first `State` snapshot
@@ -2324,6 +2337,7 @@ mod tests {
     // under 1ms. 50ms sits with wide margin on both sides of that gap.
     #[test]
     fn close_project_returns_promptly_without_blocking_on_session_killing() {
+        isolate_ide_dir_for_tests();
         let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("RESH_CMD"); // real dtach: a `cat` client has no master to wait on
@@ -2367,6 +2381,7 @@ mod tests {
     // `closing` is still true.
     #[test]
     fn start_terminal_is_refused_while_a_close_is_in_flight() {
+        isolate_ide_dir_for_tests();
         let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("RESH_CMD"); // real dtach: needs a kill that takes real wall time

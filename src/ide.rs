@@ -61,12 +61,27 @@ impl Ide {
     /// thread's closure) drops too, which is what actually closes the port.
     fn request_shutdown(&self) {
         self.stopped.store(true, Ordering::SeqCst);
-        // Best-effort: if this connect fails (e.g. the listener already
-        // closed for some other reason) the accept loop still exits on the
-        // next real connection or at process exit. Never panic here — this
-        // runs on the CloseProject path and must not take a browser socket
-        // down with it.
-        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        // Bounded, not just best-effort: Task 5's review (finding 1) caught
+        // this connect running *inside* `stop`'s registry-lock critical
+        // section, which made a stalled loopback connect a global stall —
+        // every `attach` in the process reads `ide::port_for` while holding
+        // the *sessions* lock (see `session::attach`'s doc comment), so one
+        // wedged `TcpStream::connect` here would have wedged every session
+        // in every project, the exact historical defect CLAUDE.md's "never
+        // hold a lock across blocking I/O" constraint was written from.
+        // `stop` no longer holds that lock across this call at all (see
+        // `stop`), but the connect itself still gets its own timeout rather
+        // than staying unbounded: an untimed connect here would still be a
+        // real, if now solitary, way for `stop` itself to hang, and nothing
+        // requires this self-connect to succeed for shutdown to be correct
+        // (see the comment below).
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], self.port));
+        // If this fails or times out (e.g. the listener already closed for
+        // some other reason) the accept loop still exits on the next real
+        // connection or at process exit. Never panic here — this runs on
+        // the CloseProject path and must not take a browser socket down
+        // with it.
+        let _ = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500));
     }
 }
 
@@ -160,17 +175,23 @@ pub fn for_project_in(dir: &Path, project: &str, workspace: PathBuf) -> Option<A
     let built = start_in(dir, project, workspace);
     let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = map.get(project) {
+        let existing = existing.clone();
         // Another caller for the same project won the race while this one
-        // was building its own listener. Its own `Ide` (dropped here) is
-        // never accepted into the map — that drop removes the lock file it
-        // wrote, but its accept thread has no signal to stop, so it leaks
-        // until the process exits. Losing this race requires two callers
-        // opening the very same never-yet-registered project at the same
-        // instant, which the product's own flow (open project, then start a
-        // terminal) does not do concurrently; accepted as a known, narrow
-        // gap rather than adding a second synchronization mechanism to
-        // close it.
-        return Some(existing.clone());
+        // was building its own listener. Task 5's review (finding 3)
+        // pointed out this is not the rare case the first draft of this
+        // comment claimed — a page load opens the `_workspace` socket
+        // (`hub.rs`) and a terminal socket (`term.rs`) for the same project
+        // near-simultaneously, which is the ordinary reconnect flow, not an
+        // edge case. So the loser's `Ide` is shut down properly, the same
+        // way `stop` does it: released from the registry lock first (its
+        // own `request_shutdown` call, and the lock-file removal its final
+        // drop triggers, are both real syscalls), rather than just letting
+        // it leak a live accept thread until process exit.
+        drop(map);
+        if let Ok(losing_ide) = built {
+            losing_ide.request_shutdown();
+        }
+        return Some(existing);
     }
     match built {
         Ok(ide) => {
@@ -202,10 +223,26 @@ pub fn port_for(project: &str) -> Option<u16> {
 /// what stops the *listener*; without it the accept loop would keep running,
 /// unadvertised, until the process exits. Must not disturb any other
 /// project's entry: removed by key, never by clearing the map.
+///
+/// Task 5's review (finding 1, Critical): the registry lock used to stay
+/// held across both `request_shutdown`'s connect *and* the removed `Arc`'s
+/// own drop (which runs `idelock::Lock::drop`'s `remove_file`) — two real
+/// syscalls, one process-global mutex, exactly the "never hold a lock
+/// across blocking I/O" constraint this codebase has already shipped one
+/// deadlock from. `session::attach` reads `ide::port_for` while holding the
+/// *sessions* lock, so a stalled connect here would have stalled every
+/// `attach` in every project, not just this one's. `map.remove` now returns
+/// the `Arc` out of the locked block entirely — the lock is released before
+/// `ide` (and everything its drop does) is ever touched.
 pub fn stop(project: &str) {
-    let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(ide) = map.remove(project) {
+    let ide = {
+        let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(project)
+    };
+    if let Some(ide) = ide {
         ide.request_shutdown();
+        // `ide` drops here, well after the registry lock above was
+        // released — that drop is what removes the lock file.
     }
 }
 

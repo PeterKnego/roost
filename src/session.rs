@@ -113,18 +113,6 @@ fn sessions() -> &'static Mutex<HashMap<String, Session>> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Attach to a session, creating it if needed. The new subscriber is sent the
-/// session's screen immediately — its scrollback, and the switch that says
-/// which buffer a running full-screen app is painting on — so a reconnecting
-/// browser sees where it was rather than a log it cannot place.
-///
-/// Locking discipline: the registry mutex is held only for the short,
-/// non-blocking bookkeeping steps (map lookups, inserting a new Session,
-/// registering a subscriber). It is never held across a blocking read or
-/// write — the pump thread below re-acquires the lock fresh on every loop
-/// iteration, only around the read()-independent fan-out, so `attach` can
-/// never block behind a PTY that has nothing to say.
-///
 /// The environment a resh shell is spawned with, factored out of `attach` so
 /// it can be asserted on directly rather than through a real PTY spawn.
 fn session_env(
@@ -153,6 +141,19 @@ fn session_env(
     env
 }
 
+/// Attach to a session, creating it if needed. The new subscriber is sent the
+/// session's screen immediately — its scrollback, and the switch that says
+/// which buffer a running full-screen app is painting on — so a reconnecting
+/// browser sees where it was rather than a log it cannot place.
+///
+/// Locking discipline: the registry mutex is held only for the short,
+/// non-blocking bookkeeping steps (map lookups, inserting a new Session,
+/// registering a subscriber, and — since this task — reading the ide port
+/// via `session_env`/`ide::port_for`, itself just a `HashMap` lookup under
+/// `ide`'s own registry lock). It is never held across a blocking read or
+/// write — the pump thread below re-acquires the lock fresh on every loop
+/// iteration, only around the read()-independent fan-out, so `attach` can
+/// never block behind a PTY that has nothing to say.
 pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, String> {
     if !valid_name(name) {
         return Err("invalid session name".into());

@@ -15,10 +15,41 @@
 use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Test-only redirect for `ide_dir()`. Not `#[cfg(test)]`: `tests/integration.rs`
+/// links this crate as an ordinary dependency (no `cfg(test)`), so a
+/// cfg-gated item would be invisible to it — the override has to be a real,
+/// always-compiled item that test code opts into via `set_ide_dir_for_test`.
+///
+/// Task 5's review (finding 2): without this, `cargo test` wrote real lock
+/// files into the developer's actual `~/.claude/ide` — a directory shared
+/// with every other real IDE on the host, whose stale-entry cleanup is the
+/// `claude` CLI's job, not this codebase's, so test debris left there
+/// becomes the CLI's problem. Deliberately a `OnceLock` set at most once to
+/// one directory shared by every test in the process, not a per-test value
+/// and not an env var: a per-test directory would need its own
+/// `STATE_ENV_LOCK`-style global lock to avoid one test's `set` racing
+/// another's `ide_dir()` read, for no benefit — `ide`'s own registry is
+/// already keyed by project name, and lock filenames are already keyed by
+/// port, so many unrelated test "projects" sharing one directory cannot
+/// collide there either.
+static TEST_IDE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Redirects `ide_dir()` for the remainder of this process. Idempotent — a
+/// second call (from another test, or another test module) is a silent
+/// no-op — so any number of call sites can each set it defensively without
+/// coordinating who goes first.
+pub fn set_ide_dir_for_test(dir: PathBuf) {
+    let _ = TEST_IDE_DIR.set(dir);
+}
 
 /// `$CLAUDE_CONFIG_DIR/ide` when set — the CLI honours the same override, so
 /// a user who relocated their Claude config still finds us.
 pub fn ide_dir() -> PathBuf {
+    if let Some(d) = TEST_IDE_DIR.get() {
+        return d.clone();
+    }
     if let Ok(d) = std::env::var("CLAUDE_CONFIG_DIR") {
         if !d.is_empty() {
             return PathBuf::from(d).join("ide");

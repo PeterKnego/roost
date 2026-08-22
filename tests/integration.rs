@@ -1,7 +1,20 @@
 use std::net::TcpListener;
 use std::path::PathBuf;
 
+/// One temp directory, shared by every test in this binary, for any real
+/// ide lock file opening a terminal writes (`ide::for_project` ->
+/// `idelock::ide_dir()`). Set once and idempotently — see
+/// `idelock::set_ide_dir_for_test`'s doc comment for why a directory shared
+/// across tests, not one per test, is the right shape — so `cargo test`
+/// never touches the real `~/.claude/ide` (Task 5 review, finding 2).
+fn isolate_ide_dir_for_tests() {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let d = DIR.get_or_init(|| tempfile::tempdir().unwrap());
+    resh::idelock::set_ide_dir_for_test(d.path().to_path_buf());
+}
+
 fn start(roots: Vec<PathBuf>) -> u16 {
+    isolate_ide_dir_for_tests();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || resh::serve(listener, roots));
@@ -1920,11 +1933,13 @@ fn a_fresh_projects_first_terminal_already_carries_the_ide_port() {
     );
     let _ = term.close(None);
     std::env::remove_var("RESH_CMD");
-    // Best-effort cleanup: this test necessarily writes a real lock file to
-    // the real `~/.claude/ide` (the ide registry has no per-test override —
-    // see this task's report), and nothing else ever closes "sseportproj"'s
-    // project to remove it. `remove_file`, never a directory scan, matching
-    // the same rule `idelock::Lock`'s own `Drop` follows.
+    // Best-effort cleanup: this writes a real lock file into the shared
+    // test ide directory (`isolate_ide_dir_for_tests`), and nothing else
+    // ever closes "sseportproj"'s project to remove it. Not load-bearing —
+    // the whole directory is a `TempDir` that removes itself when this test
+    // binary exits — but tidy, and it matches the same rule
+    // `idelock::Lock`'s own `Drop` follows: `remove_file`, never a
+    // directory scan.
     if let Some(p) = ide_port {
         let _ = std::fs::remove_file(resh::idelock::ide_dir().join(format!("{p}.lock")));
     }
