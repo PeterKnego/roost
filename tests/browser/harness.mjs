@@ -186,12 +186,22 @@ export async function startResh({ repoRoot, stateDir, roots, port, extraEnv = {}
       // low turns a run into a soak test for the keepalive ping, so a browser
       // meets hundreds of them instead of two.
       ...(Deno.env.get("RESH_PING_SECS") ? { RESH_PING_SECS: Deno.env.get("RESH_PING_SECS") } : {}),
-      // A second deliberate hole in clearEnv, for ide.mjs: pointing
-      // CLAUDE_CONFIG_DIR at a scratch directory keeps the real IDE
-      // integration's lock files (~/.claude/ide/*.lock, see idelock.rs) out
-      // of the developer's actual Claude config instead of writing there and
-      // having to sweep it up afterward, the way earlier tasks' manual
-      // real-`claude` checks did.
+      // Every run gets its own Claude config dir, not just ide.mjs's.
+      // `idelock.rs` writes a lock file per open project into
+      // `$CLAUDE_CONFIG_DIR/ide/` (falling back to `~/.claude/ide/`), and a
+      // browser test opens projects under a temp root that is deleted
+      // afterwards — so without this the run leaves lock files behind that
+      // point at directories which no longer exist, in a directory shared
+      // with the developer's real IDEs. Measured after six suites: nine
+      // stale locks, every one a dead pid and a vanished workspace.
+      //
+      // The Rust suite's own isolation (`idelock::set_ide_dir_for_test`)
+      // does not cover this path: these tests run the real binary as a
+      // subprocess, so the only lever is its environment.
+      //
+      // Before `...extraEnv`, so a test that wants a specific directory —
+      // ide.mjs reads the lock file it writes — can still say so.
+      CLAUDE_CONFIG_DIR: `${stateDir}/claude`,
       ...extraEnv,
     },
     stdout: "null", stderr: "null",
