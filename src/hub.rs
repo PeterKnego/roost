@@ -386,6 +386,7 @@ impl Hub {
             Intent::CloseProject => return self.do_close_project(from),
             Intent::EndSession { session } => return self.do_end_session(from, session.clone()),
             Intent::NewTerminal { pane } => return self.do_new_terminal(from, *pane),
+            Intent::OpenPath { text } => return self.do_open_path(from, text.clone()),
             _ => {}
         }
         // CloseTab removes the tab from `self.ws` inside `apply_layout`
@@ -1019,6 +1020,45 @@ impl Hub {
                 self.ws.version += 1;
                 self.broadcast(&Event::TerminalStarted { session: name });
                 self.refresh_live_sessions();
+                let snap = self.snapshot_event(from);
+                self.broadcast(&snap);
+                self.persist();
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let ev = Event::Error { msg: e };
+                self.send_to(from, &ev);
+            }
+        }
+    }
+
+    /// A terminal link resolves *before* anything reaches the layout.
+    ///
+    /// `OpenTab` validates nothing: `apply_layout` pushes the tab straight in
+    /// and the resulting snapshot goes to every connected browser. Since a
+    /// path scraped out of terminal output is a guess, opening optimistically
+    /// would leave a dead tab in everyone's window for one person's false
+    /// positive — so the guess is settled here, and only a real file is
+    /// allowed to become an `OpenTab`.
+    ///
+    /// Building that `OpenTab` rather than reaching into the panes directly is
+    /// what makes a `.png` from a terminal coerce exactly as one clicked in
+    /// the tree does, and what gets tab de-duplication (`find_tab`) for free.
+    fn do_open_path(&mut self, from: &ConnId, text: String) {
+        let rel = match crate::projects::resolve_terminal_path(&self.dir, &text) {
+            Ok(rel) => rel,
+            Err(msg) => {
+                let ev = Event::PathRefused { text, msg };
+                return self.send_to(from, &ev);
+            }
+        };
+        let intent = Intent::OpenTab {
+            pane: crate::proto::MIDDLE,
+            tab: Tab::File { rel, mode: Mode::Preview },
+        };
+        match workspace::apply_layout(&mut self.ws, &intent) {
+            Ok(true) => {
+                self.ws.version += 1;
                 let snap = self.snapshot_event(from);
                 self.broadcast(&snap);
                 self.persist();
@@ -2492,6 +2532,144 @@ mod tests {
         assert!(
             msgs.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("binary file")),
             "switching to Edit on an unreadable file must say why, got {msgs:?}"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    // These four tests reach `apply_layout`'s `Ok(true)` branch (opening or
+    // reusing a tab), which calls `self.persist()`. Every other test in this
+    // file that persists scopes `RESH_STATE_DIR` under `STATE_ENV_LOCK` first
+    // — without it, `wsstate::save` writes to this host's real default state
+    // directory under the project's storage key, which is exactly the kind
+    // of test-run side effect this codebase's own testing culture warns
+    // against. Confirmed by running without the guard: a stray `linktwice`
+    // tab count of 3 (not the expected 2) showed up from a prior run's
+    // leftover persisted file.
+    #[test]
+    fn open_path_opens_the_file_it_names() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", dir.path().join("state"));
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), b"fn main() {}").unwrap();
+        let mut h = Hub::new("linkopen", dir.path().to_path_buf());
+        let (conn, _rx) = h.subscribe();
+
+        let abs = dir.path().join("src/a.rs");
+        h.handle(&conn, Intent::OpenPath { text: format!("{}:42", abs.display()) });
+
+        // The rel, not the count. "a tab opened" passes for the wrong file.
+        let tabs = &h.ws.panes[proto::MIDDLE as usize].tabs;
+        assert!(
+            tabs.iter().any(|t| matches!(t, Tab::File { rel, mode: Mode::Preview } if rel == "src/a.rs")),
+            "expected a Preview tab for src/a.rs, got {tabs:?}"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// Two subscribers, deliberately. With one, `send_to` and `broadcast` are
+    /// indistinguishable and this test would pass with the privacy removed —
+    /// which is on CLAUDE.md's own list of tests that passed for the wrong
+    /// reason.
+    ///
+    /// Revert 1 (Step 5): changing the `Err` arm's `self.send_to(from, &ev)`
+    /// to `self.broadcast(&ev)` failed this test on the second assertion, with
+    /// the actual panic message:
+    /// `a refusal leaked to a second browser: ["{\"t\":\"PathRefused\",
+    ///  \"text\":\"src/gone.rs\",\"msg\":\"not found: No such file or
+    ///  directory (os error 2)\"}"]`
+    #[test]
+    fn open_path_refusal_reaches_only_the_client_that_asked() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", dir.path().join("state"));
+        let mut h = Hub::new("linkrefuse", dir.path().to_path_buf());
+        let (asker, rx_asker) = h.subscribe();
+        let (_other, rx_other) = h.subscribe();
+
+        h.handle(&asker, Intent::OpenPath { text: "src/gone.rs".into() });
+
+        let got: Vec<String> = rx_asker.try_iter().collect();
+        assert!(
+            got.iter().any(|m| m.contains("PathRefused")),
+            "the asking client got no refusal: {got:?}"
+        );
+        let others: Vec<String> = rx_other.try_iter().collect();
+        assert!(
+            !others.iter().any(|m| m.contains("PathRefused")),
+            "a refusal leaked to a second browser: {others:?}"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// Revert 2 (Step 5): moving `apply_layout` above `resolve_terminal_path`
+    /// (using the raw `text` as the rel) failed this test with the actual
+    /// panic:
+    /// `assertion \`left == right\` failed: a refused path still added a tab
+    ///   left: 1
+    ///  right: 0`
+    #[test]
+    fn open_path_refuses_without_touching_the_layout() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", dir.path().join("state"));
+        let mut h = Hub::new("linknotab", dir.path().to_path_buf());
+        let (conn, _rx) = h.subscribe();
+        let before = h.ws.panes[proto::MIDDLE as usize].tabs.len();
+
+        h.handle(&conn, Intent::OpenPath { text: "../../etc/passwd".into() });
+
+        // The whole reason resolution happens before the layout changes: a
+        // dead tab would land in every connected browser's window.
+        assert_eq!(
+            h.ws.panes[proto::MIDDLE as usize].tabs.len(),
+            before,
+            "a refused path still added a tab"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// Clicking the same path twice must not stack tabs.
+    ///
+    /// This is the assertion that proves the handler goes THROUGH
+    /// `apply_layout` rather than pushing a tab itself, and it is deliberately
+    /// not an image-coercion test: `OpenPath` always asks for `Preview`, and
+    /// `coerce_tab` only rewrites `Edit`→`Preview`, so an image assertion here
+    /// would hold identically with `apply_layout` bypassed — passing for the
+    /// wrong reason. De-duplication lives in `find_tab`, which only
+    /// `apply_layout` reaches.
+    ///
+    /// Revert 3 (Step 5): replacing the `apply_layout` call with a direct
+    /// `self.ws.panes[proto::MIDDLE as usize].tabs.push(...)` failed this
+    /// test on the count, exactly as expected — the actual panic:
+    /// `assertion \`left == right\` failed: opening the same path twice
+    ///  stacked tabs: [File { rel: "src/a.rs", mode: Preview }, File { rel:
+    ///  "src/a.rs", mode: Preview }]
+    ///   left: 2
+    ///  right: 1`
+    #[test]
+    fn open_path_reuses_the_tab_it_already_opened() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", dir.path().join("state"));
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), b"x").unwrap();
+        let mut h = Hub::new("linktwice", dir.path().to_path_buf());
+        let (conn, _rx) = h.subscribe();
+
+        h.handle(&conn, Intent::OpenPath { text: "src/a.rs".into() });
+        h.handle(&conn, Intent::OpenPath { text: "src/a.rs:9".into() });
+
+        let pane = &h.ws.panes[proto::MIDDLE as usize];
+        let hits = pane
+            .tabs
+            .iter()
+            .filter(|t| matches!(t, Tab::File { rel, .. } if rel == "src/a.rs"))
+            .count();
+        assert_eq!(hits, 1, "opening the same path twice stacked tabs: {:?}", pane.tabs);
+        assert!(
+            matches!(pane.tabs.get(pane.active), Some(Tab::File { rel, .. }) if rel == "src/a.rs"),
+            "the second open did not activate the existing tab: {pane:?}"
         );
         std::env::remove_var("RESH_STATE_DIR");
     }
