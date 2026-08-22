@@ -424,22 +424,36 @@ neighbouring test first and follow it rather than inventing a second style.
         );
     }
 
+    /// Clicking the same path twice must not stack tabs.
+    ///
+    /// This is the assertion that proves the handler goes THROUGH
+    /// `apply_layout` rather than pushing a tab itself, and it is deliberately
+    /// not an image-coercion test: `OpenPath` always asks for `Preview`, and
+    /// `coerce_tab` only rewrites `Edit`→`Preview`, so an image assertion here
+    /// would hold identically with `apply_layout` bypassed — passing for the
+    /// wrong reason. De-duplication lives in `find_tab`, which only
+    /// `apply_layout` reaches.
     #[test]
-    fn open_path_coerces_an_image_to_preview() {
+    fn open_path_reuses_the_tab_it_already_opened() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("shot.png"), b"\x89PNG\r\n\x1a\n").unwrap();
-        let mut h = Hub::new("linkpng", dir.path().to_path_buf());
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), b"x").unwrap();
+        let mut h = Hub::new("linktwice", dir.path().to_path_buf());
         let (conn, _rx) = h.subscribe();
 
-        h.handle(&conn, Intent::OpenPath { text: "shot.png".into() });
+        h.handle(&conn, Intent::OpenPath { text: "src/a.rs".into() });
+        h.handle(&conn, Intent::OpenPath { text: "src/a.rs:9".into() });
 
-        // Proves it went THROUGH apply_layout/coerce_tab rather than around
-        // it — the reason the handler builds an OpenTab instead of pushing a
-        // tab itself.
-        let tabs = &h.ws.panes[proto::MIDDLE as usize].tabs;
+        let pane = &h.ws.panes[proto::MIDDLE as usize];
+        let hits = pane
+            .tabs
+            .iter()
+            .filter(|t| matches!(t, Tab::File { rel, .. } if rel == "src/a.rs"))
+            .count();
+        assert_eq!(hits, 1, "opening the same path twice stacked tabs: {:?}", pane.tabs);
         assert!(
-            tabs.iter().any(|t| matches!(t, Tab::File { rel, mode: Mode::Preview } if rel == "shot.png")),
-            "expected a coerced Preview tab for shot.png, got {tabs:?}"
+            matches!(pane.tabs.get(pane.active), Some(Tab::File { rel, .. }) if rel == "src/a.rs"),
+            "the second open did not activate the existing tab: {pane:?}"
         );
     }
 ```
@@ -525,8 +539,13 @@ so a green count alone says nothing about lock ordering:
 2. Move the `apply_layout` call above the `resolve_terminal_path` call, using
    the raw `text` as the rel. Expected:
    `open_path_refuses_without_touching_the_layout` fails.
+3. Replace the `apply_layout` call with a direct
+   `self.ws.panes[proto::MIDDLE as usize].tabs.push(...)`. Expected:
+   `open_path_reuses_the_tab_it_already_opened` fails on the count — this is
+   what proves that test discriminates, rather than holding for any handler
+   that opens the right file.
 
-Restore both and record the failure messages in a comment above the tests.
+Restore all three and record the failure messages in a comment above the tests.
 
 - [ ] **Step 6: Commit**
 
@@ -730,7 +749,12 @@ function nudgeLinks() {
   const host = el && el.closest && el.closest(".termhost");
   if (!host) return;
   const r = host.getBoundingClientRect();
-  const cell = Math.max(1, Math.round(r.width / 80));
+  // Derived from the terminal's real column count, never a guessed 80: the
+  // synthetic move has to land in a DIFFERENT cell to invalidate the cache,
+  // and a wrong cell width can leave it in the same one.
+  const entry = terms.get(host.dataset.session);
+  const cols = (entry && entry.term.cols) || 80;
+  const cell = Math.max(1, Math.round(r.width / cols));
   const away = { x: r.left + (lastPointer.x - r.left > cell ? 1 : cell + 1), y: lastPointer.y };
   for (const p of [away, lastPointer]) {
     host.dispatchEvent(
@@ -1099,7 +1123,9 @@ git commit -m "app: settle whether a link survives an app that owns the mouse"
 split → Task 4; arming/disarming → Task 4; the matchers, `:line` consumption
 and the bare-filename exclusion → Task 4; `OpenPath` and server-side resolution
 → Tasks 1–3; optimistic-mark-not-optimistic-open → Task 3's
-`open_path_refuses_without_touching_the_layout`; `PathRefused` over `Error`,
+`open_path_refuses_without_touching_the_layout`; reuse of `apply_layout` (and
+with it `coerce_tab` and `find_tab`) → Task 3's
+`open_path_reuses_the_tab_it_already_opened`; `PathRefused` over `Error`,
 `send_to` over `broadcast` → Tasks 2, 3, 5; OSC 8 and the scheme allowlist →
 Task 6; the open mouse-reporting risk → Task 7. The spec's three open questions
 are answered by their stated defaults, plus the flash naming a dropped line
