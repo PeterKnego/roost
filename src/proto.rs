@@ -68,6 +68,16 @@ pub enum Intent {
     /// attaching creates only when absent — so a client-chosen name would
     /// eventually drop the user into somebody else's old shell.
     NewTerminal { pane: PaneId },
+    /// A span matched in terminal output, sent **verbatim** —
+    /// `~/projects/resh/src/a.rs:42` and all. Deliberately not pre-parsed by
+    /// the client: the parser and the confinement it feeds belong together, in
+    /// Rust, next to `safe_resolve`.
+    ///
+    /// Separate from `OpenTab` because `OpenTab` validates nothing —
+    /// `apply_layout` pushes the tab straight into the layout that is then
+    /// broadcast to every connected browser. A path a regex guessed at cannot
+    /// be allowed down that road.
+    OpenPath { text: String },
     InitGit,
     CloseProject,
     /// Tree visibility for this workspace, overriding the config file's
@@ -129,6 +139,15 @@ pub enum Event {
     TreeChanged,
     StatusChanged,
     Error { msg: String },
+    /// A terminal link that would not resolve.
+    ///
+    /// Distinct from `Error` for two reasons: `Error` funnels to the workspace
+    /// banner, which is the wrong shape for a link that missed and is already
+    /// on the backlog to be redesigned; and it carries no way back to the
+    /// terminal that was clicked (see the `Error` case in app.js, which says
+    /// exactly that). Sent with `send_to` and never broadcast — one person's
+    /// mis-click must not flash every window in the project.
+    PathRefused { text: String, msg: String },
     TerminalStarted { session: String },
     GitInit { ok: bool, msg: String },
     CloseRefused { dirty: Vec<String> },
@@ -256,5 +275,29 @@ mod tests {
         let s = encode(&Event::Notices { list: vec![n] });
         assert!(s.contains(r#""t":"Notices""#));
         assert!(s.contains(r#""list":["#), "got {s}");
+    }
+
+    #[test]
+    fn decodes_open_path_verbatim() {
+        let i = decode(r#"{"t":"OpenPath","text":"~/p/resh/src/a.rs:42"}"#).unwrap();
+        // Verbatim is the contract: the client does no parsing, so the suffix
+        // and the tilde must both survive the wire intact.
+        match i {
+            Intent::OpenPath { text } => assert_eq!(text, "~/p/resh/src/a.rs:42"),
+            other => panic!("decoded to {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encodes_path_refused_with_both_fields() {
+        let s = encode(&Event::PathRefused {
+            text: "src/gone.rs".into(),
+            msg: "cannot read src/gone.rs".into(),
+        });
+        // The client matches on `text` to find the terminal that was clicked,
+        // so dropping it would leave the message with nowhere to go.
+        assert!(s.contains(r#""t":"PathRefused""#), "got {s}");
+        assert!(s.contains(r#""text":"src/gone.rs""#), "got {s}");
+        assert!(s.contains(r#""msg":"cannot read src/gone.rs""#), "got {s}");
     }
 }
