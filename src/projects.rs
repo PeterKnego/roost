@@ -329,6 +329,74 @@ pub fn safe_resolve(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// Turns a span matched in terminal output into a project-relative path.
+///
+/// This is a trust boundary, not a convenience. Terminal text is chosen by
+/// whatever printed it — a cloned repo's build output, a `cat`ed file — so the
+/// matcher in the browser is treated as a hint and every path ends here, at
+/// `safe_resolve`. That one call answers both questions worth asking: is this
+/// inside the project, and is it really there. A missing file is an `Err` on
+/// purpose; there is no third state to invent, and nothing here destroys
+/// anything, so refusing is always the safe answer.
+pub fn resolve_terminal_path(project_dir: &Path, text: &str) -> Result<String, String> {
+    let bare = strip_line_suffix(text.trim());
+    if bare.is_empty() {
+        return Err("empty path".into());
+    }
+
+    let rel = if let Some(rest) = bare.strip_prefix("~/") {
+        let home = std::env::var_os("HOME").ok_or("no home directory")?;
+        abs_to_rel(project_dir, &PathBuf::from(home).join(rest))?
+    } else if bare.starts_with('/') {
+        abs_to_rel(project_dir, Path::new(bare))?
+    } else {
+        bare.trim_start_matches("./").to_string()
+    };
+
+    let abs = safe_resolve(project_dir, &rel)?;
+    // Not `is_dir()`: it answers `false` both for "not a directory" and for
+    // "could not look", and this codebase has shipped that conflation eleven
+    // times. Three outcomes, matched explicitly.
+    match std::fs::metadata(&abs) {
+        Ok(m) if m.is_dir() => Err(format!("{rel} is a directory")),
+        Ok(_) => Ok(rel),
+        Err(e) => Err(format!("cannot read {rel}: {e}")),
+    }
+}
+
+/// `src/main.rs:42` and `src/main.rs:42:7` both name `src/main.rs`. The browser
+/// matcher deliberately swallows the suffix so the whole reference underlines;
+/// this is where it comes back off.
+///
+/// A file whose real name ends in `:42` is therefore unreachable by this route.
+/// That trade is not close: a colon in a filename is rare, a compiler citation
+/// is most of what a terminal prints, and the file is still reachable from the
+/// tree.
+fn strip_line_suffix(text: &str) -> &str {
+    let mut s = text;
+    for _ in 0..2 {
+        let Some((head, tail)) = s.rsplit_once(':') else { break };
+        if tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
+        s = head;
+    }
+    s
+}
+
+/// An absolute path is only this project's to open if it is under this
+/// project. Both sides are canonicalised before comparing, so a symlinked
+/// project root still matches its own files rather than refusing them.
+fn abs_to_rel(project_dir: &Path, abs: &Path) -> Result<String, String> {
+    let root = project_dir
+        .canonicalize()
+        .map_err(|e| format!("project root unreadable: {e}"))?;
+    let abs = abs.canonicalize().map_err(|_| "no such file".to_string())?;
+    abs.strip_prefix(&root)
+        .map_err(|_| "path is outside this project".to_string())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Confine a path whose *target does not exist yet* (creation, rename
 /// destination). `safe_resolve` canonicalizes the target and so cannot be
 /// used here. Canonicalize the parent instead, confine that, then validate
@@ -567,6 +635,106 @@ mod tests {
         assert!(safe_resolve(&alpha, "../beta").is_err());
         assert!(safe_resolve(&alpha, "/etc/passwd").is_err());
         assert!(safe_resolve(&alpha, "missing.txt").is_err());
+    }
+
+    // Revert-the-fix check (CLAUDE.md: "the technique that actually works"),
+    // applied for real against this working tree, one change at a time, then
+    // restored. Exact panic output observed for each:
+    //
+    // 1. `abs.strip_prefix(&root)` arm in `abs_to_rel` replaced with
+    //    `Ok(abs.to_string_lossy().into_owned())` (confinement check removed).
+    //    Two tests failed, not one — `safe_resolve`'s own outside-project
+    //    check still fired (the absolute path, once let through unconfined,
+    //    still failed `canon.starts_with(&base)` downstream), but with a
+    //    different message than this test asserts on, and the absolute-path
+    //    case in the other test now returned the *un*confined absolute string:
+    //      terminal_path_refuses_a_real_file_outside_the_project:
+    //        panicked at src/projects.rs:699:9:
+    //        expected a confinement refusal naming the reason, got "path outside project: /tmp/.tmp0xSRIq/secret.txt"
+    //      terminal_path_resolves_relative_absolute_and_tilde:
+    //        panicked at src/projects.rs:670:9:
+    //        assertion `left == right` failed
+    //          left: "/tmp/.tmpRc9oVQ/src/a.rs"
+    //         right: "src/a.rs"
+    // 2. `Ok(m) if m.is_dir()` arm deleted from `resolve_terminal_path`'s match.
+    //      terminal_path_refuses_a_directory:
+    //        panicked at src/projects.rs:713:61:
+    //        called `Result::unwrap_err()` on an `Ok` value: "src"
+    // 3. `strip_line_suffix` changed to `fn strip_line_suffix(text: &str) -> &str { text }`.
+    //    Failed one step earlier than expected: the untouched suffix made
+    //    `safe_resolve` look up a file named `src/a.rs:42`, which does not
+    //    exist, so the panic is `safe_resolve`'s "not found", not an
+    //    equality mismatch on the returned path:
+    //      terminal_path_strips_line_and_column:
+    //        panicked at src/projects.rs:675:70:
+    //        called `Result::unwrap()` on an `Err` value: "not found: No such file or directory (os error 2)"
+    // All three restored; full `terminal_path` suite passes again (5/5).
+
+    #[test]
+    fn terminal_path_resolves_relative_absolute_and_tilde() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/a.rs"), b"fn main() {}").unwrap();
+
+        assert_eq!(resolve_terminal_path(root.path(), "src/a.rs").unwrap(), "src/a.rs");
+        assert_eq!(resolve_terminal_path(root.path(), "./src/a.rs").unwrap(), "src/a.rs");
+
+        let abs = root.path().join("src/a.rs");
+        assert_eq!(
+            resolve_terminal_path(root.path(), abs.to_str().unwrap()).unwrap(),
+            "src/a.rs"
+        );
+    }
+
+    #[test]
+    fn terminal_path_strips_line_and_column() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/a.rs"), b"x").unwrap();
+
+        assert_eq!(resolve_terminal_path(root.path(), "src/a.rs:42").unwrap(), "src/a.rs");
+        assert_eq!(resolve_terminal_path(root.path(), "src/a.rs:42:7").unwrap(), "src/a.rs");
+    }
+
+    /// The escape target is a REAL file outside the project. Without it this
+    /// test would fail with "no such file" before confinement was consulted
+    /// at all — green, and proving nothing. CLAUDE.md lists that exact
+    /// failure as the reason a symlink escape once survived review.
+    #[test]
+    fn terminal_path_refuses_a_real_file_outside_the_project() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = parent.path().join("secret.txt");
+        std::fs::write(&outside, b"real file, really there").unwrap();
+
+        let err = resolve_terminal_path(&root, outside.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.contains("outside this project"),
+            "expected a confinement refusal naming the reason, got {err:?}"
+        );
+
+        let err = resolve_terminal_path(&root, "../secret.txt").unwrap_err();
+        assert!(!err.is_empty(), "a ../ escape must refuse");
+    }
+
+    #[test]
+    fn terminal_path_refuses_a_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+
+        let err = resolve_terminal_path(root.path(), "src").unwrap_err();
+        assert!(
+            err.contains("directory"),
+            "expected the refusal to say it is a directory, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_path_refuses_a_file_that_is_not_there() {
+        let root = tempfile::tempdir().unwrap();
+        let err = resolve_terminal_path(root.path(), "src/gone.rs").unwrap_err();
+        assert!(!err.is_empty(), "a missing file must refuse, not resolve");
     }
 
     #[test]
