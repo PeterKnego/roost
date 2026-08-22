@@ -1154,7 +1154,26 @@ impl Hub {
                 return self.send_to(from, &ev);
             }
         };
-        let lines = line_start.zip(line_end);
+        // A half-specified range (one bound present, the other absent) is
+        // refused rather than guessed at. `Option::zip` — the previous
+        // shape of this line — silently turned it into `None`, i.e. a
+        // whole-file mention: a different answer than what was asked for,
+        // not the one asked for with a gap filled in. Defaulting the
+        // missing bound to the one given would be just as much a guess in
+        // the other direction. Both are the same "I could not determine X"
+        // folded into a definite answer that CLAUDE.md's absence-of-evidence
+        // rule exists to prevent — this is a wire-protocol input, not
+        // internal state, but the principle is the same one.
+        let lines = match (line_start, line_end) {
+            (Some(a), Some(b)) => Some((a, b)),
+            (None, None) => None,
+            _ => {
+                let ev = Event::Error {
+                    msg: "mention: line_start and line_end must both be set or both be absent".into(),
+                };
+                return self.send_to(from, &ev);
+            }
+        };
         if let Err(e) = crate::ide::mention(&self.project, &abs, lines) {
             let ev = Event::Error { msg: e };
             self.send_to(from, &ev);
@@ -2851,6 +2870,39 @@ mod tests {
         assert!(got.iter().any(|m| m.contains("no Claude")), "the asking client got no refusal: {got:?}");
         let others: Vec<String> = rx_other.try_iter().collect();
         assert!(others.is_empty(), "a refusal must leave the other subscriber's inbox empty, got: {others:?}");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// A half-specified line range must be refused by name, not silently
+    /// turned into a whole-file mention (the old `Option::zip` behavior) or
+    /// a guessed single line. The refusal message is checked specifically —
+    /// not just `contains("Error")` — because "no Claude is connected"
+    /// (from `ide::mention`, reached only if this check is skipped) would
+    /// also satisfy a looser assertion, and this test exists to prove the
+    /// rejection happens *before* `ide::mention`, on this exact input shape.
+    ///
+    /// Revert-checked: reverting the match arm back to
+    /// `let lines = line_start.zip(line_end);` failed this test — the
+    /// asker's inbox held only `{"t":"Error","msg":"no Claude is connected
+    /// to this project"}` (from `ide::mention`, since `zip` silently turned
+    /// the half-specified range into `None`), so `got.iter().any(|m|
+    /// m.contains("line_start") ...)` was false — then restored.
+    #[test]
+    fn mention_path_with_a_half_specified_line_range_is_refused_not_guessed() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", dir.path().join("state"));
+        std::fs::write(dir.path().join("a.rs"), b"fn main() {}").unwrap();
+        let mut h = Hub::new("mentionhalfrange", dir.path().to_path_buf());
+        let (asker, rx) = h.subscribe();
+
+        h.handle(&asker, Intent::MentionPath { rel: "a.rs".into(), line_start: Some(5), line_end: None });
+
+        let got: Vec<String> = rx.try_iter().collect();
+        assert!(
+            got.iter().any(|m| m.contains("line_start") && m.contains("line_end")),
+            "a half-specified range must be refused by name, not silently degraded: {got:?}"
+        );
         std::env::remove_var("RESH_STATE_DIR");
     }
 

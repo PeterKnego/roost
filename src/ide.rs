@@ -416,6 +416,32 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
     // is load-bearing, not cosmetic).
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+    // Constructed before `accept_hdr_with_config` is even called, not after
+    // it returns: both fields it needs (`project`, `conn_id`) already exist
+    // by this point, and the callback below can register this connection
+    // and then have tungstenite panic somewhere *inside* the handshake
+    // machinery afterward — a case the previous version of this function
+    // missed, since its guard did not exist yet when that could happen.
+    // Building the guard this early means its `Drop` runs on every exit
+    // from here on, panic included, so a registration can never outlive
+    // this function without a guard in scope to remove it — the same
+    // reasoning `wsconn.rs:145` gives for creating its own `UnsubGuard`
+    // before, not after, the call whose failure it needs to survive.
+    //
+    // Revert-checked by hand, not with a permanent test (there is no clean
+    // way to make tungstenite itself panic mid-handshake from a test): with
+    // this declaration moved back to just before `let Ok(mut ws) =
+    // accepted...` (its original position) and a `panic!()` temporarily
+    // injected into the callback right after the `map.entry(...).push(...)`
+    // line below, a fake client's connect attempt drove the callback to
+    // register and then panic; the panic unwound through `serve_conn` with
+    // no `guard` yet in scope, and a follow-up `mention(project, ...)`
+    // returned `Ok(())` — a leaked, undeliverable target. Moving this
+    // declaration back to here (unchanged) with the same injected panic
+    // still in place made the same `mention` call correctly return
+    // `Err("no Claude is connected to this project")`. Both the panic and
+    // the temporary test used to observe this were removed afterward.
+    let guard = ConnGuard { project: project.to_string(), id: conn_id };
     let reg_tx = reply_tx.clone();
     let reg_project = project.to_string();
     let accepted = accept_hdr_with_config(
@@ -465,41 +491,82 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
         },
         Some(config),
     );
-    // Built right after the handshake attempt, before checking whether it
-    // actually succeeded: the callback above can register this connection
-    // and then have the handshake still fail as a whole (e.g. a write error
-    // flushing the response tungstenite already decided to send) — an
-    // "accepted, but then failed anyway" outcome that would otherwise leave
-    // a registration nothing ever cleans up. Constructing the guard
-    // unconditionally, before the `Ok`/`Err` branch, means its `Drop` always
-    // runs on every exit from here on, including that one; for a handshake
-    // that was denied before ever reaching the registration line (a bad
-    // token, an Origin), removing an id that was never inserted is a no-op.
-    let guard = ConnGuard { project: project.to_string(), id: conn_id };
     let Ok(mut ws) = accepted else { return };
+
+    // Everything from here on runs on this one thread through this one
+    // `WebSocket`, and that is deliberate, not merely the simplest option.
+    // The first cut of this function split read and write into a read half
+    // and a writer thread owning a second `WebSocket` built from a
+    // `try_clone`d file descriptor of the same socket — the shape
+    // `wsconn.rs` and `term.rs` already use. Review caught that this socket
+    // cannot tolerate it: tungstenite auto-replies to a Ping by queuing a
+    // Pong and writing+flushing it on the *next* call to `read`/`write`/
+    // `flush` on whichever `WebSocketContext` is asked (see tungstenite
+    // 0.24's `protocol/mod.rs::read`, which calls `self.flush(stream)`
+    // whenever `additional_send`/`unflushed_additional` is set) — so a Ping
+    // arriving while the writer thread was mid-write on an `at_mentioned`
+    // would have the read half's Pong reply interleave, frame-for-frame,
+    // with it, corrupting the JSON-RPC stream Claude is parsing. There is no
+    // config flag in this tungstenite version to suppress that auto-reply or
+    // redirect it elsewhere (`WebSocketConfig` has no such field, and
+    // `read`'s auto-reply is unconditional whenever a Ping/Close was
+    // queued) — the only way to guarantee no two writers ever touch this
+    // fd is to have only one. `wsconn.rs` and `term.rs` carry the identical
+    // two-descriptor shape; see this task's report for why they are left
+    // alone here rather than folded into this fix.
+    //
+    // A short read timeout is what lets one thread still deliver an
+    // out-of-band `at_mentioned` (queued on `reply_rx` from some other
+    // connection's hub thread, via `mention`) without a second writer: this
+    // loop wakes on the timeout even when the CLI sends nothing, drains the
+    // channel, and writes from the one object that owns the fd — bounding
+    // an out-of-band notification's latency to at most one `POLL` interval
+    // instead of "whenever the CLI next happens to send a frame."
+    const POLL: std::time::Duration = std::time::Duration::from_millis(200);
+    if ws.get_ref().set_read_timeout(Some(POLL)).is_err() {
+        // Degrades rather than fails the connection outright, matching the
+        // rest of this module's "IDE integration is a convenience" stance:
+        // a `mention` for this connection now waits for the CLI's own next
+        // frame (a periodic `ping` at minimum) instead of at most `POLL`.
+        eprintln!("resh: could not set a read timeout on an ide connection; mentions to it may be delayed");
+    }
+
     let mut conn = Conn::new(project, workspace.to_path_buf(), reply_tx.clone());
     // Only conn's and the registry's own clones should keep the channel
     // open from here — this one has done its job.
     drop(reply_tx);
 
-    // Splits read and write the way wsconn.rs and term.rs do: a writer
-    // thread owns `ws_write` exclusively and drains `reply_rx`, so every
-    // outbound message — a direct reply *and* an out-of-band `at_mentioned`
-    // pushed by `mention` from another thread — goes through one writer,
-    // never two threads racing to write the same socket.
-    let Ok(write_half) = ws.get_ref().try_clone() else { return };
-    let mut ws_write: tungstenite::WebSocket<TcpStream> =
-        tungstenite::WebSocket::from_raw_socket(write_half, tungstenite::protocol::Role::Server, None);
-    let writer = std::thread::spawn(move || {
-        while let Ok(msg) = reply_rx.recv() {
-            if ws_write.send(tungstenite::Message::Text(msg)).is_err() {
-                break;
+    loop {
+        // Drains anything queued for this connection from another thread —
+        // in practice, only `mention`. A direct request/response reply is
+        // written synchronously below instead, in the same call that
+        // produced it (dispatch runs on this thread already, so there is no
+        // reason to round-trip it through the channel). Either way, this
+        // loop is the only place `ws.send`/`ws.read` is ever called for
+        // this connection, so there is never a second writer to interleave
+        // with — see the comment above for why that has to be true here.
+        while let Ok(msg) = reply_rx.try_recv() {
+            if ws.send(tungstenite::Message::Text(msg)).is_err() {
+                drop(conn);
+                drop(guard);
+                return;
             }
         }
-    });
-
-    loop {
-        let Ok(msg) = ws.read() else { break };
+        let msg = match ws.read() {
+            Ok(m) => m,
+            // The `POLL` timeout expiring with nothing to read: loop back
+            // around to drain `reply_rx` again rather than treating this as
+            // a dead connection. Both `WouldBlock` and `TimedOut` are
+            // checked because which one a timed-out read surfaces as is
+            // platform-dependent (see `TcpStream::set_read_timeout`'s docs).
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        };
         let text = match msg {
             tungstenite::Message::Text(t) => t,
             tungstenite::Message::Close(_) => break,
@@ -507,7 +574,7 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
         };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
         if let Some(reply) = dispatch(&v, &mut conn) {
-            if conn.reply.send(reply.to_string()).is_err() {
+            if ws.send(tungstenite::Message::Text(reply.to_string())).is_err() {
                 break;
             }
         }
@@ -516,14 +583,10 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
         }
     }
 
-    // Drop `conn` (its own reply clone) and the guard (deregisters, and
-    // drops its clone too) before joining: `reply_rx.recv()` above only
-    // returns once every `Sender` clone for this connection is gone, and
-    // joining first would deadlock waiting for a thread that is itself
-    // waiting on us — the same ordering `wsconn.rs`'s `handle` uses.
+    // No writer thread to join any more — this thread was the only writer
+    // throughout, which is the whole point of the restructuring above.
     drop(conn);
     drop(guard);
-    let _ = writer.join();
 }
 
 #[cfg(test)]
@@ -915,9 +978,19 @@ mod tests {
     }
 
     /// Connects a client the way the CLI does and returns (frames it
-    /// receives, the live Ide). Holding the returned `Arc<Ide>` matters: it
-    /// owns the lock file, and dropping it unregisters the project.
-    fn connected_fake_client_for(project: &str) -> (std::sync::mpsc::Receiver<String>, Arc<Ide>, tempfile::TempDir) {
+    /// receives, the live Ide, the lock dir, the workspace dir). Holding the
+    /// returned `Arc<Ide>` matters: it owns the lock file, and dropping it
+    /// unregisters the project.
+    ///
+    /// Both temp dirs are returned, not just the lock dir: the workspace one
+    /// (`ws` below) used to be dropped — and so deleted — before this
+    /// function even returned, since it was never in the returned tuple.
+    /// Harmless for Task 6 (nothing here reads the workspace directory back),
+    /// but Task 7's `openDiff` fixtures write into it and need it to still
+    /// exist for the life of the test.
+    fn connected_fake_client_for(
+        project: &str,
+    ) -> (std::sync::mpsc::Receiver<String>, Arc<Ide>, tempfile::TempDir, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
         let ide = for_project_in(dir.path(), project, ws.path().to_path_buf()).unwrap();
@@ -961,7 +1034,7 @@ mod tests {
             }
         });
         senders().lock().unwrap().insert(project.to_string(), send_tx);
-        (rx, ide, dir)
+        (rx, ide, dir, ws)
     }
 
     /// Revert-checked: adding `"id": 1` to `mention`'s constructed message
@@ -971,7 +1044,7 @@ mod tests {
     /// reply it never gets"`. Then restored.
     #[test]
     fn a_mention_is_the_notification_the_cli_expects() {
-        let (rx, ide, _d) = connected_fake_client_for("mention-shape");
+        let (rx, ide, _d, _ws) = connected_fake_client_for("mention-shape");
         mention("mention-shape", Path::new("/w/src/hub.rs"), Some((12, 40))).unwrap();
         let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
         assert_eq!(v["method"], "at_mentioned");
@@ -989,7 +1062,7 @@ mod tests {
     /// carrying a bogus line range the CLI would render as a real selection.
     #[test]
     fn a_whole_file_mention_carries_no_line_numbers() {
-        let (rx, _ide, _d) = connected_fake_client_for("mention-wholefile");
+        let (rx, _ide, _d, _ws) = connected_fake_client_for("mention-wholefile");
         mention("mention-wholefile", Path::new("/w/README.md"), None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
         assert!(v["params"].get("lineStart").is_none());
@@ -1026,8 +1099,8 @@ mod tests {
         // Two terminals, two claudes, one project. Sending to only the first
         // is indistinguishable from sending to all with a single subscriber —
         // which is exactly the trap CLAUDE.md records.
-        let (rx1, _a, _d1) = connected_fake_client_for("mention-fanout");
-        let (rx2, _b, _d2) = connected_fake_client_for("mention-fanout");
+        let (rx1, _a, _d1, _w1) = connected_fake_client_for("mention-fanout");
+        let (rx2, _b, _d2, _w2) = connected_fake_client_for("mention-fanout");
         mention("mention-fanout", Path::new("/w/x.rs"), None).unwrap();
         assert!(rx1.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
         assert!(rx2.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
@@ -1060,4 +1133,5 @@ mod tests {
         let err = mention(project, Path::new("/w/x.rs"), None).unwrap_err();
         assert!(err.contains("no Claude"), "the registry entry must be gone once the guard drops: {err}");
     }
+
 }
