@@ -181,12 +181,13 @@ That is the whole client-side contract. The handler:
 Marking is optimistic: a path is underlined without first proving it resolves.
 Opening is not, and the asymmetry is deliberate. A wrong underline costs the
 person who pressed the modifier one click. A wrong tab costs **everyone** —
-`Intent::OpenTab` does not validate the rel at all. `workspace::apply_layout`
-pushes the tab straight into the shared layout, and the only thing that ever
-looks at the path is the fragment fetch afterwards, which is far too late to
-refuse. The layout is then broadcast to every connected browser. Firing `OpenTab`
-optimistically on a false positive would open a dead tab in every window in the
-project, which each of those people then has to close.
+`Intent::OpenTab` never confines the rel it is handed. `workspace::apply_layout`
+pushes the tab into the shared layout first, and only afterwards does the hub
+call `open_buffer_for`, whose read of a nonexistent or out-of-project path
+simply fails. By then the tab is in the layout and the snapshot has been
+broadcast. Firing `OpenTab` optimistically on a false positive would leave a
+dead tab in every window in the project, which each of those people then has to
+close.
 
 So: optimistic about the mark, never about the tab.
 

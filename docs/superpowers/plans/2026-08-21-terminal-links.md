@@ -25,8 +25,8 @@ tests.
 ## Where to run this
 
 **Implement in the primary checkout `/home/claude/projects/resh`, not in a
-worktree.** The spec was written in `.claude/worktrees/terminal-links`, which is
-safe for markdown and unsafe for cargo: this host points every workspace at one
+worktree.** The spec was written in a worktree, which is safe for markdown and
+unsafe for cargo: this host points every workspace at one
 shared `target-dir`, and `build.rs` bakes *absolute* asset paths into its
 generated table. A `cargo build` from a second checkout rewrites that table with
 the other checkout's paths and leaves the shared binary built from the other
