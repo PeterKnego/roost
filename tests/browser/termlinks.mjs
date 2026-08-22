@@ -220,7 +220,14 @@
 //!      wedges the renderer, so Input.dispatchMouseEvent never returned.
 //!      Both are fixed here — confirm() is stubbed in the initial block, and
 //!      the assertions that carry this revert are the click's, not the
-//!      count's. Three then failed:
+//!      count's. The harness now also rejects any CDP command that goes
+//!      unanswered for 30s, so the *next* file to find a way to wedge the
+//!      renderer fails legibly instead of hanging; re-running this revert
+//!      with the confirm() stub removed proves it, ending in 43s with
+//!        error: Uncaught (in promise) Error: CDP command
+//!        Input.dispatchMouseEvent (id 128) got no reply in 30s
+//!      rather than the >10-minute hang that had to be killed by hand.
+//!      With the stub in place, three failed:
 //!        FAIL  CONTROL: clicking a plain https OSC 8 link actually reached
 //!        window.open
 //!        FAIL  window.open was asked for the URL the application declared
@@ -344,7 +351,8 @@ async function typeInTerm(page, cmd) {
 
 // How many links xterm's own OscLinkProvider (plus resh's two) offer over
 // the row holding `needle` — see the __oscLinksAt comment above for why this
-// has to reach past entry.linkProviders to ask.
+// has to reach past entry.linkProviders to ask. -1 means it could not look
+// at all; callers must not read that as zero.
 async function linksAt(page, needle) {
   return await page.evalIn(`__oscLinksAt(${JSON.stringify(needle)})`);
 }
@@ -400,7 +408,14 @@ try {
     // failing. Recording the call and returning false turns that hang into
     // an assertion — "resh's handler ran, not xterm's fallback" — which is
     // the one thing in this section that actually discriminates linkHandler.
-    // (It also stops app.js's own delete/close confirms from wedging a run.)
+    //
+    // Note for anyone extending this file: the stub is file-wide and always
+    // answers false, so app.js's own confirms — deleting a file, closing a
+    // dirty buffer, ending a session — are silently *declined* in every
+    // section, including ones added after this one. That stops them wedging
+    // a run, but it also means an assertion like "the tab was closed" would
+    // be measuring the stub, not the feature. Read window.__confirms, or
+    // override the stub for the duration of such a section.
     window.__confirms = [];
     window.confirm = (...args) => { window.__confirms.push(args); return false; };
     window.__t = () => [...terms.values()][0];
@@ -472,10 +487,19 @@ try {
     // instead). No precedence merge is needed here the way __resolve needs
     // one for D: PATH_RE and URL_RE do not match plain link text like
     // "click me" or "bad", so there is nothing for them to contest.
+    //
+    // Returns -1, never 0, when it could not look: a missing row, or a
+    // private xterm field this reaches past its API to read and which an
+    // upgrade may rename. Folding that into "no links" is the conflation
+    // CLAUDE.md opens with, and it bites asymmetrically here: a count of 1
+    // fails safely, but a count of 0 ("never even offered the non-http
+    // destination") would go green precisely when the probe had stopped
+    // working. A sentinel the assertions cannot mistake for an answer is
+    // the third outcome that rule asks for.
     window.__oscLinksAt = (needle) => new Promise((res) => {
       const y = __rowY(needle);
-      const ps = (__t().term._core?._linkProviderService || {}).linkProviders || [];
-      if (y < 0 || !ps.length) return res(0);
+      const ps = (__t().term._core?._linkProviderService || {}).linkProviders;
+      if (y < 0 || !Array.isArray(ps) || !ps.length) return res(-1);
       let n = 0, count = 0;
       ps.forEach((p) => p.provideLinks(y, (ls) => {
         count += (ls || []).length;
@@ -903,8 +927,9 @@ try {
   // (mdlinks.mjs note 6 was the first) — passing on a refusal made two
   // layers away from the guard it claims to cover. Deleting SAFE_URL from
   // openUrl leaves both green.
-  ok(await linksAt(page, "bad") === 0,
-     "xterm's own provider never even offered the non-http destination");
+  const badLinks = await linksAt(page, "bad");
+  ok(badLinks === 0,
+     `xterm's own provider never even offered the non-http destination (got ${badLinks}${badLinks === -1 ? ": could not look, NOT zero" : ""})`);
 
   // So the scheme allowlist gets its own, reachable, test. openUrl is what
   // every other link route in this file ends at — the matchers' clicks, the
