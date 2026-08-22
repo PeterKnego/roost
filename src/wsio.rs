@@ -102,7 +102,6 @@ impl Write for GatedStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read as _;
     use std::net::TcpListener;
 
     /// A connected pair, so the assertions are about real socket bytes
