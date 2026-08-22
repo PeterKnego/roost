@@ -28,8 +28,10 @@ use tungstenite::handshake::server::{Request as WsRequest, Response as WsRespons
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::accept_hdr_with_config;
 
-/// An `openDiff` carries a whole file, capped elsewhere at 2 MB; this is the
-/// coarse backstop against an oversized frame being buffered at all.
+/// An `openDiff` carries a whole file. Both of its sides are capped at
+/// `projects::MAX_FILE_BYTES` (2 MB) by `open_diff` itself; this is only the
+/// coarse backstop against an oversized frame being buffered at all, and is
+/// deliberately looser than the real limit rather than a second copy of it.
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct Ide {
@@ -637,8 +639,31 @@ fn open_diff(
     conn: &Conn,
 ) -> Option<serde_json::Value> {
     let path = args["old_file_path"].as_str().unwrap_or("");
-    let new_text = args["new_file_contents"].as_str().unwrap_or("").to_string();
+    let new_raw = args["new_file_contents"].as_str().unwrap_or("");
     let tab_name = args["tab_name"].as_str().unwrap_or("proposal").to_string();
+
+    // The two sides of one proposal get the same ceiling. The *old* side comes
+    // through `projects::read_text_file`, which refuses anything over
+    // `MAX_FILE_BYTES`; without this check the side Claude sends was bounded
+    // only by `MAX_FRAME_BYTES`, four times larger. That gap is not academic:
+    // `Hub::proposals` retains both sides for the life of the tab, and
+    // `Event::Proposal` broadcasts a full copy to every connected browser, so
+    // an 8 MB `new_file_contents` is 8 MB held plus 8 MB per browser — for a
+    // file resh would have refused to *read* at a quarter of the size.
+    // Checked before the path work below so an oversized frame costs no
+    // filesystem calls, and before the `to_string` that would copy it again.
+    if new_raw.len() as u64 > crate::projects::MAX_FILE_BYTES {
+        return Some(err(
+            id,
+            -32602,
+            format!(
+                "new_file_contents is {} bytes, over the {} byte limit",
+                new_raw.len(),
+                crate::projects::MAX_FILE_BYTES
+            ),
+        ));
+    }
+    let new_text = new_raw.to_string();
 
     // Confined against the project, never against `conn.cwd`. The cwd is the
     // directory Claude is *in*, which may be a subdirectory of the project (or
@@ -1757,6 +1782,76 @@ mod tests {
                 .unwrap();
         assert!(v["error"].is_object(), "expected a refusal, got {v}");
         assert!(pending_id_for_tab(proj, "p1").is_none(), "and nothing may be parked");
+    }
+
+    #[test]
+    // The *old* side of a proposal goes through `projects::read_text_file` and
+    // is refused over `MAX_FILE_BYTES`; the new side used to be bounded only by
+    // `MAX_FRAME_BYTES`, 4x larger — and both sides are retained by
+    // `Hub::proposals` for the tab's life and broadcast whole to every browser.
+    //
+    // The at-the-limit control is what makes this discriminating: without it,
+    // a refusal for *any* reason (a bad path, an unwritable fixture, the frame
+    // cap) would pass the first half. Same project, same file, same code path,
+    // one byte apart — so the only thing that can distinguish them is the cap.
+    //
+    // Revert-checked: deleting the `new_raw.len()` guard from `open_diff`
+    // failed this test — `no answer to the oversized openDiff: Timeout`, after
+    // genuinely waiting out the full 10s `recv_timeout` rather than passing
+    // vacuously. The failure lands there rather than on the `is_object`
+    // assertion because without the guard the oversized request is *parked*,
+    // and a parked request answers nothing at all. Then restored.
+    fn an_oversized_new_file_contents_is_refused_and_names_the_limit() {
+        let proj = "diff-big";
+        let (rx, _ide, _d, ws) = connected_fake_client_for(proj);
+        let f = ws.path().join("a.rs");
+        std::fs::write(&f, "original").unwrap();
+        let path = f.to_str().unwrap().to_string();
+
+        let too_big = "x".repeat(crate::projects::MAX_FILE_BYTES as usize + 1);
+        send_from_claude(
+            proj,
+            &rpc(
+                4242,
+                "tools/call",
+                serde_json::json!({
+                    "name": "openDiff",
+                    "arguments": {
+                        "old_file_path": path, "new_file_path": path,
+                        "new_file_contents": too_big, "tab_name": "oversized",
+                    }
+                }),
+            ),
+        );
+        let v = loop {
+            let v: serde_json::Value = serde_json::from_str(
+                &rx.recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("no answer to the oversized openDiff"),
+            )
+            .unwrap();
+            if v["id"] == 4242 {
+                break v;
+            }
+        };
+        assert!(v["error"].is_object(), "oversized new_file_contents must be refused, got {v}");
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains(&crate::projects::MAX_FILE_BYTES.to_string()),
+            "the refusal must name the limit so Claude can act on it, got {msg:?}"
+        );
+        assert!(
+            pending_id_for_tab(proj, "oversized").is_none(),
+            "a refused proposal must not also be parked"
+        );
+
+        // Exactly at the limit — one byte less than the refusal above, and
+        // otherwise identical in every respect: this one parks normally.
+        let at_limit = "y".repeat(crate::projects::MAX_FILE_BYTES as usize);
+        let pending = open_diff_from_claude(proj, &path, &at_limit, "at-limit");
+        assert!(
+            answer(proj, &pending, Answer::Rejected).is_ok(),
+            "a proposal exactly at the limit is a normal proposal"
+        );
     }
 
     #[test]
