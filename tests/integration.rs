@@ -820,6 +820,98 @@ fn ws_rejects_foreign_and_missing_origin() {
 /// Revert-checked: deleting the `Ok(Message::Ping(p))` arm in `term.rs` makes
 /// this fail on the 5s read timeout with "no Pong came back"; deleting the
 /// same arm in `wsconn.rs` fails its sibling below the same way.
+/// The discriminating test for the fix itself, as opposed to for the gate
+/// type or for pings still working.
+///
+/// Before this fix, the reader answered a `Ping` itself, from its own
+/// `WebSocket` over a second descriptor — that reply is what could splice
+/// into a frame the writer thread was part-way through. The fix mutes the
+/// reader and forwards the reply through the one writer. If the muting is
+/// removed but the forwarding kept, *both* halves answer and the peer gets
+/// **two** Pongs for one Ping — which is exactly the observable signature of
+/// two writers on this socket.
+///
+/// So: exactly one Pong means exactly one writer.
+///
+/// Revert-checked: deleting `gate.close()` from `wsconn.rs` fails this with
+/// "2 Pongs came back for one Ping", and the sibling tests all stay green —
+/// they cannot see the difference.
+#[test]
+fn one_ping_gets_exactly_one_pong_because_only_one_half_can_write() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("RESH_CMD", "cat");
+    let (_d, port) = fixture();
+    let mut ws = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    ws.send(tungstenite::Message::Ping(b"once".to_vec().into())).unwrap();
+
+    // Read for a fixed window rather than stopping at the first Pong: the
+    // whole point is to catch a *second* one, so stopping early would make
+    // this pass against the very bug it exists for.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    let mut pongs = 0usize;
+    if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+        s.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+    }
+    while std::time::Instant::now() < deadline {
+        match ws.read() {
+            Ok(tungstenite::Message::Pong(p)) => {
+                assert_eq!(p.to_vec(), b"once".to_vec(), "a Pong must echo the Ping's payload");
+                pongs += 1;
+            }
+            Ok(_) => continue,
+            // The read timeout expiring is the loop's clock, not a failure.
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        pongs, 1,
+        "{pongs} Pongs came back for one Ping — more than one means both the \
+         reader and the writer answered, which is the two-writer bug itself"
+    );
+}
+
+/// The terminal socket's half of the test above — `term.rs` has its own
+/// `gate.close()`, and a test that only covered `wsconn.rs` would leave the
+/// socket that matters more (its writer is pumping PTY output continuously,
+/// so it is nearly always mid-frame) unguarded.
+///
+/// Revert-checked: deleting `gate.close()` from `term.rs` fails this with
+/// "2 Pongs came back for one Ping".
+#[test]
+fn one_ping_to_a_terminal_gets_exactly_one_pong() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("RESH_CMD", "cat");
+    let (_d, port) = fixture();
+    let mut ws = ws_connect(port, Some("http://127.0.0.1:8444")).unwrap();
+    ws.send(tungstenite::Message::Ping(b"once".to_vec().into())).unwrap();
+    if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+        s.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    let mut pongs = 0usize;
+    while std::time::Instant::now() < deadline {
+        match ws.read() {
+            Ok(tungstenite::Message::Pong(p)) => {
+                assert_eq!(p.to_vec(), b"once".to_vec(), "a Pong must echo the Ping's payload");
+                pongs += 1;
+            }
+            Ok(_) => continue,
+            Err(tungstenite::Error::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        pongs, 1,
+        "{pongs} Pongs came back for one Ping — more than one means both the \
+         reader and the writer answered, which is the two-writer bug itself"
+    );
+}
+
 #[test]
 fn a_terminal_socket_still_answers_a_ping_after_the_reader_stops_writing() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

@@ -100,9 +100,19 @@ without racing:
   instead of discarding, drive a `Ping` and a `Close` through the read loop, and
   assert nothing was written by that object — that fails against today's code,
   which writes the pong there.
-- **Behavioural**: a `Ping` still gets a `Pong`, and a `Close` still gets a
-  `Close`, over the real socket. That fails if the forwarding is dropped, which
-  is what the structural change would otherwise silently break.
+- **Behavioural**: a `Ping` still gets a `Pong` over the real socket. That
+  fails if the forwarding is dropped, which is what the structural change would
+  otherwise silently break.
+- **The fix itself, in situ**: send one `Ping` and count the replies for a
+  fixed window. Two writers answer a ping twice — the reader from its own
+  descriptor, the writer from the forward — so **exactly one `Pong` means
+  exactly one writer**. This is the assertion that fails if `gate.close()` is
+  removed from either socket, and the two above do *not* fail then: the first
+  is a unit test of the gate type, and the second stops at the first reply. A
+  fix is not covered by a test of its parts.
 
-The interleaving itself stays untested, and this document says so rather than
-implying a green suite covers it.
+The interleaving itself stays untested — reproducing it means winning a race,
+and a test that pings a quiet socket passes with the bug fully present. What is
+covered is the property that makes the interleave impossible rather than
+unlikely: after the gate closes there is one writer, and the ping count proves
+it from outside.
