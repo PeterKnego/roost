@@ -149,6 +149,32 @@ mod tests {
         tungstenite::connect(req).map(|_| ()).map_err(|e| e.to_string())
     }
 
+    /// Same request-building as `connect`, but keeps the handshake response
+    /// instead of discarding it — needed to assert on a response *header*
+    /// (the echoed subprotocol), which `connect`'s callers never inspect.
+    fn connect_response(
+        port: u16,
+        token: Option<&str>,
+        origin: Option<&str>,
+    ) -> Result<tungstenite::http::Response<Option<Vec<u8>>>, String> {
+        let mut b = tungstenite::http::Request::builder()
+            .uri(format!("ws://127.0.0.1:{port}/"))
+            .header("Host", format!("127.0.0.1:{port}"))
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", tungstenite::handshake::client::generate_key())
+            .header("Sec-WebSocket-Protocol", "mcp");
+        if let Some(t) = token {
+            b = b.header("X-Claude-Code-Ide-Authorization", t);
+        }
+        if let Some(o) = origin {
+            b = b.header("Origin", o);
+        }
+        let req = b.body(()).unwrap().into_client_request().unwrap();
+        tungstenite::connect(req).map(|(_, resp)| resp).map_err(|e| e.to_string())
+    }
+
     fn started() -> (tempfile::TempDir, tempfile::TempDir, Arc<Ide>) {
         let lockdir = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
@@ -198,7 +224,9 @@ mod tests {
         // resh's own page has no business here either, and allowing it would
         // reopen the hole for anything that can forge an origin.
         let (_l, _w, ide) = started();
-        assert!(connect(ide.port, Some(&ide.token), Some("http://127.0.0.1:8444")).is_err());
+        let err = connect(ide.port, Some(&ide.token), Some("http://127.0.0.1:8444"))
+            .expect_err("a loopback origin must be refused too");
+        assert!(err.contains("403"), "expected an HTTP 403, got: {err}");
     }
 
     #[test]
@@ -209,6 +237,22 @@ mod tests {
         assert_eq!(v["authToken"], ide.token.as_str());
         assert_eq!(v["workspaceFolders"], serde_json::json!([ws.path().to_str().unwrap()]));
         assert_ne!(ide.port, 0, "an OS-assigned port must be read back after bind");
+    }
+
+    #[test]
+    fn the_server_echoes_the_mcp_subprotocol_the_client_asked_for() {
+        // tungstenite's client does not itself verify the negotiated
+        // subprotocol, so a missing echo would not show up as a connection
+        // failure anywhere else in this file — it has to be checked directly
+        // against the handshake response's own headers.
+        let (_l, _w, ide) = started();
+        let resp = connect_response(ide.port, Some(&ide.token), None)
+            .expect("the right token and no origin must connect");
+        assert_eq!(
+            resp.headers().get("sec-websocket-protocol").and_then(|v| v.to_str().ok()),
+            Some("mcp"),
+            "the server must echo back the `mcp` subprotocol the client asked for"
+        );
     }
 
     #[test]
