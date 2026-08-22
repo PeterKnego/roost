@@ -17,6 +17,7 @@
 //! WebSocket handshakes bypass the same-origin policy, any web page could scan
 //! localhost, connect, and read files — CVE-2025-52882, fixed in 1.0.24 by the
 //! lock-file token this module implements.
+use crate::idecwd::{self, Cwd};
 use crate::idelock;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -80,7 +81,96 @@ pub fn start(project: &str, workspace: PathBuf) -> Result<Arc<Ide>, String> {
     start_in(&idelock::ide_dir(), project, workspace)
 }
 
-fn serve_conn(stream: TcpStream, token: &str, _project: &str, _workspace: &Path) {
+pub struct Conn {
+    /// Claude's working directory, learned from `ide_connected`'s pid. `None`
+    /// until it connects, or when resh could not read it — those are different
+    /// situations with the same representation here only because both mean
+    /// "do not trust a path against it yet".
+    pub cwd: Option<PathBuf>,
+    pub workspace: PathBuf,
+    pub project: String,
+    /// This connection's writer channel. Unused until Task 6 gives the
+    /// connection a writer thread, and carried from the start because the
+    /// connection owns its identity and its output from the moment it exists.
+    pub reply: std::sync::mpsc::Sender<String>,
+    pub closed: bool,
+}
+
+impl Conn {
+    pub fn new(project: &str, workspace: PathBuf, reply: std::sync::mpsc::Sender<String>) -> Self {
+        Conn { cwd: None, workspace, project: project.to_string(), reply, closed: false }
+    }
+}
+
+fn err(id: &serde_json::Value, code: i64, message: String) -> serde_json::Value {
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+fn ok(id: &serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+fn text_result(s: &str) -> serde_json::Value {
+    serde_json::json!({"content": [{"type": "text", "text": s}]})
+}
+
+fn dispatch(msg: &serde_json::Value, conn: &mut Conn) -> Option<serde_json::Value> {
+    let method = msg["method"].as_str().unwrap_or("");
+    let id = msg.get("id").cloned();
+
+    // A message with no id is a notification: answering one is a protocol
+    // error, not a harmless extra.
+    let Some(id) = id else {
+        if method == "ide_connected" {
+            let pid = msg["params"]["pid"].as_u64().unwrap_or(0) as u32;
+            match idecwd::cwd_of(pid) {
+                Cwd::At(p) => conn.cwd = Some(p),
+                // Gone and Unknown both leave cwd unset, and neither closes
+                // the connection here: the socket itself is the evidence that
+                // something is on the other end, and it is more trustworthy
+                // than a /proc lookup that just failed.
+                Cwd::Gone | Cwd::Unknown => {}
+            }
+        }
+        return None;
+    };
+
+    match method {
+        "initialize" => Some(ok(
+            &id,
+            serde_json::json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "resh", "version": env!("CARGO_PKG_VERSION")},
+            }),
+        )),
+        "tools/list" => Some(ok(
+            &id,
+            serde_json::json!({"tools": [{
+                "name": "getDiagnostics",
+                "description": "Get language diagnostics from the editor",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"uri": {"type": "string"}},
+                },
+            }]}),
+        )),
+        "tools/call" => {
+            let name = msg["params"]["name"].as_str().unwrap_or("");
+            match name {
+                // resh has no language server. An empty list is the honest
+                // answer and is what Claude sees when nothing is wrong — so
+                // if a `cargo check` bridge ever lands, it lands here.
+                "getDiagnostics" => Some(ok(&id, text_result("[]"))),
+                other => Some(err(&id, -32601, format!("resh does not implement {other}"))),
+            }
+        }
+        "ping" => Some(ok(&id, serde_json::json!({}))),
+        other => Some(err(&id, -32601, format!("unknown method {other}"))),
+    }
+}
+
+fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
     let config = WebSocketConfig { max_message_size: Some(MAX_FRAME_BYTES), ..Default::default() };
     let accepted = accept_hdr_with_config(
         stream,
@@ -115,8 +205,26 @@ fn serve_conn(stream: TcpStream, token: &str, _project: &str, _workspace: &Path)
         Some(config),
     );
     let Ok(mut ws) = accepted else { return };
-    // Task 4 replaces this with the JSON-RPC loop.
-    while ws.read().is_ok() {}
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    let mut conn = Conn::new(project, workspace.to_path_buf(), reply_tx);
+    let _ = reply_rx; // drained by the writer thread from Task 6 onward
+    loop {
+        let Ok(msg) = ws.read() else { break };
+        let text = match msg {
+            tungstenite::Message::Text(t) => t,
+            tungstenite::Message::Close(_) => break,
+            _ => continue,
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        if let Some(reply) = dispatch(&v, &mut conn) {
+            if ws.send(tungstenite::Message::Text(reply.to_string())).is_err() {
+                break;
+            }
+        }
+        if conn.closed {
+            break;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -262,5 +370,106 @@ mod tests {
         assert!(!ct_eq(b"abc", b"abcd"));
         assert!(!ct_eq(b"", b"a"));
         assert!(ct_eq(b"", b""));
+    }
+
+    fn rpc(id: i64, method: &str, params: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+    }
+
+    #[test]
+    fn initialize_answers_with_resh_as_the_server_name() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
+        let out = dispatch(&rpc(1, "initialize", serde_json::json!({})), &mut c).unwrap();
+        assert_eq!(out["id"], 1);
+        assert_eq!(out["result"]["serverInfo"]["name"], "resh");
+        assert!(out["result"]["capabilities"]["tools"].is_object());
+    }
+
+    #[test]
+    fn the_tool_list_offers_diagnostics_and_never_offers_code_execution() {
+        // executeCode is one of only two tools the CLI makes visible to the
+        // model, and it is arbitrary code execution reachable from this
+        // socket. Adding it to the list is the defect this asserts against.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
+        let out = dispatch(&rpc(2, "tools/list", serde_json::json!({})), &mut c).unwrap();
+        let names: Vec<String> = out["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["getDiagnostics".to_string()]);
+    }
+
+    #[test]
+    fn calling_execute_code_is_a_method_error_not_an_empty_success() {
+        // An empty success would read to Claude as "ran, produced nothing".
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
+        let out = dispatch(
+            &rpc(3, "tools/call", serde_json::json!({"name": "executeCode", "arguments": {"code": "1"}})),
+            &mut c,
+        )
+        .unwrap();
+        assert_eq!(out["error"]["code"], -32601);
+        assert!(
+            out["error"]["message"].as_str().unwrap().contains("executeCode"),
+            "the refusal must name what was refused: {}", out["error"]["message"]
+        );
+        assert!(out.get("result").is_none());
+    }
+
+    #[test]
+    fn diagnostics_answers_empty_rather_than_failing() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
+        let out = dispatch(
+            &rpc(4, "tools/call", serde_json::json!({"name": "getDiagnostics", "arguments": {}})),
+            &mut c,
+        )
+        .unwrap();
+        assert_eq!(out["result"]["content"][0]["type"], "text");
+        assert_eq!(out["result"]["content"][0]["text"], "[]");
+    }
+
+    #[test]
+    fn ide_connected_resolves_the_senders_directory_and_is_not_answered() {
+        // A notification has no id, so a reply would be a protocol error.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut c = Conn::new("t", std::env::current_dir().unwrap(), tx);
+        let note = serde_json::json!({
+            "jsonrpc": "2.0", "method": "ide_connected",
+            "params": {"pid": std::process::id()}
+        });
+        assert!(dispatch(&note, &mut c).is_none(), "notifications get no response");
+        assert_eq!(
+            c.cwd.as_ref().unwrap().canonicalize().unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn ide_connected_from_an_unreadable_pid_leaves_the_connection_usable() {
+        // Cwd::Unknown must not disconnect. Folding it into "gone" would kill
+        // a live Claude because a check failed.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
+        let note = serde_json::json!({
+            "jsonrpc": "2.0", "method": "ide_connected", "params": {"pid": u32::MAX}
+        });
+        assert!(dispatch(&note, &mut c).is_none());
+        assert!(c.cwd.is_none(), "no directory was learned");
+        assert!(!c.closed, "but the connection stays open");
+    }
+
+    #[test]
+    fn an_unknown_method_is_a_method_error_carrying_the_request_id() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut c = Conn::new("t", PathBuf::from("/tmp"), tx);
+        let out = dispatch(&rpc(9, "nonsense/method", serde_json::json!({})), &mut c).unwrap();
+        assert_eq!(out["id"], 9);
+        assert_eq!(out["error"]["code"], -32601);
     }
 }
