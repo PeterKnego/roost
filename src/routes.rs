@@ -228,7 +228,7 @@ pub const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "ic
 /// `static/app.js` keeps a copy of THIS list, for the ✎ toggle. Nothing
 /// checks the two agree — the design doc records why neither direction of
 /// mismatch loses data, because `workspace.rs` is the actual guard.
-pub const NO_TEXT_EDIT_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "ico"];
+pub const NO_TEXT_EDIT_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf"];
 
 pub fn is_image(rel: &str) -> bool {
     IMAGE_EXT.contains(&crate::assets::ext_of(rel).as_str())
