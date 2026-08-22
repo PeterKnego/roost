@@ -103,16 +103,55 @@ export async function openPage(cdpPort, url) {
   await new Promise((r) => (ws.onopen = r));
   let id = 0;
   const pending = new Map();
-  ws.onmessage = (e) => { const m = JSON.parse(e.data); pending.get(m.id)?.(m); pending.delete(m.id); };
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    const p = pending.get(m.id);
+    if (!p) return;
+    clearTimeout(p.timer);
+    pending.delete(m.id);
+    p.res(m);
+  };
+  // A CDP command that never gets a reply used to wedge the run forever:
+  // resolved from `pending` with no timeout and no reject path, so the suite
+  // stopped dead mid-file with no failing assertion and no output. That is
+  // CLAUDE.md's "a deadlock hangs rather than fails" applied to the harness
+  // itself — CI shows a run that never ends, not a test that went red.
+  //
+  // Not hypothetical: termlinks.mjs hit it. xterm's fallback for an OSC 8
+  // link with no linkHandler calls confirm(), and a native dialog with no
+  // Page.javascriptDialogOpening handler wedges the renderer, so
+  // Input.dispatchMouseEvent never replied. A crashed renderer or a dropped
+  // frame does the same to any file here.
+  //
+  // 30s is far past any legitimate command — the slowest is the initial page
+  // load — so a timeout means something is wrong, never that a command was
+  // merely slow. The method name is in the message because the whole point
+  // is to turn a wall-clock mystery into a legible failure.
+  const CMD_TIMEOUT_MS = 30_000;
   const cmd = (method, params = {}) =>
-    new Promise((res) => { const i = ++id; pending.set(i, res); ws.send(JSON.stringify({ id: i, method, params })); });
+    new Promise((res, rej) => {
+      const i = ++id;
+      const timer = setTimeout(() => {
+        pending.delete(i);
+        rej(new Error(`CDP command ${method} (id ${i}) got no reply in ${CMD_TIMEOUT_MS / 1000}s`));
+      }, CMD_TIMEOUT_MS);
+      pending.set(i, { res, timer });
+      ws.send(JSON.stringify({ id: i, method, params }));
+    });
   const evalIn = async (expression) => {
     const r = await cmd("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
     if (r.result?.exceptionDetails) throw new Error(r.result.exceptionDetails.exception?.description || "eval failed");
     return r.result?.result?.value;
   };
   await cmd("Runtime.enable");
-  return { cmd, evalIn, close: () => { try { ws.close(); } catch {} } };
+  // Outstanding timers are cleared on close, or a 30s timer left armed by an
+  // in-flight command keeps the process alive well past the last assertion.
+  const close = () => {
+    for (const p of pending.values()) clearTimeout(p.timer);
+    pending.clear();
+    try { ws.close(); } catch { /* already gone */ }
+  };
+  return { cmd, evalIn, close };
 }
 
 // ------------------------------------------------------------------- resh

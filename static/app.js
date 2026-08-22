@@ -60,6 +60,28 @@ const extOf = (rel) => {
 };
 const refusesTextEdit = (rel) => NO_TEXT_EDIT_EXT.includes(extOf(rel));
 
+// --- terminal links ------------------------------------------------------
+// Cmd on macOS, Ctrl everywhere else. Not a preference: Ctrl+click on a Mac is
+// right-click emulation, so binding there would pop a context menu and open a
+// link at once. This is the same platform split xterm itself makes in
+// shouldForceSelection (alt on Mac, shift elsewhere).
+const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+const linkModifier = (e) => (IS_MAC ? e.metaKey : e.ctrlKey);
+
+// Tracked rather than read off the event, because provideLinks is never handed
+// one. Cleared on blur: a user who switches apps with the key down would
+// otherwise come back to a terminal that is silently armed.
+let linksArmed = false;
+
+// http and https only. `javascript:`, `data:` and `file:` never become a link
+// at all — not a refused one, one that was never offered.
+const SAFE_URL = /^https?:\/\//i;
+const URL_RE = /\bhttps?:\/\/[^\s"'<>`]+/gi;
+// A slash is the evidence. Bare `main.rs` is deliberately not a path: a repo
+// has many, so resolution would have to guess, and the same shape matches a
+// version string and the `foo.bar` in an error message.
+const PATH_RE = /(?:~\/|\.{1,2}\/|\/)?(?:[\w.@+-]+\/)+[\w.@+-]+(?::\d+(?::\d+)?)?/g;
+
 let state = null;
 let myOrigin = null;
 let ctrl = null;
@@ -224,6 +246,11 @@ function onEvent(ev) {
         try { e.node.remove(); } catch {}
       });
       terms.clear();
+      // Every one of pendingLink's possible entries just had its node
+      // removed and its xterm disposed above — drop the stale reference so a
+      // later, unrelated PathRefused (a duplicate delivery, say) cannot
+      // termFlash a detached node instead of silently finding nothing.
+      pendingLink = null;
       // Every node above is gone, but `state.live_sessions` is still the
       // stale pre-close list until the trailing State broadcast lands —
       // tabKey would keep reading ":live" from it, render()'s mountedKey
@@ -257,6 +284,23 @@ function onEvent(ev) {
       // silent no-op. console.warn stays too, for anyone actually watching devtools.
       console.warn("resh:", ev.msg);
       showError(ev.msg);
+      break;
+    case "PathRefused":
+      // Not showError: that funnels to the workspace banner, which is the
+      // wrong shape here and — as the Error case above notes — carries no way
+      // back to the terminal that was clicked. This does, via the click still
+      // in flight.
+      console.warn("resh:", ev.msg);
+      if (pendingLink && pendingLink.text === ev.text) {
+        termFlash(pendingLink.entry, ev.msg);
+        // Cleared only on a match. A mismatch means a DIFFERENT click is
+        // still in flight (PATH_RE marks ordinary prose, so a user arming
+        // links over a paragraph and clicking twice before the first reply
+        // lands is the common case, not an edge case) — clearing here would
+        // strand that click's own refusal, which would then find an empty
+        // slot and drop silently to console.warn instead of flashing.
+        pendingLink = null;
+      }
       break;
   }
 }
@@ -425,6 +469,9 @@ function render() {
     try { e.term.dispose(); } catch {}
     e.node.remove();
     terms.delete(session);
+    // Same reasoning as ProjectClosed's teardown: this entry's node is gone,
+    // so a pendingLink still pointing at it must not outlive it.
+    if (pendingLink && pendingLink.entry === e) pendingLink = null;
   });
 }
 
@@ -798,6 +845,182 @@ function refreshFile(rel) {
   });
 }
 
+function openUrl(u) {
+  if (!SAFE_URL.test(u)) return;
+  // noopener,noreferrer: an opened page gets no handle back to the workspace.
+  window.open(u, "_blank", "noopener,noreferrer");
+}
+
+// A URL at the end of a sentence, or inside prose parentheses, must not
+// swallow the punctuation. A parenthesised segment *within* the URL survives,
+// which is why the bracket trim counts rather than strips.
+function trimUrl(u) {
+  u = u.replace(/[.,;:!?'"]+$/, "");
+  while (
+    u.endsWith(")") &&
+    (u.match(/\(/g) || []).length < (u.match(/\)/g) || []).length
+  ) {
+    u = u.slice(0, -1);
+  }
+  return u;
+}
+
+// The click that was sent, so a refusal can be shown in the terminal it came
+// from. A single slot, not a map: only one link can be clicked at a time, and
+// a map keyed by text would grow for the life of the page.
+let pendingLink = null;
+
+function openTermPath(entry, raw) {
+  pendingLink = { entry, text: raw };
+  // The line number is matched so the whole reference underlines, then dropped
+  // — the viewer has no line addressing to spend it on. Saying so is the only
+  // thing between "we ignored part of what you clicked" and silence.
+  const line = raw.match(/:(\d+)(?::\d+)?$/);
+  if (line) termFlash(entry, `line ${line[1]} — opening file`);
+  // Verbatim. The client does no parsing; resolution and confinement are one
+  // function in projects.rs.
+  send({ t: "OpenPath", text: raw });
+}
+
+// One provider per pattern, URL registered first. Where the two overlap — the
+// path-looking tail of a URL — xterm resolves it by provider index in
+// _removeIntersectingLinks, so registration order is the entire mechanism.
+// xterm's own OscLinkProvider is registered at construction, ahead of both,
+// which is the ordering this wants for free: a link an application declared
+// beats anything resh would have guessed over the same cells.
+let warnedProvider = false;
+
+function matchProvider(term, re, activate) {
+  return {
+    provideLinks(y, cb) {
+      // Nothing may escape here. _askForLink runs the providers in a loop
+      // straight out of the mousemove listener, so a throw from this one
+      // skips every provider after it for that event — the same shape as the
+      // panic-in-a-socket-thread rule this project holds server-side. Warned
+      // once, not per pointer move, or a broken matcher floods the console.
+      try {
+        // The gate. No link exists to hover, so nothing underlines and
+        // nothing can be clicked — rather than a link that exists and refuses.
+        if (!linksArmed) return cb(undefined);
+        // y is 1-based and absolute: xterm adds buffer.ydisp to the hovered
+        // row before asking, so this indexes the scrollback too, not the
+        // viewport.
+        const line = term.buffer.active.getLine(y - 1);
+        if (!line) return cb(undefined);
+        const text = line.translateToString(true);
+        const out = [];
+        re.lastIndex = 0;
+        for (let m; (m = re.exec(text)); ) {
+          const raw = m[0];
+          out.push({
+            range: {
+              start: { x: m.index + 1, y },
+              end: { x: m.index + raw.length, y },
+            },
+            text: raw,
+            // Re-checked at click time: an underline left stale by a missed
+            // keyup — alt-tabbing away while holding the key — must not open
+            // anything.
+            activate: (ev) => {
+              if (linkModifier(ev)) activate(raw, ev);
+            },
+          });
+        }
+        cb(out.length ? out : undefined);
+      } catch (e) {
+        if (!warnedProvider) { warnedProvider = true; console.warn("resh: link provider failed:", e); }
+        cb(undefined);
+      }
+    },
+  };
+}
+
+function registerTermLinks(term, entry) {
+  // Built as one ordered list and registered from it, so the order xterm sees
+  // and the order a reader (or a test) sees cannot drift apart.
+  const providers = [
+    matchProvider(term, URL_RE, (raw) => openUrl(trimUrl(raw))),
+    matchProvider(term, PATH_RE, (raw) => openTermPath(entry, raw)),
+  ];
+  for (const p of providers) term.registerLinkProvider(p);
+  // Kept on the entry for tests/browser/termlinks.mjs, which has no other way
+  // in: xterm exposes no API for enumerating registered link providers, and
+  // the alternative — asserting on rendered underline styling — would couple
+  // the test to renderer internals that differ between the DOM and canvas
+  // renderers. Not dead code; deleting it blinds the only test of the gate.
+  entry.linkProviders = providers;
+}
+
+// Arming has to nudge xterm to ask again: the Linkifier caches the last cell
+// it resolved (_lastBufferCell) and will not re-ask for the same position, so
+// a bare re-dispatch at the current spot is ignored. Moving the pointer
+// through somewhere else first invalidates that cache using nothing but
+// public events.
+//
+// If this proves unreliable, the graceful degradation is that arming takes
+// effect on the next real pointer movement, which is what a user holding a
+// modifier is about to do anyway.
+let lastPointer = null;
+addEventListener("mousemove", (e) => { lastPointer = { x: e.clientX, y: e.clientY }; }, true);
+
+function nudgeLinks() {
+  if (!lastPointer) return;
+  const el = document.elementFromPoint(lastPointer.x, lastPointer.y);
+  const host = el && el.closest && el.closest(".termhost");
+  if (!host) return;
+  // Dispatched on .xterm-screen rather than on the host, because that is the
+  // element xterm hands its Linkifier and therefore the only one carrying the
+  // mousemove listener. It is a *descendant* of the host, so a bubbling event
+  // dispatched on the host travels the other way and never arrives: measured,
+  // and the provider call count did not move at all.
+  const screen = host.querySelector(".xterm-screen");
+  if (!screen) return;
+  const r = screen.getBoundingClientRect();
+  // A different *cell* is not enough, and this was measured rather than
+  // assumed: within one line the Linkifier answers from its cached provider
+  // replies (_askForLink's useLinkCache branch, taken whenever _activeLine
+  // still matches), so a sideways nudge asks nobody anything. Only a change of
+  // line makes it re-ask. Hence the row height, derived from the terminal's
+  // real row count rather than a guessed constant — a wrong height can land
+  // the synthetic move back on the same line and quietly do nothing.
+  const entry = terms.get(host.dataset.session);
+  const rows = (entry && entry.term.rows) || 24;
+  const rowH = Math.max(1, r.height / rows);
+  const away = {
+    x: lastPointer.x,
+    y: lastPointer.y - r.top > rowH ? r.top + rowH / 2 : r.top + rowH * 1.5,
+  };
+  for (const p of [away, lastPointer]) {
+    // bubbles: false, and this is load-bearing rather than tidiness. When an
+    // application turns on mouse motion reporting (mode 1003), xterm's own
+    // bindMouse attaches a mousemove listener to `.xterm` — the PARENT of the
+    // element below — which forwards any event with no buttons held to the
+    // PTY. A synthetic MouseEvent has buttons === 0, so a bubbling nudge
+    // reports four phantom motions per Ctrl chord, two of them at the detour
+    // row, and a TUI's hover highlight jumps away and back every time the
+    // user reaches for the modifier. It also keeps the nudge away from the
+    // selection service's document-level listeners.
+    //
+    // The Linkifier still sees it: its listener is bound directly on
+    // .xterm-screen, and composedPath() still returns the full ancestor chain
+    // for a non-bubbling event, so its .xterm-hover guard keeps working. So
+    // does the window-level capture listener that maintains lastPointer.
+    screen.dispatchEvent(
+      new MouseEvent("mousemove", { clientX: p.x, clientY: p.y, bubbles: false }),
+    );
+  }
+}
+
+function setArmed(on) {
+  if (linksArmed === on) return;
+  linksArmed = on;
+  nudgeLinks();
+}
+
+addEventListener("keydown", (e) => { if (linkModifier(e)) setArmed(true); });
+addEventListener("keyup", (e) => { if (!linkModifier(e)) setArmed(false); });
+addEventListener("blur", () => setArmed(false));
+
 function ensureTerm(session) {
   // No "the socket died, rebuild it" branch any more: an entry now heals its
   // own socket (see connectTerm), so a caller cannot find a dead one here.
@@ -827,12 +1050,28 @@ function ensureTerm(session) {
       cursorAccent: v("--bg", "#1e1f22"),
       selectionBackground: v("--sel-bg", "#2e436e"),
     },
+    // xterm already registers an OscLinkProvider, so OSC 8 sequences are
+    // parsed and their ranges tracked; this option is the only thing missing,
+    // and it defaults to null. Not gated on the modifier, unlike the matchers:
+    // the application said in a control sequence that these cells are a link,
+    // so there is no guess to protect the user from.
+    //
+    // The destination is still scheme-checked in openUrl. What is running
+    // chooses it, which makes it exactly as trustworthy as plain text.
+    // This vendored OscLinkProvider happens to drop non-http(s) URIs before
+    // offering them, so today that check is the second of two — but it is
+    // the only one resh owns, and it is what covers every other link route
+    // in this file as well.
+    linkHandler: {
+      activate: (ev, uri) => openUrl(uri),
+    },
   });
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(node);
   const entry = { node, term, fit, sock: null, tries: 0, timer: null, attached: false, gone: false,
-                  selTimer: null, flashTimer: null };
+                  selTimer: null, flashTimer: null, linkProviders: null };
+  registerTermLinks(term, entry);
   // Copy on select. xterm's rows are `user-select: none`, so a browser
   // selection over terminal text is impossible and xterm's own selection is
   // the only route to the clipboard — reached, until now, only by the

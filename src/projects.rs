@@ -329,6 +329,96 @@ pub fn safe_resolve(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// Turns a span matched in terminal output into a project-relative path.
+///
+/// This is a trust boundary, not a convenience. Terminal text is chosen by
+/// whatever printed it — a cloned repo's build output, a `cat`ed file — so the
+/// matcher in the browser is treated as a hint and every path ends here, at
+/// `safe_resolve`. That one call answers both questions worth asking: is this
+/// inside the project, and is it really there. A missing file is an `Err` on
+/// purpose; there is no third state to invent, and nothing here destroys
+/// anything, so refusing is always the safe answer.
+pub fn resolve_terminal_path(project_dir: &Path, text: &str) -> Result<String, String> {
+    let bare = strip_line_suffix(text.trim());
+    if bare.is_empty() {
+        return Err("empty path".into());
+    }
+
+    let rel = if let Some(rest) = bare.strip_prefix("~/") {
+        let home = std::env::var_os("HOME").ok_or("no home directory")?;
+        abs_to_rel(project_dir, &PathBuf::from(home).join(rest))?
+    } else if bare.starts_with('/') {
+        abs_to_rel(project_dir, Path::new(bare))?
+    } else {
+        bare.trim_start_matches("./").to_string()
+    };
+
+    let abs = safe_resolve(project_dir, &rel).map_err(|e| {
+        // `safe_resolve`'s own text is written for a log line, not a
+        // terminal flash — the not-found branch is `format!("not found:
+        // {e}")`, where `{e}` is a raw `io::Error` ("No such file or
+        // directory (os error 2)"). A person clicking a false-positive link
+        // (PATH_RE matches ordinary prose like "and/or" or "24/7", so this is
+        // the common case, not the rare one) should see a short sentence, not
+        // an errno.
+        //
+        // Only two shapes reach here, and they stay distinct: `safe_resolve`
+        // separately reports "outside the project" (a confident, positive
+        // refusal) from a canonicalize failure (anything else). The second
+        // is deliberately worded "couldn't open", not "does not exist":
+        // canonicalize fails the same way for a missing file as it does for
+        // one that exists but can't be read (permission denied, a symlink
+        // loop, ...), and CLAUDE.md's central rule is that "I could not
+        // determine X" must never be folded into "X is false".
+        if e.starts_with("path outside project") {
+            format!("{rel} is outside this project")
+        } else {
+            format!("couldn't open {rel}")
+        }
+    })?;
+    // Not `is_dir()`: it answers `false` both for "not a directory" and for
+    // "could not look", and this codebase has shipped that conflation eleven
+    // times. Three outcomes, matched explicitly.
+    match std::fs::metadata(&abs) {
+        Ok(m) if m.is_dir() => Err(format!("{rel} is a directory")),
+        Ok(_) => Ok(rel),
+        Err(e) => Err(format!("cannot read {rel}: {e}")),
+    }
+}
+
+/// `src/main.rs:42` and `src/main.rs:42:7` both name `src/main.rs`. The browser
+/// matcher deliberately swallows the suffix so the whole reference underlines;
+/// this is where it comes back off.
+///
+/// A file whose real name ends in `:42` is therefore unreachable by this route.
+/// That trade is not close: a colon in a filename is rare, a compiler citation
+/// is most of what a terminal prints, and the file is still reachable from the
+/// tree.
+fn strip_line_suffix(text: &str) -> &str {
+    let mut s = text;
+    for _ in 0..2 {
+        let Some((head, tail)) = s.rsplit_once(':') else { break };
+        if tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
+        s = head;
+    }
+    s
+}
+
+/// An absolute path is only this project's to open if it is under this
+/// project. Both sides are canonicalised before comparing, so a symlinked
+/// project root still matches its own files rather than refusing them.
+fn abs_to_rel(project_dir: &Path, abs: &Path) -> Result<String, String> {
+    let root = project_dir
+        .canonicalize()
+        .map_err(|e| format!("project root unreadable: {e}"))?;
+    let abs = abs.canonicalize().map_err(|_| "no such file".to_string())?;
+    abs.strip_prefix(&root)
+        .map_err(|_| "path is outside this project".to_string())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Confine a path whose *target does not exist yet* (creation, rename
 /// destination). `safe_resolve` canonicalizes the target and so cannot be
 /// used here. Canonicalize the parent instead, confine that, then validate
@@ -567,6 +657,181 @@ mod tests {
         assert!(safe_resolve(&alpha, "../beta").is_err());
         assert!(safe_resolve(&alpha, "/etc/passwd").is_err());
         assert!(safe_resolve(&alpha, "missing.txt").is_err());
+    }
+
+    // Revert-the-fix check (CLAUDE.md: "the technique that actually works"),
+    // applied for real against this working tree, one change at a time, then
+    // restored. Exact panic output observed for each:
+    //
+    // 1. `abs.strip_prefix(&root)` arm in `abs_to_rel` replaced with
+    //    `Ok(abs.to_string_lossy().into_owned())` (confinement check removed).
+    //    Two tests failed, not one — `safe_resolve`'s own outside-project
+    //    check still fired (the absolute path, once let through unconfined,
+    //    still failed `canon.starts_with(&base)` downstream), but with a
+    //    different message than this test asserts on, and the absolute-path
+    //    case in the other test now returned the *un*confined absolute string:
+    //      terminal_path_refuses_a_real_file_outside_the_project:
+    //        panicked at src/projects.rs:699:9:
+    //        expected a confinement refusal naming the reason, got "path outside project: /tmp/.tmp0xSRIq/secret.txt"
+    //      terminal_path_resolves_relative_and_absolute:
+    //        panicked at src/projects.rs:670:9:
+    //        assertion `left == right` failed
+    //          left: "/tmp/.tmpRc9oVQ/src/a.rs"
+    //         right: "src/a.rs"
+    // 2. `Ok(m) if m.is_dir()` arm deleted from `resolve_terminal_path`'s match.
+    //      terminal_path_refuses_a_directory:
+    //        panicked at src/projects.rs:713:61:
+    //        called `Result::unwrap_err()` on an `Ok` value: "src"
+    // 3. `strip_line_suffix` changed to `fn strip_line_suffix(text: &str) -> &str { text }`.
+    //    Failed one step earlier than expected: the untouched suffix made
+    //    `safe_resolve` look up a file named `src/a.rs:42`, which does not
+    //    exist, so the panic is `safe_resolve`'s "not found", not an
+    //    equality mismatch on the returned path:
+    //      terminal_path_strips_line_and_column:
+    //        panicked at src/projects.rs:675:70:
+    //        called `Result::unwrap()` on an `Err` value: "not found: No such file or directory (os error 2)"
+    // 4. (Fix round 1) The `if let Some(rest) = bare.strip_prefix("~/")` arm
+    //    removed from `resolve_terminal_path`, so `~/...` falls into the
+    //    plain-relative arm unchanged.
+    //      terminal_path_resolves_a_tilde_path:
+    //        panicked at src/projects.rs:707:63:
+    //        called `Result::unwrap()` on an `Err` value: "not found: No such file or directory (os error 2)"
+    //    (`safe_resolve` looked for a literal directory named `~`, which does
+    //    not exist, and refused before reaching the assertion — same shape as
+    //    revert 3 above: the missing-branch failure surfaces one layer down,
+    //    inside `safe_resolve`, not at the equality check.)
+    // All four restored; full `terminal_path` suite passes again (7/7).
+
+    #[test]
+    fn terminal_path_resolves_relative_and_absolute() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/a.rs"), b"fn main() {}").unwrap();
+
+        assert_eq!(resolve_terminal_path(root.path(), "src/a.rs").unwrap(), "src/a.rs");
+        assert_eq!(resolve_terminal_path(root.path(), "./src/a.rs").unwrap(), "src/a.rs");
+
+        let abs = root.path().join("src/a.rs");
+        assert_eq!(
+            resolve_terminal_path(root.path(), abs.to_str().unwrap()).unwrap(),
+            "src/a.rs"
+        );
+    }
+
+    /// Building the fixture under the real `$HOME` (rather than mutating
+    /// `HOME` itself) is deliberate: env vars are process-global and `cargo
+    /// test` runs tests in parallel, so `set_var` here would corrupt
+    /// whichever other test happened to read `HOME` concurrently.
+    #[test]
+    fn terminal_path_resolves_a_tilde_path() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return; // no HOME on this machine: a legitimate state, not a failure
+        };
+        let home = PathBuf::from(home);
+        match std::fs::metadata(&home) {
+            Ok(m) if m.is_dir() => {}
+            _ => return, // HOME missing, unreadable, or not a directory: skip, don't fail
+        }
+
+        let root = tempfile::tempdir_in(&home).unwrap();
+        std::fs::write(root.path().join("a.rs"), b"fn main() {}").unwrap();
+
+        let rel_to_home = root.path().strip_prefix(&home).unwrap().to_str().unwrap();
+        let input = format!("~/{rel_to_home}/a.rs");
+
+        assert_eq!(resolve_terminal_path(root.path(), &input).unwrap(), "a.rs");
+    }
+
+    /// Verifies the claim in `abs_to_rel`'s doc comment: a symlinked project
+    /// root still matches its own files rather than refusing them, because
+    /// both sides are canonicalised before the `strip_prefix` comparison.
+    #[test]
+    fn terminal_path_resolves_through_a_symlinked_project_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("a.rs"), b"fn main() {}").unwrap();
+
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let abs = link.join("a.rs");
+        assert_eq!(resolve_terminal_path(&link, abs.to_str().unwrap()).unwrap(), "a.rs");
+    }
+
+    #[test]
+    fn terminal_path_strips_line_and_column() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/a.rs"), b"x").unwrap();
+
+        assert_eq!(resolve_terminal_path(root.path(), "src/a.rs:42").unwrap(), "src/a.rs");
+        assert_eq!(resolve_terminal_path(root.path(), "src/a.rs:42:7").unwrap(), "src/a.rs");
+    }
+
+    /// The escape target is a REAL file outside the project. Without it this
+    /// test would fail with "no such file" before confinement was consulted
+    /// at all — green, and proving nothing. CLAUDE.md lists that exact
+    /// failure as the reason a symlink escape once survived review.
+    #[test]
+    fn terminal_path_refuses_a_real_file_outside_the_project() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = parent.path().join("secret.txt");
+        std::fs::write(&outside, b"real file, really there").unwrap();
+
+        // Absolute-path route: refused inside `abs_to_rel`, before `safe_resolve`
+        // is ever called, with its own fixed wording.
+        let err = resolve_terminal_path(&root, outside.to_str().unwrap()).unwrap_err();
+        assert_eq!(
+            err,
+            "path is outside this project",
+            "expected a confinement refusal naming the reason, got {err:?}"
+        );
+
+        // Relative `../` route: never touches `abs_to_rel`, so this is what
+        // exercises the new mapping over `safe_resolve`'s own
+        // "path outside project: {rel}" — the case the review flagged
+        // (item 1) as leaking that string, and later ones as leaking a raw
+        // errno for the not-found branch below.
+        let err = resolve_terminal_path(&root, "../secret.txt").unwrap_err();
+        assert_eq!(err, "../secret.txt is outside this project", "unexpected refusal: {err:?}");
+    }
+
+    #[test]
+    fn terminal_path_refuses_a_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+
+        let err = resolve_terminal_path(root.path(), "src").unwrap_err();
+        assert!(
+            err.contains("directory"),
+            "expected the refusal to say it is a directory, got {err:?}"
+        );
+    }
+
+    /// The review that shipped this test's earlier `!err.is_empty()` version
+    /// (item 1 of the terminal-links fix wave) is the whole reason this one
+    /// asserts on exact text: the previous message was `safe_resolve`'s raw
+    /// `io::Error` verbatim — "not found: No such file or directory (os
+    /// error 2)" — an errno flashed at a person clicking a false-positive
+    /// link, which `PATH_RE` produces often (`and/or`, `24/7`, ...). A
+    /// non-empty check would still pass on that regression.
+    #[test]
+    fn terminal_path_refuses_a_file_that_is_not_there() {
+        let root = tempfile::tempdir().unwrap();
+        let err = resolve_terminal_path(root.path(), "src/gone.rs").unwrap_err();
+        assert_eq!(
+            err,
+            "couldn't open src/gone.rs",
+            "expected a readable refusal with no raw errno, got {err:?}"
+        );
+        // "couldn't open", not "does not exist": a canonicalize failure here
+        // could equally be a permission problem, and CLAUDE.md's central
+        // rule is that "I could not determine X" must never be folded into
+        // "X is false".
+        assert!(!err.contains("os error"), "errno leaked into the refusal: {err:?}");
     }
 
     #[test]
