@@ -88,6 +88,11 @@ pub enum Intent {
     MarkNoticeRead { id: u64 },
     MarkAllNoticesRead,
     ClearNotices,
+    /// A file or selection the user wants Claude to look at. Resolved
+    /// server-side and sent as `at_mentioned`, not pasted into a terminal:
+    /// a paste lands in whatever state the terminal is in and competes with
+    /// whatever Claude is doing at that instant.
+    MentionPath { rel: String, line_start: Option<u32>, line_end: Option<u32> },
 }
 
 /// Snapshot sent as `Event::State`. Deliberately carries buffer *metadata*
@@ -275,6 +280,20 @@ mod tests {
         let s = encode(&Event::Notices { list: vec![n] });
         assert!(s.contains(r#""t":"Notices""#));
         assert!(s.contains(r#""list":["#), "got {s}");
+    }
+
+    #[test]
+    fn decodes_mention_path_with_and_without_a_line_range() {
+        let i = decode(r#"{"t":"MentionPath","rel":"src/hub.rs","line_start":12,"line_end":40}"#).unwrap();
+        assert!(matches!(
+            i,
+            Intent::MentionPath { rel, line_start: Some(12), line_end: Some(40) } if rel == "src/hub.rs"
+        ));
+        let i = decode(r#"{"t":"MentionPath","rel":"README.md","line_start":null,"line_end":null}"#).unwrap();
+        assert!(matches!(
+            i,
+            Intent::MentionPath { rel, line_start: None, line_end: None } if rel == "README.md"
+        ));
     }
 
     #[test]

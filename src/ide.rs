@@ -246,6 +246,80 @@ pub fn stop(project: &str) {
     }
 }
 
+/// Live Claude connections per project. A `Sender` per connection, drained by
+/// that connection's writer thread — the notification path must never block
+/// on a socket write, and must never hold this lock while doing one.
+///
+/// Each entry carries a small connection id alongside its `Sender`.
+/// `std::sync::mpsc::Sender` — unlike tokio's or crossbeam's — exposes no
+/// `same_channel`/identity check at all, so a `ConnGuard` has no way to find
+/// "its" entry in a `Vec<Sender<String>>` once other connections have
+/// registered and deregistered around it; the id is what makes removal
+/// correct regardless of registration/deregistration order.
+static CONNS: OnceLock<Mutex<HashMap<String, Vec<(u64, std::sync::mpsc::Sender<String>)>>>> =
+    OnceLock::new();
+
+fn conns() -> &'static Mutex<HashMap<String, Vec<(u64, std::sync::mpsc::Sender<String>)>>> {
+    CONNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Deregisters this connection's writer channel even if `serve_conn`'s read
+/// loop panics — the same guarantee `wsconn.rs`'s `UnsubGuard` gives its
+/// subscriber list. Without it a panicking connection would leave a dead
+/// `Sender` in `CONNS` forever, and every later `mention` for this project
+/// would "succeed" into a void: the send itself never fails (the writer
+/// thread on the other end is what actually delivers it, and that thread
+/// exited when its own channel disconnected, so nothing is left to act on
+/// the send).
+struct ConnGuard {
+    project: String,
+    id: u64,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        let mut map = conns().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = map.get_mut(&self.project) {
+            v.retain(|(id, _)| *id != self.id);
+            if v.is_empty() {
+                map.remove(&self.project);
+            }
+        }
+    }
+}
+
+/// Tells every Claude connected to `project` that the user pointed at `abs`
+/// (and optionally a line range within it). A notification, not a request —
+/// see `dispatch`'s id handling: an `at_mentioned` carrying an `id` would
+/// make the CLI wait for a response that will never come.
+pub fn mention(project: &str, abs: &Path, lines: Option<(u32, u32)>) -> Result<(), String> {
+    let mut params = serde_json::json!({"filePath": abs.to_string_lossy()});
+    if let Some((a, b)) = lines {
+        params["lineStart"] = serde_json::json!(a);
+        params["lineEnd"] = serde_json::json!(b);
+    }
+    let msg = serde_json::json!({"jsonrpc": "2.0", "method": "at_mentioned", "params": params})
+        .to_string();
+    // Cloned out under the lock, sent outside it: CLAUDE.md's "never hold a
+    // lock across blocking I/O" — a channel send only blocks if the writer
+    // thread's queue capacity is exceeded (it is unbounded here, so it never
+    // does), but the principle is the same one that bit `stop`, so this
+    // follows the same shape regardless.
+    let targets: Vec<_> = {
+        let map = conns().lock().unwrap_or_else(|e| e.into_inner());
+        map.get(project).cloned().unwrap_or_default()
+    };
+    if targets.is_empty() {
+        return Err("no Claude is connected to this project".into());
+    }
+    for (_, t) in &targets {
+        let _ = t.send(msg.clone());
+    }
+    Ok(())
+}
+
 pub struct Conn {
     /// Claude's working directory, learned from `ide_connected`'s pid. `None`
     /// until it connects, or when resh could not read it — those are different
@@ -337,9 +411,16 @@ fn dispatch(msg: &serde_json::Value, conn: &mut Conn) -> Option<serde_json::Valu
 
 fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
     let config = WebSocketConfig { max_message_size: Some(MAX_FRAME_BYTES), ..Default::default() };
+    // Built before the handshake, not after: registration happens inside the
+    // handshake callback below (see the comment there for why that ordering
+    // is load-bearing, not cosmetic).
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+    let reg_tx = reply_tx.clone();
+    let reg_project = project.to_string();
     let accepted = accept_hdr_with_config(
         stream,
-        |req: &WsRequest, mut resp: WsResponse| {
+        move |req: &WsRequest, mut resp: WsResponse| {
             let deny = |why: &str| {
                 eprintln!("resh: rejected ide ws handshake ({why})");
                 tungstenite::http::Response::builder()
@@ -365,14 +446,58 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
                 "sec-websocket-protocol",
                 tungstenite::http::HeaderValue::from_static("mcp"),
             );
+            // Registered here, inside the handshake callback, and not after
+            // `accept_hdr_with_config` returns: this callback runs and
+            // returns *before* tungstenite writes the handshake response
+            // bytes to the client. Registering after the call returned lost
+            // the race in practice — a fake client's `connect()` can return
+            // and this thread can call `mention` before the accepting
+            // thread gets scheduled again, so `mention` found nothing and
+            // `a_mention_is_the_notification_the_cli_expects` failed with
+            // "no Claude is connected to this project" (see this task's
+            // report for the actual failure output). Registering here
+            // instead makes "the client observed a successful handshake"
+            // happen-after "this connection is in `CONNS`", not merely
+            // usually-before.
+            let mut map = conns().lock().unwrap_or_else(|e| e.into_inner());
+            map.entry(reg_project.clone()).or_default().push((conn_id, reg_tx.clone()));
             Ok(resp)
         },
         Some(config),
     );
+    // Built right after the handshake attempt, before checking whether it
+    // actually succeeded: the callback above can register this connection
+    // and then have the handshake still fail as a whole (e.g. a write error
+    // flushing the response tungstenite already decided to send) — an
+    // "accepted, but then failed anyway" outcome that would otherwise leave
+    // a registration nothing ever cleans up. Constructing the guard
+    // unconditionally, before the `Ok`/`Err` branch, means its `Drop` always
+    // runs on every exit from here on, including that one; for a handshake
+    // that was denied before ever reaching the registration line (a bad
+    // token, an Origin), removing an id that was never inserted is a no-op.
+    let guard = ConnGuard { project: project.to_string(), id: conn_id };
     let Ok(mut ws) = accepted else { return };
-    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-    let mut conn = Conn::new(project, workspace.to_path_buf(), reply_tx);
-    let _ = reply_rx; // drained by the writer thread from Task 6 onward
+    let mut conn = Conn::new(project, workspace.to_path_buf(), reply_tx.clone());
+    // Only conn's and the registry's own clones should keep the channel
+    // open from here — this one has done its job.
+    drop(reply_tx);
+
+    // Splits read and write the way wsconn.rs and term.rs do: a writer
+    // thread owns `ws_write` exclusively and drains `reply_rx`, so every
+    // outbound message — a direct reply *and* an out-of-band `at_mentioned`
+    // pushed by `mention` from another thread — goes through one writer,
+    // never two threads racing to write the same socket.
+    let Ok(write_half) = ws.get_ref().try_clone() else { return };
+    let mut ws_write: tungstenite::WebSocket<TcpStream> =
+        tungstenite::WebSocket::from_raw_socket(write_half, tungstenite::protocol::Role::Server, None);
+    let writer = std::thread::spawn(move || {
+        while let Ok(msg) = reply_rx.recv() {
+            if ws_write.send(tungstenite::Message::Text(msg)).is_err() {
+                break;
+            }
+        }
+    });
+
     loop {
         let Ok(msg) = ws.read() else { break };
         let text = match msg {
@@ -382,7 +507,7 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
         };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
         if let Some(reply) = dispatch(&v, &mut conn) {
-            if ws.send(tungstenite::Message::Text(reply.to_string())).is_err() {
+            if conn.reply.send(reply.to_string()).is_err() {
                 break;
             }
         }
@@ -390,6 +515,15 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
             break;
         }
     }
+
+    // Drop `conn` (its own reply clone) and the guard (deregisters, and
+    // drops its clone too) before joining: `reply_rx.recv()` above only
+    // returns once every `Sender` clone for this connection is gone, and
+    // joining first would deadlock waiting for a thread that is itself
+    // waiting on us — the same ordering `wsconn.rs`'s `handle` uses.
+    drop(conn);
+    drop(guard);
+    let _ = writer.join();
 }
 
 #[cfg(test)]
@@ -763,5 +897,167 @@ mod tests {
                 Ok(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
             }
         }
+    }
+
+    // --- Task 6: at_mentioned ---
+    //
+    // `CONNS` is process-global like `REGISTRY`, so every test below (and
+    // every fake client it connects) gets a project name unique to it — the
+    // same discipline Task 5's tests already established.
+
+    /// Test-only: the send half of each fake client's socket, so a test can
+    /// speak as Claude without owning the socket itself.
+    static SENDERS: OnceLock<Mutex<HashMap<String, std::sync::mpsc::Sender<String>>>> =
+        OnceLock::new();
+
+    fn senders() -> &'static Mutex<HashMap<String, std::sync::mpsc::Sender<String>>> {
+        SENDERS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Connects a client the way the CLI does and returns (frames it
+    /// receives, the live Ide). Holding the returned `Arc<Ide>` matters: it
+    /// owns the lock file, and dropping it unregisters the project.
+    fn connected_fake_client_for(project: &str) -> (std::sync::mpsc::Receiver<String>, Arc<Ide>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let ide = for_project_in(dir.path(), project, ws.path().to_path_buf()).unwrap();
+        // `IntoClientRequest for http::Request<()>` is a pass-through: it adds
+        // nothing. `generate_request` requires Host, Connection, Upgrade,
+        // Sec-WebSocket-Version and Sec-WebSocket-Key to be present already and
+        // errors without the key (tungstenite 0.24 handshake/client.rs:111-135),
+        // so a hand-built request must carry all five itself.
+        let req = tungstenite::http::Request::builder()
+            .uri(format!("ws://127.0.0.1:{}/", ide.port))
+            .header("Host", format!("127.0.0.1:{}", ide.port))
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", tungstenite::handshake::client::generate_key())
+            .header("Sec-WebSocket-Protocol", "mcp")
+            .header("X-Claude-Code-Ide-Authorization", &ide.token)
+            .body(())
+            .unwrap()
+            .into_client_request()
+            .unwrap();
+        let (mut sock, _) = tungstenite::connect(req).expect("the fake client must connect");
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The test drives sends through this channel too, so one thread owns
+        // the socket and the test never races itself.
+        let (send_tx, send_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || loop {
+            while let Ok(out) = send_rx.try_recv() {
+                if sock.send(tungstenite::Message::Text(out)).is_err() {
+                    return;
+                }
+            }
+            match sock.read() {
+                Ok(tungstenite::Message::Text(t)) => {
+                    if tx.send(t).is_err() {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        });
+        senders().lock().unwrap().insert(project.to_string(), send_tx);
+        (rx, ide, dir)
+    }
+
+    /// Revert-checked: adding `"id": 1` to `mention`'s constructed message
+    /// (turning the notification into something shaped like a request)
+    /// failed only this test, on the `id.is_none()` assertion — the actual
+    /// panic: `"a notification must carry no id or the CLI will wait for a
+    /// reply it never gets"`. Then restored.
+    #[test]
+    fn a_mention_is_the_notification_the_cli_expects() {
+        let (rx, ide, _d) = connected_fake_client_for("mention-shape");
+        mention("mention-shape", Path::new("/w/src/hub.rs"), Some((12, 40))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert_eq!(v["method"], "at_mentioned");
+        assert_eq!(v["params"]["filePath"], "/w/src/hub.rs");
+        assert_eq!(v["params"]["lineStart"], 12);
+        assert_eq!(v["params"]["lineEnd"], 40);
+        assert!(v.get("id").is_none(), "a notification must carry no id or the CLI will wait for a reply it never gets");
+        let _ = ide;
+    }
+
+    /// Revert-checked: changing `mention` to always set `lineStart`/`lineEnd`
+    /// (defaulting to `(0, 0)` when `lines` is `None`) failed only this test —
+    /// `assertion failed: v["params"].get("lineStart").is_none()` — then
+    /// restored. Without this test a whole-file mention would silently start
+    /// carrying a bogus line range the CLI would render as a real selection.
+    #[test]
+    fn a_whole_file_mention_carries_no_line_numbers() {
+        let (rx, _ide, _d) = connected_fake_client_for("mention-wholefile");
+        mention("mention-wholefile", Path::new("/w/README.md"), None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert!(v["params"].get("lineStart").is_none());
+    }
+
+    /// Revert-checked: disabling `mention`'s `targets.is_empty()` check (so
+    /// an empty target list falls through to `Ok(())` instead of refusing)
+    /// failed this test — `called Result::unwrap_err() on an Ok value: ()` —
+    /// and, for the same reason, also failed the sibling
+    /// `a_dropped_connection_deregisters_so_a_later_mention_reports_no_claude`
+    /// test below, which exercises the same empty-target path from the other
+    /// direction (a connection that *was* registered and then deregistered,
+    /// rather than one that was never registered at all). Both are
+    /// legitimate hits on the one break, not evidence of a false positive —
+    /// see CLAUDE.md's note on the `ide_connected` notification test for the
+    /// same pattern. Then restored.
+    #[test]
+    fn mentioning_with_no_claude_connected_is_an_error_not_a_panic() {
+        // The tree's keybinding is always available; Claude is not. This must
+        // surface as a refusal the UI can show, never as a socket-thread panic.
+        let err = mention("nobody-here", Path::new("/w/x.rs"), None).unwrap_err();
+        assert!(err.contains("no Claude"), "the message must say what is missing: {err}");
+    }
+
+    /// Revert-checked (Task 6's brief, Step 6): changing `for t in &targets`
+    /// to send only to `targets.first()` failed only this test, and only on
+    /// `rx2` — `rx1.recv_timeout` still succeeded (it got the first sender),
+    /// `rx2.recv_timeout` timed out. With a single subscriber "send to all"
+    /// and "send to the first" are indistinguishable, which is exactly the
+    /// trap CLAUDE.md records; that is why this test uses two clients. Then
+    /// restored.
+    #[test]
+    fn a_mention_reaches_every_connected_claude_not_just_the_first() {
+        // Two terminals, two claudes, one project. Sending to only the first
+        // is indistinguishable from sending to all with a single subscriber —
+        // which is exactly the trap CLAUDE.md records.
+        let (rx1, _a, _d1) = connected_fake_client_for("mention-fanout");
+        let (rx2, _b, _d2) = connected_fake_client_for("mention-fanout");
+        mention("mention-fanout", Path::new("/w/x.rs"), None).unwrap();
+        assert!(rx1.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
+        assert!(rx2.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
+    }
+
+    /// A dead connection (its read loop already broke, panicked or not) must
+    /// not leave a phantom target in `CONNS` — `mention` would then report
+    /// success into a void nothing will ever deliver. Exercises `ConnGuard`
+    /// directly rather than tearing down a real socket, so the assertion is
+    /// about the registry's own bookkeeping, not about socket teardown timing.
+    ///
+    /// Revert-checked: emptying `ConnGuard::drop`'s body (so registering still
+    /// happens but deregistering does not) failed this test — `mention`
+    /// returned `Ok(())` instead of the expected `Err`, because the dead
+    /// sender was still counted as a live target. Then restored.
+    #[test]
+    fn a_dropped_connection_deregisters_so_a_later_mention_reports_no_claude() {
+        let project = "mention-guard-drop";
+        let (tx, _rx) = std::sync::mpsc::channel::<String>();
+        let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut map = conns().lock().unwrap();
+            map.entry(project.to_string()).or_default().push((id, tx));
+        }
+        let guard = ConnGuard { project: project.to_string(), id };
+        // Sanity: the registration really did take effect before the drop
+        // this test is actually about.
+        assert!(mention(project, Path::new("/w/x.rs"), None).is_ok());
+        drop(guard);
+        let err = mention(project, Path::new("/w/x.rs"), None).unwrap_err();
+        assert!(err.contains("no Claude"), "the registry entry must be gone once the guard drops: {err}");
     }
 }

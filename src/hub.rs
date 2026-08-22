@@ -404,6 +404,9 @@ impl Hub {
             Intent::EndSession { session } => return self.do_end_session(from, session.clone()),
             Intent::NewTerminal { pane } => return self.do_new_terminal(from, *pane),
             Intent::OpenPath { text } => return self.do_open_path(from, text.clone()),
+            Intent::MentionPath { rel, line_start, line_end } => {
+                return self.do_mention_path(from, rel.clone(), *line_start, *line_end)
+            }
             _ => {}
         }
         // CloseTab removes the tab from `self.ws` inside `apply_layout`
@@ -1135,6 +1138,27 @@ impl Hub {
             tab: Tab::File { rel, mode: Mode::Preview },
         };
         self.handle(from, intent)
+    }
+
+    /// Resolves `rel` against this project's directory before it ever
+    /// reaches `ide::mention` — `safe_resolve` is the confinement boundary,
+    /// and a path a browser sent must never be trusted past it. Failure
+    /// (an escaping path, or no Claude connected) is reported with
+    /// `send_to`, never `broadcast`: only the browser that pressed the key
+    /// should see "no Claude is connected".
+    fn do_mention_path(&mut self, from: &ConnId, rel: String, line_start: Option<u32>, line_end: Option<u32>) {
+        let abs = match crate::projects::safe_resolve(&self.dir, &rel) {
+            Ok(p) => p,
+            Err(e) => {
+                let ev = Event::Error { msg: e };
+                return self.send_to(from, &ev);
+            }
+        };
+        let lines = line_start.zip(line_end);
+        if let Err(e) = crate::ide::mention(&self.project, &abs, lines) {
+            let ev = Event::Error { msg: e };
+            self.send_to(from, &ev);
+        }
     }
 
     fn do_close_project(&mut self, from: &ConnId) {
@@ -2762,6 +2786,71 @@ mod tests {
             h.ws.version, version_before,
             "a refusal must not bump ws.version — that's what gates a broadcasted snapshot"
         );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// Confinement runs before the notification ever reaches `ide::mention`:
+    /// a path that escapes the project must be refused by `safe_resolve`
+    /// itself, not silently forwarded — there being no listening Claude in
+    /// this test would otherwise make an escape indistinguishable from an
+    /// ordinary "resolved fine, nobody's connected" refusal.
+    ///
+    /// Revert-checked: swapping the arm order so `ide::mention` runs first
+    /// against the raw `rel` (bypassing `safe_resolve` entirely) failed this
+    /// test — the refusal's message became `"no Claude is connected to this
+    /// project"`, tripping the `!m.contains("no Claude")` assertion, i.e. the
+    /// escaping path silently made it past confinement. Restored.
+    #[test]
+    fn mention_path_outside_the_project_is_refused_before_reaching_claude() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", dir.path().join("state"));
+        let mut h = Hub::new("mentionescape", dir.path().to_path_buf());
+        let (asker, rx) = h.subscribe();
+
+        h.handle(&asker, Intent::MentionPath {
+            rel: "../../etc/passwd".into(),
+            line_start: None,
+            line_end: None,
+        });
+
+        let got: Vec<String> = rx.try_iter().collect();
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"Error""#) && !m.contains("no Claude")),
+            "an escaping path must be refused by safe_resolve, not treated as \
+             'resolved but no Claude connected': {got:?}"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// Two subscribers, for the reason CLAUDE.md records and the sibling
+    /// `open_path_refusal_reaches_only_the_client_that_asked` test above
+    /// gives: with one subscriber, `send_to` and `broadcast` cannot be told
+    /// apart.
+    ///
+    /// Revert-checked: changing both `Event::Error` arms in `do_mention_path`
+    /// from `self.send_to(from, &ev)` to `self.broadcast(&ev)` failed this
+    /// test — `others` was no longer empty (`a refusal must leave the other
+    /// subscriber's inbox empty, got: ["{\"t\":\"Error\",\"msg\":\"no Claude
+    /// is connected to this project\"}"]`) — then restored.
+    #[test]
+    fn mention_path_refusal_reaches_only_the_client_that_asked() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", dir.path().join("state"));
+        std::fs::write(dir.path().join("a.rs"), b"fn main() {}").unwrap();
+        let mut h = Hub::new("mentionrefuse", dir.path().to_path_buf());
+        let (asker, rx_asker) = h.subscribe();
+        let (_other, rx_other) = h.subscribe();
+
+        // No fake Claude is registered for "mentionrefuse", so this resolves
+        // fine and then refuses at `ide::mention` for lack of a connection.
+        h.handle(&asker, Intent::MentionPath { rel: "a.rs".into(), line_start: None, line_end: None });
+
+        let got: Vec<String> = rx_asker.try_iter().collect();
+        assert!(got.iter().any(|m| m.contains("no Claude")), "the asking client got no refusal: {got:?}");
+        let others: Vec<String> = rx_other.try_iter().collect();
+        assert!(others.is_empty(), "a refusal must leave the other subscriber's inbox empty, got: {others:?}");
         std::env::remove_var("RESH_STATE_DIR");
     }
 
