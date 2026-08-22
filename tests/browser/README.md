@@ -26,6 +26,7 @@ deno run -A tests/browser/autosave.mjs   # the editor writes itself out, and sto
 deno run -A tests/browser/tabwrap.mjs    # the tab strip wraps, and re-fits the terminal under it
 deno run -A tests/browser/shiftenter.mjs # shift+enter sends LF, so Claude inserts a newline
 deno run -A tests/browser/hledit.mjs     # a code file stays highlighted while you edit it
+deno run -A tests/browser/edit-by-default.mjs # clicking a text file opens an editor, not a preview
 deno run -A tests/browser/preview-follows.mjs # a previewed file follows the file on disk
 deno run -A tests/browser/buffer-lifecycle.mjs # navigating a file is not an edit; undoing one comes back clean
 deno run -A tests/browser/termlinks.mjs # a printed path or URL is a link only while the modifier is held
@@ -91,6 +92,12 @@ performed.
   the document-level handler) fails 2 assertions in `save.mjs` — both unfocused
   cases time out with the file unchanged on disk — while the focused case goes
   on passing, which is what says the test is testing focus and not saving.
+- In `edit-by-default.mjs`: putting the tree click back to `mode: "Preview"`
+  fails 2; handing the ✎ to every editable file again fails 2 — one because a
+  code tab regains a toggle to a mode nothing opens in, one because the count
+  is per tab rather than per strip. The svg section is the guard on the rule
+  that broke first: an svg draws *and* is text, so a "markdown only" toggle
+  rule silently made it read-only, which `mdlinks.mjs` caught before it shipped.
 - In `hledit.mjs`: making every file plain fails 3; setting the wrong
   `language` attribute fails 3 different ones (spans still exist, but not
   Rust's); wiring a textarea other than the one `<code-input>` builds fails

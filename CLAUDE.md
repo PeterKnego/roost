@@ -25,6 +25,12 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   because the target does not exist yet).
 - **Session names match `^[A-Za-z0-9_-]{1,32}$`** — they land in a dtach socket
   path and a command line.
+- **A text file opens in Edit; only a file with a rendered form opens in
+  Preview** (markdown, images — and svg, which has both and keeps the ✎ that
+  switches). A file the server cannot read as text is demoted back to Preview
+  by `hub::open_buffer_for`, silently when the mode was a default and with a
+  banner when a user asked for it: an empty textarea over a file that is not
+  empty is how work gets overwritten.
 - **Project storage keys are percent-encoded** (`karpie%2Fsrc`) while URLs keep
   readable slashes. Existing top-level keys must stay byte-for-byte identical.
 - **Never hold a lock across blocking I/O.** This project has already shipped

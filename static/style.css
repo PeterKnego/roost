@@ -289,7 +289,10 @@ details[open] > summary { background-image: var(--twisty-open); }
 .hint { color: var(--muted); padding: 16px; }
 .path { position: sticky; top: 0; background: var(--bg2); border-bottom: 1px solid var(--hairline, var(--border)); padding: 4px 10px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .codeview { padding: 10px; font: 13px/1.55 var(--mono); overflow-x: auto; background: var(--bg); }
-.codeview code { background: none; }
+/* font too, not just the background: the UA stylesheet sets `code { font-family:
+   monospace }`, which beats inheritance from .codeview and rendered a preview
+   in the browser's default mono while every editor and terminal used --mono. */
+.codeview code { background: none; font: inherit; }
 .diffview { font: 12.5px/1.5 var(--mono); padding: 6px 0; }
 .dl { padding: 0 12px; white-space: pre-wrap; }
 .dl.add { background: var(--add-bg); color: var(--add-fg); }

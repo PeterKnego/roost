@@ -48,7 +48,7 @@ const wsUrl = (p) => `${location.protocol === "https:" ? "wss" : "ws"}://${locat
 // server-side too (SetMode refuses it, OpenTab coerces a raw Edit request to
 // Preview, and EditBuffer — the actual save chokepoint — refuses to create a
 // buffer at all), so no client bug here can make a save truncate a file.
-const NO_TEXT_EDIT_EXT = ["png", "jpg", "jpeg", "gif", "webp", "ico"];
+const NO_TEXT_EDIT_EXT = ["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf"];
 // Must extract the extension exactly as assets::ext_of does, or syncing the
 // lists would not sync the behaviour: take the LAST path segment (so
 // `img.d/README` has no extension rather than inheriting `d`) and require a
@@ -59,6 +59,27 @@ const extOf = (rel) => {
   return i < 0 ? "" : name.slice(i + 1).toLowerCase();
 };
 const refusesTextEdit = (rel) => NO_TEXT_EDIT_EXT.includes(extOf(rel));
+/// Files this app can *draw* rather than only spell out: markdown renders, and
+/// so does every image. Mirrors routes.rs's IMAGE_EXT plus the two markdown
+/// extensions render.rs's file_fragment branches on.
+///
+/// Deliberately wider than NO_TEXT_EDIT_EXT, and the gap is the point — svg is
+/// here *and* editable, because it draws as a picture and is text. CLAUDE.md
+/// records the release where gating Edit on "is it an image" silently took
+/// that away.
+const RENDERED_EXT = ["md", "markdown", "png", "jpg", "jpeg", "gif", "webp", "svg", "ico"];
+const hasRenderedForm = (rel) => RENDERED_EXT.includes(extOf(rel));
+/// How a file opens when the user just clicks it.
+///
+/// Edit, for anything the editor can hold — which is what an IDE does, and
+/// what this app's preview was standing in for. Preview survives where it is
+/// not a stand-in: a file with a rendered form, where the drawing is the thing
+/// you opened it to see. A file that turns out not to be text at all is not
+/// decided here — the server reads it, fails, and moves the tab back to
+/// Preview itself, because only it can know.
+function defaultMode(rel) {
+  return hasRenderedForm(rel) ? "Preview" : "Edit";
+}
 
 // --- terminal links ------------------------------------------------------
 // Cmd on macOS, Ctrl everywhere else. Not a preference: Ctrl+click on a Mac is
@@ -398,7 +419,12 @@ function render() {
       // — see hasAttention/focusSession below.
       b.onclick = () =>
         t.k === "Terminal" ? focusSession(t.session) : send({ t: "ActivateTab", pane: pi, idx: ti });
-      if (t.k === "File" && !refusesTextEdit(t.rel)) {
+      // Two modes are worth switching between only where the file has both: a
+      // rendered form to look at and text to edit. That is markdown and svg —
+      // a png renders but cannot be edited, and a code file is editable but
+      // renders as nothing, so offering it "switch to preview" would advertise
+      // a mode nothing now opens in.
+      if (t.k === "File" && hasRenderedForm(t.rel) && !refusesTextEdit(t.rel)) {
         const e = document.createElement("span");
         e.className = "x";
         e.title = t.mode === "Edit" ? "switch to preview" : "switch to edit";
@@ -792,7 +818,7 @@ function wireFileLinks(root) {
       send({
         t: "OpenTab",
         pane: 2,
-        tab: isDiff ? { k: "Diff", rel: rel || null } : { k: "File", rel, mode: "Preview" },
+        tab: isDiff ? { k: "Diff", rel: rel || null } : { k: "File", rel, mode: defaultMode(rel) },
       });
     };
     a.oncontextmenu = (e) => { e.preventDefault(); fileMenu(e, a.dataset.rel); };

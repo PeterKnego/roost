@@ -415,7 +415,7 @@ impl Hub {
                 // conflict against content it never compared against.
                 match &intent {
                     Intent::SetMode { rel, mode: Mode::Edit } => {
-                        self.open_buffer_for(from, rel, Mode::Edit)
+                        self.open_buffer_for(from, rel, Mode::Edit, true)
                     }
                     // Dispatched off the COERCED tab, not off the intent:
                     // apply_layout may have forced Edit to Preview, and
@@ -465,7 +465,7 @@ impl Hub {
                                 .is_some_and(|b| !b.dirty() && !b.stale);
                             if !reactivating_a_settled_buffer && !crate::routes::refuses_text_edit(&rel)
                             {
-                                self.open_buffer_for(from, &rel, mode)
+                                self.open_buffer_for(from, &rel, mode, false)
                             }
                         }
                     }
@@ -501,7 +501,7 @@ impl Hub {
                             )
                         });
                         if still_open {
-                            self.open_buffer_for(from, rel, Mode::Edit);
+                            self.open_buffer_for(from, rel, Mode::Edit, false);
                         }
                     }
                     _ => {}
@@ -540,7 +540,30 @@ impl Hub {
     /// perfectly well with no buffer at all, and a banner on that everyday
     /// tree click would be reporting a failure the user neither caused nor
     /// can act on.
-    fn open_buffer_for(&mut self, from: &ConnId, rel: &str, mode: Mode) {
+    /// Puts every Edit tab on `rel` back into Preview. Returns whether any
+    /// tab actually moved — false means nothing referenced it in Edit, in
+    /// which case the caller still owes the client an explanation.
+    fn demote_to_preview(&mut self, rel: &str) -> bool {
+        let mut moved = false;
+        for p in self.ws.panes.iter_mut() {
+            for t in p.tabs.iter_mut() {
+                if let crate::proto::Tab::File { rel: r, mode } = t {
+                    if r == rel && *mode == Mode::Edit {
+                        *mode = Mode::Preview;
+                        moved = true;
+                    }
+                }
+            }
+        }
+        moved
+    }
+
+    /// `requested` distinguishes a user pressing ✎ from a tab defaulting into
+    /// Edit because that is how text files open now. Both demote to Preview
+    /// when the file turns out not to be readable as text; only the first is
+    /// worth a banner, because only there did somebody ask for something the
+    /// system could not do.
+    fn open_buffer_for(&mut self, from: &ConnId, rel: &str, mode: Mode, requested: bool) {
         let already_dirty = self.ws.buffers.get(rel).map(|b| b.dirty()).unwrap_or(false);
         // The text to broadcast below. A freshly-read buffer holds nothing
         // (Content::Clean), so it cannot be read back out of the buffer the
@@ -572,8 +595,36 @@ impl Hub {
                     freshly_read = Some(text);
                 }
                 Err(e) => {
+                    // A file the editor cannot hold must not leave a tab
+                    // sitting in Edit over it: the textarea would be empty,
+                    // and the only thing telling the user why would be a
+                    // banner. Since a text file now opens in Edit by default,
+                    // this is no longer an edge case — it is what clicking a
+                    // .zip, or a log past the 2 MB cap, does. Fall back to the
+                    // preview, which renders its own explanation of why the
+                    // file is not text.
+                    //
+                    // Reported only when the mode was *asked for*. A tab that
+                    // merely defaulted into Edit and quietly landed in Preview
+                    // is the system working; a ⌘-toggle into Edit that could
+                    // not be honoured is worth a banner.
                     if mode == Mode::Edit {
-                        self.send_to(from, &Event::Error { msg: e });
+                        // Always demote: an empty textarea over a file that
+                        // is not empty is how work gets overwritten, and that
+                        // is what a tab left in Edit here would be.
+                        if self.demote_to_preview(rel) {
+                            self.ws.version += 1;
+                            let snap = self.snapshot_event(from);
+                            self.broadcast(&snap);
+                            self.persist();
+                        }
+                        // Explain only what somebody asked for. A click that
+                        // defaulted into Edit and quietly landed in Preview is
+                        // the system working; a ✎ that could not be honoured
+                        // is not, and the preview alone does not say why.
+                        if requested {
+                            self.send_to(from, &Event::Error { msg: e });
+                        }
                     }
                     return;
                 }
@@ -1580,6 +1631,49 @@ mod tests {
     /// self.open_buffer_for(from, rel)` and running this test: it failed at
     /// "a coerced tab must not get a buffer" — the buffer was there, holding
     /// the lossy text of the PNG.
+    /// With Edit as the default mode for text files, clicking a `.zip` or a
+    /// log past the 2 MB cap sends `OpenTab{Edit}` for a file the editor
+    /// cannot hold. Leaving the tab in Edit puts an empty textarea over it,
+    /// and an empty textarea over a file that exists is how work gets
+    /// overwritten. The tab must land in Preview instead, which renders its
+    /// own explanation.
+    ///
+    /// Reverting the Err arm to `send_to(Error)` fails this at the mode
+    /// assertion — the tab stays in Edit.
+    #[test]
+    fn a_file_the_editor_cannot_hold_falls_back_to_preview() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        // A NUL byte is what read_text_file refuses as binary. `.bin` is off
+        // NO_TEXT_EDIT_EXT on purpose, so coerce_tab cannot be what saves us
+        // here — this is the read failing, not the extension list.
+        std::fs::write(d.path().join("blob.bin"), b"a\0b").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "blob.bin".into(), mode: Mode::Edit },
+            },
+        );
+
+        assert_eq!(
+            h.ws.panes[proto::MIDDLE as usize].tabs.last(),
+            Some(&Tab::File { rel: "blob.bin".into(), mode: Mode::Preview }),
+            "an unreadable file's tab must not stay in Edit"
+        );
+        assert!(!h.ws.buffers.contains_key("blob.bin"), "and it gets no buffer");
+        let msgs = drain(&rx);
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"State""#)),
+            "the client has to be told the mode moved, or its tab strip disagrees with the server"
+        );
+    }
+
     #[test]
     fn a_coerced_open_does_not_read_the_file_it_could_not_edit() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
