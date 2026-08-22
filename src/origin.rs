@@ -6,6 +6,15 @@
 //! The allowlist comes from RESH_ORIGINS or the *global* config only.
 //! Never from {project}/.resh/config.toml: a hostile repo must not be
 //! able to allowlist its own domain.
+//!
+//! **This module is not the rule for every socket.** `src/ide.rs` deliberately
+//! inverts it: the socket Claude Code connects to refuses a handshake that
+//! *carries* an Origin, and authenticates by lock-file token instead, because
+//! its client is a Bun process and a browser is the only thing that would send
+//! one there. Do not "restore consistency" by routing that socket through
+//! `origin_allowed` — Claude Code's own extensions shipped this socket
+//! Origin-blind and unauthenticated through 1.0.23 and that is CVE-2025-52882.
+//! See `ide.rs`'s module doc and CLAUDE.md's two Origin constraints.
 
 /// Extract the host portion of an origin like `https://host:8444`.
 fn host_of(origin: &str) -> Option<&str> {

@@ -1,7 +1,20 @@
 use std::net::TcpListener;
 use std::path::PathBuf;
 
+/// One temp directory, shared by every test in this binary, for any real
+/// ide lock file opening a terminal writes (`ide::for_project` ->
+/// `idelock::ide_dir()`). Set once and idempotently — see
+/// `idelock::set_ide_dir_for_test`'s doc comment for why a directory shared
+/// across tests, not one per test, is the right shape — so `cargo test`
+/// never touches the real `~/.claude/ide` (Task 5 review, finding 2).
+fn isolate_ide_dir_for_tests() {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let d = DIR.get_or_init(|| tempfile::tempdir().unwrap());
+    resh::idelock::set_ide_dir_for_test(d.path().to_path_buf());
+}
+
 fn start(roots: Vec<PathBuf>) -> u16 {
+    isolate_ide_dir_for_tests();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || resh::serve(listener, roots));
@@ -108,6 +121,37 @@ fn post(port: u16, path: &str, origin: Option<&str>, ctype: &str, body: &[u8]) -
     let text = String::from_utf8_lossy(&resp).to_string();
     let status = text.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
     (status, text)
+}
+
+/// `POST /paste/{project}/{session}` needs a session that is already in
+/// `session::sessions()`, but connecting the terminal websocket only
+/// *starts* `attach` — the WS handshake completes (and so the client's
+/// `ws_connect` call returns) before the server has necessarily called it,
+/// let alone had it finish spawning the PTY. That gap has always existed;
+/// it only became wide enough to lose routinely once opening a terminal
+/// started guaranteeing the project's ide listener exists first (real
+/// I/O — a TCP bind, a token, a lock file — genuinely ahead of the spawn,
+/// not merely slow test scheduling). Retrying is safe: a "no such session"
+/// 404 is refused before any paste content is touched, so it leaves nothing
+/// behind to double up on the next attempt. Poll rather than sleep-once,
+/// per this file's own idiom elsewhere (see `any_process_holds`'s callers):
+/// bounded, and exits the moment the condition holds.
+fn post_when_session_ready(
+    port: u16,
+    path: &str,
+    origin: Option<&str>,
+    ctype: &str,
+    body: &[u8],
+) -> (u16, String) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (status, resp) = post(port, path, origin, ctype, body);
+        let session_not_ready_yet = status == 404 && resp.contains("no such session");
+        if !session_not_ready_yet || std::time::Instant::now() >= deadline {
+            return (status, resp);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// The check the whole GET-only amendment is traded against, so it gets the
@@ -240,7 +284,7 @@ fn a_pasted_image_injects_a_bracketed_path_into_the_pty() {
 
     let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0];
     let (ct, body) = multipart(&[("clip.png", &png)]);
-    let (status, resp) = post(port, "/paste/proj/shell", Some(&origin), &ct, &body);
+    let (status, resp) = post_when_session_ready(port, "/paste/proj/shell", Some(&origin), &ct, &body);
     assert_eq!(status, 200, "response: {resp}");
 
     let mut seen = String::new();
@@ -290,7 +334,7 @@ fn a_paste_of_a_non_image_is_refused() {
     // A BMP: a real image the *clipboard* route would take, refused here
     // because the receiver cannot read `.bmp` from a path.
     let (ct, body) = multipart(&[("clip.png", b"BM\0\0\0\0\0\0\0\0\0\0")]);
-    let (status, resp) = post(port, "/paste/proj/shell", Some(&origin), &ct, &body);
+    let (status, resp) = post_when_session_ready(port, "/paste/proj/shell", Some(&origin), &ct, &body);
     assert_eq!(status, 400, "response: {resp}");
     assert!(resp.contains("PNG"), "the error must name what is accepted: {resp}");
     assert!(
@@ -958,6 +1002,162 @@ fn two_terminal_clients_mirror_one_session() {
     }
     let _ = a.close(None);
     let _ = b.close(None);
+    std::env::remove_var("RESH_STATE_DIR");
+}
+
+/// A browser that connects *after* a proposal opened must be shown what it is
+/// being asked to approve. `Event::Proposal` goes out once, live; `State`
+/// names the tab but carries neither side of the diff. Without the connect-time
+/// replay, the second browser draws an empty proposal tab it can still click
+/// Accept on — agreeing to a change nobody showed it.
+///
+/// The assertion is on the *text*, not on the tab: a test that only checked
+/// for `"k":"Proposal"` in the snapshot cannot tell a rendered proposal from
+/// a blank one, which is the whole defect.
+///
+/// Revert-checked twice. Removing the `proposal_replay` loop from `wsconn`'s
+/// connect path failed this test — `never saw "\"t\":\"Proposal\"" within
+/// the deadline`, after genuinely waiting out `read_until`'s full 15s rather
+/// than passing vacuously. Separately, keeping the loop but making
+/// `open_proposal_tab` store nothing failed the same way. The hub-level unit
+/// test for `proposal_replay` kept passing through both, which is exactly why
+/// this one exists. Then restored.
+#[test]
+fn a_browser_that_connects_after_a_proposal_is_shown_both_sides_of_it() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    let (_d, port) = fixture();
+    // The first connection is what builds the hub this proposal is opened on.
+    let mut a = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    let _ = read_until(&mut a, r#""t":"State""#);
+
+    resh::hub::open_proposal("proj", "late-1", "hello.md", "what is there", "what claude wants");
+
+    let mut b = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
+    let seen = read_until(&mut b, r#""t":"Proposal""#);
+    assert!(
+        seen.contains("what is there") && seen.contains("what claude wants"),
+        "the late browser was shown a proposal tab with no content: {seen}"
+    );
+    assert!(seen.contains(r#""rel":"hello.md""#), "and it must name the file: {seen}");
+
+    // The hub registry is process-global and keyed by project name, so this
+    // proposal would otherwise sit in "proj"'s layout for every later test in
+    // this binary.
+    resh::hub::close_proposal("proj", "late-1");
+    let _ = a.close(None);
+    let _ = b.close(None);
+    std::env::remove_var("RESH_STATE_DIR");
+}
+
+/// The connect path must emit content before the tab that renders it, the
+/// same order the live path already used (`Hub::open_proposal_tab` broadcasts
+/// `Event::Proposal` before the `State` that follows it). Before this task,
+/// `wsconn::handle` sent the connect-time snapshot (`State`, which names
+/// every open `Tab::Proposal`) *before* replaying `proposal_replay`'s
+/// `Event::Proposal`s — so a client had to handle both orders, and a
+/// straightforward implementation of the client's "keyed by id" map (see
+/// static/app.js's `proposals`/`tabKey`) would draw an accept-able blank tab
+/// for exactly one frame.
+///
+/// This only checks the very first frame after connecting — not merely that
+/// both eventually arrive (`a_browser_that_connects_after_a_proposal_is_
+/// shown_both_sides_of_it`, above, already covers that) — because ordering
+/// is exactly what a "did both arrive" assertion cannot see.
+///
+/// Revert-checked: swapping wsconn's two `send_to` calls back (`State` before
+/// the `proposal_replay` loop) fails this test — `the first frame after
+/// connecting must be the proposal's content, not "State": {"t":"State",...`
+/// — while `a_browser_that_connects_after_a_proposal_is_shown_both_sides_of_it`
+/// keeps passing, which is exactly why this test exists alongside it.
+/// Restored.
+#[test]
+fn a_late_browsers_first_frame_is_the_proposals_content_not_its_tab() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    let (_d, port) = fixture_named("proposal-order");
+    let mut a = ws_connect_path(port, "/ws/proposal-order/_workspace").unwrap();
+    let _ = read_until(&mut a, r#""t":"State""#);
+
+    resh::hub::open_proposal(
+        "proposal-order",
+        "order-1",
+        "hello.md",
+        "what is there",
+        "what claude wants",
+    );
+
+    let mut b = ws_connect_path(port, "/ws/proposal-order/_workspace").unwrap();
+    let first = loop {
+        match b.read().unwrap() {
+            tungstenite::Message::Text(t) => break t.to_string(),
+            _ => continue,
+        }
+    };
+    assert!(
+        first.contains(r#""t":"Proposal""#),
+        "the first frame after connecting must be the proposal's content, not \"State\": {first}"
+    );
+
+    resh::hub::close_proposal("proposal-order", "order-1");
+    let _ = a.close(None);
+    let _ = b.close(None);
+    std::env::remove_var("RESH_STATE_DIR");
+}
+
+/// The `/frag/{project}/proposal` route (added in review, replacing a
+/// client-side port of textdiff.rs::unified in static/app.js): a real HTTP
+/// fetch against a real open proposal must show the changed hunk, and an id
+/// that is not (or no longer) open must render the "no longer open"
+/// fragment rather than a 500 or an empty body — a browser fetch racing an
+/// answer is the ordinary case, not an edge case (see `Hub::do_answer_proposal`,
+/// which closes the tab and answers in that order).
+#[test]
+fn proposal_fragment_route_shows_the_hunk_and_handles_a_missing_id() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    let (_d, port) = fixture_named("proposal-frag");
+    // The first connection is what builds the hub this proposal opens on —
+    // same reasoning as the other proposal tests above.
+    let mut a = ws_connect_path(port, "/ws/proposal-frag/_workspace").unwrap();
+    let _ = read_until(&mut a, r#""t":"State""#);
+
+    resh::hub::open_proposal(
+        "proposal-frag",
+        "frag-1",
+        "hello.md",
+        "line one
+line two
+line three
+",
+        "line one
+CHANGED
+line three
+",
+    );
+
+    let body = ureq::get(&format!("http://127.0.0.1:{port}/frag/proposal-frag/proposal?id=frag-1"))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(body.contains("hello.md"), "must name the file: {body}");
+    assert!(body.contains("-line two") && body.contains("+CHANGED"), "must show the changed hunk: {body}");
+
+    // A withdrawn/answered/unknown id: the fragment must say so, not 500 or
+    // silently render nothing.
+    let gone = ureq::get(&format!("http://127.0.0.1:{port}/frag/proposal-frag/proposal?id=no-such-id"))
+        .call()
+        .unwrap()
+        .into_string()
+        .unwrap();
+    assert!(gone.contains("no longer open"), "got {gone}");
+
+    resh::hub::close_proposal("proposal-frag", "frag-1");
+    let _ = a.close(None);
     std::env::remove_var("RESH_STATE_DIR");
 }
 
@@ -1680,6 +1880,131 @@ fn close_project_ends_the_real_dtach_master_not_just_the_client() {
     std::env::remove_var("RESH_STATE_DIR");
 }
 
+/// After a `CloseProject`, `term.rs`'s direct `ide::for_project` call is the
+/// *only* thing left that can rebuild the project's IDE listener.
+///
+/// `ide::stop` removes the project from `ide`'s registry, but nothing ever
+/// removes it from `hub::REGISTRY` — so `Hub::for_project`'s `or_insert_with`
+/// closure, the only other caller of `ide::for_project`, can never run again
+/// for that project. `term.rs`'s comment describes that line as a
+/// first-terminal race fix, which reads like something the hub already covers;
+/// deleting it as redundant would leave every reopened project with no lock
+/// file, no `CLAUDE_CODE_SSE_PORT`, and a `claude` that silently comes up with
+/// no IDE — while every other test in this suite stays green.
+///
+/// Reconnecting the `_workspace` socket after the close is the control, and it
+/// is what makes this discriminating: it proves the listener is *not* coming
+/// back through the hub, so the assertion that follows can only be satisfied
+/// by `term.rs`. Asserting on the lock file rather than only on
+/// `ide::port_for` is deliberate too — the lock file is what `claude` actually
+/// scans, and a registry entry whose lock file was never rewritten would
+/// advertise nothing to anyone.
+///
+/// Revert-checked twice, and the second one is the one that matters.
+///
+/// Deleting `crate::ide::for_project(&project, dir.clone());` from `term.rs`
+/// outright failed this test — `reopening the project must rebuild its ide
+/// listener: term.rs's ide::for_project call is the only path left that can,
+/// and nothing else does`, after genuinely waiting out the full 5s poll — but
+/// it also failed five *existing* integration tests, so that break was already
+/// covered and says nothing about why this test needs to exist.
+///
+/// The break that isolates it is the actual mistake the comment in `term.rs`
+/// guards against: replacing that line with
+/// `crate::hub::Hub::for_project(&project, dir.clone())` — "the hub already
+/// does this, so this call is redundant". A fresh project still gets its
+/// listener (`or_insert_with` runs), so
+/// `a_fresh_projects_first_terminal_already_carries_the_ide_port` and all 59
+/// other integration tests stay green; a *reopened* one never does, and this
+/// test was the only failure in the suite, with the message above. Then
+/// restored.
+#[test]
+fn reopening_a_closed_project_rebuilds_its_ide_listener() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("RESH_CMD", "cat");
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    let (_d, port) = fixture_named("idereopen");
+    let ide_dir = resh::idelock::ide_dir();
+
+    // Opening the workspace socket is what builds the hub, and the hub's
+    // `or_insert_with` is what starts the listener the first time.
+    let mut ws = ws_connect_path(port, "/ws/idereopen/_workspace").unwrap();
+    let _ = read_until(&mut ws, r#""t":"State""#);
+    let first_port = wait_for_ide_port("idereopen").expect("test setup: no ide listener was ever started");
+    let first_lock = ide_dir.join(format!("{first_port}.lock"));
+    assert!(first_lock.exists(), "test setup: the first listener must have written a lock file");
+
+    ws.send(tungstenite::Message::Text(r#"{"t":"CloseProject"}"#.into())).unwrap();
+    let _ = read_until(&mut ws, r#""t":"ProjectClosed""#);
+    // `ide::stop` runs before `ProjectClosed` is broadcast, so this is ordered,
+    // not raced.
+    assert!(
+        resh::ide::port_for("idereopen").is_none(),
+        "CloseProject must have stopped the ide listener, or the rest of this test proves nothing"
+    );
+    assert!(!first_lock.exists(), "and removed exactly the lock file it wrote");
+
+    // The control: the hub entry survived the close, so this reconnect takes
+    // `for_project`'s hit path and its `or_insert_with` never runs again.
+    let mut ws2 = ws_connect_path(port, "/ws/idereopen/_workspace").unwrap();
+    let _ = read_until(&mut ws2, r#""t":"State""#);
+    assert!(
+        resh::ide::port_for("idereopen").is_none(),
+        "a reconnected _workspace socket must NOT be what brings the listener back — \
+         if it is, this test has stopped covering term.rs and the comment there is wrong"
+    );
+
+    // Reopening a terminal is the path that must rebuild it.
+    let mut term = ws_connect_path(port, "/ws/idereopen/term/shell").unwrap();
+    let second_port = wait_for_ide_port("idereopen").expect(
+        "reopening the project must rebuild its ide listener: term.rs's ide::for_project \
+         call is the only path left that can, and nothing else does",
+    );
+    let second_lock = ide_dir.join(format!("{second_port}.lock"));
+    assert!(
+        wait_for_path(&second_lock),
+        "the rebuilt listener must advertise itself in a lock file — that file is what \
+         `claude` scans, and a registry entry alone reaches nobody"
+    );
+
+    let _ = term.close(None);
+    let _ = ws.close(None);
+    let _ = ws2.close(None);
+    resh::ide::stop("idereopen");
+    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("RESH_CMD");
+}
+
+/// The ide listener is built on the connection thread, after the handshake has
+/// already returned to the client, so every check of it has to be a bounded
+/// poll rather than an immediate read.
+fn wait_for_ide_port(project: &str) -> Option<u16> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(p) = resh::ide::port_for(project) {
+            return Some(p);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn wait_for_path(p: &std::path::Path) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if p.exists() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn http_rejects_rebinding_host() {
     use std::io::{Read, Write};
@@ -1837,4 +2162,66 @@ fn a_terminal_child_can_discover_that_notifications_exist() {
     assert!(seen.contains("SESS=envprobe"), "session missing: {seen:?}");
     let _ = term.close(None);
     std::env::remove_var("RESH_CMD");
+}
+
+/// Connects the terminal socket directly, with **no** prior `_workspace`
+/// connection — the one thing a real browser always does first (loading the
+/// project page), but a reconnecting client or a raw client is not
+/// guaranteed to. That ordering is exactly what exposed a real bug while
+/// implementing this: `term.rs` used to call `session::attach` (which reads
+/// `ide::port_for`) *before* anything had ever started this project's ide
+/// listener, so the very first terminal in a brand-new project came up with
+/// no `CLAUDE_CODE_SSE_PORT` at all. Revert-checked: reverting `term.rs`'s
+/// `ide::for_project` call back out (so only the pre-existing, later
+/// `Hub::for_project` call remains) reproduces exactly this — see this
+/// task's report for the observed failure.
+#[test]
+fn a_fresh_projects_first_terminal_already_carries_the_ide_port() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let bin = tempfile::tempdir().unwrap();
+    let script = bin.path().join("sseport.sh");
+    std::fs::write(&script, "#!/bin/sh\necho \"SSEPORT=$CLAUDE_CODE_SSE_PORT\"\nsleep 5\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::env::set_var("RESH_CMD", script.to_str().unwrap());
+
+    let (_d, port) = fixture_named("sseportproj");
+    // No `_workspace` connection anywhere above this line: this project's
+    // hub, and so its ide listener, has never been touched before.
+    let mut term = ws_connect_path(port, "/ws/sseportproj/term/sseprobe").unwrap();
+    let mut seen = String::new();
+    for _ in 0..100 {
+        match term.read() {
+            Ok(tungstenite::Message::Binary(b)) => seen.push_str(&String::from_utf8_lossy(&b)),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if seen.contains("SSEPORT=") {
+            break;
+        }
+    }
+    let ide_port: Option<u16> = seen
+        .split("SSEPORT=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|p| p.trim().parse().ok());
+    assert!(
+        matches!(ide_port, Some(p) if p != 0),
+        "expected a nonzero CLAUDE_CODE_SSE_PORT in the spawned shell's env; got: {seen:?}"
+    );
+    let _ = term.close(None);
+    std::env::remove_var("RESH_CMD");
+    // Best-effort cleanup: this writes a real lock file into the shared
+    // test ide directory (`isolate_ide_dir_for_tests`), and nothing else
+    // ever closes "sseportproj"'s project to remove it. Not load-bearing —
+    // the whole directory is a `TempDir` that removes itself when this test
+    // binary exits — but tidy, and it matches the same rule
+    // `idelock::Lock`'s own `Drop` follows: `remove_file`, never a
+    // directory scan.
+    if let Some(p) = ide_port {
+        let _ = std::fs::remove_file(resh::idelock::ide_dir().join(format!("{p}.lock")));
+    }
 }

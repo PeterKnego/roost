@@ -113,6 +113,34 @@ fn sessions() -> &'static Mutex<HashMap<String, Session>> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The environment a resh shell is spawned with, factored out of `attach` so
+/// it can be asserted on directly rather than through a real PTY spawn.
+fn session_env(
+    project: &str,
+    name: &str,
+    ide_port: Option<u16>,
+) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    env.insert("TERM".into(), "xterm-256color".into());
+    // How a process in this terminal — Claude, mainly — discovers that it
+    // can raise a notification at all, and what to attribute it to. A
+    // model can answer "can I notify?" from its own environment rather
+    // than having to be told in a prompt.
+    env.insert("RESH_NOTIFY".into(), "1".into());
+    env.insert("RESH_PROJECT".into(), project.to_string());
+    env.insert("RESH_SESSION".into(), name.to_string());
+    // Claude Code matches a lock file by port before it tries to match by
+    // path, so this makes a claude started here connect without any path
+    // comparison at all — which sidesteps every worktree, symlink and
+    // canonicalisation question in one line. Absent, not empty, when there
+    // is no listener: an empty value would tell Claude Code to try port 0
+    // rather than to skip the SSE-port shortcut entirely.
+    if let Some(p) = ide_port {
+        env.insert("CLAUDE_CODE_SSE_PORT".into(), p.to_string());
+    }
+    env
+}
+
 /// Attach to a session, creating it if needed. The new subscriber is sent the
 /// session's screen immediately — its scrollback, and the switch that says
 /// which buffer a running full-screen app is painting on — so a reconnecting
@@ -120,7 +148,9 @@ fn sessions() -> &'static Mutex<HashMap<String, Session>> {
 ///
 /// Locking discipline: the registry mutex is held only for the short,
 /// non-blocking bookkeeping steps (map lookups, inserting a new Session,
-/// registering a subscriber). It is never held across a blocking read or
+/// registering a subscriber, and — since this task — reading the ide port
+/// via `session_env`/`ide::port_for`, itself just a `HashMap` lookup under
+/// `ide`'s own registry lock). It is never held across a blocking read or
 /// write — the pump thread below re-acquires the lock fresh on every loop
 /// iteration, only around the read()-independent fan-out, so `attach` can
 /// never block behind a PTY that has nothing to say.
@@ -188,14 +218,9 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         let mut cb = CommandBuilder::new(&cmd[0]);
         cb.args(&cmd[1..]);
         cb.cwd(dir);
-        cb.env("TERM", "xterm-256color");
-        // How a process in this terminal — Claude, mainly — discovers that it
-        // can raise a notification at all, and what to attribute it to. A
-        // model can answer "can I notify?" from its own environment rather
-        // than having to be told in a prompt.
-        cb.env("RESH_NOTIFY", "1");
-        cb.env("RESH_PROJECT", project);
-        cb.env("RESH_SESSION", name);
+        for (k, v) in session_env(project, name, crate::ide::port_for(project)) {
+            cb.env(k, v);
+        }
         let child = pair.slave.spawn_command(cb).map_err(|e| e.to_string())?;
         // Best-effort: some platforms/backends can decline to report a pid.
         // 0 degrades list_sessions' age lookup to "unknown" rather than
@@ -635,6 +660,25 @@ pub static SESSION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    // Revert-checked (Task 5, Step 5): removing the `if let Some(p) =
+    // ide_port` block from `session_env` — so `CLAUDE_CODE_SSE_PORT` is
+    // never inserted at all — failed only this test. See this task's report
+    // for the exact command and output.
+    fn a_spawned_shell_is_told_which_port_to_connect_to() {
+        // Without this a claude in a resh terminal has to path-match, which
+        // is exactly the comparison that goes wrong for worktrees.
+        let env = session_env("alpha", "main", Some(5599));
+        assert_eq!(env.get("CLAUDE_CODE_SSE_PORT").map(String::as_str), Some("5599"));
+        assert_eq!(env.get("RESH_PROJECT").map(String::as_str), Some("alpha"));
+    }
+
+    #[test]
+    fn a_project_without_a_listener_gets_no_port_variable() {
+        let env = session_env("alpha", "main", None);
+        assert!(!env.contains_key("CLAUDE_CODE_SSE_PORT"), "an empty value would be worse than absence");
+    }
 
     #[test]
     fn session_names_are_strictly_validated() {

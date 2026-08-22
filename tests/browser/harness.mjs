@@ -161,7 +161,7 @@ export async function openPage(cdpPort, url) {
 /// directory reach production green (see CLAUDE.md, "The dev/prod
 /// substitution trap"). A browser test that skipped real dtach would be
 /// testing the same fiction from a different angle.
-export async function startResh({ repoRoot, stateDir, roots, port }) {
+export async function startResh({ repoRoot, stateDir, roots, port, extraEnv = {} }) {
   const meta = JSON.parse(new TextDecoder().decode(
     (await new Deno.Command("cargo", { args: ["metadata", "--format-version", "1", "--no-deps"], cwd: repoRoot, stdout: "piped" }).output()).stdout,
   ));
@@ -186,6 +186,13 @@ export async function startResh({ repoRoot, stateDir, roots, port }) {
       // low turns a run into a soak test for the keepalive ping, so a browser
       // meets hundreds of them instead of two.
       ...(Deno.env.get("RESH_PING_SECS") ? { RESH_PING_SECS: Deno.env.get("RESH_PING_SECS") } : {}),
+      // A second deliberate hole in clearEnv, for ide.mjs: pointing
+      // CLAUDE_CONFIG_DIR at a scratch directory keeps the real IDE
+      // integration's lock files (~/.claude/ide/*.lock, see idelock.rs) out
+      // of the developer's actual Claude config instead of writing there and
+      // having to sweep it up afterward, the way earlier tasks' manual
+      // real-`claude` checks did.
+      ...extraEnv,
     },
     stdout: "null", stderr: "null",
   }).spawn();

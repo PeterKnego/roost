@@ -23,6 +23,11 @@ pub enum Tab {
     File { rel: String, mode: Mode },
     Diff { rel: Option<String> },
     Terminal { session: String },
+    /// A change Claude has proposed and nobody has answered yet. Deliberately
+    /// not `Tab::Diff`, which is a git diff of a tracked path: a proposal
+    /// compares disk against content that has never been written, and it is
+    /// keyed by a pending request rather than by a file.
+    Proposal { id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +93,35 @@ pub enum Intent {
     MarkNoticeRead { id: u64 },
     MarkAllNoticesRead,
     ClearNotices,
+    /// A file or selection the user wants Claude to look at. Resolved
+    /// server-side and sent as `at_mentioned`, not pasted into a terminal:
+    /// a paste lands in whatever state the terminal is in and competes with
+    /// whatever Claude is doing at that instant.
+    MentionPath { rel: String, line_start: Option<u32>, line_end: Option<u32> },
+    /// The human's answer to an `openDiff` Claude is still blocked on. This
+    /// intent **is** the permission answer, which is why `text` exists: a
+    /// proposal the user edited before accepting must travel back as the
+    /// content Claude writes, or Claude writes the version the user rejected.
+    ///
+    /// `accept: false` with a `text` is still a rejection — the text is only
+    /// ever read on the accepting path.
+    AnswerProposal { id: String, accept: bool, text: Option<String> },
+    /// The editor's current selection, sent as ambient context on a debounce
+    /// from `static/app.js` — not a deliberate gesture like `MentionPath`'s
+    /// Alt+K. `rel` is resolved and confined server-side exactly like
+    /// `MentionPath`'s, never trusted as an absolute path; `text` is the
+    /// selection's own content, which is the reason this whole intent exists
+    /// behind `Settings::share_selection` — everything else on this enum
+    /// either moves data Claude already had or data the user explicitly
+    /// pointed at, and this ships file contents with neither.
+    ShareSelection {
+        rel: String,
+        text: String,
+        start_line: u32,
+        start_col: u32,
+        end_line: u32,
+        end_col: u32,
+    },
 }
 
 /// Snapshot sent as `Event::State`. Deliberately carries buffer *metadata*
@@ -156,6 +190,11 @@ pub enum Event {
     /// snapshot goes out on every workspace change, and history does not
     /// belong on that path.
     Notice { notice: crate::notify::Notice },
+    /// The two sides of a proposal tab, sent when the tab opens rather than
+    /// carried in `WorkspaceView`: that snapshot goes out on every workspace
+    /// change (every debounced keystroke, via `EditBuffer`), and two whole
+    /// file bodies have no business on that path.
+    Proposal { id: String, rel: String, old_text: String, new_text: String },
     /// The whole store — every project's notices, not just this client's —
     /// sent on connect and after any read-state change, so no two browsers
     /// disagree about the badge count.
@@ -278,6 +317,20 @@ mod tests {
     }
 
     #[test]
+    fn decodes_mention_path_with_and_without_a_line_range() {
+        let i = decode(r#"{"t":"MentionPath","rel":"src/hub.rs","line_start":12,"line_end":40}"#).unwrap();
+        assert!(matches!(
+            i,
+            Intent::MentionPath { rel, line_start: Some(12), line_end: Some(40) } if rel == "src/hub.rs"
+        ));
+        let i = decode(r#"{"t":"MentionPath","rel":"README.md","line_start":null,"line_end":null}"#).unwrap();
+        assert!(matches!(
+            i,
+            Intent::MentionPath { rel, line_start: None, line_end: None } if rel == "README.md"
+        ));
+    }
+
+    #[test]
     fn decodes_open_path_verbatim() {
         let i = decode(r#"{"t":"OpenPath","text":"~/p/resh/src/a.rs:42"}"#).unwrap();
         // Verbatim is the contract: the client does no parsing, so the suffix
@@ -286,6 +339,74 @@ mod tests {
             Intent::OpenPath { text } => assert_eq!(text, "~/p/resh/src/a.rs:42"),
             other => panic!("decoded to {other:?}"),
         }
+    }
+
+    /// Revert-checked: marking `text` `#[serde(skip)]` — the shape a
+    /// hand-written decoder would most plausibly land in — failed this test
+    /// on the `Some(t)` arm, then restored.
+    #[test]
+    fn decodes_an_answer_with_and_without_edited_text() {
+        // The `text` arm is how "the user changed my proposal before
+        // accepting" reaches Claude. Decoding it as `None` would make Claude
+        // write the text the user rejected.
+        let i = decode(r#"{"t":"AnswerProposal","id":"p-1","accept":true,"text":"mine"}"#).unwrap();
+        assert!(matches!(
+            i,
+            Intent::AnswerProposal { id, accept: true, text: Some(t) } if id == "p-1" && t == "mine"
+        ));
+        let i = decode(r#"{"t":"AnswerProposal","id":"p-1","accept":false,"text":null}"#).unwrap();
+        assert!(matches!(i, Intent::AnswerProposal { accept: false, text: None, .. }));
+    }
+
+    /// Revert-checked: adding `#[serde(rename = "path")]` to the `rel` field
+    /// (a plausible name mismatch between this decoder and the JS sender)
+    /// failed this test — `decode(...)` returned
+    /// `Err("missing field \`path\` ...")` on the `.unwrap()` — since the
+    /// wire JSON here still carries `"rel"`, matching what `static/app.js`
+    /// actually sends. Then restored.
+    #[test]
+    fn decodes_share_selection() {
+        let i = decode(
+            r#"{"t":"ShareSelection","rel":"src/a.rs","text":"let x = 1;","start_line":10,"start_col":4,"end_line":10,"end_col":14}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            i,
+            Intent::ShareSelection { rel, text, start_line: 10, start_col: 4, end_line: 10, end_col: 14 }
+                if rel == "src/a.rs" && text == "let x = 1;"
+        ));
+    }
+
+    #[test]
+    fn a_proposal_tab_round_trips_by_id() {
+        // The id, not a path: two proposals for the same file are two tabs,
+        // and the id is the only thing that can tell them apart.
+        let i = decode(r#"{"t":"OpenTab","pane":2,"tab":{"k":"Proposal","id":"diff-1-7"}}"#).unwrap();
+        match i {
+            Intent::OpenTab { tab, .. } => assert_eq!(tab, Tab::Proposal { id: "diff-1-7".into() }),
+            other => panic!("decoded to {other:?}"),
+        }
+    }
+
+    /// Revert-checked: renaming `old_text` on the wire (`#[serde(rename =
+    /// "was")]`) failed this test — `got {"t":"Proposal","id":"p-1",
+    /// "rel":"src/a.rs","was":"before","new_text":"after"}` — then restored.
+    /// Removing the field outright does not compile, which is the other half
+    /// of the guarantee.
+    #[test]
+    fn encodes_a_proposal_with_both_sides() {
+        // Both sides on the wire, or the client has nothing to diff against:
+        // the old side is disk, the new side has never been written anywhere.
+        let s = encode(&Event::Proposal {
+            id: "p-1".into(),
+            rel: "src/a.rs".into(),
+            old_text: "before".into(),
+            new_text: "after".into(),
+        });
+        assert!(s.contains(r#""t":"Proposal""#), "got {s}");
+        assert!(s.contains(r#""rel":"src/a.rs""#), "got {s}");
+        assert!(s.contains(r#""old_text":"before""#), "got {s}");
+        assert!(s.contains(r#""new_text":"after""#), "got {s}");
     }
 
     #[test]

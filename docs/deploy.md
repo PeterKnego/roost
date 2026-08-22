@@ -336,6 +336,49 @@ happened, autosave stops for that buffer instead of re-raising the conflict
 banner every second. An explicit ⌘S is what resolves it, and a save that
 actually lands is what starts autosave again.
 
+### Sharing the editor selection with Claude
+
+Off by default. When on, resh sends whatever text is currently highlighted in
+the editor to every Claude connected over the ide socket, as ambient context,
+on a 200ms debounce after the selection stops changing — not only when you
+press a key that means "share this." That is a different posture than every
+other IDE integration in this file: `allowed_origins` and the Origin checks
+guard who can *reach* resh, and `@`-mentioning a file (Alt+K) is a deliberate
+act; this ships file contents with no explicit gesture at all, the moment
+someone selects a line. A highlighted line of `.env` leaves the host exactly
+the same way a highlighted line of anything else does. To turn it on:
+
+```toml
+share_selection = true
+```
+
+Settable in either file, unlike `allowed_origins` and `max_upload_bytes`,
+which are global-config only. A project's own `.resh/config.toml` can turn
+this on for itself: it only exposes that project's own files, so there is no
+ceiling to widen, the same reasoning `autosave` uses. `~/.config/resh/
+config.toml` is a different trust boundary, not a wider version of the same
+one — it is yours, not something a cloned repo ships, so setting it there
+turns sharing on for every project you open, deliberately, the same way
+`allowed_origins` also grants access from that one file. What must never
+happen is a *project* file reaching past itself; the global file reaching
+every project is the point of it being global.
+
+A malformed project `.resh/config.toml` is skipped whole, not partially
+applied (see "Config is re-read every request" above) — so with a global
+`share_selection = true`, a typo anywhere else in that file silently leaves
+sharing *on* for that project, with only the page's `⚠ config` warning to
+notice by.
+
+Read once per page load like `autosave`, not resolved per request: an open tab
+keeps the value it loaded with until reloaded. Whenever it is on, the header
+shows `⧉ sharing selection` for as long as the tab is open — that indicator is
+the whole visibility half of the contract (resh has no permission system to
+scope this the way Claude Code's own `Read` deny rules do), so its absence is
+the only thing standing between a stale `share_selection = true` and a
+never-again-noticed cross-project accident. Checked again on the server for
+every selection resh receives, so flipping the key back off during a session
+takes effect on the very next selection change, not on the next reload.
+
 ### Hidden files in the tree
 
 The file tree hides every entry beginning with a dot — `.git`, `.claude`,

@@ -246,7 +246,10 @@ pub fn load(project: &str) -> (Workspace, Option<String>) {
                     );
                 }
             }
-            (w, warn)
+            // Last, not earlier: a tab whose counterparty died with the
+            // process must not come back, and this is the one place every
+            // restored layout passes through. See `drop_dead_tabs`.
+            (crate::workspace::drop_dead_tabs(w), warn)
         }
         Err(e) => (w, Some(format!("workspace state unreadable: {e}"))),
     }
@@ -316,6 +319,37 @@ mod tests {
             !d.to_string_lossy().contains("deadlight"),
             "the old name must not survive in a path users will find on disk: {d:?}"
         );
+    }
+
+    /// `workspace::drop_dead_tabs` having the right behaviour is worth
+    /// nothing if nothing calls it, and the load path is the only caller
+    /// that matters. This test is the one that fails if the call site is
+    /// dropped — the unit test in `workspace` would keep passing.
+    ///
+    /// Revert-checked: removing the `drop_dead_tabs` wrapper from `load`'s
+    /// return failed only this test — `panicked ... "a proposal whose
+    /// counterparty died with the process must not come back: [Proposal {
+    /// id: \"p-9\" }, File {...}]"` — then restored.
+    #[test]
+    fn loading_drops_a_proposal_tab_but_keeps_the_rest_of_the_pane() {
+        with_state_dir(|| {
+            let mut w = Workspace::default_layout();
+            w.panes[proto::MIDDLE as usize].tabs = vec![
+                Tab::Proposal { id: "p-9".into() },
+                Tab::File { rel: "a.rs".into(), mode: Mode::Edit },
+            ];
+            save("deadtabs", &w).unwrap();
+            let tabs = load("deadtabs").0.panes[proto::MIDDLE as usize].tabs.clone();
+            assert!(
+                !tabs.iter().any(|t| matches!(t, Tab::Proposal { .. })),
+                "a proposal whose counterparty died with the process must not come back: {tabs:?}"
+            );
+            assert_eq!(
+                tabs,
+                vec![Tab::File { rel: "a.rs".into(), mode: Mode::Edit }],
+                "and the rest of the layout must survive"
+            );
+        });
     }
 
     #[test]

@@ -409,7 +409,17 @@ fn strip_line_suffix(text: &str) -> &str {
 /// An absolute path is only this project's to open if it is under this
 /// project. Both sides are canonicalised before comparing, so a symlinked
 /// project root still matches its own files rather than refusing them.
-fn abs_to_rel(project_dir: &Path, abs: &Path) -> Result<String, String> {
+///
+/// `pub(crate)` for `ide.rs`: `openDiff` carries absolute paths chosen by
+/// whatever Claude is looking at, which is the same trust level as a path
+/// scraped out of terminal output. A second copy of this over there would be
+/// a second trust boundary to keep in sync, and the two would drift.
+///
+/// Note the precondition this carries: `abs` must already exist, because
+/// `canonicalize` is what resolves the symlinks the comparison depends on. A
+/// caller confining a path that does not exist yet must confine the parent —
+/// see `safe_resolve_parent` for the same split.
+pub(crate) fn abs_to_rel(project_dir: &Path, abs: &Path) -> Result<String, String> {
     let root = project_dir
         .canonicalize()
         .map_err(|e| format!("project root unreadable: {e}"))?;

@@ -11,6 +11,14 @@ const SHOW_HIDDEN_DEFAULT = document.body.dataset.showHidden === "1";
 // like SHOW_HIDDEN_DEFAULT: it changes only when someone edits a config file,
 // which already needs a reload to take effect.
 const AUTOSAVE = document.body.dataset.autosave === "1";
+// Whether the editor's current selection is sent to Claude as ambient
+// context, embedded once per page load like AUTOSAVE and SHOW_HIDDEN_DEFAULT.
+// Off unless the project's config opted in (Settings::share_selection); the
+// server checks this again on every ShareSelection it receives (see
+// ide::selection_changed), so this client-side gate is a courtesy that saves
+// a wasted round trip, not the actual boundary — the boundary is the server
+// re-checking a config file it, not this client, controls.
+const SHARE_SELECTION = document.body.dataset.shareSelection === "1";
 // How long after the last keystroke an autosave fires. VS Code's default,
 // and comfortably longer than the 200ms EditBuffer debounce it depends on.
 const AUTOSAVE_MS = 1000;
@@ -132,6 +140,14 @@ const autosavePaused = new Set();
 /// type again or blur the window. Idle, the State wins that race and the gap
 /// is invisible; on a loaded machine it does not.
 const sentEdits = new Set();
+// id -> {rel, old_text, new_text} for every proposal this client has seen
+// content for. Kept outside `state` itself (which is replaced wholesale by
+// every "State" event, and `State` never carries proposal text — see
+// hub.rs's `ProposalSides`) and reattached as `state.proposals` right after
+// each replacement below, so a tab's content survives every later State
+// broadcast instead of vanishing on the next keystroke anywhere in the
+// project.
+const proposals = {};
 
 function send(intent) {
   if (ctrl && ctrl.readyState === 1) ctrl.send(JSON.stringify(intent));
@@ -171,7 +187,18 @@ function onEvent(ev) {
           const b = state.buffers.find((x) => x.rel === rel);
           if (!b || (!b.dirty && !b.stale)) autosavePaused.delete(rel);
         }
+        // A proposal id missing from every pane's tabs was answered,
+        // withdrawn, or rejected by closing its tab — same pruning shape as
+        // openRels above, so a long session does not accumulate whole file
+        // bodies for proposals nobody can act on any more.
+        const openProposalIds = new Set();
+        for (const p of state.panes) for (const t of p.tabs) if (t.k === "Proposal") openProposalIds.add(t.id);
+        for (const id of Object.keys(proposals)) if (!openProposalIds.has(id)) delete proposals[id];
       }
+      // Reattached, not copied, on every State: renderProposal reads
+      // state.proposals[tab.id], and this is what keeps that name valid
+      // after `state` itself was just replaced above.
+      state.proposals = proposals;
       render();
       // Toggling visibility changes what the *server* renders, not how the
       // client draws it, so the State that carries the new value has to be
@@ -239,6 +266,18 @@ function onEvent(ev) {
     // A write that landed is the only thing that resumes autosave: the
     // divergence it paused for is resolved, whether by ⌘S or by overwrite.
     case "SaveOk": autosavePaused.delete(ev.rel); sentEdits.delete(ev.rel); break;
+    case "Proposal":
+      // Content before the tab that renders it — both on the live path
+      // (hub.rs's open_proposal_tab broadcasts this before the State that
+      // adds the Tab::Proposal) and on connect (wsconn.rs now replays these
+      // ahead of the snapshot too) — so by the time a Tab::Proposal ever
+      // reaches tabKey below, this is already populated for it in the
+      // overwhelming majority of cases. tabKey still folds "has content"
+      // into its own key (see below) to cover the remaining sub-millisecond
+      // window rather than assume that ordering.
+      proposals[ev.id] = { rel: ev.rel, old_text: ev.old_text, new_text: ev.new_text };
+      if (state) { state.proposals = proposals; render(); }
+      break;
     case "TerminalStarted":
       // The server only validated the name and notified everyone; opening
       // this socket is what actually spawns the PTY (see ensureTerm). But
@@ -361,6 +400,15 @@ function tabKey(t) {
       const live = terms.has(t.session) || state.live_sessions.includes(t.session);
       return live ? `Terminal:${t.session}:live` : `Terminal:${t.session}:placeholder:${state.is_git}`;
     }
+    // Whether content has arrived is part of the key, not just the id: a
+    // Tab::Proposal on its own carries only an id (see proto.rs), so the
+    // placeholder and the real hunk view are two different DOM shapes for
+    // the same tab, exactly like Terminal's live/placeholder split above.
+    // Without this, render()'s mountedKey guard would see an unchanged key
+    // when the Proposal event lands right after the tab and never remount —
+    // the placeholder (which offers no Accept/Reject) would stick around
+    // even once there is something to show and answer.
+    case "Proposal": return `Proposal:${t.id}:${state.proposals && state.proposals[t.id] ? "content" : "pending"}`;
     default: return t.k;
   }
 }
@@ -381,6 +429,10 @@ function tabLabel(t) {
     case "File": return t.rel.split("/").pop();
     case "Diff": return t.rel ? t.rel.split("/").pop() : "full diff";
     case "Terminal": return t.session;
+    case "Proposal": {
+      const p = state && state.proposals && state.proposals[t.id];
+      return p ? p.rel.split("/").pop() : "proposal";
+    }
   }
 }
 
@@ -639,6 +691,7 @@ function mountTab(content, t) {
     return;
   }
   if (t.k === "File" && t.mode === "Edit") { mountEditor(content, t.rel); return; }
+  if (t.k === "Proposal") { renderProposal(content, t); return; }
   const url =
     t.k === "Tree" ? `/frag/${PROJECT}/tree`
     : t.k === "Changes" ? `/frag/${PROJECT}/changes`
@@ -660,6 +713,73 @@ function mountTab(content, t) {
   });
 }
 
+// --- proposal tabs (openDiff) ---------------------------------------------
+//
+// The hunk view itself is server-rendered (`/frag/{project}/proposal?id=`,
+// render::proposal_fragment — reusing textdiff.rs::unified + diff_html, the
+// same pair the save-conflict banner's diff_html comes from) rather than
+// built here: CLAUDE.md is explicit that HTML is built in Rust, and a
+// hand-ported second copy of textdiff.rs's trim/LCS/cap algorithm already
+// drifted from it once (an empty old_text produced a phantom "-" line here
+// that Rust's `.lines()` never would) before this was caught in review.
+//
+// What stays client-side is only `state.proposals` — the map keyed by
+// proposal id that says whether `Event::Proposal`'s content has arrived yet
+// — because that presence check, and the `tabKey` fold built on it below,
+// are the safety property: a `Tab::Proposal` carries only an id (proto.rs),
+// and the placeholder branch below is what guarantees nothing can be
+// accepted or rejected before this client has independently confirmed the
+// content exists, not merely trusted that the fragment fetch will succeed.
+function renderProposal(el, tab) {
+  const p = state.proposals && state.proposals[tab.id];
+  if (!p) {
+    // Reachable only in the sub-millisecond window between the State that
+    // names this tab and the Event::Proposal that carries its content —
+    // tabKey folds "has content" into itself, so this is remounted the
+    // instant that event lands and is never the tab's steady state.
+    //
+    // No Accept/Reject button anywhere below this branch, and no fetch
+    // either: answering a proposal nobody can read is answering a
+    // permission prompt blind, which is exactly what this codebase's
+    // conflict-guard exists to prevent (see CLAUDE.md).
+    el.textContent = "Waiting for the proposed change to arrive…";
+    return;
+  }
+  el.innerHTML = "";
+  const url = `/frag/${PROJECT}/proposal?id=${encodeURIComponent(tab.id)}`;
+  // Same in-flight-fetch guard mountTab's generic branch below uses: a
+  // proposal answered (or this pane moved on to a different tab entirely)
+  // while this fetch was in the air must not have its response land and
+  // clobber whatever is showing now.
+  el.dataset.url = url;
+  fetch(url).then((r) => r.text()).then((html) => {
+    if (el.dataset.url !== url) return;
+    el.innerHTML = html;
+    const bar = document.createElement("div");
+    // Reuses .conflict's own button styling (see style.css's
+    // ".conflict button, .proposal-actions button" rule) rather than
+    // duplicating it under a parallel class.
+    bar.className = "proposal-actions";
+    // Task 9: the opt-in hook for editing a proposal before accepting.
+    // Nothing here ever builds a `.proposal-edit` box, so `edited()` always
+    // returns null (an unedited accept) until that task adds one.
+    const edited = () => {
+      const box = el.querySelector(".proposal-edit");
+      return box && box.value !== p.new_text ? box.value : null;
+    };
+    const answer = (accept) => send({
+      t: "AnswerProposal", id: tab.id, accept, text: accept ? edited() : null,
+    });
+    const mkButton = (label, fn) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.onclick = fn;
+      return b;
+    };
+    bar.append(mkButton("Accept", () => answer(true)), mkButton("Reject", () => answer(false)));
+    el.appendChild(bar);
+  });
+}
 // A bare empty pane is not discoverable, and a plain button would train the
 // wrong muscle memory — people already press Enter in a fresh terminal to
 // check it's alive. So the hint itself *is* the control: Enter or a click
@@ -1528,6 +1648,90 @@ document.addEventListener("keydown", (e) => {
   if (rel === null) return;
   e.preventDefault();
   saveNow(rel);
+});
+
+// Which editor tab a mention keystroke means — same logic as saveTarget
+// above (focused editor first, else the visible MIDDLE/RIGHT File tab in
+// Edit mode), for the same reason: focus is often on the body, not a
+// textarea, right after a reconnect or a click elsewhere on the page.
+function mentionTarget() {
+  const el = document.activeElement;
+  if (el && el.classList && el.classList.contains("editor")) {
+    for (const [rel, ta] of editors) if (ta === el) return rel;
+  }
+  for (const p of [MIDDLE, RIGHT]) {
+    const pane = state && state.panes && state.panes[p];
+    const tab = pane && pane.tabs[pane.active];
+    if (tab && tab.k === "File" && tab.mode === "Edit" && editors.has(tab.rel)) return tab.rel;
+  }
+  return null;
+}
+
+// 1-based inclusive line numbers, matching how MentionPath's line_start/
+// line_end read (Option<u32> — a caret with no selection sends neither).
+function mentionSelection(rel) {
+  const ta = editors.get(rel);
+  if (!ta || ta.selectionStart === ta.selectionEnd) return { startLine: null, endLine: null };
+  const before = ta.value.slice(0, ta.selectionStart);
+  const selected = ta.value.slice(ta.selectionStart, ta.selectionEnd);
+  const startLine = before.split("\n").length;
+  let endLine = startLine + selected.split("\n").length - 1;
+  // A selection ending exactly at a line boundary (the caret sits right
+  // after the trailing \n) must not count the following, unselected line.
+  if (selected.endsWith("\n")) endLine -= 1;
+  return { startLine, endLine };
+}
+
+// Alt+K, matching the extensions' own binding. The selection's line range
+// travels; the text does not (that is Task 9, and it is opt-in).
+document.addEventListener("keydown", (e) => {
+  if (!e.altKey || e.key.toLowerCase() !== "k") return;
+  const rel = mentionTarget();
+  if (rel === null) return;
+  e.preventDefault();
+  const sel = mentionSelection(rel);
+  send({ t: "MentionPath", rel, line_start: sel.startLine, line_end: sel.endLine });
+});
+
+// --- selection sharing (opt-in, off by default — see SHARE_SELECTION) ------
+//
+// 0-based line and character offsets, unlike mentionSelection's 1-based line
+// numbers above: this feeds `ShareSelection`, which the server turns straight
+// into the LSP-style `{line, character}` pairs selection_changed puts on the
+// wire (src/ide.rs), not MentionPath's 1-based lineStart/lineEnd.
+function shareSelectionSnapshot(rel) {
+  const ta = editors.get(rel);
+  if (!ta || ta.selectionStart === ta.selectionEnd) return null;
+  const before = ta.value.slice(0, ta.selectionStart);
+  const text = ta.value.slice(ta.selectionStart, ta.selectionEnd);
+  const beforeLines = before.split("\n");
+  const startLine = beforeLines.length - 1;
+  const startCol = beforeLines[beforeLines.length - 1].length;
+  const selLines = text.split("\n");
+  const endLine = startLine + selLines.length - 1;
+  const endCol = selLines.length === 1 ? startCol + selLines[0].length : selLines[selLines.length - 1].length;
+  return { rel, text, startLine, startCol, endLine, endCol };
+}
+
+// Debounced in the browser, not the socket thread: a debounce there would
+// hold per-connection state (a timer, a pending send) for no reason, since
+// this client is the only one that ever needs to coalesce its own rapid
+// selection changes.
+let shareSelectionTimer = null;
+document.addEventListener("selectionchange", () => {
+  if (!SHARE_SELECTION) return; // cheapest possible no-op for the common case
+  clearTimeout(shareSelectionTimer);
+  shareSelectionTimer = setTimeout(() => {
+    const rel = mentionTarget(); // same "which editor" rule Alt+K uses
+    if (rel === null) return;
+    const sel = shareSelectionSnapshot(rel);
+    if (!sel) return;
+    send({
+      t: "ShareSelection", rel: sel.rel, text: sel.text,
+      start_line: sel.startLine, start_col: sel.startCol,
+      end_line: sel.endLine, end_col: sel.endCol,
+    });
+  }, 200);
 });
 
 /// The one save path. The shortcut above and the breadcrumb's Save button both

@@ -67,6 +67,17 @@ workspace change. `show_hidden = true` in a global or per-project
 `.resh/config.toml` sets what a workspace starts out doing — see
 [`docs/deploy.md`](docs/deploy.md#hidden-files-in-the-tree).
 
+**Claude Code sees the workspace.** A `claude` running in a terminal pane
+connects back to resh as its IDE: it can point at a file instead of pasting a
+path, and a file it proposes to change opens as a diff tab with Accept /
+Reject rather than eighty columns of terminal ASCII. Off by default, and
+separate from all of that, resh can also send whatever you have highlighted in
+the editor to every connected Claude as ambient context: set
+`share_selection = true` in a global or per-project `.resh/config.toml`. It
+ships file contents with no explicit gesture, so read
+[`docs/deploy.md`](docs/deploy.md#sharing-the-editor-selection-with-claude)
+before turning it on; while it is on, the header says `⧉ sharing selection`.
+
 **Desktop notifications.** A process in a terminal — Claude finishing a task,
 a hook needing a decision — can raise a notification with one escape sequence
 or `resh notify`; it shows up as a bell across every project and, given a

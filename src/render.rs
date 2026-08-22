@@ -36,6 +36,28 @@ pub fn diff_html(diff: &str) -> String {
         .collect()
 }
 
+/// The hunk view for an `openDiff` proposal Claude is still waiting on an
+/// answer for. Same shape as the `diff` fragment's own output (a `.path`
+/// breadcrumb over a `.diffview` of `diff_html`-classified lines) — reusing
+/// `textdiff::unified` rather than a second diff implementation, the same
+/// way the save-conflict banner does: a proposal compares disk against
+/// content that has never been written, exactly the case `textdiff.rs`
+/// exists for.
+///
+/// Was a client-side port of `textdiff::unified` in `static/app.js` (a
+/// second implementation of the trim/LCS/context-cap algorithm in a second
+/// language); review caught it had already drifted — an empty `old_text`
+/// produced a phantom `-` line there that Rust's `str::lines()` never
+/// would. This is the one implementation both the conflict banner and a
+/// proposal now render through.
+pub fn proposal_fragment(rel: &str, old_text: &str, new_text: &str) -> String {
+    format!(
+        "<div class=\"path\">{}</div><div class=\"diffview\">{}</div>",
+        esc(rel),
+        diff_html(&crate::textdiff::unified(old_text, new_text)),
+    )
+}
+
 /// Where a markdown link or image destination points, once resolved against
 /// the file it appeared in.
 ///
@@ -730,6 +752,18 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<
     // override against it: `ws.show_hidden ?? SHOW_HIDDEN_DEFAULT`.
     let sh = if s.show_hidden { "1" } else { "0" };
     let autosave = if s.autosave { "1" } else { "0" };
+    let share_selection = if s.share_selection { "1" } else { "0" };
+    // Rendered only when the key is on — never a `hidden` element the client
+    // toggles, and never present-but-empty. This is the whole visibility
+    // half of the "off by default, visible when on" contract: a highlighted
+    // line of `.env` leaving the host with no indicator on the page at all
+    // would be exactly the silent exfiltration this feature exists to avoid.
+    // The same reason the header shows which projects have shells running.
+    let sharing_indicator = if s.share_selection {
+        r#"<span id="sharing" title="the editor's current selection is sent to Claude as context on every change">⧉ sharing selection</span>"#
+    } else {
+        ""
+    };
     let theme_css = match theme_rel {
         Some(rel) => format!("<link rel=\"stylesheet\" href=\"/frag/{proj_url}/{rel}\">"),
         None => String::new(),
@@ -750,11 +784,12 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/code-input.min.js"></script>
-</head><body data-project="{proj_txt}" data-default-tab="{tab}" data-show-hidden="{sh}" data-autosave="{autosave}">
+</head><body data-project="{proj_txt}" data-default-tab="{tab}" data-show-hidden="{sh}" data-autosave="{autosave}" data-share-selection="{share_selection}">
 <header>
   <a class="home" href="/">◆</a><span class="proj">{proj_txt}</span>
   <span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body"></span>
   {warn}
+  {sharing_indicator}
   <button id="projbtn" title="running projects">◆<span id="projcount"></span></button>
   <button id="closeproj" title="close project — ends all its terminal sessions">✕ Close</button>
   <button id="bell" title="notifications (n)">🔔<span id="bellcount"></span></button>
@@ -807,6 +842,60 @@ mod tests {
         assert!(h.contains("dl add"));
         assert!(h.contains("dl ctx"));
         assert!(h.contains("-old &lt;")); // escaped
+    }
+
+    /// The property the JS port had no test for at all before it was
+    /// deleted: two distant single-line changes must render as two
+    /// separate `@@` hunks, with the untouched middle omitted — proving
+    /// `unified`'s own multi-hunk behavior actually reaches the browser
+    /// through this fragment, not just through textdiff.rs's own suite.
+    #[test]
+    fn proposal_fragment_reports_distant_changes_as_separate_hunks() {
+        let numbered = |n: usize| (1..=n).map(|i| format!("line {i}\n")).collect::<String>();
+        let old = numbered(60);
+        let new = old.replace("line 10\n", "line 10 edited\n").replace("line 50\n", "line 50 edited\n");
+        let h = proposal_fragment("a.rs", &old, &new);
+        let hunks = h.matches("dl hunk").count();
+        assert_eq!(hunks, 2, "one header per hunk, two hunks: {h}");
+        assert!(!h.contains("line 30<"), "the untouched middle must not be included: {h}");
+    }
+
+    /// Two changes close enough that their context windows overlap must
+    /// merge into one hunk, not render as two with a redundant context
+    /// line printed twice between them.
+    #[test]
+    fn proposal_fragment_merges_nearby_changes_into_one_hunk() {
+        let numbered = |n: usize| (1..=n).map(|i| format!("line {i}\n")).collect::<String>();
+        let old = numbered(20);
+        // Two edits four lines apart — within CONTEXT (3) of each other's window.
+        let new = old.replace("line 10\n", "line 10 edited\n").replace("line 14\n", "line 14 edited\n");
+        let h = proposal_fragment("a.rs", &old, &new);
+        let hunks = h.matches("dl hunk").count();
+        assert_eq!(hunks, 1, "close changes must merge into one hunk, got: {h}");
+    }
+
+    /// textdiff.rs's MAX_DIVERGENT_LINES fallback (a wholly divergent pair
+    /// is quadratic to align and useless to read) has to survive the trip
+    /// through this fragment too, or a huge proposal would park the socket
+    /// thread the way the save-conflict banner used to.
+    #[test]
+    fn proposal_fragment_falls_back_to_a_summary_for_a_wholly_divergent_pair() {
+        let old: String = (0..1100).map(|i| format!("disk {i}\n")).collect();
+        let new: String = (0..1100).map(|i| format!("proposed {i}\n")).collect();
+        let h = proposal_fragment("a.rs", &old, &new);
+        assert!(h.contains("too different to show"), "must say why, not dump either file: {h}");
+        assert!(h.matches("<div").count() < 20, "and must not dump either file: {h}");
+    }
+
+    /// The breadcrumb names the file, and — since a proposal's `rel` and
+    /// content both arrive off a socket — everything interpolated has to be
+    /// escaped, per CLAUDE.md.
+    #[test]
+    fn proposal_fragment_escapes_the_path_and_the_content() {
+        let h = proposal_fragment("<script>.rs", "a", "a<b");
+        assert!(!h.contains("<script>"), "the path must be escaped: {h}");
+        assert!(h.contains("&lt;script&gt;"), "{h}");
+        assert!(h.contains("a&lt;b"), "the proposed content must be escaped too: {h}");
     }
 
     #[test]
@@ -1292,6 +1381,30 @@ mod tests {
         let off = Settings { autosave: false, ..Settings::default() };
         let h = workspace_page("proj", "proj", &off, None);
         assert!(h.contains(r#"data-autosave="0""#), "and a configured false reaches the page");
+    }
+
+    // "Off unless a project asks for it, and visible whenever it is on" is
+    // two separate properties, and this checks both directions of both: the
+    // default page carries neither the "1" attribute nor the indicator text,
+    // and a project that opted in carries both. A test that only checked the
+    // on-path would pass with the indicator rendered unconditionally, which
+    // is exactly the silent-exfiltration failure mode this feature exists to
+    // avoid — a project could turn sharing off and the page would still
+    // claim, or simply never say, whether it was happening.
+    //
+    // Revert-checked: hardcoding `sharing_indicator` to always render (moving
+    // it out of the `if s.share_selection` branch) failed this test's second
+    // assertion — "no visible indicator when sharing is off" — since the
+    // default page then contained "sharing selection" too. Then restored.
+    #[test]
+    fn share_selection_is_off_by_default_and_the_indicator_appears_only_when_it_is_on() {
+        let off = workspace_page("proj", "proj", &Settings::default(), None);
+        assert!(off.contains(r#"data-share-selection="0""#), "the default is off");
+        assert!(!off.contains("sharing selection"), "no visible indicator when sharing is off");
+        let s = Settings { share_selection: true, ..Settings::default() };
+        let on = workspace_page("proj", "proj", &s, None);
+        assert!(on.contains(r#"data-share-selection="1""#), "a configured true reaches the page");
+        assert!(on.contains("sharing selection"), "the indicator must be visible whenever sharing is on");
     }
 
     #[test]

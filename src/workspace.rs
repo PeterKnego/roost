@@ -192,6 +192,10 @@ fn tab_identity_eq(a: &Tab, b: &Tab) -> bool {
         (Tab::File { rel: x, .. }, Tab::File { rel: y, .. }) => x == y,
         (Tab::Diff { rel: x }, Tab::Diff { rel: y }) => x == y,
         (Tab::Terminal { session: x }, Tab::Terminal { session: y }) => x == y,
+        // By id, never by the file it proposes to change: Claude may have two
+        // proposals open for the same path, and they are two different
+        // questions with two different pending requests behind them.
+        (Tab::Proposal { id: x }, Tab::Proposal { id: y }) => x == y,
         (Tab::Tree, Tab::Tree) | (Tab::Changes, Tab::Changes) => true,
         _ => false,
     }
@@ -221,6 +225,28 @@ pub fn coerce_tab(tab: &Tab) -> Tab {
         }
         _ => tab.clone(),
     }
+}
+
+/// Tabs whose counterparty did not survive the process that created them.
+///
+/// A `Tab::Proposal` is one half of a JSON-RPC request Claude is blocked on;
+/// the other half is a websocket that died when resh exited. Restoring it
+/// from the persisted layout would draw a proposal nobody can answer —
+/// Accept and Reject would both find no pending request, and the tab would
+/// sit there forever looking live. Dropping it is the honest reload: Claude's
+/// own call already failed when its socket closed.
+///
+/// Takes and returns the workspace by value because the only caller is the
+/// load path, which is building one.
+pub fn drop_dead_tabs(mut w: Workspace) -> Workspace {
+    for p in w.panes.iter_mut() {
+        let before = p.tabs.len();
+        p.tabs.retain(|t| !matches!(t, Tab::Proposal { .. }));
+        if p.tabs.len() != before {
+            p.active = p.active.min(p.tabs.len().saturating_sub(1));
+        }
+    }
+    w
 }
 
 /// Apply a pure (no-I/O) intent. `Ok(true)` means state changed and the hub
@@ -385,6 +411,26 @@ mod tests {
         assert_eq!(w.view().show_hidden, None);
         apply_layout(&mut w, &Intent::SetShowHidden { on: true }).unwrap();
         assert_eq!(w.view().show_hidden, Some(true));
+    }
+
+    /// Its counterparty is a socket that died with the process. Restoring the
+    /// tab would render a proposal nobody can answer.
+    ///
+    /// Revert-checked: making `drop_dead_tabs` return `w` untouched failed
+    /// only this test and its sibling in `wsstate` — `left: [Proposal {..},
+    /// Tree] / right: [Tree]` — then restored.
+    #[test]
+    fn a_proposal_tab_does_not_survive_a_restart() {
+        let mut w = Workspace::default_layout();
+        let mid = proto::MIDDLE as usize;
+        w.panes[mid].tabs.push(Tab::Proposal { id: "p1".into() });
+        w.panes[mid].tabs.push(Tab::Tree);
+        w.panes[mid].active = 1;
+        let reloaded = drop_dead_tabs(w);
+        assert_eq!(reloaded.panes[mid].tabs, vec![Tab::Tree]);
+        assert_eq!(reloaded.panes[mid].active, 0, "the active index must follow the tab it named");
+        // Every other pane is untouched: dropping a dead tab is not a reset.
+        assert_eq!(reloaded.panes[proto::LEFT_TOP as usize].tabs, vec![Tab::Tree]);
     }
 
     #[test]
