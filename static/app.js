@@ -100,6 +100,17 @@ const pendingEdits = new Map();
 // ⌘S (and the banner's overwrite), which is also what clears this — via
 // SaveOk, so it reopens only on a write that actually landed.
 const autosavePaused = new Set();
+/// rels whose EditBuffer this client has sent and not yet seen settled.
+///
+/// Exists because "is there anything to save?" has three answers, not two.
+/// `pendingEdits` is gone the moment the 200ms debounce fires, and the
+/// server's `dirty` flag only becomes true when its State arrives; between
+/// those two the honest answer is "I cannot tell yet", and autosaveNow used
+/// to read that as "nothing to do" and return leaving no timer behind. The
+/// edit was then never written — not late, never, until the user happened to
+/// type again or blur the window. Idle, the State wins that race and the gap
+/// is invisible; on a loaded machine it does not.
+const sentEdits = new Set();
 
 function send(intent) {
   if (ctrl && ctrl.readyState === 1) ctrl.send(JSON.stringify(intent));
@@ -128,6 +139,7 @@ function onEvent(ev) {
         const openRels = new Set(state.buffers.map((b) => b.rel));
         for (const rel of texts.keys()) if (!openRels.has(rel)) texts.delete(rel);
         for (const rel of editors.keys()) if (!openRels.has(rel)) editors.delete(rel);
+        for (const rel of sentEdits) if (!openRels.has(rel)) sentEdits.delete(rel);
         // Autosave resumes as soon as the server says this buffer has nothing
         // outstanding — saved, discarded, or gone. SaveOk is the common route
         // and clears it sooner, but not the only one: the banner's "discard
@@ -165,6 +177,11 @@ function onEvent(ev) {
       // case, so a client-side dirty check here would be redundant at best
       // and would break the two legitimate cases above at worst.
       if (ev.origin && ev.origin === myOrigin) break;
+      // An empty origin is the server telling us what the file now says — a
+      // discard, a reload, an external write. Whatever this client had
+      // outstanding is superseded by it, and holding the flag past that would
+      // let a timer re-send text the user just discarded.
+      if (!ev.origin) sentEdits.delete(ev.rel);
       texts.set(ev.rel, ev.text);
       const ta = editors.get(ev.rel);
       // Through the <code-input> where there is one: assigning the textarea's
@@ -200,7 +217,7 @@ function onEvent(ev) {
       break;
     // A write that landed is the only thing that resumes autosave: the
     // divergence it paused for is resolved, whether by ⌘S or by overwrite.
-    case "SaveOk": autosavePaused.delete(ev.rel); break;
+    case "SaveOk": autosavePaused.delete(ev.rel); sentEdits.delete(ev.rel); break;
     case "TerminalStarted":
       // The server only validated the name and notified everyone; opening
       // this socket is what actually spawns the PTY (see ensureTerm). But
@@ -1316,6 +1333,7 @@ function wireEditor(ta, rel) {
     clearTimeout(pendingEdits.get(rel));
     pendingEdits.set(rel, setTimeout(() => {
       pendingEdits.delete(rel);
+      sentEdits.add(rel);
       send({ t: "EditBuffer", rel, text: ta.value });
     }, 200));
     // Restarted on every keystroke, so it measures the pause in typing
@@ -1415,7 +1433,10 @@ function pushEdit(rel) {
   clearTimeout(pendingEdits.get(rel));
   pendingEdits.delete(rel);
   const ta = editors.get(rel);
-  if (ta) send({ t: "EditBuffer", rel, text: ta.value });
+  if (ta) {
+    sentEdits.add(rel);
+    send({ t: "EditBuffer", rel, text: ta.value });
+  }
 }
 
 /// Writes `rel` out now, if autosave is on and this buffer is still its own
@@ -1432,7 +1453,9 @@ function autosaveNow(rel) {
   if (!AUTOSAVE || autosavePaused.has(rel)) return;
   const meta = state && state.buffers.find((x) => x.rel === rel);
   if (meta && meta.stale) return;
-  if (!pendingEdits.has(rel) && !(meta && meta.dirty)) return;
+  // sentEdits is the third answer: an edit is on the wire whose State has not
+  // come back yet. Without it this guard mistakes that for a clean buffer.
+  if (!pendingEdits.has(rel) && !sentEdits.has(rel) && !(meta && meta.dirty)) return;
   pushEdit(rel);
   send({ t: "SaveBuffer", rel, force: false });
 }
