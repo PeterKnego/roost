@@ -352,11 +352,22 @@ the same way a highlighted line of anything else does. To turn it on:
 share_selection = true
 ```
 
-Per project only, unlike `allowed_origins` and `max_upload_bytes` — a project
-opting itself in only exposes that project's own files, so there is no ceiling
-to widen. There is deliberately no global switch: turning this on for one
-project must never be a way to turn it on for every project a hostile checkout
-did not ask for.
+Settable in either file, unlike `allowed_origins` and `max_upload_bytes`,
+which are global-config only. A project's own `.resh/config.toml` can turn
+this on for itself: it only exposes that project's own files, so there is no
+ceiling to widen, the same reasoning `autosave` uses. `~/.config/resh/
+config.toml` is a different trust boundary, not a wider version of the same
+one — it is yours, not something a cloned repo ships, so setting it there
+turns sharing on for every project you open, deliberately, the same way
+`allowed_origins` also grants access from that one file. What must never
+happen is a *project* file reaching past itself; the global file reaching
+every project is the point of it being global.
+
+A malformed project `.resh/config.toml` is skipped whole, not partially
+applied (see "Config is re-read every request" above) — so with a global
+`share_selection = true`, a typo anywhere else in that file silently leaves
+sharing *on* for that project, with only the page's `⚠ config` warning to
+notice by.
 
 Read once per page load like `autosave`, not resolved per request: an open tab
 keeps the value it loaded with until reloaded. Whenever it is on, the header

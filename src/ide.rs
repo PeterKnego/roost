@@ -2113,18 +2113,31 @@ mod tests {
         let err = selection_changed(proj, ws.path(), Path::new("/w/a.rs"), "secret", (1, 0), (1, 6))
             .unwrap_err();
         assert!(err.contains("off"), "the refusal must say sharing is off: {err}");
-        // A bounded `recv_timeout`, not `try_recv`: the frame travels over a
-        // real loopback socket to a background reader thread before it ever
-        // reaches `rx` (see `connected_fake_client_for`), so a bug that sends
-        // before checking the opt-in flag would not necessarily have
-        // delivered yet at the instant a non-blocking `try_recv` ran —
-        // confirmed by hand: with the check moved to run *after* `notify_all`
-        // (so a refusal no longer prevents the send), a bare
-        // `rx.try_recv().is_err()` here still passed every time, while this
-        // `recv_timeout` version correctly failed with `Ok("{\"jsonrpc\":...
-        // \"method\":\"selection_changed\"...}")`. Restored.
-        let got = rx.recv_timeout(std::time::Duration::from_millis(300));
-        assert!(got.is_err(), "the socket must stay silent, got: {got:?}");
+        // A deterministic ordering barrier, not a wall-clock bound: an
+        // earlier version of this test waited out a fixed `recv_timeout` and
+        // hoped nothing arrived in that window, which a busy host can pass
+        // for the wrong reason (see this test's revert-check history below —
+        // the first version of that check used a non-blocking `try_recv`,
+        // which raced the delivery outright and missed a real leak). Instead,
+        // send a second, unrelated notification through the same `notify_all`
+        // fan-out right after the refused call and assert it is the *first*
+        // frame this connection ever receives. If the refused selection had
+        // reached the wire, it would already be queued ahead of this marker
+        // — the assertion is then a fact about order, not about timing, and
+        // it blocks on `rx.recv()` rather than racing a clock either way.
+        //
+        // Revert-checked: moving the opt-in check to run after `notify_all`
+        // (the same break the earlier `recv_timeout` version was written
+        // against) still fails this version — `assertion left == right
+        // failed ... got {"...\"method\":\"selection_changed\"...\"text\":
+        // \"secret\"...} first` — deterministically, not on a timing
+        // window. Restored.
+        mention(proj, Path::new("/w/marker.rs"), None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert_eq!(
+            v["method"], "at_mentioned",
+            "the socket must stay silent — the marker mention should be the first frame, got {v} first"
+        );
     }
 
     #[test]
