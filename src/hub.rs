@@ -1052,23 +1052,21 @@ impl Hub {
                 return self.send_to(from, &ev);
             }
         };
+        // Re-enter `handle` with a synthesised `OpenTab` rather than calling
+        // `apply_layout` here directly: that is the only way this path gets
+        // `open_buffer_for` (and so a real buffer, watcher coverage, and a
+        // clean flip to Edit later) for free, and the only way it stays in
+        // lockstep with a tab opened from the file tree. Safe to recurse
+        // once: `OpenTab` matches none of the early-return arms at the top
+        // of `handle`, so it falls straight through to the single
+        // `apply_layout` call and the single broadcast/persist that follow —
+        // no double broadcast, no double persist, and the refusal path above
+        // (which returns before this point) is untouched.
         let intent = Intent::OpenTab {
             pane: crate::proto::MIDDLE,
             tab: Tab::File { rel, mode: Mode::Preview },
         };
-        match workspace::apply_layout(&mut self.ws, &intent) {
-            Ok(true) => {
-                self.ws.version += 1;
-                let snap = self.snapshot_event(from);
-                self.broadcast(&snap);
-                self.persist();
-            }
-            Ok(false) => {}
-            Err(e) => {
-                let ev = Event::Error { msg: e };
-                self.send_to(from, &ev);
-            }
-        }
+        self.handle(from, intent)
     }
 
     fn do_close_project(&mut self, from: &ConnId) {

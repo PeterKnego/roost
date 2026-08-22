@@ -131,7 +131,7 @@ performed.
   no-edit-toggle assertion; narrowing the double-contextmenu guard back to
   `closest("a.file")` fails the markdown-link right-click assertion with
   `got 2`.
-- In `termlinks.mjs`: deleting `ensureTerm`'s `registerTermLinks` call fails 8
+- In `termlinks.mjs`: deleting `ensureTerm`'s `registerTermLinks` call fails 14
   assertions, deleting the `linksArmed` gate inside the provider fails 3,
   registering the path provider ahead of the URL one fails 2 (the marked text
   is `/example.com/a/b`, the URL's tail, instead of the whole URL), and

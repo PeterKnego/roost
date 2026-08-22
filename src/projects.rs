@@ -353,7 +353,29 @@ pub fn resolve_terminal_path(project_dir: &Path, text: &str) -> Result<String, S
         bare.trim_start_matches("./").to_string()
     };
 
-    let abs = safe_resolve(project_dir, &rel)?;
+    let abs = safe_resolve(project_dir, &rel).map_err(|e| {
+        // `safe_resolve`'s own text is written for a log line, not a
+        // terminal flash — the not-found branch is `format!("not found:
+        // {e}")`, where `{e}` is a raw `io::Error` ("No such file or
+        // directory (os error 2)"). A person clicking a false-positive link
+        // (PATH_RE matches ordinary prose like "and/or" or "24/7", so this is
+        // the common case, not the rare one) should see a short sentence, not
+        // an errno.
+        //
+        // Only two shapes reach here, and they stay distinct: `safe_resolve`
+        // separately reports "outside the project" (a confident, positive
+        // refusal) from a canonicalize failure (anything else). The second
+        // is deliberately worded "couldn't open", not "does not exist":
+        // canonicalize fails the same way for a missing file as it does for
+        // one that exists but can't be read (permission denied, a symlink
+        // loop, ...), and CLAUDE.md's central rule is that "I could not
+        // determine X" must never be folded into "X is false".
+        if e.starts_with("path outside project") {
+            format!("{rel} is outside this project")
+        } else {
+            format!("couldn't open {rel}")
+        }
+    })?;
     // Not `is_dir()`: it answers `false` both for "not a directory" and for
     // "could not look", and this codebase has shipped that conflation eleven
     // times. Three outcomes, matched explicitly.
@@ -759,14 +781,22 @@ mod tests {
         let outside = parent.path().join("secret.txt");
         std::fs::write(&outside, b"real file, really there").unwrap();
 
+        // Absolute-path route: refused inside `abs_to_rel`, before `safe_resolve`
+        // is ever called, with its own fixed wording.
         let err = resolve_terminal_path(&root, outside.to_str().unwrap()).unwrap_err();
-        assert!(
-            err.contains("outside this project"),
+        assert_eq!(
+            err,
+            "path is outside this project",
             "expected a confinement refusal naming the reason, got {err:?}"
         );
 
+        // Relative `../` route: never touches `abs_to_rel`, so this is what
+        // exercises the new mapping over `safe_resolve`'s own
+        // "path outside project: {rel}" — the case the review flagged
+        // (item 1) as leaking that string, and later ones as leaking a raw
+        // errno for the not-found branch below.
         let err = resolve_terminal_path(&root, "../secret.txt").unwrap_err();
-        assert!(!err.is_empty(), "a ../ escape must refuse");
+        assert_eq!(err, "../secret.txt is outside this project", "unexpected refusal: {err:?}");
     }
 
     #[test]
@@ -781,11 +811,27 @@ mod tests {
         );
     }
 
+    /// The review that shipped this test's earlier `!err.is_empty()` version
+    /// (item 1 of the terminal-links fix wave) is the whole reason this one
+    /// asserts on exact text: the previous message was `safe_resolve`'s raw
+    /// `io::Error` verbatim — "not found: No such file or directory (os
+    /// error 2)" — an errno flashed at a person clicking a false-positive
+    /// link, which `PATH_RE` produces often (`and/or`, `24/7`, ...). A
+    /// non-empty check would still pass on that regression.
     #[test]
     fn terminal_path_refuses_a_file_that_is_not_there() {
         let root = tempfile::tempdir().unwrap();
         let err = resolve_terminal_path(root.path(), "src/gone.rs").unwrap_err();
-        assert!(!err.is_empty(), "a missing file must refuse, not resolve");
+        assert_eq!(
+            err,
+            "couldn't open src/gone.rs",
+            "expected a readable refusal with no raw errno, got {err:?}"
+        );
+        // "couldn't open", not "does not exist": a canonicalize failure here
+        // could equally be a permission problem, and CLAUDE.md's central
+        // rule is that "I could not determine X" must never be folded into
+        // "X is false".
+        assert!(!err.contains("os error"), "errno leaked into the refusal: {err:?}");
     }
 
     #[test]

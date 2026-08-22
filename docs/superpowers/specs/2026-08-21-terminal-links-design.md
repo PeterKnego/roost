@@ -240,9 +240,16 @@ Event::PathRefused { text: String, msg: String }
 
 sent with `send_to`, never `broadcast`. The client matches `text` against the
 click it has in flight and calls `termFlash(entry, msg)` — the mechanism the
-OSC 52 handler already uses for "copy blocked" and "copy too large" — falling
-back to the focused terminal if the click is gone. The message lands in the pane
-the user was looking at, and nobody else's window moves.
+OSC 52 handler already uses for "copy blocked" and "copy too large". If the
+click is gone — a mismatched refusal for a click no longer pending, which
+`PATH_RE` matching ordinary prose makes routine rather than rare — the client
+does not fall back to the focused terminal; it drops the reply to
+`console.warn` and leaves the pending click's own slot alone. A fallback flash
+would land on whichever pane happens to be focused, which is not necessarily
+the one the stale click came from, so it would be a stray flash on an
+unrelated pane at least as often as it would be useful. The message lands in
+the pane the user was looking at only when it actually matches that pane's own
+in-flight click, and nobody else's window moves.
 
 `broadcast` here would flash every window in the project because one person
 mis-clicked.

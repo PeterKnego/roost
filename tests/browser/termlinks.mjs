@@ -171,15 +171,20 @@
 //!      browser's window, for a path that was never real.
 //!
 //! One regex worth flagging for the next reader: the refusal text produced
-//! by resolve_terminal_path for a missing file is "not found: No such file
-//! or directory (os error 2)" (capital N, confirmed by printing it), so the
-//! assertion below matches case-insensitively (/i) — a case-sensitive
-//! /cannot read|no such file/ never matches that string and would fail
-//! against a correct implementation, not just a broken one. It also does not
-//! include the path itself: two different refused paths refuse with the
-//! *identical* string, which is exactly why section I settles terminal 1's
-//! flash to a known "" baseline before taking one, rather than comparing
-//! against whatever it happened to be showing.
+//! by resolve_terminal_path for a missing file used to be
+//! "not found: No such file or directory (os error 2)" — an errno flashed
+//! straight at a person, since PATH_RE matches ordinary prose ("and/or",
+//! "24/7", ...) and this is the refusal most clicks actually produce. The
+//! terminal-links review's fix wave (item 1) mapped it to a short, honest
+//! sentence instead — "couldn't open {rel}", not "does not exist", because
+//! a canonicalize failure can equally mean unreadable rather than missing —
+//! so the assertion below now matches /cannot read|couldn't open/i. It is
+//! still case-insensitive out of the same caution the original comment
+//! flagged: nothing here depends on a particular capitalization surviving
+//! future wording changes. The new text DOES include the path (unlike the
+//! old errno), so MISSING and ALSO_MISSING no longer refuse with identical
+//! strings — see section I, which settles to a known "" baseline first
+//! regardless, rather than leaning on that.
 //!
 //! Fix round 1 added sections I and J and fixed pendingLink being cleared
 //! unconditionally on a refusal, whether or not it matched the click still
@@ -810,7 +815,7 @@ try {
   );
   await assert(
     "and flashed the refusal in the terminal that was clicked",
-    async () => /cannot read|no such file/i.test(await flashText(page)),
+    async () => /cannot read|couldn't open/i.test(await flashText(page)),
   );
 
   console.log("\nI. a refusal reaches only the terminal that was clicked");
@@ -823,12 +828,13 @@ try {
   // (see connectControl), so pendingLink.entry is the only thing routing a
   // PathRefused back to the DOM node the click actually came from.
   //
-  // resolve_terminal_path's ENOENT text does not include the path at all
-  // (confirmed in the report) — MISSING and ALSO_MISSING refuse with the
-  // *identical* string. So a stale flash from section H's own click could
-  // not be told apart from a wrongly-routed one by content; it has to be
-  // told apart by settling first. termFlash's fade is 1600ms — wait it out
-  // before taking the baseline below, rather than race it.
+  // resolve_terminal_path's refusal now names the path ("couldn't open
+  // {rel}"), so MISSING and ALSO_MISSING no longer refuse with identical
+  // text — but this still settles to a known "" baseline first rather than
+  // leaning on that content difference: a stale flash from section H's own
+  // click needs to be gone, not merely different-looking, before the assertion
+  // below can trust what it observes next. termFlash's fade is 1600ms — wait
+  // it out before taking the baseline, rather than race it.
   ok(await until(async () => (await flashText(page, loc.session)) === "", 5, "section H's flash to fade"),
      "terminal 1's own flash from section H settled before section I begins");
   const ALSO_MISSING = "also/missing.ts";
@@ -870,7 +876,7 @@ try {
     10, "a refusal flash on either terminal");
   await assert(
     "the refusal flashed on the terminal that was actually clicked",
-    async () => /cannot read|no such file/i.test(await flashText(page, loc2.session)),
+    async () => /cannot read|couldn't open/i.test(await flashText(page, loc2.session)),
   );
   await assert(
     "and not on the other terminal, which was never clicked",
@@ -898,7 +904,7 @@ try {
   await until(async () => (await flashText(page, loc.session)) !== "", 20, "the real click's own refusal flash");
   await assert(
     "a mismatched refusal in between did not swallow the next click's own reply",
-    async () => /cannot read|no such file/i.test(await flashText(page, loc.session)),
+    async () => /cannot read|couldn't open/i.test(await flashText(page, loc.session)),
   );
 
   console.log("\nK. an application's own hyperlink needs no modifier");
@@ -1176,9 +1182,17 @@ try {
   await sleep(200);
 
   // Leaves the shell the way section H found it, so anything appended after
-  // this section starts from a prompt rather than a wedged `sleep`.
+  // this section starts from a prompt rather than a wedged `sleep`. The ^C
+  // alone only reclaims the prompt from section L's own `sleep 300` — it
+  // does not turn mouse reporting back off, and revert 6 in this file's own
+  // header (section G's phantom-motion-report bug) is exactly the class of
+  // leak that leaving modes 1000/1002/1003/1006 armed here would cause for
+  // whatever section gets appended next. Inert today only because L is the
+  // last section in the file.
   await evalIn(`__t().term.input("\\x03")`);
   await until(async () => (await evalIn("__last()")).trimEnd().endsWith("$"), 20, "the prompt back after ^C");
+  await evalIn(`__t().term.input("printf '\\\\033[?1000l\\\\033[?1002l\\\\033[?1003l\\\\033[?1006l'\\r")`);
+  await sleep(200);
 
 } finally {
   page?.close();
