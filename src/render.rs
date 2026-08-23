@@ -829,6 +829,21 @@ pub fn human_age(secs: u64) -> String {
 // every terminal websocket) without the compiler catching it. Any producer
 // still has only literals to reach for, so this is not a call-site change,
 // just a tighter promise on the type.
+// Header iconography: stroke SVGs on the app's 16px grid, `currentColor`
+// throughout so the existing hover rules recolour them (the gear ships on
+// Feather's 24 grid — MIT — and scales down; the spec pins "the
+// conventional toothed cog, not a stylised stand-in"). None of these are
+// interpolated into; anything dynamic stays in the surrounding markup and
+// goes through esc/percent_encode as ever.
+const SVG_HOME: &str = r#"<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1.5l6.5 6.5L8 14.5 1.5 8z"/></svg>"#;
+const SVG_DIAMOND: &str = r#"<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1.5l6.5 6.5L8 14.5 1.5 8z"/></svg>"#;
+const SVG_BRANCH: &str = r#"<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true"><circle cx="5" cy="3.6" r="1.7"/><circle cx="5" cy="12.4" r="1.7"/><circle cx="11.4" cy="3.6" r="1.7"/><path d="M5 5.3v5.4M11.4 5.3v1.5a2.6 2.6 0 0 1-2.6 2.6H6.6"/></svg>"#;
+const SVG_SEARCH: &str = r#"<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>"#;
+const SVG_BELL: &str = r#"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true"><path d="M4 11V7.5a4 4 0 0 1 8 0V11l1 1.5H3z"/><path d="M6.5 13.5a1.5 1.5 0 0 0 3 0"/></svg>"#;
+const SVG_GEAR: &str = r#"<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>"#;
+const SVG_REFRESH: &str = r#"<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.5-3.6"/><path d="M13 2.5v3h-3"/></svg>"#;
+const SVG_X: &str = r#"<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>"#;
+
 /// `sharing_on` is passed in rather than read here: it is a *global-only*
 /// setting (`config::share_selection`), and this function stays pure so its
 /// tests can drive both states without touching the developer's real
@@ -901,16 +916,20 @@ pub fn workspace_page(
 <script src="/static/vendor/code-input.min.js"></script>
 </head><body data-project="{proj_txt}" data-default-tab="{tab}" data-show-hidden="{sh}" data-autosave="{autosave}" data-share-selection="{share_selection}" data-launches="{launches}">
 <header>
-  <a class="home" href="/">◆</a><span class="proj">{proj_txt}</span>
-  <span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body"></span>
+  <a class="home" href="/" title="all projects">{SVG_HOME}</a><span class="proj">{proj_txt}</span>
+  <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body"></span><span id="wtlabel"></span></button>
   {warn}
   {sharing_indicator}
-  <button id="projbtn" title="running projects">◆<span id="projcount"></span></button>
-  <button id="closeproj" title="close project — ends all its terminal sessions">✕ Close</button>
-  <button id="bell" title="notifications (n)">🔔<span id="bellcount"></span></button>
-  <button id="refresh" title="refresh (r)">⟳</button>
+  <div id="searchbox" title="project-wide search — not implemented yet">{SVG_SEARCH}<span class="hintline">Search files, symbols, sessions</span><kbd>⇧ ⇧</kbd></div>
+  <button id="projbtn" title="running projects">{SVG_DIAMOND}<span id="projcount"></span></button>
+  <button id="bell" title="notifications (n)">{SVG_BELL}<span id="bellcount"></span></button>
+  <button id="settings" title="settings — not implemented yet">{SVG_GEAR}</button>
+  <button id="refresh" title="refresh (r)">{SVG_REFRESH}</button>
+  <span class="vsep"></span>
+  <button id="closeproj" title="close project — ends all its terminal sessions">{SVG_X}<span>Close</span></button>
 </header>
 <div id="projpanel" hidden><span id="projstrip" hx-get="/frag/_projects?current={qkey}" hx-trigger="load, refresh from:body, projects from:body"></span></div>
+<div id="wtpanel" hidden><span id="wtstrip" hx-get="/frag/_worktrees?current={qkey}" hx-trigger="load, refresh from:body, projects from:body"></span></div>
 <div id="noticepanel" hidden></div>
 <main id="grid">
   <section class="pane" data-pane="0"><div class="panehead"><div class="tabstrip"></div><div class="paneicons"></div></div><div class="content"></div></section>
@@ -931,7 +950,15 @@ pub fn workspace_page(
 <script src="/static/app.js"></script>
 </body></html>"#,
         theme = esc(&s.theme),
-        tab = esc(&s.default_tab)
+        tab = esc(&s.default_tab),
+        SVG_HOME = SVG_HOME,
+        SVG_BRANCH = SVG_BRANCH,
+        SVG_SEARCH = SVG_SEARCH,
+        SVG_DIAMOND = SVG_DIAMOND,
+        SVG_BELL = SVG_BELL,
+        SVG_GEAR = SVG_GEAR,
+        SVG_REFRESH = SVG_REFRESH,
+        SVG_X = SVG_X,
     )
 }
 
@@ -1583,6 +1610,19 @@ mod tests {
             "the projects strip must refetch on the `projects` body event"
         );
         assert!(h.contains("id=\"closeproj\""));
+        // The chrome redesign: chip + switcher panel + honest placeholders.
+        assert!(h.contains("id=\"wtbtn\""), "{h}");
+        assert!(h.contains("hx-get=\"/frag/_worktrees?current=proj\""), "{h}");
+        assert!(h.contains("id=\"wtpanel\""), "{h}");
+        assert!(h.contains("id=\"wtlabel\""), "{h}");
+        assert!(h.contains("id=\"searchbox\""), "{h}");
+        assert!(h.contains("id=\"settings\""), "{h}");
+        // Placeholders say plainly that they are inert.
+        assert!(h.contains("not implemented yet"), "{h}");
+        // The emoji bell and the glyph buttons are gone from the header.
+        assert!(!h.contains("🔔"), "{h}");
+        assert!(!h.contains(">⟳<"), "{h}");
+        assert!(!h.contains("✕ Close"), "{h}");
         let no_custom = workspace_page("proj", "proj", &s, None, false, &[]);
         assert!(!no_custom.contains("theme.css\">"));
     }

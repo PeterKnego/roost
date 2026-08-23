@@ -29,18 +29,58 @@ body { background: var(--window); color: var(--fg); font: 13px/1.5 system-ui, -a
 /* Sits on the window surface with no rule under it: the gap between it and the
    pane cards below is what separates them now, and a border as well would read
    as a third seam on one edge. */
-header { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; background: var(--window); flex: none; }
-header .home { color: var(--accent); text-decoration: none; font-size: 16px; }
+header { display: flex; align-items: center; gap: 10px; height: 38px; padding: 0 10px; background: var(--window); flex: none; }
+header .home { display: flex; align-items: center; color: var(--accent); }
+header button svg { display: block; }
 header .proj { font-weight: 500; }
 #gitinfo { color: var(--muted); }
 #gitinfo #badge { color: var(--accent); margin-left: 4px; }
+/* The branch/worktree chip. #gitinfo keeps its id (htmx swaps into it) but
+   sits on the chip now, so its muted colour lifts to --fg here; the change
+   count keeps the accent via the existing #badge rule. */
+#wtbtn { display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 8px 0 7px;
+         border-radius: 6px; border: 1px solid var(--border); background: var(--tool);
+         color: var(--fg); cursor: pointer; font: inherit; }
+#wtbtn:hover { border-color: var(--accent); }
+#wtbtn svg { color: var(--muted); }
+#wtbtn #gitinfo { color: var(--fg); }
+#wtlabel { color: var(--muted); }
+#wtlabel:empty { display: none; }
+/* Honest placeholder: looks like the control it will become, and the help
+   cursor + tooltip say it is not one yet. A div, not an input — nothing to
+   focus, nothing to submit. */
+#searchbox { display: flex; align-items: center; gap: 8px; width: 400px; height: 26px;
+             margin-left: auto; margin-right: auto; padding: 0 8px 0 9px; border-radius: 6px;
+             border: 1px solid var(--border); background: var(--tool); color: var(--muted);
+             cursor: help; }
+#searchbox .hintline { flex: 1 1 auto; overflow: hidden; white-space: nowrap; }
+#searchbox kbd { border: 1px solid var(--border); border-radius: 3px; padding: 0 4px;
+                 font: 11px/16px var(--mono); }
+header .vsep { width: 1px; height: 16px; background: var(--border); margin: 0 6px; }
+#closeproj { display: flex; align-items: center; gap: 5px; border: 1px solid var(--border);
+             border-radius: 6px; background: none; color: var(--muted); padding: 3px 10px;
+             cursor: pointer; font: inherit; }
+#closeproj:hover { color: var(--fg); }
+/* The switcher panel: the third header popup, same pattern as #projpanel and
+   #noticepanel — but left-anchored, under the chip that opens it. */
+#wtpanel { position: absolute; top: var(--header-h, 40px); left: 8px; z-index: 20;
+           min-width: 220px; max-width: 380px; max-height: 60vh; overflow-y: auto;
+           background: var(--bg2); border: 1px solid var(--border);
+           border-radius: 4px; padding: 4px; }
+.wtstrip { display: flex; flex-direction: column; gap: 2px; }
+.wtstrip .wt { display: block; padding: 4px 8px; border-radius: 3px; text-decoration: none;
+               opacity: .6; white-space: nowrap; color: var(--fg); }
+.wtstrip .wt:hover { background: var(--bg); }
+.wtstrip .wt.live { opacity: 1; }
+.wtstrip .wt.current { font-weight: 600; text-decoration: underline; }
+.wtstrip .wt.unreachable { opacity: .35; cursor: default; }
+.wtstrip .branch { color: var(--muted); font-size: 12px; }
+.wtstrip .wt-empty { color: var(--muted); display: block; padding: 6px 8px; font-size: 12px; }
 .warn { color: #d29922; cursor: help; }
 /* Deliberately loud, not decorative: this is the only thing on the page that
    says a highlighted selection is leaving the machine, and it must not read
    as just more chrome next to #gitinfo and .warn. */
 #sharing { color: #d29922; cursor: help; font-weight: 500; }
-#refresh { background: none; border: 1px solid transparent; border-radius: 6px; color: var(--muted); padding: 3px 10px; cursor: pointer; font: inherit; }
-#refresh:hover { color: var(--fg); }
 main { flex: 1; min-height: 0; }
 
 /* ---- four-pane grid: left column stacks tree/changes, middle and right span both rows ---- */
@@ -427,15 +467,13 @@ details[open] > summary { background-image: var(--twisty-open); }
 .projstrip .proj { display:block; padding:4px 8px; border-radius:3px; }
 .projstrip .proj:hover { background: var(--bg); }
 .projstrip:empty::after { content:"no projects have sessions running"; color: var(--muted); display:block; padding:6px 8px; font-size:12px; }
-/* The control group sits right. `margin-left:auto` used to live on #refresh
-   alone, which was invisible while the projects strip filled the middle of the
-   header — with the strip gone it left ◆/Close/bell bunched on the left and the
-   refresh icon stranded on the right. Putting it on the first control pushes
-   the whole group over, which also parks #projpanel (right-aligned) directly
-   under the button that opens it instead of across the header from it. */
-#projbtn { margin-left: auto; }
-#projbtn, #bell { background:none; border:1px solid transparent; border-radius:6px; color:var(--muted); padding:3px 8px; cursor:pointer; font:inherit; }
-#projbtn:hover, #bell:hover { color: var(--fg); }
+/* The control group sits right. `margin-left:auto` used to separate it from
+   the left group by itself; now #searchbox's own double `margin: auto` does
+   both the centering and the pushing, so the right group needs no auto
+   margin of its own to land against the header's edge. */
+#projbtn, #bell, #settings, #refresh { background:none; border:1px solid transparent; border-radius:6px; color:var(--muted); padding:3px 8px; cursor:pointer; font:inherit; }
+#projbtn:hover, #bell:hover, #settings:hover, #refresh:hover { color: var(--fg); }
+#settings { cursor: help; }
 #projcount { margin-left:4px; }
 /* header .proj already sets font-weight:600 on every strip anchor (.projstrip
    sits inside header), so without this reset .current's own 600 would
