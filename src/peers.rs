@@ -277,11 +277,15 @@ pub fn message(project: &str, r: &Roster, now_ms: u64) -> Option<String> {
             r.uncheckable
         ));
     }
-    // Two leading spaces, like the bullets above, and not decoration: the
-    // surface that renders `systemMessage` strips newlines, so a segment
-    // whose only separator is its `\n` welds onto the end of the previous one
-    // ("started 3h ago)A resh project is..."). Every line after the first
-    // carries its own leading whitespace so the message survives flattening.
+    // Two leading spaces, like the bullets above. The terminal renders these
+    // newlines faithfully — this is for the copies. A warning like this gets
+    // pasted into chat, logs and issue threads, and those flatten newlines
+    // routinely; a segment whose only separator is its `\n` then welds onto
+    // the end of the previous one ("started 3h ago)A resh project is..."),
+    // which is exactly how this was found. Every line after the first carries
+    // its own leading whitespace, so no copy of the message can join two
+    // words. It also reads better rendered: the closing note sits indented
+    // under the peers rather than flush against the left margin.
     out.push_str(
         "\n  A resh project is one directory and one branch. Coordinate before editing, \
          or start this work in a git worktree.",
@@ -557,12 +561,16 @@ mod tests {
         assert_eq!(real[0], std::process::id() as i32);
     }
 
-    /// The surface that renders `systemMessage` strips newlines, so a `\n`
-    /// cannot be a segment's only separator — it welded the closing sentence
-    /// onto the last peer ("started 3h ago)A resh project is..."), which is
-    /// how this was found. The invariant is general rather than a spot check
-    /// on that one sentence: every line after the first carries its own
-    /// leading whitespace, so flattening can never join two words.
+    /// A `\n` must not be a segment's only separator. The terminal renders
+    /// the newlines fine, but copies of the message — pasted into chat, a log,
+    /// an issue — routinely lose them, and the closing sentence then welded
+    /// onto the last peer ("started 3h ago)A resh project is..."). That paste
+    /// is how this was found, and no test could have found it: every test
+    /// here asserts on the multi-line string, where the `\n` genuinely is a
+    /// separator.
+    ///
+    /// The invariant is general rather than a spot check on that one
+    /// sentence, so a line added later without an indent fails too.
     #[test]
     fn every_line_survives_having_its_newline_stripped() {
         let r = roster(
