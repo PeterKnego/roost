@@ -13,10 +13,13 @@ fn main() {
     let roots = resh::projects::roots();
     if roots.is_empty() {
         eprintln!(
-            "resh: RESH_ROOTS is unset or empty.\n\
-             Set it to a colon-separated list of directories to scan for projects:\n\
+            "resh: no project roots configured.\n\
+             Set RESH_ROOTS to a colon-separated list of directories to scan:\n\
              \n    RESH_ROOTS=$HOME/projects resh 8444\n\
-             \nFor a service, set it in the unit file (Environment=RESH_ROOTS=...)."
+             \nFor a service, set it in the unit file (Environment=RESH_ROOTS=...).\n\
+             Or list them in ~/.config/resh/config.toml, which callers that do not\n\
+             inherit the unit's environment (such as `resh peers`) also read:\n\
+             \n    roots = [\"~/projects\"]"
         );
         std::process::exit(2);
     }
