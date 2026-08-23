@@ -32,6 +32,7 @@ deno run -A tests/browser/buffer-lifecycle.mjs # navigating a file is not an edi
 deno run -A tests/browser/termlinks.mjs # a printed path or URL is a link only while the modifier is held
 deno run -A tests/browser/ide.mjs       # openDiff's proposal tab (Accept/Reject) and the Alt+K mention keybinding
 deno run -A tests/browser/claudeterm.mjs # the ✻ button: a terminal with claude typed in, hidden when claude is not installed
+deno run -A tests/browser/worktrees.mjs # the header's worktree switcher chip + panel
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -227,6 +228,21 @@ performed.
   (`proposal_fragment_reports_distant_changes_as_separate_hunks` and its
   siblings), since the hunk view is Rust now, not a second implementation in
   `app.js`.
+- In `worktrees.mjs`: commenting out the `["frag", "_worktrees"]` arm in
+  `routes.rs` fails 5 — the chip label, the two row checks in section B
+  against an empty fragment, "the current row is the main worktree", and,
+  cascading, section C's navigation (there is no row left to click). The
+  href/target pair check passes vacuously against zero rows, which is why it
+  alone does not appear in that count. Commenting out `wtBtn.onclick` in
+  `app.js` fails exactly 1 — "clicking the chip opens the panel" — while
+  every other row/branch/href/current assertion in B still passes, because
+  the fragment loads on its own `hx-trigger="load"` regardless of the
+  button; only panel *visibility* depends on the handler. Adding
+  `target="dl-x"` to the reachable row's anchor in `worktrees_strip` fails
+  2: the href/target pair assertion directly, and, cascading, section C's
+  navigation check — a targeted anchor opens a new browsing context instead
+  of navigating the tab, which is exactly the bug the missing `target=`
+  exists to prevent.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
