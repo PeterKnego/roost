@@ -31,6 +31,7 @@ deno run -A tests/browser/preview-follows.mjs # a previewed file follows the fil
 deno run -A tests/browser/buffer-lifecycle.mjs # navigating a file is not an edit; undoing one comes back clean
 deno run -A tests/browser/termlinks.mjs # a printed path or URL is a link only while the modifier is held
 deno run -A tests/browser/ide.mjs       # openDiff's proposal tab (Accept/Reject) and the Alt+K mention keybinding
+deno run -A tests/browser/claudeterm.mjs # the ✻ button: a terminal with claude typed in, hidden when claude is not installed
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -128,6 +129,16 @@ performed.
   of the two fails. Both halves were watched failing — the plain-Enter half
   first passed for the wrong reason, reading the *previous* probe's number out
   of the scrollback, which only agreed while both answers were 13.
+- In `claudeterm.mjs`: deleting `term.rs`'s write of the launch keystrokes
+  fails 2 (claude never starts; no port line to read); pinning `LAUNCHES` to
+  `["claude"]` instead of reading `data-launches` fails 1 (a ✻ on a server
+  whose shell has no claude); and restoring `do_new_terminal`'s old order —
+  `TerminalStarted` *before* the snapshot that carries the tab — fails 6,
+  starting with "the tab is attached": the client drops a start event for a
+  tab it does not hold yet, and both + and ✻ land on the "press Enter"
+  placeholder. That last one was the + button's actual behaviour until this
+  test clicked it; no Rust test had, because the guard that drops the event
+  lives in app.js.
 - Restoring the tab strip's single scrolling row (`overflow-x: auto` with a
   hidden scrollbar, `height: 32px` on `.panehead`) fails 11 assertions in
   `tabwrap.mjs`; keeping the wrap but deleting render()'s re-fit of a terminal

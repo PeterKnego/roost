@@ -47,6 +47,10 @@ fn main() {
     }
     let port: u16 = args.first().and_then(|p| p.parse().ok()).unwrap_or(8444);
     let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind 127.0.0.1");
+    // Here rather than in `serve`: the check asks the user's real login shell,
+    // and the test servers `serve` starts must not depend on what that shell
+    // has installed. Background, so listening does not wait on a profile.
+    resh::launch::probe_all_in_background();
     eprintln!("resh listening on http://127.0.0.1:{port}");
     resh::serve(listener, roots);
 }

@@ -431,7 +431,7 @@ impl Hub {
             Intent::InitGit => return self.do_init_git(from),
             Intent::CloseProject => return self.do_close_project(from),
             Intent::EndSession { session } => return self.do_end_session(from, session.clone()),
-            Intent::NewTerminal { pane } => return self.do_new_terminal(from, *pane),
+            Intent::NewTerminal { pane, launch } => return self.do_new_terminal(from, *pane, *launch),
             Intent::OpenPath { text } => return self.do_open_path(from, text.clone()),
             Intent::MentionPath { rel, line_start, line_end } => {
                 return self.do_mention_path(from, rel.clone(), *line_start, *line_end)
@@ -1140,7 +1140,12 @@ impl Hub {
 
     /// Opens a terminal on a server-allocated name. See
     /// `session::next_free_name` for why the client must not choose it.
-    fn do_new_terminal(&mut self, from: &ConnId, pane: crate::proto::PaneId) {
+    fn do_new_terminal(
+        &mut self,
+        from: &ConnId,
+        pane: crate::proto::PaneId,
+        launch: Option<crate::proto::Launch>,
+    ) {
         if self.closing {
             let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
             return self.send_to(from, &ev);
@@ -1162,14 +1167,25 @@ impl Hub {
             let ev = Event::Error { msg: "too many terminal sessions".into() };
             return self.send_to(from, &ev);
         };
+        // Unconditionally, `None` included: this name may have been handed
+        // out before to a ✻ click whose tab was closed before any browser
+        // attached, and a plain + must not inherit that click. The shell is
+        // spawned by whichever browser attaches first, so the request waits
+        // in `session` until then.
+        crate::session::set_launch(&self.project, &name, launch);
         let intent = Intent::OpenTab { pane, tab: Tab::Terminal { session: name.clone() } };
         match workspace::apply_layout(&mut self.ws, &intent) {
             Ok(true) => {
                 self.ws.version += 1;
-                self.broadcast(&Event::TerminalStarted { session: name });
                 self.refresh_live_sessions();
                 let snap = self.snapshot_event(from);
+                // Snapshot first, then the start: a browser attaches on
+                // `TerminalStarted` only for a session it has a tab for, and
+                // the tab is in this snapshot. Sent the other way round, every
+                // browser dropped the event and showed the "press Enter"
+                // placeholder for a terminal the click had already asked for.
                 self.broadcast(&snap);
+                self.broadcast(&Event::TerminalStarted { session: name });
                 self.persist();
             }
             Ok(false) => {}
@@ -2550,8 +2566,8 @@ mod tests {
         }
         drain(&rx);
 
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None });
         drain(&rx);
 
         let names: Vec<String> = h.ws.panes[proto::RIGHT as usize]
@@ -2563,6 +2579,53 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["term", "term1"], "each click must get its own shell");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// The ✻ button is the + button plus a program to type in. The hub only
+    /// parks the request against the name it allocates; the shell it reaches
+    /// is the one `session::attach` spawns for that name later.
+    #[test]
+    fn a_claude_terminal_parks_its_launch_on_the_name_it_was_given() {
+        // STATE first, SESSION second — the order session.rs's lock comment fixes.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("newterm_launch", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        for p in h.ws.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+            p.active = 0;
+        }
+        drain(&rx);
+
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude) });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None });
+        drain(&rx);
+        let first = crate::session::attach("newterm_launch", "term", d.path()).unwrap();
+        assert_eq!(first.launch, Some(proto::Launch::Claude), "✻ got `term`, so `term` starts claude");
+        let second = crate::session::attach("newterm_launch", "term1", d.path()).unwrap();
+        assert_eq!(second.launch, None, "+ got `term1`, which stays a plain shell");
+        crate::session::kill_project("newterm_launch");
+
+        // The stale case: ✻ allocates `term2`, its tab is closed before any
+        // browser attaches, and + is then handed `term2` back. The click that
+        // made it a claude shell is gone, so the shell must be plain.
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude) });
+        let idx = h.ws.panes[proto::RIGHT as usize]
+            .tabs
+            .iter()
+            .position(|t| matches!(t, Tab::Terminal { session } if session == "term2"))
+            .expect("✻ was handed term2");
+        h.handle(&c, Intent::CloseTab { pane: proto::RIGHT, idx });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None });
+        drain(&rx);
+        let reused = crate::session::attach("newterm_launch", "term2", d.path()).unwrap();
+        assert_eq!(reused.launch, None, "a reallocated name must not inherit the old click");
+        crate::session::kill_project("newterm_launch");
+        std::env::remove_var("RESH_CMD");
         std::env::remove_var("RESH_STATE_DIR");
     }
 

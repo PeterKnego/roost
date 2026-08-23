@@ -750,6 +750,7 @@ pub fn workspace_page(
     s: &Settings,
     theme_rel: Option<&'static str>,
     sharing_on: bool,
+    launches: &[&str],
 ) -> String {
     let warn = s
         .warning
@@ -774,6 +775,10 @@ pub fn workspace_page(
     let sh = if s.show_hidden { "1" } else { "0" };
     let autosave = if s.autosave { "1" } else { "0" };
     let share_selection = if sharing_on { "1" } else { "0" };
+    // The launch buttons the tab strip may show, space-separated so a second
+    // program is one more word, not one more attribute. Names are the wire
+    // names of `proto::Launch`, which the client sends straight back.
+    let launches = esc(&launches.join(" "));
     // Rendered only when the key is on — never a `hidden` element the client
     // toggles, and never present-but-empty. This is the whole visibility
     // half of the "off by default, visible when on" contract: a highlighted
@@ -805,7 +810,7 @@ pub fn workspace_page(
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/code-input.min.js"></script>
-</head><body data-project="{proj_txt}" data-default-tab="{tab}" data-show-hidden="{sh}" data-autosave="{autosave}" data-share-selection="{share_selection}">
+</head><body data-project="{proj_txt}" data-default-tab="{tab}" data-show-hidden="{sh}" data-autosave="{autosave}" data-share-selection="{share_selection}" data-launches="{launches}">
 <header>
   <a class="home" href="/">◆</a><span class="proj">{proj_txt}</span>
   <span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body"></span>
@@ -1407,10 +1412,10 @@ mod tests {
     // the off position.
     #[test]
     fn the_page_carries_the_configured_default_for_the_toggle() {
-        let off = workspace_page("proj", "proj", &Settings::default(), None, false);
+        let off = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
         assert!(off.contains(r#"data-show-hidden="0""#), "the default is off");
         let on = Settings { show_hidden: true, ..Settings::default() };
-        let h = workspace_page("proj", "proj", &on, None, false);
+        let h = workspace_page("proj", "proj", &on, None, false, &[]);
         assert!(h.contains(r#"data-show-hidden="1""#), "and a configured true reaches the page");
     }
 
@@ -1420,10 +1425,10 @@ mod tests {
     // it off.
     #[test]
     fn the_page_carries_the_autosave_setting() {
-        let on = workspace_page("proj", "proj", &Settings::default(), None, false);
+        let on = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
         assert!(on.contains(r#"data-autosave="1""#), "autosave is on by default");
         let off = Settings { autosave: false, ..Settings::default() };
-        let h = workspace_page("proj", "proj", &off, None, false);
+        let h = workspace_page("proj", "proj", &off, None, false, &[]);
         assert!(h.contains(r#"data-autosave="0""#), "and a configured false reaches the page");
     }
 
@@ -1446,10 +1451,10 @@ mod tests {
     // developer's real `~/.config/resh/config.toml`.
     #[test]
     fn share_selection_is_off_by_default_and_the_indicator_appears_only_when_it_is_on() {
-        let off = workspace_page("proj", "proj", &Settings::default(), None, false);
+        let off = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
         assert!(off.contains(r#"data-share-selection="0""#), "the default is off");
         assert!(!off.contains("sharing selection"), "no visible indicator when sharing is off");
-        let on = workspace_page("proj", "proj", &Settings::default(), None, true);
+        let on = workspace_page("proj", "proj", &Settings::default(), None, true, &[]);
         assert!(on.contains(r#"data-share-selection="1""#), "a configured true reaches the page");
         assert!(on.contains("sharing selection"), "the indicator must be visible whenever sharing is on");
         // The page attribute the client gates on and the human-visible
@@ -1457,10 +1462,22 @@ mod tests {
         // sending with no indicator shown is the failure this prevents.
     }
 
+    // Which launch buttons the page offers is a parameter, not read in here:
+    // it comes from a startup probe of the developer's real login shell, and
+    // a test must not depend on what that shell has installed.
+    #[test]
+    fn the_page_lists_the_launches_the_startup_check_allowed() {
+        let with = workspace_page("proj", "proj", &Settings::default(), None, false, &["claude"]);
+        assert!(with.contains(r#"data-launches="claude""#), "{with}");
+        let without = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
+        assert!(without.contains(r#"data-launches="""#), "an empty list is an explicit empty attribute");
+        assert!(!without.contains(r#"data-launches="claude""#));
+    }
+
     #[test]
     fn workspace_page_wires_everything() {
         let s = Settings { theme: "gruvbox".into(), ..Settings::default() };
-        let h = workspace_page("proj", "proj", &s, Some("theme.css"), false);
+        let h = workspace_page("proj", "proj", &s, Some("theme.css"), false, &[]);
         assert!(h.contains("/static/themes/gruvbox.css"));
         assert!(h.contains("/frag/proj/theme.css")); // has_theme_css
         assert!(h.contains("data-project=\"proj\""));
@@ -1477,22 +1494,22 @@ mod tests {
             "the projects strip must refetch on the `projects` body event"
         );
         assert!(h.contains("id=\"closeproj\""));
-        let no_custom = workspace_page("proj", "proj", &s, None, false);
+        let no_custom = workspace_page("proj", "proj", &s, None, false, &[]);
         assert!(!no_custom.contains("theme.css\">"));
     }
 
     #[test]
     fn the_workspace_links_exactly_one_theme_stylesheet() {
         let s = Settings::default();
-        let dir_themed = workspace_page("proj", "proj", &s, Some("theme/style.css"), false);
+        let dir_themed = workspace_page("proj", "proj", &s, Some("theme/style.css"), false, &[]);
         assert!(dir_themed.contains("/frag/proj/theme/style.css"));
         assert_eq!(dir_themed.matches("theme.css\"").count(), 0, "never both links");
 
-        let file_themed = workspace_page("proj", "proj", &s, Some("theme.css"), false);
+        let file_themed = workspace_page("proj", "proj", &s, Some("theme.css"), false, &[]);
         assert!(file_themed.contains("/frag/proj/theme.css"));
         assert!(!file_themed.contains("/frag/proj/theme/style.css"));
 
-        let bare = workspace_page("proj", "proj", &s, None, false);
+        let bare = workspace_page("proj", "proj", &s, None, false, &[]);
         assert!(!bare.contains("/frag/proj/theme"));
     }
 
@@ -1504,14 +1521,14 @@ mod tests {
     #[test]
     fn workspace_page_percent_encodes_the_current_key_for_the_query_string() {
         let s = Settings::default();
-        let h = workspace_page("karpie/src", "karpie%2Fsrc", &s, None, false);
+        let h = workspace_page("karpie/src", "karpie%2Fsrc", &s, None, false, &[]);
         assert!(h.contains("hx-get=\"/frag/_projects?current=karpie%252Fsrc\""));
     }
 
     #[test]
     fn the_workspace_page_carries_the_notification_centre() {
         let s = crate::config::Settings::default();
-        let html = workspace_page("proj", "proj", &s, None, false);
+        let html = workspace_page("proj", "proj", &s, None, false, &[]);
         assert!(html.contains(r#"id="bell""#), "no bell button");
         assert!(html.contains(r#"id="bellcount""#), "no unread badge");
         assert!(html.contains(r#"id="noticepanel""#), "no panel container");
@@ -1629,7 +1646,7 @@ mod tests {
     #[test]
     fn project_name_is_escaped_everywhere() {
         let s = Settings::default();
-        let h = workspace_page("a\"><script>", "a\"><script>", &s, None, false);
+        let h = workspace_page("a\"><script>", "a\"><script>", &s, None, false, &[]);
         assert!(!h.contains("a\"><script>"));
         let c = changes_fragment("a\"><script>", &Status { branch: String::new(), changes: vec![crate::gitio::Change { xy: "??".into(), path: "x".into() }] });
         assert!(!c.contains("\"><script>"));

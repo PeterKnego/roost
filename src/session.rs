@@ -111,12 +111,45 @@ pub struct Attachment {
     /// a mirrored tab reconnecting to a live session must not make every
     /// browser on the machine refetch it.
     pub spawned: bool,
+    /// Set only on the attach that actually spawned the shell, and only when
+    /// a `NewTerminal` asked for it (`set_launch`). The caller types the
+    /// program in (`launch::keystrokes`) once the socket is up. Reattaches,
+    /// mirroring browsers and a later respawn of the same name get `None`:
+    /// the entry is consumed at spawn, so one click starts one claude.
+    pub launch: Option<crate::proto::Launch>,
 }
 
 static SESSIONS: OnceLock<Mutex<HashMap<String, Session>>> = OnceLock::new();
 
 fn sessions() -> &'static Mutex<HashMap<String, Session>> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// What a not-yet-spawned session should start, keyed like `SESSIONS`. The
+/// hub allocates a name and the browser connects later, so the request has
+/// to wait somewhere in between; it is taken out by the attach that spawns.
+static PENDING_LAUNCH: OnceLock<Mutex<HashMap<String, crate::proto::Launch>>> = OnceLock::new();
+
+fn pending_launch() -> &'static Mutex<HashMap<String, crate::proto::Launch>> {
+    PENDING_LAUNCH.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Records — or with `None`, clears — what the next spawn of `project/name`
+/// should type into its shell. Called on *every* allocation, not just the
+/// ones that launch something: a name handed out for a ✻ click whose tab
+/// was closed before any browser attached leaves its entry behind, and the
+/// plain `+` click that is handed the same name next must not inherit it.
+pub fn set_launch(project: &str, name: &str, launch: Option<crate::proto::Launch>) {
+    let key = format!("{}/{}", crate::projects::storage_key(project), name);
+    let mut map = pending_launch().lock().unwrap_or_else(|e| e.into_inner());
+    match launch {
+        Some(l) => {
+            map.insert(key, l);
+        }
+        None => {
+            map.remove(&key);
+        }
+    }
 }
 
 /// The environment a resh shell is spawned with, factored out of `attach` so
@@ -184,11 +217,17 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
     }
 
     let spawned = !map.contains_key(&key);
+    let mut launch = None;
     if spawned {
         let cmd = default_command(project, name);
         if cmd.is_empty() {
             return Err("empty command".into());
         }
+        // Taken here, before the spawn can fail, rather than after: a spawn
+        // that fails leaves no session, and the browser's retry would
+        // otherwise find the entry still there and type claude into a
+        // shell nobody asked to be a claude shell. One click, one chance.
+        launch = pending_launch().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
         // dtach -A refuses to create a socket in a directory that doesn't
         // exist yet; nothing else creates it. 0o700: this directory grants
         // shell access to whoever can connect to a socket in it. Gated on
@@ -321,7 +360,7 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         let _ = tx.try_send(replay);
     }
     s.subs.insert(id, tx);
-    Ok(Attachment { id, key, rx, spawned })
+    Ok(Attachment { id, key, rx, spawned, launch })
 }
 
 /// Takes the registry lock only long enough to clone the writer's `Arc`,
@@ -740,6 +779,11 @@ mod tests {
 
     #[test]
     fn default_command_wraps_dtach_with_no_ui() {
+        // Reads RESH_CMD, so it is a participant in the env-var race the
+        // lock's comment describes, even though it never sets the variable:
+        // unlocked, it fails whenever it interleaves with a `RESH_CMD=cat`
+        // test, and more such tests make it lose more often.
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let c = default_command("proj", "shell");
         assert_eq!(c[0], "dtach");
         assert!(c.contains(&"-E".to_string()), "no escape character");
@@ -868,6 +912,42 @@ mod tests {
         );
 
         kill_project("capproj");
+        std::env::remove_var("RESH_CMD");
+    }
+
+    #[test]
+    fn a_pending_launch_rides_the_attach_that_spawns_and_no_other() {
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        set_launch("launchproj", "term", Some(crate::proto::Launch::Claude));
+
+        let first = attach("launchproj", "term", d.path()).unwrap();
+        assert_eq!(first.launch, Some(crate::proto::Launch::Claude), "the attach that spawns carries it");
+        let mirror = attach("launchproj", "term", d.path()).unwrap();
+        assert_eq!(mirror.launch, None, "a second browser on the same shell must not retype it");
+
+        // Consumed at spawn: when the shell exits and the name is respawned
+        // later, the old click must not start claude again.
+        kill_project("launchproj");
+        let respawn = attach("launchproj", "term", d.path()).unwrap();
+        assert_eq!(respawn.launch, None);
+        kill_project("launchproj");
+        std::env::remove_var("RESH_CMD");
+    }
+
+    #[test]
+    fn reallocating_a_name_without_a_launch_clears_one_nobody_connected_for() {
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        // The ✻ click whose tab was closed before any browser attached.
+        set_launch("launchproj2", "term", Some(crate::proto::Launch::Claude));
+        // The plain + click that got the same name back.
+        set_launch("launchproj2", "term", None);
+        let a = attach("launchproj2", "term", d.path()).unwrap();
+        assert_eq!(a.launch, None, "a stale launch must not leak into an unrelated terminal");
+        kill_project("launchproj2");
         std::env::remove_var("RESH_CMD");
     }
 

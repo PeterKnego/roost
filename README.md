@@ -70,7 +70,12 @@ workspace change. `show_hidden = true` in a global or per-project
 **Claude Code sees the workspace.** A `claude` running in a terminal pane
 connects back to resh as its IDE: it can point at a file instead of pasting a
 path, and a file it proposes to change opens as a diff tab with Accept /
-Reject rather than eighty columns of terminal ASCII. Off by default, and
+Reject rather than eighty columns of terminal ASCII. The ✻ next to a tab
+strip's + opens a new terminal with `claude` already typed into it — no
+flags, because the shell's environment is what links it to this resh. The
+button is there unless resh asked your login shell at startup and it could
+not find `claude` (a check that could not run keeps the button and says so on
+stderr). Off by default, and
 separate from all of that, resh can also send whatever you have highlighted in
 the editor to every connected Claude as ambient context: set
 `share_selection = true` in a global or per-project `.resh/config.toml`. It

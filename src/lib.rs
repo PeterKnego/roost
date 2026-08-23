@@ -10,6 +10,7 @@ pub mod http;
 pub mod ide;
 pub mod idecwd;
 pub mod idelock;
+pub mod launch;
 pub mod notify;
 pub mod origin;
 pub mod osc;
