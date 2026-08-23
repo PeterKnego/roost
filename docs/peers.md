@@ -116,6 +116,28 @@ project — runs no git at all.
 never "a different repository". The cost of that is a missing advisory line
 rather than a false one, which is the right direction for it to fall.
 
+## The roster tracks where a session is, not where it started
+
+Verified 2026-08-23 by watching a session relocate. A session was started in
+the main checkout and told to enter a worktree; its registry entry moved with
+it, in step with the process's own cwd:
+
+```
+t= 5s  registry=/home/claude/projects/resh
+       proc    =/home/claude/projects/resh
+t=10s  registry=…/.claude/worktrees/cwd-probe
+       proc    =…/.claude/worktrees/cwd-probe
+```
+
+So a session that relocates mid-life is attributed to where it now is, and
+both its old and new neighbours get the right answer. This mattered because the
+alternative — a `cwd` recorded once at startup — would have silently
+misattributed exactly the sessions most likely to move.
+
+A shell `cd` inside a session is a different thing and moves nothing: the
+harness pins the working directory back, and the registry entry is not even
+rewritten (`updatedAt` unchanged). Only a harness-level relocation counts.
+
 ## Roots
 
 `resh peers` needs to know the project roots, and a hook inherits none of the

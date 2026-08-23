@@ -309,14 +309,6 @@ totally — text typed and highlighted while nothing was ever sent or saved.
   advertises. The pid `resh peers` also prints *is* unique, but `SendMessage`
   does not accept one.
 
-- **Whether the registry's `cwd` follows a session that changes directory is
-  unverified.** If it records only the startup directory, a session that `cd`s
-  into a worktree mid-session stays attributed to the project it started in,
-  and both its old and new neighbours get the wrong answer.
-  **Not measured.** Registry `cwd` and `/proc/<pid>/cwd` agreed for every live
-  session when checked, but no session was observed changing directory, which
-  is the case that decides it.
-
 - **resh's own UI says nothing about peers.** The count is known per project at
   any moment, so the picker or project strip could badge a project more than
   one Claude is working in — reaching the person rather than only the arriving
