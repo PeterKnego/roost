@@ -755,6 +755,17 @@ function renderProposal(el, tab) {
   fetch(url).then((r) => r.text()).then((html) => {
     if (el.dataset.url !== url) return;
     el.innerHTML = html;
+    // The edit box and the action bar go *inside* render.rs's .proposalview,
+    // not beside it: that element carries the flex column, so a sibling would
+    // sit outside the layout and the bar would stop being pinned.
+    //
+    // The `|| el` is a deliberate degrade, not a guess papering over a
+    // failure. If the wrapper is ever missing (a stale fragment from a server
+    // mid-deploy is the realistic way), the honest outcome is the old
+    // in-flow layout — ugly but answerable. Refusing to mount the bar would
+    // instead leave a proposal on screen that cannot be accepted or
+    // rejected, and Claude blocked waiting on an answer nobody can give.
+    const view = el.querySelector(".proposalview") || el;
     const bar = document.createElement("div");
     // Reuses .conflict's own button styling (see style.css's
     // ".conflict button, .proposal-actions button" rule) rather than
@@ -793,7 +804,7 @@ function renderProposal(el, tab) {
       box.spellcheck = false;
       // Above the buttons, below the diff: the diff stays readable while
       // you edit, which is the point of reviewing it at all.
-      el.insertBefore(box, bar);
+      view.insertBefore(box, bar);
       editButton.remove();
       box.focus();
     });
@@ -802,7 +813,7 @@ function renderProposal(el, tab) {
       mkButton("Reject", () => answer(false)),
       editButton,
     );
-    el.appendChild(bar);
+    view.appendChild(bar);
   });
 }
 // A bare empty pane is not discoverable, and a plain button would train the
