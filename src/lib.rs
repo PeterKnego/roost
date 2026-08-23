@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod cli;
 pub mod config;
+pub mod errlog;
 pub mod fileops;
 pub mod gitio;
 pub mod health;

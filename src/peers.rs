@@ -340,33 +340,6 @@ fn ago(started_ms: u64, now_ms: u64) -> String {
     }
 }
 
-/// Append a line to `{state_dir}/peers.log`.
-///
-/// Not stderr. `resh peers` runs as a Claude Code hook that always exits 0,
-/// and a hook's stderr is shown only when it fails or is slow — so a warning
-/// written there on a successful run is discarded, which is the same as not
-/// detecting anything. A file is the only place a hook can leave a record
-/// that survives the session it was written in.
-///
-/// Best-effort by design: a session must never fail to start because resh
-/// could not write a log line, so every error here is swallowed. The file is
-/// only ever appended to when something was actually detected, so it stays
-/// empty on a healthy host rather than growing per session start.
-pub fn log_line(text: &str, now_secs: u64) {
-    log_line_to(&crate::wsstate::state_dir(), text, now_secs)
-}
-
-/// Split from [`log_line`] so a test can point at a real directory instead of
-/// setting `RESH_STATE_DIR`, which other tests in this crate read concurrently.
-pub fn log_line_to(dir: &Path, text: &str, now_secs: u64) {
-    use std::io::Write;
-    let path = dir.join("peers.log");
-    let _ = std::fs::create_dir_all(dir);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{now_secs} {text}");
-    }
-}
-
 /// This session's own name, from its own registry record.
 ///
 /// Found the same two ways `roster` excludes itself, and for the same reason:
@@ -1225,23 +1198,4 @@ mod tests {
         assert_eq!(own_name(&entries, &[], Some("sid-nobody")), None, "no record of us");
     }
 
-    /// The log has to be a file. `resh peers` runs as a hook that always exits
-    /// 0, and a hook's stderr is shown only when it fails or is slow — so a
-    /// warning written there on a successful run is discarded, which is
-    /// indistinguishable from never having detected anything.
-    #[test]
-    fn a_detected_collision_is_written_where_it_outlives_the_session() {
-        let d = tempfile::tempdir().unwrap();
-        log_line_to(d.path(), "duplicate session name in resh: resh-f8", 1_787_400_000);
-        log_line_to(d.path(), "second entry", 1_787_400_060);
-        let text = std::fs::read_to_string(d.path().join("peers.log")).expect("the log must exist");
-        assert!(text.contains("resh-f8"), "the finding is recorded: {text:?}");
-        assert!(text.contains("1787400000"), "stamped, so a later reader can order events: {text:?}");
-        assert_eq!(text.lines().count(), 2, "appended, never truncated: {text:?}");
-
-        // Nothing detected, nothing written: the file must stay absent on a
-        // healthy host rather than growing on every session start.
-        let quiet = tempfile::tempdir().unwrap();
-        assert!(!quiet.path().join("peers.log").exists());
-    }
 }

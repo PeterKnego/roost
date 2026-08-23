@@ -100,15 +100,8 @@ ambiguous address reaches whichever session wins, silently. So when a listed
 name is shared — including with the reader's own session — the row is marked,
 and the instruction is qualified with where to get the disambiguating ref.
 
-The finding is also appended to `{RESH_STATE_DIR}/peers.log`, stamped, so it
-survives the session. **Not stderr**: `resh peers` always exits 0, and a hook's
-stderr is shown only when it fails or is slow, so a warning written there on a
-successful run is discarded — indistinguishable from never detecting anything.
-The file is written only when something is detected, so it stays absent on a
-healthy host rather than growing per session start.
-
-Writing it is best-effort; a session must never fail to start because a log
-line could not be written.
+The finding is also appended to `{RESH_STATE_DIR}/error.log` — see
+*The error log*, below.
 
 ## When the two root sources disagree
 
@@ -117,14 +110,36 @@ file is authoritative for the service. But silence is wrong when the two were
 meant to agree: the server then resolves one set of projects while `resh peers`,
 which inherits none of its environment, resolves another.
 
-The server checks at startup and complains on stderr, which systemd captures.
-Only a genuine conflict counts — both sources speaking and disagreeing. One
+The server checks at startup, complains on stderr (which systemd captures) and
+records the same finding in `error.log`. Only a genuine conflict counts — both sources speaking and disagreeing. One
 being silent is the ordinary case, not a problem, and warning about it would
 make the check noise on every host.
 
 Order counts as disagreement: roots are searched in order and the first match
 wins, so the same set listed differently resolves a duplicate project name to a
 different directory.
+
+## The error log
+
+Everything resh detects and nobody would otherwise see goes to one file:
+`{RESH_STATE_DIR}/error.log`, one stamped line per finding.
+
+It is a file rather than stderr because `resh peers` runs as a hook that always
+exits 0, and a hook's stderr is shown only when it fails or is slow — a warning
+written there on a successful run is discarded, which is indistinguishable from
+never detecting anything. The server could use stderr, and still does, but then
+a reader has two places to look and no reason to guess which; the file is the
+one place that has everything.
+
+It is written only when something is detected, so on a healthy host it does not
+exist. That absence is the signal, and it means the file does not grow with
+ordinary use. Writing is best effort: nothing resh does may fail because a log
+line could not be written, least of all a session starting.
+
+```
+$ cat ~/.local/state/resh/error.log
+1787493223 duplicate session name in resh: resh-f8 — SendMessage by name is ambiguous
+```
 
 ## Other worktrees of the same repository
 

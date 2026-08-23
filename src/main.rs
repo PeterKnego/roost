@@ -37,6 +37,13 @@ fn main() {
              config `roots` (used by `resh peers` and anything without this environment): {cfg:?}\n  \
              Bring them into step, or callers outside this process will resolve different projects."
         );
+        // Also to the one file, so a reader has a single place to look rather
+        // than having to know which detector reports where. stderr stays
+        // because journald already carries this process's startup messages.
+        resh::errlog::record(
+            &format!("RESH_ROOTS {env:?} disagrees with the global config's roots {cfg:?}"),
+            resh::errlog::now_secs(),
+        );
     }
     let port: u16 = args.first().and_then(|p| p.parse().ok()).unwrap_or(8444);
     let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind 127.0.0.1");

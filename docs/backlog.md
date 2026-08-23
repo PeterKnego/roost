@@ -300,7 +300,7 @@ totally — text typed and highlighted while nothing was ever sent or saved.
 - **Names can still collide; it is now detected rather than prevented.** Since
   2026-08-23 a shared name marks the offending rows, qualifies the announce
   instruction with where to get `ListAgents`' disambiguating ref, and appends a
-  stamped line to `{RESH_STATE_DIR}/peers.log`. What is *not* fixed is the
+  stamped line to `{RESH_STATE_DIR}/error.log`. What is *not* fixed is the
   cause: resh cannot mint or read the ref, so it cannot print an unambiguous
   address, and `SendMessage` accepts no pid. A reader who ignores the warning
   still messages the wrong session.
@@ -342,7 +342,7 @@ totally — text typed and highlighted while nothing was ever sent or saved.
   `~/.config/resh/config.toml` must still be kept in step by hand — the env var
   winning is deliberate, so the fix is not deleting one but teaching the unit
   to read the config. Since 2026-08-23 the server compares them at startup and
-  complains on stderr, which systemd captures, when both speak and disagree.
+  complains on stderr and in `error.log` when both speak and disagree.
   **Not measured.** Both entries were written on 2026-08-23 and have not
   drifted; the detector has never fired.
 
