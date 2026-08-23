@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod fileops;
 pub mod gitio;
+pub mod health;
 pub mod hub;
 pub mod http;
 pub mod ide;
@@ -50,6 +51,9 @@ pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
     if swept.removed > 0 {
         eprintln!("resh: startup reap — {} stale ide lock file(s) from a previous run", swept.removed);
     }
+    // Periodic, and it only ever logs — see health.rs for why it may not
+    // repair anything and why it calls nothing that reaps.
+    crate::health::spawn();
     let report = registry::reconcile(&roots);
     if report.dead_sockets > 0 || report.gone_projects > 0 {
         eprintln!(
