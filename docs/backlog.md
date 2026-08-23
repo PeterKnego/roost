@@ -493,3 +493,15 @@ ledger they lived in was scratch. Each was re-checked against the tree on
   shipped. A text file now opens in its editor; Preview survives only where a
   file has a rendered form to look at (markdown, images, and svg, which has
   both and keeps the ✎).
+- A one-click Claude terminal → shipped 2026-08-23 as the ✻ next to each tab
+  strip's +: a new terminal with `claude` typed into it by the server the
+  moment its shell spawns (`proto::Launch`, `launch.rs`). It was never listed
+  here — it arrived as a request, not a deferral. No flags, because
+  `CLAUDE_CODE_SSE_PORT` in the spawned environment already links the claude
+  to this resh's IDE socket; the button hides itself only when a startup probe
+  of the login shell positively says `claude` is not installed (an Unknown
+  keeps it). Found and fixed on the way: + had been landing on the "press
+  Enter" placeholder, because `TerminalStarted` went out before the snapshot
+  that carried the tab. Deferred from it: a global-only config key for flags
+  (`claude --continue` and the like) — nobody has asked, and a per-project
+  value would let a cloned checkout decide what a click executes.
