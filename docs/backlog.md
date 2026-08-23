@@ -309,19 +309,6 @@ totally — text typed and highlighted while nothing was ever sent or saved.
   advertises. The pid `resh peers` also prints *is* unique, but `SendMessage`
   does not accept one.
 
-- **Sibling worktrees are deliberately not peers, and that is not the whole
-  truth.** A worktree is its own project, and git will not check one branch out
-  twice, so two worktrees of a repo cannot collide over a file — the reason the
-  warning stays silent. They can still collide over everything *outside* the
-  working tree.
-  **Evidence (2026-08-23): measured, and it fired twice in one day.** A build
-  from `.claude/worktrees/projstrip-live` rewrote the shared cargo target dir's
-  `assets_table.rs` to that checkout's paths, failing two `assets::` tests in
-  this checkout and leaving the shared binary built from the other tree — the
-  trap CLAUDE.md's *Build from one checkout* describes. Whether the fix belongs
-  here (a quieter same-repo signal) or in the build is unresolved; the
-  collision is not hypothetical.
-
 - **Whether the registry's `cwd` follows a session that changes directory is
   unverified.** If it records only the startup directory, a session that `cd`s
   into a worktree mid-session stays attributed to the project it started in,
