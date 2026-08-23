@@ -7,4 +7,5 @@
   --add-bg: #253d2c; --add-fg: #6fbf73; --del-bg: #4a2b2b; --del-fg: #e06c6c;
   --hunk: #9876aa;
   --bg3: #35373b; --hairline: #1e1f22; --guide: #4a4d54; --sel-fg: #ffffff;
+  --warn: #d6a441;
 }

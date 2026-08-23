@@ -132,6 +132,66 @@ mod tests {
         }
     }
 
+    /// Every theme must define `--warn`, and define it *legibly* against its
+    /// own `--bg`.
+    ///
+    /// Asserting the contrast rather than the mere presence of the variable,
+    /// because presence is the assertion that would have passed while the bug
+    /// was live: `--warn` was defined in no theme at all, so all four of
+    /// style.css's `var(--warn, #d79921)` sites fell back to one hardcoded
+    /// gruvbox yellow. That reads fine on the four dark themes and sits at
+    /// 2.48:1 on light.css's white — below WCAG AA (4.5:1) and below even
+    /// AA-large (3.0:1) — for `.savestate.warn`, which is 11px text saying a
+    /// write is being withheld. A presence check would also pass for a new
+    /// theme that defines `--warn` as something unreadable, which is the same
+    /// defect wearing a different hat.
+    ///
+    /// Revert-checked: dropping the `--warn` line from light.css alone fails
+    /// this with "light.css: --warn is not defined"; setting it back to
+    /// #d79921 fails with the 2.48 ratio.
+    #[test]
+    fn every_theme_defines_a_legible_warn_colour() {
+        /// WCAG 2.x relative luminance.
+        fn lum(hex: &str) -> f64 {
+            let c = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex pair") as f64 / 255.0;
+            let f = |v: f64| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+            0.2126 * f(c(1)) + 0.7152 * f(c(3)) + 0.0722 * f(c(5))
+        }
+        /// The `--name: #rrggbb` value from a theme's text, if present.
+        fn var_of(css: &str, name: &str) -> Option<String> {
+            let at = css.find(&format!("{name}:"))? + name.len() + 1;
+            let rest = css[at..].trim_start();
+            let hex: String = rest.chars().take_while(|c| *c == '#' || c.is_ascii_alphanumeric()).collect();
+            (hex.len() == 7 && hex.starts_with('#')).then_some(hex)
+        }
+
+        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/static/themes"));
+        let mut checked = 0;
+        for e in std::fs::read_dir(&dir).expect("themes dir") {
+            let p = e.expect("theme entry").path();
+            if p.extension().and_then(|s| s.to_str()) != Some("css") {
+                continue;
+            }
+            let name = p.file_name().expect("file name").to_string_lossy().into_owned();
+            let css = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let warn = var_of(&css, "--warn").unwrap_or_else(|| panic!("{name}: --warn is not defined"));
+            let bg = var_of(&css, "--bg").unwrap_or_else(|| panic!("{name}: --bg is not defined"));
+            let (a, b) = (lum(&warn), lum(&bg));
+            let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+            let ratio = (hi + 0.05) / (lo + 0.05);
+            assert!(
+                ratio >= 4.5,
+                "{name}: --warn {warn} on --bg {bg} is {ratio:.2}:1, below WCAG AA 4.5:1 \
+                 (.savestate.warn is 11px text)"
+            );
+            checked += 1;
+        }
+        // Or a rename of the directory turns this into a test that asserts
+        // nothing and passes — the vacuous-green failure mode CLAUDE.md is
+        // explicit about.
+        assert!(checked >= 5, "expected every theme to be checked, saw {checked}");
+    }
+
     #[test]
     fn the_table_is_sorted_so_binary_search_is_valid() {
         let keys: Vec<&str> = ASSETS.iter().map(|(k, _)| *k).collect();
