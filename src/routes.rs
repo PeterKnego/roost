@@ -169,7 +169,7 @@ fn serve_workspace(w: &mut impl Write, roots: &[PathBuf], project: &str) {
     let settings = config::for_project(&dir);
     let theme_rel = theme_link_for(&dir);
     let key = projects::storage_key(project);
-    http::html(w, &render::workspace_page(project, &key, &settings, theme_rel));
+    http::html(w, &render::workspace_page(project, &key, &settings, theme_rel, config::share_selection()));
 }
 
 /// Serialises the tests that set the process-global `RESH_STATIC`/`HOME`.

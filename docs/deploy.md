@@ -49,6 +49,7 @@ Tests: `cargo test` (never `--release`). Everything else is environment:
 | `RESH_DEBOUNCE_MS` | Filesystem-watch debounce | 300 |
 | `RESH_PING_SECS` | Websocket keepalive ping interval — lower it only to test that path | 30 |
 | `RESH_HEALTH_SECS` | Interval for the periodic health pass, which only logs. Values under 10 are ignored | 300 |
+| `RESH_CONFIG` | Path to the global config file, overriding `~/.config/resh/config.toml` | unset |
 | `RESH_STATIC` | Serve web assets from this directory instead of the embedded copies (development) | unset — assets are compiled in |
 
 `RESH_ROOTS` is required: the binary carries no compiled-in default, and
@@ -337,6 +338,32 @@ happened, autosave stops for that buffer instead of re-raising the conflict
 banner every second. An explicit ⌘S is what resolves it, and a save that
 actually lands is what starts autosave again.
 
+### Turning the Claude Code integration off
+
+**Global config only.** On by default. To switch it off:
+
+```toml
+ide = false
+```
+
+resh then starts no ide listener, writes no lock file, and puts no
+`CLAUDE_CODE_SSE_PORT` in a spawned shell — so `claude` never discovers resh
+and falls back to its own terminal diffs. That is the only shape this switch
+can take from resh's side: refusing an `openDiff` *after* the CLI has already
+connected makes it log `Failed to show diff in IDE` and rethrow, which fails
+the edit instead of degrading it.
+
+**If you only want the diff drawn in the terminal, this is the wrong knob** —
+use the CLI's own `diffTool` setting (`/config` → *Diff tool* → `terminal`).
+That decision is made before the CLI ever calls `openDiff`, which is why it
+degrades cleanly and `ide = false` does not.
+
+Global only, for the same reason as `allowed_origins`: a checked-out repo must
+not be able to switch an integration back on after you have switched it off.
+An unreadable or unparseable global config leaves the integration **on** — a
+typo elsewhere in that file must not silently disable it. (`share_selection`
+defaults the other way, and deliberately: see below.)
+
 ### Sharing the editor selection with Claude
 
 Off by default. When on, resh sends whatever text is currently highlighted in
@@ -353,16 +380,13 @@ the same way a highlighted line of anything else does. To turn it on:
 share_selection = true
 ```
 
-Settable in either file, unlike `allowed_origins` and `max_upload_bytes`,
-which are global-config only. A project's own `.resh/config.toml` can turn
-this on for itself: it only exposes that project's own files, so there is no
-ceiling to widen, the same reasoning `autosave` uses. `~/.config/resh/
-config.toml` is a different trust boundary, not a wider version of the same
-one — it is yours, not something a cloned repo ships, so setting it there
-turns sharing on for every project you open, deliberately, the same way
-`allowed_origins` also grants access from that one file. What must never
-happen is a *project* file reaching past itself; the global file reaching
-every project is the point of it being global.
+**Global config only**, like `allowed_origins` and `max_upload_bytes`. It was
+settable per-project until 2026-08-23, on the argument that a project enabling
+it only exposes its own files, so there is no ceiling to widen. True as far as
+it goes — but it left a "does file content leave this machine" decision in a
+file a cloned repo ships. Every such decision now lives in the one config file
+that is yours rather than a checkout's. A `share_selection` line in
+`{project}/.resh/config.toml` is ignored.
 
 A malformed project `.resh/config.toml` is skipped whole, not partially
 applied (see "Config is re-read every request" above) — so with a global

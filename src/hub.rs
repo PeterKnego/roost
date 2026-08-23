@@ -1282,7 +1282,7 @@ impl Hub {
                 return self.send_to(from, &ev);
             }
         };
-        let _ = crate::ide::selection_changed(&self.project, &self.dir, &abs, &text, start, end);
+        let _ = crate::ide::selection_changed(&self.project, &abs, &text, start, end);
     }
 
     /// The human's Accept/Reject, which **is** the permission answer Claude

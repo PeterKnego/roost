@@ -14,6 +14,7 @@ struct RawConfig {
     allowed_origins: Option<Vec<String>>,
     max_upload_bytes: Option<u64>,
     share_selection: Option<bool>,
+    ide: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,7 +36,6 @@ pub struct Settings {
     /// project: sharing your own selection with your own Claude cannot raise
     /// a ceiling on anything, so a project opting itself in is a decision
     /// only that project's own files are exposed by.
-    pub share_selection: bool,
     pub warning: Option<String>,
 }
 
@@ -67,13 +67,22 @@ impl Default for Settings {
             hide: vec![],
             show_hidden: false,
             autosave: true,
-            share_selection: false,
             warning: None,
         }
     }
 }
 
+/// `RESH_CONFIG` overrides the location, which is what lets a test drive a
+/// *global-only* setting without touching the developer's real
+/// `~/.config/resh/config.toml` — the same reason `RESH_STATE_DIR` exists.
+/// Operators get the same knob for free: a second instance can carry its own
+/// origins and caps without a second home directory.
 pub fn global_config_path() -> PathBuf {
+    if let Ok(p) = std::env::var("RESH_CONFIG") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
         .join(".config/resh/config.toml")
 }
@@ -101,9 +110,6 @@ pub fn load(paths: &[&Path]) -> Settings {
                 }
                 if let Some(v) = raw.autosave {
                     s.autosave = v;
-                }
-                if let Some(v) = raw.share_selection {
-                    s.share_selection = v;
                 }
             }
             Err(e) => warnings.push(format!("{}: {}", path.display(), e.message())),
@@ -185,6 +191,57 @@ pub fn max_upload_bytes() -> u64 {
 /// Split from [`max_upload_bytes`] so tests can point at a real file instead of
 /// rewriting `HOME`, which `state_dir` and `global_config_path` both read and
 /// which other tests are running against concurrently.
+/// Is the Claude Code IDE integration enabled? **Global config only.**
+///
+/// Off means resh starts no ide listener, writes no lock file, and puts no
+/// `CLAUDE_CODE_SSE_PORT` in a spawned shell — so `claude` simply never
+/// discovers resh and falls back to its own terminal diffs. That is the only
+/// shape a kill switch can take from this side: refusing an `openDiff` once
+/// the CLI has already found us makes it log "Failed to show diff in IDE" and
+/// rethrow, which fails the edit rather than degrading it. The graceful
+/// per-user choice about *where* a diff is drawn is the CLI's own `diffTool`
+/// setting, not ours.
+///
+/// Global only, like `allowed_origins` and `max_upload_bytes`: a checked-out
+/// repo must not be able to switch an integration back on for itself after
+/// the user has switched it off.
+pub fn ide_enabled() -> bool {
+    ide_enabled_from(&global_config_path())
+}
+
+fn ide_enabled_from(global: &Path) -> bool {
+    std::fs::read_to_string(global)
+        .ok()
+        .and_then(|s| toml::from_str::<RawConfig>(&s).ok())
+        .and_then(|r| r.ide)
+        // Absent, unreadable or unparseable all mean "on": the integration is
+        // the default, and a typo elsewhere in the file must not silently
+        // disable a feature the user never asked to turn off.
+        .unwrap_or(true)
+}
+
+/// Does the editor selection travel to Claude? **Global config only.**
+///
+/// Moved here from the per-project cascade on 2026-08-23. The old reasoning
+/// was that a project enabling it only exposes its own files, so there is no
+/// ceiling to widen — true, but it put a "does file content leave this
+/// machine" decision in a file a cloned repo ships. Every such decision now
+/// lives in the one config file that is the user's own.
+pub fn share_selection() -> bool {
+    share_selection_from(&global_config_path())
+}
+
+fn share_selection_from(global: &Path) -> bool {
+    std::fs::read_to_string(global)
+        .ok()
+        .and_then(|s| toml::from_str::<RawConfig>(&s).ok())
+        .and_then(|r| r.share_selection)
+        // Absent, unreadable or unparseable all mean "off". This one guards
+        // content leaving the host, so the failure of a check is never
+        // allowed to read as consent.
+        .unwrap_or(false)
+}
+
 fn max_upload_from(global: &Path) -> u64 {
     // A zero or unparseable value falls back rather than disabling the limit:
     // the failure mode of reading a typo as "unlimited" is a full disk.
@@ -292,25 +349,65 @@ mod tests {
     // appears_only_when_it_is_on` — three legitimate hits on the one default,
     // not evidence any of the three is redundant. Then restored.
     #[test]
-    fn share_selection_defaults_off_and_either_layer_can_turn_it_on() {
+    fn share_selection_is_global_only_and_a_project_cannot_turn_it_on() {
+        // Scope changed on 2026-08-23: it used to cascade like `autosave`,
+        // on the argument that a project enabling it only exposes its own
+        // files. True, but it left a "does file content leave this machine"
+        // decision in a file a cloned repo ships. Now every such decision
+        // lives in the one config file that is the user's own.
+        //
+        // Revert-checked: routing `share_selection_from` through `load(&[global,
+        // project])` instead of reading the global file alone failed the third
+        // assertion here — the project's `true` reached it. Then restored.
         let d = tempfile::tempdir().unwrap();
         let g = d.path().join("global.toml");
         let p = d.path().join("project.toml");
+
         fs::write(&g, "hide = [\"dist\"]").unwrap();
-        assert!(!load(&[&g]).share_selection, "off unless something says otherwise");
+        assert!(!share_selection_from(&g), "off unless the global file says otherwise");
 
-        fs::write(&p, "share_selection = true").unwrap();
-        let s = load(&[&g, &p]);
-        assert!(s.share_selection, "a project can turn it on for itself");
-        assert_eq!(s.hide, vec!["dist"], "and the global key still survives");
-
-        // The other direction: a project can turn a global `true` back off,
-        // or the setting is a one-way latch.
         fs::write(&g, "share_selection = true").unwrap();
-        assert!(load(&[&g]).share_selection);
-        fs::write(&p, "share_selection = false").unwrap();
-        assert!(!load(&[&g, &p]).share_selection, "a project can turn it back off");
-        assert!(load(&[&g, &p]).warning.is_none());
+        assert!(share_selection_from(&g), "the user's own global file can turn it on");
+
+        // The whole point of the move: this file is a checkout's, not the
+        // user's, and it must not be able to reach this setting at all.
+        fs::write(&p, "share_selection = true").unwrap();
+        fs::write(&g, "hide = [\"dist\"]").unwrap();
+        assert!(!share_selection_from(&g), "a project file cannot turn it on");
+
+        // And the cascade no longer carries it, so nothing reads it by accident.
+        let s = load(&[&g, &p]);
+        assert_eq!(s.hide, vec!["dist"], "the global keys that do cascade still do");
+    }
+
+    #[test]
+    fn an_unreadable_global_file_leaves_sharing_off_and_the_ide_on() {
+        // The two defaults point opposite ways on purpose. A check that
+        // failed must never read as consent to send file contents, and must
+        // never silently disable an integration the user did not turn off.
+        let d = tempfile::tempdir().unwrap();
+        let missing = d.path().join("nope.toml");
+        assert!(!share_selection_from(&missing), "cannot read => not sharing");
+        assert!(ide_enabled_from(&missing), "cannot read => integration stays on");
+
+        let junk = d.path().join("junk.toml");
+        fs::write(&junk, "this is not toml [[[").unwrap();
+        assert!(!share_selection_from(&junk), "unparseable => not sharing");
+        assert!(ide_enabled_from(&junk), "unparseable => integration stays on");
+    }
+
+    #[test]
+    fn the_ide_kill_switch_is_global_only() {
+        let d = tempfile::tempdir().unwrap();
+        let g = d.path().join("global.toml");
+        let p = d.path().join("project.toml");
+        assert!(ide_enabled_from(&g), "on by default");
+        fs::write(&g, "ide = false").unwrap();
+        assert!(!ide_enabled_from(&g), "the user's global file can switch it off");
+        // A repo must not be able to switch it back on for itself.
+        fs::write(&p, "ide = true").unwrap();
+        assert!(!ide_enabled_from(&g), "a project file cannot re-enable it");
+        let _ = p;
     }
 
     // The reverse direction: a global `true` is what a per-project `false`

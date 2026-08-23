@@ -207,11 +207,16 @@ await Deno.writeTextFile(`${projectDir}/${MENTION_FILE}`, "aaa\nbbb\nccc\nddd\ne
 // for every other browser-tested project in this repo — this is the one file
 // in the suite that deliberately turns it on, to exercise the wiring.
 await Deno.mkdir(`${projectDir}/.resh`, { recursive: true });
-await Deno.writeTextFile(`${projectDir}/.resh/config.toml`, "share_selection = true\n");
+// Global config, not the project's own: `share_selection` became
+// global-only on 2026-08-23, so a `.resh/config.toml` in the project can no
+// longer reach it — which is the point of the move. `RESH_CONFIG` is how a
+// test points resh at a global file it owns.
+const globalConfig = `${fx.base}/resh-global.toml`;
+await Deno.writeTextFile(globalConfig, "share_selection = true\n");
 
 const resh = await startResh({
   repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(),
-  extraEnv: { CLAUDE_CONFIG_DIR: claudeConfigDir },
+  extraEnv: { CLAUDE_CONFIG_DIR: claudeConfigDir, RESH_CONFIG: globalConfig },
 });
 const browser = await startBrowser(profileDir(repoRoot));
 let page, claude;
@@ -299,7 +304,7 @@ try {
   ok(await until(() => evalIn(`!state.panes.some((p) => p.tabs.some((t) => t.k === "Proposal"))`), 10, "tab closed"),
      "the proposal tab closes once it has been answered");
 
-  console.log("\nF. Editing a proposal before accepting answers FILE_SAVED with the edited text");
+  console.log("\nG. Editing a proposal before accepting answers FILE_SAVED with the edited text");
   // The third of openDiff's three outcomes, and the only one that tells
   // Claude the file will NOT match what it proposed. Until the editable box
   // existed, `edited()` could only ever return null, so this path was
