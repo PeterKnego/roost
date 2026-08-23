@@ -154,6 +154,16 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
             return;
         }
     };
+    // Only the attach that spawned the shell carries a launch (see
+    // `session::Attachment::launch`), so a reconnect or a mirroring browser
+    // never types it twice. Typed through `write_input` — the same lock-free
+    // path as keystrokes from the browser — and before any browser input
+    // can arrive on this socket, so it lands at the shell's first prompt.
+    if let Some(l) = att.launch {
+        if let Err(e) = session::write_input(&att.key, crate::launch::keystrokes(l)) {
+            eprintln!("resh: could not start {l:?} in {project}/{name}: {e}");
+        }
+    }
     let Ok(write_half) = ws_read.get_ref().try_clone_inner() else { return };
     // From here on this connection has two threads and exactly one writer.
     gate.close();

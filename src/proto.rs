@@ -43,6 +43,17 @@ impl Default for Sizes {
     }
 }
 
+/// A program the client may ask a new terminal to start. A closed set on
+/// purpose: the browser already owns a PTY, so this is no new capability, but
+/// a message that says "run this command line" should not exist on the wire
+/// when one that says "run claude" is all that is wanted. Each variant maps
+/// to a fixed command in `launch.rs`; add a variant there to offer another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Launch {
+    Claude,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "t")]
 pub enum Intent {
@@ -72,7 +83,15 @@ pub enum Intent {
     /// client sees the sessions it has tabs for, never the detached ones, and
     /// attaching creates only when absent — so a client-chosen name would
     /// eventually drop the user into somebody else's old shell.
-    NewTerminal { pane: PaneId },
+    NewTerminal {
+        pane: PaneId,
+        /// What to start in the new shell, if anything. Typed into the shell
+        /// as keystrokes after it spawns (see `session::attach`), so the
+        /// user keeps the shell when the program exits. Absent for the plain
+        /// `+` button — the message it has always sent.
+        #[serde(default)]
+        launch: Option<Launch>,
+    },
     /// A span matched in terminal output, sent **verbatim** —
     /// `~/projects/resh/src/a.rs:42` and all. Deliberately not pre-parsed by
     /// the client: the parser and the confinement it feeds belong together, in
@@ -222,6 +241,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn new_terminal_without_a_launch_is_the_plain_plus_button() {
+        // The `+` button predates `launch`; its message must keep parsing
+        // unchanged, and parse to "no launch", not to some default program.
+        let i = decode(r#"{"t":"NewTerminal","pane":3}"#).unwrap();
+        assert!(matches!(i, Intent::NewTerminal { pane: 3, launch: None }), "got {i:?}");
+    }
+
+    #[test]
+    fn new_terminal_can_ask_for_claude_by_name() {
+        let i = decode(r#"{"t":"NewTerminal","pane":3,"launch":"claude"}"#).unwrap();
+        assert!(matches!(i, Intent::NewTerminal { pane: 3, launch: Some(Launch::Claude) }), "got {i:?}");
+        // A closed set: the client names a program resh knows, never a
+        // command line of its own.
+        assert!(decode(r#"{"t":"NewTerminal","pane":3,"launch":"rm -rf /"}"#).is_err());
+    }
+
+    #[test]
     fn decodes_open_tab() {
         let i = decode(r#"{"t":"OpenTab","pane":2,"tab":{"k":"File","rel":"src/main.rs","mode":"Preview"}}"#).unwrap();
         match i {
@@ -278,7 +314,7 @@ mod tests {
         ));
         assert!(matches!(
             decode(r#"{"t":"NewTerminal","pane":2}"#).unwrap(),
-            Intent::NewTerminal { pane } if pane == 2
+            Intent::NewTerminal { pane, .. } if pane == 2
         ));
     }
 

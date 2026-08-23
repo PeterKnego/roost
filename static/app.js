@@ -3,6 +3,11 @@
 // DOM nodes that are MOVED between panes with appendChild, never rebuilt —
 // rebuilding a xterm instance drops its websocket and detaches the shell.
 const PROJECT = document.body.dataset.project;
+// The programs a new terminal can be asked to start, by wire name. Decided
+// server-side at startup (`launch::probe`): a name is here only if the login
+// shell could find it, or the check could not tell — a failed check must not
+// hide a working button.
+const LAUNCHES = (document.body.dataset.launches || "").split(" ").filter(Boolean);
 // The config file's `show_hidden`, embedded by render.rs at page load. The
 // workspace's own toggle (state.show_hidden) overrides it when set; null
 // means nobody has touched the header button, so the file still decides.
@@ -512,6 +517,20 @@ function render() {
     plus.textContent = "+";
     plus.onclick = () => newTerminal(pi);
     strip.appendChild(plus);
+    // ✻ (U+273B), the spark from Claude Code's own banner — text
+    // presentation, so it cannot turn into a colour emoji on some platform.
+    // The same button as +, plus a program to type in: the server allocates
+    // the name and types `claude` into the shell it spawns, so no flags are
+    // needed — CLAUDE_CODE_SSE_PORT in that shell's environment is how the
+    // claude it starts finds this resh's IDE socket.
+    if (LAUNCHES.includes("claude")) {
+      const star = document.createElement("span");
+      star.className = "newclaude";
+      star.title = "new terminal running Claude";
+      star.textContent = "✻";
+      star.onclick = () => newTerminal(pi, "claude");
+      strip.appendChild(star);
+    }
 
     const active = pane.tabs[pane.active];
     const activeKey = active ? tabKey(active) : "";
@@ -670,12 +689,16 @@ function maximizedSizes(pi) {
 
 function pool() { return document.getElementById("termpool"); }
 
-function newTerminal(pane) {
+function newTerminal(pane, launch) {
   // No prompt: the server allocates term/term1/term2… from `live_names`, which
   // sees detached sessions the client has no tabs for. A name picked here could
   // collide with one of those, and since attaching creates only when absent,
   // "new terminal" would silently reattach to an old shell instead.
-  send({ t: "NewTerminal", pane });
+  //
+  // `launch` names a program (one of LAUNCHES), never a command line: the
+  // server owns what is typed, this only says which. Omitted, not null, for
+  // the plain + so its message stays the one it has always sent.
+  send(launch ? { t: "NewTerminal", pane, launch } : { t: "NewTerminal", pane });
 }
 
 function mountTab(content, t) {

@@ -10,7 +10,7 @@
 //!                        after the last "theme" segment is itself a path
 //!                        into the project's `.resh/theme/` directory
 //! Fragment errors render as 200 + hint (htmx ignores 4xx bodies).
-use crate::{config, gitio, http, projects, registry, render};
+use crate::{config, gitio, http, launch, projects, registry, render};
 use std::io::{BufReader, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -169,7 +169,17 @@ fn serve_workspace(w: &mut impl Write, roots: &[PathBuf], project: &str) {
     let settings = config::for_project(&dir);
     let theme_rel = theme_link_for(&dir);
     let key = projects::storage_key(project);
-    http::html(w, &render::workspace_page(project, &key, &settings, theme_rel, config::share_selection()));
+    http::html(
+        w,
+        &render::workspace_page(
+            project,
+            &key,
+            &settings,
+            theme_rel,
+            config::share_selection(),
+            &launch::offered_names(),
+        ),
+    );
 }
 
 /// Serialises the tests that set the process-global `RESH_STATIC`/`HOME`.

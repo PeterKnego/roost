@@ -1450,6 +1450,102 @@ fn new_terminal_names_itself_and_ending_one_clears_only_its_own_tab() {
     std::env::remove_var("RESH_STATE_DIR");
 }
 
+/// `TerminalStarted` tells a browser "attach to this session now", and the
+/// browser only obeys for a session it has a tab for (app.js gates it, so a
+/// mirroring tab never opens a PTY socket for a terminal it does not show).
+/// For `NewTerminal` the tab is born in the same handler — so the snapshot
+/// that carries it has to reach the browser *first*, or every browser,
+/// including the one that clicked, drops the event and lands on the "press
+/// Enter" placeholder. That was the + button's behaviour before this test:
+/// one click for the tab, a keypress for the shell.
+#[test]
+fn a_new_terminals_started_event_follows_the_snapshot_that_carries_its_tab() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    let (_d, port) = fixture_named("newtermorder");
+    let mut a = ws_connect_path(port, "/ws/newtermorder/_workspace").unwrap();
+    read_until(&mut a, r#""t":"State""#);
+    a.send(tungstenite::Message::Text(r#"{"t":"NewTerminal","pane":3}"#.into())).unwrap();
+    // Both frames mention the new name; collect them in arrival order.
+    let mut order = Vec::new();
+    for _ in 0..10 {
+        let msg = read_until(&mut a, r#""session":"term1""#);
+        if msg.contains(r#""t":"TerminalStarted""#) {
+            order.push("started");
+            break;
+        }
+        if msg.contains(r#""t":"State""#) {
+            order.push("state");
+        }
+    }
+    assert_eq!(
+        order,
+        vec!["state", "started"],
+        "the browser must hold the tab before it is told to attach to it"
+    );
+    std::env::remove_var("RESH_STATE_DIR");
+}
+
+/// The ✻ button end to end: the intent names no session, the server allocates
+/// one, and the program is typed into that session's PTY by the socket that
+/// spawns it — not by the hub, which has no PTY yet, and not by the client,
+/// which a mirroring browser could race. `RESH_CMD=cat` makes the shell echo
+/// its input, so the keystrokes come back out as proof they went in.
+#[test]
+fn a_claude_terminal_has_claude_typed_into_it_once_its_shell_exists() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("RESH_CMD", "cat");
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("RESH_STATE_DIR", sd.path());
+    let (_d, port) = fixture_named("claudeterm");
+    let mut a = ws_connect_path(port, "/ws/claudeterm/_workspace").unwrap();
+    read_until(&mut a, r#""t":"State""#);
+    a.send(tungstenite::Message::Text(r#"{"t":"NewTerminal","pane":3,"launch":"claude"}"#.into())).unwrap();
+    // default_layout seeds `term`, so the click is handed `term1`.
+    read_until(&mut a, r#""session":"term1""#);
+
+    let mut t = ws_connect_path(port, "/ws/claudeterm/term/term1").unwrap();
+    let mut seen = String::new();
+    for _ in 0..100 {
+        match t.read() {
+            Ok(tungstenite::Message::Binary(b)) => seen.push_str(&String::from_utf8_lossy(&b)),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if seen.contains("claude\r") {
+            break;
+        }
+    }
+    assert!(seen.contains("claude\r"), "claude + Enter must reach the PTY; got: {seen:?}");
+
+    // The plain + button on the same project stays a plain shell: nothing is
+    // typed into it, so nothing comes back out.
+    a.send(tungstenite::Message::Text(r#"{"t":"NewTerminal","pane":3}"#.into())).unwrap();
+    read_until(&mut a, r#""session":"term2""#);
+    let mut p = ws_connect_path(port, "/ws/claudeterm/term/term2").unwrap();
+    p.send(tungstenite::Message::Binary(b"marker\r".to_vec())).unwrap();
+    let mut plain = String::new();
+    for _ in 0..100 {
+        match p.read() {
+            Ok(tungstenite::Message::Binary(b)) => plain.push_str(&String::from_utf8_lossy(&b)),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if plain.contains("marker") {
+            break;
+        }
+    }
+    // `marker` arriving proves the socket is live and echoing, so the absence
+    // of `claude` before it is absence, not a socket that never answered.
+    assert!(plain.contains("marker"), "the plain terminal must echo; got: {plain:?}");
+    assert!(!plain.contains("claude"), "+ must not type claude; got: {plain:?}");
+
+    let _ = t.close(None);
+    let _ = p.close(None);
+    std::env::remove_var("RESH_STATE_DIR");
+}
+
 #[test]
 fn workspace_state_mirrors_between_two_clients() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
