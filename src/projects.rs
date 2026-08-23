@@ -56,21 +56,45 @@ const TEXT_EXTENSIONS: &[&str] = &[
     "ini", "service", "env", "gitignore", "dockerignore",
 ];
 
-/// Roots to scan for projects: `RESH_ROOTS` (colon-separated) when set
-/// and non-empty. Empty when it is unset; `main` refuses to start on that
-/// rather than guessing.
+/// Roots to scan for projects: `RESH_ROOTS` (colon-separated) when set and
+/// non-empty, otherwise the global config's `roots`. Empty when neither says
+/// anything; `main` refuses to start on that rather than guessing.
 ///
-/// There is deliberately no compiled-in default. One machine's paths used to
-/// live here, which put that host's layout into every binary and into the
-/// repository. Where a deployment keeps its projects is configuration, and it
-/// belongs on the host — in the unit file that starts the process.
+/// There is still deliberately no compiled-in default. One machine's paths
+/// used to live here, which put that host's layout into every binary and into
+/// the repository. A config file is not that: it sits on the host, is not in
+/// the checkout, and is the same file `allowed_origins` already lives in.
+///
+/// The env var wins so the unit file stays authoritative for the service, and
+/// so a test or a second instance can point somewhere else for one run
+/// without editing the user's config. The config entry exists for the callers
+/// that are *not* the service — `resh peers` runs from a Claude Code hook,
+/// which inherits none of the unit's environment, and hard-coding the roots
+/// into that hook duplicated the unit file in a second place that would drift.
+///
+/// Config side is global-only; see [`crate::config::configured_roots`] for why
+/// a project file must never reach this.
 pub fn roots() -> Vec<PathBuf> {
-    std::env::var("RESH_ROOTS")
+    roots_from(
+        std::env::var("RESH_ROOTS").ok().as_deref(),
+        &crate::config::global_config_path(),
+    )
+}
+
+/// Split from [`roots`] so the precedence can be tested without setting a
+/// process-wide env var or rewriting `HOME` — both of which other tests in
+/// this crate are reading concurrently.
+pub fn roots_from(env_value: Option<&str>, global: &Path) -> Vec<PathBuf> {
+    let from_env: Vec<PathBuf> = env_value
         .unwrap_or_default()
         .split(':')
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .collect()
+        .collect();
+    if !from_env.is_empty() {
+        return from_env;
+    }
+    crate::config::roots_from_global(global)
 }
 
 pub struct Project {
@@ -853,19 +877,60 @@ mod tests {
         assert!(read_text_file(&bin).unwrap_err().contains("binary"));
     }
 
-    /// Reverting this to a compiled-in fallback makes the last two assertions
-    /// fail with the old host paths in the `left` value — which is exactly the
-    /// leak: those paths were readable in the binary and in the repository.
+    /// The original assertion this replaces: reverting to a *compiled-in*
+    /// fallback made the no-env cases fail with the old host paths in `left`,
+    /// which was the leak — those paths were readable in the binary and in
+    /// the repository. That property is still pinned by the last case here:
+    /// with nothing in the environment and a config file that mentions no
+    /// roots, the answer is empty rather than some guessed directory.
     #[test]
-    fn roots_come_only_from_the_environment() {
-        std::env::set_var("RESH_ROOTS", "/one:/two");
-        assert_eq!(roots(), vec![PathBuf::from("/one"), PathBuf::from("/two")]);
-        // No built-in fallback. Unset means empty, and `main` exits rather
-        // than serving some guessed directory.
-        std::env::set_var("RESH_ROOTS", "");
-        assert!(roots().is_empty(), "empty RESH_ROOTS must not fall back");
-        std::env::remove_var("RESH_ROOTS");
-        assert!(roots().is_empty(), "unset RESH_ROOTS must not fall back");
+    fn roots_come_from_the_environment_first_then_the_global_config_and_never_from_the_binary() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("config.toml");
+        std::fs::write(&cfg, "roots = [\"/from/config\"]\n").unwrap();
+
+        assert_eq!(
+            roots_from(Some("/one:/two"), &cfg),
+            vec![PathBuf::from("/one"), PathBuf::from("/two")],
+            "the unit file's env must stay authoritative for the service"
+        );
+        assert_eq!(
+            roots_from(None, &cfg),
+            vec![PathBuf::from("/from/config")],
+            "with no env, the global config answers — this is what `resh peers` relies on"
+        );
+        assert_eq!(
+            roots_from(Some(""), &cfg),
+            vec![PathBuf::from("/from/config")],
+            "an empty RESH_ROOTS is 'unset', not 'deliberately no roots'"
+        );
+
+        // No built-in fallback, still. A config file that says nothing about
+        // roots leaves the answer empty and `main` exits.
+        let silent = d.path().join("silent.toml");
+        std::fs::write(&silent, "allowed_origins = []\n").unwrap();
+        assert!(roots_from(None, &silent).is_empty(), "a config without roots must not fall back");
+        assert!(
+            roots_from(None, &d.path().join("absent.toml")).is_empty(),
+            "a missing config must not fall back"
+        );
+    }
+
+    /// A hand-edited file invites `~/`. Left literal it would name a
+    /// directory that matches nothing, and resh would come up healthy showing
+    /// no projects at all — indistinguishable from every project having been
+    /// deleted, which is the failure mode this codebase keeps relearning.
+    #[test]
+    fn a_tilde_root_expands_rather_than_naming_a_directory_that_cannot_exist() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("config.toml");
+        std::fs::write(&cfg, "roots = [\"~/projects\", \"/absolute\", \"  \"]\n").unwrap();
+        let home = std::env::var("HOME").expect("tests run with HOME set");
+        assert_eq!(
+            roots_from(None, &cfg),
+            vec![PathBuf::from(&home).join("projects"), PathBuf::from("/absolute")],
+            "~/ expands, absolute paths pass through, blank entries are dropped"
+        );
     }
 
     #[test]

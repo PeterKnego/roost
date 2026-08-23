@@ -15,6 +15,7 @@ struct RawConfig {
     max_upload_bytes: Option<u64>,
     share_selection: Option<bool>,
     ide: Option<bool>,
+    roots: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -218,6 +219,53 @@ fn ide_enabled_from(global: &Path) -> bool {
         // the default, and a typo elsewhere in the file must not silently
         // disable a feature the user never asked to turn off.
         .unwrap_or(true)
+}
+
+/// The directories scanned for projects, from the global config's `roots`.
+/// **Global config only**, and the strictest case of that rule in this file.
+///
+/// `allowed_origins` and `max_upload_bytes` are global-only because a cloned
+/// repo could otherwise widen a boundary set around it. `roots` is worse: it
+/// does not widen a boundary, it *defines* the space every path confinement
+/// is relative to. A project file that could add a root would make itself the
+/// parent of directories it has no business seeing — so this is deliberately
+/// not part of [`Settings`], which is the only thing a project file reaches.
+///
+/// A leading `~/` expands against `HOME`. This file is hand-edited, unlike
+/// the unit file's `RESH_ROOTS`, and a literal `~` directory that matches
+/// nothing would fail as "no projects at all" — indistinguishable from every
+/// project having vanished.
+pub fn configured_roots() -> Vec<PathBuf> {
+    roots_from_global(&global_config_path())
+}
+
+/// Split from [`configured_roots`] for the reason [`max_upload_from`] is:
+/// tests point at a real file rather than rewriting `HOME`, which
+/// `state_dir` and `global_config_path` both read and which other tests are
+/// running against concurrently.
+pub fn roots_from_global(global: &Path) -> Vec<PathBuf> {
+    std::fs::read_to_string(global)
+        .ok()
+        .and_then(|t| toml::from_str::<RawConfig>(&t).ok())
+        .and_then(|r| r.roots)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| expand_home(s.trim()))
+        .collect()
+}
+
+fn expand_home(s: &str) -> PathBuf {
+    match s.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(h) => PathBuf::from(h).join(rest),
+            // No HOME to expand against. Keep the literal rather than
+            // silently dropping the entry: a root that resolves to nothing
+            // shows up as one missing project, not as every project gone.
+            None => PathBuf::from(s),
+        },
+        None => PathBuf::from(s),
+    }
 }
 
 /// Does the editor selection travel to Claude? **Global config only.**
@@ -541,4 +589,36 @@ mod tests {
         }
         std::env::remove_var("RESH_MAX_UPLOAD");
     }
+
+    /// The property that makes `roots` global-only, pinned rather than left
+    /// to the shape of `Settings`.
+    ///
+    /// Discriminating on purpose: the theme assertion proves the project file
+    /// really is read and merged over the global one, so the empty roots
+    /// result cannot be explained away as "the project file was ignored
+    /// entirely". Adding `roots` to the per-project cascade later would let a
+    /// cloned repo declare itself the parent of directories it has no
+    /// business seeing, and this is what would fail.
+    #[test]
+    fn a_project_config_cannot_contribute_a_project_root() {
+        let d = tempfile::tempdir().unwrap();
+        let global = d.path().join("global.toml");
+        std::fs::write(&global, "theme = \"dawn\"\n").unwrap();
+        std::fs::create_dir_all(d.path().join(".resh")).unwrap();
+        let project = d.path().join(".resh/config.toml");
+        std::fs::write(&project, "theme = \"midnight\"\nroots = [\"/etc\"]\n").unwrap();
+
+        // The project file is genuinely read and genuinely wins on a key the
+        // cascade does carry.
+        let settings = load(&[&global, &project]);
+        assert_eq!(settings.theme, "midnight", "the project file must really be parsed and merged");
+
+        // And yet it contributes no root: `roots` consults the global path
+        // alone, so the project's entry is never in the list at all.
+        assert!(
+            crate::projects::roots_from(None, &global).is_empty(),
+            "the project file declared /etc as a root and it must not appear"
+        );
+    }
+
 }
