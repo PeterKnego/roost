@@ -491,3 +491,20 @@ ul.picker li .git:hover { text-decoration: underline; }
    withheld. */
 .savestate { font-size: 11px; opacity: .55; white-space: nowrap; }
 .savestate.warn { color: var(--warn, #d79921); opacity: 1; }
+
+/* The editable side of a proposal. Monospace and full width because it is
+   file content, not prose; a generous min-height so a one-line proposal does
+   not open a box too small to see what you are changing. */
+.proposal-edit {
+  width: 100%;
+  min-height: 12em;
+  margin: 0.5em 0;
+  font: inherit;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  background: var(--bg, #fff);
+  color: var(--fg, #111);
+  border: 1px solid var(--line, #ccc);
+  border-radius: 3px;
+  padding: 0.5em;
+  resize: vertical;
+}

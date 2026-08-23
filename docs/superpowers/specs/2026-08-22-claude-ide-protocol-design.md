@@ -320,24 +320,32 @@ Three responses, matching the three the CLI accepts:
 | Accept after editing the proposal | `FILE_SAVED` + the edited text |
 | Reject, or close the tab | `DIFF_REJECTED` |
 
-*(Amended after the final whole-branch review, which found the middle row
-unreachable from the UI — the same way rule 2 under "Which directory Claude is
-actually in" was amended after Task 7.)* **Two of the three are reachable
-today; the third is wired everywhere except the UI.** Accept and Reject on the
-proposal tab produce `TAB_CLOSED` and `DIFF_REJECTED` end to end. `FILE_SAVED`
-does not happen: nothing in `static/app.js` ever builds the `.proposal-edit`
-box, so the client's `edited()` always returns `null`, and `Answer::
-AcceptedEdited` — which does exist, and does answer `FILE_SAVED` with the
-edited text — is exercised only by Rust tests.
+*(Amended twice: after the final whole-branch review, which found the middle
+row unreachable from the UI, and again once the editable box landed.)* **All
+three outcomes are now reachable.** Accept and Reject on the proposal tab
+produce `TAB_CLOSED` and `DIFF_REJECTED`; an **Edit** button beside them opens
+a textarea seeded with Claude's proposed content, and accepting after changing
+it answers `FILE_SAVED` plus the text the human typed — which is how Claude
+learns the file will not match its own proposal.
 
-The table stays as written, because it is the *wire contract* and the wire
-contract is fully implemented: the protocol handling, the answer type, the
-reply shape and their tests are all in place. What is missing is one editable
-box in `static/app.js` and nothing behind it. That box is the next increment,
-deliberately deferred rather than dropped: adding a new UI affordance during a
-final pre-merge review would ship it without a review cycle of its own. Until
-it lands, "the proposal side editable" in the paragraph above describes the
-intended end state, not what a user can do.
+The box is built with `createElement` and seeded through `.value`, *not*
+rendered into the server-side fragment, and that is a deliberate reading of
+CLAUDE.md's "all HTML is built in `render.rs`". That rule exists because
+hand-built markup is where escaping goes wrong, and file content inside a
+server-rendered `<textarea>` is precisely that trap: a `</textarea>` occurring
+in the proposed text would close the element and let the remainder parse as
+markup. `.value` is never parsed as HTML at all, so this is the stronger
+guarantee rather than a shortcut around the rule.
+
+Two properties the box must not weaken, both covered by
+`tests/browser/ide.mjs` §F:
+
+- **It appears only on request.** The diff is the thing to read; a textarea
+  covering it by default would defeat reviewing the change.
+- **It changes nothing about the content-less case.** A proposal whose
+  `Event::Proposal` has not arrived still renders a placeholder with no
+  buttons at all — no Accept, no Reject, and no Edit — because answering what
+  you cannot see is the failure this whole tab exists to prevent.
 
 **resh must not write the file.** On acceptance the CLI continues its own tool
 call with the (possibly edited) content as updated input — `l({behavior:"allow",

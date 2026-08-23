@@ -760,9 +760,11 @@ function renderProposal(el, tab) {
     // ".conflict button, .proposal-actions button" rule) rather than
     // duplicating it under a parallel class.
     bar.className = "proposal-actions";
-    // Task 9: the opt-in hook for editing a proposal before accepting.
-    // Nothing here ever builds a `.proposal-edit` box, so `edited()` always
-    // returns null (an unedited accept) until that task adds one.
+    // Null unless the box exists *and* its text differs from what Claude
+    // proposed. That distinction is the whole protocol difference: an
+    // unedited accept answers TAB_CLOSED ("write what you proposed"), an
+    // edited one answers FILE_SAVED plus this text ("write mine instead"),
+    // which is how Claude learns the file will not match its own proposal.
     const edited = () => {
       const box = el.querySelector(".proposal-edit");
       return box && box.value !== p.new_text ? box.value : null;
@@ -776,7 +778,30 @@ function renderProposal(el, tab) {
       b.onclick = fn;
       return b;
     };
-    bar.append(mkButton("Accept", () => answer(true)), mkButton("Reject", () => answer(false)));
+    // Built with createElement and seeded through `.value`, not rendered
+    // into the fragment server-side. CLAUDE.md puts HTML in render.rs
+    // because hand-built markup is where escaping goes wrong — and file
+    // content inside a server-rendered `<textarea>` is exactly that trap: a
+    // `</textarea>` in the proposed text would close the element and let
+    // the rest parse as markup. `.value` is never parsed as HTML at all, so
+    // this is the stronger guarantee rather than a shortcut around the rule.
+    const editButton = mkButton("Edit", () => {
+      if (el.querySelector(".proposal-edit")) return;
+      const box = document.createElement("textarea");
+      box.className = "proposal-edit";
+      box.value = p.new_text;
+      box.spellcheck = false;
+      // Above the buttons, below the diff: the diff stays readable while
+      // you edit, which is the point of reviewing it at all.
+      el.insertBefore(box, bar);
+      editButton.remove();
+      box.focus();
+    });
+    bar.append(
+      mkButton("Accept", () => answer(true)),
+      mkButton("Reject", () => answer(false)),
+      editButton,
+    );
     el.appendChild(bar);
   });
 }
