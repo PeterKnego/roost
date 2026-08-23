@@ -41,10 +41,10 @@ moves.
   placement. The sharing indicator is deliberately loud (it is the only thing
   on the page saying a selection is leaving the machine — see the comment above
   `#sharing` in `style.css`); a chrome pass must not quiet it.
-- **`✻` and `+`** stay text glyphs, as do the tab-level `●` (dirty/attention),
-  `⚠` (stale), `✎` and `×`. They are the app's existing vocabulary; `✻` is
-  specifically the spark from Claude Code's own banner (`app.js` documents the
-  choice, including the text-presentation reason).
+- **`+`** stays a text glyph, as do the tab-level `●` (dirty/attention), `⚠`
+  (stale), `✎` and `×`. They are the app's existing vocabulary. The one glyph
+  that *does* change is `✻` — see "Pane-header icons" below: the
+  launch-Claude button becomes the official Claude mark.
 - **The bottom status bar stays hidden.** Considered in the design round and
   dropped as redundant — the information it would carry (session liveness,
   save state) is already on the tabs and the `.path` bar. `#statusbar` remains
@@ -152,6 +152,18 @@ working. The `innerHTML` here is constant markup with no interpolation — no
 escaping surface is added; anything ever interpolated into an icon goes
 through the existing escape paths.
 
+**The launch-Claude button (`.newclaude`) drops the `✻` text glyph for the
+official Claude mark** — the starburst logo as packaged by lobehub
+(<https://lobehub.com/icons/claude>; path fetched 2026-08-23 from
+`lobehub/lobe-icons` `static-svg/icons/claude-color.svg`), inlined as one SVG
+constant in `app.js`, 13px on the 24-viewBox it ships with, filled the brand's
+`#D97757` in every theme rather than `currentColor` — the point of using the
+real mark is that it is recognisable, and it reads against all five shipped
+theme backgrounds (the darkest, solarized's `#002b36`, included). Hover keeps
+the existing background treatment; the fill does not change. The old comment
+in `app.js` explaining the ✻-as-text choice is replaced by one recording this
+decision and the asset's provenance.
+
 ## Non-goals
 
 - Live project-wide search, the settings pane, theme switching — placeholders
@@ -193,7 +205,8 @@ reverted before it counts (per CLAUDE.md):
 Browser (`tests/browser/`, per CLAUDE.md nothing in `cargo test` reaches
 `app.js`): chip click opens `#wtpanel`; a row click navigates the page to the
 other worktree's URL and the workspace renders there; pane icons render and
-the dotfiles toggle still drives its intent. Mind the four traps in
+the dotfiles toggle still drives its intent; the `.newclaude` button carries
+the Claude-mark SVG and still starts a terminal running Claude. Mind the four traps in
 `tests/browser/README.md`. Also verify by eye in a real browser and run the
 suite on the Linux host — both have caught what the suites did not.
 
