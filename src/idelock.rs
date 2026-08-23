@@ -128,6 +128,105 @@ impl Drop for Lock {
     }
 }
 
+/// What a sweep did, so startup can say it rather than doing it silently.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    pub removed: usize,
+    /// Left alone, for any reason — not ours, still live, or unreadable.
+    pub kept: usize,
+}
+
+/// Is this pid running? Three outcomes, not two — the same rule `idecwd`
+/// applies to `/proc`, for the same reason: "I could not look" must never
+/// become "it is gone", because the branch that follows deletes something.
+fn pid_state(proc_root: &Path, pid: u32) -> Option<bool> {
+    match std::fs::symlink_metadata(proc_root.join(pid.to_string())) {
+        Ok(_) => Some(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Distinguish "no such process" from "no /proc at all".
+            match std::fs::symlink_metadata(proc_root) {
+                Ok(_) => Some(false),
+                Err(_) => None,
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+/// Is something accepting connections on this loopback port?
+fn port_busy(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(200),
+    )
+    .is_ok()
+}
+
+/// Removes the lock files a *previous* resh left behind.
+///
+/// systemd stops resh with `SIGTERM`, which unwinds nothing, so `Lock::drop`
+/// never runs and every restart strands one lock file per open project. The
+/// `claude` CLI does reap stale entries by pid, but leaving our debris for it
+/// to clear puts this codebase's mess in a directory it shares with every
+/// other IDE on the host — so resh cleans up after itself.
+///
+/// Three conditions, all required, because this directory is not ours:
+/// the file says `ideName: resh`, its pid is *known* dead, and nothing is
+/// listening on the port it advertises. Any doubt at all — an unparseable
+/// file, an unreadable `/proc`, a port that answers — and the file stays.
+/// A stale row is recoverable; deleting a live IntelliJ's registration is not,
+/// and neither is deleting the lock of a resh that is still serving.
+///
+/// Deliberately *not* the CLI's rule: it unlinks lock files it cannot parse.
+/// That is right for the client, which owns the directory's hygiene; it is
+/// wrong for us, because a file we cannot read is a file we cannot claim.
+pub fn sweep_strays_in(dir: &Path, proc_root: &Path) -> SweepReport {
+    let mut r = SweepReport::default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // Cannot list it — that is not evidence of anything.
+        return r;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        let Some(port) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".lock"))
+            .and_then(|n| n.parse::<u16>().ok())
+        else {
+            r.kept += 1;
+            continue;
+        };
+        let ours_and_dead = (|| {
+            let text = std::fs::read_to_string(&path).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+            if v.get("ideName").and_then(|x| x.as_str()) != Some("resh") {
+                return Some(false);
+            }
+            let pid = u32::try_from(v.get("pid")?.as_u64()?).ok()?;
+            // `Some(true)` means alive, `None` means we could not tell.
+            match pid_state(proc_root, pid) {
+                Some(false) => Some(true),
+                _ => Some(false),
+            }
+        })()
+        .unwrap_or(false);
+        if ours_and_dead && !port_busy(port) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => r.removed += 1,
+                Err(_) => r.kept += 1,
+            }
+        } else {
+            r.kept += 1;
+        }
+    }
+    r
+}
+
+pub fn sweep_strays() -> SweepReport {
+    sweep_strays_in(&ide_dir(), Path::new("/proc"))
+}
+
 pub fn write_in(dir: &Path, port: u16, token: &str, workspace: &Path) -> Result<Lock, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let body = serde_json::json!({
@@ -158,6 +257,115 @@ pub fn write(port: u16, token: &str, workspace: &Path) -> Result<Lock, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dead pid that cannot be reused during the test: pick one, confirm
+    /// it is absent, and fabricate the /proc root so nothing depends on the
+    /// host's real process table.
+    fn fake_proc(alive: &[u32]) -> tempfile::TempDir {
+        let p = tempfile::tempdir().unwrap();
+        for pid in alive {
+            std::fs::create_dir(p.path().join(pid.to_string())).unwrap();
+        }
+        p
+    }
+
+    fn write_lock(dir: &Path, port: u16, ide: &str, pid: u32) -> std::path::PathBuf {
+        let f = dir.join(format!("{port}.lock"));
+        std::fs::write(
+            &f,
+            serde_json::json!({"pid": pid, "workspaceFolders": ["/w"], "ideName": ide,
+                               "transport": "ws", "authToken": "x"})
+            .to_string(),
+        )
+        .unwrap();
+        f
+    }
+
+    #[test]
+    fn a_stray_of_ours_is_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let proc = fake_proc(&[]);
+        let f = write_lock(d.path(), 5501, "resh", 4242);
+        let r = sweep_strays_in(d.path(), proc.path());
+        assert_eq!(r, SweepReport { removed: 1, kept: 0 });
+        assert!(!f.exists());
+    }
+
+    #[test]
+    fn another_ides_lock_is_never_touched() {
+        // The whole reason this is three conditions and not one. This
+        // directory is shared with every real IDE on the host, and a live
+        // IntelliJ's registration looks exactly like ours apart from the
+        // name. Dropping the `ideName` check makes this the only failing
+        // test — verified by doing it.
+        let d = tempfile::tempdir().unwrap();
+        let proc = fake_proc(&[]);
+        let f = write_lock(d.path(), 5502, "IntelliJ IDEA", 4242);
+        let r = sweep_strays_in(d.path(), proc.path());
+        assert_eq!(r, SweepReport { removed: 0, kept: 1 });
+        assert!(f.exists(), "a foreign lock must survive even when its pid is dead");
+    }
+
+    #[test]
+    fn a_live_resh_keeps_its_lock() {
+        // Deleting a serving instance's lock unregisters a working
+        // integration: `claude` stops finding it, silently.
+        let d = tempfile::tempdir().unwrap();
+        let proc = fake_proc(&[4242]);
+        let f = write_lock(d.path(), 5503, "resh", 4242);
+        let r = sweep_strays_in(d.path(), proc.path());
+        assert_eq!(r, SweepReport { removed: 0, kept: 1 });
+        assert!(f.exists());
+    }
+
+    #[test]
+    fn a_lock_we_cannot_parse_is_left_alone() {
+        // "I could not read it" is not "it is mine and it is dead". The CLI
+        // does delete unparseable locks — that is its directory to keep tidy,
+        // and the opposite rule for us: a file we cannot read is a file we
+        // cannot claim.
+        let d = tempfile::tempdir().unwrap();
+        let proc = fake_proc(&[]);
+        let f = d.path().join("5504.lock");
+        std::fs::write(&f, "{ this is not json").unwrap();
+        let r = sweep_strays_in(d.path(), proc.path());
+        assert_eq!(r, SweepReport { removed: 0, kept: 1 });
+        assert!(f.exists());
+    }
+
+    #[test]
+    fn an_unreadable_proc_means_we_cannot_tell_so_nothing_is_removed() {
+        // `pid_state` returns None, which must not collapse into "dead".
+        let d = tempfile::tempdir().unwrap();
+        let absent = d.path().join("no-proc-here");
+        let f = write_lock(d.path(), 5505, "resh", 4242);
+        let r = sweep_strays_in(d.path(), &absent);
+        assert_eq!(r, SweepReport { removed: 0, kept: 1 });
+        assert!(f.exists());
+    }
+
+    #[test]
+    fn a_dead_pid_whose_port_still_answers_is_left_alone() {
+        // The port outlived the pid in the lock — something is serving on it,
+        // so the advertised endpoint is real even if the recorded pid is not.
+        let d = tempfile::tempdir().unwrap();
+        let proc = fake_proc(&[]);
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let f = write_lock(d.path(), port, "resh", 4242);
+        let r = sweep_strays_in(d.path(), proc.path());
+        assert_eq!(r, SweepReport { removed: 0, kept: 1 });
+        assert!(f.exists(), "a port that answers means the endpoint is live");
+    }
+
+    #[test]
+    fn an_unreadable_directory_is_not_an_empty_one() {
+        // Reports nothing rather than claiming a clean sweep of a directory
+        // it never managed to list.
+        let d = tempfile::tempdir().unwrap();
+        let missing = d.path().join("gone");
+        assert_eq!(sweep_strays_in(&missing, Path::new("/proc")), SweepReport::default());
+    }
 
     #[test]
     fn a_token_is_thirty_two_hex_chars_and_not_a_constant() {

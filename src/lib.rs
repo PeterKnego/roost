@@ -39,6 +39,17 @@ pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
     crate::notify::load();
     // Sessions outlive resh, so the registry must be rebuilt from disk
     // and live processes rather than assumed empty.
+    // Lock files a previous resh left behind. systemd stops it with SIGTERM,
+    // which unwinds nothing, so `idelock::Lock::drop` never runs and every
+    // restart strands one file per open project. Swept before anything binds,
+    // so this instance's own locks — written later, as projects open — are
+    // never candidates. Only files that say `ideName: resh`, whose pid is
+    // known dead, and whose port answers nothing: `~/.claude/ide` belongs to
+    // every IDE on the host, not to us.
+    let swept = crate::idelock::sweep_strays();
+    if swept.removed > 0 {
+        eprintln!("resh: startup reap — {} stale ide lock file(s) from a previous run", swept.removed);
+    }
     let report = registry::reconcile(&roots);
     if report.dead_sockets > 0 || report.gone_projects > 0 {
         eprintln!(
