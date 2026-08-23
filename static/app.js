@@ -51,6 +51,23 @@ let treeShownHidden = null;
 const SESSION_RE = /^[A-Za-z0-9_-]{1,32}$/; // must match session::valid_name server-side
 const DIVIDER_PX = 8; // keep in step with --divider in style.css
 
+// Pane-header and launcher icon set. Constant markup ONLY — nothing here is
+// ever interpolated, which is what makes innerHTML safe; anything dynamic
+// stays in text nodes and dataset attributes as everywhere else.
+const PANE_ICONS = {
+  dotsOff: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="5" stroke-dasharray="2.2 2.2"/></svg>',
+  dotsOn: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="5" stroke-dasharray="2.2 2.2"/><circle cx="8" cy="8" r="2" fill="currentColor" stroke="none"/></svg>',
+  collapse: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10l4-4 4 4"/></svg>',
+  move: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5.5h10l-2.5-2.5M13.5 10.5h-10l2.5 2.5"/></svg>',
+  maximize: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2.5h4.5V7M7 11.5H2.5V7M13.5 2.5L9 7M2.5 13.5L7 9"/></svg>',
+  restore: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 7H9V2.5M2.5 9H7v4.5M9 7l4.5-4.5M7 9l-4.5 4.5"/></svg>',
+};
+// The official Claude mark (lobehub packaging of Anthropic's starburst,
+// fetched 2026-08-23 from lobehub/lobe-icons static-svg/icons/claude-color.svg),
+// brand-filled in every theme on purpose: the point of the real mark is that
+// it is recognisable, so it does not take currentColor.
+const CLAUDE_MARK = '<svg width="13" height="13" viewBox="0 0 24 24" fill="#D97757"><path d="M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z"/></svg>';
+
 const wsUrl = (p) => `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${p}`;
 
 // Mirrors routes.rs NO_TEXT_EDIT_EXT — NOT IMAGE_EXT, which is a wider list
@@ -517,17 +534,14 @@ function render() {
     plus.textContent = "+";
     plus.onclick = () => newTerminal(pi);
     strip.appendChild(plus);
-    // ✻ (U+273B), the spark from Claude Code's own banner — text
-    // presentation, so it cannot turn into a colour emoji on some platform.
-    // The same button as +, plus a program to type in: the server allocates
-    // the name and types `claude` into the shell it spawns, so no flags are
-    // needed — CLAUDE_CODE_SSE_PORT in that shell's environment is how the
-    // claude it starts finds this resh's IDE socket.
+    // The official Claude mark (see CLAUDE_MARK above), replacing the ✻ text
+    // glyph this button used to carry. Same button as +, same behaviour: the
+    // server allocates the name and types `claude` into the shell it spawns.
     if (LAUNCHES.includes("claude")) {
       const star = document.createElement("span");
       star.className = "newclaude";
       star.title = "new terminal running Claude";
-      star.textContent = "✻";
+      star.innerHTML = CLAUDE_MARK;
       star.onclick = () => newTerminal(pi, "claude");
       strip.appendChild(star);
     }
@@ -606,11 +620,11 @@ function render() {
 function buildPaneIcons(host, pi, pane, active, content) {
   if (!host) return;
   host.innerHTML = "";
-  const icon = (glyph, title, fn) => {
+  const icon = (svg, title, fn) => {
     const b = document.createElement("span");
     b.className = "paneicon";
     b.title = title;
-    b.textContent = glyph;
+    b.innerHTML = svg; // constant markup from PANE_ICONS only
     b.onclick = fn;
     host.appendChild(b);
     return b;
@@ -620,10 +634,10 @@ function buildPaneIcons(host, pi, pane, active, content) {
     // Filled ring = dot entries are showing. This drives an intent rather
     // than filtering client-side: the rows do not exist in the fragment the
     // server sent, so there is nothing here to un-hide.
-    icon(hidden ? "◍" : "◌", hidden ? "hide dotfiles" : "show dotfiles", () => {
+    icon(hidden ? PANE_ICONS.dotsOn : PANE_ICONS.dotsOff, hidden ? "hide dotfiles" : "show dotfiles", () => {
       send({ t: "SetShowHidden", on: !showHidden() });
     });
-    icon("⌃", "collapse all", () => {
+    icon(PANE_ICONS.collapse, "collapse all", () => {
       content.querySelectorAll("details[open]").forEach((d) => { d.open = false; });
     });
   }
@@ -635,7 +649,7 @@ function buildPaneIcons(host, pi, pane, active, content) {
   // that isn't there.
   const swap = MOVE_BETWEEN[pi];
   if (pane.tabs.length && swap !== undefined) {
-    icon("⇄", `move this tab to the ${swap === RIGHT ? "right" : "middle"} pane`, () => {
+    icon(PANE_ICONS.move, `move this tab to the ${swap === RIGHT ? "right" : "middle"} pane`, () => {
       // Append, and let the server clamp: `at` is checked against the
       // destination's real length in workspace.rs, which is the authority on
       // a layout this client may already be a broadcast behind on.
@@ -643,7 +657,7 @@ function buildPaneIcons(host, pi, pane, active, content) {
     });
   }
   const on = maxState.pane === pi;
-  icon(on ? "⤡" : "⤢", on ? "restore pane sizes" : "maximize pane", () => toggleMaximized(pi));
+  icon(on ? PANE_ICONS.restore : PANE_ICONS.maximize, on ? "restore pane sizes" : "maximize pane", () => toggleMaximized(pi));
 }
 
 // Pane ids, matching proto.rs's LEFT_TOP / LEFT_BOTTOM / MIDDLE / RIGHT.
@@ -1968,6 +1982,21 @@ if (projBtn && projPanel) {
       if (badge) badge.textContent = n ? String(n) : "";
     }
   });
+}
+
+// The worktree switcher popup: third of the header popups, same pattern as
+// projpanel above and the bell below. Rows are plain anchors — plain click
+// navigates this tab, ⌘/ctrl-click is the browser's own new-tab, no JS here.
+const wtBtn = document.getElementById("wtbtn");
+const wtPanel = document.getElementById("wtpanel");
+if (wtBtn && wtPanel) {
+  wtBtn.onclick = () => {
+    wtPanel.hidden = !wtPanel.hidden;
+    if (!wtPanel.hidden && window.htmx) htmx.trigger(document.body, "refresh");
+  };
+  // A plain click through to a worktree navigates away anyway; this is for
+  // the ⌘-click case, which stays on this page with the panel open.
+  wtPanel.onclick = (e) => { if (e.target.closest("a")) wtPanel.hidden = true; };
 }
 
 const bell = document.getElementById("bell");

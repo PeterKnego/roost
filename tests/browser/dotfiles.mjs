@@ -48,7 +48,7 @@ const wire = (page) => {
     `(() => { const pi = state.panes.findIndex((p) => p.tabs.some((t) => t.k === "Tree"));
       const b = [...document.querySelectorAll('.pane[data-pane="' + pi + '"] .paneicons .paneicon')]
         .find((x) => /dotfiles/.test(x.title));
-      return JSON.stringify(b ? { glyph: b.textContent, title: b.title } : null); })()`,
+      return JSON.stringify(b ? { circles: b.querySelectorAll("circle").length, title: b.title } : null); })()`,
   ));
   // The click goes through the real element, not through send(): a control
   // wired to nothing is exactly the defect this file exists to catch.
@@ -80,10 +80,10 @@ try {
   ok(!(await one.has(".config")), "nor a dot-directory");
   {
     const t = await one.toggle();
-    // Glyph asserted explicitly: strip tests with no glyph assertion are the
-    // exact failure CLAUDE.md records — swapping ● and ○ left them all green.
+    // Circle count asserted explicitly: strip tests with no glyph assertion are
+    // the exact failure CLAUDE.md records — swapping ● and ○ left them all green.
     ok(t !== null, "the tree pane offers a dotfile control");
-    ok(t?.glyph === "◌", `it draws the hollow ring while hidden (got ${t?.glyph})`);
+    ok(t?.circles === 1, `it draws the hollow ring while hidden (got ${t?.circles} circles)`);
     ok(t?.title === "show dotfiles", `and offers to show (got ${JSON.stringify(t?.title)})`);
   }
 
@@ -95,14 +95,14 @@ try {
   ok(await one.has("hello.md"), "and the ordinary rows are still there");
   {
     const t = await one.toggle();
-    ok(t?.glyph === "◍", `the glyph fills in (got ${t?.glyph})`);
+    ok(t?.circles === 2, `the marker fills in (got ${t?.circles} circles)`);
     ok(t?.title === "hide dotfiles", `and now offers to hide (got ${JSON.stringify(t?.title)})`);
   }
 
   console.log("\nC. and in the browser that did not click");
   ok(await until(() => two.has(".gitignore"), 10, "mirrored dotfile row"),
      "page two updated without being touched");
-  ok((await two.toggle())?.glyph === "◍", "its control shows the new state too");
+  ok((await two.toggle())?.circles === 2, "its control shows the new state too");
 
   console.log("\nD. a page opened afterwards renders it from the snapshot");
   three = wire(await openPage(browser.port, url));
@@ -111,7 +111,7 @@ try {
   // it connected with. A client that applied the value on events alone would
   // pass B and C and fail here.
   ok(await three.has(".gitignore"), "its first render already includes dot rows");
-  ok((await three.toggle())?.glyph === "◍", "and its control agrees");
+  ok((await three.toggle())?.circles === 2, "and its control agrees");
 
   console.log("\nE. expanded directories survive the toggle");
   await one.evalIn(
@@ -129,7 +129,7 @@ try {
   // A remount would have collapsed this; refreshTree reconciles in place.
   ok(await one.evalIn(`document.querySelectorAll('.pane .content details[open][data-rel="src"]').length`) === 1,
      "and src is still expanded — the tree was reconciled, not rebuilt");
-  ok((await one.toggle())?.glyph === "◌", "the glyph is hollow again");
+  ok((await one.toggle())?.circles === 1, "the marker is hollow again");
 
   console.log("\nF. the control belongs to the tree pane only");
   const elsewhere = await one.evalIn(

@@ -127,6 +127,7 @@ main { flex: 1; min-height: 0; }
 .paneicon { display: flex; align-items: center; justify-content: center; width: 20px; height: 20px;
             border-radius: 5px; cursor: pointer; user-select: none; line-height: 1; }
 .paneicon:hover { color: var(--fg); background: var(--tab-hover); }
+.paneicon svg { display: block; }
 /* Tabs wrap onto further rows rather than scrolling off to the right. The
    strip used to be a single row that scrolled horizontally with its scrollbar
    hidden, so once a pane held more tabs than fit across it — four or five in
@@ -169,6 +170,7 @@ main { flex: 1; min-height: 0; }
 /* Sits right after +, and reads as its sibling: same box, slightly tighter so
    the pair reads as one control group rather than two stray glyphs. */
 .tabstrip .newclaude { padding: 0 8px 0 4px; }
+.tabstrip .newclaude svg { display: block; }
 .content { flex: 1 1 auto; overflow: auto; position: relative; }
 /* Inset from the card edge rather than bleeding into it: the fit addon sizes
    the grid from the host's *inner* box, so padding costs a column, not a
