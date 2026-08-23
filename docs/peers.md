@@ -42,6 +42,29 @@ would swallow its escape sequence. Here that capture is the mechanism: a
 what reaches the session. Same fact about the harness, opposite conclusion —
 do not make the two consistent.
 
+## It informs the arriving session only
+
+The hook fires when a session starts, so a session learns who was already
+there. The sessions already there learn nothing about it — this is a snapshot
+taken at startup, not a subscription.
+
+The warning closes that asymmetry by hand rather than by machinery: the name
+it prints for each peer is a `SendMessage` address (`ListAgents` describes a
+session's name as "the name other sessions use to message it", and it is the
+same string the registry stores). An arriving session can announce itself to
+the sessions it found.
+
+That is offered as a capability, not an instruction. A session told to notify
+its peers would message all of them unprompted, and a message wakes the
+receiver mid-task — turning a warning meant to prevent disruption into a
+source of it. Whether an interruption is worth it depends on what the peer is
+doing, which only the reader knows.
+
+One caveat: names are not guaranteed unique. Two sessions in one project have
+been observed sharing a derived name, distinguished only by a short reference
+that `ListAgents` appends and that the registry file does not carry. The pid
+resh prints is unique, but `SendMessage` does not take one.
+
 ## Where the roster comes from
 
 Claude Code already keeps one: a file per live session under
