@@ -278,6 +278,66 @@ totally — text typed and highlighted while nothing was ever sent or saved.
   re-asserts its *mouse* modes on interaction so that half tends to heal by
   itself; `?2004h` it emits once at startup only, so paste does not.
 
+### Peer sessions (`resh peers`, 2026-08-23)
+
+- **Only the arriving session is told.** The hook fires at `SessionStart`, so a
+  session learns who was already there; the sessions already there learn
+  nothing about it, ever. Closing it means either polling or resh pushing into
+  running sessions — a lifecycle, where today there is one file read.
+  **Evidence (2026-08-23): measured, both directions.** `resh-2e` (started
+  09:52) was told about `resh-f8` at its own start and quoted the text back
+  verbatim when asked over `SendMessage`; `resh-f8` (started 05:44) was never
+  told about `resh-2e` and only found it hours later by running `resh peers`
+  by hand. The warning already prints each peer's `SendMessage` address, so an
+  arriving session *can* close it by announcing itself — deliberately offered
+  as a capability rather than an instruction, because a message wakes the
+  receiver mid-task and that turns a warning against disruption into a source
+  of it.
+
+- **The name resh prints is not guaranteed unique, and the name is the
+  address.** `SendMessage` is addressed by name, so an ambiguous one is
+  unreachable exactly when it matters — two sessions in one project.
+  **Evidence (2026-08-23): measured.** `ListAgents` showed two live peers both
+  named `resh-f8`, separated only by a short ref (`28d115` / `7c6d24`) that the
+  registry file does not carry and that is not derivable from `sessionId`
+  (`e2faa2ad…` has ref `28d115`). The pid `resh peers` also prints *is* unique,
+  but `SendMessage` does not accept one.
+
+- **Sibling worktrees are deliberately not peers, and that is not the whole
+  truth.** A worktree is its own project, and git will not check one branch out
+  twice, so two worktrees of a repo cannot collide over a file — the reason the
+  warning stays silent. They can still collide over everything *outside* the
+  working tree.
+  **Evidence (2026-08-23): measured, and it fired twice in one day.** A build
+  from `.claude/worktrees/projstrip-live` rewrote the shared cargo target dir's
+  `assets_table.rs` to that checkout's paths, failing two `assets::` tests in
+  this checkout and leaving the shared binary built from the other tree — the
+  trap CLAUDE.md's *Build from one checkout* describes. Whether the fix belongs
+  here (a quieter same-repo signal) or in the build is unresolved; the
+  collision is not hypothetical.
+
+- **Whether the registry's `cwd` follows a session that changes directory is
+  unverified.** If it records only the startup directory, a session that `cd`s
+  into a worktree mid-session stays attributed to the project it started in,
+  and both its old and new neighbours get the wrong answer.
+  **Not measured.** Registry `cwd` and `/proc/<pid>/cwd` agreed for every live
+  session when checked, but no session was observed changing directory, which
+  is the case that decides it.
+
+- **resh's own UI says nothing about peers.** The count is known per project at
+  any moment, so the picker or project strip could badge a project more than
+  one Claude is working in — reaching the person rather than only the arriving
+  session, and sidestepping the asymmetry above entirely.
+  **Demand unmeasured.** Raised while designing the hook and never asked for.
+
+- **`roots` now lives in two places** — `Environment=RESH_ROOTS` in the unit
+  file and `roots` in `~/.config/resh/config.toml` — and they must be kept in
+  step by hand. The env var winning is deliberate (a test or a second instance
+  can redirect one run without editing the user's config), so the fix is not
+  simply deleting one: it would be teaching the unit to read the config too.
+  **Not measured.** Both were written on 2026-08-23 and have not yet had a
+  chance to drift.
+
 ## Git
 
 - Enforcing project == git repo more strongly than the current soft gate
