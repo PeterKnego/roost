@@ -81,8 +81,10 @@ follows without a further change.
    reserved slot instead of reopening the header.
 4. **Actions, right-aligned:** running-projects (SVG diamond + `#projcount`),
    bell (stroke SVG replacing `🔔`; `#bellcount` badge and `#noticepanel`
-   unchanged), settings gear placeholder (tooltip: settings are not implemented
-   yet; no handler), refresh (SVG replacing `⟳`), a 1px divider, then `Close`
+   unchanged), settings gear placeholder — the conventional toothed cog
+   (Feather's MIT-licensed "settings" shape), not a stylised stand-in
+   (tooltip: settings are not implemented yet; no handler), refresh (SVG
+   replacing `⟳`), a 1px divider, then `Close`
    as a bordered quiet button (SVG × + label; same handler and confirmation
    semantics as today).
 
