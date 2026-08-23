@@ -17,6 +17,7 @@ include = [
     "CLAUDE.md",
     "docs/deploy.md",
     "docs/notifications.md",
+    "docs/peers.md",
 ]
 
 [dependencies]

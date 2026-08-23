@@ -36,13 +36,14 @@ but rename it by hand (`git mv .deadlight .resh` inside the project, if it's
 tracked) on any project that carries one.
 
 `cargo run` binds `127.0.0.1:8444`; the sole CLI argument to the server itself
-is the port. The one other subcommand is `resh notify <title> [body]`,
-which never binds a port — see [`docs/notifications.md`](notifications.md).
+is the port. Two subcommands never bind a port: `resh notify <title> [body]`
+(see [`docs/notifications.md`](notifications.md)) and `resh peers`
+(see [`docs/peers.md`](peers.md)).
 Tests: `cargo test` (never `--release`). Everything else is environment:
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `RESH_ROOTS` | Colon-separated project roots | **required** — no built-in default |
+| `RESH_ROOTS` | Colon-separated project roots | global config `roots`, else none — resh exits 2 |
 | `RESH_STATE_DIR` | Workspace state + dtach sockets | `~/.local/state/resh/` |
 | `RESH_ORIGINS` | Comma-separated origin allowlist | global config, else loopback only |
 | `RESH_CMD` | Terminal command override — **test hook, never set in production** | `dtach -A … -E -r winch -z $SHELL -l` |
@@ -52,11 +53,14 @@ Tests: `cargo test` (never `--release`). Everything else is environment:
 | `RESH_CONFIG` | Path to the global config file, overriding `~/.config/resh/config.toml` | unset |
 | `RESH_STATIC` | Serve web assets from this directory instead of the embedded copies (development) | unset — assets are compiled in |
 
-`RESH_ROOTS` is required: the binary carries no compiled-in default, and
-starting without it exits 2 with a message rather than serving an empty
-project list — which would come up healthy and look exactly like every project
-had vanished. One host's paths used to be the default, which put that machine's
-layout into every binary. Give a second instance its own
+`RESH_ROOTS` is required unless the global config supplies `roots`: the binary
+carries no compiled-in default, and starting with neither exits 2 with a
+message rather than serving an empty project list — which would come up healthy
+and look exactly like every project had vanished. One host's paths used to be
+the default, which put that machine's layout into every binary. The env var
+wins when both are set, so the unit file stays authoritative for the service;
+the config entry exists for callers that inherit none of the unit's
+environment, which today means `resh peers`. Give a second instance its own
 `RESH_STATE_DIR` too — sharing one is safe as of the `.origin` marker (see
 *Projects and sessions*), but two instances sharing a state dir will still show
 each other's projects in the strip, which is rarely what you want.
