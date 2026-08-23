@@ -189,13 +189,17 @@ const claudeConfigDir = `${fx.base}/claude-config`;
 
 const ACCEPT_FILE = "accept-me.txt";
 const REJECT_FILE = "reject-me.txt";
+const EDIT_FILE = "edit-me.txt";
 const MENTION_FILE = "mention-me.txt";
 const acceptOld = "alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\ngolf\n";
 const acceptNew = acceptOld.replace("delta\n", "DELTA CHANGED\n");
+const editOld = "one\ntwo\nthree\n";
+const editNew = "one\nTWO PROPOSED\nthree\n";
 const rejectOld = "one\ntwo\nthree\nfour\nfive\nsix\nseven\n";
 const rejectNew = rejectOld.replace("three\n", "THREE CHANGED\n");
 await Deno.writeTextFile(`${projectDir}/${ACCEPT_FILE}`, acceptOld);
 await Deno.writeTextFile(`${projectDir}/${REJECT_FILE}`, rejectOld);
+await Deno.writeTextFile(`${projectDir}/${EDIT_FILE}`, editOld);
 await Deno.writeTextFile(`${projectDir}/${MENTION_FILE}`, "aaa\nbbb\nccc\nddd\neee\n");
 // Opts this project into selection sharing before the page ever loads: it is
 // embedded once per page load (render.rs's data-share-selection), so writing
@@ -294,6 +298,60 @@ try {
      "resh itself never wrote the file — only the reply above says the proposal was accepted");
   ok(await until(() => evalIn(`!state.panes.some((p) => p.tabs.some((t) => t.k === "Proposal"))`), 10, "tab closed"),
      "the proposal tab closes once it has been answered");
+
+  console.log("\nF. Editing a proposal before accepting answers FILE_SAVED with the edited text");
+  // The third of openDiff's three outcomes, and the only one that tells
+  // Claude the file will NOT match what it proposed. Until the editable box
+  // existed, `edited()` could only ever return null, so this path was
+  // reachable from Rust tests and from nothing a person could click.
+  const editAbs = `${projectDir}/${EDIT_FILE}`;
+  const editReqId = await claude.call("tools/call", {
+    name: "openDiff",
+    arguments: {
+      old_file_path: editAbs, new_file_path: editAbs,
+      new_file_contents: editNew, tab_name: "edit-me",
+    },
+  });
+  ok(await until(() => evalIn(`state.panes.some((p) => p.tabs.some((t) => t.k === "Proposal"))`), 15, "proposal tab"),
+     "the proposal to be edited opens a tab");
+
+  // No box until asked for: the diff is the thing to read first, and a
+  // textarea covering it by default would defeat reviewing the change.
+  ok(await evalIn(`!document.querySelector('.pane[data-pane="2"] .proposal-edit')`),
+     "no edit box is shown until Edit is clicked");
+  ok(await evalIn(`(() => { const b = [...document.querySelectorAll(
+       '.pane[data-pane="2"] .proposal-actions button')].find((x) => x.textContent === "Edit");
+     if (!b) return false; b.click(); return true; })()`),
+     "the Edit button is present and clickable");
+
+  // Seeded from the proposal, not from the file on disk: you are editing
+  // Claude's suggestion, not re-typing the original.
+  const seeded = await poll(() => evalIn(
+    `(() => { const t = document.querySelector('.pane[data-pane="2"] .proposal-edit');
+      return t ? t.value : null; })()`), 10, "the edit box");
+  ok(seeded === editNew,
+     `the box opens seeded with Claude's proposed content, got ${JSON.stringify(seeded)}`);
+
+  const mine = "MY OWN VERSION\n";
+  ok(await evalIn(`(() => { const t = document.querySelector('.pane[data-pane="2"] .proposal-edit');
+     t.value = ${JSON.stringify(mine)}; return true; })()`), "the box accepts an edit");
+  ok(await evalIn(`(() => { const b = [...document.querySelectorAll(
+       '.pane[data-pane="2"] .proposal-actions button')].find((x) => x.textContent === "Accept");
+     if (!b) return false; b.click(); return true; })()`),
+     "Accept is clickable after editing");
+
+  const editReply = await poll(
+    () => claude.log.find((m) => m.id === editReqId && m.result), 10, "the edited accept reply",
+  );
+  // Both halves matter and neither alone is enough: FILE_SAVED without the
+  // text tells Claude nothing about what to write, and the text under
+  // TAB_CLOSED would be ignored.
+  ok(editReply?.result?.content?.[0]?.text === "FILE_SAVED",
+     `an edited accept reports FILE_SAVED, got ${JSON.stringify(editReply?.result)}`);
+  ok(editReply?.result?.content?.[1]?.text === mine,
+     `and carries the text the human typed, got ${JSON.stringify(editReply?.result?.content?.[1])}`);
+  ok((await Deno.readTextFile(editAbs)) !== mine,
+     "resh still never writes the file — the CLI applies the edited content itself");
 
   console.log("\nC. Reject leaves the file untouched and reports DIFF_REJECTED");
   const rejectAbs = `${projectDir}/${REJECT_FILE}`;
