@@ -131,10 +131,78 @@ pub fn starttime_field(stat: &str) -> Option<String> {
     rest.split_whitespace().nth(19).map(str::to_string)
 }
 
+/// Which repository a directory belongs to, as git sees it.
+///
+/// Every worktree of one repository shares a *common* git dir — the main
+/// checkout's `.git` — so two directories with the same common dir are two
+/// views of one repository. That is the whole test; nothing here needs to know
+/// what a worktree looks like on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Repo {
+    At(PathBuf),
+    /// git could not tell us. Never read as "a different repository".
+    Unknown,
+}
+
+/// Ask git, rather than looking for a `.git` entry.
+///
+/// `worktree.rs` established the rule for the same reason it applies here: a
+/// session's cwd may be a subdirectory rather than a checkout root, and a
+/// worktree can live anywhere — a path convention would answer confidently and
+/// wrongly. `run` is injected so the parsing is testable without a repository.
+pub fn git_common_dir(cwd: &Path, run: &dyn Fn(&Path) -> Option<String>) -> Repo {
+    // Three outcomes, and this is the one that needs saying: the runner
+    // returns None for "did not run, or ran and I cannot trust the output"
+    // (non-zero exit, or empty stdout where a live repository must produce
+    // some). Folding that into "not the same repository" would silently drop
+    // the warning rather than mis-state it, which is the quieter half of the
+    // same mistake.
+    let Some(out) = run(cwd) else { return Repo::Unknown };
+    let out = out.trim();
+    if out.is_empty() {
+        return Repo::Unknown;
+    }
+    // `--git-common-dir` answers relatively when cwd is the checkout root
+    // (".git"), so it is only comparable once resolved against that cwd.
+    let path = PathBuf::from(out);
+    let abs = if path.is_absolute() { path } else { cwd.join(path) };
+    match abs.canonicalize() {
+        Ok(p) => Repo::At(p),
+        Err(_) => Repo::Unknown,
+    }
+}
+
+/// Run `git rev-parse --git-common-dir` in `cwd`.
+pub fn run_git_common_dir(cwd: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    // `status.success()` is not optional here: `git rev-parse` outside a
+    // repository exits non-zero and still prints to stderr, and a caller that
+    // only read stdout would treat the empty result as an answer.
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
 /// Peers in one project, plus how many records could not be judged.
 #[derive(Debug, Default)]
 pub struct Roster {
+    /// Same directory: they will overwrite each other's files.
     pub peers: Vec<Session>,
+    /// Same repository, a different worktree. They cannot collide over files
+    /// — git will not check one branch out twice — but they share `.git` and
+    /// whatever build output the repo's tooling shares.
+    pub siblings: Vec<Session>,
+    /// Same-directory records that could not be judged. Deliberately counts
+    /// only those: a missed peer means overwritten work, while a missed
+    /// sibling means a missed advisory, and reporting uncertainty about the
+    /// quieter case would cost more noise than it buys.
     pub uncheckable: usize,
 }
 
@@ -160,8 +228,18 @@ pub fn roster(
     self_pids: &[i32],
     self_sid: Option<&str>,
     probe: &dyn Fn(i32) -> Probe,
+    repo: &dyn Fn(&Path) -> Repo,
 ) -> Roster {
     let mut out = Roster::default();
+    // Resolving a repository costs a subprocess, so it is spent as late as
+    // possible: once per distinct directory rather than once per session
+    // (sessions commonly share a cwd), and not at all until some candidate is
+    // somewhere other than here. A session starting alone — the ordinary case,
+    // on every project on the host — therefore runs no git at all, and one
+    // that only has peers in its own directory runs none either.
+    let mut resolved: std::collections::HashMap<PathBuf, Repo> =
+        std::collections::HashMap::new();
+    let mut here_repo: Option<Repo> = None;
     for s in entries {
         let is_self = match (self_sid, s.session_id.as_deref()) {
             // Both sides named an id, so the match is exact and nothing else
@@ -185,16 +263,32 @@ pub fn roster(
         if s.kind.as_deref() == Some("bg") {
             continue;
         }
-        if normalise(&s.cwd) != here {
+        let their_cwd = normalise(&s.cwd);
+        let same_dir = their_cwd == here;
+        // A sibling only when git says both directories share one common dir.
+        // `Repo::Unknown` on either side is not a match and not a mismatch —
+        // it simply yields no line, which is the direction this failure should
+        // fall for an advisory.
+        let same_repo = if same_dir {
+            false
+        } else {
+            let ours = here_repo.get_or_insert_with(|| repo(here)).clone();
+            let theirs =
+                resolved.entry(their_cwd.clone()).or_insert_with(|| repo(&their_cwd)).clone();
+            matches!((ours, theirs), (Repo::At(a), Repo::At(b)) if a == b)
+        };
+        if !same_dir && !same_repo {
             continue;
         }
-        match liveness(&s, probe) {
-            Liveness::Live => out.peers.push(s),
-            Liveness::Unknown => out.uncheckable += 1,
-            Liveness::Gone => {}
+        match (liveness(&s, probe), same_dir) {
+            (Liveness::Live, true) => out.peers.push(s),
+            (Liveness::Live, false) => out.siblings.push(s),
+            (Liveness::Unknown, true) => out.uncheckable += 1,
+            _ => {}
         }
     }
     out.peers.sort_by_key(|s| s.started_at.unwrap_or(0));
+    out.siblings.sort_by_key(|s| s.started_at.unwrap_or(0));
     out
 }
 
@@ -252,16 +346,27 @@ fn ago(started_ms: u64, now_ms: u64) -> String {
 /// degraded, and reporting "I could not tell" is the whole point of keeping
 /// it as a third outcome rather than folding it into "no peers".
 pub fn message(project: &str, r: &Roster, now_ms: u64) -> Option<String> {
-    if r.peers.is_empty() && r.uncheckable == 0 {
+    if r.peers.is_empty() && r.siblings.is_empty() && r.uncheckable == 0 {
         return None;
     }
     let mut out = String::new();
-    if r.peers.is_empty() {
+    if r.peers.is_empty() && r.uncheckable > 0 {
         out.push_str(&format!(
             "resh: {} session record(s) in {project} could not be checked, \
              so another Claude may be working here unnoticed.",
             r.uncheckable
         ));
+        if r.siblings.is_empty() {
+            return Some(out);
+        }
+        out.push_str(&siblings_block(r));
+        return Some(out);
+    }
+    if r.peers.is_empty() {
+        // Nobody in this directory, but the repository is shared. The loud
+        // section would be a lie here, so the quiet one stands alone.
+        out.push_str(&format!("No other Claude session is in {project}."));
+        out.push_str(&siblings_block(r));
         return Some(out);
     }
     let n = r.peers.len();
@@ -310,6 +415,7 @@ pub fn message(project: &str, r: &Roster, now_ms: u64) -> Option<String> {
     // as "the name other sessions use to message it", and it is the same
     // string the registry stores, so the lines above need nothing added.
     out.push_str("\n  Each name above is a SendMessage address, if you want to coordinate directly.");
+    out.push_str(&siblings_block(r));
     Some(out)
 }
 
@@ -354,6 +460,28 @@ pub fn ppid_of(pid: i32) -> Option<i32> {
 }
 
 
+/// The same-repository section. Separate from the peers above because the
+/// hazard is different: these cannot touch your files — git will not check one
+/// branch out twice — but they share the repository around them.
+///
+/// The advice names no specific tool. Which build directory a repository's
+/// tooling shares is a property of the machine, not of resh, so stating it
+/// concretely here would be true of one host and wrong elsewhere.
+fn siblings_block(r: &Roster) -> String {
+    if r.siblings.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n  Also in this repository, in other worktrees:");
+    for s in &r.siblings {
+        out.push_str(&format!("\n    - {} ({}) in {}", s.label(), s.status.as_deref().unwrap_or("unknown state"), s.cwd));
+    }
+    out.push_str(
+        "\n    They cannot collide over your files, but they share .git and whatever \
+         build output this repository's tooling shares.",
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,9 +504,16 @@ mod tests {
         Probe::Started("1000".to_string())
     }
 
+    /// git can tell us nothing, so no directory is a sibling of any other.
+    /// The default for every test that predates worktree detection, so their
+    /// assertions still mean exactly what they meant.
+    fn no_repo(_: &Path) -> Repo {
+        Repo::Unknown
+    }
+
     #[test]
     fn a_live_peer_in_this_directory_is_named() {
-        let r = roster(vec![sess(2, "/w")], Path::new("/w"), &[], None, &all_live);
+        let r = roster(vec![sess(2, "/w")], Path::new("/w"), &[], None, &all_live, &no_repo);
         assert_eq!(r.peers.len(), 1);
         assert_eq!(r.peers[0].label(), "peer-2");
         assert_eq!(r.uncheckable, 0);
@@ -395,6 +530,7 @@ mod tests {
             &[],
             None,
             &|_| Probe::NoSuchProcess,
+            &no_repo,
         );
         assert!(r.peers.is_empty(), "a dead pid must not be reported as a peer");
         assert_eq!(r.uncheckable, 0, "'not running' is positive evidence, not uncertainty");
@@ -412,6 +548,7 @@ mod tests {
             None,
             // Alive, but started at a different moment than the record claims.
             &|_| Probe::Started("999999".to_string()),
+            &no_repo,
         );
         assert!(r.peers.is_empty(), "a reused pid must not be reported as its old owner");
         assert_eq!(r.uncheckable, 0, "a starttime mismatch is positive evidence of Gone");
@@ -429,13 +566,14 @@ mod tests {
             &[],
             None,
             &|_| Probe::Unreadable,
+            &no_repo,
         );
         assert!(unreadable.peers.is_empty());
         assert_eq!(unreadable.uncheckable, 1, "an unreadable /proc must be reported, not dropped");
 
         let mut no_start = sess(3, "/w");
         no_start.proc_start = None;
-        let old = roster(vec![no_start], Path::new("/w"), &[], None, &all_live);
+        let old = roster(vec![no_start], Path::new("/w"), &[], None, &all_live, &no_repo);
         assert!(old.peers.is_empty(), "a pid with no recorded starttime proves nothing");
         assert_eq!(old.uncheckable, 1);
     }
@@ -448,19 +586,19 @@ mod tests {
     fn a_background_job_is_filtered_and_the_same_record_otherwise_is_not() {
         let mut bg = sess(2, "/w");
         bg.kind = Some("bg".to_string());
-        let hidden = roster(vec![bg.clone()], Path::new("/w"), &[], None, &all_live);
+        let hidden = roster(vec![bg.clone()], Path::new("/w"), &[], None, &all_live, &no_repo);
         assert!(hidden.peers.is_empty(), "a bg job is not a second pair of hands");
         assert_eq!(hidden.uncheckable, 0, "filtering must happen before the liveness verdict");
 
         let mut interactive = bg;
         interactive.kind = Some("interactive".to_string());
-        let shown = roster(vec![interactive], Path::new("/w"), &[], None, &all_live);
+        let shown = roster(vec![interactive], Path::new("/w"), &[], None, &all_live, &no_repo);
         assert_eq!(shown.peers.len(), 1, "the very same record, interactive, must appear");
     }
 
     #[test]
     fn a_session_in_another_directory_is_another_project() {
-        let r = roster(vec![sess(2, "/elsewhere")], Path::new("/w"), &[], None, &all_live);
+        let r = roster(vec![sess(2, "/elsewhere")], Path::new("/w"), &[], None, &all_live, &no_repo);
         assert!(r.peers.is_empty());
     }
 
@@ -470,13 +608,13 @@ mod tests {
     /// breaking cannot be masked by the other.
     #[test]
     fn this_session_is_not_its_own_peer_by_either_route() {
-        let by_pid = roster(vec![sess(2, "/w")], Path::new("/w"), &[2], None, &all_live);
+        let by_pid = roster(vec![sess(2, "/w")], Path::new("/w"), &[2], None, &all_live, &no_repo);
         assert!(by_pid.peers.is_empty(), "own pid, found via process ancestry");
 
-        let by_sid = roster(vec![sess(2, "/w")], Path::new("/w"), &[], Some("sid-2"), &all_live);
+        let by_sid = roster(vec![sess(2, "/w")], Path::new("/w"), &[], Some("sid-2"), &all_live, &no_repo);
         assert!(by_sid.peers.is_empty(), "own session id, found on stdin");
 
-        let other = roster(vec![sess(2, "/w")], Path::new("/w"), &[99], Some("sid-99"), &all_live);
+        let other = roster(vec![sess(2, "/w")], Path::new("/w"), &[99], Some("sid-99"), &all_live, &no_repo);
         assert_eq!(other.peers.len(), 1, "a different session must still be reported");
     }
 
@@ -533,7 +671,7 @@ mod tests {
     fn silence_when_alone_and_a_message_that_names_who_is_here() {
         assert!(message("proj", &Roster::default(), 0).is_none(), "no peers, nothing to say");
 
-        let r = roster(vec![sess(2, "/w")], Path::new("/w"), &[], None, &all_live);
+        let r = roster(vec![sess(2, "/w")], Path::new("/w"), &[], None, &all_live, &no_repo);
         let m = message("resh", &r, 60_000).expect("a peer must produce a message");
         assert!(m.contains("peer-2"), "the peer must be named: {m}");
         assert!(m.contains("resh"), "the project must be named: {m}");
@@ -546,7 +684,7 @@ mod tests {
     /// thing this module must never assert without evidence.
     #[test]
     fn uncertainty_alone_still_produces_a_message() {
-        let r = Roster { peers: Vec::new(), uncheckable: 2 };
+        let r = Roster { peers: Vec::new(), siblings: Vec::new(), uncheckable: 2 };
         let m = message("resh", &r, 0).expect("uncertainty must not be silent");
         assert!(m.contains("could not be checked"), "{m}");
     }
@@ -604,6 +742,7 @@ mod tests {
             &[],
             None,
             &all_live,
+            &no_repo,
         );
         let m = message("resh", &r, 60_000).expect("two peers must produce a message");
         for line in m.split('\n').skip(1) {
@@ -627,11 +766,11 @@ mod tests {
     /// names no peers, so offering a way to reach them would be nonsense.
     #[test]
     fn the_warning_says_the_names_are_addresses_but_only_when_it_names_someone() {
-        let r = roster(vec![sess(2, "/w")], Path::new("/w"), &[], None, &all_live);
+        let r = roster(vec![sess(2, "/w")], Path::new("/w"), &[], None, &all_live, &no_repo);
         let named = message("resh", &r, 0).expect("a peer must produce a message");
         assert!(named.contains("SendMessage"), "the address hint must be present: {named}");
 
-        let uncertain = Roster { peers: Vec::new(), uncheckable: 2 };
+        let uncertain = Roster { peers: Vec::new(), siblings: Vec::new(), uncheckable: 2 };
         let vague = message("resh", &uncertain, 0).expect("uncertainty must not be silent");
         assert!(
             !vague.contains("SendMessage"),
@@ -656,6 +795,7 @@ mod tests {
             &[2],
             Some("sid-99"),
             &all_live,
+            &no_repo,
         );
         assert_eq!(
             spawner.peers.len(),
@@ -670,6 +810,7 @@ mod tests {
             &[2],
             Some("sid-2"),
             &all_live,
+            &no_repo,
         );
         assert!(ourselves.peers.is_empty(), "an exact id match is still us");
     }
@@ -687,10 +828,211 @@ mod tests {
             &[2],
             Some("sid-99"),
             &all_live,
+            &no_repo,
         );
         assert!(known_id.peers.is_empty(), "a record with no id falls back to ancestry");
 
-        let no_payload = roster(vec![anon], Path::new("/w"), &[2], None, &all_live);
+        let no_payload = roster(vec![anon], Path::new("/w"), &[2], None, &all_live, &no_repo);
         assert!(no_payload.peers.is_empty(), "no payload at all falls back to ancestry");
+    }
+
+    fn repo_a() -> Repo { Repo::At(PathBuf::from("/repo/.git")) }
+
+    /// The collision this exists for: a session in another worktree of the
+    /// same repository. It cannot touch your files — git will not check one
+    /// branch out twice — but it shares .git and whatever build output the
+    /// repo's tooling shares, which on one host meant a build from a sibling
+    /// worktree leaving the shared binary built from the other tree.
+    #[test]
+    fn a_session_in_another_worktree_of_this_repo_is_a_sibling_not_a_peer() {
+        let r = roster(
+            vec![sess(2, "/repo/wt")],
+            Path::new("/repo"),
+            &[],
+            None,
+            &all_live,
+            &|_| repo_a(),
+        );
+        assert!(r.peers.is_empty(), "a different directory is never a peer");
+        assert_eq!(r.siblings.len(), 1, "but the same repository makes it a sibling");
+        assert_eq!(r.siblings[0].label(), "peer-2");
+    }
+
+    /// Same directory always wins: a session here is a peer, never demoted to
+    /// the quieter section just because it also shares the repository.
+    #[test]
+    fn a_session_in_this_very_directory_is_a_peer_even_though_the_repo_matches() {
+        let r = roster(
+            vec![sess(2, "/repo")],
+            Path::new("/repo"),
+            &[],
+            None,
+            &all_live,
+            &|_| repo_a(),
+        );
+        assert_eq!(r.peers.len(), 1, "same directory is the loud case");
+        assert!(r.siblings.is_empty(), "and must not be counted twice");
+    }
+
+    /// A different repository is not a sibling, and — the part that matters —
+    /// neither is one git could not resolve. "I cannot tell" must not become
+    /// "same repository": that would invent a warning rather than miss one.
+    #[test]
+    fn a_different_repo_and_an_unresolvable_one_both_yield_no_sibling() {
+        let different = roster(
+            vec![sess(2, "/other/wt")],
+            Path::new("/repo"),
+            &[],
+            None,
+            &all_live,
+            &|p| {
+                if p.starts_with("/repo") { repo_a() } else { Repo::At(PathBuf::from("/other/.git")) }
+            },
+        );
+        assert!(different.siblings.is_empty(), "a different repository is not a sibling");
+
+        let theirs_unknown = roster(
+            vec![sess(2, "/repo/wt")],
+            Path::new("/repo"),
+            &[],
+            None,
+            &all_live,
+            &|p| if p == Path::new("/repo") { repo_a() } else { Repo::Unknown },
+        );
+        assert!(theirs_unknown.siblings.is_empty(), "their repo unresolvable: claim nothing");
+
+        let ours_unknown = roster(
+            vec![sess(2, "/repo/wt")],
+            Path::new("/repo"),
+            &[],
+            None,
+            &all_live,
+            &|p| if p == Path::new("/repo") { Repo::Unknown } else { repo_a() },
+        );
+        assert!(ours_unknown.siblings.is_empty(), "our own repo unresolvable: claim nothing");
+    }
+
+    /// A subprocess has three results, not two. `git rev-parse` outside a
+    /// repository exits non-zero while still writing to stderr, so a caller
+    /// reading only stdout would take the empty result for an answer.
+    #[test]
+    fn git_that_failed_or_said_nothing_is_unknown_not_a_different_repo() {
+        assert_eq!(git_common_dir(Path::new("/x"), &|_| None), Repo::Unknown, "did not run / non-zero exit");
+        assert_eq!(git_common_dir(Path::new("/x"), &|_| Some(String::new())), Repo::Unknown, "empty stdout");
+        assert_eq!(git_common_dir(Path::new("/x"), &|_| Some("   \n".into())), Repo::Unknown, "whitespace only");
+    }
+
+    /// `--git-common-dir` answers relatively when cwd is the checkout root, so
+    /// two directories under one repo would otherwise both report ".git" and
+    /// compare equal to every other repository's root.
+    #[test]
+    fn a_relative_git_dir_is_resolved_against_the_directory_it_came_from() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        assert_eq!(
+            git_common_dir(&root, &|_| Some(".git".into())),
+            Repo::At(root.join(".git")),
+            "a bare \".git\" must resolve against the cwd that produced it"
+        );
+        assert_eq!(
+            git_common_dir(&root, &|_| Some(root.join(".git").to_string_lossy().into())),
+            Repo::At(root.join(".git")),
+            "an absolute answer passes through"
+        );
+    }
+
+    #[test]
+    fn the_message_carries_the_quieter_worktree_section() {
+        let mut sib = sess(3, "/repo/wt");
+        sib.name = Some("sibling-one".into());
+        let r = roster(
+            vec![sess(2, "/repo"), sib],
+            Path::new("/repo"),
+            &[],
+            None,
+            &all_live,
+            &|_| repo_a(),
+        );
+        let m = message("resh", &r, 0).expect("peers and siblings must produce a message");
+        assert!(m.contains("peer-2"), "the same-directory peer is named: {m}");
+        assert!(m.contains("Also in this repository"), "the quieter section is present: {m}");
+        assert!(m.contains("sibling-one"), "the sibling is named: {m}");
+        assert!(m.contains("/repo/wt"), "and located: {m}");
+        // The advice must not name a specific build tool: which directory a
+        // repo's tooling shares is a property of the machine, not of resh.
+        assert!(!m.to_lowercase().contains("cargo"), "no host-specific tool may be asserted: {m}");
+        for line in m.split('\n').skip(1) {
+            assert!(line.starts_with(' '), "flattening invariant still holds: {line:?}");
+        }
+    }
+
+    /// Nobody in this directory but the repository is shared: the loud opening
+    /// would be a lie, so the quiet section stands on its own.
+    #[test]
+    fn siblings_alone_produce_a_message_without_claiming_a_peer_is_here() {
+        let r = roster(
+            vec![sess(3, "/repo/wt")],
+            Path::new("/repo"),
+            &[],
+            None,
+            &all_live,
+            &|_| repo_a(),
+        );
+        assert!(r.peers.is_empty());
+        let m = message("resh", &r, 0).expect("a sibling alone is still worth saying");
+        assert!(!m.contains("already working in resh:"), "must not claim a peer is here: {m}");
+        assert!(m.contains("No other Claude session is in resh"), "{m}");
+        assert!(m.contains("Also in this repository"), "{m}");
+    }
+
+    /// Resolving a repository costs a subprocess, so the code claims two
+    /// things about when it spends one: never for a session already in this
+    /// directory, and once per distinct directory rather than once per
+    /// session. Both are claims in a comment, which is worth exactly nothing
+    /// unless something fails when they stop being true.
+    ///
+    /// Revert-checked: dropping the `!same_dir &&` guard makes the first
+    /// assertion fail. Note it does NOT move anyone between buckets — the
+    /// bucket is chosen by `same_dir` alone — so this is the only test that
+    /// can catch that edit at all.
+    #[test]
+    fn a_repository_is_resolved_once_per_directory_and_never_for_this_one() {
+        use std::cell::RefCell;
+        let seen: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+        let count = |entries: Vec<Session>| {
+            seen.borrow_mut().clear();
+            let r = roster(
+                entries,
+                Path::new("/repo"),
+                &[],
+                None,
+                &all_live,
+                &|p| {
+                    seen.borrow_mut().push(p.to_path_buf());
+                    repo_a()
+                },
+            );
+            (r, seen.borrow().clone())
+        };
+
+        // Alone, and peers-in-this-directory-only: no git at all. This is the
+        // ordinary case on every project on the host, so it must stay free.
+        let (_, calls) = count(Vec::new());
+        assert!(calls.is_empty(), "a session with no candidates must run no git: {calls:?}");
+        let (r, calls) = count(vec![sess(2, "/repo"), sess(3, "/repo")]);
+        assert_eq!(r.peers.len(), 2);
+        assert!(calls.is_empty(), "peers in this very directory need no repository: {calls:?}");
+
+        // One elsewhere: our own directory resolved once, theirs once, and a
+        // second session sharing their directory reuses it.
+        let (r, calls) = count(vec![sess(4, "/repo/wt"), sess(5, "/repo/wt")]);
+        assert_eq!(r.siblings.len(), 2);
+        assert_eq!(
+            calls.iter().filter(|p| *p == Path::new("/repo/wt")).count(),
+            1,
+            "two sessions sharing a directory must share one resolution: {calls:?}"
+        );
+        assert_eq!(calls.len(), 2, "ours and theirs, nothing more: {calls:?}");
     }
 }

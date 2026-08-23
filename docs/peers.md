@@ -78,6 +78,44 @@ vanishes from it with no way to rebuild.
 What resh adds is the project — mapping a `cwd` to a project name — which is
 the part of the question only resh can answer.
 
+## Other worktrees of the same repository
+
+A worktree is its own project, so two sessions in two worktrees are not peers
+and are not reported in the loud section. They cannot collide over files: git
+will not check one branch out twice.
+
+They can still collide over everything around the working tree — `.git` itself,
+and whatever build output the repository's tooling shares. So they get their
+own quieter block:
+
+```
+Also in this repository, in other worktrees:
+    - resh-f2 (idle) in /home/claude/projects/resh/.claude/worktrees/projstrip-live
+    They cannot collide over your files, but they share .git and whatever build
+    output this repository's tooling shares.
+```
+
+The advice deliberately names no build tool. Which directory a repository's
+tooling shares is a property of the machine, not of resh — this host points
+every cargo workspace at one target dir, which is recorded in CLAUDE.md where
+it belongs rather than asserted by a binary that runs anywhere.
+
+Membership is decided by `git rev-parse --git-common-dir`: every worktree of a
+repository shares the main checkout's `.git`, so equal common dirs means one
+repository. resh asks git rather than looking for a `.git` entry, for the
+reason `worktree.rs` already gives — a cwd may be a subdirectory, and a
+worktree can live anywhere, so a path convention answers confidently and
+wrongly.
+
+That costs a subprocess, so it is spent as late as possible: never until some
+session is somewhere other than here, then once per distinct directory rather
+than once per session. A session starting alone — the ordinary case on every
+project — runs no git at all.
+
+`git` failing to run, exiting non-zero, or printing nothing is *cannot tell*,
+never "a different repository". The cost of that is a missing advisory line
+rather than a false one, which is the right direction for it to fall.
+
 ## Roots
 
 `resh peers` needs to know the project roots, and a hook inherits none of the

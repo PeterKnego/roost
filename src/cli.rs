@@ -263,6 +263,7 @@ pub fn run_peers(_args: &[String]) -> i32 {
         &mine,
         self_sid,
         &crate::peers::probe_proc,
+        &|dir| crate::peers::git_common_dir(dir, &crate::peers::run_git_common_dir),
     );
 
     let now_ms = std::time::SystemTime::now()
