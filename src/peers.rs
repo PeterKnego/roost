@@ -405,16 +405,34 @@ pub fn message(project: &str, r: &Roster, now_ms: u64) -> Option<String> {
         "\n  A resh project is one directory and one branch. Coordinate before editing, \
          or start this work in a git worktree.",
     );
-    // Stated as a capability, not an instruction. Told to notify its peers, a
-    // starting session would message every one of them unprompted, and a
-    // message wakes the receiver mid-task — turning a warning meant to prevent
-    // disruption into a source of it. Whether the interruption is worth it is
-    // a judgement about what the peer is doing, which only the reader has.
+    // An instruction, not a capability — reversed on 2026-08-23 after the
+    // feature was measured against what it was actually for.
+    //
+    // The hook informs the session that is starting and nobody else, so with
+    // sessions arriving in sequence every one of them learns about its
+    // predecessors and the earliest learns about nobody. The goal was for a
+    // group sharing a repository to know about each other, and one-way
+    // arrival notice does not reach that: the session most likely to be deep
+    // in work when someone joins is exactly the one told nothing.
+    //
+    // The first phrasing offered the address and left the choice to the
+    // reader, reasoning that a message wakes its receiver mid-task and a
+    // warning against disruption should not become a source of it. That
+    // reasoning was sound and aimed at the wrong target: one short message per
+    // session start is the price of the group knowing, and it is paid once,
+    // by the session that just started and has nothing in flight.
+    //
+    // Peers only, deliberately. A sibling in another worktree cannot overwrite
+    // your files, so it does not need waking.
     //
     // The name is already the address: `ListAgents` describes a session's name
     // as "the name other sessions use to message it", and it is the same
-    // string the registry stores, so the lines above need nothing added.
-    out.push_str("\n  Each name above is a SendMessage address, if you want to coordinate directly.");
+    // string the registry stores.
+    out.push_str(
+        "\n  They have NOT been told about you — this hook only informs the session that \
+         is starting.\n  Send each name above a brief SendMessage saying you have started \
+         here, so the whole group knows.",
+    );
     out.push_str(&siblings_block(r));
     Some(out)
 }
@@ -768,7 +786,18 @@ mod tests {
     fn the_warning_says_the_names_are_addresses_but_only_when_it_names_someone() {
         let r = roster(vec![sess(2, "/w")], Path::new("/w"), &[], None, &all_live, &no_repo);
         let named = message("resh", &r, 0).expect("a peer must produce a message");
-        assert!(named.contains("SendMessage"), "the address hint must be present: {named}");
+        assert!(named.contains("SendMessage"), "the address must be present: {named}");
+        // An offer and an instruction both mention SendMessage, so mentioning
+        // it proves nothing. What distinguishes them is that the reader is
+        // told the peers do not already know, and told to act.
+        assert!(
+            named.contains("NOT been told about you"),
+            "the reader must learn the peers are unaware of it: {named}"
+        );
+        assert!(
+            named.contains("Send each name above"),
+            "and be told to announce itself, not merely offered the address: {named}"
+        );
 
         let uncertain = Roster { peers: Vec::new(), siblings: Vec::new(), uncheckable: 2 };
         let vague = message("resh", &uncertain, 0).expect("uncertainty must not be silent");

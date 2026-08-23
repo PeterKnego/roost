@@ -54,11 +54,21 @@ session's name as "the name other sessions use to message it", and it is the
 same string the registry stores). An arriving session can announce itself to
 the sessions it found.
 
-That is offered as a capability, not an instruction. A session told to notify
-its peers would message all of them unprompted, and a message wakes the
-receiver mid-task — turning a warning meant to prevent disruption into a
-source of it. Whether an interruption is worth it depends on what the peer is
-doing, which only the reader knows.
+The warning therefore *instructs* the arriving session to announce itself,
+rather than merely offering the address. That was reversed on 2026-08-23 after
+the feature was weighed against what it is for: with sessions arriving in
+sequence, each learns about its predecessors and the earliest learns about
+nobody — so the session most likely to be deep in work when someone joins is
+exactly the one told nothing.
+
+The first phrasing left the choice to the reader, reasoning that a message
+wakes its receiver mid-task and a warning against disruption should not become
+a source of it. That reasoning was sound and aimed at the wrong target: one
+short message per session start is what the group knowing actually costs, and
+it is paid once, by the session that just started and has nothing in flight.
+
+Peers only. A sibling in another worktree cannot overwrite your files, so it
+does not need waking.
 
 One caveat: names are not guaranteed unique. Two sessions in one project have
 been observed sharing a derived name, distinguished only by a short reference

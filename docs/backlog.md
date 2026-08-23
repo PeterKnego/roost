@@ -280,19 +280,22 @@ totally — text typed and highlighted while nothing was ever sent or saved.
 
 ### Peer sessions (`resh peers`, 2026-08-23)
 
-- **Only the arriving session is told.** The hook fires at `SessionStart`, so a
-  session learns who was already there; the sessions already there learn
-  nothing about it, ever. Closing it means either polling or resh pushing into
-  running sessions — a lifecycle, where today there is one file read.
-  **Evidence (2026-08-23): measured, both directions.** `resh-2e` (started
-  09:52) was told about `resh-f8` at its own start and quoted the text back
-  verbatim when asked over `SendMessage`; `resh-f8` (started 05:44) was never
-  told about `resh-2e` and only found it hours later by running `resh peers`
-  by hand. The warning already prints each peer's `SendMessage` address, so an
-  arriving session *can* close it by announcing itself — deliberately offered
-  as a capability rather than an instruction, because a message wakes the
-  receiver mid-task and that turns a warning against disruption into a source
-  of it.
+- **Nothing guarantees the group is told; the arriving session is asked to do
+  it.** The hook informs the session that is starting and no one else. Since
+  2026-08-23 the warning instructs that session to announce itself to each peer
+  by `SendMessage`, which reaches the earliest session — the one the hook can
+  never reach, and the one most likely to be mid-task when someone joins. That
+  is a convention carried out by a model, not a guarantee: a session that
+  ignores the instruction, or whose peer refuses inbound messages, leaves the
+  group as uninformed as before. A guarantee means resh pushing into running
+  sessions or re-checking on a timer — a lifecycle, where today there is one
+  file read.
+  **Evidence (2026-08-23): the one-way gap was measured before the change.**
+  `resh-2e` (started 09:52) was told about `resh-f8` at its own start and
+  quoted it back verbatim over `SendMessage`; `resh-f8` (started 05:44) was
+  never told about `resh-2e` and found it hours later by running `resh peers`
+  by hand. Whether the announcement instruction is actually followed in
+  practice has **not** been measured — it was deployed the same day.
 
 - **The name resh prints is not guaranteed unique, and the name is the
   address.** `SendMessage` is addressed by name, so an ambiguous one is
