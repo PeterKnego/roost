@@ -471,7 +471,7 @@ details[open] > summary { background-image: var(--twisty-open); }
    the left group by itself; now #searchbox's own double `margin: auto` does
    both the centering and the pushing, so the right group needs no auto
    margin of its own to land against the header's edge. */
-#projbtn, #bell, #settings, #refresh { background:none; border:1px solid transparent; border-radius:6px; color:var(--muted); padding:3px 8px; cursor:pointer; font:inherit; }
+#projbtn, #bell, #settings, #refresh { display: flex; align-items: center; gap: 5px; background:none; border:1px solid transparent; border-radius:6px; color:var(--muted); padding:3px 8px; cursor:pointer; font:inherit; }
 #projbtn:hover, #bell:hover, #settings:hover, #refresh:hover { color: var(--fg); }
 #settings { cursor: help; }
 #projcount { margin-left:4px; }

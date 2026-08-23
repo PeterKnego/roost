@@ -475,10 +475,15 @@ pub fn changes_fragment(project: &str, st: &Status) -> String {
     out
 }
 
+// `#gitinfo` (whose content this fills) is only ever rendered inside the
+// header chip now, next to the SVG_BRANCH icon — the icon *is* the branch
+// marker there, so a second textual "⎇ " here would double it. The other
+// three renderers of a branch name (projects_strip, worktrees_strip, the
+// picker) have no icon beside their rows and keep the "⎇ " prefix.
 pub fn status_fragment(st: &Status) -> String {
     format!(
         "<span id=\"branch\">{}</span><span id=\"badge\">{}</span>",
-        if st.branch.is_empty() { String::new() } else { format!("⎇ {}", esc(&st.branch)) },
+        if st.branch.is_empty() { String::new() } else { esc(&st.branch) },
         if st.changes.is_empty() { String::new() } else { format!("({})", st.changes.len()) }
     )
 }
