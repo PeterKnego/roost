@@ -16,6 +16,16 @@ been, and should be read as "someone wanted this once", not as a signal.
 Some things are not measurable from here at all, and say so. That is a third
 answer, not a quiet vote for "unused".
 
+## First things to do:
+- select file in tree or select text in preview, pres Cmd-<Key> and it gets pasted with @reference to Claude active terminal
+- moving file/term tabs
+- handle worktree selection/switching: top-bar left we already have project+branch, we should add worktree+selector. Rethink how to select/switch worktrees. In-place or new browser tab?
+- fix popup UX+design (notifications, dialogs)
+- settings system, 
+- theme selector
+- all project search, ala Idea shift-shift. Opens new search dialog with results.
+- multi-wiew per project: now all windows synchronize to project. Could we have same project open with different tab layout / files open. So basically project could have different "views".
+
 ## UI / UX
 
 - Split terminal/viewer layout — listed as a v2 nice-to-have ("post-v1, only
@@ -162,16 +172,33 @@ genuinely in use, unlike most of the UI/UX list above. That does not rank the
 five items below against each other, but it does mean the section is not
 speculative.
 
-1. Syntax highlighting while editing. highlight.js is already vendored, so
-   this costs almost no new bytes.
+1. ~~Syntax highlighting while editing.~~ **Shipped 2026-08-21** — see the
+   decision below.
 2. Tab inserts an indent instead of moving focus; auto-indent on Enter.
 3. Line numbers, and go-to-line.
 4. In-buffer find. Browser find over a `textarea` barely works.
 5. Bracket and quote auto-close.
 
+Items 2 and 5 are now cheaper than they look: `code-input` ships optional
+single-file plugins for indentation and bracket closing, neither vendored.
+
 ### Candidate libraries
 
-Constraints that decide this: plain JS, no framework, no build step, and
+**Decided 2026-08-21: none of the four below.** The winner was
+[`code-input`](https://github.com/WebCoder49/code-input) (MIT, no
+dependencies, 27 KB), which is not a text editor at all — it wraps a *real*
+`<textarea>` and paints a highlighted `<pre>` underneath it, driven by the
+highlight.js already vendored here. That is what settled it: see "The risk
+that decides it" below, which every candidate in this table has to answer and
+which does not arise when the textarea is still the textarea. `editors`, the
+200 ms debounce, autosave, ⌘S and the conflict path all kept talking to the
+same element they always had. Provenance and the two non-obvious integration
+details are in [vendor.md](vendor.md).
+
+The analysis below is kept as the record of what was weighed, not as an open
+question.
+
+Constraints that decided it: plain JS, no framework, no build step, and
 everything vendored into `static/vendor/` so it can be audited and served
 offline.
 
@@ -199,6 +226,14 @@ before it is believed: seeding from `texts`, the 200 ms debounced
 and CodeMirror own their own text model and sidestep the normalisation
 problem; CodeJar is cheapest but carries it directly. That trade — not the
 feature list — is what a spec for this needs to resolve.
+
+**How it actually resolved:** by not choosing a text model at all. The
+normalisation risk above is a property of replacing the textarea, and
+`code-input` does not. The path was still tested end to end
+(`tests/browser/hledit.mjs`), and the one thing that nearly went wrong was
+unrelated to bytes: the element builds its *own* textarea on connect, so
+wiring the app's handlers to the one handed *to* it failed silently and
+totally — text typed and highlighted while nothing was ever sent or saved.
 
 ## Terminals and sessions
 
@@ -290,6 +325,39 @@ feature list — is what a spec for this needs to resolve.
   guard — but it is the same unchecked-sync hazard `FRAGMENT_KINDS` carries,
   and a build-time check could close both.
 
+### Sharp edges left by the buffers-without-text branch (2026-08-22)
+
+Findings its own reviews raised and deliberately deferred, kept because the
+ledger they lived in was scratch. Each was re-checked against the tree on
+2026-08-22; the ones already closed are not listed.
+
+- **`wsstate::load` reads an unreadable state file as "never saved".**
+  `let Ok(text) = std::fs::read_to_string(path_for(project)) else { return (w,
+  None) }` — a permissions blip, or any transient error, is indistinguishable
+  from a first run, silently. The workspace comes up as the default layout,
+  and the *next* save writes that default over the real state file: every tab,
+  and any unsaved buffer text it held, gone. This is the eleven-times defect in
+  CLAUDE.md's own table, in the one place whose whole job is not losing state.
+  `symlink_metadata` distinguishes the three cases; `Err(NotFound)` is the only
+  one that means "never saved".
+- **A restore with more than `MAX_BUFFERS` dirty buffers is unbounded.** The
+  load cap deliberately truncates only the clean tail, so unsaved work is never
+  dropped to make room — right, but it means a hand-edited or corrupt file can
+  make `reconcile_buffers_with_disk` re-read arbitrarily many files under the
+  registry lock. A sanity ceiling with a warning would close it without
+  reintroducing the data loss.
+- **`stale` can be true on a `Clean` buffer** (edit → external change → undo
+  back to base), which the design doc says cannot happen. Self-heals on
+  reactivation; cosmetic, but the doc is wrong until one of them moves.
+- **A rename during `wsconn`'s unlocked replay window** rekeys the buffer with
+  no `BufferText`, so the old rel replays nothing and the new one is absent
+  from the snapshot. Pre-dates the branch.
+- **Preview-only buffers get a full `BufferText`**, not the hash-only update
+  the spec describes, so every client holds the text of every previewed file in
+  `texts`.
+- **Two no-op assignments** (`hub.rs`, `b.content = Content::Clean` inside an
+  `if b.dirty()` else-branch, where it is already `Clean`).
+
 ## Testing
 
 - `tests/browser/mdlinks.mjs`'s `javascript:` step evaluates `!!a` to prove the
@@ -300,6 +368,16 @@ feature list — is what a spec for this needs to resolve.
   this is the same defect class that produced three vacuous tests during that
   branch's own execution and it is a one-line fix
   (`2026-08-19-preview-links-and-images-design.md`).
+- Three tests carry assertions weaker than their comments claim, all from the
+  buffers-without-text branch and all verified still present on 2026-08-22:
+  `routes.rs`'s `clicking_an_image_shows_a_picture_not_a_binary_error` matches
+  the image URL by prefix rather than anchored, so a stray parameter appended
+  after `v=<n>` would pass (the mtime is wall-clock, which is why it was
+  loosened); `preview-follows.mjs` uses one pane and one file, so the
+  "does not re-fetch other panes" property is only verified by reading the
+  `rel` match; and `wsstate`'s pre-`base_hash` fixture hand-builds
+  `state_dir().join(...)` instead of using the in-scope `path_for`, so a change
+  to the naming scheme would make it miss the file.
 - `tests/integration.rs`'s `notices_are_replayed_on_connect_and_read_state_mirrors`
   fails intermittently, timing out waiting for `"read":true`. Diagnosed
   mechanism: `notify::load()` ends by *destructively* replacing the
@@ -334,3 +412,14 @@ feature list — is what a spec for this needs to resolve.
 - Images in markdown preview (v2 and v3 nice-to-have) → shipped 2026-08-20,
   along with link rewriting and image tabs, which were never listed here
   because nobody had noticed a preview could not follow its own references.
+- Syntax highlighting while editing (Editing → low-hanging fruit, item 1) →
+  shipped 2026-08-21 for code files; markdown and plaintext stay plain, and
+  files past 100 KB stay a plain textarea rather than a laggy one.
+- A previewed file following the disk → shipped 2026-08-21. It had never been
+  listed as future work because it read as a bug: the watcher only ever
+  reported files that had an edit buffer, so a preview had no invalidation
+  path at any of the three layers.
+- Preview/Edit as a per-file choice → **retired** 2026-08-22 rather than
+  shipped. A text file now opens in its editor; Preview survives only where a
+  file has a rendered form to look at (markdown, images, and svg, which has
+  both and keeps the ✎).

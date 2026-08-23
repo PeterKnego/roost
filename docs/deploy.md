@@ -48,6 +48,7 @@ Tests: `cargo test` (never `--release`). Everything else is environment:
 | `RESH_CMD` | Terminal command override — **test hook, never set in production** | `dtach -A … -E -r winch -z $SHELL -l` |
 | `RESH_DEBOUNCE_MS` | Filesystem-watch debounce | 300 |
 | `RESH_PING_SECS` | Websocket keepalive ping interval — lower it only to test that path | 30 |
+| `RESH_HEALTH_SECS` | Interval for the periodic health pass, which only logs. Values under 10 are ignored | 300 |
 | `RESH_STATIC` | Serve web assets from this directory instead of the embedded copies (development) | unset — assets are compiled in |
 
 `RESH_ROOTS` is required: the binary carries no compiled-in default, and
