@@ -708,6 +708,95 @@ pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectSta
     out
 }
 
+/// The worktree switcher: the header chip's label (out-of-band, so one
+/// fragment feeds two places) plus one row per member of the current
+/// repository's worktree family.
+///
+/// Deliberately NOT a reuse of `projects_strip`, and not filtered to
+/// `live > 0`: that strip answers "what is running anywhere", this one
+/// answers "where can I go in *this* repo" — and an idle worktree is
+/// exactly what you switch to before starting work in it.
+///
+/// Reachable rows carry `href` and no `target` on purpose: plain click
+/// navigates this tab (workspace state is server-side, nothing is lost),
+/// and ⌘/ctrl-click opens a new tab through the browser's own modifier
+/// handling. The absence of `target` is load-bearing and pinned by test.
+pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectStatus]) -> String {
+    // Family root: the current entry's parent when it is a worktree, else
+    // itself. An unknown current key means the registry has no entry for
+    // this project (not yet opened, or not a git repo) — that is "cannot
+    // list", stated as an empty panel, never guessed around.
+    let root_key: Option<&str> = projects
+        .iter()
+        .find(|p| p.key == current_key)
+        .map(|p| p.parent.as_deref().unwrap_or(p.key.as_str()));
+    let family: Vec<&crate::registry::ProjectStatus> = match root_key {
+        Some(root) => projects
+            .iter()
+            .filter(|p| p.key == root || p.parent.as_deref() == Some(root))
+            .collect(),
+        None => Vec::new(),
+    };
+    // The label renders only when there is something to switch to — with a
+    // single member the chip stays today's plain branch text, no caret.
+    let label = if family.len() >= 2 {
+        match family.iter().find(|p| p.key == current_key) {
+            Some(p) if p.parent.is_none() => "· main worktree ▾".to_string(),
+            Some(p) => {
+                let name = p.url.rsplit('/').next().unwrap_or(&p.url);
+                format!("· {} ▾", esc(name))
+            }
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "<span id=\"wtlabel\" hx-swap-oob=\"true\">{label}</span><span class=\"wtstrip\">"
+    );
+    if family.is_empty() {
+        out.push_str("<span class=\"wt-empty\">no worktrees</span>");
+    }
+    for p in &family {
+        let marker = if p.live > 0 { "●" } else { "○" };
+        // The root shows its full url (it names the repo); a child shows its
+        // last segment, with the full path in the tooltip.
+        let name = if p.parent.is_none() {
+            p.url.as_str()
+        } else {
+            p.url.rsplit('/').next().unwrap_or(&p.url)
+        };
+        let branch = if p.branch.is_empty() {
+            String::new()
+        } else {
+            format!(" <span class=\"branch\">⎇ {}</span>", esc(&p.branch))
+        };
+        let mut cls = String::from("wt");
+        if p.live > 0 {
+            cls.push_str(" live");
+        }
+        if p.key == current_key {
+            cls.push_str(" current");
+        }
+        if !p.reachable {
+            cls.push_str(" unreachable");
+            out.push_str(&format!(
+                "<span class=\"{cls}\" title=\"worktree outside resh's roots — cannot be opened\">{marker} {}{branch}</span>",
+                esc(name)
+            ));
+            continue;
+        }
+        out.push_str(&format!(
+            "<a class=\"{cls}\" href=\"/{}\" title=\"{}\">{marker} {}{branch}</a>",
+            crate::http::percent_encode(&p.url),
+            esc(&p.url),
+            esc(name),
+        ));
+    }
+    out.push_str("</span>");
+    out
+}
+
 /// Coarse, human-readable age. Precision beyond this is noise when the
 /// question is only "is this old enough that I have forgotten it?".
 /// `1 session` / `2 sessions`. English only, matching the rest of this file.
@@ -1958,5 +2047,122 @@ mod tests {
         assert!(a != b, "the same file at a different mtime must not reuse one URL");
         // The path is still the path: the key is additional, not a rewrite.
         assert!(a.contains("path=shot.png"), "{a}");
+    }
+
+    /// Fixture for the worktree switcher. `url` is passed separately from
+    /// `key` because a child's key is percent-encoded (`a%2Fb`) while its
+    /// url keeps readable slashes (`a/b`) — conflating them in the fixture
+    /// would hide exactly the encoding bugs the strip must not have.
+    fn wt(key: &str, url: &str, parent: Option<&str>, live: usize, branch: &str, reachable: bool)
+        -> crate::registry::ProjectStatus
+    {
+        crate::registry::ProjectStatus {
+            key: key.into(), url: url.into(),
+            live, oldest_age_secs: None, has_layout: true,
+            branch: branch.into(),
+            parent: parent.map(|s| s.to_string()),
+            reachable,
+        }
+    }
+
+    fn karpie_family() -> Vec<crate::registry::ProjectStatus> {
+        vec![
+            wt("karpie", "karpie", None, 1, "master", true),
+            wt("karpie%2F.claude%2Fworktrees%2Ffeat", "karpie/.claude/worktrees/feat",
+               Some("karpie"), 0, "feature-x", true),
+            wt("unrelated", "unrelated", None, 3, "main", true),
+        ]
+    }
+
+    /// The reason this is not a reuse of `projects_strip`: an idle worktree
+    /// is exactly what you switch to before starting work in it, and
+    /// `projects_strip` filters `live == 0` out. Same input to both — the
+    /// idle child must appear here and must not appear there.
+    #[test]
+    fn worktrees_lists_the_idle_family_member_that_projects_strip_hides() {
+        let ps = karpie_family();
+        let wt_html = worktrees_strip("karpie", &ps);
+        assert!(wt_html.contains("feat"), "{wt_html}");
+        assert!(wt_html.contains("⎇ feature-x"), "{wt_html}");
+        let proj_html = projects_strip("karpie", &ps);
+        assert!(!proj_html.contains("feature-x"), "projects_strip must still hide idle: {proj_html}");
+    }
+
+    #[test]
+    fn worktrees_excludes_projects_outside_the_family() {
+        let h = worktrees_strip("karpie", &karpie_family());
+        assert!(!h.contains("unrelated"), "{h}");
+    }
+
+    #[test]
+    fn worktrees_family_from_a_child_matches_family_from_the_root() {
+        let ps = karpie_family();
+        let from_root = worktrees_strip("karpie", &ps);
+        let from_child = worktrees_strip("karpie%2F.claude%2Fworktrees%2Ffeat", &ps);
+        // Same rows either way; only the `current` marking and the label move.
+        assert!(from_child.contains("feat") && from_child.contains("karpie"), "{from_child}");
+        assert!(from_root.contains("feat"), "{from_root}");
+    }
+
+    #[test]
+    fn worktrees_marks_exactly_one_row_current() {
+        let h = worktrees_strip("karpie", &karpie_family());
+        assert_eq!(h.matches(" current\"").count(), 1, "{h}");
+        // and it is the root's row, not the child's
+        assert!(h.contains(r#"class="wt live current" href="/karpie""#), "{h}");
+    }
+
+    /// The ⌘/ctrl-click behaviour IS the absence of `target=` on a plain
+    /// href — so the test pins href-present AND target-absent as a pair
+    /// (absence alone would pass on an empty string).
+    #[test]
+    fn a_reachable_row_links_without_target_and_an_unreachable_row_not_at_all() {
+        let mut ps = karpie_family();
+        ps.push(wt("karpie%2Fgone", "karpie/gone", Some("karpie"), 0, "old", false));
+        let h = worktrees_strip("karpie", &ps);
+        assert!(h.contains(r#"href="/karpie/.claude/worktrees/feat""#), "{h}");
+        assert!(!h.contains("target="), "no row may carry target=: {h}");
+        // unreachable: a span with the tooltip, no href anywhere near it
+        assert!(h.contains("unreachable"), "{h}");
+        assert!(h.contains("worktree outside resh's roots"), "{h}");
+        assert!(!h.contains(r#"href="/karpie/gone""#), "{h}");
+    }
+
+    #[test]
+    fn wtlabel_is_empty_alone_and_names_the_current_worktree_in_company() {
+        // One-member family: no label, no caret — the chip stays plain.
+        let alone = vec![wt("solo", "solo", None, 1, "main", true)];
+        let h = worktrees_strip("solo", &alone);
+        assert!(h.contains(r#"<span id="wtlabel" hx-swap-oob="true"></span>"#), "{h}");
+        // Root of a real family:
+        let h = worktrees_strip("karpie", &karpie_family());
+        assert!(h.contains("· main worktree ▾"), "{h}");
+        // A child names itself by its last path segment:
+        let h = worktrees_strip("karpie%2F.claude%2Fworktrees%2Ffeat", &karpie_family());
+        assert!(h.contains("· feat ▾"), "{h}");
+    }
+
+    /// The fixture must contain real metacharacters or this asserts nothing
+    /// (the vacuous-fixture trap is on record in CLAUDE.md).
+    #[test]
+    fn worktrees_escape_names_and_branches() {
+        let ps = vec![
+            wt("a<b", "a<b", None, 1, "main", true),
+            wt("a<b%2Fwt", "a<b/wt", Some("a<b"), 0, "dev<&>", true),
+        ];
+        let h = worktrees_strip("a<b", &ps);
+        assert!(h.contains("a&lt;b"), "{h}");
+        assert!(h.contains("dev&lt;&amp;&gt;"), "{h}");
+        assert!(!h.contains("dev<&>"), "{h}");
+    }
+
+    /// "The current key resolves to no entry" is the absent case stated as
+    /// absent — empty label, no rows, an explanatory line. Never an error.
+    #[test]
+    fn an_unknown_current_key_yields_no_worktrees_not_an_error() {
+        let h = worktrees_strip("nosuch", &karpie_family());
+        assert!(h.contains(r#"<span id="wtlabel" hx-swap-oob="true"></span>"#), "{h}");
+        assert!(h.contains("no worktrees"), "{h}");
+        assert!(!h.contains("href="), "{h}");
     }
 }
