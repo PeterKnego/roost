@@ -1,9 +1,11 @@
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // One subcommand only. Everything else keeps the historical contract:
+    // Subcommands first. Everything else keeps the historical contract:
     // the single argument is the port.
-    if args.first().map(String::as_str) == Some("notify") {
-        std::process::exit(resh::cli::run_notify(&args[1..]));
+    match args.first().map(String::as_str) {
+        Some("notify") => std::process::exit(resh::cli::run_notify(&args[1..])),
+        Some("peers") => std::process::exit(resh::cli::run_peers(&args[1..])),
+        _ => {}
     }
     // No compiled-in roots any more, so an unset RESH_ROOTS is a
     // misconfiguration, not a default. Serving an empty root list would come
