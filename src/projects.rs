@@ -81,6 +81,34 @@ pub fn roots() -> Vec<PathBuf> {
     )
 }
 
+/// Both sources naming roots and disagreeing.
+///
+/// `RESH_ROOTS` wins silently, which is correct — the unit file is
+/// authoritative for the service — but silence is wrong when the two were
+/// meant to say the same thing. The config entry exists so callers that
+/// inherit none of the unit's environment (`resh peers`, from a hook) resolve
+/// the same projects the server does; when they drift, those callers quietly
+/// answer about a different set of directories than the server serves.
+///
+/// Only a conflict, never a preference: one source silent is the ordinary
+/// case, not a problem.
+pub fn roots_conflict(env_value: Option<&str>, global: &Path) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let from_env: Vec<PathBuf> = env_value
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    if from_env.is_empty() {
+        return None;
+    }
+    let from_config = crate::config::roots_from_global(global);
+    if from_config.is_empty() || from_config == from_env {
+        return None;
+    }
+    Some((from_env, from_config))
+}
+
 /// Split from [`roots`] so the precedence can be tested without setting a
 /// process-wide env var or rewriting `HOME` — both of which other tests in
 /// this crate are reading concurrently.
@@ -1121,5 +1149,33 @@ mod tests {
         assert!(!names.contains(&"target"), "target should be skipped");
         assert!(!names.contains(&"node_modules"), "node_modules should be skipped");
         assert!(!names.contains(&"__pycache__"), "__pycache__ should be skipped");
+    }
+
+    /// A conflict is both sources speaking and disagreeing — never one being
+    /// silent, which is the ordinary case on every host that sets only the
+    /// unit file. Detected because `RESH_ROOTS` wins here while `resh peers`,
+    /// which inherits none of the server's environment, silently resolves the
+    /// other set.
+    #[test]
+    fn only_two_disagreeing_sources_are_a_conflict() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = d.path().join("config.toml");
+        std::fs::write(&cfg, "roots = [\"/a\", \"/b\"]\n").unwrap();
+        let silent = d.path().join("silent.toml");
+        std::fs::write(&silent, "theme = \"dawn\"\n").unwrap();
+
+        assert!(roots_conflict(None, &cfg).is_none(), "no env: config simply answers");
+        assert!(roots_conflict(Some(""), &cfg).is_none(), "empty env is 'unset', not a conflict");
+        assert!(roots_conflict(Some("/a:/b"), &silent).is_none(), "no config: env simply answers");
+        assert!(roots_conflict(Some("/a:/b"), &cfg).is_none(), "agreeing sources are not a conflict");
+
+        let got = roots_conflict(Some("/a:/different"), &cfg).expect("disagreeing sources conflict");
+        assert_eq!(got.0, vec![PathBuf::from("/a"), PathBuf::from("/different")], "env side");
+        assert_eq!(got.1, vec![PathBuf::from("/a"), PathBuf::from("/b")], "config side");
+
+        // Order is part of the answer: roots are searched in order and the
+        // first match wins, so the same set listed differently resolves a
+        // duplicate project name to a different directory.
+        assert!(roots_conflict(Some("/b:/a"), &cfg).is_some(), "reordering changes which root wins");
     }
 }

@@ -257,8 +257,10 @@ pub fn run_peers(_args: &[String]) -> i32 {
     let Some(project) = crate::peers::project_name(&roots, &here) else { return 0 };
 
     let mine = crate::peers::ancestry(std::process::id() as i32, &|p| crate::peers::ppid_of(p));
+    let entries = crate::peers::read_dir(&dir);
+    let self_name = crate::peers::own_name(&entries, &mine, self_sid);
     let roster = crate::peers::roster(
-        crate::peers::read_dir(&dir),
+        entries,
         &here,
         &mine,
         self_sid,
@@ -270,7 +272,21 @@ pub fn run_peers(_args: &[String]) -> i32 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let Some(text) = crate::peers::message(&project, &roster, now_ms) else { return 0 };
+    // Detected collisions are recorded where they survive the session: a
+    // hook's stderr is discarded on a successful run, and this one always
+    // succeeds.
+    let ambiguous = crate::peers::ambiguous_names(&roster, self_name.as_deref());
+    if !ambiguous.is_empty() {
+        crate::peers::log_line(
+            &format!(
+                "duplicate session name in {project}: {} — SendMessage by name is ambiguous",
+                ambiguous.iter().cloned().collect::<Vec<_>>().join(", ")
+            ),
+            now_ms / 1000,
+        );
+    }
+
+    let Some(text) = crate::peers::message(&project, &roster, now_ms, self_name.as_deref()) else { return 0 };
 
     let out = serde_json::json!({
         "systemMessage": text,
