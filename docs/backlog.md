@@ -29,9 +29,6 @@ answer, not a quiet vote for "unused".
 
 ## UI / UX
 
-- Split terminal/viewer layout — listed as a v2 nice-to-have ("post-v1, only
-  if asked"). **Already shipped**: this became the v3 four-pane workspace
-  (`2026-08-16-deadlight-v2-design.md`).
 - Git log view — nice-to-have in both the v2 and v3 specs; no stated reason,
   just unprioritized (`2026-08-16-deadlight-v2-design.md`,
   `2026-08-16-deadlight-v3-workspace-design.md`).
@@ -53,13 +50,6 @@ answer, not a quiet vote for "unused".
   themes** in any `.resh/theme/`, and no `theme =` set in the global config —
   so every window is on the default. A favicon that varies by theme has nothing
   to vary with yet.
-- Images in markdown preview — **shipped**, see
-  `2026-08-19-preview-links-and-images-design.md`. Grew in scope on the way:
-  the same missing piece (no route served raw project bytes) was also why a
-  `.png` in the tree answered "binary file", and rewriting image `src` was
-  half a job without rewriting link `href` too — a link to another file used
-  to navigate the browser clean out of the workspace. Heading anchors are the
-  recorded non-goal; see below.
 - Drag-and-drop tab reordering — speculative idea in the v3 spec, noted as
   partly moot since v3 already ships a "move to pane" command as the
   mechanism for relocating tabs (`2026-08-16-deadlight-v3-workspace-design.md`).
@@ -254,6 +244,13 @@ totally — text typed and highlighted while nothing was ever sent or saved.
   The zellij leftovers below went unnoticed for weeks while holding ~342 MB —
   exactly the kind of thing per-process visibility surfaces. That is an argument
   for the feature, though not one the original entry made.
+
+- **Flags for the one-click Claude terminal.** The ✻ button spawns `claude`
+  with no arguments; a global-only config key would let it be `claude
+  --continue` or similar. Global-only for the usual reason — a per-project
+  value would let a cloned checkout decide what a click on your machine
+  executes. Deferred when the button shipped (2026-08-23).
+  **Demand unmeasured.** Nobody has asked.
 
 - Persisting a session's mode table across a resh restart — the one case
   `2026-08-20-sticky-modes-design.md` deliberately does not fix. Modes are
@@ -472,36 +469,3 @@ ledger they lived in was scratch. Each was re-checked against the tree on
   ones. This predates embedded assets, which has since merged to master and
   brought two more `start()` call sites into the same binary — so the race is
   marginally more likely to trigger now, not less.
-
-## Already shipped (found listed as future/nice-to-have in an earlier doc)
-
-- Split terminal/viewer layout (v2 nice-to-have) → shipped as the v3 four-pane
-  workspace.
-- File editing (implicit in v2's "viewer is stateless and read-only" framing)
-  → shipped in v3 as the Preview/Edit toggle with conflict-guarded save.
-- Images in markdown preview (v2 and v3 nice-to-have) → shipped 2026-08-20,
-  along with link rewriting and image tabs, which were never listed here
-  because nobody had noticed a preview could not follow its own references.
-- Syntax highlighting while editing (Editing → low-hanging fruit, item 1) →
-  shipped 2026-08-21 for code files; markdown and plaintext stay plain, and
-  files past 100 KB stay a plain textarea rather than a laggy one.
-- A previewed file following the disk → shipped 2026-08-21. It had never been
-  listed as future work because it read as a bug: the watcher only ever
-  reported files that had an edit buffer, so a preview had no invalidation
-  path at any of the three layers.
-- Preview/Edit as a per-file choice → **retired** 2026-08-22 rather than
-  shipped. A text file now opens in its editor; Preview survives only where a
-  file has a rendered form to look at (markdown, images, and svg, which has
-  both and keeps the ✎).
-- A one-click Claude terminal → shipped 2026-08-23 as the ✻ next to each tab
-  strip's +: a new terminal with `claude` typed into it by the server the
-  moment its shell spawns (`proto::Launch`, `launch.rs`). It was never listed
-  here — it arrived as a request, not a deferral. No flags, because
-  `CLAUDE_CODE_SSE_PORT` in the spawned environment already links the claude
-  to this resh's IDE socket; the button hides itself only when a startup probe
-  of the login shell positively says `claude` is not installed (an Unknown
-  keeps it). Found and fixed on the way: + had been landing on the "press
-  Enter" placeholder, because `TerminalStarted` went out before the snapshot
-  that carried the tab. Deferred from it: a global-only config key for flags
-  (`claude --continue` and the like) — nobody has asked, and a per-project
-  value would let a cloned checkout decide what a click executes.
