@@ -248,10 +248,25 @@ main { flex: 1; min-height: 0; }
            cursor: pointer; border: 1px solid var(--border); background: none; color: var(--muted); }
 .savebtn:hover { color: var(--fg); background: var(--tab-hover); }
 .conflict { border: 1px solid var(--warn, #d79921); padding: 8px; margin: 8px; background: var(--bg2); }
+.conflict button { margin: 8px 8px 0 0; font: inherit; cursor: pointer; }
 /* .proposal-actions (the Accept/Reject bar under a proposal's hunk view,
-   app.js's renderProposal) reuses this rule rather than a parallel one —
-   same buttons, same treatment. */
-.conflict button, .proposal-actions button { margin: 8px 8px 0 0; font: inherit; cursor: pointer; }
+   app.js's renderProposal) shared .conflict's rule until the proposal became
+   a pinned footer, and then the shared treatment stopped being right for
+   both: .conflict is a transient in-flow warning, and native button chrome
+   suits it — it should read as an interruption. A proposal's bar is permanent
+   pane furniture sitting inside the layout, so it takes .savebtn's quieter
+   treatment instead.
+
+   Accept is styled no differently from Reject on purpose. An accented primary
+   is the correct pattern for a form the user came to submit, and the wrong
+   one here: this is someone else's change being put to you for review, and
+   the affordance should not lean on the answer. */
+.proposal-actions { flex: 0 0 auto; display: flex; gap: 8px; padding: 8px 10px;
+                    border-top: 1px solid var(--border); background: var(--tool); }
+.proposal-actions button { font: inherit; font-size: 12px; line-height: 1.5; padding: 3px 12px;
+                           border-radius: 5px; cursor: pointer; border: 1px solid var(--border);
+                           background: none; color: var(--muted); }
+.proposal-actions button:hover { color: var(--fg); background: var(--tab-hover); }
 /* Error events aren't tied to any one pane (a delete or rename failure has
    no "content" to prepend into), so this variant floats above everything
    instead of the .conflict base's normal in-flow placement. */
@@ -492,19 +507,45 @@ ul.picker li .git:hover { text-decoration: underline; }
 .savestate { font-size: 11px; opacity: .55; white-space: nowrap; }
 .savestate.warn { color: var(--warn, #d79921); opacity: 1; }
 
-/* The editable side of a proposal. Monospace and full width because it is
-   file content, not prose; a generous min-height so a one-line proposal does
-   not open a box too small to see what you are changing. */
+/* A proposal is the only fragment that has to *fill* its pane rather than sit
+   in the pane's scroll flow, and the reason is the Accept/Reject bar: it is a
+   decision about someone's file, and a decision you must scroll past a diff to
+   reach is one people end up making without having read what is above it. So
+   the column owns the height, `.diffview` inside it does the scrolling, and
+   the bar is pinned by construction — the last non-flexing child of a
+   full-height column. No position:sticky and no z-index to get wrong later.
+   Same shape as .editwrap above, which fills its pane for the same reason. */
+.proposalview { display: flex; flex-direction: column; height: 100%; }
+.proposalview .path { flex: 0 0 auto; }
+/* min-height:0 is load-bearing, not defensive: a flex child's default
+   min-height:auto refuses to shrink below its content, so without it a long
+   diff pushes the column past the bottom of the pane — taking the action bar
+   off screen, which is the whole thing this layout exists to prevent. */
+.proposalview .diffview { flex: 1 1 auto; min-height: 0; overflow: auto; }
+
+/* The editable side of a proposal. Monospace because it is file content, not
+   prose; a generous min-height so a one-line proposal does not open a box too
+   small to see what you are changing.
+
+   `flex: 0 1 auto` with a `height`, deliberately not a flex-basis: a
+   flex-basis would win over the inline height the resize handle writes, so
+   the handle would still drag and change nothing. Basis `auto` reads the
+   height, which is what keeps the grip honest. It shrinks (not grows) so a
+   short pane still leaves the diff and the buttons visible. */
 .proposal-edit {
-  width: 100%;
-  min-height: 12em;
-  margin: 0.5em 0;
-  font: inherit;
-  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-  background: var(--bg, #fff);
-  color: var(--fg, #111);
-  border: 1px solid var(--line, #ccc);
-  border-radius: 3px;
-  padding: 0.5em;
+  flex: 0 1 auto;
+  height: 40%;
+  min-height: 6em;
+  margin: 0;
+  font: 13px/1.55 var(--mono);
+  background: var(--bg);
+  color: var(--fg);
+  border: 0;
+  border-top: 1px solid var(--border);
+  padding: 8px 10px;
+  outline: none;
   resize: vertical;
 }
+/* Matches the focus treatment .editwrap gives the file editor, so the two
+   editable surfaces in this app agree about what "focused" looks like. */
+.proposal-edit:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
