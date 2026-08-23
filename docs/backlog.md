@@ -297,11 +297,17 @@ totally — text typed and highlighted while nothing was ever sent or saved.
 - **The name resh prints is not guaranteed unique, and the name is the
   address.** `SendMessage` is addressed by name, so an ambiguous one is
   unreachable exactly when it matters — two sessions in one project.
-  **Evidence (2026-08-23): measured.** `ListAgents` showed two live peers both
-  named `resh-f8`, separated only by a short ref (`28d115` / `7c6d24`) that the
-  registry file does not carry and that is not derivable from `sessionId`
-  (`e2faa2ad…` has ref `28d115`). The pid `resh peers` also prints *is* unique,
-  but `SendMessage` does not accept one.
+  **Evidence (2026-08-23): observed once, and no longer true.** For a stretch
+  that morning `ListAgents` listed this session as `resh-f8 [28d115]` and a
+  *peer* also named `resh-f8 [7c6d24]` — two live sessions sharing one derived
+  name, separated only by a short ref that the registry file does not carry and
+  that is not derivable from `sessionId` (`e2faa2ad…` has ref `28d115`). That
+  peer has since exited; checked again the same afternoon, all nine live
+  sessions had distinct names. So this is a collision the naming scheme
+  permits and that was seen happening, not a standing condition — and it
+  matters because the name is the `SendMessage` address the warning
+  advertises. The pid `resh peers` also prints *is* unique, but `SendMessage`
+  does not accept one.
 
 - **Sibling worktrees are deliberately not peers, and that is not the whole
   truth.** A worktree is its own project, and git will not check one branch out
