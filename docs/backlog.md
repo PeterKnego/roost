@@ -323,6 +323,28 @@ totally — text typed and highlighted while nothing was ever sent or saved.
   session, and sidestepping the asymmetry above entirely.
   **Demand unmeasured.** Raised while designing the hook and never asked for.
 
+- **The `git` call has no timeout of its own.** `git_common_dir` uses
+  `Command::output()`, which blocks until git exits. A git that hangs — a
+  repository on a network filesystem, or one waiting on a lock another process
+  holds — would stall a session start rather than let it proceed.
+  **Evidence (2026-08-23): measured, and small.** Three resolutions took 10ms
+  on this host, ~3ms each, and the hook entry carries `timeout: 10`, so even a
+  fully wedged git costs ten seconds once and the session then starts anyway.
+  The resolution is also lazy, so a session alone in a project spends none at
+  all. That backstop is Claude Code's, not resh's: a caller wiring `resh peers`
+  without a timeout inherits the stall.
+
+- **A sibling whose liveness cannot be judged is dropped silently.** The
+  `uncheckable` count deliberately covers same-directory records only, so an
+  unreadable `/proc` entry for a session in another worktree produces no line
+  at all rather than an "N could not be checked" note. That asymmetry is a
+  decision, not an oversight: a missed peer means overwritten work while a
+  missed sibling means a missed advisory, and reporting uncertainty about the
+  quiet case costs more noise than it buys. Recorded so the next reader finds a
+  decision rather than rediscovers a gap.
+  **Not measured.** No unreadable `/proc` entry has been observed on this host;
+  the path exists because it must, not because it has fired.
+
 - **`roots` now lives in two places** — `Environment=RESH_ROOTS` in the unit
   file and `roots` in `~/.config/resh/config.toml` — and they must be kept in
   step by hand. The env var winning is deliberate (a test or a second instance
