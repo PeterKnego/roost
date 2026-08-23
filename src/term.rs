@@ -233,6 +233,17 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
         let ev = h.snapshot_event(&String::new());
         h.broadcast(&ev);
     }
+    // And every *other* project's ◆ panel: this attach is where the socket
+    // file that panel counts actually appears (the hub's `TerminalStarted`
+    // went out before it existed). Outside the block above — `broadcast_all`
+    // locks every hub, including the one just released. Only when this
+    // attach spawned the process: every tab that mirrors a session attaches
+    // too, and a nudge per mere reconnect would have every browser on the
+    // machine refetch (and `known_projects` fork `ps` per session) each time
+    // one tab reloads.
+    if att.spawned {
+        crate::hub::broadcast_all(&crate::proto::Event::ProjectsChanged { project: project.clone() });
+    }
 
     loop {
         match ws_read.read() {

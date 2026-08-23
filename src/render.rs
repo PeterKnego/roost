@@ -816,7 +816,7 @@ pub fn workspace_page(
   <button id="bell" title="notifications (n)">🔔<span id="bellcount"></span></button>
   <button id="refresh" title="refresh (r)">⟳</button>
 </header>
-<div id="projpanel" hidden><span id="projstrip" hx-get="/frag/_projects?current={qkey}" hx-trigger="load, refresh from:body"></span></div>
+<div id="projpanel" hidden><span id="projstrip" hx-get="/frag/_projects?current={qkey}" hx-trigger="load, refresh from:body, projects from:body"></span></div>
 <div id="noticepanel" hidden></div>
 <main id="grid">
   <section class="pane" data-pane="0"><div class="panehead"><div class="tabstrip"></div><div class="paneicons"></div></div><div class="content"></div></section>
@@ -1470,6 +1470,12 @@ mod tests {
         assert!(h.contains("id=\"termpool\""));
         assert!(h.contains("hx-get=\"/frag/_projects?current=proj\""));
         assert!(h.contains("id=\"projstrip\""));
+        // The name app.js dispatches on `ProjectsChanged`; if the two drift
+        // apart the strip silently goes back to refetching only on reload.
+        assert!(
+            h.contains("hx-trigger=\"load, refresh from:body, projects from:body\""),
+            "the projects strip must refetch on the `projects` body event"
+        );
         assert!(h.contains("id=\"closeproj\""));
         let no_custom = workspace_page("proj", "proj", &s, None, false);
         assert!(!no_custom.contains("theme.css\">"));

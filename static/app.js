@@ -309,6 +309,16 @@ function onEvent(ev) {
       // server processing the intent.
       showError("Cannot close: unsaved changes in " + ev.dirty.join(", "));
       break;
+    case "ProjectsChanged":
+      // Some project — usually not this one — gained its first shell or
+      // lost its last. The ◆ panel and its badge are a server-rendered
+      // fragment that otherwise refetches only on this tab's own triggers,
+      // so without this a project closed from another tab stayed "●" here
+      // until a reload. A dedicated event, not "refresh": that one also
+      // refetches #gitinfo, and another project's shell ending is no reason
+      // to re-run git status here.
+      document.body.dispatchEvent(new Event("projects"));
+      break;
     case "ProjectClosed":
       // A successful close, not a failure — showBanner directly so this
       // doesn't get the "Error:" prefix showError adds.
