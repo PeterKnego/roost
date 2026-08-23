@@ -1522,6 +1522,9 @@ mod tests {
         let s = status_fragment(&st);
         assert!(s.contains("main"));
         assert!(s.contains("(1)"));
+        // The chip draws the branch icon as SVG, so a text ⎇ here would double
+        // the marker.
+        assert!(!s.contains("⎇"), "{s}");
         let clean = changes_fragment("proj", &Status { branch: "main".into(), changes: vec![] });
         assert!(clean.contains("working tree clean"));
     }
@@ -2145,8 +2148,17 @@ mod tests {
         let from_root = worktrees_strip("karpie", &ps);
         let from_child = worktrees_strip("karpie%2F.claude%2Fworktrees%2Ffeat", &ps);
         // Same rows either way; only the `current` marking and the label move.
+        // `from_child.contains("karpie")` alone would pass even if from-child
+        // resolution wrongly listed only the child (its own url/title also
+        // contain "karpie"), so pin the ROOT'S OWN row specifically.
+        assert!(from_child.contains(r#"href="/karpie" title="karpie""#), "{from_child}");
         assert!(from_child.contains("feat") && from_child.contains("karpie"), "{from_child}");
         assert!(from_root.contains("feat"), "{from_root}");
+        // Both renderings must list exactly the 2-member family (root + child),
+        // not just the querying end — count `<a class="wt` (row links only;
+        // `wt-empty` starts with "wt" too but is a <span>, not an <a>).
+        assert_eq!(from_root.matches(r#"<a class="wt"#).count(), 2, "{from_root}");
+        assert_eq!(from_child.matches(r#"<a class="wt"#).count(), 2, "{from_child}");
     }
 
     #[test]

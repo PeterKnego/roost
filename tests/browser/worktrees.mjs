@@ -109,11 +109,26 @@ try {
   }
   ok(navigated, "the same tab now shows the worktree's workspace");
 
+  console.log("\nC2. the destination chip names the worktree we switched to");
+  // Reuse the app-ready `until` pattern, via the CURRENT page.evalIn — the
+  // handle may have been reopened above if evalIn went stale on navigation.
+  await until(() => page.evalIn("typeof terms !== 'undefined' && !!state"), 30, "app on destination");
+  ok(await until(() => page.evalIn(
+      `document.getElementById("wtlabel").textContent.includes("· feat")`),
+     15, "wtlabel filled on destination"),
+     "the destination chip's label names the child worktree (fragment needs a load; " +
+     "also exercises the percent-encoded child key round-trip in a real browser)");
+  await page.evalIn(`document.getElementById("wtbtn").click()`);
+  ok(await until(() => page.evalIn(
+      `document.querySelector("#wtpanel .wt.current")?.textContent.includes("feat") ?? false`),
+     10, "current row on destination"),
+     "the destination panel's current row is the child worktree");
+
   console.log("\nD. the launcher carries the Claude mark");
   await until(() => page.evalIn("typeof terms !== 'undefined' && !!state"), 30, "app again");
   ok(await until(() => page.evalIn(
-      `document.querySelectorAll(".tabstrip .newclaude svg").length > 0`),
-     10, "mark"), "the ✻ button is an SVG mark now");
+      `!!document.querySelector('.tabstrip .newclaude svg[fill="#D97757"]')`),
+     10, "mark"), "the ✻ button is an SVG mark with the Claude brand fill now");
 } finally {
   try { page?.close(); } catch {}
   browser.close();
