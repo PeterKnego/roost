@@ -8,9 +8,7 @@ use std::path::PathBuf;
 /// across tests, not one per test, is the right shape — so `cargo test`
 /// never touches the real `~/.claude/ide` (Task 5 review, finding 2).
 fn isolate_ide_dir_for_tests() {
-    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    let d = DIR.get_or_init(|| tempfile::tempdir().unwrap());
-    resh::idelock::set_ide_dir_for_test(d.path().to_path_buf());
+    resh::idelock::isolate_ide_dir_for_test();
 }
 
 fn start(roots: Vec<PathBuf>) -> u16 {

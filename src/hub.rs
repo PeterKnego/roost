@@ -1606,9 +1606,7 @@ mod tests {
     /// finding 2) — the same isolation `tests/integration.rs` applies for
     /// the same reason, via its own `isolate_ide_dir_for_tests`.
     fn isolate_ide_dir_for_tests() {
-        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-        let d = DIR.get_or_init(|| tempfile::tempdir().unwrap());
-        crate::idelock::set_ide_dir_for_test(d.path().to_path_buf());
+        crate::idelock::isolate_ide_dir_for_test();
     }
 
     // Helper: drain whatever a receiver has without blocking.
@@ -3405,9 +3403,21 @@ mod tests {
     /// A `Hub` with a private state directory, for the proposal tests below.
     /// They all persist on some path or other, and none of them should write
     /// into this host's real state directory.
+    /// Points `RESH_STATE_DIR` at the shared stable test directory rather
+    /// than at this test's `TempDir`.
+    ///
+    /// Not a `STATE_ENV_LOCK` guard: holding that across the test body
+    /// deadlocks, because `std::sync::Mutex` is not reentrant and code these
+    /// tests reach takes the same lock again. And pointing the global at a
+    /// per-test `TempDir` is what leaked — the variable is read on every
+    /// `state_dir()` call, so a concurrently-running test writes into this
+    /// directory while it is being removed, `TempDir::drop` ignores the
+    /// failed removal, and the directory survives silently. A stable path
+    /// has nothing to race and nothing to accumulate; the project directory
+    /// stays a `TempDir`, since nothing outside this test writes there.
     fn proposal_hub(project: &str) -> (Hub, tempfile::TempDir) {
+        crate::wsstate::set_state_dir_for_test();
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", dir.path().join("state"));
         (Hub::new(project, dir.path().to_path_buf()), dir)
     }
 

@@ -1909,8 +1909,12 @@ mod tests {
         let proj = "diff-orphan";
         let d = tempfile::tempdir().unwrap();
         std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
-        let lockdir = tempfile::tempdir().unwrap();
-        idelock::set_ide_dir_for_test(lockdir.path().to_path_buf());
+        // The shared stable directory, not a per-test `TempDir`:
+        // `set_ide_dir_for_test` sets a process-global `OnceLock`, so a
+        // directory handed to it outlives this test and every later write
+        // recreates it after the `TempDir` is gone — one leaked directory per
+        // test process. `hub`'s helper owns the stable path; reuse it.
+        idelock::isolate_ide_dir_for_test();
         // The hub first: it is what creates this project's ide listener, so
         // the fake client below joins that one rather than a second.
         let hub = crate::hub::Hub::for_project(proj, d.path().to_path_buf());
