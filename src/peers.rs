@@ -277,8 +277,13 @@ pub fn message(project: &str, r: &Roster, now_ms: u64) -> Option<String> {
             r.uncheckable
         ));
     }
+    // Two leading spaces, like the bullets above, and not decoration: the
+    // surface that renders `systemMessage` strips newlines, so a segment
+    // whose only separator is its `\n` welds onto the end of the previous one
+    // ("started 3h ago)A resh project is..."). Every line after the first
+    // carries its own leading whitespace so the message survives flattening.
     out.push_str(
-        "\nA resh project is one directory and one branch. Coordinate before editing, \
+        "\n  A resh project is one directory and one branch. Coordinate before editing, \
          or start this work in a git worktree.",
     );
     Some(out)
@@ -550,5 +555,34 @@ mod tests {
         let real = ancestry(std::process::id() as i32, &|p| ppid_of(p));
         assert!(real.len() >= 2, "we have at least one ancestor, got {real:?}");
         assert_eq!(real[0], std::process::id() as i32);
+    }
+
+    /// The surface that renders `systemMessage` strips newlines, so a `\n`
+    /// cannot be a segment's only separator — it welded the closing sentence
+    /// onto the last peer ("started 3h ago)A resh project is..."), which is
+    /// how this was found. The invariant is general rather than a spot check
+    /// on that one sentence: every line after the first carries its own
+    /// leading whitespace, so flattening can never join two words.
+    #[test]
+    fn every_line_survives_having_its_newline_stripped() {
+        let r = roster(
+            vec![sess(2, "/w"), sess(3, "/w")],
+            Path::new("/w"),
+            &[],
+            None,
+            &all_live,
+        );
+        let m = message("resh", &r, 60_000).expect("two peers must produce a message");
+        for line in m.split('\n').skip(1) {
+            assert!(
+                line.starts_with(' '),
+                "every continuation line must lead with a space so it survives flattening: {line:?}"
+            );
+        }
+        let flat = m.replace('\n', "");
+        assert!(
+            !flat.contains(")A") && !flat.contains("wA"),
+            "flattened, nothing may weld onto the previous segment: {flat}"
+        );
     }
 }
