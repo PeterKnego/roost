@@ -1,3 +1,4 @@
+<!-- Not a roadmap: everywhere "later" was said, gathered so it stays findable. -->
 # Backlog
 
 A collection point for deferred, future-work, and nice-to-have items scattered
