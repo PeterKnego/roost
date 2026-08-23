@@ -148,6 +148,12 @@ Seven separate reviews caught tests that could not fail:
   fixture never entered the state that triggers it.
 - A test whose subject was `attach`'s call to `record_origin`, but which only
   asserted survival — also true with no marker written at all.
+- A message-formatting test that asserted on the multi-line string, where `\n`
+  is a genuine separator — so it could not see that the closing line had no
+  *other* separator, and welded onto the previous one wherever the newlines
+  were flattened. No review caught this one and no test could have: every test
+  in the module asserts on the same intermediate string. A paste of the real
+  output found it.
 
 When writing a test, ask: **would this fail if I deleted the code it covers?**
 If a negative test errors, assert on *why* — the message, not just `is_err()`.
