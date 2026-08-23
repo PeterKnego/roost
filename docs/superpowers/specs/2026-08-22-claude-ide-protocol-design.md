@@ -338,7 +338,7 @@ markup. `.value` is never parsed as HTML at all, so this is the stronger
 guarantee rather than a shortcut around the rule.
 
 Two properties the box must not weaken, both covered by
-`tests/browser/ide.mjs` §F:
+`tests/browser/ide.mjs` §G:
 
 - **It appears only on request.** The diff is the thing to read; a textarea
   covering it by default would defeat reviewing the change.

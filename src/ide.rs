@@ -151,7 +151,35 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<Ide>>> {
 
 /// `dir`-parameterised for tests (see `Task 4`'s `start_in`); production
 /// code should call `for_project`.
-pub fn for_project_in(dir: &Path, project: &str, workspace: PathBuf) -> Option<Arc<Ide>> {
+pub fn for_project_in(
+    dir: &Path,
+    project: &str,
+    workspace: PathBuf,
+    enabled: bool,
+) -> Option<Arc<Ide>> {
+    // The kill switch arrives as a parameter rather than being read here, so
+    // a test can drive both states without touching the process-global
+    // `RESH_CONFIG`. That is not fastidiousness: `for_project_in` is called
+    // by tests that do not hold `STATE_ENV_LOCK`, so a test that flipped the
+    // env to `ide = false` would make *their* listeners fail to build for the
+    // width of its own window — a failure that lands in whichever test loses
+    // the race, which is the flake shape CLAUDE.md records.
+    //
+    // The kill switch, checked here because this is the only place a listener
+    // is ever created — so `None` propagates to everything downstream at
+    // once: no lock file (nothing to discover), no `CLAUDE_CODE_SSE_PORT`
+    // (`port_for` finds no entry), and no socket. `claude` then never finds
+    // resh at all and uses its own terminal diffs, which is the only way a
+    // kill switch can degrade gracefully: refusing an `openDiff` after the
+    // CLI has already connected makes it log "Failed to show diff in IDE"
+    // and rethrow, failing the edit instead of falling back.
+    //
+    // Re-read per call rather than cached, so turning it off takes effect on
+    // the next project opened rather than at the next restart — `config` is
+    // already re-read per request everywhere else for the same reason.
+    if !enabled {
+        return None;
+    }
     // Fast path only touches the map: no I/O, so the lock is held for a
     // lookup and a clone, nothing more.
     {
@@ -211,7 +239,7 @@ pub fn for_project_in(dir: &Path, project: &str, workspace: PathBuf) -> Option<A
 }
 
 pub fn for_project(project: &str, workspace: PathBuf) -> Option<Arc<Ide>> {
-    for_project_in(&idelock::ide_dir(), project, workspace)
+    for_project_in(&idelock::ide_dir(), project, workspace, crate::config::ide_enabled())
 }
 
 pub fn port_for(project: &str) -> Option<u16> {
@@ -383,14 +411,13 @@ pub fn mention(project: &str, abs: &Path, lines: Option<(u32, u32)>) -> Result<(
 /// itself is keyed by; the hub already holds it as `Hub::dir`.
 pub fn selection_changed(
     project: &str,
-    project_dir: &Path,
     abs: &Path,
     text: &str,
     start: (u32, u32),
     end: (u32, u32),
 ) -> Result<(), String> {
-    if !crate::config::for_project(project_dir).share_selection {
-        return Err("selection sharing is off for this project".into());
+    if !crate::config::share_selection() {
+        return Err("selection sharing is off (set share_selection = true in the global config)".into());
     }
     let msg = serde_json::json!({
         "jsonrpc": "2.0",
@@ -1303,10 +1330,39 @@ mod tests {
     }
 
     #[test]
+    fn the_kill_switch_stops_a_listener_being_created_at_all() {
+        // Found by revert-check: deleting the guard from `for_project_in`
+        // passed the entire suite, so the switch shipped untested.
+        //
+        // Drives the flag as a parameter, not through `RESH_CONFIG`: this
+        // function is called by tests that hold no env lock, so flipping the
+        // process-global here would break *their* listeners for the width of
+        // this test — which is how a "flake" gets manufactured. The env
+        // plumbing itself is covered by `config::tests`.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        assert!(
+            for_project_in(dir.path(), "killswitch-off", ws.path().to_path_buf(), false).is_none(),
+            "disabled means no listener at all"
+        );
+        assert!(port_for("killswitch-off").is_none(), "nothing registered, so no port reaches a shell");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "and no lock file, so `claude` cannot discover resh"
+        );
+        // The same call enabled must succeed, or the assertions above would
+        // hold for any reason at all.
+        let on = for_project_in(dir.path(), "killswitch-on", ws.path().to_path_buf(), true);
+        assert!(on.is_some(), "enabled builds the listener as usual");
+        stop("killswitch-on");
+    }
+
+    #[test]
     fn one_listener_per_project_not_one_per_connection() {
         let (dir, ws, _) = dirs();
-        let a = for_project_in(dir.path(), "reuse-alpha", ws.path().to_path_buf()).unwrap();
-        let again = for_project_in(dir.path(), "reuse-alpha", ws.path().to_path_buf()).unwrap();
+        let a = for_project_in(dir.path(), "reuse-alpha", ws.path().to_path_buf(), true).unwrap();
+        let again = for_project_in(dir.path(), "reuse-alpha", ws.path().to_path_buf(), true).unwrap();
         assert_eq!(a.port, again.port, "a second call must reuse the listener");
     }
 
@@ -1316,8 +1372,8 @@ mod tests {
         // One listener listing both roots would let a claude in beta be
         // handed alpha's socket: the CLI takes the first workspaceFolder that
         // contains its cwd.
-        let a = for_project_in(dir.path(), "twoports-alpha", wa.path().to_path_buf()).unwrap();
-        let b = for_project_in(dir.path(), "twoports-beta", wb.path().to_path_buf()).unwrap();
+        let a = for_project_in(dir.path(), "twoports-alpha", wa.path().to_path_buf(), true).unwrap();
+        let b = for_project_in(dir.path(), "twoports-beta", wb.path().to_path_buf(), true).unwrap();
         assert_ne!(a.port, b.port);
         assert!(dir.path().join(format!("{}.lock", a.port)).exists());
         assert!(dir.path().join(format!("{}.lock", b.port)).exists());
@@ -1326,8 +1382,8 @@ mod tests {
     #[test]
     fn stopping_a_project_removes_its_lock_and_leaves_the_others() {
         let (dir, wa, wb) = dirs();
-        let a = for_project_in(dir.path(), "stop-alpha", wa.path().to_path_buf()).unwrap();
-        let b = for_project_in(dir.path(), "stop-beta", wb.path().to_path_buf()).unwrap();
+        let a = for_project_in(dir.path(), "stop-alpha", wa.path().to_path_buf(), true).unwrap();
+        let b = for_project_in(dir.path(), "stop-beta", wb.path().to_path_buf(), true).unwrap();
         let (a_port, b_port) = (a.port, b.port);
         // `for_project_in` hands back its own `Arc` clone, separate from the
         // one the registry map holds; `stop` can only drop the map's clone.
@@ -1352,7 +1408,7 @@ mod tests {
         // degrade it, never stop a project opening.
         let blocked = dir.path().join("not-a-directory");
         std::fs::write(&blocked, "").unwrap();
-        assert!(for_project_in(&blocked, "lockfail-alpha", ws.path().to_path_buf()).is_none());
+        assert!(for_project_in(&blocked, "lockfail-alpha", ws.path().to_path_buf(), true).is_none());
     }
 
     #[test]
@@ -1368,7 +1424,7 @@ mod tests {
     // 5s poll deadline rather than passing vacuously — then restored.
     fn stop_actually_closes_the_listening_socket() {
         let (dir, ws, _) = dirs();
-        let ide = for_project_in(dir.path(), "stopclose-alpha", ws.path().to_path_buf()).unwrap();
+        let ide = for_project_in(dir.path(), "stopclose-alpha", ws.path().to_path_buf(), true).unwrap();
         let port = ide.port;
         drop(ide); // the registry still holds its own Arc; this must not matter
         stop("stopclose-alpha");
@@ -1426,7 +1482,7 @@ mod tests {
     ) -> (std::sync::mpsc::Receiver<String>, Arc<Ide>, tempfile::TempDir, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
-        let ide = for_project_in(dir.path(), project, ws.path().to_path_buf()).unwrap();
+        let ide = for_project_in(dir.path(), project, ws.path().to_path_buf(), true).unwrap();
         // `IntoClientRequest for http::Request<()>` is a pass-through: it adds
         // nothing. `generate_request` requires Host, Connection, Upgrade,
         // Sec-WebSocket-Version and Sec-WebSocket-Key to be present already and
@@ -2146,30 +2202,27 @@ mod tests {
         assert!(err.contains("no Claude"), "the registry entry must be gone once the guard drops: {err}");
     }
 
-    /// The struct is `Settings`, not `Config`. The default must be off, or a
-    /// highlighted line of `.env` leaves the host the moment someone selects
-    /// it, with no config file ever written.
-    ///
-    /// Revert-checked: flipping `Settings::default()`'s `share_selection` to
-    /// `true` failed this test (`assertion failed: !cfg.share_selection`) —
-    /// and, for the same reason, also failed
-    /// `config::tests::share_selection_defaults_off_and_either_layer_can_
-    /// turn_it_on` and `render::tests::share_selection_is_off_by_default_
-    /// and_the_indicator_appears_only_when_it_is_on`, three legitimate hits
-    /// on the one default. Then restored.
-    #[test]
-    fn selection_sharing_is_off_unless_a_project_opts_in() {
-        let cfg = crate::config::Settings::default();
-        assert!(!cfg.share_selection, "a highlighted line of .env must not leave the host by default");
-    }
 
     /// Writes `share_selection = true` into the fake client's own project
     /// directory (`connected_fake_client_for`'s `ws`, which is what
     /// `Hub::dir` — and so this call's `project_dir` — actually is) so the
     /// opt-in check inside `selection_changed` passes.
-    fn opt_in(ws: &Path) {
-        std::fs::create_dir_all(ws.join(".resh")).unwrap();
-        std::fs::write(ws.join(".resh/config.toml"), "share_selection = true\n").unwrap();
+    /// Turns sharing on for this process by pointing `RESH_CONFIG` at a
+    /// global file that says so.
+    ///
+    /// It is a *global-only* setting as of 2026-08-23 — a project's own
+    /// `.resh/config.toml` can no longer reach it — so opting in by writing
+    /// into the workspace, the way this helper used to, is exactly what must
+    /// not work. The returned guard holds `STATE_ENV_LOCK` (the env var is
+    /// process-global) and the `TempDir` (the file must outlive the call),
+    /// so callers bind it for the length of the test.
+    fn opt_in(on: bool) -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+        let g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("config.toml");
+        std::fs::write(&f, if on { "share_selection = true\n" } else { "hide = []\n" }).unwrap();
+        std::env::set_var("RESH_CONFIG", &f);
+        (g, d)
     }
 
     #[test]
@@ -2179,9 +2232,9 @@ mod tests {
     // `left: "at_mentioned" / right: "selection_changed"` — then restored.
     fn a_shared_selection_is_the_notification_the_cli_expects() {
         let proj = "selection-shape";
-        let (rx, _ide, _d, ws) = connected_fake_client_for(proj);
-        opt_in(ws.path());
-        selection_changed(proj, ws.path(), Path::new("/w/a.rs"), "let x = 1;", (10, 4), (10, 14))
+        let (_envg, _cfg) = opt_in(true);
+        let (rx, _ide, _d, _ws) = connected_fake_client_for(proj);
+        selection_changed(proj, Path::new("/w/a.rs"), "let x = 1;", (10, 4), (10, 14))
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
         assert_eq!(v["method"], "selection_changed");
@@ -2205,11 +2258,15 @@ mod tests {
     /// first assertion (`is_err()`) stayed green throughout, which is exactly
     /// the false-confidence this test exists to catch. Then restored.
     #[test]
-    fn nothing_is_sent_when_the_project_has_not_opted_in() {
+    fn nothing_is_sent_when_sharing_is_off() {
+        // Pins the off state under the env lock: `RESH_CONFIG` is
+        // process-global, so without this a neighbouring test's "on" file is
+        // still in effect and this passes for the wrong reason.
+        let (_envg, _cfg) = opt_in(false);
         let proj = "selection-optout";
-        let (rx, _ide, _d, ws) = connected_fake_client_for(proj);
+        let (rx, _ide, _d, _ws) = connected_fake_client_for(proj);
         // No .resh/config.toml written: share_selection defaults to false.
-        let err = selection_changed(proj, ws.path(), Path::new("/w/a.rs"), "secret", (1, 0), (1, 6))
+        let err = selection_changed(proj, Path::new("/w/a.rs"), "secret", (1, 0), (1, 6))
             .unwrap_err();
         assert!(err.contains("off"), "the refusal must say sharing is off: {err}");
         // A deterministic ordering barrier, not a wall-clock bound: an
@@ -2253,8 +2310,8 @@ mod tests {
     // not evidence either test is redundant. Then restored.
     fn selection_sharing_off_is_a_different_refusal_than_no_claude_connected() {
         let proj = "selection-optout-reason";
-        let (_rx, _ide, _d, ws) = connected_fake_client_for(proj);
-        let err = selection_changed(proj, ws.path(), Path::new("/w/a.rs"), "x", (0, 0), (0, 1))
+        let (_rx, _ide, _d, _ws) = connected_fake_client_for(proj);
+        let err = selection_changed(proj, Path::new("/w/a.rs"), "x", (0, 0), (0, 1))
             .unwrap_err();
         assert!(err.contains("off") && !err.contains("no Claude"), "got: {err}");
     }
@@ -2269,9 +2326,10 @@ mod tests {
     // — all legitimate hits on the one break in shared code, not evidence of
     // a false positive (see CLAUDE.md's note on this exact pattern). Restored.
     fn selection_sharing_with_no_claude_connected_is_an_error_not_a_panic() {
-        let d = tempfile::tempdir().unwrap();
-        opt_in(d.path());
-        let err = selection_changed("selection-nobody-here", d.path(), Path::new("/w/x.rs"), "x", (0, 0), (0, 1))
+        let (_envg, _cfg) = opt_in(true);
+        let _d = tempfile::tempdir().unwrap();
+
+        let err = selection_changed("selection-nobody-here", Path::new("/w/x.rs"), "x", (0, 0), (0, 1))
             .unwrap_err();
         assert!(err.contains("no Claude"), "the message must say what is missing: {err}");
     }
@@ -2287,11 +2345,12 @@ mod tests {
     // legitimate hits on the one break in the now-shared fan-out loop.
     // Restored.
     fn a_shared_selection_reaches_every_connected_claude_not_just_the_first() {
+        let (_envg, _cfg) = opt_in(true);
         let proj = "selection-fanout";
-        let (rx1, _a, _d1, w1) = connected_fake_client_for(proj);
-        opt_in(w1.path());
+        let (rx1, _a, _d1, _w1) = connected_fake_client_for(proj);
+
         let (rx2, _b, _d2, _w2) = connected_fake_client_for(proj);
-        selection_changed(proj, w1.path(), Path::new("/w/x.rs"), "x", (0, 0), (0, 1)).unwrap();
+        selection_changed(proj, Path::new("/w/x.rs"), "x", (0, 0), (0, 1)).unwrap();
         assert!(rx1.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
         assert!(rx2.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
     }

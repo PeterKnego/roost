@@ -50,9 +50,20 @@ pub fn diff_html(diff: &str) -> String {
 /// produced a phantom `-` line there that Rust's `str::lines()` never
 /// would. This is the one implementation both the conflict banner and a
 /// proposal now render through.
+///
+/// The `.proposalview` wrapper is the one departure from the `diff`
+/// fragment's shape, and it is a layout element, not decoration: a proposal
+/// is the only fragment a pane must *fill* rather than merely scroll,
+/// because its Accept/Reject bar has to stay reachable without scrolling
+/// past the diff to find it. It carries the `height: 100%` flex column that
+/// makes that true (style.css, next to `.editwrap`, which fills its pane the
+/// same way), and `app.js`'s `renderProposal` inserts the edit box and the
+/// action bar *into* it — appending them beside it would put them outside
+/// the column and undo both properties.
 pub fn proposal_fragment(rel: &str, old_text: &str, new_text: &str) -> String {
     format!(
-        "<div class=\"path\">{}</div><div class=\"diffview\">{}</div>",
+        "<div class=\"proposalview\"><div class=\"path\">{}</div>\
+         <div class=\"diffview\">{}</div></div>",
         esc(rel),
         diff_html(&crate::textdiff::unified(old_text, new_text)),
     )
@@ -729,7 +740,17 @@ pub fn human_age(secs: u64) -> String {
 // every terminal websocket) without the compiler catching it. Any producer
 // still has only literals to reach for, so this is not a call-site change,
 // just a tighter promise on the type.
-pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<&'static str>) -> String {
+/// `sharing_on` is passed in rather than read here: it is a *global-only*
+/// setting (`config::share_selection`), and this function stays pure so its
+/// tests can drive both states without touching the developer's real
+/// `~/.config/resh/config.toml`.
+pub fn workspace_page(
+    project: &str,
+    key: &str,
+    s: &Settings,
+    theme_rel: Option<&'static str>,
+    sharing_on: bool,
+) -> String {
     let warn = s
         .warning
         .as_deref()
@@ -752,14 +773,14 @@ pub fn workspace_page(project: &str, key: &str, s: &Settings, theme_rel: Option<
     // override against it: `ws.show_hidden ?? SHOW_HIDDEN_DEFAULT`.
     let sh = if s.show_hidden { "1" } else { "0" };
     let autosave = if s.autosave { "1" } else { "0" };
-    let share_selection = if s.share_selection { "1" } else { "0" };
+    let share_selection = if sharing_on { "1" } else { "0" };
     // Rendered only when the key is on — never a `hidden` element the client
     // toggles, and never present-but-empty. This is the whole visibility
     // half of the "off by default, visible when on" contract: a highlighted
     // line of `.env` leaving the host with no indicator on the page at all
     // would be exactly the silent exfiltration this feature exists to avoid.
     // The same reason the header shows which projects have shells running.
-    let sharing_indicator = if s.share_selection {
+    let sharing_indicator = if sharing_on {
         r#"<span id="sharing" title="the editor's current selection is sent to Claude as context on every change">⧉ sharing selection</span>"#
     } else {
         ""
@@ -842,6 +863,29 @@ mod tests {
         assert!(h.contains("dl add"));
         assert!(h.contains("dl ctx"));
         assert!(h.contains("-old &lt;")); // escaped
+    }
+
+    /// Both halves must sit *inside* one `.proposalview` element, because
+    /// that element is what carries `height: 100%` and the flex column —
+    /// the pane-filling layout, the scrolling `.diffview`, and the pinned
+    /// action bar all hang off it, and `app.js`'s `renderProposal` inserts
+    /// the edit box and the Accept/Reject bar into it by query.
+    ///
+    /// Asserting on containment rather than `contains("proposalview")`: a
+    /// stray empty wrapper emitted *beside* the two divs would satisfy a
+    /// substring check while leaving every one of those properties broken,
+    /// and `querySelector` in app.js would then append into an element that
+    /// is not an ancestor of the diff.
+    #[test]
+    fn proposal_fragment_wraps_both_halves_in_one_layout_element() {
+        let h = proposal_fragment("a.rs", "old\n", "new\n");
+        assert!(h.starts_with("<div class=\"proposalview\">"), "wrapper must open the fragment: {h}");
+        assert!(h.ends_with("</div>"), "wrapper must close the fragment: {h}");
+        let open = h.find("<div class=\"proposalview\">").unwrap();
+        let path = h.find("class=\"path\"").expect("path div");
+        let diff = h.find("class=\"diffview\"").expect("diffview div");
+        assert!(open < path && path < diff, "both halves must fall inside the wrapper: {h}");
+        assert_eq!(h.matches("proposalview").count(), 1, "exactly one wrapper: {h}");
     }
 
     /// The property the JS port had no test for at all before it was
@@ -1363,10 +1407,10 @@ mod tests {
     // the off position.
     #[test]
     fn the_page_carries_the_configured_default_for_the_toggle() {
-        let off = workspace_page("proj", "proj", &Settings::default(), None);
+        let off = workspace_page("proj", "proj", &Settings::default(), None, false);
         assert!(off.contains(r#"data-show-hidden="0""#), "the default is off");
         let on = Settings { show_hidden: true, ..Settings::default() };
-        let h = workspace_page("proj", "proj", &on, None);
+        let h = workspace_page("proj", "proj", &on, None, false);
         assert!(h.contains(r#"data-show-hidden="1""#), "and a configured true reaches the page");
     }
 
@@ -1376,10 +1420,10 @@ mod tests {
     // it off.
     #[test]
     fn the_page_carries_the_autosave_setting() {
-        let on = workspace_page("proj", "proj", &Settings::default(), None);
+        let on = workspace_page("proj", "proj", &Settings::default(), None, false);
         assert!(on.contains(r#"data-autosave="1""#), "autosave is on by default");
         let off = Settings { autosave: false, ..Settings::default() };
-        let h = workspace_page("proj", "proj", &off, None);
+        let h = workspace_page("proj", "proj", &off, None, false);
         assert!(h.contains(r#"data-autosave="0""#), "and a configured false reaches the page");
     }
 
@@ -1393,24 +1437,30 @@ mod tests {
     // claim, or simply never say, whether it was happening.
     //
     // Revert-checked: hardcoding `sharing_indicator` to always render (moving
-    // it out of the `if s.share_selection` branch) failed this test's second
+    // it out of the `if sharing_on` branch) failed this test's second
     // assertion — "no visible indicator when sharing is off" — since the
     // default page then contained "sharing selection" too. Then restored.
+    //
+    // The flag is a parameter, not read in here, because `share_selection`
+    // is global-only: reading it inside would make this test depend on the
+    // developer's real `~/.config/resh/config.toml`.
     #[test]
     fn share_selection_is_off_by_default_and_the_indicator_appears_only_when_it_is_on() {
-        let off = workspace_page("proj", "proj", &Settings::default(), None);
+        let off = workspace_page("proj", "proj", &Settings::default(), None, false);
         assert!(off.contains(r#"data-share-selection="0""#), "the default is off");
         assert!(!off.contains("sharing selection"), "no visible indicator when sharing is off");
-        let s = Settings { share_selection: true, ..Settings::default() };
-        let on = workspace_page("proj", "proj", &s, None);
+        let on = workspace_page("proj", "proj", &Settings::default(), None, true);
         assert!(on.contains(r#"data-share-selection="1""#), "a configured true reaches the page");
         assert!(on.contains("sharing selection"), "the indicator must be visible whenever sharing is on");
+        // The page attribute the client gates on and the human-visible
+        // indicator come from the same parameter, so they cannot disagree —
+        // sending with no indicator shown is the failure this prevents.
     }
 
     #[test]
     fn workspace_page_wires_everything() {
         let s = Settings { theme: "gruvbox".into(), ..Settings::default() };
-        let h = workspace_page("proj", "proj", &s, Some("theme.css"));
+        let h = workspace_page("proj", "proj", &s, Some("theme.css"), false);
         assert!(h.contains("/static/themes/gruvbox.css"));
         assert!(h.contains("/frag/proj/theme.css")); // has_theme_css
         assert!(h.contains("data-project=\"proj\""));
@@ -1421,22 +1471,22 @@ mod tests {
         assert!(h.contains("hx-get=\"/frag/_projects?current=proj\""));
         assert!(h.contains("id=\"projstrip\""));
         assert!(h.contains("id=\"closeproj\""));
-        let no_custom = workspace_page("proj", "proj", &s, None);
+        let no_custom = workspace_page("proj", "proj", &s, None, false);
         assert!(!no_custom.contains("theme.css\">"));
     }
 
     #[test]
     fn the_workspace_links_exactly_one_theme_stylesheet() {
         let s = Settings::default();
-        let dir_themed = workspace_page("proj", "proj", &s, Some("theme/style.css"));
+        let dir_themed = workspace_page("proj", "proj", &s, Some("theme/style.css"), false);
         assert!(dir_themed.contains("/frag/proj/theme/style.css"));
         assert_eq!(dir_themed.matches("theme.css\"").count(), 0, "never both links");
 
-        let file_themed = workspace_page("proj", "proj", &s, Some("theme.css"));
+        let file_themed = workspace_page("proj", "proj", &s, Some("theme.css"), false);
         assert!(file_themed.contains("/frag/proj/theme.css"));
         assert!(!file_themed.contains("/frag/proj/theme/style.css"));
 
-        let bare = workspace_page("proj", "proj", &s, None);
+        let bare = workspace_page("proj", "proj", &s, None, false);
         assert!(!bare.contains("/frag/proj/theme"));
     }
 
@@ -1448,14 +1498,14 @@ mod tests {
     #[test]
     fn workspace_page_percent_encodes_the_current_key_for_the_query_string() {
         let s = Settings::default();
-        let h = workspace_page("karpie/src", "karpie%2Fsrc", &s, None);
+        let h = workspace_page("karpie/src", "karpie%2Fsrc", &s, None, false);
         assert!(h.contains("hx-get=\"/frag/_projects?current=karpie%252Fsrc\""));
     }
 
     #[test]
     fn the_workspace_page_carries_the_notification_centre() {
         let s = crate::config::Settings::default();
-        let html = workspace_page("proj", "proj", &s, None);
+        let html = workspace_page("proj", "proj", &s, None, false);
         assert!(html.contains(r#"id="bell""#), "no bell button");
         assert!(html.contains(r#"id="bellcount""#), "no unread badge");
         assert!(html.contains(r#"id="noticepanel""#), "no panel container");
@@ -1573,7 +1623,7 @@ mod tests {
     #[test]
     fn project_name_is_escaped_everywhere() {
         let s = Settings::default();
-        let h = workspace_page("a\"><script>", "a\"><script>", &s, None);
+        let h = workspace_page("a\"><script>", "a\"><script>", &s, None, false);
         assert!(!h.contains("a\"><script>"));
         let c = changes_fragment("a\"><script>", &Status { branch: String::new(), changes: vec![crate::gitio::Change { xy: "??".into(), path: "x".into() }] });
         assert!(!c.contains("\"><script>"));
