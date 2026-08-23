@@ -1111,10 +1111,16 @@ impl Hub {
                             );
                             false
                         });
-                        let mut h = Hub::lock(&hub_arc);
-                        h.refresh_live_sessions();
-                        let snap = h.snapshot_event(&String::new());
-                        h.broadcast(&snap);
+                        {
+                            let mut h = Hub::lock(&hub_arc);
+                            h.refresh_live_sessions();
+                            let snap = h.snapshot_event(&String::new());
+                            h.broadcast(&snap);
+                        }
+                        // Ending a project's last session empties its row in
+                        // every other project's ◆ panel; same placement
+                        // rules as `do_close_project`'s nudge.
+                        broadcast_all(&Event::ProjectsChanged { project: thread_project });
                     });
                 if let Err(e) = spawned {
                     eprintln!("resh: could not spawn end-session thread for {project}: {e}");
@@ -1462,13 +1468,25 @@ impl Hub {
                         // longer advertised in any lock file. stop() itself
                         // cannot panic (no unwrap, no I/O it doesn't guard).
                         crate::ide::stop(&thread_project);
-                        let mut h = Hub::lock(&hub_arc);
-                        h.closing = false;
-                        h.ws.version += 1;
-                        h.broadcast(&Event::ProjectClosed { ended });
-                        h.refresh_live_sessions();
-                        let snap = h.snapshot_event(&String::new());
-                        h.broadcast(&snap);
+                        {
+                            let mut h = Hub::lock(&hub_arc);
+                            h.closing = false;
+                            h.ws.version += 1;
+                            h.broadcast(&Event::ProjectClosed { ended });
+                            h.refresh_live_sessions();
+                            let snap = h.snapshot_event(&String::new());
+                            h.broadcast(&snap);
+                        }
+                        // Every *other* project's ◆ panel, which nothing
+                        // above reaches. After the block, not inside it:
+                        // `broadcast_all` locks every hub including this
+                        // one. And after `kill_project`, not before — the
+                        // nudge makes every browser refetch the roster, and
+                        // the roster counts socket files, so a nudge sent
+                        // while they were still being unlinked would have
+                        // them re-read the very state they were told had
+                        // changed.
+                        broadcast_all(&Event::ProjectsChanged { project: thread_project });
                     },
                 );
                 if let Err(e) = spawned {
@@ -2703,6 +2721,114 @@ mod tests {
              under the hub lock — took {elapsed:?}"
         );
 
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    // The ◆ "running projects" panel in every *other* project's browser is a
+    // server-rendered fragment that only ever refetches on that tab's own
+    // triggers (page load, ⟳, opening the panel, its own ProjectClosed). So
+    // closing project A from A's tab left B's tab showing "● A" — and badge
+    // "1" — for as long as B stayed open. Reproduced in a real browser before
+    // this existed: A's socket gone from disk and A redirected to `/`, B's
+    // open panel still listing A. The roster is machine-wide in exactly the
+    // way notices are, so the fix is the same shape: a `broadcast_all` nudge
+    // once the close has actually finished.
+    //
+    // Asserted on B's subscriber, not A's: A's own clients already get
+    // ProjectClosed and refetch on that, so a nudge that only reached A would
+    // pass a single-hub test and fix nothing. And deliberately with *no*
+    // session in A: a killed session's pump thread sends its own nudge as it
+    // winds down (see `a_shell_exiting_on_its_own_...` below), which would
+    // satisfy this assertion whether or not the close thread said anything.
+    // With nothing to kill, the close thread is the only possible source.
+    // Watched fail with its `broadcast_all` removed: B's receiver timed out.
+    #[test]
+    fn closing_a_project_tells_every_other_projects_clients_the_roster_changed() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+
+        let hub_a = Hub::for_project("roster-a", dir_a.path().to_path_buf());
+        let hub_b = Hub::for_project("roster-b", dir_b.path().to_path_buf());
+        let (ca, rxa) = Hub::lock(&hub_a).subscribe();
+        let (_cb, rxb) = Hub::lock(&hub_b).subscribe();
+        while rxb.try_recv().is_ok() {}
+
+        Hub::lock(&hub_a).handle(&ca, Intent::CloseProject);
+        // The close runs on its own thread (see close_project_returns_promptly
+        // above); ProjectClosed on A's subscriber is the signal that it is
+        // done. 10s is wide margin over the real ps/kill spawns it makes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let m = rxa.recv_timeout(left).expect("A's close must report ProjectClosed");
+            if m.contains(r#""t":"ProjectClosed""#) {
+                break;
+            }
+        }
+
+        // Attributed by project name, because `broadcast_all` reaches every
+        // hub in the registry — including ones belonging to tests running
+        // concurrently, whose own sessions ending would otherwise be
+        // indistinguishable from this close and let this pass vacuously.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let m = rxb
+                .recv_timeout(left)
+                .expect("project B's clients must be told that A's close changed the roster");
+            if m.contains(r#""t":"ProjectsChanged""#) && m.contains(r#""project":"roster-a""#) {
+                break;
+            }
+        }
+
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    // The other way a project leaves the roster: its shell exits (`exit`,
+    // ctrl-d, or its dtach master dying) with no intent ever asking. The
+    // only place that notices is the PTY pump as it winds down, so that is
+    // where the nudge has to come from; nothing in `handle` runs. `RESH_CMD=
+    // true` is a shell that exits on its own the instant it starts, without
+    // dtach — which is the point: the socket-file side is `registry`'s job,
+    // this pins that the *event* is sent at all. Watched fail with the pump's
+    // `broadcast_all` removed: B's receiver timed out.
+    #[test]
+    fn a_shell_exiting_on_its_own_tells_every_project_the_roster_changed() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "true");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+
+        // Only B has a hub: the project whose shell exits need not have one
+        // (its tab can be long gone), and the nudge must still reach the others.
+        let hub_b = Hub::for_project("roster-exit-b", dir_b.path().to_path_buf());
+        let (_cb, rxb) = Hub::lock(&hub_b).subscribe();
+        while rxb.try_recv().is_ok() {}
+
+        let att = crate::session::attach("roster-exit", "shell", dir_a.path())
+            .expect("attach with RESH_CMD=true spawns `true`");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let m = rxb
+                .recv_timeout(left)
+                .expect("a shell ending on its own must tell other projects the roster changed");
+            if m.contains(r#""t":"ProjectsChanged""#) && m.contains(r#""project":"roster-exit""#) {
+                break;
+            }
+        }
+        drop(att);
+
+        std::env::remove_var("RESH_CMD");
         std::env::remove_var("RESH_STATE_DIR");
     }
 

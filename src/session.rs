@@ -105,6 +105,12 @@ pub struct Attachment {
     pub id: u64,
     pub key: String,
     pub rx: Receiver<Vec<u8>>,
+    /// True when this attach spawned the session's process rather than
+    /// joining one already pumping. `term.rs` uses it to nudge every
+    /// project's ◆ panel only when the roster can actually have changed —
+    /// a mirrored tab reconnecting to a live session must not make every
+    /// browser on the machine refetch it.
+    pub spawned: bool,
 }
 
 static SESSIONS: OnceLock<Mutex<HashMap<String, Session>>> = OnceLock::new();
@@ -177,7 +183,8 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         return Err("too many terminal sessions".into());
     }
 
-    if !map.contains_key(&key) {
+    let spawned = !map.contains_key(&key);
+    if spawned {
         let cmd = default_command(project, name);
         if cmd.is_empty() {
             return Err("empty command".into());
@@ -284,11 +291,24 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                 }
             }
             // PTY closed: drop the session so the next attach respawns it.
-            let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(mut s) = map.remove(&pump_key) {
-                let _ = s.child.kill();
-                let _ = s.child.wait();
+            {
+                let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(mut s) = map.remove(&pump_key) {
+                    let _ = s.child.kill();
+                    let _ = s.child.wait();
+                }
             }
+            // A shell that ended on its own (`exit`, or its dtach master
+            // dying) changes the running-projects roster without any intent
+            // having asked for it, so nothing in hub.rs knows to say so.
+            // After the registry lock is released, for the same lock-order
+            // reason `publish` above runs outside it. Also fires when a
+            // kill path took the process down, redundantly and possibly
+            // before that path has unlinked the socket — harmless, since
+            // those paths send their own nudge once they are done.
+            crate::hub::broadcast_all(&crate::proto::Event::ProjectsChanged {
+                project: pump_project.clone(),
+            });
         });
     }
 
@@ -301,7 +321,7 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         let _ = tx.try_send(replay);
     }
     s.subs.insert(id, tx);
-    Ok(Attachment { id, key, rx })
+    Ok(Attachment { id, key, rx, spawned })
 }
 
 /// Takes the registry lock only long enough to clone the writer's `Arc`,

@@ -186,6 +186,14 @@ pub enum Event {
     GitInit { ok: bool, msg: String },
     CloseRefused { dirty: Vec<String> },
     ProjectClosed { ended: usize },
+    /// The set of projects with live sessions changed — `project` started
+    /// its first shell, ended its last, or was closed. Machine-wide, sent to
+    /// every project's clients via `hub::broadcast_all` like `Notice`, because
+    /// the ◆ "running projects" panel is shown in every workspace and is
+    /// otherwise refetched only by the tab that caused the change. Carries no
+    /// roster: the client refetches the server-rendered fragment, which is
+    /// the one place the count is computed (`registry::known_projects`).
+    ProjectsChanged { project: String },
     /// One live notice. Deliberately not folded into `WorkspaceView`: that
     /// snapshot goes out on every workspace change, and history does not
     /// belong on that path.
