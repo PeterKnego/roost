@@ -4,4 +4,5 @@
   --add-bg: #073a2e; --add-fg: #859900; --del-bg: #3a1a20; --del-fg: #dc322f;
   --hunk: #6c71c4;
   --bg3: #0a4b5a; --hairline: #001f27; --guide: #0e4a59; --sel-fg: #fdf6e3;
+  --warn: #b58900;
 }
