@@ -277,12 +277,12 @@ pub fn run_peers(_args: &[String]) -> i32 {
     // succeeds.
     let ambiguous = crate::peers::ambiguous_names(&roster, self_name.as_deref());
     if !ambiguous.is_empty() {
-        crate::peers::log_line(
+        crate::errlog::record(
             &format!(
                 "duplicate session name in {project}: {} — SendMessage by name is ambiguous",
                 ambiguous.iter().cloned().collect::<Vec<_>>().join(", ")
             ),
-            now_ms / 1000,
+            crate::errlog::now_secs(),
         );
     }
 
