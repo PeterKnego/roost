@@ -347,6 +347,24 @@ Two properties the box must not weaken, both covered by
   buttons at all — no Accept, no Reject, and no Edit — because answering what
   you cannot see is the failure this whole tab exists to prevent.
 
+**The CLI keeps its own permission prompt open at the same time, and that is
+expected.** Its prompt component takes a `showingDiffInIDE` flag and only swaps
+the title — `Opened changes in ${ideName} \u29C9` instead of "Do you want to
+make this edit" — so both surfaces are live at once and either resolves the
+same request: resh's Accept becomes `{behavior:"allow", updatedInput:…}` and
+its Reject becomes `{behavior:"deny", message:"User denied via IDE"}`.
+**Observed 2026-08-23 against a real `claude` v2.1.241: clicking Accept in resh
+cleared the terminal prompt.** resh cannot suppress that prompt and should not
+try — its only outputs are the three reply strings. A user who does not want it
+is choosing a permission mode (`acceptEdits`), not an integration setting.
+
+Note one wording mismatch inherited from the same component: its
+`showingDiffInIDE` branch can print *"Save file to continue"*, which describes
+the VS Code flow — edit the diff buffer, save, and the save produces
+`FILE_SAVED`. resh gets there by an explicit **Edit** button and then Accept,
+because a `/frag` view has no editor buffer to save and "save" in a browser
+would read as "write to disk", which is precisely what resh must not do.
+
 **resh must not write the file.** On acceptance the CLI continues its own tool
 call with the (possibly edited) content as updated input — `l({behavior:"allow",
 updatedInput:C, ...})`. If resh also wrote, the file would be written twice and
