@@ -74,6 +74,29 @@ struct Disk {
 
 /// Honours `RESH_STATE_DIR` for tests and operators who want state
 /// elsewhere; otherwise the XDG-ish default, never inside the project tree.
+/// Points `RESH_STATE_DIR` at one stable, reused directory for this user.
+///
+/// For tests that need *a* state directory rather than an isolated one.
+/// `RESH_STATE_DIR` is process-global and read on every `state_dir()` call,
+/// so a test that points it at its own `TempDir` has that directory written
+/// into by whatever else is running — and the write can land while the
+/// directory is being removed. `TempDir::drop` ignores a failed removal, so
+/// the directory then survives with nobody owning it: measured at one leaked
+/// directory per parallel `cargo test --lib`, and none when run with a single
+/// thread. Holding `STATE_ENV_LOCK` instead is not an option for every such
+/// test — the mutex is not reentrant and some of them reach code that takes
+/// it again, which deadlocks.
+pub fn set_state_dir_for_test() {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let d = DIR.get_or_init(|| {
+        let who = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+        let p = std::env::temp_dir().join(format!("resh-test-state-{who}"));
+        let _ = std::fs::create_dir_all(&p);
+        p
+    });
+    std::env::set_var("RESH_STATE_DIR", d);
+}
+
 pub fn state_dir() -> PathBuf {
     if let Ok(d) = std::env::var("RESH_STATE_DIR") {
         if !d.is_empty() {

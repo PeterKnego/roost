@@ -340,17 +340,35 @@ mod tests {
 
     /// Every test here mutates process-global state (the store and
     /// RESH_STATE_DIR); cargo runs tests in parallel threads.
-    fn setup() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
         let g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let d = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", d.path());
+        // A stable, reused directory rather than a fresh `TempDir` per test.
+        // `TempDir::drop` removes the tree and *ignores* the error, and
+        // `hub::publish` -> `notify::record` runs on the PTY pump thread
+        // (session.rs), which reads the process-global `RESH_STATE_DIR` at
+        // write time and can hold no test's lock. So a pump writing while a
+        // finished test's directory was being removed made the removal fail
+        // silently, leaking the directory — reliably once per parallel `cargo
+        // test --lib`, and never when run with one thread. Reusing one path
+        // means there is nothing to delete mid-write and nothing to
+        // accumulate; `reset_for_test` plus clearing the file below still
+        // gives each test an empty store.
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let d = DIR.get_or_init(|| {
+            let who = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+            let p = std::env::temp_dir().join(format!("resh-test-state-{who}"));
+            let _ = std::fs::create_dir_all(&p);
+            p
+        });
+        std::env::set_var("RESH_STATE_DIR", d);
+        let _ = std::fs::remove_dir_all(d.join("notify"));
         reset_for_test();
-        (g, d)
+        g
     }
 
     #[test]
     fn record_assigns_increasing_ids_and_keeps_server_side_attribution() {
-        let (_g, _d) = setup();
+        let _g = setup();
         let a = record("karpie", "claude", parsed("one")).unwrap();
         let b = record("resh", "shell", parsed("two")).unwrap();
         assert!(b.id > a.id, "ids must increase: {} then {}", a.id, b.id);
@@ -363,7 +381,7 @@ mod tests {
 
     #[test]
     fn the_ring_evicts_oldest_first() {
-        let (_g, _d) = setup();
+        let _g = setup();
         for i in 0..MAX_NOTICES + 5 {
             // A fresh session name each time, or the rate limiter would fire.
             record("p", &format!("s{i}"), parsed(&format!("n{i}")));
@@ -376,7 +394,7 @@ mod tests {
 
     #[test]
     fn the_rate_limiter_admits_the_cap_then_rejects_and_counts() {
-        let (_g, _d) = setup();
+        let _g = setup();
         for i in 0..RATE_LIMIT_PER_MIN {
             assert!(record("p", "loop", parsed(&format!("n{i}"))).is_some(), "notice {i} rejected");
         }
@@ -389,7 +407,7 @@ mod tests {
 
     #[test]
     fn suppressed_notices_are_reported_on_the_next_admitted_one() {
-        let (_g, _d) = setup();
+        let _g = setup();
         for i in 0..RATE_LIMIT_PER_MIN {
             record("p", "loop", parsed(&format!("n{i}")));
         }
@@ -406,7 +424,7 @@ mod tests {
         // p.body already arrives at exactly MAX_BODY (osc::sanitise's job);
         // appending "(N suppressed)" after that must still respect the cap,
         // not exceed it — the suffix has to eat into the body, not add to it.
-        let (_g, _d) = setup();
+        let _g = setup();
         let full = parsed(&"x".repeat(crate::osc::MAX_BODY));
         for _ in 0..RATE_LIMIT_PER_MIN {
             record("p", "loud", full.clone());
@@ -425,7 +443,7 @@ mod tests {
 
     #[test]
     fn mark_all_read_clears_every_notice_not_just_one() {
-        let (_g, _d) = setup();
+        let _g = setup();
         record("p", "s1", parsed("one"));
         record("p", "s2", parsed("two"));
         record("p", "s3", parsed("three"));
@@ -437,7 +455,7 @@ mod tests {
 
     #[test]
     fn mark_read_and_clear_change_what_list_returns() {
-        let (_g, _d) = setup();
+        let _g = setup();
         let a = record("p", "s1", parsed("one")).unwrap();
         record("p", "s2", parsed("two"));
         mark_read(a.id);
@@ -450,7 +468,7 @@ mod tests {
 
     #[test]
     fn state_survives_a_reload_including_ids_and_read_flags() {
-        let (_g, _d) = setup();
+        let _g = setup();
         let a = record("karpie", "claude", parsed("survive me")).unwrap();
         record("karpie", "shell", parsed("second"));
         mark_read(a.id);
@@ -478,7 +496,8 @@ mod tests {
     /// in turn on the next notice.
     #[test]
     fn the_store_cannot_collide_with_a_project_named_notifications() {
-        let (_g, d) = setup();
+        let _g = setup();
+        let d = std::path::PathBuf::from(std::env::var("RESH_STATE_DIR").unwrap());
         record("p", "s", parsed("a real notice")).unwrap();
 
         // What a project literally named "notifications" writes.
@@ -497,7 +516,7 @@ mod tests {
 
         // ...and the store must not sit in the top-level `*.json` namespace at
         // all, which is what produced the phantom project row.
-        let strays: Vec<String> = std::fs::read_dir(d.path())
+        let strays: Vec<String> = std::fs::read_dir(d.as_path())
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -513,8 +532,9 @@ mod tests {
     /// old top-level path is still read when the new one is absent.
     #[test]
     fn a_pre_subdirectory_store_is_still_loaded() {
-        let (_g, d) = setup();
-        let legacy = d.path().join("notifications.json");
+        let _g = setup();
+        let d = std::path::PathBuf::from(std::env::var("RESH_STATE_DIR").unwrap());
+        let legacy = d.as_path().join("notifications.json");
         std::fs::write(
             &legacy,
             br#"[{"id":7,"project":"p","session":"s","title":"t","body":"from the old path","at":1,"read":false}]"#,
@@ -543,8 +563,9 @@ mod tests {
     /// alone, not mistaken for an old store and removed.
     #[test]
     fn a_foreign_file_at_the_legacy_name_is_never_deleted() {
-        let (_g, d) = setup();
-        let legacy = d.path().join("notifications.json");
+        let _g = setup();
+        let d = std::path::PathBuf::from(std::env::var("RESH_STATE_DIR").unwrap());
+        let legacy = d.as_path().join("notifications.json");
         // A workspace, not a notice array.
         std::fs::write(&legacy, br#"{"sizes":{"left_w":260},"panes":[]}"#).unwrap();
         load();
@@ -557,9 +578,10 @@ mod tests {
 
     #[test]
     fn a_corrupt_state_file_is_ignored_rather_than_fatal() {
-        let (_g, d) = setup();
-        std::fs::create_dir_all(d.path().join("notify")).unwrap();
-        std::fs::write(d.path().join("notify/notices.json"), b"{ not json").unwrap();
+        let _g = setup();
+        let d = std::path::PathBuf::from(std::env::var("RESH_STATE_DIR").unwrap());
+        std::fs::create_dir_all(d.as_path().join("notify")).unwrap();
+        std::fs::write(d.as_path().join("notify/notices.json"), b"{ not json").unwrap();
         load(); // must not panic
         assert!(list().is_empty());
         assert!(record("p", "s", parsed("still works")).is_some());
@@ -567,7 +589,7 @@ mod tests {
 
     #[test]
     fn expired_rate_limit_windows_are_evicted() {
-        let (_g, _d) = setup();
+        let _g = setup();
         record("p", "gone", parsed("one")).unwrap();
         assert_eq!(window_count(), 1);
         expire_window_for_test("p", "gone");
@@ -588,21 +610,22 @@ mod tests {
 
     #[test]
     fn persisted_state_is_not_readable_by_other_users() {
-        let (_g, d) = setup();
+        let _g = setup();
+        let d = std::path::PathBuf::from(std::env::var("RESH_STATE_DIR").unwrap());
         record("p", "s", parsed("private terminal output")).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let f = std::fs::metadata(d.path().join("notify/notices.json")).unwrap();
+            let f = std::fs::metadata(d.as_path().join("notify/notices.json")).unwrap();
             assert_eq!(f.permissions().mode() & 0o077, 0, "the notice store is group/world readable");
-            let dir = std::fs::metadata(d.path().join("notify")).unwrap();
+            let dir = std::fs::metadata(d.as_path().join("notify")).unwrap();
             assert_eq!(dir.permissions().mode() & 0o077, 0, "the notice dir is group/world readable");
         }
     }
 
     #[test]
     fn a_missing_title_falls_back_to_the_session_name() {
-        let (_g, _d) = setup();
+        let _g = setup();
         let n = record("p", "claude", Parsed { title: None, body: "hi".into() }).unwrap();
         assert_eq!(n.title, "claude");
     }
@@ -621,7 +644,7 @@ mod tests {
     /// for a slightly different one would not show up in the count at all.)
     #[test]
     fn concurrent_persists_never_lose_a_rename_and_leave_a_file_load_can_recover() {
-        let (_g, _d) = setup();
+        let _g = setup();
         const THREADS: usize = 8;
         const PER_THREAD: usize = 150;
         let handles: Vec<_> = (0..THREADS)

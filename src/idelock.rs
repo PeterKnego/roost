@@ -40,6 +40,26 @@ static TEST_IDE_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// second call (from another test, or another test module) is a silent
 /// no-op — so any number of call sites can each set it defensively without
 /// coordinating who goes first.
+/// Points `ide_dir()` at one stable, reused directory for this user.
+///
+/// Prefer this over handing `set_ide_dir_for_test` a `tempfile::TempDir`:
+/// the override is a process-global `OnceLock`, so the directory outlives
+/// whichever test supplied it, and every later write recreates it after that
+/// `TempDir` has been removed — one leaked directory per test process, which
+/// is how 154 of them accumulated in /tmp before this was measured. A stable
+/// path keeps the isolation (nothing here touches the real `~/.claude/ide`)
+/// without the accumulation. Idempotent, so every test can call it.
+pub fn isolate_ide_dir_for_test() {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let d = DIR.get_or_init(|| {
+        let who = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+        let p = std::env::temp_dir().join(format!("resh-test-ide-{who}"));
+        let _ = std::fs::create_dir_all(&p);
+        p
+    });
+    set_ide_dir_for_test(d.clone());
+}
+
 pub fn set_ide_dir_for_test(dir: PathBuf) {
     let _ = TEST_IDE_DIR.set(dir);
 }
