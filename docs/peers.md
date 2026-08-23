@@ -88,6 +88,44 @@ vanishes from it with no way to rebuild.
 What resh adds is the project — mapping a `cwd` to a project name — which is
 the part of the question only resh can answer.
 
+## When the address is ambiguous
+
+`SendMessage` resolves *by name*, and session names are derived, so two
+sessions can carry one. Observed 2026-08-23: two sessions in one project both
+named `resh-f8`, separated only by a short ref `ListAgents` appends and the
+registry file does not carry.
+
+That is not cosmetic once the warning tells you to message each name: an
+ambiguous address reaches whichever session wins, silently. So when a listed
+name is shared — including with the reader's own session — the row is marked,
+and the instruction is qualified with where to get the disambiguating ref.
+
+The finding is also appended to `{RESH_STATE_DIR}/peers.log`, stamped, so it
+survives the session. **Not stderr**: `resh peers` always exits 0, and a hook's
+stderr is shown only when it fails or is slow, so a warning written there on a
+successful run is discarded — indistinguishable from never detecting anything.
+The file is written only when something is detected, so it stays absent on a
+healthy host rather than growing per session start.
+
+Writing it is best-effort; a session must never fail to start because a log
+line could not be written.
+
+## When the two root sources disagree
+
+`RESH_ROOTS` wins over the config's `roots`, silently and correctly — the unit
+file is authoritative for the service. But silence is wrong when the two were
+meant to agree: the server then resolves one set of projects while `resh peers`,
+which inherits none of its environment, resolves another.
+
+The server checks at startup and complains on stderr, which systemd captures.
+Only a genuine conflict counts — both sources speaking and disagreeing. One
+being silent is the ordinary case, not a problem, and warning about it would
+make the check noise on every host.
+
+Order counts as disagreement: roots are searched in order and the first match
+wins, so the same set listed differently resolves a duplicate project name to a
+different directory.
+
 ## Other worktrees of the same repository
 
 A worktree is its own project, so two sessions in two worktrees are not peers

@@ -297,20 +297,17 @@ totally — text typed and highlighted while nothing was ever sent or saved.
   by hand. Whether the announcement instruction is actually followed in
   practice has **not** been measured — it was deployed the same day.
 
-- **The name resh prints is not guaranteed unique, and the name is the
-  address.** `SendMessage` is addressed by name, so an ambiguous one is
-  unreachable exactly when it matters — two sessions in one project.
-  **Evidence (2026-08-23): observed once, and no longer true.** For a stretch
-  that morning `ListAgents` listed this session as `resh-f8 [28d115]` and a
-  *peer* also named `resh-f8 [7c6d24]` — two live sessions sharing one derived
-  name, separated only by a short ref that the registry file does not carry and
-  that is not derivable from `sessionId` (`e2faa2ad…` has ref `28d115`). That
-  peer has since exited; checked again the same afternoon, all nine live
-  sessions had distinct names. So this is a collision the naming scheme
-  permits and that was seen happening, not a standing condition — and it
-  matters because the name is the `SendMessage` address the warning
-  advertises. The pid `resh peers` also prints *is* unique, but `SendMessage`
-  does not accept one.
+- **Names can still collide; it is now detected rather than prevented.** Since
+  2026-08-23 a shared name marks the offending rows, qualifies the announce
+  instruction with where to get `ListAgents`' disambiguating ref, and appends a
+  stamped line to `{RESH_STATE_DIR}/peers.log`. What is *not* fixed is the
+  cause: resh cannot mint or read the ref, so it cannot print an unambiguous
+  address, and `SendMessage` accepts no pid. A reader who ignores the warning
+  still messages the wrong session.
+  **Evidence (2026-08-23): the collision was observed once, that morning, and
+  had ended by the afternoon.** Whether the detection ever fires again has not
+  been measured — it was deployed the same day, on a host where all nine live
+  sessions then had distinct names.
 
 - **resh's own UI says nothing about peers.** The count is known per project at
   any moment, so the picker or project strip could badge a project more than
@@ -340,13 +337,15 @@ totally — text typed and highlighted while nothing was ever sent or saved.
   **Not measured.** No unreadable `/proc` entry has been observed on this host;
   the path exists because it must, not because it has fired.
 
-- **`roots` now lives in two places** — `Environment=RESH_ROOTS` in the unit
-  file and `roots` in `~/.config/resh/config.toml` — and they must be kept in
-  step by hand. The env var winning is deliberate (a test or a second instance
-  can redirect one run without editing the user's config), so the fix is not
-  simply deleting one: it would be teaching the unit to read the config too.
-  **Not measured.** Both were written on 2026-08-23 and have not yet had a
-  chance to drift.
+- **`roots` still lives in two places; drift is now loud instead of silent.**
+  `Environment=RESH_ROOTS` in the unit file and `roots` in
+  `~/.config/resh/config.toml` must still be kept in step by hand — the env var
+  winning is deliberate, so the fix is not deleting one but teaching the unit
+  to read the config. Since 2026-08-23 the server compares them at startup and
+  complains on stderr, which systemd captures, when both speak and disagree.
+  **Not measured.** Both entries were written on 2026-08-23 and have not
+  drifted; the detector has never fired.
+
 
 ## Git
 

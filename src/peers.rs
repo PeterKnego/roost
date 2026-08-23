@@ -340,12 +340,80 @@ fn ago(started_ms: u64, now_ms: u64) -> String {
     }
 }
 
+/// Append a line to `{state_dir}/peers.log`.
+///
+/// Not stderr. `resh peers` runs as a Claude Code hook that always exits 0,
+/// and a hook's stderr is shown only when it fails or is slow — so a warning
+/// written there on a successful run is discarded, which is the same as not
+/// detecting anything. A file is the only place a hook can leave a record
+/// that survives the session it was written in.
+///
+/// Best-effort by design: a session must never fail to start because resh
+/// could not write a log line, so every error here is swallowed. The file is
+/// only ever appended to when something was actually detected, so it stays
+/// empty on a healthy host rather than growing per session start.
+pub fn log_line(text: &str, now_secs: u64) {
+    log_line_to(&crate::wsstate::state_dir(), text, now_secs)
+}
+
+/// Split from [`log_line`] so a test can point at a real directory instead of
+/// setting `RESH_STATE_DIR`, which other tests in this crate read concurrently.
+pub fn log_line_to(dir: &Path, text: &str, now_secs: u64) {
+    use std::io::Write;
+    let path = dir.join("peers.log");
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{now_secs} {text}");
+    }
+}
+
+/// This session's own name, from its own registry record.
+///
+/// Found the same two ways `roster` excludes itself, and for the same reason:
+/// an exact `session_id` when both sides carry one, otherwise process
+/// ancestry. Needed because a peer sharing *our* name is the collision that
+/// makes `SendMessage` ambiguous, and our own record is the one `roster`
+/// deliberately drops.
+pub fn own_name(entries: &[Session], self_pids: &[i32], self_sid: Option<&str>) -> Option<String> {
+    entries
+        .iter()
+        .find(|s| match (self_sid, s.session_id.as_deref()) {
+            (Some(mine), Some(theirs)) => mine == theirs,
+            _ => self_pids.contains(&s.pid),
+        })
+        .and_then(|s| s.name.clone())
+        .filter(|n| !n.is_empty())
+}
+
+/// Names shared by more than one session this warning mentions, including our
+/// own.
+///
+/// This is not cosmetic. The warning tells the reader to `SendMessage` each
+/// name, and `SendMessage` is addressed *by name* — so a name belonging to two
+/// live sessions sends to whichever one wins, silently. Observed on
+/// 2026-08-23: two sessions in one project both derived the name `resh-f8`,
+/// separated only by a short ref that `ListAgents` appends and the registry
+/// file does not carry.
+pub fn ambiguous_names(r: &Roster, self_name: Option<&str>) -> std::collections::BTreeSet<String> {
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for s in r.peers.iter().chain(r.siblings.iter()) {
+        *seen.entry(s.label().to_string()).or_default() += 1;
+    }
+    // Our own name counts: a peer that shares it makes the address ambiguous
+    // between us and them, which is exactly the collision that was observed.
+    if let Some(mine) = self_name.filter(|m| !m.is_empty()) {
+        *seen.entry(mine.to_string()).or_default() += 1;
+    }
+    seen.into_iter().filter(|(_, n)| *n > 1).map(|(k, _)| k).collect()
+}
+
 /// The warning, or `None` when there is nothing to say.
 ///
 /// `uncheckable` alone still produces a message: it means the detection ran
 /// degraded, and reporting "I could not tell" is the whole point of keeping
 /// it as a third outcome rather than folding it into "no peers".
-pub fn message(project: &str, r: &Roster, now_ms: u64) -> Option<String> {
+pub fn message(project: &str, r: &Roster, now_ms: u64, self_name: Option<&str>) -> Option<String> {
+    let ambiguous = ambiguous_names(r, self_name);
     if r.peers.is_empty() && r.siblings.is_empty() && r.uncheckable == 0 {
         return None;
     }
@@ -384,6 +452,9 @@ pub fn message(project: &str, r: &Roster, now_ms: u64) -> Option<String> {
         match p.started_at {
             Some(t) => out.push_str(&format!(", started {})", ago(t, now_ms))),
             None => out.push(')'),
+        }
+        if ambiguous.contains(p.label()) {
+            out.push_str("  <- this name is shared by more than one live session");
         }
     }
     if r.uncheckable > 0 {
@@ -433,6 +504,18 @@ pub fn message(project: &str, r: &Roster, now_ms: u64) -> Option<String> {
          is starting.\n  Send each name above a brief SendMessage saying you have started \
          here, so the whole group knows.",
     );
+    if !ambiguous.is_empty() {
+        // Do not quietly leave the instruction above pointing at an address
+        // that resolves to the wrong session. `ListAgents` disambiguates with
+        // a `name [ref]` form; the ref is not in the registry, so resh cannot
+        // print it and can only say where to get it.
+        out.push_str(&format!(
+            "\n  Careful: {} is shared by more than one live session, so a SendMessage \
+             addressed by that name alone may reach the wrong one.\n  Run ListAgents and \
+             use its `name [ref]` form for those.",
+            ambiguous.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
+        ));
+    }
     out.push_str(&siblings_block(r));
     Some(out)
 }
@@ -687,10 +770,10 @@ mod tests {
 
     #[test]
     fn silence_when_alone_and_a_message_that_names_who_is_here() {
-        assert!(message("proj", &Roster::default(), 0).is_none(), "no peers, nothing to say");
+        assert!(message("proj", &Roster::default(), 0, None).is_none(), "no peers, nothing to say");
 
         let r = roster(vec![sess(2, "/w")], Path::new("/w"), &[], None, &all_live, &no_repo);
-        let m = message("resh", &r, 60_000).expect("a peer must produce a message");
+        let m = message("resh", &r, 60_000, None).expect("a peer must produce a message");
         assert!(m.contains("peer-2"), "the peer must be named: {m}");
         assert!(m.contains("resh"), "the project must be named: {m}");
         assert!(m.contains("1m ago"), "age is rendered from the caller's clock: {m}");
@@ -703,7 +786,7 @@ mod tests {
     #[test]
     fn uncertainty_alone_still_produces_a_message() {
         let r = Roster { peers: Vec::new(), siblings: Vec::new(), uncheckable: 2 };
-        let m = message("resh", &r, 0).expect("uncertainty must not be silent");
+        let m = message("resh", &r, 0, None).expect("uncertainty must not be silent");
         assert!(m.contains("could not be checked"), "{m}");
     }
 
@@ -762,7 +845,7 @@ mod tests {
             &all_live,
             &no_repo,
         );
-        let m = message("resh", &r, 60_000).expect("two peers must produce a message");
+        let m = message("resh", &r, 60_000, None).expect("two peers must produce a message");
         for line in m.split('\n').skip(1) {
             assert!(
                 line.starts_with(' '),
@@ -785,7 +868,7 @@ mod tests {
     #[test]
     fn the_warning_says_the_names_are_addresses_but_only_when_it_names_someone() {
         let r = roster(vec![sess(2, "/w")], Path::new("/w"), &[], None, &all_live, &no_repo);
-        let named = message("resh", &r, 0).expect("a peer must produce a message");
+        let named = message("resh", &r, 0, None).expect("a peer must produce a message");
         assert!(named.contains("SendMessage"), "the address must be present: {named}");
         // An offer and an instruction both mention SendMessage, so mentioning
         // it proves nothing. What distinguishes them is that the reader is
@@ -800,7 +883,7 @@ mod tests {
         );
 
         let uncertain = Roster { peers: Vec::new(), siblings: Vec::new(), uncheckable: 2 };
-        let vague = message("resh", &uncertain, 0).expect("uncertainty must not be silent");
+        let vague = message("resh", &uncertain, 0, None).expect("uncertainty must not be silent");
         assert!(
             !vague.contains("SendMessage"),
             "with no peer named there is no address to offer: {vague}"
@@ -983,7 +1066,7 @@ mod tests {
             &all_live,
             &|_| repo_a(),
         );
-        let m = message("resh", &r, 0).expect("peers and siblings must produce a message");
+        let m = message("resh", &r, 0, None).expect("peers and siblings must produce a message");
         assert!(m.contains("peer-2"), "the same-directory peer is named: {m}");
         assert!(m.contains("Also in this repository"), "the quieter section is present: {m}");
         assert!(m.contains("sibling-one"), "the sibling is named: {m}");
@@ -1009,7 +1092,7 @@ mod tests {
             &|_| repo_a(),
         );
         assert!(r.peers.is_empty());
-        let m = message("resh", &r, 0).expect("a sibling alone is still worth saying");
+        let m = message("resh", &r, 0, None).expect("a sibling alone is still worth saying");
         assert!(!m.contains("already working in resh:"), "must not claim a peer is here: {m}");
         assert!(m.contains("No other Claude session is in resh"), "{m}");
         assert!(m.contains("Also in this repository"), "{m}");
@@ -1063,5 +1146,102 @@ mod tests {
             "two sessions sharing a directory must share one resolution: {calls:?}"
         );
         assert_eq!(calls.len(), 2, "ours and theirs, nothing more: {calls:?}");
+    }
+
+    /// The collision observed on 2026-08-23, and why it is not cosmetic: the
+    /// warning tells the reader to `SendMessage` each name, and `SendMessage`
+    /// resolves *by name*, so an ambiguous one reaches whichever session wins.
+    /// Leaving the instruction unqualified would send an announcement to the
+    /// wrong session and report success.
+    #[test]
+    fn a_name_shared_by_two_sessions_is_flagged_and_the_instruction_is_qualified() {
+        let mut a = sess(2, "/w");
+        let mut b = sess(3, "/w");
+        a.name = Some("resh-f8".into());
+        b.name = Some("resh-f8".into());
+        let r = roster(vec![a, b], Path::new("/w"), &[], None, &all_live, &no_repo);
+        assert_eq!(r.peers.len(), 2);
+
+        let m = message("resh", &r, 0, None).expect("two peers must produce a message");
+        assert_eq!(
+            m.matches("this name is shared by more than one live session").count(),
+            2,
+            "both rows carrying the shared name must be marked: {m}"
+        );
+        assert!(m.contains("may reach the wrong one"), "the instruction must be qualified: {m}");
+        assert!(m.contains("`resh-f8`"), "the ambiguous name must be quoted: {m}");
+        assert!(m.contains("ListAgents"), "and the way to disambiguate given: {m}");
+    }
+
+    /// The precise shape that was seen: not two peers, but a peer sharing the
+    /// name of the session being warned. Our own record never reaches the
+    /// roster — `roster` drops it — so this only works because the name is
+    /// looked up separately and passed in.
+    #[test]
+    fn a_peer_sharing_our_own_name_is_ambiguous_too() {
+        let mut p = sess(2, "/w");
+        p.name = Some("resh-f8".into());
+        let r = roster(vec![p], Path::new("/w"), &[], None, &all_live, &no_repo);
+
+        let unaware = message("resh", &r, 0, None).expect("message");
+        assert!(
+            !unaware.contains("may reach the wrong one"),
+            "without our own name there is nothing to compare against: {unaware}"
+        );
+
+        let aware = message("resh", &r, 0, Some("resh-f8")).expect("message");
+        assert!(
+            aware.contains("may reach the wrong one"),
+            "a peer wearing our name makes the address ambiguous: {aware}"
+        );
+    }
+
+    /// The discriminating half: distinct names must produce no warning at all,
+    /// or the flag would be noise on every message and mean nothing.
+    #[test]
+    fn distinct_names_raise_nothing() {
+        let r = roster(
+            vec![sess(2, "/w"), sess(3, "/w")],
+            Path::new("/w"),
+            &[],
+            None,
+            &all_live,
+            &no_repo,
+        );
+        let m = message("resh", &r, 0, Some("something-else")).expect("message");
+        assert!(!m.contains("shared by more than one"), "no collision, no flag: {m}");
+        assert!(!m.contains("may reach the wrong one"), "and no qualification: {m}");
+    }
+
+    #[test]
+    fn our_own_name_comes_from_our_own_record_by_id_then_ancestry() {
+        let mut mine = sess(7, "/w");
+        mine.name = Some("me".into());
+        mine.session_id = Some("sid-me".into());
+        let entries = vec![sess(2, "/w"), mine];
+
+        assert_eq!(own_name(&entries, &[], Some("sid-me")).as_deref(), Some("me"), "by id");
+        assert_eq!(own_name(&entries, &[7], None).as_deref(), Some("me"), "by ancestry");
+        assert_eq!(own_name(&entries, &[], Some("sid-nobody")), None, "no record of us");
+    }
+
+    /// The log has to be a file. `resh peers` runs as a hook that always exits
+    /// 0, and a hook's stderr is shown only when it fails or is slow — so a
+    /// warning written there on a successful run is discarded, which is
+    /// indistinguishable from never having detected anything.
+    #[test]
+    fn a_detected_collision_is_written_where_it_outlives_the_session() {
+        let d = tempfile::tempdir().unwrap();
+        log_line_to(d.path(), "duplicate session name in resh: resh-f8", 1_787_400_000);
+        log_line_to(d.path(), "second entry", 1_787_400_060);
+        let text = std::fs::read_to_string(d.path().join("peers.log")).expect("the log must exist");
+        assert!(text.contains("resh-f8"), "the finding is recorded: {text:?}");
+        assert!(text.contains("1787400000"), "stamped, so a later reader can order events: {text:?}");
+        assert_eq!(text.lines().count(), 2, "appended, never truncated: {text:?}");
+
+        // Nothing detected, nothing written: the file must stay absent on a
+        // healthy host rather than growing on every session start.
+        let quiet = tempfile::tempdir().unwrap();
+        assert!(!quiet.path().join("peers.log").exists());
     }
 }

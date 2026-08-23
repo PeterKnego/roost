@@ -23,6 +23,21 @@ fn main() {
         );
         std::process::exit(2);
     }
+    // Both sources naming roots and disagreeing is a misconfiguration that is
+    // otherwise invisible: RESH_ROOTS wins here, while `resh peers` — which
+    // inherits none of this process's environment — silently resolves the
+    // other set. Loud, on the server's stderr, which systemd captures.
+    if let Some((env, cfg)) = resh::projects::roots_conflict(
+        std::env::var("RESH_ROOTS").ok().as_deref(),
+        &resh::config::global_config_path(),
+    ) {
+        eprintln!(
+            "resh: RESH_ROOTS and the global config's `roots` disagree.\n  \
+             RESH_ROOTS (used here): {env:?}\n  \
+             config `roots` (used by `resh peers` and anything without this environment): {cfg:?}\n  \
+             Bring them into step, or callers outside this process will resolve different projects."
+        );
+    }
     let port: u16 = args.first().and_then(|p| p.parse().ok()).unwrap_or(8444);
     let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind 127.0.0.1");
     eprintln!("resh listening on http://127.0.0.1:{port}");
