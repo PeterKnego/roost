@@ -163,13 +163,23 @@ pub fn roster(
 ) -> Roster {
     let mut out = Roster::default();
     for s in entries {
-        if self_pids.contains(&s.pid) {
+        let is_self = match (self_sid, s.session_id.as_deref()) {
+            // Both sides named an id, so the match is exact and nothing else
+            // is us. Ancestry must NOT also be consulted here: it excludes
+            // every Claude this process descends from, and a session that
+            // merely happened to spawn us is still a separate session editing
+            // the same files. Hiding it is exactly the under-warn this module
+            // exists to prevent — found by launching a session from inside
+            // another one's shell and watching the parent vanish from its own
+            // warning.
+            (Some(mine), Some(theirs)) => mine == theirs,
+            // One side is silent — no payload on stdin, or a record predating
+            // the field. Fall back to process ancestry, which is a fact about
+            // this process rather than about another program's payload shape.
+            _ => self_pids.contains(&s.pid),
+        };
+        if is_self {
             continue;
-        }
-        if let (Some(mine), Some(theirs)) = (self_sid, s.session_id.as_deref()) {
-            if mine == theirs {
-                continue;
-            }
         }
         // A background job is not a second pair of hands on the keyboard.
         if s.kind.as_deref() == Some("bg") {
@@ -307,10 +317,15 @@ pub fn message(project: &str, r: &Roster, now_ms: u64) -> Option<String> {
 ///
 /// The hook runs as a descendant of the Claude process whose session it
 /// belongs to, so that session's own registry record is always in this set.
-/// That is the self-exclusion route that does not depend on stdin carrying a
-/// session id — a payload shape belonging to another program, which may
-/// change. `parent` is injected so the walk itself is testable without a
-/// process tree to stand in.
+///
+/// This is the *fallback* route, used only when no session id is available on
+/// either side. `SessionStart` does carry one, and an exact id is strictly
+/// better: ancestry excludes every Claude this process descends from, not just
+/// us, so preferring it would hide a separate session that merely spawned us.
+/// The walk survives because a caller that pipes no payload still needs to
+/// avoid reporting itself, and because a payload shape belongs to another
+/// program and may change. `parent` is injected so the walk itself is testable
+/// without a process tree to stand in.
 ///
 /// Bounded at 64 hops: a `/proc` that reports a cycle must not hang a hook
 /// that runs before every session.
@@ -622,5 +637,60 @@ mod tests {
             !vague.contains("SendMessage"),
             "with no peer named there is no address to offer: {vague}"
         );
+    }
+
+    /// The false negative that a real session start exposed: a Claude launched
+    /// from inside another Claude's shell inherits that parent's pid in its
+    /// ancestry, so an ancestry-based exclusion hid the parent from the very
+    /// warning meant to name it. They edit the same files regardless of who
+    /// launched whom.
+    ///
+    /// `SessionStart` carries a `session_id`, so when both sides name one the
+    /// match is exact and ancestry is not consulted at all.
+    #[test]
+    fn a_session_that_spawned_us_is_still_a_peer_when_we_know_our_own_id() {
+        // pid 2 is in our ancestry — it launched us — but it is not us.
+        let spawner = roster(
+            vec![sess(2, "/w")],
+            Path::new("/w"),
+            &[2],
+            Some("sid-99"),
+            &all_live,
+        );
+        assert_eq!(
+            spawner.peers.len(),
+            1,
+            "a session we descend from is a separate session and must be named"
+        );
+
+        // And we are still not our own peer: same ancestry, our own id.
+        let ourselves = roster(
+            vec![sess(2, "/w")],
+            Path::new("/w"),
+            &[2],
+            Some("sid-2"),
+            &all_live,
+        );
+        assert!(ourselves.peers.is_empty(), "an exact id match is still us");
+    }
+
+    /// The fallback has to survive: a record written before `sessionId`
+    /// existed, or a caller that pipes no payload, still must not report the
+    /// running session as its own peer.
+    #[test]
+    fn ancestry_still_excludes_self_when_either_side_names_no_id() {
+        let mut anon = sess(2, "/w");
+        anon.session_id = None;
+        let known_id = roster(
+            vec![anon.clone()],
+            Path::new("/w"),
+            &[2],
+            Some("sid-99"),
+            &all_live,
+        );
+        assert!(known_id.peers.is_empty(), "a record with no id falls back to ancestry");
+
+        let no_payload = roster(vec![anon], Path::new("/w"), &[2], None, &all_live);
+        assert!(no_payload.peers.is_empty(), "no payload at all falls back to ancestry");
     }
 }
