@@ -290,6 +290,16 @@ pub fn message(project: &str, r: &Roster, now_ms: u64) -> Option<String> {
         "\n  A resh project is one directory and one branch. Coordinate before editing, \
          or start this work in a git worktree.",
     );
+    // Stated as a capability, not an instruction. Told to notify its peers, a
+    // starting session would message every one of them unprompted, and a
+    // message wakes the receiver mid-task — turning a warning meant to prevent
+    // disruption into a source of it. Whether the interruption is worth it is
+    // a judgement about what the peer is doing, which only the reader has.
+    //
+    // The name is already the address: `ListAgents` describes a session's name
+    // as "the name other sessions use to message it", and it is the same
+    // string the registry stores, so the lines above need nothing added.
+    out.push_str("\n  Each name above is a SendMessage address, if you want to coordinate directly.");
     Some(out)
 }
 
@@ -591,6 +601,26 @@ mod tests {
         assert!(
             !flat.contains(")A") && !flat.contains("wA"),
             "flattened, nothing may weld onto the previous segment: {flat}"
+        );
+    }
+
+    /// The names resh prints are `SendMessage` addresses, which is the only
+    /// thing that lets the arriving session close the asymmetry — it learns
+    /// about the sessions already here, and they learn nothing about it.
+    ///
+    /// Absent when there is nobody to address: the uncertainty-only message
+    /// names no peers, so offering a way to reach them would be nonsense.
+    #[test]
+    fn the_warning_says_the_names_are_addresses_but_only_when_it_names_someone() {
+        let r = roster(vec![sess(2, "/w")], Path::new("/w"), &[], None, &all_live);
+        let named = message("resh", &r, 0).expect("a peer must produce a message");
+        assert!(named.contains("SendMessage"), "the address hint must be present: {named}");
+
+        let uncertain = Roster { peers: Vec::new(), uncheckable: 2 };
+        let vague = message("resh", &uncertain, 0).expect("uncertainty must not be silent");
+        assert!(
+            !vague.contains("SendMessage"),
+            "with no peer named there is no address to offer: {vague}"
         );
     }
 }
