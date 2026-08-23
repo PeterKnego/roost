@@ -53,18 +53,15 @@ answer, not a quiet vote for "unused".
 - Drag-and-drop tab reordering — speculative idea in the v3 spec, noted as
   partly moot since v3 already ships a "move to pane" command as the
   mechanism for relocating tabs (`2026-08-16-deadlight-v3-workspace-design.md`).
-- Drag-n-drop upload, copy-paste of files into the tree, and pasting images into
-  the claude terminal — **shipped**, see
-  `docs/superpowers/specs/2026-08-19-file-upload-design.md`. Directory upload,
-  archive extraction, download/drag-out and a host clipboard bridge are the
-  recorded non-goals; scratch retention (nothing prunes `state_dir()/pasted/`)
-  and the 16-part limit are the questions left open.
-  **Evidence (2026-08-20): both open questions are unexercised.**
-  `state_dir()/pasted/` **does not exist** in either the deployed or the dev
-  state directory — no image has ever been pasted into a terminal on this host,
-  so the unpruned-scratch worry has accumulated exactly nothing. The 16-part
-  request limit has likewise never been approached. Real questions, zero
-  pressure.
+- Nothing prunes `state_dir()/pasted/`, where images pasted into a terminal
+  are kept. Left open by the upload work
+  (`2026-08-19-file-upload-design.md`).
+  **Evidence (2026-08-20): the directory does not exist** in either the
+  deployed or the dev state dir — nothing has ever been pasted on this host, so
+  the worry has accumulated exactly nothing.
+- Whether the 16-part cap on an upload request is the right number. Left open
+  by the same work.
+  **Evidence (2026-08-20): never approached.**
 - **Redesign the transient message UI.** Upload errors and the upload progress
   indicator both borrow `showBanner`'s `.conflict` styling, which was designed
   for the save-conflict box and is wrong here: ugly, and positioned where a
@@ -129,12 +126,7 @@ answer, not a quiet vote for "unused".
 
 ## Editing
 
-The v3 spec ruled rich editing out of the middle pane entirely: "Rich editing
-belongs in the editor running in the terminal pane"
-(`2026-08-16-deadlight-v3-workspace-design.md`). **Reviewed 2026-08-17 and
-softened** — the boundary moves rather than disappears.
-
-### The decision
+### What "how rich" means here
 
 The terminal is where an AI agent does the editing. The browser editor is
 therefore not an authoring surface competing with it; it is where a human
@@ -152,79 +144,32 @@ value, a line to delete. That distinction, not a feature list, is the limit on
 
 ### Low-hanging fruit, in order
 
-Edit mode is currently a bare `<textarea>` (`static/app.js`, `mountEditor`).
-Preview mode highlights and Edit mode does not, so switching to Edit makes a
-file *harder* to read — the first item exists mainly to fix that inversion.
+Edit mode is a real `<textarea>` wrapped in `code-input`, which paints a
+highlighted `<pre>` beneath it (`static/app.js`, `mountEditor`). What is
+missing is everything around the text itself.
 
 **Evidence (2026-08-20): this is the one section with measured demand behind
 it.** Across the five saved workspaces on this host there are 29 tabs, of which
 **9 are File tabs** and 2 carry persisted buffers — so the viewer and editor are
 genuinely in use, unlike most of the UI/UX list above. That does not rank the
-five items below against each other, but it does mean the section is not
+four items below against each other, but it does mean the section is not
 speculative.
 
-1. ~~Syntax highlighting while editing.~~ **Shipped 2026-08-21** — see the
-   decision below.
-2. Tab inserts an indent instead of moving focus; auto-indent on Enter.
-3. Line numbers, and go-to-line.
-4. In-buffer find. Browser find over a `textarea` barely works.
-5. Bracket and quote auto-close.
+1. Tab inserts an indent instead of moving focus; auto-indent on Enter.
+2. Line numbers, and go-to-line.
+3. In-buffer find. Browser find over a `textarea` barely works.
+4. Bracket and quote auto-close.
 
-Items 2 and 5 are now cheaper than they look: `code-input` ships optional
-single-file plugins for indentation and bracket closing, neither vendored.
+Items 1 and 4 are cheaper than they look: `code-input`, already vendored,
+ships optional single-file plugins for indentation and bracket closing.
 
-### Candidate libraries
-
-**Decided 2026-08-21: none of the four below.** The winner was
-[`code-input`](https://github.com/WebCoder49/code-input) (MIT, no
-dependencies, 27 KB), which is not a text editor at all — it wraps a *real*
-`<textarea>` and paints a highlighted `<pre>` underneath it, driven by the
-highlight.js already vendored here. That is what settled it: see "The risk
-that decides it" below, which every candidate in this table has to answer and
-which does not arise when the textarea is still the textarea. `editors`, the
-200 ms debounce, autosave, ⌘S and the conflict path all kept talking to the
-same element they always had. Provenance and the two non-obvious integration
-details are in [vendor.md](vendor.md).
-
-The analysis below is kept as the record of what was weighed, not as an open
-question.
-
-Constraints that decided it: plain JS, no framework, no build step, and
-everything vendored into `static/vendor/` so it can be audited and served
-offline.
-
-| Candidate | Fit | Cost |
-|---|---|---|
-| [CodeJar](https://github.com/antonmedv/codejar) | Best fit on paper — a few KB, and its highlighting hook takes highlight.js, which is already vendored | Uses `contenteditable`, which is the risk below |
-| [Ace](https://ace.c9.io/) | Single-file core, genuine drop-in, mature, owns its own text model | Heavier; a second highlighting engine alongside highlight.js |
-| [CodeMirror 6](https://codemirror.net/) | Best mobile support (relevant to the mobile-layout item above), modular | Official path needs a bundler; the [prebuilt community bundles](https://github.com/paul-norman/codemirror6-prebuilt) mean vendoring someone else's rebuild, which weakens the audit story |
-| Monaco | Most capable | Multi-MB with worker files; far past what this pane is for. Not investigated in this pass |
-
-### The risk that decides it
-
-Not size — **byte fidelity**. Save is conflict-guarded against a hash of what
-was read from disk, and `texts` must match the buffer exactly for
-`EditBuffer`, the stale flag, and the live-follow of external edits to behave.
-A `contenteditable` editor normalises whitespace and newlines; if the bytes
-saved differ subtly from the bytes displayed, the result is a corrupted file
-or a save that conflicts with itself — and a green test suite would not
-notice, because this is exactly the class of defect that only shows up in a
-real browser.
-
-So whichever candidate wins must be tested against the existing save path
-before it is believed: seeding from `texts`, the 200 ms debounced
-`EditBuffer`, Ctrl/Cmd+S, clean-buffer live follow, and stale flagging. Ace
-and CodeMirror own their own text model and sidestep the normalisation
-problem; CodeJar is cheapest but carries it directly. That trade — not the
-feature list — is what a spec for this needs to resolve.
-
-**How it actually resolved:** by not choosing a text model at all. The
-normalisation risk above is a property of replacing the textarea, and
-`code-input` does not. The path was still tested end to end
-(`tests/browser/hledit.mjs`), and the one thing that nearly went wrong was
-unrelated to bytes: the element builds its *own* textarea on connect, so
-wiring the app's handlers to the one handed *to* it failed silently and
-totally — text typed and highlighted while nothing was ever sent or saved.
+**Whatever implements them must not change the bytes.** Save is conflict-
+guarded against a hash of what was read from disk, and `texts` must match the
+buffer exactly or `EditBuffer`, the stale flag and live-follow of external
+edits all misbehave — a corrupted file or a save that conflicts with itself,
+which no Rust test can see. Anything that normalises whitespace or newlines is
+disqualified, and any change here is tested through the real save path
+(`tests/browser/hledit.mjs`).
 
 ## Terminals and sessions
 
@@ -249,7 +194,7 @@ totally — text typed and highlighted while nothing was ever sent or saved.
   with no arguments; a global-only config key would let it be `claude
   --continue` or similar. Global-only for the usual reason — a per-project
   value would let a cloned checkout decide what a click on your machine
-  executes. Deferred when the button shipped (2026-08-23).
+  executes. Deferred 2026-08-23.
   **Demand unmeasured.** Nobody has asked.
 
 - Persisting a session's mode table across a resh restart — the one case
@@ -277,13 +222,10 @@ totally — text typed and highlighted while nothing was ever sent or saved.
 
 ### Peer sessions (`resh peers`, 2026-08-23)
 
-- **Nothing guarantees the group is told; the arriving session is asked to do
-  it.** The hook informs the session that is starting and no one else. Since
-  2026-08-23 the warning instructs that session to announce itself to each peer
-  by `SendMessage`, which reaches the earliest session — the one the hook can
-  never reach, and the one most likely to be mid-task when someone joins. That
-  is a convention carried out by a model, not a guarantee: a session that
-  ignores the instruction, or whose peer refuses inbound messages, leaves the
+- **Nothing guarantees the group is told.** The hook informs the session that
+  is starting and no one else; that session is instructed to announce itself to
+  each peer, which is a convention carried out by a model, not a guarantee. A
+  session that ignores it, or whose peer refuses inbound messages, leaves the
   group as uninformed as before. A guarantee means resh pushing into running
   sessions or re-checking on a timer — a lifecycle, where today there is one
   file read.
@@ -294,13 +236,11 @@ totally — text typed and highlighted while nothing was ever sent or saved.
   by hand. Whether the announcement instruction is actually followed in
   practice has **not** been measured — it was deployed the same day.
 
-- **Names can still collide; it is now detected rather than prevented.** Since
-  2026-08-23 a shared name marks the offending rows, qualifies the announce
-  instruction with where to get `ListAgents`' disambiguating ref, and appends a
-  stamped line to `{RESH_STATE_DIR}/error.log`. What is *not* fixed is the
-  cause: resh cannot mint or read the ref, so it cannot print an unambiguous
-  address, and `SendMessage` accepts no pid. A reader who ignores the warning
-  still messages the wrong session.
+- **Names can collide, and resh cannot print an unambiguous one.** A collision
+  is detected and warned about, but not prevented: resh can neither mint nor
+  read the short ref `ListAgents` uses to disambiguate, and `SendMessage`
+  accepts no pid. A reader who ignores the warning still messages the wrong
+  session.
   **Evidence (2026-08-23): the collision was observed once, that morning, and
   had ended by the afternoon.** Whether the detection ever fires again has not
   been measured — it was deployed the same day, on a host where all nine live
@@ -334,12 +274,11 @@ totally — text typed and highlighted while nothing was ever sent or saved.
   **Not measured.** No unreadable `/proc` entry has been observed on this host;
   the path exists because it must, not because it has fired.
 
-- **`roots` still lives in two places; drift is now loud instead of silent.**
+- **`roots` lives in two places and must be kept in step by hand.**
   `Environment=RESH_ROOTS` in the unit file and `roots` in
-  `~/.config/resh/config.toml` must still be kept in step by hand — the env var
-  winning is deliberate, so the fix is not deleting one but teaching the unit
-  to read the config. Since 2026-08-23 the server compares them at startup and
-  complains on stderr and in `error.log` when both speak and disagree.
+  `~/.config/resh/config.toml`. Drift is detected and reported, not prevented;
+  the env var winning is deliberate, so the fix is not deleting one but
+  teaching the unit to read the config.
   **Not measured.** Both entries were written on 2026-08-23 and have not
   drifted; the detector has never fired.
 
@@ -372,12 +311,10 @@ totally — text typed and highlighted while nothing was ever sent or saved.
   leftovers holding a third of a gigabyte and a tailnet route into a shell
   spawner nothing uses.
 
-  Note the deploy notes were **wrong** about this until corrected: they recorded
-  zellij as having been killed on 2026-08-18 and the `:8443` route as dropped,
-  and both claims were false. Its sessions have previously reported themselves
-  EXITED while the processes lived on, so `kill-all-sessions` will not clear
-  them — they go by pid, with the route dropped separately. The host-specific
-  commands are in `~/.config/resh/deploy-host.md`.
+  `kill-all-sessions` will not clear them: zellij sessions have reported
+  themselves EXITED while the processes lived on, so they go by pid, with the
+  `:8443` route dropped separately. Host-specific commands are in
+  `~/.config/resh/deploy-host.md`.
 
 ## Code structure
 
@@ -392,11 +329,9 @@ totally — text typed and highlighted while nothing was ever sent or saved.
   guard — but it is the same unchecked-sync hazard `FRAGMENT_KINDS` carries,
   and a build-time check could close both.
 
-### Sharp edges left by the buffers-without-text branch (2026-08-22)
+### Sharp edges around buffers and workspace state
 
-Findings its own reviews raised and deliberately deferred, kept because the
-ledger they lived in was scratch. Each was re-checked against the tree on
-2026-08-22; the ones already closed are not listed.
+Deferred review findings, each confirmed still present on 2026-08-22.
 
 - **`wsstate::load` reads an unreadable state file as "never saved".**
   `let Ok(text) = std::fs::read_to_string(path_for(project)) else { return (w,
