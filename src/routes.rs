@@ -74,6 +74,14 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
             let ps = registry::known_projects(roots);
             http::html(w, &render::projects_strip(current, &ps));
         }
+        // Same shape as _projects above, same reason it sits before the
+        // general frag arm. Unlike _projects this does not filter to live
+        // projects — see worktrees_strip's doc comment.
+        ["frag", "_worktrees"] => {
+            let current = req.query.get("current").map(String::as_str).unwrap_or("");
+            let ps = registry::known_projects(roots);
+            http::html(w, &render::worktrees_strip(current, &ps));
+        }
         // Root scope, not /static/sw.js: a service worker may only control
         // URLs under its own path, and this one has to focus and navigate
         // workspace tabs at /{project}.
@@ -985,6 +993,20 @@ mod tests {
         // multi-segment project with no "theme" segment anywhere.
         let out = frag_route(&roots, "/frag/karpie/sub/tree");
         assert!(out.contains("inner.rs"), "must still resolve an ordinary nested project: {out}");
+    }
+
+    /// Dispatch through the real router, like every frag test here (the
+    /// helper exists because direct-call tests once stayed green while the
+    /// router could never reach the handler). Before the arm exists this
+    /// request falls through to the catch-all and is treated as a project
+    /// named "frag/_worktrees" — so the assertions below cannot pass early.
+    #[test]
+    fn the_worktrees_fragment_is_routed() {
+        let d = tempfile::tempdir().unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let out = frag_route(&roots, "/frag/_worktrees?current=nosuch");
+        assert!(out.contains("id=\"wtlabel\""), "{out}");
+        assert!(out.contains("no worktrees"), "{out}");
     }
 
     /// `content_type` must classify the same way `assets::class_of` does —
