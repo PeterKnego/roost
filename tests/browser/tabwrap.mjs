@@ -21,7 +21,11 @@ const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) 
 
 const fx = await fixture();
 const NAMES = [];
-for (let i = 1; i <= 16; i++) {
+// 28, not 16: enough to exceed the 4-row cap even now that tabs are
+// content-sized (the hidden × stopped reserving ~25px per tab on 2026-08-24,
+// and the ✎ left the tab for the filename stripe — 17 tabs then fit in
+// exactly 4 rows and section C's premise silently vanished).
+for (let i = 1; i <= 28; i++) {
   const n = `a${i}.md`;
   NAMES.push(n);
   await Deno.writeTextFile(`${fx.roots}/proj/${n}`, `# ${n}\n`);
@@ -147,17 +151,51 @@ try {
   // mountTab would fit it on the way in, and this would pass with the re-fit
   // deleted.
   let head1 = head0;
-  for (let i = 0; i < NAMES.length && head1 === head0; i++) {
+  // Close until a full ROW's worth of height is freed, not until the first
+  // pixel moves: right at the row cap, losing the below-the-fold overflow
+  // shaves ~4px (the capped max-height vs the natural 4-row height) without
+  // freeing a terminal row — the re-fit runs and correctly changes nothing,
+  // and asserting growth on that 4px was asserting the wrong thing. A strip
+  // row is 26px; 20 is that with slack.
+  for (let i = 0; i < NAMES.length && head1 > head0 - 20; i++) {
     const p = await pane();
     await evalIn(`send({ t: "CloseTab", pane: ${PANE}, idx: ${p.tabs.length - 1} })`);
     await until(async () => (await pane()).tabs.length === p.tabs.length - 1, 10, "the tab to close");
     head1 = (await m()).head;
   }
-  ok(head1 < head0, `closing tabs dropped a row from the header (${head0}px → ${head1}px)`);
+  ok(head1 <= head0 - 20, `closing tabs dropped a row from the header (${head0}px → ${head1}px)`);
   ok((await mountedKey()) === key0 && key0.startsWith("Terminal"),
      `the terminal was never remounted across those closes (${key0})`);
   const rows1 = await evalIn(`terms.get("term").term.rows`);
   ok(rows1 > rows0, `the terminal grew into the freed row (${rows0} → ${rows1} rows)`);
+
+  console.log("\nE. hidden controls take no width on inactive tabs");
+  // The × kept its box at opacity:0 until 2026-08-24 (and the ✎ beside it,
+  // before that control moved to the filename stripe), which put an
+  // invisible tail on every inactive tab — a strip of md files read as tabs
+  // scattered across the pane (reported from real use). The × is
+  // display:none until the tab is hovered or active; the tab growing under
+  // the pointer on hover is the accepted cost of content-sized tabs.
+  await open(NAMES[0]);
+  await evalIn(`send({ t: "ActivateTab", pane: ${PANE}, idx: 0 })`);
+  ok(await until(async () => (await pane()).active === 0, 10, "terminal active"), "the terminal is the active tab");
+  const probe = () => evalIn(`JSON.stringify((() => {
+    const tabs = [...document.querySelectorAll('.pane[data-pane="${PANE}"] .tabstrip .tab')];
+    const t = tabs.find((x) => x.textContent.includes(${JSON.stringify(NAMES[0])}));
+    if (!t) return null;
+    return { w: Math.round(t.getBoundingClientRect().width),
+             displays: [...t.querySelectorAll('.x')].map((x) => getComputedStyle(x).display),
+             active: t.classList.contains('active') };
+  })())`).then(JSON.parse);
+  const idle = await probe();
+  ok(!!idle && !idle.active && idle.displays.length === 1 && idle.displays.every((d) => d === "none"),
+     `an inactive tab's × is display:none, and it is the only hidden control (got ${idle && idle.displays.join(", ")})`);
+  const fi = (await pane()).tabs.findIndex((t) => t.rel === NAMES[0]);
+  await evalIn(`send({ t: "ActivateTab", pane: ${PANE}, idx: ${fi} })`);
+  ok(await until(async () => !!(await probe())?.active, 10, "file tab active"), "the file tab activates");
+  const act = await probe();
+  ok(act.displays.length === 1 && act.displays[0] !== "none", `the active tab renders its × (${act.displays.join(", ")})`);
+  ok(act.w > idle.w + 10, `activation is what pays for its width (${idle.w}px → ${act.w}px)`);
 } finally {
   page?.close();
   browser.close();

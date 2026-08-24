@@ -503,22 +503,6 @@ function render() {
       // — see hasAttention/focusSession below.
       b.onclick = () =>
         t.k === "Terminal" ? focusSession(t.session) : send({ t: "ActivateTab", pane: pi, idx: ti });
-      // Two modes are worth switching between only where the file has both: a
-      // rendered form to look at and text to edit. That is markdown and svg —
-      // a png renders but cannot be edited, and a code file is editable but
-      // renders as nothing, so offering it "switch to preview" would advertise
-      // a mode nothing now opens in.
-      if (t.k === "File" && hasRenderedForm(t.rel) && !refusesTextEdit(t.rel)) {
-        const e = document.createElement("span");
-        e.className = "x";
-        e.title = t.mode === "Edit" ? "switch to preview" : "switch to edit";
-        e.textContent = "✎";
-        e.onclick = (ev) => {
-          ev.stopPropagation();
-          send({ t: "SetMode", rel: t.rel, mode: t.mode === "Edit" ? "Preview" : "Edit" });
-        };
-        b.appendChild(e);
-      }
       const x = document.createElement("span");
       x.className = "x";
       x.title =
@@ -715,6 +699,22 @@ function newTerminal(pane, launch) {
   send(launch ? { t: "NewTerminal", pane, launch } : { t: "NewTerminal", pane });
 }
 
+// The Edit/Preview switch lives in the filename stripe (`.path`), not on the
+// tab: only the active tab's mode is visible, so a per-tab toggle spent ~20px
+// on every markdown tab for a control that mostly toggled something you could
+// not see. Two modes are worth switching between only where the file has both
+// a rendered form and text to edit — markdown and svg; a png renders but
+// cannot be edited, a code file edits but renders as nothing.
+function modeButton(rel, mode) {
+  if (!(hasRenderedForm(rel) && !refusesTextEdit(rel))) return null;
+  const b = document.createElement("button");
+  b.className = "savebtn modebtn";
+  b.textContent = mode === "Edit" ? "Preview" : "Edit";
+  b.title = mode === "Edit" ? "switch to preview" : "switch to edit";
+  b.onclick = () => send({ t: "SetMode", rel, mode: mode === "Edit" ? "Preview" : "Edit" });
+  return b;
+}
+
 function mountTab(content, t) {
   // Invalidate any fetch already in flight for this content element: a
   // response landing after the pane has moved on (e.g. to a Terminal tab)
@@ -750,6 +750,11 @@ function mountTab(content, t) {
     content.innerHTML = html;
     content.querySelectorAll("pre code").forEach((b) => window.hljs && hljs.highlightElement(b));
     wireFragment(content);
+    if (t.k === "File") {
+      const mb = modeButton(t.rel, t.mode);
+      const path = content.querySelector(".path");
+      if (mb && path) path.appendChild(mb);
+    }
     // Tree fragments carry lazy <details hx-get="...tree?dir=..."
     // hx-trigger="toggle once"> nodes (render::tree_level). htmx only binds
     // hx-* attributes when it walks the DOM itself (page boot, or its own
@@ -1602,7 +1607,8 @@ function mountEditor(content, rel) {
   btn.textContent = "Save";
   btn.title = "write this file out (⌘S / ctrl-S)";
   btn.onclick = () => saveNow(rel);
-  bar.append(name, st, btn);
+  const mb = modeButton(rel, "Edit");
+  if (mb) bar.append(name, st, mb, btn); else bar.append(name, st, btn);
   const lang = codeLanguage(rel, text);
   if (lang) {
     const host = document.createElement("code-input");

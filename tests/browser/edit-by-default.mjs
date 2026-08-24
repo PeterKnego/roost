@@ -1,13 +1,13 @@
 //! Clicking a text file opens it in an editor, the way an IDE does.
 //!
 //! Preview used to be the default for everything, so reading code meant one
-//! click and editing it meant two — and the second was a ✎ most people never
+//! click and editing it meant two — and the second was a toggle most people never
 //! found. Preview survives only where it is not a stand-in for an editor:
 //! markdown, whose rendered form is the point of the file, and the formats a
 //! textarea would destroy.
 //!
 //! What no Rust test can see: the default lives in the tree's click handler in
-//! static/app.js, and the ✎ that used to switch modes is drawn there too.
+//! static/app.js, and the Edit/Preview switch in the filename stripe too.
 //!
 //! Run: deno run -A tests/browser/edit-by-default.mjs
 import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
@@ -60,14 +60,16 @@ try {
   const tabFor = (rel) => evalIn(
     `JSON.stringify(state.panes[2].tabs.find((t) => t.k === "File" && t.rel === ${JSON.stringify(rel)}) || null)`)
     .then((s) => JSON.parse(s));
-  // Per tab, not per strip: several tabs are open by the end of this file and
-  // a count across all of them would pass for the wrong tab's ✎.
-  const pencilOn = (rel) => evalIn(`(() => {
-    const name = ${JSON.stringify(rel)}.split("/").pop();
-    const tab = [...document.querySelectorAll('.pane[data-pane="2"] .tabstrip .tab')]
-      .find((t) => t.textContent.includes(name));
-    if (!tab) return "no tab";
-    return [...tab.querySelectorAll(".x")].some((e) => e.textContent === "✎");
+  // The Edit/Preview switch lives in the filename stripe under the tabs (it
+  // moved out of the tab on 2026-08-24), so it exists only for the active
+  // tab — which each clickInTree above has just made this file. Guarding on
+  // the stripe naming the right file keeps this from passing on some other
+  // tab's button. Returns the button's label, or false.
+  const modeBtnFor = (rel) => evalIn(`(() => {
+    const c = document.querySelector('.pane[data-pane="2"] .content');
+    if (!c || !c.textContent.includes(${JSON.stringify(rel)})) return "wrong tab";
+    const b = c.querySelector(".path .modebtn");
+    return b ? b.textContent : false;
   })()`);
 
   console.log("A. a code file opens in its editor");
@@ -75,13 +77,13 @@ try {
   ok((await tabFor("main.rs")).mode === "Edit", `and it is in Edit (got ${(await tabFor("main.rs")).mode})`);
   ok(await until(() => evalIn(`!!document.querySelector('.pane[data-pane="2"] textarea.editor')`), 10, "editor"),
      "the pane really shows an editor, not a preview");
-  ok((await pencilOn("main.rs")) === false, "and offers no ✎, because there is no second mode to reach");
+  ok((await modeBtnFor("main.rs")) === false, "and its stripe offers no mode switch — there is no second mode to reach");
 
   console.log("\nB. markdown keeps its rendered preview, and its toggle");
   ok(await clickInTree("notes.md"), "clicking notes.md opens a tab");
   ok((await tabFor("notes.md")).mode === "Preview", `and it is in Preview (got ${(await tabFor("notes.md")).mode})`);
-  ok(await until(async () => (await pencilOn("notes.md")) === true, 5, "the ✎"),
-     "the markdown tab offers the ✎ that switches modes");
+  ok(await until(async () => (await modeBtnFor("notes.md")) === "Edit", 5, "the Edit switch"),
+     "the preview's filename stripe offers the Edit switch");
 
   console.log("\nC. a file the editor cannot hold lands in Preview by itself");
   // The client asks for Edit — blob.bin's extension is not on any list it
@@ -101,8 +103,8 @@ try {
   ok(await clickInTree("logo.svg"), "clicking logo.svg opens a tab");
   ok((await tabFor("logo.svg")).mode === "Preview",
      `it opens on the picture (got ${(await tabFor("logo.svg")).mode})`);
-  ok(await until(async () => (await pencilOn("logo.svg")) === true, 5, "the ✎"),
-     "and still offers the ✎ that switches to its text");
+  ok(await until(async () => (await modeBtnFor("logo.svg")) === "Edit", 5, "the Edit switch"),
+     "and its stripe still offers the switch to its text");
 
 } finally {
   page?.close();

@@ -160,10 +160,15 @@ main { flex: 1; min-height: 0; }
 .tabstrip .tab.active { background: var(--tab-on); color: var(--fg); }
 .tabstrip .tab .dirty { color: var(--accent); }
 .tabstrip .tab .stale { color: var(--warn, #d79921); }
-/* opacity, not display: the control keeps its box at all times, so revealing
-   it on hover never reflows the strip under the pointer. */
-.tabstrip .tab .x { opacity: 0; margin-left: 2px; padding: 0 2px; border-radius: 3px; transition: opacity .1s; }
-.tabstrip .tab:hover .x, .tabstrip .tab.active .x { opacity: .55; }
+/* display, not opacity — reversing the earlier keep-the-box rule. The box
+   was kept so revealing the × on hover never reflowed the strip under the
+   pointer; but that reserved ~25px of invisible tail on every tab (and ~45px
+   while the ✎ also lived here), which read as tabs scattered loosely across
+   the pane — reported from real use, 2026-08-24. Content-sized tabs won:
+   the tab now grows under the pointer on hover, and that is the accepted
+   cost. The ✎ moved to the filename stripe (.modebtn below) the same day. */
+.tabstrip .tab .x { display: none; margin-left: 2px; padding: 0 2px; border-radius: 3px; }
+.tabstrip .tab:hover .x, .tabstrip .tab.active .x { display: block; opacity: .55; }
 .tabstrip .tab .x:hover { opacity: 1; background: var(--bg3, var(--bg2)); }
 .tabstrip .newterm, .tabstrip .newclaude { display: flex; align-items: center; padding: 0 9px; cursor: pointer; color: var(--muted); }
 .tabstrip .newterm:hover, .tabstrip .newclaude:hover { color: var(--fg); background: var(--bg3, var(--bg)); }
@@ -292,6 +297,10 @@ main { flex: 1; min-height: 0; }
 .savebtn { font: inherit; font-size: 11px; line-height: 1.4; padding: 1px 8px; border-radius: 5px;
            cursor: pointer; border: 1px solid var(--border); background: none; color: var(--muted); }
 .savebtn:hover { color: var(--fg); background: var(--tab-hover); }
+/* The Edit/Preview switch in the filename stripe. The edit bar is a flex row
+   (order comes from the DOM); a preview's .path is a plain sticky block, so
+   there the button floats clear of the breadcrumb text. */
+.path .modebtn { float: right; margin-left: 8px; }
 .conflict { border: 1px solid var(--warn, #d79921); padding: 8px; margin: 8px; background: var(--bg2); }
 .conflict button { margin: 8px 8px 0 0; font: inherit; cursor: pointer; }
 /* .proposal-actions (the Accept/Reject bar under a proposal's hunk view,

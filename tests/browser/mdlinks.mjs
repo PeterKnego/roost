@@ -1,7 +1,7 @@
 //! Do a preview's own references actually work in a browser?
 //!
 //! No Rust test reaches static/app.js, so the selector that turns <a data-rel>
-//! into an OpenTab intent, the ✎ suppression, and whether an <img> element's
+//! into an OpenTab intent, the mode-switch suppression, and whether an <img> element's
 //! bytes ever arrived are all untested without this.
 //!
 //! naturalWidth, not presence: an <img> exists in the DOM whether or not the
@@ -208,23 +208,23 @@ try {
   ok(await evalIn(
     `(() => { const i = document.querySelector("img.imgview"); return !!i && i.naturalWidth === 1; })()`),
     "the pane rendered the picture (bytes loaded), not a textarea, after the coerced open");
-  // ---- 7. An SVG is text: it keeps the ✎ toggle and really opens ----------
+  // ---- 7. An SVG is text: it keeps the Edit switch and really opens -------
   // A .svg previews as a picture like any image, but it is text on disk, so
   // gating Edit on "renders as a picture" silently made every SVG in every
-  // project read-only — with no toggle left to get back out of a tab already
-  // in Edit. Driven through the real ✎ click, not a handcrafted intent, so
-  // this covers the client list and the server guard together.
+  // project read-only — with no switch left to get back out of a tab already
+  // in Edit. Driven through the real switch in the filename stripe (where the
+  // old per-tab ✎ moved on 2026-08-24), not a handcrafted intent, so this
+  // covers the client list and the server guard together.
   await evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: "docs/logo.svg", mode: "Preview" } })`);
   await until(() => evalIn(
-    `[...document.querySelectorAll(".tabstrip .tab")].some(b => b.textContent.includes("logo.svg"))`),
-    15, "svg tab");
+    `(() => { const c = document.querySelector('.pane[data-pane="2"] .content');
+       return !!c && c.textContent.includes("logo.svg") && !!c.querySelector(".path .modebtn"); })()`),
+    15, "svg preview with its mode switch");
   const svgToggle = await evalIn(
-    `(() => { const b = [...document.querySelectorAll(".tabstrip .tab")]
-        .find(x => x.textContent.includes("logo.svg"));
-      const e = b && b.querySelector("span.x[title*='edit']");
-      if (e) e.click();
-      return !!e; })()`);
-  ok(svgToggle, "an svg tab offers the edit toggle");
+    `(() => { const b = document.querySelector('.pane[data-pane="2"] .content .path .modebtn');
+      if (b) b.click();
+      return b ? b.textContent : false; })()`);
+  ok(svgToggle === "Edit", "an svg preview's stripe offers the Edit switch");
   const svgEdits = await until(() => evalIn(
     `(() => { const t = document.querySelector("textarea");
        return !!t && t.value.includes("<svg"); })()`), 15, "svg editor");
