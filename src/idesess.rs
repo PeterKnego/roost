@@ -63,7 +63,16 @@ pub fn session_of_in(proc_root: &Path, pid: u32, project: &str) -> Sess {
         // A clean environment with neither variable: resh did not spawn this
         // process. Positive evidence.
         (None, None) => Sess::Outside,
-        // Positively in a different project's terminal. Also evidence.
+        // In this project, but the session name is gone. "Cannot tell which
+        // terminal" — not "in no terminal": the symmetric (Some, None) case
+        // below is Unknown for the same reason, and only positive evidence
+        // may exclude a connection from a mention.
+        (None, Some(p)) if p == project => Sess::Unknown,
+        // `RESH_PROJECT` is set and names a different project — with or
+        // without a session name, since the arms above already claimed
+        // every same-project case (named session, or the guard just above).
+        // Positive evidence: this pid is accounted for by another project's
+        // terminal, not "cannot tell".
         (_, Some(_)) => Sess::Outside,
         // One variable without the other. Something scrubbed the
         // environment partially; the name cannot be trusted to mean this
@@ -168,6 +177,17 @@ mod tests {
     #[test]
     fn a_session_without_a_project_is_unknown() {
         let d = fake_proc(&["RESH_SESSION=main"]);
+        assert_eq!(session_of_in(d.path(), 4242, "karpie"), Sess::Unknown);
+    }
+
+    /// The symmetric partial scrub: the project is named and matches, but
+    /// the session is gone. This is "cannot tell which terminal", not
+    /// "positively in a different project" — the `(_, Some(_))` arm must not
+    /// swallow this case, since `p == project` is caught by the guarded arm
+    /// above it only when a session name is also present.
+    #[test]
+    fn a_project_without_a_session_is_unknown_not_outside() {
+        let d = fake_proc(&["RESH_PROJECT=karpie"]);
         assert_eq!(session_of_in(d.path(), 4242, "karpie"), Sess::Unknown);
     }
 
