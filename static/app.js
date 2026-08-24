@@ -1307,6 +1307,21 @@ function ensureTerm(session) {
   node.className = "termhost";
   node.dataset.session = session;
   pool().appendChild(node);
+  // `focusSession` (below) is the funnel for *activation* — a tab strip
+  // click, a notice, the service-worker focus message, #session= routing —
+  // but activation and "the user clicked into this terminal's body" are
+  // different events. With two panes each showing an active Terminal tab,
+  // clicking straight into the one that is already active fires neither
+  // ActivateTab nor focusSession, so lastFocusedSession would keep
+  // pointing at whichever terminal was last activated (or, right after a
+  // reload, stay null and fall back to live[0]) even though the user is now
+  // typing into a different one. `focusin` bubbles, and xterm's hidden
+  // textarea is a descendant of `node`, so this catches the real DOM focus
+  // event a click produces without depending on an xterm API for it — this
+  // vendored build's public Terminal facade (the "d" class the UMD bundle
+  // exports) wraps an internal core that has its own onFocus/onBlur, but
+  // does not forward either one; calling `term.onFocus` throws.
+  node.addEventListener("focusin", () => { lastFocusedSession = session; });
   // xterm's own defaults are black-on-white-ish and take no part in the theme
   // cascade, so the active theme's variables are read off :root and handed to
   // it — otherwise the terminal is a black rectangle inside a #1e1f22 pane.
@@ -1430,18 +1445,6 @@ function ensureTerm(session) {
     const s = entry.sock;
     if (s && s.readyState === 1) s.send(new TextEncoder().encode(d));
   });
-  // `focusSession` (below) is the funnel for *activation* — a tab strip
-  // click, a notice, the service-worker focus message, #session= routing —
-  // but activation and "the user clicked into this terminal's body" are
-  // different events. With two panes each showing an active Terminal tab,
-  // clicking straight into the one that is already active fires neither
-  // ActivateTab nor focusSession, so lastFocusedSession would keep
-  // pointing at whichever terminal was last activated (or, right after a
-  // reload, stay null and fall back to live[0]) even though the user is now
-  // typing into a different one. xterm's own onFocus is tied to the real
-  // DOM focus event on its hidden textarea, so it catches this case for
-  // free and needs no click handler wired onto the terminal host.
-  term.onFocus(() => { lastFocusedSession = session; });
   terms.set(session, entry);
   connectTerm(entry, session);
   return entry;
