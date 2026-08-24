@@ -286,10 +286,27 @@ pub fn stop(project: &str) {
 /// "its" entry in a `Vec<Sender<String>>` once other connections have
 /// registered and deregistered around it; the id is what makes removal
 /// correct regardless of registration/deregistration order.
-static CONNS: OnceLock<Mutex<HashMap<String, Vec<(u64, std::sync::mpsc::Sender<String>)>>>> =
-    OnceLock::new();
+/// One registered connection, as the fan-out sees it.
+///
+/// A struct rather than the `(u64, Sender<String>)` tuple this used to be:
+/// routing a mention needs to know which resh terminal each Claude is in,
+/// and that fact has to live where the fan-out can read it. Putting it on
+/// `Conn` instead — where `cwd` lives — would hide it from `notify_selected`,
+/// and a second map keyed by conn id is a second lifetime to get right whose
+/// failure mode is a dead connection claiming a terminal forever.
+struct Target {
+    id: u64,
+    reply: std::sync::mpsc::Sender<String>,
+    /// Learned from `ide_connected`'s pid. `Unknown` until that notification
+    /// arrives — which is correct rather than merely convenient: between the
+    /// handshake and `ide_connected` resh genuinely cannot tell, and
+    /// `Unknown` is the value that leaves the connection eligible.
+    session: crate::idesess::Sess,
+}
 
-fn conns() -> &'static Mutex<HashMap<String, Vec<(u64, std::sync::mpsc::Sender<String>)>>> {
+static CONNS: OnceLock<Mutex<HashMap<String, Vec<Target>>>> = OnceLock::new();
+
+fn conns() -> &'static Mutex<HashMap<String, Vec<Target>>> {
     CONNS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -313,7 +330,7 @@ impl Drop for ConnGuard {
         {
             let mut map = conns().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(v) = map.get_mut(&self.project) {
-                v.retain(|(id, _)| *id != self.id);
+                v.retain(|t| t.id != self.id);
                 if v.is_empty() {
                     map.remove(&self.project);
                 }
@@ -369,17 +386,33 @@ fn reclaim_pending_for(project: &str, conn_id: u64) {
 /// shape regardless.
 fn notify_all(project: &str, msg: &serde_json::Value) -> Result<(), String> {
     let msg = msg.to_string();
-    let targets: Vec<_> = {
+    let targets: Vec<std::sync::mpsc::Sender<String>> = {
         let map = conns().lock().unwrap_or_else(|e| e.into_inner());
-        map.get(project).cloned().unwrap_or_default()
+        map.get(project).map(|v| v.iter().map(|t| t.reply.clone()).collect()).unwrap_or_default()
     };
     if targets.is_empty() {
         return Err("no Claude is connected to this project".into());
     }
-    for (_, t) in &targets {
+    for t in &targets {
         let _ = t.send(msg.clone());
     }
     Ok(())
+}
+
+/// Records what `ide_connected` learned about this connection's terminal.
+///
+/// Separate from registration because the two happen at different times and
+/// cannot be merged: registration runs inside the handshake callback (see
+/// `serve_conn`), before any message has been read, so the pid does not
+/// exist yet. Looked up by id for the same reason removal is — the position
+/// in the Vec is not stable across other connections coming and going.
+fn set_session(project: &str, id: u64, sess: crate::idesess::Sess) {
+    let mut map = conns().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = map.get_mut(project) {
+        if let Some(t) = v.iter_mut().find(|t| t.id == id) {
+            t.session = sess;
+        }
+    }
 }
 
 /// Tells every Claude connected to `project` that the user pointed at `abs`
@@ -818,6 +851,12 @@ fn dispatch(msg: &serde_json::Value, conn: &mut Conn) -> Option<serde_json::Valu
                 // than a /proc lookup that just failed.
                 Cwd::Gone | Cwd::Unknown => {}
             }
+            // Written through to CONNS rather than kept on `conn`, because
+            // the mention fan-out reads the registry, not this struct. Every
+            // outcome is recorded, Unknown included — leaving the previous
+            // value in place on a failed lookup would let a stale answer
+            // outlive the evidence for it.
+            set_session(&conn.project, conn.id, crate::idesess::session_of(pid, &conn.project));
         }
         return None;
     };
@@ -938,7 +977,11 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
             // happen-after "this connection is in `CONNS`", not merely
             // usually-before.
             let mut map = conns().lock().unwrap_or_else(|e| e.into_inner());
-            map.entry(reg_project.clone()).or_default().push((conn_id, reg_tx.clone()));
+            map.entry(reg_project.clone()).or_default().push(Target {
+                id: conn_id,
+                reply: reg_tx.clone(),
+                session: crate::idesess::Sess::Unknown,
+            });
             Ok(resp)
         },
         Some(config),
@@ -2191,7 +2234,9 @@ mod tests {
         let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
         {
             let mut map = conns().lock().unwrap();
-            map.entry(project.to_string()).or_default().push((id, tx));
+            map.entry(project.to_string())
+                .or_default()
+                .push(Target { id, reply: tx, session: crate::idesess::Sess::Unknown });
         }
         let guard = ConnGuard { project: project.to_string(), id };
         // Sanity: the registration really did take effect before the drop
@@ -2202,6 +2247,59 @@ mod tests {
         assert!(err.contains("no Claude"), "the registry entry must be gone once the guard drops: {err}");
     }
 
+    /// The registry must record what `ide_connected` learned, or Task 3's
+    /// routing has nothing to filter on. Asserted against the registry
+    /// directly rather than through a mention, so a failure here says
+    /// "not recorded" rather than "not delivered".
+    #[test]
+    fn a_connection_records_the_session_it_was_told_about() {
+        let project = "sess-record";
+        let (tx, _rx) = std::sync::mpsc::channel::<String>();
+        let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut map = conns().lock().unwrap();
+            map.entry(project.to_string())
+                .or_default()
+                .push(Target { id, reply: tx, session: crate::idesess::Sess::Unknown });
+        }
+        let _guard = ConnGuard { project: project.to_string(), id };
+        set_session(project, id, crate::idesess::Sess::In("term3".into()));
+        let map = conns().lock().unwrap();
+        let t = map[project].iter().find(|t| t.id == id).expect("the connection is registered");
+        assert_eq!(t.session, crate::idesess::Sess::In("term3".into()));
+    }
+
+    /// A pid that cannot exist gives a deterministic Unknown from the real
+    /// /proc, which is what makes this assertion stable on any host: the
+    /// point is that `ide_connected` writes the answer through to the
+    /// registry at all, and that a failed lookup lands as Unknown rather
+    /// than Outside. The three-outcome logic itself is covered by
+    /// `idesess.rs`'s fixture tests.
+    #[test]
+    fn ide_connected_records_unknown_for_a_pid_that_cannot_exist() {
+        let project = "sess-connected";
+        let (tx, _rx) = std::sync::mpsc::channel::<String>();
+        let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut map = conns().lock().unwrap();
+            map.entry(project.to_string())
+                .or_default()
+                .push(Target { id, reply: tx.clone(), session: crate::idesess::Sess::Outside });
+        }
+        let _guard = ConnGuard { project: project.to_string(), id };
+        let mut conn = Conn::new(project, std::path::PathBuf::from("/w"), tx, id);
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "method": "ide_connected", "params": {"pid": u32::MAX}
+        });
+        assert!(dispatch(&msg, &mut conn).is_none(), "a notification must not be answered");
+        let map = conns().lock().unwrap();
+        let t = map[project].iter().find(|t| t.id == id).unwrap();
+        assert_eq!(
+            t.session,
+            crate::idesess::Sess::Unknown,
+            "a pid resh cannot read must land as Unknown, not left at its previous value"
+        );
+    }
 
     /// Writes `share_selection = true` into the fake client's own project
     /// directory (`connected_fake_client_for`'s `ws`, which is what
