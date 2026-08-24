@@ -228,6 +228,12 @@ performed.
   (`proposal_fragment_reports_distant_changes_as_separate_hunks` and its
   siblings), since the hunk view is Rust now, not a second implementation in
   `app.js`.
+  Section I covers `activeTerminalSession()` itself, which none of the above
+  reach: making it always return `null` fails the session-name assertion
+  (`got {"...,"session":null}`) while the weaker "not session2" assertion
+  **keeps passing** — a direct instance of the "no link is offered" trap
+  further up this file, which is why the section asserts equality to the
+  focused terminal's name, not just inequality to the other live one.
 - In `worktrees.mjs`: commenting out the `["frag", "_worktrees"]` arm in
   `routes.rs` fails 5 — the chip label, the two row checks in section B
   against an empty fragment, "the current row is the main worktree", and,
