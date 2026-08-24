@@ -22,6 +22,20 @@ only thing that exercises any of it.
 | `highlight.min.js`, `hljs-github-dark.min.css` | `highlight.js` | 11.9.0 | BSD-3-Clause |
 | `github-markdown.min.css` | `github-markdown-css` | 5.3.3 | MIT |
 | `code-input.min.js`, `code-input.min.css` | `@webcoder49/code-input` | 2.8.3 | MIT |
+| file-type/folder icons (data URIs in `static/style.css`) | `material-extensions/vscode-material-icon-theme` | 5.38.0 | MIT |
+
+## The file-type icons
+
+The one vendored asset that is not a file under `static/vendor/`: the tree,
+changes and tab icons are Material Icon Theme SVGs URL-encoded into CSS
+variables in `static/style.css` (the `--ic-*` block). They ride inside the
+stylesheet because that is how the hand-drawn set they replaced already
+shipped — one request, no binary assets — and a 20-icon subset is ~11KB.
+Update by fetching `icons/<name>.svg` from the tagged release and re-encoding
+(swap `"`→`'`, then percent-encode `< > # % & { }`); the mapping from
+extension to variable is the `[data-ext=…]` block directly below the icons.
+The twisties and the branch/terminal/diff icons are not from this set — they
+are this codebase's own stroke drawings and follow the theme.
 
 ## code-input
 
