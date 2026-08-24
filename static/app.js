@@ -1740,19 +1740,52 @@ document.addEventListener("keydown", (e) => {
   saveNow(rel);
 });
 
-// Which editor tab a mention keystroke means — same logic as saveTarget
-// above (focused editor first, else the visible MIDDLE/RIGHT File tab in
-// Edit mode), for the same reason: focus is often on the body, not a
-// textarea, right after a reconnect or a click elsewhere on the page.
+// The terminal a mention is aimed at. Recorded on focus rather than derived
+// from the layout alone: two panes can each hold an active Terminal tab, and
+// the layout says nothing about which one the user last looked at.
+let lastFocusedSession = null;
+
+function activeTerminalSession() {
+  if (!state) return null;
+  const live = [];
+  for (const pane of state.panes) {
+    const tab = pane.tabs[pane.active];
+    if (tab && tab.k === "Terminal") live.push(tab.session);
+  }
+  if (!live.length) return null;
+  // The remembered one only counts while it is still an active tab somewhere;
+  // otherwise a closed terminal would keep claiming every mention.
+  if (live.includes(lastFocusedSession)) return lastFocusedSession;
+  return live[0];
+}
+
+// Which tab a mention keystroke means, and in which mode — same "focused
+// editor first, else the visible MIDDLE/RIGHT File tab" rule saveTarget uses
+// above, for the same reason: focus is often on the body, not a textarea,
+// right after a reconnect or a click elsewhere on the page.
+//
+// Two clauses that look alike are doing different jobs here. `mode === "Edit"`
+// is what this function deliberately stops requiring — a Preview tab is a
+// perfectly good thing to point Claude at. `editors.has(rel)` stays, but only
+// on the Edit branch: `editors` holds textareas, so a Preview tab never has an
+// entry, and keeping that test unconditional would leave this returning null
+// for every Preview tab — the feature would look implemented and do nothing.
 function mentionTarget() {
   const el = document.activeElement;
   if (el && el.classList && el.classList.contains("editor")) {
-    for (const [rel, ta] of editors) if (ta === el) return rel;
+    for (const [rel, ta] of editors) if (ta === el) return { rel, mode: "Edit" };
   }
   for (const p of [MIDDLE, RIGHT]) {
     const pane = state && state.panes && state.panes[p];
     const tab = pane && pane.tabs[pane.active];
-    if (tab && tab.k === "File" && tab.mode === "Edit" && editors.has(tab.rel)) return tab.rel;
+    if (!tab || tab.k !== "File") continue;
+    if (tab.mode === "Edit") {
+      // An Edit tab whose textarea has not mounted yet is not a target; fall
+      // through to the other pane, exactly as this did before.
+      if (editors.has(tab.rel)) return { rel: tab.rel, mode: "Edit" };
+      continue;
+    }
+    return { rel: tab.rel, mode: tab.mode };
   }
   return null;
 }
@@ -1773,14 +1806,33 @@ function mentionSelection(rel) {
 }
 
 // Alt+K, matching the extensions' own binding. The selection's line range
-// travels; the text does not (that is Task 9, and it is opt-in).
+// travels; the text does not (that is ShareSelection, and it is opt-in).
 document.addEventListener("keydown", (e) => {
   if (!e.altKey || e.key.toLowerCase() !== "k") return;
-  const rel = mentionTarget();
-  if (rel === null) return;
+  const target = mentionTarget();
+  if (target === null) {
+    // Alt+K is Meta-k in readline, so a keystroke aimed at a shell must not
+    // raise a banner about tabs. Only a keystroke with nowhere to go and no
+    // terminal under it is worth reporting.
+    if (e.target && e.target.closest && e.target.closest(".xterm")) return;
+    // Silence here is indistinguishable from a broken binding, which is how
+    // this was reported in the first place.
+    showError("Alt+K mentions the file in the active tab — open a file first.");
+    return;
+  }
   e.preventDefault();
-  const sel = mentionSelection(rel);
-  send({ t: "MentionPath", rel, line_start: sel.startLine, line_end: sel.endLine });
+  // A Preview tab has no textarea and no source-line mapping, so it mentions
+  // the whole file. See the spec's "Why a preview carries no line range".
+  const sel = target.mode === "Edit"
+    ? mentionSelection(target.rel)
+    : { startLine: null, endLine: null };
+  send({
+    t: "MentionPath",
+    rel: target.rel,
+    line_start: sel.startLine,
+    line_end: sel.endLine,
+    session: activeTerminalSession(),
+  });
 });
 
 // --- selection sharing (opt-in, off by default — see SHARE_SELECTION) ------
@@ -1812,9 +1864,9 @@ document.addEventListener("selectionchange", () => {
   if (!SHARE_SELECTION) return; // cheapest possible no-op for the common case
   clearTimeout(shareSelectionTimer);
   shareSelectionTimer = setTimeout(() => {
-    const rel = mentionTarget(); // same "which editor" rule Alt+K uses
-    if (rel === null) return;
-    const sel = shareSelectionSnapshot(rel);
+    const target = mentionTarget(); // same "which tab" rule Alt+K uses
+    if (target === null || target.mode !== "Edit") return;
+    const sel = shareSelectionSnapshot(target.rel);
     if (!sel) return;
     send({
       t: "ShareSelection", rel: sel.rel, text: sel.text,
@@ -2224,6 +2276,7 @@ function markSessionNoticesRead(session) {
 // Both paths are ordinary intents, so every connected client follows.
 function focusSession(session) {
   if (!session || !SESSION_RE.test(session) || !state) return;
+  lastFocusedSession = session;
   markSessionNoticesRead(session);
   for (let pi = 0; pi < state.panes.length; pi++) {
     const ti = state.panes[pi].tabs.findIndex((t) => t.k === "Terminal" && t.session === session);
