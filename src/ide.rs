@@ -1000,10 +1000,10 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
     // injected into the callback right after the `map.entry(...).push(...)`
     // line below, a fake client's connect attempt drove the callback to
     // register and then panic; the panic unwound through `serve_conn` with
-    // no `guard` yet in scope, and a follow-up `mention(project, ...)`
-    // returned `Ok(())` — a leaked, undeliverable target. Moving this
+    // no `guard` yet in scope, and a follow-up `mention_to(project, None,
+    // ...)` returned `Ok(())` — a leaked, undeliverable target. Moving this
     // declaration back to here (unchanged) with the same injected panic
-    // still in place made the same `mention` call correctly return
+    // still in place made the same `mention_to` call correctly return
     // `Err("no Claude is connected to this project")`. Both the panic and
     // the temporary test used to observe this were removed afterward.
     let guard = ConnGuard { project: project.to_string(), id: conn_id };
@@ -2253,7 +2253,7 @@ mod tests {
         assert!(v["params"].get("lineStart").is_none());
     }
 
-    /// Revert-checked: disabling `mention`'s `targets.is_empty()` check (so
+    /// Revert-checked: disabling `notify_selected`'s `total == 0` check (so
     /// an empty target list falls through to `Ok(())` instead of refusing)
     /// failed this test — `called Result::unwrap_err() on an Ok value: ()` —
     /// and, for the same reason, also failed the sibling
@@ -2594,13 +2594,13 @@ mod tests {
 
     #[test]
     // Revert-checked: deleting `notify_all`'s `targets.is_empty()` check (so
-    // an empty target list falls through to `Ok(())`) failed this test along
-    // with the three pre-existing tests over the same shared function —
-    // `mentioning_with_no_claude_connected_is_an_error_not_a_panic`,
-    // `a_dropped_connection_deregisters_so_a_later_mention_reports_no_claude`,
-    // and hub.rs's `mention_path_refusal_reaches_only_the_client_that_asked`
-    // — all legitimate hits on the one break in shared code, not evidence of
-    // a false positive (see CLAUDE.md's note on this exact pattern). Restored.
+    // an empty target list falls through to `Ok(())`) failed only this test
+    // — `called Result::unwrap_err() on an Ok value: ()`. `mention_to` now
+    // routes through the separate `notify_selected`, with its own `total ==
+    // 0` check (see the revert-check on that function's tests instead), so
+    // the mention tests that once shared this collateral no longer do; this
+    // is the last caller of `notify_all` that can hit an empty target list
+    // (the direct-call fan-out test above always registers two). Restored.
     fn selection_sharing_with_no_claude_connected_is_an_error_not_a_panic() {
         let (_envg, _cfg) = opt_in(true);
         let _d = tempfile::tempdir().unwrap();
@@ -2611,13 +2611,13 @@ mod tests {
     }
 
     #[test]
-    // Same fanout guarantee `mention` already has, and the same reason it
+    // Same fanout guarantee `mention_to` already has, and the same reason it
     // needs two subscribers to prove: with one, "send to all" and "send to
     // the first" are indistinguishable.
     //
-    // Revert-checked: changing `notify_all`'s `for (_, t) in &targets` to
-    // `targets.first()` failed this test alongside the pre-existing
-    // `a_mention_reaches_every_connected_claude_not_just_the_first` — both
+    // Revert-checked: changing `notify_all`'s `for t in &targets` to
+    // `if let Some(t) = targets.first()` failed this test alongside the
+    // direct-call `notify_all_still_reaches_every_connected_claude` — both
     // legitimate hits on the one break in the now-shared fan-out loop.
     // Restored.
     fn a_shared_selection_reaches_every_connected_claude_not_just_the_first() {

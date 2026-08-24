@@ -3320,13 +3320,13 @@ mod tests {
         std::env::remove_var("RESH_STATE_DIR");
     }
 
-    /// Confinement runs before the notification ever reaches `ide::mention`:
+    /// Confinement runs before the notification ever reaches `ide::mention_to`:
     /// a path that escapes the project must be refused by `safe_resolve`
     /// itself, not silently forwarded — there being no listening Claude in
     /// this test would otherwise make an escape indistinguishable from an
     /// ordinary "resolved fine, nobody's connected" refusal.
     ///
-    /// Revert-checked: swapping the arm order so `ide::mention` runs first
+    /// Revert-checked: swapping the arm order so `ide::mention_to` runs first
     /// against the raw `rel` (bypassing `safe_resolve` entirely) failed this
     /// test — the refusal's message became `"no Claude is connected to this
     /// project"`, tripping the `!m.contains("no Claude")` assertion, i.e. the
@@ -3398,14 +3398,14 @@ mod tests {
     /// turned into a whole-file mention (the old `Option::zip` behavior) or
     /// a guessed single line. The refusal message is checked specifically —
     /// not just `contains("Error")` — because "no Claude is connected"
-    /// (from `ide::mention`, reached only if this check is skipped) would
+    /// (from `ide::mention_to`, reached only if this check is skipped) would
     /// also satisfy a looser assertion, and this test exists to prove the
-    /// rejection happens *before* `ide::mention`, on this exact input shape.
+    /// rejection happens *before* `ide::mention_to`, on this exact input shape.
     ///
     /// Revert-checked: reverting the match arm back to
     /// `let lines = line_start.zip(line_end);` failed this test — the
     /// asker's inbox held only `{"t":"Error","msg":"no Claude is connected
-    /// to this project"}` (from `ide::mention`, since `zip` silently turned
+    /// to this project"}` (from `ide::mention_to`, since `zip` silently turned
     /// the half-specified range into `None`), so `got.iter().any(|m|
     /// m.contains("line_start") ...)` was false — then restored.
     #[test]
