@@ -1822,8 +1822,19 @@ function mentionSelection(rel) {
 
 // Alt+K, matching the extensions' own binding. The selection's line range
 // travels; the text does not (that is ShareSelection, and it is opt-in).
+//
+// `e.code` first, and that is the whole binding on macOS. Option there is a
+// character-composing modifier, not a plain one: Option+K emits "˚" (U+02DA
+// on the US layout), so `e.key` is never "k" and an `e.key`-only guard means
+// this shortcut simply does not exist on a Mac. It shipped that way and was
+// reported from real use. The vendored xterm carries a `macOptionIsMeta`
+// option for the same underlying reason.
+//
+// `e.key` is kept as an alternative rather than replaced: `e.code` names a
+// physical position, so on a layout where "k" is not where QWERTY puts it,
+// the key the user thinks of as K still works.
 document.addEventListener("keydown", (e) => {
-  if (!e.altKey || e.key.toLowerCase() !== "k") return;
+  if (!e.altKey || (e.code !== "KeyK" && e.key.toLowerCase() !== "k")) return;
   const target = mentionTarget();
   if (target === null) {
     // Alt+K is Meta-k in readline, so a keystroke aimed at a shell must not

@@ -547,6 +547,34 @@ try {
   ok(await until(() => evalIn(`!!document.querySelector("textarea.editor")`), 10, "the mention file's editor, reopened"),
      "the mention file's editor is back for section F to reuse");
 
+  // macOS sends Option+K as a COMPOSED CHARACTER, not as "k": Option is a
+  // character-composing modifier there, so `e.key` is "˚" (U+02DA on the US
+  // layout) while `e.code` stays "KeyK". A handler matching on `e.key` alone
+  // therefore never fires on a Mac — which is how this shipped broken and was
+  // reported from real use.
+  //
+  // Every other dispatch in this file passes `key: "k"`, because CDP sets
+  // `e.key` directly and bypasses the OS keyboard layer entirely. That is
+  // precisely why no existing test could catch this: they are all green on
+  // Linux AND would be green on a Mac. This one dispatches what the Mac
+  // actually produces.
+  const beforeMacK = claude.log.length;
+  for (const type of ["rawKeyDown", "keyUp"]) {
+    await cmd("Input.dispatchKeyEvent", {
+      type, modifiers: 1 /* Alt */, key: "˚", code: "KeyK",
+      windowsVirtualKeyCode: 75, nativeVirtualKeyCode: 75,
+    });
+  }
+  // Sliced from the pre-dispatch length, not searched from the start: section
+  // E already put an at_mentioned for this same file in the log, so a plain
+  // find() would match that one and pass with the bug fully present.
+  const macMention = await poll(
+    () => claude.log.slice(beforeMacK).find(
+      (m) => m.method === "at_mentioned" && (m.params?.filePath || "").endsWith(MENTION_FILE)),
+    10, "an at_mentioned from a macOS-style Option+K",
+  );
+  ok(macMention, "Option+K on macOS, where e.key is the composed character, still mentions the file");
+
   console.log("\nF. selection sharing: the header says so, and a selection reaches Claude as selection_changed");
   // The visible half of the "off by default, visible when on" contract —
   // this project opted in before the page ever loaded (see the config.toml
@@ -617,24 +645,32 @@ try {
   // activeTerminalSession fell back to live[0] (the bug Fix 3 in this wave
   // addresses), it would name session2 here instead, since RIGHT's pane
   // index sorts after LEFT_BOTTOM's.
-  await evalIn(`terms.get("term").term.focus()`);
-  ok(await until(() => evalIn(`lastFocusedSession === "term"`), 10, "right-pane focus recorded"),
-     "focusing back into the right-pane terminal updates lastFocusedSession again");
-
-  // A render shortly after switching panes can transiently steal focus back
-  // (observed directly: a flake reproduced by hand showed `lastFocusedSession`
-  // flip to session2 again a few hundred ms after the check above, before
-  // Alt+K ever dispatched) — so this settles by re-focusing and re-checking
-  // against real DOM focus, not app.js's own bookkeeping, until it holds.
-  let settled = false;
-  for (let i = 0; i < 20 && !settled; i++) {
-    await evalIn(`terms.get("term").term.focus()`);
-    await sleep(150);
-    settled = await evalIn(
+  // Re-focus on EVERY poll rather than focusing once and then watching. A
+  // render shortly after switching panes can steal focus back, and a passive
+  // `until` cannot recover from that — it just watches the wrong element stay
+  // focused until it times out. That is not hypothetical: this test failed
+  // exactly that way in a full-suite run (`focusing back into the right-pane
+  // terminal updates lastFocusedSession again`) while passing in isolation.
+  //
+  // Two CONSECUTIVE holds, and the second one without re-focusing first: one
+  // passing check can land in the window between a steal and the next
+  // re-focus, which is a pass that proves nothing. Requiring it to still hold
+  // on the following poll, unaided, is what distinguishes "focus is settled
+  // here" from "focus was here for an instant".
+  //
+  // Checked against real DOM focus as well as app.js's own bookkeeping, so a
+  // `lastFocusedSession` that is merely stale cannot satisfy it.
+  let holds = 0;
+  for (let i = 0; i < 40 && holds < 2; i++) {
+    if (holds === 0) await evalIn(`terms.get("term").term.focus()`);
+    await sleep(100);
+    const held = await evalIn(
       `lastFocusedSession === "term" && document.activeElement?.closest("[data-session]")?.dataset.session === "term"`,
     );
+    holds = held ? holds + 1 : 0;
   }
-  ok(settled, "focus on the right-pane terminal settles before Alt+K is dispatched");
+  ok(holds >= 2,
+     "focusing back into the right-pane terminal records it, and that focus holds before Alt+K dispatches");
 
   // `send` is a plain top-level function, not a module export, so wrapping
   // window.send here intercepts every call the page makes from this point
