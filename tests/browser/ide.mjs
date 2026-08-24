@@ -191,6 +191,7 @@ const ACCEPT_FILE = "accept-me.txt";
 const REJECT_FILE = "reject-me.txt";
 const EDIT_FILE = "edit-me.txt";
 const MENTION_FILE = "mention-me.txt";
+const PREVIEW_FILE = "preview-me.md";
 const acceptOld = "alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\ngolf\n";
 const acceptNew = acceptOld.replace("delta\n", "DELTA CHANGED\n");
 const editOld = "one\ntwo\nthree\n";
@@ -201,6 +202,7 @@ await Deno.writeTextFile(`${projectDir}/${ACCEPT_FILE}`, acceptOld);
 await Deno.writeTextFile(`${projectDir}/${REJECT_FILE}`, rejectOld);
 await Deno.writeTextFile(`${projectDir}/${EDIT_FILE}`, editOld);
 await Deno.writeTextFile(`${projectDir}/${MENTION_FILE}`, "aaa\nbbb\nccc\nddd\neee\n");
+await Deno.writeTextFile(`${projectDir}/${PREVIEW_FILE}`, "# Heading\n\nSome prose.\n");
 // Opts this project into selection sharing before the page ever loads: it is
 // embedded once per page load (render.rs's data-share-selection), so writing
 // this after openPage would not be seen without a reload. Off is the default
@@ -472,6 +474,78 @@ try {
   ok(mentioned?.params?.lineStart === 2 && mentioned?.params?.lineEnd === 3,
      `it carries the selected line range (2-3), got ${JSON.stringify(mentioned?.params)}`);
   ok(mentioned && !("id" in mentioned), "at_mentioned is a notification (no id), not something resh expects an answer to");
+
+  console.log("\nH. Alt+K mentions a markdown file from its Preview tab");
+  // The regression this guards: mentionTarget used to require mode === "Edit"
+  // AND editors.has(rel). A Preview tab satisfies neither, so Alt+K silently
+  // did nothing. "No error appeared" is equally true of a handler that
+  // returned null, so this asserts the notification itself arrived AND that
+  // it names this file — per tests/browser/README.md's trap list.
+  await evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: ${JSON.stringify(PREVIEW_FILE)}, mode: "Preview" } })`);
+  ok(await until(() => evalIn(`!!document.querySelector("article.markdown-body")`), 10, "the rendered preview"),
+     "the markdown file opens in a preview, not an editor");
+  ok(await evalIn(`!document.querySelector("textarea.editor")`),
+     "and there is no textarea — otherwise this is testing the Edit path by accident");
+
+  // Select a run of rendered text. It must NOT produce a line range: rendered
+  // markdown has no source-line mapping, and a guessed range is worse than none.
+  await evalIn(`(() => {
+    const p = document.querySelector("article.markdown-body p");
+    const r = document.createRange();
+    r.selectNodeContents(p);
+    const s = window.getSelection();
+    s.removeAllRanges();
+    s.addRange(r);
+  })()`);
+  for (const type of ["rawKeyDown", "keyUp"]) {
+    await cmd("Input.dispatchKeyEvent", {
+      type, modifiers: 1 /* Alt */, key: "k", code: "KeyK",
+      windowsVirtualKeyCode: 75, nativeVirtualKeyCode: 75,
+    });
+  }
+  const previewed = await poll(
+    () => claude.log.find((m) => m.method === "at_mentioned" && (m.params?.filePath || "").endsWith(PREVIEW_FILE)),
+    10, "the at_mentioned notification for the previewed file",
+  );
+  ok(previewed, "Alt+K in a Preview tab reaches Claude");
+  ok(previewed?.params?.lineStart === undefined && previewed?.params?.lineEnd === undefined,
+     `a preview selection carries no line range, got ${JSON.stringify(previewed?.params)}`);
+
+  // A second, related property no Rust test can reach: closing every File
+  // tab this run has opened leaves mentionTarget() with nothing to return —
+  // and Alt+K must say so with a banner, not do nothing. "Nothing happened"
+  // is exactly what a silently-broken binding also looks like, which is why
+  // this asserts the banner's text, not just its presence.
+  await evalIn(`send({ t: "CloseTab", pane: 2, idx: 1 })`); // the just-opened Preview tab
+  ok(await until(() => evalIn(`state.panes[2].tabs.length === 1`), 10, "preview tab closed"),
+     "the preview tab closes");
+  await evalIn(`send({ t: "CloseTab", pane: 2, idx: 0 })`); // the Edit tab section E opened
+  ok(await until(() => evalIn(`state.panes[2].tabs.length === 0`), 10, "mention tab closed"),
+     "the mention tab closes too, leaving pane 2 with no File tab");
+  ok(await evalIn(`!state.panes.some((p) => { const t = p.tabs[p.active]; return t && t.k === "File"; })`),
+     "and confirms no pane anywhere still has an active File tab (the RIGHT pane's own Terminal tab is untouched)");
+  // Blur first: a still-focused terminal makes Alt+K "aimed at readline" (see
+  // app.js's own guard), which is a different, deliberately silent case from
+  // the one under test here — nothing left to aim at, with focus elsewhere.
+  await evalIn(`document.activeElement && document.activeElement.blur && document.activeElement.blur()`);
+  for (const type of ["rawKeyDown", "keyUp"]) {
+    await cmd("Input.dispatchKeyEvent", {
+      type, modifiers: 1 /* Alt */, key: "k", code: "KeyK",
+      windowsVirtualKeyCode: 75, nativeVirtualKeyCode: 75,
+    });
+  }
+  ok(await until(() => evalIn(`!!document.querySelector(".error-banner")`), 10, "the no-target banner"),
+     "Alt+K with no File tab open anywhere raises a banner instead of doing nothing");
+  const banner = await evalIn(`(document.querySelector(".error-banner") || {}).textContent || ""`);
+  ok(banner.includes("Alt+K mentions the file in the active tab"),
+     `the banner explains what Alt+K needs, got ${JSON.stringify(banner)}`);
+
+  // Section F below reuses MENTION_FILE's editor, so reopen it — this run's
+  // way of tearing down the "no target" state it just built, not something
+  // section F should have to know about.
+  await evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: ${JSON.stringify(MENTION_FILE)}, mode: "Edit" } })`);
+  ok(await until(() => evalIn(`!!document.querySelector("textarea.editor")`), 10, "the mention file's editor, reopened"),
+     "the mention file's editor is back for section F to reuse");
 
   console.log("\nF. selection sharing: the header says so, and a selection reaches Claude as selection_changed");
   // The visible half of the "off by default, visible when on" contract —
