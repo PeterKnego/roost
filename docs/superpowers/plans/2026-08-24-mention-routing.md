@@ -162,14 +162,16 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Declare the module**
+
+In `src/lib.rs`, add `pub mod idesess;` after `pub mod idelock;` (line 12), keeping the list's alphabetical order. **`pub mod`, not `mod`** — all 34 modules there are `pub mod`.
+
+This comes *before* the first test run on purpose. An undeclared module file is never compiled, so running the suite first would report `0 tests` and exit 0 — a red phase that cannot go red, which is the vacuous-test failure mode CLAUDE.md catalogues.
+
+- [ ] **Step 3: Run the tests to verify they fail**
 
 Run: `cargo test --lib idesess`
-Expected: FAIL — the module is not declared in `lib.rs` yet, so this is a compile error (`failed to resolve: use of undeclared crate or module`). That is the correct first failure.
-
-- [ ] **Step 3: Declare the module**
-
-In `src/lib.rs`, add `mod idesess;` alongside the existing `mod idecwd;` declaration, keeping the list's existing alphabetical order (`idecwd` then `idelock` — `idesess` goes after `idelock`).
+Expected: FAIL to compile — `cannot find function session_of_in in this scope`, `cannot find type Sess in this scope`. Nine test functions, all unresolved.
 
 - [ ] **Step 4: Write the implementation**
 
@@ -730,8 +732,8 @@ pub fn mention_to(
     notify_selected(project, session, &msg)
 }
 
-/// An unaimed mention. Kept so existing callers and tests that do not care
-/// about terminals read the same as before.
+/// An unaimed mention. Temporary: `hub.rs:1270` still calls it at the end of
+/// this task, and Task 4 deletes it once that call site moves to `mention_to`.
 pub fn mention(project: &str, abs: &Path, lines: Option<(u32, u32)>) -> Result<(), String> {
     mention_to(project, None, abs, lines)
 }
@@ -925,15 +927,33 @@ Rust requires every field on a struct-variant literal, so `#[serde(default)]` do
         // session: None — this test is about path confinement, not routing.
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 6: Delete `ide::mention`, now that nothing in production calls it**
 
-Run: `cargo test`
-Expected: PASS, 0 failed.
+`hub.rs:1270` was its only non-production-test caller and Step 4 just moved it to `mention_to`. A `pub fn` kept alive solely by its own tests is dead code, and keeping it to avoid touching three call sites is the wrong trade — an unaimed mention reads better as `mention_to(project, None, ...)` anyway, because the `None` is the decision, spelled out.
 
-- [ ] **Step 7: Commit**
+Delete the `pub fn mention` wrapper from `src/ide.rs` and rewrite its remaining call sites in that file's tests to pass `None` explicitly. Find them with:
 
 ```bash
-git add src/proto.rs src/hub.rs
+grep -n "mention(" src/ide.rs
+```
+
+Expected call sites: `mention_shape` (~`src/ide.rs:2115`), `mention_wholefile` (~`:2133`), and `a_dropped_connection_deregisters_so_a_later_mention_reports_no_claude` (~`:2199`, which calls it twice). Each becomes `mention_to(project, None, path, lines)`. Do not change what those tests assert.
+
+- [ ] **Step 7: Run the tests to verify they pass**
+
+Run: `cargo test`
+Expected: PASS, 0 failed. Also confirm no dead-code warning remains:
+
+```bash
+cargo build 2>&1 | grep -i "never used"
+```
+
+Expected: no output.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/proto.rs src/hub.rs src/ide.rs
 git commit -m "mention: carry the terminal the browser had in focus"
 ```
 
