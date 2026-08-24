@@ -2014,6 +2014,43 @@ if (bell) {
     renderNotices();
   };
 }
+
+// Header control buttons must not steal keyboard focus from the terminal or
+// the editor. Glancing at notifications, or opening the worktree switcher,
+// should leave you still typing where you were — but a <button> grabs focus
+// on mousedown by default, so the next keystroke went to the button instead
+// of the shell. Preventing that one default keeps focus put; the click still
+// fires, and Tab-to-focus is untouched, so keyboard users are not locked out.
+// (The pane-header icons are <span>s, which are not focusable, so they never
+// had this problem — only these real buttons do.)
+for (const id of ["projbtn", "wtbtn", "bell", "settings", "refresh", "closeproj"]) {
+  const b = document.getElementById(id);
+  if (b) b.addEventListener("mousedown", (e) => e.preventDefault());
+}
+
+// Any open header popup closes when you click outside it and its trigger.
+// Capture phase for two reasons: it runs before xterm (or any inner handler)
+// can stopPropagation the event, and it runs before the trigger's own click
+// toggles the panel — so a click on the trigger is seen as "inside the
+// trigger" and left alone, and opening a popup never immediately re-closes it.
+const HEADER_POPUPS = [
+  ["projbtn", "projpanel"],
+  ["wtbtn", "wtpanel"],
+  ["bell", "noticepanel"],
+];
+document.addEventListener(
+  "mousedown",
+  (e) => {
+    for (const [btnId, panelId] of HEADER_POPUPS) {
+      const panel = document.getElementById(panelId);
+      const btn = document.getElementById(btnId);
+      if (panel && !panel.hidden && !panel.contains(e.target) && btn && !btn.contains(e.target)) {
+        panel.hidden = true;
+      }
+    }
+  },
+  true,
+);
 setFavicon(false);
 
 // A notification click can land on a cold load; consume the fragment once and
