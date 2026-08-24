@@ -165,7 +165,7 @@ main { flex: 1; min-height: 0; }
 .tabstrip::-webkit-scrollbar { width: 6px; height: 6px; }
 .tabstrip::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 .tabstrip::-webkit-scrollbar-track { background: transparent; }
-.tabstrip .tab { display: flex; align-items: center; gap: 3px; height: 24px; padding: 0 5px 0 7px;
+.tabstrip .tab { display: flex; align-items: center; gap: 3px; height: 24px; padding: 0 5px;
                  border-radius: 6px; cursor: pointer; white-space: nowrap; color: var(--muted);
                  position: relative; }
 .tabstrip .tab:hover { color: var(--fg); background: var(--tab-hover); }
