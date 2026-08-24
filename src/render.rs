@@ -480,12 +480,95 @@ pub fn changes_fragment(project: &str, st: &Status) -> String {
 // marker there, so a second textual "⎇ " here would double it. The other
 // three renderers of a branch name (projects_strip, worktrees_strip, the
 // picker) have no icon beside their rows and keep the "⎇ " prefix.
+/// Categorise a porcelain-v2 XY code. X (index) and Y (worktree) are each a
+/// real status letter or `.` for unchanged; an untracked entry is the
+/// synthetic "??" the parser emits. A file can be both staged and modified
+/// (e.g. "MM"), and is counted in both — matching what `git diff --cached`
+/// and `git diff` report separately, which is the convention the reference
+/// statusline follows.
+fn categorise(xy: &str) -> (bool, bool, bool) {
+    if xy == "??" {
+        return (false, false, true); // untracked
+    }
+    let mut cs = xy.chars();
+    let staged = cs.next().is_some_and(|x| x != '.'); // index side
+    let modified = cs.next().is_some_and(|y| y != '.'); // worktree side
+    (staged, modified, false)
+}
+
+/// The header chip's git status, in the shape a developer's shell prompt uses:
+/// `branch ● +staged ~modified ↑ahead ↓behind`. The bullet is the at-a-glance
+/// signal — red when the tree is dirty, green when clean — and each count is
+/// omitted when zero, so a clean, up-to-date branch is just its name and a
+/// green dot. A plain-language `title` on the wrapper spells the same state
+/// out for hover, because a row of coloured glyphs explains nothing to
+/// someone who has not memorised the convention.
 pub fn status_fragment(st: &Status) -> String {
-    format!(
-        "<span id=\"branch\">{}</span><span id=\"badge\">{}</span>",
-        if st.branch.is_empty() { String::new() } else { esc(&st.branch) },
-        if st.changes.is_empty() { String::new() } else { format!("({})", st.changes.len()) }
-    )
+    if st.branch.is_empty() {
+        // Not a git repo (or git could not answer): render nothing rather
+        // than an empty dirty/clean claim.
+        return String::new();
+    }
+    let (mut staged, mut modified, mut untracked) = (0u32, 0u32, 0u32);
+    for c in &st.changes {
+        let (s, m, u) = categorise(&c.xy);
+        staged += s as u32;
+        modified += m as u32;
+        untracked += u as u32;
+    }
+    let dirty = staged + modified + untracked > 0;
+
+    let mut parts = format!("<span id=\"branch\">{}</span>", esc(&st.branch));
+    parts.push_str(&format!(
+        " <span class=\"gbullet {}\">●</span>",
+        if dirty { "dirty" } else { "clean" }
+    ));
+    if staged > 0 {
+        parts.push_str(&format!(" <span class=\"gstaged\">+{staged}</span>"));
+    }
+    if modified > 0 {
+        parts.push_str(&format!(" <span class=\"gmod\">~{modified}</span>"));
+    }
+    // Untracked has no count glyph of its own (it would crowd the chip); it
+    // reddens the bullet and is named in the tooltip. The reference statusline
+    // makes the same call.
+    if st.ahead > 0 {
+        parts.push_str(&format!(" <span class=\"gahead\">↑{}</span>", st.ahead));
+    }
+    if st.behind > 0 {
+        parts.push_str(&format!(" <span class=\"gbehind\">↓{}</span>", st.behind));
+    }
+
+    // The tooltip: the same state as a sentence. Built from the same numbers,
+    // so it can never disagree with the glyphs.
+    let mut bits: Vec<String> = Vec::new();
+    if staged > 0 {
+        bits.push(format!("{staged} staged"));
+    }
+    if modified > 0 {
+        bits.push(format!("{modified} modified"));
+    }
+    if untracked > 0 {
+        bits.push(format!("{untracked} untracked"));
+    }
+    let changed = if bits.is_empty() { "working tree clean".to_string() } else { bits.join(", ") };
+    let sync = if st.upstream.is_empty() {
+        "no upstream set".to_string()
+    } else if st.ahead == 0 && st.behind == 0 {
+        format!("up to date with {}", st.upstream)
+    } else {
+        let mut ab = Vec::new();
+        if st.ahead > 0 {
+            ab.push(format!("{} ahead", st.ahead));
+        }
+        if st.behind > 0 {
+            ab.push(format!("{} behind", st.behind));
+        }
+        format!("{} {}", ab.join(", "), st.upstream)
+    };
+    let title = esc(&format!("On {} · {changed} · {sync}", st.branch));
+
+    format!("<span id=\"gitstatus\" title=\"{title}\">{parts}</span>")
 }
 
 /// Breadcrumb for the directory picker: "resh" always links back to the
@@ -1514,19 +1597,74 @@ mod tests {
         let st = Status {
             branch: "main".into(),
             changes: vec![crate::gitio::Change { xy: ".M".into(), path: "a.txt".into() }],
+            ..Default::default()
         };
         let c = changes_fragment("proj", &st);
         assert!(c.contains("full diff"));
         assert!(c.contains("class=\"xy\""));
         assert!(c.contains("hx-get=\"/frag/proj/diff?path=a.txt\""));
         let s = status_fragment(&st);
-        assert!(s.contains("main"));
-        assert!(s.contains("(1)"));
+        assert!(s.contains(r#"id="branch">main"#), "{s}");
+        // One unstaged modification (".M") → the ~1 glyph and a dirty bullet,
+        // no staged glyph.
+        assert!(s.contains("gbullet dirty") || s.contains(r#"gbullet dirty"#), "{s}");
+        assert!(s.contains("~1"), "{s}");
+        assert!(!s.contains("+1"), "nothing is staged: {s}");
         // The chip draws the branch icon as SVG, so a text ⎇ here would double
         // the marker.
         assert!(!s.contains("⎇"), "{s}");
-        let clean = changes_fragment("proj", &Status { branch: "main".into(), changes: vec![] });
+        let clean = changes_fragment("proj", &Status { branch: "main".into(), changes: vec![], ..Default::default() });
         assert!(clean.contains("working tree clean"));
+    }
+
+    #[test]
+    fn status_fragment_reports_the_git_state_like_a_shell_prompt() {
+        use crate::gitio::{Change, Status};
+        let ch = |xy: &str| Change { xy: xy.into(), path: "p".into() };
+        // Staged add ("A."), staged+unstaged modify ("MM" = one staged AND one
+        // modified), a plain unstaged modify (".M"), and an untracked file.
+        let st = Status {
+            branch: "feat/x".into(),
+            changes: vec![ch("A."), ch("MM"), ch(".M"), ch("??")],
+            ahead: 3,
+            behind: 1,
+            upstream: "origin/main".into(),
+        };
+        let s = status_fragment(&st);
+        // A.=staged, MM=staged+modified, .M=modified → +2 staged, ~2 modified.
+        assert!(s.contains("+2"), "two staged: {s}");
+        assert!(s.contains("~2"), "two modified: {s}");
+        assert!(s.contains("↑3") && s.contains("↓1"), "ahead/behind: {s}");
+        assert!(s.contains("gbullet dirty"), "{s}");
+        // The tooltip spells the same state, untracked included (it has no glyph).
+        assert!(s.contains("2 staged, 2 modified, 1 untracked"), "tooltip counts: {s}");
+        assert!(s.contains("3 ahead, 1 behind origin/main"), "tooltip sync: {s}");
+
+        // Clean and up to date: green bullet, no count glyphs, calm tooltip.
+        let clean = Status {
+            branch: "main".into(),
+            changes: vec![],
+            ahead: 0,
+            behind: 0,
+            upstream: "origin/main".into(),
+        };
+        let c = status_fragment(&clean);
+        assert!(c.contains("gbullet clean"), "{c}");
+        assert!(!c.contains('+') && !c.contains('~') && !c.contains('↑'), "no glyphs when clean: {c}");
+        assert!(c.contains("working tree clean · up to date with origin/main"), "{c}");
+
+        // A branch with no upstream says so rather than claiming sync.
+        let solo = Status { branch: "wip".into(), upstream: String::new(), ..Default::default() };
+        assert!(status_fragment(&solo).contains("no upstream set"), "{}", status_fragment(&solo));
+
+        // Not a repo → nothing, never a false "clean".
+        assert_eq!(status_fragment(&Status::default()), "");
+
+        // A hostile branch name is escaped in both the body and the title.
+        let evil = Status { branch: "a\"><script>".into(), ..Default::default() };
+        let e = status_fragment(&evil);
+        assert!(!e.contains("<script>"), "{e}");
+        assert!(e.contains("&lt;script&gt;"), "{e}");
     }
 
     // app.js resolves `ws.show_hidden ?? SHOW_HIDDEN_DEFAULT`, and this
@@ -1785,7 +1923,7 @@ mod tests {
         let s = Settings::default();
         let h = workspace_page("a\"><script>", "a\"><script>", &s, None, false, &[]);
         assert!(!h.contains("a\"><script>"));
-        let c = changes_fragment("a\"><script>", &Status { branch: String::new(), changes: vec![crate::gitio::Change { xy: "??".into(), path: "x".into() }] });
+        let c = changes_fragment("a\"><script>", &Status { branch: String::new(), changes: vec![crate::gitio::Change { xy: "??".into(), path: "x".into() }], ..Default::default() });
         assert!(!c.contains("\"><script>"));
     }
 

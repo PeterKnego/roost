@@ -8,9 +8,19 @@ pub struct Change {
     pub path: String,
 }
 
+#[derive(Default)]
 pub struct Status {
     pub branch: String,
     pub changes: Vec<Change>,
+    /// Commits the local branch is ahead of / behind its upstream, and the
+    /// upstream's name. All from the same `--porcelain=v2 -b` output already
+    /// fetched — `# branch.ab +A -B` and `# branch.upstream NAME` — so this
+    /// costs no extra `git` invocation. Zero and empty when there is no
+    /// upstream (a fresh branch never pushed), which reads correctly as "no
+    /// divergence to report".
+    pub ahead: u32,
+    pub behind: u32,
+    pub upstream: String,
 }
 
 pub(crate) fn run_git(repo: &Path, args: &[&str], allow_exit_1: bool) -> Result<String, String> {
@@ -68,10 +78,26 @@ pub(crate) fn run_git(repo: &Path, args: &[&str], allow_exit_1: bool) -> Result<
 
 pub fn parse_status(porcelain: &str) -> Status {
     let mut branch = String::new();
+    let mut upstream = String::new();
+    let mut ahead = 0u32;
+    let mut behind = 0u32;
     let mut changes = Vec::new();
     for line in porcelain.lines() {
         if let Some(rest) = line.strip_prefix("# branch.head ") {
             branch = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("# branch.upstream ") {
+            upstream = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
+            // "+A -B" — a plus/minus token pair. Parse defensively: a token
+            // that does not match leaves its count at zero rather than
+            // guessing, since these gate what the header tells the user.
+            for tok in rest.split_whitespace() {
+                if let Some(n) = tok.strip_prefix('+') {
+                    ahead = n.parse().unwrap_or(0);
+                } else if let Some(n) = tok.strip_prefix('-') {
+                    behind = n.parse().unwrap_or(0);
+                }
+            }
         } else if line.starts_with("1 ") {
             // "1 XY sub mH mI mW hH hI path"
             let parts: Vec<&str> = line.splitn(9, ' ').collect();
@@ -89,7 +115,7 @@ pub fn parse_status(porcelain: &str) -> Status {
             changes.push(Change { xy: "??".into(), path: rest.to_string() });
         }
     }
-    Status { branch, changes }
+    Status { branch, changes, ahead, behind, upstream }
 }
 
 /// Gated on being inside *any* work tree, matching `is_inside_work_tree` and
@@ -214,10 +240,15 @@ mod tests {
     #[test]
     fn parses_ordinary_and_untracked_lines() {
         let p = "# branch.head main\n\
+                 # branch.upstream origin/main\n\
+                 # branch.ab +2 -1\n\
                  1 .M N... 100644 100644 100644 abc def a.txt\n\
                  ? b.txt\n";
         let st = parse_status(p);
         assert_eq!(st.branch, "main");
+        assert_eq!(st.upstream, "origin/main");
+        assert_eq!(st.ahead, 2);
+        assert_eq!(st.behind, 1);
         assert_eq!(st.changes.len(), 2);
         assert_eq!(st.changes[0].xy, ".M");
         assert_eq!(st.changes[0].path, "a.txt");

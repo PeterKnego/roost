@@ -446,7 +446,7 @@ fn serve_frag(
         },
         ["status"] => {
             let st = gitio::status(&dir)
-                .unwrap_or(gitio::Status { branch: String::new(), changes: vec![] });
+                .unwrap_or(gitio::Status { branch: String::new(), changes: vec![], ..Default::default() });
             http::html(w, &render::status_fragment(&st));
         }
         ["diff"] => {
