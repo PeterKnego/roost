@@ -561,8 +561,16 @@ try {
   const beforeMacK = claude.log.length;
   for (const type of ["rawKeyDown", "keyUp"]) {
     await cmd("Input.dispatchKeyEvent", {
-      type, modifiers: 1 /* Alt */, key: "˚", code: "KeyK",
-      windowsVirtualKeyCode: 75, nativeVirtualKeyCode: 75,
+      // Firefox on macOS, measured from a real browser on 2026-08-24:
+      //   {key: "˚", code: "", alt: true, keyCode: 0, which: 0}
+      // The physical key is simply ABSENT — empty `code`, zero `keyCode`,
+      // zero `which`. Chromium reports `code: "KeyK"` for the identical
+      // keystroke, which is why an earlier fix matching `e.code` worked
+      // everywhere it was tested and still did nothing on the machine that
+      // reported the bug. The composed character is the ONLY thing that
+      // identifies this keystroke to page JS in that browser.
+      type, modifiers: 1 /* Alt */, key: "˚", code: "",
+      windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0,
     });
   }
   // Sliced from the pre-dispatch length, not searched from the start: section

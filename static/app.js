@@ -1823,18 +1823,29 @@ function mentionSelection(rel) {
 // Alt+K, matching the extensions' own binding. The selection's line range
 // travels; the text does not (that is ShareSelection, and it is opt-in).
 //
-// `e.code` first, and that is the whole binding on macOS. Option there is a
-// character-composing modifier, not a plain one: Option+K emits "˚" (U+02DA
-// on the US layout), so `e.key` is never "k" and an `e.key`-only guard means
-// this shortcut simply does not exist on a Mac. It shipped that way and was
-// reported from real use. The vendored xterm carries a `macOptionIsMeta`
-// option for the same underlying reason.
+// Three ways to recognise one keystroke, because no single property covers
+// every browser. Option on macOS is a character-composing modifier, so
+// `e.key` is the composed glyph rather than "k" — and what the browser
+// reports *instead* differs:
 //
-// `e.key` is kept as an alternative rather than replaced: `e.code` names a
-// physical position, so on a layout where "k" is not where QWERTY puts it,
-// the key the user thinks of as K still works.
+//   Linux / Windows      key "k"   code "KeyK"   keyCode 75
+//   Chromium on macOS    key "˚"   code "KeyK"   keyCode 75
+//   Firefox on macOS     key "˚"   code ""       keyCode 0     <- measured
+//
+// The last row is the one that keeps biting. macOS exposes no scancode, so
+// Firefox derives `code` from the virtual keycode, which is 0 while Option
+// is held — mozilla bug 300678 / 44259, open for two decades. There is no
+// physical-key information in that event at all: the composed character is
+// the only thing identifying it, which is why it is matched literally here.
+//
+// "˚" is U+02DA and is what Option+K yields on the US layout. This is
+// therefore layout-specific by necessity, not by choice — on a layout where
+// Option+K composes something else, Firefox on macOS has nothing left to
+// match on. The durable answer for that case is a Cmd chord (Cmd does not
+// compose, and Firefox reports key and code correctly for it), not another
+// character literal.
 document.addEventListener("keydown", (e) => {
-  if (!e.altKey || (e.code !== "KeyK" && e.key.toLowerCase() !== "k")) return;
+  if (!e.altKey || (e.code !== "KeyK" && e.key.toLowerCase() !== "k" && e.key !== "˚")) return;
   const target = mentionTarget();
   if (target === null) {
     // Alt+K is Meta-k in readline, so a keystroke aimed at a shell must not
