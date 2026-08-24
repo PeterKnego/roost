@@ -2253,16 +2253,13 @@ mod tests {
         assert!(v["params"].get("lineStart").is_none());
     }
 
-    /// Revert-checked: disabling `notify_selected`'s `total == 0` check (so
-    /// an empty target list falls through to `Ok(())` instead of refusing)
-    /// failed this test — `called Result::unwrap_err() on an Ok value: ()` —
-    /// and, for the same reason, also failed the sibling
-    /// `a_dropped_connection_deregisters_so_a_later_mention_reports_no_claude`
-    /// test below, which exercises the same empty-target path from the other
-    /// direction (a connection that *was* registered and then deregistered,
-    /// rather than one that was never registered at all). Both are
-    /// legitimate hits on the one break, not evidence of a false positive —
-    /// see CLAUDE.md's note on the `ide_connected` notification test for the
+    /// Revert-checked: disabling `notify_selected`'s `total == 0` check failed
+    /// this test and its sibling below — both failed on the message assertion
+    /// `err.contains("no Claude")`, because an empty target list now falls
+    /// through to the ambiguity branch instead of succeeding, returning
+    /// "0 Claudes are connected…" rather than the expected "no Claude". Both
+    /// are legitimate hits on the one break, not evidence of a false positive
+    /// — see CLAUDE.md's note on the `ide_connected` notification test for the
     /// same pattern. Then restored.
     #[test]
     fn mentioning_with_no_claude_connected_is_an_error_not_a_panic() {
