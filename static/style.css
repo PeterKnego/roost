@@ -52,6 +52,10 @@ header .proj { font-weight: 500; }
    modified in the warn colour, behind dimmed. Slightly smaller and mono so
    the counts read as data, not prose. */
 #gitstatus { display: inline-flex; align-items: baseline; gap: 4px; }
+/* 11px, matching the +N/~N counts rather than the chip's 13px: the ● sat a
+   touch large and high, looming over the counts instead of sharing their
+   line. */
+#gitstatus .gbullet { font-size: 11px; }
 #gitstatus .gbullet.dirty { color: var(--del-fg); }
 #gitstatus .gbullet.clean { color: var(--add-fg); }
 #gitstatus .gstaged { color: var(--add-fg); font-family: var(--mono); font-size: 11px; }
