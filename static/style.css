@@ -297,10 +297,14 @@ main { flex: 1; min-height: 0; }
 .savebtn { font: inherit; font-size: 11px; line-height: 1.4; padding: 1px 8px; border-radius: 5px;
            cursor: pointer; border: 1px solid var(--border); background: none; color: var(--muted); }
 .savebtn:hover { color: var(--fg); background: var(--tab-hover); }
-/* The Edit/Preview switch in the filename stripe. The edit bar is a flex row
-   (order comes from the DOM); a preview's .path is a plain sticky block, so
-   there the button floats clear of the breadcrumb text. */
-.path .modebtn { float: right; margin-left: 8px; }
+/* The Edit/Preview switch in the filename stripe: a quiet icon button (eye
+   to preview, pencil to edit — the markup comes from app.js's MODE_ICONS).
+   The edit bar is a flex row (order comes from the DOM); a preview's .path
+   is a plain sticky block, so there the button floats clear of the text. */
+.path .modebtn { float: right; margin-left: 8px; display: flex; align-items: center;
+                 padding: 1px 6px; border-radius: 5px; border: 1px solid transparent;
+                 background: none; color: var(--muted); cursor: pointer; }
+.path .modebtn:hover { color: var(--fg); background: var(--tab-hover); }
 .conflict { border: 1px solid var(--warn, #d79921); padding: 8px; margin: 8px; background: var(--bg2); }
 .conflict button { margin: 8px 8px 0 0; font: inherit; cursor: pointer; }
 /* .proposal-actions (the Accept/Reject bar under a proposal's hunk view,

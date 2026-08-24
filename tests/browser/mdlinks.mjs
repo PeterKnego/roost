@@ -223,12 +223,20 @@ try {
   const svgToggle = await evalIn(
     `(() => { const b = document.querySelector('.pane[data-pane="2"] .content .path .modebtn');
       if (b) b.click();
-      return b ? b.textContent : false; })()`);
-  ok(svgToggle === "Edit", "an svg preview's stripe offers the Edit switch");
+      return b ? b.title : false; })()`);
+  ok(svgToggle === "switch to edit", "an svg preview's stripe offers the switch to edit");
   const svgEdits = await until(() => evalIn(
     `(() => { const t = document.querySelector("textarea");
        return !!t && t.value.includes("<svg"); })()`), 15, "svg editor");
   ok(svgEdits, "clicking it mounts a textarea holding the svg's real text");
+  // The switch back must be VISIBLE in the edit stripe. It once carried the
+  // .savebtn class, so paintSaveState's querySelector(".savebtn") found it
+  // first and hid the toggle instead of managing Save (autosave on hides
+  // Save on a clean buffer — the wrong element vanished).
+  ok(await until(() => evalIn(
+    `(() => { const b = document.querySelector('.pane[data-pane="2"] .content .path .modebtn');
+       return !!b && !b.hidden && b.title === "switch to preview"; })()`), 10, "the preview switch"),
+     "and the edit stripe offers the visible switch back to the picture");
 
   // ---- 8. A javascript: link cannot run --------------------------------
   // One click on a cloned repo's README, in the origin that drives every

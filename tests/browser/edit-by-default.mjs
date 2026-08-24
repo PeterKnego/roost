@@ -18,6 +18,11 @@ let fail = 0;
 const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) fail++; };
 
 const fx = await fixture();
+// Autosave off for this suite: section A covers the Save button's visibility
+// rule (hidden while clean, back when dirty), whose interesting branch only
+// exists without autosave. autosave.mjs owns the autosave-on states.
+await Deno.mkdir(`${fx.roots}/proj/.resh`, { recursive: true });
+await Deno.writeTextFile(`${fx.roots}/proj/.resh/config.toml`, "autosave = false\n");
 await Deno.writeTextFile(`${fx.roots}/proj/main.rs`, "fn main() {}\n");
 await Deno.writeTextFile(`${fx.roots}/proj/notes.md`, "# heading\n");
 // Not on NO_TEXT_EDIT_EXT, so nothing but the *read* can save this one — it is
@@ -69,7 +74,7 @@ try {
     const c = document.querySelector('.pane[data-pane="2"] .content');
     if (!c || !c.textContent.includes(${JSON.stringify(rel)})) return "wrong tab";
     const b = c.querySelector(".path .modebtn");
-    return b ? b.textContent : false;
+    return b ? b.title : false;
   })()`);
 
   console.log("A. a code file opens in its editor");
@@ -78,12 +83,23 @@ try {
   ok(await until(() => evalIn(`!!document.querySelector('.pane[data-pane="2"] textarea.editor')`), 10, "editor"),
      "the pane really shows an editor, not a preview");
   ok((await modeBtnFor("main.rs")) === false, "and its stripe offers no mode switch — there is no second mode to reach");
+  // Save earns its place: a clean buffer's Save did nothing when clicked
+  // (reported from real use, 2026-08-24), so it only renders once there is
+  // something to write.
+  ok(await evalIn(`(() => { const b = document.querySelector('.pane[data-pane="2"] .savebtn');
+       return !!b && b.hidden; })()`),
+     "a clean buffer shows no Save button, even with autosave off");
+  await evalIn(`(() => { const t = document.querySelector('.pane[data-pane="2"] textarea.editor');
+    t.value += "x"; t.dispatchEvent(new Event("input", { bubbles: true })); })()`);
+  ok(await until(() => evalIn(`(() => { const b = document.querySelector('.pane[data-pane="2"] .savebtn');
+       return !!b && !b.hidden; })()`), 10, "Save appears"),
+     "and typing is what brings it back");
 
   console.log("\nB. markdown keeps its rendered preview, and its toggle");
   ok(await clickInTree("notes.md"), "clicking notes.md opens a tab");
   ok((await tabFor("notes.md")).mode === "Preview", `and it is in Preview (got ${(await tabFor("notes.md")).mode})`);
-  ok(await until(async () => (await modeBtnFor("notes.md")) === "Edit", 5, "the Edit switch"),
-     "the preview's filename stripe offers the Edit switch");
+  ok(await until(async () => (await modeBtnFor("notes.md")) === "switch to edit", 5, "the edit switch"),
+     "the preview's filename stripe offers the switch to edit");
 
   console.log("\nC. a file the editor cannot hold lands in Preview by itself");
   // The client asks for Edit — blob.bin's extension is not on any list it
@@ -103,7 +119,7 @@ try {
   ok(await clickInTree("logo.svg"), "clicking logo.svg opens a tab");
   ok((await tabFor("logo.svg")).mode === "Preview",
      `it opens on the picture (got ${(await tabFor("logo.svg")).mode})`);
-  ok(await until(async () => (await modeBtnFor("logo.svg")) === "Edit", 5, "the Edit switch"),
+  ok(await until(async () => (await modeBtnFor("logo.svg")) === "switch to edit", 5, "the edit switch"),
      "and its stripe still offers the switch to its text");
 
 } finally {
