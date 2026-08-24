@@ -503,12 +503,6 @@ pub fn mention_to(
     notify_selected(project, session, &msg)
 }
 
-/// An unaimed mention. Temporary: `hub.rs:1270` still calls it at the end of
-/// this task, and Task 4 deletes it once that call site moves to `mention_to`.
-pub fn mention(project: &str, abs: &Path, lines: Option<(u32, u32)>) -> Result<(), String> {
-    mention_to(project, None, abs, lines)
-}
-
 /// Ships the editor's current selection to Claude as ambient context — the
 /// one notification in this module that carries file *contents* with no
 /// explicit user gesture behind it. `mention` and `openDiff` both require a
@@ -2236,7 +2230,7 @@ mod tests {
     #[test]
     fn a_mention_is_the_notification_the_cli_expects() {
         let (rx, ide, _d, _ws) = connected_fake_client_for("mention-shape");
-        mention("mention-shape", Path::new("/w/src/hub.rs"), Some((12, 40))).unwrap();
+        mention_to("mention-shape", None, Path::new("/w/src/hub.rs"), Some((12, 40))).unwrap();
         let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
         assert_eq!(v["method"], "at_mentioned");
         assert_eq!(v["params"]["filePath"], "/w/src/hub.rs");
@@ -2254,7 +2248,7 @@ mod tests {
     #[test]
     fn a_whole_file_mention_carries_no_line_numbers() {
         let (rx, _ide, _d, _ws) = connected_fake_client_for("mention-wholefile");
-        mention("mention-wholefile", Path::new("/w/README.md"), None).unwrap();
+        mention_to("mention-wholefile", None, Path::new("/w/README.md"), None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
         assert!(v["params"].get("lineStart").is_none());
     }
@@ -2274,7 +2268,7 @@ mod tests {
     fn mentioning_with_no_claude_connected_is_an_error_not_a_panic() {
         // The tree's keybinding is always available; Claude is not. This must
         // surface as a refusal the UI can show, never as a socket-thread panic.
-        let err = mention("nobody-here", Path::new("/w/x.rs"), None).unwrap_err();
+        let err = mention_to("nobody-here", None, Path::new("/w/x.rs"), None).unwrap_err();
         assert!(err.contains("no Claude"), "the message must say what is missing: {err}");
     }
 
@@ -2425,9 +2419,9 @@ mod tests {
         let guard = ConnGuard { project: project.to_string(), id };
         // Sanity: the registration really did take effect before the drop
         // this test is actually about.
-        assert!(mention(project, Path::new("/w/x.rs"), None).is_ok());
+        assert!(mention_to(project, None, Path::new("/w/x.rs"), None).is_ok());
         drop(guard);
-        let err = mention(project, Path::new("/w/x.rs"), None).unwrap_err();
+        let err = mention_to(project, None, Path::new("/w/x.rs"), None).unwrap_err();
         assert!(err.contains("no Claude"), "the registry entry must be gone once the guard drops: {err}");
     }
 
@@ -2570,7 +2564,7 @@ mod tests {
         // failed ... got {"...\"method\":\"selection_changed\"...\"text\":
         // \"secret\"...} first` — deterministically, not on a timing
         // window. Restored.
-        mention(proj, Path::new("/w/marker.rs"), None).unwrap();
+        mention_to(proj, None, Path::new("/w/marker.rs"), None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
         assert_eq!(
             v["method"], "at_mentioned",

@@ -433,8 +433,14 @@ impl Hub {
             Intent::EndSession { session } => return self.do_end_session(from, session.clone()),
             Intent::NewTerminal { pane, launch } => return self.do_new_terminal(from, *pane, *launch),
             Intent::OpenPath { text } => return self.do_open_path(from, text.clone()),
-            Intent::MentionPath { rel, line_start, line_end } => {
-                return self.do_mention_path(from, rel.clone(), *line_start, *line_end)
+            Intent::MentionPath { rel, line_start, line_end, session } => {
+                return self.do_mention_path(
+                    from,
+                    rel.clone(),
+                    *line_start,
+                    *line_end,
+                    session.clone(),
+                )
             }
             Intent::ShareSelection { rel, text, start_line, start_col, end_line, end_col } => {
                 return self.do_share_selection(
@@ -1234,12 +1240,19 @@ impl Hub {
     }
 
     /// Resolves `rel` against this project's directory before it ever
-    /// reaches `ide::mention` — `safe_resolve` is the confinement boundary,
-    /// and a path a browser sent must never be trusted past it. Failure
-    /// (an escaping path, or no Claude connected) is reported with
-    /// `send_to`, never `broadcast`: only the browser that pressed the key
-    /// should see "no Claude is connected".
-    fn do_mention_path(&mut self, from: &ConnId, rel: String, line_start: Option<u32>, line_end: Option<u32>) {
+    /// reaches `ide::mention_to` — `safe_resolve` is the confinement
+    /// boundary, and a path a browser sent must never be trusted past it.
+    /// Failure (an escaping path, an invalid session name, or no Claude
+    /// connected) is reported with `send_to`, never `broadcast`: only the
+    /// browser that pressed the key should see the refusal.
+    fn do_mention_path(
+        &mut self,
+        from: &ConnId,
+        rel: String,
+        line_start: Option<u32>,
+        line_end: Option<u32>,
+        session: Option<String>,
+    ) {
         let abs = match crate::projects::safe_resolve(&self.dir, &rel) {
             Ok(p) => p,
             Err(e) => {
@@ -1247,6 +1260,20 @@ impl Hub {
                 return self.send_to(from, &ev);
             }
         };
+        // Refused rather than dropped to `None`: silently ignoring an
+        // unusable name would degrade an aimed mention into an unaimed one,
+        // which is a different request. Truncated in the message because the
+        // value is unvalidated wire input and an error banner is not the
+        // place to render four kilobytes of it.
+        if let Some(s) = &session {
+            if !crate::session::valid_name(s) {
+                let shown: String = s.chars().take(32).collect();
+                let ev = Event::Error {
+                    msg: format!("mention: invalid session name {shown:?}"),
+                };
+                return self.send_to(from, &ev);
+            }
+        }
         // A half-specified range (one bound present, the other absent) is
         // refused rather than guessed at. `Option::zip` — the previous
         // shape of this line — silently turned it into `None`, i.e. a
@@ -1267,7 +1294,7 @@ impl Hub {
                 return self.send_to(from, &ev);
             }
         };
-        if let Err(e) = crate::ide::mention(&self.project, &abs, lines) {
+        if let Err(e) = crate::ide::mention_to(&self.project, session.as_deref(), &abs, lines) {
             let ev = Event::Error { msg: e };
             self.send_to(from, &ev);
         }
@@ -3316,6 +3343,8 @@ mod tests {
             rel: "../../etc/passwd".into(),
             line_start: None,
             line_end: None,
+            // session: None — this test is about path confinement, not routing.
+            session: None,
         });
 
         let got: Vec<String> = rx.try_iter().collect();
@@ -3348,8 +3377,15 @@ mod tests {
         let (_other, rx_other) = h.subscribe();
 
         // No fake Claude is registered for "mentionrefuse", so this resolves
-        // fine and then refuses at `ide::mention` for lack of a connection.
-        h.handle(&asker, Intent::MentionPath { rel: "a.rs".into(), line_start: None, line_end: None });
+        // fine and then refuses at `ide::mention_to` for lack of a connection.
+        h.handle(&asker, Intent::MentionPath {
+            rel: "a.rs".into(),
+            line_start: None,
+            line_end: None,
+            // session: None — this test is about the refusal reaching only
+            // the asker, not about which terminal it was aimed at.
+            session: None,
+        });
 
         let got: Vec<String> = rx_asker.try_iter().collect();
         assert!(got.iter().any(|m| m.contains("no Claude")), "the asking client got no refusal: {got:?}");
@@ -3381,13 +3417,51 @@ mod tests {
         let mut h = Hub::new("mentionhalfrange", dir.path().to_path_buf());
         let (asker, rx) = h.subscribe();
 
-        h.handle(&asker, Intent::MentionPath { rel: "a.rs".into(), line_start: Some(5), line_end: None });
+        h.handle(&asker, Intent::MentionPath {
+            rel: "a.rs".into(),
+            line_start: Some(5),
+            line_end: None,
+            // session: None — this test is about the line-range check, which
+            // runs before routing is ever consulted.
+            session: None,
+        });
 
         let got: Vec<String> = rx.try_iter().collect();
         assert!(
             got.iter().any(|m| m.contains("line_start") && m.contains("line_end")),
             "a half-specified range must be refused by name, not silently degraded: {got:?}"
         );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// A session name off the wire is refused before it reaches `ide`, and
+    /// the refusal goes only to the client that asked — the same rule the
+    /// sibling path-confinement test pins. Two subscribers, because with one
+    /// `send_to` and `broadcast` are indistinguishable.
+    #[test]
+    fn an_invalid_session_name_is_refused_and_only_the_asker_hears() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", dir.path().join("state"));
+        std::fs::write(dir.path().join("a.rs"), b"fn main() {}").unwrap();
+        let mut h = Hub::new("mentionsess", dir.path().to_path_buf());
+        let (asker, rx_asker) = h.subscribe();
+        let (_other, rx_other) = h.subscribe();
+
+        h.handle(&asker, Intent::MentionPath {
+            rel: "a.rs".into(),
+            line_start: None,
+            line_end: None,
+            session: Some("../../etc/passwd".into()),
+        });
+
+        let got: Vec<String> = rx_asker.try_iter().collect();
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("session")),
+            "an invalid session name must be refused by name, not treated as 'no Claude': {got:?}"
+        );
+        let others: Vec<String> = rx_other.try_iter().collect();
+        assert!(others.is_empty(), "a refusal must reach only the asker, got: {others:?}");
         std::env::remove_var("RESH_STATE_DIR");
     }
 

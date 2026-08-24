@@ -116,7 +116,20 @@ pub enum Intent {
     /// server-side and sent as `at_mentioned`, not pasted into a terminal:
     /// a paste lands in whatever state the terminal is in and competes with
     /// whatever Claude is doing at that instant.
-    MentionPath { rel: String, line_start: Option<u32>, line_end: Option<u32> },
+    ///
+    /// `session` is the terminal the browser had in focus, and it is what
+    /// makes this reach one Claude rather than all of them. `None` means the
+    /// browser had no terminal tab active — a real answer, not a missing
+    /// one, and the server refuses rather than guessing when more than one
+    /// Claude is connected. Optional on the wire so an older client's
+    /// payload still parses.
+    MentionPath {
+        rel: String,
+        line_start: Option<u32>,
+        line_end: Option<u32>,
+        #[serde(default)]
+        session: Option<String>,
+    },
     /// The human's answer to an `openDiff` Claude is still blocked on. This
     /// intent **is** the permission answer, which is why `text` exists: a
     /// proposal the user edited before accepting must travel back as the
@@ -365,13 +378,32 @@ mod tests {
         let i = decode(r#"{"t":"MentionPath","rel":"src/hub.rs","line_start":12,"line_end":40}"#).unwrap();
         assert!(matches!(
             i,
-            Intent::MentionPath { rel, line_start: Some(12), line_end: Some(40) } if rel == "src/hub.rs"
+            Intent::MentionPath { rel, line_start: Some(12), line_end: Some(40), .. } if rel == "src/hub.rs"
         ));
         let i = decode(r#"{"t":"MentionPath","rel":"README.md","line_start":null,"line_end":null}"#).unwrap();
         assert!(matches!(
             i,
-            Intent::MentionPath { rel, line_start: None, line_end: None } if rel == "README.md"
+            Intent::MentionPath { rel, line_start: None, line_end: None, .. } if rel == "README.md"
         ));
+    }
+
+    /// The field is optional on the wire so an older client's payload still
+    /// parses. Pinning it means a later `#[serde(deny_unknown_fields)]` or a
+    /// dropped `default` cannot silently start rejecting them.
+    #[test]
+    fn a_mention_without_a_session_still_decodes() {
+        let i = decode(r#"{"t":"MentionPath","rel":"a.rs","line_start":null,"line_end":null}"#)
+            .unwrap();
+        assert!(matches!(i, Intent::MentionPath { session: None, .. }));
+    }
+
+    #[test]
+    fn a_mention_carries_the_terminal_it_is_aimed_at() {
+        let i = decode(
+            r#"{"t":"MentionPath","rel":"a.rs","line_start":null,"line_end":null,"session":"term2"}"#,
+        )
+        .unwrap();
+        assert!(matches!(i, Intent::MentionPath { session: Some(s), .. } if s == "term2"));
     }
 
     #[test]
