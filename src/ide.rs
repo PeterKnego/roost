@@ -415,18 +415,98 @@ fn set_session(project: &str, id: u64, sess: crate::idesess::Sess) {
     }
 }
 
-/// Tells every Claude connected to `project` that the user pointed at `abs`
+/// Sends `msg` to the connections a mention is aimed at, or reports why
+/// none were chosen. Never falls back to the whole fan-out: reaching a
+/// Claude the user was not looking at is the failure this exists to prevent,
+/// and it is invisible when it happens.
+///
+/// Cloned out under the lock, sent outside it, for the reason `notify_all`
+/// gives.
+fn notify_selected(
+    project: &str,
+    session: Option<&str>,
+    msg: &serde_json::Value,
+) -> Result<(), String> {
+    let msg = msg.to_string();
+    // Every decision is made inside the one lock scope, and only the sends
+    // happen outside it. Taking the lock a second time for the lone-connection
+    // fallback would let a connection arrive or die between the two looks, so
+    // the fallback would act on a different registry than the filter saw.
+    let chosen: Vec<std::sync::mpsc::Sender<String>> = {
+        let map = conns().lock().unwrap_or_else(|e| e.into_inner());
+        let all: &[Target] = map.get(project).map(|v| v.as_slice()).unwrap_or(&[]);
+        let total = all.len();
+        if total == 0 {
+            // Unchanged wording: existing tests match on "no Claude".
+            return Err("no Claude is connected to this project".into());
+        }
+        let matched: Vec<std::sync::mpsc::Sender<String>> = match session {
+            // No terminal named, so nothing to match on; the lone-connection
+            // case below is the only way an unaimed mention gets delivered.
+            None => Vec::new(),
+            Some(want) => all
+                .iter()
+                .filter(|t| match &t.session {
+                    crate::idesess::Sess::In(s) => s == want,
+                    // resh could not place this Claude, so it cannot rule it
+                    // out. One notification too many is recoverable; none
+                    // looks like a broken keystroke.
+                    crate::idesess::Sess::Unknown => true,
+                    crate::idesess::Sess::Outside => false,
+                })
+                .map(|t| t.reply.clone())
+                .collect(),
+        };
+        if !matched.is_empty() {
+            matched
+        } else if total == 1 {
+            // One Claude is unambiguous whatever resh managed to learn about
+            // where it lives — including nothing at all. This is what keeps
+            // the ordinary single-Claude case working when the environ read
+            // failed, or when Claude was started outside resh entirely.
+            all.iter().map(|t| t.reply.clone()).collect()
+        } else {
+            return Err(match session {
+                Some(want) => format!(
+                    "no Claude is running in terminal \"{want}\" ({total} connected to this project)"
+                ),
+                None => format!(
+                    "{total} Claudes are connected to this project — click the terminal you mean, then press Alt+K"
+                ),
+            });
+        }
+    };
+    for t in &chosen {
+        let _ = t.send(msg.clone());
+    }
+    Ok(())
+}
+
+/// Tells the Claude in `session`'s terminal that the user pointed at `abs`
 /// (and optionally a line range within it). A notification, not a request —
 /// see `dispatch`'s id handling: an `at_mentioned` carrying an `id` would
 /// make the CLI wait for a response that will never come.
-pub fn mention(project: &str, abs: &Path, lines: Option<(u32, u32)>) -> Result<(), String> {
+///
+/// `session` is `None` when the browser had no terminal tab in focus.
+pub fn mention_to(
+    project: &str,
+    session: Option<&str>,
+    abs: &Path,
+    lines: Option<(u32, u32)>,
+) -> Result<(), String> {
     let mut params = serde_json::json!({"filePath": abs.to_string_lossy()});
     if let Some((a, b)) = lines {
         params["lineStart"] = serde_json::json!(a);
         params["lineEnd"] = serde_json::json!(b);
     }
     let msg = serde_json::json!({"jsonrpc": "2.0", "method": "at_mentioned", "params": params});
-    notify_all(project, &msg)
+    notify_selected(project, session, &msg)
+}
+
+/// An unaimed mention. Temporary: `hub.rs:1270` still calls it at the end of
+/// this task, and Task 4 deletes it once that call site moves to `mention_to`.
+pub fn mention(project: &str, abs: &Path, lines: Option<(u32, u32)>) -> Result<(), String> {
+    mention_to(project, None, abs, lines)
 }
 
 /// Ships the editor's current selection to Claude as ambient context — the
@@ -2198,23 +2278,127 @@ mod tests {
         assert!(err.contains("no Claude"), "the message must say what is missing: {err}");
     }
 
-    /// Revert-checked (Task 6's brief, Step 6): changing `for t in &targets`
-    /// to send only to `targets.first()` failed only this test, and only on
-    /// `rx2` — `rx1.recv_timeout` still succeeded (it got the first sender),
-    /// `rx2.recv_timeout` timed out. With a single subscriber "send to all"
-    /// and "send to the first" are indistinguishable, which is exactly the
-    /// trap CLAUDE.md records; that is why this test uses two clients. Then
-    /// restored.
+    /// Two terminals, two claudes, one project, and no terminal named. The
+    /// old contract was "reach both"; the new one is "refuse", because a
+    /// mention that reaches a Claude the user was not looking at interrupts
+    /// work they did not ask about. Two clients, not one — with a single
+    /// subscriber `send to the chosen one` and `send to all` are
+    /// indistinguishable, the trap CLAUDE.md records.
     #[test]
-    fn a_mention_reaches_every_connected_claude_not_just_the_first() {
-        // Two terminals, two claudes, one project. Sending to only the first
-        // is indistinguishable from sending to all with a single subscriber —
-        // which is exactly the trap CLAUDE.md records.
-        let (rx1, _a, _d1, _w1) = connected_fake_client_for("mention-fanout");
-        let (rx2, _b, _d2, _w2) = connected_fake_client_for("mention-fanout");
-        mention("mention-fanout", Path::new("/w/x.rs"), None).unwrap();
+    fn an_unaimed_mention_with_two_claudes_is_refused_not_broadcast() {
+        let (rx1, _a, _d1, _w1) = connected_fake_client_for("mention-ambiguous");
+        let (rx2, _b, _d2, _w2) = connected_fake_client_for("mention-ambiguous");
+        let err = mention_to("mention-ambiguous", None, Path::new("/w/x.rs"), None).unwrap_err();
+        assert!(err.contains("2 "), "the message must say how many are connected: {err}");
+        assert!(
+            rx1.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "the first Claude must receive nothing"
+        );
+        assert!(
+            rx2.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "the second Claude must receive nothing"
+        );
+    }
+
+    /// The fan-out itself still exists and still works — `selection_changed`
+    /// uses it. Without this, deleting `notify_all` outright would leave the
+    /// suite green.
+    #[test]
+    fn notify_all_still_reaches_every_connected_claude() {
+        let (rx1, _a, _d1, _w1) = connected_fake_client_for("notify-fanout");
+        let (rx2, _b, _d2, _w2) = connected_fake_client_for("notify-fanout");
+        notify_all("notify-fanout", &serde_json::json!({"jsonrpc": "2.0", "method": "ping"}))
+            .unwrap();
         assert!(rx1.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
         assert!(rx2.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
+    }
+
+    /// The case the feature exists for: two Claudes, one named. The
+    /// assertion that matters is the *empty* inbox, not the full one.
+    ///
+    /// Revert-checked: pointing `mention_to` at `notify_all` instead of
+    /// `notify_selected` failed only this test, on the observed panic
+    /// `"the other terminal's Claude must receive nothing"` at the
+    /// `rx1.recv_timeout(...).is_err()` assertion. Then restored.
+    #[test]
+    fn a_named_mention_reaches_only_that_terminals_claude() {
+        let (rx1, _a, _d1, _w1) = connected_fake_client_for("mention-aimed");
+        let (rx2, _b, _d2, _w2) = connected_fake_client_for("mention-aimed");
+        // Label the two registered connections in registration order.
+        {
+            let mut map = conns().lock().unwrap();
+            let v = map.get_mut("mention-aimed").expect("both clients registered");
+            assert_eq!(v.len(), 2, "the test needs two distinct connections");
+            v[0].session = crate::idesess::Sess::In("term1".into());
+            v[1].session = crate::idesess::Sess::In("term2".into());
+        }
+        mention_to("mention-aimed", Some("term2"), Path::new("/w/x.rs"), None).unwrap();
+        assert!(
+            rx2.recv_timeout(std::time::Duration::from_secs(2)).is_ok(),
+            "the named terminal's Claude must receive it"
+        );
+        assert!(
+            rx1.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "the other terminal's Claude must receive nothing"
+        );
+    }
+
+    /// resh could not read one connection's environment. Excluding it would
+    /// silently drop the mention; including it costs one extra notification.
+    /// The conservative direction is the one this asserts.
+    #[test]
+    fn a_connection_resh_cannot_place_stays_eligible() {
+        let (rx1, _a, _d1, _w1) = connected_fake_client_for("mention-unknown");
+        let (rx2, _b, _d2, _w2) = connected_fake_client_for("mention-unknown");
+        {
+            let mut map = conns().lock().unwrap();
+            let v = map.get_mut("mention-unknown").unwrap();
+            v[0].session = crate::idesess::Sess::Outside;
+            v[1].session = crate::idesess::Sess::Unknown;
+        }
+        mention_to("mention-unknown", Some("term9"), Path::new("/w/x.rs"), None).unwrap();
+        assert!(
+            rx2.recv_timeout(std::time::Duration::from_secs(2)).is_ok(),
+            "an Unknown connection must still be reached"
+        );
+        assert!(
+            rx1.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "an Outside connection must not be, once a terminal is named"
+        );
+    }
+
+    /// One Claude and a terminal name nothing claims: the lone connection is
+    /// still the only sensible target, and refusing here would break the
+    /// ordinary single-Claude case whenever the environ read failed.
+    #[test]
+    fn a_lone_claude_receives_a_mention_it_does_not_claim() {
+        let (rx, _a, _d, _w) = connected_fake_client_for("mention-lone");
+        {
+            let mut map = conns().lock().unwrap();
+            map.get_mut("mention-lone").unwrap()[0].session = crate::idesess::Sess::Outside;
+        }
+        mention_to("mention-lone", Some("term7"), Path::new("/w/x.rs"), None).unwrap();
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
+    }
+
+    /// Two Claudes, both positively placed elsewhere. Unlike the lone case
+    /// above there is nothing to fall back to, so this must refuse rather
+    /// than pick one.
+    #[test]
+    fn a_mention_for_a_terminal_no_claude_is_in_is_refused() {
+        let (rx1, _a, _d1, _w1) = connected_fake_client_for("mention-nomatch");
+        let (rx2, _b, _d2, _w2) = connected_fake_client_for("mention-nomatch");
+        {
+            let mut map = conns().lock().unwrap();
+            let v = map.get_mut("mention-nomatch").unwrap();
+            v[0].session = crate::idesess::Sess::In("term1".into());
+            v[1].session = crate::idesess::Sess::In("term2".into());
+        }
+        let err = mention_to("mention-nomatch", Some("term9"), Path::new("/w/x.rs"), None)
+            .unwrap_err();
+        assert!(err.contains("term9"), "the message must name the terminal asked for: {err}");
+        assert!(rx1.recv_timeout(std::time::Duration::from_millis(300)).is_err());
+        assert!(rx2.recv_timeout(std::time::Duration::from_millis(300)).is_err());
     }
 
     /// A dead connection (its read loop already broke, panicked or not) must
