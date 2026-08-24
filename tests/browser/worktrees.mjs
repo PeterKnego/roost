@@ -127,7 +127,7 @@ try {
   console.log("\nD. the launcher carries the Claude mark");
   await until(() => page.evalIn("typeof terms !== 'undefined' && !!state"), 30, "app again");
   ok(await until(() => page.evalIn(
-      `!!document.querySelector('.tabstrip .newclaude svg[fill="#D97757"]')`),
+      `!!document.querySelector('.paneicons .newclaude svg[fill="#D97757"]')`),
      10, "mark"), "the ✻ button is an SVG mark with the Claude brand fill now");
 } finally {
   try { page?.close(); } catch {}

@@ -170,12 +170,10 @@ main { flex: 1; min-height: 0; }
 .tabstrip .tab .x { display: none; margin-left: 2px; padding: 0 2px; border-radius: 3px; }
 .tabstrip .tab:hover .x, .tabstrip .tab.active .x { display: block; opacity: .55; }
 .tabstrip .tab .x:hover { opacity: 1; background: var(--bg3, var(--bg2)); }
-.tabstrip .newterm, .tabstrip .newclaude { display: flex; align-items: center; padding: 0 9px; cursor: pointer; color: var(--muted); }
-.tabstrip .newterm:hover, .tabstrip .newclaude:hover { color: var(--fg); background: var(--bg3, var(--bg)); }
-/* Sits right after +, and reads as its sibling: same box, slightly tighter so
-   the pair reads as one control group rather than two stray glyphs. */
-.tabstrip .newclaude { padding: 0 8px 0 4px; }
-.tabstrip .newclaude svg { display: block; }
+/* The create pair lives with the pane controls now (see buildPaneIcons), so
+   it takes .paneicon's box and hover; only the Claude mark's brand fill sets
+   it apart. */
+.paneicons .newclaude svg { display: block; }
 .content { flex: 1 1 auto; overflow: auto; position: relative; }
 /* Inset from the card edge rather than bleeding into it: the fit addon sizes
    the grid from the host's *inner* box, so padding costs a column, not a

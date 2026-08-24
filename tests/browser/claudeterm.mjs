@@ -71,14 +71,14 @@ try {
     window.__last = (s) => __txt(s).split("\\n").filter((l) => l.trim()).pop() || "";
     window.__sessions = (pi) => state.panes[pi].tabs.filter((t) => t.k === "Terminal").map((t) => t.session);`);
 
-  const strips = Number(await evalIn(`document.querySelectorAll(".tabstrip .newterm").length`));
-  const stars = Number(await evalIn(`document.querySelectorAll(".tabstrip .newclaude").length`));
-  ok(stars > 0 && stars === strips, `every strip with a + has a ✻ (${stars} of ${strips})`);
-  ok((await evalIn(`document.querySelector('.pane[data-pane="3"] .tabstrip .newclaude').title`)).includes("Claude"),
+  const strips = Number(await evalIn(`document.querySelectorAll(".paneicons .newterm").length`));
+  const stars = Number(await evalIn(`document.querySelectorAll(".paneicons .newclaude").length`));
+  ok(stars > 0 && stars === strips, `every pane with a new-terminal control has the Claude one (${stars} of ${strips})`);
+  ok((await evalIn(`document.querySelector('.pane[data-pane="3"] .paneicons .newclaude').title`)).includes("Claude"),
      "the glyph says what it does");
 
   const before = JSON.parse(await evalIn(`JSON.stringify(__sessions(3))`));
-  await evalIn(`document.querySelector('.pane[data-pane="3"] .tabstrip .newclaude').click()`);
+  await evalIn(`document.querySelector('.pane[data-pane="3"] .paneicons .newclaude').click()`);
   ok(await until(async () => JSON.parse(await evalIn(`JSON.stringify(__sessions(3))`)).length > before.length, 20, "a new terminal tab"),
      "clicking ✻ opens a new terminal tab");
   const sess = JSON.parse(await evalIn(`JSON.stringify(__sessions(3))`)).find((s) => !before.includes(s));
@@ -92,7 +92,7 @@ try {
 
   console.log("\nB. the plain + is still plain");
   const before2 = JSON.parse(await evalIn(`JSON.stringify(__sessions(3))`));
-  await evalIn(`document.querySelector('.pane[data-pane="3"] .tabstrip .newterm').click()`);
+  await evalIn(`document.querySelector('.pane[data-pane="3"] .paneicons .newterm').click()`);
   await until(async () => JSON.parse(await evalIn(`JSON.stringify(__sessions(3))`)).length > before2.length, 20, "a new terminal tab");
   const plain = JSON.parse(await evalIn(`JSON.stringify(__sessions(3))`)).find((s) => !before2.includes(s));
   await until(() => evalIn(`terms.has(${JSON.stringify(plain)})`), 30, "the terminal");
@@ -110,10 +110,10 @@ try {
      "the startup check reaches the page: no launches offered");
   page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
   await until(() => page.evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "app.js");
-  const stars2 = Number(await page.evalIn(`document.querySelectorAll(".tabstrip .newclaude").length`));
-  const plus2 = Number(await page.evalIn(`document.querySelectorAll(".tabstrip .newterm").length`));
+  const stars2 = Number(await page.evalIn(`document.querySelectorAll(".paneicons .newclaude").length`));
+  const plus2 = Number(await page.evalIn(`document.querySelectorAll(".paneicons .newterm").length`));
   ok(stars2 === 0, `no ✻ anywhere (${stars2})`);
-  ok(plus2 > 0, `the + is still there (${plus2})`);
+  ok(plus2 > 0, `the new-terminal control is still there (${plus2})`);
 } finally {
   page?.close();
   browser.close();

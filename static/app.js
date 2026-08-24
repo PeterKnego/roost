@@ -61,6 +61,7 @@ const PANE_ICONS = {
   move: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5.5h10l-2.5-2.5M13.5 10.5h-10l2.5 2.5"/></svg>',
   maximize: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2.5h4.5V7M7 11.5H2.5V7M13.5 2.5L9 7M2.5 13.5L7 9"/></svg>',
   restore: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 7H9V2.5M2.5 9H7v4.5M9 7l4.5-4.5M7 9l-4.5 4.5"/></svg>',
+  newterm: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="10.5" height="9.5" rx="1.2"/><path d="M4 6.8l1.7 1.5L4 9.8M8 10.6h2.6"/><path d="M13.3 2.2v3.6M11.5 4h3.6"/></svg>',
 };
 // The official Claude mark (lobehub packaging of Anthropic's starburst,
 // fetched 2026-08-23 from lobehub/lobe-icons static-svg/icons/claude-color.svg),
@@ -518,23 +519,6 @@ function render() {
       b.appendChild(x);
       strip.appendChild(b);
     });
-    const plus = document.createElement("span");
-    plus.className = "newterm";
-    plus.title = "new terminal";
-    plus.textContent = "+";
-    plus.onclick = () => newTerminal(pi);
-    strip.appendChild(plus);
-    // The official Claude mark (see CLAUDE_MARK above), replacing the ✻ text
-    // glyph this button used to carry. Same button as +, same behaviour: the
-    // server allocates the name and types `claude` into the shell it spawns.
-    if (LAUNCHES.includes("claude")) {
-      const star = document.createElement("span");
-      star.className = "newclaude";
-      star.title = "new terminal running Claude";
-      star.innerHTML = CLAUDE_MARK;
-      star.onclick = () => newTerminal(pi, "claude");
-      strip.appendChild(star);
-    }
 
     const active = pane.tabs[pane.active];
     const activeKey = active ? tabKey(active) : "";
@@ -610,15 +594,26 @@ function render() {
 function buildPaneIcons(host, pi, pane, active, content) {
   if (!host) return;
   host.innerHTML = "";
-  const icon = (svg, title, fn) => {
+  const icon = (svg, title, fn, cls) => {
     const b = document.createElement("span");
-    b.className = "paneicon";
+    b.className = cls ? `paneicon ${cls}` : "paneicon";
     b.title = title;
-    b.innerHTML = svg; // constant markup from PANE_ICONS only
+    b.innerHTML = svg; // constant markup from PANE_ICONS/CLAUDE_MARK only
     b.onclick = fn;
     host.appendChild(b);
     return b;
   };
+  // The create pair leads the group — they used to trail the last tab inside
+  // the wrapping strip, where they drifted with the tab count instead of
+  // sitting where pane controls live (moved 2026-08-24, from real use). The
+  // extra classes are their stable identity for tests and future styling.
+  icon(PANE_ICONS.newterm, "new terminal", () => newTerminal(pi), "newterm");
+  // The official Claude mark (see CLAUDE_MARK above). Same button, plus a
+  // program to type in: the server allocates the name and types `claude`
+  // into the shell it spawns.
+  if (LAUNCHES.includes("claude")) {
+    icon(CLAUDE_MARK, "new terminal running Claude", () => newTerminal(pi, "claude"), "newclaude");
+  }
   if (active && active.k === "Tree") {
     const hidden = showHidden();
     // Filled ring = dot entries are showing. This drives an intent rather
