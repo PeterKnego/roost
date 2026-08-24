@@ -121,6 +121,7 @@ answer, not a quiet vote for "unused".
   routes every image extension in it to `image_fragment` before
   `file_fragment` is reached, leaving only markdown. Anyone picking this up
   and hoping to start with the easy case should know there isn't one.
+
 - Notification centre on the picker page (`/`) as well as the workspace
   page — the notice store is already global, only the markup is missing
   (`2026-08-17-deadlight-notifications-design.md`).
