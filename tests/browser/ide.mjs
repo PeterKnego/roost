@@ -587,6 +587,97 @@ try {
     `it carries 0-based line/character bounds, got ${JSON.stringify(shared?.params?.selection)}`,
   );
   ok(shared && !("id" in shared), "selection_changed is a notification (no id), not something resh expects an answer to");
+
+  console.log("\nI. Alt+K aims at the terminal that actually has focus, not the lowest-indexed pane");
+  // The one link in this feature with no automated coverage before this test:
+  // which terminal activeTerminalSession() names when two are live in two
+  // different panes. Its failure mode is silent — a broken pick still sends
+  // a MentionPath, just with the wrong (or no) session, which degrades to
+  // the unaimed path and still works with a single Claude. That is exactly
+  // the two-Claude case this feature exists for, so "it compiled and Alt+K
+  // did something" proves nothing here; this section reads the outgoing
+  // intent's `session` field, not just that one went out.
+  await evalIn(`send({ t: "NewTerminal", pane: 1 })`); // LEFT_BOTTOM: a pane index *lower* than RIGHT's 3
+  const session2 = await poll(() => evalIn(
+    `(() => { const t = state.panes[1].tabs.find((t) => t.k === "Terminal"); return t ? t.session : null; })()`,
+  ), 15, "a second terminal tab in the left-bottom pane");
+  ok(!!session2 && session2 !== "term",
+     `a second, distinctly-named terminal opens next to "term", got ${JSON.stringify(session2)}`);
+  ok(await until(() => evalIn(`terms.has(${JSON.stringify(session2)})`), 30, "the second terminal"),
+     "the second terminal attaches");
+
+  // Focus it first, so the assertion below cannot pass merely because this
+  // pane's terminal was the one mounted (and so auto-focused by mountTab)
+  // most recently.
+  await evalIn(`terms.get(${JSON.stringify(session2)}).term.focus()`);
+  ok(await until(() => evalIn(`lastFocusedSession === ${JSON.stringify(session2)}`), 10, "left-bottom focus recorded"),
+     "clicking into the left-bottom terminal records it as last-focused");
+
+  // Now move focus back to "term" in RIGHT — the *higher*-indexed pane. If
+  // activeTerminalSession fell back to live[0] (the bug Fix 3 in this wave
+  // addresses), it would name session2 here instead, since RIGHT's pane
+  // index sorts after LEFT_BOTTOM's.
+  await evalIn(`terms.get("term").term.focus()`);
+  ok(await until(() => evalIn(`lastFocusedSession === "term"`), 10, "right-pane focus recorded"),
+     "focusing back into the right-pane terminal updates lastFocusedSession again");
+
+  // A render shortly after switching panes can transiently steal focus back
+  // (observed directly: a flake reproduced by hand showed `lastFocusedSession`
+  // flip to session2 again a few hundred ms after the check above, before
+  // Alt+K ever dispatched) — so this settles by re-focusing and re-checking
+  // against real DOM focus, not app.js's own bookkeeping, until it holds.
+  let settled = false;
+  for (let i = 0; i < 20 && !settled; i++) {
+    await evalIn(`terms.get("term").term.focus()`);
+    await sleep(150);
+    settled = await evalIn(
+      `lastFocusedSession === "term" && document.activeElement?.closest("[data-session]")?.dataset.session === "term"`,
+    );
+  }
+  ok(settled, "focus on the right-pane terminal settles before Alt+K is dispatched");
+
+  // `send` is a plain top-level function, not a module export, so wrapping
+  // window.send here intercepts every call the page makes from this point
+  // on — including the one the Alt+K handler below is about to issue —
+  // without needing a hook built into app.js itself for this test alone.
+  await evalIn(`(() => {
+    window.__mentionIntents = [];
+    if (!window.__origSend) window.__origSend = send;
+    window.send = function(intent) {
+      if (intent && intent.t === "MentionPath") window.__mentionIntents.push(intent);
+      return window.__origSend(intent);
+    };
+  })()`);
+
+  // Blur before dispatching: xterm's own keydown handler calls
+  // stopPropagation on a translated key (confirmed by hand — Alt+K
+  // translates to a Meta-k escape sequence, which is exactly why app.js's
+  // own comment above calls it "Meta-k in readline"), so with focus still
+  // inside the terminal the keystroke never reaches app.js's document-level
+  // listener at all. That is also the realistic moment for this feature:
+  // the user was last in "term" a moment ago (which is what the two
+  // focus() calls above establish), then looked away to the file they want
+  // to mention, and pressed Alt+K from there — not from inside the
+  // terminal itself. See also section H's own blur, same reason.
+  await evalIn(`document.activeElement && document.activeElement.blur && document.activeElement.blur()`);
+
+  // MIDDLE still holds the MENTION_FILE editor section F left open — a
+  // valid Alt+K target, so this exercises the real end-to-end path (focus
+  // last in one pane's terminal, target file read from another) rather
+  // than a synthetic call.
+  for (const type of ["rawKeyDown", "keyUp"]) {
+    await cmd("Input.dispatchKeyEvent", {
+      type, modifiers: 1 /* Alt */, key: "k", code: "KeyK",
+      windowsVirtualKeyCode: 75, nativeVirtualKeyCode: 75,
+    });
+  }
+
+  const mentionIntents = JSON.parse(await evalIn(`JSON.stringify(window.__mentionIntents)`));
+  ok(mentionIntents.length === 1, `exactly one MentionPath intent went out, got ${JSON.stringify(mentionIntents)}`);
+  ok(mentionIntents[0]?.session === "term",
+     `the intent names the terminal that actually has focus ("term"), not the other live terminal or null — got ${JSON.stringify(mentionIntents[0])}`);
+  ok(mentionIntents[0]?.session !== session2,
+     "and specifically not the other live terminal, which differs from \"term\" only by pane index");
 } finally {
   try { claude?.close(); } catch {}
   try { page?.close(); } catch {}
