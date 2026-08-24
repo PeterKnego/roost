@@ -459,6 +459,14 @@ details[open] > summary { background-image: var(--twisty-open); }
   width: 16px; height: 16px; margin-right: 5px; vertical-align: -3.5px;
   background: center / 15px 15px no-repeat var(--ic, var(--ic-file));
 }
+/* Tabs carry a larger glyph than the tree rows and sit it right next to the
+   name — the tree's 5px icon margin plus the tab's flex gap read as too much
+   air on a tab (IDEA keeps its tab icon big and tight). The gap alone (3px)
+   is the icon→name space now. */
+.tabstrip .tab::before {
+  width: 18px; height: 18px; margin-right: 0;
+  background-size: 18px 18px;
+}
 .content summary::before { --ic: var(--ic-folder); }
 
 /* File-type icons. Anything unlisted keeps the neutral --ic-file above. */
