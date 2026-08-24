@@ -169,33 +169,33 @@ try {
   const rows1 = await evalIn(`terms.get("term").term.rows`);
   ok(rows1 > rows0, `the terminal grew into the freed row (${rows0} → ${rows1} rows)`);
 
-  console.log("\nE. hidden controls take no width on inactive tabs");
-  // The × kept its box at opacity:0 until 2026-08-24 (and the ✎ beside it,
-  // before that control moved to the filename stripe), which put an
-  // invisible tail on every inactive tab — a strip of md files read as tabs
-  // scattered across the pane (reported from real use). The × is
-  // display:none until the tab is hovered or active; the tab growing under
-  // the pointer on hover is the accepted cost of content-sized tabs.
+  console.log("\nE. a tab keeps its width when selected — no jump");
+  // The × keeps its box (opacity:0) whether or not the tab is active, so
+  // selecting or hovering a tab never changes its width and the strip does
+  // not reflow ("jump") under the pointer — the behaviour a user reported
+  // wanting, and what IDEA does. Reverting to display:none (× taking no space
+  // until shown) makes the active tab wider than the idle one, failing the
+  // width-equality assertion below.
   await open(NAMES[0]);
-  await evalIn(`send({ t: "ActivateTab", pane: ${PANE}, idx: 0 })`);
+  await evalIn(`send({ t: "ActivateTab", pane: ${PANE}, idx: 0 })`); // terminal active → the file tab is idle
   ok(await until(async () => (await pane()).active === 0, 10, "terminal active"), "the terminal is the active tab");
   const probe = () => evalIn(`JSON.stringify((() => {
     const tabs = [...document.querySelectorAll('.pane[data-pane="${PANE}"] .tabstrip .tab')];
     const t = tabs.find((x) => x.textContent.includes(${JSON.stringify(NAMES[0])}));
     if (!t) return null;
+    const x = t.querySelector('.x');
     return { w: Math.round(t.getBoundingClientRect().width),
-             displays: [...t.querySelectorAll('.x')].map((x) => getComputedStyle(x).display),
+             xWidth: x ? Math.round(x.getBoundingClientRect().width) : 0,
              active: t.classList.contains('active') };
   })())`).then(JSON.parse);
   const idle = await probe();
-  ok(!!idle && !idle.active && idle.displays.length === 1 && idle.displays.every((d) => d === "none"),
-     `an inactive tab's × is display:none, and it is the only hidden control (got ${idle && idle.displays.join(", ")})`);
+  ok(!!idle && !idle.active, "the file tab is idle to begin with");
+  ok(idle.xWidth > 0, `its × already occupies its box while idle (${idle && idle.xWidth}px) — reserved, not collapsed`);
   const fi = (await pane()).tabs.findIndex((t) => t.rel === NAMES[0]);
   await evalIn(`send({ t: "ActivateTab", pane: ${PANE}, idx: ${fi} })`);
   ok(await until(async () => !!(await probe())?.active, 10, "file tab active"), "the file tab activates");
   const act = await probe();
-  ok(act.displays.length === 1 && act.displays[0] !== "none", `the active tab renders its × (${act.displays.join(", ")})`);
-  ok(act.w > idle.w + 10, `activation is what pays for its width (${idle.w}px → ${act.w}px)`);
+  ok(act.w === idle.w, `and selecting it does not change its width (${idle.w}px idle → ${act.w}px active)`);
 } finally {
   page?.close();
   browser.close();

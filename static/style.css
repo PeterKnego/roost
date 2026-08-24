@@ -165,7 +165,7 @@ main { flex: 1; min-height: 0; }
 .tabstrip::-webkit-scrollbar { width: 6px; height: 6px; }
 .tabstrip::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 .tabstrip::-webkit-scrollbar-track { background: transparent; }
-.tabstrip .tab { display: flex; align-items: center; gap: 4px; height: 24px; padding: 0 6px 0 9px;
+.tabstrip .tab { display: flex; align-items: center; gap: 3px; height: 24px; padding: 0 5px 0 7px;
                  border-radius: 6px; cursor: pointer; white-space: nowrap; color: var(--muted);
                  position: relative; }
 .tabstrip .tab:hover { color: var(--fg); background: var(--tab-hover); }
@@ -176,15 +176,16 @@ main { flex: 1; min-height: 0; }
 .tabstrip .tab.active { background: var(--tab-on); color: var(--fg); }
 .tabstrip .tab .dirty { color: var(--accent); }
 .tabstrip .tab .stale { color: var(--warn, #d79921); }
-/* display, not opacity — reversing the earlier keep-the-box rule. The box
-   was kept so revealing the × on hover never reflowed the strip under the
-   pointer; but that reserved ~25px of invisible tail on every tab (and ~45px
-   while the ✎ also lived here), which read as tabs scattered loosely across
-   the pane — reported from real use, 2026-08-24. Content-sized tabs won:
-   the tab now grows under the pointer on hover, and that is the accepted
-   cost. The ✎ moved to the filename stripe (.modebtn below) the same day. */
-.tabstrip .tab .x { display: none; margin-left: 2px; padding: 0 2px; border-radius: 3px; }
-.tabstrip .tab:hover .x, .tabstrip .tab.active .x { display: block; opacity: .55; }
+/* opacity, not display: the × keeps its box at all times, so revealing it on
+   hover or activation never changes the tab's width. That is what stops the
+   strip reflowing and the tabs "jumping" as you select among them (IDEA
+   reserves the same way). This box was briefly collapsed to display:none on
+   2026-08-24 to kill the invisible tail a strip of tabs carried — but that
+   tail was the ✎ *and* the × together; the right fix was moving the ✎ to the
+   filename stripe (.modebtn below), which it was, so a single reserved × is
+   modest and the jumping is gone. */
+.tabstrip .tab .x { opacity: 0; margin-left: 2px; padding: 0 2px; border-radius: 3px; transition: opacity .1s; }
+.tabstrip .tab:hover .x, .tabstrip .tab.active .x { opacity: .55; }
 .tabstrip .tab .x:hover { opacity: 1; background: var(--bg3, var(--bg2)); }
 /* The create pair lives with the pane controls now (see buildPaneIcons), so
    it takes .paneicon's box and hover; only the Claude mark's brand fill sets
