@@ -98,6 +98,29 @@ answer, not a quiet vote for "unused".
   `location.hash` interacts with a single-page app whose URL already encodes
   the project.
 
+- Source line ranges from a markdown preview selection, so Alt+K in a preview
+  can send `@docs/deploy.md#L12-14` rather than the bare file. Deferred out of
+  `2026-08-24-mention-routing-design.md`, which ships the preview trigger with
+  no range.
+
+  The approach is settled even though the work is not: pulldown-cmark 0.13
+  (`Cargo.toml:26`) offers `into_offset_iter()`, which yields a byte range per
+  event, so block-level source lines come from the parser rather than from
+  hand-tracking. Two things make it more than a small change. It reshapes
+  every arm of `markdown_html` (`render.rs:234-295`) — this file's raw-HTML
+  neutralizing and link/image escaping surface, which CLAUDE.md's testing
+  notes single out. And it is block-accurate only: a selection of three words
+  inside a paragraph resolves to that paragraph's line span, not to the words,
+  so the feature's ceiling is coarser than the editor's exact ranges.
+
+  Worth recording alongside it, because it is not obvious from reading the
+  code: `file_fragment`'s `<pre class="codeview">` branch — the one preview
+  shape that *does* hold verbatim file text, and so the one that could give
+  exact ranges for free — is unreachable from any Preview tab. `RENDERED_EXT`
+  (`app.js:107`) is the only set that opens in Preview, and `routes.rs:415`
+  routes every image extension in it to `image_fragment` before
+  `file_fragment` is reached, leaving only markdown. Anyone picking this up
+  and hoping to start with the easy case should know there isn't one.
 - Notification centre on the picker page (`/`) as well as the workspace
   page — the notice store is already global, only the markup is missing
   (`2026-08-17-deadlight-notifications-design.md`).
