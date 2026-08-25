@@ -19,7 +19,7 @@
 //! looks like a broken keystroke.
 use std::path::Path;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sess {
     /// `RESH_SESSION` read, the name is valid, and `RESH_PROJECT` names the
     /// project being asked about.
