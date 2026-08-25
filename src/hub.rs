@@ -2717,6 +2717,9 @@ mod tests {
     }
 
     #[test]
+    // Revert-checked: dropping the `launch == Some(Claude)` clause in
+    // `do_new_terminal` fails this at the "a plain shell opens beside a
+    // Claude" assertion (src/hub.rs:2734) — a `+` click gets prompted too.
     fn a_plus_click_never_prompts() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
