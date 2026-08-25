@@ -2162,7 +2162,13 @@ if (wtBtn && wtPanel) {
     wtPanel.hidden = !wtPanel.hidden;
     if (!wtPanel.hidden && window.htmx) {
       // State costs two git calls per worktree; ask only while looking.
-      htmx.ajax("GET", `/frag/_worktrees?current=${encodeURIComponent(document.body.dataset.key || "")}&state=1`, "#wtstrip");
+      // `document.body.dataset.key` is already the server's `percent_encode(key)`
+      // (render.rs's `qkey`, embedded raw into the sibling `hx-get` on
+      // #wtstrip's own span) — wrapping it in encodeURIComponent here escaped
+      // the '%' a second time (`%2F` -> `%252F`), which the server's single
+      // percent_decode could not undo, so the switcher silently rendered "no
+      // worktrees" for any project whose key needed encoding at all.
+      htmx.ajax("GET", `/frag/_worktrees?current=${document.body.dataset.key || ""}&state=1`, "#wtstrip");
     }
   };
   // A plain click through to a worktree navigates away anyway; this is for

@@ -83,6 +83,21 @@
 //!   (c) dropping `history.replaceState` from the State-case launch consumer:
 //!       section C's "the ?launch= parameter was consumed" FAILED —
 //!       location.search stayed `?launch=claude`. Restored: passes again.
+//!   (d) (fix round 1) re-wrapping the switcher's `document.body.dataset.key`
+//!       in `encodeURIComponent` before sending it as `current=`: that key is
+//!       already `percent_encode(key)` from the server (render.rs's `qkey`),
+//!       so re-encoding it turns `outer%2Finner` into `outer%252Finner`,
+//!       which the server's single `percent_decode` cannot recover — the
+//!       fragment renders "no worktrees" for any project whose key needs
+//!       encoding at all. Invisible to this file before this fix round: the
+//!       fixture project was flat ("proj"), whose key needs no encoding.
+//!       Switched the fixture to a nested project ("outer/inner", key
+//!       `outer%2Finner`) so section E's fetch actually exercises this path.
+//!       With the bug reintroduced: section E's "the worktree row shows 0
+//!       ahead" FAILED deterministically (not a timing flake — the retry
+//!       loop's 20 attempts over 20s all hit the broken URL), cascading into
+//!       "the remove control appears" and a crash on the next line. Restored:
+//!       passes again.
 //!
 //! Run: deno run -A tests/browser/worktree-launch.mjs
 import { fixture, freePort, openPage, attachTarget, profileDir, startBrowser, startResh, until, sleep }
@@ -104,7 +119,19 @@ const git = async (dir, ...args) => {
   const o = await new Deno.Command("git", { args: ["-C", dir, ...args], stdout: "piped", stderr: "piped" }).output();
   return { ok: o.success, out: new TextDecoder().decode(o.stdout), err: new TextDecoder().decode(o.stderr) };
 };
-const projDir = `${fx.roots}/${fx.project}`;
+// A *nested* project, not fixture()'s flat "proj": its storage key
+// (`projects::storage_key`) percent-encodes the '/' to `%2F`
+// (`outer%2Finner`), which is exactly what section E's switcher fetch needs
+// to catch a double-encoding regression — `document.body.dataset.key` is
+// already that percent-encoded key, and wrapping it in encodeURIComponent a
+// second time turns `%2F` into `%252F`, which the server's single
+// percent_decode cannot recover. The flat "proj" fixture needs no encoding
+// at all, so that bug was invisible to this file until now.
+const project = "outer/inner";
+const projDir = `${fx.roots}/${project}`;
+await Deno.mkdir(projDir, { recursive: true });
+await Deno.writeFile(`${projDir}/hello.md`, enc.encode("# hello\n"));
+await new Deno.Command("git", { args: ["init", "-q"], cwd: projDir, stdout: "null", stderr: "null" }).output();
 await git(projDir, "config", "user.email", "t@t"); await git(projDir, "config", "user.name", "t");
 await git(projDir, "add", "."); await git(projDir, "commit", "-qm", "init");
 
@@ -128,8 +155,8 @@ const clickReal = async (pg, selector) => {
 
 try {
   resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shell } });
-  await until(async () => (await (await fetch(`http://127.0.0.1:${resh.port}/${fx.project}`)).text()).includes('data-launches="claude"'), 15, "claude offered");
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  await until(async () => (await (await fetch(`http://127.0.0.1:${resh.port}/${project}`)).text()).includes('data-launches="claude"'), 15, "claude offered");
+  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${project}`);
   const { evalIn } = page;
   await until(() => evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "app.js");
   await evalIn(helpers);
