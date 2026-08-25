@@ -1224,12 +1224,17 @@ pub fn known_projects_with_state(roots: &[PathBuf]) -> Vec<ProjectStatus> {
     // A worktree's directory comes from git's own listing of its parent, not
     // from `resolve_project`: that refuses dot segments (`.claude/…`), and
     // `is_vouched_worktree` is an exception to *naming* only.
+    // Keyed by the child's storage key — the identity `group_worktrees`
+    // mints via `rel_under_roots` — never by branch name: `claude-1` exists
+    // in every repo resh has made a worktree for, so a branch-keyed map
+    // would hand one project another project's git state (review finding,
+    // Task 8).
     let mut dirs: std::collections::HashMap<String, PathBuf> = Default::default();
     for p in ps.iter().filter(|p| p.parent.is_none()) {
         if let Some(pd) = crate::projects::resolve_project(roots, &p.url) {
             for w in crate::worktree::list(&pd).into_iter().filter(|w| !w.is_main) {
-                if let Ok(c) = w.path.canonicalize() {
-                    dirs.insert(w.branch.clone(), c);
+                if let (Some(child_url), Ok(c)) = (rel_under_roots(roots, &w.path), w.path.canonicalize()) {
+                    dirs.insert(crate::projects::storage_key(&child_url), c);
                 }
             }
         }
@@ -1237,16 +1242,14 @@ pub fn known_projects_with_state(roots: &[PathBuf]) -> Vec<ProjectStatus> {
     for p in ps.iter_mut() {
         let Some(parent) = p.parent.as_deref() else { continue };
         if !p.reachable { continue }
-        let Some(dir) = dirs.get(&p.branch).cloned() else { continue };
+        let Some(dir) = dirs.get(&p.key).cloned() else { continue };
         let (base, base_recorded) = match crate::worktree::read_base(&state_dir, &p.key) {
             Some(b) => (b, true),
             None => (main_branch.get(parent).cloned().unwrap_or_default(), false),
         };
-        let st = if base.is_empty() {
-            crate::worktree::State { dirty: None, ahead: None }
-        } else {
-            crate::worktree::state(&dir, &base, &crate::worktree::real_git)
-        };
+        // `dirty` never depends on the base; only `ahead` does.
+        let st = crate::worktree::state(&dir, &base, &crate::worktree::real_git);
+        let st = if base.is_empty() { crate::worktree::State { dirty: st.dirty, ahead: None } } else { st };
         p.wt = Some(WorktreeStatus {
             claude: crate::claudes::claude_evidence(&p.url),
             dirty: st.dirty,
