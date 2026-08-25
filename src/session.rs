@@ -27,13 +27,32 @@ pub fn valid_name(name: &str) -> bool {
 /// `projects::resolve_project` before ever reaching here, but this function
 /// also builds a socket path and a session-registry key from it, so it
 /// re-validates independently rather than trusting a caller never to
-/// regress. Mirrors resolve_project's *syntactic* checks only (no empty,
+/// regress. Mirrors resolve_project's *syntactic* checks (no empty,
 /// absolute, or leading-dot segment) — it has no `roots` to canonicalize
 /// against, and doesn't need one, since the filesystem-confinement half of
 /// that check already happened before this project ever had a live `dir`
 /// to spawn a shell in. A nested project (`karpie/src`) is legitimate here.
+///
+/// One dot-segment exception, mirroring `resolve_project`'s own worktree
+/// vouching: the sole dot-segment shape resh itself ever mints is
+/// `.claude/worktrees/<name>` (`worktree::create`, `do_new_worktree`'s
+/// `WorktreeReady.url`), so that literal shape is let through without
+/// `roots` to re-derive real vouching — this was already vouched for once,
+/// by `resolve_project`, before this project had a `dir` to reach here with.
+/// Without this, no worktree's terminal can ever start: `attach` rejects
+/// the project string before it gets anywhere near a shell.
 fn valid_project(project: &str) -> bool {
-    !project.is_empty() && project.split('/').all(|s| !s.is_empty() && !s.starts_with('.'))
+    if project.is_empty() {
+        return false;
+    }
+    let segs: Vec<&str> = project.split('/').collect();
+    if segs.iter().any(|s| s.is_empty()) {
+        return false;
+    }
+    segs.iter().enumerate().all(|(i, s)| {
+        !s.starts_with('.')
+            || (i > 0 && *s == ".claude" && segs.get(i + 1) == Some(&"worktrees") && i + 3 == segs.len())
+    })
 }
 
 /// `{project}/{name}` rather than a flattened `{project}-{name}`: project and
@@ -790,6 +809,24 @@ mod tests {
         assert!(!valid_project("a//b"));
         assert!(!valid_project(".hidden"));
         assert!(!valid_project("a/../b"));
+    }
+
+    // Revert-checked: reverting to the blanket `!s.starts_with('.')` check
+    // (deleting the worktree exception) fails the first assertion here —
+    // observed: `assertion failed: valid_project("repo/.claude/worktrees/claude-1")`.
+    // `resolve_project` (projects.rs) already grew this exception for real
+    // vouched worktrees; this function's own doc comment claims to mirror
+    // resolve_project's syntactic checks, and had silently drifted out of
+    // sync with it.
+    #[test]
+    fn valid_project_accepts_only_the_exact_worktree_shape_as_a_dot_segment() {
+        assert!(valid_project("repo/.claude/worktrees/claude-1"), "the one shape resh itself mints");
+        assert!(valid_project("karpie/src/.claude/worktrees/claude-2"), "a nested project's worktree too");
+        assert!(!valid_project("repo/.claude"), "the parent dot-dir alone is still not a project");
+        assert!(!valid_project("repo/.claude/worktrees"), "missing the worktree name");
+        assert!(!valid_project("repo/.claude/worktrees/claude-1/extra"), "not a deeper path under it");
+        assert!(!valid_project(".claude/worktrees/claude-1"), "not at the top level either");
+        assert!(!valid_project("repo/.git"), "no exception for any other dotfile");
     }
 
     #[test]
