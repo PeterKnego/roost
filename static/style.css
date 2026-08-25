@@ -92,6 +92,10 @@ header .vsep { width: 1px; height: 16px; background: var(--border); margin: 0 6p
 .wtstrip .wt.unreachable { opacity: .35; cursor: default; }
 .wtstrip .branch { color: var(--muted); font-size: 12px; }
 .wtstrip .wt-empty { color: var(--muted); display: block; padding: 6px 8px; font-size: 12px; }
+.wtrow { display: flex; align-items: center; gap: 6px; }
+.wtf { color: var(--muted); font-size: 12px; }
+.wtf.on { color: var(--fg); }
+.wtremove { font: inherit; font-size: 12px; cursor: pointer; background: none; border: 1px solid var(--muted); border-radius: 3px; }
 .warn { color: #d29922; cursor: help; }
 /* Deliberately loud, not decorative: this is the only thing on the page that
    says a highlighted selection is leaving the machine, and it must not read

@@ -35,6 +35,81 @@ pub struct ProjectStatus {
     /// rather than silently omitted. Always true for entries not discovered
     /// via worktree grouping.
     pub reachable: bool,
+    /// Populated only by `known_projects_with_state`, only for reachable
+    /// linked worktrees. `known_projects` always leaves this `None` — it is
+    /// two git calls per worktree, paid only when the switcher panel opens.
+    pub wt: Option<WorktreeStatus>,
+}
+
+/// Per-worktree state for the switcher panel. Groups the four things a row
+/// can say into one `Option` on `ProjectStatus`, so a main-worktree entry
+/// (or a plain project) carries no half-filled state — there is nothing to
+/// leave blank, just `None`.
+#[derive(Debug, Clone)]
+pub struct WorktreeStatus {
+    pub claude: crate::claudes::ClaudeEvidence,
+    pub dirty: Option<bool>,
+    pub ahead: Option<u32>,
+    /// The branch this worktree's ahead-count is measured against.
+    pub base: String,
+    /// True when `base` came from the `.base` file resh wrote at
+    /// `create` time; false when it fell back to the main worktree's
+    /// current branch (a worktree resh did not create, or a lost record).
+    pub base_recorded: bool,
+}
+
+/// Can this worktree be offered for removal? Every axis positively clean;
+/// a single unknown says no. The hub re-derives this at the moment of the
+/// intent — the row is a hint, not an authorisation.
+pub fn removable(w: &WorktreeStatus, live: usize) -> bool {
+    live == 0
+        && w.claude == crate::claudes::ClaudeEvidence::Absent
+        && w.dirty == Some(false)
+        && w.ahead == Some(0)
+}
+
+/// `known_projects` plus per-worktree state. Costs two git calls per linked
+/// worktree, so it is requested only when the switcher panel opens.
+pub fn known_projects_with_state(roots: &[PathBuf]) -> Vec<ProjectStatus> {
+    let mut ps = known_projects(roots);
+    let state_dir = crate::wsstate::state_dir();
+    let main_branch: std::collections::HashMap<String, String> =
+        ps.iter().filter(|p| p.parent.is_none()).map(|p| (p.key.clone(), p.branch.clone())).collect();
+    // A worktree's directory comes from git's own listing of its parent, not
+    // from `resolve_project`: that refuses dot segments (`.claude/…`), and
+    // `is_vouched_worktree` is an exception to *naming* only.
+    let mut dirs: std::collections::HashMap<String, PathBuf> = Default::default();
+    for p in ps.iter().filter(|p| p.parent.is_none()) {
+        if let Some(pd) = crate::projects::resolve_project(roots, &p.url) {
+            for w in crate::worktree::list(&pd).into_iter().filter(|w| !w.is_main) {
+                if let Ok(c) = w.path.canonicalize() {
+                    dirs.insert(w.branch.clone(), c);
+                }
+            }
+        }
+    }
+    for p in ps.iter_mut() {
+        let Some(parent) = p.parent.as_deref() else { continue };
+        if !p.reachable { continue }
+        let Some(dir) = dirs.get(&p.branch).cloned() else { continue };
+        let (base, base_recorded) = match crate::worktree::read_base(&state_dir, &p.key) {
+            Some(b) => (b, true),
+            None => (main_branch.get(parent).cloned().unwrap_or_default(), false),
+        };
+        let st = if base.is_empty() {
+            crate::worktree::State { dirty: None, ahead: None }
+        } else {
+            crate::worktree::state(&dir, &base, &crate::worktree::real_git)
+        };
+        p.wt = Some(WorktreeStatus {
+            claude: crate::claudes::claude_evidence(&p.url),
+            dirty: st.dirty,
+            ahead: st.ahead,
+            base,
+            base_recorded,
+        });
+    }
+    ps
 }
 
 pub struct ReapReport {
@@ -814,6 +889,7 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
                     branch: String::new(),
                     parent: None,
                     reachable: true,
+                    wt: None,
                 },
             );
         }
@@ -879,6 +955,7 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
                     branch: String::new(),
                     parent: None,
                     reachable: true,
+                    wt: None,
                 });
                 slot.live = live;
                 slot.oldest_age_secs = oldest;
@@ -946,6 +1023,7 @@ fn group_worktrees(roots: &[PathBuf], by_key: &mut std::collections::BTreeMap<St
                         branch: String::new(),
                         parent: None,
                         reachable: true,
+                        wt: None,
                     });
                     slot.branch = w.branch;
                     slot.parent = Some(key.clone());
@@ -969,6 +1047,7 @@ fn group_worktrees(roots: &[PathBuf], by_key: &mut std::collections::BTreeMap<St
                         branch: w.branch,
                         parent: Some(key.clone()),
                         reachable: false,
+                        wt: None,
                     });
                 }
             }

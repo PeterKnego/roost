@@ -88,6 +88,22 @@ pub fn real_git(repo: &Path, args: &[&str]) -> Result<String, String> {
 
 pub const MAX_WORKTREES: u32 = 64;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct State {
+    pub dirty: Option<bool>,
+    pub ahead: Option<u32>,
+}
+
+/// Two git calls, each three-valued. `None` is "git did not answer" and is
+/// never rendered or acted on as clean.
+pub fn state(path: &Path, base: &str, run: GitRunner) -> State {
+    let dirty = run(path, &["status", "--porcelain"]).ok().map(|o| !o.trim().is_empty());
+    let ahead = run(path, &["rev-list", "--count", &format!("{base}..HEAD")])
+        .ok()
+        .and_then(|o| o.trim().parse::<u32>().ok());
+    State { dirty, ahead }
+}
+
 #[derive(Debug)]
 pub struct Created {
     pub name: String,
@@ -490,5 +506,31 @@ mod tests {
         assert!(std::fs::read_dir(state.join("worktrees")).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(".tmp")), "no temp file left");
         std::fs::write(base_file(&state, "torn"), "").unwrap();
         assert_eq!(read_base(&state, "torn"), None, "empty is not a base");
+    }
+
+    #[test]
+    fn state_reads_dirty_and_ahead_against_the_recorded_base() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo_with_commit(root.path());
+        let c = create(&repo, &root.path().join("state"), &key_of, &real_git).unwrap();
+        assert_eq!(state(&c.path, "main", &real_git), State { dirty: Some(false), ahead: Some(0) });
+        std::fs::write(c.path.join("new.txt"), "y").unwrap();
+        assert_eq!(state(&c.path, "main", &real_git).dirty, Some(true));
+        real_git(&c.path, &["add", "."]).unwrap();
+        real_git(&c.path, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "wt"]).unwrap();
+        assert_eq!(state(&c.path, "main", &real_git), State { dirty: Some(false), ahead: Some(1) });
+        // Merged into the base: ahead drops to 0 even though main moved.
+        real_git(&repo, &["merge", "-q", "--no-edit", "claude-1"]).unwrap();
+        assert_eq!(state(&c.path, "main", &real_git).ahead, Some(0));
+    }
+
+    #[test]
+    fn state_reports_unknown_not_clean_when_git_does_not_answer() {
+        // Revert-checked: `unwrap_or(false)` / `unwrap_or(0)` fail here.
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo_with_commit(root.path());
+        let dead = |_: &Path, _: &[&str]| -> Result<String, String> { Err("timeout".into()) };
+        assert_eq!(state(&repo, "main", &dead), State { dirty: None, ahead: None });
+        assert_eq!(state(&repo, "no-such-base", &real_git).ahead, None, "a bad base is unknown, not zero");
     }
 }
