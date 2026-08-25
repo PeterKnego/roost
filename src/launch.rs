@@ -223,8 +223,10 @@ mod tests {
 
     #[test]
     fn claude_is_typed_with_its_session_id_and_enter() {
-        // Revert-checked: with `keystrokes` returning the old `claude\r`
-        // this fails on the `--session-id` assertion.
+        // Revert-checked: when keystrokes returns b"claude\r" unconditionally,
+        // this fails at src/launch.rs:226:9: assertion `left == right` failed,
+        // left: [99, 108, 97, 117, 100, 101, 13] (claude\r),
+        // right: [99, 108, 97, 117, 100, 101, 32, 45, 45, 115, ...] (claude --session-id ...\r).
         let id = "0123abcd-0123-4abc-8abc-0123456789ab";
         assert_eq!(
             keystrokes(Launch::Claude, Some(id)),
@@ -234,6 +236,10 @@ mod tests {
 
     #[test]
     fn without_an_id_the_bare_command_is_typed() {
+        // Revert-checked: when fallback arm returns b"claude --session-id broken-id\r",
+        // this fails at src/launch.rs:239:9: assertion `left == right` failed,
+        // left: [99, 108, 97, 117, 100, 101, 32, 45, 45, ...] (claude --session-id broken-id\r),
+        // right: [99, 108, 97, 117, 100, 101, 13] (claude\r).
         assert_eq!(keystrokes(Launch::Claude, None), b"claude\r".to_vec());
     }
 
@@ -242,6 +248,10 @@ mod tests {
         // The id lands on a command line. Anything that is not exactly a
         // uuid falls back to the bare command — the metacharacter must be
         // absent from what is typed, not merely quoted.
+        // Revert-checked: when guard on valid_session_id(id) is removed,
+        // this fails at src/launch.rs:253:9: assertion `left == right` failed,
+        // left: [99, 108, 97, 117, 100, 101, 32, 45, 45, 115, 101, 115, 115, 105, 111, 110, 45, 105, 100, 32, ..., 59, ...] (contains injected semicolon),
+        // right: [99, 108, 97, 117, 100, 101, 13] (claude\r).
         let bad = "0123abcd-0123-4abc-8abc-0123456789ab; rm -rf ~";
         let typed = keystrokes(Launch::Claude, Some(bad));
         assert_eq!(typed, b"claude\r".to_vec());
@@ -253,11 +263,19 @@ mod tests {
 
     #[test]
     fn a_minted_id_is_a_valid_v4_uuid() {
-        let id = new_session_id().expect("/dev/urandom is readable on a test host");
-        assert!(valid_session_id(&id), "{id}");
-        assert_eq!(&id[14..15], "4", "version nibble: {id}");
-        assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"), "variant nibble: {id}");
-        assert_ne!(id, new_session_id().unwrap(), "two mints differ");
+        // Revert-checked: when nibble-setting lines are dropped from new_session_id,
+        // the version nibble (position 14, should be '4') and variant nibble (position 19, should be 8-b)
+        // are random. The test fails ~93.75% of runs on the variant check at src/launch.rs:268:9:
+        // panicked at assertion `matches!(...), "variant nibble: <uuid>"`, e.g. uuid "266d78b4-1a5d-4884-20fd-279048848c18"
+        // with variant nibble '2' instead of 8-b. Mint 8 ids to make deterministic (probability of all
+        // 8 passing accidentally is ~6.3e-14).
+        for _ in 0..8 {
+            let id = new_session_id().expect("/dev/urandom is readable on a test host");
+            assert!(valid_session_id(&id), "{id}");
+            assert_eq!(&id[14..15], "4", "version nibble: {id}");
+            assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"), "variant nibble: {id}");
+        }
+        assert_ne!(new_session_id().unwrap(), new_session_id().unwrap(), "two mints differ");
     }
 
     use std::time::Duration;
