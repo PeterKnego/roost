@@ -187,6 +187,20 @@ pub fn create(
     Ok(Created { name, path, base })
 }
 
+/// `git worktree remove` without `--force`, then `git branch -d` without
+/// `-D`. git's own refusals are gates that share no code with the caller's
+/// checks: a dirty tree stops step one, an unmerged branch stops step two.
+/// A kept branch is `Ok(Some(note))` — a branch is cheap, a lost commit is
+/// not, and the caller reports it rather than retrying harder.
+pub fn remove(repo: &Path, path: &Path, branch: &str, run: GitRunner) -> Result<Option<String>, String> {
+    let p = path.to_string_lossy();
+    run(repo, &["worktree", "remove", &p]).map_err(|e| format!("git worktree remove refused: {e}"))?;
+    match run(repo, &["branch", "-d", branch]) {
+        Ok(_) => Ok(None),
+        Err(e) => Ok(Some(format!("worktree removed; branch {branch} kept: git reports it unmerged ({})", e.trim()))),
+    }
+}
+
 /// True when git itself reports `rel` as a worktree of some repository under
 /// `roots`. This is the sole exception to the dot-segment rule, and it is an
 /// exception to *naming* only — the caller still confines the path.
@@ -532,5 +546,40 @@ mod tests {
         let dead = |_: &Path, _: &[&str]| -> Result<String, String> { Err("timeout".into()) };
         assert_eq!(state(&repo, "main", &dead), State { dirty: None, ahead: None });
         assert_eq!(state(&repo, "no-such-base", &real_git).ahead, None, "a bad base is unknown, not zero");
+    }
+
+    #[test]
+    fn remove_takes_the_worktree_and_the_branch_when_git_agrees() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo_with_commit(root.path());
+        let c = create(&repo, &root.path().join("state"), &key_of, &real_git).unwrap();
+        assert_eq!(remove(&repo, &c.path, "claude-1", &real_git).unwrap(), None);
+        assert!(matches!(std::fs::symlink_metadata(&c.path), Err(e) if e.kind() == std::io::ErrorKind::NotFound));
+        assert!(real_git(&repo, &["branch", "--list", "claude-1"]).unwrap().trim().is_empty());
+    }
+
+    #[test]
+    fn remove_keeps_an_unmerged_branch_and_says_so() {
+        // git's own `-d` refusal is the gate here, not ours.
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo_with_commit(root.path());
+        let c = create(&repo, &root.path().join("state"), &key_of, &real_git).unwrap();
+        std::fs::write(c.path.join("n.txt"), "y").unwrap();
+        real_git(&c.path, &["add", "."]).unwrap();
+        real_git(&c.path, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "wt"]).unwrap();
+        let note = remove(&repo, &c.path, "claude-1", &real_git).unwrap().expect("a note");
+        assert!(note.contains("claude-1") && note.contains("unmerged"), "{note}");
+        assert!(!real_git(&repo, &["branch", "--list", "claude-1"]).unwrap().trim().is_empty(), "branch kept");
+    }
+
+    #[test]
+    fn remove_refuses_a_dirty_worktree_without_force() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo_with_commit(root.path());
+        let c = create(&repo, &root.path().join("state"), &key_of, &real_git).unwrap();
+        std::fs::write(c.path.join("n.txt"), "y").unwrap();
+        let err = remove(&repo, &c.path, "claude-1", &real_git).unwrap_err();
+        assert!(err.contains("worktree remove"), "{err}");
+        assert!(c.path.join("n.txt").is_file(), "nothing touched");
     }
 }

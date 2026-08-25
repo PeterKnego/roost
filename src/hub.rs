@@ -432,6 +432,7 @@ impl Hub {
             Intent::CloseProject => return self.do_close_project(from),
             Intent::EndSession { session } => return self.do_end_session(from, session.clone()),
             Intent::NewWorktree { launch } => return self.do_new_worktree(from, *launch),
+            Intent::RemoveWorktree { key } => return self.do_remove_worktree(from, key.clone()),
             Intent::NewTerminal { pane, launch, force } => {
                 return self.do_new_terminal(from, *pane, *launch, *force)
             }
@@ -1214,6 +1215,147 @@ impl Hub {
                 let r = work();
                 if let Some(url) = finish(self, r) {
                     broadcast_all(&Event::ProjectsChanged { project: url });
+                }
+            }
+        }
+    }
+
+    /// `git worktree remove` (no `--force`), then `git branch -d` (no
+    /// `-D`) off the hub lock, the `do_new_worktree` shape. Four independent
+    /// gates are re-derived here — Claude evidence, a live terminal, dirty,
+    /// ahead — rather than trusted from whatever state the row that offered
+    /// the button was rendered from; see CLAUDE.md's "Absence of evidence is
+    /// not evidence of absence": this is the destructive path that section
+    /// exists for. git's own two refusals (a dirty tree, an unmerged
+    /// branch) are gates this function does not duplicate — a `state`-based
+    /// check makes sure this project never even tries.
+    ///
+    /// The worktree is found from this repo's own `git worktree list`, not
+    /// `projects::roots()`/`resolve_project`: every worktree resh creates
+    /// lives under `.claude/worktrees/{name}` inside this project's own
+    /// directory, so asking git which linked worktrees it has and matching
+    /// their storage key is exact, and the main checkout — never a non-main
+    /// entry in that list — can never match.
+    fn do_remove_worktree(&mut self, from: &ConnId, key: String) {
+        if self.closing {
+            let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
+            return self.send_to(from, &ev);
+        }
+        let repo = self.dir.clone();
+        let project = self.project.clone();
+        let from = from.clone();
+        // A separate clone for `finish`: the spawn-failure arm below still
+        // needs `from` after `finish` (a `move` closure) has taken its own
+        // copy, since only one of the two ever runs but the borrow checker
+        // cannot see that (same shape as `do_new_worktree`'s `finish_from`).
+        let finish_from = from.clone();
+        let work = move || -> Result<Option<String>, String> {
+            let decoded = crate::registry::decode_key(&key);
+            let repo_canon = repo
+                .canonicalize()
+                .map_err(|e| format!("cannot resolve project directory: {e}"))?;
+            let ws = crate::worktree::list(&repo);
+            let mut target: Option<(std::path::PathBuf, String, String)> = None;
+            for w in ws.iter().filter(|w| !w.is_main) {
+                let Ok(canon) = w.path.canonicalize() else { continue };
+                let Ok(rel) = canon.strip_prefix(&repo_canon) else { continue };
+                let url = format!("{project}/{}", rel.display());
+                if crate::projects::storage_key(&url) == key {
+                    target = Some((canon, w.branch.clone(), url));
+                    break;
+                }
+            }
+            let (dir, name, url) =
+                target.ok_or_else(|| format!("{decoded}: not a worktree of this project"))?;
+            // Each check names itself. Order: the most specific first, so a
+            // launched Claude is reported as such and not as "a terminal".
+            match crate::claudes::claude_evidence(&url) {
+                crate::claudes::ClaudeEvidence::Present(_) => {
+                    return Err(format!("{name}: a Claude is running there"))
+                }
+                crate::claudes::ClaudeEvidence::Unknown => {
+                    return Err(format!(
+                        "{name}: cannot tell whether a Claude is running there (IDE integration is off)"
+                    ))
+                }
+                crate::claudes::ClaudeEvidence::Absent => {}
+            }
+            if !crate::session::live_names(&url).is_empty() {
+                return Err(format!("{name} has a live terminal"));
+            }
+            let state_dir = crate::wsstate::state_dir();
+            let base = crate::worktree::read_base(&state_dir, &key)
+                .or_else(|| ws.iter().find(|w| w.is_main).map(|m| m.branch.clone()))
+                .ok_or_else(|| format!("{name}: no base to measure against"))?;
+            let st = crate::worktree::state(&dir, &base, &crate::worktree::real_git);
+            match st.dirty {
+                Some(false) => {}
+                Some(true) => return Err(format!("{name} has uncommitted changes")),
+                None => return Err(format!("{name}: git did not answer (status)")),
+            }
+            match st.ahead {
+                Some(0) => {}
+                Some(n) => {
+                    return Err(format!(
+                        "{name} is {n} commit{} ahead of {base}",
+                        if n == 1 { "" } else { "s" }
+                    ))
+                }
+                None => return Err(format!("{name}: git did not answer (rev-list)")),
+            }
+            let note = crate::worktree::remove(&repo, &dir, &name, &crate::worktree::real_git)?;
+            // Only after both git steps succeed: resh's own records about a
+            // thing that, by this point, no longer exists.
+            let _ = std::fs::remove_file(crate::worktree::base_file(&state_dir, &key));
+            let _ = std::fs::remove_file(state_dir.join(format!("{key}.json")));
+            Ok(note)
+        };
+        // `finish` runs under the hub lock and only talks to the clicker.
+        // `broadcast_all` locks EVERY registered hub — this one included —
+        // so it must run after the guard is dropped (Task 7 found the
+        // self-deadlock; `do_new_worktree`/`do_end_session` have the same
+        // ordering).
+        let finish = move |h: &mut Hub, r: Result<Option<String>, String>| -> bool {
+            match r {
+                Ok(note) => {
+                    let ev = match note {
+                        Some(n) => Event::Error { msg: n },
+                        None => Event::ProjectsChanged { project: h.project.clone() },
+                    };
+                    h.send_to(&finish_from, &ev);
+                    true
+                }
+                Err(msg) => {
+                    let ev = Event::Error { msg };
+                    h.send_to(&finish_from, &ev);
+                    false
+                }
+            }
+        };
+        let project_for_broadcast = self.project.clone();
+        match self.self_ref.upgrade() {
+            Some(arc) => {
+                let spawned = std::thread::Builder::new().name("remove-worktree".into()).spawn(move || {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                        .unwrap_or_else(|_| Err("worktree removal panicked".into()));
+                    let changed = {
+                        let mut h = Hub::lock(&arc);
+                        finish(&mut h, r)
+                    }; // guard dropped here, before any other hub is locked
+                    if changed {
+                        broadcast_all(&Event::ProjectsChanged { project: project_for_broadcast });
+                    }
+                });
+                if spawned.is_err() {
+                    let ev = Event::Error { msg: "could not start worktree removal".into() };
+                    self.send_to(&from, &ev);
+                }
+            }
+            None => {
+                let r = work();
+                let changed = finish(self, r);
+                if changed {
+                    broadcast_all(&Event::ProjectsChanged { project: project_for_broadcast });
                 }
             }
         }
@@ -4206,6 +4348,148 @@ mod tests {
         let got = rxa.recv_timeout(std::time::Duration::from_secs(5));
         assert!(got.is_ok(), "timed out waiting for WorktreeReady -- broadcast_all deadlocked against this hub's own lock");
         assert!(got.unwrap().contains(r#""t":"WorktreeReady""#));
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// A repo with one resh-created worktree, both registered under a temp
+    /// state dir; returns (hub for the repo, worktree url, worktree dir).
+    fn repo_with_worktree(root: &std::path::Path) -> (Hub, String, std::path::PathBuf) {
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let key_of = |n: &str| crate::projects::storage_key(&format!("repo/.claude/worktrees/{n}"));
+        let c = crate::worktree::create(&repo, &crate::wsstate::state_dir(), &key_of, &crate::worktree::real_git).unwrap();
+        (Hub::new("repo", repo), "repo/.claude/worktrees/claude-1".into(), c.path)
+    }
+    const WT_KEY: &str = "repo%2F.claude%2Fworktrees%2Fclaude-1";
+
+    fn refusal_of(h: &mut Hub, a: &ConnId, rx: &Receiver<String>) -> String {
+        h.handle(a, Intent::RemoveWorktree { key: WT_KEY.into() });
+        let got = rx.try_recv().expect("an answer");
+        assert!(got.contains(r#""t":"Error""#), "expected a refusal, got {got}");
+        got
+    }
+
+    #[test]
+    fn remove_refuses_a_worktree_with_a_live_terminal() {
+        // Revert-checked: with the live check deleted this passes the
+        // worktree straight to git, which removes it — `refusal_of`'s own
+        // assertion that the answer was an `Error` fails first (removal
+        // *succeeds*, so no later assertion in this test even runs).
+        // Observed: `panicked ... expected a refusal, got
+        // {"t":"ProjectsChanged","project":"repo"}`.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
+        let (mut h, url, dir) = repo_with_worktree(root.path());
+        let (a, rx) = h.subscribe(); drain(&rx);
+        let _att = crate::session::attach(&url, "term", &dir).unwrap();
+        let got = refusal_of(&mut h, &a, &rx);
+        assert!(got.contains("live terminal"), "{got}");
+        assert!(dir.is_dir());
+        crate::session::kill_project(&url);
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn remove_refuses_a_worktree_where_a_claude_was_launched() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
+        let (mut h, url, dir) = repo_with_worktree(root.path());
+        let (a, rx) = h.subscribe(); drain(&rx);
+        crate::session::set_launch(&url, "term", Some(crate::session::LaunchRequest { launch: proto::Launch::Claude, session_id: None }));
+        let _att = crate::session::attach(&url, "term", &dir).unwrap();
+        let got = refusal_of(&mut h, &a, &rx);
+        // Names the more specific reason even though "live terminal" is also true.
+        assert!(got.contains("Claude"), "{got}");
+        assert!(dir.is_dir());
+        crate::session::kill_project(&url);
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn remove_refuses_a_dirty_worktree() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
+        let (mut h, _url, dir) = repo_with_worktree(root.path());
+        let (a, rx) = h.subscribe(); drain(&rx);
+        std::fs::write(dir.join("n.txt"), "y").unwrap();
+        let got = refusal_of(&mut h, &a, &rx);
+        assert!(got.contains("uncommitted"), "{got}");
+        assert!(dir.join("n.txt").is_file());
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn remove_refuses_a_worktree_with_commits_ahead() {
+        // Revert-checked: with the `st.ahead` match deleted, `remove` runs
+        // and git itself refuses the unmerged branch, so this still gets an
+        // `Error` — but the wrong one, and the worktree is gone. Observed:
+        // `panicked ... {"t":"Error","msg":"worktree removed; branch
+        // claude-1 kept: git reports it unmerged (...)"}`, failing the
+        // `got.contains("1 commit")` assertion.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
+        let (mut h, _url, dir) = repo_with_worktree(root.path());
+        let (a, rx) = h.subscribe(); drain(&rx);
+        std::fs::write(dir.join("n.txt"), "y").unwrap();
+        crate::worktree::real_git(&dir, &["add", "."]).unwrap();
+        crate::worktree::real_git(&dir, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "wt"]).unwrap();
+        let got = refusal_of(&mut h, &a, &rx);
+        assert!(got.contains("1 commit"), "{got}");
+        assert!(dir.is_dir());
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn remove_takes_a_clean_idle_worktree_and_its_state() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
+        let (mut h, _url, dir) = repo_with_worktree(root.path());
+        let (a, rx) = h.subscribe(); drain(&rx);
+        let state = crate::wsstate::state_dir();
+        std::fs::write(state.join(format!("{WT_KEY}.json")), "{}").unwrap();
+        h.handle(&a, Intent::RemoveWorktree { key: WT_KEY.into() });
+        let got = rx.try_recv().unwrap();
+        assert!(!got.contains(r#""t":"Error""#), "{got}");
+        assert!(matches!(std::fs::symlink_metadata(&dir), Err(e) if e.kind() == std::io::ErrorKind::NotFound));
+        assert!(crate::worktree::read_base(&state, WT_KEY).is_none(), ".base gone");
+        assert!(!state.join(format!("{WT_KEY}.json")).exists(), "layout gone");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn remove_refuses_a_key_that_is_not_a_worktree_of_this_project() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
+        let (mut h, _url, _dir) = repo_with_worktree(root.path());
+        let (a, rx) = h.subscribe(); drain(&rx);
+        h.handle(&a, Intent::RemoveWorktree { key: "repo".into() });
+        let got = rx.try_recv().unwrap();
+        assert!(got.contains("not a worktree of this project"), "the main checkout is never removable: {got}");
         std::env::remove_var("RESH_STATE_DIR");
     }
 }

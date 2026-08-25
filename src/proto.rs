@@ -117,6 +117,10 @@ pub enum Intent {
         #[serde(default)]
         launch: Option<Launch>,
     },
+    /// Remove a finished worktree of this project. The server re-derives
+    /// every "finished" check at this moment; the row that offered the
+    /// button is a hint, not an authorisation.
+    RemoveWorktree { key: String },
     /// Tree visibility for this workspace, overriding the config file's
     /// `show_hidden` for everyone looking at this project. A workspace that
     /// has never been toggled carries `None` and follows the config instead —
