@@ -22,9 +22,9 @@ fn main() {
         std::process::exit(2);
     }
     // Both sources naming roots and disagreeing is a misconfiguration that is
-    // otherwise invisible: RESH_ROOTS wins here, while `resh peers` — which
-    // inherits none of this process's environment — silently resolves the
-    // other set. Loud, on the server's stderr, which systemd captures.
+    // otherwise invisible: RESH_ROOTS wins here, while a caller that inherits
+    // none of this process's environment — a hook, say — silently resolves
+    // the other set. Loud, on the server's stderr, which systemd captures.
     if let Some((env, cfg)) = resh::projects::roots_conflict(
         std::env::var("RESH_ROOTS").ok().as_deref(),
         &resh::config::global_config_path(),

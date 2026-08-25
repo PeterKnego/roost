@@ -68,9 +68,9 @@ const TEXT_EXTENSIONS: &[&str] = &[
 /// The env var wins so the unit file stays authoritative for the service, and
 /// so a test or a second instance can point somewhere else for one run
 /// without editing the user's config. The config entry exists for the callers
-/// that are *not* the service — `resh peers` runs from a Claude Code hook,
-/// which inherits none of the unit's environment, and hard-coding the roots
-/// into that hook duplicated the unit file in a second place that would drift.
+/// that are *not* the service — a caller that inherits none of the unit's
+/// environment, such as a hook, and hard-coding the roots into that caller
+/// duplicated the unit file in a second place that would drift.
 ///
 /// Config side is global-only; see [`crate::config::configured_roots`] for why
 /// a project file must never reach this.
@@ -86,9 +86,9 @@ pub fn roots() -> Vec<PathBuf> {
 /// `RESH_ROOTS` wins silently, which is correct — the unit file is
 /// authoritative for the service — but silence is wrong when the two were
 /// meant to say the same thing. The config entry exists so callers that
-/// inherit none of the unit's environment (`resh peers`, from a hook) resolve
-/// the same projects the server does; when they drift, those callers quietly
-/// answer about a different set of directories than the server serves.
+/// inherit none of the unit's environment (a hook, say) resolve the same
+/// projects the server does; when they drift, those callers quietly answer
+/// about a different set of directories than the server serves.
 ///
 /// Only a conflict, never a preference: one source silent is the ordinary
 /// case, not a problem.
@@ -925,7 +925,7 @@ mod tests {
         assert_eq!(
             roots_from(None, &cfg),
             vec![PathBuf::from("/from/config")],
-            "with no env, the global config answers — this is what `resh peers` relies on"
+            "with no env, the global config answers — what any caller outside the service relies on"
         );
         assert_eq!(
             roots_from(Some(""), &cfg),
@@ -1153,9 +1153,9 @@ mod tests {
 
     /// A conflict is both sources speaking and disagreeing — never one being
     /// silent, which is the ordinary case on every host that sets only the
-    /// unit file. Detected because `RESH_ROOTS` wins here while `resh peers`,
-    /// which inherits none of the server's environment, silently resolves the
-    /// other set.
+    /// unit file. Detected because `RESH_ROOTS` wins here while a caller that
+    /// inherits none of the server's environment, such as a hook, silently
+    /// resolves the other set.
     #[test]
     fn only_two_disagreeing_sources_are_a_conflict() {
         let d = tempfile::tempdir().unwrap();

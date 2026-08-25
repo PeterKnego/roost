@@ -1,7 +1,7 @@
 //! One file for problems resh detects but nobody would otherwise see.
 //!
-//! Two of resh's detectors have nowhere useful to complain. `resh peers` runs
-//! as a Claude Code hook that always exits 0, and a hook's stderr is shown
+//! Some of resh's detectors have nowhere useful to complain. A hook or other
+//! non-service caller can exit 0 unconditionally, and its stderr is shown
 //! only when it fails or is slow — so a warning written there on a successful
 //! run is discarded, which is indistinguishable from never having detected
 //! anything. The server can use stderr, since systemd captures it, but then a

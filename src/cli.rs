@@ -1,4 +1,4 @@
-//! The `resh notify` and `resh peers` subcommands.
+//! The `resh notify` subcommand.
 //!
 //! It runs *inside* the terminal resh is already reading, so there is no
 //! IPC here and no socket to connect to: printing the escape sequence to the
