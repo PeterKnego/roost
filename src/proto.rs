@@ -109,6 +109,14 @@ pub enum Intent {
     OpenPath { text: String },
     InitGit,
     CloseProject,
+    /// Create `.claude/worktrees/claude-N` off this project's HEAD. No name
+    /// from the browser: the server mints it, so nothing typed reaches a
+    /// path or a command line. `launch` is echoed back in `WorktreeReady`
+    /// so the new tab knows what to start.
+    NewWorktree {
+        #[serde(default)]
+        launch: Option<Launch>,
+    },
     /// Tree visibility for this workspace, overriding the config file's
     /// `show_hidden` for everyone looking at this project. A workspace that
     /// has never been toggled carries `None` and follows the config instead —
@@ -226,6 +234,9 @@ pub enum Event {
     GitInit { ok: bool, msg: String },
     CloseRefused { dirty: Vec<String> },
     ProjectClosed { ended: usize },
+    /// The worktree exists and is registered. Sent to the clicker only —
+    /// it is the one holding the tab to navigate.
+    WorktreeReady { url: String, launch: Option<Launch> },
     /// The set of projects with live sessions changed — `project` started
     /// its first shell, ended its last, or was closed. Machine-wide, sent to
     /// every project's clients via `hub::broadcast_all` like `Notice`, because
