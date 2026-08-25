@@ -77,13 +77,20 @@ pub fn known_projects_with_state(roots: &[PathBuf]) -> Vec<ProjectStatus> {
         ps.iter().filter(|p| p.parent.is_none()).map(|p| (p.key.clone(), p.branch.clone())).collect();
     // A worktree's directory comes from git's own listing of its parent, not
     // from `resolve_project`: that refuses dot segments (`.claude/…`), and
-    // `is_vouched_worktree` is an exception to *naming* only.
+    // `is_vouched_worktree` is an exception to *naming* only. Keyed by the
+    // child's storage key, not its bare branch name: this codebase's own
+    // auto-naming (claude-1, claude-2, … per repo) makes two different
+    // projects sharing a branch name the expected common case, and a
+    // branch-keyed map would silently hand one project's directory (and
+    // thus its dirty/ahead state) to another's row.
     let mut dirs: std::collections::HashMap<String, PathBuf> = Default::default();
     for p in ps.iter().filter(|p| p.parent.is_none()) {
         if let Some(pd) = crate::projects::resolve_project(roots, &p.url) {
             for w in crate::worktree::list(&pd).into_iter().filter(|w| !w.is_main) {
+                let Some(child_url) = rel_under_roots(roots, &w.path) else { continue };
+                let child_key = crate::projects::storage_key(&child_url);
                 if let Ok(c) = w.path.canonicalize() {
-                    dirs.insert(w.branch.clone(), c);
+                    dirs.insert(child_key, c);
                 }
             }
         }
@@ -91,16 +98,23 @@ pub fn known_projects_with_state(roots: &[PathBuf]) -> Vec<ProjectStatus> {
     for p in ps.iter_mut() {
         let Some(parent) = p.parent.as_deref() else { continue };
         if !p.reachable { continue }
-        let Some(dir) = dirs.get(&p.branch).cloned() else { continue };
+        let Some(dir) = dirs.get(&p.key).cloned() else { continue };
         let (base, base_recorded) = match crate::worktree::read_base(&state_dir, &p.key) {
             Some(b) => (b, true),
             None => (main_branch.get(parent).cloned().unwrap_or_default(), false),
         };
-        let st = if base.is_empty() {
-            crate::worktree::State { dirty: None, ahead: None }
-        } else {
-            crate::worktree::state(&dir, &base, &crate::worktree::real_git)
-        };
+        // `dirty` never depends on knowing a base — only `ahead` does. When
+        // no base is known (no record, and no main-worktree branch to fall
+        // back to), a null sha is passed as the range endpoint: `git
+        // rev-list` genuinely cannot resolve it (unlike an empty string,
+        // which `..HEAD` silently accepts as shorthand and answers `0` for
+        // — that would be exactly the "unknown read as clean" bug this
+        // codebase keeps shipping), so `state`'s own `.ok()` plumbing
+        // naturally yields `ahead: None` while `status --porcelain` still
+        // runs unconditionally and answers `dirty` normally.
+        const NULL_SHA: &str = "0000000000000000000000000000000000000000";
+        let base_for_ahead = if base.is_empty() { NULL_SHA } else { base.as_str() };
+        let st = crate::worktree::state(&dir, base_for_ahead, &crate::worktree::real_git);
         p.wt = Some(WorktreeStatus {
             claude: crate::claudes::claude_evidence(&p.url),
             dirty: st.dirty,
@@ -1342,6 +1356,68 @@ mod tests {
                 .expect("a worktree outside ROOTS must still be listed, not omitted");
             assert!(!child.reachable, "a worktree outside ROOTS must never be marked reachable");
             assert_eq!(child.parent.as_deref(), Some("repo"));
+        });
+    }
+
+    // Regression: `known_projects_with_state` used to key its worktree
+    // directory map by bare branch name. This codebase's own auto-naming
+    // (claude-1, claude-2, ... per repo, minted independently in every
+    // project) makes two different projects sharing a branch name the
+    // expected common case, not a corner case — when it happens, a
+    // branch-keyed map lets one project's row silently read another
+    // project's directory, including reporting a dirty worktree as clean
+    // and eligible for the remove button.
+    //
+    // Revert-checked: reverting the fix (keying `dirs` by `w.branch.clone()`
+    // and looking up via `dirs.get(&p.branch)`, as it originally shipped)
+    // makes this fail — observed:
+    //   thread '...' panicked at src/registry.rs:...:
+    //   assertion `left == right` failed: a's worktree is untouched
+    //     left: Some(true)
+    //    right: Some(false)
+    // ("a"'s row read "b"'s directory: both repos mint "claude-1", the
+    // branch-keyed map's second insert — "b", sorted after "a" — silently
+    // overwrote "a"'s entry, so both rows resolved to "b"'s worktree).
+    // Restored afterward.
+    #[test]
+    fn worktree_state_is_not_confused_across_projects_sharing_a_branch_name() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let repo_a = root.path().join("a");
+            let repo_b = root.path().join("b");
+            for repo in [&repo_a, &repo_b] {
+                fs::create_dir_all(repo).unwrap();
+                run_git(repo, &["init", "-q", "-b", "main"]);
+                run_git(repo, &["config", "user.email", "t@t"]);
+                run_git(repo, &["config", "user.name", "t"]);
+                fs::write(repo.join("f.txt"), "x").unwrap();
+                run_git(repo, &["add", "."]);
+                run_git(repo, &["commit", "-qm", "init"]);
+            }
+
+            // Both repos independently mint "claude-1" as their first free
+            // worktree name — the collision this test exists to catch.
+            let key_of_a = |n: &str| crate::projects::storage_key(&format!("a/.claude/worktrees/{n}"));
+            let key_of_b = |n: &str| crate::projects::storage_key(&format!("b/.claude/worktrees/{n}"));
+            let ca = crate::worktree::create(&repo_a, state, &key_of_a, &crate::worktree::real_git).unwrap();
+            let cb = crate::worktree::create(&repo_b, state, &key_of_b, &crate::worktree::real_git).unwrap();
+            assert_eq!(ca.name, "claude-1");
+            assert_eq!(cb.name, "claude-1", "both repos mint claude-1 independently");
+
+            // Dirty in b's worktree only.
+            fs::write(cb.path.join("untracked.txt"), "y").unwrap();
+
+            fs::create_dir_all(state).unwrap();
+            fs::write(state.join("a.json"), "{}").unwrap();
+            fs::write(state.join("b.json"), "{}").unwrap();
+
+            let ps = known_projects_with_state(&[root.path().to_path_buf()]);
+            let a_child = ps.iter().find(|p| p.parent.as_deref() == Some("a"))
+                .expect("a's worktree must be listed");
+            let b_child = ps.iter().find(|p| p.parent.as_deref() == Some("b"))
+                .expect("b's worktree must be listed");
+            assert_eq!(a_child.wt.as_ref().and_then(|w| w.dirty), Some(false), "a's worktree is untouched");
+            assert_eq!(b_child.wt.as_ref().and_then(|w| w.dirty), Some(true), "b's worktree has an untracked file");
         });
     }
 
