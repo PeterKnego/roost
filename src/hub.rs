@@ -4412,6 +4412,12 @@ mod tests {
         let _att = crate::session::attach(&url, "term", &dir).unwrap();
         let got = refusal_of(&mut h, &a, &rx);
         // Names the more specific reason even though "live terminal" is also true.
+        //
+        // Revert-checked: deleting the `claude_evidence` match falls through
+        // to the live-terminal gate instead, which still refuses — but with
+        // the wrong, less specific reason. Observed: `panicked ...
+        // {"t":"Error","msg":"claude-1 has a live terminal"}`, failing
+        // `got.contains("Claude")`. Restored.
         assert!(got.contains("Claude"), "{got}");
         assert!(dir.is_dir());
         crate::session::kill_project(&url);
@@ -4420,6 +4426,15 @@ mod tests {
 
     #[test]
     fn remove_refuses_a_dirty_worktree() {
+        // Revert-checked: deleting the `st.dirty` match still refuses — git
+        // itself is the backstop here, since a dirty tree also fails
+        // `git worktree remove` without `--force` — but with a different
+        // message than ours ("uncommitted"), so the assertion below already
+        // discriminates the hub's own gate from git's. Observed: `panicked
+        // ... {"t":"Error","msg":"git worktree remove refused: fatal:
+        // '.../.claude/worktrees/claude-1' contains modified or untracked
+        // files, use --force to delete it"}`, failing
+        // `got.contains("uncommitted")`. Restored.
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RESH_CMD", "cat");
@@ -4460,6 +4475,11 @@ mod tests {
 
     #[test]
     fn remove_takes_a_clean_idle_worktree_and_its_state() {
+        // Revert-checked: flipping the dirty match's `Some(false) => {}` arm
+        // to also refuse (simulating any one gate wrongly always firing)
+        // turns this success case into a refusal. Observed: `panicked ...
+        // {"t":"Error","msg":"claude-1 has uncommitted changes"}`, failing
+        // the `!got.contains(r#""t":"Error""#)` assertion. Restored.
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RESH_CMD", "cat");
@@ -4480,6 +4500,24 @@ mod tests {
 
     #[test]
     fn remove_refuses_a_key_that_is_not_a_worktree_of_this_project() {
+        // The key the *unfiltered* `ws.iter()` loop would mint for the main
+        // checkout itself: its canonicalized path strips to an empty `rel`
+        // against the canonicalized repo, so `format!("{project}/{}", "")`
+        // is "repo/" and its storage key is "repo%2F" — not "repo". Using
+        // plain "repo" here would pass whether or not the `!w.is_main`
+        // filter exists (it never collides with anything the loop mints
+        // either way), so it wouldn't discriminate the filter this test is
+        // named for.
+        //
+        // Revert-checked: deleting `.filter(|w| !w.is_main)` at the
+        // `for w in ws.iter()...` loop makes this key match the main
+        // checkout, so identification succeeds and the flow reaches the
+        // dirty gate — which then refuses for an unrelated reason (the
+        // freshly-created `.claude/worktrees/claude-1` sits as an untracked
+        // directory in the main checkout's own `git status`). Observed:
+        // `panicked ... the main checkout is never removable:
+        // {"t":"Error","msg":"main has uncommitted changes"}` — no longer
+        // containing "not a worktree of this project". Restored.
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RESH_CMD", "cat");
@@ -4487,7 +4525,8 @@ mod tests {
         std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
         let (mut h, _url, _dir) = repo_with_worktree(root.path());
         let (a, rx) = h.subscribe(); drain(&rx);
-        h.handle(&a, Intent::RemoveWorktree { key: "repo".into() });
+        let key = crate::projects::storage_key("repo/");
+        h.handle(&a, Intent::RemoveWorktree { key });
         let got = rx.try_recv().unwrap();
         assert!(got.contains("not a worktree of this project"), "the main checkout is never removable: {got}");
         std::env::remove_var("RESH_STATE_DIR");

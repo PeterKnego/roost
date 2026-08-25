@@ -550,6 +550,11 @@ mod tests {
 
     #[test]
     fn remove_takes_the_worktree_and_the_branch_when_git_agrees() {
+        // Revert-checked: replacing the body with `Ok(None)` (no git calls
+        // at all) still returns the right value but leaves the worktree in
+        // place. Observed: `panicked ... assertion failed:
+        // matches!(std::fs::symlink_metadata(&c.path), Err(e) if e.kind() ==
+        // std::io::ErrorKind::NotFound)`. Restored.
         let root = tempfile::tempdir().unwrap();
         let repo = repo_with_commit(root.path());
         let c = create(&repo, &root.path().join("state"), &key_of, &real_git).unwrap();
@@ -561,6 +566,11 @@ mod tests {
     #[test]
     fn remove_keeps_an_unmerged_branch_and_says_so() {
         // git's own `-d` refusal is the gate here, not ours.
+        //
+        // Revert-checked: swapping `-d` for `-D` force-deletes the unmerged
+        // branch and returns `Ok(None)` instead of `Ok(Some(note))`.
+        // Observed: `panicked at src/worktree.rs:575:75: a note` (the
+        // `.expect("a note")` on a `None`). Restored.
         let root = tempfile::tempdir().unwrap();
         let repo = repo_with_commit(root.path());
         let c = create(&repo, &root.path().join("state"), &key_of, &real_git).unwrap();
@@ -574,6 +584,10 @@ mod tests {
 
     #[test]
     fn remove_refuses_a_dirty_worktree_without_force() {
+        // Revert-checked: adding `--force` to the `worktree remove` call
+        // makes git remove the dirty tree instead of refusing it. Observed:
+        // `panicked ... called Result::unwrap_err() on an Ok value: None`.
+        // Restored.
         let root = tempfile::tempdir().unwrap();
         let repo = repo_with_commit(root.path());
         let c = create(&repo, &root.path().join("state"), &key_of, &real_git).unwrap();
