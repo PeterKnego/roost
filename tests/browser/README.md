@@ -33,6 +33,7 @@ deno run -A tests/browser/termlinks.mjs # a printed path or URL is a link only w
 deno run -A tests/browser/ide.mjs       # openDiff's proposal tab (Accept/Reject) and the Alt+K mention keybinding
 deno run -A tests/browser/claudeterm.mjs # the ✻ button: a terminal with claude typed in, hidden when claude is not installed
 deno run -A tests/browser/worktrees.mjs # the header's worktree switcher chip + panel
+deno run -A tests/browser/worktree-launch.mjs # the ✻ prompt, worktree creation into a second tab, switcher state and removal; needs a real CDP click for window.open
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -249,6 +250,26 @@ performed.
   navigation check — a targeted anchor opens a new browsing context instead
   of navigating the tab, which is exactly the bug the missing `target=`
   exists to prevent.
+- In `worktree-launch.mjs`: removing `force: true` from the prompt's "start
+  here anyway" button fails section D (the prompt reappears instead of a
+  second terminal opening). Making the prompt call `newTerminal` on its own,
+  with no click, does *not* fail the obvious assertion ("no terminal was
+  opened") — the server intercepts that call exactly like the one that
+  raised the prompt and answers with another `ClaudeHere`, so the two chase
+  each other forever without ever reaching a real terminal, and whether that
+  contention starves some unrelated poll enough to fail depends on host load
+  at the time (observed both ways). The reliable catch counts
+  `NewTerminal{launch:"claude"}` sends over the 1.5s after the prompt
+  appears, by wrapping `window.send` (a plain top-level function, reachable
+  off `window` since this is not a module script) — 0 with the bug fixed,
+  dozens to low hundreds with it back. Dropping `history.replaceState` from
+  the launch consumer fails "the ?launch= parameter was consumed" only, with
+  no cascade — the terminal still opens from the still-present query param,
+  it just never gets cleared. See the file's own header for the full
+  revert-check log, including a second trap this test needed a workaround
+  for: `Workspace::default_layout` always seeds pane 3 with one Terminal tab
+  named `"term"` before anything is clicked, so every session-count
+  assertion here is written against that baseline rather than an empty pane.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:

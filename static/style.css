@@ -348,6 +348,12 @@ main { flex: 1; min-height: 0; }
    no "content" to prepend into), so this variant floats above everything
    instead of the .conflict base's normal in-flow placement. */
 .conflict.error-banner { position: fixed; top: 12px; right: 12px; z-index: 1000; max-width: 420px; }
+/* showClaudeHere's prompt: .conflict already supplies the border/padding and
+   the button margin, so this only overrides what makes the "start in a new
+   worktree" choice read as the recommended one. */
+.claudehere { margin: 8px; }
+.claudehere button { margin: 8px 8px 0 0; font: inherit; cursor: pointer; }
+.claudehere .wt-new { font-weight: 600; }
 
 /* ---- fragment content shared by tree/changes/file/diff (rendered server-side) ---- */
 /* Indentation is a row property (--d, the depth render::tree_level stamps on

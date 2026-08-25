@@ -8,6 +8,19 @@ const PROJECT = document.body.dataset.project;
 // shell could find it, or the check could not tell — a failed check must not
 // hide a working button.
 const LAUNCHES = (document.body.dataset.launches || "").split(" ").filter(Boolean);
+// A worktree tab opened by "start in a new worktree" arrives with
+// ?launch=…, read once at load and validated against LAUNCHES the same way a
+// server-sent value would be — a stray or hand-edited query string must not
+// send an arbitrary wire name to newTerminal.
+const pendingLaunch = (() => {
+  const l = new URLSearchParams(location.search).get("launch");
+  return l && LAUNCHES.includes(l) ? l : null;
+})();
+let pendingLaunchSent = false;
+// The blank tab opened synchronously on the "new worktree" click, navigated
+// when WorktreeReady arrives. Opened on the click because a window.open after
+// a websocket round trip is not reliably inside the user gesture.
+let pendingTab = null;
 // The config file's `show_hidden`, embedded by render.rs at page load. The
 // workspace's own toggle (state.show_hidden) overrides it when set; null
 // means nobody has touched the header button, so the file still decides.
@@ -235,6 +248,14 @@ function onEvent(ev) {
       // the user had expanded.
       if (treeShownHidden !== null && treeShownHidden !== showHidden()) refreshTree();
       treeShownHidden = showHidden();
+      // A tab opened by "start in a new worktree" arrives with ?launch=…;
+      // consume it exactly once, after the first State, then strip it so a
+      // reload does not start a second program.
+      if (pendingLaunch && !pendingLaunchSent) {
+        pendingLaunchSent = true;
+        newTerminal(3, pendingLaunch);
+        history.replaceState(null, "", location.pathname);
+      }
       break;
     case "BufferText": {
       // Skip our own text or the cursor jumps; empty origin = external change
@@ -324,6 +345,25 @@ function onEvent(ev) {
       // so ○ becomes ● without waiting for a manual refresh or reload.
       document.body.dispatchEvent(new Event("refresh"));
       break;
+    case "ClaudeHere":
+      showClaudeHere(ev.pane, ev.terminals);
+      break;
+    case "WorktreeReady": {
+      const url = "/" + projectPath(ev.url) + (ev.launch ? `?launch=${encodeURIComponent(ev.launch)}` : "");
+      if (pendingTab && !pendingTab.closed) {
+        pendingTab.location = url;
+      } else {
+        // The popup was blocked (or something else closed it): fall back to
+        // a link rather than lose the worktree the server already created.
+        showBanner(`opened ${ev.url.split("/").pop()} — `);
+        const a = document.createElement("a");
+        a.href = url; a.target = "_blank"; a.textContent = "click to go there";
+        document.querySelector(".error-banner:last-of-type b")?.append(a);
+      }
+      pendingTab = null;
+      document.body.dispatchEvent(new Event("projects"));
+      break;
+    }
     case "GitInit":
       if (!ev.ok) showError("git init failed: " + ev.msg);
       // On success, is_git flips in the State snapshot that follows this
@@ -1939,6 +1979,38 @@ function showConflict(ev) {
   document.querySelector('.pane[data-pane="2"] .content').prepend(box);
 }
 
+// The "a Claude is already here" prompt. Per-browser and transient: it is a
+// question to the person who clicked, not a state of the project.
+function showClaudeHere(pane, terminals) {
+  document.querySelectorAll(".claudehere").forEach((n) => n.remove());
+  const box = document.createElement("div");
+  box.className = "conflict claudehere";
+  const b = document.createElement("b");
+  b.textContent = terminals.length
+    ? `A Claude is already working in this project (${terminals.join(", ")}).`
+    : "A Claude is already working in this project.";
+  const wt = document.createElement("button");
+  wt.className = "wt-new";
+  wt.textContent = "Start in a new worktree";
+  wt.onclick = () => {
+    // Opened synchronously, inside this click's user-gesture, so the popup
+    // blocker allows it; WorktreeReady navigates it once the server responds.
+    pendingTab = window.open("about:blank");
+    send({ t: "NewWorktree", launch: "claude" });
+    box.remove();
+  };
+  const here = document.createElement("button");
+  here.className = "wt-here";
+  here.textContent = "Start here anyway";
+  here.onclick = () => { send({ t: "NewTerminal", pane, launch: "claude", force: true }); box.remove(); };
+  const dismiss = document.createElement("button");
+  dismiss.textContent = "dismiss";
+  dismiss.onclick = () => box.remove();
+  box.append(b, wt, here, dismiss);
+  const host = document.querySelector(`.pane[data-pane="${pane}"]`) || document.body;
+  host.prepend(box);
+}
+
 // Transient, dismissible: reuses .conflict's border/padding/button styling
 // (positioned as a fixed overlay via .error-banner) rather than inventing a
 // new visual language just for this. Takes the exact text to show — callers
@@ -2088,11 +2160,25 @@ const wtPanel = document.getElementById("wtpanel");
 if (wtBtn && wtPanel) {
   wtBtn.onclick = () => {
     wtPanel.hidden = !wtPanel.hidden;
-    if (!wtPanel.hidden && window.htmx) htmx.trigger(document.body, "refresh");
+    if (!wtPanel.hidden && window.htmx) {
+      // State costs two git calls per worktree; ask only while looking.
+      htmx.ajax("GET", `/frag/_worktrees?current=${encodeURIComponent(document.body.dataset.key || "")}&state=1`, "#wtstrip");
+    }
   };
   // A plain click through to a worktree navigates away anyway; this is for
-  // the ⌘-click case, which stays on this page with the panel open.
-  wtPanel.onclick = (e) => { if (e.target.closest("a")) wtPanel.hidden = true; };
+  // the ⌘-click case, which stays on this page with the panel open. The
+  // remove control is the other thing this popup's clicks can mean.
+  wtPanel.onclick = (e) => {
+    const rm = e.target.closest(".wtremove");
+    if (rm) {
+      e.preventDefault();
+      const key = rm.dataset.key;
+      const name = rm.closest(".wtrow")?.textContent.trim().split(/\s+/)[1] || key;
+      if (confirm(`Remove worktree ${name} and its branch? resh re-checks that it is clean, idle and merged first.`)) send({ t: "RemoveWorktree", key });
+      return;
+    }
+    if (e.target.closest("a")) wtPanel.hidden = true;
+  };
 }
 
 const bell = document.getElementById("bell");
