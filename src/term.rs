@@ -160,7 +160,7 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // path as keystrokes from the browser — and before any browser input
     // can arrive on this socket, so it lands at the shell's first prompt.
     if let Some(l) = att.launch {
-        if let Err(e) = session::write_input(&att.key, crate::launch::keystrokes(l)) {
+        if let Err(e) = session::write_input(&att.key, &crate::launch::keystrokes(l, None)) {
             eprintln!("resh: could not start {l:?} in {project}/{name}: {e}");
         }
     }
