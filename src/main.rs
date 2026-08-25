@@ -4,7 +4,6 @@ fn main() {
     // the single argument is the port.
     match args.first().map(String::as_str) {
         Some("notify") => std::process::exit(resh::cli::run_notify(&args[1..])),
-        Some("peers") => std::process::exit(resh::cli::run_peers(&args[1..])),
         _ => {}
     }
     // No compiled-in roots any more, so an unset RESH_ROOTS is a
@@ -17,8 +16,7 @@ fn main() {
              Set RESH_ROOTS to a colon-separated list of directories to scan:\n\
              \n    RESH_ROOTS=$HOME/projects resh 8444\n\
              \nFor a service, set it in the unit file (Environment=RESH_ROOTS=...).\n\
-             Or list them in ~/.config/resh/config.toml, which callers that do not\n\
-             inherit the unit's environment (such as `resh peers`) also read:\n\
+             Or list them in ~/.config/resh/config.toml:\n\
              \n    roots = [\"~/projects\"]"
         );
         std::process::exit(2);
@@ -34,7 +32,7 @@ fn main() {
         eprintln!(
             "resh: RESH_ROOTS and the global config's `roots` disagree.\n  \
              RESH_ROOTS (used here): {env:?}\n  \
-             config `roots` (used by `resh peers` and anything without this environment): {cfg:?}\n  \
+             config `roots` (used by anything without this environment): {cfg:?}\n  \
              Bring them into step, or callers outside this process will resolve different projects."
         );
         // Also to the one file, so a reader has a single place to look rather
