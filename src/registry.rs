@@ -684,6 +684,49 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
     } else if roots_ok && !roots_were_ok {
         eprintln!("resh: configured roots are readable again — reaping resumed");
     }
+
+    // resh's own worktree markers: a `.base` whose directory is *positively*
+    // gone (NotFound, nothing else) is a file about nothing. Same rule as
+    // `.origin`: unreadable is "cannot tell", and cannot-tell keeps. Gated
+    // on `roots_ok` for the same reason the project-gone sweep below is —
+    // an unreadable root must suspend reaping, not be read as "not found".
+    //
+    // Deliberately placed before the `sock_root()` early return just below:
+    // `sock/` is created lazily, on a project's first attach (session.rs),
+    // so a state dir that has worktrees but no live or ever-live session
+    // has no `sock/` at all — and this sweep must still run there, or an
+    // orphaned `.base` from a project with no sessions is never reaped.
+    if roots_ok {
+        if let Ok(rd) = std::fs::read_dir(crate::wsstate::state_dir().join("worktrees")) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let Some(key) = name.strip_suffix(".base") else { continue };
+                if key.starts_with('.') {
+                    continue; // a temp file mid-write (write_base's `.{key}.base.tmp.{pid}`)
+                }
+                let url = decode_key(key);
+                let mut found_or_uncertain = false;
+                for r in roots {
+                    let p = r.join(&url);
+                    match std::fs::symlink_metadata(&p) {
+                        Ok(_) => {
+                            found_or_uncertain = true;
+                            break;
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => {
+                            found_or_uncertain = true; // cannot tell: keep
+                            break;
+                        }
+                    }
+                }
+                if !found_or_uncertain {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+
     let Ok(rd) = std::fs::read_dir(sock_root()) else { return report };
     // One process listing for the whole sweep (see process_snapshot's doc
     // comment) rather than one `ps` per socket file. `None` here means the
@@ -2266,5 +2309,65 @@ mod tests {
                 "the repair must arrive by rename, not by truncating the marker in place"
             );
         }
+    }
+
+    // Revert-checked: changed the `Err(_) => { found_or_uncertain = true; ... }`
+    // arm in the reaping loop to `Err(_) => continue` (treat "cannot tell" as
+    // "not here, keep looking at other roots" — with only one root,
+    // indistinguishable from "gone"). Observed failure: `panicked at
+    // src/registry.rs:2363:13: cannot tell: kept` — `blocked` was reaped
+    // instead of kept, exactly the case `Path::exists()` vs
+    // `symlink_metadata` alone would not have caught. Restored; this test
+    // passes again. (Non-root run; see the guard below for why this needs
+    // it.)
+    #[test]
+    fn a_base_file_for_a_worktree_that_no_longer_exists_is_reaped_and_one_that_does_is_kept() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        std::env::set_var("RESH_STATE_DIR", &state);
+        let roots = vec![root.path().to_path_buf()];
+        std::fs::create_dir_all(root.path().join("repo/.claude/worktrees/claude-1")).unwrap();
+        let live = crate::projects::storage_key("repo/.claude/worktrees/claude-1");
+        let gone = crate::projects::storage_key("repo/.claude/worktrees/claude-2");
+        crate::worktree::write_base(&state, &live, "main").unwrap();
+        crate::worktree::write_base(&state, &gone, "main").unwrap();
+        // A base whose directory cannot be looked at: parent unreadable.
+        let blocked = crate::projects::storage_key("repo/.claude/worktrees/blocked/deep");
+        std::fs::create_dir_all(root.path().join("repo/.claude/worktrees/blocked")).unwrap();
+        crate::worktree::write_base(&state, &blocked, "main").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                root.path().join("repo/.claude/worktrees/blocked"),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+        }
+        // SnapshotFn is `&dyn Fn() -> Option<Vec<(u32, String)>>` (see
+        // `type SnapshotFn` above), not `Option<String>` — an empty process
+        // list, not an empty string. This pass reaps `.base` files, not
+        // sockets, so no process needs to be "running" for this test.
+        reconcile_with(&roots, &|| Some(Vec::new()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                root.path().join("repo/.claude/worktrees/blocked"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        assert!(crate::worktree::read_base(&state, &live).is_some(), "kept");
+        assert!(crate::worktree::read_base(&state, &gone).is_none(), "reaped");
+        // chmod 000 does not block root, so this assertion is vacuous under
+        // a root-run suite — skip just it rather than the whole test, and
+        // rely on code inspection (the `Err(_) => keep` arm above) for that
+        // case. The other two assertions above still run unconditionally.
+        if std::env::var("USER").as_deref() != Ok("root") {
+            assert!(crate::worktree::read_base(&state, &blocked).is_some(), "cannot tell: kept");
+        }
+        std::env::remove_var("RESH_STATE_DIR");
     }
 }
