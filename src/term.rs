@@ -160,8 +160,9 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // path as keystrokes from the browser — and before any browser input
     // can arrive on this socket, so it lands at the shell's first prompt.
     if let Some(l) = att.launch {
-        if let Err(e) = session::write_input(&att.key, &crate::launch::keystrokes(l, None)) {
-            eprintln!("resh: could not start {l:?} in {project}/{name}: {e}");
+        let typed = crate::launch::keystrokes(l.launch, l.session_id.as_deref());
+        if let Err(e) = session::write_input(&att.key, &typed) {
+            eprintln!("resh: could not start {:?} in {project}/{name}: {e}", l.launch);
         }
     }
     let Ok(write_half) = ws_read.get_ref().try_clone_inner() else { return };

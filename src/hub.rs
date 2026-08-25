@@ -1178,7 +1178,11 @@ impl Hub {
         // attached, and a plain + must not inherit that click. The shell is
         // spawned by whichever browser attaches first, so the request waits
         // in `session` until then.
-        crate::session::set_launch(&self.project, &name, launch);
+        crate::session::set_launch(
+            &self.project,
+            &name,
+            launch.map(|l| crate::session::LaunchRequest { launch: l, session_id: crate::launch::new_session_id() }),
+        );
         let intent = Intent::OpenTab { pane, tab: Tab::Terminal { session: name.clone() } };
         match workspace::apply_layout(&mut self.ws, &intent) {
             Ok(true) => {
@@ -2632,7 +2636,15 @@ mod tests {
         h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None });
         drain(&rx);
         let first = crate::session::attach("newterm_launch", "term", d.path()).unwrap();
-        assert_eq!(first.launch, Some(proto::Launch::Claude), "✻ got `term`, so `term` starts claude");
+        assert_eq!(
+            first.launch.as_ref().map(|l| l.launch),
+            Some(proto::Launch::Claude),
+            "✻ got `term`, so `term` starts claude"
+        );
+        assert!(
+            first.launch.as_ref().and_then(|l| l.session_id.as_deref()).is_some_and(crate::launch::valid_session_id),
+            "the hub minted an id"
+        );
         let second = crate::session::attach("newterm_launch", "term1", d.path()).unwrap();
         assert_eq!(second.launch, None, "+ got `term1`, which stays a plain shell");
         crate::session::kill_project("newterm_launch");

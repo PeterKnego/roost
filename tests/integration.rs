@@ -1513,11 +1513,20 @@ fn a_claude_terminal_has_claude_typed_into_it_once_its_shell_exists() {
             Ok(_) => {}
             Err(_) => break,
         }
-        if seen.contains("claude\r") {
+        // `keystrokes` now types the minted session id along with the
+        // program (Task 3), so the PTY sees `claude --session-id <uuid>`
+        // rather than the bare `claude` this test used to look for.
+        if seen.contains("claude --session-id ") && seen.contains('\r') {
             break;
         }
     }
-    assert!(seen.contains("claude\r"), "claude + Enter must reach the PTY; got: {seen:?}");
+    assert!(seen.contains("claude --session-id "), "claude + Enter must reach the PTY; got: {seen:?}");
+    let id = seen
+        .split("claude --session-id ")
+        .nth(1)
+        .and_then(|rest| rest.split(['\r', '\n']).next())
+        .unwrap_or("");
+    assert!(resh::launch::valid_session_id(id), "the typed id must be a valid session id; got: {id:?}");
 
     // The plain + button on the same project stays a plain shell: nothing is
     // typed into it, so nothing comes back out.
