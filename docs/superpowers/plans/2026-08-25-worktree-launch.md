@@ -1598,41 +1598,58 @@ pub fn remove(repo: &Path, path: &Path, branch: &str, run: GitRunner) -> Result<
             let _ = std::fs::remove_file(state_dir.join(format!("{key}.json")));
             Ok(note)
         };
-        let finish = move |h: &mut Hub, r: Result<Option<String>, String>| {
+        // `finish` runs under the hub lock and only talks to the clicker.
+        // `broadcast_all` locks EVERY registered hub — this one included —
+        // so it must run after the guard is dropped (Task 7 found the
+        // self-deadlock; `do_end_session` has the same ordering).
+        let finish = move |h: &mut Hub, r: Result<Option<String>, String>| -> bool {
             match r {
                 Ok(note) => {
-                    broadcast_all(&Event::ProjectsChanged { project: h.project.clone() });
-                    if let Some(n) = note {
-                        let ev = Event::Error { msg: n };
-                        h.send_to(&from, &ev);
-                    } else {
-                        let ev = Event::ProjectsChanged { project: h.project.clone() };
-                        h.send_to(&from, &ev);
-                    }
+                    let ev = match note {
+                        Some(n) => Event::Error { msg: n },
+                        None => Event::ProjectsChanged { project: h.project.clone() },
+                    };
+                    h.send_to(&from, &ev);
+                    true
                 }
                 Err(msg) => {
                     let ev = Event::Error { msg };
                     h.send_to(&from, &ev);
+                    false
                 }
             }
         };
+        let project_for_broadcast = self.project.clone();
         match self.self_ref.upgrade() {
             Some(arc) => {
                 let spawned = std::thread::Builder::new().name("remove-worktree".into()).spawn(move || {
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
                         .unwrap_or_else(|_| Err("worktree removal panicked".into()));
-                    let mut h = Hub::lock(&arc);
-                    finish(&mut h, r);
+                    let changed = {
+                        let mut h = Hub::lock(&arc);
+                        finish(&mut h, r)
+                    }; // guard dropped here, before any other hub is locked
+                    if changed {
+                        broadcast_all(&Event::ProjectsChanged { project: project_for_broadcast });
+                    }
                 });
                 if spawned.is_err() {
                     let ev = Event::Error { msg: "could not start worktree removal".into() };
                     self.send_to(&from, &ev);
                 }
             }
-            None => { let r = work(); finish(self, r); }
+            None => {
+                let r = work();
+                let changed = finish(self, r);
+                if changed {
+                    broadcast_all(&Event::ProjectsChanged { project: project_for_broadcast });
+                }
+            }
         }
     }
 ```
+
+Mirror the committed `do_new_worktree` (Task 7) for the exact borrow/move shape — it is the same function with a different `work`.
 
 The kept-branch note goes out as `Error` deliberately: it is shown as a banner, and the person should read it.
 
