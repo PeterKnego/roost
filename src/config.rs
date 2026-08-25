@@ -16,6 +16,7 @@ struct RawConfig {
     share_selection: Option<bool>,
     ide: Option<bool>,
     roots: Option<Vec<String>>,
+    worktree_prompt: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -218,6 +219,21 @@ fn ide_enabled_from(global: &Path) -> bool {
         // Absent, unreadable or unparseable all mean "on": the integration is
         // the default, and a typo elsewhere in the file must not silently
         // disable a feature the user never asked to turn off.
+        .unwrap_or(true)
+}
+
+/// Whether ✻ offers a worktree when a Claude is already in the project.
+/// Global only: it changes what a button does everywhere, and a checkout
+/// must not get to decide that. Absent, unreadable or unparseable mean on.
+pub fn worktree_prompt() -> bool {
+    worktree_prompt_from(&global_config_path())
+}
+
+fn worktree_prompt_from(global: &Path) -> bool {
+    std::fs::read_to_string(global)
+        .ok()
+        .and_then(|s| toml::from_str::<RawConfig>(&s).ok())
+        .and_then(|r| r.worktree_prompt)
         .unwrap_or(true)
 }
 
@@ -456,6 +472,18 @@ mod tests {
         fs::write(&p, "ide = true").unwrap();
         assert!(!ide_enabled_from(&g), "a project file cannot re-enable it");
         let _ = p;
+    }
+
+    #[test]
+    fn worktree_prompt_is_on_unless_the_global_config_says_off() {
+        // Revert-checked: `unwrap_or(false)` fails the first assertion.
+        let d = tempfile::tempdir().unwrap();
+        let g = d.path().join("config.toml");
+        assert!(worktree_prompt_from(&g), "absent file: on");
+        std::fs::write(&g, "worktree_prompt = false\n").unwrap();
+        assert!(!worktree_prompt_from(&g));
+        std::fs::write(&g, "this is not toml\n").unwrap();
+        assert!(worktree_prompt_from(&g), "unparseable: on, a typo must not change a button");
     }
 
     // The reverse direction: a global `true` is what a per-project `false`

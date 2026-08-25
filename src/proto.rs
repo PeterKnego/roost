@@ -48,7 +48,7 @@ impl Default for Sizes {
 /// a message that says "run this command line" should not exist on the wire
 /// when one that says "run claude" is all that is wanted. Each variant maps
 /// to a fixed command in `launch.rs`; add a variant there to offer another.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Launch {
     Claude,
@@ -91,6 +91,11 @@ pub enum Intent {
         /// `+` button — the message it has always sent.
         #[serde(default)]
         launch: Option<Launch>,
+        /// Skip the "a Claude is already here" prompt. Sent by the prompt's
+        /// own "start here anyway" button. Not a boundary — typing `claude`
+        /// was always one keystroke away.
+        #[serde(default)]
+        force: bool,
     },
     /// A span matched in terminal output, sent **verbatim** —
     /// `~/projects/resh/src/a.rs:42` and all. Deliberately not pre-parsed by
@@ -215,6 +220,9 @@ pub enum Event {
     /// mis-click must not flash every window in the project.
     PathRefused { text: String, msg: String },
     TerminalStarted { session: String },
+    /// A ✻ click in a project resh has positive evidence a Claude is
+    /// already running in. Sent to the clicker only; nothing was opened.
+    ClaudeHere { pane: PaneId, terminals: Vec<String> },
     GitInit { ok: bool, msg: String },
     CloseRefused { dirty: Vec<String> },
     ProjectClosed { ended: usize },
@@ -258,13 +266,13 @@ mod tests {
         // The `+` button predates `launch`; its message must keep parsing
         // unchanged, and parse to "no launch", not to some default program.
         let i = decode(r#"{"t":"NewTerminal","pane":3}"#).unwrap();
-        assert!(matches!(i, Intent::NewTerminal { pane: 3, launch: None }), "got {i:?}");
+        assert!(matches!(i, Intent::NewTerminal { pane: 3, launch: None, .. }), "got {i:?}");
     }
 
     #[test]
     fn new_terminal_can_ask_for_claude_by_name() {
         let i = decode(r#"{"t":"NewTerminal","pane":3,"launch":"claude"}"#).unwrap();
-        assert!(matches!(i, Intent::NewTerminal { pane: 3, launch: Some(Launch::Claude) }), "got {i:?}");
+        assert!(matches!(i, Intent::NewTerminal { pane: 3, launch: Some(Launch::Claude), .. }), "got {i:?}");
         // A closed set: the client names a program resh knows, never a
         // command line of its own.
         assert!(decode(r#"{"t":"NewTerminal","pane":3,"launch":"rm -rf /"}"#).is_err());

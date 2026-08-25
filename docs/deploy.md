@@ -415,6 +415,25 @@ never-again-noticed cross-project accident. Checked again on the server for
 every selection resh receives, so flipping the key back off during a session
 takes effect on the very next selection change, not on the next reload.
 
+### Prompting before a second Claude
+
+On by default. When resh has positive evidence a Claude is already running in
+a project — a terminal it typed `claude` into, or a connection on the IDE
+socket — a further ✻ click asks instead of opening another terminal there.
+The prompt is sent to the clicker alone; nothing changes for anyone else
+looking at the project, and no session name is allocated until the click is
+confirmed. To turn it off, so ✻ always opens a terminal the way it did before
+this existed:
+
+```toml
+worktree_prompt = false
+```
+
+**Global config only**, like `allowed_origins` and `ide`: it changes what a
+button does in every project, and a checkout must not get to decide that. An
+unreadable or unparseable global config leaves the prompt **on** — a typo
+elsewhere in that file must not silently change what a click does.
+
 ### Hidden files in the tree
 
 The file tree hides every entry beginning with a dot — `.git`, `.claude`,

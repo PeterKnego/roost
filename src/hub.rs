@@ -431,7 +431,9 @@ impl Hub {
             Intent::InitGit => return self.do_init_git(from),
             Intent::CloseProject => return self.do_close_project(from),
             Intent::EndSession { session } => return self.do_end_session(from, session.clone()),
-            Intent::NewTerminal { pane, launch } => return self.do_new_terminal(from, *pane, *launch),
+            Intent::NewTerminal { pane, launch, force } => {
+                return self.do_new_terminal(from, *pane, *launch, *force)
+            }
             Intent::OpenPath { text } => return self.do_open_path(from, text.clone()),
             Intent::MentionPath { rel, line_start, line_end, session } => {
                 return self.do_mention_path(
@@ -1151,10 +1153,21 @@ impl Hub {
         from: &ConnId,
         pane: crate::proto::PaneId,
         launch: Option<crate::proto::Launch>,
+        force: bool,
     ) {
         if self.closing {
             let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
             return self.send_to(from, &ev);
+        }
+        if launch == Some(crate::proto::Launch::Claude) && !force && crate::config::worktree_prompt() {
+            if let crate::claudes::ClaudeEvidence::Present(terminals) =
+                crate::claudes::claude_evidence(&self.project)
+            {
+                // The clicker only: nothing changed for anyone else, and a
+                // prompt is a question, not a state.
+                let ev = Event::ClaudeHere { pane, terminals };
+                return self.send_to(from, &ev);
+            }
         }
         // Names already on a tab but not yet connected are in no registry —
         // `next_free_name`'s `also_taken` is what stops two quick clicks from
@@ -2597,8 +2610,8 @@ mod tests {
         }
         drain(&rx);
 
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
         drain(&rx);
 
         let names: Vec<String> = h.ws.panes[proto::RIGHT as usize]
@@ -2632,8 +2645,8 @@ mod tests {
         }
         drain(&rx);
 
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude) });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
         drain(&rx);
         let first = crate::session::attach("newterm_launch", "term", d.path()).unwrap();
         assert_eq!(
@@ -2652,20 +2665,74 @@ mod tests {
         // The stale case: ✻ allocates `term2`, its tab is closed before any
         // browser attaches, and + is then handed `term2` back. The click that
         // made it a claude shell is gone, so the shell must be plain.
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude) });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
         let idx = h.ws.panes[proto::RIGHT as usize]
             .tabs
             .iter()
             .position(|t| matches!(t, Tab::Terminal { session } if session == "term2"))
             .expect("✻ was handed term2");
         h.handle(&c, Intent::CloseTab { pane: proto::RIGHT, idx });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
         drain(&rx);
         let reused = crate::session::attach("newterm_launch", "term2", d.path()).unwrap();
         assert_eq!(reused.launch, None, "a reallocated name must not inherit the old click");
         crate::session::kill_project("newterm_launch");
         std::env::remove_var("RESH_CMD");
         std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn a_second_claude_click_gets_a_prompt_that_only_the_clicker_sees() {
+        // Revert-checked: with the evidence check removed, `a` receives
+        // State + TerminalStarted and the ClaudeHere assertion fails;
+        // with `send_to` swapped for `broadcast`, the `b` assertion fails.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("prompt_second", d.path().to_path_buf());
+        let (a, rxa) = h.subscribe();
+        let (_b, rxb) = h.subscribe();
+        for p in h.ws.panes.iter_mut() { p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. })); p.active = 0; }
+        // First ✻: allocates `term`; spawn it the way a browser would, so the
+        // launch is consumed and recorded on the session.
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        let _att = crate::session::attach("prompt_second", "term", d.path()).unwrap();
+        assert_eq!(crate::session::launched_names("prompt_second").len(), 1, "fixture: a launched terminal exists");
+        drain(&rxa); drain(&rxb);
+        let version = h.ws.version;
+
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        let got = rxa.try_recv().expect("the clicker hears back");
+        assert!(got.contains(r#""t":"ClaudeHere""#) && got.contains(r#""terminals":["term"]"#), "{got}");
+        assert!(rxb.try_recv().is_err(), "nobody else hears anything");
+        assert_eq!(h.ws.version, version, "no layout change");
+        assert_eq!(crate::session::live_names("prompt_second").len(), 1, "no session allocated");
+
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: true });
+        assert!(h.ws.version > version, "force opens a terminal");
+        assert!(rxb.try_recv().is_ok_and(|m| m.contains(r#""t":"State""#)), "…which everyone sees");
+        crate::session::kill_project("prompt_second");
+    }
+
+    #[test]
+    fn a_plus_click_never_prompts() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("prompt_plus", d.path().to_path_buf());
+        let (a, rxa) = h.subscribe();
+        for p in h.ws.panes.iter_mut() { p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. })); p.active = 0; }
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        let _att = crate::session::attach("prompt_plus", "term", d.path()).unwrap();
+        drain(&rxa);
+        let version = h.ws.version;
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
+        assert!(h.ws.version > version, "a plain shell opens beside a Claude");
+        crate::session::kill_project("prompt_plus");
     }
 
     /// Ending a session is what makes closing a tab reclaim a slot; the tab
