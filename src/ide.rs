@@ -415,6 +415,14 @@ fn set_session(project: &str, id: u64, sess: crate::idesess::Sess) {
     }
 }
 
+/// Which terminal each of this project's connected Claudes is in — cloned
+/// out under the lock, so the caller (the hub, on a ✻ click) holds nothing
+/// of ours while it decides.
+pub fn connected_sessions(project: &str) -> Vec<crate::idesess::Sess> {
+    let map = conns().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(project).map(|v| v.iter().map(|t| t.session.clone()).collect()).unwrap_or_default()
+}
+
 /// Sends `msg` to the connections a mention is aimed at, or reports why
 /// none were chosen. Never falls back to the whole fan-out: reaching a
 /// Claude the user was not looking at is the failure this exists to prevent,

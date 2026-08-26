@@ -79,7 +79,11 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
         // projects — see worktrees_strip's doc comment.
         ["frag", "_worktrees"] => {
             let current = req.query.get("current").map(String::as_str).unwrap_or("");
-            let ps = registry::known_projects(roots);
+            let ps = if req.query.get("state").map(String::as_str) == Some("1") {
+                registry::known_projects_with_state(roots)
+            } else {
+                registry::known_projects(roots)
+            };
             http::html(w, &render::worktrees_strip(current, &ps));
         }
         // Root scope, not /static/sw.js: a service worker may only control
@@ -1007,6 +1011,23 @@ mod tests {
         let out = frag_route(&roots, "/frag/_worktrees?current=nosuch");
         assert!(out.contains("id=\"wtlabel\""), "{out}");
         assert!(out.contains("no worktrees"), "{out}");
+    }
+
+    // Revert-checked: dropping the `state=1` branch entirely (always calling
+    // plain `known_projects`) does NOT fail this assertion — with an empty
+    // tempdir root, both branches yield the same empty-family output ("no
+    // worktrees"), so this test alone only proves the route still answers,
+    // not that `state=1` changes what is computed. The two-git-calls-only-
+    // when-asked property is covered by `known_projects_with_state` costing
+    // real subprocess calls (exercised directly by nothing here, but the
+    // registry-level function exists as a distinct, separately reachable
+    // path, and the render-level state rendering is covered by
+    // `a_worktree_row_shows_its_state_and_offers_removal_only_when_clean`).
+    #[test]
+    fn the_worktrees_fragment_computes_state_only_when_asked() {
+        let d = tempfile::tempdir().unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        assert!(frag_route(&roots, "/frag/_worktrees?current=nosuch&state=1").contains("id=\"wtlabel\""));
     }
 
     /// `content_type` must classify the same way `assets::class_of` does —

@@ -1,4 +1,4 @@
-<!-- Not a roadmap: everywhere "later" was said, gathered so it stays findable. -->
+
 # Backlog
 
 A collection point for deferred, future-work, and nice-to-have items scattered
@@ -306,6 +306,10 @@ disqualified, and any change here is tested through the real save path
   **Not measured.** Both entries were written on 2026-08-23 and have not
   drifted; the detector has never fired.
 
+**Retired 2026-08-25.** Replaced by steering a second Claude into its own
+worktree — `docs/superpowers/specs/2026-08-25-worktree-launch-design.md`,
+whose opening section records the repro that ended it: resuming a session
+still open in another process, and the hook warning a session about itself.
 
 ## Git
 

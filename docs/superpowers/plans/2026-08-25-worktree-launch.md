@@ -1224,12 +1224,17 @@ pub fn known_projects_with_state(roots: &[PathBuf]) -> Vec<ProjectStatus> {
     // A worktree's directory comes from git's own listing of its parent, not
     // from `resolve_project`: that refuses dot segments (`.claude/…`), and
     // `is_vouched_worktree` is an exception to *naming* only.
+    // Keyed by the child's storage key — the identity `group_worktrees`
+    // mints via `rel_under_roots` — never by branch name: `claude-1` exists
+    // in every repo resh has made a worktree for, so a branch-keyed map
+    // would hand one project another project's git state (review finding,
+    // Task 8).
     let mut dirs: std::collections::HashMap<String, PathBuf> = Default::default();
     for p in ps.iter().filter(|p| p.parent.is_none()) {
         if let Some(pd) = crate::projects::resolve_project(roots, &p.url) {
             for w in crate::worktree::list(&pd).into_iter().filter(|w| !w.is_main) {
-                if let Ok(c) = w.path.canonicalize() {
-                    dirs.insert(w.branch.clone(), c);
+                if let (Some(child_url), Ok(c)) = (rel_under_roots(roots, &w.path), w.path.canonicalize()) {
+                    dirs.insert(crate::projects::storage_key(&child_url), c);
                 }
             }
         }
@@ -1237,16 +1242,14 @@ pub fn known_projects_with_state(roots: &[PathBuf]) -> Vec<ProjectStatus> {
     for p in ps.iter_mut() {
         let Some(parent) = p.parent.as_deref() else { continue };
         if !p.reachable { continue }
-        let Some(dir) = dirs.get(&p.branch).cloned() else { continue };
+        let Some(dir) = dirs.get(&p.key).cloned() else { continue };
         let (base, base_recorded) = match crate::worktree::read_base(&state_dir, &p.key) {
             Some(b) => (b, true),
             None => (main_branch.get(parent).cloned().unwrap_or_default(), false),
         };
-        let st = if base.is_empty() {
-            crate::worktree::State { dirty: None, ahead: None }
-        } else {
-            crate::worktree::state(&dir, &base, &crate::worktree::real_git)
-        };
+        // `dirty` never depends on the base; only `ahead` does.
+        let st = crate::worktree::state(&dir, &base, &crate::worktree::real_git);
+        let st = if base.is_empty() { crate::worktree::State { dirty: st.dirty, ahead: None } } else { st };
         p.wt = Some(WorktreeStatus {
             claude: crate::claudes::claude_evidence(&p.url),
             dirty: st.dirty,
@@ -1598,41 +1601,58 @@ pub fn remove(repo: &Path, path: &Path, branch: &str, run: GitRunner) -> Result<
             let _ = std::fs::remove_file(state_dir.join(format!("{key}.json")));
             Ok(note)
         };
-        let finish = move |h: &mut Hub, r: Result<Option<String>, String>| {
+        // `finish` runs under the hub lock and only talks to the clicker.
+        // `broadcast_all` locks EVERY registered hub — this one included —
+        // so it must run after the guard is dropped (Task 7 found the
+        // self-deadlock; `do_end_session` has the same ordering).
+        let finish = move |h: &mut Hub, r: Result<Option<String>, String>| -> bool {
             match r {
                 Ok(note) => {
-                    broadcast_all(&Event::ProjectsChanged { project: h.project.clone() });
-                    if let Some(n) = note {
-                        let ev = Event::Error { msg: n };
-                        h.send_to(&from, &ev);
-                    } else {
-                        let ev = Event::ProjectsChanged { project: h.project.clone() };
-                        h.send_to(&from, &ev);
-                    }
+                    let ev = match note {
+                        Some(n) => Event::Error { msg: n },
+                        None => Event::ProjectsChanged { project: h.project.clone() },
+                    };
+                    h.send_to(&from, &ev);
+                    true
                 }
                 Err(msg) => {
                     let ev = Event::Error { msg };
                     h.send_to(&from, &ev);
+                    false
                 }
             }
         };
+        let project_for_broadcast = self.project.clone();
         match self.self_ref.upgrade() {
             Some(arc) => {
                 let spawned = std::thread::Builder::new().name("remove-worktree".into()).spawn(move || {
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
                         .unwrap_or_else(|_| Err("worktree removal panicked".into()));
-                    let mut h = Hub::lock(&arc);
-                    finish(&mut h, r);
+                    let changed = {
+                        let mut h = Hub::lock(&arc);
+                        finish(&mut h, r)
+                    }; // guard dropped here, before any other hub is locked
+                    if changed {
+                        broadcast_all(&Event::ProjectsChanged { project: project_for_broadcast });
+                    }
                 });
                 if spawned.is_err() {
                     let ev = Event::Error { msg: "could not start worktree removal".into() };
                     self.send_to(&from, &ev);
                 }
             }
-            None => { let r = work(); finish(self, r); }
+            None => {
+                let r = work();
+                let changed = finish(self, r);
+                if changed {
+                    broadcast_all(&Event::ProjectsChanged { project: project_for_broadcast });
+                }
+            }
         }
     }
 ```
+
+Mirror the committed `do_new_worktree` (Task 7) for the exact borrow/move shape — it is the same function with a different `work`.
 
 The kept-branch note goes out as `Error` deliberately: it is shown as a banner, and the person should read it.
 

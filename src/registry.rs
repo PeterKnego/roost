@@ -35,6 +35,95 @@ pub struct ProjectStatus {
     /// rather than silently omitted. Always true for entries not discovered
     /// via worktree grouping.
     pub reachable: bool,
+    /// Populated only by `known_projects_with_state`, only for reachable
+    /// linked worktrees. `known_projects` always leaves this `None` — it is
+    /// two git calls per worktree, paid only when the switcher panel opens.
+    pub wt: Option<WorktreeStatus>,
+}
+
+/// Per-worktree state for the switcher panel. Groups the four things a row
+/// can say into one `Option` on `ProjectStatus`, so a main-worktree entry
+/// (or a plain project) carries no half-filled state — there is nothing to
+/// leave blank, just `None`.
+#[derive(Debug, Clone)]
+pub struct WorktreeStatus {
+    pub claude: crate::claudes::ClaudeEvidence,
+    pub dirty: Option<bool>,
+    pub ahead: Option<u32>,
+    /// The branch this worktree's ahead-count is measured against.
+    pub base: String,
+    /// True when `base` came from the `.base` file resh wrote at
+    /// `create` time; false when it fell back to the main worktree's
+    /// current branch (a worktree resh did not create, or a lost record).
+    pub base_recorded: bool,
+}
+
+/// Can this worktree be offered for removal? Every axis positively clean;
+/// a single unknown says no. The hub re-derives this at the moment of the
+/// intent — the row is a hint, not an authorisation.
+pub fn removable(w: &WorktreeStatus, live: usize) -> bool {
+    live == 0
+        && w.claude == crate::claudes::ClaudeEvidence::Absent
+        && w.dirty == Some(false)
+        && w.ahead == Some(0)
+}
+
+/// `known_projects` plus per-worktree state. Costs two git calls per linked
+/// worktree, so it is requested only when the switcher panel opens.
+pub fn known_projects_with_state(roots: &[PathBuf]) -> Vec<ProjectStatus> {
+    let mut ps = known_projects(roots);
+    let state_dir = crate::wsstate::state_dir();
+    let main_branch: std::collections::HashMap<String, String> =
+        ps.iter().filter(|p| p.parent.is_none()).map(|p| (p.key.clone(), p.branch.clone())).collect();
+    // A worktree's directory comes from git's own listing of its parent, not
+    // from `resolve_project`: that refuses dot segments (`.claude/…`), and
+    // `is_vouched_worktree` is an exception to *naming* only. Keyed by the
+    // child's storage key, not its bare branch name: this codebase's own
+    // auto-naming (claude-1, claude-2, … per repo) makes two different
+    // projects sharing a branch name the expected common case, and a
+    // branch-keyed map would silently hand one project's directory (and
+    // thus its dirty/ahead state) to another's row.
+    let mut dirs: std::collections::HashMap<String, PathBuf> = Default::default();
+    for p in ps.iter().filter(|p| p.parent.is_none()) {
+        if let Some(pd) = crate::projects::resolve_project(roots, &p.url) {
+            for w in crate::worktree::list(&pd).into_iter().filter(|w| !w.is_main) {
+                let Some(child_url) = rel_under_roots(roots, &w.path) else { continue };
+                let child_key = crate::projects::storage_key(&child_url);
+                if let Ok(c) = w.path.canonicalize() {
+                    dirs.insert(child_key, c);
+                }
+            }
+        }
+    }
+    for p in ps.iter_mut() {
+        let Some(parent) = p.parent.as_deref() else { continue };
+        if !p.reachable { continue }
+        let Some(dir) = dirs.get(&p.key).cloned() else { continue };
+        let (base, base_recorded) = match crate::worktree::read_base(&state_dir, &p.key) {
+            Some(b) => (b, true),
+            None => (main_branch.get(parent).cloned().unwrap_or_default(), false),
+        };
+        // `dirty` never depends on knowing a base — only `ahead` does. When
+        // no base is known (no record, and no main-worktree branch to fall
+        // back to), a null sha is passed as the range endpoint: `git
+        // rev-list` genuinely cannot resolve it (unlike an empty string,
+        // which `..HEAD` silently accepts as shorthand and answers `0` for
+        // — that would be exactly the "unknown read as clean" bug this
+        // codebase keeps shipping), so `state`'s own `.ok()` plumbing
+        // naturally yields `ahead: None` while `status --porcelain` still
+        // runs unconditionally and answers `dirty` normally.
+        const NULL_SHA: &str = "0000000000000000000000000000000000000000";
+        let base_for_ahead = if base.is_empty() { NULL_SHA } else { base.as_str() };
+        let st = crate::worktree::state(&dir, base_for_ahead, &crate::worktree::real_git);
+        p.wt = Some(WorktreeStatus {
+            claude: crate::claudes::claude_evidence(&p.url),
+            dirty: st.dirty,
+            ahead: st.ahead,
+            base,
+            base_recorded,
+        });
+    }
+    ps
 }
 
 pub struct ReapReport {
@@ -595,6 +684,49 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
     } else if roots_ok && !roots_were_ok {
         eprintln!("resh: configured roots are readable again — reaping resumed");
     }
+
+    // resh's own worktree markers: a `.base` whose directory is *positively*
+    // gone (NotFound, nothing else) is a file about nothing. Same rule as
+    // `.origin`: unreadable is "cannot tell", and cannot-tell keeps. Gated
+    // on `roots_ok` for the same reason the project-gone sweep below is —
+    // an unreadable root must suspend reaping, not be read as "not found".
+    //
+    // Deliberately placed before the `sock_root()` early return just below:
+    // `sock/` is created lazily, on a project's first attach (session.rs),
+    // so a state dir that has worktrees but no live or ever-live session
+    // has no `sock/` at all — and this sweep must still run there, or an
+    // orphaned `.base` from a project with no sessions is never reaped.
+    if roots_ok {
+        if let Ok(rd) = std::fs::read_dir(crate::wsstate::state_dir().join("worktrees")) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let Some(key) = name.strip_suffix(".base") else { continue };
+                if key.starts_with('.') {
+                    continue; // a temp file mid-write (write_base's `.{key}.base.tmp.{pid}`)
+                }
+                let url = decode_key(key);
+                let mut found_or_uncertain = false;
+                for r in roots {
+                    let p = r.join(&url);
+                    match std::fs::symlink_metadata(&p) {
+                        Ok(_) => {
+                            found_or_uncertain = true;
+                            break;
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(_) => {
+                            found_or_uncertain = true; // cannot tell: keep
+                            break;
+                        }
+                    }
+                }
+                if !found_or_uncertain {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+
     let Ok(rd) = std::fs::read_dir(sock_root()) else { return report };
     // One process listing for the whole sweep (see process_snapshot's doc
     // comment) rather than one `ps` per socket file. `None` here means the
@@ -814,6 +946,7 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
                     branch: String::new(),
                     parent: None,
                     reachable: true,
+                    wt: None,
                 },
             );
         }
@@ -879,6 +1012,7 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
                     branch: String::new(),
                     parent: None,
                     reachable: true,
+                    wt: None,
                 });
                 slot.live = live;
                 slot.oldest_age_secs = oldest;
@@ -946,6 +1080,7 @@ fn group_worktrees(roots: &[PathBuf], by_key: &mut std::collections::BTreeMap<St
                         branch: String::new(),
                         parent: None,
                         reachable: true,
+                        wt: None,
                     });
                     slot.branch = w.branch;
                     slot.parent = Some(key.clone());
@@ -969,6 +1104,7 @@ fn group_worktrees(roots: &[PathBuf], by_key: &mut std::collections::BTreeMap<St
                         branch: w.branch,
                         parent: Some(key.clone()),
                         reachable: false,
+                        wt: None,
                     });
                 }
             }
@@ -1263,6 +1399,68 @@ mod tests {
                 .expect("a worktree outside ROOTS must still be listed, not omitted");
             assert!(!child.reachable, "a worktree outside ROOTS must never be marked reachable");
             assert_eq!(child.parent.as_deref(), Some("repo"));
+        });
+    }
+
+    // Regression: `known_projects_with_state` used to key its worktree
+    // directory map by bare branch name. This codebase's own auto-naming
+    // (claude-1, claude-2, ... per repo, minted independently in every
+    // project) makes two different projects sharing a branch name the
+    // expected common case, not a corner case — when it happens, a
+    // branch-keyed map lets one project's row silently read another
+    // project's directory, including reporting a dirty worktree as clean
+    // and eligible for the remove button.
+    //
+    // Revert-checked: reverting the fix (keying `dirs` by `w.branch.clone()`
+    // and looking up via `dirs.get(&p.branch)`, as it originally shipped)
+    // makes this fail — observed:
+    //   thread '...' panicked at src/registry.rs:...:
+    //   assertion `left == right` failed: a's worktree is untouched
+    //     left: Some(true)
+    //    right: Some(false)
+    // ("a"'s row read "b"'s directory: both repos mint "claude-1", the
+    // branch-keyed map's second insert — "b", sorted after "a" — silently
+    // overwrote "a"'s entry, so both rows resolved to "b"'s worktree).
+    // Restored afterward.
+    #[test]
+    fn worktree_state_is_not_confused_across_projects_sharing_a_branch_name() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let repo_a = root.path().join("a");
+            let repo_b = root.path().join("b");
+            for repo in [&repo_a, &repo_b] {
+                fs::create_dir_all(repo).unwrap();
+                run_git(repo, &["init", "-q", "-b", "main"]);
+                run_git(repo, &["config", "user.email", "t@t"]);
+                run_git(repo, &["config", "user.name", "t"]);
+                fs::write(repo.join("f.txt"), "x").unwrap();
+                run_git(repo, &["add", "."]);
+                run_git(repo, &["commit", "-qm", "init"]);
+            }
+
+            // Both repos independently mint "claude-1" as their first free
+            // worktree name — the collision this test exists to catch.
+            let key_of_a = |n: &str| crate::projects::storage_key(&format!("a/.claude/worktrees/{n}"));
+            let key_of_b = |n: &str| crate::projects::storage_key(&format!("b/.claude/worktrees/{n}"));
+            let ca = crate::worktree::create(&repo_a, state, &key_of_a, &crate::worktree::real_git).unwrap();
+            let cb = crate::worktree::create(&repo_b, state, &key_of_b, &crate::worktree::real_git).unwrap();
+            assert_eq!(ca.name, "claude-1");
+            assert_eq!(cb.name, "claude-1", "both repos mint claude-1 independently");
+
+            // Dirty in b's worktree only.
+            fs::write(cb.path.join("untracked.txt"), "y").unwrap();
+
+            fs::create_dir_all(state).unwrap();
+            fs::write(state.join("a.json"), "{}").unwrap();
+            fs::write(state.join("b.json"), "{}").unwrap();
+
+            let ps = known_projects_with_state(&[root.path().to_path_buf()]);
+            let a_child = ps.iter().find(|p| p.parent.as_deref() == Some("a"))
+                .expect("a's worktree must be listed");
+            let b_child = ps.iter().find(|p| p.parent.as_deref() == Some("b"))
+                .expect("b's worktree must be listed");
+            assert_eq!(a_child.wt.as_ref().and_then(|w| w.dirty), Some(false), "a's worktree is untouched");
+            assert_eq!(b_child.wt.as_ref().and_then(|w| w.dirty), Some(true), "b's worktree has an untracked file");
         });
     }
 
@@ -2111,5 +2309,65 @@ mod tests {
                 "the repair must arrive by rename, not by truncating the marker in place"
             );
         }
+    }
+
+    // Revert-checked: changed the `Err(_) => { found_or_uncertain = true; ... }`
+    // arm in the reaping loop to `Err(_) => continue` (treat "cannot tell" as
+    // "not here, keep looking at other roots" — with only one root,
+    // indistinguishable from "gone"). Observed failure: `panicked at
+    // src/registry.rs:2363:13: cannot tell: kept` — `blocked` was reaped
+    // instead of kept, exactly the case `Path::exists()` vs
+    // `symlink_metadata` alone would not have caught. Restored; this test
+    // passes again. (Non-root run; see the guard below for why this needs
+    // it.)
+    #[test]
+    fn a_base_file_for_a_worktree_that_no_longer_exists_is_reaped_and_one_that_does_is_kept() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        std::env::set_var("RESH_STATE_DIR", &state);
+        let roots = vec![root.path().to_path_buf()];
+        std::fs::create_dir_all(root.path().join("repo/.claude/worktrees/claude-1")).unwrap();
+        let live = crate::projects::storage_key("repo/.claude/worktrees/claude-1");
+        let gone = crate::projects::storage_key("repo/.claude/worktrees/claude-2");
+        crate::worktree::write_base(&state, &live, "main").unwrap();
+        crate::worktree::write_base(&state, &gone, "main").unwrap();
+        // A base whose directory cannot be looked at: parent unreadable.
+        let blocked = crate::projects::storage_key("repo/.claude/worktrees/blocked/deep");
+        std::fs::create_dir_all(root.path().join("repo/.claude/worktrees/blocked")).unwrap();
+        crate::worktree::write_base(&state, &blocked, "main").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                root.path().join("repo/.claude/worktrees/blocked"),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+        }
+        // SnapshotFn is `&dyn Fn() -> Option<Vec<(u32, String)>>` (see
+        // `type SnapshotFn` above), not `Option<String>` — an empty process
+        // list, not an empty string. This pass reaps `.base` files, not
+        // sockets, so no process needs to be "running" for this test.
+        reconcile_with(&roots, &|| Some(Vec::new()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                root.path().join("repo/.claude/worktrees/blocked"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        assert!(crate::worktree::read_base(&state, &live).is_some(), "kept");
+        assert!(crate::worktree::read_base(&state, &gone).is_none(), "reaped");
+        // chmod 000 does not block root, so this assertion is vacuous under
+        // a root-run suite — skip just it rather than the whole test, and
+        // rely on code inspection (the `Err(_) => keep` arm above) for that
+        // case. The other two assertions above still run unconditionally.
+        if std::env::var("USER").as_deref() != Ok("root") {
+            assert!(crate::worktree::read_base(&state, &blocked).is_some(), "cannot tell: kept");
+        }
+        std::env::remove_var("RESH_STATE_DIR");
     }
 }

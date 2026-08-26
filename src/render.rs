@@ -874,8 +874,44 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
             ));
             continue;
         }
+        // Per-worktree state (Claude, dirty, ahead) and, when every axis is
+        // positively clean, a remove control. Only present when the caller
+        // asked for it (`known_projects_with_state`) — `p.wt` is `None`
+        // otherwise, and `None` renders no state at all, never "clean".
+        let state_html = match &p.wt {
+            None => String::new(),
+            Some(w) => {
+                let claude = match &w.claude {
+                    crate::claudes::ClaudeEvidence::Present(_) => "<span class=\"wtf on\" title=\"a Claude is running here\">✻</span>".to_string(),
+                    crate::claudes::ClaudeEvidence::Absent => "<span class=\"wtf\" title=\"no Claude here\">—</span>".to_string(),
+                    crate::claudes::ClaudeEvidence::Unknown => "<span class=\"wtf\" title=\"IDE integration is off, so resh cannot tell\">?</span>".to_string(),
+                };
+                let dirty = match w.dirty {
+                    Some(true) => "<span class=\"wtf on\">dirty</span>".to_string(),
+                    Some(false) => "<span class=\"wtf\">clean</span>".to_string(),
+                    None => "<span class=\"wtf\" title=\"git did not answer (status)\">?</span>".to_string(),
+                };
+                let against = if w.base_recorded {
+                    format!("measured against {}, recorded when resh created this worktree", esc(&w.base))
+                } else {
+                    format!("measured against {}, the main worktree's branch — resh did not create this worktree", esc(&w.base))
+                };
+                let ahead = match w.ahead {
+                    Some(n) => format!("<span class=\"wtf{}\" title=\"{against}. A squash-merged branch stays ahead forever; remove it by hand.\">{n} ahead</span>", if n > 0 { " on" } else { "" }),
+                    None => "<span class=\"wtf\" title=\"git did not answer (rev-list), or no base is known\">?</span>".to_string(),
+                };
+                let remove = if crate::registry::removable(w, p.live) {
+                    format!(" <button class=\"wtremove\" data-key=\"{}\" title=\"remove this worktree and its branch\">✕</button>", esc(&p.key))
+                } else {
+                    String::new()
+                };
+                format!(" · {claude} {dirty} {ahead}{remove}")
+            }
+        };
+        // A `<button>` cannot nest inside an `<a>` (invalid HTML), so the row
+        // is a flex span wrapping the link and the state/control separately.
         out.push_str(&format!(
-            "<a class=\"{cls}\" href=\"/{}\" title=\"{}\">{marker} {}{branch}</a>",
+            "<span class=\"wtrow\"><a class=\"{cls}\" href=\"/{}\" title=\"{}\">{marker} {}{branch}</a>{state_html}</span>",
             crate::http::percent_encode(&p.url),
             esc(&p.url),
             esc(name),
@@ -1002,7 +1038,7 @@ pub fn workspace_page(
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/code-input.min.js"></script>
-</head><body data-project="{proj_txt}" data-default-tab="{tab}" data-show-hidden="{sh}" data-autosave="{autosave}" data-share-selection="{share_selection}" data-launches="{launches}">
+</head><body data-project="{proj_txt}" data-key="{qkey}" data-default-tab="{tab}" data-show-hidden="{sh}" data-autosave="{autosave}" data-share-selection="{share_selection}" data-launches="{launches}">
 <header>
   <a class="home" href="/" title="all projects">{SVG_HOME}</a><span class="proj">{proj_txt}</span>
   <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body"></span><span id="wtlabel"></span></button>
@@ -1859,11 +1895,13 @@ mod tests {
                 key: "karpie".into(), url: "karpie".into(),
                 live: 2, oldest_age_secs: Some(60), has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
+                wt: None,
             },
             crate::registry::ProjectStatus {
                 key: "glow".into(), url: "glow".into(),
                 live: 0, oldest_age_secs: None, has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
+                wt: None,
             },
         ];
         let h = index_page("", &entries, false, &ps);
@@ -1980,11 +2018,13 @@ mod tests {
                 key: "karpie".into(), url: "karpie".into(),
                 live: 2, oldest_age_secs: Some(8 * 3600), has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
+                wt: None,
             },
             crate::registry::ProjectStatus {
                 key: "glow".into(), url: "glow".into(),
                 live: 0, oldest_age_secs: None, has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
+                wt: None,
             },
         ];
         let h = projects_strip("karpie", &ps);
@@ -2021,6 +2061,7 @@ mod tests {
             key: "solo".into(), url: "solo".into(),
             live: 1, oldest_age_secs: Some(3600), has_layout: true,
             branch: String::new(), parent: None, reachable: true,
+            wt: None,
         }];
         let h = projects_strip("other", &one);
         assert!(h.contains("1 session ·"), "expected the singular: {h}");
@@ -2032,6 +2073,7 @@ mod tests {
             key: "duo".into(), url: "duo".into(),
             live: 2, oldest_age_secs: None, has_layout: true,
             branch: String::new(), parent: None, reachable: true,
+            wt: None,
         }];
         assert!(projects_strip("other", &two).contains("2 sessions"), "two must stay plural");
     }
@@ -2042,6 +2084,7 @@ mod tests {
             key: "karpie".into(), url: "karpie".into(),
             live: 3, oldest_age_secs: None, has_layout: false,
             branch: String::new(), parent: None, reachable: true,
+            wt: None,
         }];
         let h = projects_strip("other", &ps);
         assert!(h.contains("3 sessions"), "the count is known even when the age is not");
@@ -2062,6 +2105,7 @@ mod tests {
                 key: "a%3Cb".into(), url: "a<b".into(),
                 live: 1, oldest_age_secs: None, has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
+                wt: None,
             },
             // storage_key only escapes '/' and '%' — a raw '"' from a
             // filesystem name can reach `key` unescaped, so this must be
@@ -2073,6 +2117,7 @@ mod tests {
                 key: "a\" onmouseover=x".into(), url: "b".into(),
                 live: 1, oldest_age_secs: None, has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
+                wt: None,
             },
         ];
         let h = projects_strip("", &ps);
@@ -2098,6 +2143,7 @@ mod tests {
                 key: "ultima_marketing".into(), url: "ultima_marketing".into(),
                 live: 2, oldest_age_secs: Some(60), has_layout: true,
                 branch: "main".into(), parent: None, reachable: true,
+                wt: None,
             },
             crate::registry::ProjectStatus {
                 key: "ultima_marketing%2F.claude%2Fworktrees%2Fsite-launch".into(),
@@ -2106,6 +2152,7 @@ mod tests {
                 branch: "site-launch".into(),
                 parent: Some("ultima_marketing".into()),
                 reachable: true,
+                wt: None,
             },
         ];
         let h = projects_strip("", &ps);
@@ -2138,6 +2185,7 @@ mod tests {
                 key: "repo".into(), url: "repo".into(),
                 live: 1, oldest_age_secs: None, has_layout: true,
                 branch: "main".into(), parent: None, reachable: true,
+                wt: None,
             },
             crate::registry::ProjectStatus {
                 // Live *and* unreachable is not a contradiction: ROOTS can
@@ -2149,6 +2197,7 @@ mod tests {
                 key: "%2Felsewhere%2Fstray".into(), url: "/elsewhere/stray".into(),
                 live: 1, oldest_age_secs: None, has_layout: false,
                 branch: "wip".into(), parent: Some("repo".into()), reachable: false,
+                wt: None,
             },
         ];
         let h = projects_strip("", &ps);
@@ -2248,6 +2297,7 @@ mod tests {
             branch: branch.into(),
             parent: parent.map(|s| s.to_string()),
             reachable,
+            wt: None,
         }
     }
 
@@ -2359,5 +2409,34 @@ mod tests {
         assert!(h.contains(r#"<span id="wtlabel" hx-swap-oob="true"></span>"#), "{h}");
         assert!(h.contains("no worktrees"), "{h}");
         assert!(!h.contains("href="), "{h}");
+    }
+
+    #[test]
+    fn a_worktree_row_shows_its_state_and_offers_removal_only_when_clean() {
+        // Revert-checked: rendering the control whenever `ahead == Some(0)`
+        // alone fails the dirty case; `?` for None fails if None renders as `—`.
+        use crate::registry::{ProjectStatus, WorktreeStatus};
+        use crate::claudes::ClaudeEvidence;
+        let mk = |wt: WorktreeStatus, live: usize| vec![
+            ProjectStatus { key: "r".into(), url: "r".into(), live: 1, oldest_age_secs: None, has_layout: true, branch: "main".into(), parent: None, reachable: true, wt: None },
+            ProjectStatus { key: "r%2F.claude%2Fworktrees%2Fclaude-1".into(), url: "r/.claude/worktrees/claude-1".into(), live, oldest_age_secs: None, has_layout: false, branch: "claude-1".into(), parent: Some("r".into()), reachable: true, wt: Some(wt) },
+        ];
+        let clean = WorktreeStatus { claude: ClaudeEvidence::Absent, dirty: Some(false), ahead: Some(0), base: "main".into(), base_recorded: true };
+        let out = worktrees_strip("r", &mk(clean.clone(), 0));
+        assert!(out.contains("0 ahead") && out.contains("class=\"wtremove\"") && out.contains("data-key=\"r%2F.claude%2Fworktrees%2Fclaude-1\""), "{out}");
+        let dirty = WorktreeStatus { dirty: Some(true), ..clean.clone() };
+        let out = worktrees_strip("r", &mk(dirty, 0));
+        assert!(out.contains("dirty") && !out.contains("wtremove"), "{out}");
+        let unknown = WorktreeStatus { dirty: None, ..clean.clone() };
+        let out = worktrees_strip("r", &mk(unknown, 0));
+        assert!(out.contains("title=\"git did not answer") && !out.contains("wtremove"), "{out}");
+        let present = WorktreeStatus { claude: ClaudeEvidence::Present(vec!["term".into()]), ..clean.clone() };
+        let out = worktrees_strip("r", &mk(present, 0));
+        assert!(out.contains("✻") && !out.contains("wtremove"), "{out}");
+        let out = worktrees_strip("r", &mk(clean.clone(), 1));
+        assert!(!out.contains("wtremove"), "a live terminal blocks removal: {out}");
+        let unrecorded = WorktreeStatus { base_recorded: false, ..clean };
+        let out = worktrees_strip("r", &mk(unrecorded, 0));
+        assert!(out.contains("measured against main, the main worktree's branch"), "{out}");
     }
 }

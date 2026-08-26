@@ -99,7 +99,15 @@ export async function startBrowser(profileDir) {
 /// state (`terms`, an entry's socket, the xterm buffer).
 export async function openPage(cdpPort, url) {
   const t = await (await fetch(`http://127.0.0.1:${cdpPort}/json/new?${url}`, { method: "PUT" })).json();
-  const ws = new WebSocket(t.webSocketDebuggerUrl);
+  return attachTarget(t.webSocketDebuggerUrl);
+}
+
+/// Attaches a CDP client to a target that already exists — a tab opened by
+/// `window.open` from inside a page the test is driving, say. `/json/list`
+/// gives that tab its own `webSocketDebuggerUrl`; this is how a test reaches
+/// it, since `openPage` above only knows how to create a fresh one.
+export async function attachTarget(webSocketDebuggerUrl) {
+  const ws = new WebSocket(webSocketDebuggerUrl);
   await new Promise((r) => (ws.onopen = r));
   let id = 0;
   const pending = new Map();

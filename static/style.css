@@ -92,6 +92,10 @@ header .vsep { width: 1px; height: 16px; background: var(--border); margin: 0 6p
 .wtstrip .wt.unreachable { opacity: .35; cursor: default; }
 .wtstrip .branch { color: var(--muted); font-size: 12px; }
 .wtstrip .wt-empty { color: var(--muted); display: block; padding: 6px 8px; font-size: 12px; }
+.wtrow { display: flex; align-items: center; gap: 6px; }
+.wtf { color: var(--muted); font-size: 12px; }
+.wtf.on { color: var(--fg); }
+.wtremove { font: inherit; font-size: 12px; cursor: pointer; background: none; border: 1px solid var(--muted); border-radius: 3px; }
 .warn { color: #d29922; cursor: help; }
 /* Deliberately loud, not decorative: this is the only thing on the page that
    says a highlighted selection is leaving the machine, and it must not read
@@ -344,6 +348,12 @@ main { flex: 1; min-height: 0; }
    no "content" to prepend into), so this variant floats above everything
    instead of the .conflict base's normal in-flow placement. */
 .conflict.error-banner { position: fixed; top: 12px; right: 12px; z-index: 1000; max-width: 420px; }
+/* showClaudeHere's prompt: .conflict already supplies the border/padding and
+   the button margin, so this only overrides what makes the "start in a new
+   worktree" choice read as the recommended one. */
+.claudehere { margin: 8px; }
+.claudehere button { margin: 8px 8px 0 0; font: inherit; cursor: pointer; }
+.claudehere .wt-new { font-weight: 600; }
 
 /* ---- fragment content shared by tree/changes/file/diff (rendered server-side) ---- */
 /* Indentation is a row property (--d, the depth render::tree_level stamps on

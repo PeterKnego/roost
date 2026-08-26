@@ -1,5 +1,6 @@
 pub mod assets;
 pub mod cli;
+pub mod claudes;
 pub mod config;
 pub mod errlog;
 pub mod fileops;
@@ -16,7 +17,6 @@ pub mod notify;
 pub mod origin;
 pub mod osc;
 pub mod paste;
-pub mod peers;
 pub mod projects;
 pub mod proto;
 pub mod registry;

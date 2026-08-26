@@ -33,10 +33,42 @@ use std::time::{Duration, Instant};
 use crate::proto::Launch;
 
 /// The bytes typed into the shell for a launch. `\r` is Enter on a PTY.
-pub fn keystrokes(launch: Launch) -> &'static [u8] {
-    match launch {
-        Launch::Claude => b"claude\r",
+///
+/// `session_id` is typed only when it is exactly a lowercase v4-shaped uuid:
+/// it lands on a command line, and the validation is the whole boundary
+/// between "resh chose this id" and "something typed a shell command". A
+/// malformed id degrades to the bare program, which still starts.
+pub fn keystrokes(launch: Launch, session_id: Option<&str>) -> Vec<u8> {
+    match (launch, session_id) {
+        (Launch::Claude, Some(id)) if valid_session_id(id) => {
+            format!("claude --session-id {id}\r").into_bytes()
+        }
+        (Launch::Claude, _) => b"claude\r".to_vec(),
     }
+}
+
+/// `8-4-4-4-12` lowercase hex, and nothing else.
+pub fn valid_session_id(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    b.iter().enumerate().all(|(i, c)| match i {
+        8 | 13 | 18 | 23 => *c == b'-',
+        _ => matches!(c, b'0'..=b'9' | b'a'..=b'f'),
+    })
+}
+
+/// A fresh v4 uuid from `/dev/urandom`. `None` when the kernel would not
+/// give sixteen bytes — the launch then goes without an id rather than with
+/// a weak one.
+pub fn new_session_id() -> Option<String> {
+    let mut buf = [0u8; 16];
+    std::fs::File::open("/dev/urandom").ok()?.read_exact(&mut buf).ok()?;
+    buf[6] = (buf[6] & 0x0f) | 0x40;
+    buf[8] = (buf[8] & 0x3f) | 0x80;
+    let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    Some(format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]))
 }
 
 /// The executable `keystrokes` runs, as `command -v` would look it up.
@@ -190,10 +222,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn claude_is_typed_as_the_command_and_enter() {
-        // The trailing `\r` is what runs it; without it the command sits at
-        // the prompt waiting for a key.
-        assert_eq!(keystrokes(Launch::Claude), b"claude\r");
+    fn claude_is_typed_with_its_session_id_and_enter() {
+        // Revert-checked: when keystrokes returns b"claude\r" unconditionally,
+        // this fails at src/launch.rs:226:9: assertion `left == right` failed,
+        // left: [99, 108, 97, 117, 100, 101, 13] (claude\r),
+        // right: [99, 108, 97, 117, 100, 101, 32, 45, 45, 115, ...] (claude --session-id ...\r).
+        let id = "0123abcd-0123-4abc-8abc-0123456789ab";
+        assert_eq!(
+            keystrokes(Launch::Claude, Some(id)),
+            format!("claude --session-id {id}\r").into_bytes()
+        );
+    }
+
+    #[test]
+    fn without_an_id_the_bare_command_is_typed() {
+        // Revert-checked: when fallback arm returns b"claude --session-id broken-id\r",
+        // this fails at src/launch.rs:239:9: assertion `left == right` failed,
+        // left: [99, 108, 97, 117, 100, 101, 32, 45, 45, ...] (claude --session-id broken-id\r),
+        // right: [99, 108, 97, 117, 100, 101, 13] (claude\r).
+        assert_eq!(keystrokes(Launch::Claude, None), b"claude\r".to_vec());
+    }
+
+    #[test]
+    fn a_malformed_id_is_never_typed() {
+        // The id lands on a command line. Anything that is not exactly a
+        // uuid falls back to the bare command — the metacharacter must be
+        // absent from what is typed, not merely quoted.
+        // Revert-checked: when guard on valid_session_id(id) is removed,
+        // this fails at src/launch.rs:253:9: assertion `left == right` failed,
+        // left: [99, 108, 97, 117, 100, 101, 32, 45, 45, 115, 101, 115, 115, 105, 111, 110, 45, 105, 100, 32, ..., 59, ...] (contains injected semicolon),
+        // right: [99, 108, 97, 117, 100, 101, 13] (claude\r).
+        let bad = "0123abcd-0123-4abc-8abc-0123456789ab; rm -rf ~";
+        let typed = keystrokes(Launch::Claude, Some(bad));
+        assert_eq!(typed, b"claude\r".to_vec());
+        assert!(!String::from_utf8_lossy(&typed).contains(';'));
+        assert!(!valid_session_id(bad));
+        assert!(!valid_session_id("0123ABCD-0123-4abc-8abc-0123456789ab"), "uppercase is not the form claude prints");
+        assert!(valid_session_id("0123abcd-0123-4abc-8abc-0123456789ab"));
+    }
+
+    #[test]
+    fn a_minted_id_is_a_valid_v4_uuid() {
+        // Revert-checked: when nibble-setting lines are dropped from new_session_id,
+        // the version nibble (position 14, should be '4') and variant nibble (position 19, should be 8-b)
+        // are random. The test fails ~93.75% of runs on the variant check at src/launch.rs:268:9:
+        // panicked at assertion `matches!(...), "variant nibble: <uuid>"`, e.g. uuid "266d78b4-1a5d-4884-20fd-279048848c18"
+        // with variant nibble '2' instead of 8-b. Mint 8 ids to make deterministic (probability of all
+        // 8 passing accidentally is ~6.3e-14).
+        for _ in 0..8 {
+            let id = new_session_id().expect("/dev/urandom is readable on a test host");
+            assert!(valid_session_id(&id), "{id}");
+            assert_eq!(&id[14..15], "4", "version nibble: {id}");
+            assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"), "variant nibble: {id}");
+        }
+        assert_ne!(new_session_id().unwrap(), new_session_id().unwrap(), "two mints differ");
     }
 
     use std::time::Duration;

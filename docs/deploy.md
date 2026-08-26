@@ -36,9 +36,8 @@ but rename it by hand (`git mv .deadlight .resh` inside the project, if it's
 tracked) on any project that carries one.
 
 `cargo run` binds `127.0.0.1:8444`; the sole CLI argument to the server itself
-is the port. Two subcommands never bind a port: `resh notify <title> [body]`
-(see [`docs/notifications.md`](notifications.md)) and `resh peers`
-(see [`docs/peers.md`](peers.md)).
+is the port. One subcommand never binds a port: `resh notify <title> [body]`
+(see [`docs/notifications.md`](notifications.md)).
 Tests: `cargo test` (never `--release`). Everything else is environment:
 
 | Variable | Purpose | Default |
@@ -60,7 +59,8 @@ and look exactly like every project had vanished. One host's paths used to be
 the default, which put that machine's layout into every binary. The env var
 wins when both are set, so the unit file stays authoritative for the service;
 the config entry exists for callers that inherit none of the unit's
-environment, which today means `resh peers`. Give a second instance its own
+environment, which today means nothing shipped with resh, but the key stays
+so a second instance's tooling can read it. Give a second instance its own
 `RESH_STATE_DIR` too — sharing one is safe as of the `.origin` marker (see
 *Projects and sessions*), but two instances sharing a state dir will still show
 each other's projects in the strip, which is rarely what you want.
@@ -73,6 +73,13 @@ state under `RESH_STATE_DIR`. OS notifications additionally need a
 secure context — `localhost` or an HTTPS origin such as `tailscale serve`;
 plain `http://` to a tailnet IP still shows the in-page notice panel but
 cannot ask the OS for permission.
+
+## Upgrading from a build that shipped `resh peers`
+
+`resh peers` is gone (spec `docs/superpowers/specs/2026-08-25-worktree-launch-design.md`).
+Remove its `SessionStart` entry from `~/.claude/settings.json` on every host that
+had it; left in place it prints `command not found` at every session start —
+loud, harmless, and the reason this note exists.
 
 ## Projects and sessions
 
@@ -407,6 +414,25 @@ the only thing standing between a stale `share_selection = true` and a
 never-again-noticed cross-project accident. Checked again on the server for
 every selection resh receives, so flipping the key back off during a session
 takes effect on the very next selection change, not on the next reload.
+
+### Prompting before a second Claude
+
+On by default. When resh has positive evidence a Claude is already running in
+a project — a terminal it typed `claude` into, or a connection on the IDE
+socket — a further ✻ click asks instead of opening another terminal there.
+The prompt is sent to the clicker alone; nothing changes for anyone else
+looking at the project, and no session name is allocated until the click is
+confirmed. To turn it off, so ✻ always opens a terminal the way it did before
+this existed:
+
+```toml
+worktree_prompt = false
+```
+
+**Global config only**, like `allowed_origins` and `ide`: it changes what a
+button does in every project, and a checkout must not get to decide that. An
+unreadable or unparseable global config leaves the prompt **on** — a typo
+elsewhere in that file must not silently change what a click does.
 
 ### Hidden files in the tree
 

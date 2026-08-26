@@ -27,13 +27,32 @@ pub fn valid_name(name: &str) -> bool {
 /// `projects::resolve_project` before ever reaching here, but this function
 /// also builds a socket path and a session-registry key from it, so it
 /// re-validates independently rather than trusting a caller never to
-/// regress. Mirrors resolve_project's *syntactic* checks only (no empty,
+/// regress. Mirrors resolve_project's *syntactic* checks (no empty,
 /// absolute, or leading-dot segment) — it has no `roots` to canonicalize
 /// against, and doesn't need one, since the filesystem-confinement half of
 /// that check already happened before this project ever had a live `dir`
 /// to spawn a shell in. A nested project (`karpie/src`) is legitimate here.
+///
+/// One dot-segment exception, mirroring `resolve_project`'s own worktree
+/// vouching: the sole dot-segment shape resh itself ever mints is
+/// `.claude/worktrees/<name>` (`worktree::create`, `do_new_worktree`'s
+/// `WorktreeReady.url`), so that literal shape is let through without
+/// `roots` to re-derive real vouching — this was already vouched for once,
+/// by `resolve_project`, before this project had a `dir` to reach here with.
+/// Without this, no worktree's terminal can ever start: `attach` rejects
+/// the project string before it gets anywhere near a shell.
 fn valid_project(project: &str) -> bool {
-    !project.is_empty() && project.split('/').all(|s| !s.is_empty() && !s.starts_with('.'))
+    if project.is_empty() {
+        return false;
+    }
+    let segs: Vec<&str> = project.split('/').collect();
+    if segs.iter().any(|s| s.is_empty()) {
+        return false;
+    }
+    segs.iter().enumerate().all(|(i, s)| {
+        !s.starts_with('.')
+            || (i > 0 && *s == ".claude" && segs.get(i + 1) == Some(&"worktrees") && i + 3 == segs.len())
+    })
 }
 
 /// `{project}/{name}` rather than a flattened `{project}-{name}`: project and
@@ -99,6 +118,9 @@ struct Session {
     subs: HashMap<u64, SyncSender<Vec<u8>>>,
     sizes: HashMap<u64, (u16, u16)>,
     next_id: u64,
+    /// Set on the spawn that consumed a parked launch; `None` for a plain
+    /// shell. Survives the typing of the keystrokes on purpose.
+    launched: Option<LaunchRequest>,
 }
 
 pub struct Attachment {
@@ -116,7 +138,17 @@ pub struct Attachment {
     /// program in (`launch::keystrokes`) once the socket is up. Reattaches,
     /// mirroring browsers and a later respawn of the same name get `None`:
     /// the entry is consumed at spawn, so one click starts one claude.
-    pub launch: Option<crate::proto::Launch>,
+    pub launch: Option<LaunchRequest>,
+}
+
+/// What a ✻ click asked a terminal to start, and the session id resh chose
+/// for it. Kept on the `Session` after the keystrokes are typed — it is the
+/// only record that this terminal was handed `claude`, and `claudes.rs`
+/// reads it to answer "is a Claude already here?".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchRequest {
+    pub launch: crate::proto::Launch,
+    pub session_id: Option<String>,
 }
 
 static SESSIONS: OnceLock<Mutex<HashMap<String, Session>>> = OnceLock::new();
@@ -128,9 +160,9 @@ fn sessions() -> &'static Mutex<HashMap<String, Session>> {
 /// What a not-yet-spawned session should start, keyed like `SESSIONS`. The
 /// hub allocates a name and the browser connects later, so the request has
 /// to wait somewhere in between; it is taken out by the attach that spawns.
-static PENDING_LAUNCH: OnceLock<Mutex<HashMap<String, crate::proto::Launch>>> = OnceLock::new();
+static PENDING_LAUNCH: OnceLock<Mutex<HashMap<String, LaunchRequest>>> = OnceLock::new();
 
-fn pending_launch() -> &'static Mutex<HashMap<String, crate::proto::Launch>> {
+fn pending_launch() -> &'static Mutex<HashMap<String, LaunchRequest>> {
     PENDING_LAUNCH.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -139,7 +171,7 @@ fn pending_launch() -> &'static Mutex<HashMap<String, crate::proto::Launch>> {
 /// ones that launch something: a name handed out for a ✻ click whose tab
 /// was closed before any browser attached leaves its entry behind, and the
 /// plain `+` click that is handed the same name next must not inherit it.
-pub fn set_launch(project: &str, name: &str, launch: Option<crate::proto::Launch>) {
+pub fn set_launch(project: &str, name: &str, launch: Option<LaunchRequest>) {
     let key = format!("{}/{}", crate::projects::storage_key(project), name);
     let mut map = pending_launch().lock().unwrap_or_else(|e| e.into_inner());
     match launch {
@@ -286,6 +318,7 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                 subs: HashMap::new(),
                 sizes: HashMap::new(),
                 next_id: 0,
+                launched: launch.clone(),
             },
         );
         let pump_key = key.clone();
@@ -539,6 +572,19 @@ pub fn live_names(project: &str) -> Vec<String> {
     out
 }
 
+/// Sessions of `project` this process spawned with a launch. A map scan
+/// only, like `live_names`: it runs under the hub on every ✻ click.
+pub fn launched_names(project: &str) -> Vec<(String, LaunchRequest)> {
+    let prefix = format!("{}/", crate::projects::storage_key(project));
+    let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<(String, LaunchRequest)> = map
+        .iter()
+        .filter_map(|(k, s)| Some((k.strip_prefix(&prefix)?.to_string(), s.launched.clone()?)))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// Session names with a socket on disk for this project. Dotfiles are skipped:
 /// `.origin` is metadata about the project key, not a session.
 fn socket_names(project: &str) -> Vec<String> {
@@ -765,6 +811,24 @@ mod tests {
         assert!(!valid_project("a/../b"));
     }
 
+    // Revert-checked: reverting to the blanket `!s.starts_with('.')` check
+    // (deleting the worktree exception) fails the first assertion here —
+    // observed: `assertion failed: valid_project("repo/.claude/worktrees/claude-1")`.
+    // `resolve_project` (projects.rs) already grew this exception for real
+    // vouched worktrees; this function's own doc comment claims to mirror
+    // resolve_project's syntactic checks, and had silently drifted out of
+    // sync with it.
+    #[test]
+    fn valid_project_accepts_only_the_exact_worktree_shape_as_a_dot_segment() {
+        assert!(valid_project("repo/.claude/worktrees/claude-1"), "the one shape resh itself mints");
+        assert!(valid_project("karpie/src/.claude/worktrees/claude-2"), "a nested project's worktree too");
+        assert!(!valid_project("repo/.claude"), "the parent dot-dir alone is still not a project");
+        assert!(!valid_project("repo/.claude/worktrees"), "missing the worktree name");
+        assert!(!valid_project("repo/.claude/worktrees/claude-1/extra"), "not a deeper path under it");
+        assert!(!valid_project(".claude/worktrees/claude-1"), "not at the top level either");
+        assert!(!valid_project("repo/.git"), "no exception for any other dotfile");
+    }
+
     #[test]
     fn storage_key_keeps_a_nested_projects_session_key_unambiguous() {
         // project "karpie" with session "src", vs. project "karpie/src"
@@ -920,10 +984,18 @@ mod tests {
         let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RESH_CMD", "cat");
         let d = tempfile::tempdir().unwrap();
-        set_launch("launchproj", "term", Some(crate::proto::Launch::Claude));
+        set_launch(
+            "launchproj",
+            "term",
+            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session_id: None }),
+        );
 
         let first = attach("launchproj", "term", d.path()).unwrap();
-        assert_eq!(first.launch, Some(crate::proto::Launch::Claude), "the attach that spawns carries it");
+        assert_eq!(
+            first.launch,
+            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session_id: None }),
+            "the attach that spawns carries it"
+        );
         let mirror = attach("launchproj", "term", d.path()).unwrap();
         assert_eq!(mirror.launch, None, "a second browser on the same shell must not retype it");
 
@@ -942,13 +1014,37 @@ mod tests {
         std::env::set_var("RESH_CMD", "cat");
         let d = tempfile::tempdir().unwrap();
         // The ✻ click whose tab was closed before any browser attached.
-        set_launch("launchproj2", "term", Some(crate::proto::Launch::Claude));
+        set_launch(
+            "launchproj2",
+            "term",
+            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session_id: None }),
+        );
         // The plain + click that got the same name back.
         set_launch("launchproj2", "term", None);
         let a = attach("launchproj2", "term", d.path()).unwrap();
         assert_eq!(a.launch, None, "a stale launch must not leak into an unrelated terminal");
         kill_project("launchproj2");
         std::env::remove_var("RESH_CMD");
+    }
+
+    #[test]
+    fn a_launched_session_stays_known_as_launched_for_its_lifetime() {
+        // Revert-checked: with `launched` never stored on the Session this
+        // fails on the first assertion with an empty Vec.
+        let _s = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        let req = LaunchRequest { launch: crate::proto::Launch::Claude, session_id: Some("0123abcd-0123-4abc-8abc-0123456789ab".into()) };
+        set_launch("launched", "term", Some(req.clone()));
+        let a = attach("launched", "term", d.path()).unwrap();
+        assert_eq!(a.launch, Some(req.clone()), "the spawning attach carries it");
+        let _plain = attach("launched", "term1", d.path()).unwrap();
+        assert_eq!(launched_names("launched"), vec![("term".to_string(), req)], "only the launched one, still after the launch was consumed");
+        let again = attach("launched", "term", d.path()).unwrap();
+        assert_eq!(again.launch, None, "a reattach types nothing");
+        assert_eq!(launched_names("launched").len(), 1, "…and does not forget");
+        kill_project("launched");
+        assert!(launched_names("launched").is_empty(), "gone with the session");
     }
 
     #[test]

@@ -431,7 +431,11 @@ impl Hub {
             Intent::InitGit => return self.do_init_git(from),
             Intent::CloseProject => return self.do_close_project(from),
             Intent::EndSession { session } => return self.do_end_session(from, session.clone()),
-            Intent::NewTerminal { pane, launch } => return self.do_new_terminal(from, *pane, *launch),
+            Intent::NewWorktree { launch } => return self.do_new_worktree(from, *launch),
+            Intent::RemoveWorktree { key } => return self.do_remove_worktree(from, key.clone()),
+            Intent::NewTerminal { pane, launch, force } => {
+                return self.do_new_terminal(from, *pane, *launch, *force)
+            }
             Intent::OpenPath { text } => return self.do_open_path(from, text.clone()),
             Intent::MentionPath { rel, line_start, line_end, session } => {
                 return self.do_mention_path(
@@ -1144,6 +1148,219 @@ impl Hub {
         self.persist();
     }
 
+    /// `git worktree add` off the hub lock, the `do_end_session` shape: the
+    /// work runs on a thread when this hub has a self-handle, synchronously
+    /// (unit tests, bare `Hub::new`) when it does not, and in both cases
+    /// the hub is re-locked only to deliver the answer.
+    fn do_new_worktree(&mut self, from: &ConnId, launch: Option<crate::proto::Launch>) {
+        if self.closing {
+            let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
+            return self.send_to(from, &ev);
+        }
+        let project = self.project.clone();
+        let dir = self.dir.clone();
+        let from = from.clone();
+        // A separate clone for `finish`: the spawn-failure arm below still
+        // needs `from` after `finish` (a `move` closure) has taken its own
+        // copy, since only one of the two ever runs but the borrow checker
+        // cannot see that.
+        let finish_from = from.clone();
+        let work = move || -> Result<String, String> {
+            let key_of = |n: &str| crate::projects::storage_key(&format!("{project}/.claude/worktrees/{n}"));
+            let c = crate::worktree::create(&dir, &crate::wsstate::state_dir(), &key_of, &crate::worktree::real_git)?;
+            Ok(format!("{project}/.claude/worktrees/{}", c.name))
+        };
+        // Delivers the reply under the hub lock and hands back the url on
+        // success, but does *not* call `broadcast_all` itself: that locks
+        // every registered hub, including this one, and this closure runs
+        // while this hub's own lock is held (see both call sites below) —
+        // calling `broadcast_all` from in here deadlocked every time,
+        // confirmed with a `for_project`-registered hub timing out on
+        // `recv_timeout` before this was split apart. The caller does the
+        // broadcast only after that lock is released, the same ordering
+        // `do_end_session` uses for its own `broadcast_all` call.
+        let finish = move |h: &mut Hub, r: Result<String, String>| -> Option<String> {
+            match r {
+                Ok(url) => {
+                    let ev = Event::WorktreeReady { url: url.clone(), launch };
+                    h.send_to(&finish_from, &ev);
+                    Some(url)
+                }
+                Err(msg) => {
+                    let ev = Event::Error { msg };
+                    h.send_to(&finish_from, &ev);
+                    None
+                }
+            }
+        };
+        match self.self_ref.upgrade() {
+            Some(arc) => {
+                let spawned = std::thread::Builder::new().name("new-worktree".into()).spawn(move || {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                        .unwrap_or_else(|_| Err("worktree creation panicked".into()));
+                    let url = {
+                        let mut h = Hub::lock(&arc);
+                        finish(&mut h, r)
+                    };
+                    if let Some(url) = url {
+                        broadcast_all(&Event::ProjectsChanged { project: url });
+                    }
+                });
+                if spawned.is_err() {
+                    let ev = Event::Error { msg: "could not start worktree creation".into() };
+                    self.send_to(&from, &ev);
+                }
+            }
+            None => {
+                let r = work();
+                if let Some(url) = finish(self, r) {
+                    broadcast_all(&Event::ProjectsChanged { project: url });
+                }
+            }
+        }
+    }
+
+    /// `git worktree remove` (no `--force`), then `git branch -d` (no
+    /// `-D`) off the hub lock, the `do_new_worktree` shape. Four independent
+    /// gates are re-derived here — Claude evidence, a live terminal, dirty,
+    /// ahead — rather than trusted from whatever state the row that offered
+    /// the button was rendered from; see CLAUDE.md's "Absence of evidence is
+    /// not evidence of absence": this is the destructive path that section
+    /// exists for. git's own two refusals (a dirty tree, an unmerged
+    /// branch) are gates this function does not duplicate — a `state`-based
+    /// check makes sure this project never even tries.
+    ///
+    /// The worktree is found from this repo's own `git worktree list`, not
+    /// `projects::roots()`/`resolve_project`: every worktree resh creates
+    /// lives under `.claude/worktrees/{name}` inside this project's own
+    /// directory, so asking git which linked worktrees it has and matching
+    /// their storage key is exact, and the main checkout — never a non-main
+    /// entry in that list — can never match.
+    fn do_remove_worktree(&mut self, from: &ConnId, key: String) {
+        if self.closing {
+            let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
+            return self.send_to(from, &ev);
+        }
+        let repo = self.dir.clone();
+        let project = self.project.clone();
+        let from = from.clone();
+        // A separate clone for `finish`: the spawn-failure arm below still
+        // needs `from` after `finish` (a `move` closure) has taken its own
+        // copy, since only one of the two ever runs but the borrow checker
+        // cannot see that (same shape as `do_new_worktree`'s `finish_from`).
+        let finish_from = from.clone();
+        let work = move || -> Result<Option<String>, String> {
+            let decoded = crate::registry::decode_key(&key);
+            let repo_canon = repo
+                .canonicalize()
+                .map_err(|e| format!("cannot resolve project directory: {e}"))?;
+            let ws = crate::worktree::list(&repo);
+            let mut target: Option<(std::path::PathBuf, String, String)> = None;
+            for w in ws.iter().filter(|w| !w.is_main) {
+                let Ok(canon) = w.path.canonicalize() else { continue };
+                let Ok(rel) = canon.strip_prefix(&repo_canon) else { continue };
+                let url = format!("{project}/{}", rel.display());
+                if crate::projects::storage_key(&url) == key {
+                    target = Some((canon, w.branch.clone(), url));
+                    break;
+                }
+            }
+            let (dir, name, url) =
+                target.ok_or_else(|| format!("{decoded}: not a worktree of this project"))?;
+            // Each check names itself. Order: the most specific first, so a
+            // launched Claude is reported as such and not as "a terminal".
+            match crate::claudes::claude_evidence(&url) {
+                crate::claudes::ClaudeEvidence::Present(_) => {
+                    return Err(format!("{name}: a Claude is running there"))
+                }
+                crate::claudes::ClaudeEvidence::Unknown => {
+                    return Err(format!(
+                        "{name}: cannot tell whether a Claude is running there (IDE integration is off)"
+                    ))
+                }
+                crate::claudes::ClaudeEvidence::Absent => {}
+            }
+            if !crate::session::live_names(&url).is_empty() {
+                return Err(format!("{name} has a live terminal"));
+            }
+            let state_dir = crate::wsstate::state_dir();
+            let base = crate::worktree::read_base(&state_dir, &key)
+                .or_else(|| ws.iter().find(|w| w.is_main).map(|m| m.branch.clone()))
+                .ok_or_else(|| format!("{name}: no base to measure against"))?;
+            let st = crate::worktree::state(&dir, &base, &crate::worktree::real_git);
+            match st.dirty {
+                Some(false) => {}
+                Some(true) => return Err(format!("{name} has uncommitted changes")),
+                None => return Err(format!("{name}: git did not answer (status)")),
+            }
+            match st.ahead {
+                Some(0) => {}
+                Some(n) => {
+                    return Err(format!(
+                        "{name} is {n} commit{} ahead of {base}",
+                        if n == 1 { "" } else { "s" }
+                    ))
+                }
+                None => return Err(format!("{name}: git did not answer (rev-list)")),
+            }
+            let note = crate::worktree::remove(&repo, &dir, &name, &crate::worktree::real_git)?;
+            // Only after both git steps succeed: resh's own records about a
+            // thing that, by this point, no longer exists.
+            let _ = std::fs::remove_file(crate::worktree::base_file(&state_dir, &key));
+            let _ = std::fs::remove_file(state_dir.join(format!("{key}.json")));
+            Ok(note)
+        };
+        // `finish` runs under the hub lock and only talks to the clicker.
+        // `broadcast_all` locks EVERY registered hub — this one included —
+        // so it must run after the guard is dropped (Task 7 found the
+        // self-deadlock; `do_new_worktree`/`do_end_session` have the same
+        // ordering).
+        let finish = move |h: &mut Hub, r: Result<Option<String>, String>| -> bool {
+            match r {
+                Ok(note) => {
+                    let ev = match note {
+                        Some(n) => Event::Error { msg: n },
+                        None => Event::ProjectsChanged { project: h.project.clone() },
+                    };
+                    h.send_to(&finish_from, &ev);
+                    true
+                }
+                Err(msg) => {
+                    let ev = Event::Error { msg };
+                    h.send_to(&finish_from, &ev);
+                    false
+                }
+            }
+        };
+        let project_for_broadcast = self.project.clone();
+        match self.self_ref.upgrade() {
+            Some(arc) => {
+                let spawned = std::thread::Builder::new().name("remove-worktree".into()).spawn(move || {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                        .unwrap_or_else(|_| Err("worktree removal panicked".into()));
+                    let changed = {
+                        let mut h = Hub::lock(&arc);
+                        finish(&mut h, r)
+                    }; // guard dropped here, before any other hub is locked
+                    if changed {
+                        broadcast_all(&Event::ProjectsChanged { project: project_for_broadcast });
+                    }
+                });
+                if spawned.is_err() {
+                    let ev = Event::Error { msg: "could not start worktree removal".into() };
+                    self.send_to(&from, &ev);
+                }
+            }
+            None => {
+                let r = work();
+                let changed = finish(self, r);
+                if changed {
+                    broadcast_all(&Event::ProjectsChanged { project: project_for_broadcast });
+                }
+            }
+        }
+    }
+
     /// Opens a terminal on a server-allocated name. See
     /// `session::next_free_name` for why the client must not choose it.
     fn do_new_terminal(
@@ -1151,10 +1368,21 @@ impl Hub {
         from: &ConnId,
         pane: crate::proto::PaneId,
         launch: Option<crate::proto::Launch>,
+        force: bool,
     ) {
         if self.closing {
             let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
             return self.send_to(from, &ev);
+        }
+        if launch == Some(crate::proto::Launch::Claude) && !force && crate::config::worktree_prompt() {
+            if let crate::claudes::ClaudeEvidence::Present(terminals) =
+                crate::claudes::claude_evidence(&self.project)
+            {
+                // The clicker only: nothing changed for anyone else, and a
+                // prompt is a question, not a state.
+                let ev = Event::ClaudeHere { pane, terminals };
+                return self.send_to(from, &ev);
+            }
         }
         // Names already on a tab but not yet connected are in no registry —
         // `next_free_name`'s `also_taken` is what stops two quick clicks from
@@ -1178,7 +1406,11 @@ impl Hub {
         // attached, and a plain + must not inherit that click. The shell is
         // spawned by whichever browser attaches first, so the request waits
         // in `session` until then.
-        crate::session::set_launch(&self.project, &name, launch);
+        crate::session::set_launch(
+            &self.project,
+            &name,
+            launch.map(|l| crate::session::LaunchRequest { launch: l, session_id: crate::launch::new_session_id() }),
+        );
         let intent = Intent::OpenTab { pane, tab: Tab::Terminal { session: name.clone() } };
         match workspace::apply_layout(&mut self.ws, &intent) {
             Ok(true) => {
@@ -2593,8 +2825,8 @@ mod tests {
         }
         drain(&rx);
 
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
         drain(&rx);
 
         let names: Vec<String> = h.ws.panes[proto::RIGHT as usize]
@@ -2628,11 +2860,19 @@ mod tests {
         }
         drain(&rx);
 
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude) });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
         drain(&rx);
         let first = crate::session::attach("newterm_launch", "term", d.path()).unwrap();
-        assert_eq!(first.launch, Some(proto::Launch::Claude), "✻ got `term`, so `term` starts claude");
+        assert_eq!(
+            first.launch.as_ref().map(|l| l.launch),
+            Some(proto::Launch::Claude),
+            "✻ got `term`, so `term` starts claude"
+        );
+        assert!(
+            first.launch.as_ref().and_then(|l| l.session_id.as_deref()).is_some_and(crate::launch::valid_session_id),
+            "the hub minted an id"
+        );
         let second = crate::session::attach("newterm_launch", "term1", d.path()).unwrap();
         assert_eq!(second.launch, None, "+ got `term1`, which stays a plain shell");
         crate::session::kill_project("newterm_launch");
@@ -2640,20 +2880,77 @@ mod tests {
         // The stale case: ✻ allocates `term2`, its tab is closed before any
         // browser attaches, and + is then handed `term2` back. The click that
         // made it a claude shell is gone, so the shell must be plain.
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude) });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
         let idx = h.ws.panes[proto::RIGHT as usize]
             .tabs
             .iter()
             .position(|t| matches!(t, Tab::Terminal { session } if session == "term2"))
             .expect("✻ was handed term2");
         h.handle(&c, Intent::CloseTab { pane: proto::RIGHT, idx });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
         drain(&rx);
         let reused = crate::session::attach("newterm_launch", "term2", d.path()).unwrap();
         assert_eq!(reused.launch, None, "a reallocated name must not inherit the old click");
         crate::session::kill_project("newterm_launch");
         std::env::remove_var("RESH_CMD");
         std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn a_second_claude_click_gets_a_prompt_that_only_the_clicker_sees() {
+        // Revert-checked: with the evidence check removed, `a` receives
+        // State + TerminalStarted and the ClaudeHere assertion fails;
+        // with `send_to` swapped for `broadcast`, the `b` assertion fails.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("prompt_second", d.path().to_path_buf());
+        let (a, rxa) = h.subscribe();
+        let (_b, rxb) = h.subscribe();
+        for p in h.ws.panes.iter_mut() { p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. })); p.active = 0; }
+        // First ✻: allocates `term`; spawn it the way a browser would, so the
+        // launch is consumed and recorded on the session.
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        let _att = crate::session::attach("prompt_second", "term", d.path()).unwrap();
+        assert_eq!(crate::session::launched_names("prompt_second").len(), 1, "fixture: a launched terminal exists");
+        drain(&rxa); drain(&rxb);
+        let version = h.ws.version;
+
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        let got = rxa.try_recv().expect("the clicker hears back");
+        assert!(got.contains(r#""t":"ClaudeHere""#) && got.contains(r#""terminals":["term"]"#), "{got}");
+        assert!(rxb.try_recv().is_err(), "nobody else hears anything");
+        assert_eq!(h.ws.version, version, "no layout change");
+        assert_eq!(crate::session::live_names("prompt_second").len(), 1, "no session allocated");
+
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: true });
+        assert!(h.ws.version > version, "force opens a terminal");
+        assert!(rxb.try_recv().is_ok_and(|m| m.contains(r#""t":"State""#)), "…which everyone sees");
+        crate::session::kill_project("prompt_second");
+    }
+
+    #[test]
+    // Revert-checked: dropping the `launch == Some(Claude)` clause in
+    // `do_new_terminal` fails this at the "a plain shell opens beside a
+    // Claude" assertion (src/hub.rs:2734) — a `+` click gets prompted too.
+    fn a_plus_click_never_prompts() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("prompt_plus", d.path().to_path_buf());
+        let (a, rxa) = h.subscribe();
+        for p in h.ws.panes.iter_mut() { p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. })); p.active = 0; }
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        let _att = crate::session::attach("prompt_plus", "term", d.path()).unwrap();
+        drain(&rxa);
+        let version = h.ws.version;
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
+        assert!(h.ws.version > version, "a plain shell opens beside a Claude");
+        crate::session::kill_project("prompt_plus");
     }
 
     /// Ending a session is what makes closing a tab reclaim a slot; the tab
@@ -3949,6 +4246,289 @@ mod tests {
 
         close_proposal("proposal-route-a", "p-7");
         assert!(!has_tab(&a), "close_proposal left the tab behind");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn new_worktree_creates_claude_1_announces_it_and_answers_the_clicker() {
+        // Revert-checked: with `WorktreeReady` sent via `broadcast` instead
+        // of `send_to`, the `rxb` assertion below fails ("the reply is the
+        // clicker's alone") — confirmed, then restored.
+        //
+        // `broadcast_all` reaches hubs registered in the global map, which a
+        // bare `Hub::new` (used here, as `do_end_session`'s convention
+        // requires for the synchronous branch) never is — so this test
+        // cannot observe the `ProjectsChanged` broadcast itself; that is
+        // left to the browser test.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        let (_b, rxb) = h.subscribe();
+        drain(&rxa); drain(&rxb);
+        h.handle(&a, Intent::NewWorktree { launch: Some(proto::Launch::Claude) });
+        // Hub::new has no self_ref, so the work ran synchronously (the
+        // do_end_session convention) and the reply is already queued.
+        let got = rxa.try_recv().expect("clicker answered");
+        assert!(got.contains(r#""t":"WorktreeReady""#) && got.contains(r#""url":"repo/.claude/worktrees/claude-1""#) && got.contains(r#""launch":"claude""#), "{got}");
+        assert!(rxb.try_recv().is_err(), "the reply is the clicker's alone");
+        assert!(repo.join(".claude/worktrees/claude-1/a.txt").is_file());
+        assert_eq!(crate::worktree::read_base(&crate::wsstate::state_dir(), "repo%2F.claude%2Fworktrees%2Fclaude-1").as_deref(), Some("main"));
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn new_worktree_in_a_non_repository_is_an_error_to_the_clicker() {
+        // Revert-checked: swallowing the `Err` branch in `finish` instead of
+        // sending an `Error` event fails this test's `unwrap()` with
+        // `Err(Empty)` (nothing was ever sent) — confirmed, then restored.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("plain", d.path().to_path_buf());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::NewWorktree { launch: None });
+        let got = rxa.try_recv().unwrap();
+        assert!(got.contains(r#""t":"Error""#) && got.contains("not a git repository"), "{got}");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// `Hub::new` (used by the two tests above) never has a `self_ref`, so
+    /// they never exercise the threaded branch's own hub re-lock at all —
+    /// this is the one test in the file that goes through `for_project`
+    /// and therefore a hub that really is in `REGISTRY`. That distinction
+    /// matters: `broadcast_all` locks every registered hub, including this
+    /// one, so calling it while still holding *this* hub's own lock (taken
+    /// in the spawned thread to deliver the reply) is a guaranteed
+    /// self-deadlock on `std::sync::Mutex`, which is not reentrant.
+    ///
+    /// Caught in self-review, not by the brief's own tests: moving
+    /// `broadcast_all` back inside the locked section (the shape the task
+    /// brief's literal code used) reproduces it — `recv_timeout` times out
+    /// instead of ever receiving `WorktreeReady`. Confirmed, then restored
+    /// to the fixed ordering (`broadcast_all` only after the lock guard is
+    /// dropped, the same ordering `do_end_session` already uses for its own
+    /// `broadcast_all` call).
+    #[test]
+    fn new_worktree_on_a_registered_hub_does_not_deadlock_broadcasting_projects_changed() {
+        isolate_ide_dir_for_tests();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let hub = Hub::for_project("worktree-registered", repo.clone());
+        let (a, rxa) = Hub::lock(&hub).subscribe();
+        drain(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::NewWorktree { launch: None });
+        let got = rxa.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(got.is_ok(), "timed out waiting for WorktreeReady -- broadcast_all deadlocked against this hub's own lock");
+        assert!(got.unwrap().contains(r#""t":"WorktreeReady""#));
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// A repo with one resh-created worktree, both registered under a temp
+    /// state dir; returns (hub for the repo, worktree url, worktree dir).
+    fn repo_with_worktree(root: &std::path::Path) -> (Hub, String, std::path::PathBuf) {
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let key_of = |n: &str| crate::projects::storage_key(&format!("repo/.claude/worktrees/{n}"));
+        let c = crate::worktree::create(&repo, &crate::wsstate::state_dir(), &key_of, &crate::worktree::real_git).unwrap();
+        (Hub::new("repo", repo), "repo/.claude/worktrees/claude-1".into(), c.path)
+    }
+    const WT_KEY: &str = "repo%2F.claude%2Fworktrees%2Fclaude-1";
+
+    fn refusal_of(h: &mut Hub, a: &ConnId, rx: &Receiver<String>) -> String {
+        h.handle(a, Intent::RemoveWorktree { key: WT_KEY.into() });
+        let got = rx.try_recv().expect("an answer");
+        assert!(got.contains(r#""t":"Error""#), "expected a refusal, got {got}");
+        got
+    }
+
+    #[test]
+    fn remove_refuses_a_worktree_with_a_live_terminal() {
+        // Revert-checked: with the live check deleted this passes the
+        // worktree straight to git, which removes it — `refusal_of`'s own
+        // assertion that the answer was an `Error` fails first (removal
+        // *succeeds*, so no later assertion in this test even runs).
+        // Observed: `panicked ... expected a refusal, got
+        // {"t":"ProjectsChanged","project":"repo"}`.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
+        let (mut h, url, dir) = repo_with_worktree(root.path());
+        let (a, rx) = h.subscribe(); drain(&rx);
+        let _att = crate::session::attach(&url, "term", &dir).unwrap();
+        let got = refusal_of(&mut h, &a, &rx);
+        assert!(got.contains("live terminal"), "{got}");
+        assert!(dir.is_dir());
+        crate::session::kill_project(&url);
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn remove_refuses_a_worktree_where_a_claude_was_launched() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
+        let (mut h, url, dir) = repo_with_worktree(root.path());
+        let (a, rx) = h.subscribe(); drain(&rx);
+        crate::session::set_launch(&url, "term", Some(crate::session::LaunchRequest { launch: proto::Launch::Claude, session_id: None }));
+        let _att = crate::session::attach(&url, "term", &dir).unwrap();
+        let got = refusal_of(&mut h, &a, &rx);
+        // Names the more specific reason even though "live terminal" is also true.
+        //
+        // Revert-checked: deleting the `claude_evidence` match falls through
+        // to the live-terminal gate instead, which still refuses — but with
+        // the wrong, less specific reason. Observed: `panicked ...
+        // {"t":"Error","msg":"claude-1 has a live terminal"}`, failing
+        // `got.contains("Claude")`. Restored.
+        assert!(got.contains("Claude"), "{got}");
+        assert!(dir.is_dir());
+        crate::session::kill_project(&url);
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn remove_refuses_a_dirty_worktree() {
+        // Revert-checked: deleting the `st.dirty` match still refuses — git
+        // itself is the backstop here, since a dirty tree also fails
+        // `git worktree remove` without `--force` — but with a different
+        // message than ours ("uncommitted"), so the assertion below already
+        // discriminates the hub's own gate from git's. Observed: `panicked
+        // ... {"t":"Error","msg":"git worktree remove refused: fatal:
+        // '.../.claude/worktrees/claude-1' contains modified or untracked
+        // files, use --force to delete it"}`, failing
+        // `got.contains("uncommitted")`. Restored.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
+        let (mut h, _url, dir) = repo_with_worktree(root.path());
+        let (a, rx) = h.subscribe(); drain(&rx);
+        std::fs::write(dir.join("n.txt"), "y").unwrap();
+        let got = refusal_of(&mut h, &a, &rx);
+        assert!(got.contains("uncommitted"), "{got}");
+        assert!(dir.join("n.txt").is_file());
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn remove_refuses_a_worktree_with_commits_ahead() {
+        // Revert-checked: with the `st.ahead` match deleted, `remove` runs
+        // and git itself refuses the unmerged branch, so this still gets an
+        // `Error` — but the wrong one, and the worktree is gone. Observed:
+        // `panicked ... {"t":"Error","msg":"worktree removed; branch
+        // claude-1 kept: git reports it unmerged (...)"}`, failing the
+        // `got.contains("1 commit")` assertion.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
+        let (mut h, _url, dir) = repo_with_worktree(root.path());
+        let (a, rx) = h.subscribe(); drain(&rx);
+        std::fs::write(dir.join("n.txt"), "y").unwrap();
+        crate::worktree::real_git(&dir, &["add", "."]).unwrap();
+        crate::worktree::real_git(&dir, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "wt"]).unwrap();
+        let got = refusal_of(&mut h, &a, &rx);
+        assert!(got.contains("1 commit"), "{got}");
+        assert!(dir.is_dir());
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn remove_takes_a_clean_idle_worktree_and_its_state() {
+        // Revert-checked: flipping the dirty match's `Some(false) => {}` arm
+        // to also refuse (simulating any one gate wrongly always firing)
+        // turns this success case into a refusal. Observed: `panicked ...
+        // {"t":"Error","msg":"claude-1 has uncommitted changes"}`, failing
+        // the `!got.contains(r#""t":"Error""#)` assertion. Restored.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
+        let (mut h, _url, dir) = repo_with_worktree(root.path());
+        let (a, rx) = h.subscribe(); drain(&rx);
+        let state = crate::wsstate::state_dir();
+        std::fs::write(state.join(format!("{WT_KEY}.json")), "{}").unwrap();
+        h.handle(&a, Intent::RemoveWorktree { key: WT_KEY.into() });
+        let got = rx.try_recv().unwrap();
+        assert!(!got.contains(r#""t":"Error""#), "{got}");
+        assert!(matches!(std::fs::symlink_metadata(&dir), Err(e) if e.kind() == std::io::ErrorKind::NotFound));
+        assert!(crate::worktree::read_base(&state, WT_KEY).is_none(), ".base gone");
+        assert!(!state.join(format!("{WT_KEY}.json")).exists(), "layout gone");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn remove_refuses_a_key_that_is_not_a_worktree_of_this_project() {
+        // The key the *unfiltered* `ws.iter()` loop would mint for the main
+        // checkout itself: its canonicalized path strips to an empty `rel`
+        // against the canonicalized repo, so `format!("{project}/{}", "")`
+        // is "repo/" and its storage key is "repo%2F" — not "repo". Using
+        // plain "repo" here would pass whether or not the `!w.is_main`
+        // filter exists (it never collides with anything the loop mints
+        // either way), so it wouldn't discriminate the filter this test is
+        // named for.
+        //
+        // Revert-checked: deleting `.filter(|w| !w.is_main)` at the
+        // `for w in ws.iter()...` loop makes this key match the main
+        // checkout, so identification succeeds and the flow reaches the
+        // dirty gate — which then refuses for an unrelated reason (the
+        // freshly-created `.claude/worktrees/claude-1` sits as an untracked
+        // directory in the main checkout's own `git status`). Observed:
+        // `panicked ... the main checkout is never removable:
+        // {"t":"Error","msg":"main has uncommitted changes"}` — no longer
+        // containing "not a worktree of this project". Restored.
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
+        let (mut h, _url, _dir) = repo_with_worktree(root.path());
+        let (a, rx) = h.subscribe(); drain(&rx);
+        let key = crate::projects::storage_key("repo/");
+        h.handle(&a, Intent::RemoveWorktree { key });
+        let got = rx.try_recv().unwrap();
+        assert!(got.contains("not a worktree of this project"), "the main checkout is never removable: {got}");
         std::env::remove_var("RESH_STATE_DIR");
     }
 }

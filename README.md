@@ -97,12 +97,10 @@ RESH_ROOTS="$HOME/Projects" cargo run --quiet 8444
 ```
 
 Requires `dtach` (`brew install dtach` / `apt install dtach`) and `git`.
-Running the binary directly takes one CLI argument, the port. Two
-subcommands bind nothing: `resh notify <title> [body]` raises a
-notification from inside a resh terminal, and `resh peers` reports which
-other Claude sessions are already working in this project — see
-[`docs/notifications.md`](docs/notifications.md) and
-[`docs/peers.md`](docs/peers.md). Everything else is
+Running the binary directly takes one CLI argument, the port. One
+subcommand binds nothing: `resh notify <title> [body]` raises a
+notification from inside a resh terminal — see
+[`docs/notifications.md`](docs/notifications.md). Everything else is
 environment — see [`docs/deploy.md`](docs/deploy.md).
 
 ## URL surface
