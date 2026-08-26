@@ -108,7 +108,7 @@ pub fn overview_page(roots_label: &str) -> String {
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>resh</title>\
          <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
          <link rel=\"stylesheet\" href=\"/static/style.css\">\
-         <script src=\"/static/htmx.min.js\"></script>\
+         <script src=\"/static/vendor/htmx.min.js\"></script>\
          </head><body class=\"overview-body\">\
          <header><span class=\"proj\">resh</span>\
            <span class=\"roots\" title=\"{roots}\"></span>\
@@ -125,7 +125,7 @@ pub fn overview_page(roots_label: &str) -> String {
 }
 ```
 
-Confirm the htmx script path resh already serves — `grep -n "htmx" src/render.rs static/*` — and use whatever the workspace page uses (it may be `/static/htmx.min.js` or embedded). Match it exactly; do not add a new asset.
+The htmx path is `/static/vendor/htmx.min.js` (the workspace page uses it, `render.rs:1036`); it is already embedded via `static/vendor/`. Do not add a new asset.
 
 `src/routes.rs` `serve_index`:
 
