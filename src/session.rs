@@ -1201,6 +1201,9 @@ mod tests {
     #[test]
     fn parse_ages_reads_pid_and_etime_columns() {
         // `ps -o pid=,etime=` output: pid, whitespace, etime, one row per line.
+        // Revert-checked: hardcoding the inserted age to 0 instead of
+        // `parse_etime`'s result fails this with
+        // `left: Some(0)\n right: Some(310)`; restored.
         let out = "  123 05:10\n 4567 1-02:03:04\n89 00:42\n";
         let m = parse_ages(out);
         assert_eq!(m.get(&123), Some(&310)); // 5m10s
@@ -1218,6 +1221,7 @@ mod tests {
     }
 
     #[test]
+    // The "no ps" property is structural (live_rows has no ps call); this asserts the scan's data is real.
     fn live_rows_lists_a_projects_sessions_without_forking_ps() {
         let _s = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RESH_CMD", "cat");
@@ -1226,7 +1230,11 @@ mod tests {
         let _b = attach("ovproj", "term1", d.path()).unwrap();
         let rows = live_rows("ovproj");
         assert_eq!(rows.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(), vec!["term", "term1"]);
-        assert!(rows.iter().all(|(_, pid, _)| *pid != 0) || std::env::var("RESH_CMD").is_ok());
+        // Revert-checked: hardcoding live_rows to emit pid 0 per row fails this
+        // with `live_rows must carry real pids: [("term", 0, 1), ("term1", 0, 1)]`; restored.
+        assert!(rows.iter().all(|(_, pid, _)| *pid != 0), "live_rows must carry real pids: {rows:?}");
+        // `attach` itself registers a subscriber, so each fresh session already shows 1 attached.
+        assert_eq!(rows.iter().map(|(_, _, attached)| *attached).collect::<Vec<_>>(), vec![1, 1]);
         kill_project("ovproj");
         std::env::remove_var("RESH_CMD");
     }
