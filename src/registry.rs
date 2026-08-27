@@ -1166,6 +1166,45 @@ fn rel_under_roots(roots: &[PathBuf], path: &std::path::Path) -> Option<String> 
 /// guarantee — a child worktree's storage key has no relationship to its
 /// parent's. Top-level entries keep key order; children of one parent sort
 /// by branch.
+/// Every project directory under `roots`, carrying the state resh knows for
+/// the ones it has opened.
+///
+/// `known_projects` answers "projects resh has opened" — a saved layout or a
+/// live session — which is the right answer for the header switcher and the
+/// wrong one for a front page. The page this replaced was a directory
+/// picker that browsed the filesystem, so every directory was reachable
+/// from it; listing only opened ones lost that silently. Measured on the
+/// deploy host: 19 of 28 directories under the roots were invisible.
+///
+/// The filesystem rows are added *after* `known_projects_with_state` has
+/// run and carry no git state, so a directory nobody has opened costs no
+/// subprocess: the `git worktree list` per entry that `group_worktrees`
+/// pays is still spent only on projects being displayed with state. A
+/// never-opened directory is therefore listed as plain and idle even if it
+/// is a repository with worktrees — opening it fills that in.
+pub fn all_projects_with_state(roots: &[PathBuf]) -> Vec<ProjectStatus> {
+    let mut ps = known_projects_with_state(roots);
+    let known: std::collections::HashSet<String> = ps.iter().map(|p| p.key.clone()).collect();
+    for p in crate::projects::list_projects(roots) {
+        let key = crate::projects::storage_key(&p.name);
+        if known.contains(&key) {
+            continue;
+        }
+        ps.push(ProjectStatus {
+            key,
+            url: p.name,
+            live: 0,
+            oldest_age_secs: None,
+            has_layout: false,
+            branch: String::new(),
+            parent: None,
+            reachable: true,
+            wt: None,
+        });
+    }
+    order_with_children(ps)
+}
+
 fn order_with_children(mut items: Vec<ProjectStatus>) -> Vec<ProjectStatus> {
     items.sort_by(|a, b| a.key.cmp(&b.key));
     let mut children: std::collections::HashMap<String, Vec<ProjectStatus>> = Default::default();
@@ -2421,5 +2460,30 @@ mod tests {
         let keys: Vec<&str> = ps.iter().map(|p| p.key.as_str()).collect();
         assert!(!keys.contains(&"ghost"), "ghost has no directory: {keys:?}");
         assert!(keys.contains(&"realproj"), "{keys:?}");
+    }
+
+    /// The front page must list a directory nobody has opened yet — the
+    /// picker it replaced showed every directory under the roots.
+    /// Revert-checked: with the filesystem merge dropped this failed with
+    /// `neveropened missing: ["opened"]`.
+    #[test]
+    fn all_projects_lists_directories_that_were_never_opened() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::env::set_var("RESH_STATE_DIR", &state);
+        let root = d.path().join("root");
+        std::fs::create_dir_all(root.join("opened")).unwrap();
+        std::fs::create_dir_all(root.join("neveropened")).unwrap();
+        std::fs::write(state.join("opened.json"), "{}").unwrap();
+        let ps = all_projects_with_state(&[root.clone()]);
+        let keys: Vec<&str> = ps.iter().map(|p| p.key.as_str()).collect();
+        assert!(keys.contains(&"neveropened"), "neveropened missing: {keys:?}");
+        assert!(keys.contains(&"opened"), "{keys:?}");
+        let never = ps.iter().find(|p| p.key == "neveropened").unwrap();
+        assert!(!never.has_layout && never.live == 0 && never.reachable, "listed as plain and idle");
+        // Opened-ness is still visible: only that one has a layout.
+        assert!(ps.iter().find(|p| p.key == "opened").unwrap().has_layout);
     }
 }

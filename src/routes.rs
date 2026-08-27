@@ -91,7 +91,10 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
         // before the general frag arm.
         ["frag", "_overview_projects"] => {
             let sel = req.query.get("sel").map(String::as_str).unwrap_or("");
-            let ps = registry::known_projects_with_state(roots);
+            // Every directory under the roots, not only the opened ones —
+            // this is the front page, and the picker it replaced reached
+            // all of them.
+            let ps = registry::all_projects_with_state(roots);
             http::html(w, &render::overview_projects(sel, &ps));
         }
         // Same shape as _overview_projects above, same reason it sits before
