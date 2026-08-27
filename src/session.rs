@@ -516,19 +516,9 @@ fn parse_etime(s: &str) -> Option<u64> {
 /// hold a lock across blocking I/O — this project has already shipped one
 /// deadlock of that shape.
 pub fn list_sessions(project: &str) -> Vec<SessionInfo> {
-    let prefix = format!("{}/", crate::projects::storage_key(project));
-    // Everything needing the lock, and nothing else.
-    let mut found: Vec<(String, u32, usize)> = {
-        let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
-        map.iter()
-            .filter_map(|(k, s)| {
-                let name = k.strip_prefix(&prefix)?;
-                Some((name.to_string(), s.child_pid, s.subs.len()))
-            })
-            .collect()
-    }; // guard dropped here, before any `ps`
-    found.sort_by(|a, b| a.0.cmp(&b.0));
-    found
+    // The lock-only scan lives in `live_rows`; the guard is already dropped
+    // by the time it returns, so the `ps` fork below is outside it too.
+    live_rows(project)
         .into_iter()
         .map(|(name, pid, attached)| SessionInfo {
             name,
@@ -537,6 +527,54 @@ pub fn list_sessions(project: &str) -> Vec<SessionInfo> {
             attached,
         })
         .collect()
+}
+
+/// (name, pid, attached) for a project's live sessions — the lock-only scan
+/// `list_sessions` used to do inline, now shared with the overview's
+/// all-sessions view (which joins these against one `ages_snapshot` instead
+/// of forking `ps` per session). No `ps` here at all: see `list_sessions`'s
+/// doc comment on why the fork must happen after the guard is dropped.
+pub fn live_rows(project: &str) -> Vec<(String, u32, usize)> {
+    let prefix = format!("{}/", crate::projects::storage_key(project));
+    let mut found: Vec<(String, u32, usize)> = {
+        let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .filter_map(|(k, s)| {
+                let name = k.strip_prefix(&prefix)?;
+                Some((name.to_string(), s.child_pid, s.subs.len()))
+            })
+            .collect()
+    }; // guard dropped here, before any I/O
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
+/// pid → elapsed seconds, from ONE `ps -Aww -o pid=,etime=` for the whole
+/// host — so the overview's all-projects view costs one fork rather than one
+/// per session, unlike `list_sessions`'s per-project `process_age_secs`.
+/// Failure (missing `ps`, non-zero exit) is an empty map: every age then
+/// renders "unknown", never `0` — see CLAUDE.md, "Absence of evidence is not
+/// evidence of absence".
+pub fn ages_snapshot() -> HashMap<u32, u64> {
+    match std::process::Command::new("ps").args(["-Aww", "-o", "pid=,etime="]).output() {
+        Ok(o) if o.status.success() => parse_ages(&String::from_utf8_lossy(&o.stdout)),
+        _ => HashMap::new(),
+    }
+}
+
+/// Parses `ps -Aww -o pid=,etime=` output: one `pid etime` pair per line,
+/// split on the first run of whitespace. A line that doesn't parse (an
+/// unexpected column, a truncated read) is skipped rather than panicking —
+/// one bad row from a live `ps` shouldn't blank every other session's age.
+pub fn parse_ages(out: &str) -> HashMap<u32, u64> {
+    let mut m = HashMap::new();
+    for line in out.lines() {
+        let t = line.trim();
+        let Some((pid_s, etime_s)) = t.split_once(char::is_whitespace) else { continue };
+        let (Ok(pid), Some(age)) = (pid_s.trim().parse::<u32>(), parse_etime(etime_s.trim())) else { continue };
+        m.insert(pid, age);
+    }
+    m
 }
 
 /// Just the names of a project's live sessions — no `ps` invocation, unlike
@@ -1157,6 +1195,39 @@ mod tests {
         );
 
         kill_project("lockproj");
+        std::env::remove_var("RESH_CMD");
+    }
+
+    #[test]
+    fn parse_ages_reads_pid_and_etime_columns() {
+        // `ps -o pid=,etime=` output: pid, whitespace, etime, one row per line.
+        let out = "  123 05:10\n 4567 1-02:03:04\n89 00:42\n";
+        let m = parse_ages(out);
+        assert_eq!(m.get(&123), Some(&310)); // 5m10s
+        assert_eq!(m.get(&4567), Some(&(93784))); // 1d2h3m4s
+        assert_eq!(m.get(&89), Some(&42));
+        assert_eq!(m.len(), 3);
+    }
+
+    #[test]
+    fn parse_ages_skips_a_malformed_line_rather_than_panicking() {
+        // Revert-checked: an `unwrap` on the split fails this instead of skipping.
+        let m = parse_ages("nonsense\n  7 03:00\n");
+        assert_eq!(m.get(&7), Some(&180));
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn live_rows_lists_a_projects_sessions_without_forking_ps() {
+        let _s = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        let _a = attach("ovproj", "term", d.path()).unwrap();
+        let _b = attach("ovproj", "term1", d.path()).unwrap();
+        let rows = live_rows("ovproj");
+        assert_eq!(rows.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(), vec!["term", "term1"]);
+        assert!(rows.iter().all(|(_, pid, _)| *pid != 0) || std::env::var("RESH_CMD").is_ok());
+        kill_project("ovproj");
         std::env::remove_var("RESH_CMD");
     }
 
