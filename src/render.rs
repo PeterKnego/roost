@@ -823,6 +823,38 @@ pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectSta
     out
 }
 
+/// The per-worktree state chips (Claude / dirty / ahead) and, when every
+/// axis is positively clean, the remove control. Shared by the header
+/// switcher and the overview's left pane so the two never drift. `None`
+/// on any axis renders `?`, never "clean" — see the switcher's own comment.
+fn worktree_chips(w: &crate::registry::WorktreeStatus, key: &str, live: usize) -> String {
+    let claude = match &w.claude {
+        crate::claudes::ClaudeEvidence::Present(_) => "<span class=\"wtf on\" title=\"a Claude is running here\">✻</span>".to_string(),
+        crate::claudes::ClaudeEvidence::Absent => "<span class=\"wtf\" title=\"no Claude here\">—</span>".to_string(),
+        crate::claudes::ClaudeEvidence::Unknown => "<span class=\"wtf\" title=\"IDE integration is off, so resh cannot tell\">?</span>".to_string(),
+    };
+    let dirty = match w.dirty {
+        Some(true) => "<span class=\"wtf on\">dirty</span>".to_string(),
+        Some(false) => "<span class=\"wtf\">clean</span>".to_string(),
+        None => "<span class=\"wtf\" title=\"git did not answer (status)\">?</span>".to_string(),
+    };
+    let against = if w.base_recorded {
+        format!("measured against {}, recorded when resh created this worktree", esc(&w.base))
+    } else {
+        format!("measured against {}, the main worktree's branch — resh did not create this worktree", esc(&w.base))
+    };
+    let ahead = match w.ahead {
+        Some(n) => format!("<span class=\"wtf{}\" title=\"{against}. A squash-merged branch stays ahead forever; remove it by hand.\">{n} ahead</span>", if n > 0 { " on" } else { "" }),
+        None => "<span class=\"wtf\" title=\"git did not answer (rev-list), or no base is known\">?</span>".to_string(),
+    };
+    let remove = if crate::registry::removable(w, live) {
+        format!(" <button class=\"wtremove\" data-key=\"{}\" title=\"remove this worktree and its branch\">✕</button>", esc(key))
+    } else {
+        String::new()
+    };
+    format!("{claude} {dirty} {ahead}{remove}")
+}
+
 /// The worktree switcher: the header chip's label (out-of-band, so one
 /// fragment feeds two places) plus one row per member of the current
 /// repository's worktree family.
@@ -907,33 +939,7 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
         // otherwise, and `None` renders no state at all, never "clean".
         let state_html = match &p.wt {
             None => String::new(),
-            Some(w) => {
-                let claude = match &w.claude {
-                    crate::claudes::ClaudeEvidence::Present(_) => "<span class=\"wtf on\" title=\"a Claude is running here\">✻</span>".to_string(),
-                    crate::claudes::ClaudeEvidence::Absent => "<span class=\"wtf\" title=\"no Claude here\">—</span>".to_string(),
-                    crate::claudes::ClaudeEvidence::Unknown => "<span class=\"wtf\" title=\"IDE integration is off, so resh cannot tell\">?</span>".to_string(),
-                };
-                let dirty = match w.dirty {
-                    Some(true) => "<span class=\"wtf on\">dirty</span>".to_string(),
-                    Some(false) => "<span class=\"wtf\">clean</span>".to_string(),
-                    None => "<span class=\"wtf\" title=\"git did not answer (status)\">?</span>".to_string(),
-                };
-                let against = if w.base_recorded {
-                    format!("measured against {}, recorded when resh created this worktree", esc(&w.base))
-                } else {
-                    format!("measured against {}, the main worktree's branch — resh did not create this worktree", esc(&w.base))
-                };
-                let ahead = match w.ahead {
-                    Some(n) => format!("<span class=\"wtf{}\" title=\"{against}. A squash-merged branch stays ahead forever; remove it by hand.\">{n} ahead</span>", if n > 0 { " on" } else { "" }),
-                    None => "<span class=\"wtf\" title=\"git did not answer (rev-list), or no base is known\">?</span>".to_string(),
-                };
-                let remove = if crate::registry::removable(w, p.live) {
-                    format!(" <button class=\"wtremove\" data-key=\"{}\" title=\"remove this worktree and its branch\">✕</button>", esc(&p.key))
-                } else {
-                    String::new()
-                };
-                format!(" · {claude} {dirty} {ahead}{remove}")
-            }
+            Some(w) => format!(" · {}", worktree_chips(w, &p.key, p.live)),
         };
         // A `<button>` cannot nest inside an `<a>` (invalid HTML), so the row
         // is a flex span wrapping the link and the state/control separately.
@@ -945,6 +951,47 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
         ));
     }
     out.push_str("</span>");
+    out
+}
+
+/// The overview's left pane: known projects, each expandable to its worktree
+/// family. Rows are pre-ordered by `known_projects_with_state` (parent then
+/// its children), so this renders in order and lets `parent` decide nesting.
+/// A parent with children gets a caret; a worktree row carries `worktree_chips`.
+/// Selection (`sel`, a storage key) marks the current row; expansion is the
+/// client's job (`overview.js`). A reachable row is a link to `/<url>` (open
+/// the project); an unreachable worktree is inert text.
+pub fn overview_projects(sel: &str, projects: &[crate::registry::ProjectStatus]) -> String {
+    let has_children: std::collections::HashSet<&str> =
+        projects.iter().filter_map(|p| p.parent.as_deref()).collect();
+    let mut out = String::from("<ul class=\"ovtree\">");
+    for p in projects {
+        let is_child = p.parent.is_some();
+        let mut cls = String::from("ovrow");
+        if is_child { cls.push_str(" child"); }
+        if p.live > 0 { cls.push_str(" live"); }
+        if p.key == sel { cls.push_str(" current"); }
+        let marker = if p.live > 0 { "●" } else { "○" };
+        let caret = if !is_child && has_children.contains(p.key.as_str()) {
+            "<span class=\"ovcaret\" aria-hidden=\"true\">▸</span>"
+        } else {
+            "<span class=\"ovcaret placeholder\" aria-hidden=\"true\"></span>"
+        };
+        let name = if is_child { p.url.rsplit('/').next().unwrap_or(&p.url) } else { p.url.as_str() };
+        let branch = if p.branch.is_empty() { String::new() } else { format!(" <span class=\"branch\">⎇ {}</span>", esc(&p.branch)) };
+        let chips = match &p.wt { Some(w) => format!(" <span class=\"ovchips\">{}</span>", worktree_chips(w, &p.key, p.live)), None => String::new() };
+        let parent_attr = p.parent.as_deref().map(|pk| format!(" data-parent=\"{}\"", esc(pk))).unwrap_or_default();
+        if !p.reachable {
+            out.push_str(&format!(
+                "<li class=\"{cls} unreachable\" data-key=\"{}\"{parent_attr} title=\"worktree outside resh's roots — cannot be opened\">{caret}{marker} {}{branch}{chips}</li>",
+                esc(&p.key), esc(name)));
+            continue;
+        }
+        out.push_str(&format!(
+            "<li class=\"{cls}\" data-key=\"{}\"{parent_attr}>{caret}<a href=\"/{}\">{marker} {}{branch}</a>{chips}</li>",
+            esc(&p.key), crate::http::percent_encode(&p.url), esc(name)));
+    }
+    out.push_str("</ul>");
     out
 }
 
@@ -2476,5 +2523,42 @@ mod tests {
         let unrecorded = WorktreeStatus { base_recorded: false, ..clean };
         let out = worktrees_strip("r", &mk(unrecorded, 0));
         assert!(out.contains("measured against main, the main worktree's branch"), "{out}");
+    }
+
+    fn ps_row(key: &str, url: &str, live: usize, branch: &str, parent: Option<&str>, wt: Option<crate::registry::WorktreeStatus>) -> crate::registry::ProjectStatus {
+        crate::registry::ProjectStatus { key: key.into(), url: url.into(), live, oldest_age_secs: None, has_layout: true, branch: branch.into(), parent: parent.map(str::to_string), reachable: true, wt }
+    }
+
+    #[test]
+    fn overview_projects_nests_worktrees_under_their_parent_and_marks_selection() {
+        use crate::claudes::ClaudeEvidence;
+        let wt = crate::registry::WorktreeStatus { claude: ClaudeEvidence::Present(vec!["term".into()]), dirty: Some(true), ahead: Some(3), base: "main".into(), base_recorded: true };
+        let ps = vec![
+            ps_row("ultima", "ultima", 1, "main", None, None),
+            ps_row("ultima%2F.claude%2Fworktrees%2Fclaude-1", "ultima/.claude/worktrees/claude-1", 1, "claude-1", Some("ultima"), Some(wt)),
+        ];
+        let out = overview_projects("ultima", &ps);
+        // Revert-checked: rendering the chip span as empty (chips not reused
+        // from worktree_chips) fails the "3 ahead"/"dirty"/"✻" assertion below.
+        // Parent row carries an expansion caret and is current; child row is present with its chips.
+        assert!(out.contains("ovcaret") && out.contains("current"), "{out}");
+        assert!(out.contains("data-key=\"ultima\""), "{out}");
+        assert!(out.contains("data-parent=\"ultima\"") && out.contains("claude-1"), "child under parent: {out}");
+        assert!(out.contains("✻") && out.contains("dirty") && out.contains("3 ahead"), "chips reused: {out}");
+    }
+
+    #[test]
+    fn overview_projects_renders_an_unreachable_worktree_as_inert_text() {
+        // Revert-checked: disabling the `!p.reachable` branch (so this row
+        // renders as an ordinary `<a>` link) fails the `contains("unreachable")` assertion below.
+        let ps = vec![
+            ps_row("repo", "repo", 0, "main", None, None),
+            {
+                let mut r = ps_row("x", "/outside/wt", 0, "feat", Some("repo"), Some(crate::registry::WorktreeStatus { claude: crate::claudes::ClaudeEvidence::Absent, dirty: None, ahead: None, base: "main".into(), base_recorded: false }));
+                r.reachable = false; r
+            },
+        ];
+        let out = overview_projects("", &ps);
+        assert!(out.contains("unreachable"), "{out}");
     }
 }

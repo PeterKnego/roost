@@ -87,6 +87,13 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
             };
             http::html(w, &render::worktrees_strip(current, &ps));
         }
+        // Same shape as _projects/_worktrees above, same reason it sits
+        // before the general frag arm.
+        ["frag", "_overview_projects"] => {
+            let sel = req.query.get("sel").map(String::as_str).unwrap_or("");
+            let ps = registry::known_projects_with_state(roots);
+            http::html(w, &render::overview_projects(sel, &ps));
+        }
         // Root scope, not /static/sw.js: a service worker may only control
         // URLs under its own path, and this one has to focus and navigate
         // workspace tabs at /{project}.
