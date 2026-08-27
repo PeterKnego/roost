@@ -709,6 +709,9 @@ ul.picker li .git:hover { text-decoration: underline; }
 #ovprojects .branch { color: var(--muted); font-size: 12px; }
 .ovcaret { display: inline-block; width: 1em; flex: none; color: var(--muted); cursor: pointer; }
 .ovcaret.placeholder { cursor: default; }
+/* Opened and nothing came back: it is not an expander, and should not keep
+   inviting the click that taught us so. */
+.ovcaret.empty { opacity: .3; cursor: default; }
 /* The chips themselves are already styled globally (`.wtf`, shared with the
    header switcher — same helper renders both); this only lays them out. */
 .ovchips { display: flex; align-items: center; gap: 6px; margin-left: auto; }

@@ -131,6 +131,13 @@ try {
   // Found by visible label, not by an assumed `data-key` shape —
   // `registry::encode_key`'s exact encoding is an implementation detail
   // this test shouldn't have to reproduce.
+  // A document reload wipes anything on `window`, so this marker is what
+  // tells "the pane was swapped in place" apart from "the page navigated" —
+  // the point of the selection being app-like rather than a link.
+  // Revert-checked: restoring the old `location.href = "?sel=…"` in
+  // overview.js fails this line ("FAIL selecting swapped the panes in
+  // place — the document never reloaded").
+  await page3.evalIn(`window.__alive = "kept"`);
   const clickedKey = await page3.evalIn(`(() => {
     const rows = [...document.querySelectorAll('#ovprojects .ovrow:not(.unreachable)')];
     const row = rows.find((r) => r.textContent.includes(${JSON.stringify(fx.project)}) && !r.textContent.includes(${JSON.stringify(proj2)}));
@@ -139,6 +146,8 @@ try {
     return row.dataset.key ?? "";
   })()`);
   ok(clickedKey !== null, `found ${fx.project}'s row in the left pane and clicked it`);
+  ok(await page3.evalIn(`window.__alive`) === "kept",
+     "selecting swapped the panes in place — the document never reloaded");
   ok(await until(async () => (await page3.evalIn("location.search")).includes("sel="), 15, "?sel= navigation"),
      "clicking the row navigates to a ?sel= URL (the row-click intent, not the row's own <a>)");
   // Project-qualified labels, as the "before selecting" check above uses:

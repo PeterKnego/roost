@@ -941,6 +941,14 @@ fn reconcile_throttled(roots: &[PathBuf]) {
 /// Every project resh knows about: those with a saved layout, those with
 /// live sessions, and those with both.
 pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
+    known_projects_inner(roots, true)
+}
+
+/// `group` pays git: `git worktree list` per repository, to fold linked
+/// worktrees in as children. The header switcher wants that; the front page
+/// does not — it lists every directory under the roots and loads a
+/// project's worktrees only when the user opens it (`worktree_rows`).
+fn known_projects_inner(roots: &[PathBuf], group: bool) -> Vec<ProjectStatus> {
     reconcile_throttled(roots);
     let mut by_key: std::collections::BTreeMap<String, ProjectStatus> = Default::default();
 
@@ -1046,10 +1054,127 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
     by_key.retain(|_, p| {
         p.live > 0
             || crate::projects::resolve_project(roots, &p.url).is_some()
-            || crate::worktree::is_vouched_worktree(roots, &p.url)
+            // `is_vouched_worktree` runs git, so it is only asked when the
+            // caller is already paying for worktree discovery.
+            || (group && crate::worktree::is_vouched_worktree(roots, &p.url))
     });
-    group_worktrees(roots, &mut by_key);
+    if group {
+        group_worktrees(roots, &mut by_key);
+    }
     order_with_children(by_key.into_values().collect())
+}
+
+/// The checked-out branch, read straight out of `.git` — a file read, never
+/// a subprocess.
+///
+/// `group_worktrees` learns branches from `git worktree list`, which is the
+/// right tool when it is already spawning git for worktree discovery. The
+/// front page labels every directory under the roots, so a process per row
+/// is not available to it: on the deploy host that would be 28 spawns every
+/// five seconds. A linked worktree's `.git` is a file pointing at the real
+/// gitdir, so that indirection is followed. Empty when this is not a
+/// repository, when HEAD is detached, or when anything cannot be read — the
+/// caller then shows no branch and no expander rather than guessing one.
+pub fn head_branch(dir: &std::path::Path) -> String {
+    let dot = dir.join(".git");
+    let gitdir = match std::fs::symlink_metadata(&dot) {
+        Ok(m) if m.is_dir() => dot,
+        Ok(_) => {
+            let Ok(text) = std::fs::read_to_string(&dot) else { return String::new() };
+            let Some(p) = text.lines().find_map(|l| l.strip_prefix("gitdir:")) else {
+                return String::new();
+            };
+            PathBuf::from(p.trim())
+        }
+        Err(_) => return String::new(),
+    };
+    let Ok(head) = std::fs::read_to_string(gitdir.join("HEAD")) else { return String::new() };
+    head.trim().strip_prefix("ref: refs/heads/").unwrap_or("").to_string()
+}
+
+/// The overview's top level: every project directory under the roots, with
+/// the live counts and layouts resh knows, and no git subprocess at all.
+///
+/// Worktree-shaped keys are left out — a worktree is a child row, loaded by
+/// `worktree_rows` when its project is opened. Without that filter a saved
+/// layout for one would sit at the top level showing its whole dot-path.
+pub fn project_rows(roots: &[PathBuf]) -> Vec<ProjectStatus> {
+    let mut ps = known_projects_inner(roots, false);
+    ps.retain(|p| !p.url.contains("/.claude/worktrees/"));
+    let known: std::collections::HashSet<String> = ps.iter().map(|p| p.key.clone()).collect();
+    for p in crate::projects::list_projects(roots) {
+        let key = crate::projects::storage_key(&p.name);
+        if known.contains(&key) {
+            continue;
+        }
+        ps.push(ProjectStatus {
+            key,
+            url: p.name,
+            live: 0,
+            oldest_age_secs: None,
+            has_layout: false,
+            branch: String::new(),
+            parent: None,
+            reachable: true,
+            wt: None,
+        });
+    }
+    for p in ps.iter_mut() {
+        if let Some(dir) = crate::projects::resolve_project(roots, &p.url) {
+            p.branch = head_branch(&dir);
+        }
+    }
+    order_with_children(ps)
+}
+
+/// One project's linked worktrees, with the state chips — the expensive half
+/// of the old listing, now paid only for a project the user has opened.
+pub fn worktree_rows(roots: &[PathBuf], parent_key: &str) -> Vec<ProjectStatus> {
+    let url = decode_key(parent_key);
+    let Some(pd) = crate::projects::resolve_project(roots, &url) else { return Vec::new() };
+    let state_dir = crate::wsstate::state_dir();
+    let main_branch = head_branch(&pd);
+    let scan = crate::claudes::claude_terminals(std::path::Path::new("/proc"));
+    let mut out = Vec::new();
+    for w in crate::worktree::list(&pd).into_iter().filter(|w| !w.is_main) {
+        let (child_url, reachable) = match rel_under_roots(roots, &w.path) {
+            Some(u) => (u, true),
+            None => (w.path.to_string_lossy().into_owned(), false),
+        };
+        let key = crate::projects::storage_key(&child_url);
+        let live = crate::session::session_rows(&child_url).len();
+        let wt = if reachable {
+            let (base, base_recorded) = match crate::worktree::read_base(&state_dir, &key) {
+                Some(b) => (b, true),
+                None => (main_branch.clone(), false),
+            };
+            const NULL_SHA: &str = "0000000000000000000000000000000000000000";
+            let base_for_ahead = if base.is_empty() { NULL_SHA } else { base.as_str() };
+            let st = crate::worktree::state(&w.path, base_for_ahead, &crate::worktree::real_git);
+            Some(WorktreeStatus {
+                claude: crate::claudes::claude_evidence_with_scan(&child_url, &scan),
+                dirty: st.dirty,
+                ahead: if base.is_empty() { None } else { st.ahead },
+                base,
+                base_recorded,
+            })
+        } else {
+            None
+        };
+        out.push(ProjectStatus {
+            key,
+            url: child_url,
+            live,
+            oldest_age_secs: None,
+            has_layout: false,
+            branch: w.branch,
+            parent: Some(parent_key.to_string()),
+            reachable,
+            wt,
+        });
+    }
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    out
 }
 
 /// For every already-known entry that is a git repository, asks git for its
@@ -1166,45 +1291,6 @@ fn rel_under_roots(roots: &[PathBuf], path: &std::path::Path) -> Option<String> 
 /// guarantee — a child worktree's storage key has no relationship to its
 /// parent's. Top-level entries keep key order; children of one parent sort
 /// by branch.
-/// Every project directory under `roots`, carrying the state resh knows for
-/// the ones it has opened.
-///
-/// `known_projects` answers "projects resh has opened" — a saved layout or a
-/// live session — which is the right answer for the header switcher and the
-/// wrong one for a front page. The page this replaced was a directory
-/// picker that browsed the filesystem, so every directory was reachable
-/// from it; listing only opened ones lost that silently. Measured on the
-/// deploy host: 19 of 28 directories under the roots were invisible.
-///
-/// The filesystem rows are added *after* `known_projects_with_state` has
-/// run and carry no git state, so a directory nobody has opened costs no
-/// subprocess: the `git worktree list` per entry that `group_worktrees`
-/// pays is still spent only on projects being displayed with state. A
-/// never-opened directory is therefore listed as plain and idle even if it
-/// is a repository with worktrees — opening it fills that in.
-pub fn all_projects_with_state(roots: &[PathBuf]) -> Vec<ProjectStatus> {
-    let mut ps = known_projects_with_state(roots);
-    let known: std::collections::HashSet<String> = ps.iter().map(|p| p.key.clone()).collect();
-    for p in crate::projects::list_projects(roots) {
-        let key = crate::projects::storage_key(&p.name);
-        if known.contains(&key) {
-            continue;
-        }
-        ps.push(ProjectStatus {
-            key,
-            url: p.name,
-            live: 0,
-            oldest_age_secs: None,
-            has_layout: false,
-            branch: String::new(),
-            parent: None,
-            reachable: true,
-            wt: None,
-        });
-    }
-    order_with_children(ps)
-}
-
 fn order_with_children(mut items: Vec<ProjectStatus>) -> Vec<ProjectStatus> {
     items.sort_by(|a, b| a.key.cmp(&b.key));
     let mut children: std::collections::HashMap<String, Vec<ProjectStatus>> = Default::default();
@@ -2467,7 +2553,7 @@ mod tests {
     /// Revert-checked: with the filesystem merge dropped this failed with
     /// `neveropened missing: ["opened"]`.
     #[test]
-    fn all_projects_lists_directories_that_were_never_opened() {
+    fn project_rows_lists_directories_that_were_never_opened() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
         let state = d.path().join("state");
@@ -2477,7 +2563,7 @@ mod tests {
         std::fs::create_dir_all(root.join("opened")).unwrap();
         std::fs::create_dir_all(root.join("neveropened")).unwrap();
         std::fs::write(state.join("opened.json"), "{}").unwrap();
-        let ps = all_projects_with_state(&[root.clone()]);
+        let ps = project_rows(&[root.clone()]);
         let keys: Vec<&str> = ps.iter().map(|p| p.key.as_str()).collect();
         assert!(keys.contains(&"neveropened"), "neveropened missing: {keys:?}");
         assert!(keys.contains(&"opened"), "{keys:?}");

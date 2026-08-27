@@ -93,9 +93,21 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
             let sel = req.query.get("sel").map(String::as_str).unwrap_or("");
             // Every directory under the roots, not only the opened ones —
             // this is the front page, and the picker it replaced reached
-            // all of them.
-            let ps = registry::all_projects_with_state(roots);
-            http::html(w, &render::overview_projects(sel, &ps));
+            // all of them. `open` names the projects the user has expanded;
+            // their worktrees are the only git work this endpoint does, so
+            // a page nobody has expanded costs no subprocess at all.
+            let mut open: Vec<&str> = req
+                .query
+                .get("open")
+                .map(|v| v.split(',').filter(|k| !k.is_empty()).collect())
+                .unwrap_or_default();
+            // A selected project is open by definition: that is what makes a
+            // shared `?sel=` URL come back as the view it described, without
+            // the client having to fetch the pane a second time to expand it.
+            if !sel.is_empty() && !open.contains(&sel) {
+                open.push(sel);
+            }
+            http::html(w, &render::overview_projects(sel, &build_overview_projects(roots, &open)));
         }
         // Same shape as _overview_projects above, same reason it sits before
         // the general frag arm.
@@ -183,6 +195,40 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
 /// worktree key → just it. One ages snapshot for the whole set, since
 /// `session::ages_snapshot` is already a single `ps` fork for the host — see
 /// its doc comment on why per-session `ps` is what the overview must avoid.
+/// The overview's left pane: the cheap top-level list, with each expanded
+/// project's worktrees spliced in right after it.
+///
+/// A worktree that also sits directly under a root (a sibling checkout
+/// rather than one under `.claude/worktrees/`) would otherwise appear
+/// twice — once as a directory of its own, once as its project's child —
+/// so the top-level copy is dropped once git has told us whose child it is.
+fn build_overview_projects(roots: &[PathBuf], open: &[&str]) -> Vec<registry::ProjectStatus> {
+    let top = registry::project_rows(roots);
+    let mut kids: std::collections::HashMap<String, Vec<registry::ProjectStatus>> =
+        Default::default();
+    for key in open {
+        // Only a project actually on the list may be expanded: `open` comes
+        // off the query string.
+        if top.iter().any(|p| p.key == *key) {
+            kids.insert((*key).to_string(), registry::worktree_rows(roots, key));
+        }
+    }
+    let child_keys: std::collections::HashSet<String> =
+        kids.values().flatten().map(|c| c.key.clone()).collect();
+    let mut out = Vec::new();
+    for p in top {
+        if child_keys.contains(&p.key) {
+            continue;
+        }
+        let children = kids.remove(&p.key);
+        out.push(p);
+        if let Some(cs) = children {
+            out.extend(cs);
+        }
+    }
+    out
+}
+
 fn build_overview_sessions(roots: &[PathBuf], sel: &str) -> Vec<render::OvSession> {
     let all = registry::known_projects(roots);
     let in_scope: Vec<&registry::ProjectStatus> = if sel.is_empty() {
@@ -1119,6 +1165,45 @@ mod tests {
     /// class, not on the old inline "SESSIONS" heading: the pane title is
     /// now static chrome in `overview_page`, so the fragment no longer
     /// carries that word at all.
+    /// Worktrees are loaded lazily: the top-level list must not contain
+    /// them (and must not pay `git worktree list` to find out), and opening
+    /// a project must bring its worktrees in as children of that row.
+    ///
+    /// Revert-checked: with `open` ignored (the `kids` map left empty) the
+    /// second assertion failed — no `data-parent`, no `feat` row — while the
+    /// first still passed, which is exactly the split this guards.
+    #[test]
+    fn a_projects_worktrees_arrive_only_when_it_is_opened() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C").arg(&repo).args(args)
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                .status().unwrap().success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        git(&["worktree", "add", "-q", "-b", "feat", ".claude/worktrees/feat"]);
+        let roots = vec![root.path().to_path_buf()];
+
+        let closed = frag_route(&roots, "/frag/_overview_projects?sel=");
+        assert!(closed.contains("data-key=\"repo\""), "the project is listed: {closed}");
+        assert!(!closed.contains("data-parent"), "no worktrees until opened: {closed}");
+        // A repository still offers the expander that fetches them.
+        assert!(closed.contains(">▸</span>"), "a repo gets an expander: {closed}");
+
+        let opened = frag_route(&roots, "/frag/_overview_projects?sel=&open=repo");
+        assert!(opened.contains("data-parent=\"repo\""), "opening brings its worktrees: {opened}");
+        assert!(opened.contains("feat"), "{opened}");
+        assert!(opened.contains(">▾</span>"), "and the arrow turns: {opened}");
+    }
+
     #[test]
     fn the_overview_sessions_fragment_is_routed() {
         let d = tempfile::tempdir().unwrap();

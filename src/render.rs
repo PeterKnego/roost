@@ -980,8 +980,6 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
 /// client's job (`overview.js`). A reachable row is a link to `/<url>` (open
 /// the project); an unreachable worktree is inert text.
 pub fn overview_projects(sel: &str, projects: &[crate::registry::ProjectStatus]) -> String {
-    let has_children: std::collections::HashSet<&str> =
-        projects.iter().filter_map(|p| p.parent.as_deref()).collect();
     let mut out = String::from("<ul class=\"ovtree\">");
     for p in projects {
         let is_child = p.parent.is_some();
@@ -990,10 +988,19 @@ pub fn overview_projects(sel: &str, projects: &[crate::registry::ProjectStatus])
         if p.live > 0 { cls.push_str(" live"); }
         if p.key == sel { cls.push_str(" current"); }
         let marker = if p.live > 0 { "●" } else { "○" };
-        let caret = if !is_child && has_children.contains(p.key.as_str()) {
-            "<span class=\"ovcaret\" aria-hidden=\"true\">▸</span>"
+        // A repository may have worktrees, so it gets an expander; whether
+        // it actually has any is only known once the user opens it and the
+        // server pays `git worktree list` for that one project. The arrow
+        // direction is read off the response itself — children are present
+        // exactly when this project is expanded — so there is no expansion
+        // state for the client to hold and re-apply after a swap.
+        let expanded = projects.iter().any(|c| c.parent.as_deref() == Some(p.key.as_str()));
+        let caret = if is_child || p.branch.is_empty() {
+            "<span class=\"ovcaret placeholder\" aria-hidden=\"true\"></span>".to_string()
+        } else if expanded {
+            "<span class=\"ovcaret\" aria-hidden=\"true\">▾</span>".to_string()
         } else {
-            "<span class=\"ovcaret placeholder\" aria-hidden=\"true\"></span>"
+            "<span class=\"ovcaret\" aria-hidden=\"true\">▸</span>".to_string()
         };
         let name = if is_child { p.url.rsplit('/').next().unwrap_or(&p.url) } else { p.url.as_str() };
         let branch = if p.branch.is_empty() { String::new() } else { format!(" <span class=\"branch\">⎇ {}</span>", esc(&p.branch)) };
