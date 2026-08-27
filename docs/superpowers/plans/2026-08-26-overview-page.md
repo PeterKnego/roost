@@ -364,7 +364,10 @@ git commit -m "overview: left pane — project/worktree tree, chips shared with 
         let _b = attach("ovproj", "term1", d.path()).unwrap();
         let rows = live_rows("ovproj");
         assert_eq!(rows.iter().map(|(n,_,_)| n.as_str()).collect::<Vec<_>>(), vec!["term", "term1"]);
-        assert!(rows.iter().all(|(_, pid, _)| *pid != 0) || std::env::var("RESH_CMD").is_ok());
+        // The "no ps" property is structural (live_rows has no ps call); this
+        // asserts the scan's data is real. Revert-check: make live_rows return
+        // pid 0 for each row and this fails.
+        assert!(rows.iter().all(|(_, pid, _)| *pid != 0), "live_rows must carry real pids: {rows:?}");
         kill_project("ovproj");
     }
 ```
