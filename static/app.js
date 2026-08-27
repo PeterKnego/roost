@@ -17,6 +17,15 @@ const pendingLaunch = (() => {
   return l && LAUNCHES.includes(l) ? l : null;
 })();
 let pendingLaunchSent = false;
+// A row clicked on the overview arrives with ?focus=<session>, read once at
+// load and validated against the session-name shape the same way a
+// server-sent value would be — a stray or hand-edited query string must not
+// send an arbitrary string into focusSession.
+const pendingFocus = (() => {
+  const f = new URLSearchParams(location.search).get("focus");
+  return f && /^[A-Za-z0-9_-]{1,32}$/.test(f) ? f : null;   // session-name shape
+})();
+let pendingFocusDone = false;
 // The blank tab opened synchronously on the "new worktree" click, navigated
 // when WorktreeReady arrives. Opened on the click because a window.open after
 // a websocket round trip is not reliably inside the user gesture.
@@ -254,6 +263,17 @@ function onEvent(ev) {
       if (pendingLaunch && !pendingLaunchSent) {
         pendingLaunchSent = true;
         newTerminal(3, pendingLaunch);
+        history.replaceState(null, "", location.pathname);
+      }
+      // A row clicked on the overview arrives with ?focus=<session>; focus
+      // that terminal once, after the first State (so its tab exists), then
+      // strip it so a reload doesn't re-focus. Uses the same focusSession the
+      // tab bar uses; a name the layout lacks is simply ignored.
+      if (pendingFocus && !pendingFocusDone) {
+        pendingFocusDone = true;
+        if (state.panes.some((p) => p.tabs.some((t) => t.k === "Terminal" && t.session === pendingFocus))) {
+          focusSession(pendingFocus);
+        }
         history.replaceState(null, "", location.pathname);
       }
       break;
