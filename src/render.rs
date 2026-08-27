@@ -710,7 +710,12 @@ pub fn index_page(at: &str, entries: &[Entry], refused: bool, projects: &[crate:
 /// `?at=` query and the "Open a directory" button here — no new reserved
 /// path, which would collide with a project of that name the way `static`
 /// and `frag` already can.
-pub fn overview_page(roots_label: &str) -> String {
+pub fn overview_page(sel: &str, roots_label: &str) -> String {
+    // `sel` is already a percent-encoded storage key (e.g. `karpie%2Fsrc`);
+    // encoding it again here means the server's single `percent_decode` of
+    // the query value lands back on that exact key — same pattern as the
+    // header switcher's `?current={qkey}`.
+    let qsel = crate::http::percent_encode(sel);
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>resh</title>\
          <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
@@ -722,8 +727,8 @@ pub fn overview_page(roots_label: &str) -> String {
            <a class=\"openbtn\" href=\"/?at=\">＋ Open a directory</a>\
          </header>\
          <main id=\"overview\">\
-           <section id=\"ovprojects\" hx-get=\"/frag/_overview_projects\" hx-trigger=\"load, every 5s\"></section>\
-           <section id=\"ovsessions\" hx-get=\"/frag/_overview_sessions\" hx-trigger=\"load, every 5s\"></section>\
+           <section id=\"ovprojects\" hx-get=\"/frag/_overview_projects?sel={qsel}\" hx-trigger=\"load, every 5s\"></section>\
+           <section id=\"ovsessions\" hx-get=\"/frag/_overview_sessions?sel={qsel}\" hx-trigger=\"load, every 5s\"></section>\
          </main>\
          <script src=\"/static/overview.js\"></script>\
          </body></html>",
@@ -2012,13 +2017,42 @@ mod tests {
 
     #[test]
     fn overview_page_wires_both_fragment_panes() {
-        let h = overview_page("/home/claude/projects");
+        let h = overview_page("", "/home/claude/projects");
         assert!(h.contains("id=\"overview\""));
-        assert!(h.contains("hx-get=\"/frag/_overview_projects\""), "{h}");
-        assert!(h.contains("hx-get=\"/frag/_overview_sessions\""), "{h}");
+        // sel="" still emits `?sel=` (empty, unfiltered) — the URL always
+        // carries the param so htmx has a consistent shape to trigger from.
+        assert!(h.contains("hx-get=\"/frag/_overview_projects?sel=\""), "{h}");
+        assert!(h.contains("hx-get=\"/frag/_overview_sessions?sel=\""), "{h}");
         assert!(h.contains("/static/overview.js"), "{h}");
         // The picker entry point, not a new reserved path.
         assert!(h.contains("href=\"/?at=\""), "open-a-directory reaches the picker: {h}");
+    }
+
+    // The overview shell is stateless HTML re-rendered fresh on every `/`
+    // load; it's the fragment hx-get URLs that must carry `sel` forward so
+    // htmx fetches the *filtered* panes and the left pane can mark the
+    // current row. `sel` is a storage key, already percent-encoded once
+    // (e.g. `karpie%2Fsrc`); it goes through `percent_encode` a second time
+    // so the server's single `percent_decode` on the query value lands back
+    // on the exact storage key — same pattern as the header switcher's
+    // `hx-get="/frag/_worktrees?current={qkey}"`.
+    //
+    // Revert-checked: with the hardcoded (no-`?sel=`) URLs this fails —
+    // `h.contains("_overview_projects?sel=karpie%252Fsrc")` is false because
+    // the emitted URL is bare `/frag/_overview_projects` with no query at
+    // all.
+    #[test]
+    fn overview_page_threads_sel_into_both_fragment_urls() {
+        let sel = "karpie%2Fsrc";
+        // Confirm the round-trip property this test relies on: encoding sel
+        // once and decoding it once yields sel back, unchanged.
+        let encoded = crate::http::percent_encode(sel);
+        assert_eq!(encoded, "karpie%252Fsrc", "{encoded}");
+        assert_eq!(crate::http::percent_decode(&encoded), sel);
+
+        let h = overview_page(sel, "/roots");
+        assert!(h.contains("/frag/_overview_projects?sel=karpie%252Fsrc"), "{h}");
+        assert!(h.contains("/frag/_overview_sessions?sel=karpie%252Fsrc"), "{h}");
     }
 
     // A picker row for a directory that is also a known project carries the

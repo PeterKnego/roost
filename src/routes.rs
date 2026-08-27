@@ -216,7 +216,8 @@ fn serve_index(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
     // `at` absent → the overview; `at` present (empty included) → the picker.
     if req.query.get("at").is_none() {
         let label = roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(":");
-        return http::html(w, &render::overview_page(&label));
+        let sel = req.query.get("sel").map(String::as_str).unwrap_or("");
+        return http::html(w, &render::overview_page(sel, &label));
     }
     let requested = req.query.get("at").map(String::as_str).unwrap_or("");
     let (at, entries, refused) = match projects::list_dir(roots, requested) {
@@ -1127,6 +1128,23 @@ mod tests {
         assert!(overview.contains("_overview_projects") && overview.contains("_overview_sessions"), "{overview}");
         let picker = frag_route(&roots, "/?at=");
         assert!(picker.contains("id=\"picker\""), "?at= is the picker: {picker}");
+    }
+
+    // `sel` in the overview's own query string must reach the fragment
+    // hx-get URLs the shell emits, or htmx re-fetches unfiltered on load and
+    // the round-trip from static/overview.js's `/?sel=<key>` navigation is
+    // lost.
+    //
+    // Revert-checked: with `serve_index` not reading `sel` (calling
+    // `render::overview_page("", &label)` unconditionally), this fails —
+    // the response carries `_overview_projects?sel=` (empty), not
+    // `?sel=proj`, so `.contains("_overview_projects?sel=proj")` is false.
+    #[test]
+    fn overview_at_root_threads_sel_to_fragments() {
+        let d = tempfile::tempdir().unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let out = frag_route(&roots, "/?sel=proj");
+        assert!(out.contains("_overview_projects?sel=proj"), "{out}");
     }
 
     // Revert-checked: dropping the `state=1` branch entirely (always calling
