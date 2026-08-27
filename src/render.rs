@@ -704,6 +704,38 @@ pub fn index_page(at: &str, entries: &[Entry], refused: bool, projects: &[crate:
     )
 }
 
+/// The front page: a two-pane overview. Both panes are htmx fragments that
+/// load on open and poll (see `overview.js` / the fragment routes); this
+/// shell only lays them out. The picker still lives on `/`, reached by the
+/// `?at=` query and the "Open a directory" button here — no new reserved
+/// path, which would collide with a project of that name the way `static`
+/// and `frag` already can.
+pub fn overview_page(sel: &str, roots_label: &str) -> String {
+    // `sel` is already a percent-encoded storage key (e.g. `karpie%2Fsrc`);
+    // encoding it again here means the server's single `percent_decode` of
+    // the query value lands back on that exact key — same pattern as the
+    // header switcher's `?current={qkey}`.
+    let qsel = crate::http::percent_encode(sel);
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>resh</title>\
+         <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
+         <link rel=\"stylesheet\" href=\"/static/style.css\">\
+         <script src=\"/static/vendor/htmx.min.js\"></script>\
+         </head><body class=\"overview-body\">\
+         <header><span class=\"proj\">resh</span>\
+           <span class=\"roots\" title=\"{roots}\"></span>\
+           <a class=\"openbtn\" href=\"/?at=\">＋ Open a directory</a>\
+         </header>\
+         <main id=\"overview\">\
+           <section id=\"ovprojects\" hx-get=\"/frag/_overview_projects?sel={qsel}\" hx-trigger=\"load, every 5s\"></section>\
+           <section id=\"ovsessions\" hx-get=\"/frag/_overview_sessions?sel={qsel}\" hx-trigger=\"load, every 5s\"></section>\
+         </main>\
+         <script src=\"/static/overview.js\"></script>\
+         </body></html>",
+        roots = esc(roots_label),
+    )
+}
+
 /// The header strip of known projects. ● means live sessions, ○ means a saved
 /// layout with nothing running — the distinction that answers "what did I
 /// leave running?" without opening anything.
@@ -796,6 +828,42 @@ pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectSta
     out
 }
 
+/// The per-worktree state chips (Claude / dirty / ahead) and, when
+/// `show_remove` is set and every axis is positively clean, the remove
+/// control. Shared by the header switcher and the overview's left pane so
+/// the two never drift on the chips themselves — but only the switcher
+/// carries the JS handler for `.wtremove`, so only it passes `show_remove:
+/// true`; the overview's left pane loads no such handler and would leave
+/// the button dead, so it passes `false`. `None` on any axis renders `?`,
+/// never "clean" — see the switcher's own comment.
+fn worktree_chips(w: &crate::registry::WorktreeStatus, key: &str, live: usize, show_remove: bool) -> String {
+    let claude = match &w.claude {
+        crate::claudes::ClaudeEvidence::Present(_) => "<span class=\"wtf on\" title=\"a Claude is running here\">✻</span>".to_string(),
+        crate::claudes::ClaudeEvidence::Absent => "<span class=\"wtf\" title=\"no Claude here\">—</span>".to_string(),
+        crate::claudes::ClaudeEvidence::Unknown => "<span class=\"wtf\" title=\"IDE integration is off, so resh cannot tell\">?</span>".to_string(),
+    };
+    let dirty = match w.dirty {
+        Some(true) => "<span class=\"wtf on\">dirty</span>".to_string(),
+        Some(false) => "<span class=\"wtf\">clean</span>".to_string(),
+        None => "<span class=\"wtf\" title=\"git did not answer (status)\">?</span>".to_string(),
+    };
+    let against = if w.base_recorded {
+        format!("measured against {}, recorded when resh created this worktree", esc(&w.base))
+    } else {
+        format!("measured against {}, the main worktree's branch — resh did not create this worktree", esc(&w.base))
+    };
+    let ahead = match w.ahead {
+        Some(n) => format!("<span class=\"wtf{}\" title=\"{against}. A squash-merged branch stays ahead forever; remove it by hand.\">{n} ahead</span>", if n > 0 { " on" } else { "" }),
+        None => "<span class=\"wtf\" title=\"git did not answer (rev-list), or no base is known\">?</span>".to_string(),
+    };
+    let remove = if show_remove && crate::registry::removable(w, live) {
+        format!(" <button class=\"wtremove\" data-key=\"{}\" title=\"remove this worktree and its branch\">✕</button>", esc(key))
+    } else {
+        String::new()
+    };
+    format!("{claude} {dirty} {ahead}{remove}")
+}
+
 /// The worktree switcher: the header chip's label (out-of-band, so one
 /// fragment feeds two places) plus one row per member of the current
 /// repository's worktree family.
@@ -880,33 +948,7 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
         // otherwise, and `None` renders no state at all, never "clean".
         let state_html = match &p.wt {
             None => String::new(),
-            Some(w) => {
-                let claude = match &w.claude {
-                    crate::claudes::ClaudeEvidence::Present(_) => "<span class=\"wtf on\" title=\"a Claude is running here\">✻</span>".to_string(),
-                    crate::claudes::ClaudeEvidence::Absent => "<span class=\"wtf\" title=\"no Claude here\">—</span>".to_string(),
-                    crate::claudes::ClaudeEvidence::Unknown => "<span class=\"wtf\" title=\"IDE integration is off, so resh cannot tell\">?</span>".to_string(),
-                };
-                let dirty = match w.dirty {
-                    Some(true) => "<span class=\"wtf on\">dirty</span>".to_string(),
-                    Some(false) => "<span class=\"wtf\">clean</span>".to_string(),
-                    None => "<span class=\"wtf\" title=\"git did not answer (status)\">?</span>".to_string(),
-                };
-                let against = if w.base_recorded {
-                    format!("measured against {}, recorded when resh created this worktree", esc(&w.base))
-                } else {
-                    format!("measured against {}, the main worktree's branch — resh did not create this worktree", esc(&w.base))
-                };
-                let ahead = match w.ahead {
-                    Some(n) => format!("<span class=\"wtf{}\" title=\"{against}. A squash-merged branch stays ahead forever; remove it by hand.\">{n} ahead</span>", if n > 0 { " on" } else { "" }),
-                    None => "<span class=\"wtf\" title=\"git did not answer (rev-list), or no base is known\">?</span>".to_string(),
-                };
-                let remove = if crate::registry::removable(w, p.live) {
-                    format!(" <button class=\"wtremove\" data-key=\"{}\" title=\"remove this worktree and its branch\">✕</button>", esc(&p.key))
-                } else {
-                    String::new()
-                };
-                format!(" · {claude} {dirty} {ahead}{remove}")
-            }
+            Some(w) => format!(" · {}", worktree_chips(w, &p.key, p.live, true)),
         };
         // A `<button>` cannot nest inside an `<a>` (invalid HTML), so the row
         // is a flex span wrapping the link and the state/control separately.
@@ -918,6 +960,47 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
         ));
     }
     out.push_str("</span>");
+    out
+}
+
+/// The overview's left pane: known projects, each expandable to its worktree
+/// family. Rows are pre-ordered by `known_projects_with_state` (parent then
+/// its children), so this renders in order and lets `parent` decide nesting.
+/// A parent with children gets a caret; a worktree row carries `worktree_chips`.
+/// Selection (`sel`, a storage key) marks the current row; expansion is the
+/// client's job (`overview.js`). A reachable row is a link to `/<url>` (open
+/// the project); an unreachable worktree is inert text.
+pub fn overview_projects(sel: &str, projects: &[crate::registry::ProjectStatus]) -> String {
+    let has_children: std::collections::HashSet<&str> =
+        projects.iter().filter_map(|p| p.parent.as_deref()).collect();
+    let mut out = String::from("<ul class=\"ovtree\">");
+    for p in projects {
+        let is_child = p.parent.is_some();
+        let mut cls = String::from("ovrow");
+        if is_child { cls.push_str(" child"); }
+        if p.live > 0 { cls.push_str(" live"); }
+        if p.key == sel { cls.push_str(" current"); }
+        let marker = if p.live > 0 { "●" } else { "○" };
+        let caret = if !is_child && has_children.contains(p.key.as_str()) {
+            "<span class=\"ovcaret\" aria-hidden=\"true\">▸</span>"
+        } else {
+            "<span class=\"ovcaret placeholder\" aria-hidden=\"true\"></span>"
+        };
+        let name = if is_child { p.url.rsplit('/').next().unwrap_or(&p.url) } else { p.url.as_str() };
+        let branch = if p.branch.is_empty() { String::new() } else { format!(" <span class=\"branch\">⎇ {}</span>", esc(&p.branch)) };
+        let chips = match &p.wt { Some(w) => format!(" <span class=\"ovchips\">{}</span>", worktree_chips(w, &p.key, p.live, false)), None => String::new() };
+        let parent_attr = p.parent.as_deref().map(|pk| format!(" data-parent=\"{}\"", esc(pk))).unwrap_or_default();
+        if !p.reachable {
+            out.push_str(&format!(
+                "<li class=\"{cls} unreachable\" data-key=\"{}\"{parent_attr} title=\"worktree outside resh's roots — cannot be opened\">{caret}{marker} {}{branch}{chips}</li>",
+                esc(&p.key), esc(name)));
+            continue;
+        }
+        out.push_str(&format!(
+            "<li class=\"{cls}\" data-key=\"{}\"{parent_attr}>{caret}<a href=\"/{}\">{marker} {}{branch}</a>{chips}</li>",
+            esc(&p.key), crate::http::percent_encode(&p.url), esc(name)));
+    }
+    out.push_str("</ul>");
     out
 }
 
@@ -942,6 +1025,62 @@ pub fn human_age(secs: u64) -> String {
     } else {
         format!("{secs}s")
     }
+}
+
+pub struct OvSession {
+    pub project_url: String,
+    pub name: String,
+    pub is_claude: bool,
+    pub age_secs: Option<u64>,
+    pub attached: usize,
+}
+
+/// The overview's right pane. Pure over `rows` so it is tested without a
+/// real `ps` or IDE socket. Each row: ✻ Claude vs ○ shell (Claude only when
+/// the caller had positive evidence), the project/worktree label, a coarse
+/// age (never `0` for unknown — `—`), and the attached-browser count. The
+/// row links to `/<project>?focus=<session>`.
+pub fn overview_sessions(sel: &str, rows: &[OvSession]) -> String {
+    let scope = if sel.is_empty() {
+        "all active".to_string()
+    } else {
+        format!("in {}", esc(&crate::registry::decode_key(sel)))
+    };
+    let mut out = format!(
+        "<div class=\"ovshead\">SESSIONS · {scope} <a class=\"ovall\" href=\"/\">All</a></div><ul class=\"ovsessions\">"
+    );
+    if rows.is_empty() {
+        out.push_str("<li class=\"ovempty\">no sessions running</li></ul>");
+        return out;
+    }
+    for r in rows {
+        let mark = if r.is_claude {
+            "<span class=\"ovkind on\" title=\"Claude\">✻ claude</span>"
+        } else {
+            "<span class=\"ovkind\" title=\"shell\">○ shell</span>"
+        };
+        let age = match r.age_secs {
+            Some(s) => human_age(s),
+            None => "—".to_string(),
+        };
+        let attached = if r.attached > 0 {
+            format!(" <span class=\"ovatt\">·{}</span>", r.attached)
+        } else {
+            String::new()
+        };
+        let href = format!(
+            "/{}?focus={}",
+            crate::http::percent_encode(&r.project_url),
+            crate::http::percent_encode(&r.name)
+        );
+        out.push_str(&format!(
+            "<li class=\"ovsession\"><a href=\"{href}\">{mark} <span class=\"ovlabel\">{} · {}</span> <span class=\"ovage\">{age}</span>{attached}</a></li>",
+            esc(&r.project_url),
+            esc(&r.name)
+        ));
+    }
+    out.push_str("</ul>");
+    out
 }
 
 // `theme_rel` is interpolated into an `href` below without `esc` or
@@ -1880,6 +2019,46 @@ mod tests {
         assert!(!h2.contains("data-rel=\"karpie/main.rs\"")); // files carry no selection hook
     }
 
+    #[test]
+    fn overview_page_wires_both_fragment_panes() {
+        let h = overview_page("", "/home/claude/projects");
+        assert!(h.contains("id=\"overview\""));
+        // sel="" still emits `?sel=` (empty, unfiltered) — the URL always
+        // carries the param so htmx has a consistent shape to trigger from.
+        assert!(h.contains("hx-get=\"/frag/_overview_projects?sel=\""), "{h}");
+        assert!(h.contains("hx-get=\"/frag/_overview_sessions?sel=\""), "{h}");
+        assert!(h.contains("/static/overview.js"), "{h}");
+        // The picker entry point, not a new reserved path.
+        assert!(h.contains("href=\"/?at=\""), "open-a-directory reaches the picker: {h}");
+    }
+
+    // The overview shell is stateless HTML re-rendered fresh on every `/`
+    // load; it's the fragment hx-get URLs that must carry `sel` forward so
+    // htmx fetches the *filtered* panes and the left pane can mark the
+    // current row. `sel` is a storage key, already percent-encoded once
+    // (e.g. `karpie%2Fsrc`); it goes through `percent_encode` a second time
+    // so the server's single `percent_decode` on the query value lands back
+    // on the exact storage key — same pattern as the header switcher's
+    // `hx-get="/frag/_worktrees?current={qkey}"`.
+    //
+    // Revert-checked: with the hardcoded (no-`?sel=`) URLs this fails —
+    // `h.contains("_overview_projects?sel=karpie%252Fsrc")` is false because
+    // the emitted URL is bare `/frag/_overview_projects` with no query at
+    // all.
+    #[test]
+    fn overview_page_threads_sel_into_both_fragment_urls() {
+        let sel = "karpie%2Fsrc";
+        // Confirm the round-trip property this test relies on: encoding sel
+        // once and decoding it once yields sel back, unchanged.
+        let encoded = crate::http::percent_encode(sel);
+        assert_eq!(encoded, "karpie%252Fsrc", "{encoded}");
+        assert_eq!(crate::http::percent_decode(&encoded), sel);
+
+        let h = overview_page(sel, "/roots");
+        assert!(h.contains("/frag/_overview_projects?sel=karpie%252Fsrc"), "{h}");
+        assert!(h.contains("/frag/_overview_sessions?sel=karpie%252Fsrc"), "{h}");
+    }
+
     // A picker row for a directory that is also a known project carries the
     // same ●/○ the header strip uses; an ordinary directory with no
     // matching project carries neither.
@@ -2438,5 +2617,98 @@ mod tests {
         let unrecorded = WorktreeStatus { base_recorded: false, ..clean };
         let out = worktrees_strip("r", &mk(unrecorded, 0));
         assert!(out.contains("measured against main, the main worktree's branch"), "{out}");
+    }
+
+    fn ps_row(key: &str, url: &str, live: usize, branch: &str, parent: Option<&str>, wt: Option<crate::registry::WorktreeStatus>) -> crate::registry::ProjectStatus {
+        crate::registry::ProjectStatus { key: key.into(), url: url.into(), live, oldest_age_secs: None, has_layout: true, branch: branch.into(), parent: parent.map(str::to_string), reachable: true, wt }
+    }
+
+    #[test]
+    fn overview_projects_nests_worktrees_under_their_parent_and_marks_selection() {
+        use crate::claudes::ClaudeEvidence;
+        let wt = crate::registry::WorktreeStatus { claude: ClaudeEvidence::Present(vec!["term".into()]), dirty: Some(true), ahead: Some(3), base: "main".into(), base_recorded: true };
+        let ps = vec![
+            ps_row("ultima", "ultima", 1, "main", None, None),
+            ps_row("ultima%2F.claude%2Fworktrees%2Fclaude-1", "ultima/.claude/worktrees/claude-1", 1, "claude-1", Some("ultima"), Some(wt)),
+        ];
+        let out = overview_projects("ultima", &ps);
+        // Revert-checked: rendering the chip span as empty (chips not reused
+        // from worktree_chips) fails the "3 ahead"/"dirty"/"✻" assertion below.
+        // Parent row carries an expansion caret and is current; child row is present with its chips.
+        assert!(out.contains("ovcaret") && out.contains("current"), "{out}");
+        assert!(out.contains("data-key=\"ultima\""), "{out}");
+        assert!(out.contains("data-parent=\"ultima\"") && out.contains("claude-1"), "child under parent: {out}");
+        assert!(out.contains("✻") && out.contains("dirty") && out.contains("3 ahead"), "chips reused: {out}");
+    }
+
+    #[test]
+    fn overview_projects_never_renders_the_remove_button_even_when_removable() {
+        // The overview's left pane loads only overview.js + htmx — no remove
+        // handler — so the ✕ affordance from worktree_chips must stay
+        // suppressed there even for a worktree that `registry::removable`
+        // would allow (live == 0, everything clean).
+        //
+        // Revert-checked: passing `true` (or dropping the gate entirely) for
+        // overview_projects's call into worktree_chips makes this fail —
+        // observed `assertion failed: !out.contains("wtremove")` because the
+        // row then renders `<button class="wtremove" ...>✕</button>`.
+        use crate::claudes::ClaudeEvidence;
+        let wt = crate::registry::WorktreeStatus { claude: ClaudeEvidence::Absent, dirty: Some(false), ahead: Some(0), base: "main".into(), base_recorded: true };
+        let ps = vec![
+            ps_row("ultima", "ultima", 1, "main", None, None),
+            ps_row("ultima%2F.claude%2Fworktrees%2Fclaude-1", "ultima/.claude/worktrees/claude-1", 0, "claude-1", Some("ultima"), Some(wt)),
+        ];
+        assert!(crate::registry::removable(ps[1].wt.as_ref().unwrap(), ps[1].live), "fixture must actually be removable");
+        let out = overview_projects("ultima", &ps);
+        assert!(!out.contains("wtremove"), "{out}");
+    }
+
+    #[test]
+    fn overview_projects_renders_an_unreachable_worktree_as_inert_text() {
+        // Revert-checked: disabling the `!p.reachable` branch (so this row
+        // renders as an ordinary `<a>` link) fails the `contains("unreachable")` assertion below.
+        let ps = vec![
+            ps_row("repo", "repo", 0, "main", None, None),
+            {
+                let mut r = ps_row("x", "/outside/wt", 0, "feat", Some("repo"), Some(crate::registry::WorktreeStatus { claude: crate::claudes::ClaudeEvidence::Absent, dirty: None, ahead: None, base: "main".into(), base_recorded: false }));
+                r.reachable = false; r
+            },
+        ];
+        let out = overview_projects("", &ps);
+        assert!(out.contains("unreachable"), "{out}");
+    }
+
+    #[test]
+    fn overview_sessions_marks_claude_only_on_evidence_and_shows_label_age_attached() {
+        // Revert-checked: forcing `mark` to always render the claude span
+        // (dropping `r.is_claude`) fails the "shell row marked ○" assertion
+        // — panic showed the shell row rendered "✻ claude" instead of "○
+        // shell". Also revert-checked: rendering `None` age as the literal
+        // "0" (rather than "—") fails the "unknown age must not render as 0"
+        // assertion. Both restored.
+        let rows = vec![
+            OvSession { project_url: "ultima".into(), name: "term".into(), is_claude: true, age_secs: Some(14400), attached: 1 },
+            OvSession { project_url: "ultima/.claude/worktrees/claude-1".into(), name: "term".into(), is_claude: true, age_secs: Some(1200), attached: 0 },
+            OvSession { project_url: "resh".into(), name: "shell".into(), is_claude: false, age_secs: None, attached: 0 },
+        ];
+        let out = overview_sessions("", &rows);
+        assert!(out.contains("claude") && out.contains("✻"), "claude row: {out}");
+        assert!(out.contains("shell") && out.contains("○"), "shell row marked ○: {out}");
+        assert!(out.contains("4h") && out.contains("20m"), "coarse ages: {out}");
+        assert!(out.contains("ultima/.claude/worktrees/claude-1"), "worktree label: {out}");
+        assert!(out.contains("·1"), "attached count: {out}");
+        // The click target: /<project>?focus=<session>, percent-encoded project.
+        assert!(out.contains("?focus=term"), "{out}");
+        // Unknown age is not 0.
+        assert!(!out.contains(">0<"), "unknown age must not render as 0: {out}");
+    }
+
+    #[test]
+    fn overview_sessions_empty_scope_says_so() {
+        // Revert-checked: skipping the empty-rows branch (never emitting the
+        // "no sessions running" `<li>`) fails this assertion — panic showed
+        // just the empty `<ul class="ovsessions"></ul>` with no message. Restored.
+        let out = overview_sessions("", &[]);
+        assert!(out.contains("no sessions") || out.contains("nothing running"), "{out}");
     }
 }

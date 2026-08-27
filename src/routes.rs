@@ -1,5 +1,6 @@
 //! HTTP request routing. URL surface (spec §URLs):
-//!   /                    directory picker (?at=<rel> browses a subdirectory)
+//!   /                    overview shell (?at=<rel> reaches the directory
+//!                        picker instead, to browse a subdirectory)
 //!   /{project}           workspace page — {project} may be multi-segment,
 //!                        e.g. /karpie/src, naming a nested directory
 //!   /static/*            assets
@@ -86,6 +87,19 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
             };
             http::html(w, &render::worktrees_strip(current, &ps));
         }
+        // Same shape as _projects/_worktrees above, same reason it sits
+        // before the general frag arm.
+        ["frag", "_overview_projects"] => {
+            let sel = req.query.get("sel").map(String::as_str).unwrap_or("");
+            let ps = registry::known_projects_with_state(roots);
+            http::html(w, &render::overview_projects(sel, &ps));
+        }
+        // Same shape as _overview_projects above, same reason it sits before
+        // the general frag arm.
+        ["frag", "_overview_sessions"] => {
+            let sel = req.query.get("sel").map(String::as_str).unwrap_or("");
+            http::html(w, &render::overview_sessions(sel, &build_overview_sessions(roots, sel)));
+        }
         // Root scope, not /static/sw.js: a service worker may only control
         // URLs under its own path, and this one has to focus and navigate
         // workspace tabs at /{project}.
@@ -161,10 +175,50 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
     }
 }
 
-/// `/` — the directory picker. `?at=<rel>` browses one directory; with no
-/// `at` (or one that fails to resolve — refused the same way opening it as
-/// a workspace would be) it shows the merged top level of both ROOTS.
+/// The scope resolution + data gathering for the session pane. `sel` empty →
+/// every known project; a project key → it and its worktree children; a
+/// worktree key → just it. One ages snapshot for the whole set, since
+/// `session::ages_snapshot` is already a single `ps` fork for the host — see
+/// its doc comment on why per-session `ps` is what the overview must avoid.
+fn build_overview_sessions(roots: &[PathBuf], sel: &str) -> Vec<render::OvSession> {
+    let all = registry::known_projects(roots);
+    let in_scope: Vec<&registry::ProjectStatus> = if sel.is_empty() {
+        all.iter().collect()
+    } else {
+        all.iter().filter(|p| p.key == sel || p.parent.as_deref() == Some(sel)).collect()
+    };
+    let ages = crate::session::ages_snapshot();
+    let mut rows = Vec::new();
+    for p in in_scope {
+        let launched: std::collections::HashSet<String> =
+            crate::session::launched_names(&p.url).into_iter().map(|(n, _)| n).collect();
+        let evidence = crate::claudes::claude_evidence(&p.url);
+        for (name, pid, attached) in crate::session::live_rows(&p.url) {
+            let is_claude = launched.contains(&name)
+                || matches!(&evidence, crate::claudes::ClaudeEvidence::Present(ts) if ts.iter().any(|t| t == &name));
+            rows.push(render::OvSession {
+                project_url: p.url.clone(),
+                name,
+                is_claude,
+                age_secs: ages.get(&pid).copied(),
+                attached,
+            });
+        }
+    }
+    rows
+}
+
+/// `/` — with no `at` query, the projects/sessions overview shell (panes
+/// fill in over htmx). `?at=<rel>` browses one directory in the picker
+/// instead; an `at` that fails to resolve is refused the same way opening it
+/// as a workspace would be, showing the merged top level of both ROOTS.
 fn serve_index(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
+    // `at` absent → the overview; `at` present (empty included) → the picker.
+    if req.query.get("at").is_none() {
+        let label = roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(":");
+        let sel = req.query.get("sel").map(String::as_str).unwrap_or("");
+        return http::html(w, &render::overview_page(sel, &label));
+    }
     let requested = req.query.get("at").map(String::as_str).unwrap_or("");
     let (at, entries, refused) = match projects::list_dir(roots, requested) {
         Some(entries) => (requested, entries, false),
@@ -1011,6 +1065,86 @@ mod tests {
         let out = frag_route(&roots, "/frag/_worktrees?current=nosuch");
         assert!(out.contains("id=\"wtlabel\""), "{out}");
         assert!(out.contains("no worktrees"), "{out}");
+    }
+
+    /// Dispatch through the real router, like `the_worktrees_fragment_is_routed`
+    /// above (whose own comment explains why: a direct call to
+    /// `render::overview_projects` would stay green even if the `["frag",
+    /// "_overview_projects"]` arm were deleted or the router could never
+    /// reach it, since that arm must sit ahead of the general two-segment
+    /// `["frag", rest @ ..]` fragment arm — see that arm's own comment on
+    /// why `_projects`/`_worktrees` need the same placement). Asserting on
+    /// `ovtree`, the class the fragment always emits regardless of how many
+    /// (if any) real projects the host's state directory holds, keeps this
+    /// independent of what's actually on disk.
+    ///
+    /// Revert-checked: with the `["frag", "_overview_projects"]` arm
+    /// removed, this falls through the catch-all and 404s ("no such
+    /// project") instead of ever reaching `render::overview_projects` —
+    /// panic showed the literal 404 response body, no `ovtree` anywhere.
+    /// Restored.
+    #[test]
+    fn the_overview_projects_fragment_is_routed() {
+        let d = tempfile::tempdir().unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let out = frag_route(&roots, "/frag/_overview_projects");
+        assert!(out.contains("ovtree"), "{out}");
+    }
+
+    /// Same reasoning as `the_overview_projects_fragment_is_routed` above,
+    /// for the `["frag", "_overview_sessions"]` arm added in Task 4. Before
+    /// that arm exists, this path falls through to the catch-all and is
+    /// treated as a project literally named "frag/_overview_sessions" — a
+    /// 404, not this fragment's markup — so the assertion below cannot pass
+    /// early. `SESSIONS` (the pane heading) and `ovsessions` (the list
+    /// class) are both emitted unconditionally, independent of whether the
+    /// host's state directory holds any real sessions.
+    ///
+    /// Revert-checked: with the `["frag", "_overview_sessions"]` arm
+    /// removed, this falls through the catch-all and 404s ("no such
+    /// project") instead of ever reaching `render::overview_sessions` —
+    /// panic showed the literal 404 response body, no `SESSIONS`/`ovsessions`
+    /// anywhere. Restored.
+    #[test]
+    fn the_overview_sessions_fragment_is_routed() {
+        let d = tempfile::tempdir().unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let out = frag_route(&roots, "/frag/_overview_sessions");
+        assert!(out.contains("SESSIONS") && out.contains("ovsessions"), "{out}");
+    }
+
+    #[test]
+    fn root_with_no_at_serves_the_overview_and_at_serves_the_picker() {
+        // Revert-checked: with serve_index always calling index_page, the
+        // first assertion fails (no overview markup at `/`) — the response
+        // body is the picker's `<ul class="picker" id="picker" ...>`, no
+        // `id="overview"` anywhere. See
+        // .superpowers/sdd/2026-08-26-overview-page/task-1-report.md for the
+        // captured failure output.
+        let d = tempfile::tempdir().unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let overview = frag_route(&roots, "/");
+        assert!(overview.contains("id=\"overview\""), "no-at is the overview: {overview}");
+        assert!(overview.contains("_overview_projects") && overview.contains("_overview_sessions"), "{overview}");
+        let picker = frag_route(&roots, "/?at=");
+        assert!(picker.contains("id=\"picker\""), "?at= is the picker: {picker}");
+    }
+
+    // `sel` in the overview's own query string must reach the fragment
+    // hx-get URLs the shell emits, or htmx re-fetches unfiltered on load and
+    // the round-trip from static/overview.js's `/?sel=<key>` navigation is
+    // lost.
+    //
+    // Revert-checked: with `serve_index` not reading `sel` (calling
+    // `render::overview_page("", &label)` unconditionally), this fails —
+    // the response carries `_overview_projects?sel=` (empty), not
+    // `?sel=proj`, so `.contains("_overview_projects?sel=proj")` is false.
+    #[test]
+    fn overview_at_root_threads_sel_to_fragments() {
+        let d = tempfile::tempdir().unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let out = frag_route(&roots, "/?sel=proj");
+        assert!(out.contains("_overview_projects?sel=proj"), "{out}");
     }
 
     // Revert-checked: dropping the `state=1` branch entirely (always calling

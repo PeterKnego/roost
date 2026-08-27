@@ -41,6 +41,8 @@
 ---
 
 ### Task 1: Route split + overview page shell
+> **Integration fix (found by Task 6's browser test):** `overview_page` must take `sel: &str` and bake it into BOTH fragment hx-get URLs as `?sel={percent_encode(sel)}`, and `serve_index` must read `sel` from the query and pass it — otherwise `/?sel=key` renders identically to `/` and selection never filters. This is the sel-threading wiring; see Task 8 in the SDD ledger.
+
 
 **Files:**
 - Modify: `src/routes.rs:167-175` (`serve_index`)
@@ -364,7 +366,10 @@ git commit -m "overview: left pane — project/worktree tree, chips shared with 
         let _b = attach("ovproj", "term1", d.path()).unwrap();
         let rows = live_rows("ovproj");
         assert_eq!(rows.iter().map(|(n,_,_)| n.as_str()).collect::<Vec<_>>(), vec!["term", "term1"]);
-        assert!(rows.iter().all(|(_, pid, _)| *pid != 0) || std::env::var("RESH_CMD").is_ok());
+        // The "no ps" property is structural (live_rows has no ps call); this
+        // asserts the scan's data is real. Revert-check: make live_rows return
+        // pid 0 for each row and this fails.
+        assert!(rows.iter().all(|(_, pid, _)| *pid != 0), "live_rows must carry real pids: {rows:?}");
         kill_project("ovproj");
     }
 ```

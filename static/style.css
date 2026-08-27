@@ -664,3 +664,30 @@ ul.picker li .git:hover { text-decoration: underline; }
 /* Matches the focus treatment .editwrap gives the file editor, so the two
    editable surfaces in this app agree about what "focused" looks like. */
 .proposal-edit:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
+
+/* The front page: two htmx panes (overview.js) side by side. */
+.overview-body { margin: 0; }
+.overview-body header { display: flex; align-items: center; gap: 12px; padding: 6px 10px; }
+.overview-body .openbtn { margin-left: auto; text-decoration: none; padding: 2px 8px; border: 1px solid var(--muted); border-radius: 3px; }
+#overview { display: grid; grid-template-columns: minmax(260px, 30%) 1fr; gap: 0; height: calc(100vh - 40px); }
+#ovprojects, #ovsessions { overflow: auto; padding: 8px; }
+#ovprojects { border-right: 1px solid var(--bg2); }
+.ovtree { list-style: none; margin: 0; padding: 0; }
+.ovrow { padding: 3px 4px; border-radius: 3px; white-space: nowrap; }
+.ovrow.child { padding-left: 22px; }
+.ovrow.current { background: var(--bg2); font-weight: 600; }
+.ovrow a { text-decoration: none; }
+.ovrow.unreachable { opacity: .35; }
+.ovcaret { display: inline-block; width: 1em; cursor: pointer; color: var(--muted); }
+.ovcaret.placeholder { cursor: default; }
+.ovchips .wtf { color: var(--muted); font-size: 12px; }
+.ovchips .wtf.on { color: var(--fg); }
+.ovshead { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.ovall { margin-left: 8px; }
+.ovsessions { list-style: none; margin: 0; padding: 0; }
+.ovsession { padding: 4px; border-radius: 3px; }
+.ovsession a { text-decoration: none; display: flex; gap: 8px; align-items: baseline; }
+.ovkind.on { color: var(--fg); }
+.ovkind { color: var(--muted); }
+.ovage, .ovatt { color: var(--muted); font-size: 12px; }
+.ovempty { color: var(--muted); padding: 6px 4px; }
