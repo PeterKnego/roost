@@ -64,6 +64,12 @@ fn valid_project(project: &str) -> bool {
 /// project's directory structure would leak into (and collide with) this
 /// one's, and the on-disk directory layout this join doubles as would gain
 /// a directory level nothing else expects.
+/// The dtach socket path for `project/name` — public for the overview,
+/// which needs to find the *master* holding it (see `registry::pids_holding_path`).
+pub fn socket_path(project: &str, name: &str) -> PathBuf {
+    sock_path(project, name)
+}
+
 fn sock_path(project: &str, name: &str) -> PathBuf {
     crate::wsstate::state_dir()
         .join("sock")
@@ -549,6 +555,26 @@ pub fn live_rows(project: &str) -> Vec<(String, u32, usize)> {
     found
 }
 
+/// `live_rows` plus the sockets on disk. The in-memory map is only what
+/// THIS process attached; dtach sessions outlive resh, so after a restart
+/// every surviving session is missing from it while its socket is still on
+/// disk and its shell still running — the bug `live_names` documents, seen
+/// on the overview as a right pane listing two sessions under a left pane
+/// marking four projects live. Sockets are the restart-proof truth; a
+/// socket-only row carries pid 0 (the existing "unknown" sentinel) and 0
+/// attached. Separate from `live_rows` so `list_sessions` keeps its
+/// in-memory contract (its callers count "sessions this process holds").
+pub fn session_rows(project: &str) -> Vec<(String, u32, usize)> {
+    let mut found = live_rows(project);
+    for name in socket_names(project) {
+        if !found.iter().any(|(n, _, _)| *n == name) {
+            found.push((name, 0, 0));
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
 /// pid → elapsed seconds, from ONE `ps -Aww -o pid=,etime=` for the whole
 /// host — so the overview's all-projects view costs one fork rather than one
 /// per session, unlike `list_sessions`'s per-project `process_age_secs`.
@@ -566,6 +592,15 @@ pub fn ages_snapshot() -> HashMap<u32, u64> {
 /// split on the first run of whitespace. A line that doesn't parse (an
 /// unexpected column, a truncated read) is skipped rather than panicking —
 /// one bad row from a live `ps` shouldn't blank every other session's age.
+/// The age of a session is the age of the oldest process holding its socket
+/// — the dtach master, which outlives resh. `child_pid` is only the client
+/// *this* resh spawned, so after a restart it reports "10m" for an 18-hour
+/// shell (the time since resh reattached). `None` when no holder is known
+/// or none has an age: unknown, never `0`.
+pub fn oldest_age_of(pids: &[u32], ages: &HashMap<u32, u64>) -> Option<u64> {
+    pids.iter().filter_map(|p| ages.get(p).copied()).max()
+}
+
 pub fn parse_ages(out: &str) -> HashMap<u32, u64> {
     let mut m = HashMap::new();
     for line in out.lines() {
@@ -1199,6 +1234,19 @@ mod tests {
     }
 
     #[test]
+    /// Revert-checked: `.min()` instead of `.max()` fails with
+    /// `left: Some(30) right: Some(64000)` — the master is the oldest holder.
+    #[test]
+    fn session_age_is_the_oldest_holder_never_zero_when_unknown() {
+        let mut ages = HashMap::new();
+        ages.insert(10u32, 64_000u64); // the master
+        ages.insert(11u32, 30u64);     // this resh's fresh client
+        assert_eq!(oldest_age_of(&[10, 11], &ages), Some(64_000));
+        assert_eq!(oldest_age_of(&[99], &ages), None, "no known holder: unknown, not 0");
+        assert_eq!(oldest_age_of(&[], &ages), None);
+    }
+
+    #[test]
     fn parse_ages_reads_pid_and_etime_columns() {
         // `ps -o pid=,etime=` output: pid, whitespace, etime, one row per line.
         // Revert-checked: hardcoding the inserted age to 0 instead of
@@ -1222,6 +1270,25 @@ mod tests {
 
     #[test]
     // The "no ps" property is structural (live_rows has no ps call); this asserts the scan's data is real.
+    /// After a resh restart the in-memory map is empty while the sockets
+    /// on disk still name every surviving shell. Revert-checked: without the
+    /// socket-floor merge this failed with `left: [] right: [("term7", 0, 0)]`.
+    #[test]
+    fn session_rows_includes_sessions_known_only_from_their_sockets() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path());
+        let sockdir = d.path().join("sock").join(crate::projects::storage_key("ghostproj"));
+        std::fs::create_dir_all(&sockdir).unwrap();
+        std::fs::write(sockdir.join("term7"), b"").unwrap();
+        std::fs::write(sockdir.join(".origin"), b"/x\n").unwrap();
+        let rows = session_rows("ghostproj");
+        assert_eq!(rows, vec![("term7".to_string(), 0u32, 0usize)], "socket-only row, pid 0 sentinel: {rows:?}");
+        assert!(live_rows("ghostproj").is_empty(), "live_rows stays in-memory only (list_sessions' contract)");
+    }
+
+    #[test]
     fn live_rows_lists_a_projects_sessions_without_forking_ps() {
         let _s = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RESH_CMD", "cat");

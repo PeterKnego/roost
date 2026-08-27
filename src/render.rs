@@ -723,7 +723,7 @@ pub fn overview_page(sel: &str, roots_label: &str) -> String {
          <script src=\"/static/vendor/htmx.min.js\"></script>\
          </head><body class=\"overview-body\">\
          <header><span class=\"proj\">resh</span>\
-           <span class=\"roots\" title=\"{roots}\"></span>\
+           <span class=\"roots\" title=\"{roots}\">{roots}</span>\
            <a class=\"openbtn\" href=\"/?at=\">＋ Open a directory</a>\
          </header>\
          <main id=\"overview\">\

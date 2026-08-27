@@ -238,6 +238,17 @@ fn line_has_whole_arg(line: &str, target: &str) -> bool {
 /// argument (see `line_has_whole_arg`). `dtach` always carries the socket
 /// path as a single, whole argument (see `session::default_command`) —
 /// never embedded in a larger word.
+/// One process listing for the overview's ages, `None` when `ps` could not
+/// be trusted — the caller then renders every age unknown.
+pub fn holders_snapshot() -> Option<Vec<(u32, String)>> {
+    process_snapshot()
+}
+
+/// Public face of `pids_holding` for the overview.
+pub fn pids_holding_path(snapshot: &[(u32, String)], path: &std::path::Path) -> Vec<u32> {
+    pids_holding(snapshot, path)
+}
+
 fn pids_holding(snapshot: &[(u32, String)], path: &std::path::Path) -> Vec<u32> {
     let target = path.to_string_lossy();
     snapshot.iter().filter(|(_, line)| line_has_whole_arg(line, &target)).map(|(pid, _)| *pid).collect()
@@ -1023,6 +1034,18 @@ pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
         }
     }
 
+    // A layout file whose directory no longer resolves under any root — a
+    // deleted worktree, a renamed project, test-fixture pollution — is not a
+    // project the user can open, and it clutters the overview as a `○` row
+    // that 404s. Keep it only while it has live sessions: those are exactly
+    // what "what did I leave running?" must still show, and reaping them is
+    // `reconcile`'s job, never a listing's. Display-only, so an unreadable
+    // root merely hides an idle row for one refresh; it destroys nothing.
+    by_key.retain(|_, p| {
+        p.live > 0
+            || crate::projects::resolve_project(roots, &p.url).is_some()
+            || crate::worktree::is_vouched_worktree(roots, &p.url)
+    });
     group_worktrees(roots, &mut by_key);
     order_with_children(by_key.into_values().collect())
 }
@@ -1261,7 +1284,12 @@ mod tests {
         with_state(|state| {
             fs::create_dir_all(state).unwrap();
             fs::write(state.join("karpie.json"), "{}").unwrap();
-            let roots = vec![PathBuf::from("/nonexistent-root")];
+            // A layout is only a project while its directory resolves under
+            // a root (see `known_projects`'s retain); the absent-directory
+            // case is `a_layout_whose_directory_is_gone_is_not_listed_unless_live`.
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir_all(root.path().join("karpie")).unwrap();
+            let roots = vec![root.path().to_path_buf()];
             let ps = known_projects(&roots);
             let p = ps.iter().find(|p| p.key == "karpie").expect("saved layout must be listed");
             assert!(p.has_layout);
@@ -1604,7 +1632,9 @@ mod tests {
         with_state(|state| {
             fs::create_dir_all(state).unwrap();
             fs::write(state.join("karpie%2Fsrc.json"), "{}").unwrap();
-            let ps = known_projects(&[PathBuf::from("/nonexistent-root")]);
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir_all(root.path().join("karpie/src")).unwrap();
+            let ps = known_projects(&[root.path().to_path_buf()]);
             let p = ps.iter().find(|p| p.key == "karpie%2Fsrc").expect("nested project must list");
             assert_eq!(p.url, "karpie/src", "the URL keeps readable slashes");
         });
@@ -2369,5 +2399,25 @@ mod tests {
             assert!(crate::worktree::read_base(&state, &blocked).is_some(), "cannot tell: kept");
         }
         std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// A layout file for a directory that no longer exists is not a
+    /// project; one with a real directory is. Revert-checked: without the
+    /// `retain`, `ghost` is listed and the first assertion fails.
+    #[test]
+    fn a_layout_whose_directory_is_gone_is_not_listed_unless_live() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::env::set_var("RESH_STATE_DIR", &state);
+        let root = d.path().join("root");
+        std::fs::create_dir_all(root.join("realproj")).unwrap();
+        std::fs::write(state.join("ghost.json"), "{}").unwrap();
+        std::fs::write(state.join("realproj.json"), "{}").unwrap();
+        let ps = known_projects(&[root.clone()]);
+        let keys: Vec<&str> = ps.iter().map(|p| p.key.as_str()).collect();
+        assert!(!keys.contains(&"ghost"), "ghost has no directory: {keys:?}");
+        assert!(keys.contains(&"realproj"), "{keys:?}");
     }
 }
