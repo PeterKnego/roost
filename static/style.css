@@ -666,28 +666,68 @@ ul.picker li .git:hover { text-decoration: underline; }
 .proposal-edit:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
 
 /* The front page: two htmx panes (overview.js) side by side. */
-.overview-body { margin: 0; }
-.overview-body header { display: flex; align-items: center; gap: 12px; padding: 6px 10px; }
-.overview-body .openbtn { margin-left: auto; text-decoration: none; padding: 2px 8px; border: 1px solid var(--muted); border-radius: 3px; }
-#overview { display: grid; grid-template-columns: minmax(260px, 30%) 1fr; gap: 0; height: calc(100vh - 40px); }
-#ovprojects, #ovsessions { overflow: auto; padding: 8px; }
-#ovprojects { border-right: 1px solid var(--bg2); }
-.ovtree { list-style: none; margin: 0; padding: 0; }
-.ovrow { padding: 3px 4px; border-radius: 3px; white-space: nowrap; }
+/* ---- the overview front page ---------------------------------------------
+   Deliberately the same language as a workspace, because it is one: a darker
+   window, floating rounded panes with a 32px head, the tool tone on the left
+   (like Files/Changes) and the editor tone on the right. Anything here that a
+   workspace would not recognise is a bug, not a style choice — the first cut
+   drew two flush columns of unstyled UA-blue links and read as a different
+   application. */
+.overview-body header .roots { color: var(--muted); min-width: 0; overflow: hidden;
+                               text-overflow: ellipsis; white-space: nowrap; }
+/* Matches #projbtn/#bell/#settings exactly: muted until hovered, a border that
+   only appears on hover. It is the same kind of thing they are — a chrome
+   affordance — so it must not invent its own chip. */
+.overview-body .ovopen { margin-left: auto; display: flex; align-items: center; gap: 5px;
+                         background: none; border: 1px solid transparent; border-radius: 6px;
+                         color: var(--muted); padding: 3px 8px; text-decoration: none;
+                         font: inherit; white-space: nowrap; }
+.overview-body .ovopen:hover { color: var(--fg); border-color: var(--border); }
+
+#overview { display: grid; padding: 6px; gap: var(--divider, 8px);
+            grid-template-columns: var(--ov-left, 360px) 1fr;
+            height: calc(100vh - var(--header-h, 38px)); }
+.ovpane { min-width: 0; }
+.ovpane.tool { background: var(--tool); }
+.panetitle { display: flex; align-items: center; padding: 0 10px; font-weight: 500; }
+.panemeta { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+.ovbody { flex: 1; min-height: 0; overflow: auto; padding: 6px 4px; }
+
+/* Rows read like the file tree: full weight when something is running there,
+   set back when idle, hover and selection borrowed from the tab strip so the
+   two pages highlight identically. */
+.ovtree, .ovsessions { list-style: none; margin: 0; padding: 0; }
+.ovrow { display: flex; align-items: center; gap: 6px; padding: 3px 6px;
+         border-radius: 4px; white-space: nowrap; }
+.ovrow a { color: var(--fg); text-decoration: none; min-width: 0; overflow: hidden;
+           text-overflow: ellipsis; }
+.ovrow:not(.live) a { color: var(--muted); }
+.ovrow:hover { background: var(--tab-hover); }
+.ovrow.current { background: var(--tab-on); }
 .ovrow.child { padding-left: 22px; }
-.ovrow.current { background: var(--bg2); font-weight: 600; }
-.ovrow a { text-decoration: none; }
 .ovrow.unreachable { opacity: .35; }
-.ovcaret { display: inline-block; width: 1em; cursor: pointer; color: var(--muted); }
+#ovprojects .branch { color: var(--muted); font-size: 12px; }
+.ovcaret { display: inline-block; width: 1em; flex: none; color: var(--muted); cursor: pointer; }
 .ovcaret.placeholder { cursor: default; }
-.ovchips .wtf { color: var(--muted); font-size: 12px; }
-.ovchips .wtf.on { color: var(--fg); }
-.ovshead { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
-.ovall { margin-left: 8px; }
-.ovsessions { list-style: none; margin: 0; padding: 0; }
-.ovsession { padding: 4px; border-radius: 3px; }
-.ovsession a { text-decoration: none; display: flex; gap: 8px; align-items: baseline; }
-.ovkind.on { color: var(--fg); }
-.ovkind { color: var(--muted); }
-.ovage, .ovatt { color: var(--muted); font-size: 12px; }
-.ovempty { color: var(--muted); padding: 6px 4px; }
+/* The chips themselves are already styled globally (`.wtf`, shared with the
+   header switcher — same helper renders both); this only lays them out. */
+.ovchips { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+
+.ovsession { border-radius: 4px; }
+.ovsession a { display: flex; align-items: center; gap: 10px; padding: 4px 8px;
+               color: var(--fg); text-decoration: none; }
+.ovsession:hover { background: var(--tab-hover); }
+/* Fixed width so every mark, label and age lines up down the column — a
+   ragged left edge is what made the first cut read as debug output. */
+.ovkind { flex: none; width: 5.5em; color: var(--muted); }
+/* The same orange the ✻ button carries in a pane, so "a Claude is here" is
+   one colour across the app. */
+.ovkind.on { color: var(--claude, #d97757); }
+/* Grouped left, not right-aligned: the pane is as wide as the window, and an
+   age pinned to the far edge sat a thousand pixels from the session it
+   described — the row stopped reading as one thing. */
+.ovlabel { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.ovage, .ovatt { flex: none; color: var(--muted); font-size: 12px; }
+.ovall { color: var(--accent); text-decoration: none; }
+.ovall:hover { text-decoration: underline; }
+.ovempty { color: var(--muted); padding: 6px 8px; }

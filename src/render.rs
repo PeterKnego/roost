@@ -722,17 +722,26 @@ pub fn overview_page(sel: &str, roots_label: &str) -> String {
          <link rel=\"stylesheet\" href=\"/static/style.css\">\
          <script src=\"/static/vendor/htmx.min.js\"></script>\
          </head><body class=\"overview-body\">\
-         <header><span class=\"proj\">resh</span>\
+         <header>\
+           <span class=\"home\">{SVG_DIAMOND}</span><span class=\"proj\">resh</span>\
+           <span class=\"vsep\"></span>\
            <span class=\"roots\" title=\"{roots}\">{roots}</span>\
-           <a class=\"openbtn\" href=\"/?at=\">＋ Open a directory</a>\
+           <a class=\"ovopen\" href=\"/?at=\" title=\"open a directory resh has not seen\">+ Open a directory</a>\
          </header>\
          <main id=\"overview\">\
-           <section id=\"ovprojects\" hx-get=\"/frag/_overview_projects?sel={qsel}\" hx-trigger=\"load, every 5s\"></section>\
-           <section id=\"ovsessions\" hx-get=\"/frag/_overview_sessions?sel={qsel}\" hx-trigger=\"load, every 5s\"></section>\
+           <section class=\"pane ovpane tool\">\
+             <div class=\"panehead\"><span class=\"panetitle\">Projects</span></div>\
+             <div id=\"ovprojects\" class=\"ovbody\" hx-get=\"/frag/_overview_projects?sel={qsel}\" hx-trigger=\"load, every 5s\"></div>\
+           </section>\
+           <section class=\"pane ovpane\">\
+             <div class=\"panehead\"><span class=\"panetitle\">Sessions</span><span id=\"ovscope\" class=\"panemeta\"></span></div>\
+             <div id=\"ovsessions\" class=\"ovbody\" hx-get=\"/frag/_overview_sessions?sel={qsel}\" hx-trigger=\"load, every 5s\"></div>\
+           </section>\
          </main>\
          <script src=\"/static/overview.js\"></script>\
          </body></html>",
         roots = esc(roots_label),
+        SVG_DIAMOND = SVG_DIAMOND,
     )
 }
 
@@ -1046,8 +1055,18 @@ pub fn overview_sessions(sel: &str, rows: &[OvSession]) -> String {
     } else {
         format!("in {}", esc(&crate::registry::decode_key(sel)))
     };
+    // The scope belongs in the pane's head, which htmx must not swap away —
+    // so it travels out of band into `#ovscope`, the same trick
+    // `worktrees_strip` uses for `#wtlabel`. The `All` way out only appears
+    // when there is something to get back from.
+    let all = if sel.is_empty() {
+        String::new()
+    } else {
+        " <a class=\"ovall\" href=\"/\">All</a>".to_string()
+    };
     let mut out = format!(
-        "<div class=\"ovshead\">SESSIONS · {scope} <a class=\"ovall\" href=\"/\">All</a></div><ul class=\"ovsessions\">"
+        "<span id=\"ovscope\" class=\"panemeta\" hx-swap-oob=\"true\">· {scope}{all}</span>\
+         <ul class=\"ovsessions\">"
     );
     if rows.is_empty() {
         out.push_str("<li class=\"ovempty\">no sessions running</li></ul>");

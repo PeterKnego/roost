@@ -1109,14 +1109,19 @@ mod tests {
     /// Revert-checked: with the `["frag", "_overview_sessions"]` arm
     /// removed, this falls through the catch-all and 404s ("no such
     /// project") instead of ever reaching `render::overview_sessions` —
-    /// panic showed the literal 404 response body, no `SESSIONS`/`ovsessions`
+    /// panic showed the literal 404 response body, no `ovscope`/`ovsessions`
     /// anywhere. Restored.
+    ///
+    /// Asserts on `ovscope` (the out-of-band scope label) and the list
+    /// class, not on the old inline "SESSIONS" heading: the pane title is
+    /// now static chrome in `overview_page`, so the fragment no longer
+    /// carries that word at all.
     #[test]
     fn the_overview_sessions_fragment_is_routed() {
         let d = tempfile::tempdir().unwrap();
         let roots = vec![d.path().to_path_buf()];
         let out = frag_route(&roots, "/frag/_overview_sessions");
-        assert!(out.contains("SESSIONS") && out.contains("ovsessions"), "{out}");
+        assert!(out.contains("ovscope") && out.contains("ovsessions"), "{out}");
     }
 
     #[test]
