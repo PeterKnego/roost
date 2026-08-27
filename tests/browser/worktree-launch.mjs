@@ -262,7 +262,11 @@ try {
   ok(sawRemove, "the remove control appears once the worktree is idle and clean");
   await evalIn(`window.confirm = () => true; document.querySelector("#wtstrip .wtremove").click()`);
   ok(await until(async () => !(await git(projDir, "worktree", "list", "--porcelain")).out.includes("claude-1"), 20, "worktree gone"), "clicking it removes the worktree");
-  ok((await git(projDir, "branch", "--list", "claude-1")).out.trim() === "", "…and its branch");
+  // `until`, like its neighbours: the branch goes in git step 2 of the same
+  // closure that removed the worktree in step 1, so an immediate check can
+  // land in the gap. Observed once on a slow host: worktree gone, branch
+  // still listed, then gone a moment later.
+  ok(await until(async () => (await git(projDir, "branch", "--list", "claude-1")).out.trim() === "", 10, "branch gone"), "…and its branch");
   ok(await until(async () => { try { await Deno.stat(`${projDir}/.claude/worktrees/claude-1`); return false; } catch { return true; } }, 5, "directory gone"), "the directory is gone");
 } finally {
   page?.close(); page2?.close();
