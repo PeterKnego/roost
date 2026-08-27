@@ -141,7 +141,15 @@ try {
   ok(clickedKey !== null, `found ${fx.project}'s row in the left pane and clicked it`);
   ok(await until(async () => (await page3.evalIn("location.search")).includes("sel="), 15, "?sel= navigation"),
      "clicking the row navigates to a ?sel= URL (the row-click intent, not the row's own <a>)");
-  ok(await until(async () => (await sessionsPane()).includes(sess) && !(await sessionsPane()).includes(sess2), 15, "narrowed sessions"),
+  // Project-qualified labels, as the "before selecting" check above uses:
+  // both fixtures' first terminal is named `term`, so a bare
+  // `includes(sess) && !includes(sess2)` is `includes("term") &&
+  // !includes("term")` — unsatisfiable. Found by the first real run of
+  // this file (the server's ?sel= round-trip was correct; the test wasn't).
+  ok(await until(async () => {
+    const t = await sessionsPane();
+    return t.includes(`${fx.project} · ${sess}`) && !t.includes(`${proj2} · ${sess2}`);
+  }, 15, "narrowed sessions"),
      `selecting ${fx.project} narrows #ovsessions to its own session and excludes ${proj2}'s`);
 
   ok(await until(() => page3.evalIn(`!!document.querySelector('.ovall')`), 10, "All link"),
