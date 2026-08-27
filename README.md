@@ -55,9 +55,15 @@ saved · changed on disk`), which is also where ⌘S is advertised when autosave
 is off. Turn it off with `autosave = false` in a global or per-project
 `.resh/config.toml` — see [`docs/deploy.md`](docs/deploy.md#autosave).
 
-**A directory picker, not a fixed list.** Browse into any directory under the
-configured roots and open it as a workspace — single click selects, double
-click descends, Enter opens, and git repos get a one-click shortcut.
+**A projects/worktrees/sessions overview.** The front page (`/`) is a
+two-pane overview: known projects and their worktrees on the left (expand a
+project to see its worktrees, each with its Claude/dirty/ahead state), and the
+live terminal/Claude sessions on the right — filtered to a project's family
+when you select one, all of them otherwise. Clicking a session opens its
+workspace with that terminal focused. **＋ Open a directory** (or `/?at=`)
+reaches the directory picker to open a directory resh hasn't seen — single
+click selects, double click descends, Enter opens, git repos get a one-click
+shortcut.
 
 **Dot entries are hidden, until you say otherwise.** The tree leaves out
 `.git`, `.claude` and every other dot entry by default, along with build and
@@ -107,7 +113,7 @@ environment — see [`docs/deploy.md`](docs/deploy.md).
 
 | Path | Purpose |
 |---|---|
-| `/` | Directory picker (`?at=` browses) |
+| `/` | Projects/worktrees/sessions overview (`?at=` is the directory picker) |
 | `/{project}` | Workspace — may be nested, e.g. `/karpie/src` |
 | `/frag/{project}/…` | Server-rendered HTML fragments |
 | `/ws/{project}/_workspace` | Workspace state socket — JSON intents up, events down |
