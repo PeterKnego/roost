@@ -1,5 +1,6 @@
 //! HTTP request routing. URL surface (spec §URLs):
-//!   /                    directory picker (?at=<rel> browses a subdirectory)
+//!   /                    overview shell (?at=<rel> reaches the directory
+//!                        picker instead, to browse a subdirectory)
 //!   /{project}           workspace page — {project} may be multi-segment,
 //!                        e.g. /karpie/src, naming a nested directory
 //!   /static/*            assets
@@ -161,10 +162,16 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
     }
 }
 
-/// `/` — the directory picker. `?at=<rel>` browses one directory; with no
-/// `at` (or one that fails to resolve — refused the same way opening it as
-/// a workspace would be) it shows the merged top level of both ROOTS.
+/// `/` — with no `at` query, the projects/sessions overview shell (panes
+/// fill in over htmx). `?at=<rel>` browses one directory in the picker
+/// instead; an `at` that fails to resolve is refused the same way opening it
+/// as a workspace would be, showing the merged top level of both ROOTS.
 fn serve_index(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
+    // `at` absent → the overview; `at` present (empty included) → the picker.
+    if req.query.get("at").is_none() {
+        let label = roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(":");
+        return http::html(w, &render::overview_page(&label));
+    }
     let requested = req.query.get("at").map(String::as_str).unwrap_or("");
     let (at, entries, refused) = match projects::list_dir(roots, requested) {
         Some(entries) => (requested, entries, false),
@@ -1011,6 +1018,23 @@ mod tests {
         let out = frag_route(&roots, "/frag/_worktrees?current=nosuch");
         assert!(out.contains("id=\"wtlabel\""), "{out}");
         assert!(out.contains("no worktrees"), "{out}");
+    }
+
+    #[test]
+    fn root_with_no_at_serves_the_overview_and_at_serves_the_picker() {
+        // Revert-checked: with serve_index always calling index_page, the
+        // first assertion fails (no overview markup at `/`) — the response
+        // body is the picker's `<ul class="picker" id="picker" ...>`, no
+        // `id="overview"` anywhere. See
+        // .superpowers/sdd/2026-08-26-overview-page/task-1-report.md for the
+        // captured failure output.
+        let d = tempfile::tempdir().unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let overview = frag_route(&roots, "/");
+        assert!(overview.contains("id=\"overview\""), "no-at is the overview: {overview}");
+        assert!(overview.contains("_overview_projects") && overview.contains("_overview_sessions"), "{overview}");
+        let picker = frag_route(&roots, "/?at=");
+        assert!(picker.contains("id=\"picker\""), "?at= is the picker: {picker}");
     }
 
     // Revert-checked: dropping the `state=1` branch entirely (always calling

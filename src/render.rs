@@ -704,6 +704,33 @@ pub fn index_page(at: &str, entries: &[Entry], refused: bool, projects: &[crate:
     )
 }
 
+/// The front page: a two-pane overview. Both panes are htmx fragments that
+/// load on open and poll (see `overview.js` / the fragment routes); this
+/// shell only lays them out. The picker still lives on `/`, reached by the
+/// `?at=` query and the "Open a directory" button here — no new reserved
+/// path, which would collide with a project of that name the way `static`
+/// and `frag` already can.
+pub fn overview_page(roots_label: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>resh</title>\
+         <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
+         <link rel=\"stylesheet\" href=\"/static/style.css\">\
+         <script src=\"/static/vendor/htmx.min.js\"></script>\
+         </head><body class=\"overview-body\">\
+         <header><span class=\"proj\">resh</span>\
+           <span class=\"roots\" title=\"{roots}\"></span>\
+           <a class=\"openbtn\" href=\"/?at=\">＋ Open a directory</a>\
+         </header>\
+         <main id=\"overview\">\
+           <section id=\"ovprojects\" hx-get=\"/frag/_overview_projects\" hx-trigger=\"load, every 5s\"></section>\
+           <section id=\"ovsessions\" hx-get=\"/frag/_overview_sessions\" hx-trigger=\"load, every 5s\"></section>\
+         </main>\
+         <script src=\"/static/overview.js\"></script>\
+         </body></html>",
+        roots = esc(roots_label),
+    )
+}
+
 /// The header strip of known projects. ● means live sessions, ○ means a saved
 /// layout with nothing running — the distinction that answers "what did I
 /// leave running?" without opening anything.
@@ -1878,6 +1905,17 @@ mod tests {
         assert!(h2.contains("class=\"dir\" data-rel=\"karpie/sub\""));
         assert!(h2.contains("class=\"file\""));
         assert!(!h2.contains("data-rel=\"karpie/main.rs\"")); // files carry no selection hook
+    }
+
+    #[test]
+    fn overview_page_wires_both_fragment_panes() {
+        let h = overview_page("/home/claude/projects");
+        assert!(h.contains("id=\"overview\""));
+        assert!(h.contains("hx-get=\"/frag/_overview_projects\""), "{h}");
+        assert!(h.contains("hx-get=\"/frag/_overview_sessions\""), "{h}");
+        assert!(h.contains("/static/overview.js"), "{h}");
+        // The picker entry point, not a new reserved path.
+        assert!(h.contains("href=\"/?at=\""), "open-a-directory reaches the picker: {h}");
     }
 
     // A picker row for a directory that is also a known project carries the
