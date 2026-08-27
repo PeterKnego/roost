@@ -588,10 +588,6 @@ pub fn ages_snapshot() -> HashMap<u32, u64> {
     }
 }
 
-/// Parses `ps -Aww -o pid=,etime=` output: one `pid etime` pair per line,
-/// split on the first run of whitespace. A line that doesn't parse (an
-/// unexpected column, a truncated read) is skipped rather than panicking —
-/// one bad row from a live `ps` shouldn't blank every other session's age.
 /// The age of a session is the age of the oldest process holding its socket
 /// — the dtach master, which outlives resh. `child_pid` is only the client
 /// *this* resh spawned, so after a restart it reports "10m" for an 18-hour
@@ -601,6 +597,10 @@ pub fn oldest_age_of(pids: &[u32], ages: &HashMap<u32, u64>) -> Option<u64> {
     pids.iter().filter_map(|p| ages.get(p).copied()).max()
 }
 
+/// Parses `ps -Aww -o pid=,etime=` output: one `pid etime` pair per line,
+/// split on the first run of whitespace. A line that doesn't parse (an
+/// unexpected column, a truncated read) is skipped rather than panicking —
+/// one bad row from a live `ps` shouldn't blank every other session's age.
 pub fn parse_ages(out: &str) -> HashMap<u32, u64> {
     let mut m = HashMap::new();
     for line in out.lines() {
@@ -662,6 +662,10 @@ pub fn launched_names(project: &str) -> Vec<(String, LaunchRequest)> {
 /// `.origin` is metadata about the project key, not a session.
 fn socket_names(project: &str) -> Vec<String> {
     let dir = crate::wsstate::state_dir().join("sock").join(crate::projects::storage_key(project));
+    // An unreadable socket dir reads as "no sessions" here. Display-only:
+    // this feeds listings, never `reconcile`'s reaping, so the fold hides a
+    // row for one refresh and destroys nothing — the exception CLAUDE.md's
+    // table allows, stated so it is not mistaken for the destructive kind.
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
     rd.flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -1233,7 +1237,6 @@ mod tests {
         std::env::remove_var("RESH_CMD");
     }
 
-    #[test]
     /// Revert-checked: `.min()` instead of `.max()` fails with
     /// `left: Some(30) right: Some(64000)` — the master is the oldest holder.
     #[test]
@@ -1268,8 +1271,6 @@ mod tests {
         assert_eq!(m.len(), 1);
     }
 
-    #[test]
-    // The "no ps" property is structural (live_rows has no ps call); this asserts the scan's data is real.
     /// After a resh restart the in-memory map is empty while the sockets
     /// on disk still name every surviving shell. Revert-checked: without the
     /// socket-floor merge this failed with `left: [] right: [("term7", 0, 0)]`.
@@ -1288,6 +1289,7 @@ mod tests {
         assert!(live_rows("ghostproj").is_empty(), "live_rows stays in-memory only (list_sessions' contract)");
     }
 
+    // The "no ps" property is structural (live_rows has no ps call); this asserts the scan's data is real.
     #[test]
     fn live_rows_lists_a_projects_sessions_without_forking_ps() {
         let _s = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

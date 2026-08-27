@@ -52,27 +52,58 @@ pub fn evidence_from(launched: &[String], connected: &[Sess], ide_on: bool) -> C
 /// `proc_root` is injectable so a fake `/proc` can drive the test; an
 /// unreadable entry is skipped, never treated as "no Claude here".
 pub fn claudes_in_proc(proc_root: &std::path::Path, project: &str) -> Vec<String> {
+    names_for(project, &claude_terminals(proc_root))
+}
+
+/// Every `(project, terminal)` a running `claude` sits in, from ONE walk of
+/// `proc_root`. The overview polls every few seconds and asks about every
+/// project, so the walk is done once per request and shared — the same
+/// hoisting `ages_snapshot`/`holders_snapshot` do for `ps` — rather than
+/// once per project. An entry whose environment cannot be read is skipped,
+/// never counted as "no Claude".
+pub fn claude_terminals(proc_root: &std::path::Path) -> Vec<(String, String)> {
     let Ok(rd) = std::fs::read_dir(proc_root) else { return Vec::new() };
-    let mut names = Vec::new();
+    let mut out = Vec::new();
     for e in rd.flatten() {
-        let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
+        let Ok(_pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
         let Ok(comm) = std::fs::read_to_string(e.path().join("comm")) else { continue };
         if comm.trim() != "claude" {
             continue;
         }
-        if let Sess::In(name) = crate::idesess::session_of_in(proc_root, pid, project) {
-            names.push(name);
+        let Ok(raw) = std::fs::read(e.path().join("environ")) else { continue };
+        let (mut proj, mut sess) = (None, None);
+        for entry in raw.split(|b| *b == 0) {
+            let Ok(kv) = std::str::from_utf8(entry) else { continue };
+            if let Some(v) = kv.strip_prefix("RESH_PROJECT=") { proj = Some(v.to_string()); }
+            else if let Some(v) = kv.strip_prefix("RESH_SESSION=") { sess = Some(v.to_string()); }
+        }
+        if let (Some(p), Some(s)) = (proj, sess) {
+            if crate::session::valid_name(&s) {
+                out.push((p, s));
+            }
         }
     }
-    names.sort();
-    names.dedup();
-    names
+    out.sort();
+    out.dedup();
+    out
 }
 
+fn names_for(project: &str, scan: &[(String, String)]) -> Vec<String> {
+    scan.iter().filter(|(p, _)| p == project).map(|(_, s)| s.clone()).collect()
+}
+
+/// One project's evidence, walking `/proc` itself. For a single question —
+/// a ✻ click — this is the right call; a loop over projects should scan
+/// once with `claude_terminals` and use `claude_evidence_with_scan`.
 pub fn claude_evidence(project: &str) -> ClaudeEvidence {
+    claude_evidence_with_scan(project, &claude_terminals(std::path::Path::new("/proc")))
+}
+
+/// `claude_evidence` over an already-taken process scan.
+pub fn claude_evidence_with_scan(project: &str, scan: &[(String, String)]) -> ClaudeEvidence {
     let mut launched: Vec<String> =
         crate::session::launched_names(project).into_iter().map(|(n, _)| n).collect();
-    launched.extend(claudes_in_proc(std::path::Path::new("/proc"), project));
+    launched.extend(names_for(project, scan));
     evidence_from(&launched, &crate::ide::connected_sessions(project), crate::config::ide_enabled())
 }
 
@@ -142,5 +173,10 @@ mod tests {
         std::fs::write(d.path().join("self"), b"").unwrap(); // a non-pid entry, skipped
         assert_eq!(claudes_in_proc(d.path(), "karpie"), vec!["term3".to_string()]);
         assert!(claudes_in_proc(d.path(), "nowhere").is_empty());
+        // The one-walk scan every loop shares: both claudes, neither the bash.
+        assert_eq!(
+            claude_terminals(d.path()),
+            vec![("karpie".to_string(), "term3".to_string()), ("other".to_string(), "term".to_string())]
+        );
     }
 }

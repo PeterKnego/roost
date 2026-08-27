@@ -95,6 +95,8 @@ pub fn known_projects_with_state(roots: &[PathBuf]) -> Vec<ProjectStatus> {
             }
         }
     }
+    // One /proc walk for every worktree row, not one per row.
+    let scan = crate::claudes::claude_terminals(std::path::Path::new("/proc"));
     for p in ps.iter_mut() {
         let Some(parent) = p.parent.as_deref() else { continue };
         if !p.reachable { continue }
@@ -116,7 +118,7 @@ pub fn known_projects_with_state(roots: &[PathBuf]) -> Vec<ProjectStatus> {
         let base_for_ahead = if base.is_empty() { NULL_SHA } else { base.as_str() };
         let st = crate::worktree::state(&dir, base_for_ahead, &crate::worktree::real_git);
         p.wt = Some(WorktreeStatus {
-            claude: crate::claudes::claude_evidence(&p.url),
+            claude: crate::claudes::claude_evidence_with_scan(&p.url, &scan),
             dirty: st.dirty,
             ahead: st.ahead,
             base,

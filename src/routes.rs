@@ -191,11 +191,12 @@ fn build_overview_sessions(roots: &[PathBuf], sel: &str) -> Vec<render::OvSessio
     // Who holds each socket: the dtach master is the oldest holder and is
     // the session's real age; `child_pid` is only this resh's client.
     let holders = registry::holders_snapshot().unwrap_or_default();
+    let scan = crate::claudes::claude_terminals(std::path::Path::new("/proc"));
     let mut rows = Vec::new();
     for p in in_scope {
         let launched: std::collections::HashSet<String> =
             crate::session::launched_names(&p.url).into_iter().map(|(n, _)| n).collect();
-        let evidence = crate::claudes::claude_evidence(&p.url);
+        let evidence = crate::claudes::claude_evidence_with_scan(&p.url, &scan);
         for (name, pid, attached) in crate::session::session_rows(&p.url) {
             let is_claude = launched.contains(&name)
                 || matches!(&evidence, crate::claudes::ClaudeEvidence::Present(ts) if ts.iter().any(|t| t == &name));
