@@ -94,6 +94,12 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
             let ps = registry::known_projects_with_state(roots);
             http::html(w, &render::overview_projects(sel, &ps));
         }
+        // Same shape as _overview_projects above, same reason it sits before
+        // the general frag arm.
+        ["frag", "_overview_sessions"] => {
+            let sel = req.query.get("sel").map(String::as_str).unwrap_or("");
+            http::html(w, &render::overview_sessions(sel, &build_overview_sessions(roots, sel)));
+        }
         // Root scope, not /static/sw.js: a service worker may only control
         // URLs under its own path, and this one has to focus and navigate
         // workspace tabs at /{project}.
@@ -167,6 +173,39 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
             serve_workspace(w, roots, &full)
         }
     }
+}
+
+/// The scope resolution + data gathering for the session pane. `sel` empty →
+/// every known project; a project key → it and its worktree children; a
+/// worktree key → just it. One ages snapshot for the whole set, since
+/// `session::ages_snapshot` is already a single `ps` fork for the host — see
+/// its doc comment on why per-session `ps` is what the overview must avoid.
+fn build_overview_sessions(roots: &[PathBuf], sel: &str) -> Vec<render::OvSession> {
+    let all = registry::known_projects(roots);
+    let in_scope: Vec<&registry::ProjectStatus> = if sel.is_empty() {
+        all.iter().collect()
+    } else {
+        all.iter().filter(|p| p.key == sel || p.parent.as_deref() == Some(sel)).collect()
+    };
+    let ages = crate::session::ages_snapshot();
+    let mut rows = Vec::new();
+    for p in in_scope {
+        let launched: std::collections::HashSet<String> =
+            crate::session::launched_names(&p.url).into_iter().map(|(n, _)| n).collect();
+        let evidence = crate::claudes::claude_evidence(&p.url);
+        for (name, pid, attached) in crate::session::live_rows(&p.url) {
+            let is_claude = launched.contains(&name)
+                || matches!(&evidence, crate::claudes::ClaudeEvidence::Present(ts) if ts.iter().any(|t| t == &name));
+            rows.push(render::OvSession {
+                project_url: p.url.clone(),
+                name,
+                is_claude,
+                age_secs: ages.get(&pid).copied(),
+                attached,
+            });
+        }
+    }
+    rows
 }
 
 /// `/` — with no `at` query, the projects/sessions overview shell (panes
@@ -1025,6 +1064,52 @@ mod tests {
         let out = frag_route(&roots, "/frag/_worktrees?current=nosuch");
         assert!(out.contains("id=\"wtlabel\""), "{out}");
         assert!(out.contains("no worktrees"), "{out}");
+    }
+
+    /// Dispatch through the real router, like `the_worktrees_fragment_is_routed`
+    /// above (whose own comment explains why: a direct call to
+    /// `render::overview_projects` would stay green even if the `["frag",
+    /// "_overview_projects"]` arm were deleted or the router could never
+    /// reach it, since that arm must sit ahead of the general two-segment
+    /// `["frag", rest @ ..]` fragment arm — see that arm's own comment on
+    /// why `_projects`/`_worktrees` need the same placement). Asserting on
+    /// `ovtree`, the class the fragment always emits regardless of how many
+    /// (if any) real projects the host's state directory holds, keeps this
+    /// independent of what's actually on disk.
+    ///
+    /// Revert-checked: with the `["frag", "_overview_projects"]` arm
+    /// removed, this falls through the catch-all and 404s ("no such
+    /// project") instead of ever reaching `render::overview_projects` —
+    /// panic showed the literal 404 response body, no `ovtree` anywhere.
+    /// Restored.
+    #[test]
+    fn the_overview_projects_fragment_is_routed() {
+        let d = tempfile::tempdir().unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let out = frag_route(&roots, "/frag/_overview_projects");
+        assert!(out.contains("ovtree"), "{out}");
+    }
+
+    /// Same reasoning as `the_overview_projects_fragment_is_routed` above,
+    /// for the `["frag", "_overview_sessions"]` arm added in Task 4. Before
+    /// that arm exists, this path falls through to the catch-all and is
+    /// treated as a project literally named "frag/_overview_sessions" — a
+    /// 404, not this fragment's markup — so the assertion below cannot pass
+    /// early. `SESSIONS` (the pane heading) and `ovsessions` (the list
+    /// class) are both emitted unconditionally, independent of whether the
+    /// host's state directory holds any real sessions.
+    ///
+    /// Revert-checked: with the `["frag", "_overview_sessions"]` arm
+    /// removed, this falls through the catch-all and 404s ("no such
+    /// project") instead of ever reaching `render::overview_sessions` —
+    /// panic showed the literal 404 response body, no `SESSIONS`/`ovsessions`
+    /// anywhere. Restored.
+    #[test]
+    fn the_overview_sessions_fragment_is_routed() {
+        let d = tempfile::tempdir().unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let out = frag_route(&roots, "/frag/_overview_sessions");
+        assert!(out.contains("SESSIONS") && out.contains("ovsessions"), "{out}");
     }
 
     #[test]

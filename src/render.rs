@@ -1018,6 +1018,62 @@ pub fn human_age(secs: u64) -> String {
     }
 }
 
+pub struct OvSession {
+    pub project_url: String,
+    pub name: String,
+    pub is_claude: bool,
+    pub age_secs: Option<u64>,
+    pub attached: usize,
+}
+
+/// The overview's right pane. Pure over `rows` so it is tested without a
+/// real `ps` or IDE socket. Each row: ✻ Claude vs ○ shell (Claude only when
+/// the caller had positive evidence), the project/worktree label, a coarse
+/// age (never `0` for unknown — `—`), and the attached-browser count. The
+/// row links to `/<project>?focus=<session>`.
+pub fn overview_sessions(sel: &str, rows: &[OvSession]) -> String {
+    let scope = if sel.is_empty() {
+        "all active".to_string()
+    } else {
+        format!("in {}", esc(&crate::registry::decode_key(sel)))
+    };
+    let mut out = format!(
+        "<div class=\"ovshead\">SESSIONS · {scope} <a class=\"ovall\" href=\"/\">All</a></div><ul class=\"ovsessions\">"
+    );
+    if rows.is_empty() {
+        out.push_str("<li class=\"ovempty\">no sessions running</li></ul>");
+        return out;
+    }
+    for r in rows {
+        let mark = if r.is_claude {
+            "<span class=\"ovkind on\" title=\"Claude\">✻ claude</span>"
+        } else {
+            "<span class=\"ovkind\" title=\"shell\">○ shell</span>"
+        };
+        let age = match r.age_secs {
+            Some(s) => human_age(s),
+            None => "—".to_string(),
+        };
+        let attached = if r.attached > 0 {
+            format!(" <span class=\"ovatt\">·{}</span>", r.attached)
+        } else {
+            String::new()
+        };
+        let href = format!(
+            "/{}?focus={}",
+            crate::http::percent_encode(&r.project_url),
+            crate::http::percent_encode(&r.name)
+        );
+        out.push_str(&format!(
+            "<li class=\"ovsession\"><a href=\"{href}\">{mark} <span class=\"ovlabel\">{} · {}</span> <span class=\"ovage\">{age}</span>{attached}</a></li>",
+            esc(&r.project_url),
+            esc(&r.name)
+        ));
+    }
+    out.push_str("</ul>");
+    out
+}
+
 // `theme_rel` is interpolated into an `href` below without `esc` or
 // `percent_encode`, unlike every other value this function interpolates.
 // Nothing is injectable today — `routes::theme_link_for` only ever returns
@@ -2560,5 +2616,39 @@ mod tests {
         ];
         let out = overview_projects("", &ps);
         assert!(out.contains("unreachable"), "{out}");
+    }
+
+    #[test]
+    fn overview_sessions_marks_claude_only_on_evidence_and_shows_label_age_attached() {
+        // Revert-checked: forcing `mark` to always render the claude span
+        // (dropping `r.is_claude`) fails the "shell row marked ○" assertion
+        // — panic showed the shell row rendered "✻ claude" instead of "○
+        // shell". Also revert-checked: rendering `None` age as the literal
+        // "0" (rather than "—") fails the "unknown age must not render as 0"
+        // assertion. Both restored.
+        let rows = vec![
+            OvSession { project_url: "ultima".into(), name: "term".into(), is_claude: true, age_secs: Some(14400), attached: 1 },
+            OvSession { project_url: "ultima/.claude/worktrees/claude-1".into(), name: "term".into(), is_claude: true, age_secs: Some(1200), attached: 0 },
+            OvSession { project_url: "resh".into(), name: "shell".into(), is_claude: false, age_secs: None, attached: 0 },
+        ];
+        let out = overview_sessions("", &rows);
+        assert!(out.contains("claude") && out.contains("✻"), "claude row: {out}");
+        assert!(out.contains("shell") && out.contains("○"), "shell row marked ○: {out}");
+        assert!(out.contains("4h") && out.contains("20m"), "coarse ages: {out}");
+        assert!(out.contains("ultima/.claude/worktrees/claude-1"), "worktree label: {out}");
+        assert!(out.contains("·1"), "attached count: {out}");
+        // The click target: /<project>?focus=<session>, percent-encoded project.
+        assert!(out.contains("?focus=term"), "{out}");
+        // Unknown age is not 0.
+        assert!(!out.contains(">0<"), "unknown age must not render as 0: {out}");
+    }
+
+    #[test]
+    fn overview_sessions_empty_scope_says_so() {
+        // Revert-checked: skipping the empty-rows branch (never emitting the
+        // "no sessions running" `<li>`) fails this assertion — panic showed
+        // just the empty `<ul class="ovsessions"></ul>` with no message. Restored.
+        let out = overview_sessions("", &[]);
+        assert!(out.contains("no sessions") || out.contains("nothing running"), "{out}");
     }
 }
