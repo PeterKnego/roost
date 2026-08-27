@@ -828,11 +828,15 @@ pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectSta
     out
 }
 
-/// The per-worktree state chips (Claude / dirty / ahead) and, when every
-/// axis is positively clean, the remove control. Shared by the header
-/// switcher and the overview's left pane so the two never drift. `None`
-/// on any axis renders `?`, never "clean" — see the switcher's own comment.
-fn worktree_chips(w: &crate::registry::WorktreeStatus, key: &str, live: usize) -> String {
+/// The per-worktree state chips (Claude / dirty / ahead) and, when
+/// `show_remove` is set and every axis is positively clean, the remove
+/// control. Shared by the header switcher and the overview's left pane so
+/// the two never drift on the chips themselves — but only the switcher
+/// carries the JS handler for `.wtremove`, so only it passes `show_remove:
+/// true`; the overview's left pane loads no such handler and would leave
+/// the button dead, so it passes `false`. `None` on any axis renders `?`,
+/// never "clean" — see the switcher's own comment.
+fn worktree_chips(w: &crate::registry::WorktreeStatus, key: &str, live: usize, show_remove: bool) -> String {
     let claude = match &w.claude {
         crate::claudes::ClaudeEvidence::Present(_) => "<span class=\"wtf on\" title=\"a Claude is running here\">✻</span>".to_string(),
         crate::claudes::ClaudeEvidence::Absent => "<span class=\"wtf\" title=\"no Claude here\">—</span>".to_string(),
@@ -852,7 +856,7 @@ fn worktree_chips(w: &crate::registry::WorktreeStatus, key: &str, live: usize) -
         Some(n) => format!("<span class=\"wtf{}\" title=\"{against}. A squash-merged branch stays ahead forever; remove it by hand.\">{n} ahead</span>", if n > 0 { " on" } else { "" }),
         None => "<span class=\"wtf\" title=\"git did not answer (rev-list), or no base is known\">?</span>".to_string(),
     };
-    let remove = if crate::registry::removable(w, live) {
+    let remove = if show_remove && crate::registry::removable(w, live) {
         format!(" <button class=\"wtremove\" data-key=\"{}\" title=\"remove this worktree and its branch\">✕</button>", esc(key))
     } else {
         String::new()
@@ -944,7 +948,7 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
         // otherwise, and `None` renders no state at all, never "clean".
         let state_html = match &p.wt {
             None => String::new(),
-            Some(w) => format!(" · {}", worktree_chips(w, &p.key, p.live)),
+            Some(w) => format!(" · {}", worktree_chips(w, &p.key, p.live, true)),
         };
         // A `<button>` cannot nest inside an `<a>` (invalid HTML), so the row
         // is a flex span wrapping the link and the state/control separately.
@@ -984,7 +988,7 @@ pub fn overview_projects(sel: &str, projects: &[crate::registry::ProjectStatus])
         };
         let name = if is_child { p.url.rsplit('/').next().unwrap_or(&p.url) } else { p.url.as_str() };
         let branch = if p.branch.is_empty() { String::new() } else { format!(" <span class=\"branch\">⎇ {}</span>", esc(&p.branch)) };
-        let chips = match &p.wt { Some(w) => format!(" <span class=\"ovchips\">{}</span>", worktree_chips(w, &p.key, p.live)), None => String::new() };
+        let chips = match &p.wt { Some(w) => format!(" <span class=\"ovchips\">{}</span>", worktree_chips(w, &p.key, p.live, false)), None => String::new() };
         let parent_attr = p.parent.as_deref().map(|pk| format!(" data-parent=\"{}\"", esc(pk))).unwrap_or_default();
         if !p.reachable {
             out.push_str(&format!(
@@ -2635,6 +2639,28 @@ mod tests {
         assert!(out.contains("data-key=\"ultima\""), "{out}");
         assert!(out.contains("data-parent=\"ultima\"") && out.contains("claude-1"), "child under parent: {out}");
         assert!(out.contains("✻") && out.contains("dirty") && out.contains("3 ahead"), "chips reused: {out}");
+    }
+
+    #[test]
+    fn overview_projects_never_renders_the_remove_button_even_when_removable() {
+        // The overview's left pane loads only overview.js + htmx — no remove
+        // handler — so the ✕ affordance from worktree_chips must stay
+        // suppressed there even for a worktree that `registry::removable`
+        // would allow (live == 0, everything clean).
+        //
+        // Revert-checked: passing `true` (or dropping the gate entirely) for
+        // overview_projects's call into worktree_chips makes this fail —
+        // observed `assertion failed: !out.contains("wtremove")` because the
+        // row then renders `<button class="wtremove" ...>✕</button>`.
+        use crate::claudes::ClaudeEvidence;
+        let wt = crate::registry::WorktreeStatus { claude: ClaudeEvidence::Absent, dirty: Some(false), ahead: Some(0), base: "main".into(), base_recorded: true };
+        let ps = vec![
+            ps_row("ultima", "ultima", 1, "main", None, None),
+            ps_row("ultima%2F.claude%2Fworktrees%2Fclaude-1", "ultima/.claude/worktrees/claude-1", 0, "claude-1", Some("ultima"), Some(wt)),
+        ];
+        assert!(crate::registry::removable(ps[1].wt.as_ref().unwrap(), ps[1].live), "fixture must actually be removable");
+        let out = overview_projects("ultima", &ps);
+        assert!(!out.contains("wtremove"), "{out}");
     }
 
     #[test]

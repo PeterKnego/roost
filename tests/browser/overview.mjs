@@ -43,24 +43,17 @@
 //!       is not independently observable through this test — the mark is
 //!       text, not checked against process state here — which is why the
 //!       brief redirects that revert-check to the scope-empty one instead.)
-//!   (c) Section D: tracing the server and client while writing this file —
-//!       `routes.rs`'s `serve_index`, `render.rs`'s `overview_page`, and
-//!       `overview.js`'s click handler — found no code path that carries
-//!       `?sel=` from the row-click navigation into either fragment's
-//!       `hx-get` (both are hardcoded strings with no query string). This
-//!       was confirmed directly, outside the browser, by building resh and
-//!       curling a throwaway instance: `GET /` and `GET /?sel=proj` return
-//!       byte-identical `hx-get="/frag/_overview_projects"` /
-//!       `hx-get="/frag/_overview_sessions"` markup. If that is still true
-//!       when this file is finally run, Section D's "narrows" and (to a
-//!       lesser extent, since an always-unfiltered view also "widens" back
-//!       to nothing changed) "widens" assertions are expected to FAIL for
-//!       real — that is a genuine product gap (the client never re-supplies
-//!       `sel` to the polled fragments, whether via `overview.js` reading
-//!       `location.search` on load or `overview_page` threading it through
-//!       the initial `hx-get` attributes), not a bug in this test. Fixing it
-//!       is outside this task's scope (no Rust/JS changes) and is called
-//!       out separately in the task report.
+//!   (c) Section D: at the time this file was first written, `?sel=` was
+//!       not carried from the row-click navigation into either fragment's
+//!       `hx-get`, so Section D was expected to fail for real. That gap was
+//!       closed in commit 5b411b3: `render.rs`'s `overview_page` now bakes
+//!       `?sel=<key>` into both fragments' `hx-get` URLs, and `routes.rs`'s
+//!       `serve_index` reads `sel` off the query string to render it. So as
+//!       of that commit, all four sections — including Section D's "narrows"
+//!       and "widens" assertions — are expected to PASS when this file is
+//!       run against a real Chromium. Revert `overview_page`'s `?sel=`
+//!       threading (or `serve_index`'s reading of it) to re-observe Section D
+//!       fail the way it originally did.
 //!
 //! Run: deno run -A tests/browser/overview.mjs
 import { fixture, freePort, openPage, attachTarget, profileDir, startBrowser, startResh, until, sleep }
