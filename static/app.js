@@ -331,7 +331,16 @@ function onEvent(ev) {
       break;
     }
     case "TreeChanged": refreshTree(); break;
-    case "StatusChanged": refreshKind("Changes"); break;
+    // The header chip renders the same `git status` the Changes pane does —
+    // its dirty dot and counts went stale in exactly the same way, and until
+    // this event started firing on ordinary edits (watch.rs) there was
+    // nothing to hang it on. A dedicated "git" trigger rather than "refresh":
+    // that one also refetches the projects and worktrees strips, which have
+    // no stake in this project's working tree.
+    case "StatusChanged":
+      refreshKind("Changes");
+      document.body.dispatchEvent(new Event("git")); // #gitinfo hx-trigger listens
+      break;
     case "FileChanged": refreshKind("Diff"); refreshFile(ev.rel); break;
     case "SaveConflict":
       // Without this an autosaving client re-raises the banner every second.

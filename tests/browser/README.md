@@ -36,6 +36,7 @@ deno run -A tests/browser/worktrees.mjs # the header's worktree switcher chip + 
 deno run -A tests/browser/worktree-launch.mjs # the ✻ prompt, worktree creation into a second tab, switcher state and removal; needs a real CDP click for window.open
 deno run -A tests/browser/overview.mjs   # the front page (/): live session list, clicking one focuses it, ?at= reaches the picker, and selecting a project narrows/widens the session list
 deno run -A tests/browser/claudetab.mjs  # a terminal tab running a Claude wears the Claude mark: the /proc watcher, the data-claude attribute, and the CSS that turns it into a different picture
+deno run -A tests/browser/changes.mjs    # the Changes pane and the header chip follow the working tree, not just `.git/index`
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -133,6 +134,17 @@ performed.
   of the two fails. Both halves were watched failing — the plain-Enter half
   first passed for the wrong reason, reading the *previous* probe's number out
   of the scrollback, which only agreed while both answers were 13.
+- In `changes.mjs`: putting `StatusChanged` back behind `.git/index`/`.git/HEAD`
+  alone (the `Class::Ignore` guard in `watch.rs`'s batch loop) fails 8 of the 13
+  — every "it appeared" assertion, in all four sections. Restoring that and
+  dropping only app.js's `new Event("git")` dispatch fails exactly 2, both in
+  the header chip, so the two halves of the fix are separately attributable.
+  Section B's 2-second settle is load-bearing, not politeness: serving the pane
+  runs `git status`, which writes `.git/index` to refresh its stat cache, and
+  that write was already a refresh trigger — without the wait, the load's own
+  round trip carries B's edit into the pane and B is the *only* section that
+  survives the revert. It passed for that wrong reason once, which is how the
+  wait got there.
 - In `claudetab.mjs`: deleting `app.js`'s `b.dataset.claude` fails 3, starting
   with the marking itself; deleting the `.tabstrip .tab[data-claude]` rule
   from `style.css` fails only 2 — "the picture actually changed" and "brand-
