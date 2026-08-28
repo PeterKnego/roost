@@ -460,6 +460,13 @@ details[open] > summary { background-image: var(--twisty-open); }
   --ic-img: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%2326a69a' d='M8.5 6h4l-4-4zM3.875 1H9.5l4 4v8.6c0 .773-.616 1.4-1.375 1.4h-8.25c-.76 0-1.375-.627-1.375-1.4V2.4c0-.777.612-1.4 1.375-1.4M4 13.6h8V8l-2.625 2.8L8 9.4zm1.25-7.7c-.76 0-1.375.627-1.375 1.4s.616 1.4 1.375 1.4c.76 0 1.375-.627 1.375-1.4S6.009 5.9 5.25 5.9'/%3E%3C/svg%3E");
 
   --ic-branch: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%238c8c8c' stroke-width='1.2'%3E%3Ccircle cx='5' cy='3.6' r='1.7'/%3E%3Ccircle cx='5' cy='12.4' r='1.7'/%3E%3Ccircle cx='11.4' cy='3.6' r='1.7'/%3E%3Cpath d='M5 5.3v5.4M11.4 5.3v1.5a2.6 2.6 0 0 1-2.6 2.6H6.6'/%3E%3C/svg%3E");
+  /* The Claude mark on a terminal tab that is running one. Same path data as
+     app.js's CLAUDE_MARK, which paints the launcher button; there is no build
+     step here to share one source between an inline <svg> and a CSS url(), so
+     the two are kept in step by hand — change one, change the other.
+     Brand-filled rather than stroked with --ic's grey: the point of the real
+     mark is that it is recognisable. */
+  --ic-claude: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23D97757'%3E%3Cpath d='M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z'/%3E%3C/svg%3E");
   --ic-term: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%238c8c8c' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='2' y='3' width='12' height='10' rx='1.2'/%3E%3Cpath d='M4.8 6.4l1.9 1.7-1.9 1.7M8.9 10.3h3'/%3E%3C/svg%3E");
   --ic-diff: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke-width='1.4' stroke-linecap='round'%3E%3Cg stroke='%236fbf73'%3E%3Cpath d='M8 3v4.6M5.7 5.3h4.6'/%3E%3C/g%3E%3Cg stroke='%23e06c6c'%3E%3Cpath d='M5.7 11.6h4.6'/%3E%3C/g%3E%3C/svg%3E");
 }
@@ -504,6 +511,9 @@ details[open] > summary { background-image: var(--twisty-open); }
 .tabstrip .tab[data-kind="tree"]     { --ic: var(--ic-folder); }
 .tabstrip .tab[data-kind="changes"]  { --ic: var(--ic-branch); }
 .tabstrip .tab[data-kind="terminal"] { --ic: var(--ic-term); }
+/* After the [data-kind] rules so it wins on equal specificity: a terminal tab
+   running a Claude trades the terminal glyph for the mark. */
+.tabstrip .tab[data-claude]          { --ic: var(--ic-claude); }
 .tabstrip .tab[data-kind="diff"], .changes a.file[data-kind="diff"] { --ic: var(--ic-diff); }
 
 /* ---- terminal start placeholder: opening a project must never spawn a

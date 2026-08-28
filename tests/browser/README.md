@@ -35,6 +35,7 @@ deno run -A tests/browser/claudeterm.mjs # the ✻ button: a terminal with claud
 deno run -A tests/browser/worktrees.mjs # the header's worktree switcher chip + panel
 deno run -A tests/browser/worktree-launch.mjs # the ✻ prompt, worktree creation into a second tab, switcher state and removal; needs a real CDP click for window.open
 deno run -A tests/browser/overview.mjs   # the front page (/): live session list, clicking one focuses it, ?at= reaches the picker, and selecting a project narrows/widens the session list
+deno run -A tests/browser/claudetab.mjs  # a terminal tab running a Claude wears the Claude mark: the /proc watcher, the data-claude attribute, and the CSS that turns it into a different picture
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -132,6 +133,22 @@ performed.
   of the two fails. Both halves were watched failing — the plain-Enter half
   first passed for the wrong reason, reading the *previous* probe's number out
   of the scrollback, which only agreed while both answers were 13.
+- In `claudetab.mjs`: deleting `app.js`'s `b.dataset.claude` fails 3, starting
+  with the marking itself; deleting the `.tabstrip .tab[data-claude]` rule
+  from `style.css` fails only 2 — "the picture actually changed" and "brand-
+  filled" — while "marks its tab" goes on passing. That second run is the
+  reason the assertions read `getComputedStyle(tab, "::before")
+  .backgroundImage` rather than stopping at the attribute: a tab can carry
+  `data-claude` and still look exactly like every other terminal, so an
+  attribute-only test would have shipped green over a feature that draws
+  nothing. Both were watched failing, then restored.
+
+  A third failure was the fixture's own, and is worth recording because it
+  looked like a product bug: the fake `claude` began as a copy of `/bin/sleep`
+  and never ran at all — coreutils is a multi-call binary that dispatches on
+  `argv[0]` and answers `unknown program 'claude'`. The screen dump is what
+  found it. It is a copy of `bash` now, with a trailing `; :` so bash does not
+  exec-optimise itself away and hand `comm` back to `sleep`.
 - In `claudeterm.mjs`: deleting `term.rs`'s write of the launch keystrokes
   fails 2 (claude never starts; no port line to read); pinning `LAUNCHES` to
   `["claude"]` instead of reading `data-launches` fails 1 (a ✻ on a server

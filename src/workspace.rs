@@ -178,6 +178,9 @@ impl Workspace {
             buffers,
             watch_degraded: self.watch_degraded,
             live_sessions: self.live_sessions.clone(),
+            // Filled by `hub::snapshot_event`; `WsState` deliberately has no
+            // such field (see the doc on `WorkspaceView::claude_sessions`).
+            claude_sessions: vec![],
             is_git: self.is_git,
             show_hidden: self.show_hidden,
         }

@@ -81,7 +81,13 @@ const PANE_ICONS = {
   dotsOn: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="5" stroke-dasharray="2.2 2.2"/><circle cx="8" cy="8" r="2" fill="currentColor" stroke="none"/></svg>',
   collapse: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10l4-4 4 4"/></svg>',
   move: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5.5h10l-2.5-2.5M13.5 10.5h-10l2.5 2.5"/></svg>',
-  maximize: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2.5h4.5V7M7 11.5H2.5V7M13.5 2.5L9 7M2.5 13.5L7 9"/></svg>',
+  // The two arms are a 180° rotation of each other about the 16x16 centre:
+  // a corner bracket at (13.5,2.5) with 4.5-long arms, and its mirror at
+  // (2.5,13.5). The bracket and the diagonal that feeds it must share that
+  // corner — the bottom-left bracket was drawn at (2.5,11.5) while its
+  // diagonal still ended at (2.5,13.5), so the shaft ran straight through a
+  // detached arrowhead.
+  maximize: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2.5h4.5V7M7 13.5H2.5V9M13.5 2.5L9 7M2.5 13.5L7 9"/></svg>',
   restore: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 7H9V2.5M2.5 9H7v4.5M9 7l4.5-4.5M7 9l-4.5 4.5"/></svg>',
   newterm: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="10.5" height="9.5" rx="1.2"/><path d="M4 6.8l1.7 1.5L4 9.8M8 10.6h2.6"/><path d="M13.3 2.2v3.6M11.5 4h3.6"/></svg>',
 };
@@ -559,6 +565,14 @@ function render() {
       // data-kind/data-ext drive the tab's icon; see the [data-kind]/[data-ext]
       // rules in style.css, which paint tree rows from the same attributes.
       b.dataset.kind = t.k.toLowerCase();
+      // A terminal running a Claude swaps the terminal glyph for the Claude
+      // mark (the [data-claude] rule in style.css). The server derives the
+      // list; the client never guesses from the session name, because
+      // "claude" is a legal name for a plain shell.
+      if (t.k === "Terminal" && (state.claude_sessions || []).includes(t.session)) {
+        b.dataset.claude = "";
+        b.title = "running Claude";
+      }
       if ((t.k === "File" || t.k === "Diff") && t.rel) b.dataset.ext = iconExt(t.rel);
       const meta = t.k === "File" ? state.buffers.find((x) => x.rel === t.rel) : null;
       b.innerHTML =

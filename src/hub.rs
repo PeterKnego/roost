@@ -339,7 +339,13 @@ impl Hub {
     }
 
     pub fn snapshot_event(&self, origin: &ConnId) -> Event {
-        Event::State { version: self.ws.version, origin: origin.clone(), ws: self.ws.view() }
+        let mut ws = self.ws.view();
+        // Derived here rather than kept in `WsState`: `wsstate::save` persists
+        // that struct, and which terminal is running a Claude is true of the
+        // running host, not of the saved layout. Reading it back from disk
+        // would mark tabs from a previous boot.
+        ws.claude_sessions = crate::claudes::cached_sessions(&self.project);
+        Event::State { version: self.ws.version, origin: origin.clone(), ws }
     }
 
     fn persist(&mut self) {
@@ -1868,6 +1874,25 @@ pub fn broadcast_all(ev: &Event) {
     for h in hubs {
         Hub::lock(&h).broadcast(ev);
     }
+}
+
+/// Push a fresh snapshot to one project's clients. Unlike every other
+/// snapshot push, nothing in the workspace changed — what the snapshot
+/// *derives* did (see `claudes::tick`). A project nobody has open has no hub
+/// and needs nothing, so a miss here is the normal case, not an error.
+pub fn broadcast_state_for(project: &str) {
+    let Some(reg) = REGISTRY.get() else { return };
+    // The registry lock is released before the hub lock is taken, as in
+    // `broadcast_all`: holding both is how this project's one shipped
+    // deadlock happened.
+    let hub = {
+        let map = reg.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(project).cloned()
+    };
+    let Some(h) = hub else { return };
+    let mut g = Hub::lock(&h);
+    let ev = g.snapshot_event(&String::new());
+    g.broadcast(&ev);
 }
 
 /// Record a parsed sequence and tell every client. Called from the PTY pump
@@ -4172,6 +4197,38 @@ mod tests {
     /// `openDiff` asks this before parking anything: accepting a proposal for
     /// a file the user has unsaved edits to would discard them silently.
     ///
+    /// The snapshot is the only path by which the browser learns which tabs
+    /// are running a Claude, so this covers the wiring, not the detection
+    /// (`claudes.rs` owns that). Asserts on the *names*, not just that the
+    /// list is non-empty: marking the wrong tab is the failure that matters,
+    /// and a length check could not see it.
+    ///
+    /// Revert-checked: dropping the `ws.claude_sessions = ...` line from
+    /// `snapshot_event` failed here with
+    /// `left: [] right: ["term7"]`, then restored.
+    #[test]
+    fn a_snapshot_names_the_terminals_running_a_claude() {
+        let _s = crate::claudes::SCAN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        isolate_ide_dir_for_tests();
+
+        // Seeded before the hub exists, so `tick`'s broadcast finds no hub to
+        // wake and this tests the snapshot path alone.
+        let proc_root = d.path().join("proc");
+        crate::claudes::fake_proc(&proc_root, &[(100, "claude-tab-snap", "term7")]);
+        crate::claudes::tick(&proc_root);
+
+        let hub = Hub::for_project("claude-tab-snap", d.path().to_path_buf());
+        let ev = Hub::lock(&hub).snapshot_event(&String::new());
+        let crate::proto::Event::State { ws, .. } = ev else { panic!("not a State event") };
+        assert_eq!(ws.claude_sessions, vec!["term7".to_string()]);
+
+        std::fs::remove_dir_all(proc_root.join("100")).unwrap();
+        crate::claudes::tick(&proc_root); // leave the shared cache empty
+    }
+
     /// Goes through `Hub::for_project`, not `Hub::new`, because the registry
     /// lookup is half of what is under test — `ide.rs` has no hub of its own
     /// to ask.
