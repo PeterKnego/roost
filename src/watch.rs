@@ -397,9 +397,36 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                 // self-write suppression exists to prevent.
                 let mut buffer_rels = std::collections::HashSet::new();
                 for rel in &rels {
-                    match classify(rel, &open, &filter) {
+                    let class = classify(rel, &open, &filter);
+                    // Every class but `Ignore` is a working-tree path, and a
+                    // working-tree path is what `git status` reports on — so
+                    // all of them refresh the Changes pane, not just git's own
+                    // internals. Gating that pane on `.git/index`/`.git/HEAD`
+                    // alone meant the ordinary case never reached it: editing
+                    // a file writes neither, so the list stayed frozen at
+                    // whatever the last commit (or the page load) rendered,
+                    // while the full diff beside it — recomputed per request —
+                    // showed the change.
+                    //
+                    // `Ignore` is the right boundary rather than "any path at
+                    // all": it is where `target/` and `node_modules/` land, and
+                    // a `cargo build` writing thousands of files there would
+                    // otherwise put a `git status` subprocess behind every
+                    // debounced batch, for paths git itself ignores. The cost
+                    // is that a hidden file with `show_hidden` off (a
+                    // `.gitignore` edit, say) does not refresh the pane it
+                    // would appear in, which the ⟳ button recovers; the
+                    // storm does not have a recovery.
+                    if !matches!(class, Class::Ignore) {
+                        status = true;
+                    }
+                    match class {
                         Class::Tree => tree = true,
-                        Class::Status => status = true,
+                        // Already handled above, along with everything else
+                        // that is not `Ignore` — a commit or a checkout is
+                        // still a status change, it is just no longer the
+                        // only one.
+                        Class::Status => {}
                         Class::Buffer(r) => {
                             buffer_rels.insert(r);
                         }
@@ -673,6 +700,68 @@ mod tests {
             }
         }
         false
+    }
+
+    // The Changes pane renders `git status`, and the only thing that used to
+    // refresh it was a write to `.git/index` or `.git/HEAD` — git's own
+    // internals, which an ordinary edit never touches. A file modified after
+    // the last git command was therefore absent from the list while showing
+    // up in the full diff beside it, which is recomputed per request. That is
+    // how it was reported: README.md edited, listed by `git diff HEAD`, and
+    // missing from the pane whose whole job is to list it.
+    //
+    // Two cases, because they take different branches of the classifier and
+    // one of them refreshed nothing at all: an ordinary file (`Class::Tree`,
+    // which at least re-rendered the tree) and a file open in a buffer
+    // (`Class::Buffer`, which broadcasts only the file's own text) — the
+    // reported case, since README.md was open in a tab.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_working_tree_write_refreshes_the_status_pane() {
+        assert!(
+            writing_refreshes_the_status_pane("plain.txt", &[]),
+            "an edit to an ordinary file changes what `git status` reports"
+        );
+        assert!(
+            writing_refreshes_the_status_pane("open.txt", &["open.txt"]),
+            "and so does one to a file that happens to be open in a buffer"
+        );
+    }
+
+    /// Writes `rel` under a live watcher, with `buffers` registered as open
+    /// buffers, and reports whether a `StatusChanged` followed. The `saw_any`
+    /// control is what makes a `false` mean something: the buffer case
+    /// broadcasts `BufferText`/`FileChanged` and the tree case `TreeChanged`,
+    /// so a run that saw *nothing* is a dead watcher, not a classifier that
+    /// declined to refresh the pane.
+    #[cfg(target_os = "linux")]
+    fn writing_refreshes_the_status_pane(rel: &str, buffers: &[&str]) -> bool {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join(rel), "before\n").unwrap();
+
+        let hub = Arc::new(Mutex::new(Hub::new("watch_status", d.path().to_path_buf())));
+        for b in buffers {
+            Hub::lock(&hub).ws.buffers.insert((*b).to_string(), crate::workspace::Buffer::default());
+        }
+        assert!(spawn("watch_status", d.path().to_path_buf(), hub.clone(), Duration::from_millis(20)));
+        let rx = Hub::lock(&hub).subscribe().1;
+
+        std::fs::write(d.path().join(rel), "after\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let (mut saw_status, mut saw_any) = (false, false);
+        while let Ok(m) = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            saw_any = true;
+            if m.contains(r#""t":"StatusChanged""#) {
+                saw_status = true;
+                break;
+            }
+        }
+        assert!(saw_any, "the watcher delivered nothing at all for {rel}; the result below would mean nothing");
+
+        std::env::remove_var("RESH_STATE_DIR");
+        saw_status
     }
 
     // The storm, as a test. Rendering the tree is a `read_dir` of the watched

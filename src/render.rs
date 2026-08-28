@@ -1131,7 +1131,7 @@ pub fn workspace_page(
 </head><body data-project="{proj_txt}" data-key="{qkey}" data-default-tab="{tab}" data-show-hidden="{sh}" data-autosave="{autosave}" data-share-selection="{share_selection}" data-launches="{launches}">
 <header>
   <a class="home" href="/" title="all projects">{SVG_HOME}</a><span class="proj">{proj_txt}</span>
-  <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body"></span><span id="wtlabel"></span></button>
+  <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body, git from:body"></span><span id="wtlabel"></span></button>
   {warn}
   {sharing_indicator}
   <div id="searchbox" title="project-wide search — not implemented yet">{SVG_SEARCH}<span class="hintline">Search files, symbols, sessions</span><kbd>⇧ ⇧</kbd></div>
