@@ -565,6 +565,14 @@ function render() {
       // data-kind/data-ext drive the tab's icon; see the [data-kind]/[data-ext]
       // rules in style.css, which paint tree rows from the same attributes.
       b.dataset.kind = t.k.toLowerCase();
+      // A terminal running a Claude swaps the terminal glyph for the Claude
+      // mark (the [data-claude] rule in style.css). The server derives the
+      // list; the client never guesses from the session name, because
+      // "claude" is a legal name for a plain shell.
+      if (t.k === "Terminal" && (state.claude_sessions || []).includes(t.session)) {
+        b.dataset.claude = "";
+        b.title = "running Claude";
+      }
       if ((t.k === "File" || t.k === "Diff") && t.rel) b.dataset.ext = iconExt(t.rel);
       const meta = t.k === "File" ? state.buffers.find((x) => x.rel === t.rel) : null;
       b.innerHTML =

@@ -49,6 +49,10 @@ fn main() {
     // and the test servers `serve` starts must not depend on what that shell
     // has installed. Background, so listening does not wait on a profile.
     resh::launch::probe_all_in_background();
+    // Also here rather than in `serve`, and for the same reason: this walks
+    // the host's real process table on a timer, which the test servers
+    // `serve` starts have no business doing.
+    resh::claudes::watch();
     eprintln!("resh listening on http://127.0.0.1:{port}");
     resh::serve(listener, roots);
 }
