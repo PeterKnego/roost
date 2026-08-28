@@ -117,10 +117,9 @@ try {
   ws2 = t2.w;
   const sess2 = t2.sess;
 
-  // A fresh tab: `page` already navigated away in Section B, and this
-  // section's own row click navigates too (overview.js sets
-  // `location.href`), so reusing `page` or racing `page2` would confuse
-  // which navigation an assertion is reading.
+  // A fresh tab: `page` already navigated away in Section B. This
+  // section's row click no longer navigates (the panes swap in place), but
+  // it still needs a tab that is actually on the overview.
   page3 = await openPage(browser.port, `http://127.0.0.1:${resh.port}/`);
   const sessionsPane = () => page3.evalIn(`document.getElementById("ovsessions")?.textContent || ""`);
   ok(await until(async () => (await sessionsPane()).includes(sess) && (await sessionsPane()).includes(sess2), 15, "both sessions listed"),
@@ -168,6 +167,95 @@ try {
      "the All link (href=\"/\") clears ?sel=");
   ok(await until(async () => (await sessionsPane()).includes(sess) && (await sessionsPane()).includes(sess2), 15, "widened sessions"),
      `All widens #ovsessions back to both ${fx.project} and ${proj2}`);
+
+  console.log("E. expanding one project survives selecting another");
+  // Worktrees to expand: the fixture's projects have none, and an expander
+  // that yields nothing cannot show whether expansion was preserved.
+  for (const p of [`${fx.roots}/${fx.project}`, `${fx.roots}/${proj2}`]) {
+    const g = async (...a) =>
+      await new Deno.Command("git", { args: ["-C", p, ...a], stdout: "null", stderr: "null" }).output();
+    await g("config", "user.email", "t@t");
+    await g("config", "user.name", "t");
+    await g("add", "-A");
+    await g("commit", "-qm", "init");
+    await g("worktree", "add", "-q", "-b", `wt-${p.split("/").pop()}`, ".claude/worktrees/wt");
+  }
+  const page4 = await openPage(browser.port, `http://127.0.0.1:${resh.port}/`);
+  const tree = () => page4.evalIn(`document.getElementById("ovprojects")?.textContent || ""`);
+  const kidsOf = (label) =>
+    page4.evalIn(`(() => {
+      const rows = [...document.querySelectorAll('#ovprojects .ovrow')];
+      const parent = rows.find((r) => !r.classList.contains('child') && r.textContent.includes(${JSON.stringify(label)}));
+      if (!parent) return -1;
+      return rows.filter((r) => r.dataset.parent === parent.dataset.key).length;
+    })()`);
+  const clickRow = (label, what) =>
+    page4.evalIn(`(() => {
+      const rows = [...document.querySelectorAll('#ovprojects .ovrow')];
+      const row = rows.find((r) => !r.classList.contains('child') && r.textContent.includes(${JSON.stringify(label)}));
+      if (!row) return false;
+      (${what === "caret" ? "row.querySelector('.ovcaret')" : "row"}).click();
+      return true;
+    })()`);
+
+  ok(await until(async () => (await tree()).includes(fx.project) && (await tree()).includes(proj2), 15, "both projects"),
+     "the left pane lists both projects");
+  ok(await clickRow(fx.project, "caret"), `clicked ${fx.project}'s expander`);
+  ok(await until(async () => (await kidsOf(fx.project)) > 0, 15, "worktree child"),
+     `expanding ${fx.project} loads its worktree`);
+
+  await page4.evalIn(`window.__alive2 = "kept"`);
+  ok(await clickRow(proj2, "row"), `selected ${proj2}`);
+  ok(await until(async () => (await kidsOf(proj2)) > 0, 15, "selected project's worktree"),
+     `selecting ${proj2} loads its worktree too`);
+  ok(await page4.evalIn(`window.__alive2`) === "kept",
+     "selecting did not reload the document");
+  // The reported bug: selecting a project collapsed whatever was already
+  // open, because the left pane is re-fetched and the expanded set has to
+  // survive that round trip.
+  ok((await kidsOf(fx.project)) > 0,
+     `${fx.project} is still expanded after selecting ${proj2}`);
+
+  // Selecting must not re-fetch the list the selection was made from: the
+  // row is already on screen, and the only thing the server can add is that
+  // project's own worktrees.
+  //
+  // Counted from the browser's own resource timeline, not by wrapping
+  // `fetch`/`XMLHttpRequest`: those wrappers looked right and caught
+  // nothing, so the first version of this assertion passed with the
+  // re-fetch fully restored — a test that could not fail. The poll is
+  // stopped first (a detached node stops polling) so the count reflects the
+  // click and not a poll that happened to land beside it.
+  //
+  // Revert-checked: putting `refresh("proj", sel)` back into select() fails
+  // this line ("FAIL neither collapsing nor selecting re-fetched the project
+  // list (1 requests, unchanged)").
+  //
+  // Revert-checked: putting `refresh("proj", sel)` back into select() fails
+  // this line ("FAIL neither collapsing nor selecting re-fetched the
+  // project list (1 requests, unchanged)").
+  const listRequests = () =>
+    page4.evalIn(
+      `performance.getEntriesByType('resource').filter((e) => e.name.includes('_overview_projects')).length`,
+    );
+  await page4.evalIn(`(() => {
+    const el = document.getElementById('ovprojects');
+    const clone = el.cloneNode(true);
+    clone.setAttribute('hx-trigger', 'none');
+    el.replaceWith(clone);
+    if (window.htmx) htmx.process(clone);
+  })()`);
+  const before = await listRequests();
+  await clickRow(proj2, "caret");
+  ok(await until(async () => (await kidsOf(proj2)) === 0, 10, "collapsed"),
+     `collapsing ${proj2} removes its worktree rows`);
+  await clickRow(proj2, "row");
+  ok(await until(async () => (await kidsOf(proj2)) > 0, 15, "worktrees back"),
+     `selecting ${proj2} again brings its worktrees back`);
+  await sleep(700); // any re-fetch would have been recorded by now
+  ok((await listRequests()) === before,
+     `neither collapsing nor selecting re-fetched the project list (${before} requests, unchanged)`);
+  page4.close();
 } finally {
   page?.close(); page2?.close(); page3?.close(); ws?.close(); ws2?.close();
   browser.close();

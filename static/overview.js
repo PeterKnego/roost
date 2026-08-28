@@ -34,30 +34,71 @@
     if (window.htmx) htmx.ajax("GET", url, `#${panes[which]}`);
   }
 
+  // Splice one project's worktrees in under its row, or take them out
+  // again. Selecting or opening a project must never re-fetch the list it
+  // was chosen from — the only thing the server can add is that project's
+  // own children, so that is all that is asked for.
+  async function setOpen(key, wanted) {
+    const row = document.querySelector(`#ovprojects .ovrow[data-key="${CSS.escape(key)}"]`);
+    if (!row) return;
+    const caret = row.querySelector(".ovcaret:not(.placeholder)");
+    document
+      .querySelectorAll(`#ovprojects .ovrow[data-parent="${CSS.escape(key)}"]`)
+      .forEach((r) => r.remove());
+    if (!wanted) {
+      open.delete(key);
+      if (caret) caret.textContent = "\u25b8";
+      // The poll must stop asking for it too.
+      const pane = el(panes.proj);
+      if (pane) pane.setAttribute("hx-get", projectsUrl(selNow()));
+      return;
+    }
+    open.add(key);
+    const pane = el(panes.proj);
+    if (pane) pane.setAttribute("hx-get", projectsUrl(selNow()));
+    const url =
+      `/frag/_overview_worktrees?project=${encodeURIComponent(key)}` +
+      `&sel=${encodeURIComponent(selNow())}`;
+    const html = await (await fetch(url)).text();
+    // The row may have been swapped out by a poll while this was in flight.
+    const live = document.querySelector(`#ovprojects .ovrow[data-key="${CSS.escape(key)}"]`);
+    if (!live) return;
+    if (html.trim()) {
+      live.insertAdjacentHTML("afterend", html);
+      const c = live.querySelector(".ovcaret:not(.placeholder)");
+      if (c) c.textContent = "\u25be";
+    } else if (caret) {
+      // Opened and nothing came back: it is not an expander, and should not
+      // keep inviting the click that taught us so.
+      caret.classList.add("empty");
+      caret.title = "no worktrees";
+    }
+  }
+
   function select(sel, push) {
     if (push) {
       const url = sel ? `${location.pathname}?sel=${encodeURIComponent(sel)}` : location.pathname;
       history.pushState({ sel }, "", url);
     }
-    // Mark the row immediately rather than waiting for the round trip — the
-    // click should feel answered even on a slow fetch.
+    // The selection is a property of the list already on screen: mark it
+    // here rather than asking the server to render the same rows again.
     document.querySelectorAll("#ovprojects .ovrow").forEach((r) => {
       r.classList.toggle("current", !!sel && r.dataset.key === sel);
     });
-    refresh("proj", sel);
+    // The next poll still has to know, or it would render the old selection.
+    const pane = el(panes.proj);
+    if (pane) pane.setAttribute("hx-get", projectsUrl(sel));
     refresh("sess", sel);
   }
 
   // Delegated: htmx replaces the panes wholesale, so nothing may be bound to
   // a row.
   document.addEventListener("click", (e) => {
-    const caret = e.target.closest("#ovprojects .ovcaret:not(.placeholder)");
+    const caret = e.target.closest("#ovprojects .ovcaret:not(.placeholder):not(.empty)");
     if (caret) {
       e.preventDefault();
       const key = caret.closest(".ovrow").dataset.key;
-      if (open.has(key)) open.delete(key);
-      else open.add(key);
-      refresh("proj", selNow());
+      setOpen(key, !open.has(key));
       return;
     }
     const all = e.target.closest(".ovall");
@@ -73,8 +114,8 @@
     if (row && !e.metaKey && !e.ctrlKey) {
       e.preventDefault();
       const key = row.dataset.key;
-      if (!row.classList.contains("child")) open.add(key);
       select(key, true);
+      if (!row.classList.contains("child") && !open.has(key)) setOpen(key, true);
     }
   });
 

@@ -982,47 +982,76 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
 pub fn overview_projects(sel: &str, projects: &[crate::registry::ProjectStatus]) -> String {
     let mut out = String::from("<ul class=\"ovtree\">");
     for p in projects {
-        let is_child = p.parent.is_some();
-        let mut cls = String::from("ovrow");
-        if is_child { cls.push_str(" child"); }
-        if p.live > 0 { cls.push_str(" live"); }
-        if p.key == sel { cls.push_str(" current"); }
-        let marker = if p.live > 0 { "●" } else { "○" };
-        // A repository may have worktrees, so it gets an expander; whether
-        // it actually has any is only known once the user opens it and the
-        // server pays `git worktree list` for that one project. The arrow
-        // direction is read off the response itself — children are present
-        // exactly when this project is expanded — so there is no expansion
-        // state for the client to hold and re-apply after a swap.
+        // Children are present exactly when their project is open, which is
+        // also how the arrow knows which way to point.
         let expanded = projects.iter().any(|c| c.parent.as_deref() == Some(p.key.as_str()));
-        let caret = if is_child || p.branch.is_empty() {
-            "<span class=\"ovcaret placeholder\" aria-hidden=\"true\"></span>".to_string()
-        } else if expanded {
-            "<span class=\"ovcaret\" aria-hidden=\"true\">▾</span>".to_string()
-        } else {
-            "<span class=\"ovcaret\" aria-hidden=\"true\">▸</span>".to_string()
-        };
-        let name = if is_child { p.url.rsplit('/').next().unwrap_or(&p.url) } else { p.url.as_str() };
-        let branch = if p.branch.is_empty() { String::new() } else { format!(" <span class=\"branch\">⎇ {}</span>", esc(&p.branch)) };
-        let chips = match &p.wt { Some(w) => format!(" <span class=\"ovchips\">{}</span>", worktree_chips(w, &p.key, p.live, false)), None => String::new() };
-        let parent_attr = p.parent.as_deref().map(|pk| format!(" data-parent=\"{}\"", esc(pk))).unwrap_or_default();
-        if !p.reachable {
-            out.push_str(&format!(
-                "<li class=\"{cls} unreachable\" data-key=\"{}\"{parent_attr} title=\"worktree outside resh's roots — cannot be opened\">{caret}{marker} {}{branch}{chips}</li>",
-                esc(&p.key), esc(name)));
-            continue;
-        }
-        out.push_str(&format!(
-            "<li class=\"{cls}\" data-key=\"{}\"{parent_attr}>{caret}<a href=\"/{}\">{marker} {}{branch}</a>{chips}</li>",
-            esc(&p.key), crate::http::percent_encode(&p.url), esc(name)));
+        out.push_str(&ov_row(p, sel, expanded));
     }
     out.push_str("</ul>");
     out
 }
 
-/// Coarse, human-readable age. Precision beyond this is noise when the
-/// question is only "is this old enough that I have forgotten it?".
-/// `1 session` / `2 sessions`. English only, matching the rest of this file.
+/// One project's worktrees as bare `<li>`s, for the client to splice in
+/// under the row it opened. Selecting a project must not re-fetch the list
+/// the selection was made from — the only thing the server can add is that
+/// project's own children, so that is all this returns.
+pub fn overview_worktree_rows(sel: &str, rows: &[crate::registry::ProjectStatus]) -> String {
+    rows.iter().map(|p| ov_row(p, sel, false)).collect()
+}
+
+fn ov_row(p: &crate::registry::ProjectStatus, sel: &str, expanded: bool) -> String {
+    let is_child = p.parent.is_some();
+    let mut cls = String::from("ovrow");
+    if is_child {
+        cls.push_str(" child");
+    }
+    if p.live > 0 {
+        cls.push_str(" live");
+    }
+    if p.key == sel {
+        cls.push_str(" current");
+    }
+    let marker = if p.live > 0 { "\u{25cf}" } else { "\u{25cb}" };
+    // A repository may have worktrees, so it gets an expander; whether it
+    // actually has any is only known once the user opens it and the server
+    // pays `git worktree list` for that one project.
+    let caret = if is_child || p.branch.is_empty() {
+        "<span class=\"ovcaret placeholder\" aria-hidden=\"true\"></span>".to_string()
+    } else if expanded {
+        "<span class=\"ovcaret\" aria-hidden=\"true\">\u{25be}</span>".to_string()
+    } else {
+        "<span class=\"ovcaret\" aria-hidden=\"true\">\u{25b8}</span>".to_string()
+    };
+    let name = if is_child { p.url.rsplit('/').next().unwrap_or(&p.url) } else { p.url.as_str() };
+    let branch = if p.branch.is_empty() {
+        String::new()
+    } else {
+        format!(" <span class=\"branch\">\u{2387} {}</span>", esc(&p.branch))
+    };
+    let chips = match &p.wt {
+        Some(w) => format!(" <span class=\"ovchips\">{}</span>", worktree_chips(w, &p.key, p.live, false)),
+        None => String::new(),
+    };
+    let parent_attr = p
+        .parent
+        .as_deref()
+        .map(|pk| format!(" data-parent=\"{}\"", esc(pk)))
+        .unwrap_or_default();
+    if !p.reachable {
+        return format!(
+            "<li class=\"{cls} unreachable\" data-key=\"{}\"{parent_attr} title=\"worktree outside resh's roots — cannot be opened\">{caret}{marker} {}{branch}{chips}</li>",
+            esc(&p.key),
+            esc(name)
+        );
+    }
+    format!(
+        "<li class=\"{cls}\" data-key=\"{}\"{parent_attr}>{caret}<a href=\"/{}\">{marker} {}{branch}</a>{chips}</li>",
+        esc(&p.key),
+        crate::http::percent_encode(&p.url),
+        esc(name)
+    )
+}
+
 fn plural(n: usize, word: &str) -> String {
     if n == 1 {
         format!("{n} {word}")

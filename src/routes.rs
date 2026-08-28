@@ -111,6 +111,15 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
         }
         // Same shape as _overview_projects above, same reason it sits before
         // the general frag arm.
+        // One project's worktrees, for the client to splice under the row
+        // it opened — so selecting a project never re-fetches the list the
+        // selection was made from.
+        ["frag", "_overview_worktrees"] => {
+            let key = req.query.get("project").map(String::as_str).unwrap_or("");
+            let sel = req.query.get("sel").map(String::as_str).unwrap_or("");
+            let rows = if key.is_empty() { Vec::new() } else { registry::worktree_rows(roots, key) };
+            http::html(w, &render::overview_worktree_rows(sel, &rows));
+        }
         ["frag", "_overview_sessions"] => {
             let sel = req.query.get("sel").map(String::as_str).unwrap_or("");
             http::html(w, &render::overview_sessions(sel, &build_overview_sessions(roots, sel)));
