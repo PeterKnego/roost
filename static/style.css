@@ -685,14 +685,6 @@ ul.picker li .git:hover { text-decoration: underline; }
    application. */
 .overview-body header .roots { color: var(--muted); min-width: 0; overflow: hidden;
                                text-overflow: ellipsis; white-space: nowrap; }
-/* Matches #projbtn/#bell/#settings exactly: muted until hovered, a border that
-   only appears on hover. It is the same kind of thing they are — a chrome
-   affordance — so it must not invent its own chip. */
-.overview-body .ovopen { margin-left: auto; display: flex; align-items: center; gap: 5px;
-                         background: none; border: 1px solid transparent; border-radius: 6px;
-                         color: var(--muted); padding: 3px 8px; text-decoration: none;
-                         font: inherit; white-space: nowrap; }
-.overview-body .ovopen:hover { color: var(--fg); border-color: var(--border); }
 
 #overview { display: grid; padding: 6px; gap: var(--divider, 8px);
             grid-template-columns: var(--ov-left, 360px) 1fr;
@@ -724,7 +716,20 @@ ul.picker li .git:hover { text-decoration: underline; }
 .ovcaret.empty { opacity: .3; cursor: default; }
 /* The chips themselves are already styled globally (`.wtf`, shared with the
    header switcher — same helper renders both); this only lays them out. */
+/* The free space goes here, before the chips, so the name and branch keep
+   their width in a narrow pane — putting it after them truncated the branch
+   to make room for chips that had already been given a whole column. */
 .ovchips { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+/* The way into a project, at project level: a plain click selects (that is
+   what fills the right pane), so opening needs its own control. Shown on the
+   row under the pointer and on the selected row — a selected project always
+   offers a way in, which is exactly what one with nothing running lacked. */
+.ovgo { margin-left: 8px; flex: none; color: var(--accent); text-decoration: none;
+        font-size: 12px; padding: 0 2px; visibility: hidden; }
+.ovrow:hover .ovgo, .ovrow.current .ovgo { visibility: visible; }
+.ovrow > .ovgo:nth-child(3) { margin-left: auto; } /* no chips on this row */
+.ovgo:hover { text-decoration: underline; }
+.ovempty .ovgo { visibility: visible; margin-left: 6px; }
 
 .ovsession { border-radius: 4px; }
 .ovsession a { display: flex; align-items: center; gap: 10px; padding: 4px 8px;

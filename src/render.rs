@@ -2,7 +2,6 @@
 //! Fragments target htmx swap sites; pages are full documents.
 use crate::config::Settings;
 use crate::gitio::Status;
-use crate::projects::Entry;
 use std::path::Path;
 
 pub fn esc(s: &str) -> String {
@@ -575,135 +574,6 @@ pub fn status_fragment(st: &Status) -> String {
 /// top level (`at=""`), every segment but the last is a clickable link to
 /// browsing that prefix, and the last segment is plain text (you're already
 /// there — the picker doesn't render a `..` row, this is the way up).
-fn breadcrumb(at: &str) -> String {
-    if at.is_empty() {
-        return "<nav class=\"crumbs\"><span class=\"crumb-current\">resh</span></nav>".to_string();
-    }
-    let mut out = String::from("<nav class=\"crumbs\"><a href=\"/\">resh</a>");
-    let segs: Vec<&str> = at.split('/').collect();
-    let mut acc = String::new();
-    for (i, seg) in segs.iter().enumerate() {
-        if !acc.is_empty() {
-            acc.push('/');
-        }
-        acc.push_str(seg);
-        out.push_str(" / ");
-        if i + 1 == segs.len() {
-            out.push_str(&format!("<span class=\"crumb-current\">{}</span>", esc(seg)));
-        } else {
-            // Slash-preserving encode, like tree_level's `dir=` query value
-            // above — `acc` is itself a rel path, not an opaque token.
-            out.push_str(&format!(
-                "<a href=\"/?at={}\">{}</a>",
-                crate::http::percent_encode(&acc),
-                esc(seg)
-            ));
-        }
-    }
-    out.push_str("</nav>");
-    out
-}
-
-/// One `<li>` per picker row. Directories are selectable (click/dblclick/
-/// keyboard, wired client-side by `/static/picker.js` off `li.dir`); files
-/// are rendered but carry no such hooks — `.file`'s CSS greys them out, and
-/// the absence of any click handler is what makes them actually
-/// unselectable, not just visually muted.
-///
-/// Git repos additionally get a `⎇` shortcut: a real `<a href>` straight to
-/// the workspace URL, not a `<span>` with a JS click handler, so opening it
-/// gets keyboard reachability (Tab + Enter), middle-click-for-new-tab, and
-/// ctrl/cmd-click for free from the browser rather than reimplementing them.
-/// picker.js still needs a couple of lines to stop this anchor's click/
-/// dblclick from *also* bubbling to the row's own listeners below (which
-/// would select or descend the row in addition to navigating).
-/// Same ●/○ distinction as `projects_strip`, matched against `entries` via
-/// rel path (`ProjectStatus.url` is the readable slashed form, exactly what
-/// `Entry.rel` is), so a directory that turns out to be a known project
-/// carries the same live/idle cue in the picker as it does in the header
-/// strip — without leaving the picker to open it.
-fn project_marker(rel: &str, projects: &[crate::registry::ProjectStatus]) -> &'static str {
-    // Wrapped in an element, not emitted as a bare glyph: unstyled it inherited
-    // the row's colour and rendered as a dim blob beside an accent-coloured
-    // `⎇`, so the louder mark was the less important one. Which projects are
-    // RUNNING is the question this page can answer that a plain directory
-    // listing cannot, so it gets the accent and the git icon steps back.
-    // Titles because a bare dot is not self-explanatory the first time.
-    match projects.iter().find(|p| p.url == rel) {
-        Some(p) if p.live > 0 => {
-            " <span class=\"mark live\" title=\"terminal sessions running\">●</span>"
-        }
-        Some(_) => " <span class=\"mark idle\" title=\"saved layout, nothing running\">○</span>",
-        None => "",
-    }
-}
-
-fn picker_rows(entries: &[Entry], projects: &[crate::registry::ProjectStatus]) -> String {
-    entries
-        .iter()
-        .map(|e| {
-            if e.is_dir {
-                let git = if e.git {
-                    format!(
-                        " <a class=\"git\" href=\"/{href}\" title=\"open this repo\">⎇</a>",
-                        href = crate::http::percent_encode(&e.rel)
-                    )
-                } else {
-                    String::new()
-                };
-                let marker = project_marker(&e.rel, projects);
-                format!(
-                    "<li class=\"dir\" data-rel=\"{rel}\"><span class=\"name\">{name}</span>{marker}{git}</li>",
-                    rel = esc(&e.rel),
-                    name = esc(&e.name)
-                )
-            } else {
-                format!(
-                    "<li class=\"file\"><span class=\"name\">{}</span></li>",
-                    esc(&e.name)
-                )
-            }
-        })
-        .collect()
-}
-
-/// The `/` directory picker (see routes::route's `?at=` handling). `at` is
-/// the rel path currently being browsed ("" for the merged top level);
-/// `entries` is its already-confined listing (`projects::list_dir`).
-///
-/// `refused` marks the case where the caller's `?at=` did not resolve
-/// (missing, outside ROOTS, or otherwise rejected) and routes.rs silently
-/// fell back to the top level rather than erroring. The rejected path
-/// itself is never echoed here — it's query-string input the user can
-/// already see in their own URL bar, and folding it into the message would
-/// just be another string to escape for no benefit. That's a distinct
-/// situation from `entries` being empty (a real, successfully-opened
-/// directory with nothing in it), so the two get separate messages rather
-/// than being collapsed into one "nothing to show" hint.
-///
-/// `projects` (`registry::known_projects`) marks any row that is itself a
-/// known project with the same ●/○ the header strip uses — see
-/// `project_marker`.
-pub fn index_page(at: &str, entries: &[Entry], refused: bool, projects: &[crate::registry::ProjectStatus]) -> String {
-    let notice = if refused { hint("no such directory — showing the top level") } else { String::new() };
-    let rows_hint = if entries.is_empty() { hint("empty directory") } else { String::new() };
-    let rows = if entries.is_empty() { String::new() } else { picker_rows(entries, projects) };
-    format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>resh</title>\
-         <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
-         <link rel=\"stylesheet\" href=\"/static/style.css\">\
-         </head><body><header><span class=\"proj\">resh</span></header>\
-         <main>{notice}{crumbs}\
-         <ul class=\"picker\" id=\"picker\" data-at=\"{at_attr}\" tabindex=\"0\">{rows}</ul>\
-         {rows_hint}<div class=\"pickerbar\"><button id=\"openBtn\" type=\"button\">Open</button></div>\
-         </main>\
-         <script src=\"/static/picker.js\"></script>\
-         </body></html>",
-        crumbs = breadcrumb(at),
-        at_attr = esc(at),
-    )
-}
-
 /// The front page: a two-pane overview. Both panes are htmx fragments that
 /// load on open and poll (see `overview.js` / the fragment routes); this
 /// shell only lays them out. The picker still lives on `/`, reached by the
@@ -726,7 +596,6 @@ pub fn overview_page(sel: &str, roots_label: &str) -> String {
            <span class=\"home\">{SVG_DIAMOND}</span><span class=\"proj\">resh</span>\
            <span class=\"vsep\"></span>\
            <span class=\"roots\" title=\"{roots}\">{roots}</span>\
-           <a class=\"ovopen\" href=\"/?at=\" title=\"open a directory resh has not seen\">+ Open a directory</a>\
          </header>\
          <main id=\"overview\">\
            <section class=\"pane ovpane tool\">\
@@ -1023,7 +892,10 @@ fn ov_row(p: &crate::registry::ProjectStatus, sel: &str, expanded: bool) -> Stri
         "<span class=\"ovcaret\" aria-hidden=\"true\">\u{25b8}</span>".to_string()
     };
     let name = if is_child { p.url.rsplit('/').next().unwrap_or(&p.url) } else { p.url.as_str() };
-    let branch = if p.branch.is_empty() {
+    // A worktree resh made is checked out on a branch of the same name, so
+    // its row said `claude-1 ⎇ claude-1` — the same word twice, and wide
+    // enough to push the name into an ellipsis in a narrow pane. Say it once.
+    let branch = if p.branch.is_empty() || (is_child && p.branch == name) {
         String::new()
     } else {
         format!(" <span class=\"branch\">\u{2387} {}</span>", esc(&p.branch))
@@ -1044,8 +916,19 @@ fn ov_row(p: &crate::registry::ProjectStatus, sel: &str, expanded: bool) -> Stri
             esc(name)
         );
     }
+    // Opening is a property of the project, not of something running inside
+    // it: a project with no sessions had no way to be opened at all, because
+    // the only link on the page that reached a workspace was a session row.
+    // A plain click still selects (that is what fills the right pane), so
+    // the way in is its own control — shown on the row under the pointer and
+    // on the selected row, so the selected project always offers it.
+    let open = format!(
+        " <a class=\"ovgo\" href=\"/{}\" title=\"open {}\">open</a>",
+        crate::http::percent_encode(&p.url),
+        esc(&p.url)
+    );
     format!(
-        "<li class=\"{cls}\" data-key=\"{}\"{parent_attr}>{caret}<a href=\"/{}\">{marker} {}{branch}</a>{chips}</li>",
+        "<li class=\"{cls}\" data-key=\"{}\"{parent_attr}>{caret}<a class=\"ovname\" href=\"/{}\">{marker} {}{branch}</a>{chips}{open}</li>",
         esc(&p.key),
         crate::http::percent_encode(&p.url),
         esc(name)
@@ -1105,7 +988,20 @@ pub fn overview_sessions(sel: &str, rows: &[OvSession]) -> String {
          <ul class=\"ovsessions\">"
     );
     if rows.is_empty() {
-        out.push_str("<li class=\"ovempty\">no sessions running</li></ul>");
+        // Nothing is running here, which is exactly when the way in matters
+        // most: without this the pane was a dead end for every project that
+        // had never been opened.
+        let go = if sel.is_empty() {
+            String::new()
+        } else {
+            let url = crate::registry::decode_key(sel);
+            format!(
+                " <a class=\"ovgo\" href=\"/{}\">open {}</a>",
+                crate::http::percent_encode(&url),
+                esc(&url)
+            )
+        };
+        out.push_str(&format!("<li class=\"ovempty\">no sessions running{go}</li></ul>"));
         return out;
     }
     for r in rows {
@@ -2043,38 +1939,6 @@ mod tests {
     }
 
     #[test]
-    fn index_page_renders_picker_rows_and_breadcrumb() {
-        let entries = vec![
-            Entry { name: "alpha".into(), rel: "alpha".into(), is_dir: true, git: true },
-            Entry { name: "beta".into(), rel: "beta".into(), is_dir: true, git: false },
-        ];
-        let h = index_page("", &entries, false, &[]);
-        assert!(h.contains("data-rel=\"alpha\""));
-        assert!(h.contains("class=\"dir\""));
-        // alpha is a git repo: gets a one-click shortcut straight to its
-        // workspace URL, not just the plain ⎇ marker
-        assert!(h.contains("<a class=\"git\" href=\"/alpha\" title=\"open this repo\">⎇</a>"));
-        // beta is not a git repo: no shortcut anchor for it at all
-        assert!(!h.contains("href=\"/beta\""));
-        assert!(h.contains("id=\"openBtn\""));
-        assert!(h.contains("crumb-current\">resh"));
-        assert!(h.contains("/static/picker.js"));
-
-        // browsing a subdirectory: breadcrumb links back up, files are
-        // present but not marked selectable the way directories are
-        let sub = vec![
-            Entry { name: "sub".into(), rel: "karpie/sub".into(), is_dir: true, git: false },
-            Entry { name: "main.rs".into(), rel: "karpie/main.rs".into(), is_dir: false, git: false },
-        ];
-        let h2 = index_page("karpie", &sub, false, &[]);
-        assert!(h2.contains("<a href=\"/\">resh</a>"));
-        assert!(h2.contains("crumb-current\">karpie"));
-        assert!(h2.contains("class=\"dir\" data-rel=\"karpie/sub\""));
-        assert!(h2.contains("class=\"file\""));
-        assert!(!h2.contains("data-rel=\"karpie/main.rs\"")); // files carry no selection hook
-    }
-
-    #[test]
     fn overview_page_wires_both_fragment_panes() {
         let h = overview_page("", "/home/claude/projects");
         assert!(h.contains("id=\"overview\""));
@@ -2083,8 +1947,10 @@ mod tests {
         assert!(h.contains("hx-get=\"/frag/_overview_projects?sel=\""), "{h}");
         assert!(h.contains("hx-get=\"/frag/_overview_sessions?sel=\""), "{h}");
         assert!(h.contains("/static/overview.js"), "{h}");
-        // The picker entry point, not a new reserved path.
-        assert!(h.contains("href=\"/?at=\""), "open-a-directory reaches the picker: {h}");
+        // The directory picker is gone, and so is the button that reached
+        // it: the overview lists every project directory under the roots, so
+        // browsing to find one had nothing left to offer.
+        assert!(!h.contains("?at="), "no picker entry point: {h}");
     }
 
     // The overview shell is stateless HTML re-rendered fresh on every `/`
@@ -2117,79 +1983,11 @@ mod tests {
     // A picker row for a directory that is also a known project carries the
     // same ●/○ the header strip uses; an ordinary directory with no
     // matching project carries neither.
-    #[test]
-    fn picker_rows_mark_known_projects_live_or_idle() {
-        let entries = vec![
-            Entry { name: "karpie".into(), rel: "karpie".into(), is_dir: true, git: false },
-            Entry { name: "glow".into(), rel: "glow".into(), is_dir: true, git: false },
-            Entry { name: "plain".into(), rel: "plain".into(), is_dir: true, git: false },
-        ];
-        let ps = vec![
-            crate::registry::ProjectStatus {
-                key: "karpie".into(), url: "karpie".into(),
-                live: 2, oldest_age_secs: Some(60), has_layout: true,
-                branch: String::new(), parent: None, reachable: true,
-                wt: None,
-            },
-            crate::registry::ProjectStatus {
-                key: "glow".into(), url: "glow".into(),
-                live: 0, oldest_age_secs: None, has_layout: true,
-                branch: String::new(), parent: None, reachable: true,
-                wt: None,
-            },
-        ];
-        let h = index_page("", &entries, false, &ps);
-        // The marker must be an *element*, not a bare glyph: as plain text it
-        // inherited the row colour and was quieter than the accent-coloured git
-        // icon next to it, so the least important mark was the loudest. The
-        // class is what lets CSS put liveness first, so assert on it.
-        assert!(
-            h.contains("<span class=\"name\">karpie</span> <span class=\"mark live\""),
-            "a live project's marker must carry the live class, not just the glyph"
-        );
-        assert!(h.contains(">●</span>"), "live project row carries ●");
-        assert!(
-            h.contains("<span class=\"name\">glow</span> <span class=\"mark idle\""),
-            "an idle project's marker must carry the idle class"
-        );
-        assert!(h.contains(">○</span>"), "idle-but-known project row carries ○");
-        assert!(h.contains("<span class=\"name\">plain</span></li>"), "unknown directory carries neither marker");
-    }
-
     // The shortcut's href is a real workspace URL, so it needs the same
     // slash-preserving percent-encoding as breadcrumb's `?at=` links (a `/`
     // between segments must stay a literal separator, not become %2F) plus
     // HTML-escaping on the visible bits, since both the segment names and
     // the entry name come straight off the filesystem.
-    #[test]
-    fn git_shortcut_href_is_percent_encoded_for_a_nested_path() {
-        let entries = vec![Entry {
-            name: "sp ace\"<>".into(),
-            rel: "karpie/sp ace\"<>".into(),
-            is_dir: true,
-            git: true,
-        }];
-        let h = index_page("karpie", &entries, false, &[]);
-        // "/" between segments survives; the space and quote/angle-bracket
-        // characters inside the leaf segment are percent-encoded, not left
-        // raw (which would break the URL) and not HTML-entity-encoded
-        // (which would break the URL differently) — this is the URL
-        // encoder, distinct from `esc`'s HTML entities used elsewhere in
-        // the same row for the visible name.
-        assert!(h.contains("href=\"/karpie/sp%20ace%22%3C%3E\""));
-        // the visible name is still HTML-escaped, same as any other text
-        assert!(h.contains("sp ace&quot;&lt;&gt;"));
-        assert!(!h.contains("sp ace\"<>")); // raw, unescaped name must not appear
-    }
-
-    #[test]
-    fn index_page_breadcrumb_links_every_intermediate_segment() {
-        let h = index_page("a/b/c", &[], false, &[]);
-        assert!(h.contains("<a href=\"/?at=a\">a</a>"));
-        assert!(h.contains("<a href=\"/?at=a/b\">b</a>"));
-        assert!(h.contains("crumb-current\">c")); // the current directory itself is not a link
-    }
-
     #[test]
     fn project_name_is_escaped_everywhere() {
         let s = Settings::default();
@@ -2204,14 +2002,6 @@ mod tests {
     // so it reads as "empty" instead. `refused` is false here: this is the
     // opposite situation from a rejected `?at=`, and must not also print
     // the refused notice.
-    #[test]
-    fn index_page_empty_listing_shows_empty_hint() {
-        let h = index_page("karpie", &[], false, &[]);
-        assert!(h.contains("class=\"hint\">empty directory"));
-        assert!(!h.contains("showing the top level"));
-        assert!(h.contains("id=\"openBtn\"")); // Open stays present and enabled by picker.js's own logic
-    }
-
     // A rejected `?at=` (missing, outside ROOTS, refused for any other
     // reason) still falls back to the top level, but that fallback must not
     // be silent — the caller sees a notice explaining why they landed here
@@ -2220,26 +2010,9 @@ mod tests {
     // redirect). The two hints are independent: a refused `?at=` whose
     // fallback happens to have entries must show the notice but not the
     // empty-directory hint.
-    #[test]
-    fn index_page_refused_at_shows_notice_and_still_lists_top_level() {
-        let entries = vec![Entry { name: "alpha".into(), rel: "alpha".into(), is_dir: true, git: false }];
-        let h = index_page("", &entries, true, &[]);
-        assert!(h.contains("class=\"hint\">no such directory"));
-        assert!(h.contains("showing the top level"));
-        assert!(h.contains("data-rel=\"alpha\"")); // fallback listing still renders
-        assert!(!h.contains("class=\"hint\">empty directory"));
-    }
-
     // Baseline: an ordinary, non-empty, successfully-resolved listing shows
     // neither hint — both are edge-case annotations, not part of the normal
     // render.
-    #[test]
-    fn index_page_normal_listing_shows_neither_hint() {
-        let entries = vec![Entry { name: "alpha".into(), rel: "alpha".into(), is_dir: true, git: false }];
-        let h = index_page("", &entries, false, &[]);
-        assert!(!h.contains("class=\"hint\""));
-    }
-
     /// The panel lists what is RUNNING. An idle project — a saved layout with
     /// no shells — belongs on the front page, which already carries the same
     /// ●/○ markers; listing it here duplicated that at the cost of header
@@ -2716,6 +2489,29 @@ mod tests {
         assert!(crate::registry::removable(ps[1].wt.as_ref().unwrap(), ps[1].live), "fixture must actually be removable");
         let out = overview_projects("ultima", &ps);
         assert!(!out.contains("wtremove"), "{out}");
+    }
+
+    /// `claude-1 ⎇ claude-1` is the same word twice: a worktree resh made is
+    /// on a branch named after it. Revert-checked: without the `is_child &&
+    /// branch == name` guard the first assertion fails, the row carrying
+    /// `⎇ claude-1` after the name.
+    #[test]
+    fn a_worktree_row_does_not_repeat_its_branch_as_its_name() {
+        use crate::registry::{ProjectStatus, WorktreeStatus};
+        let row = |name: &str, branch: &str| ProjectStatus {
+            key: format!("repo%2F.claude%2Fworktrees%2F{name}"),
+            url: format!("repo/.claude/worktrees/{name}"),
+            live: 0, oldest_age_secs: None, has_layout: false,
+            branch: branch.into(), parent: Some("repo".into()), reachable: true,
+            wt: Some(WorktreeStatus { claude: crate::claudes::ClaudeEvidence::Absent,
+                dirty: Some(false), ahead: Some(0), base: "main".into(), base_recorded: true }),
+        };
+        let same = overview_projects("", &[row("claude-1", "claude-1")]);
+        assert!(!same.contains("\u{2387} claude-1"), "the branch is not repeated: {same}");
+        assert!(same.contains("claude-1</a>"), "the name is still there: {same}");
+        // A worktree on a differently-named branch still says which.
+        let diff = overview_projects("", &[row("wt", "feature/x")]);
+        assert!(diff.contains("\u{2387} feature/x"), "{diff}");
     }
 
     #[test]

@@ -107,6 +107,8 @@
       select("", true);
       return;
     }
+    // The way-in control is a real link and must be left alone.
+    if (e.target.closest(".ovgo")) return;
     // A plain click selects (and opens the project's worktrees, which is
     // where the git cost is paid); ⌘/ctrl-click falls through to the row's
     // own <a> so the browser can open the project in a new tab.
@@ -135,6 +137,16 @@
         caret.title = "no worktrees";
       }
     }
+  });
+
+  // Double-click opens, the way a double click has always meant "go in" —
+  // the picker this page replaced used it to descend.
+  document.addEventListener("dblclick", (e) => {
+    const row = e.target.closest("#ovprojects .ovrow:not(.unreachable)");
+    const go = row && row.querySelector(".ovgo");
+    if (!go) return;
+    e.preventDefault();
+    location.href = go.getAttribute("href");
   });
 
   // Back/forward must move the panes, not just the address bar.

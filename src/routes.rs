@@ -276,20 +276,15 @@ fn build_overview_sessions(roots: &[PathBuf], sel: &str) -> Vec<render::OvSessio
 /// fill in over htmx). `?at=<rel>` browses one directory in the picker
 /// instead; an `at` that fails to resolve is refused the same way opening it
 /// as a workspace would be, showing the merged top level of both ROOTS.
+/// `/` — the overview, and now the only front page. The directory picker
+/// that used to live behind `?at=` is gone: the overview lists every project
+/// directory under the roots (`registry::project_rows`), so browsing to find
+/// one had nothing left to add, and the button that reached it was pointing
+/// at a page that answered a question the front page already answers.
 fn serve_index(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
-    // `at` absent → the overview; `at` present (empty included) → the picker.
-    if req.query.get("at").is_none() {
-        let label = roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(":");
-        let sel = req.query.get("sel").map(String::as_str).unwrap_or("");
-        return http::html(w, &render::overview_page(sel, &label));
-    }
-    let requested = req.query.get("at").map(String::as_str).unwrap_or("");
-    let (at, entries, refused) = match projects::list_dir(roots, requested) {
-        Some(entries) => (requested, entries, false),
-        None => ("", projects::list_dir(roots, "").expect("top level never fails to resolve"), true),
-    };
-    let ps = registry::known_projects(roots);
-    http::html(w, &render::index_page(at, &entries, refused, &ps));
+    let label = roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(":");
+    let sel = req.query.get("sel").map(String::as_str).unwrap_or("");
+    http::html(w, &render::overview_page(sel, &label));
 }
 
 fn serve_workspace(w: &mut impl Write, roots: &[PathBuf], project: &str) {
@@ -1180,62 +1175,21 @@ mod tests {
     ///
     /// Revert-checked: with `open` ignored (the `kids` map left empty) the
     /// second assertion failed — no `data-parent`, no `feat` row — while the
-    /// first still passed, which is exactly the split this guards.
+    /// One front page. `?at=` used to serve a directory picker; it is gone,
+    /// and the query is simply ignored rather than reserved.
+    ///
+    /// Revert-checked: with `serve_index` restored to its `at`-branching
+    /// form, the second assertion fails — `/?at=` renders `id="picker"` and
+    /// no overview.
     #[test]
-    fn a_projects_worktrees_arrive_only_when_it_is_opened() {
-        let root = tempfile::tempdir().unwrap();
-        let repo = root.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        let git = |args: &[&str]| {
-            assert!(std::process::Command::new("git")
-                .arg("-C").arg(&repo).args(args)
-                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-                .status().unwrap().success(), "git {args:?}");
-        };
-        git(&["init", "-q", "-b", "main"]);
-        git(&["config", "user.email", "t@t"]);
-        git(&["config", "user.name", "t"]);
-        std::fs::write(repo.join("a.txt"), "x").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-qm", "init"]);
-        git(&["worktree", "add", "-q", "-b", "feat", ".claude/worktrees/feat"]);
-        let roots = vec![root.path().to_path_buf()];
-
-        let closed = frag_route(&roots, "/frag/_overview_projects?sel=");
-        assert!(closed.contains("data-key=\"repo\""), "the project is listed: {closed}");
-        assert!(!closed.contains("data-parent"), "no worktrees until opened: {closed}");
-        // A repository still offers the expander that fetches them.
-        assert!(closed.contains(">▸</span>"), "a repo gets an expander: {closed}");
-
-        let opened = frag_route(&roots, "/frag/_overview_projects?sel=&open=repo");
-        assert!(opened.contains("data-parent=\"repo\""), "opening brings its worktrees: {opened}");
-        assert!(opened.contains("feat"), "{opened}");
-        assert!(opened.contains(">▾</span>"), "and the arrow turns: {opened}");
-    }
-
-    #[test]
-    fn the_overview_sessions_fragment_is_routed() {
+    fn the_front_page_is_the_overview_whatever_the_query() {
         let d = tempfile::tempdir().unwrap();
         let roots = vec![d.path().to_path_buf()];
-        let out = frag_route(&roots, "/frag/_overview_sessions");
-        assert!(out.contains("ovscope") && out.contains("ovsessions"), "{out}");
-    }
-
-    #[test]
-    fn root_with_no_at_serves_the_overview_and_at_serves_the_picker() {
-        // Revert-checked: with serve_index always calling index_page, the
-        // first assertion fails (no overview markup at `/`) — the response
-        // body is the picker's `<ul class="picker" id="picker" ...>`, no
-        // `id="overview"` anywhere. See
-        // .superpowers/sdd/2026-08-26-overview-page/task-1-report.md for the
-        // captured failure output.
-        let d = tempfile::tempdir().unwrap();
-        let roots = vec![d.path().to_path_buf()];
-        let overview = frag_route(&roots, "/");
-        assert!(overview.contains("id=\"overview\""), "no-at is the overview: {overview}");
-        assert!(overview.contains("_overview_projects") && overview.contains("_overview_sessions"), "{overview}");
-        let picker = frag_route(&roots, "/?at=");
-        assert!(picker.contains("id=\"picker\""), "?at= is the picker: {picker}");
+        for path in ["/", "/?at=", "/?at=karpie"] {
+            let out = frag_route(&roots, path);
+            assert!(out.contains("id=\"overview\""), "{path} is the overview: {out}");
+            assert!(!out.contains("id=\"picker\""), "{path} is not the picker: {out}");
+        }
     }
 
     // `sel` in the overview's own query string must reach the fragment

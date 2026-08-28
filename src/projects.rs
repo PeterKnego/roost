@@ -312,61 +312,7 @@ pub fn decode_storage_key(key: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// One row in the directory picker (see `render::index_page`): either a
-/// browsable/openable directory or a greyed-out, unselectable file.
-pub struct Entry {
-    pub name: String,
-    /// Full rel path from the ROOTS, e.g. `"karpie/src"` — used both as the
-    /// next `?at=` value (browsing) and as the workspace path (opening).
-    pub rel: String,
-    pub is_dir: bool,
-    /// Only ever true for directories; a useful cue when choosing where to open.
-    pub git: bool,
-}
 
-/// Lists the picker's rows for `at`: the merged top level (both ROOTS'
-/// children, directories only — unchanged from the pre-picker index) when
-/// `at` is empty, or one directory's immediate children otherwise. `None`
-/// means `at` is not a legitimate, confined directory — refused the same
-/// way `resolve_project` refuses to open it as a workspace, which is
-/// exactly the function this reuses to resolve it.
-pub fn list_dir(roots: &[PathBuf], at: &str) -> Option<Vec<Entry>> {
-    if at.is_empty() {
-        return Some(
-            list_projects(roots)
-                .into_iter()
-                .map(|p| Entry { rel: p.name.clone(), name: p.name, is_dir: true, git: p.git })
-                .collect(),
-        );
-    }
-    let dir = resolve_project(roots, at)?;
-    let rd = std::fs::read_dir(&dir).ok()?;
-    let mut entries: Vec<_> = rd.flatten().collect();
-    // Directories before files, then the same case-insensitive key the top
-    // level uses, so one listing does not order names by a different rule than
-    // the listing one click above it.
-    entries.sort_by_key(|e| (e.path().is_file(), sort_key(&e.file_name().to_string_lossy())));
-    let mut out = Vec::new();
-    for e in entries {
-        let name = e.file_name().to_string_lossy().into_owned();
-        // Same hidden-entry convention as list_projects: dotfiles (which
-        // includes each directory's own .git) never appear as rows.
-        if name.starts_with('.') {
-            continue;
-        }
-        // Skip build/vendor directories (target, node_modules, __pycache__).
-        // The picker chooses a workspace, and these are never that; hiding
-        // them here keeps the picker consistent with the file tree's SKIP_DIRS.
-        if SKIP_DIRS.contains(&name.as_str()) {
-            continue;
-        }
-        let p = e.path();
-        let is_dir = p.is_dir();
-        let git = is_dir && p.join(".git").exists();
-        out.push(Entry { rel: format!("{at}/{name}"), name, is_dir, git });
-    }
-    Some(out)
-}
 
 pub fn safe_resolve(project_dir: &Path, rel: &str) -> Result<PathBuf, String> {
     let canon = project_dir
@@ -649,22 +595,6 @@ mod tests {
     // stops the sub-level from drifting back to byte order while the top level
     // stays folded, which is exactly the split the fix removed. Reverting
     // list_dir's key to a raw `e.file_name()` turns this red.
-    #[test]
-    fn subdirectory_listing_folds_case_the_same_way_as_the_top_level() {
-        let d = root_fixture();
-        fs::create_dir(d.path().join("alpha/zulu")).unwrap();
-        fs::create_dir(d.path().join("alpha/Mike")).unwrap();
-        fs::create_dir(d.path().join("alpha/charlie")).unwrap();
-        let roots = vec![d.path().to_path_buf()];
-        let entries = list_dir(&roots, "alpha").unwrap();
-        let dirs: Vec<_> = entries.iter().filter(|e| e.is_dir).map(|e| e.name.as_str()).collect();
-        assert_eq!(dirs, vec!["charlie", "Mike", "zulu"]);
-        // directories still precede files
-        let first_file = entries.iter().position(|e| !e.is_dir).unwrap();
-        assert!(entries[..first_file].iter().all(|e| e.is_dir));
-        assert!(entries[first_file..].iter().all(|e| !e.is_dir));
-    }
-
     #[test]
     fn resolve_rejects_bad_names() {
         let d = root_fixture();
@@ -1091,64 +1021,6 @@ mod tests {
         // The two deliberate exceptions, unchanged by this widening.
         assert_eq!(storage_key("karpie/src"), "karpie%2Fsrc");
         assert_eq!(storage_key("a%2Fb"), "a%252Fb");
-    }
-
-    #[test]
-    fn list_dir_at_empty_is_the_merged_top_level() {
-        let d = root_fixture();
-        let entries = list_dir(&[d.path().to_path_buf()], "").unwrap();
-        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["alpha", "beta"]); // same set/order as list_projects
-        assert!(entries.iter().all(|e| e.is_dir), "top level is directories only");
-        assert!(entries.iter().find(|e| e.name == "alpha").unwrap().git);
-    }
-
-    #[test]
-    fn list_dir_at_a_directory_shows_its_children_marked_distinctly() {
-        let d = root_fixture();
-        fs::create_dir_all(d.path().join("alpha/sub/.git")).unwrap();
-        let roots = vec![d.path().to_path_buf()];
-        let entries = list_dir(&roots, "alpha").unwrap();
-        let file = entries.iter().find(|e| e.name == "readme.md").unwrap();
-        assert!(!file.is_dir, "files are listed but must be marked non-directory");
-        assert!(!file.git);
-        let dir = entries.iter().find(|e| e.name == "sub").unwrap();
-        assert!(dir.is_dir);
-        assert!(dir.git, "sub's own .git marks it, independent of alpha's");
-        assert_eq!(dir.rel, "alpha/sub"); // rel is the full path from the ROOTS
-        // .git itself and other dotfiles never appear as rows
-        assert!(!entries.iter().any(|e| e.name == ".git"));
-    }
-
-    #[test]
-    fn list_dir_refuses_an_at_outside_the_roots() {
-        let d = root_fixture();
-        let roots = vec![d.path().join("alpha")]; // root is alpha itself
-        // "beta" is a real directory, but it's a sibling of the root, not
-        // under it — the same escape list_dir must refuse that
-        // resolve_project already refuses for opening a workspace.
-        assert!(list_dir(&roots, "../beta").is_none());
-        assert!(list_dir(&roots, "nonexistent").is_none());
-    }
-
-    #[test]
-    fn list_dir_skips_build_and_vendor_dirs() {
-        let d = root_fixture();
-        let roots = vec![d.path().to_path_buf()];
-        // Create a subdirectory with normal dirs, build dirs, and a file.
-        fs::create_dir(d.path().join("alpha/src")).unwrap();
-        fs::create_dir(d.path().join("alpha/target")).unwrap();
-        fs::create_dir(d.path().join("alpha/node_modules")).unwrap();
-        fs::create_dir(d.path().join("alpha/__pycache__")).unwrap();
-        fs::write(d.path().join("alpha/cargo.toml"), "").unwrap();
-        // list_dir should return src and cargo.toml, but not the build/vendor dirs.
-        let entries = list_dir(&roots, "alpha").unwrap();
-        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"src"), "normal dirs should be listed");
-        assert!(names.contains(&"cargo.toml"), "files should be listed");
-        assert!(!names.contains(&"target"), "target should be skipped");
-        assert!(!names.contains(&"node_modules"), "node_modules should be skipped");
-        assert!(!names.contains(&"__pycache__"), "__pycache__ should be skipped");
     }
 
     /// A conflict is both sources speaking and disagreeing — never one being

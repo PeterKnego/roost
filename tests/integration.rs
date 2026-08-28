@@ -471,36 +471,6 @@ fn frag_projects_route_serves_the_cross_project_strip() {
 }
 
 #[test]
-fn picker_at_shows_a_directorys_children_marked_distinctly() {
-    let (_d, port) = nested_fixture();
-    let body = ureq::get(&format!("http://127.0.0.1:{port}/?at=karpie"))
-        .call().unwrap().into_string().unwrap();
-    assert!(body.contains("class=\"dir\" data-rel=\"karpie/sub\""));
-    assert!(body.contains("class=\"file\""));
-    assert!(body.contains("top.txt"));
-    assert!(body.contains("crumb-current\">karpie"));
-}
-
-#[test]
-fn picker_at_outside_the_roots_falls_back_to_the_top_level_not_a_leak() {
-    let (_d, port) = nested_fixture();
-    // `at` is fully attacker-controlled query text; a traversal attempt or
-    // a bogus rel must never surface foreign directory content — it must
-    // fall back to the same safe top level opening the page fresh would show.
-    for at in ["../../etc", "nonexistent", "/etc"] {
-        let body = ureq::get(&format!("http://127.0.0.1:{port}/?at={at}"))
-            .call().unwrap().into_string().unwrap();
-        assert!(!body.contains("passwd"), "leaked for at={at}: {body}");
-        assert!(body.contains("crumb-current\">resh"), "did not fall back for at={at}");
-        assert!(body.contains("data-rel=\"karpie\""), "top level missing for at={at}");
-        // The fallback is silent to the URL (still `at=""`) but must not be
-        // silent to the reader — a notice explains why they landed at the
-        // top level instead of where `?at=` pointed.
-        assert!(body.contains("showing the top level"), "no notice for at={at}");
-    }
-}
-
-#[test]
 fn nested_project_websockets_connect() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();

@@ -102,9 +102,15 @@ try {
   ok(await until(async () => (await page.evalIn("location.search")) === "", 10, "?focus consumed"),
      "?focus was stripped after focusing");
 
-  console.log("C. Open a directory reaches the picker");
+  console.log("C. the directory picker is gone");
+  // `?at=` was the picker's URL. The overview lists every project directory
+  // under the roots, so browsing to find one had nothing left to add.
   page2 = await openPage(browser.port, `http://127.0.0.1:${resh.port}/?at=`);
-  ok(await until(() => page2.evalIn(`!!document.getElementById("picker")`), 10, "picker"), "?at= shows the picker");
+  ok(await until(() => page2.evalIn(`!!document.getElementById("overview")`), 10, "overview"),
+     "?at= serves the overview");
+  ok(!(await page2.evalIn(`!!document.getElementById("picker")`)), "there is no picker any more");
+  ok(!(await page2.evalIn(`document.body.innerHTML.includes("?at=")`)),
+     "and nothing on the page points at one");
 
   console.log("D. selecting a project narrows the right pane; All widens it back");
   // A second project, built directly under fx.roots the same way fixture()
@@ -309,6 +315,40 @@ try {
      20, "a project created after load"),
      "the pane keeps refreshing: a directory created after load shows up on its own");
   page5.close();
+
+  console.log("G. a project with nothing running can still be opened");
+  // The reported dead end: the only link on the page that reached a
+  // workspace was a session row, so a project with no sessions — every
+  // project nobody has opened yet — could not be opened at all.
+  const page6 = await openPage(browser.port, `http://127.0.0.1:${resh.port}/`);
+  const idle = "quiet-project";
+  await Deno.mkdir(`${fx.roots}/${idle}`, { recursive: true });
+  const pickRow = (label) =>
+    page6.evalIn(`(() => {
+      const rows = [...document.querySelectorAll('#ovprojects .ovrow')];
+      const row = rows.find((r) => !r.classList.contains('child') && r.textContent.includes(${JSON.stringify(label)}));
+      if (!row) return false;
+      row.click();
+      return true;
+    })()`);
+  ok(await until(async () =>
+      (await page6.evalIn(`document.getElementById("ovprojects")?.textContent || ""`)).includes(idle),
+     20, "the idle project"), `${idle} is listed though nothing runs in it`);
+  ok(await pickRow(idle), `selected ${idle}`);
+  ok(await until(async () =>
+      (await page6.evalIn(`document.getElementById("ovsessions")?.textContent || ""`)).includes("no sessions running"),
+     15, "empty sessions pane"), "its sessions pane says nothing is running");
+  // Two ways in, both at project level: the row's own control, and the one
+  // the empty pane offers. Revert-checked: dropping the row's control from
+  // `ov_row` fails "the selected row offers a way in".
+  ok(await page6.evalIn(`!!document.querySelector('#ovprojects .ovrow.current .ovgo')`),
+     "the selected row offers a way in");
+  ok(await page6.evalIn(`!!document.querySelector('#ovsessions .ovgo')`),
+     "so does the pane that has nothing to list");
+  await page6.evalIn(`document.querySelector('#ovprojects .ovrow.current .ovgo').click()`);
+  ok(await until(async () => (await page6.evalIn("location.pathname")) === `/${idle}`, 15, "workspace"),
+     `it opens ${idle}'s workspace`);
+  page6.close();
 } finally {
   page?.close(); page2?.close(); page3?.close(); ws?.close(); ws2?.close();
   browser.close();
