@@ -256,6 +256,59 @@ try {
   ok((await listRequests()) === before,
      `neither collapsing nor selecting re-fetched the project list (${before} requests, unchanged)`);
   page4.close();
+
+  console.log("F. a selection survives the poll");
+  // The reported bug, as reported: select a project, wait past one poll,
+  // select another, wait again. Verified against the bug: before the fix
+  // these four assertions failed ("proj is still the selected row after a
+  // poll" and the three like it) while everything else in the file passed. htmx captures a polling element's URL when
+  // it processes the node, so a selection that only rewrites `hx-get` never
+  // reaches the poll — five seconds later the pane snaps back to whatever
+  // the page was first opened with.
+  const page5 = await openPage(browser.port, `http://127.0.0.1:${resh.port}/`);
+  const curRow = () =>
+    page5.evalIn(`(document.querySelector('#ovprojects .ovrow.current')?.textContent || "").trim()`);
+  const sessText = () => page5.evalIn(`document.getElementById("ovsessions")?.textContent || ""`);
+  const pick = (label) =>
+    page5.evalIn(`(() => {
+      const rows = [...document.querySelectorAll('#ovprojects .ovrow')];
+      const row = rows.find((r) => !r.classList.contains('child') && r.textContent.includes(${JSON.stringify(label)}));
+      if (!row) return false;
+      row.click();
+      return true;
+    })()`);
+
+  ok(await until(async () => (await page5.evalIn(`document.querySelectorAll('#ovprojects .ovrow').length`)) > 1, 15, "rows"),
+     "the left pane lists the projects");
+  ok(await pick(fx.project), `selected ${fx.project}`);
+  ok(await until(async () => (await curRow()).includes(fx.project), 10, "marked current"),
+     `${fx.project} is marked current`);
+  await sleep(6000); // one poll interval, and then some
+  ok((await curRow()).includes(fx.project),
+     `${fx.project} is still the selected row after a poll`);
+  ok(!(await sessText()).includes(`${proj2} · `),
+     `the sessions pane is still narrowed to ${fx.project} after a poll`);
+
+  ok(await pick(proj2), `selected ${proj2}`);
+  ok(await until(async () => (await curRow()).includes(proj2), 10, "marked current"),
+     `${proj2} is marked current`);
+  await sleep(6000);
+  ok((await curRow()).includes(proj2),
+     `${proj2} is still the selected row after a poll`);
+  ok(!(await sessText()).includes(`${fx.project} · ${sess}`),
+     `the sessions pane is still narrowed to ${proj2} after a poll`);
+
+  // …and the loop is still a loop. Every assertion above would also pass if
+  // refreshing had simply stopped, so this proves the page still learns
+  // things it was not told: a directory created after load must appear on
+  // its own. Revert-checked by deleting the `setInterval` — this line is
+  // the only one in the section that then fails.
+  await Deno.mkdir(`${fx.roots}/latecomer`, { recursive: true });
+  ok(await until(async () =>
+      (await page5.evalIn(`document.getElementById("ovprojects")?.textContent || ""`)).includes("latecomer"),
+     20, "a project created after load"),
+     "the pane keeps refreshing: a directory created after load shows up on its own");
+  page5.close();
 } finally {
   page?.close(); page2?.close(); page3?.close(); ws?.close(); ws2?.close();
   browser.close();

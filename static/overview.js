@@ -23,16 +23,24 @@
     (open.size ? `&open=${[...open].map(encodeURIComponent).join(",")}` : "");
   const sessionsUrl = (sel) => `/frag/_overview_sessions?sel=${encodeURIComponent(sel)}`;
 
-  // Both panes poll on their own `hx-get`, so that attribute is the single
-  // source of truth for what the next poll asks: refresh it before firing a
-  // request, or the poll five seconds later would undo the click.
   function refresh(which, sel) {
     const node = el(panes[which]);
-    if (!node) return;
-    const url = which === "proj" ? projectsUrl(sel) : sessionsUrl(sel);
-    node.setAttribute("hx-get", url);
-    if (window.htmx) htmx.ajax("GET", url, `#${panes[which]}`);
+    if (!node || !window.htmx) return;
+    htmx.ajax("GET", which === "proj" ? projectsUrl(sel) : sessionsUrl(sel), `#${panes[which]}`);
   }
+
+  // The refresh loop lives here rather than in `hx-trigger="every 5s"`,
+  // because htmx captures a polling element's URL when it processes the
+  // node: rewriting `hx-get` afterwards does not reach the poll, so five
+  // seconds after every click both panes refetched the URL the page was
+  // opened with and threw the selection away — the tree appeared to switch
+  // projects on its own. Driving it from here means each tick asks for
+  // whatever is selected and open *now*.
+  setInterval(() => {
+    const sel = selNow();
+    refresh("proj", sel);
+    refresh("sess", sel);
+  }, 5000);
 
   // Splice one project's worktrees in under its row, or take them out
   // again. Selecting or opening a project must never re-fetch the list it
@@ -48,14 +56,9 @@
     if (!wanted) {
       open.delete(key);
       if (caret) caret.textContent = "\u25b8";
-      // The poll must stop asking for it too.
-      const pane = el(panes.proj);
-      if (pane) pane.setAttribute("hx-get", projectsUrl(selNow()));
       return;
     }
     open.add(key);
-    const pane = el(panes.proj);
-    if (pane) pane.setAttribute("hx-get", projectsUrl(selNow()));
     const url =
       `/frag/_overview_worktrees?project=${encodeURIComponent(key)}` +
       `&sel=${encodeURIComponent(selNow())}`;
@@ -85,9 +88,6 @@
     document.querySelectorAll("#ovprojects .ovrow").forEach((r) => {
       r.classList.toggle("current", !!sel && r.dataset.key === sel);
     });
-    // The next poll still has to know, or it would render the old selection.
-    const pane = el(panes.proj);
-    if (pane) pane.setAttribute("hx-get", projectsUrl(sel));
     refresh("sess", sel);
   }
 

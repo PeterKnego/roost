@@ -731,11 +731,11 @@ pub fn overview_page(sel: &str, roots_label: &str) -> String {
          <main id=\"overview\">\
            <section class=\"pane ovpane tool\">\
              <div class=\"panehead\"><span class=\"panetitle\">Projects</span></div>\
-             <div id=\"ovprojects\" class=\"ovbody\" hx-get=\"/frag/_overview_projects?sel={qsel}\" hx-trigger=\"load, every 5s\"></div>\
+             <div id=\"ovprojects\" class=\"ovbody\" hx-get=\"/frag/_overview_projects?sel={qsel}\" hx-trigger=\"load\"></div>\
            </section>\
            <section class=\"pane ovpane\">\
              <div class=\"panehead\"><span class=\"panetitle\">Sessions</span><span id=\"ovscope\" class=\"panemeta\"></span></div>\
-             <div id=\"ovsessions\" class=\"ovbody\" hx-get=\"/frag/_overview_sessions?sel={qsel}\" hx-trigger=\"load, every 5s\"></div>\
+             <div id=\"ovsessions\" class=\"ovbody\" hx-get=\"/frag/_overview_sessions?sel={qsel}\" hx-trigger=\"load\"></div>\
            </section>\
          </main>\
          <script src=\"/static/overview.js\"></script>\
