@@ -748,6 +748,64 @@ impl Hub {
         self.broadcast(&Event::BufferText { rel: rel.to_string(), text, origin: String::new() });
     }
 
+    /// A file that is positively gone from under whatever has it open.
+    ///
+    /// This is the *proven* absence — `symlink_metadata` said `NotFound`, not
+    /// "I could not look" — so acting on it is safe in the way CLAUDE.md's
+    /// third-outcome rule requires. What is not safe is the state the watcher
+    /// used to leave behind: an external `mv` deletes the old path, nothing
+    /// touched the tab, and the tab went on addressing it in Edit. The editor
+    /// is seeded from the `BufferText` this method's caller would have sent —
+    /// no readable file, no push — so the next mount paints an *empty*
+    /// textarea under the old filename, labelled "saved". `open_buffer_for`
+    /// already refuses to create exactly that state on the open path ("always
+    /// demote"); this applies the same rule when the file leaves on its own.
+    ///
+    /// Always returns `false`, because that is what "still there?" means to
+    /// the watcher, which turns it into the tree refresh that drops the row.
+    ///
+    /// The tab itself is never closed. A `git checkout` or a rebase removes
+    /// files it is about to put back, and a wrongly closed tab is not
+    /// recoverable from the UI the way a wrongly demoted one is — a demoted
+    /// tab re-renders itself the moment the file returns, because a Preview
+    /// pane fetches its own fragment.
+    fn file_vanished(&mut self, rel: &str) -> bool {
+        // A dirty buffer is now the only copy of that text anywhere. Demoting
+        // it would hide the user's unsaved work behind a "not found" page and
+        // dropping it would delete the work outright, so it is marked stale
+        // instead — the same flag a file changing underneath sets, and the one
+        // the client uses to pause autosave, which matters more here than
+        // there: every autosave from now on writes to a path that is gone.
+        if self.ws.buffers.get(rel).map(|b| b.dirty()).unwrap_or(false) {
+            if let Some(b) = self.ws.buffers.get_mut(rel) {
+                b.stale = true;
+            }
+            let ev = Event::BufferStale { rel: rel.to_string() };
+            self.broadcast(&ev);
+            self.broadcast(&Event::FileChanged { rel: rel.to_string() });
+            return false;
+        }
+        // Nothing was unsaved, so the buffer holds only a base hash for a file
+        // that no longer exists. Keeping it would have every later reconnect
+        // re-read a path it cannot read (`wsconn`'s replay reads one file per
+        // buffer, every time) to learn the same thing again.
+        let dropped = self.ws.buffers.remove(rel).is_some();
+        let demoted = self.demote_to_preview(rel);
+        if dropped || demoted {
+            self.ws.version += 1;
+            let snap = self.snapshot_event(&String::new());
+            self.broadcast(&snap);
+            self.persist();
+        }
+        // Every pane showing this rel, not just the one that owns the buffer:
+        // a Preview pane paints from a fetched fragment and otherwise goes on
+        // showing the deleted file's contents until something makes it look
+        // again. Sent after the snapshot so a demoted tab has already been
+        // told which mode it is in.
+        self.broadcast(&Event::FileChanged { rel: rel.to_string() });
+        false
+    }
+
     /// A file with an open buffer changed on disk. Clean buffers follow the
     /// file so you watch Claude's edits land live; dirty buffers are only
     /// flagged stale, so unsaved work is never overwritten by a background
@@ -764,12 +822,13 @@ impl Hub {
     ///   goes out anyway. That event is what re-fetches a previewed image's
     ///   fragment and with it the cache key on its `<img src>`; folding this
     ///   case into "deleted" left the browser showing the old picture forever.
-    /// - genuinely absent (`symlink_metadata` says `NotFound`): returns
-    ///   false. `classify` routes an open buffer's path to `Buffer`, not
-    ///   `Tree`, so without this the caller's tree pane would keep listing a
-    ///   file that no longer exists until some unrelated event happened to
-    ///   arrive and trigger a refresh. Callers must treat `false` as a tree
-    ///   change too.
+    /// - genuinely absent (`symlink_metadata` says `NotFound`): hands off to
+    ///   `file_vanished`, which settles what happens to the tab and the
+    ///   buffer, and returns false. `classify` routes an open buffer's path to
+    ///   `Buffer`, not `Tree`, so without this the caller's tree pane would
+    ///   keep listing a file that no longer exists until some unrelated event
+    ///   happened to arrive and trigger a refresh. Callers must treat `false`
+    ///   as a tree change too.
     pub fn file_changed_externally(&mut self, base: &std::path::Path, rel: &str) -> bool {
         let path = base.join(rel);
         let disk = match std::fs::read_to_string(&path) {
@@ -781,7 +840,9 @@ impl Hub {
             // as absence, so it lands on the "still there" side: a spurious
             // re-mount costs a repaint, a spurious "deleted" costs the tab.
             Err(_) => match std::fs::symlink_metadata(&path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return self.file_vanished(rel)
+                }
                 _ => None,
             },
         };
@@ -807,10 +868,22 @@ impl Hub {
         // below update what a *buffer* holds; the broadcast at the end is
         // what every open tab needs either way.
         if let Some(b) = self.ws.buffers.get_mut(rel) {
+            // Diverged, not merely touched. A rename fires an event for the
+            // destination without changing a byte, and flagging that would
+            // tell the user their file had been rewritten underneath them by
+            // the act of moving it — and pause autosave until they resolved a
+            // conflict that does not exist. Equal hashes mean a save from this
+            // buffer would not even reach the conflict check.
             if b.dirty() {
-                b.stale = true;
-                let ev = Event::BufferStale { rel: rel.to_string() };
-                self.broadcast(&ev);
+                if disk_hash != b.base_hash {
+                    b.stale = true;
+                    let ev = Event::BufferStale { rel: rel.to_string() };
+                    self.broadcast(&ev);
+                }
+                // Equal hashes: nothing to say and nothing to do. Falling
+                // through to the clean branch below would reset this buffer to
+                // Clean and broadcast the disk text over the user's unsaved
+                // edit, which is why this is a nested `if` and not an `&&`.
             } else {
                 // A clean buffer holds nothing, so following the file is
                 // just staying Clean — the disk text goes straight into the
@@ -865,6 +938,63 @@ impl Hub {
                 self.send_to(from, &ev);
             }
         }
+    }
+
+    /// A rename resh did not perform — `mv` from a terminal, `git mv`, a
+    /// Claude's own edit tool. `watch.rs` only calls this when the kernel
+    /// paired the two halves itself (inotify's rename cookie, surfaced by
+    /// `notify` as one `Modify(Name(Both))` event carrying both paths), so
+    /// this is told where the file went rather than inferring it. A move out
+    /// of the project never pairs, and correctly stays a deletion.
+    ///
+    /// Returns whether anything was actually following that path. The guard is
+    /// not an optimisation: every atomic save is a rename (`atomic_write`
+    /// writes a temp file and renames over the target) and so is most of what
+    /// git does to its index, so without it a build or a commit would bump the
+    /// workspace version, persist the layout, and wake every browser on the
+    /// project several times a second.
+    pub fn follow_rename(&mut self, old: &str, new: &str) -> bool {
+        let referenced = self.ws.buffers.keys().any(|k| k == old || has_prefix_boundary(k, old))
+            || self.ws.panes.iter().flat_map(|p| p.tabs.iter()).any(|t| match t {
+                Tab::File { rel, .. } | Tab::Diff { rel: Some(rel) } => {
+                    rel == old || has_prefix_boundary(rel, old)
+                }
+                _ => false,
+            });
+        if !referenced {
+            return false;
+        }
+        // Handles a directory rename too, by `/`-boundary prefix: renaming
+        // `src` moves every open tab under it. That is the same method resh's
+        // own rename intent uses, so both paths cannot drift apart.
+        self.rekey_after_rename(old, new);
+        self.ws.version += 1;
+        let snap = self.snapshot_event(&String::new());
+        self.broadcast(&snap);
+        self.persist();
+        // Only a dirty buffer. A clean one holds no text of its own and the
+        // batch's own classification of the destination re-reads it from disk a
+        // moment later; an unsaved edit has no other source, and app.js keys its
+        // editor text by rel, so without this the editor re-mounts at the new
+        // name with nothing to put in it — the empty-editor failure this line of
+        // work started from, arriving through the rename door.
+        //
+        // Sent after the snapshot because that is the natural order, not because
+        // it is required: measured by sending it first, and the client is fine
+        // either way. It mounts the editor empty and fills it in whenever the
+        // text lands (`mountEditor` documents exactly that), and the `texts`
+        // pruning every State does cannot drop this one — the State that moves
+        // the tab lists the buffer under its new rel, so the new rel is in the
+        // set the prune keeps.
+        let edited = self.ws.buffers.get(new).and_then(|b| b.edited_text()).map(|t| t.to_string());
+        if let Some(text) = edited {
+            self.broadcast(&Event::BufferText {
+                rel: new.to_string(),
+                text,
+                origin: String::new(), // no author: every client applies it
+            });
+        }
+        true
     }
 
     /// Move the buffer and rewrite every tab's rel from `old` to `new` after
@@ -3466,6 +3596,141 @@ mod tests {
         std::env::remove_var("RESH_STATE_DIR");
     }
 
+
+    /// A rename resh did not perform. The tab has to move with the file, and
+    /// unsaved work has to arrive at the new name — app.js keys its editor
+    /// text by rel, so a tab that changes rel with nothing sent for the new one
+    /// mounts an empty textarea over the user's edit, which is the failure this
+    /// whole line of work began with.
+    #[test]
+    fn an_external_rename_moves_the_tab_and_its_unsaved_work() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("old.rs"), "fn one() {}\n").unwrap();
+        let mut h = Hub::new("renameproj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "old.rs".into(), mode: Mode::Edit },
+            },
+        );
+        h.handle(&c, Intent::EditBuffer { rel: "old.rs".into(), text: "unsaved work\n".into() });
+        drain(&rx);
+
+        std::fs::rename(d.path().join("old.rs"), d.path().join("new.rs")).unwrap();
+        assert!(h.follow_rename("old.rs", "new.rs"), "something referenced the old path");
+
+        let tab = h.ws.panes[proto::MIDDLE as usize]
+            .tabs
+            .iter()
+            .find_map(|t| match t {
+                Tab::File { rel, mode } => Some((rel.clone(), *mode)),
+                _ => None,
+            })
+            .expect("the tab is still open");
+        assert_eq!(tab.0, "new.rs", "the tab addresses where the file went");
+        assert_eq!(tab.1, Mode::Edit, "and stays in the mode it was in — nothing here is unreadable");
+        assert!(!h.ws.buffers.contains_key("old.rs"), "nothing is left under the old key");
+        assert_eq!(
+            h.ws.buffers.get("new.rs").and_then(|b| b.edited_text()),
+            Some("unsaved work\n"),
+            "the unsaved edit moves with the file"
+        );
+
+        let msgs = drain(&rx);
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"State""#)),
+            "the browser has to be told the tab moved; got {msgs:?}"
+        );
+        // Presence, deliberately not order. The obvious worry is that app.js
+        // prunes its `texts` map against every State's buffer list, so a
+        // BufferText arriving first would be deleted by the State behind it —
+        // but the State that moves the tab lists the buffer under the *new*
+        // rel, so the prune keeps it. Checked rather than assumed: sending the
+        // text first leaves `renamed.mjs` fully green, so an ordering assertion
+        // here would only be a trap for whoever refactors this next.
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains(r#""t":"BufferText""#) && m.contains("unsaved work")),
+            "the text has to reach the browser under the new rel; got {msgs:?}"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// Every atomic save is a rename (`fileops::atomic_write`) and so is most
+    /// of what git does to its index. Following one that nothing has open must
+    /// not touch the workspace at all — a version bump per temp file would
+    /// persist the layout and wake every browser several times a second during
+    /// a build.
+    #[test]
+    fn a_rename_nobody_has_open_leaves_the_workspace_alone() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("quietrename", d.path().to_path_buf());
+        let (_c, rx) = h.subscribe();
+        drain(&rx);
+        let version_before = h.ws.version;
+
+        assert!(!h.follow_rename(".tmp.1234", "notes.rs"), "nothing referenced the old path");
+
+        assert_eq!(h.ws.version, version_before, "an unrelated rename is not a workspace change");
+        let msgs = drain(&rx);
+        assert!(msgs.is_empty(), "and nothing is broadcast for it; got {msgs:?}");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// A dirty buffer is flagged stale when the file underneath it changes,
+    /// which is what pauses autosave and raises the banner. But "changed" has
+    /// to mean *diverged*: a rename fires an event for the destination while
+    /// leaving the bytes identical, and flagging that would tell the user their
+    /// file had been rewritten underneath them by the act of moving it.
+    #[test]
+    fn a_file_still_matching_the_buffers_base_has_not_diverged_from_it() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.rs"), "on disk\n").unwrap();
+        let mut h = Hub::new("nodiverge", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "a.rs".into(), mode: Mode::Edit },
+            },
+        );
+        h.handle(&c, Intent::EditBuffer { rel: "a.rs".into(), text: "mine\n".into() });
+        drain(&rx);
+
+        // Same bytes the buffer was opened against, touched by something else.
+        assert!(h.file_changed_externally(d.path(), "a.rs"));
+        assert!(
+            !h.ws.buffers["a.rs"].stale,
+            "the file matches this buffer's base exactly; a save would not even conflict"
+        );
+        // The assertion that catches the tempting way to write the guard. As
+        // `&&` on the existing condition, a non-divergent event falls into the
+        // clean-buffer branch, which resets the buffer and broadcasts the disk
+        // text — silently discarding the edit while leaving `stale` false, so
+        // the check above passes.
+        assert_eq!(
+            h.ws.buffers["a.rs"].edited_text(),
+            Some("mine\n"),
+            "and the unsaved edit is still there — not quietly replaced by the disk text"
+        );
+
+        // The control: a real divergence must still be caught, or the assertion
+        // above is just testing that staleness never happens.
+        std::fs::write(d.path().join("a.rs"), "somebody else\n").unwrap();
+        assert!(h.file_changed_externally(d.path(), "a.rs"));
+        assert!(h.ws.buffers["a.rs"].stale, "different bytes on disk is exactly what stale is for");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
     /// A genuinely deleted file is the third outcome and must still say so:
     /// the watcher turns `false` into the tree refresh that drops the row.
     #[test]
@@ -3477,6 +3742,111 @@ mod tests {
         let mut h = Hub::new("delproj", d.path().to_path_buf());
         std::fs::remove_file(d.path().join("gone.md")).unwrap();
         assert!(!h.file_changed_externally(d.path(), "gone.md"));
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// …and reporting `false` is not all it owes. A file that vanished under
+    /// an open Edit tab leaves that tab addressing a path with nothing behind
+    /// it: `mountEditor` seeds its textarea from the `BufferText` the server
+    /// pushes, no push arrives for a file that cannot be read, and the editor
+    /// mounts *empty* — over a file that was not empty, wearing the old name
+    /// and a "saved" label. That is what an external `mv` looks like from the
+    /// browser, and it is the exact state `open_buffer_for` refuses to create
+    /// on the open path ("always demote"); the watcher path just never applied
+    /// the same rule.
+    ///
+    /// Preview is honest here where Edit cannot be: it fetches its own
+    /// fragment and renders the server's "not found" instead of a blank
+    /// editor.
+    #[test]
+    fn a_vanished_file_does_not_leave_an_edit_tab_over_it() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("gone.rs"), "fn one() {}\n").unwrap();
+        let mut h = Hub::new("vanishproj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "gone.rs".into(), mode: Mode::Edit },
+            },
+        );
+        assert!(h.ws.buffers.contains_key("gone.rs"), "opening in Edit reads the file into a buffer");
+        drain(&rx);
+
+        std::fs::remove_file(d.path().join("gone.rs")).unwrap();
+        assert!(!h.file_changed_externally(d.path(), "gone.rs"), "gone is still gone");
+
+        let mode = h.ws.panes[proto::MIDDLE as usize]
+            .tabs
+            .iter()
+            .find_map(|t| match t {
+                Tab::File { rel, mode } if rel == "gone.rs" => Some(*mode),
+                _ => None,
+            })
+            .expect("the tab itself stays — closing it would throw away the user's layout");
+        assert_eq!(mode, Mode::Preview, "an Edit tab over a file that is not there paints an empty editor");
+        assert!(
+            !h.ws.buffers.contains_key("gone.rs"),
+            "and a clean buffer for a file that no longer exists holds nothing worth keeping — \
+             every later reconnect would re-read it and fail"
+        );
+        // Without this the browser only learns on its next reload, which is
+        // where the empty editor was actually seen.
+        let msgs = drain(&rx);
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"State""#)),
+            "the demotion has to reach the browser that is looking at it; got {msgs:?}"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// The other half, and the one that must not follow the rule above: a
+    /// *dirty* buffer is the only copy of that text in the world once the file
+    /// is gone. Demoting it to Preview would hide the user's unsaved work
+    /// behind a "not found" page, and dropping the buffer would delete it
+    /// outright. Mark it stale instead — which is what pauses autosave
+    /// client-side, so nothing tries to write it back to a path that vanished.
+    #[test]
+    fn a_vanished_file_keeps_unsaved_work_and_says_so() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("gone.rs"), "fn one() {}\n").unwrap();
+        let mut h = Hub::new("vanishdirty", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "gone.rs".into(), mode: Mode::Edit },
+            },
+        );
+        h.handle(&c, Intent::EditBuffer { rel: "gone.rs".into(), text: "unsaved work\n".into() });
+        drain(&rx);
+
+        std::fs::remove_file(d.path().join("gone.rs")).unwrap();
+        assert!(!h.file_changed_externally(d.path(), "gone.rs"));
+
+        let b = h.ws.buffers.get("gone.rs").expect("unsaved work must survive the file's deletion");
+        assert_eq!(b.edited_text(), Some("unsaved work\n"), "and survive it unaltered");
+        assert!(b.stale, "the buffer no longer matches anything on disk, and must say so");
+        let mode = h.ws.panes[proto::MIDDLE as usize]
+            .tabs
+            .iter()
+            .find_map(|t| match t {
+                Tab::File { rel, mode } if rel == "gone.rs" => Some(*mode),
+                _ => None,
+            })
+            .expect("the tab stays");
+        assert_eq!(mode, Mode::Edit, "Preview would hide the only copy of the user's text");
+        let msgs = drain(&rx);
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"BufferStale""#)),
+            "autosave pauses on BufferStale; without it the client keeps writing to a dead path; got {msgs:?}"
+        );
         std::env::remove_var("RESH_STATE_DIR");
     }
 

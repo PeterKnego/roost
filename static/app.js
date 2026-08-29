@@ -786,11 +786,22 @@ function newTerminal(pane, launch) {
 // The Edit/Preview switch lives in the filename stripe (`.path`), not on the
 // tab: only the active tab's mode is visible, so a per-tab toggle spent ~20px
 // on every markdown tab for a control that mostly toggled something you could
-// not see. Two modes are worth switching between only where the file has both
-// a rendered form and text to edit — markdown and svg; a png renders but
-// cannot be edited, a code file edits but renders as nothing.
+// not see. A png renders but cannot be edited, and a code file edits but
+// renders as nothing — so which half of the switch is worth offering depends
+// on the mode the tab is in, which is what the guard below works out.
 function modeButton(rel, mode) {
-  if (!(hasRenderedForm(rel) && !refusesTextEdit(rel))) return null;
+  // Asymmetric on purpose. The eye is offered only where there is a rendered
+  // form worth looking at, as before — a code file in Edit gains nothing from
+  // a toggle to a mode nothing opens it in. The pencil is offered from
+  // Preview for anything editable, which is wider than it used to be: a text
+  // file can now *arrive* in Preview without anyone asking for it, because
+  // the server demotes a tab whose file it cannot read — one past the size
+  // cap, and (hub::file_vanished) one that was renamed away underneath the
+  // tab. With the old rule a demoted .rs was stranded there, with no way back
+  // even once the file returned, since re-clicking it in the tree only
+  // focuses the tab it already has and never revisits its mode.
+  const editable = !refusesTextEdit(rel);
+  if (!editable || (mode === "Edit" && !hasRenderedForm(rel))) return null;
   const b = document.createElement("button");
   b.className = "modebtn"; // NOT .savebtn: paintSaveState selects ".savebtn" and must find Save, not this
   b.innerHTML = mode === "Edit" ? MODE_ICONS.preview : MODE_ICONS.edit; // constant markup only
