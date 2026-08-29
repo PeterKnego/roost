@@ -488,6 +488,14 @@ function onEvent(ev) {
       // silent no-op. console.warn stays too, for anyone actually watching devtools.
       console.warn("resh:", ev.msg);
       showError(ev.msg);
+      // do_open_at_line's own confinement check (src/hub.rs) refuses here,
+      // never with a RevealLine — so a flag armed for it would otherwise
+      // stay armed forever, ready to steal focus (and via wireEditor's blur
+      // listener, trigger an autosave) on some *other* browser's later,
+      // unrelated RevealLine. Clearing unconditionally on every Error is
+      // safe even when this Error has nothing to do with a reveal: the flag
+      // only ever changes whether the next RevealLine focuses.
+      focusNextReveal = false;
       break;
     case "PathRefused":
       // Not showError: that funnels to the workspace banner, which is the
@@ -495,6 +503,11 @@ function onEvent(ev) {
       // back to the terminal that was clicked. This does, via the click still
       // in flight.
       console.warn("resh:", ev.msg);
+      // Same reasoning as the Error case above: a link that doesn't resolve
+      // (the comment below calls this "the common case, not an edge case")
+      // armed focusNextReveal in openTermPath and will never get the
+      // RevealLine that would otherwise have cleared it.
+      focusNextReveal = false;
       if (pendingLink && pendingLink.text === ev.text) {
         termFlash(pendingLink.entry, ev.msg);
         // Cleared only on a match. A mismatch means a DIFFERENT click is
@@ -1284,8 +1297,13 @@ function openTermPath(entry, raw) {
   const line = raw.match(/:(\d+)(?::\d+)?$/);
   if (line) {
     termFlash(entry, `line ${line[1]}`);
-    // Only the client that clicked gets focus stolen into the editor once
-    // the tab opens — see revealLine()'s focus parameter.
+    // do_open_path (src/hub.rs) opens the target in Preview, not Edit, so
+    // revealInPreview — which never focuses anything — is what usually runs
+    // for this click, not revealInEditor. This flag still only ever matters
+    // for the Edit case: the incidental one where this rel also happens to
+    // have an Edit-mode pane open elsewhere. Armed here regardless, since
+    // openTermPath cannot know which case it will be before the reply
+    // arrives — see revealLine()'s focus parameter.
     focusNextReveal = true;
   }
   // Verbatim. The client does no parsing; resolution and confinement are one
@@ -2990,6 +3008,16 @@ let focusNextReveal = false;
 // again from mountTab's fetch completion, because a Preview pane's fetch can
 // still be in flight when RevealLine arrives (the State event that creates
 // the tab only starts that fetch, it does not wait for it).
+//
+// A single slot, last-wins: a second RevealLine that arrives before the
+// first one's target pane finishes mounting replaces it outright, and the
+// first is never applied anywhere. Deliberate, not an oversight — RevealLine
+// only ever follows a user-driven OpenAtLine or line-suffixed OpenPath, so
+// two in flight on one client at once means two of those landed back to
+// back, and jumping to wherever the most recent one points is the same
+// "whatever the user is looking at now wins" rule SearchResults' own `seq`
+// guard already applies elsewhere in this file — not a queue holding onto
+// something the user has moved past.
 let pendingReveal = null;
 let pendingRevealTimer = null;
 
@@ -3014,12 +3042,22 @@ let pendingRevealTimer = null;
 function revealLine(rel, line, focus) {
   pendingReveal = { rel, line, focus };
   clearTimeout(pendingRevealTimer);
-  // The backstop for a pane that never arrives at all (closed before its
-  // fetch landed, or any other path this client cannot observe) — without
-  // it a stale target would sit armed forever, ready to hijack the scroll
-  // position of some unrelated pane that happens to open later and match
-  // the same rel.
-  pendingRevealTimer = setTimeout(() => { pendingReveal = null; }, 4000);
+  // Reached only when tryReveal() below (and every retry from mountTab's
+  // fetch completion) never got every matching pane to a `pre.codeview` or
+  // `textarea.editor` within this window — the ordinary cases (a fetch that
+  // lands, or a rendered form with genuinely no line mapping) clear
+  // pendingReveal themselves, well before this fires. Reaching here means
+  // some pane matching `rel` is still stuck empty: closed before its fetch
+  // landed, or some other path this client cannot observe. Silence here
+  // would be exactly the failure mode CLAUDE.md calls out — treating "I
+  // could not tell" as nothing having gone wrong — so it says so instead.
+  // 4000ms is not measured against any real fetch latency; it is an
+  // arbitrary, generously long backstop, chosen only so a stale target
+  // can't sit armed indefinitely (see the comment above pendingReveal).
+  pendingRevealTimer = setTimeout(() => {
+    showBanner(`couldn't scroll to line ${line} of ${rel} — its tab may have closed, or never finished opening`);
+    pendingReveal = null;
+  }, 4000);
   tryReveal();
 }
 
@@ -3027,20 +3065,32 @@ function revealLine(rel, line, focus) {
 /// matches — every pane, not just the first: a file open in two panes at
 /// once must scroll both, and which one a DOM-order `return` would have hit
 /// first is an implementation detail no user should have to think about.
+///
+/// Marks each pane it actually reveals into (`content._revealedFor`) so a
+/// later call for the *same* pendingReveal — mountTab calls this again once
+/// some other, still-loading pane's fetch finally lands — does not re-apply
+/// to a pane that already got it, which would otherwise re-snap the scroll
+/// (and, for the focused client, re-select) out from under a user who
+/// scrolled away in the meantime. A new revealLine() call always creates a
+/// fresh pendingReveal object, so this marker never blocks a genuinely new
+/// reveal of the same pane later.
 function tryReveal() {
   if (!pendingReveal) return;
   const { rel, line, focus } = pendingReveal;
   let stillWaiting = false;
   for (const content of document.querySelectorAll(".pane .content")) {
+    if (content._revealedFor === pendingReveal) continue;
     const ta = content.querySelector("textarea.editor");
     if (ta && editorRel(content) === rel) {
       revealInEditor(ta, line, focus);
+      content._revealedFor = pendingReveal;
       continue;
     }
     if (!matchesRel(content, rel)) continue;
     const pre = content.querySelector("pre.codeview");
     if (pre) {
       revealInPreview(content, pre, line);
+      content._revealedFor = pendingReveal;
       continue;
     }
     // This pane's fragment is rel's, but neither surface is mounted. An
@@ -3058,35 +3108,49 @@ function tryReveal() {
   }
 }
 
+/// Unlike revealInPreview(), this is exact only on the focused branch.
+/// `.editor` sets no white-space override (static/style.css) so a plain
+/// textarea soft-wraps by default, and `.editwrap code-input` explicitly
+/// sets `white-space: pre-wrap`, which the vendor stylesheet's `code-input
+/// textarea, code-input pre { white-space: inherit }` pushes onto both of
+/// its layers — so in *both* editor shapes one logical line is not
+/// reliably one visual row, unlike the preview's <pre> (see revealInPreview
+/// for why that one is exact). A pixel formula built on `(line-1)*lh` alone
+/// undercounts by one `lh` for every wrapped row above the target, which
+/// can be tens of rows in a real source file and leave the target off
+/// screen entirely.
 function revealInEditor(ta, line, focus) {
   const lines = ta.value.split("\n");
   const upto = lines.slice(0, Math.max(0, line - 1)).join("\n").length + (line > 1 ? 1 : 0);
   ta.setSelectionRange(upto, upto + (lines[line - 1] || "").length);
-  if (focus) ta.focus();
-  // code-input scrolls its *host*, not the textarea inside it: the textarea
-  // and its highlighted overlay share one grid cell
-  // (static/vendor/code-input.min.css) and move together only because the
-  // host is the element with overflow:auto — the library has no separate
-  // scroll bridge (nothing named "scroll" anywhere in its bundled JS besides
-  // the no-highlighting fallback swap), so scrolling the textarea alone
-  // would either no-op or desync the caret layer from the highlighted text
-  // painted under it. A plain, unhighlighted textarea (.md and the other
-  // non-highlightable extensions, mountEditor's `else` branch) has no
-  // code-input host at all and is its own scroll container — `box` covers
-  // both, and `extra` is only meaningful when they differ: ta.offsetTop is
-  // relative to *ta's own* offsetParent, which is nonsense to add when
-  // `box === ta`.
+  if (focus) {
+    // Exact, and wrap-aware for free: focusing a textarea with an active
+    // selection makes the browser scroll that selection into view within
+    // its nearest scrollable ancestor — code-input's host for the
+    // highlighted case (its textarea and pre share one grid cell with
+    // overflow:hidden; only the host itself has overflow:auto — confirmed
+    // by reading code-input.min.js's syncSize(), which sizes the textarea
+    // to its full content rather than scrolling it), or the textarea itself
+    // for the plain case. This native scroll already knows the wrapped
+    // layout; a hand-rolled pixel offset below does not. Do not also set
+    // scrollTop here — that would overwrite this correct position with the
+    // wrap-blind approximation the mirror branch is stuck with below.
+    ta.focus();
+    return;
+  }
+  // A mirroring client (focus=false) gets no such native scroll: this
+  // client deliberately never focuses ta for someone else's action (see
+  // focusNextReveal). The line-height arithmetic below is the fallback,
+  // and it is an approximation, not the exact placement the focused branch
+  // gets above — it assumes one logical line is one visual row, which the
+  // doc comment above already says is false the moment a line wraps. A
+  // mirror can therefore land above the true target by roughly one line
+  // height per wrapped row between the top of the file and this line. That
+  // is judged better than leaving a mirroring browser's view completely
+  // unscrolled, but it is not exact, and no comment here should claim
+  // otherwise.
   const box = ta.closest("code-input") || ta;
   const extra = box === ta ? 0 : ta.offsetTop;
-  // Measured, never assumed: line-height and top padding are set in
-  // style.css (.editor's `font: 13px/1.55`, code-input's `--padding-top`)
-  // and differ from the preview's. Both resolve to a used pixel length
-  // here, never the string "normal" the `|| 20` fallback exists for:
-  // line-height is unitless-but-set (not "normal") wherever .editor's or
-  // code-input's own `font` shorthand applies, which is everywhere this
-  // branch runs. Padding is part of the offset, not decoration: scrollTop=0
-  // shows the padding box first, so line N's top sits `extra + pad +
-  // (N-1)*lh` below the scroll origin, not `(N-1)*lh` alone.
   const lh = parseFloat(getComputedStyle(ta).lineHeight) || 20;
   const pad = parseFloat(getComputedStyle(ta).paddingTop) || 0;
   box.scrollTop = Math.max(0, extra + pad + (line - 1) * lh - box.clientHeight / 3);
