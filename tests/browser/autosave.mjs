@@ -17,7 +17,7 @@
 //! this file asserts on: zero from autosave, one from an explicit ⌘S.
 //!
 //! Run: deno run -A tests/browser/autosave.mjs
-import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
+import { disableAutosave, fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -31,8 +31,7 @@ await Deno.writeTextFile(file, "start\n");
 // A second project that turns autosave off, so the config cascade is exercised
 // end to end rather than only in config.rs's own tests. Same server, because
 // settings are re-read per request and never cached.
-await Deno.mkdir(`${fx.roots}/noauto/.resh`, { recursive: true });
-await Deno.writeTextFile(`${fx.roots}/noauto/.resh/config.toml`, "autosave = false\n");
+await disableAutosave(`${fx.roots}/noauto`);
 const manualFile = `${fx.roots}/noauto/manual.md`;
 await Deno.writeTextFile(manualFile, "start\n");
 // Its own file, so section F's forced race cannot disturb the buffer D3 is

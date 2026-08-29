@@ -69,6 +69,32 @@ runs start faster. Deleting it is always safe. It lives there, rather than in a
 temp dir, because snap-packaged Chromium is confined to non-hidden paths under
 `$HOME` and cannot read `/tmp`.
 
+## Buffers that have to stay dirty: `autosave: false`
+
+`AUTOSAVE_MS` is 1000ms and a blur flushes too, so a test that types into a
+buffer and then does something within a second sees a dirty buffer *whether or
+not* it asked for autosave to be off. It passes, on a race it happened to win,
+and stops winning on a loaded box — or worse, passes for the opposite reason:
+`do_save` resets any successfully-saved buffer to `Content::Clean`, so an
+autosave can clean up a buffer that a broken hash rule wrongly dirtied.
+
+`fixture({ autosave: false })` writes `.resh/config.toml` into the fixture's own
+project before the server starts; `disableAutosave(dir)` does the same for a
+second project (`autosave.mjs` and `buffer-lifecycle.mjs` keep one of each, so
+both halves of the config cascade are exercised).
+
+**A test that depends on it must prove it took**, because a fixture that
+silently does nothing leaves the test green and meaningless. The cheap proof is
+`ok(await page.evalIn('AUTOSAVE === false'), ...)`; where the point is a buffer
+staying unsaved, wait past the window and require the file on disk to be
+untouched as well. Measured by commenting the key out of `disableAutosave` so
+every project silently had autosave on again: `renamed.mjs` fails 4,
+`vanished.mjs` 6, `autosave.mjs` 4, `edit-by-default.mjs` 1 — and
+`buffer-lifecycle.mjs` failed **nothing**, despite a header comment explaining
+that its section C depends on autosave being off. Its protection was real and
+invisible; it now asserts `AUTOSAVE === false` first, and fails 1 under the same
+neutering.
+
 ## Writing another one
 
 Ask the question CLAUDE.md asks of every test here: **would this fail if I

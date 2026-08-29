@@ -24,7 +24,9 @@ const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
 let fail = 0;
 const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) fail++; };
 
-const fx = await fixture();
+// autosave off, for section D: it needs a buffer that is still dirty when its
+// file goes away, which with autosave on is a race against a 1s timer.
+const fx = await fixture({ autosave: false });
 await Deno.writeTextFile(`${fx.roots}/proj/notes.rs`, "fn one() {}\nfn two() {}\n");
 await Deno.writeTextFile(`${fx.roots}/proj/draft.rs`, "fn draft() {}\n");
 
@@ -122,6 +124,12 @@ try {
     ta.value = "fn draft() {}\\nunsaved work\\n"; ta.dispatchEvent(new Event("input", { bubbles: true })); })()`);
   ok(await until(async () => (await page.buffer("draft.rs"))?.dirty === true, 10, "the dirty buffer"),
      "typing makes it dirty");
+  // Same proof as renamed.mjs: without it this section passes on a race won
+  // rather than on a buffer that is genuinely still unsaved when the file goes.
+  await new Promise((r) => setTimeout(r, 1500));
+  ok(await page.evalIn(`AUTOSAVE === false`), "the project config turned autosave off");
+  ok((await Deno.readTextFile(`${fx.roots}/proj/draft.rs`)) === "fn draft() {}\n",
+     "so a second later the edit is still only in the browser");
   // A plain delete this time, not a move: the two arrive as different events
   // (`Remove` versus an unpaired rename `From`) and both have to land here.
   await Deno.remove(`${fx.roots}/proj/draft.rs`);
@@ -130,7 +138,11 @@ try {
   ok((await page.tab("draft.rs"))?.mode === "Edit",
      "the tab stays in Edit — Preview would hide the only copy of that text");
   ok((await page.pane()).editorText === "fn draft() {}\nunsaved work\n", "and the unsaved work is still on screen");
-  ok(await page.paused("draft.rs"), "autosave is paused, so nothing writes it back to a path that is gone");
+  // With autosave off nothing was going to write anyway; what this asserts is
+  // that the client *flags* the buffer on BufferStale, which is what would hold
+  // autosave back on a project that has it on. Deleting that line in app.js
+  // fails here.
+  ok(await page.paused("draft.rs"), "and the client flags it, so autosave could not write it back to a path that is gone");
 } finally {
   try { await page?.close(); } catch { /* already gone */ }
   browser.close();

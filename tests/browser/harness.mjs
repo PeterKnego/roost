@@ -284,17 +284,37 @@ export function startProxy({ listenPort, upstreamPort }) {
 /// A throwaway project for the run. Its own directory and its own state dir
 /// mean the sessions this test spawns cannot collide with a real one, and the
 /// teardown can identify its own dtach processes by that unique path.
-export async function fixture() {
+/// Turns autosave off for one project, by writing the `.resh/config.toml` the
+/// server reads (per batch, so it does not even need to exist before startup).
+///
+/// Worth a helper because getting it wrong is invisible: `AUTOSAVE_MS` is 1000
+/// and a blur flushes too, so a test that types into a buffer and then does
+/// something to the file within a second sees a dirty buffer whether or not
+/// this ran. It passes, and it is testing the race it happened to win — on a
+/// loaded box it stops winning. Tests that depend on a buffer *staying* dirty
+/// should call this and then prove it took, by waiting out the window and
+/// requiring the file on disk to be untouched.
+export async function disableAutosave(dir) {
+  await Deno.mkdir(`${dir}/.resh`, { recursive: true });
+  await Deno.writeTextFile(`${dir}/.resh/config.toml`, "autosave = false\n");
+}
+
+/// `autosave: false` writes the config above into the fixture's own project
+/// before the server starts. Default is autosave on, which is resh's own
+/// default — a test that wants the other one should have to say so, and
+/// `autosave.mjs` and `save.mjs` are about that machinery itself.
+export async function fixture({ autosave = true } = {}) {
   const base = await Deno.makeTempDir({ prefix: "resh-browser-" });
   const roots = `${base}/roots`;
   const project = `${roots}/proj`;
   await Deno.mkdir(project, { recursive: true });
   await Deno.writeFile(`${project}/hello.md`, enc.encode("# hello\n"));
   await new Deno.Command("git", { args: ["init", "-q"], cwd: project, stdout: "null", stderr: "null" }).output();
+  if (!autosave) await disableAutosave(project);
   const stateDir = `${base}/state`;
   await Deno.mkdir(stateDir, { recursive: true });
   return {
-    base, roots, project: "proj", stateDir,
+    base, roots, project: "proj", dir: project, stateDir,
     cleanup: async () => {
       // The shells this run started are dtach masters holding sockets under
       // our state dir; nothing else on the machine can match that path.

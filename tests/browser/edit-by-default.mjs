@@ -10,7 +10,7 @@
 //! static/app.js, and the Edit/Preview switch in the filename stripe too.
 //!
 //! Run: deno run -A tests/browser/edit-by-default.mjs
-import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
+import { disableAutosave, fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -21,8 +21,7 @@ const fx = await fixture();
 // Autosave off for this suite: section A covers the Save button's visibility
 // rule (hidden while clean, back when dirty), whose interesting branch only
 // exists without autosave. autosave.mjs owns the autosave-on states.
-await Deno.mkdir(`${fx.roots}/proj/.resh`, { recursive: true });
-await Deno.writeTextFile(`${fx.roots}/proj/.resh/config.toml`, "autosave = false\n");
+await disableAutosave(`${fx.roots}/proj`);
 await Deno.writeTextFile(`${fx.roots}/proj/main.rs`, "fn main() {}\n");
 await Deno.writeTextFile(`${fx.roots}/proj/notes.md`, "# heading\n");
 // Not on NO_TEXT_EDIT_EXT, so nothing but the *read* can save this one — it is
