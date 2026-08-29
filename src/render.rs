@@ -293,6 +293,19 @@ pub fn markdown_html(md: &str, project: &str, rel: &str) -> String {
     format!("<article class=\"markdown-body\">{out}</article>")
 }
 
+/// A File tab whose content could not be produced: deleted from under the tab,
+/// past the 2 MB cap, or not text at all.
+///
+/// Carries the same `.path` breadcrumb the readable fragments do, and that is
+/// load-bearing twice over. A bare "not found: No such file or directory" does
+/// not say *which* file, which is no help with three panes open; and app.js
+/// hangs the Edit/Preview switch on that breadcrumb, so a tab the server
+/// demoted into Preview because it could not read the file would otherwise
+/// have no control at all to get back once the file returns.
+pub fn file_error_fragment(rel: &str, msg: &str) -> String {
+    format!("<div class=\"path\">{}</div>{}", esc(rel), hint(msg))
+}
+
 pub fn file_fragment(project: &str, rel: &str, content: &str) -> String {
     let ext = rel.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     if ext == "md" || ext == "markdown" {
@@ -1295,6 +1308,17 @@ mod tests {
         assert!(!h.contains("<script>"));
         assert!(!h.contains("<iframe"));
         assert!(h.contains("&lt;script&gt;"));
+    }
+
+    /// Both halves matter and each has its own caller: the message is what the
+    /// user reads, and the breadcrumb is what app.js appends the Edit/Preview
+    /// switch to (`mountTab` looks for `.path`). Dropping either one leaves a
+    /// pane that either does not say which file, or cannot be got out of.
+    #[test]
+    fn an_unreadable_file_still_names_itself() {
+        let h = file_error_fragment("src/gone.rs", "not found: No such file or directory");
+        assert!(h.contains(r#"<div class="path">src/gone.rs</div>"#), "{h}");
+        assert!(h.contains("not found: No such file or directory"), "{h}");
     }
 
     #[test]

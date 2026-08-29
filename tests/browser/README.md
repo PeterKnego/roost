@@ -37,6 +37,7 @@ deno run -A tests/browser/worktree-launch.mjs # the ✻ prompt, worktree creatio
 deno run -A tests/browser/overview.mjs   # the front page (/): live session list, clicking one focuses it, ?at= reaches the picker, and selecting a project narrows/widens the session list
 deno run -A tests/browser/claudetab.mjs  # a terminal tab running a Claude wears the Claude mark: the /proc watcher, the data-claude attribute, and the CSS that turns it into a different picture
 deno run -A tests/browser/changes.mjs    # the Changes pane and the header chip follow the working tree, not just `.git/index`
+deno run -A tests/browser/vanished.mjs   # a file renamed away from under an open tab: no empty editor, and unsaved work survives
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -134,6 +135,18 @@ performed.
   of the two fails. Both halves were watched failing — the plain-Enter half
   first passed for the wrong reason, reading the *previous* probe's number out
   of the scrollback, which only agreed while both answers were 13.
+- In `vanished.mjs`: making `file_changed_externally` return a bare `false` for
+  a deleted file again — the state before `hub::file_vanished` — fails 9 of the
+  20, including the reported one, where the pane reads
+  `notes.rssavedSavecode-input…fn one() {` — an editor, mounted, empty, over a
+  file that is gone. Restoring that and reverting only app.js's `modeButton`
+  guard fails exactly 1 (the demoted tab has no way back to Edit); reverting
+  only `render::file_error_fragment` fails the same 1, because the switch is
+  appended to the `.path` breadcrumb that fragment carries. Section B polls for
+  the not-found text rather than reading it once: the demotion arrives as a
+  State event and the pane re-mounts by fetching, so a single read can catch an
+  empty `.content` — which would have passed the `!hasEditor` half on its own.
+  That was seen during the revert run, not reasoned about.
 - In `changes.mjs`: putting `StatusChanged` back behind `.git/index`/`.git/HEAD`
   alone (the `Class::Ignore` guard in `watch.rs`'s batch loop) fails 8 of the 13
   — every "it appeared" assertion, in all four sections. Restoring that and

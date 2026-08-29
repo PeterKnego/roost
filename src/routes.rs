@@ -530,7 +530,7 @@ fn serve_frag(
             // renders a fragment whose picture then 404s, which reads to the
             // user as a corrupt file rather than a bad path.
             Some(rel) if is_image(rel) => match crate::assets::normalize(rel) {
-                None => http::html(w, &render::hint("path outside project")),
+                None => http::html(w, &render::file_error_fragment(rel, "path outside project")),
                 Some(rel) => match projects::safe_resolve(&dir, rel) {
                     Ok(path) => {
                         let mtime_secs = std::fs::metadata(&path)
@@ -543,14 +543,14 @@ fn serve_frag(
                             .unwrap_or(0);
                         http::html(w, &render::image_fragment(project, rel, mtime_secs))
                     },
-                    Err(e) => http::html(w, &render::hint(&e)),
+                    Err(e) => http::html(w, &render::file_error_fragment(rel, &e)),
                 },
             },
             Some(rel) => match projects::safe_resolve(&dir, rel)
                 .and_then(|p| projects::read_text_file(&p))
             {
                 Ok(content) => http::html(w, &render::file_fragment(project, rel, &content)),
-                Err(e) => http::html(w, &render::hint(&e)),
+                Err(e) => http::html(w, &render::file_error_fragment(rel, &e)),
             },
         },
         ["raw"] => match req.query.get("path") {
