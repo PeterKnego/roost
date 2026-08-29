@@ -200,14 +200,30 @@ paths and sessions answer from the first keystroke.
 
 ## Line addressing
 
-`Tab::File { rel, mode }` (`proto.rs:23`) gains `line: Option<u32>`, with
-`#[serde(default)]`. Tabs are persisted as JSON by `wsstate.rs`, which already
-uses that pattern for exactly this reason (`wsstate.rs:36, 55, 71`), so
-workspaces saved before this change keep loading.
+The line travels as its own intent and its own event — `Intent::OpenAtLine
+{ pane, rel, line }` and `Event::RevealLine { rel, line }` — and **not** as a
+field on `Tab::File`.
 
-**Same `rel` remains one tab.** A second hit in a file already open re-scrolls
-the existing tab rather than opening another, or a session of searching litters
-every pane.
+*(Revised while planning. This section originally specified `line:
+Option<u32>` on `Tab::File`. Two facts killed it: `Tab::File { .. }` is
+constructed at 74 sites in `src/`, which is a great deal of churn for a value
+none of them care about; and `Tab` is persisted by `wsstate.rs`, so a line
+would survive a restart and scroll you to yesterday's search hit. A line
+belongs to one act of navigation, not to the layout.)*
+
+`RevealLine` is broadcast rather than sent to the asker, so a second browser
+mirroring the tab follows it to the same line — but it stays an event, so
+nothing about it persists.
+
+**Same `rel` remains one tab**, and this needs no new code:
+`workspace::tab_identity_eq` (`workspace.rs:193-205`) already compares File
+tabs on `rel` alone, with a doc saying why ("A File tab differing only in Mode
+is still the same file"). A second hit in an open file re-scrolls it rather
+than cloning the tab.
+
+**A content hit opens in Edit.** Search matched the file's source text, and a
+rendered markdown preview has no line 412 in it to land on. `coerce_tab` still
+demotes anything that cannot be edited as text.
 
 The client scrolls both Preview and Edit to the line and highlights that row.
 This also retires the gap at `app.js:1249-1253`, where a terminal link
@@ -221,7 +237,7 @@ closes `docs/backlog.md`'s "Line numbers, and go-to-line" for the viewer.
 | File | Change |
 |---|---|
 | `src/search.rs` | New. The walk, the matchers, the caps, the three-state outcome. |
-| `src/proto.rs` | `Intent::Search { q, seq }`, `Event::SearchResults { seq, .. }`, `line` on `Tab::File`. |
+| `src/proto.rs` | `Intent::Search { q, seq }` and `Intent::OpenAtLine`; `Event::SearchResults { seq, .. }` and `Event::RevealLine`. `Tab` is unchanged. |
 | `src/wsconn.rs` | Route `Search` before the hub lock; own the per-connection worker and its seq. |
 | `src/hub.rs` | Snapshot accessor for the worker; honour `line` on `OpenTab`. |
 | `src/render.rs` | Hint text; `#searchbox` becomes a control; the overlay's static shell. |
