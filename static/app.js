@@ -513,12 +513,22 @@ function onEvent(ev) {
       if (ev.seq !== searchSeq) break;
       renderSearch(ev.results);
       break;
-    case "RevealLine":
-      // After a frame: the tab that this line belongs to may be mounting
-      // right now, from the State event that arrived immediately before this
-      // one.
-      requestAnimationFrame(() => revealLine(ev.rel, ev.line));
+    case "RevealLine": {
+      // Consumed once, immediately: focusNextReveal marks "the intent I just
+      // sent (OpenAtLine or a line-suffixed OpenPath) is mine", and this
+      // RevealLine may be that broadcast coming back, or it may be a
+      // completely different browser's action mirrored to this one — the
+      // only way to tell them apart client-side. No requestAnimationFrame:
+      // an Edit tab mounts synchronously inside the State handler that runs
+      // before this event is even queued, and a Preview tab's fetch can take
+      // far longer than one frame anyway — revealLine()/tryReveal() below
+      // handle that race by retrying from the fetch's own completion, not by
+      // guessing at a delay.
+      const focus = focusNextReveal;
+      focusNextReveal = false;
+      revealLine(ev.rel, ev.line, focus);
       break;
+    }
   }
 }
 
@@ -875,6 +885,12 @@ function mountTab(content, t) {
       const mb = modeButton(t.rel, t.mode);
       const path = content.querySelector(".path");
       if (mb && path) path.appendChild(mb);
+      // A RevealLine can arrive before this fetch resolves — the State event
+      // that creates this tab only starts the fetch, it does not wait for
+      // it. tryReveal() is a no-op unless something is still waiting on
+      // exactly this rel, so calling it unconditionally on every File mount
+      // is cheap and correct either way.
+      tryReveal();
     }
     // Tree fragments carry lazy <details hx-get="...tree?dir=..."
     // hx-trigger="toggle once"> nodes (render::tree_level). htmx only binds
@@ -1260,9 +1276,18 @@ let pendingLink = null;
 function openTermPath(entry, raw) {
   pendingLink = { entry, text: raw };
   // The line is no longer dropped: the server sends a RevealLine alongside
-  // the tab it opens (hub::do_open_path), and revealLine() scrolls there.
+  // the tab it opens (hub::do_open_path), and revealLine() scrolls there —
+  // except when the tab lands on a rendered form with no line surface (a
+  // markdown preview, an image), in which case revealLine() finds nothing
+  // and does nothing. The label still names the line the link pointed at
+  // either way; it is not a promise that the view will jump.
   const line = raw.match(/:(\d+)(?::\d+)?$/);
-  if (line) termFlash(entry, `line ${line[1]}`);
+  if (line) {
+    termFlash(entry, `line ${line[1]}`);
+    // Only the client that clicked gets focus stolen into the editor once
+    // the tab opens — see revealLine()'s focus parameter.
+    focusNextReveal = true;
+  }
   // Verbatim. The client does no parsing; resolution and confinement are one
   // function in projects.rs.
   send({ t: "OpenPath", text: raw });
@@ -2926,6 +2951,10 @@ function activateSearchRow(i) {
   if (r.kind === "session") {
     send({ t: "OpenTab", pane: 3, tab: { k: "Terminal", session: r.session } });
   } else if (r.kind === "line") {
+    // Only the client that pressed Enter on this row gets focus stolen into
+    // the editor once RevealLine comes back — see revealLine()'s focus
+    // parameter.
+    focusNextReveal = true;
     send({ t: "OpenAtLine", pane: 2, rel: r.rel, line: r.line });
   } else {
     // Same rule the file tree uses (defaultMode, line 145): a rendered form
@@ -2944,36 +2973,138 @@ document.getElementById("searchresults")?.addEventListener("click", (e) => {
   activateSearchRow(rows.indexOf(row));
 });
 
-/// Scroll whichever pane holds `rel` to `line`, and flash the row.
+// Set true by whichever intent (OpenAtLine from a search row, or a
+// line-suffixed OpenPath from a terminal link) is about to provoke a
+// RevealLine broadcast from this client, and consumed exactly once by the
+// "RevealLine" case in onEvent. RevealLine is broadcast to every browser on
+// the tab on purpose (a second browser mirroring the view follows the
+// scroll), but focus is not scroll: a mirroring browser's user may be typing
+// in an unrelated terminal or editor right now, and wireEditor's blur
+// listener would autosave whatever they were in the moment focus is yanked
+// away. Everyone gets scrolled and selected; only the client that actually
+// asked gets focus.
+let focusNextReveal = false;
+
+// {rel, line, focus} for a reveal that has not finished landing anywhere yet,
+// or null. Armed by revealLine(), consumed by tryReveal() — which is called
+// again from mountTab's fetch completion, because a Preview pane's fetch can
+// still be in flight when RevealLine arrives (the State event that creates
+// the tab only starts that fetch, it does not wait for it).
+let pendingReveal = null;
+let pendingRevealTimer = null;
+
+/// Scroll whichever pane holds `rel` to `line`, and select it where the
+/// surface has a selection to give it (the editor). There is no flash here:
+/// the editor's selection and the preview's centered scroll are the only
+/// feedback either surface has — search's own result list and the
+/// terminal's line flash (termFlash, in openTermPath) cover the rest.
 ///
 /// Three surfaces, and only two of them have lines. A code preview is a
 /// single <pre class="codeview"> with no per-line elements, but `.codeview`
 /// sets no white-space override, so <pre>'s default `white-space: pre`
 /// applies and one source line is exactly one visual line — which is what
-/// makes the arithmetic below exact. A *rendered markdown* preview has no
-/// line mapping at all, so it says so rather than scrolling somewhere
-/// arbitrary and looking broken.
-function revealLine(rel, line) {
+/// makes the arithmetic in revealInPreview() exact. A *rendered* form —
+/// markdown, an image, a read-error placeholder — has no line mapping at
+/// all: tryReveal() finds neither a textarea nor a `pre.codeview` for that
+/// pane and leaves it alone rather than guessing at a scroll position that
+/// would be meaningless there.
+///
+/// `focus` is per-caller, not per-event: see the comment on
+/// `focusNextReveal` above.
+function revealLine(rel, line, focus) {
+  pendingReveal = { rel, line, focus };
+  clearTimeout(pendingRevealTimer);
+  // The backstop for a pane that never arrives at all (closed before its
+  // fetch landed, or any other path this client cannot observe) — without
+  // it a stale target would sit armed forever, ready to hijack the scroll
+  // position of some unrelated pane that happens to open later and match
+  // the same rel.
+  pendingRevealTimer = setTimeout(() => { pendingReveal = null; }, 4000);
+  tryReveal();
+}
+
+/// Applies `pendingReveal`, if any, to every currently-mounted pane that
+/// matches — every pane, not just the first: a file open in two panes at
+/// once must scroll both, and which one a DOM-order `return` would have hit
+/// first is an implementation detail no user should have to think about.
+function tryReveal() {
+  if (!pendingReveal) return;
+  const { rel, line, focus } = pendingReveal;
+  let stillWaiting = false;
   for (const content of document.querySelectorAll(".pane .content")) {
     const ta = content.querySelector("textarea.editor");
     if (ta && editorRel(content) === rel) {
-      const lines = ta.value.split("\n");
-      const upto = lines.slice(0, Math.max(0, line - 1)).join("\n").length + (line > 1 ? 1 : 0);
-      ta.focus();
-      ta.setSelectionRange(upto, upto + (lines[line - 1] || "").length);
-      // Measured, never assumed: line-height is set in style.css and the
-      // editor inherits it through code-input's layers.
-      const lh = parseFloat(getComputedStyle(ta).lineHeight) || 20;
-      ta.scrollTop = Math.max(0, (line - 1) * lh - ta.clientHeight / 3);
-      return;
+      revealInEditor(ta, line, focus);
+      continue;
     }
+    if (!matchesRel(content, rel)) continue;
     const pre = content.querySelector("pre.codeview");
-    if (pre && content.dataset.url && content.dataset.url.includes(encodeURIComponent(rel))) {
-      const lh = parseFloat(getComputedStyle(pre).lineHeight) || 20;
-      pre.scrollTop = Math.max(0, (line - 1) * lh - pre.clientHeight / 3);
-      return;
+    if (pre) {
+      revealInPreview(content, pre, line);
+      continue;
     }
+    // This pane's fragment is rel's, but neither surface is mounted. An
+    // empty innerHTML means mountTab's fetch hasn't landed yet — worth
+    // another pass once it does (mountTab calls tryReveal() itself when it
+    // finishes). A non-empty one means the fetch already landed on a
+    // rendered form with no line mapping (markdown, an image, a read-error
+    // placeholder) — nothing will ever match here, and there is nothing
+    // further to wait for.
+    if (!content.innerHTML.trim()) stillWaiting = true;
   }
+  if (!stillWaiting) {
+    pendingReveal = null;
+    clearTimeout(pendingRevealTimer);
+  }
+}
+
+function revealInEditor(ta, line, focus) {
+  const lines = ta.value.split("\n");
+  const upto = lines.slice(0, Math.max(0, line - 1)).join("\n").length + (line > 1 ? 1 : 0);
+  ta.setSelectionRange(upto, upto + (lines[line - 1] || "").length);
+  if (focus) ta.focus();
+  // code-input scrolls its *host*, not the textarea inside it: the textarea
+  // and its highlighted overlay share one grid cell
+  // (static/vendor/code-input.min.css) and move together only because the
+  // host is the element with overflow:auto — the library has no separate
+  // scroll bridge (nothing named "scroll" anywhere in its bundled JS besides
+  // the no-highlighting fallback swap), so scrolling the textarea alone
+  // would either no-op or desync the caret layer from the highlighted text
+  // painted under it. A plain, unhighlighted textarea (.md and the other
+  // non-highlightable extensions, mountEditor's `else` branch) has no
+  // code-input host at all and is its own scroll container — `box` covers
+  // both, and `extra` is only meaningful when they differ: ta.offsetTop is
+  // relative to *ta's own* offsetParent, which is nonsense to add when
+  // `box === ta`.
+  const box = ta.closest("code-input") || ta;
+  const extra = box === ta ? 0 : ta.offsetTop;
+  // Measured, never assumed: line-height and top padding are set in
+  // style.css (.editor's `font: 13px/1.55`, code-input's `--padding-top`)
+  // and differ from the preview's. Both resolve to a used pixel length
+  // here, never the string "normal" the `|| 20` fallback exists for:
+  // line-height is unitless-but-set (not "normal") wherever .editor's or
+  // code-input's own `font` shorthand applies, which is everywhere this
+  // branch runs. Padding is part of the offset, not decoration: scrollTop=0
+  // shows the padding box first, so line N's top sits `extra + pad +
+  // (N-1)*lh` below the scroll origin, not `(N-1)*lh` alone.
+  const lh = parseFloat(getComputedStyle(ta).lineHeight) || 20;
+  const pad = parseFloat(getComputedStyle(ta).paddingTop) || 0;
+  box.scrollTop = Math.max(0, extra + pad + (line - 1) * lh - box.clientHeight / 3);
+}
+
+function revealInPreview(content, pre, line) {
+  // .codeview (static/style.css) sets padding and font but no height or
+  // max-height, so it grows to fit its content: pre.scrollHeight ===
+  // pre.clientHeight always, and pre.scrollTop is permanently clamped to 0.
+  // The element that actually scrolls is `.content` itself — `flex: 1 1
+  // auto; overflow: auto`, made a definite size by `.pane`'s
+  // `display:flex; flex-direction:column; overflow:hidden` — offset by the
+  // <pre>'s own position within it (content.querySelector("pre.codeview")
+  // was never the whole story) plus the <pre>'s own top padding, for the
+  // same reason the editor branch above adds one.
+  const lh = parseFloat(getComputedStyle(pre).lineHeight) || 20;
+  const pad = parseFloat(getComputedStyle(pre).paddingTop) || 0;
+  content.scrollTop = Math.max(0, pre.offsetTop + pad + (line - 1) * lh - content.clientHeight / 3);
 }
 
 /// The rel an editor pane is showing. The path is already in the breadcrumb
@@ -2982,4 +3113,22 @@ function revealLine(rel, line) {
 function editorRel(content) {
   const n = content.querySelector(".editwrap .path .rel");
   return n ? n.textContent : null;
+}
+
+/// Whether `content`'s fetched fragment is a File preview of exactly `rel` —
+/// an exact match on the `path` query parameter, never a substring.
+/// `encodeURIComponent("main.rs")` is a substring of `?path=src%2Fmain.rs`,
+/// and `src%2Fapp.js` is a substring of `src%2Fapp.js.bak`; either direction
+/// of a substring test can scroll a pane that is not showing `rel` at all.
+/// The `/file` suffix check matters too: a Diff tab's fragment URL
+/// (`/frag/{project}/diff?path=...`) carries the same `path` param naming
+/// for a different rel-adjacent thing entirely — a Diff never has a
+/// `pre.codeview` to match, but without this check a Diff on the same rel
+/// could still count as "still waiting" in tryReveal() and stall the 4s
+/// timeout for no reason.
+function matchesRel(content, rel) {
+  if (!content.dataset.url) return false;
+  const [path, query] = content.dataset.url.split("?");
+  if (!path.endsWith("/file")) return false;
+  return new URLSearchParams(query || "").get("path") === rel;
 }
