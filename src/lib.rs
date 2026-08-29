@@ -23,6 +23,7 @@ pub mod registry;
 pub mod render;
 pub mod routes;
 pub mod screen;
+pub mod search;
 pub mod session;
 pub mod term;
 pub mod textdiff;

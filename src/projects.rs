@@ -56,6 +56,14 @@ const TEXT_EXTENSIONS: &[&str] = &[
     "ini", "service", "env", "gitignore", "dockerignore",
 ];
 
+/// Whether an extension is one we treat as text even when it sniffs binary.
+/// Exposed so `search.rs` applies this rule rather than keeping a second
+/// copy: two lists that disagree is how a file becomes searchable in one
+/// place and invisible in another.
+pub fn is_text_extension(ext: &str) -> bool {
+    TEXT_EXTENSIONS.contains(&ext)
+}
+
 /// Roots to scan for projects: `RESH_ROOTS` (colon-separated) when set and
 /// non-empty, otherwise the global config's `roots`. Empty when neither says
 /// anything; `main` refuses to start on that rather than guessing.
