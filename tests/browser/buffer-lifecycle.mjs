@@ -15,7 +15,7 @@
 //! than `Content::Edited(original_text)`.
 //!
 //! Run: deno run -A tests/browser/buffer-lifecycle.mjs
-import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
+import { disableAutosave, fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -36,8 +36,7 @@ await Deno.writeTextFile(file, "fn main() {}\n");
 // autosave itself clean up a wrongly-dirtied buffer and mask a broken hash
 // rule. Turning autosave off for C removes the race instead of narrowing a
 // window to dodge it — nothing but the hash rule can make that buffer clean.
-await Deno.mkdir(`${fx.roots}/noauto/.resh`, { recursive: true });
-await Deno.writeTextFile(`${fx.roots}/noauto/.resh/config.toml`, "autosave = false\n");
+await disableAutosave(`${fx.roots}/noauto`);
 const file2 = `${fx.roots}/noauto/watched.rs`;
 await Deno.writeTextFile(file2, "fn main() {}\n");
 
@@ -105,6 +104,13 @@ try {
   // The "noauto" project: see the header comment for why this section needs
   // autosave off rather than a narrow timing window.
   page2 = await openEditor("noauto", "watched.rs");
+  // Proof the fixture took, before anything depends on it. Without this the
+  // section is silently self-defeating: with autosave on, do_save cleans the
+  // buffer for its own reasons and "comes back clean" passes with the hash rule
+  // broken — the exact masking the header comment is about. Verified by
+  // commenting the key out of `disableAutosave`: every other test that leans on
+  // autosave being off failed, and this one stayed green.
+  ok(await page2.evalIn(`AUTOSAVE === false`), "the noauto project really has autosave off");
   await page2.type("x");
   ok(await until(async () => await page2.dirty(), 5, "dirty"), "typing marks it dirty");
   await page2.cmd("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Backspace", code: "Backspace",

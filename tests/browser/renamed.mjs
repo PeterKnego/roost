@@ -22,7 +22,10 @@ const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
 let fail = 0;
 const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) fail++; };
 
-const fx = await fixture();
+// autosave off: section B needs a buffer that is *still* dirty when the file
+// moves, and with autosave on that is a race against a 1s timer the test would
+// merely tend to win. It proves the fixture took rather than assuming it.
+const fx = await fixture({ autosave: false });
 await Deno.writeTextFile(`${fx.roots}/proj/notes.rs`, "fn one() {}\nfn two() {}\n");
 await Deno.writeTextFile(`${fx.roots}/proj/draft.rs`, "fn draft() {}\n");
 await Deno.mkdir(`${fx.roots}/proj/sub`, { recursive: true });
@@ -91,6 +94,15 @@ try {
   await page.evalIn(`(() => { const ta = document.querySelector('.pane[data-pane="2"] .content textarea');
     ta.value = "fn draft() {}\\nunsaved work\\n"; ta.dispatchEvent(new Event("input", { bubbles: true })); })()`);
   ok(await until(async () => (await page.buffer("draft.rs"))?.dirty === true, 10, "the dirty buffer"), "typing makes it dirty");
+  // The fixture, proved rather than trusted: past AUTOSAVE_MS (1000) the edit
+  // is still only in the browser. Without this pair the section below passes
+  // whether or not `autosave: false` took effect — it would just be racing a
+  // timer, which is the failure mode this fixture exists to remove.
+  await new Promise((r) => setTimeout(r, 1500));
+  ok(await page.evalIn(`AUTOSAVE === false`), "the project config turned autosave off");
+  ok((await Deno.readTextFile(`${fx.roots}/proj/draft.rs`)) === "fn draft() {}\n",
+     "so a second later the edit is still only in the browser");
+  ok((await page.buffer("draft.rs"))?.dirty === true, "and the buffer is still dirty, not saved out from under us");
   await Deno.rename(`${fx.roots}/proj/draft.rs`, `${fx.roots}/proj/final.rs`);
   ok(await until(async () => (await page.tab("final.rs")) !== null, 10, "the moved tab"), "its tab follows too");
   // The assertion this whole file is for. `texts` is keyed by rel and pruned
@@ -101,7 +113,10 @@ try {
   ok((await page.buffer("final.rs"))?.dirty === true, "and the buffer is still dirty, under the new key");
   ok((await page.buffer("final.rs"))?.stale === false,
      "not stale: moving a file changes its name, not its bytes, so nothing diverged");
-  ok(!(await page.paused("final.rs")), "so autosave is not paused either");
+  // The client's own view of the same fact, one layer out from the `stale`
+  // flag above: `autosavePaused` is only ever set by the BufferStale handler,
+  // so this failing would mean the server sent one after all.
+  ok(!(await page.paused("final.rs")), "and no staleness reached the client either");
 
   console.log("\nC. a directory rename takes every tab under it");
   ok(await page.expand("sub"), "the sub directory expands");
