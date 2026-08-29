@@ -37,7 +37,8 @@ deno run -A tests/browser/worktree-launch.mjs # the ✻ prompt, worktree creatio
 deno run -A tests/browser/overview.mjs   # the front page (/): live session list, clicking one focuses it, ?at= reaches the picker, and selecting a project narrows/widens the session list
 deno run -A tests/browser/claudetab.mjs  # a terminal tab running a Claude wears the Claude mark: the /proc watcher, the data-claude attribute, and the CSS that turns it into a different picture
 deno run -A tests/browser/changes.mjs    # the Changes pane and the header chip follow the working tree, not just `.git/index`
-deno run -A tests/browser/vanished.mjs   # a file renamed away from under an open tab: no empty editor, and unsaved work survives
+deno run -A tests/browser/vanished.mjs   # a file deleted or moved out of the project from under an open tab: no empty editor, and unsaved work survives
+deno run -A tests/browser/renamed.mjs    # a file renamed *inside* the project: the tab follows it, with its unsaved work
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -135,6 +136,19 @@ performed.
   of the two fails. Both halves were watched failing — the plain-Enter half
   first passed for the wrong reason, reading the *previous* probe's number out
   of the scrollback, which only agreed while both answers were 13.
+- In `renamed.mjs`: dropping the `follow_rename` call from `watch.rs`'s batch
+  fails 10 of the 20 — the tab never moves. Keeping it and deleting only the
+  `BufferText` that follows the rekey fails exactly 1, and it is the one that
+  matters: the editor re-mounts at the new name reporting `""`, which is the
+  empty editor `vanished.mjs` exists to prevent, arriving through the rename
+  door. Deleting the `disk_hash != base_hash` guard in `file_changed_externally`
+  fails 2 (the moved buffer is flagged stale and autosave pauses, over a file
+  whose bytes never changed).
+  Also checked and *not* asserted: sending that `BufferText` before the `State`
+  instead of after leaves the file fully green. The prune app.js runs on every
+  State keeps the new rel, because the State that moves the tab lists the
+  buffer under it — so an ordering assertion would have been a trap rather
+  than a guard.
 - In `vanished.mjs`: making `file_changed_externally` return a bare `false` for
   a deleted file again — the state before `hub::file_vanished` — fails 9 of the
   20, including the reported one, where the pane reads

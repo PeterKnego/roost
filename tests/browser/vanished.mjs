@@ -1,4 +1,9 @@
-//! A file that disappears from under an open tab.
+//! A file that disappears from under an open tab: deleted, or moved out of
+//! the project where nothing can follow it.
+//!
+//! A rename *within* the project is a different outcome now — the tab follows
+//! the file — and has its own test in renamed.mjs. This one is the case where
+//! there is nowhere to follow to.
 //!
 //! Reported from a live instance: a file was renamed from a terminal, and the
 //! tab kept the old name over an *empty* editor. Nothing in that is visible to
@@ -8,8 +13,8 @@
 //! labelled "saved", under a filename, which is the exact shape CLAUDE.md
 //! names as how work gets overwritten.
 //!
-//! The rename is done on disk with no browser involved, because that is how it
-//! happens: a Claude in a terminal pane, or a `git mv`.
+//! Every move here is done on disk with no browser involved, because that is
+//! how it happens: a Claude in a terminal pane, or a `git mv`.
 //!
 //! Run: deno run -A tests/browser/vanished.mjs
 import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
@@ -71,8 +76,11 @@ try {
   ok(await until(async () => (await page.pane()).editorText === "fn one() {}\nfn two() {}\n", 10, "the editor's text"),
      "with the file's text in it — the control for everything below");
 
-  console.log("\nB. renamed away from outside, with no browser involved");
-  await Deno.rename(`${fx.roots}/proj/notes.rs`, `${fx.roots}/proj/renamed.rs`);
+  console.log("\nB. moved out of the project, where nothing can follow it");
+  // Out of the watched tree entirely: inotify delivers the `From` half of the
+  // rename and no `To`, which is exactly the information a project that cannot
+  // see the destination has. `renamed.mjs` covers the paired case.
+  await Deno.rename(`${fx.roots}/proj/notes.rs`, `${fx.base}/carried-away.rs`);
   ok(await until(async () => (await page.tab("notes.rs"))?.mode === "Preview", 10, "the demotion"),
      "the tab leaves Edit, so nothing paints a textarea over a file that is gone");
   {
@@ -107,14 +115,16 @@ try {
     ok(p.modebtn === "switch to edit", `and offers a way back to Edit (got ${JSON.stringify(p.modebtn)})`);
   }
 
-  console.log("\nD. a file with unsaved work in it is not treated the same way");
+  console.log("\nD. a deleted file with unsaved work in it is not treated the same way");
   ok(await page.open("draft.rs"), "draft.rs opens");
   await until(async () => (await page.pane()).editorText === "fn draft() {}\n", 10, "draft's text");
   await page.evalIn(`(() => { const ta = document.querySelector('.pane[data-pane="2"] .content textarea');
     ta.value = "fn draft() {}\\nunsaved work\\n"; ta.dispatchEvent(new Event("input", { bubbles: true })); })()`);
   ok(await until(async () => (await page.buffer("draft.rs"))?.dirty === true, 10, "the dirty buffer"),
      "typing makes it dirty");
-  await Deno.rename(`${fx.roots}/proj/draft.rs`, `${fx.roots}/proj/draft-renamed.rs`);
+  // A plain delete this time, not a move: the two arrive as different events
+  // (`Remove` versus an unpaired rename `From`) and both have to land here.
+  await Deno.remove(`${fx.roots}/proj/draft.rs`);
   ok(await until(async () => (await page.buffer("draft.rs"))?.stale === true, 10, "the stale flag"),
      "losing the file marks the buffer stale");
   ok((await page.tab("draft.rs"))?.mode === "Edit",

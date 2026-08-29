@@ -369,8 +369,57 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                 // editing `.resh/config.toml` takes effect on the next
                 // change instead of at the next restart, matching the
                 // request path.
+                // Rename pairs, straight from the kernel. inotify gives both
+                // halves of a rename the same cookie and `notify` merges them
+                // into a single `Modify(Name(Both))` carrying both paths, so
+                // this is *told* where a file went — it does not infer it from
+                // a delete and a create landing in the same window, which is
+                // what makes it safe to rewrite tabs on. Measured on this
+                // host: an in-tree move delivers From, To and Both under one
+                // tracker; a move out of the tree delivers From alone and a
+                // move in delivers To alone, so neither pairs, and both stay
+                // the deletion and the creation they are to a project that
+                // cannot see the other end.
+                //
+                // macOS delivers `RenameMode::Any` with no tracker and no
+                // pairing at all ("FSEvents provides no mechanism to associate
+                // the old and new sides", notify's own fsevent.rs), so there a
+                // rename keeps the older behaviour: the tab demotes and says
+                // the file is not found. See
+                // docs/superpowers/specs/2026-08-29-follow-external-renames-design.md
+                // for why neither notify-debouncer-full nor file-id is used to
+                // close that gap.
+                let mut renames: Vec<(String, String)> = Vec::new();
+                for ev in &events {
+                    if !matches!(
+                        ev.kind,
+                        notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                            notify::event::RenameMode::Both
+                        ))
+                    ) {
+                        continue;
+                    }
+                    if let [from, to] = &ev.paths[..] {
+                        if let (Ok(f), Ok(t)) = (from.strip_prefix(&base), to.strip_prefix(&base)) {
+                            renames.push((
+                                f.to_string_lossy().replace('\\', "/"),
+                                t.to_string_lossy().replace('\\', "/"),
+                            ));
+                        }
+                    }
+                }
+
                 let settings = crate::config::for_project(&base);
                 let mut h = Hub::lock(&hub);
+                // Applied before `open` is collected, so everything below
+                // classifies against where the file is *now*: the destination's
+                // own events are in `rels` too, and they have to find the tab
+                // that just moved onto them. The old path falls through to
+                // `Class::Tree` — nothing references it any more — which is the
+                // tree refresh that drops its row.
+                for (old, new) in &renames {
+                    h.follow_rename(old, new);
+                }
                 // The workspace's own override comes from the hub already
                 // locked here — no registry lookup and no I/O under the lock.
                 let filter = settings.tree_filter_with(h.ws.show_hidden);
@@ -686,6 +735,71 @@ mod tests {
 
         std::env::remove_var("RESH_STATE_DIR");
         saw_dotfile
+    }
+
+    /// The whole chain, through a real watcher and a real `mv`: kernel event →
+    /// `Modify(Name(Both))` → `Hub::follow_rename` → the tab addresses the new
+    /// path. Every piece of it is covered by a unit test somewhere; none of
+    /// those would notice if the batch loop stopped looking at rename events
+    /// at all, which is the failure this one exists for.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_external_rename_moves_the_tab_through_a_live_watcher() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("old.rs"), "fn one() {}\n").unwrap();
+
+        let hub = Arc::new(Mutex::new(Hub::new("watch_rename", d.path().to_path_buf())));
+        let rx = {
+            let mut h = Hub::lock(&hub);
+            let (c, rx) = h.subscribe();
+            h.handle(
+                &c,
+                crate::proto::Intent::OpenTab {
+                    pane: crate::proto::MIDDLE,
+                    tab: crate::proto::Tab::File {
+                        rel: "old.rs".into(),
+                        mode: crate::proto::Mode::Edit,
+                    },
+                },
+            );
+            rx
+        };
+        assert!(spawn("watch_rename", d.path().to_path_buf(), hub.clone(), Duration::from_millis(20)));
+
+        std::fs::rename(d.path().join("old.rs"), d.path().join("new.rs")).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let moved = loop {
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            let rel = Hub::lock(&hub).ws.panes[crate::proto::MIDDLE as usize]
+                .tabs
+                .iter()
+                .find_map(|t| match t {
+                    crate::proto::Tab::File { rel, .. } => Some(rel.clone()),
+                    _ => None,
+                });
+            if rel.as_deref() == Some("new.rs") {
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(moved, "the tab must follow the file to where it was moved");
+
+        // The browser is told, not just the server's own copy: everything the
+        // user sees comes off this channel, and a rekey nobody hears about is
+        // a tab that stays wrong on screen until a reload.
+        let mut saw_state = false;
+        while let Ok(m) = rx.try_recv() {
+            if m.contains(r#""t":"State""#) && m.contains("new.rs") {
+                saw_state = true;
+            }
+        }
+        assert!(saw_state, "a State naming the new rel has to reach the browser");
+        std::env::remove_var("RESH_STATE_DIR");
     }
 
     /// True if a TreeChanged arrives within the window. The window only has to
