@@ -62,11 +62,12 @@ header .proj { font-weight: 500; }
 #gitstatus .gmod    { color: var(--warn, #d79921); font-family: var(--mono); font-size: 11px; }
 #gitstatus .gahead  { color: var(--add-fg); font-family: var(--mono); font-size: 11px; }
 #gitstatus .gbehind { color: var(--muted); font-family: var(--mono); font-size: 11px; }
-/* A real control: opens #searchoverlay. */
+/* A real, focusable control now, rather than the honest placeholder it
+   replaces — the wiring arrives with the overlay's JavaScript. */
 #searchbox { display: flex; align-items: center; gap: 8px; width: 400px; height: 26px;
              margin-left: auto; margin-right: auto; padding: 0 8px 0 9px; border-radius: 6px;
              border: 1px solid var(--border); background: var(--tool); color: var(--muted);
-             cursor: pointer; }
+             font: inherit; cursor: pointer; }
 #searchbox .hintline { flex: 1 1 auto; overflow: hidden; white-space: nowrap; }
 #searchbox kbd { border: 1px solid var(--border); border-radius: 3px; padding: 0 4px;
                  font: 11px/16px var(--mono); }
