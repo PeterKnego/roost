@@ -29,6 +29,10 @@
 //!     with no `Page.javascriptDialogOpening` handler wedges the renderer,
 //!     which is the harness's documented 30s-timeout hang, not a failure.
 //!
+//! Section D covers a second, separate defect found the same day: a close
+//! that races a terminal still spawning. Revert-checked on its own — see the
+//! second paragraph below.
+//!
 //! Revert-check, performed: with both `drop_terminal_tabs()` calls removed
 //! from `hub.rs`'s `do_close_project`, this fails 3 — B's tab assertion and
 //! its saved-layout assertion (`term`, `term1`, `term2` all back), plus C,
@@ -40,7 +44,7 @@
 //! assertion, and is the one that stands for "even after reload".
 //!
 //! Run: deno run -A tests/browser/closeproject.mjs
-import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until, sleep }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -94,6 +98,14 @@ try {
   await ws.evalIn(`window.confirm = () => true; window.alert = () => {}; document.getElementById("closeproj").click()`);
   ok(await until(async () => (await sockets()).length === 0, 30, "every socket unlinked"),
      `the shells themselves ended: ${JSON.stringify(await sockets())}`);
+  // The sockets go early in the close, but the close is not over: it sweeps a
+  // second time after `CLOSE_SETTLE` (see Section D), and `closing` stays true
+  // across both — so `term.rs` deliberately refuses a new terminal for that
+  // whole window. Reopening inside it made B and C fail here for that reason
+  // alone, which is a real property worth waiting out rather than hiding: a
+  // user who closes a project and immediately reopens it meets the same
+  // refusal, and it clears itself.
+  await sleep(1500);
   // A close ends by navigating to `/`; reopen the project the way a user
   // would, which is the reload the report was about.
   after = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
@@ -119,6 +131,38 @@ try {
      "a new terminal can be started in the closed project again");
   ok(await until(async () => (await sockets()).length === 1, 30, "its socket"),
      `and it is a real shell: ${JSON.stringify(await sockets())}`);
+  console.log("D. a terminal still spawning when the close runs must not survive it");
+  // The second reported failure, and a different bug from A-C: the close
+  // ended the shells and cleared the tabs, and a shell appeared anyway. In
+  // production the survivor's dtach had resh itself as its parent and a start
+  // time in the same second as the close — a terminal websocket that reached
+  // `session::attach` (which creates when absent) while `kill_project` was
+  // reading a socket directory and a `ps` snapshot that could not show it yet.
+  //
+  // No wait between starting the terminal and closing: every other section
+  // here waits for the socket to exist first, and that wait is exactly what
+  // hides this. Both clicks go in one evaluation so the browser cannot
+  // interleave a round trip between them.
+  const race = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  await until(() => race.evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "race page");
+  await race.evalIn(`
+    window.confirm = () => true; window.alert = () => {};
+    document.querySelector('.pane[data-pane="3"] .paneicons .newterm').click();
+    document.getElementById("closeproj").click();
+  `);
+  await sleep(9000);   // past CLOSE_SETTLE and the second sweep, with margin
+  const savedAfter = JSON.parse(await Deno.readTextFile(`${fx.stateDir}/${fx.project}.json`));
+  const raceTerms = savedAfter.panes.flatMap((p) => p.tabs).filter((t) => t.k === "Terminal");
+  // Proves the close actually committed. Without it, a close that was refused
+  // or never sent would leave no sessions to find and pass the next assertion
+  // for the opposite reason.
+  ok(raceTerms.length === 0, `the racing close committed (layout cleared): ${JSON.stringify(raceTerms)}`);
+  ok((await sockets()).length === 0, `no socket outlived the racing close: ${JSON.stringify(await sockets())}`);
+  const ps = await new Deno.Command("ps", { args: ["-Ao", "args="], stdout: "piped" }).output();
+  const orphans = new TextDecoder().decode(ps.stdout).split("\n")
+    .filter((l) => l.includes(`${fx.stateDir}/sock/${fx.project}/`) && l.includes("dtach -A"));
+  ok(orphans.length === 0, `no dtach master outlived the racing close: ${orphans.length}`);
+  try { race.close(); } catch { /* already gone */ }
 } finally {
   try { ws?.close(); } catch { /* already gone */ }
   try { after?.close(); } catch { /* already gone */ }
