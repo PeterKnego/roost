@@ -2717,6 +2717,11 @@ let searchRows = [];      // [{kind, rel, line, session}] parallel to the DOM ro
 let searchSel = 0;
 let searchDebounce = null;
 let searchReturnFocus = null;
+// #searchbox is a <button>, and a browser focuses a button on mousedown —
+// before its click handler runs. Captured here, on mousedown, so openSearch
+// still sees whatever had focus before the click (usually a terminal)
+// instead of the button itself.
+let searchboxMousedownFocus = null;
 
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Shift") { shiftPending = 0; return; }
@@ -2730,12 +2735,15 @@ document.addEventListener("keydown", (e) => {
   shiftPending = now;
 });
 
-function openSearch() {
+function openSearch(returnFocus) {
   const ov = document.getElementById("searchoverlay");
   if (!ov || !ov.hidden) return;
   // Remembered before focus moves: closing must give the terminal back, or
-  // every dismissal costs the user their shell focus.
-  searchReturnFocus = document.activeElement;
+  // every dismissal costs the user their shell focus. A caller that already
+  // captured the pre-click target (the searchbox mousedown handler below)
+  // passes it in, because by the time a click handler runs, a <button> has
+  // already taken focus for itself.
+  searchReturnFocus = returnFocus !== undefined ? returnFocus : document.activeElement;
   ov.hidden = false;
   const input = document.getElementById("searchinput");
   input.value = "";
@@ -2748,13 +2756,24 @@ function closeSearch() {
   if (!ov || ov.hidden) return;
   ov.hidden = true;
   searchRows = [];
-  // A terminal's focus lives on its xterm textarea; .focus() on the remembered
-  // element restores it without knowing which pane it was.
-  try { searchReturnFocus && searchReturnFocus.focus(); } catch {}
+  // Dismissing mid-debounce must not let the pending Search still fire: its
+  // reply would repopulate searchRows and the (now hidden) result list from
+  // a query the user no longer has open.
+  clearTimeout(searchDebounce);
+  searchSeq++;
+  // .focus() on an element no longer in the document does not throw — it
+  // silently no-ops and focus falls to <body>. A State broadcast can detach
+  // the remembered terminal node while the overlay is open (a tabstrip
+  // re-render), so this has to be checked explicitly rather than trusted to
+  // fail loudly.
+  if (searchReturnFocus && document.contains(searchReturnFocus)) searchReturnFocus.focus();
   searchReturnFocus = null;
 }
 
-document.getElementById("searchbox")?.addEventListener("click", openSearch);
+document.getElementById("searchbox")?.addEventListener("mousedown", () => {
+  searchboxMousedownFocus = document.activeElement;
+});
+document.getElementById("searchbox")?.addEventListener("click", () => openSearch(searchboxMousedownFocus));
 
 document.getElementById("searchinput")?.addEventListener("input", (e) => {
   const q = e.target.value;
@@ -2763,7 +2782,18 @@ document.getElementById("searchinput")?.addEventListener("input", (e) => {
   // queries the user has already typed past, but not sending them at all is
   // cheaper than cancelling them.
   searchDebounce = setTimeout(() => {
-    if (!q) { renderSearch(null); return; }
+    // Erasing the query bumps searchSeq too: a reply to the just-abandoned
+    // query must not paint over the now-empty box, the same reason the send
+    // branch below bumps it.
+    if (!q) { searchSeq++; renderSearch(null); return; }
+    if (!ctrl || ctrl.readyState !== 1) {
+      // send() would silently no-op here; without this the box would just
+      // sit there showing stale rows (or nothing), which reads as "no
+      // matches" when the truth is "never asked".
+      searchSeq++;
+      renderSearchDisconnected();
+      return;
+    }
     send({ t: "Search", q, seq: ++searchSeq });
   }, 120);
 });
@@ -2810,6 +2840,18 @@ function searchRow(primary, secondary) {
     row.appendChild(b);
   }
   return row;
+}
+
+// The "socket is down" case send() handles by silently dropping the intent —
+// right for most callers, wrong here, where silence reads as "no matches"
+// instead of "never asked".
+function renderSearchDisconnected() {
+  const host = document.getElementById("searchresults");
+  const note = document.getElementById("searchnote");
+  if (host) host.textContent = "";
+  searchRows = [];
+  searchSel = 0;
+  if (note) note.textContent = "not connected";
 }
 
 function renderSearch(results) {
@@ -2881,7 +2923,12 @@ function activateSearchRow(i) {
   } else if (r.kind === "line") {
     send({ t: "OpenAtLine", pane: 2, rel: r.rel, line: r.line });
   } else {
-    send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: r.rel, mode: "Preview" } });
+    // Same rule the file tree uses (defaultMode, line 145): a rendered form
+    // opens in Preview, everything else opens in Edit. Hardcoding Preview
+    // here would open the same file differently depending on which path the
+    // user clicked it from, and the server does not correct it — coerce_tab
+    // only ever demotes Edit to Preview, never promotes back.
+    send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: r.rel, mode: defaultMode(r.rel) } });
   }
 }
 
