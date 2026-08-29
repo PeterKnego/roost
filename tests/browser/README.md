@@ -39,6 +39,7 @@ deno run -A tests/browser/claudetab.mjs  # a terminal tab running a Claude wears
 deno run -A tests/browser/changes.mjs    # the Changes pane and the header chip follow the working tree, not just `.git/index`
 deno run -A tests/browser/vanished.mjs   # a file deleted or moved out of the project from under an open tab: no empty editor, and unsaved work survives
 deno run -A tests/browser/renamed.mjs    # a file renamed *inside* the project: the tab follows it, with its unsaved work
+deno run -A tests/browser/closeproject.mjs # Close Project ends the shells *and* clears their tabs, so reopening shows no ghosts
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -353,6 +354,16 @@ performed.
   for: `Workspace::default_layout` always seeds pane 3 with one Terminal tab
   named `"term"` before anything is clicked, so every session-count
   assertion here is written against that baseline rather than an empty pane.
+- In `closeproject.mjs`: removing both `drop_terminal_tabs()` calls from
+  `hub.rs`'s `do_close_project` — the state this bug was reported in — fails 3
+  of the 11: the reopened project shows `term`, `term1`, `term2` again, the
+  saved layout still lists them, and Section C's "fresh" terminal comes up as
+  `term3` beside the three ghosts. Removing only that helper's `persist()`
+  fails exactly 1, the saved-layout read. Everything the *page* shows still
+  passes there, because the reopen talks to the same still-running hub whose
+  in-memory layout was cleared — which is why "even after reload" is asserted
+  against the state file rather than against the DOM, and why a DOM-only
+  version of this file would have shipped green over half the bug.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
