@@ -315,6 +315,25 @@ impl Hub {
         }
     }
 
+    /// Everything a search needs, copied out under the lock so the walk can
+    /// run without it.
+    ///
+    /// Deliberately does *not* resolve the config here: `config::for_project`
+    /// reads files, and this method's whole purpose is that its caller can
+    /// drop the lock immediately. The worker resolves the settings itself,
+    /// off-lock, from `dir`.
+    pub fn search_snapshot(&self) -> crate::search::Snapshot {
+        crate::search::Snapshot {
+            dir: self.dir.clone(),
+            show_hidden_override: self.ws.show_hidden,
+            // `ws.live_sessions`, never `session::list_sessions`: that forks
+            // a `ps` per session while holding the global session-registry
+            // mutex (see `refresh_live_sessions`), which would reintroduce
+            // exactly the stall this snapshot exists to avoid.
+            sessions: self.ws.live_sessions.clone(),
+        }
+    }
+
     pub fn snapshot_event(&self, origin: &ConnId) -> Event {
         let mut ws = self.ws.view();
         // Derived here rather than kept in `WsState`: `wsstate::save` persists
