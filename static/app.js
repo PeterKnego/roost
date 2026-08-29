@@ -513,6 +513,12 @@ function onEvent(ev) {
       if (ev.seq !== searchSeq) break;
       renderSearch(ev.results);
       break;
+    case "RevealLine":
+      // After a frame: the tab that this line belongs to may be mounting
+      // right now, from the State event that arrived immediately before this
+      // one.
+      requestAnimationFrame(() => revealLine(ev.rel, ev.line));
+      break;
   }
 }
 
@@ -1253,11 +1259,10 @@ let pendingLink = null;
 
 function openTermPath(entry, raw) {
   pendingLink = { entry, text: raw };
-  // The line number is matched so the whole reference underlines, then dropped
-  // — the viewer has no line addressing to spend it on. Saying so is the only
-  // thing between "we ignored part of what you clicked" and silence.
+  // The line is no longer dropped: the server sends a RevealLine alongside
+  // the tab it opens (hub::do_open_path), and revealLine() scrolls there.
   const line = raw.match(/:(\d+)(?::\d+)?$/);
-  if (line) termFlash(entry, `line ${line[1]} — opening file`);
+  if (line) termFlash(entry, `line ${line[1]}`);
   // Verbatim. The client does no parsing; resolution and confinement are one
   // function in projects.rs.
   send({ t: "OpenPath", text: raw });
@@ -2938,3 +2943,43 @@ document.getElementById("searchresults")?.addEventListener("click", (e) => {
   const rows = [...document.querySelectorAll("#searchresults .searchrow")];
   activateSearchRow(rows.indexOf(row));
 });
+
+/// Scroll whichever pane holds `rel` to `line`, and flash the row.
+///
+/// Three surfaces, and only two of them have lines. A code preview is a
+/// single <pre class="codeview"> with no per-line elements, but `.codeview`
+/// sets no white-space override, so <pre>'s default `white-space: pre`
+/// applies and one source line is exactly one visual line — which is what
+/// makes the arithmetic below exact. A *rendered markdown* preview has no
+/// line mapping at all, so it says so rather than scrolling somewhere
+/// arbitrary and looking broken.
+function revealLine(rel, line) {
+  for (const content of document.querySelectorAll(".pane .content")) {
+    const ta = content.querySelector("textarea.editor");
+    if (ta && editorRel(content) === rel) {
+      const lines = ta.value.split("\n");
+      const upto = lines.slice(0, Math.max(0, line - 1)).join("\n").length + (line > 1 ? 1 : 0);
+      ta.focus();
+      ta.setSelectionRange(upto, upto + (lines[line - 1] || "").length);
+      // Measured, never assumed: line-height is set in style.css and the
+      // editor inherits it through code-input's layers.
+      const lh = parseFloat(getComputedStyle(ta).lineHeight) || 20;
+      ta.scrollTop = Math.max(0, (line - 1) * lh - ta.clientHeight / 3);
+      return;
+    }
+    const pre = content.querySelector("pre.codeview");
+    if (pre && content.dataset.url && content.dataset.url.includes(encodeURIComponent(rel))) {
+      const lh = parseFloat(getComputedStyle(pre).lineHeight) || 20;
+      pre.scrollTop = Math.max(0, (line - 1) * lh - pre.clientHeight / 3);
+      return;
+    }
+  }
+}
+
+/// The rel an editor pane is showing. The path is already in the breadcrumb
+/// as a text node, which is the only place it exists client-side once the
+/// textarea is mounted.
+function editorRel(content) {
+  const n = content.querySelector(".editwrap .path .rel");
+  return n ? n.textContent : null;
+}
