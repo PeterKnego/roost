@@ -78,22 +78,6 @@ pub struct Hub {
     pub notices_dirty: bool,
 }
 
-/// How long a close waits between its two `kill_project` sweeps, so a shell
-/// that was still forking during the first one is visible to the second.
-///
-/// Sized against what it is waiting for, not chosen round: `session::attach`
-/// returns once `dtach` has been spawned, but dtach's own fork-and-detach —
-/// the part that creates the socket and leaves a master in `ps` — completes
-/// after that, and the browser tests poll for it in 25ms steps because it is
-/// unpredictable. It is normally well under 100ms; 400 leaves several times
-/// that in hand.
-///
-/// The cost of overshooting is only that `ProjectClosed` (and its session
-/// count) reaches the browser a little later, on a background thread, while
-/// the UI already shows the close in progress. The cost of undershooting is a
-/// live shell nobody can reach. Those are not symmetric, so this errs long.
-const CLOSE_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
-
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<Hub>>>>> = OnceLock::new();
 
 impl Hub {
@@ -121,6 +105,11 @@ impl Hub {
         // `.git` may have appeared or vanished on disk in the meantime.
         hub.refresh_live_sessions();
         hub.reconcile_buffers_with_disk();
+        // The restored layout's terminal tabs are as much a request for those
+        // sessions as a fresh click is — including `default_layout`'s own
+        // `term`, which is every project's first terminal and goes through no
+        // intent at all.
+        hub.sync_reservations();
         hub
     }
 
@@ -276,37 +265,9 @@ impl Hub {
         h.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// True when this project has a live hub currently mid-`CloseProject`
-    /// (see `closing`). Exists for `term.rs`: refusing the `StartTerminal`
-    /// *intent* while a close is in flight only stops a browser that asks
-    /// first, and the actual PTY spawn happens when something connects to
-    /// `/ws/{project}/term/{name}` — which a mirrored tab already showing a
-    /// terminal does on reconnect, with no intent of its own.
-    ///
-    /// Deliberately does *not* create a hub the way `for_project` does: a
-    /// project with no hub at all cannot be closing, and building one here
-    /// would also start a filesystem watcher as a side effect of a mere
-    /// question. The registry guard is dropped before the hub is locked, for
-    /// the same reason `for_project` drops it: a thread holding a hub lock
-    /// may want the registry lock.
-    pub fn is_closing(project: &str) -> bool {
-        let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-        let arc = {
-            let map = reg.lock().unwrap_or_else(|e| e.into_inner());
-            match map.get(project) {
-                Some(a) => a.clone(),
-                None => return false,
-            }
-        };
-        // Bound, not returned inline: as a tail expression the guard would
-        // outlive `arc` and this would not compile.
-        let closing = Hub::lock(&arc).closing;
-        closing
-    }
-
     /// This workspace's tree-visibility override, or `None` when it is still
     /// following the config file. Answers from the registry without creating
-    /// a hub, exactly like [`Hub::is_closing`] and for the same reason: a
+    /// a hub, for the reason `show_hidden` gives below: a
     /// project nobody has opened has no override, and building a hub to ask
     /// would start a filesystem watcher as a side effect of a question the
     /// tree fragment asks on every render.
@@ -362,6 +323,33 @@ impl Hub {
         // would mark tabs from a previous boot.
         ws.claude_sessions = crate::claudes::cached_sessions(&self.project);
         Event::State { version: self.ws.version, origin: origin.clone(), ws }
+    }
+
+    /// Every terminal tab in this layout is reserved, so the browser that
+    /// mounts it may spawn its shell.
+    ///
+    /// A tab *is* the server's record that this session is wanted — that is
+    /// what a layout is. Reservations that only came from `NewTerminal` were
+    /// not enough, because the two commonest terminals in the product never
+    /// go through it: `Workspace::default_layout` seeds pane 3 with `term`,
+    /// so a fresh project's first terminal comes straight from the layout,
+    /// and a restored layout's tabs do the same on every reload. Without this
+    /// both were refused and no terminal could be started at all — caught by
+    /// `reconnect.mjs`, which failed at "start a terminal", not by any Rust
+    /// test, because none of them mounts a tab.
+    ///
+    /// Additive: `reserve_if_absent` never disturbs a launch already parked
+    /// for a name (`✻` reserves before the tab exists). Nothing here removes
+    /// reservations — `do_close_project` drops the whole project's in one
+    /// go, which is the case that matters.
+    fn sync_reservations(&self) {
+        for p in &self.ws.panes {
+            for t in &p.tabs {
+                if let Tab::Terminal { session } = t {
+                    crate::session::reserve_if_absent(&self.project, session);
+                }
+            }
+        }
     }
 
     fn persist(&mut self) {
@@ -514,6 +502,12 @@ impl Hub {
         };
         match workspace::apply_layout(&mut self.ws, &intent) {
             Ok(true) => {
+                // A layout change can add a terminal tab (OpenTab, MoveTab
+                // between panes); the reservation follows it. Cheap and
+                // idempotent, so it runs on every change rather than being
+                // enumerated per intent — an intent list is the kind of thing
+                // that silently stops covering a case someone adds later.
+                self.sync_reservations();
                 self.ws.version += 1;
                 // Entering Edit mode is the server's cue to become this
                 // buffer's owner: read the file now, so base_hash
@@ -1558,7 +1552,7 @@ impl Hub {
         // attached, and a plain + must not inherit that click. The shell is
         // spawned by whichever browser attaches first, so the request waits
         // in `session` until then.
-        crate::session::set_launch(
+        crate::session::reserve(
             &self.project,
             &name,
             launch.map(|l| crate::session::LaunchRequest { launch: l, session_id: crate::launch::new_session_id() }),
@@ -1566,6 +1560,12 @@ impl Hub {
         let intent = Intent::OpenTab { pane, tab: Tab::Terminal { session: name.clone() } };
         match workspace::apply_layout(&mut self.ws, &intent) {
             Ok(true) => {
+                // A layout change can add a terminal tab (OpenTab, MoveTab
+                // between panes); the reservation follows it. Cheap and
+                // idempotent, so it runs on every change rather than being
+                // enumerated per intent — an intent list is the kind of thing
+                // that silently stops covering a case someone adds later.
+                self.sync_reservations();
                 self.ws.version += 1;
                 self.refresh_live_sessions();
                 let snap = self.snapshot_event(from);
@@ -1879,54 +1879,23 @@ impl Hub {
                         // stuck true — that would leave the UI showing a
                         // close that silently never finished, and refuse
                         // every later StartTerminal/CloseProject forever.
-                        let sweep = || {
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                crate::session::kill_project(&thread_project)
-                            }))
-                            .unwrap_or_else(|_| {
-                                eprintln!(
-                                    "resh: kill_project panicked while closing {thread_project}; reporting 0 ended"
-                                );
-                                0
-                            })
-                        };
-                        // Swept twice, and the second one is not belt and
-                        // braces — it is the whole reason a close could leave
-                        // a live shell behind.
-                        //
-                        // `kill_project` finds sessions two ways: the socket
-                        // files on disk, and a `ps` snapshot of what holds
-                        // them. A terminal websocket that connected moments
-                        // before this thread started is inside
-                        // `session::attach`, forking dtach; its master has
-                        // reached neither list yet, so the first sweep is
-                        // blind to it and it survives as an orphan — no tab
-                        // (the layout was already cleared), no client, and no
-                        // way back to it from the UI. That is CLAUDE.md's
-                        // "the socket's holder not yet visible" one door
-                        // along, and it was observed in production: the
-                        // survivor's dtach had resh itself as its parent and
-                        // a start time in the same second as the close.
-                        //
-                        // The settle is what makes the second sweep see it:
-                        // dtach's fork-and-detach takes an unpredictable,
-                        // usually small amount of wall time, and a sweep run
-                        // back to back with the first would read the same
-                        // blind snapshot again.
-                        //
-                        // This runs before the block below reacquires the
-                        // lock, so `closing` is still true throughout — which
-                        // means `term.rs`'s `is_closing` guard is also
-                        // refusing new connects for the whole window, and
-                        // nothing can be spawned *into* the gap between the
-                        // two sweeps. What remains uncovered is a connect
-                        // that lands after `closing` clears, by which point
-                        // the browser has been sent `ProjectClosed` and has
-                        // no terminal tab left to mount.
-                        let ended = sweep() + {
-                            std::thread::sleep(CLOSE_SETTLE);
-                            sweep()
-                        };
+                        // One sweep. The second one (and `CLOSE_SETTLE`)
+                        // existed to catch a shell that was still forking
+                        // when the first read the map and the socket
+                        // directory; `session::begin_close` now marks the
+                        // project closing in the same acquisition that drains
+                        // it, so there is nothing left for a second pass to
+                        // find. A timing hack kept beside an invariant only
+                        // invites the next reader to trust the wrong one.
+                        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            crate::session::kill_project(&thread_project)
+                        }))
+                        .unwrap_or_else(|_| {
+                            eprintln!(
+                                "resh: kill_project panicked while closing {thread_project}; reporting 0 ended"
+                            );
+                            0
+                        });
                         // Outside the catch_unwind above, not inside it: a
                         // panic in kill_project must not skip stopping the
                         // ide listener, or a closed project keeps
@@ -2012,7 +1981,7 @@ impl Hub {
 /// `REGISTRY.get()`, not `get_or_init`: everything below is a question asked
 /// from an `ide` connection thread, and building a hub as a side effect of a
 /// question would start a filesystem watcher for a project nobody opened —
-/// the same reasoning `Hub::is_closing` and `Hub::show_hidden` give.
+/// the same reasoning `Hub::show_hidden` gives.
 ///
 /// The registry guard is dropped before the caller ever locks the hub, so the
 /// registry-then-hub order `for_project` established is preserved.
@@ -3105,7 +3074,7 @@ mod tests {
         h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
         h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
         drain(&rx);
-        let first = crate::session::attach("newterm_launch", "term", d.path()).unwrap();
+        let first = crate::session::reserve_and_attach("newterm_launch", "term", d.path()).unwrap();
         assert_eq!(
             first.launch.as_ref().map(|l| l.launch),
             Some(proto::Launch::Claude),
@@ -3115,7 +3084,7 @@ mod tests {
             first.launch.as_ref().and_then(|l| l.session_id.as_deref()).is_some_and(crate::launch::valid_session_id),
             "the hub minted an id"
         );
-        let second = crate::session::attach("newterm_launch", "term1", d.path()).unwrap();
+        let second = crate::session::reserve_and_attach("newterm_launch", "term1", d.path()).unwrap();
         assert_eq!(second.launch, None, "+ got `term1`, which stays a plain shell");
         crate::session::kill_project("newterm_launch");
 
@@ -3131,7 +3100,7 @@ mod tests {
         h.handle(&c, Intent::CloseTab { pane: proto::RIGHT, idx });
         h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
         drain(&rx);
-        let reused = crate::session::attach("newterm_launch", "term2", d.path()).unwrap();
+        let reused = crate::session::reserve_and_attach("newterm_launch", "term2", d.path()).unwrap();
         assert_eq!(reused.launch, None, "a reallocated name must not inherit the old click");
         crate::session::kill_project("newterm_launch");
         std::env::remove_var("RESH_CMD");
@@ -3155,7 +3124,7 @@ mod tests {
         // First ✻: allocates `term`; spawn it the way a browser would, so the
         // launch is consumed and recorded on the session.
         h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
-        let _att = crate::session::attach("prompt_second", "term", d.path()).unwrap();
+        let _att = crate::session::reserve_and_attach("prompt_second", "term", d.path()).unwrap();
         assert_eq!(crate::session::launched_names("prompt_second").len(), 1, "fixture: a launched terminal exists");
         drain(&rxa); drain(&rxb);
         let version = h.ws.version;
@@ -3187,7 +3156,7 @@ mod tests {
         let (a, rxa) = h.subscribe();
         for p in h.ws.panes.iter_mut() { p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. })); p.active = 0; }
         h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
-        let _att = crate::session::attach("prompt_plus", "term", d.path()).unwrap();
+        let _att = crate::session::reserve_and_attach("prompt_plus", "term", d.path()).unwrap();
         drain(&rxa);
         let version = h.ws.version;
         h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
@@ -3393,7 +3362,7 @@ mod tests {
         let hub = Hub::for_project("closepromptly", project_dir.path().to_path_buf());
         let (c, _rx) = Hub::lock(&hub).subscribe();
 
-        let Ok(_att) = crate::session::attach("closepromptly", "shell", project_dir.path()) else {
+        let Ok(_att) = crate::session::reserve_and_attach("closepromptly", "shell", project_dir.path()) else {
             eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
             std::env::remove_var("RESH_STATE_DIR");
             return;
@@ -3501,7 +3470,7 @@ mod tests {
         let (_cb, rxb) = Hub::lock(&hub_b).subscribe();
         while rxb.try_recv().is_ok() {}
 
-        let att = crate::session::attach("roster-exit", "shell", dir_a.path())
+        let att = crate::session::reserve_and_attach("roster-exit", "shell", dir_a.path())
             .expect("attach with RESH_CMD=true spawns `true`");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -3545,7 +3514,7 @@ mod tests {
         let hub = Hub::for_project("closeinflight", project_dir.path().to_path_buf());
         let (c, rx) = Hub::lock(&hub).subscribe();
 
-        let Ok(_att) = crate::session::attach("closeinflight", "shell", project_dir.path()) else {
+        let Ok(_att) = crate::session::reserve_and_attach("closeinflight", "shell", project_dir.path()) else {
             eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
             std::env::remove_var("RESH_STATE_DIR");
             return;
@@ -3553,29 +3522,19 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         Hub::lock(&hub).handle(&c, Intent::CloseProject);
-        // The same window, as `term.rs` sees it: refusing the intent only
-        // stops a browser that asks first, and it is the connect to
-        // /ws/{project}/term/{name} that actually spawns the PTY — a mirrored
-        // tab reconnects straight there with no intent at all. That path has
-        // nothing but this to check.
-        assert!(
-            Hub::is_closing("closeinflight"),
-            "term.rs's own guard must be able to observe the in-flight close"
-        );
-        assert!(
-            !Hub::is_closing("no-such-project-ever"),
-            "a project with no hub cannot be closing"
-        );
-        // Asking must not *create* a hub the way `for_project` does — that
-        // would start a filesystem watcher as a side effect of a question,
-        // for a directory nobody asked about.
-        let created = REGISTRY
-            .get()
-            .map(|r| {
-                r.lock().unwrap_or_else(|e| e.into_inner()).contains_key("no-such-project-ever")
-            })
-            .unwrap_or(false);
-        assert!(!created, "is_closing must not register a hub for a project it was merely asked about");
+        // What `term.rs` used to check here — `Hub::is_closing` — is gone: it
+        // took the *hub* mutex while the spawn it guarded is serialised by
+        // the *session* mutex, so it ordered nothing. The connect side is now
+        // asserted where it is deterministic, in `session`'s
+        // `a_close_refuses_every_attach_until_it_finishes` and
+        // `an_attach_that_wins_the_lock_is_still_seen_by_the_close`. Asserting
+        // it here needed the close to still be in flight at the moment of the
+        // call, which is a race: with the second sweep gone the close now
+        // finishes first often enough that this observed `NotReserved`
+        // instead — a correct refusal, for the wrong reason to assert on.
+        //
+        // What remains here is the *intent* half, which is the hub's own job
+        // and is not timing-dependent.
         Hub::lock(&hub).handle(&c, Intent::StartTerminal { session: "fresh".into() });
 
         let msgs: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
@@ -4964,7 +4923,7 @@ mod tests {
         std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
         let (mut h, url, dir) = repo_with_worktree(root.path());
         let (a, rx) = h.subscribe(); drain(&rx);
-        let _att = crate::session::attach(&url, "term", &dir).unwrap();
+        let _att = crate::session::reserve_and_attach(&url, "term", &dir).unwrap();
         let got = refusal_of(&mut h, &a, &rx);
         assert!(got.contains("live terminal"), "{got}");
         assert!(dir.is_dir());
@@ -4981,8 +4940,8 @@ mod tests {
         std::env::set_var("RESH_STATE_DIR", root.path().join("state"));
         let (mut h, url, dir) = repo_with_worktree(root.path());
         let (a, rx) = h.subscribe(); drain(&rx);
-        crate::session::set_launch(&url, "term", Some(crate::session::LaunchRequest { launch: proto::Launch::Claude, session_id: None }));
-        let _att = crate::session::attach(&url, "term", &dir).unwrap();
+        crate::session::reserve(&url, "term", Some(crate::session::LaunchRequest { launch: proto::Launch::Claude, session_id: None }));
+        let _att = crate::session::reserve_and_attach(&url, "term", &dir).unwrap();
         let got = refusal_of(&mut h, &a, &rx);
         // Names the more specific reason even though "live terminal" is also true.
         //

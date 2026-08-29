@@ -33,12 +33,24 @@ The running binary was confirmed byte-identical to a fresh build of master
 (`8026c9b0…`, installed and `/proc/<MainPID>/exe` alike), so both sweeps and
 the `is_closing` guard were live.
 
-**And by the current model, that survivor should have died.** `closing` is set
-before the thread starts, so `term.rs:102` should have refused the connect;
-failing that, `attach` inserts into the session map before returning, so the
-second sweep — which re-reads that map ~400ms after the first finishes —
-should have found it. It did not. The interleaving that produced this is *not
-established*, and this document does not guess at it.
+**Update (implementation, same day): the mechanism is now established.**
+
+`term.rs:102`'s guard called `Hub::is_closing`, which takes the **hub** mutex,
+while the spawn it guards (`session::attach`) is serialised by the **sessions**
+mutex. A check on a different lock from the operation it guards orders nothing
+at all: a connect could pass it and spawn arbitrarily later. That is not a
+narrow window — it is however long the code between the check and `attach`
+takes, which includes starting the project's IDE listener.
+
+And a connect arriving *after* the close finished needed no window at all:
+`attach` created when absent, so a browser reconnecting to a session the close
+had just ended simply got a new one. `closeproject.mjs`'s Section F now
+reproduces exactly that, deterministically — with create-when-absent restored,
+a single reconnect after a close produces a `term1` socket and two `dtach`
+processes, which is the report verbatim.
+
+Both are closed by the design below, and for the same reason: the
+authorisation moved onto the lock that serialises the spawn.
 
 That is the finding, not a gap in the write-up. A close is currently correct
 only if a reader can hold the interleaving of a websocket thread, a session

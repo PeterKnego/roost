@@ -487,7 +487,7 @@ fn nested_project_websockets_connect() {
     assert!(state.contains(r#""t":"State""#));
     let _ = ws.close(None);
 
-    let mut term = ws_connect_path(port, "/ws/karpie/sub/term/shell").unwrap();
+    let mut term = ws_connect_term(port, "/ws/karpie/sub/term/shell").unwrap();
     term.send(tungstenite::Message::Binary(b"hi\r".to_vec())).unwrap();
     let mut seen = String::new();
     for _ in 0..60 {
@@ -752,6 +752,11 @@ fn ws_connect(
 ) -> Result<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, tungstenite::Error>
 {
     use tungstenite::client::IntoClientRequest;
+    // Reserved first, for the reason `ws_connect_term` gives: a bare connect
+    // no longer creates a session. Unconditional, including for the tests that
+    // expect a refusal — the Origin check runs long before `attach`, so those
+    // still fail exactly where they are meant to.
+    resh::session::reserve_if_absent("proj", "shell");
     let mut req = format!("ws://127.0.0.1:{port}/ws/proj/term/shell").into_client_request().unwrap();
     if let Some(o) = origin {
         req.headers_mut().insert("origin", o.parse().unwrap());
@@ -1000,7 +1005,7 @@ fn ws_closes_when_child_exits_first() {
     // terminal_ws_echoes_through_pty's `cat`), in which case RESH_CMD
     // would never be consulted for a fresh spawn and this test would prove
     // nothing about a child exiting first.
-    let mut ws = ws_connect_path(port, "/ws/proj/term/exiter").unwrap();
+    let mut ws = ws_connect_term(port, "/ws/proj/term/exiter").unwrap();
     // child exited at spawn; the server must close/shutdown the socket rather than hang
     assert_ws_closes(&mut ws, "ws_closes_when_child_exits_first");
 }
@@ -1012,7 +1017,7 @@ fn child_exit_delivers_a_close_frame_not_a_bare_eof() {
     std::env::set_var("RESH_STATE_DIR", sd.path());
     std::env::set_var("RESH_CMD", "true"); // exits immediately
     let (_d, port) = fixture_named("closeproj");
-    let mut ws = ws_connect_path(port, "/ws/closeproj/term/exiter").unwrap();
+    let mut ws = ws_connect_term(port, "/ws/closeproj/term/exiter").unwrap();
 
     // Deliberately stricter than assert_ws_closes, which also accepts a bare
     // EOF. The browser turns that distinction into `wasClean`, and app.js's
@@ -1076,7 +1081,7 @@ fn an_idle_terminal_socket_is_pinged() {
     std::env::set_var("RESH_CMD", "cat"); // reads stdin, writes nothing unprompted
     std::env::set_var("RESH_PING_SECS", "1");
     let (_d, port) = fixture_named("pingterm");
-    let mut ws = ws_connect_path(port, "/ws/pingterm/term/idle").unwrap();
+    let mut ws = ws_connect_term(port, "/ws/pingterm/term/idle").unwrap();
     // Nothing is sent from either side after the handshake. Without the
     // ping this socket would sit silent forever, which is exactly how a
     // dead peer's attachment goes on holding a `sizes` entry — and the PTY
@@ -1107,8 +1112,8 @@ fn two_terminal_clients_mirror_one_session() {
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("RESH_STATE_DIR", sd.path());
     let (_d, port) = fixture();
-    let mut a = ws_connect_path(port, "/ws/proj/term/shell").unwrap();
-    let mut b = ws_connect_path(port, "/ws/proj/term/shell").unwrap();
+    let mut a = ws_connect_term(port, "/ws/proj/term/shell").unwrap();
+    let mut b = ws_connect_term(port, "/ws/proj/term/shell").unwrap();
     a.send(tungstenite::Message::Binary(b"mirrored\r".to_vec().into())).unwrap();
 
     for ws in [&mut a, &mut b] {
@@ -1302,6 +1307,85 @@ fn invalid_session_name_is_refused() {
     }
 }
 
+/// A connect for a session that does not exist creates nothing, and says so
+/// with a *clean* close.
+///
+/// Both halves matter and they are separate failures. If it created, a
+/// terminal websocket would still be a session factory and a close would
+/// still be raceable. If it refused but the Close frame never reached the
+/// browser, `app.js` would read 1006 as a dead connection and reconnect on a
+/// backoff — re-entering the same door until one attempt landed somewhere it
+/// was allowed, which is the shape of the bug this whole change is about.
+///
+/// Revert-checked: dropping the `NotReserved` rule so `attach` creates again
+/// fails the first assertion, naming the session it should not have made.
+///
+/// The flush in `term.rs` after `close(None)` is **not** pinned by this test —
+/// removing it leaves this green. It is kept as defensive correctness (a Close
+/// that is only enqueued may never be written), but nothing here demonstrates
+/// that it matters, and this comment says so rather than implying a proof the
+/// revert did not produce.
+#[test]
+fn an_unreserved_terminal_connect_creates_nothing_and_closes_cleanly() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("RESH_CMD", "cat");
+    let (_d, port) = fixture();
+
+    // Deliberately `ws_connect_path`, not `ws_connect_term`: the point is a
+    // connect with no reservation behind it.
+    let mut ws = ws_connect_path(port, "/ws/proj/term/nosuchsession").unwrap();
+    let mut closed = false;
+    let mut read_err = None;
+    for _ in 0..20 {
+        match ws.read() {
+            Ok(tungstenite::Message::Close(_)) => {
+                closed = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                read_err = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    // Creation is asserted first, deliberately. When `attach` creates again
+    // the socket simply stays open, so the loop above ends on a read timeout
+    // — and asserting the close frame first reported that as "no Close
+    // frame", which diagnoses the wrong half. Checked by reverting: with the
+    // `NotReserved` rule removed this now fails here, naming the session it
+    // should not have made.
+    assert!(
+        !resh::session::live_names("proj").iter().any(|n| n == "nosuchsession"),
+        "an unreserved connect must not create the session it was refused: {:?}",
+        resh::session::live_names("proj")
+    );
+    assert!(closed, "the refusal must arrive as a Close frame; read ended with {read_err:?}");
+    std::env::remove_var("RESH_CMD");
+}
+
+/// Connect to a terminal socket the way a browser actually does: *after* an
+/// intent reserved the name.
+///
+/// `session::attach` no longer creates a session on a bare connect — that was
+/// what made every terminal websocket a session factory and let a client race
+/// a close. Production always gets here via `NewTerminal`, which reserves; a
+/// test that connects cold is exercising a path the server now refuses, so it
+/// has to reserve too. Tests that mean to assert the *refusal* call
+/// `ws_connect_path` directly, and that difference is now meaningful.
+fn ws_connect_term(
+    port: u16,
+    path: &str,
+) -> Result<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, tungstenite::Error>
+{
+    if let Some(rest) = path.strip_prefix("/ws/") {
+        if let Some((project, name)) = rest.rsplit_once("/term/") {
+            resh::session::reserve_if_absent(project, name);
+        }
+    }
+    ws_connect_path(port, path)
+}
+
 fn ws_connect_path(
     port: u16,
     path: &str,
@@ -1475,7 +1559,7 @@ fn a_claude_terminal_has_claude_typed_into_it_once_its_shell_exists() {
     // default_layout seeds `term`, so the click is handed `term1`.
     read_until(&mut a, r#""session":"term1""#);
 
-    let mut t = ws_connect_path(port, "/ws/claudeterm/term/term1").unwrap();
+    let mut t = ws_connect_term(port, "/ws/claudeterm/term/term1").unwrap();
     let mut seen = String::new();
     for _ in 0..100 {
         match t.read() {
@@ -1502,7 +1586,7 @@ fn a_claude_terminal_has_claude_typed_into_it_once_its_shell_exists() {
     // typed into it, so nothing comes back out.
     a.send(tungstenite::Message::Text(r#"{"t":"NewTerminal","pane":3}"#.into())).unwrap();
     read_until(&mut a, r#""session":"term2""#);
-    let mut p = ws_connect_path(port, "/ws/claudeterm/term/term2").unwrap();
+    let mut p = ws_connect_term(port, "/ws/claudeterm/term/term2").unwrap();
     p.send(tungstenite::Message::Binary(b"marker\r".to_vec())).unwrap();
     let mut plain = String::new();
     for _ in 0..100 {
@@ -1936,7 +2020,7 @@ fn opening_a_project_spawns_no_terminal_session() {
     // "live_sessions":[] could just as well mean the field is hardcoded
     // empty, or State ignores live_sessions entirely, as it could mean
     // nothing was spawned.
-    let mut term = ws_connect_path(port, "/ws/spawncheck/term/shell").unwrap();
+    let mut term = ws_connect_term(port, "/ws/spawncheck/term/shell").unwrap();
     let live_state = wait_for_live_session(&mut ws, &my_id, "shell");
     assert!(
         live_state.contains(r#""live_sessions":["shell"]"#),
@@ -1971,9 +2055,9 @@ fn close_project_ends_sessions_and_isolates_other_projects() {
     let (_d, port) = two_project_fixture("closealpha", "closebeta");
 
     // Starting a terminal is what creates a session: connect its socket.
-    let mut term_a1 = ws_connect_path(port, "/ws/closealpha/term/shell").unwrap();
-    let mut term_a2 = ws_connect_path(port, "/ws/closealpha/term/build").unwrap();
-    let mut term_b = ws_connect_path(port, "/ws/closebeta/term/shell").unwrap();
+    let mut term_a1 = ws_connect_term(port, "/ws/closealpha/term/shell").unwrap();
+    let mut term_a2 = ws_connect_term(port, "/ws/closealpha/term/build").unwrap();
+    let mut term_b = ws_connect_term(port, "/ws/closebeta/term/shell").unwrap();
 
     let mut ws_a = ws_connect_path(port, "/ws/closealpha/_workspace").unwrap();
     let mut ws_b = ws_connect_path(port, "/ws/closebeta/_workspace").unwrap();
@@ -2067,7 +2151,7 @@ fn close_project_ends_the_real_dtach_master_not_just_the_client() {
     std::env::set_var("RESH_STATE_DIR", sd.path());
     let (_d, port) = fixture_named("realclose");
 
-    let mut term = ws_connect_path(port, "/ws/realclose/term/shell").unwrap();
+    let mut term = ws_connect_term(port, "/ws/realclose/term/shell").unwrap();
     let mut ws = ws_connect_path(port, "/ws/realclose/_workspace").unwrap();
     let init = read_until(&mut ws, r#""t":"State""#);
     let my_id = extract_origin(&init);
@@ -2186,7 +2270,7 @@ fn reopening_a_closed_project_rebuilds_its_ide_listener() {
     );
 
     // Reopening a terminal is the path that must rebuild it.
-    let mut term = ws_connect_path(port, "/ws/idereopen/term/shell").unwrap();
+    let mut term = ws_connect_term(port, "/ws/idereopen/term/shell").unwrap();
     let second_port = wait_for_ide_port("idereopen").expect(
         "reopening the project must rebuild its ide listener: term.rs's ide::for_project \
          call is the only path left that can, and nothing else does",
@@ -2344,7 +2428,7 @@ fn an_escape_sequence_from_a_terminal_becomes_a_notice() {
     let mut ctrl = ws_connect_path(port, "/ws/notifyproj/_workspace").unwrap();
     read_until(&mut ctrl, r#""t":"State""#);
     // Attaching the terminal socket is what spawns the session and its pump.
-    let mut term = ws_connect_path(port, "/ws/notifyproj/term/claude").unwrap();
+    let mut term = ws_connect_term(port, "/ws/notifyproj/term/claude").unwrap();
 
     let seen = read_until(&mut ctrl, r#""t":"Notice""#);
     assert!(seen.contains("Build done"), "title missing: {seen}");
@@ -2375,7 +2459,7 @@ fn a_terminal_child_can_discover_that_notifications_exist() {
     std::env::set_var("RESH_CMD", script.to_str().unwrap());
 
     let (_d, port) = fixture_named("envproj");
-    let mut term = ws_connect_path(port, "/ws/envproj/term/envprobe").unwrap();
+    let mut term = ws_connect_term(port, "/ws/envproj/term/envprobe").unwrap();
     let mut seen = String::new();
     for _ in 0..100 {
         match term.read() {
@@ -2421,7 +2505,7 @@ fn a_fresh_projects_first_terminal_already_carries_the_ide_port() {
     let (_d, port) = fixture_named("sseportproj");
     // No `_workspace` connection anywhere above this line: this project's
     // hub, and so its ide listener, has never been touched before.
-    let mut term = ws_connect_path(port, "/ws/sseportproj/term/sseprobe").unwrap();
+    let mut term = ws_connect_term(port, "/ws/sseportproj/term/sseprobe").unwrap();
     let mut seen = String::new();
     for _ in 0..100 {
         match term.read() {

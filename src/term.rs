@@ -78,32 +78,16 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
         let _ = ws_read.close(None);
         return;
     };
-    // A close in flight is SIGKILLing every one of this project's sessions on
-    // a background thread, and `kill_and_unlink` kills whatever holds a
-    // socket path — including a session spawned *after* it took its process
-    // snapshot. `hub::do_start_terminal` refuses the `StartTerminal` intent
-    // for that reason, but that only stops a browser that asks first: this
-    // connect is what actually spawns the PTY, and a mirrored tab already
-    // showing a terminal reconnects straight here with no intent at all. So
-    // the same guard has to exist on this path.
+    // The guard that used to stand here asked `Hub::is_closing`, which takes
+    // the *hub* mutex — while the spawn it was guarding is serialised by the
+    // *session* mutex. A check on a different lock from the operation it
+    // guards orders nothing: a connect could pass it and spawn arbitrarily
+    // later, and did, leaving a live shell in a project the user had closed.
     //
-    // Not airtight, and cannot be from here: a close starting in the moment
-    // between this check and `attach` below still races. Closing that
-    // properly would mean holding the hub lock across `attach` (a PTY spawn
-    // — blocking I/O under a lock, which CLAUDE.md forbids outright). What
-    // remains is a microsecond-scale window instead of the whole ~100ms+
-    // kill, and the losing case degrades to what it already was.
-    //
-    // Safe to touch a hub lock *here*, unlike the refresh block further down
-    // (see its placement comment): no subscriber exists until `attach`
-    // returns, so waiting on a busy hub can only delay this terminal's own
-    // start — there is no queue yet that could fill and get this tab dropped
-    // mid-connect.
-    if crate::hub::Hub::is_closing(&project) {
-        eprintln!("resh: term socket refused — project {project:?} is closing");
-        let _ = ws_read.close(None);
-        return;
-    }
+    // `session::attach` now decides for itself, under the one lock that also
+    // serialises the close (see `session::Registry`), so both orders are
+    // correct and there is no window here to widen. The refusal comes back
+    // below as an error, where it is answered rather than pre-empted.
     // Must run before `attach`, not after: `attach` builds the spawned
     // shell's environment (`session::session_env`) from
     // `ide::port_for(project)`, which on a brand-new project's first-ever
@@ -150,7 +134,15 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("resh: term socket refused — attach {project}/{name} failed: {e}");
+            // Flushed as well as closed: `close` only *enqueues* the frame,
+            // and a Close that is never written reaches the browser as 1006,
+            // which `onclose` reads as a dead connection and answers with a
+            // reconnect — back into this same refusal on a backoff. Defensive
+            // rather than demonstrated: removing the flush does not fail
+            // `an_unreserved_terminal_connect_creates_nothing_and_closes_cleanly`,
+            // so treat it as cheap insurance, not as a tested property.
             let _ = ws_read.close(None);
+            let _ = ws_read.flush();
             return;
         }
     };
