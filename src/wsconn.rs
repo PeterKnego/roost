@@ -534,8 +534,11 @@ mod tests {
     /// The size is calibrated, not arbitrary. The first version of this
     /// fixture (4000 one-line files) walked in 10 ms, and the lock-held
     /// implementation of `run_search` passed this test — see the comment on
-    /// the test below. Measured here: 18000 files x 120 lines costs 72 ms to
-    /// build and 553 ms to walk, which is ~500 polls of a 1 ms loop.
+    /// the test below. Sized down again afterwards, because this runs on
+    /// every `cargo test --lib` and the deploy host is modest. Measured here
+    /// at 12000 files x 40 lines (~19 MB, ~40 ms to build): a walk of
+    /// 150-210 ms, which is 163 polls of a 1 ms loop against a threshold of
+    /// 10, and a superseded walk that stops 3 ms after being told to.
     fn wide_project(n: usize, lines: usize) -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
         let body = "some ordinary line of source text here\n".repeat(lines);
@@ -601,13 +604,21 @@ mod tests {
     ///    Sleeping first gives the walker time to take the lock it means to
     ///    hold, so a lock-held walk owns it for every poll that follows.
     /// 2. The fixture size. A 10 ms walk leaves ~10 polls, which is too few
-    ///    to tell "free throughout" from "free by luck". The fixture now
-    ///    walks for ~550 ms, so the correct implementation scores in the
-    ///    hundreds and the threshold has room.
+    ///    to tell "free throughout" from "free by luck". The fixture walks
+    ///    for ~170 ms here, so the correct implementation scores 163 against
+    ///    a threshold of 10.
+    ///
+    /// The barrier cannot mask the defect it was added to expose, which is
+    /// the obvious worry about sleeping before you look. If a lock-held walk
+    /// finished inside those 20 ms, its result would already be in the
+    /// channel, the loop's `rx.try_recv()` would succeed on the first check,
+    /// the body would never run, and `locked_during` would be 0 — a failure,
+    /// not a pass. The barrier can only ever cost this test samples it would
+    /// have counted, never manufacture one.
     #[test]
     fn the_hub_lock_is_free_while_a_search_walks() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let d = wide_project(18_000, 120);
+        let d = wide_project(12_000, 40);
         let state = tempfile::tempdir().unwrap();
         std::env::set_var("RESH_STATE_DIR", state.path().join("state"));
 
@@ -649,7 +660,12 @@ mod tests {
         std::env::remove_var("RESH_STATE_DIR");
     }
 
-    /// A query the user has already typed past must not be answered.
+    /// A query the user typed past *before it started* must not be answered.
+    ///
+    /// Only covers the pre-flight check: `latest` is already 5 when the call
+    /// is made, so `run_search` returns before it ever walks. The mid-walk
+    /// case — the one that decides whether a fast typist's superseded walk
+    /// abandons or runs to completion — is a different test, below.
     #[test]
     fn a_superseded_query_sends_nothing() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -665,6 +681,79 @@ mod tests {
         let latest = Arc::new(AtomicU64::new(5));
         run_search(&hub, &asker, "needle", 1, &latest);
 
+        let mut got = vec![];
+        while let Ok(m) = rx.try_recv() { got.push(m); }
+        assert!(
+            !got.iter().any(|m| m.contains(r#""t":"SearchResults""#)),
+            "a superseded query must not answer, got {got:?}"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// A query superseded *while the walk is running* stops walking.
+    ///
+    /// The three other search tests here all pass with the cancellation
+    /// wiring gutted: `a_superseded_query_sends_nothing` returns at the
+    /// pre-flight check and never reaches the walk, so it survives deleting
+    /// either check individually and survives replacing the `cancelled`
+    /// closure `run_search` hands to `search::run` with `|| false`. Nothing
+    /// exercised the closure that `search::run` actually polls at every
+    /// directory boundary — which is the only thing that makes a superseded
+    /// walk stop rather than finish and then decline to send.
+    ///
+    /// So the load-bearing assertion here is the *timing* one, and it comes
+    /// first: "no SearchResults arrived" is equally true of a walk that ran
+    /// to the very end and then dropped its answer. The walk is timed on this
+    /// host rather than compared against a hard-coded duration, because the
+    /// fixture's cost varies by machine and filesystem and only the ratio is
+    /// meaningful.
+    #[test]
+    fn a_query_superseded_mid_walk_abandons_the_walk() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = wide_project(12_000, 40);
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", state.path().join("state"));
+
+        let hub = Arc::new(Mutex::new(Hub::new("proj", d.path().to_path_buf())));
+        let (asker, rx) = Hub::lock(&hub).subscribe();
+        while rx.try_recv().is_ok() {}
+
+        // Baseline: one uninterrupted walk over this very fixture, to learn
+        // what "ran to completion" costs here. Asserting it answered is also
+        // what proves the fixture is walkable at all — a fixture that failed
+        // to walk would make the interrupted run below fast for the wrong
+        // reason.
+        let latest = Arc::new(AtomicU64::new(1));
+        let t0 = std::time::Instant::now();
+        run_search(&hub, &asker, "needle", 1, &latest);
+        let full = t0.elapsed();
+        let mut base = vec![];
+        while let Ok(m) = rx.try_recv() { base.push(m); }
+        assert!(
+            base.iter().any(|m| m.contains(r#""t":"SearchResults""#)),
+            "the baseline walk must have completed and answered, got {base:?}"
+        );
+
+        // The same walk, superseded once it is provably under way.
+        let latest2 = Arc::new(AtomicU64::new(3));
+        let h2 = hub.clone();
+        let l2 = latest2.clone();
+        let id2 = asker.clone();
+        let walker = std::thread::spawn(move || run_search(&h2, &id2, "needle", 3, &l2));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Timed from the store, not from the spawn, so the barrier sleep is
+        // not counted as walking: this measures only how long the walk kept
+        // going after it was superseded.
+        let superseded_at = std::time::Instant::now();
+        latest2.store(4, Ordering::SeqCst);
+        walker.join().unwrap();
+        let after = superseded_at.elapsed();
+
+        assert!(
+            after < full / 2,
+            "the walk kept going {after:?} after being superseded, against a full walk of \
+             {full:?} — it is running to the end and only then declining to answer"
+        );
         let mut got = vec![];
         while let Ok(m) = rx.try_recv() { got.push(m); }
         assert!(
