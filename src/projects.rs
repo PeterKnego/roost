@@ -392,6 +392,29 @@ pub fn resolve_terminal_path(project_dir: &Path, text: &str) -> Result<String, S
     }
 }
 
+/// The `:42` a terminal link may carry, if it has one.
+///
+/// Separate from `resolve_terminal_path`, which resolves and confines the
+/// path and has no use for the line: this reads the same suffix for the one
+/// caller that does. `a/b:c.md` is not a line number, so only a trailing run
+/// of digits after the final colon counts, and only when the rest is
+/// non-empty.
+pub fn trailing_line(text: &str) -> Option<u32> {
+    let (rest, tail) = text.rsplit_once(':')?;
+    if rest.is_empty() {
+        return None;
+    }
+    // `file.rs:42:7` — column form; the line is the first of the two.
+    if let Some((rest2, mid)) = rest.rsplit_once(':') {
+        if !rest2.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty() {
+            if let Ok(n) = mid.parse::<u32>() {
+                return Some(n);
+            }
+        }
+    }
+    tail.parse::<u32>().ok()
+}
+
 /// `src/main.rs:42` and `src/main.rs:42:7` both name `src/main.rs`. The browser
 /// matcher deliberately swallows the suffix so the whole reference underlines;
 /// this is where it comes back off.

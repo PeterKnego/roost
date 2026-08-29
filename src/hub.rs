@@ -466,6 +466,9 @@ impl Hub {
                 return self.do_new_terminal(from, *pane, *launch, *force)
             }
             Intent::OpenPath { text } => return self.do_open_path(from, text.clone()),
+            Intent::OpenAtLine { pane, rel, line } => {
+                return self.do_open_at_line(from, *pane, rel.clone(), *line)
+            }
             Intent::MentionPath { rel, line_start, line_end, session } => {
                 return self.do_mention_path(
                     from,
@@ -1635,11 +1638,45 @@ impl Hub {
         // `apply_layout` call and the single broadcast/persist that follow —
         // no double broadcast, no double persist, and the refusal path above
         // (which returns before this point) is untouched.
+        let line = crate::projects::trailing_line(&text);
         let intent = Intent::OpenTab {
             pane: crate::proto::MIDDLE,
-            tab: Tab::File { rel, mode: Mode::Preview },
+            tab: Tab::File { rel: rel.clone(), mode: Mode::Preview },
         };
-        self.handle(from, intent)
+        self.handle(from, intent);
+        // The line the link named. Until this existed the client stripped it
+        // and flashed "line 42 — opening file", because, as app.js put it,
+        // "the viewer has no line addressing to spend it on". It does now.
+        if let Some(line) = line {
+            let ev = Event::RevealLine { rel, line };
+            self.broadcast(&ev);
+        }
+    }
+
+    /// Open `rel` and tell every browser to scroll it to `line`.
+    ///
+    /// The confinement check is here for the reason `do_open_path` gives:
+    /// `apply_layout` validates nothing, and this `rel` came off a wire. That
+    /// a search produced it is no guarantee — a client can send this intent
+    /// with anything in it.
+    ///
+    /// The refusal is a generic "path outside project", not `safe_resolve`'s
+    /// own message interpolated with `rel`: `rel` is attacker-controlled at
+    /// this point, and echoing it back into the one event this client
+    /// receives would hand it right back out. Nothing about a rejected path
+    /// needs to be repeated to the client that just sent it.
+    fn do_open_at_line(&mut self, from: &ConnId, pane: crate::proto::PaneId, rel: String, line: u32) {
+        if crate::projects::safe_resolve(&self.dir, &rel).is_err() {
+            let ev = Event::Error { msg: "path outside project".into() };
+            return self.send_to(from, &ev);
+        }
+        // Edit, not Preview: a content hit was matched against the file's
+        // source, and a rendered markdown preview has no line 412 to land on.
+        // `coerce_tab` still demotes anything that cannot be edited as text.
+        let intent = Intent::OpenTab { pane, tab: Tab::File { rel: rel.clone(), mode: Mode::Edit } };
+        self.handle(from, intent);
+        let ev = Event::RevealLine { rel, line };
+        self.broadcast(&ev);
     }
 
     /// Resolves `rel` against this project's directory before it ever
@@ -5080,6 +5117,130 @@ mod tests {
         h.handle(&a, Intent::RemoveWorktree { key });
         let got = rx.try_recv().unwrap();
         assert!(got.contains("not a worktree of this project"), "the main checkout is never removable: {got}");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn open_at_line_opens_the_file_and_reveals_the_line() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.rs"), "one\ntwo\nthree\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        let (_other, rx_other) = h.subscribe();
+        drain(&rx);
+        drain(&rx_other);
+
+        h.handle(&c, Intent::OpenAtLine { pane: proto::MIDDLE, rel: "a.rs".into(), line: 2 });
+
+        let mine = drain(&rx);
+        assert!(mine.iter().any(|m| m.contains(r#""t":"State""#) && m.contains("a.rs")), "{mine:?}");
+        assert!(
+            mine.iter().any(|m| m.contains(r#""t":"RevealLine""#) && m.contains(r#""line":2"#)),
+            "{mine:?}"
+        );
+        // Broadcast, not send_to: a second browser mirroring this tab follows
+        // it to the same line. Asserted explicitly so the choice cannot flip
+        // silently in either direction.
+        assert!(
+            drain(&rx_other).iter().any(|m| m.contains(r#""t":"RevealLine""#)),
+            "a mirroring browser must be told where to scroll"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn open_at_line_opening_a_file_twice_does_not_open_a_second_tab() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.rs"), "one\ntwo\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(&c, Intent::OpenAtLine { pane: proto::MIDDLE, rel: "a.rs".into(), line: 1 });
+        h.handle(&c, Intent::OpenAtLine { pane: proto::MIDDLE, rel: "a.rs".into(), line: 2 });
+
+        let tabs = h.ws.panes[proto::MIDDLE as usize]
+            .tabs
+            .iter()
+            .filter(|t| matches!(t, Tab::File { rel, .. } if rel == "a.rs"))
+            .count();
+        assert_eq!(tabs, 1, "a second hit in an open file must re-scroll it, not clone the tab");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// `rel` arrives from a browser. `apply_layout` validates nothing, so the
+    /// confinement check has to be here — the same reasoning `OpenPath`
+    /// carries. Asserts on the *message*, not merely that something failed:
+    /// an intent rejected for the wrong reason would pass an `is_err`-style
+    /// check while leaving the escape open.
+    #[test]
+    fn open_at_line_refuses_a_path_outside_the_project() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(&c, Intent::OpenAtLine {
+            pane: proto::MIDDLE,
+            rel: "../../etc/passwd".into(),
+            line: 1,
+        });
+
+        let got = drain(&rx);
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("outside project")),
+            "must refuse by confinement and say so, got {got:?}"
+        );
+        assert!(
+            !got.iter().any(|m| m.contains("passwd")),
+            "nothing outside the project may reach the layout, got {got:?}"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn a_terminal_link_with_a_line_number_reveals_that_line() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.rs"), "one\ntwo\nthree\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(&c, Intent::OpenPath { text: "a.rs:3".into() });
+
+        let got = drain(&rx);
+        assert!(got.iter().any(|m| m.contains(r#""t":"State""#) && m.contains("a.rs")), "{got:?}");
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"RevealLine""#) && m.contains(r#""line":3"#)),
+            "a link that named a line must land on it, got {got:?}"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn a_terminal_link_without_a_line_number_reveals_nothing() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.rs"), "one\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(&c, Intent::OpenPath { text: "a.rs".into() });
+
+        assert!(
+            !drain(&rx).iter().any(|m| m.contains(r#""t":"RevealLine""#)),
+            "a plain path must not scroll anywhere"
+        );
         std::env::remove_var("RESH_STATE_DIR");
     }
 }
