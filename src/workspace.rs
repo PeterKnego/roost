@@ -293,6 +293,24 @@ pub fn apply_layout(w: &mut Workspace, intent: &Intent) -> Result<bool, String> 
             }
             Ok(changed)
         }
+        // The whole-project form of `EndSession` above, and it exists for the
+        // same reason: `kill_project` ends every session here, so every
+        // terminal tab now points at a shell that is gone. One difference
+        // makes it matter more — this layout is persisted, so a tab left
+        // behind is not merely stale until the next reload, it *is* what the
+        // next reload restores.
+        Intent::CloseProject => {
+            let mut changed = false;
+            for p in w.panes.iter_mut() {
+                let before = p.tabs.len();
+                p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+                if p.tabs.len() != before {
+                    p.active = p.active.min(p.tabs.len().saturating_sub(1));
+                    changed = true;
+                }
+            }
+            Ok(changed)
+        }
         Intent::ActivateTab { pane, idx } => {
             let p = pane_mut(w, *pane)?;
             if *idx >= p.tabs.len() {
@@ -485,6 +503,50 @@ mod tests {
 
         // Nothing to remove is not a change — it must not bump the version.
         assert!(!apply_layout(&mut w, &Intent::EndSession { session: "gone".into() }).unwrap());
+    }
+
+    /// Close Project ends *every* session in the project, so it owes the
+    /// layout the same cleanup `EndSession` does for one — for the same
+    /// reason, one pane over: a terminal tab left behind is a click that
+    /// silently starts a fresh shell in a project the user just closed. It is
+    /// worse here than for a single session, because the layout is persisted:
+    /// the stale tabs come back on every reload of that project, forever,
+    /// which is how this was reported.
+    #[test]
+    fn closing_a_project_clears_every_terminal_tab_and_leaves_the_others() {
+        let mut w = Workspace::default_layout();
+        let term = |n: &str| Tab::Terminal { session: n.to_string() };
+        apply_layout(&mut w, &Intent::OpenTab { pane: proto::MIDDLE, tab: file("a.txt") }).unwrap();
+        apply_layout(&mut w, &Intent::OpenTab { pane: proto::MIDDLE, tab: term("term1") }).unwrap();
+        apply_layout(&mut w, &Intent::OpenTab { pane: proto::RIGHT, tab: term("term2") }).unwrap();
+        // RIGHT now holds [term, term2] with `active` on the last one, so the
+        // clamp below has something real to clamp — without this the "active
+        // index must stay addressable" assertion would hold vacuously.
+        assert_eq!(w.panes[proto::RIGHT as usize].active, 1);
+
+        let changed = apply_layout(&mut w, &Intent::CloseProject).unwrap();
+
+        assert!(changed);
+        let live: Vec<&Tab> = w.panes.iter().flat_map(|p| p.tabs.iter()).collect();
+        assert!(
+            !live.iter().any(|t| matches!(t, Tab::Terminal { .. })),
+            "a closed project may keep no terminal tab at all: {live:?}"
+        );
+        // The other half of the claim: this clears terminals, not the layout.
+        // Without these, emptying every pane outright would pass.
+        assert!(live.iter().any(|t| matches!(t, Tab::Tree)), "the tree must survive");
+        assert!(live.iter().any(|t| matches!(t, Tab::Changes)), "changes must survive");
+        assert!(
+            live.iter().any(|t| matches!(t, Tab::File { rel, .. } if rel == "a.txt")),
+            "an open file must survive: closing ends shells, it does not close files"
+        );
+        for p in &w.panes {
+            assert!(p.active < p.tabs.len().max(1), "active index must stay addressable");
+        }
+
+        // A project with no terminals left is not a change — closing it twice
+        // must not bump the version a second time.
+        assert!(!apply_layout(&mut w, &Intent::CloseProject).unwrap());
     }
 
     #[test]

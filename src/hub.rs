@@ -1905,17 +1905,49 @@ impl Hub {
                     eprintln!("resh: could not spawn close-project thread for {project}: {e}");
                     let ev = Event::Error { msg: "could not close the project; try again".into() };
                     self.send_to(from, &ev);
+                    // Nothing was ended, so nothing may be cleared: returning
+                    // here is what keeps the tab drop below on the committed
+                    // path only. Dropping the tabs of shells that are still
+                    // running would hide them from the one browser that can
+                    // still reach them.
+                    return;
                 }
+                // After the spawn, not before: the thread blocks on the hub
+                // lock this call still holds, so it cannot observe the
+                // half-applied layout, and a failed spawn has already
+                // returned above. It broadcasts the cleared layout itself,
+                // in the `State` that follows its `ProjectClosed`.
+                self.drop_terminal_tabs();
             }
             None => {
                 let ended = crate::session::kill_project(&project);
                 crate::ide::stop(&project);
+                // Before the version bump, so the one bump covers the kill
+                // and the layout change together — two bumps for a single
+                // intent would make a client's `version` check see a state it
+                // never received.
+                self.drop_terminal_tabs();
                 self.ws.version += 1;
                 self.broadcast(&Event::ProjectClosed { ended });
                 self.refresh_live_sessions();
                 let snap = self.snapshot_event(&String::new());
                 self.broadcast(&snap);
             }
+        }
+    }
+
+    /// Removes every terminal tab and persists the result — the layout half
+    /// of a close, which `session::kill_project` knows nothing about.
+    ///
+    /// Called only once a close is committed. Persisting is the point, not an
+    /// afterthought: the sessions really were ended before this existed, but
+    /// the tabs pointing at them stayed in the saved layout, so reopening the
+    /// project restored a tab per dead session on every reload — reported as
+    /// "I close the project but still see terminals under it".
+    fn drop_terminal_tabs(&mut self) {
+        if let Ok(true) = workspace::apply_layout(&mut self.ws, &Intent::CloseProject) {
+            self.ws.version += 1;
+            self.persist();
         }
     }
 }
@@ -3144,6 +3176,65 @@ mod tests {
         assert!(
             msgs_other.iter().any(|m| m.contains(r#""t":"State""#)),
             "a second browser must be told its terminal tab is gone"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// The half of a close the user actually sees afterwards. `kill_project`
+    /// really does end the shells (see `close_project_..._reports_what_it_ended`),
+    /// but the tabs pointing at them lived on in the layout — and the layout
+    /// is persisted, so reopening the closed project re-rendered a terminal
+    /// tab per dead session, on every reload, forever.
+    ///
+    /// Asserts on the reloaded-from-disk workspace, not just `h.ws`: the
+    /// in-memory half alone would pass with `persist()` missing, which is
+    /// exactly the "even after reload" the report was about.
+    #[test]
+    fn close_project_clears_the_terminal_tabs_of_the_sessions_it_ended() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.txt"), "disk\n").unwrap();
+        let mut h = Hub::new("closetabs", d.path().to_path_buf());
+        let (c, _rx) = h.subscribe();
+        h.handle(
+            &c,
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::Terminal { session: "term1".into() } },
+        );
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::File { rel: "a.txt".into(), mode: crate::proto::Mode::Edit },
+            },
+        );
+        let before: Vec<&Tab> = h.ws.panes.iter().flat_map(|p| p.tabs.iter()).collect();
+        assert!(
+            before.iter().filter(|t| matches!(t, Tab::Terminal { .. })).count() >= 2,
+            "test setup: there must be terminal tabs to lose: {before:?}"
+        );
+
+        h.handle(&c, Intent::CloseProject);
+
+        let live: Vec<&Tab> = h.ws.panes.iter().flat_map(|p| p.tabs.iter()).collect();
+        assert!(
+            !live.iter().any(|t| matches!(t, Tab::Terminal { .. })),
+            "a closed project may keep no terminal tab: {live:?}"
+        );
+        // What a reload actually reads. `load` returns the same workspace the
+        // next `Hub::new` for this project would start from.
+        let (reloaded, warn) = crate::wsstate::load("closetabs");
+        assert!(warn.is_none(), "the state file must have been written cleanly: {warn:?}");
+        let saved: Vec<&Tab> = reloaded.panes.iter().flat_map(|p| p.tabs.iter()).collect();
+        assert!(
+            !saved.iter().any(|t| matches!(t, Tab::Terminal { .. })),
+            "reopening a closed project must not bring its dead terminals back: {saved:?}"
+        );
+        // Closing ends shells; it does not close the files being worked on.
+        // Without this, wiping the layout outright would pass.
+        assert!(
+            saved.iter().any(|t| matches!(t, Tab::File { rel, .. } if rel == "a.txt")),
+            "an open file tab must survive the close: {saved:?}"
         );
         std::env::remove_var("RESH_STATE_DIR");
     }
