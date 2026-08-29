@@ -355,15 +355,21 @@ performed.
   named `"term"` before anything is clicked, so every session-count
   assertion here is written against that baseline rather than an empty pane.
 - In `closeproject.mjs`: removing both `drop_terminal_tabs()` calls from
-  `hub.rs`'s `do_close_project` — the state this bug was reported in — fails 3
-  of the 11: the reopened project shows `term`, `term1`, `term2` again, the
+  `hub.rs`'s `do_close_project` — the state this bug was reported in — fails 3:
+  the reopened project shows `term`, `term1`, `term2` again, the
   saved layout still lists them, and Section C's "fresh" terminal comes up as
   `term3` beside the three ghosts. Removing only that helper's `persist()`
   fails exactly 1, the saved-layout read. Everything the *page* shows still
   passes there, because the reopen talks to the same still-running hub whose
   in-memory layout was cleared — which is why "even after reload" is asserted
   against the state file rather than against the DOM, and why a DOM-only
-  version of this file would have shipped green over half the bug.
+  version of this file would have shipped green over half the bug. Section D:
+  dropping the second `kill_project` sweep fails it 3 runs of 3. Section E:
+  removing `e.gone = true` / `clearTimeout(e.timer)` from app.js's
+  ProjectClosed teardown fails it with `[false]`. E took three attempts to
+  become honest — its first setup assertion was vacuous on an empty map, and
+  its second read `[]` after the page had navigated and called that "not
+  disarmed" rather than "could not look".
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
