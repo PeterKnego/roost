@@ -506,6 +506,13 @@ function onEvent(ev) {
         pendingLink = null;
       }
       break;
+    case "SearchResults":
+      // A late answer to a query the user has typed past must not paint over
+      // what they are looking at now. The server drops most of these; this is
+      // the client half of the same rule, for the ones already in flight.
+      if (ev.seq !== searchSeq) break;
+      renderSearch(ev.results);
+      break;
   }
 }
 
@@ -2691,3 +2698,196 @@ document.addEventListener("paste", (e) => {
   e.preventDefault();
   uploadFiles(files, dir);
 }, true);
+
+// --- project search (⇧⇧) ---------------------------------------------------
+//
+// Double-tap Shift, IntelliJ-style. Two properties make it safe to arm on the
+// document even while a terminal has focus, which is where focus usually is:
+//
+//   - Shift alone emits nothing to a shell, so intercepting it steals no
+//     keystroke. Any Ctrl-/Cmd- chord would have to be taken away from the
+//     program running in the terminal instead.
+//   - The two presses must be consecutive. Typing "HI" presses Shift twice in
+//     quick succession, but the H lands between them and resets the pending
+//     state, so ordinary typing cannot open this.
+const SHIFT_GAP_MS = 400;
+let shiftPending = 0;
+let searchSeq = 0;
+let searchRows = [];      // [{kind, rel, line, session}] parallel to the DOM rows
+let searchSel = 0;
+let searchDebounce = null;
+let searchReturnFocus = null;
+
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Shift") { shiftPending = 0; return; }
+  if (e.repeat) return;   // holding Shift down is one press, not many
+  const now = Date.now();
+  if (shiftPending && now - shiftPending < SHIFT_GAP_MS) {
+    shiftPending = 0;
+    openSearch();
+    return;
+  }
+  shiftPending = now;
+});
+
+function openSearch() {
+  const ov = document.getElementById("searchoverlay");
+  if (!ov || !ov.hidden) return;
+  // Remembered before focus moves: closing must give the terminal back, or
+  // every dismissal costs the user their shell focus.
+  searchReturnFocus = document.activeElement;
+  ov.hidden = false;
+  const input = document.getElementById("searchinput");
+  input.value = "";
+  renderSearch(null);
+  input.focus();
+}
+
+function closeSearch() {
+  const ov = document.getElementById("searchoverlay");
+  if (!ov || ov.hidden) return;
+  ov.hidden = true;
+  searchRows = [];
+  // A terminal's focus lives on its xterm textarea; .focus() on the remembered
+  // element restores it without knowing which pane it was.
+  try { searchReturnFocus && searchReturnFocus.focus(); } catch {}
+  searchReturnFocus = null;
+}
+
+document.getElementById("searchbox")?.addEventListener("click", openSearch);
+
+document.getElementById("searchinput")?.addEventListener("input", (e) => {
+  const q = e.target.value;
+  clearTimeout(searchDebounce);
+  // Debounced, because every keystroke is a walk. The server drops answers to
+  // queries the user has already typed past, but not sending them at all is
+  // cheaper than cancelling them.
+  searchDebounce = setTimeout(() => {
+    if (!q) { renderSearch(null); return; }
+    send({ t: "Search", q, seq: ++searchSeq });
+  }, 120);
+});
+
+document.getElementById("searchoverlay")?.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { e.preventDefault(); closeSearch(); return; }
+  if (e.key === "ArrowDown") { e.preventDefault(); moveSearchSel(1); return; }
+  if (e.key === "ArrowUp") { e.preventDefault(); moveSearchSel(-1); return; }
+  if (e.key === "Enter") { e.preventDefault(); activateSearchRow(searchSel); }
+});
+
+// Clicking the backdrop closes; clicking the panel does not.
+document.getElementById("searchoverlay")?.addEventListener("mousedown", (e) => {
+  if (e.target.id === "searchoverlay") closeSearch();
+});
+
+function moveSearchSel(d) {
+  if (!searchRows.length) return;
+  searchSel = (searchSel + d + searchRows.length) % searchRows.length;
+  paintSearchSel();
+}
+
+function paintSearchSel() {
+  const rows = document.querySelectorAll("#searchresults .searchrow");
+  rows.forEach((n, i) => n.classList.toggle("sel", i === searchSel));
+  rows[searchSel]?.scrollIntoView({ block: "nearest" });
+}
+
+/// Builds one result row. Every dynamic part is a text node: a matched line is
+/// arbitrary file content and a path is arbitrary filesystem content, which
+/// makes these the most attacker-influenced strings this client renders. The
+/// innerHTML rule at the top of this file (constant markup only) is the whole
+/// defence, and it only holds if nothing here interpolates.
+function searchRow(primary, secondary) {
+  const row = document.createElement("div");
+  row.className = "searchrow";
+  const a = document.createElement("span");
+  a.textContent = primary;
+  row.appendChild(a);
+  if (secondary !== null && secondary !== undefined) {
+    const b = document.createElement("span");
+    b.className = "where";
+    b.textContent = secondary;
+    row.appendChild(b);
+  }
+  return row;
+}
+
+function renderSearch(results) {
+  const host = document.getElementById("searchresults");
+  const note = document.getElementById("searchnote");
+  if (!host) return;
+  host.textContent = "";
+  note.textContent = "";
+  searchRows = [];
+  searchSel = 0;
+  if (!results) return;
+
+  const group = (label) => {
+    const g = document.createElement("div");
+    g.className = "searchgroup";
+    g.textContent = label;
+    host.appendChild(g);
+  };
+
+  if (results.files.length) {
+    group(`Files (${results.files.length})`);
+    for (const f of results.files) {
+      const row = searchRow(f.rel.split("/").pop(), f.rel);
+      host.appendChild(row);
+      searchRows.push({ kind: "file", rel: f.rel });
+    }
+  }
+  if (results.sessions.length) {
+    group(`Sessions (${results.sessions.length})`);
+    for (const s of results.sessions) {
+      host.appendChild(searchRow(s, "terminal"));
+      searchRows.push({ kind: "session", session: s });
+    }
+  }
+  if (results.lines.length) {
+    group(`Contents (${results.lines.length})`);
+    for (const l of results.lines) {
+      const row = searchRow(`${l.rel}:${l.line}`, null);
+      const code = document.createElement("span");
+      code.className = "line";
+      code.textContent = l.text.trim();   // textContent: this is file content
+      row.appendChild(code);
+      host.appendChild(row);
+      searchRows.push({ kind: "line", rel: l.rel, line: l.line });
+    }
+  }
+
+  // The honesty line. "No matches" and "I could not look everywhere" are
+  // different answers, and only this element can tell them apart — which is
+  // the whole reason `Results` carries an outcome instead of being a list.
+  const parts = [];
+  if (results.outcome.state === "Failed") parts.push(`search failed: ${results.outcome.msg}`);
+  if (results.outcome.state === "Truncated") parts.push(`partial results — ${results.outcome.reason}`);
+  if (results.unreadable) {
+    parts.push(`${results.unreadable} ${results.unreadable === 1 ? "place" : "places"} could not be read`);
+  }
+  if (!parts.length && !searchRows.length) parts.push("no matches");
+  note.textContent = parts.join(" · ");
+
+  if (searchRows.length) paintSearchSel();
+}
+
+function activateSearchRow(i) {
+  const r = searchRows[i];
+  if (!r) return;
+  closeSearch();
+  if (r.kind === "session") {
+    send({ t: "OpenTab", pane: 3, tab: { k: "Terminal", session: r.session } });
+  } else if (r.kind === "line") {
+    send({ t: "OpenAtLine", pane: 2, rel: r.rel, line: r.line });
+  } else {
+    send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: r.rel, mode: "Preview" } });
+  }
+}
+
+document.getElementById("searchresults")?.addEventListener("click", (e) => {
+  const row = e.target.closest(".searchrow");
+  if (!row) return;
+  const rows = [...document.querySelectorAll("#searchresults .searchrow")];
+  activateSearchRow(rows.indexOf(row));
+});
