@@ -157,36 +157,213 @@ pub struct LaunchRequest {
     pub session_id: Option<String>,
 }
 
-static SESSIONS: OnceLock<Mutex<HashMap<String, Session>>> = OnceLock::new();
-
-fn sessions() -> &'static Mutex<HashMap<String, Session>> {
-    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+/// Permission for the *next* attach on this key to spawn a shell, placed by
+/// whichever intent asked for a terminal and consumed once.
+///
+/// A distinct type rather than `Option<LaunchRequest>` because those are not
+/// the same question. `do_new_terminal` records a launch of `None` on every
+/// allocation, so "no launch requested" and "no terminal was ever asked for"
+/// had exactly one representation — and the second one is now the difference
+/// between spawning a shell and refusing to.
+#[derive(Debug, Clone, Default)]
+pub struct Reservation {
+    pub launch: Option<LaunchRequest>,
 }
 
-/// What a not-yet-spawned session should start, keyed like `SESSIONS`. The
-/// hub allocates a name and the browser connects later, so the request has
-/// to wait somewhere in between; it is taken out by the attach that spawns.
-static PENDING_LAUNCH: OnceLock<Mutex<HashMap<String, LaunchRequest>>> = OnceLock::new();
-
-fn pending_launch() -> &'static Mutex<HashMap<String, LaunchRequest>> {
-    PENDING_LAUNCH.get_or_init(|| Mutex::new(HashMap::new()))
+/// Everything a spawn or a close has to agree about, behind **one** mutex.
+///
+/// The three fields were three separate pieces of state, and the close raced
+/// the spawn because the guard that was supposed to order them
+/// (`Hub::is_closing`) took the *hub* mutex while the spawn is serialised by
+/// this one. A check on a different lock from the operation it guards orders
+/// nothing at all: a connect could pass it and spawn arbitrarily later, which
+/// is how a closed project kept ending up with one live shell.
+///
+/// Merged here so `attach` and `kill_project` cannot interleave: whichever
+/// takes this lock first wins, and *both* orders are correct. Close first —
+/// reservations are gone and `closing` is set, so the attach refuses. Attach
+/// first — it has inserted into `map` before releasing, so the close's own
+/// scan sees it and kills it. There is no third outcome and no timing in it.
+#[derive(Default)]
+struct Registry {
+    map: HashMap<String, Session>,
+    /// Keyed exactly like `map` (`{storage_key}/{name}`).
+    reservations: HashMap<String, Reservation>,
+    /// Storage keys of projects mid-close. Not a bool per session: a close
+    /// has to refuse names that do not exist yet, which is the whole point.
+    closing: std::collections::HashSet<String>,
 }
 
-/// Records — or with `None`, clears — what the next spawn of `project/name`
-/// should type into its shell. Called on *every* allocation, not just the
-/// ones that launch something: a name handed out for a ✻ click whose tab
+static SESSIONS: OnceLock<Mutex<Registry>> = OnceLock::new();
+
+fn sessions() -> &'static Mutex<Registry> {
+    SESSIONS.get_or_init(|| Mutex::new(Registry::default()))
+}
+
+/// Reserves `project/name`, so the next attach on it is allowed to spawn, and
+/// records what that spawn should type into its shell.
+///
+/// Called on *every* allocation, not just the ones that launch something —
+/// which is why the launch is `Option` *inside* the reservation rather than
+/// the reservation being optional. A name handed out for a ✻ click whose tab
 /// was closed before any browser attached leaves its entry behind, and the
-/// plain `+` click that is handed the same name next must not inherit it.
-pub fn set_launch(project: &str, name: &str, launch: Option<LaunchRequest>) {
+/// plain `+` click handed the same name next must not inherit that launch;
+/// it must still be allowed to spawn, so it needs a reservation of its own
+/// with no launch in it.
+pub fn reserve(project: &str, name: &str, launch: Option<LaunchRequest>) {
     let key = format!("{}/{}", crate::projects::storage_key(project), name);
-    let mut map = pending_launch().lock().unwrap_or_else(|e| e.into_inner());
-    match launch {
-        Some(l) => {
-            map.insert(key, l);
+    let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    guard.reservations.insert(key, Reservation { launch });
+}
+
+/// Authorises a spawn *without* disturbing a launch already parked for this
+/// name.
+///
+/// `reserve` overwrites, which is right when an intent is deciding what the
+/// next shell should be. It is wrong for anything that only wants to permit
+/// the spawn: overwriting a `✻` click's launch with `None` leaves a plain
+/// shell and a test that still passes every assertion except the one about
+/// the launch. Both the lib and integration harnesses hit exactly that.
+pub fn reserve_if_absent(project: &str, name: &str) {
+    let key = format!("{}/{}", crate::projects::storage_key(project), name);
+    let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    guard.reservations.entry(key).or_default();
+}
+
+/// Drops a reservation without spawning — a tab closed before any browser
+/// attached. Without it a name stays permanently spawnable.
+pub fn release(project: &str, name: &str) {
+    let key = format!("{}/{}", crate::projects::storage_key(project), name);
+    let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    guard.reservations.remove(&key);
+}
+
+/// Opens a close: marks the project closing, drops every reservation it has,
+/// and takes its live sessions out of the map — killing each one's child — in
+/// a single acquisition of the one lock `attach` also needs.
+///
+/// Returning the names is not a convenience. `kill_project` used to take this
+/// lock, scan, release, and only then work through the sockets; a spawn could
+/// land in between and appear in neither the scan nor the socket directory.
+/// Draining under the same lock that now refuses new spawns closes that by
+/// construction: after this returns, this project's set of sessions cannot
+/// grow again until `end_close`.
+pub fn begin_close(project: &str) -> Vec<String> {
+    let skey = crate::projects::storage_key(project);
+    let prefix = format!("{skey}/");
+    let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    guard.closing.insert(skey);
+    guard.reservations.retain(|k, _| !k.starts_with(&prefix));
+    let keys: Vec<String> = guard.map.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+    let mut names = Vec::with_capacity(keys.len());
+    for k in keys {
+        if let Some(mut s) = guard.map.remove(&k) {
+            let _ = s.child.kill();
+            let _ = s.child.wait();
+            if let Some(name) = k.strip_prefix(&prefix) {
+                names.push(name.to_string());
+            }
         }
-        None => {
-            map.remove(&key);
+    }
+    names
+}
+
+/// Closes a close. Until this runs every attach on the project is refused,
+/// including one for a session that still exists — it is about to stop.
+pub fn end_close(project: &str) {
+    let skey = crate::projects::storage_key(project);
+    let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    guard.closing.remove(&skey);
+}
+
+/// What `Registry::decide` concluded about one connect.
+enum Decision {
+    /// The session is already running here; this is a second viewer.
+    Join,
+    /// Authorised to spawn, carrying whatever the reservation asked for.
+    Spawn(Reservation),
+    /// Nothing local says yes; ask the filesystem whether a session survived
+    /// a restart. Deliberately *not* decided under the lock — see `attach`.
+    Probe,
+    Refuse(AttachRefusal),
+}
+
+/// Whether a socket on disk still has a process behind it.
+///
+/// Four states, not two, and the fourth is the point: `Unknown` is "the
+/// process listing could not be trusted", which must never be folded into
+/// "nothing holds it" here — that answer leads to a spawn.
+enum SocketState {
+    Absent,
+    Held,
+    Unheld,
+    Unknown,
+}
+
+/// `symlink_metadata`, not `exists()`: the latter collapses "not there" and
+/// "cannot look" into one `false` and follows symlinks, which is the exact
+/// shape of several defects this project has already shipped.
+fn probe_socket(sock: &Path) -> SocketState {
+    match std::fs::symlink_metadata(sock) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SocketState::Absent,
+        Err(_) => return SocketState::Unknown,
+        Ok(_) => {}
+    }
+    match crate::registry::holders_snapshot() {
+        None => SocketState::Unknown,
+        Some(snap) if !crate::registry::pids_holding_path(&snap, sock).is_empty() => {
+            SocketState::Held
         }
+        Some(_) => SocketState::Unheld,
+    }
+}
+
+impl Registry {
+    /// The authorisation rule, in one place and under one lock, so it can be
+    /// tested without a PTY and cannot drift from what `attach` does.
+    ///
+    /// Order matters: `Closing` outranks even an existing session, because a
+    /// session that exists during a close is one that is about to stop.
+    fn decide(&mut self, skey: &str, key: &str) -> Decision {
+        if self.closing.contains(skey) {
+            return Decision::Refuse(AttachRefusal::Closing);
+        }
+        if self.map.contains_key(key) {
+            return Decision::Join;
+        }
+        if let Some(r) = self.reservations.remove(key) {
+            return Decision::Spawn(r);
+        }
+        Decision::Probe
+    }
+}
+
+/// Why an attach was refused. Typed rather than a `String` so `term.rs` can
+/// answer each differently and a negative test can assert on *which* refusal
+/// it got — this codebase has shipped confinement tests that passed on the
+/// wrong error entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachRefusal {
+    /// The project is mid-close. Outranks every other rule.
+    Closing,
+    /// No session, no reservation, no live socket to rejoin. `attach` used to
+    /// create here, which made every terminal websocket a session factory and
+    /// a close something a client could race.
+    NotReserved,
+    /// A socket is on disk but whether anything holds it could not be
+    /// determined. Refused rather than guessed: guessing "nothing holds it"
+    /// falls through to a spawn, and a spawn nobody asked for is an orphan
+    /// with no tab and no way back to it.
+    Unverifiable,
+}
+
+impl std::fmt::Display for AttachRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Closing => "the project is closing",
+            Self::NotReserved => "that session has ended",
+            Self::Unverifiable => "could not determine whether that session is still running",
+        })
     }
 }
 
@@ -248,7 +425,42 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
     // session cap with another's sessions.
     let skey = crate::projects::storage_key(project);
     let key = format!("{skey}/{name}");
-    let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+
+    // Authorised first, in its own acquisition, because deciding whether this
+    // connect may *create* a session is the whole invariant — see `Registry`.
+    // The probe branch is the only one that touches the filesystem, and it
+    // does so with the lock released: a `ps` fork under this mutex would
+    // stall every other session's output, which is the deadlock class
+    // CLAUDE.md already records shipping once.
+    let decision = {
+        let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        guard.decide(&skey, &key)
+    };
+    let reservation = match decision {
+        Decision::Join => None,
+        Decision::Spawn(r) => Some(r),
+        Decision::Refuse(why) => return Err(why.to_string()),
+        Decision::Probe => {
+            // Restart survival, and the only case that has to ask the
+            // filesystem: this process never attached, so the map is empty,
+            // but the dtach master is alive and `dtach -A` will rejoin it.
+            match probe_socket(&sock_path(project, name)) {
+                SocketState::Held => Some(Reservation::default()),
+                SocketState::Absent | SocketState::Unheld => {
+                    return Err(AttachRefusal::NotReserved.to_string())
+                }
+                SocketState::Unknown => return Err(AttachRefusal::Unverifiable.to_string()),
+            }
+        }
+    };
+
+    let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    // Re-checked after the probe released the lock: a close may have started
+    // in between, and it outranks an authorisation taken a moment ago.
+    if guard.closing.contains(&skey) {
+        return Err(AttachRefusal::Closing.to_string());
+    }
+    let map = &mut guard.map;
     let live_for_project = map.keys().filter(|k| k.starts_with(&format!("{skey}/"))).count();
     if !map.contains_key(&key) && live_for_project >= MAX_SESSIONS_PER_PROJECT {
         return Err("too many terminal sessions".into());
@@ -261,11 +473,12 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         if cmd.is_empty() {
             return Err("empty command".into());
         }
-        // Taken here, before the spawn can fail, rather than after: a spawn
-        // that fails leaves no session, and the browser's retry would
-        // otherwise find the entry still there and type claude into a
-        // shell nobody asked to be a claude shell. One click, one chance.
-        launch = pending_launch().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        // The reservation was consumed by `decide` above, before the spawn can
+        // fail, rather than after: a spawn that fails leaves no session, and
+        // the browser's retry would otherwise find the entry still there and
+        // type claude into a shell nobody asked to be a claude shell. One
+        // click, one chance.
+        launch = reservation.and_then(|r| r.launch);
         // dtach -A refuses to create a socket in a directory that doesn't
         // exist yet; nothing else creates it. 0o700: this directory grants
         // shell access to whoever can connect to a socket in it. Gated on
@@ -351,7 +564,8 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                         let notices = osc.feed(&buf[..n]);
                         let switches = screen.feed(&buf[..n]);
                         {
-                            let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+                            let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+                            let map = &mut guard.map;
                             let Some(s) = map.get_mut(&pump_key) else { break };
                             // What goes out is what `ingest` returns, not the
                             // raw read: it is the same bytes except for the
@@ -370,7 +584,8 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
             }
             // PTY closed: drop the session so the next attach respawns it.
             {
-                let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+                let map = &mut guard.map;
                 if let Some(mut s) = map.remove(&pump_key) {
                     let _ = s.child.kill();
                     let _ = s.child.wait();
@@ -410,7 +625,8 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
 /// unblock it by draining output — needs that same lock to make progress.
 pub fn write_input(key: &str, data: &[u8]) -> Result<(), String> {
     let writer = {
-        let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        let map = &mut guard.map;
         let s = map.get_mut(key).ok_or("no such session")?;
         s.writer.clone()
     };
@@ -420,7 +636,8 @@ pub fn write_input(key: &str, data: &[u8]) -> Result<(), String> {
 }
 
 pub fn resize(key: &str, id: u64, cols: u16, rows: u16) {
-    let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let map = &mut guard.map;
     let Some(s) = map.get_mut(key) else { return };
     s.sizes.insert(id, (cols, rows));
     if let Some((c, r)) = min_geometry(&s.sizes) {
@@ -431,7 +648,8 @@ pub fn resize(key: &str, id: u64, cols: u16, rows: u16) {
 /// Detach only. The PTY keeps running and dtach keeps the session alive, so
 /// reopening the same name reattaches.
 pub fn detach(key: &str, id: u64) {
-    let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let map = &mut guard.map;
     let Some(s) = map.get_mut(key) else { return };
     s.subs.remove(&id);
     s.sizes.remove(&id);
@@ -543,7 +761,8 @@ pub fn list_sessions(project: &str) -> Vec<SessionInfo> {
 pub fn live_rows(project: &str) -> Vec<(String, u32, usize)> {
     let prefix = format!("{}/", crate::projects::storage_key(project));
     let mut found: Vec<(String, u32, usize)> = {
-        let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        let guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        let map = &guard.map;
         map.iter()
             .filter_map(|(k, s)| {
                 let name = k.strip_prefix(&prefix)?;
@@ -623,7 +842,8 @@ pub fn parse_ages(out: &str) -> HashMap<u32, u64> {
 pub fn live_names(project: &str) -> Vec<String> {
     let prefix = format!("{}/", crate::projects::storage_key(project));
     let mut out: Vec<String> = {
-        let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        let guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        let map = &guard.map;
         map.keys().filter_map(|k| k.strip_prefix(&prefix)).map(str::to_string).collect()
     };
     // The in-memory map is only what THIS process attached. dtach sessions
@@ -649,7 +869,8 @@ pub fn live_names(project: &str) -> Vec<String> {
 /// only, like `live_names`: it runs under the hub on every ✻ click.
 pub fn launched_names(project: &str) -> Vec<(String, LaunchRequest)> {
     let prefix = format!("{}/", crate::projects::storage_key(project));
-    let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let map = &guard.map;
     let mut out: Vec<(String, LaunchRequest)> = map
         .iter()
         .filter_map(|(k, s)| Some((k.strip_prefix(&prefix)?.to_string(), s.launched.clone()?)))
@@ -674,7 +895,8 @@ fn socket_names(project: &str) -> Vec<String> {
 }
 
 pub fn has_session(project: &str, name: &str) -> bool {
-    let map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let map = &guard.map;
     map.contains_key(&key_for(project, name))
 }
 
@@ -739,7 +961,8 @@ pub fn end_session(project: &str, name: &str) -> bool {
     }
     let key = format!("{}/{}", crate::projects::storage_key(project), name);
     {
-        let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+        let map = &mut guard.map;
         if let Some(mut s) = map.remove(&key) {
             let _ = s.child.kill();
             let _ = s.child.wait();
@@ -774,22 +997,21 @@ pub fn next_free_name(project: &str, also_taken: &[String]) -> Option<String> {
 }
 
 pub fn kill_project(project: &str) -> usize {
-    let prefix = format!("{}/", crate::projects::storage_key(project));
-    let removed_names: Vec<String> = {
-        let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
-        let keys: Vec<String> = map.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
-        let mut names = Vec::with_capacity(keys.len());
-        for k in keys {
-            if let Some(mut s) = map.remove(&k) {
-                let _ = s.child.kill();
-                let _ = s.child.wait();
-                if let Some(name) = k.strip_prefix(&prefix) {
-                    names.push(name.to_string());
-                }
-            }
-        }
-        names
-    }; // registry lock released here, before any blocking socket work
+    // `begin_close` does the map drain, and marks the project closing in the
+    // same acquisition — so from here on no attach can add to what this
+    // function is about to walk. That ordering is the whole fix: the scan
+    // used to release the lock before the socket work below, leaving a window
+    // in which a spawn landed in neither the scan nor the socket directory.
+    //
+    // `end_close` is paired here, at the bottom of this function, rather than
+    // left to the caller. The refusal has to outlast the *killing* — a
+    // browser reconnecting mid-kill must not be authorised by the very
+    // absence the kill is creating — and this function is exactly that
+    // span. Leaving it to callers made the invariant depend on every one of
+    // them remembering, and the first thing that forgot left the project
+    // permanently unable to open a terminal again, which is a worse failure
+    // than the one being prevented.
+    let removed_names: Vec<String> = begin_close(project);
 
     // Sessions that outlived a restart are not in the map above, but their
     // sockets are on disk — and they are exactly the long-running shells a user
@@ -810,6 +1032,7 @@ pub fn kill_project(project: &str) -> usize {
             ended += 1;
         }
     }
+    end_close(project);
     // Not removing the now-possibly-empty sock/<project>/ directory here:
     // `registry::reconcile` already does that unconditionally on every
     // pass, and it runs on every subsequent project listing or header-strip
@@ -818,6 +1041,25 @@ pub fn kill_project(project: &str) -> usize {
     // correctness requirement — the directory disappears on the very next
     // such load regardless.
     ended
+}
+
+/// Reserve, then attach — the production sequence, for tests that used to get
+/// a session merely by connecting.
+///
+/// Not a convenience: `attach` no longer creates on its own, so a test that
+/// calls it bare is asserting against a connect that production would refuse.
+/// Every test below that wants a *running* session goes through here, which
+/// is also what keeps the refusal tests honest — they call `attach` directly,
+/// and that difference is now meaningful rather than incidental.
+#[cfg(test)]
+pub fn reserve_and_attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, String> {
+    // `or_default`, not `reserve`: a test that has already reserved a *launch*
+    // for this name must keep it. Overwriting it here silently turned every
+    // "the launch rides the attach that spawns" test into a test of a plain
+    // shell — six of them, all still green on the launch assertions they were
+    // no longer exercising, until the launch itself was asserted.
+    reserve_if_absent(project, name);
+    attach(project, name, dir)
 }
 
 // Serializes tests that mutate the process-global RESH_CMD env var.
@@ -974,9 +1216,9 @@ mod tests {
         let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RESH_CMD", "cat");
         let d = tempfile::tempdir().unwrap();
-        attach("endproj", "term", d.path()).unwrap();
-        attach("endproj", "term1", d.path()).unwrap();
-        attach("otherend", "term", d.path()).unwrap();
+        reserve_and_attach("endproj", "term", d.path()).unwrap();
+        reserve_and_attach("endproj", "term1", d.path()).unwrap();
+        reserve_and_attach("otherend", "term", d.path()).unwrap();
 
         assert!(end_session("endproj", "term"));
 
@@ -1010,10 +1252,10 @@ mod tests {
 
         assert_eq!(next_free_name("nameproj", &[]).as_deref(), Some("term"));
 
-        attach("nameproj", "term", d.path()).unwrap();
+        reserve_and_attach("nameproj", "term", d.path()).unwrap();
         assert_eq!(next_free_name("nameproj", &[]).as_deref(), Some("term1"));
 
-        attach("nameproj", "term1", d.path()).unwrap();
+        reserve_and_attach("nameproj", "term1", d.path()).unwrap();
         assert_eq!(next_free_name("nameproj", &[]).as_deref(), Some("term2"));
 
         // A gap is reused: term1 ending frees the name below term2.
@@ -1040,7 +1282,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         for i in 0..MAX_SESSIONS_PER_PROJECT {
             let n = if i == 0 { "term".to_string() } else { format!("term{i}") };
-            attach("capproj", &n, d.path()).unwrap();
+            reserve_and_attach("capproj", &n, d.path()).unwrap();
         }
         assert_eq!(live_names("capproj").len(), MAX_SESSIONS_PER_PROJECT);
         assert_eq!(next_free_name("capproj", &[]), None, "the cap refuses, it does not wrap");
@@ -1056,30 +1298,132 @@ mod tests {
         std::env::remove_var("RESH_CMD");
     }
 
+    /// Rule 1, and the reason the whole `Registry` exists: while a project is
+    /// closing every attach is refused — including one for a session that is
+    /// still in the map, because that session is about to stop existing.
+    ///
+    /// Deterministic on purpose. The hub-level version of this had to catch
+    /// the close still in flight, which is a race; here the state is set
+    /// directly, so the assertion is on the rule rather than on who won.
+    #[test]
+    fn a_close_refuses_every_attach_until_it_finishes() {
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        let live = reserve_and_attach("closerule", "term", d.path()).expect("setup: a live session");
+        drop(live);
+
+        let names = begin_close("closerule");
+        assert_eq!(names, vec!["term".to_string()], "the drain must report what it took");
+
+        // The existing session's own name, and a fresh one: both refused, and
+        // both *as closing* — the reason is the assertion, since "refused
+        // because it has ended" would be a different rule firing by luck.
+        for n in ["term", "brandnew"] {
+            let Err(e) = attach("closerule", n, d.path()) else {
+                panic!("attach({n}) must be refused while the project is closing")
+            };
+            assert_eq!(e, AttachRefusal::Closing.to_string(), "attach({n}) refused for the wrong reason");
+        }
+        // Even a reservation does not buy past a close.
+        reserve("closerule", "reserved", None);
+        let Err(e) = attach("closerule", "reserved", d.path()) else {
+            panic!("a reservation must not buy past a close")
+        };
+        assert_eq!(e, AttachRefusal::Closing.to_string());
+
+        end_close("closerule");
+        // And the refusal lifts, or a closed project could never be reopened.
+        reserve("closerule", "after", None);
+        assert!(reserve_and_attach("closerule", "after", d.path()).is_ok(), "the close must lift");
+        kill_project("closerule");
+        std::env::remove_var("RESH_CMD");
+    }
+
+    /// The other order, which is the half that used to leak. A spawn that
+    /// takes the lock before the close must be *visible* to it — the close
+    /// drains the map under the same lock, so a session that got in is in the
+    /// list the close returns and gets killed, rather than surviving in
+    /// neither the scan nor the socket directory.
+    #[test]
+    fn an_attach_that_wins_the_lock_is_still_seen_by_the_close() {
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        let a = reserve_and_attach("winrace", "term", d.path()).expect("setup");
+        let b = reserve_and_attach("winrace", "term1", d.path()).expect("setup");
+        drop(a);
+        drop(b);
+
+        let mut names = begin_close("winrace");
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["term".to_string(), "term1".to_string()],
+            "a close must take every session that got in before it"
+        );
+        end_close("winrace");
+        std::env::remove_var("RESH_CMD");
+    }
+
+    /// The invariant in one test: a connect with no reservation creates
+    /// nothing. This is what `term.rs` used to do on every websocket, which
+    /// made a close something a client could race by simply reconnecting.
+    #[test]
+    fn a_connect_with_no_reservation_creates_nothing() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RESH_CMD", "cat");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", state.path());
+        let d = tempfile::tempdir().unwrap();
+
+        let Err(e) = attach("noreservation", "term", d.path()) else {
+            panic!("an unreserved connect must not create a session")
+        };
+        assert_eq!(e, AttachRefusal::NotReserved.to_string());
+        assert!(live_names("noreservation").is_empty(), "and must leave nothing behind");
+
+        // A reservation is single use: it authorises one spawn, not a name
+        // that is spawnable forever. Without this the fix would only move the
+        // hole rather than close it.
+        reserve("noreservation", "term", None);
+        let ok = attach("noreservation", "term", d.path()).expect("the reservation authorises one");
+        drop(ok);
+        kill_project("noreservation");
+        let Err(e) = attach("noreservation", "term", d.path()) else {
+            panic!("a consumed reservation must not authorise a second spawn")
+        };
+        assert_eq!(e, AttachRefusal::NotReserved.to_string(), "the reservation must be consumed");
+
+        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("RESH_CMD");
+    }
+
     #[test]
     fn a_pending_launch_rides_the_attach_that_spawns_and_no_other() {
         let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RESH_CMD", "cat");
         let d = tempfile::tempdir().unwrap();
-        set_launch(
+        reserve(
             "launchproj",
             "term",
             Some(LaunchRequest { launch: crate::proto::Launch::Claude, session_id: None }),
         );
 
-        let first = attach("launchproj", "term", d.path()).unwrap();
+        let first = reserve_and_attach("launchproj", "term", d.path()).unwrap();
         assert_eq!(
             first.launch,
             Some(LaunchRequest { launch: crate::proto::Launch::Claude, session_id: None }),
             "the attach that spawns carries it"
         );
-        let mirror = attach("launchproj", "term", d.path()).unwrap();
+        let mirror = reserve_and_attach("launchproj", "term", d.path()).unwrap();
         assert_eq!(mirror.launch, None, "a second browser on the same shell must not retype it");
 
         // Consumed at spawn: when the shell exits and the name is respawned
         // later, the old click must not start claude again.
         kill_project("launchproj");
-        let respawn = attach("launchproj", "term", d.path()).unwrap();
+        let respawn = reserve_and_attach("launchproj", "term", d.path()).unwrap();
         assert_eq!(respawn.launch, None);
         kill_project("launchproj");
         std::env::remove_var("RESH_CMD");
@@ -1091,14 +1435,14 @@ mod tests {
         std::env::set_var("RESH_CMD", "cat");
         let d = tempfile::tempdir().unwrap();
         // The ✻ click whose tab was closed before any browser attached.
-        set_launch(
+        reserve(
             "launchproj2",
             "term",
             Some(LaunchRequest { launch: crate::proto::Launch::Claude, session_id: None }),
         );
         // The plain + click that got the same name back.
-        set_launch("launchproj2", "term", None);
-        let a = attach("launchproj2", "term", d.path()).unwrap();
+        reserve("launchproj2", "term", None);
+        let a = reserve_and_attach("launchproj2", "term", d.path()).unwrap();
         assert_eq!(a.launch, None, "a stale launch must not leak into an unrelated terminal");
         kill_project("launchproj2");
         std::env::remove_var("RESH_CMD");
@@ -1112,12 +1456,12 @@ mod tests {
         std::env::set_var("RESH_CMD", "cat");
         let d = tempfile::tempdir().unwrap();
         let req = LaunchRequest { launch: crate::proto::Launch::Claude, session_id: Some("0123abcd-0123-4abc-8abc-0123456789ab".into()) };
-        set_launch("launched", "term", Some(req.clone()));
-        let a = attach("launched", "term", d.path()).unwrap();
+        reserve("launched", "term", Some(req.clone()));
+        let a = reserve_and_attach("launched", "term", d.path()).unwrap();
         assert_eq!(a.launch, Some(req.clone()), "the spawning attach carries it");
-        let _plain = attach("launched", "term1", d.path()).unwrap();
+        let _plain = reserve_and_attach("launched", "term1", d.path()).unwrap();
         assert_eq!(launched_names("launched"), vec![("term".to_string(), req)], "only the launched one, still after the launch was consumed");
-        let again = attach("launched", "term", d.path()).unwrap();
+        let again = reserve_and_attach("launched", "term", d.path()).unwrap();
         assert_eq!(again.launch, None, "a reattach types nothing");
         assert_eq!(launched_names("launched").len(), 1, "…and does not forget");
         kill_project("launched");
@@ -1131,9 +1475,9 @@ mod tests {
         std::env::set_var("RESH_CMD", "cat");
         let d = tempfile::tempdir().unwrap();
         // Two projects, so we can prove kill_project does not spill over.
-        attach("listproj", "shell", d.path()).unwrap();
-        attach("listproj", "claude", d.path()).unwrap();
-        attach("otherproj", "shell", d.path()).unwrap();
+        reserve_and_attach("listproj", "shell", d.path()).unwrap();
+        reserve_and_attach("listproj", "claude", d.path()).unwrap();
+        reserve_and_attach("otherproj", "shell", d.path()).unwrap();
 
         let mut names: Vec<String> = list_sessions("listproj").into_iter().map(|s| s.name).collect();
         names.sort();
@@ -1176,7 +1520,7 @@ mod tests {
         // something to measure.
         let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
         for name in names {
-            attach("lockproj", name, d.path()).unwrap();
+            reserve_and_attach("lockproj", name, d.path()).unwrap();
         }
         // Warm up, so the measurement is not about first-fork cost.
         assert_eq!(list_sessions("lockproj").len(), names.len());
@@ -1295,8 +1639,8 @@ mod tests {
         let _s = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("RESH_CMD", "cat");
         let d = tempfile::tempdir().unwrap();
-        let _a = attach("ovproj", "term", d.path()).unwrap();
-        let _b = attach("ovproj", "term1", d.path()).unwrap();
+        let _a = reserve_and_attach("ovproj", "term", d.path()).unwrap();
+        let _b = reserve_and_attach("ovproj", "term1", d.path()).unwrap();
         let rows = live_rows("ovproj");
         assert_eq!(rows.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(), vec!["term", "term1"]);
         // Revert-checked: hardcoding live_rows to emit pid 0 per row fails this
@@ -1353,7 +1697,7 @@ mod tests {
         std::env::set_var("RESH_STATE_DIR", state.path());
         let dir = tempfile::tempdir().unwrap();
 
-        let attach_result = attach("realdtach", "shell", dir.path());
+        let attach_result = reserve_and_attach("realdtach", "shell", dir.path());
         let Ok(_att) = attach_result else {
             eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
             std::env::remove_var("RESH_STATE_DIR");
@@ -1414,7 +1758,7 @@ mod tests {
         std::env::set_var("RESH_STATE_DIR", state.path());
         let dir = tempfile::tempdir().unwrap();
 
-        let Ok(att) = attach("survivor", "shell", dir.path()) else {
+        let Ok(att) = reserve_and_attach("survivor", "shell", dir.path()) else {
             eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
             std::env::remove_var("RESH_STATE_DIR");
             return;
@@ -1430,7 +1774,7 @@ mod tests {
         // Forget it, exactly as a restart would: the socket and its master
         // survive, the map does not.
         drop(att);
-        sessions().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        sessions().lock().unwrap_or_else(|e| e.into_inner()).map.clear();
         assert!(
             !has_session("survivor", "shell"),
             "test setup: the map must be empty, or this is not the restart case"
@@ -1467,8 +1811,8 @@ mod tests {
         std::env::set_var("RESH_CMD", "cat");
         let d = tempfile::tempdir().unwrap();
 
-        attach("nest/sub", "shell", d.path()).unwrap();
-        attach("nest", "sub", d.path()).unwrap();
+        reserve_and_attach("nest/sub", "shell", d.path()).unwrap();
+        reserve_and_attach("nest", "sub", d.path()).unwrap();
 
         assert!(has_session("nest/sub", "shell"));
         let nested_names: Vec<String> =
@@ -1499,7 +1843,7 @@ mod tests {
         // so it arrives back through this attachment's own subscriber channel.
         std::env::set_var("RESH_CMD", "env");
         let d = tempfile::tempdir().unwrap();
-        let att = attach("envproj", "shell", d.path()).expect("attach");
+        let att = reserve_and_attach("envproj", "shell", d.path()).expect("attach");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut seen = String::new();

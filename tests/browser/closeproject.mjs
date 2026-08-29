@@ -29,9 +29,23 @@
 //!     with no `Page.javascriptDialogOpening` handler wedges the renderer,
 //!     which is the harness's documented 30s-timeout hang, not a failure.
 //!
-//! Section D covers a second, separate defect found the same day: a close
-//! that races a terminal still spawning. Revert-checked on its own — see the
-//! second paragraph below.
+//! Section F is the reported bug reduced to its mechanism, and the one to read
+//! first: after a close, a websocket to /ws/{project}/term/{name} must be
+//! refused, not answered with a fresh shell. Revert-checked by restoring
+//! `session::attach`'s create-when-absent — F then fails all 4, and the
+//! failure *is* the report: `sockets: ["term1"]`, `dtach masters: 2`, from
+//! nothing but a reconnect to a project that was already closed.
+//!
+//! Sections D and E cover two further defects found the same day, both of
+//! which left a live shell behind rather than a stale tab: a close that races
+//! a terminal still spawning (D), and a close that leaves each terminal's
+//! reconnect armed (E). Each is revert-checked on its own below.
+//!
+//! D is kept for coverage but is no longer the primary guard. It could only
+//! ever be stated as a *rate* — 3-of-3 failing, 4-of-4 passing — because it
+//! depended on a spawn landing inside a timing window. F depends on a rule
+//! instead, which is the whole point of the reservation design: a connect
+//! with no reservation, no session and no live socket is refused, always.
 //!
 //! Revert-check, performed: with both `drop_terminal_tabs()` calls removed
 //! from `hub.rs`'s `do_close_project`, this fails 3 — B's tab assertion and
@@ -218,6 +232,40 @@ try {
     ok(seen.every(Boolean), `all ${held} terminal(s) disarmed by the close: ${JSON.stringify(seen)}`);
   }
   try { fin.close(); } catch { /* already gone */ }
+
+  console.log("F. after a close, reconnecting to an ended session creates nothing");
+  // The reported bug, reduced to its mechanism. Every earlier section closes
+  // a project and then checks that nothing came back; this one *tries* to
+  // bring it back, the same way a browser did — a websocket to
+  // /ws/{project}/term/{name} — and requires the server to refuse.
+  //
+  // Driven from a page rather than from Deno so the connect carries a real
+  // Origin; a header-less connect would be refused by `origin.rs` long before
+  // `attach`, which would pass this section while proving nothing about it.
+  //
+  // This is deterministic, unlike the old Section D, which could only be
+  // stated as a rate (3-of-3 failing / 4-of-4 passing) because it depended on
+  // a spawn landing inside a settle window. The invariant replaced the
+  // window: no reservation, no session, no live socket → refused, always.
+  const back = await openPage(browser.port, `http://127.0.0.1:${resh.port}/`);
+  await until(() => back.evalIn(`document.readyState === "complete"`), 20, "overview loaded");
+  const ended = await back.evalIn(`
+    new Promise((res) => {
+      const ws = new WebSocket("ws://127.0.0.1:${resh.port}/ws/${fx.project}/term/term1");
+      ws.onclose = (e) => res("closed:" + e.code + ":" + e.wasClean);
+      ws.onopen = () => setTimeout(() => res("still-open"), 4000);
+      setTimeout(() => res("no-answer"), 8000);
+    })
+  `);
+  ok(String(ended).startsWith("closed:"), `the server refused the reconnect: ${ended}`);
+  ok(String(ended).endsWith(":true"), `and refused it *cleanly*, so app.js will not retry: ${ended}`);
+  await sleep(2000);
+  ok((await sockets()).length === 0, `no shell was spawned by the attempt: ${JSON.stringify(await sockets())}`);
+  const ps2 = await new Deno.Command("ps", { args: ["-Ao", "args="], stdout: "piped" }).output();
+  const revived = new TextDecoder().decode(ps2.stdout).split("\n")
+    .filter((l) => l.includes(`${fx.stateDir}/sock/${fx.project}/`) && l.includes("dtach -A"));
+  ok(revived.length === 0, `and no dtach master appeared: ${revived.length}`);
+  try { back.close(); } catch { /* already gone */ }
 } finally {
   try { ws?.close(); } catch { /* already gone */ }
   try { after?.close(); } catch { /* already gone */ }

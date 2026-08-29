@@ -1683,7 +1683,7 @@ mod tests {
             // wanted: one in memory, two on disk.
             let _sg = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("RESH_CMD", "cat");
-            let _att = crate::session::attach("proj", "shell", &root.path().join("proj")).unwrap();
+            let _att = crate::session::reserve_and_attach("proj", "shell", &root.path().join("proj")).unwrap();
             assert_eq!(
                 crate::session::list_sessions("proj").len(),
                 1,
@@ -2190,7 +2190,7 @@ mod tests {
             let project_dir = real_root.path().join("victimproj");
             fs::create_dir_all(&project_dir).unwrap();
 
-            let Ok(_att) = crate::session::attach("victimproj", "shell", &project_dir) else {
+            let Ok(_att) = crate::session::reserve_and_attach("victimproj", "shell", &project_dir) else {
                 eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
                 return;
             };
@@ -2241,7 +2241,7 @@ mod tests {
             let project_dir = root.path().join("attachreap");
             fs::create_dir_all(&project_dir).unwrap();
 
-            let Ok(_att) = crate::session::attach("attachreap", "shell", &project_dir) else {
+            let Ok(_att) = crate::session::reserve_and_attach("attachreap", "shell", &project_dir) else {
                 eprintln!("dtach not available; skipping (it is a runtime prerequisite elsewhere)");
                 return;
             };

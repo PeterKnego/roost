@@ -369,7 +369,13 @@ performed.
   ProjectClosed teardown fails it with `[false]`. E took three attempts to
   become honest — its first setup assertion was vacuous on an empty map, and
   its second read `[]` after the page had navigated and called that "not
-  disarmed" rather than "could not look".
+  disarmed" rather than "could not look". Section F (reserved session
+  creation): restoring `session::attach`'s create-when-absent fails all 4 of
+  it, and the failure is the original report — one reconnect after a close
+  yields `sockets: ["term1"]` and two dtach masters. F replaced D as the
+  primary guard because D could only ever be stated as a rate (3-of-3
+  failing, 4-of-4 passing): it depended on a spawn landing inside a timing
+  window, while F depends on a rule.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
