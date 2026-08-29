@@ -163,6 +163,61 @@ try {
     .filter((l) => l.includes(`${fx.stateDir}/sock/${fx.project}/`) && l.includes("dtach -A"));
   ok(orphans.length === 0, `no dtach master outlived the racing close: ${orphans.length}`);
   try { race.close(); } catch { /* already gone */ }
+
+  console.log("E. the close disarms each terminal's reconnect");
+  // The third reported failure, and the one that actually explains "the last
+  // terminal always persists". `render()`'s teardown sets `gone` and clears
+  // the retry timer before closing a socket, and its comment says why:
+  // `attach` creates when absent, so a reconnect that outlives the teardown
+  // respawns the shell rather than reattaching. The ProjectClosed teardown
+  // did neither — so a PTY killed by the close whose socket died unclean
+  // scheduled `connectTerm` on backoff, and a retry landing after the server
+  // cleared `closing` was accepted and spawned. Observed live as a dtach
+  // parented to resh, started in the same second as the close, with nothing
+  // attached to it.
+  //
+  // Asserts on the entries themselves rather than on a surviving socket: the
+  // spawn needs a retry to land in a narrow window, so a socket check is a
+  // coin flip that passes most runs whether or not the bug is there. `gone`
+  // is what makes onclose bail, so it is the property, not a proxy for it.
+  const fin = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  await until(() => fin.evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "final page");
+  await fin.evalIn(`document.querySelector('.pane[data-pane="3"] .paneicons .newterm').click()`);
+  await until(async () => (await fin.evalIn(`terms.size`)) >= 1, 20, "a mounted terminal");
+  await until(async () => (await sockets()).length >= 1, 30, "its socket");
+  // Held outside `terms`, which the handler clears — otherwise there would be
+  // nothing left to inspect afterwards. Captured and *counted* before the
+  // close: `[].every()` is true, so a check that only ran afterwards would
+  // pass on an empty array, which is precisely how this section first
+  // reported a pass and then a bare `[]` under revert. The count is the guard
+  // against that.
+  const held = await fin.evalIn(`window.__entries = [...terms.values()]; window.__entries.length`);
+  ok(held > 0, `setup: ${held} live terminal(s) captured to inspect after the close`);
+  ok(await fin.evalIn(`window.__entries.every((e) => !e.gone)`),
+     "setup: none of them is marked gone before the close");
+  await fin.evalIn(`window.confirm = () => true; window.alert = () => {};
+    document.getElementById("closeproj").click();`);
+  // Read at 25ms before the handler's 1200ms navigation destroys the page,
+  // keeping the last reading that actually saw the array. After navigation
+  // `window.__entries` is undefined and the map yields `[]` — which is "I
+  // could not look", not "nothing was disarmed". Folding those together is
+  // the mistake this repo has a whole CLAUDE.md section about, and it is not
+  // hypothetical here: the first version of this section asserted on `[]` and
+  // so reported a failure it had not actually observed.
+  let seen = null;
+  for (let i = 0; i < 160; i++) {
+    let r;
+    try { r = JSON.parse(await fin.evalIn(`JSON.stringify((window.__entries || []).map((e) => !!e.gone))`)); }
+    catch { break; }                 // context destroyed by the navigation
+    if (r.length === held) { seen = r; if (r.every(Boolean)) break; }
+    await sleep(25);
+  }
+  if (seen === null) {
+    ok(false, `could not observe the entries before the page navigated (not the same as "not disarmed")`);
+  } else {
+    ok(seen.every(Boolean), `all ${held} terminal(s) disarmed by the close: ${JSON.stringify(seen)}`);
+  }
+  try { fin.close(); } catch { /* already gone */ }
 } finally {
   try { ws?.close(); } catch { /* already gone */ }
   try { after?.close(); } catch { /* already gone */ }

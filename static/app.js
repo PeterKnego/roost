@@ -428,6 +428,19 @@ function onEvent(ev) {
       // doesn't get the "Error:" prefix showError adds.
       showBanner(ev.ended + " terminal session(s) ended");
       terms.forEach((e) => {
+        // Disarm before closing, exactly as render()'s teardown does and for
+        // the same reason it spells out there: `attach` creates when absent,
+        // so a reconnect that survives this teardown does not reattach — it
+        // *respawns* a shell in the project the user just closed, into a
+        // disposed xterm, with no tab and no client. Omitting it here was the
+        // live bug: the close kills each PTY, a socket that dies unclean
+        // schedules connectTerm on backoff, `entry.gone` is unset so onclose
+        // does not bail, and a retry landing after the server clears
+        // `closing` is accepted and spawns. Observed on the deploy host as a
+        // fresh dtach whose parent was resh itself, started in the same
+        // second as the close, surviving with nothing attached to it.
+        e.gone = true;
+        clearTimeout(e.timer);
         try { e.sock.close(); } catch {}
         try { e.term.dispose(); } catch {}
         // terms.clear() below is the only chance to do this: unlike
