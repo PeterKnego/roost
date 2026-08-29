@@ -186,6 +186,12 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
     let mut scanned = 0usize;
     let mut truncated: Option<String> = None;
     let mut is_root = true;
+    // Separate from `truncated`: the file-match cap and this one are two
+    // different caps, and folding this into `truncated` immediately would
+    // let it be overwritten (or silently win over) the deadline/scanned
+    // caps depending on loop order. Recorded once, folded in after the walk,
+    // the same way the file-match cap is.
+    let mut lines_capped = false;
 
     'walk: while let Some(dir) = stack.pop() {
         if cancelled() {
@@ -203,7 +209,9 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
                 // failing: there is no partial answer to give, so say so
                 // rather than returning an empty list that looks like one.
                 if is_root {
-                    r.outcome = Outcome::Failed { msg: format!("cannot read the project directory: {e}") };
+                    r.outcome = Outcome::Failed {
+                        msg: format!("cannot read the project directory {}: {e}", dir.display()),
+                    };
                     return r;
                 }
                 r.unreadable += 1;
@@ -259,24 +267,36 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
                 scored.push((s, rel.clone()));
             }
 
-            if q.contents && r.lines.len() < MAX_PER_CATEGORY {
-                match read_candidate(&path) {
-                    Candidate::Unreadable => r.unreadable += 1,
-                    Candidate::SkippedByPolicy => {}
-                    Candidate::Text(text) => {
-                        let mut in_file = 0;
-                        for (i, line) in text.lines().enumerate() {
-                            if !line.to_ascii_lowercase().contains(&needle) {
-                                continue;
-                            }
-                            r.lines.push(LineHit {
-                                rel: rel.clone(),
-                                line: i as u32 + 1,
-                                text: line.chars().take(MAX_LINE_CHARS).collect(),
-                            });
-                            in_file += 1;
-                            if in_file >= MAX_LINES_PER_FILE || r.lines.len() >= MAX_PER_CATEGORY {
-                                break;
+            if q.contents {
+                if r.lines.len() >= MAX_PER_CATEGORY {
+                    // The cap was already full before this file was even
+                    // opened: there may be more matches past it that the
+                    // walk never looked for, which is exactly what
+                    // `lines_capped` exists to say.
+                    lines_capped = true;
+                } else {
+                    match read_candidate(&path) {
+                        Candidate::Unreadable => r.unreadable += 1,
+                        Candidate::SkippedByPolicy => {}
+                        Candidate::Text(text) => {
+                            let mut in_file = 0;
+                            for (i, line) in text.lines().enumerate() {
+                                if !line.to_ascii_lowercase().contains(&needle) {
+                                    continue;
+                                }
+                                r.lines.push(LineHit {
+                                    rel: rel.clone(),
+                                    line: i as u32 + 1,
+                                    text: line.chars().take(MAX_LINE_CHARS).collect(),
+                                });
+                                in_file += 1;
+                                if r.lines.len() >= MAX_PER_CATEGORY {
+                                    lines_capped = true;
+                                    break;
+                                }
+                                if in_file >= MAX_LINES_PER_FILE {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -295,6 +315,10 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
         truncated.get_or_insert_with(|| format!("more than {MAX_PER_CATEGORY} files matched"));
     }
     r.files = scored.into_iter().map(|(_, rel)| FileHit { rel }).collect();
+
+    if lines_capped {
+        truncated.get_or_insert_with(|| format!("more than {MAX_PER_CATEGORY} lines matched"));
+    }
 
     if let Some(reason) = truncated {
         r.outcome = Outcome::Truncated { reason };
@@ -387,6 +411,40 @@ mod tests {
         assert!(r.lines.is_empty(), "leaked: {:?}", r.lines);
         assert!(r.files.is_empty(), "leaked: {:?}", r.files);
         assert_eq!(r.unreadable, 0, "declining to follow a symlink is not a failure to read");
+        // Without this, "the walk failed outright" and "the walk correctly
+        // declined to follow the symlink" are indistinguishable: both leave
+        // every counter at zero.
+        assert_eq!(r.outcome, Outcome::Complete);
+    }
+
+    /// The root failing is handled by a different branch than a subdirectory
+    /// failing (`run`'s `is_root` check): there is no partial answer to give
+    /// when the walk cannot even start, so it must say so via `Failed`
+    /// rather than coming back with empty, `Complete` results that read as
+    /// "this project has nothing matching" instead of "I could not look".
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_root_is_reported_as_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = proj(&[("visible.rs", "needle\n")]);
+        fs::set_permissions(d.path(), fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = fs::read_dir(d.path()).is_err();
+        if !blocked {
+            fs::set_permissions(d.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipped: running as root, the premise does not hold");
+            return;
+        }
+
+        let r = run(d.path(), &query("needle", TreeFilter::default()), &never());
+        fs::set_permissions(d.path(), fs::Permissions::from_mode(0o755)).unwrap(); // so tempdir can clean up
+
+        match &r.outcome {
+            Outcome::Failed { msg } => assert!(
+                msg.contains(&d.path().display().to_string()),
+                "the message should name the directory that could not be read, got {msg:?}"
+            ),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -406,6 +464,32 @@ mod tests {
             Outcome::Truncated { reason } => assert!(
                 reason.contains("files matched"),
                 "the reason must name the cap that fired, got {reason:?}"
+            ),
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    /// The file-match cap and the line-match cap are tracked independently
+    /// (`the_result_cap_names_which_cap_fired` only drives the file cap): a
+    /// query whose paths never match "needle" but whose contents do, past
+    /// `MAX_PER_CATEGORY` lines, must still say *which* cap fired rather than
+    /// silently reporting `Complete` once the line vector stops growing.
+    #[test]
+    fn the_line_cap_names_which_cap_fired() {
+        let files: Vec<(String, String)> = (0..MAX_PER_CATEGORY + 10)
+            .map(|i| (format!("f{i}.rs"), String::from("a needle line\n")))
+            .collect();
+        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let d = proj(&refs);
+
+        let r = run(d.path(), &query("needle", TreeFilter::default()), &never());
+
+        assert!(r.files.is_empty(), "f{{i}}.rs does not match 'needle' by path: {:?}", r.files);
+        assert_eq!(r.lines.len(), MAX_PER_CATEGORY);
+        match &r.outcome {
+            Outcome::Truncated { reason } => assert!(
+                reason.contains("lines matched"),
+                "the reason must name the line cap, not be silent or name the file cap, got {reason:?}"
             ),
             other => panic!("expected Truncated, got {other:?}"),
         }
