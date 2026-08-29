@@ -78,6 +78,22 @@ pub struct Hub {
     pub notices_dirty: bool,
 }
 
+/// How long a close waits between its two `kill_project` sweeps, so a shell
+/// that was still forking during the first one is visible to the second.
+///
+/// Sized against what it is waiting for, not chosen round: `session::attach`
+/// returns once `dtach` has been spawned, but dtach's own fork-and-detach —
+/// the part that creates the socket and leaves a master in `ps` — completes
+/// after that, and the browser tests poll for it in 25ms steps because it is
+/// unpredictable. It is normally well under 100ms; 400 leaves several times
+/// that in hand.
+///
+/// The cost of overshooting is only that `ProjectClosed` (and its session
+/// count) reaches the browser a little later, on a background thread, while
+/// the UI already shows the close in progress. The cost of undershooting is a
+/// live shell nobody can reach. Those are not symmetric, so this errs long.
+const CLOSE_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<Hub>>>>> = OnceLock::new();
 
 impl Hub {
@@ -1863,15 +1879,54 @@ impl Hub {
                         // stuck true — that would leave the UI showing a
                         // close that silently never finished, and refuse
                         // every later StartTerminal/CloseProject forever.
-                        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            crate::session::kill_project(&thread_project)
-                        }))
-                        .unwrap_or_else(|_| {
-                            eprintln!(
-                                "resh: kill_project panicked while closing {thread_project}; reporting 0 ended"
-                            );
-                            0
-                        });
+                        let sweep = || {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                crate::session::kill_project(&thread_project)
+                            }))
+                            .unwrap_or_else(|_| {
+                                eprintln!(
+                                    "resh: kill_project panicked while closing {thread_project}; reporting 0 ended"
+                                );
+                                0
+                            })
+                        };
+                        // Swept twice, and the second one is not belt and
+                        // braces — it is the whole reason a close could leave
+                        // a live shell behind.
+                        //
+                        // `kill_project` finds sessions two ways: the socket
+                        // files on disk, and a `ps` snapshot of what holds
+                        // them. A terminal websocket that connected moments
+                        // before this thread started is inside
+                        // `session::attach`, forking dtach; its master has
+                        // reached neither list yet, so the first sweep is
+                        // blind to it and it survives as an orphan — no tab
+                        // (the layout was already cleared), no client, and no
+                        // way back to it from the UI. That is CLAUDE.md's
+                        // "the socket's holder not yet visible" one door
+                        // along, and it was observed in production: the
+                        // survivor's dtach had resh itself as its parent and
+                        // a start time in the same second as the close.
+                        //
+                        // The settle is what makes the second sweep see it:
+                        // dtach's fork-and-detach takes an unpredictable,
+                        // usually small amount of wall time, and a sweep run
+                        // back to back with the first would read the same
+                        // blind snapshot again.
+                        //
+                        // This runs before the block below reacquires the
+                        // lock, so `closing` is still true throughout — which
+                        // means `term.rs`'s `is_closing` guard is also
+                        // refusing new connects for the whole window, and
+                        // nothing can be spawned *into* the gap between the
+                        // two sweeps. What remains uncovered is a connect
+                        // that lands after `closing` clears, by which point
+                        // the browser has been sent `ProjectClosed` and has
+                        // no terminal tab left to mount.
+                        let ended = sweep() + {
+                            std::thread::sleep(CLOSE_SETTLE);
+                            sweep()
+                        };
                         // Outside the catch_unwind above, not inside it: a
                         // panic in kill_project must not skip stopping the
                         // ide listener, or a closed project keeps
