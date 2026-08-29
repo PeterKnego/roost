@@ -107,6 +107,19 @@ pub enum Intent {
     /// broadcast to every connected browser. A path a regex guessed at cannot
     /// be allowed down that road.
     OpenPath { text: String },
+    /// One query from one browser. `seq` is that connection's own monotonic
+    /// counter: the worker abandons a query whose seq is no longer the
+    /// latest, and the reply carries it back so a late answer to a query the
+    /// user has already typed past is dropped rather than rendered.
+    ///
+    /// Deliberately an intent and not an HTTP route, but equally deliberately
+    /// *not* handled like one: `wsconn` diverts it before taking the hub
+    /// lock, because a walk is blocking I/O. See the routing there.
+    Search { q: String, seq: u64 },
+    /// Open `rel` and scroll to `line`. Separate from `OpenTab` because the
+    /// line is navigation, not layout: `Tab` is persisted, and a line has no
+    /// business surviving a restart. See the plan's "Deviation from the spec".
+    OpenAtLine { pane: PaneId, rel: String, line: u32 },
     InitGit,
     CloseProject,
     /// Create `.claude/worktrees/claude-N` off this project's HEAD. No name
@@ -236,6 +249,15 @@ pub enum Event {
     /// exactly that). Sent with `send_to` and never broadcast — one person's
     /// mis-click must not flash every window in the project.
     PathRefused { text: String, msg: String },
+    /// Results for one query. Sent with `send_to` and never broadcast: a
+    /// query is one browser's business, and the overlay that asked is
+    /// client-local by design.
+    SearchResults { seq: u64, results: crate::search::Results },
+    /// Scroll whichever pane holds `rel` to `line`. Broadcast rather than
+    /// sent to the asker, so a second browser mirroring the tab follows it
+    /// there — but carried as an event rather than as workspace state, so
+    /// nothing about it persists.
+    RevealLine { rel: String, line: u32 },
     TerminalStarted { session: String },
     /// A ✻ click in a project resh has positive evidence a Claude is
     /// already running in. Sent to the clicker only; nothing was opened.
@@ -524,5 +546,43 @@ mod tests {
         assert!(s.contains(r#""t":"PathRefused""#), "got {s}");
         assert!(s.contains(r#""text":"src/gone.rs""#), "got {s}");
         assert!(s.contains(r#""msg":"cannot read src/gone.rs""#), "got {s}");
+    }
+
+    #[test]
+    fn a_search_carries_its_sequence_number() {
+        let i = decode(r#"{"t":"Search","q":"needle","seq":7}"#).unwrap();
+        match i {
+            Intent::Search { q, seq } => {
+                assert_eq!(q, "needle");
+                assert_eq!(seq, 7);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_at_line_carries_a_one_based_line() {
+        let i = decode(r#"{"t":"OpenAtLine","pane":2,"rel":"src/hub.rs","line":412}"#).unwrap();
+        match i {
+            Intent::OpenAtLine { pane, rel, line } => {
+                assert_eq!(pane, MIDDLE);
+                assert_eq!(rel, "src/hub.rs");
+                assert_eq!(line, 412);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A File tab's JSON is what `wsstate` has already written to disk for
+    /// every saved workspace on every host. Search must not change its shape:
+    /// this test fails loudly if a `line` field is ever added to the tab
+    /// itself, which is the design this plan deliberately avoided.
+    #[test]
+    fn a_file_tabs_wire_shape_is_unchanged_by_search() {
+        let i = decode(r#"{"t":"OpenTab","pane":2,"tab":{"k":"File","rel":"a.rs","mode":"Edit"}}"#).unwrap();
+        assert!(
+            matches!(i, Intent::OpenTab { tab: Tab::File { ref rel, mode: Mode::Edit }, .. } if rel == "a.rs"),
+            "got {i:?}"
+        );
     }
 }
