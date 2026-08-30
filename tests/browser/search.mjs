@@ -761,24 +761,34 @@ try {
 // after `CLAUDE.md:148` on one, after a 60-character spec path on the next.
 // There was nothing to run the eye down.
 {
-  await freshSearch(evalIn, "marker");
+  // "needle" rather than "marker": it hits two rows in different categories
+  // with very different path depths — src/needle.rs (a FILE hit, dir "src/")
+  // and src/very/deeply/nested/directory/tree/deep.rs (a CONTENT hit, via
+  // "let deepneedle = 1;", dir 38 characters deep). Both put their matched
+  // text in the same `.what` grid column, so this is an actual two-point
+  // comparison instead of one row trivially agreeing with itself.
+  await freshSearch(evalIn, "needle");
   ok(await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow .what").length > 0`), 10, "rows"),
      "setup: rows render with a .what cell");
 
-  // Revert-and-observe (CLAUDE.md's testing discipline): with
-  // `grid-template-columns: auto 1fr` — the pre-fix sizing — this query
-  // still printed "ok every result's text starts at one x (saw [473])".
-  // The fixture's "marker" query returns exactly one row (only needle.rs
-  // contains it), so a single-row grid is trivially at one x regardless of
-  // column sizing; this assertion does not by itself discriminate the fix.
-  // What DID fail under `auto 1fr` was the dirClipped assertion below:
-  // "FAIL  the directory half of a long path is the part that truncates" —
-  // with an auto column, `.dir` grows to fit its own content instead of
-  // being squeezed by a fixed track, so it never clips. That is the
-  // assertion this section actually depends on to catch a regression.
   const lefts = JSON.parse(await evalIn(`JSON.stringify(
     [...document.querySelectorAll("#searchresults .searchrow .what")]
       .map(n => Math.round(n.getBoundingClientRect().left)))`));
+  // A guard, not decoration: "marker" used to sit here, and it matches only
+  // one row in this fixture, so `new Set(lefts).size === 1` passed on a
+  // single element and could never fail — the exact vacuous-test shape
+  // CLAUDE.md's testing section warns about. If a future fixture change
+  // collapses "needle" back to one row, this fails loudly instead of the
+  // x-alignment assertion silently going vacuous again.
+  ok(lefts.length >= 2, `the x-alignment check needs at least two rows to mean anything (got ${lefts.length})`);
+  // Revert-and-observe (CLAUDE.md's testing discipline), rerun after
+  // switching the query to "needle": with `grid-template-columns: auto 1fr`
+  // restored, this assertion actually failed —
+  // "FAIL  every result's text starts at one x (saw [394,705])" — because
+  // src/needle.rs's shallow `.at` and the deep fixture's 38-character `.at`
+  // each size their own content-based column differently. The dirClipped
+  // assertion below failed too in the same run, for the reason recorded
+  // there. Restoring `var(--search-at) 1fr` returned both to green.
   ok(new Set(lefts).size === 1,
      `every result's text starts at one x (saw ${JSON.stringify([...new Set(lefts)])})`);
 
