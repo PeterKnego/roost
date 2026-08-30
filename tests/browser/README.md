@@ -40,6 +40,7 @@ deno run -A tests/browser/changes.mjs    # the Changes pane and the header chip 
 deno run -A tests/browser/vanished.mjs   # a file deleted or moved out of the project from under an open tab: no empty editor, and unsaved work survives
 deno run -A tests/browser/renamed.mjs    # a file renamed *inside* the project: the tab follows it, with its unsaved work
 deno run -A tests/browser/closeproject.mjs # Close Project ends the shells *and* clears their tabs, so reopening shows no ghosts
+deno run -A tests/browser/search.mjs     # the ⇧⇧ search overlay, its results, and landing on a line — see below, this one has an open finding
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -376,6 +377,25 @@ performed.
   primary guard because D could only ever be stated as a rate (3-of-3
   failing, 4-of-4 passing): it depended on a spawn landing inside a timing
   window, while F depends on a rule.
+- In `search.mjs`: reverting the `revealInEditor` fix (setting the selection
+  before calling `ta.focus()`, the order the code shipped in) fails section F
+  — Chromium only scrolls a focused textarea's selection into its scrollable
+  ancestor when the selection changes *after* the focus event, never before
+  it, which is opposite to what the code's own comment used to claim.
+  Section C's index-alignment assertion (clicking the second search-result
+  group's first row) was checked by deliberately reintroducing an off-by-one
+  — counting `.searchgroup` headers as rows before the click target — and it
+  fails on the captured `OpenAtLine` intent, not just on "some row is
+  selected". **This file does not pass clean.** Sections F and G still fail
+  after the fix above, and are left failing on purpose: F shows `revealLine`
+  can lose a race against `<code-input>`'s own asynchronous layout when a
+  file is opened and revealed by the same click (the host and the textarea
+  disagree about which of them is scrollable until that layout settles), and
+  G shows the already-open-and-focused case CLAUDE.md's own review flagged as
+  "most likely broken" is exactly that — `ta.focus()` on an already-focused
+  textarea fires no event, and nothing else moves the viewport. Both are real
+  product defects, diagnosed but not fixed; see this task's report for the
+  measurements. Do not "fix" this file by weakening either assertion.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:

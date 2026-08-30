@@ -3108,52 +3108,60 @@ function tryReveal() {
   }
 }
 
-/// Unlike revealInPreview(), this is exact only on the focused branch.
-/// `.editor` sets no white-space override (static/style.css) so a plain
-/// textarea soft-wraps by default, and `.editwrap code-input` explicitly
-/// sets `white-space: pre-wrap`, which the vendor stylesheet's `code-input
-/// textarea, code-input pre { white-space: inherit }` pushes onto both of
-/// its layers — so in *both* editor shapes one logical line is not
-/// reliably one visual row, unlike the preview's <pre> (see revealInPreview
-/// for why that one is exact). A pixel formula built on `(line-1)*lh` alone
-/// undercounts by one `lh` for every wrapped row above the target, which
-/// can be tens of rows in a real source file and leave the target off
-/// screen entirely.
+/// Exact only when the native scroll below actually fires. `.editor` sets no
+/// white-space override (static/style.css) so a plain textarea soft-wraps by
+/// default, and `.editwrap code-input` explicitly sets `white-space:
+/// pre-wrap`, which the vendor stylesheet's `code-input textarea, code-input
+/// pre { white-space: inherit }` pushes onto both of its layers — so in
+/// *both* editor shapes one logical line is not reliably one visual row,
+/// unlike the preview's <pre> (see revealInPreview for why that one is
+/// exact). A pixel formula built on `(line-1)*lh` alone undercounts by one
+/// `lh` for every wrapped row above the target, which can be tens of rows in
+/// a real source file and leave the target off screen entirely.
 function revealInEditor(ta, line, focus) {
   const lines = ta.value.split("\n");
   const upto = lines.slice(0, Math.max(0, line - 1)).join("\n").length + (line > 1 ? 1 : 0);
-  ta.setSelectionRange(upto, upto + (lines[line - 1] || "").length);
-  if (focus) {
-    // Exact, and wrap-aware for free: focusing a textarea with an active
-    // selection makes the browser scroll that selection into view within
-    // its nearest scrollable ancestor — code-input's host for the
-    // highlighted case (its textarea and pre share one grid cell with
-    // overflow:hidden; only the host itself has overflow:auto — confirmed
-    // by reading code-input.min.js's syncSize(), which sizes the textarea
-    // to its full content rather than scrolling it), or the textarea itself
-    // for the plain case. This native scroll already knows the wrapped
-    // layout; a hand-rolled pixel offset below does not. Do not also set
-    // scrollTop here — that would overwrite this correct position with the
-    // wrap-blind approximation the mirror branch is stuck with below.
-    ta.focus();
-    return;
-  }
-  // A mirroring client (focus=false) gets no such native scroll: this
-  // client deliberately never focuses ta for someone else's action (see
-  // focusNextReveal). The line-height arithmetic below is the fallback,
-  // and it is an approximation, not the exact placement the focused branch
-  // gets above — it assumes one logical line is one visual row, which the
-  // doc comment above already says is false the moment a line wraps. A
-  // mirror can therefore land above the true target by roughly one line
-  // height per wrapped row between the top of the file and this line. That
-  // is judged better than leaving a mirroring browser's view completely
-  // unscrolled, but it is not exact, and no comment here should claim
-  // otherwise.
+  const end = upto + (lines[line - 1] || "").length;
+
+  // The wrap-blind approximation, run unconditionally rather than only for a
+  // mirroring client. Measured directly (see the focus branch below): the
+  // native scroll only ever fires on an actual focus *transition*, so
+  // searching within a file that is already open and focused — a real,
+  // common case, not an edge case — calls ta.focus() on an element that is
+  // already document.activeElement. No focus event fires, nothing native
+  // happens, and without this the viewport would not move at all. This
+  // approximation is strictly worse than the exact placement below when that
+  // fires, and strictly better than nothing when it's all there is.
   const box = ta.closest("code-input") || ta;
   const extra = box === ta ? 0 : ta.offsetTop;
   const lh = parseFloat(getComputedStyle(ta).lineHeight) || 20;
   const pad = parseFloat(getComputedStyle(ta).paddingTop) || 0;
   box.scrollTop = Math.max(0, extra + pad + (line - 1) * lh - box.clientHeight / 3);
+
+  if (focus) {
+    // Exact, and wrap-aware for free, but only in this order: focus() has to
+    // run *before* setSelectionRange, not after. Measured both ways —
+    // setting the range on an unfocused textarea and then focusing it left
+    // the scrollable ancestor untouched (the approximation above is all that
+    // moved it); focusing first and setting the range afterward made
+    // Chromium scroll the new selection into view within its nearest
+    // scrollable ancestor (code-input's host for the highlighted case — its
+    // textarea and pre share one grid cell with overflow:hidden; only the
+    // host itself has overflow:auto, confirmed by reading
+    // code-input.min.js's syncSize(), which sizes the textarea to its full
+    // content rather than scrolling it — or the textarea itself for the
+    // plain case). This native scroll already knows the wrapped layout; the
+    // approximation above does not, which is why this still overwrites it
+    // when it fires.
+    ta.focus();
+    ta.setSelectionRange(upto, end);
+    return;
+  }
+  // A mirroring client (focus=false) deliberately never focuses ta for
+  // someone else's action (see focusNextReveal), so it only ever gets the
+  // approximation above; the selection is still set so the target line is
+  // highlighted even though this client's view of it is not focused.
+  ta.setSelectionRange(upto, end);
 }
 
 function revealInPreview(content, pre, line) {
