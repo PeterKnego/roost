@@ -17,6 +17,15 @@ html, body { height: 100%; }
   --tool: color-mix(in oklab, var(--bg) 90%, black);
   --tab-on: color-mix(in oklab, var(--fg) 10%, var(--tool));
   --tab-hover: color-mix(in oklab, var(--fg) 5%, var(--tool));
+  /* The selected row of a list on a --bg2 panel (the search overlay, and
+     whatever the popup pass adds next). Deliberately NOT --tab-on: that one
+     mixes into --tool, which sits *below* --bg, so on a --bg2 panel it lands
+     within about 1.02:1 of the surface in the dark themes — a selection you
+     cannot see. A highlight has to be mixed against the surface it is drawn
+     on. Toward --fg, so it lifts in a dark theme and darkens in a light one;
+     14% because the equivalent tab step measures 1.15-1.24 against --tool and
+     a modal's keyboard selection should read a little stronger than a tab. */
+  --row-on: color-mix(in oklab, var(--fg) 14%, var(--bg2));
   --pane-radius: 8px;
   /* How many rows of tabs a pane header may grow to before the strip starts
      scrolling instead. Four is roughly 16 tabs in the middle pane and 12 in
@@ -773,7 +782,7 @@ ul.picker li .git:hover { text-decoration: underline; }
                border-bottom: 1px solid var(--border); }
 .searchrow { display: flex; gap: 8px; align-items: baseline; padding: 4px 12px;
              cursor: pointer; white-space: nowrap; overflow: hidden; }
-.searchrow.sel { background: var(--tool); }
+.searchrow.sel { background: var(--row-on); }
 .searchrow .where { color: var(--muted); font-size: 11px; }
 .searchrow .line { font: 12px/1.4 var(--mono); overflow: hidden; text-overflow: ellipsis; }
 /* The honesty line: truncation, unreadable directories, outright failure. */

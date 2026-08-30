@@ -2,7 +2,7 @@
 
 Single Rust binary, no async runtime, thread per connection, hand-rolled
 HTTP (GET, plus two upload POSTs) with websockets, server-rendered HTML,
-plain JS with no framework. See [README.md](README.md1) for what it does and
+plain JS with no framework. See [README.md](README.md) for what it does and
 [docs/deploy.md](docs/deploy.md) for running and deploying it.
 
 ## Hard constraints

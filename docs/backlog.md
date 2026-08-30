@@ -215,12 +215,18 @@ demand behind them.
   the profile out of the checkout, but the general shape recurs for any
   gitignored build output not named `target`. The walk reads the filesystem;
   git reads the index; nothing reconciles them.
-- **A stronger selected-row highlight.** `.searchrow.sel` uses `--tool`
-  (`style.css`), which is `color-mix(--bg 90%, black)` — *darker* than the
-  panel's `--bg2`, and by only 18 RGB units. Measured from a screenshot,
-  because reading the CSS did not reveal it and I misread which row was
-  selected. `--tab-on` / `--tab-hover` exist one line above and are built for
-  exactly this. One line.
+- ~~**A stronger selected-row highlight.**~~ **Done (2026-08-30.)** Kept here
+  because the fix this entry prescribed was wrong, and the reason is worth not
+  rediscovering. `.searchrow.sel` was `--tool` — mixed against `--bg`, so
+  *darker* than the panel's own `--bg2`, 1.12:1 in the dark theme. But
+  `--tab-on` is `--tool` plus 10% `--fg`, so on a `--bg2` panel it lands at
+  1.02:1: the prescribed repair measured worse than the bug in four of five
+  themes. A highlight has to be mixed against **the surface it is drawn on**,
+  which is what the new `--row-on` does. Verified in Chromium across every
+  theme in `static/themes/`, by rasterising the colour through a canvas —
+  `getComputedStyle` returns an unresolved `oklab(...)` for a `color-mix` and
+  cannot be luminance-parsed. `tests/browser/search.mjs` now asserts it, and
+  fails on both wrong versions.
 - **⇧⇧ is unreliable and unadvertised.** On the deploy host's browser a lone
   Shift keydown never reaches the page at all — a capture-phase listener on
   `document` printed nothing, while `Ctrl+Shift+F` worked in the same tab.

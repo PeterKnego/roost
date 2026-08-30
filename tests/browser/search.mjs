@@ -675,6 +675,76 @@ try {
     try { await Deno.chmod(locked1, 0o755); } catch { /* best effort */ }
     try { await Deno.chmod(locked2, 0o755); } catch { /* best effort */ }
   }
+
+// --- the selected row is visible on the panel it sits on --------------------
+//
+// Kept last, because it swaps the theme stylesheet out from under the page.
+//
+// This is here because reading the CSS did not reveal the bug and a review
+// did not catch it: `.searchrow.sel` was `--tool`, a token mixed against
+// `--bg`, while `.searchpanel` is `--bg2` — so the selection was painted
+// *darker* than its own surface, 1.12:1 in the dark theme, and which row was
+// selected became a guess. The obvious repair, `--tab-on`, is also wrong for
+// the same reason (it is `--tool` plus 10% `--fg`): it measures 1.02:1 here.
+//
+// So the assertion has to be about the rendered colour, in both polarities,
+// and not about which token is named. getComputedStyle returns an unresolved
+// `oklab(...)` for a color-mix, so the value is rasterised through a canvas —
+// the engine's own resolution to sRGB.
+//
+// Both wrong versions were applied and run, not reasoned about. `var(--tool)`
+// (the shipped bug): 5 failures — four themes the wrong direction, and dark
+// also under the floor at 1.125. `var(--tab-on)` (the repair the backlog
+// prescribed): 7 failures, down to 1.023 in dark. Restored: ALL PASS.
+//
+// Note which one the light theme lets through: `--tool` mixes toward black,
+// which in a light theme *is* toward --fg, so it passes there. That is why
+// the loop covers every theme in static/themes/ rather than the default one —
+// a single-theme version of this test would have shipped the bug green.
+{
+  const probe = `(() => {
+    const cx = document.createElement("canvas").getContext("2d", { willReadFrequently: true });
+    const srgb = (css) => { cx.clearRect(0,0,1,1); cx.fillStyle = "#000"; cx.fillStyle = css;
+      cx.fillRect(0,0,1,1); const d = cx.getImageData(0,0,1,1).data; return [d[0],d[1],d[2]]; };
+    const lum = (c) => { const [r,g,b] = c.map(v => { v/=255; return v<=0.04045 ? v/12.92 : Math.pow((v+0.055)/1.055,2.4); });
+      return 0.2126*r + 0.7152*g + 0.0722*b; };
+    const el = document.querySelector(".searchrow.sel");
+    if (!el) return JSON.stringify({ err: "no selected row" });
+    const row = lum(srgb(getComputedStyle(el).backgroundColor));
+    const panel = lum(srgb(getComputedStyle(document.querySelector(".searchpanel")).backgroundColor));
+    // The --fg token, not documentElement's \`color\`: the themes set the
+    // custom property and colour the body, so \`color\` on the root reads as
+    // the UA default and inverts this check on every dark theme.
+    const fg = lum(srgb(getComputedStyle(document.documentElement).getPropertyValue("--fg").trim()));
+    return JSON.stringify({
+      ratio: +(((Math.max(row,panel)+0.05)/(Math.min(row,panel)+0.05)).toFixed(3)),
+      // The rule that holds in a light theme as well as a dark one: the
+      // highlight moves away from the surface, toward the text colour.
+      towardFg: fg > panel ? row > panel : row < panel,
+    });
+  })()`;
+
+  await freshSearch(evalIn, "marker");
+  ok(await until(() => evalIn(`!!document.querySelector(".searchrow.sel")`), 10, "a selected row"),
+     "a row is selected, so the colours below are read off a real selection");
+
+  for (const theme of ["darcula", "dark", "light", "gruvbox", "solarized-dark"]) {
+    await evalIn(`(() => { document.querySelector('link[href*="/static/themes/"]').href = "/static/themes/${theme}.css"; return 1; })()`);
+    // The swapped sheet has to be applied before the pixels mean anything;
+    // the panel's own colour changing is the signal that it is.
+    await until(async () => {
+      const r = JSON.parse(await evalIn(probe));
+      return !r.err && r.ratio > 1;
+    }, 10, `${theme} applied`);
+    const r = JSON.parse(await evalIn(probe));
+    ok(r.towardFg, `${theme}: selection moves toward --fg, not away from it (ratio ${r.ratio})`);
+    // 1.20 is just above the app's own selected-tab step (--tab-on against
+    // --tool measures 1.15-1.24); a modal's keyboard selection should not
+    // read weaker than a tab.
+    ok(r.ratio >= 1.20, `${theme}: selection is at least 1.20:1 against the panel (got ${r.ratio})`);
+  }
+}
+
 } finally {
   try { page1 && page1.close(); } catch { /* already gone */ }
   try { page2 && page2.close(); } catch { /* already gone */ }
