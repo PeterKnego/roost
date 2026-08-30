@@ -266,7 +266,15 @@ main { flex: 1; min-height: 0; }
 .editwrap .editor { flex: 1 1 auto; height: auto; min-height: 0; }
 /* A code file's editor is a <code-input>: the same textarea, with a
    highlighted <pre> painted under it (static/vendor/code-input.min.css does
-   the stacking and the scroll sync). Everything here is undoing that
+   the stacking and the scroll sync — the sync is stylesheet-only, not
+   script: that file gives the <code-input> host `display: grid; overflow:
+   auto` and stacks the textarea and the <pre> at `grid-area: 1/1`, neither
+   of them scrollable (the textarea is `overflow: hidden`, the <pre>
+   `overflow: visible`), so the host is the only thing that scrolls and the
+   two layers cannot drift. Do not go looking for a scroll listener in
+   code-input.min.js; there is none, and that is the point. scrollEditorTo()
+   in static/app.js sets `host.scrollTop` for exactly this reason — scrolling
+   the textarea instead would move nothing). Everything here is undoing that
    stylesheet's standalone defaults — an 8px margin, a 250px height, a white
    background, 16px padding and `monospace` — so the editor sits in the pane
    exactly where the plain textarea did, with the same metrics. Font and

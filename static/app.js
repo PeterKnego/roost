@@ -2846,7 +2846,18 @@ document.getElementById("searchinput")?.addEventListener("input", (e) => {
   }, 120);
 });
 
-document.getElementById("searchoverlay")?.addEventListener("keydown", (e) => {
+// Bound to the document, not to #searchoverlay, and gated on the overlay
+// being open. The overlay contains exactly one focusable element (the input),
+// so focus leaves it trivially — one Tab, or a click on any non-row part of
+// the panel, which the backdrop handler below deliberately does not treat as
+// a dismissal. With the listener scoped to the overlay, focus landing on
+// <body> took Escape, ↑/↓ and Enter with it, and `openSearch` early-returns
+// on an already-open overlay, so ⇧⇧ could not recover either: the modal was
+// stranded open with only a backdrop click left to close it. Trapping Tab
+// instead would have fixed only the first of those two routes.
+document.addEventListener("keydown", (e) => {
+  const ov = document.getElementById("searchoverlay");
+  if (!ov || ov.hidden) return;
   if (e.key === "Escape") { e.preventDefault(); closeSearch(); return; }
   if (e.key === "ArrowDown") { e.preventDefault(); moveSearchSel(1); return; }
   if (e.key === "ArrowUp") { e.preventDefault(); moveSearchSel(-1); return; }
@@ -2957,6 +2968,22 @@ function renderSearch(results) {
     parts.push(`${results.unreadable} ${results.unreadable === 1 ? "place" : "places"} could not be read`);
   }
   if (!parts.length && !searchRows.length) parts.push("no matches");
+  // The other half of the honesty line, and the one the server cannot supply:
+  // below three characters wsconn.rs sets `Query::contents = false`, so the
+  // walk never opens a single file — yet it truthfully reports `Complete` for
+  // the categories it *did* search, and the note above would therefore be
+  // empty. That is "I chose not to look" rendered as completeness, which is
+  // the one thing this line exists to prevent. Appended rather than
+  // substituted, so it composes with a Truncated reason or an unreadable
+  // count instead of hiding one.
+  //
+  // Counted in code points, matching the server's `q.chars().count() >= 3`
+  // exactly — a threshold that disagreed with the server's would announce the
+  // wrong thing for an emoji or an accented query. Not shown for an empty
+  // box: nothing was searched there at all, and the erase path renders
+  // through `renderSearch(null)` above anyway.
+  const q = document.getElementById("searchinput")?.value || "";
+  if (q && [...q].length < 3) parts.push("contents searched from 3 characters");
   note.textContent = parts.join(" · ");
 
   if (searchRows.length) paintSearchSel();
@@ -3067,7 +3094,17 @@ function revealLine(rel, line, focus) {
   // arbitrary, generously long backstop, chosen only so a stale target
   // can't sit armed indefinitely (see the comment above pendingReveal).
   pendingRevealTimer = setTimeout(() => {
-    showBanner(`couldn't scroll to line ${line} of ${rel} — its tab may have closed, or never finished opening`);
+    // Not in a hidden tab. RevealLine is broadcast, so a browser that is
+    // merely mirroring someone else's navigation arms this timer too — and
+    // in a background tab code-input's rAF loop is throttled to a stop, so
+    // scrollEditorTo's sync guard (`pre.textContent.length < ta.value.length`)
+    // never clears, the retry never lands, and this fires every time. The
+    // result was a user who did nothing being shown an error about someone
+    // else's navigation. `pendingReveal` is still cleared either way: the
+    // target is stale regardless of who can see the banner.
+    if (!document.hidden) {
+      showBanner(`couldn't scroll to line ${line} of ${rel} — its tab may have closed, or never finished opening`);
+    }
     pendingReveal = null;
   }, 4000);
   tryReveal();
