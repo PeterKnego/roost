@@ -188,6 +188,26 @@ try {
     "…and gives focus back to exactly the element that had it before — not merely 'somewhere other than the input'",
   );
 
+  // The overlay has exactly one focusable element, so focus leaves it on one
+  // Tab or on any click that is neither a row nor the backdrop. With the key
+  // handler bound to #searchoverlay, Escape and ↑/↓ went with it, and
+  // openSearch()'s `!ov.hidden` early return meant ⇧⇧ could not recover:
+  // the modal was stranded open. Reproduced here by blurring rather than by
+  // a synthetic Tab, because a dispatched KeyboardEvent does not move focus —
+  // a Tab-based version of this test would pass with the bug fully present.
+  await evalIn(shiftTwice);
+  ok(await evalIn(`document.activeElement.id === "searchinput"`), "setup: the overlay is open with focus in its input");
+  await evalIn(`document.getElementById("searchinput").blur()`);
+  ok(
+    await evalIn(`!document.getElementById("searchoverlay").contains(document.activeElement)`),
+    "setup: focus is now outside the overlay entirely — the state one Tab or a stray click produces",
+  );
+  await evalIn(`document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
+  ok(
+    await evalIn(`document.getElementById("searchoverlay").hidden`),
+    "Escape still closes the overlay once focus has left it — otherwise only a backdrop click can, and ⇧⇧ cannot reopen",
+  );
+
   console.log("\nC0. a content hit lands on its line");
   await freshSearch(evalIn, "marker");
   ok(
@@ -485,6 +505,47 @@ try {
     await evalIn(`document.getElementById("searchnote").textContent`) === "",
     "(f) rows present and nothing wrong leaves the note empty, not padded with a spurious caveat",
   );
+
+  // Contents are not searched below three characters (wsconn.rs sets
+  // Query::contents from `q.chars().count() >= 3`). That is a decision, not a
+  // result, and the server has no way to report it: it returns Complete,
+  // truthfully, for the categories it did search. Without the client-side
+  // note the UI asserts completeness over a category nobody opened — the same
+  // class of lie as (a)-(f) above, on the "chose not to look" side rather
+  // than the "could not look" side. These use real typed queries, not
+  // injected events, because the note is built from #searchinput's own value.
+  const SHORT = "contents searched from 3 characters";
+  const noteText = `document.getElementById("searchnote").textContent`;
+
+  await freshSearch(evalIn, "lo");   // matches src/long.rs by path
+  ok(
+    await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "lo rows"),
+    "(g) setup: a two-character query still answers paths, so the note below is not just 'no matches'",
+  );
+  ok(
+    await until(async () => (await evalIn(noteText)) === SHORT, 10, "short-query note"),
+    `(g) a two-character query says contents were not searched, and says only that — got ${JSON.stringify(await evalIn(noteText))}`,
+  );
+
+  await freshSearch(evalIn, "zz");   // matches nothing at all
+  ok(
+    await until(async () => (await evalIn(noteText)) === `no matches · ${SHORT}`, 10, "composed note"),
+    `(h) it composes with the note that was already there rather than replacing it — got ${JSON.stringify(await evalIn(noteText))}`,
+  );
+
+  // The discriminating half: at exactly three characters contents *are*
+  // searched, so the note must go away. Without this a regression that
+  // appended the line unconditionally would pass (g) and (h) both.
+  await freshSearch(evalIn, "mar");
+  ok(
+    await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "mar rows"),
+    "(i) setup: a three-character query answers, so the empty note below is a real answer and not a blank screen",
+  );
+  ok(
+    await evalIn(noteText) === "",
+    "(i) at three characters contents ARE searched, so the caveat is gone — the threshold is 3, not 'always'",
+  );
+
   await evalIn(`closeSearch()`);
 
   const locked1 = `${fx.dir}/locked1`;
