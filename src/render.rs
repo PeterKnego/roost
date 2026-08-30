@@ -1147,7 +1147,7 @@ pub fn workspace_page(
   <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body, git from:body"></span><span id="wtlabel"></span></button>
   {warn}
   {sharing_indicator}
-  <button id="searchbox" title="search this project (⇧ ⇧, or ctrl-shift-F / ⌘⇧F)">{SVG_SEARCH}<span class="hintline">Search files, contents, sessions</span><kbd>⇧ ⇧</kbd></button>
+  <button id="searchbox" title="search this project (ctrl-shift-F or ⌘⇧F; ⇧⇧ also works in some browsers)">{SVG_SEARCH}<span class="hintline">Search files, contents, sessions</span><kbd>⇧⌃F</kbd></button>
   <button id="projbtn" title="running projects">{SVG_DIAMOND}<span id="projcount"></span></button>
   <button id="bell" title="notifications (n)">{SVG_BELL}<span id="bellcount"></span></button>
   <button id="settings" title="settings — not implemented yet">{SVG_GEAR}</button>
