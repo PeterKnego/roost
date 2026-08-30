@@ -40,7 +40,7 @@ deno run -A tests/browser/changes.mjs    # the Changes pane and the header chip 
 deno run -A tests/browser/vanished.mjs   # a file deleted or moved out of the project from under an open tab: no empty editor, and unsaved work survives
 deno run -A tests/browser/renamed.mjs    # a file renamed *inside* the project: the tab follows it, with its unsaved work
 deno run -A tests/browser/closeproject.mjs # Close Project ends the shells *and* clears their tabs, so reopening shows no ghosts
-deno run -A tests/browser/search.mjs     # the ⇧⇧ search overlay, its results, and landing on a line
+deno run -A tests/browser/search.mjs     # the search overlay (⇧⌃F), its results, and landing on a line
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any

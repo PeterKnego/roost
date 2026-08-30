@@ -2,7 +2,7 @@
 
 Single Rust binary, no async runtime, thread per connection, hand-rolled
 HTTP (GET, plus two upload POSTs) with websockets, server-rendered HTML,
-plain JS with no framework. See [README.md](README.md) for what it does and
+plain JS with no framework. See [README.md](README.md1) for what it does and
 [docs/deploy.md](docs/deploy.md) for running and deploying it.
 
 ## Hard constraints
@@ -50,6 +50,23 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   empty is how work gets overwritten.
 - **Project storage keys are percent-encoded** (`karpie%2Fsrc`) while URLs keep
   readable slashes. Existing top-level keys must stay byte-for-byte identical.
+- **Search shares the tree's filter but is not the tree.** `search.rs` walks
+  with `projects::TreeFilter`, so `show_hidden` and the `hide` list mean the
+  same thing in both — but it additionally refuses `.git` and any directory
+  holding its own `.git`, *regardless of `show_hidden`*. The tree is lazy, one
+  fragment per level, entered deliberately; the walk is eager and enters
+  everything at once. Turning `show_hidden` on and searching once produced a
+  result list of `.git` internals and source triplicated across worktrees, and
+  the 20 000-file cap firing before the real files were reached. Making the two
+  "consistent" by dropping those refusals brings all of that back.
+- **A search that skipped something says so.** `Results` carries an `Outcome`
+  and two counters (`unreadable`, `skipped_nested`) rather than being a bare
+  list, and the client renders every one of them. The distinction that matters
+  is three-way, not two: *could not look* (an unreadable directory — a gap),
+  *chose not to look* (a nested checkout, contents below three characters — a
+  decision), and *looked and found nothing*. All three used to render as an
+  empty note, which is the same defect as the table below wearing a quieter
+  coat: no crash, no lost shell, and no way for the user to tell.
 - **Never hold a lock across blocking I/O.** This project has already shipped
   one deadlock that way (the global session registry held across a PTY write,
   which wedged every session in every project).
@@ -74,7 +91,11 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   project (`ide::MAX_PENDING`) — per project, not global, so one Claude in a
   loop cannot starve every other project — and 8 MB per websocket frame
   (`ide::MAX_FRAME_BYTES`), a coarse backstop against buffering an oversized
-  frame at all. It is not the real limit: *both* sides of an `openDiff` are
+  frame at all. Search is bounded by four at once (`search.rs`): 50 results per
+  category, 5 lines per file, 20 000 files examined, and a 1500 ms deadline —
+  constants, deliberately not config keys, and every one of them *names itself*
+  in the result when it fires. It is not the real limit: *both* sides of an
+  `openDiff` are
   bounded by the same 2 MB `MAX_FILE_BYTES` as any other file, since a
   proposal is retained for the tab's life and broadcast whole to every
   connected browser.

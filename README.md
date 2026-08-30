@@ -73,6 +73,27 @@ workspace change. `show_hidden = true` in a global or per-project
 `.resh/config.toml` sets what a workspace starts out doing — see
 [`docs/deploy.md`](docs/deploy.md#hidden-files-in-the-tree).
 
+**Project-wide search that says what it did not look at.** `⇧⌃F` (or `⌘⇧F`)
+opens an overlay over the current project: file paths, file contents, and live
+session names, in one list. Enter on a content hit opens the file *at the
+matched line* — and the same machinery finally makes a terminal link like
+`hub.rs:412` land on line 412 instead of at the top. The overlay is local to
+the browser that opened it; only the tab it opens mirrors.
+
+The search is a bounded walk, not an index and not a subprocess, so it has
+nothing to keep in sync and nothing to install. That makes what it *skipped*
+the interesting part, and it is reported rather than implied: an unreadable
+directory is counted, a cap that fired names itself ("more than 50 lines
+matched"), a query under three characters says contents were not searched at
+all, and the note says `no matches` only when there genuinely were none and
+nothing went wrong. `.git` is never walked, and a directory holding its own
+`.git` — a worktree, a submodule — is skipped and counted, because its files
+belong to another checkout.
+
+Double-tapping Shift opens it too, where the browser delivers a lone Shift
+keypress; some environments do not, which is why the header advertises the
+chord.
+
 **Claude Code sees the workspace.** A `claude` running in a terminal pane
 connects back to resh as its IDE: it can point at a file instead of pasting a
 path, and a file it proposes to change opens as a diff tab with Accept /

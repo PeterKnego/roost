@@ -24,7 +24,6 @@ answer, not a quiet vote for "unused".
 - fix popup UX+design (notifications, dialogs)
 - settings system, 
 - theme selector
-- all project search, ala Idea shift-shift. Opens new search dialog with results.
 - multi-wiew per project: now all windows synchronize to project. Could we have same project open with different tab layout / files open. So basically project could have different "views".
 
 ## UI / UX
@@ -180,8 +179,14 @@ four items below against each other, but it does mean the section is not
 speculative.
 
 1. Tab inserts an indent instead of moving focus; auto-indent on Enter.
-2. Line numbers, and go-to-line.
-3. In-buffer find. Browser find over a `textarea` barely works.
+2. Line numbers, and go-to-line. **Half done (2026-08-30).** Project search
+   landed the addressing half: `Event::RevealLine` scrolls both the editor and
+   a code preview to a given line, wrap-aware, and terminal links now land on
+   the line they name. What is still missing is the *visible* half — numbers in
+   a gutter, and a way to ask for a line rather than being sent to one.
+3. In-buffer find. Browser find over a `textarea` barely works. Project search
+   does not cover this: `⇧⌃F` searches files on disk, not the buffer you are
+   editing, and it cannot see unsaved changes at all.
 4. Bracket and quote auto-close.
 
 Items 1 and 4 are cheaper than they look: `code-input`, already vendored,
@@ -194,6 +199,53 @@ edits all misbehave — a corrupted file or a save that conflicts with itself,
 which no Rust test can see. Anything that normalises whitespace or newlines is
 disqualified, and any change here is tested through the real save path
 (`tests/browser/hledit.mjs`).
+
+## Search
+
+Shipped 2026-08-30 (`docs/superpowers/specs/2026-08-29-project-search-design.md`).
+Everything here was deferred *during* that work with a reason, or found by
+using it afterwards — so unlike most of this file, these entries have measured
+demand behind them.
+
+- **`.gitignore` awareness.** The spec ruled it out for v1 on the grounds that
+  `SKIP_DIRS` covers the common cases, and that held until it didn't: a
+  1.1 GB Chromium profile at `tests/browser/tmp/profile` — gitignored, so
+  `git status` never complained — exhausted the entire 20 000-file budget and
+  a search of this repo came back truncated. That instance was fixed by moving
+  the profile out of the checkout, but the general shape recurs for any
+  gitignored build output not named `target`. The walk reads the filesystem;
+  git reads the index; nothing reconciles them.
+- **A stronger selected-row highlight.** `.searchrow.sel` uses `--tool`
+  (`style.css`), which is `color-mix(--bg 90%, black)` — *darker* than the
+  panel's `--bg2`, and by only 18 RGB units. Measured from a screenshot,
+  because reading the CSS did not reveal it and I misread which row was
+  selected. `--tab-on` / `--tab-hover` exist one line above and are built for
+  exactly this. One line.
+- **⇧⇧ is unreliable and unadvertised.** On the deploy host's browser a lone
+  Shift keydown never reaches the page at all — a capture-phase listener on
+  `document` printed nothing, while `Ctrl+Shift+F` worked in the same tab.
+  Something between the keyboard and the browser eats standalone modifier
+  presses there. The binding is left in place (it works wherever it can be
+  tested and cannot false-fire) but the header advertises the chord. Do not
+  reopen this without first checking that a bare Shift produces a keydown.
+- **Two `handle` calls on the tab-reuse path.** `do_open_at_line` issues
+  `OpenTab` and then `SetMode` when the file is already open, so that path
+  bumps the version twice, broadcasts `State` twice, persists twice, and
+  re-reads the file for a `BufferText` that was just confirmed settled. Correct
+  but wasteful, on the feature's primary path. The best cleanup candidate here.
+- **Symbols.** The header hint used to promise "files, symbols, sessions" and
+  now promises "files, contents, sessions", because symbols need parsing or
+  ctags and neither was in scope. If they ever land, that string is where the
+  promise goes back.
+- **Cross-project search.** Declined for v1: it multiplies both walk cost and
+  the ranking question, and `/` already answers "where is that other project".
+- **`Query::contents == false` has no test**, and neither do the
+  `MAX_FILES_SCANNED` and `DEADLINE` caps — the latter two because provoking
+  them costs 20 000 files or a 1.5 s stall.
+- **The header advertises two shortcuts that do not exist.** `render.rs`'s bell
+  and refresh buttons say "notifications (n)" and "refresh (r)"; `grep` finds
+  no handler for either. Predates search; found while auditing which chords
+  were free.
 
 ## Terminals and sessions
 
