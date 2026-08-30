@@ -40,7 +40,7 @@ deno run -A tests/browser/changes.mjs    # the Changes pane and the header chip 
 deno run -A tests/browser/vanished.mjs   # a file deleted or moved out of the project from under an open tab: no empty editor, and unsaved work survives
 deno run -A tests/browser/renamed.mjs    # a file renamed *inside* the project: the tab follows it, with its unsaved work
 deno run -A tests/browser/closeproject.mjs # Close Project ends the shells *and* clears their tabs, so reopening shows no ghosts
-deno run -A tests/browser/search.mjs     # the ⇧⇧ search overlay, its results, and landing on a line — see below, this one has an open finding
+deno run -A tests/browser/search.mjs     # the ⇧⇧ search overlay, its results, and landing on a line
 ```
 
 Each scenario is its own file and its own resh, so they can be run in any
@@ -377,25 +377,30 @@ performed.
   primary guard because D could only ever be stated as a rate (3-of-3
   failing, 4-of-4 passing): it depended on a spawn landing inside a timing
   window, while F depends on a rule.
-- In `search.mjs`: reverting the `revealInEditor` fix (setting the selection
-  before calling `ta.focus()`, the order the code shipped in) fails section F
-  — Chromium only scrolls a focused textarea's selection into its scrollable
-  ancestor when the selection changes *after* the focus event, never before
-  it, which is opposite to what the code's own comment used to claim.
-  Section C's index-alignment assertion (clicking the second search-result
-  group's first row) was checked by deliberately reintroducing an off-by-one
-  — counting `.searchgroup` headers as rows before the click target — and it
-  fails on the captured `OpenAtLine` intent, not just on "some row is
-  selected". **This file does not pass clean.** Sections F and G still fail
-  after the fix above, and are left failing on purpose: F shows `revealLine`
-  can lose a race against `<code-input>`'s own asynchronous layout when a
-  file is opened and revealed by the same click (the host and the textarea
-  disagree about which of them is scrollable until that layout settles), and
-  G shows the already-open-and-focused case CLAUDE.md's own review flagged as
-  "most likely broken" is exactly that — `ta.focus()` on an already-focused
-  textarea fires no event, and nothing else moves the viewport. Both are real
-  product defects, diagnosed but not fixed; see this task's report for the
-  measurements. Do not "fix" this file by weakening either assertion.
+- In `search.mjs`: Section C's index-alignment assertion (clicking the second
+  search-result group's first row) was checked by deliberately reintroducing
+  an off-by-one — counting `.searchgroup` headers as rows before the click
+  target — and it fails on the captured `OpenAtLine` intent, not just on
+  "some row is selected". Sections F, G and H exercise `revealInEditor`'s
+  scroll, which measures the highlighted `<pre>`'s own rendered text rather
+  than delegating to the browser's native "focus a selected textarea and it
+  scrolls" behavior — that native behavior turned out to fire only on an
+  actual focus *transition*, never when the file is already open and
+  focused (section G's own case), and not reliably even on a fresh mount,
+  since `<code-input>`'s highlight can still be a frame behind. Neutering the
+  sync guard that detects an unsynced `<pre>` (`static/app.js`, the
+  `pre.textContent.length < ta.value.length` check inside `scrollEditorTo`)
+  fails 2 — F itself, plus H, which mounts the same file fresh on page two —
+  because a still-unhighlighted `<pre>` gets silently measured and reported
+  as a successful scroll instead of asked to retry. Making `scrollEditorTo`
+  return `true` unconditionally, with no real scroll performed, fails all 3
+  — F, G, and H — which is the guard against this file's own delta-based
+  assertions passing on an absent or unmoved editor: G asserts the *target
+  line is actually in the host's viewport*, not merely that some number
+  changed, and H binds `boxScrollTop()`'s result and requires it non-null
+  before comparing, since `Math.abs(null - x)` is a real, positive number in
+  JS and would otherwise satisfy a bare `> 5` check with no editor mounted
+  at all.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:

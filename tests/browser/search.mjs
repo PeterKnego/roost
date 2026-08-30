@@ -96,10 +96,13 @@ const editorMountedFor = (rel) => `(() => {
   return !!(c && c.querySelector("textarea.editor"));
 })()`;
 
-// The scrollable box a reveal actually moves: code-input's host when the
-// file is highlighted, the bare textarea otherwise (revealInEditor's own
-// `box` variable, mirrored here so a wrong scroll target fails this, not a
-// coincidence in the arithmetic).
+// The scrollable box a reveal actually moves: code-input's host (see
+// scrollEditorTo's own `host` in static/app.js) when the file is
+// highlighted, the bare textarea otherwise — mirrored here so a wrong scroll
+// target fails this, not a coincidence in the arithmetic. Returns null when
+// the pane or the editor isn't there at all; callers comparing this against
+// a baseline must check for null explicitly; Math.abs(null - x) is a real
+// (positive) number in JS, not a signal that something is missing.
 const boxScrollTop = (rel) => `(() => {
   const c = [...document.querySelectorAll(".pane .content")].find((c) => {
     const n = c.querySelector(".editwrap .path .rel");
@@ -110,6 +113,36 @@ const boxScrollTop = (rel) => `(() => {
   if (!ta) return null;
   const box = ta.closest("code-input") || ta;
   return box.scrollTop;
+})()`;
+
+// Whether the character at the start of `line` in `rel`'s *highlighted* file
+// is currently within its scrollable host's viewport — an absolute check,
+// not a before/after delta: a delta can tell "moved" from "didn't move" but
+// not "moved to the right place" from "moved to the top of the file", and a
+// regression that zeroes the scroll can still produce a large delta from a
+// nonzero starting point. Reuses app.js's own caretRect() (a bare top-level
+// function, reachable the same way send() and onEvent() are elsewhere in
+// this file) rather than reimplementing the walk, so this can't drift from
+// what scrollEditorTo() itself measures — and it returns null, not a
+// numeric guess, while the highlight is still catching up, exactly
+// mirroring scrollEditorTo's own "not yet" signal.
+const lineInView = (rel, line) => `(() => {
+  const c = [...document.querySelectorAll(".pane .content")].find((c) => {
+    const n = c.querySelector(".editwrap .path .rel");
+    return n && n.textContent === ${JSON.stringify(rel)};
+  });
+  if (!c) return null;
+  const ta = c.querySelector("textarea.editor");
+  if (!ta) return null;
+  const host = ta.closest("code-input");
+  const pre = host && host.querySelector("pre");
+  if (!pre || pre.textContent.length < ta.value.length) return null;
+  const lines = ta.value.split("\\n");
+  const upto = lines.slice(0, ${line} - 1).join("\\n").length + (${line} > 1 ? 1 : 0);
+  const rect = caretRect(pre, upto);
+  if (!rect) return null;
+  const hostRect = host.getBoundingClientRect();
+  return rect.top >= hostRect.top && rect.bottom <= hostRect.bottom;
 })()`;
 
 try {
@@ -325,7 +358,11 @@ try {
   })()`);
   ok(await evalIn(editorMountedFor("src/long.rs")) && await evalIn(`document.activeElement.classList.contains("editor")`),
      "setup: long.rs's textarea is open and focused before the search");
-  const beforeG = await evalIn(boxScrollTop("src/long.rs"));
+  // Line 245 is not in view yet: section F left the host showing roughly
+  // line 200, a third of the way down its viewport, and 245 is well past
+  // that window. Asserted as a setup fact, not assumed, so the assertion
+  // below can only pass because a scroll actually happened.
+  ok(!(await evalIn(lineInView("src/long.rs", 245))), "setup: line 245 is not yet in view");
   // ⇧⇧ dispatched on the focused textarea itself, exactly as a real keypress
   // would arrive, bubbling up to the document-level listener.
   await evalIn(`(() => {
@@ -342,15 +379,17 @@ try {
   await evalIn(`document.getElementById("searchoverlay")
     .dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }))`);
   // activateSearchRow calls closeSearch() first, which restores focus to the
-  // pre-overlay element — the SAME textarea, already focused, so no focus
-  // event fires and revealInEditor's focus()-driven native scroll has
-  // nothing to trigger it. Whether the viewport still moves rests entirely
-  // on setSelectionRange scrolling an already-focused textarea. This is the
-  // case with no arithmetic fallback at all.
+  // pre-overlay element — the SAME textarea, already focused, so ta.focus()
+  // fires no focus event here. scrollEditorTo() (static/app.js) does not
+  // need one: it measures the highlighted <pre>'s own rendered text and
+  // scrolls code-input's host directly, regardless of focus state. This
+  // section is what proves that — before scrollEditorTo existed, this case
+  // had no mechanism left to move the viewport at all once native
+  // focus-driven scrolling turned out to require an actual focus
+  // transition.
   ok(
-    await until(async () => Math.abs((await evalIn(boxScrollTop("src/long.rs"))) - beforeG) > 5, 15, "viewport moved"),
-    `searching a line near the end of an already-open, already-focused file still moves the viewport ` +
-      `(before=${beforeG})`,
+    await until(() => evalIn(lineInView("src/long.rs", 245)), 15, "line 245 in view"),
+    "searching a line near the end of an already-open, already-focused file scrolls it into view",
   );
 
   console.log("\nH. mirroring: a reveal on page one scrolls page two, without stealing its focus");
@@ -371,7 +410,16 @@ try {
   // point of a mirroring test.
   await page2.cmd("Page.bringToFront");
   ok(
-    await until(async () => Math.abs((await page2.evalIn(boxScrollTop("src/long.rs"))) - before2) > 5, 15, "page two scrolled"),
+    await until(async () => {
+      // Bound once and checked explicitly: boxScrollTop() returns null while
+      // the pane or its editor is missing (mountTab deletes and rebuilds
+      // .content on every remount, and the State this reveal broadcasts
+      // remounts page two's pane), and Math.abs(null - before2) is a real,
+      // positive number in JS — enough to satisfy a bare `> 5` check with no
+      // editor present on page two at all.
+      const v = await page2.evalIn(boxScrollTop("src/long.rs"));
+      return v !== null && Math.abs(v - before2) > 5;
+    }, 15, "page two scrolled"),
     "a reveal driven by page one scrolls page two's mirrored editor too",
   );
   ok(
@@ -379,7 +427,7 @@ try {
     "…without moving page two's focus — a real defect here triggers an autosave via the other user's blur listener",
   );
 
-  console.log("\nI. the honesty line, all four states");
+  console.log("\nI. the honesty line — every outcome renderSearch() can build a note from");
   async function isBlocked(path) {
     try { for await (const _e of Deno.readDir(path)) { /* just probing */ } return false; }
     catch { return true; }
@@ -390,6 +438,54 @@ try {
     await until(() => evalIn(`document.getElementById("searchnote").textContent === "no matches"`), 10, "no-matches note"),
     "(a) zero rows and nothing unreadable says exactly 'no matches'",
   );
+
+  // renderSearch() switches on `results.outcome.state` (static/app.js), and
+  // Failed/Truncated are real server outcomes (src/search.rs's Outcome enum)
+  // that no suite anywhere else can reach — the Rust side has its own tests
+  // for producing them, but turning them into this specific text is
+  // JS-only. Injected the same way section D's stale-reply check is: real
+  // rows are fetched and then cleared first, so the seq this lands on has no
+  // real request in flight to race against (the erase path never sends one),
+  // and every injection below reuses that same seq since nothing here types
+  // again to bump it.
+  await freshSearch(evalIn, "marker");
+  ok(
+    await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "warm seq"),
+    "setup: a real query round-trips before the injected ones, so the seq below is a real one",
+  );
+  await evalIn(setQuery(""));
+  ok(
+    await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length === 0`), 5, "cleared"),
+    "setup: cleared without sending a request, so the current seq has none in flight",
+  );
+  const honestySeq = await evalIn(`searchSeq`);
+
+  await evalIn(`onEvent({ t: "SearchResults", seq: ${JSON.stringify(honestySeq)}, results: {
+    files: [], lines: [], sessions: [], outcome: { state: "Failed", msg: "disk gremlins" }, unreadable: 0,
+  } })`);
+  ok(
+    await evalIn(`document.getElementById("searchnote").textContent`) === "search failed: disk gremlins",
+    "(d) a Failed outcome reports the server's own message, verbatim",
+  );
+
+  await evalIn(`onEvent({ t: "SearchResults", seq: ${JSON.stringify(honestySeq)}, results: {
+    files: [{ rel: "a.rs" }], lines: [], sessions: [], outcome: { state: "Truncated", reason: "stopped after 1500 ms" }, unreadable: 0,
+  } })`);
+  ok(
+    await evalIn(`document.getElementById("searchnote").textContent`) === "partial results — stopped after 1500 ms",
+    "(e) a Truncated outcome names the cap that fired, alongside the rows it did find",
+  );
+
+  // The case a regression that always appends *something* to the note would
+  // not be caught by any of the above: real rows, nothing wrong at all.
+  await evalIn(`onEvent({ t: "SearchResults", seq: ${JSON.stringify(honestySeq)}, results: {
+    files: [{ rel: "a.rs" }], lines: [], sessions: [], outcome: { state: "Complete" }, unreadable: 0,
+  } })`);
+  ok(
+    await evalIn(`document.getElementById("searchnote").textContent`) === "",
+    "(f) rows present and nothing wrong leaves the note empty, not padded with a spurious caveat",
+  );
+  await evalIn(`closeSearch()`);
 
   const locked1 = `${fx.dir}/locked1`;
   const locked2 = `${fx.dir}/locked2`;

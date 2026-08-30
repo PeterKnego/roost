@@ -3020,6 +3020,18 @@ let focusNextReveal = false;
 // something the user has moved past.
 let pendingReveal = null;
 let pendingRevealTimer = null;
+// Sweep-scoped, not per-pane: scrollEditorTo() runs once per still-unrevealed
+// pane in a single tryReveal() sweep, and without this a frame with k panes
+// stuck on an unsynced <pre> schedules k retries, each of which schedules k
+// more on its own next sweep — a runaway that a hung tab's unsaved buffers
+// would ride along with. Cleared at the top of tryReveal() so a retry that
+// is actually still needed after this sweep can still be scheduled once.
+let revealRetryScheduled = false;
+function scheduleRevealRetry() {
+  if (revealRetryScheduled) return;
+  revealRetryScheduled = true;
+  requestAnimationFrame(() => tryReveal());
+}
 
 /// Scroll whichever pane holds `rel` to `line`, and select it where the
 /// surface has a selection to give it (the editor). There is no flash here:
@@ -3075,6 +3087,7 @@ function revealLine(rel, line, focus) {
 /// fresh pendingReveal object, so this marker never blocks a genuinely new
 /// reveal of the same pane later.
 function tryReveal() {
+  revealRetryScheduled = false;
   if (!pendingReveal) return;
   const { rel, line, focus } = pendingReveal;
   let stillWaiting = false;
@@ -3203,7 +3216,7 @@ function scrollEditorTo(ta, offset) {
     // marked the pane done and cleared `pendingReveal` on the first, bogus
     // measurement, so the correct one a frame later never got a chance to run.
     if (pre.textContent.length < ta.value.length) {
-      requestAnimationFrame(() => tryReveal());
+      scheduleRevealRetry();
       return false;
     }
     const rect = caretRect(pre, offset);
@@ -3212,7 +3225,7 @@ function scrollEditorTo(ta, offset) {
       host.scrollTop = Math.max(0, host.scrollTop + (rect.top - hostRect.top) - host.clientHeight / 3);
       return true;
     }
-    requestAnimationFrame(() => tryReveal());
+    scheduleRevealRetry();
     return false;
   }
   // No <pre> to measure: a plain (unhighlighted) textarea, which is its own
