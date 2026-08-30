@@ -57,12 +57,22 @@ for (let i = 1; i <= 300; i++) previewLines.push(`// filler ${i}\n`);
 await Deno.writeTextFile(`${fx.roots}/proj/src/preview.rs`, previewLines.join(""));
 
 // A deliberately deep path, so the path column must truncate something. The
-// directory half is 38 characters against a 22ch column; the filename and
+// directory half is 38 characters against a 30ch column; the filename and
 // `:1` are 9 and must survive whole.
 await Deno.mkdir(`${fx.roots}/proj/src/very/deeply/nested/directory/tree`, { recursive: true });
 await Deno.writeTextFile(
   `${fx.roots}/proj/src/very/deeply/nested/directory/tree/deep.rs`,
   "let deepneedle = 1;\n",
+);
+
+// A basename ALONE wider than the 30ch column, with a short directory ("src/")
+// so almost the whole deficit falls on the filename rather than the
+// directory. Pins the bug a screenshot of the real repo caught: a
+// two-span .dir/.base row let a long filename overflow `.at` and get
+// clipped from the RIGHT — eating the line number, not the filename.
+await Deno.writeTextFile(
+  `${fx.roots}/proj/src/a-very-long-basename-that-exceeds-the-column-width.txt`,
+  "let longbase = 1;\n",
 );
 
 // One line with two occurrences of the query, and a second line so the
@@ -1084,30 +1094,61 @@ try {
   ok(new Set(lefts).size === 1,
      `every result's text starts at one x (saw ${JSON.stringify([...new Set(lefts)])})`);
 
-  // The long-path case: `.dir` may be clipped, `.base` may not — it carries
-  // the filename and the line number, the only parts that identify the hit.
+  // The long-path case: `.dir` may be clipped, `.name`/`.line` may not — the
+  // filename and line number are the only parts that identify the hit.
   await freshSearch(evalIn, "deepneedle");
-  await until(() => evalIn(`!!document.querySelector("#searchresults .searchrow .base")`), 10, "a deep row");
-  // `.base` is `flex: none`, so it is sized to its own content by
-  // definition — `base.scrollWidth <= base.clientWidth` can never be false,
-  // which is why the original brief's `baseWhole` probe (that comparison)
-  // was rejected: it cannot fail no matter what the CSS does. This checks
-  // geometry against `.at` (the fixed column) instead, plus the literal
-  // text, so a `.base` that overflowed the column would actually be caught.
+  await until(() => evalIn(`!!document.querySelector("#searchresults .searchrow .line")`), 10, "a deep row");
+  // `.name`/`.line` together are `deep.rs` + `:1`, nine characters, which
+  // fit even the old 22ch column whole — this fixture exercises DIRECTORY
+  // truncation only, not the basename-exceeds-the-column bug (that gets its
+  // own fixture and section below). `dir.scrollWidth > dir.clientWidth`
+  // proves the directory actually clipped, so this can't pass on a column
+  // wide enough that nothing truncates at all.
   const deep = JSON.parse(await evalIn(`(() => {
-    // Found by its .base text, not the first row: a future fixture that adds
-    // a Files-group hit ahead of the Contents-group row this assertion cares
-    // about would otherwise silently point it at the wrong row.
+    // Found by its composed .name+.line text, not the first row: a future
+    // fixture that adds a Files-group hit ahead of the Contents-group row
+    // this assertion cares about would otherwise silently point it at the
+    // wrong row.
     const r = [...document.querySelectorAll("#searchresults .searchrow")]
-      .find((row) => row.querySelector(".base")?.textContent === "deep.rs:1");
-    const at = r.querySelector(".at"), dir = r.querySelector(".dir"), base = r.querySelector(".base");
+      .find((row) => {
+        const n = row.querySelector(".name"), l = row.querySelector(".line");
+        return n && l && n.textContent + l.textContent === "deep.rs:1";
+      });
+    const at = r.querySelector(".at"), dir = r.querySelector(".dir"),
+          name = r.querySelector(".name"), line = r.querySelector(".line");
     return JSON.stringify({ dirClipped: dir.scrollWidth > dir.clientWidth,
-                            baseInside: base.getBoundingClientRect().right <= at.getBoundingClientRect().right + 1,
-                            baseText: base.textContent });
+                            lineInside: line.getBoundingClientRect().right <= at.getBoundingClientRect().right + 1,
+                            nameText: name.textContent, lineText: line.textContent });
   })()`));
   ok(deep.dirClipped, "the directory half of a long path is the part that truncates");
-  ok(deep.baseInside && deep.baseText === "deep.rs:1",
-     `the filename and line survive intact and inside the column (got "${deep.baseText}")`);
+  ok(deep.lineInside && deep.nameText === "deep.rs" && deep.lineText === ":1",
+     `the filename and line survive intact and inside the column (got "${deep.nameText}${deep.lineText}")`);
+
+  // The bug the screenshot caught: a basename ALONE wider than the column.
+  // The old two-span `.dir`/`.base` design gave `.base` `flex: none`, so a
+  // long filename simply overflowed `.at` and got clipped from the RIGHT by
+  // `.at`'s own `overflow: hidden` — eating the line number, not the
+  // filename, and leaving rows indistinguishable (`first` in this repo
+  // produced seven rows of the same clipped basename with no line number on
+  // any of them). `long.rs`'s directory ("src/") is short, so almost the
+  // entire deficit here falls on the filename — the case the deep.rs fixture
+  // above cannot reach, since its filename is only nine characters.
+  await freshSearch(evalIn, "longbase");
+  await until(() => evalIn(`!!document.querySelector("#searchresults .searchrow .line")`), 10, "a longbase row");
+  const longbase = JSON.parse(await evalIn(`(() => {
+    const r = [...document.querySelectorAll("#searchresults .searchrow")]
+      .find((row) => row.querySelector(".line")?.textContent === ":1"
+                   && row.querySelector(".name")?.textContent.includes("very-long-basename"));
+    const at = r.querySelector(".at"), name = r.querySelector(".name"), line = r.querySelector(".line");
+    return JSON.stringify({
+      nameClipped: name.scrollWidth > name.clientWidth,
+      lineText: line.textContent,
+      lineInside: line.getBoundingClientRect().right <= at.getBoundingClientRect().right + 1,
+    });
+  })()`));
+  ok(longbase.nameClipped, "setup: the filename alone is wider than the column and actually clips");
+  ok(longbase.lineText === ":1", `the line number survives — not eaten by the clipped filename (got "${longbase.lineText}")`);
+  ok(longbase.lineInside, "…and stays fully inside the column, not overflowing past it");
 }
 
 // --- the match is visible ---------------------------------------------------

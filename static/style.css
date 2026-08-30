@@ -803,18 +803,28 @@ body.searching header { position: relative; z-index: 41; }
 #searchresults { overflow-y: auto; }
 .searchgroup { padding: 4px 12px; font-size: 11px; color: var(--muted);
                border-bottom: 1px solid var(--border); }
-/* A fixed left column so every result's text starts at the same x. 22ch fits
-   `docs/backlog.md:299` whole; anything longer clips its directory half, which
-   is the half that can be lost without losing which hit this is. */
-.searchpanel { --search-at: 22ch; }
+/* A fixed left column so every result's text starts at the same x. 30ch fits
+   most real paths in this repo whole (`docs/backlog.md:299` and deeper);
+   anything longer sheds its directory first, per the .dir/.name/.line
+   flex-shrink order below. */
+.searchpanel { --search-at: 30ch; }
 .searchrow { display: grid; grid-template-columns: var(--search-at) 1fr; gap: 12px;
              align-items: baseline; padding: 3px 12px; cursor: pointer;
              font: 12px/1.6 var(--mono); }
 .searchrow.sel { background: var(--row-on); }
 .searchrow .at { display: flex; min-width: 0; white-space: nowrap; color: var(--muted);
                  overflow: hidden; }
-.searchrow .at .dir { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.searchrow .at .base { flex: none; }
+/* Three spans, not two: a lone `.base` that never shrank could still
+   overflow `.at` and get clipped from the right by `.at`'s own
+   `overflow: hidden` — losing the line number, the one thing this cell must
+   never lose (see searchRow's comment in app.js for the search-for-"first"
+   case this fixes). `.line` is `flex: none`, so it is never asked to
+   shrink. `.dir` carries a higher flex-shrink (3) than `.name` (1), so the
+   directory gives up space first and the filename only clips once the
+   directory has nothing left to give. */
+.searchrow .at .dir  { flex: 0 3 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.searchrow .at .name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.searchrow .at .line { flex: none; }
 .searchrow .what { min-width: 0; overflow: hidden; text-overflow: ellipsis;
                    white-space: nowrap; }
 .searchrow .hit { background: var(--hit); border-radius: 2px; }

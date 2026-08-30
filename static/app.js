@@ -3074,12 +3074,24 @@ function appendHighlighted(host, text, q) {
 /// rule at the top of this file is the whole defence, and it only holds if
 /// nothing here interpolates.
 ///
-/// The path is two spans rather than one so a long path ellipsises from the
-/// LEFT: `.dir` is allowed to shrink and clip, `.base` is not. CSS
-/// `text-overflow` only ever truncates the tail, and the tail of a path is
-/// the filename and the line number — the two parts that say which hit this
-/// is.
-function searchRow(dir, base) {
+/// The path is three spans, not two: a `dir:base` two-span version still
+/// ellipsises from the tail once the FILENAME alone is wider than the
+/// column — `.base` was `flex: none` so it never shrank, but `text-overflow`
+/// on a non-shrinking element does nothing, and the element simply overflows
+/// its cell and gets clipped by `.at`'s own `overflow: hidden`, eating the
+/// line number off the right end. A search for `first` in this repo showed
+/// exactly that: seven rows all reading the same clipped basename, no line
+/// number differentiating any of them — the one property this cell exists
+/// to preserve, gone.
+///
+/// So the line number is its own span, `flex: none`, and never shrinks. The
+/// filename is `.name`, and the directory `.dir` — both `flex: 0 _ auto`
+/// with `text-overflow: ellipsis` — but `.dir` carries a higher
+/// flex-shrink than `.name` (see style.css), so the directory gives up
+/// space first and the filename only starts clipping once the directory has
+/// nothing left to give. Priority, highest first: the line number, then the
+/// filename, then the directory.
+function searchRow(dir, name, line) {
   const row = document.createElement("div");
   row.className = "searchrow";
 
@@ -3088,10 +3100,13 @@ function searchRow(dir, base) {
   const d = document.createElement("span");
   d.className = "dir";
   d.textContent = dir;
-  const b = document.createElement("span");
-  b.className = "base";
-  b.textContent = base;
-  at.append(d, b);
+  const n = document.createElement("span");
+  n.className = "name";
+  n.textContent = name;
+  const ln = document.createElement("span");
+  ln.className = "line";
+  ln.textContent = line;
+  at.append(d, n, ln);
 
   const what = document.createElement("span");
   what.className = "what";
@@ -3144,7 +3159,7 @@ function renderSearch(results) {
     group(`Files (${results.files.length})`);
     for (const f of results.files) {
       const [dir, base] = splitPath(f.rel);
-      const row = searchRow(dir, "");
+      const row = searchRow(dir, "", "");
       appendHighlighted(row.querySelector(".what"), base, searchSentQuery);
       host.appendChild(row);
       searchRows.push({ kind: "file", rel: f.rel });
@@ -3153,7 +3168,7 @@ function renderSearch(results) {
   if (results.sessions.length) {
     group(`Sessions (${results.sessions.length})`);
     for (const s of results.sessions) {
-      const row = searchRow("terminal", "");
+      const row = searchRow("terminal", "", "");
       appendHighlighted(row.querySelector(".what"), s, searchSentQuery);
       host.appendChild(row);
       searchRows.push({ kind: "session", session: s });
@@ -3163,7 +3178,7 @@ function renderSearch(results) {
     group(`Contents (${results.lines.length})`);
     for (const l of results.lines) {
       const [dir, base] = splitPath(l.rel);
-      const row = searchRow(dir, `${base}:${l.line}`);
+      const row = searchRow(dir, base, `:${l.line}`);
       appendHighlighted(row.querySelector(".what"), l.text.trim(), searchSentQuery);
       host.appendChild(row);
       searchRows.push({ kind: "line", rel: l.rel, line: l.line });
