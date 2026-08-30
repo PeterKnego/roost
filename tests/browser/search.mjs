@@ -839,20 +839,25 @@ try {
 // not reasoned about:
 //
 // 1. `--hit: transparent;` — expected every onPlain/onSel ratio to read
-//    1.000 and fail. It did not: ALL PASS, with ratios like
+//    1.000 and fail. First pass: it did not — ALL PASS, with ratios like
 //    "darcula: the chip reads on a plain row (1.521)" up to
-//    "light: the chip reads on a plain row (19.726)". The chipProbe's canvas
-//    rasteriser (`clearRect` then a single `fillRect` of the resolved colour)
-//    reads a fully-transparent `background-color` as opaque black rather than
-//    as "matches whatever is behind it": `getImageData` on a zero-alpha fill
-//    over an already-transparent canvas comes back (0,0,0), so the probe ends
-//    up comparing black against each row's real background instead of
-//    detecting "no chip at all". A translucent-but-visible regression (a
-//    wrong percentage, a wrong hue) still has nonzero alpha and this probe
-//    does read that correctly — only the exact `transparent` value hits this
-//    blind spot. Left as-is because the brief specifies this exact revert
-//    verbatim and the probe is the brief's own code; flagged as a real gap in
-//    the report rather than silently "fixed" to match the prediction.
+//    "light: the chip reads on a plain row (19.726)". The chipProbe measured
+//    the chip's DECLARED colour via a canvas rasteriser (`clearRect` then a
+//    single `fillRect` of the resolved colour): a fully-transparent
+//    `background-color` came back as opaque black rather than "matches
+//    whatever is behind it", since `getImageData` on a zero-alpha fill over
+//    an already-transparent canvas returns (0,0,0) — so the probe compared
+//    black against each row's real background instead of detecting "no chip
+//    at all". That was the wrong thing to measure regardless: `--hit` is
+//    deliberately translucent, so its declared colour is never what anyone
+//    sees — only the composite of chip-over-surface is. Fixed by painting
+//    the surface first and the chip on top (`paint(...)` below) and measuring
+//    THAT pixel, which is exactly the surface colour — ratio 1.00 — when the
+//    chip is `transparent`. Re-run with the fixed probe: every assertion
+//    FAILed at ratio 1 (`darcula: the chip reads on a plain row (1)`, etc.,
+//    all five themes, both onPlain and onSel). Restored, re-run: ALL PASS,
+//    with real ratios of roughly 1.36-1.83 across the five themes — see the
+//    task report for the exact per-theme numbers.
 // 2. Chipping only the first occurrence per row (`break` right after
 //    appending the first `mark`) — expected "both occurrences on one line
 //    are chipped" to fail, and on the FIRST version of that assertion
@@ -930,24 +935,41 @@ try {
   // always has both a selected row and an unselected one to compare.
   const chipProbe = `(() => {
     const cx = document.createElement("canvas").getContext("2d", { willReadFrequently: true });
-    const srgb = (css) => { cx.clearRect(0,0,1,1); cx.fillStyle = "#000"; cx.fillStyle = css;
-      cx.fillRect(0,0,1,1); const d = cx.getImageData(0,0,1,1).data; return [d[0],d[1],d[2]]; };
+    // The chip is translucent by design, so its declared colour is not what
+    // anyone sees — what they see is the chip composited over the surface
+    // under it. Painting the surface first and the chip on top is that
+    // composite, and it is also what makes this probe falsifiable: with
+    // \`--hit: transparent\` the result is EXACTLY the surface and the ratio is
+    // 1.00. Measuring the declared colour instead read \`transparent\` as
+    // rgba(0,0,0,0) -> [0,0,0] -> opaque black, which scored a high contrast
+    // against a light panel and passed with the chip fully invisible.
+    const paint = (...cssLayers) => {
+      cx.clearRect(0, 0, 1, 1);
+      for (const css of cssLayers) { cx.fillStyle = css; cx.fillRect(0, 0, 1, 1); }
+      const d = cx.getImageData(0, 0, 1, 1).data;
+      return [d[0], d[1], d[2]];
+    };
     const lum = (c) => { const [r,g,b] = c.map(v => { v/=255; return v<=0.04045 ? v/12.92 : Math.pow((v+0.055)/1.055,2.4); });
       return 0.2126*r + 0.7152*g + 0.0722*b; };
     const ratio = (a,b) => (Math.max(a,b)+0.05)/(Math.min(a,b)+0.05);
-    const rows = [...document.querySelectorAll("#searchresults .searchrow")];
-    const sel = rows.find(r => r.classList.contains("sel"));
-    const plain = rows.find(r => !r.classList.contains("sel"));
-    const chipOf = (r) => lum(srgb(getComputedStyle(r.querySelector(".hit")).backgroundColor));
-    const rowOf = (r) => lum(srgb(getComputedStyle(r).backgroundColor));
-    const panel = lum(srgb(getComputedStyle(document.querySelector(".searchpanel")).backgroundColor));
-    // A row's own background is transparent until it is selected; fall back
-    // to the panel, or the ratio is computed against rgba(0,0,0,0) = black
-    // and passes for the wrong reason.
-    const bg = (r) => { const l = rowOf(r); return l === 0 && getComputedStyle(r).backgroundColor === "rgba(0, 0, 0, 0)" ? panel : l; };
+
+    const panelCss = getComputedStyle(document.querySelector(".searchpanel")).backgroundColor;
+    const hitCss   = getComputedStyle(document.querySelector("#searchresults .hit")).backgroundColor;
+    const selRow   = document.querySelector("#searchresults .searchrow.sel");
+    const selCss   = getComputedStyle(selRow).backgroundColor;
+
+    // The surface a plain row's chip sits on is just the panel (a row's own
+    // background is transparent until selected); the selected row's surface
+    // is its own background composited over the panel, since --row-on may
+    // itself be translucent.
+    const plainSurface = paint(panelCss);
+    const selSurface   = paint(panelCss, selCss);
+    const onPlain = ratio(lum(paint(panelCss, hitCss)),         lum(plainSurface));
+    const onSel   = ratio(lum(paint(panelCss, selCss, hitCss)), lum(selSurface));
+
     return JSON.stringify({
-      onPlain: +ratio(chipOf(plain), bg(plain)).toFixed(3),
-      onSel:   +ratio(chipOf(sel),   bg(sel)).toFixed(3),
+      onPlain: +onPlain.toFixed(3),
+      onSel:   +onSel.toFixed(3),
     });
   })()`;
 
