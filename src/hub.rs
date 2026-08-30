@@ -490,6 +490,17 @@ impl Hub {
             Intent::AnswerProposal { id, accept, text } => {
                 return self.do_answer_proposal(from, id.clone(), *accept, text.clone())
             }
+            // A search performs an unbounded filesystem walk, so `wsconn.rs`
+            // diverts it to a worker thread *before* this lock is taken —
+            // that divert is the entire enforcement of CLAUDE.md's "never
+            // hold a lock across blocking I/O" for this feature. Enumerated
+            // here rather than left to the `_` arm below so that reordering
+            // the divert, or adding a second dispatch site, fails loudly
+            // instead of quietly running the walk under the hub lock and
+            // stalling every browser on the project with nothing to say so.
+            Intent::Search { .. } => {
+                unreachable!("Search is diverted in wsconn before this lock is taken")
+            }
             _ => {}
         }
         // CloseTab removes the tab from `self.ws` inside `apply_layout`
