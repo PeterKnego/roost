@@ -120,6 +120,11 @@ async function realShift(page) {
 // forever after), and every check after the first stops being able to fail:
 // activeElement.id === "searchinput" would already be true before the
 // shortcut under test ever ran.
+// Returns whether the parking actually took: a bare `el.focus()` with the
+// return value discarded would make every "focuses the search field" check
+// below true-by-leftover the moment parking silently fails (a headless
+// quirk, `opacity:0` being treated as unfocusable, some future
+// `display:none`) — the exact failure this helper exists to rule out.
 const focusCatcher = `(() => {
   let el = document.getElementById("__focuscatcher");
   if (!el) {
@@ -129,16 +134,17 @@ const focusCatcher = `(() => {
     document.body.appendChild(el);
   }
   el.focus();
+  return document.activeElement === el;
 })()`;
 
 /// Two of them `gap` ms apart, answering whether the shortcut fired.
 ///
-/// Checked via FOCUS, not panel visibility: openSearch() now only shows the
-/// panel when the field already holds a query (`if (input.value)
-/// showSearchPanel()`), and this helper is used before any query exists, so
-/// checking `#searchoverlay.hidden` would fail even when the shortcut worked
-/// perfectly. Moving focus into the field is what openSearch() unconditionally
-/// does, so it is the contract this can actually check — and parking on
+/// Checked via FOCUS, not panel visibility: openSearch() only shows the
+/// panel when the field already holds a query, and this helper is used
+/// before any query exists, so checking `#searchoverlay.hidden` would fail
+/// even when the shortcut worked perfectly. Moving focus into the field is
+/// what openSearch() unconditionally does, so it is the contract this can
+/// actually check — and parking on
 /// `focusCatcher` first, rather than trusting wherever focus already was,
 /// is what keeps the check a real before/after delta instead of a question
 /// that was already true.
@@ -244,6 +250,12 @@ try {
   await until(() => page2.evalIn("ctrl && ctrl.readyState === 1 && !!state"), 30, "page two's app");
 
   console.log("A. the trigger");
+  // Every "focuses the search field" check below in this section depends on
+  // this actually working — asserted explicitly, once, rather than trusted
+  // silently at every one of its call sites, because a parking failure would
+  // otherwise make every one of them pass by leftover focus instead of by
+  // the trigger under test actually firing.
+  ok(await evalIn(focusCatcher), "setup: the focus catcher takes focus");
   // Real key events, through CDP's input pipeline — NOT
   // `document.dispatchEvent`. This section used to do the latter, which invokes
   // document listeners directly and therefore proves only that a listener is
@@ -278,8 +290,14 @@ try {
   await page1.cmd("Input.dispatchKeyEvent", { type: "keyUp", key: "H", code: "KeyH", windowsVirtualKeyCode: 72 });
   await realShift(page1);
   await sleep(150);
+  // Focus, not overlay.hidden: an empty field never shows the panel (see
+  // realShiftTwice above), so `overlay.hidden` is true here regardless of
+  // whether the reset logic under test actually ran — the assertion could
+  // not fail even with the bug back. Checking that focus never left the
+  // catcher is the same signal the trigger checks above use, and it is the
+  // one thing a false double-tap match would actually change.
   ok(
-    await evalIn(`document.getElementById("searchoverlay").hidden`),
+    await evalIn(`document.activeElement.id !== "searchinput"`),
     "an intervening keystroke resets the pending Shift, so ordinary typing cannot open it",
   );
 
@@ -318,7 +336,10 @@ try {
     !(await chordF(2)) && !(await chordF(4)),
     "…and the UNshifted chord is left alone, so ^F still reaches the shell",
   );
-  ok(await evalIn(`document.getElementById("searchoverlay").hidden`), "…and the overlay is still closed after that");
+  // Same reason as above: overlay.hidden is trivially true throughout this
+  // section, so it cannot tell "the unshifted chord did nothing" from "the
+  // unshifted chord fired and just didn't happen to show anything."
+  ok(await evalIn(`document.activeElement.id !== "searchinput"`), "…and focus never moved to the field from that either");
 
   console.log("\nB. Escape restores focus");
   await evalIn(`(() => {
@@ -329,8 +350,19 @@ try {
   })()`);
   const focusedBefore = await evalIn(`document.activeElement.id === "__focusprobe"`);
   ok(focusedBefore, "setup: the probe element holds focus before the overlay opens");
+  // A real, non-empty query first: openSearch() only shows the panel when
+  // the field already holds one (an empty-query open, which `shiftTwice`
+  // alone would produce, never does — see realShiftTwice in section A). Left
+  // out, every `overlay.hidden` check below this point stays trivially true
+  // for the rest of the section regardless of whether Escape or closeSearch
+  // do anything at all — which is how the stranded-modal bug this section
+  // exists to catch could be fully reintroduced (the keydown handler
+  // rescoped to `#searchoverlay`) and every assertion here would still pass:
+  // an overlay that was never genuinely opened can't fail to close.
+  await evalIn(`document.getElementById("searchinput").value = "escapeprobe"`);
   await evalIn(shiftTwice);
   ok(await evalIn(`document.activeElement.id === "searchinput"`), "opening moves focus into the search box");
+  ok(await evalIn(`!document.getElementById("searchoverlay").hidden`), "setup: the panel is genuinely open, not just focused");
   await evalIn(`document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
   ok(await evalIn(`document.getElementById("searchoverlay").hidden`), "Escape closes the overlay");
   ok(
@@ -345,8 +377,12 @@ try {
   // the modal was stranded open. Reproduced here by blurring rather than by
   // a synthetic Tab, because a dispatched KeyboardEvent does not move focus —
   // a Tab-based version of this test would pass with the bug fully present.
+  // The query from above is still sitting in the field — openSearch never
+  // clears it — so this reopen is genuine too, for the same reason the first
+  // half needed one.
   await evalIn(shiftTwice);
   ok(await evalIn(`document.activeElement.id === "searchinput"`), "setup: the overlay is open with focus in its input");
+  ok(await evalIn(`!document.getElementById("searchoverlay").hidden`), "setup: genuinely open, not just focused");
   await evalIn(`document.getElementById("searchinput").blur()`);
   ok(
     await evalIn(`!document.getElementById("searchoverlay").contains(document.activeElement)`),
@@ -379,7 +415,12 @@ try {
 
   // The assertion that catches the stacking bug behaviourally: with the
   // backdrop above the header, the point at the centre of the field belongs to
-  // #searchoverlay and the user types into a dimmed control.
+  // #searchoverlay and the user types into a dimmed control. Verified
+  // falsifiable directly: deleting `body.searching header { position:
+  // relative; z-index: 41; }` from static/style.css and re-running this file
+  // FAILs exactly this assertion (element at that point is #searchoverlay),
+  // with every other assertion in the suite still passing; restoring the
+  // rule brings it back to ALL PASS.
   ok(await evalIn(`(() => {
       const r = document.getElementById("searchinput").getBoundingClientRect();
       const el = document.elementFromPoint(r.left + r.width/2, r.top + r.height/2);
@@ -387,11 +428,25 @@ try {
     })()`),
      "the field is above the backdrop, not behind it");
 
+  // "below the header" alone doesn't tell this layout apart from the old
+  // one: the old overlay ALSO centred .searchpanel in the full viewport
+  // (`#searchoverlay { justify-content: center }` on a full-viewport-inset
+  // flex box) and its `margin-top: 12vh` put it below the header too, at any
+  // normal viewport height — so `p.top >= header.bottom` is true either way.
+  // What this task actually changed, measurably: the panel got wider
+  // (880px, up from 720px) and pinned tight under the header instead of
+  // floating ~12vh down. Horizontal centre-on-the-field was considered and
+  // dropped — measured in a real browser, #searchbox itself is NOT centred
+  // on the viewport (its margin:auto splits whatever space the header's
+  // asymmetric left/right button groups leave over, a pre-existing property
+  // of the header unrelated to this task), so a field-centred check would
+  // fail against the correct implementation, not just the broken one.
   ok(await evalIn(`(() => {
       const p = document.querySelector(".searchpanel").getBoundingClientRect();
-      return p.top >= document.querySelector("header").getBoundingClientRect().bottom - 1;
+      const h = document.querySelector("header").getBoundingClientRect();
+      return p.width > 800 && (p.top - h.bottom) < 10;
     })()`),
-     "the panel hangs below the header rather than over it");
+     "the panel is the wider, header-anchored one this task introduces — not the old floating, 12vh-down modal");
 
   await evalIn(`(() => { const i = document.getElementById("searchinput");
     i.value = ""; i.dispatchEvent(new Event("input",{bubbles:true})); return 1; })()`);
@@ -500,6 +555,52 @@ try {
     return document.querySelectorAll("#searchresults .searchrow").length;
   })()`);
   ok(afterStaleReply === 0, "a stale reply for the query the user already cleared is ignored, not repainted");
+  await evalIn(`closeSearch()`);
+
+  console.log("\nD2. reopening with a leftover query never disagrees with its own row list");
+  // The bug this guards: the query is deliberately NOT cleared on close (so
+  // refining after a miss doesn't mean retyping), but hideSearchPanel() used
+  // to clear searchRows and leave #searchresults still painted with the
+  // outgoing query's rows. Reopening then showed those stale rows while
+  // searchRows was empty, so ↑/↓/Enter looked their target up via
+  // activateSearchRow's `const r = searchRows[i]; if (!r) return;` and
+  // silently did nothing — a dead keyboard — until the user typed again and
+  // a fresh render resynced the two. Verified falsifiable directly: reverting
+  // hideSearchPanel() to `searchRows = [];` (dropping its `renderSearch(null)`
+  // call) and re-running this file FAILs the assertion below with "rendered
+  // rows: 1 searchRows: 0" (this fixture's freshSearch(evalIn, "marker")
+  // leaves exactly one row painted), while every other assertion in the
+  // suite still passes.
+  await freshSearch(evalIn, "marker");
+  ok(
+    await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "marker rows before close"),
+    "setup: a real query has rendered rows before it's closed",
+  );
+  await evalIn(`closeSearch()`);
+  ok(
+    await evalIn(`document.getElementById("searchoverlay").hidden`),
+    "setup: closed, with the query still sitting in the field (openSearch never clears it)",
+  );
+  // No wait and no keystroke between the reopen and the check: this has to
+  // catch the state right after openSearch() returns, before any debounce
+  // could quietly resync the two on its own.
+  await evalIn(`openSearch()`);
+  const rowsAtReopen = await evalIn(`document.querySelectorAll("#searchresults .searchrow").length`);
+  const searchRowsAtReopen = await evalIn(`searchRows.length`);
+  ok(
+    rowsAtReopen === searchRowsAtReopen,
+    `the rendered row count matches searchRows the instant the panel reopens, not just once the next keystroke lands ` +
+      `(rendered rows: ${rowsAtReopen} searchRows: ${searchRowsAtReopen})`,
+  );
+  // The other half of the fix: openSearch() re-issues the leftover query
+  // (via a dispatched `input` event, not a direct call) rather than just
+  // revealing an empty list forever. Without that half, the panel above
+  // would legitimately stay at 0/0 — consistent, but consistently wrong: a
+  // box full of text with no way to ever see results for it again.
+  ok(
+    await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "rows return after reopen"),
+    "reopening with a leftover query re-issues it — the panel refills on its own, without the user retyping",
+  );
   await evalIn(`closeSearch()`);
 
   console.log("\nE. Preview scroll targets .content, not the <pre>");

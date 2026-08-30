@@ -2859,7 +2859,15 @@ function hideSearchPanel() {
   if (!ov || ov.hidden) return;
   ov.hidden = true;
   document.body.classList.remove("searching");
-  searchRows = [];
+  // Repaints empty rather than just clearing the searchRows array: the query
+  // is NOT cleared from the field on close (see openSearch below), so a
+  // later reopen can find #searchresults still holding THIS query's rendered
+  // rows while searchRows says there are none. That disagreement is not
+  // cosmetic — activateSearchRow looks a row up by index in searchRows, so
+  // ↑/↓/Enter against the stale DOM silently do nothing (`if (!r) return;`)
+  // until the user types again. renderSearch(null) is what the erase path a
+  // few lines below already uses to keep the two in sync; hiding must too.
+  renderSearch(null);
   // Dismissing mid-debounce must not let the pending Search still fire: its
   // reply would repopulate searchRows and the (now hidden) result list from a
   // query the user no longer has open.
@@ -2881,7 +2889,14 @@ function openSearch(returnFocus) {
   }
   input.focus();
   input.select();
-  if (input.value) showSearchPanel();
+  // Re-issued, not just revealed: hideSearchPanel() above always leaves
+  // searchRows (and the list) empty, so a bare showSearchPanel() here would
+  // show a field full of text over an empty list until the user's next
+  // keystroke — worse than the old design, where reopening at least cleared
+  // the box to match. Dispatching `input` routes through the field's own
+  // handler so this inherits its debounce, its searchSeq bump, and its
+  // disconnected-socket branch instead of duplicating any of that here.
+  if (input.value) input.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 function closeSearch() {
