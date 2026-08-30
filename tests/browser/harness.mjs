@@ -41,17 +41,43 @@ export async function freePort() {
 /// command line, which contains the pattern as an argument, so it kills the
 /// caller. (Observed three times while developing this harness.) Reading
 /// /proc directly and skipping our own pid has no such hazard.
+/// SIGTERM, then SIGKILL whatever is still standing.
+///
+/// Two `/tmp/resh-browser-*` trees were once found abandoned on a live host,
+/// one of them still holding a running `dtach` master and its login shell.
+/// Whether cleanup ran and failed, or never ran at all, was not established
+/// after the fact — a later TERM killed that same process first try, so it was
+/// not simply TERM-proof. The escalation is therefore a backstop rather than a
+/// diagnosis, and the reported (not swallowed) removal failure in `cleanup`
+/// below is what will actually name the cause next time.
+///
+/// Worth the paranoia either way: these tests run on whatever machine is at
+/// hand, which on this project has been somebody's live box with real shells
+/// on it.
 export async function killByCmdline(needle) {
-  let killed = 0;
-  for await (const e of Deno.readDir("/proc")) {
-    const pid = Number(e.name);
-    if (!Number.isInteger(pid) || pid === Deno.pid) continue;
-    let cmd;
-    try { cmd = await Deno.readTextFile(`/proc/${pid}/cmdline`); } catch { continue; }
-    if (!cmd.replaceAll("\0", " ").includes(needle)) continue;
-    try { Deno.kill(pid, "SIGTERM"); killed++; } catch { /* already gone */ }
+  const matching = async () => {
+    const pids = [];
+    for await (const e of Deno.readDir("/proc")) {
+      const pid = Number(e.name);
+      if (!Number.isInteger(pid) || pid === Deno.pid) continue;
+      let cmd;
+      try { cmd = await Deno.readTextFile(`/proc/${pid}/cmdline`); } catch { continue; }
+      if (cmd.replaceAll("\0", " ").includes(needle)) pids.push(pid);
+    }
+    return pids;
+  };
+
+  const first = await matching();
+  for (const pid of first) {
+    try { Deno.kill(pid, "SIGTERM"); } catch { /* already gone */ }
   }
-  return killed;
+  if (!first.length) return 0;
+
+  await sleep(400);
+  for (const pid of await matching()) {
+    try { Deno.kill(pid, "SIGKILL"); } catch { /* took the TERM after all */ }
+  }
+  return first.length;
 }
 
 // ---------------------------------------------------------------- browser
@@ -320,7 +346,15 @@ export async function fixture({ autosave = true } = {}) {
       // our state dir; nothing else on the machine can match that path.
       await killByCmdline(stateDir);
       await sleep(300);
-      try { await Deno.remove(base, { recursive: true }); } catch {}
+      // Reported, not swallowed. A bare `catch {}` here is how two abandoned
+      // /tmp/resh-browser-* trees and a live shell went unnoticed: the removal
+      // failed every run and said nothing, so the only symptom was litter
+      // nobody was looking for. A cleanup that cannot clean up has to say so.
+      try {
+        await Deno.remove(base, { recursive: true });
+      } catch (e) {
+        console.log(`    (cleanup: ${base} not removed — ${e.message})`);
+      }
     },
   };
 }
