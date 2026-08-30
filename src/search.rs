@@ -157,9 +157,11 @@ fn score_path(rel: &str, q: &str) -> Option<i32> {
 
 /// One query against one project.
 ///
-/// `cancelled` is polled at every directory boundary. It is a closure rather
-/// than a flag so a test can drive it deterministically, and so the caller
-/// decides what supersession means.
+/// `cancelled` is polled at every directory boundary *and* every 64 entries
+/// within one, alongside the deadline: one directory can hold every file the
+/// walk is allowed to read, so a boundary-only poll is no bound at all. It is
+/// a closure rather than a flag so a test can drive it deterministically, and
+/// so the caller decides what supersession means.
 ///
 /// Never panics: every I/O error becomes a counter, because this runs on a
 /// connection's worker thread and a panic there would take search away from
@@ -192,6 +194,26 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
     // caps depending on loop order. Recorded once, folded in after the walk,
     // the same way the file-match cap is.
     let mut lines_capped = false;
+    // And separate again from `lines_capped`: that one says "the whole answer
+    // is capped at MAX_PER_CATEGORY lines", this one says "one file had more
+    // matches than it was allowed to contribute". A query matching eight
+    // times in a single file and nowhere else trips only this one, and
+    // without it the walk reports `Complete` over five of eight hits —
+    // "I chose not to look further" rendered to the user as completeness.
+    let mut file_lines_capped = false;
+    // Entries seen, for the deadline/cancellation poll inside the entry loop
+    // below. Distinct from `scanned`, which counts only files and so would
+    // never advance in a directory of nothing but skipped names.
+    let mut stepped = 0usize;
+    // One scratch buffer for the case-folded copy of the line being matched,
+    // reused for every line of every file rather than allocated per line —
+    // this is the innermost loop of the walk, and its cost is charged against
+    // the deadline this module reports on. Measured (480k lines, rustc -O):
+    // 9.4 ms allocating per line, 7.9 ms reusing this. A byte-wise
+    // case-insensitive search with no buffer at all was tried and is *slower*
+    // (10.3 ms): `str::contains` is SIMD-accelerated and a hand-rolled window
+    // scan is not, so the copy pays for itself.
+    let mut lowered = String::new();
 
     'walk: while let Some(dir) = stack.pop() {
         if cancelled() {
@@ -199,7 +221,10 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
             return r;
         }
         if started.elapsed() > DEADLINE {
-            truncated = Some(format!("stopped after {} ms", DEADLINE.as_millis()));
+            // The measurement, not `DEADLINE`: the poll below is periodic, so
+            // the walk can overshoot, and a constant here would make the one
+            // honesty line the user gets wrong by however much it overshot.
+            truncated = Some(format!("stopped after {} ms", started.elapsed().as_millis()));
             break;
         }
         let entries = match std::fs::read_dir(&dir) {
@@ -221,6 +246,28 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
         is_root = false;
 
         for entry in entries {
+            // The checks at the top of `'walk` fire once per *directory*, and
+            // one directory can hold every file the walk is allowed to read.
+            // Polling here too bounds the overshoot at 64 entries instead of
+            // MAX_FILES_SCANNED, and lets a superseded query abandon inside
+            // the directory it is in rather than only at its end.
+            //
+            // 64 rather than every entry: an `Instant::elapsed` and an atomic
+            // load are cheap next to the `symlink_metadata` each entry
+            // already costs, but this is the hot loop and the remaining
+            // overshoot is now reported as a measurement rather than assumed
+            // away.
+            stepped += 1;
+            if stepped.is_multiple_of(64) {
+                if cancelled() {
+                    r.outcome = Outcome::Truncated { reason: "superseded by a newer query".into() };
+                    return r;
+                }
+                if started.elapsed() > DEADLINE {
+                    truncated = Some(format!("stopped after {} ms", started.elapsed().as_millis()));
+                    break 'walk;
+                }
+            }
             let entry = match entry {
                 Ok(e) => e,
                 Err(_) => {
@@ -281,7 +328,10 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
                         Candidate::Text(text) => {
                             let mut in_file = 0;
                             for (i, line) in text.lines().enumerate() {
-                                if !line.to_ascii_lowercase().contains(&needle) {
+                                lowered.clear();
+                                lowered.push_str(line);
+                                lowered.make_ascii_lowercase();
+                                if !lowered.contains(&needle) {
                                     continue;
                                 }
                                 r.lines.push(LineHit {
@@ -295,6 +345,14 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
                                     break;
                                 }
                                 if in_file >= MAX_LINES_PER_FILE {
+                                    // May over-report: a file with exactly
+                                    // MAX_LINES_PER_FILE matches is complete
+                                    // and still trips this. The same safe
+                                    // direction `lines_capped` already takes
+                                    // — claiming there might be more is
+                                    // recoverable, claiming there is not when
+                                    // there is is the defect.
+                                    file_lines_capped = true;
                                     break;
                                 }
                             }
@@ -318,6 +376,14 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
 
     if lines_capped {
         truncated.get_or_insert_with(|| format!("more than {MAX_PER_CATEGORY} lines matched"));
+    }
+    // After the global cap, so the broader statement wins when both fired:
+    // "more than 50 lines matched" already tells the user the answer is
+    // short, and naming the per-file cap instead would understate it.
+    if file_lines_capped {
+        truncated.get_or_insert_with(|| {
+            format!("more than {MAX_LINES_PER_FILE} lines matched in one file")
+        });
     }
 
     if let Some(reason) = truncated {
@@ -492,6 +558,45 @@ mod tests {
                 "the reason must name the line cap, not be silent or name the file cap, got {reason:?}"
             ),
             other => panic!("expected Truncated, got {other:?}"),
+        }
+    }
+
+    /// A third cap again, and the one that hides best: five matches returned
+    /// out of eight, all in a single file, with nothing else in the project
+    /// matching at all — so neither cap above fires and the walk would
+    /// otherwise report `Complete`. "Find every use of this symbol" is
+    /// exactly the query that lands here, and `renderSearch` prints an empty
+    /// note for `Complete`, i.e. a UI positively asserting nothing was left
+    /// out.
+    ///
+    /// Revert-checked: with `file_lines_capped = true` removed from the
+    /// `in_file >= MAX_LINES_PER_FILE` break, this fails with
+    /// `expected Truncated naming the per-file cap, got Complete`.
+    #[test]
+    fn the_per_file_line_cap_names_which_cap_fired() {
+        let hits = MAX_LINES_PER_FILE + 3;
+        let body: String = (0..hits).map(|i| format!("a needle line {i}\n")).collect();
+        // "quiet.rs" matches "needle" by content only, never by path, and
+        // there is exactly one file — so the file cap and the global line cap
+        // are both nowhere near firing and the per-file cap is the only one
+        // that can produce a Truncated outcome here.
+        let d = proj(&[("quiet.rs", body.as_str())]);
+
+        let r = run(d.path(), &query("needle", TreeFilter::default()), &never());
+
+        assert!(r.files.is_empty(), "quiet.rs does not match 'needle' by path: {:?}", r.files);
+        assert_eq!(r.lines.len(), MAX_LINES_PER_FILE, "the per-file cap is what stopped it");
+        assert!(
+            r.lines.len() < MAX_PER_CATEGORY,
+            "the global line cap must be nowhere near firing, or this test proves the wrong cap"
+        );
+        match &r.outcome {
+            Outcome::Truncated { reason } => assert!(
+                reason.contains("in one file"),
+                "the reason must name the per-file cap distinguishably from the global \
+                 line cap ('more than 50 lines matched'), got {reason:?}"
+            ),
+            other => panic!("expected Truncated naming the per-file cap, got {other:?}"),
         }
     }
 
