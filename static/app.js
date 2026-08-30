@@ -3082,8 +3082,18 @@ function tryReveal() {
     if (content._revealedFor === pendingReveal) continue;
     const ta = content.querySelector("textarea.editor");
     if (ta && editorRel(content) === rel) {
-      revealInEditor(ta, line, focus);
-      content._revealedFor = pendingReveal;
+      // A highlighted file's <pre> can still be one animation frame behind a
+      // fresh mount (see scrollEditorTo's doc comment) — revealInEditor
+      // reports that back rather than silently landing wherever a stale
+      // layout happened to be, and schedules its own retry. Leaving
+      // _revealedFor unset here (and stillWaiting true) means the 4s banner
+      // in revealLine() still fires if that retry never lands, instead of
+      // this pane sitting unrevealed forever with no visible sign of it.
+      if (revealInEditor(ta, line, focus)) {
+        content._revealedFor = pendingReveal;
+      } else {
+        stillWaiting = true;
+      }
       continue;
     }
     if (!matchesRel(content, rel)) continue;
@@ -3108,60 +3118,157 @@ function tryReveal() {
   }
 }
 
-/// Exact only when the native scroll below actually fires. `.editor` sets no
-/// white-space override (static/style.css) so a plain textarea soft-wraps by
-/// default, and `.editwrap code-input` explicitly sets `white-space:
-/// pre-wrap`, which the vendor stylesheet's `code-input textarea, code-input
-/// pre { white-space: inherit }` pushes onto both of its layers — so in
-/// *both* editor shapes one logical line is not reliably one visual row,
-/// unlike the preview's <pre> (see revealInPreview for why that one is
-/// exact). A pixel formula built on `(line-1)*lh` alone undercounts by one
-/// `lh` for every wrapped row above the target, which can be tens of rows in
-/// a real source file and leave the target off screen entirely.
+/// Sets the selection and, if `focus` is set, steals focus — then scrolls
+/// via scrollEditorTo(), reporting back whether that scroll actually landed
+/// (see there) so tryReveal() knows whether to retry rather than mark this
+/// pane done.
+///
+/// Selection and focus are unconditional and immediate: neither depends on
+/// any layout being settled, so there is nothing to gain by deferring them,
+/// and setting them right away means the caret is in the right place even in
+/// the one frame before a highlighted file's scroll catches up.
+///
+/// Native focus-driven scrolling used to be this function's only mechanism
+/// for the focused case, on the theory that focusing a textarea with an
+/// active selection makes the browser scroll it into view for free. Measured
+/// two ways this turned out not to hold: it only fires on an actual focus
+/// *transition* (searching within a file that is already open and focused —
+/// a real, common case, not an edge case — calls focus() on an element that
+/// is already document.activeElement, so no such event exists to trigger
+/// it), and even when a transition does happen, a freshly mounted highlighted
+/// file's <pre> may not have finished laying out yet (see scrollEditorTo).
+/// scrollEditorTo replaces it with something that does not depend on focus
+/// at all.
 function revealInEditor(ta, line, focus) {
   const lines = ta.value.split("\n");
   const upto = lines.slice(0, Math.max(0, line - 1)).join("\n").length + (line > 1 ? 1 : 0);
   const end = upto + (lines[line - 1] || "").length;
+  ta.setSelectionRange(upto, end);
+  if (focus) ta.focus();
+  return scrollEditorTo(ta, upto);
+}
 
-  // The wrap-blind approximation, run unconditionally rather than only for a
-  // mirroring client. Measured directly (see the focus branch below): the
-  // native scroll only ever fires on an actual focus *transition*, so
-  // searching within a file that is already open and focused — a real,
-  // common case, not an edge case — calls ta.focus() on an element that is
-  // already document.activeElement. No focus event fires, nothing native
-  // happens, and without this the viewport would not move at all. This
-  // approximation is strictly worse than the exact placement below when that
-  // fires, and strictly better than nothing when it's all there is.
-  const box = ta.closest("code-input") || ta;
-  const extra = box === ta ? 0 : ta.offsetTop;
+/// Scrolls `ta`'s scrollable ancestor so the character at `offset` is
+/// visible, roughly a third of the way down. Returns whether it actually
+/// could — false means "try again next frame", not "gave up".
+///
+/// Two branches, not one, because only a highlighted file has something to
+/// measure. `.editor` sets no white-space override (static/style.css) so a
+/// plain textarea soft-wraps by default, and `.editwrap code-input`
+/// explicitly sets `white-space: pre-wrap`, which the vendor stylesheet's
+/// `code-input textarea, code-input pre { white-space: inherit }` pushes
+/// onto both of its layers — so in *both* editor shapes one logical line is
+/// not reliably one visual row, unlike the preview's <pre> (see
+/// revealInPreview for why that one is exact).
+///
+/// For a highlighted file, code-input's own host (the `<code-input>` element
+/// itself) has a `<pre>` beneath the textarea as a light-DOM child — not
+/// shadow DOM; code-input.min.js never calls attachShadow — containing the
+/// same text, wrapped identically (both layers share the same white-space
+/// rule and width). Walking that `<pre>`'s rendered text to `offset` and
+/// measuring a collapsed Range there answers the wrapping question exactly,
+/// instead of guessing at visual rows from a character count the way the
+/// plain-textarea branch below has to; `getBoundingClientRect()` forces a
+/// synchronous layout, so the measurement is never stale relative to
+/// whatever is currently in the DOM.
+///
+/// "Currently in the DOM" is the catch: code-input highlights on the *next*
+/// animation frame after a value is set (its scheduleHighlight() only flips
+/// a flag; the actual `<pre>` update happens in its own perpetual
+/// requestAnimationFrame loop, confirmed by reading code-input.min.js), so a
+/// reveal landing in the same tick as a fresh mount can walk a `<pre>` that
+/// has no text in it yet — caretRect() returns null. Scheduling a retry
+/// through tryReveal() itself, not a closure over this specific pane, means
+/// a pane that closed or moved on to a different file before the retry fires
+/// re-resolves cleanly (tryReveal re-checks `rel` and mounted elements from
+/// scratch) instead of scrolling stale state. revealLine()'s 4-second banner
+/// is still the backstop if code-input's own frame loop never runs — the
+/// tab closed, say.
+function scrollEditorTo(ta, offset) {
+  const host = ta.closest("code-input");
+  const pre = host && host.querySelector("pre");
+  if (pre) {
+    // code-input's own update() appends one "\n" to the value before
+    // highlighting, so a fully-synced <pre> has exactly one more character
+    // than the textarea. Anything short of that means a fresh mount's
+    // highlight genuinely has not landed yet, and caretRect() cannot tell
+    // that apart from "the target is the very last character of the file" —
+    // both look like "the walk ran out of text before reaching offset".
+    // Checked here, independently of the walk, with a signal caretRect has
+    // no way to get right on its own: without it, a reveal that lands in
+    // the same tick as a fresh mount walks a <pre> holding only its initial
+    // near-empty state, silently measures *that*, and reports success at
+    // the wrong position instead of asking to be retried — which is exactly
+    // how this looked from the outside before this check existed: `tryReveal`
+    // marked the pane done and cleared `pendingReveal` on the first, bogus
+    // measurement, so the correct one a frame later never got a chance to run.
+    if (pre.textContent.length < ta.value.length) {
+      requestAnimationFrame(() => tryReveal());
+      return false;
+    }
+    const rect = caretRect(pre, offset);
+    if (rect && rect.height > 0) {
+      const hostRect = host.getBoundingClientRect();
+      host.scrollTop = Math.max(0, host.scrollTop + (rect.top - hostRect.top) - host.clientHeight / 3);
+      return true;
+    }
+    requestAnimationFrame(() => tryReveal());
+    return false;
+  }
+  // No <pre> to measure: a plain (unhighlighted) textarea, which is its own
+  // scroll container. This is the same wrap-blind approximation the
+  // mirroring branch used to be alone in accepting — it assumes one logical
+  // line is one visual row, which is false the moment a line wraps, and
+  // that is not fixable without something to measure. Judged better than
+  // leaving the viewport unscrolled, but it is not exact, and no comment
+  // here should claim otherwise.
   const lh = parseFloat(getComputedStyle(ta).lineHeight) || 20;
   const pad = parseFloat(getComputedStyle(ta).paddingTop) || 0;
-  box.scrollTop = Math.max(0, extra + pad + (line - 1) * lh - box.clientHeight / 3);
+  const rows = ta.value.slice(0, offset).split("\n").length - 1;
+  ta.scrollTop = Math.max(0, pad + rows * lh - ta.clientHeight / 3);
+  return true;
+}
 
-  if (focus) {
-    // Exact, and wrap-aware for free, but only in this order: focus() has to
-    // run *before* setSelectionRange, not after. Measured both ways —
-    // setting the range on an unfocused textarea and then focusing it left
-    // the scrollable ancestor untouched (the approximation above is all that
-    // moved it); focusing first and setting the range afterward made
-    // Chromium scroll the new selection into view within its nearest
-    // scrollable ancestor (code-input's host for the highlighted case — its
-    // textarea and pre share one grid cell with overflow:hidden; only the
-    // host itself has overflow:auto, confirmed by reading
-    // code-input.min.js's syncSize(), which sizes the textarea to its full
-    // content rather than scrolling it — or the textarea itself for the
-    // plain case). This native scroll already knows the wrapped layout; the
-    // approximation above does not, which is why this still overwrites it
-    // when it fires.
-    ta.focus();
-    ta.setSelectionRange(upto, end);
-    return;
+/// The bounding rect of the character at `offset` within `pre`'s rendered
+/// text, walking its text nodes rather than its markup: hljs wraps tokens in
+/// nested `<span>`s, so a Range built against a raw offset into innerHTML
+/// would land inside a tag rather than on a character. Returns null if
+/// `offset` is past everything `pre` currently holds (see scrollEditorTo for
+/// when that happens).
+///
+/// Spans exactly one character (`[at, at+1)`), never a collapsed point
+/// (`[at, at)`). Measured directly: Chromium reports a degenerate
+/// `{top:0,left:0,height:0,width:0}` rect for a range collapsed exactly at a
+/// text node's own boundary — which `offset` lands on whenever the target
+/// line starts a fresh hljs span, i.e. on most lines — while a range
+/// spanning one real character never comes back degenerate. This is what
+/// broke the first version of this function: it always fell exactly on that
+/// boundary, so it read as "not laid out yet" on every measurement, real or
+/// not, and scrollEditorTo retried forever without ever fixing anything.
+function caretRect(pre, offset) {
+  const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT);
+  let node;
+  let consumed = 0;
+  let last = null;
+  while ((node = walker.nextNode())) {
+    const len = node.nodeValue.length;
+    if (len === 0) continue;
+    last = node;
+    if (offset < consumed + len) return oneCharRect(node, offset - consumed);
+    consumed += len;
   }
-  // A mirroring client (focus=false) deliberately never focuses ta for
-  // someone else's action (see focusNextReveal), so it only ever gets the
-  // approximation above; the selection is still set so the target line is
-  // highlighted even though this client's view of it is not focused.
-  ta.setSelectionRange(upto, end);
+  // `offset` lands exactly at (or past) the end of everything walked so far
+  // — the last line of the file, say. Anchor to the last real character
+  // instead of the boundary past it, for the same reason as above.
+  return last ? oneCharRect(last, last.nodeValue.length - 1) : null;
+}
+
+function oneCharRect(node, at) {
+  const start = Math.max(0, Math.min(at, node.nodeValue.length - 1));
+  const range = document.createRange();
+  range.setStart(node, start);
+  range.setEnd(node, start + 1);
+  return range.getBoundingClientRect();
 }
 
 function revealInPreview(content, pre, line) {

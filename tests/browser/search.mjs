@@ -288,6 +288,18 @@ try {
   );
 
   console.log("\nF. Editor scroll from a content hit — first open of a long file");
+  // A background tab's requestAnimationFrame is throttled to the point of
+  // never firing in this headless Chromium — measured directly: with two
+  // pages open (as this file needs for section H below), the non-active one
+  // never got past code-input's initial, unhighlighted <pre>, no matter how
+  // long the test waited. code-input's own highlighting runs entirely off
+  // its own perpetual rAF loop (confirmed by reading code-input.min.js), so
+  // scrollEditorTo's measurement — and a real backgrounded browser tab, for
+  // that matter — has nothing to measure until the tab is actually visible.
+  // This is not a workaround for a test artifact: it is what the browser
+  // does to any inactive tab, and a real user driving page one is looking at
+  // it, so it is foreground for them by definition.
+  await page1.cmd("Page.bringToFront");
   await freshSearch(evalIn, "farline_9f3");
   ok(
     await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "farline row"),
@@ -303,6 +315,7 @@ try {
   );
 
   console.log("\nG. THE case: searching within a file already open AND focused in Edit");
+  await page1.cmd("Page.bringToFront"); // see F's comment; still page one throughout this section
   await evalIn(`(() => {
     const c = [...document.querySelectorAll(".pane .content")].find((c) => {
       const n = c.querySelector(".editwrap .path .rel");
@@ -351,6 +364,12 @@ try {
   );
   await evalIn(`document.getElementById("searchoverlay")
     .dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }))`);
+  // Page two is the one being measured now, so it needs to be the visible
+  // tab for its own code-input highlighting to run — see F's comment. This
+  // also means the mirrored scroll genuinely depends on page two's *own*
+  // rendering, not on whatever page one already computed, which is the
+  // point of a mirroring test.
+  await page2.cmd("Page.bringToFront");
   ok(
     await until(async () => Math.abs((await page2.evalIn(boxScrollTop("src/long.rs"))) - before2) > 5, 15, "page two scrolled"),
     "a reveal driven by page one scrolls page two's mirrored editor too",
