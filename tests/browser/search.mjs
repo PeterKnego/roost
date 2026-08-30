@@ -73,6 +73,17 @@ await Deno.writeTextFile(
   `${fx.roots}/proj/src/twice.txt`,
   "twice here and twice again\nand twice more on another line\n",
 );
+// Every other fixture's matched text is already lowercase, so nothing above
+// exercises case folding at all. This line carries the query in two
+// different cases on one line, matching src/search.rs's own
+// `to_ascii_lowercase` (:183) via app.js's `lowerAscii` — the client folds
+// the query and the haystack ASCII-only before matching, then chips the
+// ORIGINAL (unfolded) text at the indices found, so both cases must chip
+// and each chip's text must keep the file's actual casing.
+await Deno.writeTextFile(
+  `${fx.roots}/proj/src/casefold.txt`,
+  "MixedCase and mixedcase on one line\n",
+);
 // `srch` matches `search.rs` only as a subsequence — no contiguous run.
 await Deno.writeTextFile(`${fx.roots}/proj/src/search.rs`, "nothing to match here\n");
 // The match sits past MAX_LINE_CHARS, so the text the server returns is
@@ -161,18 +172,23 @@ async function realShiftTwice(page, gap) {
 // each section starts from a known state instead of layering onto whatever
 // the previous one left behind.
 //
-// openSearch() deliberately no longer clears the query when it opens (that
-// is the point of the redesign: refining after a miss should not mean
-// retyping), and closeSearch()'s hideSearchPanel() only hides the panel — it
-// does not repaint #searchresults, so the previous section's rows are still
-// sitting in the DOM. Reopening with that leftover value would show THOSE
-// stale rows for a moment before this section's query round-trips, which is
-// real product behaviour but not something a test section — asserting
-// immediately after freshSearch — should have to account for. So this helper
-// clears the field and repaints empty directly (mirroring what the app's own
-// empty-query path does via renderSearch(null), just without waiting out the
-// debounce) before reopening. That is a test-only shortcut, not a product
-// change.
+// As of f65886c, closeSearch()'s hideSearchPanel() already repaints
+// #searchresults via renderSearch(null), so the DOM cannot go stale on
+// close the way it once could — that half is now the product's own
+// guarantee, not something this helper has to work around.
+//
+// What the product deliberately does NOT do is clear the field: openSearch()
+// leaves a leftover query in place (refining after a miss should not mean
+// retyping) and re-issues it as a real `input` event when the field is
+// non-empty. So reopening via shiftTwice below would immediately re-run the
+// PREVIOUS section's query — a real round trip a test section should not
+// have to race — before setQuery(q) overwrites it with this section's query.
+// This helper clears the field (and repaints empty directly, matching what
+// the app's own empty-query path does, so nothing here depends on timing the
+// still-pending debounce from a clear) before reopening, so shiftTwice finds
+// a blank field and re-issues nothing. That clearing is a test-only
+// shortcut, not a product change — the app itself never clears the field on
+// close.
 async function freshSearch(evalIn, q) {
   await evalIn(`closeSearch()`);
   await evalIn(`(() => { document.getElementById("searchinput").value = ""; renderSearch(null); })()`);
@@ -695,15 +711,18 @@ try {
   })()`);
   ok(await evalIn(`!document.getElementById("searchoverlay").hidden`), "⇧⇧ opens search from inside a focused editor");
   await evalIn(setQuery("editortarget_9f3"));
-  // `searchRows.length`, not just a DOM row count: section F leaves a query
-  // sitting in the field, and the ⇧⇧ above reopens the panel showing THAT
-  // section's still-rendered rows (hideSearchPanel only hides — it does not
-  // repaint #searchresults, the same leftover-DOM trap freshSearch works
-  // around elsewhere in this file). A DOM-only check can resolve on those
-  // stale rows before this query's own reply lands, so the Enter below fires
-  // on an empty searchRows array and activateSearchRow's `if (!r) return;`
+  // `searchRows.length`, not just a DOM row count: section F left "farline_9f3"
+  // sitting in the field (activateSearchRow's closeSearch() repaints
+  // #searchresults empty via hideSearchPanel()'s renderSearch(null), but it
+  // does not clear the field), and openSearch() re-issues a non-empty field
+  // as a real query on reopen (f65886c) — so the ⇧⇧ above kicks off its own
+  // round trip for "farline_9f3" BEFORE the setQuery below even sends
+  // "editortarget_9f3". A DOM-only check can resolve on that live-but-wrong
+  // reply landing before this query's own does, so the Enter below fires on
+  // an empty searchRows array and activateSearchRow's `if (!r) return;`
   // silently does nothing. searchRows itself is cleared and repopulated
-  // atomically by renderSearch(), so it cannot be satisfied by stale markup.
+  // atomically by renderSearch(), so it cannot be satisfied by the other
+  // query's rows.
   ok(
     await until(() => evalIn(`searchRows.length > 0 && document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "editortarget row"),
     "the near-the-end marker is found",
@@ -1076,7 +1095,11 @@ try {
   // geometry against `.at` (the fixed column) instead, plus the literal
   // text, so a `.base` that overflowed the column would actually be caught.
   const deep = JSON.parse(await evalIn(`(() => {
-    const r = document.querySelector("#searchresults .searchrow");
+    // Found by its .base text, not the first row: a future fixture that adds
+    // a Files-group hit ahead of the Contents-group row this assertion cares
+    // about would otherwise silently point it at the wrong row.
+    const r = [...document.querySelectorAll("#searchresults .searchrow")]
+      .find((row) => row.querySelector(".base")?.textContent === "deep.rs:1");
     const at = r.querySelector(".at"), dir = r.querySelector(".dir"), base = r.querySelector(".base");
     return JSON.stringify({ dirClipped: dir.scrollWidth > dir.clientWidth,
                             baseInside: base.getBoundingClientRect().right <= at.getBoundingClientRect().right + 1,
@@ -1161,6 +1184,39 @@ try {
     return !!row && row.querySelectorAll(".what .hit").length >= 2;
   })()`),
      "both occurrences on one line are chipped, not just the first");
+
+  // ASCII-only case folding (app.js's `lowerAscii`, matching
+  // `to_ascii_lowercase` at src/search.rs:183). Every fixture above matches
+  // in its own case, so none of them can tell a working fold from a
+  // case-sensitive match that happens to pass. "mixedcase" must chip BOTH
+  // "MixedCase" and "mixedcase" in the casefold.txt row, and each chip's
+  // rendered text must be the ORIGINAL casing from the file, not a folded
+  // copy — that second half is the property that breaks first if the index
+  // found in the folded haystack ever desynchronises from the unfolded
+  // string it is sliced out of.
+  //
+  // Revert-and-observe (CLAUDE.md's testing discipline): with the fold
+  // removed entirely — `appendHighlighted`'s `needle`/`hay` changed from
+  // `lowerAscii(...)` to the raw strings — and this section re-run, it
+  // printed "FAIL  both cases are chipped (got 1)": the query "mixedcase"
+  // then matches only the lowercase occurrence, so `hits.length` came back
+  // 1 instead of 2. Restored, re-run: back to ALL PASS. (A plain
+  // `.toLowerCase()` in place of `lowerAscii` was not tried as a second
+  // revert: both fold beyond-ASCII differently, but neither treats "M" vs
+  // "m" any differently, so it would still pass this ASCII-only fixture —
+  // it is not a case this assertion can discriminate, which is exactly why
+  // the task called for reverting the fold itself, not swapping it.)
+  await freshSearch(evalIn, "mixedcase");
+  await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "casefold rows");
+  const caseHits = JSON.parse(await evalIn(`(() => {
+    const row = [...document.querySelectorAll("#searchresults .searchrow")]
+      .find(r => r.textContent.includes("casefold.txt"));
+    const hits = row ? [...row.querySelectorAll(".what .hit")].map(n => n.textContent) : [];
+    return JSON.stringify(hits);
+  })()`));
+  ok(caseHits.length === 2, `both cases are chipped (got ${caseHits.length})`);
+  ok(JSON.stringify(caseHits) === JSON.stringify(["MixedCase", "mixedcase"]),
+     `each chip keeps the file's original casing, not a folded copy (got ${JSON.stringify(caseHits)})`);
 
   // The XSS fixture, now going through the splitting path that highlighting
   // introduces — the case the existing section could not reach, because
@@ -1258,6 +1314,83 @@ try {
     ok(r.onPlain >= 1.15, `${theme}: the chip reads on a plain row (${r.onPlain})`);
     ok(r.onSel >= 1.15, `${theme}: the chip survives on the selected row (${r.onSel})`);
   }
+}
+
+console.log("\nJ. a disconnected socket still writes where the user can see it");
+{
+  // Deliberately not a real proxy-cut teardown (see reconnect.mjs's `startProxy`
+  // for that technique): overriding the read-only `readyState` getter on the
+  // live `ctrl` WebSocket, in the page itself, is a page-side test shim, not a
+  // network event, so it needs no retry window and cannot flake on timing. It
+  // exercises exactly the branch the fix touches (`ctrl.readyState !== 1`)
+  // without tearing down a socket other sections still rely on afterwards.
+  const setCtrlReadyState = (n) => evalIn(`(() => {
+    Object.defineProperty(ctrl, "readyState", { configurable: true, get: () => ${n} });
+  })()`);
+  const restoreCtrlReadyState = () => evalIn(`(() => {
+    delete ctrl.readyState;
+  })()`);
+
+  // Baseline with the real socket: a query that matches leaves the note
+  // empty (see section I(f)), so #searchnote starts this section carrying no
+  // "skipped" class at all — the state the disconnected branch has to
+  // override on its own, not inherit.
+  await freshSearch(evalIn, "marker");
+  await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "marker rows");
+  ok(await evalIn(`!document.getElementById("searchnote").classList.contains("skipped")`),
+     "setup: a clean match leaves the note unmarked, so the mark below cannot be inherited from this");
+
+  // Chord into an EMPTY field: openSearch() only shows the panel when the
+  // field already holds a query (see B2's "one field, and it is not
+  // dimmed"), so this is the exact starting state IMPORTANT 1 describes —
+  // panel hidden, nothing to see yet.
+  await evalIn(`closeSearch()`);
+  await evalIn(`(() => { document.getElementById("searchinput").value = ""; renderSearch(null); })()`);
+  const openedOnEmptyChord = await evalIn(shiftTwice);
+  ok(!openedOnEmptyChord, "setup: chording into an empty field leaves the panel closed, by design");
+
+  await setCtrlReadyState(3); // CLOSED
+  await evalIn(setQuery("disconnectedcheck"));
+  // The debounce is 120ms; `until` both waits it out and is the assertion
+  // itself, since a pre-fix build never flips `hidden` here at all.
+  ok(await until(() => evalIn(`!document.getElementById("searchoverlay").hidden`), 10, "panel shown while disconnected"),
+     "typing while disconnected opens the panel, not just paints into a hidden one (IMPORTANT 1)");
+  const note = JSON.parse(await evalIn(`JSON.stringify({
+    text: document.getElementById("searchnote").textContent,
+    skipped: document.getElementById("searchnote").classList.contains("skipped"),
+  })`));
+  ok(note.text === "not connected", `the note says why there are no rows (got "${note.text}")`);
+  // The regression IMPORTANT 2 fixes: a disconnected socket is the strongest
+  // possible gap, so the note must wear the mark itself rather than
+  // whichever way the PREVIOUS query (the clean "marker" match above, which
+  // is deliberately unmarked) happened to leave the class.
+  ok(note.skipped, "not connected is marked as a gap, not left wearing the previous query's edge (IMPORTANT 2)");
+
+  await restoreCtrlReadyState();
+}
+
+console.log("\nK. the .skipped mark does not survive an erase");
+{
+  // The other half of IMPORTANT 2: renderSearch's own early return (the
+  // `if (!results) return;` an emptied query takes) has to clear the class
+  // where it clears the text, not just at the bottom of the function past
+  // the return it takes. A short query is the easiest way to a real,
+  // server-confirmed "skipped" note (see section I(g)/(g) above) without
+  // touching the socket at all.
+  const SHORT = "contents searched from 3 characters";
+  await freshSearch(evalIn, "lo"); // matches src/long.rs by path, two characters
+  ok(
+    await until(async () => (await evalIn(`document.getElementById("searchnote").textContent`)) === SHORT, 10, "short-query note"),
+    "setup: a two-character query leaves the caveat note showing",
+  );
+  ok(await evalIn(`document.getElementById("searchnote").classList.contains("skipped")`),
+     "setup: that caveat is marked as a gap");
+
+  await evalIn(setQuery(""));
+  ok(await until(async () => (await evalIn(`document.getElementById("searchnote").textContent`)) === "", 10, "note cleared"),
+     "erasing the query clears the note text");
+  ok(await evalIn(`!document.getElementById("searchnote").classList.contains("skipped")`),
+     "…and clears the gap mark along with it, rather than leaving it stranded on an empty note");
 }
 
 } finally {

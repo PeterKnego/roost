@@ -603,6 +603,12 @@ function render() {
   if (!state) return;
   const header = document.querySelector("header");
   if (header) document.documentElement.style.setProperty("--header-h", header.offsetHeight + "px");
+  // htmx swaps into #gitinfo/#wtlabel and the #projcount/#bellcount writes
+  // below all change the header's width while the panel is open, and
+  // #searchbox uses margin:auto, so the field (and the panel anchored to it)
+  // drifts unless every render re-measures it. Guarded on "searching" so a
+  // closed panel costs nothing on every State broadcast.
+  if (document.body.classList.contains("searching")) anchorSearchPanel();
   document.documentElement.style.setProperty("--left-w", state.sizes.left_w + "px");
   document.documentElement.style.setProperty("--right-w", state.sizes.right_w + "px");
   document.documentElement.style.setProperty("--left-split", state.sizes.left_split + "%");
@@ -2963,8 +2969,12 @@ document.getElementById("searchinput")?.addEventListener("input", (e) => {
     if (!ctrl || ctrl.readyState !== 1) {
       // send() would silently no-op here; without this the box would just
       // sit there showing stale rows (or nothing), which reads as "no
-      // matches" when the truth is "never asked".
+      // matches" when the truth is "never asked". The panel can still be
+      // hidden at this point (a chord into an empty field never opens it),
+      // so it must be shown here too or the note is painted where nobody
+      // can see it.
       searchSeq++;
+      showSearchPanel();
       renderSearchDisconnected();
       return;
     }
@@ -3100,6 +3110,10 @@ function renderSearchDisconnected() {
   searchRows = [];
   searchSel = 0;
   if (note) note.textContent = "not connected";
+  // A socket that was never asked IS a gap — the strongest one this line can
+  // report — so it must wear the same mark a partial answer does, not
+  // whatever class the previous query happened to leave behind.
+  if (note) note.classList.add("skipped");
 }
 
 function renderSearch(results) {
@@ -3108,6 +3122,10 @@ function renderSearch(results) {
   if (!host) return;
   host.textContent = "";
   note.textContent = "";
+  // Cleared alongside the text, not just at the bottom of this function: the
+  // early return below (an emptied query) must not leave a PREVIOUS query's
+  // gap mark on an otherwise-blank note.
+  note.classList.remove("skipped");
   searchRows = [];
   searchSel = 0;
   if (!results) return;
