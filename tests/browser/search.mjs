@@ -219,15 +219,19 @@ try {
     return !(await evalIn(`document.getElementById("searchoverlay").hidden`));
   };
   // CDP modifier bits: 1 alt, 2 ctrl, 4 meta/cmd, 8 shift.
-  const isMac = await evalIn(`IS_MAC`);
-  ok(await chordF(isMac ? 4 | 8 : 2 | 8), `${isMac ? "⌘⇧F" : "Ctrl+Shift+F"} opens the overlay`);
+  // Both modifiers, on every platform: the handler accepts either, so a
+  // browser whose `navigator.platform` misreports cannot silently lose the
+  // shortcut. Asserting only the "right" one for this host would not have
+  // caught the platform-sniff gate this replaced.
+  ok(await chordF(2 | 8), "Ctrl+Shift+F opens the overlay");
+  ok(await chordF(4 | 8), "…and \u2318\u21e7F does too, without depending on platform detection");
   // The unshifted chord must NOT be bound: that is the whole reason for
   // choosing the shifted one. A terminal encodes Ctrl-F and Ctrl-Shift-F
   // identically, so leaving plain Ctrl-F alone is what keeps readline's
   // forward-char working at a shell prompt. If this ever opens the overlay,
   // ^F has been taken from every terminal in the app.
   ok(
-    !(await chordF(isMac ? 4 : 2)),
+    !(await chordF(2)) && !(await chordF(4)),
     "…and the UNshifted chord is left alone, so ^F still reaches the shell",
   );
   ok(await evalIn(`document.getElementById("searchoverlay").hidden`), "…and the overlay is still closed after that");

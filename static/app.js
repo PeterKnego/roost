@@ -2817,10 +2817,20 @@ document.addEventListener("keydown", (e) => {
 //
 // preventDefault takes the browser's own find bar, which is the point: it
 // would only ever search the pane that happens to be rendered.
+// Ctrl OR Meta, not `IS_MAC ? meta : ctrl`. The platform split is right for
+// `linkModifier`, where ⌘-click and Ctrl-click are genuinely different
+// gestures — but for a chord there is no conflict to resolve, and the split
+// adds a way to fail silently: `IS_MAC` reads `navigator.platform`, which is
+// deprecated and returns "" or a frozen value in some browsers, and a
+// misdetection makes the handler demand a modifier the user is not pressing.
+// Nothing is gained by being strict here.
+//
+// `e.code` first for the same reason the mention handler ends up matching a
+// literal `˚`: `e.key` under a modifier is not dependable across layouts.
 document.addEventListener("keydown", (e) => {
-  if (e.key !== "f" && e.key !== "F") return;
+  if (e.code !== "KeyF" && e.key !== "f" && e.key !== "F") return;
   if (!e.shiftKey || e.altKey) return;
-  if (!(IS_MAC ? e.metaKey : e.ctrlKey)) return;
+  if (!e.ctrlKey && !e.metaKey) return;
   e.preventDefault();
   openSearch();
 });
