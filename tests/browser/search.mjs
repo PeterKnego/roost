@@ -874,7 +874,11 @@ try {
 // Both reverts restored, re-run: ALL PASS.
 {
   await freshSearch(evalIn, "marker");
-  await until(() => evalIn(`!!document.querySelector("#searchresults .hit")`), 10, "a chip");
+  // `.every()` on an empty NodeList is `true`, so the assertion below needs
+  // this one first: without it, a chip that silently stopped rendering would
+  // still pass "every chip wraps marker" over zero chips.
+  ok(await until(() => evalIn(`!!document.querySelector("#searchresults .hit")`), 10, "a chip"),
+     "setup: at least one chip rendered, so the assertion below has something to check");
 
   ok(JSON.parse(await evalIn(`JSON.stringify(
     [...document.querySelectorAll("#searchresults .hit")].every(n => n.textContent.toLowerCase() === "marker"))`)),
@@ -921,10 +925,18 @@ try {
 
   // A path that matched only as a subsequence has no contiguous run to wrap.
   // `src/search.rs:139-141` ranks `srch` against `search.rs` this way.
+  //
+  // Row count and chip count are bundled into one assertion, matching the
+  // 300-char-cap check above: the `until()` that waits for rows discards its
+  // result, so on its own it is a wait, not an assertion — if the `srch`
+  // fixture ever stopped matching (fixture drift, a ranking change in
+  // score_path), the row list would be empty, `.hit` count would still be 0,
+  // and a bare "hit count === 0" check would pass while testing nothing.
   await freshSearch(evalIn, "srch");
   await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "subsequence rows");
-  ok(await evalIn(`document.querySelectorAll("#searchresults .hit").length === 0`),
-     "a subsequence path match is left unchipped rather than marked at random");
+  ok(await evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0
+                   && document.querySelectorAll("#searchresults .hit").length === 0`),
+     "a subsequence path match renders its row but leaves it unchipped, rather than marking characters at random");
 
   // Contrast, on a plain row AND on the selected row, in every theme.
   //
