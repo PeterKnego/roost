@@ -56,6 +56,15 @@ const previewLines = [];
 for (let i = 1; i <= 300; i++) previewLines.push(`// filler ${i}\n`);
 await Deno.writeTextFile(`${fx.roots}/proj/src/preview.rs`, previewLines.join(""));
 
+// A deliberately deep path, so the path column must truncate something. The
+// directory half is 38 characters against a 22ch column; the filename and
+// `:1` are 9 and must survive whole.
+await Deno.mkdir(`${fx.roots}/proj/src/very/deeply/nested/directory/tree`, { recursive: true });
+await Deno.writeTextFile(
+  `${fx.roots}/proj/src/very/deeply/nested/directory/tree/deep.rs`,
+  "let deepneedle = 1;\n",
+);
+
 const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 const url = `http://127.0.0.1:${resh.port}/proj`;
@@ -743,6 +752,56 @@ try {
     // read weaker than a tab.
     ok(r.ratio >= 1.20, `${theme}: selection is at least 1.20:1 against the panel (got ${r.ratio})`);
   }
+}
+
+// --- one left edge, and a path that truncates from the left ----------------
+//
+// The complaint this answers: a row used to run `path:line` then the text in
+// one span, so the matched content began at a different x on every row —
+// after `CLAUDE.md:148` on one, after a 60-character spec path on the next.
+// There was nothing to run the eye down.
+{
+  await freshSearch(evalIn, "marker");
+  ok(await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow .what").length > 0`), 10, "rows"),
+     "setup: rows render with a .what cell");
+
+  // Revert-and-observe (CLAUDE.md's testing discipline): with
+  // `grid-template-columns: auto 1fr` — the pre-fix sizing — this query
+  // still printed "ok every result's text starts at one x (saw [473])".
+  // The fixture's "marker" query returns exactly one row (only needle.rs
+  // contains it), so a single-row grid is trivially at one x regardless of
+  // column sizing; this assertion does not by itself discriminate the fix.
+  // What DID fail under `auto 1fr` was the dirClipped assertion below:
+  // "FAIL  the directory half of a long path is the part that truncates" —
+  // with an auto column, `.dir` grows to fit its own content instead of
+  // being squeezed by a fixed track, so it never clips. That is the
+  // assertion this section actually depends on to catch a regression.
+  const lefts = JSON.parse(await evalIn(`JSON.stringify(
+    [...document.querySelectorAll("#searchresults .searchrow .what")]
+      .map(n => Math.round(n.getBoundingClientRect().left)))`));
+  ok(new Set(lefts).size === 1,
+     `every result's text starts at one x (saw ${JSON.stringify([...new Set(lefts)])})`);
+
+  // The long-path case: `.dir` may be clipped, `.base` may not — it carries
+  // the filename and the line number, the only parts that identify the hit.
+  await freshSearch(evalIn, "deepneedle");
+  await until(() => evalIn(`!!document.querySelector("#searchresults .searchrow .base")`), 10, "a deep row");
+  // `.base` is `flex: none`, so it is sized to its own content by
+  // definition — `base.scrollWidth <= base.clientWidth` can never be false,
+  // which is why the original brief's `baseWhole` probe (that comparison)
+  // was rejected: it cannot fail no matter what the CSS does. This checks
+  // geometry against `.at` (the fixed column) instead, plus the literal
+  // text, so a `.base` that overflowed the column would actually be caught.
+  const deep = JSON.parse(await evalIn(`(() => {
+    const r = document.querySelector("#searchresults .searchrow");
+    const at = r.querySelector(".at"), dir = r.querySelector(".dir"), base = r.querySelector(".base");
+    return JSON.stringify({ dirClipped: dir.scrollWidth > dir.clientWidth,
+                            baseInside: base.getBoundingClientRect().right <= at.getBoundingClientRect().right + 1,
+                            baseText: base.textContent });
+  })()`));
+  ok(deep.dirClipped, "the directory half of a long path is the part that truncates");
+  ok(deep.baseInside && deep.baseText === "deep.rs:1",
+     `the filename and line survive intact and inside the column (got "${deep.baseText}")`);
 }
 
 } finally {

@@ -2947,23 +2947,44 @@ function paintSearchSel() {
   rows[searchSel]?.scrollIntoView({ block: "nearest" });
 }
 
-/// Builds one result row. Every dynamic part is a text node: a matched line is
-/// arbitrary file content and a path is arbitrary filesystem content, which
-/// makes these the most attacker-influenced strings this client renders. The
-/// innerHTML rule at the top of this file (constant markup only) is the whole
-/// defence, and it only holds if nothing here interpolates.
-function searchRow(primary, secondary) {
+/// Splits `docs/specs/x.md` into ["docs/specs/", "x.md"]. The trailing slash
+/// stays on the directory so the two halves concatenate back to the original
+/// — the ellipsis lands after it, not instead of it.
+function splitPath(rel) {
+  const i = rel.lastIndexOf("/");
+  return i < 0 ? ["", rel] : [rel.slice(0, i + 1), rel.slice(i + 1)];
+}
+
+/// One result row: a path cell on a fixed left column, then the text that
+/// matched. Every dynamic part is a text node — a matched line is arbitrary
+/// file content and a path is arbitrary filesystem content, which makes these
+/// the most attacker-influenced strings this client renders. The innerHTML
+/// rule at the top of this file is the whole defence, and it only holds if
+/// nothing here interpolates.
+///
+/// The path is two spans rather than one so a long path ellipsises from the
+/// LEFT: `.dir` is allowed to shrink and clip, `.base` is not. CSS
+/// `text-overflow` only ever truncates the tail, and the tail of a path is
+/// the filename and the line number — the two parts that say which hit this
+/// is.
+function searchRow(dir, base) {
   const row = document.createElement("div");
   row.className = "searchrow";
-  const a = document.createElement("span");
-  a.textContent = primary;
-  row.appendChild(a);
-  if (secondary !== null && secondary !== undefined) {
-    const b = document.createElement("span");
-    b.className = "where";
-    b.textContent = secondary;
-    row.appendChild(b);
-  }
+
+  const at = document.createElement("span");
+  at.className = "at";
+  const d = document.createElement("span");
+  d.className = "dir";
+  d.textContent = dir;
+  const b = document.createElement("span");
+  b.className = "base";
+  b.textContent = base;
+  at.append(d, b);
+
+  const what = document.createElement("span");
+  what.className = "what";
+
+  row.append(at, what);
   return row;
 }
 
@@ -2996,10 +3017,15 @@ function renderSearch(results) {
     host.appendChild(g);
   };
 
+  // The text cell always holds the thing that matched — the filename for a
+  // file hit, the line for a content hit, the name for a session — so the
+  // chip Task 2 adds always lands in the same column.
   if (results.files.length) {
     group(`Files (${results.files.length})`);
     for (const f of results.files) {
-      const row = searchRow(f.rel.split("/").pop(), f.rel);
+      const [dir, base] = splitPath(f.rel);
+      const row = searchRow(dir, "");
+      row.querySelector(".what").textContent = base;
       host.appendChild(row);
       searchRows.push({ kind: "file", rel: f.rel });
     }
@@ -3007,18 +3033,18 @@ function renderSearch(results) {
   if (results.sessions.length) {
     group(`Sessions (${results.sessions.length})`);
     for (const s of results.sessions) {
-      host.appendChild(searchRow(s, "terminal"));
+      const row = searchRow("terminal", "");
+      row.querySelector(".what").textContent = s;
+      host.appendChild(row);
       searchRows.push({ kind: "session", session: s });
     }
   }
   if (results.lines.length) {
     group(`Contents (${results.lines.length})`);
     for (const l of results.lines) {
-      const row = searchRow(`${l.rel}:${l.line}`, null);
-      const code = document.createElement("span");
-      code.className = "line";
-      code.textContent = l.text.trim();   // textContent: this is file content
-      row.appendChild(code);
+      const [dir, base] = splitPath(l.rel);
+      const row = searchRow(dir, `${base}:${l.line}`);
+      row.querySelector(".what").textContent = l.text.trim();
       host.appendChild(row);
       searchRows.push({ kind: "line", rel: l.rel, line: l.line });
     }

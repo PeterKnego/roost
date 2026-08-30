@@ -780,11 +780,20 @@ ul.picker li .git:hover { text-decoration: underline; }
 #searchresults { overflow-y: auto; }
 .searchgroup { padding: 4px 12px; font-size: 11px; color: var(--muted);
                border-bottom: 1px solid var(--border); }
-.searchrow { display: flex; gap: 8px; align-items: baseline; padding: 4px 12px;
-             cursor: pointer; white-space: nowrap; overflow: hidden; }
+/* A fixed left column so every result's text starts at the same x. 22ch fits
+   `docs/backlog.md:299` whole; anything longer clips its directory half, which
+   is the half that can be lost without losing which hit this is. */
+.searchpanel { --search-at: 22ch; }
+.searchrow { display: grid; grid-template-columns: var(--search-at) 1fr; gap: 12px;
+             align-items: baseline; padding: 3px 12px; cursor: pointer;
+             font: 12px/1.6 var(--mono); }
 .searchrow.sel { background: var(--row-on); }
-.searchrow .where { color: var(--muted); font-size: 11px; }
-.searchrow .line { font: 12px/1.4 var(--mono); overflow: hidden; text-overflow: ellipsis; }
+.searchrow .at { display: flex; min-width: 0; white-space: nowrap; color: var(--muted);
+                 overflow: hidden; }
+.searchrow .at .dir { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.searchrow .at .base { flex: none; }
+.searchrow .what { min-width: 0; overflow: hidden; text-overflow: ellipsis;
+                   white-space: nowrap; }
 /* The honesty line: truncation, unreadable directories, outright failure. */
 #searchnote { padding: 6px 12px; font-size: 11px; color: var(--muted);
               border-top: 1px solid var(--border); }
