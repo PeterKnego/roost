@@ -1147,7 +1147,7 @@ pub fn workspace_page(
   <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body, git from:body"></span><span id="wtlabel"></span></button>
   {warn}
   {sharing_indicator}
-  <button id="searchbox" title="search this project (ctrl-shift-F or ⌘⇧F; ⇧⇧ also works in some browsers)">{SVG_SEARCH}<span class="hintline">Search files, contents, sessions</span><kbd>⇧⌃F</kbd></button>
+  <label id="searchbox" for="searchinput" title="search this project (ctrl-shift-F or ⌘⇧F)">{SVG_SEARCH}<input id="searchinput" type="search" autocomplete="off" spellcheck="false" placeholder="Search files, contents, sessions" aria-label="Search files, contents, sessions"><kbd>⇧⌃F</kbd></label>
   <button id="projbtn" title="running projects">{SVG_DIAMOND}<span id="projcount"></span></button>
   <button id="bell" title="notifications (n)">{SVG_BELL}<span id="bellcount"></span></button>
   <button id="settings" title="settings — not implemented yet">{SVG_GEAR}</button>
@@ -1169,7 +1169,6 @@ pub fn workspace_page(
 </main>
 <div id="searchoverlay" hidden>
   <div class="searchpanel">
-    <input id="searchinput" type="text" autocomplete="off" spellcheck="false" placeholder="Search files, contents, sessions">
     <div id="searchresults"></div>
     <div id="searchnote"></div>
   </div>
@@ -1960,6 +1959,34 @@ mod tests {
         assert!(
             !h.contains("project-wide search — not implemented yet"),
             "the tooltip must stop saying search is unimplemented"
+        );
+    }
+
+    /// The header used to carry a <button> dressed as a text field while the
+    /// real field lived in the overlay — two things that look like one
+    /// control, and only the second accepts typing. There is now exactly one,
+    /// and it is the one you can see when the overlay is closed.
+    #[test]
+    fn the_search_field_exists_once_and_lives_in_the_header() {
+        let s = Settings { theme: "gruvbox".into(), ..Settings::default() };
+        let h = workspace_page("proj", "proj", &s, Some("theme.css"), false, &[]);
+        assert_eq!(
+            h.matches("id=\"searchinput\"").count(),
+            1,
+            "exactly one search field in the page: {h}"
+        );
+        let head = h.find("<header>").expect("a header");
+        let tail = h.find("</header>").expect("a closed header");
+        assert!(
+            h[head..tail].contains("id=\"searchinput\""),
+            "the field must be in the header: {}",
+            &h[head..tail]
+        );
+        let ov = h.find("id=\"searchoverlay\"").expect("the overlay");
+        assert!(
+            !h[ov..].contains("<input"),
+            "the overlay must not carry a second field: {}",
+            &h[ov..]
         );
     }
 

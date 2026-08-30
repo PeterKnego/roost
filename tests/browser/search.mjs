@@ -56,6 +56,50 @@ const previewLines = [];
 for (let i = 1; i <= 300; i++) previewLines.push(`// filler ${i}\n`);
 await Deno.writeTextFile(`${fx.roots}/proj/src/preview.rs`, previewLines.join(""));
 
+// A deliberately deep path, so the path column must truncate something. The
+// directory half is 38 characters against a 30ch column; the filename and
+// `:1` are 9 and must survive whole.
+await Deno.mkdir(`${fx.roots}/proj/src/very/deeply/nested/directory/tree`, { recursive: true });
+await Deno.writeTextFile(
+  `${fx.roots}/proj/src/very/deeply/nested/directory/tree/deep.rs`,
+  "let deepneedle = 1;\n",
+);
+
+// A basename ALONE wider than the 30ch column, with a short directory ("src/")
+// so almost the whole deficit falls on the filename rather than the
+// directory. Pins the bug a screenshot of the real repo caught: a
+// two-span .dir/.base row let a long filename overflow `.at` and get
+// clipped from the RIGHT — eating the line number, not the filename.
+await Deno.writeTextFile(
+  `${fx.roots}/proj/src/a-very-long-basename-that-exceeds-the-column-width.txt`,
+  "let longbase = 1;\n",
+);
+
+// One line with two occurrences of the query, and a second line so the
+// result list always has both a selected and an unselected row — the
+// contrast probe compares the chip against each, and cannot do that with a
+// single-row result.
+await Deno.writeTextFile(
+  `${fx.roots}/proj/src/twice.txt`,
+  "twice here and twice again\nand twice more on another line\n",
+);
+// Every other fixture's matched text is already lowercase, so nothing above
+// exercises case folding at all. This line carries the query in two
+// different cases on one line, matching src/search.rs's own
+// `to_ascii_lowercase` (:183) via app.js's `lowerAscii` — the client folds
+// the query and the haystack ASCII-only before matching, then chips the
+// ORIGINAL (unfolded) text at the indices found, so both cases must chip
+// and each chip's text must keep the file's actual casing.
+await Deno.writeTextFile(
+  `${fx.roots}/proj/src/casefold.txt`,
+  "MixedCase and mixedcase on one line\n",
+);
+// `srch` matches `search.rs` only as a subsequence — no contiguous run.
+await Deno.writeTextFile(`${fx.roots}/proj/src/search.rs`, "nothing to match here\n");
+// The match sits past MAX_LINE_CHARS, so the text the server returns is
+// truncated before it: the row comes back with nothing to chip.
+await Deno.writeTextFile(`${fx.roots}/proj/src/capped.txt`, "x".repeat(320) + "farpastthecap\n");
+
 const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 const url = `http://127.0.0.1:${resh.port}/proj`;
@@ -87,20 +131,77 @@ async function realShift(page) {
   await page.cmd("Input.dispatchKeyEvent", { type: "keyUp", modifiers: 0, ...k });
 }
 
-/// Two of them `gap` ms apart, answering whether the overlay opened.
+// A real, persistently-focusable element to park focus on between trigger
+// checks in section A. `document.body` cannot serve this role: it carries no
+// tabIndex, so `.focus()` on it is a silent no-op — and body is exactly
+// where focus sits by default before anything on the page has been clicked,
+// which is the state every one of these checks starts from. Without
+// somewhere real to put focus back, the first successful open leaves it
+// permanently stuck on #searchinput (closeSearch's restore attempt no-ops
+// forever after), and every check after the first stops being able to fail:
+// activeElement.id === "searchinput" would already be true before the
+// shortcut under test ever ran.
+// Returns whether the parking actually took: a bare `el.focus()` with the
+// return value discarded would make every "focuses the search field" check
+// below true-by-leftover the moment parking silently fails (a headless
+// quirk, `opacity:0` being treated as unfocusable, some future
+// `display:none`) — the exact failure this helper exists to rule out.
+const focusCatcher = `(() => {
+  let el = document.getElementById("__focuscatcher");
+  if (!el) {
+    el = document.createElement("input");
+    el.id = "__focuscatcher";
+    el.style.cssText = "position:fixed;opacity:0;pointer-events:none";
+    document.body.appendChild(el);
+  }
+  el.focus();
+  return document.activeElement === el;
+})()`;
+
+/// Two of them `gap` ms apart, answering whether the shortcut fired.
+///
+/// Checked via FOCUS, not panel visibility: openSearch() only shows the
+/// panel when the field already holds a query, and this helper is used
+/// before any query exists, so checking `#searchoverlay.hidden` would fail
+/// even when the shortcut worked perfectly. Moving focus into the field is
+/// what openSearch() unconditionally does, so it is the contract this can
+/// actually check — and parking on
+/// `focusCatcher` first, rather than trusting wherever focus already was,
+/// is what keeps the check a real before/after delta instead of a question
+/// that was already true.
 async function realShiftTwice(page, gap) {
+  await page.evalIn(focusCatcher);
   await realShift(page);
   await sleep(gap);
   await realShift(page);
   await sleep(150);
-  return !(await page.evalIn(`document.getElementById("searchoverlay").hidden`));
+  return await page.evalIn(`document.activeElement && document.activeElement.id === "searchinput"`);
 }
 
 // Closes whatever is open (idempotent) and reopens with a fresh query, so
 // each section starts from a known state instead of layering onto whatever
 // the previous one left behind.
+//
+// As of f65886c, closeSearch()'s hideSearchPanel() already repaints
+// #searchresults via renderSearch(null), so the DOM cannot go stale on
+// close the way it once could — that half is now the product's own
+// guarantee, not something this helper has to work around.
+//
+// What the product deliberately does NOT do is clear the field: openSearch()
+// leaves a leftover query in place (refining after a miss should not mean
+// retyping) and re-issues it as a real `input` event when the field is
+// non-empty. So reopening via shiftTwice below would immediately re-run the
+// PREVIOUS section's query — a real round trip a test section should not
+// have to race — before setQuery(q) overwrites it with this section's query.
+// This helper clears the field (and repaints empty directly, matching what
+// the app's own empty-query path does, so nothing here depends on timing the
+// still-pending debounce from a clear) before reopening, so shiftTwice finds
+// a blank field and re-issues nothing. That clearing is a test-only
+// shortcut, not a product change — the app itself never clears the field on
+// close.
 async function freshSearch(evalIn, q) {
   await evalIn(`closeSearch()`);
+  await evalIn(`(() => { document.getElementById("searchinput").value = ""; renderSearch(null); })()`);
   await evalIn(shiftTwice);
   await evalIn(setQuery(q));
 }
@@ -175,6 +276,12 @@ try {
   await until(() => page2.evalIn("ctrl && ctrl.readyState === 1 && !!state"), 30, "page two's app");
 
   console.log("A. the trigger");
+  // Every "focuses the search field" check below in this section depends on
+  // this actually working — asserted explicitly, once, rather than trusted
+  // silently at every one of its call sites, because a parking failure would
+  // otherwise make every one of them pass by leftover focus instead of by
+  // the trigger under test actually firing.
+  ok(await evalIn(focusCatcher), "setup: the focus catcher takes focus");
   // Real key events, through CDP's input pipeline — NOT
   // `document.dispatchEvent`. This section used to do the latter, which invokes
   // document listeners directly and therefore proves only that a listener is
@@ -182,33 +289,54 @@ try {
   // land microseconds apart, it cannot see the double-tap window at all. It
   // passed green while ⇧⇧ was unusable in a real browser at a human tapping
   // speed, which is how the bug was reported rather than caught here.
-  ok(await realShiftTwice(page1, 90), "⇧⇧ (real key events, fast tap) opens the overlay");
+  ok(await realShiftTwice(page1, 90), "⇧⇧ (real key events, fast tap) focuses the search field");
   await evalIn(`closeSearch()`);
   // The gap a person actually produces when they mean it, rather than the
   // hurried one. 400 ms used to be the window and this failed at 450.
   ok(await realShiftTwice(page1, 520), "…and at a deliberate 520 ms tap, not just a hurried one");
+  // Forced into a genuinely open state first (via the global showSearchPanel,
+  // not by re-running a shift-tap) so this checks closeSearch's own hide
+  // logic specifically — by this point in the section neither trigger has
+  // ever shown the panel (an empty query never does), so `closeSearch();
+  // return hidden` on its own would be checking a state that was already
+  // true, which is true whether or not closeSearch does anything at all.
   ok(
-    await evalIn(`(() => { closeSearch(); return document.getElementById("searchoverlay").hidden; })()`),
+    await evalIn(`(() => { showSearchPanel(); const wasOpen = !document.getElementById("searchoverlay").hidden;
+      closeSearch(); return wasOpen && document.getElementById("searchoverlay").hidden; })()`),
     "closeSearch() is callable as a global, and hides the overlay",
   );
   // A Shift with a key between two Shifts must not open it — that is what stops
   // typing "HI" from opening search. Real events again: the whole question is
-  // whether the H reaches the same listener the Shifts do.
+  // whether the H reaches the same listener the Shifts do. Parked on the
+  // catcher explicitly, rather than trusting wherever the check above left
+  // focus, so this block does not depend on that chain.
+  await evalIn(focusCatcher);
   await realShift(page1);
   await page1.cmd("Input.dispatchKeyEvent", { type: "keyDown", key: "H", code: "KeyH", text: "H", windowsVirtualKeyCode: 72 });
   await page1.cmd("Input.dispatchKeyEvent", { type: "keyUp", key: "H", code: "KeyH", windowsVirtualKeyCode: 72 });
   await realShift(page1);
   await sleep(150);
+  // Focus, not overlay.hidden: an empty field never shows the panel (see
+  // realShiftTwice above), so `overlay.hidden` is true here regardless of
+  // whether the reset logic under test actually ran — the assertion could
+  // not fail even with the bug back. Checking that focus never left the
+  // catcher is the same signal the trigger checks above use, and it is the
+  // one thing a false double-tap match would actually change.
   ok(
-    await evalIn(`document.getElementById("searchoverlay").hidden`),
+    await evalIn(`document.activeElement.id !== "searchinput"`),
     "an intervening keystroke resets the pending Shift, so ordinary typing cannot open it",
   );
 
   // ⌘⇧F / Ctrl+Shift+F — the second way in, added because ⇧⇧ was reported as
   // not working in a real browser for reasons still unknown. Real key events
   // again: a synthetic dispatch would not exercise the modifier state at all.
+  // Checked via focus for the same reason realShiftTwice is: an empty field
+  // never shows the panel, and re-parking on the catcher before each attempt
+  // is what keeps this a real delta rather than a question already answered
+  // by wherever a previous attempt left focus.
   const chordF = async (mods) => {
     await evalIn(`closeSearch()`);
+    await evalIn(focusCatcher);
     await sleep(100);
     for (const type of ["keyDown", "keyUp"]) {
       await page1.cmd("Input.dispatchKeyEvent", {
@@ -216,25 +344,28 @@ try {
       });
     }
     await sleep(150);
-    return !(await evalIn(`document.getElementById("searchoverlay").hidden`));
+    return await evalIn(`document.activeElement && document.activeElement.id === "searchinput"`);
   };
   // CDP modifier bits: 1 alt, 2 ctrl, 4 meta/cmd, 8 shift.
   // Both modifiers, on every platform: the handler accepts either, so a
   // browser whose `navigator.platform` misreports cannot silently lose the
   // shortcut. Asserting only the "right" one for this host would not have
   // caught the platform-sniff gate this replaced.
-  ok(await chordF(2 | 8), "Ctrl+Shift+F opens the overlay");
+  ok(await chordF(2 | 8), "Ctrl+Shift+F focuses the search field");
   ok(await chordF(4 | 8), "…and \u2318\u21e7F does too, without depending on platform detection");
   // The unshifted chord must NOT be bound: that is the whole reason for
   // choosing the shifted one. A terminal encodes Ctrl-F and Ctrl-Shift-F
   // identically, so leaving plain Ctrl-F alone is what keeps readline's
-  // forward-char working at a shell prompt. If this ever opens the overlay,
-  // ^F has been taken from every terminal in the app.
+  // forward-char working at a shell prompt. If this ever moves focus into the
+  // field, ^F has been taken from every terminal in the app.
   ok(
     !(await chordF(2)) && !(await chordF(4)),
     "…and the UNshifted chord is left alone, so ^F still reaches the shell",
   );
-  ok(await evalIn(`document.getElementById("searchoverlay").hidden`), "…and the overlay is still closed after that");
+  // Same reason as above: overlay.hidden is trivially true throughout this
+  // section, so it cannot tell "the unshifted chord did nothing" from "the
+  // unshifted chord fired and just didn't happen to show anything."
+  ok(await evalIn(`document.activeElement.id !== "searchinput"`), "…and focus never moved to the field from that either");
 
   console.log("\nB. Escape restores focus");
   await evalIn(`(() => {
@@ -245,8 +376,19 @@ try {
   })()`);
   const focusedBefore = await evalIn(`document.activeElement.id === "__focusprobe"`);
   ok(focusedBefore, "setup: the probe element holds focus before the overlay opens");
+  // A real, non-empty query first: openSearch() only shows the panel when
+  // the field already holds one (an empty-query open, which `shiftTwice`
+  // alone would produce, never does — see realShiftTwice in section A). Left
+  // out, every `overlay.hidden` check below this point stays trivially true
+  // for the rest of the section regardless of whether Escape or closeSearch
+  // do anything at all — which is how the stranded-modal bug this section
+  // exists to catch could be fully reintroduced (the keydown handler
+  // rescoped to `#searchoverlay`) and every assertion here would still pass:
+  // an overlay that was never genuinely opened can't fail to close.
+  await evalIn(`document.getElementById("searchinput").value = "escapeprobe"`);
   await evalIn(shiftTwice);
   ok(await evalIn(`document.activeElement.id === "searchinput"`), "opening moves focus into the search box");
+  ok(await evalIn(`!document.getElementById("searchoverlay").hidden`), "setup: the panel is genuinely open, not just focused");
   await evalIn(`document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
   ok(await evalIn(`document.getElementById("searchoverlay").hidden`), "Escape closes the overlay");
   ok(
@@ -261,8 +403,12 @@ try {
   // the modal was stranded open. Reproduced here by blurring rather than by
   // a synthetic Tab, because a dispatched KeyboardEvent does not move focus —
   // a Tab-based version of this test would pass with the bug fully present.
+  // The query from above is still sitting in the field — openSearch never
+  // clears it — so this reopen is genuine too, for the same reason the first
+  // half needed one.
   await evalIn(shiftTwice);
   ok(await evalIn(`document.activeElement.id === "searchinput"`), "setup: the overlay is open with focus in its input");
+  ok(await evalIn(`!document.getElementById("searchoverlay").hidden`), "setup: genuinely open, not just focused");
   await evalIn(`document.getElementById("searchinput").blur()`);
   ok(
     await evalIn(`!document.getElementById("searchoverlay").contains(document.activeElement)`),
@@ -273,6 +419,77 @@ try {
     await evalIn(`document.getElementById("searchoverlay").hidden`),
     "Escape still closes the overlay once focus has left it — otherwise only a backdrop click can, and ⇧⇧ cannot reopen",
   );
+
+  console.log("\nB2. one field, and it is not dimmed");
+  // The querySelectorAll("input") count from the plan is wrong here: it counts
+  // EVERY input in the page, and code-input is vendored and may inject its
+  // own, so that assertion could fail for a reason that has nothing to do
+  // with search. #searchinput specifically, and specifically not inside the
+  // overlay, says what this task actually changed.
+  ok(await evalIn(`document.querySelectorAll("#searchinput").length === 1`),
+     "exactly one search field in the page");
+  ok(await evalIn(`document.querySelectorAll("#searchoverlay input").length === 0`),
+     "and it is not the overlay's — the overlay carries no field of its own");
+  ok(await evalIn(`!!document.querySelector("header #searchinput")`),
+     "and it is in the header");
+
+  await evalIn(`closeSearch()`);
+  await evalIn(`(() => { const i = document.getElementById("searchinput");
+    i.focus(); i.value = "marker"; i.dispatchEvent(new Event("input",{bubbles:true})); return 1; })()`);
+  ok(await until(() => evalIn(`!document.getElementById("searchoverlay").hidden`), 10, "panel opens"),
+     "typing in the header field opens the panel");
+
+  // The assertion that catches the stacking bug behaviourally: with the
+  // backdrop above the header, the point at the centre of the field belongs to
+  // #searchoverlay and the user types into a dimmed control. Verified
+  // falsifiable directly: deleting `body.searching header { position:
+  // relative; z-index: 41; }` from static/style.css and re-running this file
+  // FAILs exactly this assertion (element at that point is #searchoverlay),
+  // with every other assertion in the suite still passing; restoring the
+  // rule brings it back to ALL PASS.
+  ok(await evalIn(`(() => {
+      const r = document.getElementById("searchinput").getBoundingClientRect();
+      const el = document.elementFromPoint(r.left + r.width/2, r.top + r.height/2);
+      return el && el.id === "searchinput";
+    })()`),
+     "the field is above the backdrop, not behind it");
+
+  // "below the header" alone doesn't tell this layout apart from the old
+  // one: the old overlay ALSO centred .searchpanel in the full viewport
+  // (`#searchoverlay { justify-content: center }` on a full-viewport-inset
+  // flex box) and its `margin-top: 12vh` put it below the header too, at any
+  // normal viewport height — so `p.top >= header.bottom` is true either way.
+  // What this task actually changed, measurably: the panel got wider
+  // (880px, up from 720px) and pinned tight under the header instead of
+  // floating ~12vh down.
+  ok(await evalIn(`(() => {
+      const p = document.querySelector(".searchpanel").getBoundingClientRect();
+      const h = document.querySelector("header").getBoundingClientRect();
+      return p.width > 800 && (p.top - h.bottom) < 10;
+    })()`),
+     "the panel is the wider, header-anchored one this task introduces — not the old floating, 12vh-down modal");
+
+  // Centred on the FIELD, not the viewport: `#searchbox` sits ~55px left of
+  // viewport centre because the header's two button groups are different
+  // widths, so a bare `left: 50%` put the panel visibly off the control it
+  // hangs from (measured directly: field centre x≈637-649, panel centre
+  // x=700 on a 1400px viewport — ~51-63px off, which on an 880px panel is
+  // ~177px of panel to the field's left and ~303px to its right). Fixed by
+  // anchorSearchPanel() in app.js, which measures #searchbox and publishes
+  // its centre as --search-cx. Measured here too, not assumed.
+  const anchored = JSON.parse(await evalIn(`(() => {
+    const b = document.getElementById("searchbox").getBoundingClientRect();
+    const p = document.querySelector(".searchpanel").getBoundingClientRect();
+    return JSON.stringify({ field: Math.round(b.left + b.width/2),
+                            panel: Math.round(p.left + p.width/2) });
+  })()`));
+  ok(Math.abs(anchored.field - anchored.panel) <= 2,
+     `the panel is centred on the field, not the viewport (field ${anchored.field}, panel ${anchored.panel})`);
+
+  await evalIn(`(() => { const i = document.getElementById("searchinput");
+    i.value = ""; i.dispatchEvent(new Event("input",{bubbles:true})); return 1; })()`);
+  ok(await until(() => evalIn(`document.getElementById("searchoverlay").hidden`), 10, "panel closes"),
+     "emptying the field closes the panel");
 
   console.log("\nC0. a content hit lands on its line");
   await freshSearch(evalIn, "marker");
@@ -378,6 +595,52 @@ try {
   ok(afterStaleReply === 0, "a stale reply for the query the user already cleared is ignored, not repainted");
   await evalIn(`closeSearch()`);
 
+  console.log("\nD2. reopening with a leftover query never disagrees with its own row list");
+  // The bug this guards: the query is deliberately NOT cleared on close (so
+  // refining after a miss doesn't mean retyping), but hideSearchPanel() used
+  // to clear searchRows and leave #searchresults still painted with the
+  // outgoing query's rows. Reopening then showed those stale rows while
+  // searchRows was empty, so ↑/↓/Enter looked their target up via
+  // activateSearchRow's `const r = searchRows[i]; if (!r) return;` and
+  // silently did nothing — a dead keyboard — until the user typed again and
+  // a fresh render resynced the two. Verified falsifiable directly: reverting
+  // hideSearchPanel() to `searchRows = [];` (dropping its `renderSearch(null)`
+  // call) and re-running this file FAILs the assertion below with "rendered
+  // rows: 1 searchRows: 0" (this fixture's freshSearch(evalIn, "marker")
+  // leaves exactly one row painted), while every other assertion in the
+  // suite still passes.
+  await freshSearch(evalIn, "marker");
+  ok(
+    await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "marker rows before close"),
+    "setup: a real query has rendered rows before it's closed",
+  );
+  await evalIn(`closeSearch()`);
+  ok(
+    await evalIn(`document.getElementById("searchoverlay").hidden`),
+    "setup: closed, with the query still sitting in the field (openSearch never clears it)",
+  );
+  // No wait and no keystroke between the reopen and the check: this has to
+  // catch the state right after openSearch() returns, before any debounce
+  // could quietly resync the two on its own.
+  await evalIn(`openSearch()`);
+  const rowsAtReopen = await evalIn(`document.querySelectorAll("#searchresults .searchrow").length`);
+  const searchRowsAtReopen = await evalIn(`searchRows.length`);
+  ok(
+    rowsAtReopen === searchRowsAtReopen,
+    `the rendered row count matches searchRows the instant the panel reopens, not just once the next keystroke lands ` +
+      `(rendered rows: ${rowsAtReopen} searchRows: ${searchRowsAtReopen})`,
+  );
+  // The other half of the fix: openSearch() re-issues the leftover query
+  // (via a dispatched `input` event, not a direct call) rather than just
+  // revealing an empty list forever. Without that half, the panel above
+  // would legitimately stay at 0/0 — consistent, but consistently wrong: a
+  // box full of text with no way to ever see results for it again.
+  ok(
+    await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "rows return after reopen"),
+    "reopening with a leftover query re-issues it — the panel refills on its own, without the user retyping",
+  );
+  await evalIn(`closeSearch()`);
+
   console.log("\nE. Preview scroll targets .content, not the <pre>");
   await evalIn(`send({ t: "OpenPath", text: "src/preview.rs:250" })`);
   ok(
@@ -458,8 +721,20 @@ try {
   })()`);
   ok(await evalIn(`!document.getElementById("searchoverlay").hidden`), "⇧⇧ opens search from inside a focused editor");
   await evalIn(setQuery("editortarget_9f3"));
+  // `searchRows.length`, not just a DOM row count: section F left "farline_9f3"
+  // sitting in the field (activateSearchRow's closeSearch() repaints
+  // #searchresults empty via hideSearchPanel()'s renderSearch(null), but it
+  // does not clear the field), and openSearch() re-issues a non-empty field
+  // as a real query on reopen (f65886c) — so the ⇧⇧ above kicks off its own
+  // round trip for "farline_9f3" BEFORE the setQuery below even sends
+  // "editortarget_9f3". A DOM-only check can resolve on that live-but-wrong
+  // reply landing before this query's own does, so the Enter below fires on
+  // an empty searchRows array and activateSearchRow's `if (!r) return;`
+  // silently does nothing. searchRows itself is cleared and repopulated
+  // atomically by renderSearch(), so it cannot be satisfied by the other
+  // query's rows.
   ok(
-    await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "editortarget row"),
+    await until(() => evalIn(`searchRows.length > 0 && document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "editortarget row"),
     "the near-the-end marker is found",
   );
   await evalIn(`document.getElementById("searchoverlay")
@@ -659,6 +934,42 @@ try {
         "(b)+(c@1) a query with rows AND an unreadable place says both — singular 'place'",
       );
 
+      // "I could not look there" is the one thing this line exists to say, and
+      // it used to say it in the same grey as everything else. A search that
+      // found nothing is an answer, not a gap, and must NOT wear the mark.
+      ok(await evalIn(`document.getElementById("searchnote").classList.contains("skipped")`),
+         "a note reporting an unreadable place is marked");
+      ok(await evalIn(`parseFloat(getComputedStyle(document.getElementById("searchnote")).borderLeftWidth) > 0`),
+         "and the mark is a rendered edge, not just a class");
+
+      // locked1 is still chmod 000 here, and the walk descends into every
+      // directory regardless of the query — so a query run while it is locked
+      // always reports an unreadable place, never a clean "no matches". Lift
+      // the lock for this one query, then restore it: the (c@2) case below
+      // needs locked1 AND locked2 both unreadable to reach "2 places".
+      await Deno.chmod(locked1, 0o755);
+      await freshSearch(evalIn, "zzzzznotfoundzzzzz");
+      ok(
+        await until(() => evalIn(`document.getElementById("searchnote").textContent.includes("no matches")`), 10, "no-matches note"),
+        "setup: an unmatched query with nothing unreadable really does answer 'no matches'",
+      );
+      ok(await evalIn(`!document.getElementById("searchnote").classList.contains("skipped")`),
+         "a clean 'no matches' is not marked — it is an answer, not a gap");
+      // Both reverts applied to app.js's `gap` and re-run directly (not a
+      // thought experiment):
+      //   const gap = false;
+      //     -> FAIL "a note reporting an unreadable place is marked"
+      //     -> FAIL "and the mark is a rendered edge, not just a class"
+      //     -> ok   "a clean 'no matches' is not marked"      (2 FAILED)
+      //   const gap = parts.length > 0;
+      //     -> ok   "a note reporting an unreadable place is marked"
+      //     -> ok   "and the mark is a rendered edge, not just a class"
+      //     -> FAIL "a clean 'no matches' is not marked — it is an answer, not a gap"
+      //                                                        (1 FAILED)
+      // The second revert is the one that matters: it shows the class tracks
+      // the gap/answer distinction, not merely "some class got set somewhere".
+      await Deno.chmod(locked1, 0o000);
+
       await Deno.chmod(locked2, 0o000);
       if (!(await isBlocked(locked2))) {
         console.log("  SKIP  running as root — chmod 000 does not block reads, so (c@2) would be vacuous");
@@ -743,6 +1054,384 @@ try {
     // read weaker than a tab.
     ok(r.ratio >= 1.20, `${theme}: selection is at least 1.20:1 against the panel (got ${r.ratio})`);
   }
+}
+
+// --- one left edge, and a path that truncates from the left ----------------
+//
+// The complaint this answers: a row used to run `path:line` then the text in
+// one span, so the matched content began at a different x on every row —
+// after `CLAUDE.md:148` on one, after a 60-character spec path on the next.
+// There was nothing to run the eye down.
+{
+  // "needle" rather than "marker": it hits two rows in different categories
+  // with very different path depths — src/needle.rs (a FILE hit, dir "src/")
+  // and src/very/deeply/nested/directory/tree/deep.rs (a CONTENT hit, via
+  // "let deepneedle = 1;", dir 38 characters deep). Both put their matched
+  // text in the same `.what` grid column, so this is an actual two-point
+  // comparison instead of one row trivially agreeing with itself.
+  await freshSearch(evalIn, "needle");
+  ok(await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow .what").length > 0`), 10, "rows"),
+     "setup: rows render with a .what cell");
+
+  const lefts = JSON.parse(await evalIn(`JSON.stringify(
+    [...document.querySelectorAll("#searchresults .searchrow .what")]
+      .map(n => Math.round(n.getBoundingClientRect().left)))`));
+  // A guard, not decoration: "marker" used to sit here, and it matches only
+  // one row in this fixture, so `new Set(lefts).size === 1` passed on a
+  // single element and could never fail — the exact vacuous-test shape
+  // CLAUDE.md's testing section warns about. If a future fixture change
+  // collapses "needle" back to one row, this fails loudly instead of the
+  // x-alignment assertion silently going vacuous again.
+  ok(lefts.length >= 2, `the x-alignment check needs at least two rows to mean anything (got ${lefts.length})`);
+  // Revert-and-observe (CLAUDE.md's testing discipline), rerun after
+  // switching the query to "needle": with `grid-template-columns: auto 1fr`
+  // restored, this assertion actually failed —
+  // "FAIL  every result's text starts at one x (saw [394,705])" — because
+  // src/needle.rs's shallow `.at` and the deep fixture's 38-character `.at`
+  // each size their own content-based column differently. The dirClipped
+  // assertion below failed too in the same run, for the reason recorded
+  // there. Restoring `var(--search-at) 1fr` returned both to green.
+  ok(new Set(lefts).size === 1,
+     `every result's text starts at one x (saw ${JSON.stringify([...new Set(lefts)])})`);
+
+  // The long-path case: `.dir` may be clipped, `.name`/`.line` may not — the
+  // filename and line number are the only parts that identify the hit.
+  await freshSearch(evalIn, "deepneedle");
+  await until(() => evalIn(`!!document.querySelector("#searchresults .searchrow .line")`), 10, "a deep row");
+  // `.name`/`.line` together are `deep.rs` + `:1`, nine characters, which
+  // fit even the old 22ch column whole — this fixture exercises DIRECTORY
+  // truncation only, not the basename-exceeds-the-column bug (that gets its
+  // own fixture and section below). `dir.scrollWidth > dir.clientWidth`
+  // proves the directory actually clipped, so this can't pass on a column
+  // wide enough that nothing truncates at all.
+  const deep = JSON.parse(await evalIn(`(() => {
+    // Found by its composed .name+.line text, not the first row: a future
+    // fixture that adds a Files-group hit ahead of the Contents-group row
+    // this assertion cares about would otherwise silently point it at the
+    // wrong row.
+    const r = [...document.querySelectorAll("#searchresults .searchrow")]
+      .find((row) => {
+        const n = row.querySelector(".name"), l = row.querySelector(".line");
+        return n && l && n.textContent + l.textContent === "deep.rs:1";
+      });
+    const at = r.querySelector(".at"), dir = r.querySelector(".dir"),
+          name = r.querySelector(".name"), line = r.querySelector(".line");
+    return JSON.stringify({ dirClipped: dir.scrollWidth > dir.clientWidth,
+                            lineInside: line.getBoundingClientRect().right <= at.getBoundingClientRect().right + 1,
+                            nameText: name.textContent, lineText: line.textContent });
+  })()`));
+  ok(deep.dirClipped, "the directory half of a long path is the part that truncates");
+  ok(deep.lineInside && deep.nameText === "deep.rs" && deep.lineText === ":1",
+     `the filename and line survive intact and inside the column (got "${deep.nameText}${deep.lineText}")`);
+
+  // The bug the screenshot caught: a basename ALONE wider than the column.
+  // The old two-span `.dir`/`.base` design gave `.base` `flex: none`, so a
+  // long filename simply overflowed `.at` and got clipped from the RIGHT by
+  // `.at`'s own `overflow: hidden` — eating the line number, not the
+  // filename, and leaving rows indistinguishable (`first` in this repo
+  // produced seven rows of the same clipped basename with no line number on
+  // any of them). `long.rs`'s directory ("src/") is short, so almost the
+  // entire deficit here falls on the filename — the case the deep.rs fixture
+  // above cannot reach, since its filename is only nine characters.
+  await freshSearch(evalIn, "longbase");
+  await until(() => evalIn(`!!document.querySelector("#searchresults .searchrow .line")`), 10, "a longbase row");
+  const longbase = JSON.parse(await evalIn(`(() => {
+    const r = [...document.querySelectorAll("#searchresults .searchrow")]
+      .find((row) => row.querySelector(".line")?.textContent === ":1"
+                   && row.querySelector(".name")?.textContent.includes("very-long-basename"));
+    const at = r.querySelector(".at"), name = r.querySelector(".name"), line = r.querySelector(".line");
+    return JSON.stringify({
+      nameClipped: name.scrollWidth > name.clientWidth,
+      lineText: line.textContent,
+      lineInside: line.getBoundingClientRect().right <= at.getBoundingClientRect().right + 1,
+    });
+  })()`));
+  ok(longbase.nameClipped, "setup: the filename alone is wider than the column and actually clips");
+  ok(longbase.lineText === ":1", `the line number survives — not eaten by the clipped filename (got "${longbase.lineText}")`);
+  ok(longbase.lineInside, "…and stays fully inside the column, not overflowing past it");
+}
+
+// --- the match is visible ---------------------------------------------------
+//
+// Chips are asserted by rendered colour, not by class name: a `.hit` that
+// resolves to the panel's own background is invisible and would still pass a
+// class-name test. getComputedStyle returns an unresolved `oklab(...)` for a
+// color-mix, so the value is rasterised through a canvas.
+//
+// Revert-and-observe (CLAUDE.md's testing discipline), both applied and run,
+// not reasoned about:
+//
+// 1. `--hit: transparent;` — expected every onPlain/onSel ratio to read
+//    1.000 and fail. First pass: it did not — ALL PASS, with ratios like
+//    "darcula: the chip reads on a plain row (1.521)" up to
+//    "light: the chip reads on a plain row (19.726)". The chipProbe measured
+//    the chip's DECLARED colour via a canvas rasteriser (`clearRect` then a
+//    single `fillRect` of the resolved colour): a fully-transparent
+//    `background-color` came back as opaque black rather than "matches
+//    whatever is behind it", since `getImageData` on a zero-alpha fill over
+//    an already-transparent canvas returns (0,0,0) — so the probe compared
+//    black against each row's real background instead of detecting "no chip
+//    at all". That was the wrong thing to measure regardless: `--hit` is
+//    deliberately translucent, so its declared colour is never what anyone
+//    sees — only the composite of chip-over-surface is. Fixed by painting
+//    the surface first and the chip on top (`paint(...)` below) and measuring
+//    THAT pixel, which is exactly the surface colour — ratio 1.00 — when the
+//    chip is `transparent`. Re-run with the fixed probe: every assertion
+//    FAILed at ratio 1 (`darcula: the chip reads on a plain row (1)`, etc.,
+//    all five themes, both onPlain and onSel). Restored, re-run: ALL PASS,
+//    with real ratios of roughly 1.36-1.83 across the five themes — see the
+//    task report for the exact per-theme numbers.
+// 2. Chipping only the first occurrence per row (`break` right after
+//    appending the first `mark`) — expected "both occurrences on one line
+//    are chipped" to fail, and on the FIRST version of that assertion
+//    (`document.querySelectorAll("#searchresults .searchrow .what .hit").length
+//    >= 2`, a global count) it did NOT: ALL PASS, because the "twice" query
+//    also matches the file name `twice.txt` and a second content line
+//    (`twice.txt:2`), each contributing its own single chip, so the global
+//    count stayed >= 2 even with every row capped at one chip. Rewritten
+//    below to count `.hit` elements within the ONE row for `twice.txt:1`
+//    specifically; re-run with the same `break` in place then printed
+//    "FAIL  both occurrences on one line are chipped, not just the first" —
+//    the assertion as it now stands.
+//
+// Both reverts restored, re-run: ALL PASS.
+{
+  await freshSearch(evalIn, "marker");
+  // `.every()` on an empty NodeList is `true`, so the assertion below needs
+  // this one first: without it, a chip that silently stopped rendering would
+  // still pass "every chip wraps marker" over zero chips.
+  ok(await until(() => evalIn(`!!document.querySelector("#searchresults .hit")`), 10, "a chip"),
+     "setup: at least one chip rendered, so the assertion below has something to check");
+
+  ok(JSON.parse(await evalIn(`JSON.stringify(
+    [...document.querySelectorAll("#searchresults .hit")].every(n => n.textContent.toLowerCase() === "marker"))`)),
+     "a chip wraps exactly the matched characters, nothing more");
+
+  // Every occurrence, not just the first. No file in the repo has a line with
+  // the same word twice, so the fixture is authored.
+  //
+  // Counted within the ONE row for twice.txt:1, not across the whole result
+  // list: the fixture also produces a file-name match (twice.txt) and a
+  // second content row (twice.txt:2), each contributing its own single chip,
+  // so a global count is >= 2 even when a row itself only ever chips its
+  // first occurrence. Revert-and-observe (step 7 below) caught exactly this —
+  // the global-count version of this assertion still passed after the loop
+  // was made to `break` after the first match.
+  await freshSearch(evalIn, "twice");
+  await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "twice rows");
+  ok(await evalIn(`(() => {
+    const row = [...document.querySelectorAll("#searchresults .searchrow")]
+      .find(r => r.textContent.includes("twice.txt:1"));
+    return !!row && row.querySelectorAll(".what .hit").length >= 2;
+  })()`),
+     "both occurrences on one line are chipped, not just the first");
+
+  // ASCII-only case folding (app.js's `lowerAscii`, matching
+  // `to_ascii_lowercase` at src/search.rs:183). Every fixture above matches
+  // in its own case, so none of them can tell a working fold from a
+  // case-sensitive match that happens to pass. "mixedcase" must chip BOTH
+  // "MixedCase" and "mixedcase" in the casefold.txt row, and each chip's
+  // rendered text must be the ORIGINAL casing from the file, not a folded
+  // copy — that second half is the property that breaks first if the index
+  // found in the folded haystack ever desynchronises from the unfolded
+  // string it is sliced out of.
+  //
+  // Revert-and-observe (CLAUDE.md's testing discipline): with the fold
+  // removed entirely — `appendHighlighted`'s `needle`/`hay` changed from
+  // `lowerAscii(...)` to the raw strings — and this section re-run, it
+  // printed "FAIL  both cases are chipped (got 1)": the query "mixedcase"
+  // then matches only the lowercase occurrence, so `hits.length` came back
+  // 1 instead of 2. Restored, re-run: back to ALL PASS. (A plain
+  // `.toLowerCase()` in place of `lowerAscii` was not tried as a second
+  // revert: both fold beyond-ASCII differently, but neither treats "M" vs
+  // "m" any differently, so it would still pass this ASCII-only fixture —
+  // it is not a case this assertion can discriminate, which is exactly why
+  // the task called for reverting the fold itself, not swapping it.)
+  await freshSearch(evalIn, "mixedcase");
+  await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "casefold rows");
+  const caseHits = JSON.parse(await evalIn(`(() => {
+    const row = [...document.querySelectorAll("#searchresults .searchrow")]
+      .find(r => r.textContent.includes("casefold.txt"));
+    const hits = row ? [...row.querySelectorAll(".what .hit")].map(n => n.textContent) : [];
+    return JSON.stringify(hits);
+  })()`));
+  ok(caseHits.length === 2, `both cases are chipped (got ${caseHits.length})`);
+  ok(JSON.stringify(caseHits) === JSON.stringify(["MixedCase", "mixedcase"]),
+     `each chip keeps the file's original casing, not a folded copy (got ${JSON.stringify(caseHits)})`);
+
+  // The XSS fixture, now going through the splitting path that highlighting
+  // introduces — the case the existing section could not reach, because
+  // nothing split the string before.
+  await freshSearch(evalIn, "onerror");
+  await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "xss rows");
+  ok(await evalIn(`document.querySelectorAll("#searchresults img").length === 0`),
+     "a matched line containing markup is still split into text, not elements");
+  ok(await evalIn(`[...document.querySelectorAll("#searchresults .what")].some(n => n.textContent.includes("<img"))`),
+     "and the markup is visible as characters");
+
+  // A match past the server's 300-character line cap (src/search.rs:32,
+  // applied at :399) arrives as a row whose visible text does not contain the
+  // query at all. The row must still render — unadorned, not missing and not
+  // an error.
+  await freshSearch(evalIn, "farpastthecap");
+  await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "a capped row");
+  ok(await evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0
+                   && document.querySelectorAll("#searchresults .hit").length === 0`),
+     "a match beyond the 300-char cap still renders its row, just without a chip");
+
+  // A path that matched only as a subsequence has no contiguous run to wrap.
+  // `src/search.rs:139-141` ranks `srch` against `search.rs` this way.
+  //
+  // Row count and chip count are bundled into one assertion, matching the
+  // 300-char-cap check above: the `until()` that waits for rows discards its
+  // result, so on its own it is a wait, not an assertion — if the `srch`
+  // fixture ever stopped matching (fixture drift, a ranking change in
+  // score_path), the row list would be empty, `.hit` count would still be 0,
+  // and a bare "hit count === 0" check would pass while testing nothing.
+  await freshSearch(evalIn, "srch");
+  await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "subsequence rows");
+  ok(await evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0
+                   && document.querySelectorAll("#searchresults .hit").length === 0`),
+     "a subsequence path match renders its row but leaves it unchipped, rather than marking characters at random");
+
+  // Contrast, on a plain row AND on the selected row, in every theme.
+  //
+  // The query here is "twice", not "marker" as the task brief originally had
+  // it: "marker" matches exactly one line in one file, so `plain` below was
+  // `undefined` and the probe threw on `plain.querySelector`. "twice" has two
+  // matching lines (see the twice.txt fixture above), so the result list
+  // always has both a selected row and an unselected one to compare.
+  const chipProbe = `(() => {
+    const cx = document.createElement("canvas").getContext("2d", { willReadFrequently: true });
+    // The chip is translucent by design, so its declared colour is not what
+    // anyone sees — what they see is the chip composited over the surface
+    // under it. Painting the surface first and the chip on top is that
+    // composite, and it is also what makes this probe falsifiable: with
+    // \`--hit: transparent\` the result is EXACTLY the surface and the ratio is
+    // 1.00. Measuring the declared colour instead read \`transparent\` as
+    // rgba(0,0,0,0) -> [0,0,0] -> opaque black, which scored a high contrast
+    // against a light panel and passed with the chip fully invisible.
+    const paint = (...cssLayers) => {
+      cx.clearRect(0, 0, 1, 1);
+      for (const css of cssLayers) { cx.fillStyle = css; cx.fillRect(0, 0, 1, 1); }
+      const d = cx.getImageData(0, 0, 1, 1).data;
+      return [d[0], d[1], d[2]];
+    };
+    const lum = (c) => { const [r,g,b] = c.map(v => { v/=255; return v<=0.04045 ? v/12.92 : Math.pow((v+0.055)/1.055,2.4); });
+      return 0.2126*r + 0.7152*g + 0.0722*b; };
+    const ratio = (a,b) => (Math.max(a,b)+0.05)/(Math.min(a,b)+0.05);
+
+    const panelCss = getComputedStyle(document.querySelector(".searchpanel")).backgroundColor;
+    const hitCss   = getComputedStyle(document.querySelector("#searchresults .hit")).backgroundColor;
+    const selRow   = document.querySelector("#searchresults .searchrow.sel");
+    const selCss   = getComputedStyle(selRow).backgroundColor;
+
+    // The surface a plain row's chip sits on is just the panel (a row's own
+    // background is transparent until selected); the selected row's surface
+    // is its own background composited over the panel, since --row-on may
+    // itself be translucent.
+    const plainSurface = paint(panelCss);
+    const selSurface   = paint(panelCss, selCss);
+    const onPlain = ratio(lum(paint(panelCss, hitCss)),         lum(plainSurface));
+    const onSel   = ratio(lum(paint(panelCss, selCss, hitCss)), lum(selSurface));
+
+    return JSON.stringify({
+      onPlain: +onPlain.toFixed(3),
+      onSel:   +onSel.toFixed(3),
+    });
+  })()`;
+
+  await freshSearch(evalIn, "twice");
+  await until(() => evalIn(`!!document.querySelector("#searchresults .searchrow.sel .hit")`), 10, "a chip on the selected row");
+  // Would fail if the twice.txt fixture went back to one line: the contrast
+  // probe below needs a selected AND an unselected row, and cannot get one
+  // from a single-row result.
+  ok(await evalIn(`document.querySelectorAll("#searchresults .searchrow").length >= 2`),
+     "the contrast probe needs a selected AND an unselected row to compare");
+  for (const theme of ["darcula", "dark", "light", "gruvbox", "solarized-dark"]) {
+    await evalIn(`(() => { document.querySelector('link[href*="/static/themes/"]').href = "/static/themes/${theme}.css"; return 1; })()`);
+    await until(async () => JSON.parse(await evalIn(chipProbe)).onPlain > 1, 10, `${theme} applied`);
+    const r = JSON.parse(await evalIn(chipProbe));
+    ok(r.onPlain >= 1.15, `${theme}: the chip reads on a plain row (${r.onPlain})`);
+    ok(r.onSel >= 1.15, `${theme}: the chip survives on the selected row (${r.onSel})`);
+  }
+}
+
+console.log("\nJ. a disconnected socket still writes where the user can see it");
+{
+  // Deliberately not a real proxy-cut teardown (see reconnect.mjs's `startProxy`
+  // for that technique): overriding the read-only `readyState` getter on the
+  // live `ctrl` WebSocket, in the page itself, is a page-side test shim, not a
+  // network event, so it needs no retry window and cannot flake on timing. It
+  // exercises exactly the branch the fix touches (`ctrl.readyState !== 1`)
+  // without tearing down a socket other sections still rely on afterwards.
+  const setCtrlReadyState = (n) => evalIn(`(() => {
+    Object.defineProperty(ctrl, "readyState", { configurable: true, get: () => ${n} });
+  })()`);
+  const restoreCtrlReadyState = () => evalIn(`(() => {
+    delete ctrl.readyState;
+  })()`);
+
+  // Baseline with the real socket: a query that matches leaves the note
+  // empty (see section I(f)), so #searchnote starts this section carrying no
+  // "skipped" class at all — the state the disconnected branch has to
+  // override on its own, not inherit.
+  await freshSearch(evalIn, "marker");
+  await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "marker rows");
+  ok(await evalIn(`!document.getElementById("searchnote").classList.contains("skipped")`),
+     "setup: a clean match leaves the note unmarked, so the mark below cannot be inherited from this");
+
+  // Chord into an EMPTY field: openSearch() only shows the panel when the
+  // field already holds a query (see B2's "one field, and it is not
+  // dimmed"), so this is the exact starting state IMPORTANT 1 describes —
+  // panel hidden, nothing to see yet.
+  await evalIn(`closeSearch()`);
+  await evalIn(`(() => { document.getElementById("searchinput").value = ""; renderSearch(null); })()`);
+  const openedOnEmptyChord = await evalIn(shiftTwice);
+  ok(!openedOnEmptyChord, "setup: chording into an empty field leaves the panel closed, by design");
+
+  await setCtrlReadyState(3); // CLOSED
+  await evalIn(setQuery("disconnectedcheck"));
+  // The debounce is 120ms; `until` both waits it out and is the assertion
+  // itself, since a pre-fix build never flips `hidden` here at all.
+  ok(await until(() => evalIn(`!document.getElementById("searchoverlay").hidden`), 10, "panel shown while disconnected"),
+     "typing while disconnected opens the panel, not just paints into a hidden one (IMPORTANT 1)");
+  const note = JSON.parse(await evalIn(`JSON.stringify({
+    text: document.getElementById("searchnote").textContent,
+    skipped: document.getElementById("searchnote").classList.contains("skipped"),
+  })`));
+  ok(note.text === "not connected", `the note says why there are no rows (got "${note.text}")`);
+  // The regression IMPORTANT 2 fixes: a disconnected socket is the strongest
+  // possible gap, so the note must wear the mark itself rather than
+  // whichever way the PREVIOUS query (the clean "marker" match above, which
+  // is deliberately unmarked) happened to leave the class.
+  ok(note.skipped, "not connected is marked as a gap, not left wearing the previous query's edge (IMPORTANT 2)");
+
+  await restoreCtrlReadyState();
+}
+
+console.log("\nK. the .skipped mark does not survive an erase");
+{
+  // The other half of IMPORTANT 2: renderSearch's own early return (the
+  // `if (!results) return;` an emptied query takes) has to clear the class
+  // where it clears the text, not just at the bottom of the function past
+  // the return it takes. A short query is the easiest way to a real,
+  // server-confirmed "skipped" note (see section I(g)/(g) above) without
+  // touching the socket at all.
+  const SHORT = "contents searched from 3 characters";
+  await freshSearch(evalIn, "lo"); // matches src/long.rs by path, two characters
+  ok(
+    await until(async () => (await evalIn(`document.getElementById("searchnote").textContent`)) === SHORT, 10, "short-query note"),
+    "setup: a two-character query leaves the caveat note showing",
+  );
+  ok(await evalIn(`document.getElementById("searchnote").classList.contains("skipped")`),
+     "setup: that caveat is marked as a gap");
+
+  await evalIn(setQuery(""));
+  ok(await until(async () => (await evalIn(`document.getElementById("searchnote").textContent`)) === "", 10, "note cleared"),
+     "erasing the query clears the note text");
+  ok(await evalIn(`!document.getElementById("searchnote").classList.contains("skipped")`),
+     "…and clears the gap mark along with it, rather than leaving it stranded on an empty note");
 }
 
 } finally {

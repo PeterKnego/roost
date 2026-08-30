@@ -26,6 +26,14 @@ html, body { height: 100%; }
      14% because the equivalent tab step measures 1.15-1.24 against --tool and
      a modal's keyboard selection should read a little stronger than a tab. */
   --row-on: color-mix(in oklab, var(--fg) 14%, var(--bg2));
+  /* The match chip. Derived from --warn rather than given five hand-picked
+     values, because every theme already chose a warm hue there — so a sixth
+     theme gets a correct chip for free, and there is no per-theme value to get
+     wrong. Translucent on purpose: a selected row is --row-on, and a chip that
+     composites is legible on both surfaces by construction, where an opaque
+     one would need a second value for the selected case. Same lesson as
+     --row-on itself, one step earlier. */
+  --hit: color-mix(in oklab, var(--warn) 28%, transparent);
   --pane-radius: 8px;
   /* How many rows of tabs a pane header may grow to before the strip starts
      scrolling instead. Four is roughly 16 tabs in the middle pane and 12 in
@@ -71,15 +79,20 @@ header .proj { font-weight: 500; }
 #gitstatus .gmod    { color: var(--warn, #d79921); font-family: var(--mono); font-size: 11px; }
 #gitstatus .gahead  { color: var(--add-fg); font-family: var(--mono); font-size: 11px; }
 #gitstatus .gbehind { color: var(--muted); font-family: var(--mono); font-size: 11px; }
-/* A real, focusable control now, rather than the honest placeholder it
-   replaces — the wiring arrives with the overlay's JavaScript. */
+/* The field itself, not a button dressed as one — the wrapper still carries
+   the id and the border so focus-within can style the whole pill. */
 #searchbox { display: flex; align-items: center; gap: 8px; width: 400px; height: 26px;
              margin-left: auto; margin-right: auto; padding: 0 8px 0 9px; border-radius: 6px;
-             border: 1px solid var(--border); background: var(--tool); color: var(--muted);
-             font: inherit; cursor: pointer; }
-#searchbox .hintline { flex: 1 1 auto; overflow: hidden; white-space: nowrap; }
+             border: 1px solid var(--border); background: var(--tool); color: var(--muted); }
+#searchbox:focus-within { border-color: var(--accent); }
+#searchinput { flex: 1 1 auto; min-width: 0; border: none; background: none;
+               color: var(--fg); font: inherit; outline: none; }
+#searchinput::placeholder { color: var(--muted); }
 #searchbox kbd { border: 1px solid var(--border); border-radius: 3px; padding: 0 4px;
                  font: 11px/16px var(--mono); }
+/* The shortcut is a hint for finding the field, not a label for a field you
+   are already in. */
+#searchbox:focus-within kbd { display: none; }
 header .vsep { width: 1px; height: 16px; background: var(--border); margin: 0 6px; }
 #closeproj { display: flex; align-items: center; gap: 5px; border: 1px solid var(--border);
              border-radius: 6px; background: none; color: var(--muted); padding: 3px 10px;
@@ -766,26 +779,60 @@ ul.picker li .git:hover { text-decoration: underline; }
 .ovall:hover { text-decoration: underline; }
 .ovempty { color: var(--muted); padding: 6px 8px; }
 
-/* The overlay. resh's first modal — deliberately minimal, so the popup pass
-   docs/backlog.md wants can absorb it rather than having to undo it. */
-#searchoverlay { position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.35);
-                 display: flex; align-items: flex-start; justify-content: center; }
+/* The overlay is now just a backdrop — the field lives in the header, and
+   the panel hangs from it rather than floating centred on the screen. */
+#searchoverlay { position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.35); }
 #searchoverlay[hidden] { display: none; }
-.searchpanel { margin-top: 12vh; width: min(720px, 92vw); max-height: 70vh;
+/* Hangs from the header, centred on the FIELD it belongs to (not the
+   viewport — see anchorSearchPanel() in app.js, which sets --search-cx),
+   and wider than the field: a 400px column cannot hold a path and a line of
+   code side by side. */
+.searchpanel { position: absolute; top: var(--header-h, 38px); left: var(--search-cx, 50%);
+               transform: translateX(-50%); width: min(880px, 92vw); max-height: 60vh;
                display: flex; flex-direction: column;
                background: var(--bg2); border: 1px solid var(--border);
                border-radius: 8px; overflow: hidden; }
-#searchinput { border: none; border-bottom: 1px solid var(--border); background: var(--tool);
-               color: var(--fg); font: inherit; padding: 10px 12px; outline: none; }
+/* The field is in the header, and the backdrop is z-index 40 — without this
+   the user types into a dimmed control. Raising the header is what makes the
+   panel read as hanging from the bar rather than floating near it. Reverting
+   this line and re-running search.mjs was checked directly: exactly the
+   "the field is above the backdrop, not behind it" assertion FAILs, with
+   every other assertion (73 of them) still passing — confirming the check is
+   falsifiable and isolated to this rule. */
+body.searching header { position: relative; z-index: 41; }
 #searchresults { overflow-y: auto; }
 .searchgroup { padding: 4px 12px; font-size: 11px; color: var(--muted);
                border-bottom: 1px solid var(--border); }
-.searchrow { display: flex; gap: 8px; align-items: baseline; padding: 4px 12px;
-             cursor: pointer; white-space: nowrap; overflow: hidden; }
+/* A fixed left column so every result's text starts at the same x. 30ch fits
+   most real paths in this repo whole (`docs/backlog.md:299` and deeper);
+   anything longer sheds its directory first, per the .dir/.name/.line
+   flex-shrink order below. */
+.searchpanel { --search-at: 30ch; }
+.searchrow { display: grid; grid-template-columns: var(--search-at) 1fr; gap: 12px;
+             align-items: baseline; padding: 3px 12px; cursor: pointer;
+             font: 12px/1.6 var(--mono); }
 .searchrow.sel { background: var(--row-on); }
-.searchrow .where { color: var(--muted); font-size: 11px; }
-.searchrow .line { font: 12px/1.4 var(--mono); overflow: hidden; text-overflow: ellipsis; }
+.searchrow .at { display: flex; min-width: 0; white-space: nowrap; color: var(--muted);
+                 overflow: hidden; }
+/* Three spans, not two: a lone `.base` that never shrank could still
+   overflow `.at` and get clipped from the right by `.at`'s own
+   `overflow: hidden` — losing the line number, the one thing this cell must
+   never lose (see searchRow's comment in app.js for the search-for-"first"
+   case this fixes). `.line` is `flex: none`, so it is never asked to
+   shrink. `.dir` carries a higher flex-shrink (3) than `.name` (1), so the
+   directory gives up space first and the filename only clips once the
+   directory has nothing left to give. */
+.searchrow .at .dir  { flex: 0 3 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.searchrow .at .name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.searchrow .at .line { flex: none; }
+.searchrow .what { min-width: 0; overflow: hidden; text-overflow: ellipsis;
+                   white-space: nowrap; }
+.searchrow .hit { background: var(--hit); border-radius: 2px; }
 /* The honesty line: truncation, unreadable directories, outright failure. */
 #searchnote { padding: 6px 12px; font-size: 11px; color: var(--muted);
               border-top: 1px solid var(--border); }
 #searchnote:empty { display: none; }
+/* Same hue as the match chip, deliberately: inside this panel, warm means the
+   search is telling you something — whether that is "your word is here" or "I
+   could not look there". */
+#searchnote.skipped { border-left: 2px solid var(--warn); padding-left: 10px; }

@@ -603,6 +603,12 @@ function render() {
   if (!state) return;
   const header = document.querySelector("header");
   if (header) document.documentElement.style.setProperty("--header-h", header.offsetHeight + "px");
+  // htmx swaps into #gitinfo/#wtlabel and the #projcount/#bellcount writes
+  // below all change the header's width while the panel is open, and
+  // #searchbox uses margin:auto, so the field (and the panel anchored to it)
+  // drifts unless every render re-measures it. Guarded on "searching" so a
+  // closed panel costs nothing on every State broadcast.
+  if (document.body.classList.contains("searching")) anchorSearchPanel();
   document.documentElement.style.setProperty("--left-w", state.sizes.left_w + "px");
   document.documentElement.style.setProperty("--right-w", state.sizes.right_w + "px");
   document.documentElement.style.setProperty("--left-split", state.sizes.left_split + "%");
@@ -2793,11 +2799,6 @@ let searchRows = [];      // [{kind, rel, line, session}] parallel to the DOM ro
 let searchSel = 0;
 let searchDebounce = null;
 let searchReturnFocus = null;
-// #searchbox is a <button>, and a browser focuses a button on mousedown —
-// before its click handler runs. Captured here, on mousedown, so openSearch
-// still sees whatever had focus before the click (usually a terminal)
-// instead of the button itself.
-let searchboxMousedownFocus = null;
 
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Shift") { shiftPending = 0; return; }
@@ -2848,32 +2849,94 @@ document.addEventListener("keydown", (e) => {
   openSearch();
 });
 
-function openSearch(returnFocus) {
-  const ov = document.getElementById("searchoverlay");
-  if (!ov || !ov.hidden) return;
-  // Remembered before focus moves: closing must give the terminal back, or
-  // every dismissal costs the user their shell focus. A caller that already
-  // captured the pre-click target (the searchbox mousedown handler below)
-  // passes it in, because by the time a click handler runs, a <button> has
-  // already taken focus for itself.
-  searchReturnFocus = returnFocus !== undefined ? returnFocus : document.activeElement;
-  ov.hidden = false;
-  const input = document.getElementById("searchinput");
-  input.value = "";
-  renderSearch(null);
-  input.focus();
+/// The panel hangs from the search field, so it has to be centred on the
+/// FIELD — not the viewport. `#searchbox` uses `margin: auto` inside a flex
+/// header, which centres it in whatever space the left and right button
+/// groups leave over; those groups are different widths, so the field sits
+/// ~55px left of centre and a viewport-centred panel is visibly lopsided
+/// against it. Clamped so the panel cannot run off either edge on a narrow
+/// window.
+function anchorSearchPanel() {
+  const box = document.getElementById("searchbox");
+  const panel = document.querySelector(".searchpanel");
+  if (!box || !panel) return;
+  const half = panel.offsetWidth / 2;
+  const cx = box.getBoundingClientRect().left + box.offsetWidth / 2;
+  const clamped = Math.min(Math.max(cx, half + 8), window.innerWidth - half - 8);
+  document.documentElement.style.setProperty("--search-cx", `${Math.round(clamped)}px`);
 }
 
-function closeSearch() {
+/// Panel visibility only — no focus effects. Separate from openSearch because
+/// the field now lives in the header and is focusable on its own: a user can
+/// have focus in it with no panel showing, and emptying the box must close the
+/// panel without yanking focus away mid-edit.
+function showSearchPanel() {
+  const ov = document.getElementById("searchoverlay");
+  if (!ov || !ov.hidden) return;
+  ov.hidden = false;
+  document.body.classList.add("searching");
+  // anchorSearchPanel() needs the panel laid out (offsetWidth) to measure
+  // it, which is only true after un-hiding — measuring before this line
+  // would read the old, possibly-zero width from while it was `hidden`.
+  anchorSearchPanel();
+}
+
+// Re-anchor live while the panel is open: the field's on-screen position is
+// a function of viewport width (the header's flex layout reflows it), so a
+// resize without this would leave the panel pointing at where the field
+// used to be.
+window.addEventListener("resize", () => {
+  if (!document.body.classList.contains("searching")) return;
+  anchorSearchPanel();
+});
+
+function hideSearchPanel() {
   const ov = document.getElementById("searchoverlay");
   if (!ov || ov.hidden) return;
   ov.hidden = true;
-  searchRows = [];
+  document.body.classList.remove("searching");
+  // Repaints empty rather than just clearing the searchRows array: the query
+  // is NOT cleared from the field on close (see openSearch below), so a
+  // later reopen can find #searchresults still holding THIS query's rendered
+  // rows while searchRows says there are none. That disagreement is not
+  // cosmetic — activateSearchRow looks a row up by index in searchRows, so
+  // ↑/↓/Enter against the stale DOM silently do nothing (`if (!r) return;`)
+  // until the user types again. renderSearch(null) is what the erase path a
+  // few lines below already uses to keep the two in sync; hiding must too.
+  renderSearch(null);
   // Dismissing mid-debounce must not let the pending Search still fire: its
-  // reply would repopulate searchRows and the (now hidden) result list from
-  // a query the user no longer has open.
+  // reply would repopulate searchRows and the (now hidden) result list from a
+  // query the user no longer has open.
   clearTimeout(searchDebounce);
   searchSeq++;
+}
+
+/// The chord and a click both land here. The query is deliberately NOT
+/// cleared — it is selected instead, so typing replaces it but refining after
+/// a miss does not mean retyping.
+function openSearch(returnFocus) {
+  const input = document.getElementById("searchinput");
+  if (!input) return;
+  // Guarded: pressing the chord while already in the field must not remember
+  // the field itself as the place to give focus back to, which would strand
+  // focus here forever.
+  if (document.activeElement !== input) {
+    searchReturnFocus = returnFocus !== undefined ? returnFocus : document.activeElement;
+  }
+  input.focus();
+  input.select();
+  // Re-issued, not just revealed: hideSearchPanel() above always leaves
+  // searchRows (and the list) empty, so a bare showSearchPanel() here would
+  // show a field full of text over an empty list until the user's next
+  // keystroke — worse than the old design, where reopening at least cleared
+  // the box to match. Dispatching `input` routes through the field's own
+  // handler so this inherits its debounce, its searchSeq bump, and its
+  // disconnected-socket branch instead of duplicating any of that here.
+  if (input.value) input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function closeSearch() {
+  hideSearchPanel();
   // .focus() on an element no longer in the document does not throw — it
   // silently no-ops and focus falls to <body>. A State broadcast can detach
   // the remembered terminal node while the overlay is open (a tabstrip
@@ -2883,10 +2946,14 @@ function closeSearch() {
   searchReturnFocus = null;
 }
 
-document.getElementById("searchbox")?.addEventListener("mousedown", () => {
-  searchboxMousedownFocus = document.activeElement;
+// `focusin` carries relatedTarget: the element that just lost focus, which is
+// exactly what closing must give back. The <button> needed a mousedown handler
+// to capture this before it stole focus for itself; a real input receives
+// focus directly, so that bookkeeping goes away.
+document.getElementById("searchinput")?.addEventListener("focusin", (e) => {
+  if (e.relatedTarget && e.relatedTarget !== e.target) searchReturnFocus = e.relatedTarget;
+  if (e.target.value) showSearchPanel();
 });
-document.getElementById("searchbox")?.addEventListener("click", () => openSearch(searchboxMousedownFocus));
 
 document.getElementById("searchinput")?.addEventListener("input", (e) => {
   const q = e.target.value;
@@ -2898,33 +2965,45 @@ document.getElementById("searchinput")?.addEventListener("input", (e) => {
     // Erasing the query bumps searchSeq too: a reply to the just-abandoned
     // query must not paint over the now-empty box, the same reason the send
     // branch below bumps it.
-    if (!q) { searchSeq++; renderSearch(null); return; }
+    if (!q) { searchSeq++; renderSearch(null); hideSearchPanel(); return; }
     if (!ctrl || ctrl.readyState !== 1) {
       // send() would silently no-op here; without this the box would just
       // sit there showing stale rows (or nothing), which reads as "no
-      // matches" when the truth is "never asked".
+      // matches" when the truth is "never asked". The panel can still be
+      // hidden at this point (a chord into an empty field never opens it),
+      // so it must be shown here too or the note is painted where nobody
+      // can see it.
       searchSeq++;
+      showSearchPanel();
       renderSearchDisconnected();
       return;
     }
     searchSentQuery = q;
+    showSearchPanel();
     send({ t: "Search", q, seq: ++searchSeq });
   }, 120);
 });
 
-// Bound to the document, not to #searchoverlay, and gated on the overlay
-// being open. The overlay contains exactly one focusable element (the input),
-// so focus leaves it trivially — one Tab, or a click on any non-row part of
-// the panel, which the backdrop handler below deliberately does not treat as
-// a dismissal. With the listener scoped to the overlay, focus landing on
-// <body> took Escape, ↑/↓ and Enter with it, and `openSearch` early-returns
-// on an already-open overlay, so ⇧⇧ could not recover either: the modal was
-// stranded open with only a backdrop click left to close it. Trapping Tab
-// instead would have fixed only the first of those two routes.
+// Bound to the document, not to #searchoverlay, and gated on the panel being
+// open OR on focus being in the field. The overlay contains exactly one
+// focusable element (the input), so focus leaves it trivially — one Tab, or a
+// click on any non-row part of the panel, which the backdrop handler below
+// deliberately does not treat as a dismissal. With the listener scoped to the
+// overlay, focus landing on <body> took Escape, ↑/↓ and Enter with it, and
+// `openSearch` early-returns on an already-open overlay, so ⇧⇧ could not
+// recover either: the modal was stranded open with only a backdrop click left
+// to close it. Trapping Tab instead would have fixed only the first of those
+// two routes. The field now lives in the header, outside the overlay by
+// construction, so focus starting there — with no panel open yet — is a
+// reachable state that Escape must still cover.
 document.addEventListener("keydown", (e) => {
   const ov = document.getElementById("searchoverlay");
-  if (!ov || ov.hidden) return;
+  const input = document.getElementById("searchinput");
+  const open = ov && !ov.hidden;
+  const inField = input && document.activeElement === input;
+  if (!open && !inField) return;
   if (e.key === "Escape") { e.preventDefault(); closeSearch(); return; }
+  if (!open) return;
   if (e.key === "ArrowDown") { e.preventDefault(); moveSearchSel(1); return; }
   if (e.key === "ArrowUp") { e.preventDefault(); moveSearchSel(-1); return; }
   if (e.key === "Enter") { e.preventDefault(); activateSearchRow(searchSel); }
@@ -2947,23 +3026,92 @@ function paintSearchSel() {
   rows[searchSel]?.scrollIntoView({ block: "nearest" });
 }
 
-/// Builds one result row. Every dynamic part is a text node: a matched line is
-/// arbitrary file content and a path is arbitrary filesystem content, which
-/// makes these the most attacker-influenced strings this client renders. The
-/// innerHTML rule at the top of this file (constant markup only) is the whole
-/// defence, and it only holds if nothing here interpolates.
-function searchRow(primary, secondary) {
+/// Splits `docs/specs/x.md` into ["docs/specs/", "x.md"]. The trailing slash
+/// stays on the directory so the two halves concatenate back to the original
+/// — the ellipsis lands after it, not instead of it.
+function splitPath(rel) {
+  const i = rel.lastIndexOf("/");
+  return i < 0 ? ["", rel] : [rel.slice(0, i + 1), rel.slice(i + 1)];
+}
+
+/// ASCII-only lowercase, matching `to_ascii_lowercase` at src/search.rs:183.
+/// `String.toLowerCase` is wrong here twice over: it folds beyond ASCII, which
+/// the server does not, and it can change a string's length ('İ' folds to two
+/// code units) — so an index found in the folded text would not map back onto
+/// the original, and the chip would land on the wrong characters.
+function lowerAscii(s) { return s.replace(/[A-Z]/g, (c) => c.toLowerCase()); }
+
+/// Appends `text` into `host`, wrapping each occurrence of `q` in a chip.
+/// Text nodes and createElement only — never a built-up markup string. The
+/// whole reason this function exists is the reason it must not interpolate:
+/// `text` is a line out of a file in the project.
+///
+/// A query that does not occur (a path matched as a subsequence, a match past
+/// the server's 300-character line cap) simply appends the text unmarked. That
+/// is a row without a chip, not an error and not a missing row.
+function appendHighlighted(host, text, q) {
+  const needle = lowerAscii(q || "");
+  if (!needle) { host.appendChild(document.createTextNode(text)); return; }
+  const hay = lowerAscii(text);
+  let i = 0;
+  for (;;) {
+    const at = hay.indexOf(needle, i);
+    if (at < 0) break;
+    if (at > i) host.appendChild(document.createTextNode(text.slice(i, at)));
+    const mark = document.createElement("span");
+    mark.className = "hit";
+    mark.textContent = text.slice(at, at + needle.length);
+    host.appendChild(mark);
+    i = at + needle.length;
+  }
+  host.appendChild(document.createTextNode(text.slice(i)));
+}
+
+/// One result row: a path cell on a fixed left column, then the text that
+/// matched. Every dynamic part is a text node — a matched line is arbitrary
+/// file content and a path is arbitrary filesystem content, which makes these
+/// the most attacker-influenced strings this client renders. The innerHTML
+/// rule at the top of this file is the whole defence, and it only holds if
+/// nothing here interpolates.
+///
+/// The path is three spans, not two: a `dir:base` two-span version still
+/// ellipsises from the tail once the FILENAME alone is wider than the
+/// column — `.base` was `flex: none` so it never shrank, but `text-overflow`
+/// on a non-shrinking element does nothing, and the element simply overflows
+/// its cell and gets clipped by `.at`'s own `overflow: hidden`, eating the
+/// line number off the right end. A search for `first` in this repo showed
+/// exactly that: seven rows all reading the same clipped basename, no line
+/// number differentiating any of them — the one property this cell exists
+/// to preserve, gone.
+///
+/// So the line number is its own span, `flex: none`, and never shrinks. The
+/// filename is `.name`, and the directory `.dir` — both `flex: 0 _ auto`
+/// with `text-overflow: ellipsis` — but `.dir` carries a higher
+/// flex-shrink than `.name` (see style.css), so the directory gives up
+/// space first and the filename only starts clipping once the directory has
+/// nothing left to give. Priority, highest first: the line number, then the
+/// filename, then the directory.
+function searchRow(dir, name, line) {
   const row = document.createElement("div");
   row.className = "searchrow";
-  const a = document.createElement("span");
-  a.textContent = primary;
-  row.appendChild(a);
-  if (secondary !== null && secondary !== undefined) {
-    const b = document.createElement("span");
-    b.className = "where";
-    b.textContent = secondary;
-    row.appendChild(b);
-  }
+
+  const at = document.createElement("span");
+  at.className = "at";
+  const d = document.createElement("span");
+  d.className = "dir";
+  d.textContent = dir;
+  const n = document.createElement("span");
+  n.className = "name";
+  n.textContent = name;
+  const ln = document.createElement("span");
+  ln.className = "line";
+  ln.textContent = line;
+  at.append(d, n, ln);
+
+  const what = document.createElement("span");
+  what.className = "what";
+
+  row.append(at, what);
   return row;
 }
 
@@ -2977,6 +3125,10 @@ function renderSearchDisconnected() {
   searchRows = [];
   searchSel = 0;
   if (note) note.textContent = "not connected";
+  // A socket that was never asked IS a gap — the strongest one this line can
+  // report — so it must wear the same mark a partial answer does, not
+  // whatever class the previous query happened to leave behind.
+  if (note) note.classList.add("skipped");
 }
 
 function renderSearch(results) {
@@ -2985,6 +3137,10 @@ function renderSearch(results) {
   if (!host) return;
   host.textContent = "";
   note.textContent = "";
+  // Cleared alongside the text, not just at the bottom of this function: the
+  // early return below (an emptied query) must not leave a PREVIOUS query's
+  // gap mark on an otherwise-blank note.
+  note.classList.remove("skipped");
   searchRows = [];
   searchSel = 0;
   if (!results) return;
@@ -2996,10 +3152,15 @@ function renderSearch(results) {
     host.appendChild(g);
   };
 
+  // The text cell always holds the thing that matched — the filename for a
+  // file hit, the line for a content hit, the name for a session — so the
+  // chip Task 2 adds always lands in the same column.
   if (results.files.length) {
     group(`Files (${results.files.length})`);
     for (const f of results.files) {
-      const row = searchRow(f.rel.split("/").pop(), f.rel);
+      const [dir, base] = splitPath(f.rel);
+      const row = searchRow(dir, "", "");
+      appendHighlighted(row.querySelector(".what"), base, searchSentQuery);
       host.appendChild(row);
       searchRows.push({ kind: "file", rel: f.rel });
     }
@@ -3007,18 +3168,18 @@ function renderSearch(results) {
   if (results.sessions.length) {
     group(`Sessions (${results.sessions.length})`);
     for (const s of results.sessions) {
-      host.appendChild(searchRow(s, "terminal"));
+      const row = searchRow("terminal", "", "");
+      appendHighlighted(row.querySelector(".what"), s, searchSentQuery);
+      host.appendChild(row);
       searchRows.push({ kind: "session", session: s });
     }
   }
   if (results.lines.length) {
     group(`Contents (${results.lines.length})`);
     for (const l of results.lines) {
-      const row = searchRow(`${l.rel}:${l.line}`, null);
-      const code = document.createElement("span");
-      code.className = "line";
-      code.textContent = l.text.trim();   // textContent: this is file content
-      row.appendChild(code);
+      const [dir, base] = splitPath(l.rel);
+      const row = searchRow(dir, base, `:${l.line}`);
+      appendHighlighted(row.querySelector(".what"), l.text.trim(), searchSentQuery);
       host.appendChild(row);
       searchRows.push({ kind: "line", rel: l.rel, line: l.line });
     }
@@ -3065,6 +3226,12 @@ function renderSearch(results) {
   const q = searchSentQuery;
   if (q && [...q].length < 3) parts.push("contents searched from 3 characters");
   note.textContent = parts.join(" · ");
+
+  // The mark means "something is missing from this answer", so the one note
+  // that is a complete answer — nothing found, nothing skipped, nothing
+  // failed — must not carry it.
+  const gap = parts.length > 0 && !(parts.length === 1 && parts[0] === "no matches");
+  note.classList.toggle("skipped", gap);
 
   if (searchRows.length) paintSearchSel();
 }
