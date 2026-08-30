@@ -2798,6 +2798,33 @@ document.addEventListener("keydown", (e) => {
   shiftPending = now;
 });
 
+// ⌘⇧F / Ctrl+Shift+F. Added because ⇧⇧ was reported as not working in a real
+// browser and stayed broken after the double-tap window was widened — the
+// cause is still unknown, so this is a second way in rather than a
+// replacement, and ⇧⇧ above is left exactly as it is.
+//
+// Shift is what makes the chord affordable. A terminal encodes Ctrl-F and
+// Ctrl-Shift-F identically — both are `^F` — so binding the shifted one takes
+// *nothing* from the shell: plain Ctrl-F still reaches readline as
+// forward-char, and xterm needs no special case. That is the whole reason to
+// prefer it over the plain chord, which would have had to be refused in
+// `attachCustomKeyEventHandler` and would have cost `^F` at every prompt.
+//
+// `metaKey` on a Mac and `ctrlKey` elsewhere, the same platform split
+// `linkModifier` uses — and deliberately not Alt, which readline binds heavily
+// and which *composes* on macOS (see the mention handler above, reduced to
+// matching the literal `˚` that Option+K produces).
+//
+// preventDefault takes the browser's own find bar, which is the point: it
+// would only ever search the pane that happens to be rendered.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "f" && e.key !== "F") return;
+  if (!e.shiftKey || e.altKey) return;
+  if (!(IS_MAC ? e.metaKey : e.ctrlKey)) return;
+  e.preventDefault();
+  openSearch();
+});
+
 function openSearch(returnFocus) {
   const ov = document.getElementById("searchoverlay");
   if (!ov || !ov.hidden) return;

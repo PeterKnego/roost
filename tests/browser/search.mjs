@@ -203,6 +203,33 @@ try {
     await evalIn(`document.getElementById("searchoverlay").hidden`),
     "an intervening keystroke resets the pending Shift, so ordinary typing cannot open it",
   );
+
+  // ⌘⇧F / Ctrl+Shift+F — the second way in, added because ⇧⇧ was reported as
+  // not working in a real browser for reasons still unknown. Real key events
+  // again: a synthetic dispatch would not exercise the modifier state at all.
+  const chordF = async (mods) => {
+    await evalIn(`closeSearch()`);
+    await sleep(100);
+    for (const type of ["keyDown", "keyUp"]) {
+      await page1.cmd("Input.dispatchKeyEvent", {
+        type, key: "F", code: "KeyF", windowsVirtualKeyCode: 70, nativeVirtualKeyCode: 70, modifiers: mods,
+      });
+    }
+    await sleep(150);
+    return !(await evalIn(`document.getElementById("searchoverlay").hidden`));
+  };
+  // CDP modifier bits: 1 alt, 2 ctrl, 4 meta/cmd, 8 shift.
+  const isMac = await evalIn(`IS_MAC`);
+  ok(await chordF(isMac ? 4 | 8 : 2 | 8), `${isMac ? "⌘⇧F" : "Ctrl+Shift+F"} opens the overlay`);
+  // The unshifted chord must NOT be bound: that is the whole reason for
+  // choosing the shifted one. A terminal encodes Ctrl-F and Ctrl-Shift-F
+  // identically, so leaving plain Ctrl-F alone is what keeps readline's
+  // forward-char working at a shell prompt. If this ever opens the overlay,
+  // ^F has been taken from every terminal in the app.
+  ok(
+    !(await chordF(isMac ? 4 : 2)),
+    "…and the UNshifted chord is left alone, so ^F still reaches the shell",
+  );
   ok(await evalIn(`document.getElementById("searchoverlay").hidden`), "…and the overlay is still closed after that");
 
   console.log("\nB. Escape restores focus");
