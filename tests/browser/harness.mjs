@@ -363,9 +363,17 @@ export async function fixture({ autosave = true } = {}) {
 /// non-hidden paths under $HOME — it cannot read /tmp or any dotted
 /// directory — so this is neither the repo's usual tmp conventions nor
 /// makeTempDir.
-export function profileDir(repoRoot) {
+///
+/// Deliberately OUTSIDE the checkout, which is the one constraint that is not
+/// obvious. This used to sit at `<repo>/tests/browser/tmp/profile` whenever the
+/// repo was under $HOME, and a Chromium profile is not small: 1.1 GB across
+/// 40,325 files had accumulated there. `.gitignore` hid it from `git status`,
+/// so nothing ever complained — but project-wide search walks the filesystem,
+/// not the index, and that one directory exhausted the whole 20,000-file scan
+/// budget. A real search of this very repo came back truncated because of the
+/// test harness. Anything that writes at this volume belongs beside the
+/// checkout, not inside it.
+export function profileDir(_repoRoot) {
   const home = Deno.env.get("HOME") ?? "/tmp";
-  return repoRoot.startsWith(home + "/")
-    ? `${repoRoot}/tests/browser/tmp/profile`
-    : `${home}/resh-browser-tmp/profile`;
+  return `${home}/resh-browser-tmp/profile`;
 }
