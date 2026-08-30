@@ -258,7 +258,16 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
             // overshoot is now reported as a measurement rather than assumed
             // away.
             stepped += 1;
-            if stepped.is_multiple_of(64) {
+            // `% 64` rather than `is_multiple_of`, which clippy prefers:
+            // that method stabilised in Rust 1.87, and this crate declares
+            // no `rust-version`. A published crate should not demand a
+            // toolchain from last year for a modulus, and an undeclared
+            // requirement fails with "no method named" rather than an MSRV
+            // diagnostic, which tells a contributor nothing. The `allow` is
+            // load-bearing: clippy suggests the method by default, so without
+            // it a `cargo clippy --fix` reintroduces the requirement silently.
+            #[allow(clippy::manual_is_multiple_of)]
+            if stepped % 64 == 0 {
                 if cancelled() {
                     r.outcome = Outcome::Truncated { reason: "superseded by a newer query".into() };
                     return r;

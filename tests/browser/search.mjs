@@ -513,7 +513,10 @@ try {
   // note the UI asserts completeness over a category nobody opened — the same
   // class of lie as (a)-(f) above, on the "chose not to look" side rather
   // than the "could not look" side. These use real typed queries, not
-  // injected events, because the note is built from #searchinput's own value.
+  // injected events: the note reports what the server did for the query the
+  // client actually sent, so it is built from the query recorded at send time
+  // (`searchSentQuery`). An injected SearchResults carries no query and would
+  // be described by whatever the last real send happened to leave behind.
   const SHORT = "contents searched from 3 characters";
   const noteText = `document.getElementById("searchnote").textContent`;
 
@@ -544,6 +547,29 @@ try {
   ok(
     await evalIn(noteText) === "",
     "(i) at three characters contents ARE searched, so the caveat is gone — the threshold is 3, not 'always'",
+  );
+
+  // (j) The note describes the query the SERVER ran, not whatever the box
+  // holds by the time the answer lands. Typing races the 120 ms debounce:
+  // a two-character query's results can arrive when the box already holds
+  // three, and a note read from the live input then contradicts the rows
+  // under it. Driven by setting the value with no `input` event — so no new
+  // query is sent — and then delivering the reply the two-character query is
+  // still waiting on. Reading the live input scores this as a 6-character
+  // query and drops the caveat, so this fails without the fix.
+  await freshSearch(evalIn, "lo");
+  ok(
+    await until(async () => (await evalIn(noteText)) === SHORT, 10, "two-char note"),
+    "(j) setup: the two-character query's caveat is showing",
+  );
+  const raceSeq = await evalIn(`searchSeq`);
+  await evalIn(`document.getElementById("searchinput").value = "marker"`);
+  await evalIn(`onEvent({ t: "SearchResults", seq: ${JSON.stringify(raceSeq)}, results: {
+    files: [{ rel: "src/long.rs" }], lines: [], sessions: [], outcome: { state: "Complete" }, unreadable: 0,
+  } })`);
+  ok(
+    await evalIn(noteText) === SHORT,
+    "(j) the caveat still describes the query the results came from, not the characters now in the box",
   );
 
   await evalIn(`closeSearch()`);

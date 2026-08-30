@@ -2761,6 +2761,13 @@ document.addEventListener("paste", (e) => {
 const SHIFT_GAP_MS = 400;
 let shiftPending = 0;
 let searchSeq = 0;
+// The query the in-flight `searchSeq` was sent for. The note below reports
+// whether *these results* had their contents searched, which is a fact about
+// the query the server actually ran — not about whatever is in the box now.
+// Reading the live input instead let the caveat flicker for a debounce
+// window: results for a 2-character query render while the box already holds
+// 3, and the note disagrees with the rows under it.
+let searchSentQuery = "";
 let searchRows = [];      // [{kind, rel, line, session}] parallel to the DOM rows
 let searchSel = 0;
 let searchDebounce = null;
@@ -2842,6 +2849,7 @@ document.getElementById("searchinput")?.addEventListener("input", (e) => {
       renderSearchDisconnected();
       return;
     }
+    searchSentQuery = q;
     send({ t: "Search", q, seq: ++searchSeq });
   }, 120);
 });
@@ -2982,7 +2990,11 @@ function renderSearch(results) {
   // wrong thing for an emoji or an accented query. Not shown for an empty
   // box: nothing was searched there at all, and the erase path renders
   // through `renderSearch(null)` above anyway.
-  const q = document.getElementById("searchinput")?.value || "";
+  //
+  // `searchSentQuery`, not the live input: this reports what the server did
+  // for the results being rendered, and the box can have moved on during the
+  // debounce.
+  const q = searchSentQuery;
   if (q && [...q].length < 3) parts.push("contents searched from 3 characters");
   note.textContent = parts.join(" · ");
 
