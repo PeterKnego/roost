@@ -2758,7 +2758,15 @@ document.addEventListener("paste", (e) => {
 //   - The two presses must be consecutive. Typing "HI" presses Shift twice in
 //     quick succession, but the H lands between them and resets the pending
 //     state, so ordinary typing cannot open this.
-const SHIFT_GAP_MS = 400;
+//
+// 400 ms was the first guess and it was too tight to use: measured against a
+// real browser through CDP's input pipeline, a 350 ms gap opened the overlay
+// and a 450 ms gap did not, while a deliberate — rather than hurried —
+// double-tap runs past that. It read as "the shortcut does not work", which is
+// how it was reported. 700 ms is roughly a Windows double-click default with
+// room to spare, and it costs no safety: the intervening-key reset above is
+// what stops ordinary typing from reaching here, not the length of the window.
+const SHIFT_GAP_MS = 700;
 let shiftPending = 0;
 let searchSeq = 0;
 // The query the in-flight `searchSeq` was sent for. The note below reports
@@ -2974,6 +2982,16 @@ function renderSearch(results) {
   if (results.outcome.state === "Truncated") parts.push(`partial results — ${results.outcome.reason}`);
   if (results.unreadable) {
     parts.push(`${results.unreadable} ${results.unreadable === 1 ? "place" : "places"} could not be read`);
+  }
+  // A decision, not a gap — but the user cannot tell those apart from an answer
+  // that simply does not mention them, which is why it is on this line at all.
+  // A nested checkout (a worktree, a submodule) holds real source someone may
+  // have expected to see; the walk declines it because its files are another
+  // project's, and for a worktree they are near-copies of the ones already
+  // listed here.
+  if (results.skipped_nested) {
+    const n = results.skipped_nested;
+    parts.push(`${n} nested ${n === 1 ? "checkout" : "checkouts"} not searched`);
   }
   if (!parts.length && !searchRows.length) parts.push("no matches");
   // The other half of the honesty line, and the one the server cannot supply:

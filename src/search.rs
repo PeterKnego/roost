@@ -66,11 +66,23 @@ pub struct Results {
     /// say "12 matches, 3 places I could not look" instead of implying the
     /// 12 are everything.
     pub unreadable: usize,
+    /// Nested checkouts the walk declined to descend into (see the directory
+    /// branch in [`run`]). Reported for the same reason `unreadable` is: this
+    /// one is a decision rather than a gap, but the user cannot tell the
+    /// difference from an answer that simply does not mention them.
+    pub skipped_nested: usize,
 }
 
 impl Results {
     fn empty() -> Self {
-        Results { files: vec![], lines: vec![], sessions: vec![], outcome: Outcome::Complete, unreadable: 0 }
+        Results {
+            files: vec![],
+            lines: vec![],
+            sessions: vec![],
+            outcome: Outcome::Complete,
+            unreadable: 0,
+            skipped_nested: 0,
+        }
     }
 }
 
@@ -302,6 +314,44 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
                 continue;
             }
             if meta.is_dir() {
+                // Two directories the walk refuses even when `TreeFilter` would
+                // allow them, because `show_hidden` is a decision about the
+                // *tree* and the tree is lazy — one `hx-get` per level, entered
+                // deliberately — while this walk is eager and enters everything
+                // at once. Reported as a bug the first time someone turned
+                // `show_hidden` on and searched: the hits came back full of
+                // `.git` internals and triplicated source from worktrees.
+                //
+                // `.git` is a database, not source. Nothing in it is a line a
+                // person meant to land on, and it is large.
+                if name == ".git" {
+                    continue;
+                }
+                // A directory holding its own `.git` is a different checkout —
+                // resh's own `.claude/worktrees/*`, a submodule, a vendored
+                // clone. Its files are somebody else's project, and for a
+                // worktree they are near-duplicates of the ones already being
+                // searched here, which is what made the results unreadable.
+                // Detected by the marker rather than by path, so a submodule or
+                // a hand-made worktree is covered too, and with
+                // `symlink_metadata` so an unreadable parent cannot read as
+                // "no marker, descend anyway".
+                match std::fs::symlink_metadata(path.join(".git")) {
+                    Ok(_) => {
+                        r.skipped_nested += 1;
+                        continue;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // Any other error means the probe could not answer — most
+                    // often because the directory itself is unreadable. Descend
+                    // anyway and let `read_dir` classify it: it will fail for
+                    // the same reason and count `unreadable`, which is the true
+                    // answer. Skipping here instead would file "I could not
+                    // look" under "I decided not to look" — the one conflation
+                    // this module exists to prevent, and the existing
+                    // unreadable-directory test catches it.
+                    Err(_) => {}
+                }
                 stack.push(path);
                 continue;
             }
@@ -633,6 +683,61 @@ mod tests {
         let on = TreeFilter { hide: &[], show_hidden: true };
         let shown = run(d.path(), &query("needle", on), &never());
         assert_eq!(shown.files.len(), 1, "SKIP_DIRS is not a dotfile rule; target/ stays hidden");
+    }
+
+    /// Reported from real use: with `show_hidden` on, a search came back full
+    /// of `.git` internals. `TreeFilter` stops hiding dot entries in that mode
+    /// — correct for the tree, wrong for an eager walk — so the walk has to
+    /// refuse `.git` itself. Both settings are driven, because a walk that
+    /// skipped `.git` by inheriting the *default* filter would pass the
+    /// `show_hidden: false` half while still being broken in the mode the bug
+    /// was reported in.
+    #[test]
+    fn git_is_never_walked_even_with_hidden_files_shown() {
+        let d = proj(&[(".git/objects/needle.pack", "needle\n"), ("src/needle.rs", "x\n")]);
+        for filter in [TreeFilter::default(), TreeFilter { hide: &[], show_hidden: true }] {
+            let r = run(d.path(), &query("needle", filter), &never());
+            assert!(
+                r.lines.is_empty(),
+                "nothing inside .git is a line to land on, got {:?}",
+                r.lines
+            );
+            assert_eq!(
+                r.files.iter().map(|f| f.rel.as_str()).collect::<Vec<_>>(),
+                ["src/needle.rs"],
+                "only the real file matches by path"
+            );
+            // Not counted as a nested checkout: every project has a .git and
+            // saying so on every search would be noise, not honesty.
+            assert_eq!(r.skipped_nested, 0);
+        }
+    }
+
+    /// The other half of the same report: `.claude/worktrees/*` are checkouts
+    /// of the same repository, so walking them triplicated every hit.
+    ///
+    /// Keyed off the `.git` marker rather than the path, so a submodule or a
+    /// hand-made worktree is covered too — and *counted*, because unlike `.git`
+    /// these hold real source somebody might have expected to see. A decision
+    /// not to look is still something the user has to be told.
+    #[test]
+    fn a_nested_checkout_is_skipped_and_counted() {
+        let d = proj(&[
+            ("src/needle.rs", "needle here\n"),
+            (".claude/worktrees/claude-1/.git", "gitdir: /elsewhere\n"),
+            (".claude/worktrees/claude-1/src/needle.rs", "needle here\n"),
+        ]);
+        let on = TreeFilter { hide: &[], show_hidden: true };
+        let r = run(d.path(), &query("needle", on), &never());
+
+        assert_eq!(
+            r.files.iter().map(|f| f.rel.as_str()).collect::<Vec<_>>(),
+            ["src/needle.rs"],
+            "the worktree's copy must not appear beside the real one"
+        );
+        assert_eq!(r.lines.len(), 1, "one content hit, not two: {:?}", r.lines);
+        assert_eq!(r.skipped_nested, 1, "and the skip is reported, not silent");
+        assert_eq!(r.outcome, Outcome::Complete);
     }
 
     #[test]

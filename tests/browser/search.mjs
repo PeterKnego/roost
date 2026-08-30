@@ -13,7 +13,7 @@
 //! code could be wrong — not because it looked thorough to include.
 //!
 //! Run: deno run -A tests/browser/search.mjs
-import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -68,13 +68,33 @@ const setQuery = (q) => `(() => {
   i.dispatchEvent(new Event("input", { bubbles: true }));
 })()`;
 
-// Two real Shift keydowns on the document, not a call to openSearch(): an
-// overlay wired to nothing is exactly the defect this file exists to catch.
+// Two Shift keydowns dispatched on the document. Kept for the *later* sections,
+// which only need the overlay open and do not care how it got there — but note
+// what it does not prove: `document.dispatchEvent` calls document listeners
+// directly, so it exercises neither the bubble path a real key takes nor the
+// double-tap window, since both calls land in the same millisecond. Section A
+// uses `realShiftTwice` for exactly that reason.
 const shiftTwice = `(() => {
   const k = () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Shift", bubbles: true }));
   k(); k();
   return !document.getElementById("searchoverlay").hidden;
 })()`;
+
+/// One real Shift press-and-release, through the browser's own input pipeline.
+async function realShift(page) {
+  const k = { key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16, nativeVirtualKeyCode: 16 };
+  await page.cmd("Input.dispatchKeyEvent", { type: "rawKeyDown", modifiers: 8, ...k });
+  await page.cmd("Input.dispatchKeyEvent", { type: "keyUp", modifiers: 0, ...k });
+}
+
+/// Two of them `gap` ms apart, answering whether the overlay opened.
+async function realShiftTwice(page, gap) {
+  await realShift(page);
+  await sleep(gap);
+  await realShift(page);
+  await sleep(150);
+  return !(await page.evalIn(`document.getElementById("searchoverlay").hidden`));
+}
 
 // Closes whatever is open (idempotent) and reopens with a fresh query, so
 // each section starts from a known state instead of layering onto whatever
@@ -155,19 +175,34 @@ try {
   await until(() => page2.evalIn("ctrl && ctrl.readyState === 1 && !!state"), 30, "page two's app");
 
   console.log("A. the trigger");
-  ok(await evalIn(shiftTwice), "⇧⇧ opens the overlay");
+  // Real key events, through CDP's input pipeline — NOT
+  // `document.dispatchEvent`. This section used to do the latter, which invokes
+  // document listeners directly and therefore proves only that a listener is
+  // registered: it travels no capture/bubble path and, because the two calls
+  // land microseconds apart, it cannot see the double-tap window at all. It
+  // passed green while ⇧⇧ was unusable in a real browser at a human tapping
+  // speed, which is how the bug was reported rather than caught here.
+  ok(await realShiftTwice(page1, 90), "⇧⇧ (real key events, fast tap) opens the overlay");
+  await evalIn(`closeSearch()`);
+  // The gap a person actually produces when they mean it, rather than the
+  // hurried one. 400 ms used to be the window and this failed at 450.
+  ok(await realShiftTwice(page1, 520), "…and at a deliberate 520 ms tap, not just a hurried one");
   ok(
     await evalIn(`(() => { closeSearch(); return document.getElementById("searchoverlay").hidden; })()`),
     "closeSearch() is callable as a global, and hides the overlay",
   );
-  // A single Shift, and a Shift with a key between two Shifts, must not open it —
-  // that is what stops typing "HI" from opening search.
-  const notOpened = `(() => {
-    const k = (key) => document.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
-    k("Shift"); k("H"); k("Shift");
-    return document.getElementById("searchoverlay").hidden;
-  })()`;
-  ok(await evalIn(notOpened), "an intervening keystroke resets the pending Shift, so ordinary typing cannot open it");
+  // A Shift with a key between two Shifts must not open it — that is what stops
+  // typing "HI" from opening search. Real events again: the whole question is
+  // whether the H reaches the same listener the Shifts do.
+  await realShift(page1);
+  await page1.cmd("Input.dispatchKeyEvent", { type: "keyDown", key: "H", code: "KeyH", text: "H", windowsVirtualKeyCode: 72 });
+  await page1.cmd("Input.dispatchKeyEvent", { type: "keyUp", key: "H", code: "KeyH", windowsVirtualKeyCode: 72 });
+  await realShift(page1);
+  await sleep(150);
+  ok(
+    await evalIn(`document.getElementById("searchoverlay").hidden`),
+    "an intervening keystroke resets the pending Shift, so ordinary typing cannot open it",
+  );
   ok(await evalIn(`document.getElementById("searchoverlay").hidden`), "…and the overlay is still closed after that");
 
   console.log("\nB. Escape restores focus");
