@@ -26,6 +26,14 @@ html, body { height: 100%; }
      14% because the equivalent tab step measures 1.15-1.24 against --tool and
      a modal's keyboard selection should read a little stronger than a tab. */
   --row-on: color-mix(in oklab, var(--fg) 14%, var(--bg2));
+  /* The match chip. Derived from --warn rather than given five hand-picked
+     values, because every theme already chose a warm hue there — so a sixth
+     theme gets a correct chip for free, and there is no per-theme value to get
+     wrong. Translucent on purpose: a selected row is --row-on, and a chip that
+     composites is legible on both surfaces by construction, where an opaque
+     one would need a second value for the selected case. Same lesson as
+     --row-on itself, one step earlier. */
+  --hit: color-mix(in oklab, var(--warn) 28%, transparent);
   --pane-radius: 8px;
   /* How many rows of tabs a pane header may grow to before the strip starts
      scrolling instead. Four is roughly 16 tabs in the middle pane and 12 in
@@ -794,6 +802,7 @@ ul.picker li .git:hover { text-decoration: underline; }
 .searchrow .at .base { flex: none; }
 .searchrow .what { min-width: 0; overflow: hidden; text-overflow: ellipsis;
                    white-space: nowrap; }
+.searchrow .hit { background: var(--hit); border-radius: 2px; }
 /* The honesty line: truncation, unreadable directories, outright failure. */
 #searchnote { padding: 6px 12px; font-size: 11px; color: var(--muted);
               border-top: 1px solid var(--border); }

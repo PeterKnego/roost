@@ -2955,6 +2955,39 @@ function splitPath(rel) {
   return i < 0 ? ["", rel] : [rel.slice(0, i + 1), rel.slice(i + 1)];
 }
 
+/// ASCII-only lowercase, matching `to_ascii_lowercase` at src/search.rs:183.
+/// `String.toLowerCase` is wrong here twice over: it folds beyond ASCII, which
+/// the server does not, and it can change a string's length ('İ' folds to two
+/// code units) — so an index found in the folded text would not map back onto
+/// the original, and the chip would land on the wrong characters.
+function lowerAscii(s) { return s.replace(/[A-Z]/g, (c) => c.toLowerCase()); }
+
+/// Appends `text` into `host`, wrapping each occurrence of `q` in a chip.
+/// Text nodes and createElement only — never a built-up markup string. The
+/// whole reason this function exists is the reason it must not interpolate:
+/// `text` is a line out of a file in the project.
+///
+/// A query that does not occur (a path matched as a subsequence, a match past
+/// the server's 300-character line cap) simply appends the text unmarked. That
+/// is a row without a chip, not an error and not a missing row.
+function appendHighlighted(host, text, q) {
+  const needle = lowerAscii(q || "");
+  if (!needle) { host.appendChild(document.createTextNode(text)); return; }
+  const hay = lowerAscii(text);
+  let i = 0;
+  for (;;) {
+    const at = hay.indexOf(needle, i);
+    if (at < 0) break;
+    if (at > i) host.appendChild(document.createTextNode(text.slice(i, at)));
+    const mark = document.createElement("span");
+    mark.className = "hit";
+    mark.textContent = text.slice(at, at + needle.length);
+    host.appendChild(mark);
+    i = at + needle.length;
+  }
+  host.appendChild(document.createTextNode(text.slice(i)));
+}
+
 /// One result row: a path cell on a fixed left column, then the text that
 /// matched. Every dynamic part is a text node — a matched line is arbitrary
 /// file content and a path is arbitrary filesystem content, which makes these
@@ -3025,7 +3058,7 @@ function renderSearch(results) {
     for (const f of results.files) {
       const [dir, base] = splitPath(f.rel);
       const row = searchRow(dir, "");
-      row.querySelector(".what").textContent = base;
+      appendHighlighted(row.querySelector(".what"), base, searchSentQuery);
       host.appendChild(row);
       searchRows.push({ kind: "file", rel: f.rel });
     }
@@ -3034,7 +3067,7 @@ function renderSearch(results) {
     group(`Sessions (${results.sessions.length})`);
     for (const s of results.sessions) {
       const row = searchRow("terminal", "");
-      row.querySelector(".what").textContent = s;
+      appendHighlighted(row.querySelector(".what"), s, searchSentQuery);
       host.appendChild(row);
       searchRows.push({ kind: "session", session: s });
     }
@@ -3044,7 +3077,7 @@ function renderSearch(results) {
     for (const l of results.lines) {
       const [dir, base] = splitPath(l.rel);
       const row = searchRow(dir, `${base}:${l.line}`);
-      row.querySelector(".what").textContent = l.text.trim();
+      appendHighlighted(row.querySelector(".what"), l.text.trim(), searchSentQuery);
       host.appendChild(row);
       searchRows.push({ kind: "line", rel: l.rel, line: l.line });
     }

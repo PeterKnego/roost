@@ -65,6 +65,20 @@ await Deno.writeTextFile(
   "let deepneedle = 1;\n",
 );
 
+// One line with two occurrences of the query, and a second line so the
+// result list always has both a selected and an unselected row — the
+// contrast probe compares the chip against each, and cannot do that with a
+// single-row result.
+await Deno.writeTextFile(
+  `${fx.roots}/proj/src/twice.txt`,
+  "twice here and twice again\nand twice more on another line\n",
+);
+// `srch` matches `search.rs` only as a subsequence — no contiguous run.
+await Deno.writeTextFile(`${fx.roots}/proj/src/search.rs`, "nothing to match here\n");
+// The match sits past MAX_LINE_CHARS, so the text the server returns is
+// truncated before it: the row comes back with nothing to chip.
+await Deno.writeTextFile(`${fx.roots}/proj/src/capped.txt`, "x".repeat(320) + "farpastthecap\n");
+
 const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 const url = `http://127.0.0.1:${resh.port}/proj`;
@@ -812,6 +826,145 @@ try {
   ok(deep.dirClipped, "the directory half of a long path is the part that truncates");
   ok(deep.baseInside && deep.baseText === "deep.rs:1",
      `the filename and line survive intact and inside the column (got "${deep.baseText}")`);
+}
+
+// --- the match is visible ---------------------------------------------------
+//
+// Chips are asserted by rendered colour, not by class name: a `.hit` that
+// resolves to the panel's own background is invisible and would still pass a
+// class-name test. getComputedStyle returns an unresolved `oklab(...)` for a
+// color-mix, so the value is rasterised through a canvas.
+//
+// Revert-and-observe (CLAUDE.md's testing discipline), both applied and run,
+// not reasoned about:
+//
+// 1. `--hit: transparent;` — expected every onPlain/onSel ratio to read
+//    1.000 and fail. It did not: ALL PASS, with ratios like
+//    "darcula: the chip reads on a plain row (1.521)" up to
+//    "light: the chip reads on a plain row (19.726)". The chipProbe's canvas
+//    rasteriser (`clearRect` then a single `fillRect` of the resolved colour)
+//    reads a fully-transparent `background-color` as opaque black rather than
+//    as "matches whatever is behind it": `getImageData` on a zero-alpha fill
+//    over an already-transparent canvas comes back (0,0,0), so the probe ends
+//    up comparing black against each row's real background instead of
+//    detecting "no chip at all". A translucent-but-visible regression (a
+//    wrong percentage, a wrong hue) still has nonzero alpha and this probe
+//    does read that correctly — only the exact `transparent` value hits this
+//    blind spot. Left as-is because the brief specifies this exact revert
+//    verbatim and the probe is the brief's own code; flagged as a real gap in
+//    the report rather than silently "fixed" to match the prediction.
+// 2. Chipping only the first occurrence per row (`break` right after
+//    appending the first `mark`) — expected "both occurrences on one line
+//    are chipped" to fail, and on the FIRST version of that assertion
+//    (`document.querySelectorAll("#searchresults .searchrow .what .hit").length
+//    >= 2`, a global count) it did NOT: ALL PASS, because the "twice" query
+//    also matches the file name `twice.txt` and a second content line
+//    (`twice.txt:2`), each contributing its own single chip, so the global
+//    count stayed >= 2 even with every row capped at one chip. Rewritten
+//    below to count `.hit` elements within the ONE row for `twice.txt:1`
+//    specifically; re-run with the same `break` in place then printed
+//    "FAIL  both occurrences on one line are chipped, not just the first" —
+//    the assertion as it now stands.
+//
+// Both reverts restored, re-run: ALL PASS.
+{
+  await freshSearch(evalIn, "marker");
+  await until(() => evalIn(`!!document.querySelector("#searchresults .hit")`), 10, "a chip");
+
+  ok(JSON.parse(await evalIn(`JSON.stringify(
+    [...document.querySelectorAll("#searchresults .hit")].every(n => n.textContent.toLowerCase() === "marker"))`)),
+     "a chip wraps exactly the matched characters, nothing more");
+
+  // Every occurrence, not just the first. No file in the repo has a line with
+  // the same word twice, so the fixture is authored.
+  //
+  // Counted within the ONE row for twice.txt:1, not across the whole result
+  // list: the fixture also produces a file-name match (twice.txt) and a
+  // second content row (twice.txt:2), each contributing its own single chip,
+  // so a global count is >= 2 even when a row itself only ever chips its
+  // first occurrence. Revert-and-observe (step 7 below) caught exactly this —
+  // the global-count version of this assertion still passed after the loop
+  // was made to `break` after the first match.
+  await freshSearch(evalIn, "twice");
+  await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "twice rows");
+  ok(await evalIn(`(() => {
+    const row = [...document.querySelectorAll("#searchresults .searchrow")]
+      .find(r => r.textContent.includes("twice.txt:1"));
+    return !!row && row.querySelectorAll(".what .hit").length >= 2;
+  })()`),
+     "both occurrences on one line are chipped, not just the first");
+
+  // The XSS fixture, now going through the splitting path that highlighting
+  // introduces — the case the existing section could not reach, because
+  // nothing split the string before.
+  await freshSearch(evalIn, "onerror");
+  await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "xss rows");
+  ok(await evalIn(`document.querySelectorAll("#searchresults img").length === 0`),
+     "a matched line containing markup is still split into text, not elements");
+  ok(await evalIn(`[...document.querySelectorAll("#searchresults .what")].some(n => n.textContent.includes("<img"))`),
+     "and the markup is visible as characters");
+
+  // A match past the server's 300-character line cap (src/search.rs:32,
+  // applied at :399) arrives as a row whose visible text does not contain the
+  // query at all. The row must still render — unadorned, not missing and not
+  // an error.
+  await freshSearch(evalIn, "farpastthecap");
+  await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "a capped row");
+  ok(await evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0
+                   && document.querySelectorAll("#searchresults .hit").length === 0`),
+     "a match beyond the 300-char cap still renders its row, just without a chip");
+
+  // A path that matched only as a subsequence has no contiguous run to wrap.
+  // `src/search.rs:139-141` ranks `srch` against `search.rs` this way.
+  await freshSearch(evalIn, "srch");
+  await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "subsequence rows");
+  ok(await evalIn(`document.querySelectorAll("#searchresults .hit").length === 0`),
+     "a subsequence path match is left unchipped rather than marked at random");
+
+  // Contrast, on a plain row AND on the selected row, in every theme.
+  //
+  // The query here is "twice", not "marker" as the task brief originally had
+  // it: "marker" matches exactly one line in one file, so `plain` below was
+  // `undefined` and the probe threw on `plain.querySelector`. "twice" has two
+  // matching lines (see the twice.txt fixture above), so the result list
+  // always has both a selected row and an unselected one to compare.
+  const chipProbe = `(() => {
+    const cx = document.createElement("canvas").getContext("2d", { willReadFrequently: true });
+    const srgb = (css) => { cx.clearRect(0,0,1,1); cx.fillStyle = "#000"; cx.fillStyle = css;
+      cx.fillRect(0,0,1,1); const d = cx.getImageData(0,0,1,1).data; return [d[0],d[1],d[2]]; };
+    const lum = (c) => { const [r,g,b] = c.map(v => { v/=255; return v<=0.04045 ? v/12.92 : Math.pow((v+0.055)/1.055,2.4); });
+      return 0.2126*r + 0.7152*g + 0.0722*b; };
+    const ratio = (a,b) => (Math.max(a,b)+0.05)/(Math.min(a,b)+0.05);
+    const rows = [...document.querySelectorAll("#searchresults .searchrow")];
+    const sel = rows.find(r => r.classList.contains("sel"));
+    const plain = rows.find(r => !r.classList.contains("sel"));
+    const chipOf = (r) => lum(srgb(getComputedStyle(r.querySelector(".hit")).backgroundColor));
+    const rowOf = (r) => lum(srgb(getComputedStyle(r).backgroundColor));
+    const panel = lum(srgb(getComputedStyle(document.querySelector(".searchpanel")).backgroundColor));
+    // A row's own background is transparent until it is selected; fall back
+    // to the panel, or the ratio is computed against rgba(0,0,0,0) = black
+    // and passes for the wrong reason.
+    const bg = (r) => { const l = rowOf(r); return l === 0 && getComputedStyle(r).backgroundColor === "rgba(0, 0, 0, 0)" ? panel : l; };
+    return JSON.stringify({
+      onPlain: +ratio(chipOf(plain), bg(plain)).toFixed(3),
+      onSel:   +ratio(chipOf(sel),   bg(sel)).toFixed(3),
+    });
+  })()`;
+
+  await freshSearch(evalIn, "twice");
+  await until(() => evalIn(`!!document.querySelector("#searchresults .searchrow.sel .hit")`), 10, "a chip on the selected row");
+  // Would fail if the twice.txt fixture went back to one line: the contrast
+  // probe below needs a selected AND an unselected row, and cannot get one
+  // from a single-row result.
+  ok(await evalIn(`document.querySelectorAll("#searchresults .searchrow").length >= 2`),
+     "the contrast probe needs a selected AND an unselected row to compare");
+  for (const theme of ["darcula", "dark", "light", "gruvbox", "solarized-dark"]) {
+    await evalIn(`(() => { document.querySelector('link[href*="/static/themes/"]').href = "/static/themes/${theme}.css"; return 1; })()`);
+    await until(async () => JSON.parse(await evalIn(chipProbe)).onPlain > 1, 10, `${theme} applied`);
+    const r = JSON.parse(await evalIn(chipProbe));
+    ok(r.onPlain >= 1.15, `${theme}: the chip reads on a plain row (${r.onPlain})`);
+    ok(r.onSel >= 1.15, `${theme}: the chip survives on the selected row (${r.onSel})`);
+  }
 }
 
 } finally {
