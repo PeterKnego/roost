@@ -1147,7 +1147,7 @@ pub fn workspace_page(
   <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body, git from:body"></span><span id="wtlabel"></span></button>
   {warn}
   {sharing_indicator}
-  <div id="searchbox" title="project-wide search — not implemented yet">{SVG_SEARCH}<span class="hintline">Search files, symbols, sessions</span><kbd>⇧ ⇧</kbd></div>
+  <button id="searchbox" title="search this project (⇧ ⇧)">{SVG_SEARCH}<span class="hintline">Search files, contents, sessions</span><kbd>⇧ ⇧</kbd></button>
   <button id="projbtn" title="running projects">{SVG_DIAMOND}<span id="projcount"></span></button>
   <button id="bell" title="notifications (n)">{SVG_BELL}<span id="bellcount"></span></button>
   <button id="settings" title="settings — not implemented yet">{SVG_GEAR}</button>
@@ -1167,6 +1167,13 @@ pub fn workspace_page(
   <div class="divider" data-div="right-w"></div>
   <section class="pane" data-pane="3"><div class="panehead"><div class="tabstrip"></div><div class="paneicons"></div></div><div class="content"></div></section>
 </main>
+<div id="searchoverlay" hidden>
+  <div class="searchpanel">
+    <input id="searchinput" type="text" autocomplete="off" spellcheck="false" placeholder="Search files, contents, sessions">
+    <div id="searchresults"></div>
+    <div id="searchnote"></div>
+  </div>
+</div>
 <!-- Empty by default and hidden: the slots exist so a future per-pane control
      (a split, a kebab, a pane menu) has somewhere to land without reopening
      the header's layout. app.js rebuilds .tabstrip wholesale on every render,
@@ -1936,6 +1943,24 @@ mod tests {
 
         let bare = workspace_page("proj", "proj", &s, None, false, &[]);
         assert!(!bare.contains("/frag/proj/theme"));
+    }
+
+    #[test]
+    fn the_header_advertises_what_search_actually_does() {
+        let s = Settings { theme: "gruvbox".into(), ..Settings::default() };
+        let h = workspace_page("proj", "proj", &s, Some("theme.css"), false, &[]);
+        assert!(h.contains("id=\"searchoverlay\""), "the overlay shell must be in the page");
+        assert!(h.contains("id=\"searchinput\""), "{h}");
+        assert!(h.contains("id=\"searchresults\""), "{h}");
+        assert!(h.contains("id=\"searchnote\""), "{h}");
+        // Symbols are out of scope. A slot that keeps promising a category
+        // nobody is building is how a placeholder becomes a lie.
+        assert!(!h.contains("Search files, symbols"), "the hint must not promise symbols");
+        assert!(h.contains("Search files, contents, sessions"), "{h}");
+        assert!(
+            !h.contains("project-wide search — not implemented yet"),
+            "the tooltip must stop saying search is unimplemented"
+        );
     }
 
     // The strip's `?current=` value is the storage key, not the URL form —

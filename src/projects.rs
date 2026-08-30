@@ -56,6 +56,14 @@ const TEXT_EXTENSIONS: &[&str] = &[
     "ini", "service", "env", "gitignore", "dockerignore",
 ];
 
+/// Whether an extension is one we treat as text even when it sniffs binary.
+/// Exposed so `search.rs` applies this rule rather than keeping a second
+/// copy: two lists that disagree is how a file becomes searchable in one
+/// place and invisible in another.
+pub fn is_text_extension(ext: &str) -> bool {
+    TEXT_EXTENSIONS.contains(&ext)
+}
+
 /// Roots to scan for projects: `RESH_ROOTS` (colon-separated) when set and
 /// non-empty, otherwise the global config's `roots`. Empty when neither says
 /// anything; `main` refuses to start on that rather than guessing.
@@ -382,6 +390,29 @@ pub fn resolve_terminal_path(project_dir: &Path, text: &str) -> Result<String, S
         Ok(_) => Ok(rel),
         Err(e) => Err(format!("cannot read {rel}: {e}")),
     }
+}
+
+/// The `:42` a terminal link may carry, if it has one.
+///
+/// Separate from `resolve_terminal_path`, which resolves and confines the
+/// path and has no use for the line: this reads the same suffix for the one
+/// caller that does. `a/b:c.md` is not a line number, so only a trailing run
+/// of digits after the final colon counts, and only when the rest is
+/// non-empty.
+pub fn trailing_line(text: &str) -> Option<u32> {
+    let (rest, tail) = text.rsplit_once(':')?;
+    if rest.is_empty() {
+        return None;
+    }
+    // `file.rs:42:7` — column form; the line is the first of the two.
+    if let Some((rest2, mid)) = rest.rsplit_once(':') {
+        if !rest2.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty() {
+            if let Ok(n) = mid.parse::<u32>() {
+                return Some(n);
+            }
+        }
+    }
+    tail.parse::<u32>().ok()
 }
 
 /// `src/main.rs:42` and `src/main.rs:42:7` both name `src/main.rs`. The browser

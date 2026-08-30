@@ -315,6 +315,25 @@ impl Hub {
         }
     }
 
+    /// Everything a search needs, copied out under the lock so the walk can
+    /// run without it.
+    ///
+    /// Deliberately does *not* resolve the config here: `config::for_project`
+    /// reads files, and this method's whole purpose is that its caller can
+    /// drop the lock immediately. The worker resolves the settings itself,
+    /// off-lock, from `dir`.
+    pub fn search_snapshot(&self) -> crate::search::Snapshot {
+        crate::search::Snapshot {
+            dir: self.dir.clone(),
+            show_hidden_override: self.ws.show_hidden,
+            // `ws.live_sessions`, never `session::list_sessions`: that forks
+            // a `ps` per session while holding the global session-registry
+            // mutex (see `refresh_live_sessions`), which would reintroduce
+            // exactly the stall this snapshot exists to avoid.
+            sessions: self.ws.live_sessions.clone(),
+        }
+    }
+
     pub fn snapshot_event(&self, origin: &ConnId) -> Event {
         let mut ws = self.ws.view();
         // Derived here rather than kept in `WsState`: `wsstate::save` persists
@@ -447,6 +466,9 @@ impl Hub {
                 return self.do_new_terminal(from, *pane, *launch, *force)
             }
             Intent::OpenPath { text } => return self.do_open_path(from, text.clone()),
+            Intent::OpenAtLine { pane, rel, line } => {
+                return self.do_open_at_line(from, *pane, rel.clone(), *line)
+            }
             Intent::MentionPath { rel, line_start, line_end, session } => {
                 return self.do_mention_path(
                     from,
@@ -467,6 +489,17 @@ impl Hub {
             }
             Intent::AnswerProposal { id, accept, text } => {
                 return self.do_answer_proposal(from, id.clone(), *accept, text.clone())
+            }
+            // A search performs an unbounded filesystem walk, so `wsconn.rs`
+            // diverts it to a worker thread *before* this lock is taken —
+            // that divert is the entire enforcement of CLAUDE.md's "never
+            // hold a lock across blocking I/O" for this feature. Enumerated
+            // here rather than left to the `_` arm below so that reordering
+            // the divert, or adding a second dispatch site, fails loudly
+            // instead of quietly running the walk under the hub lock and
+            // stalling every browser on the project with nothing to say so.
+            Intent::Search { .. } => {
+                unreachable!("Search is diverted in wsconn before this lock is taken")
             }
             _ => {}
         }
@@ -1616,11 +1649,77 @@ impl Hub {
         // `apply_layout` call and the single broadcast/persist that follow —
         // no double broadcast, no double persist, and the refusal path above
         // (which returns before this point) is untouched.
+        let line = crate::projects::trailing_line(&text);
         let intent = Intent::OpenTab {
             pane: crate::proto::MIDDLE,
-            tab: Tab::File { rel, mode: Mode::Preview },
+            tab: Tab::File { rel: rel.clone(), mode: Mode::Preview },
         };
-        self.handle(from, intent)
+        self.handle(from, intent);
+        // The line the link named. Until this existed the client stripped it
+        // and flashed "line 42 — opening file", because, as app.js put it,
+        // "the viewer has no line addressing to spend it on". It does now.
+        if let Some(line) = line {
+            let ev = Event::RevealLine { rel, line };
+            self.broadcast(&ev);
+        }
+    }
+
+    /// Open `rel` and tell every browser to scroll it to `line`.
+    ///
+    /// The confinement check is here for the reason `do_open_path` gives:
+    /// `apply_layout` validates nothing, and this `rel` came off a wire. That
+    /// a search produced it is no guarantee — a client can send this intent
+    /// with anything in it.
+    ///
+    /// Refusal wording mirrors `resolve_terminal_path`'s own split (it keeps
+    /// "confidently outside" distinct from "canonicalize failed for some
+    /// other reason", so a file merely deleted since a search ran is never
+    /// reported as having escaped the project) — but, unlike that function,
+    /// never interpolates `rel` into the escape-case message. `rel` is
+    /// attacker-controlled at this point, and echoing it back into the one
+    /// event this client receives would hand it right back out. The
+    /// non-escape case has nothing to leak: `rel` already resolved to
+    /// somewhere inside this project, the same trust level `do_open_path`
+    /// already gives a terminal link's path in its own refusal.
+    fn do_open_at_line(&mut self, from: &ConnId, pane: crate::proto::PaneId, rel: String, line: u32) {
+        if let Err(msg) = crate::projects::safe_resolve(&self.dir, &rel) {
+            let text = if msg.starts_with("path outside project") {
+                "path outside project".to_string()
+            } else {
+                format!("couldn't open {rel}")
+            };
+            let ev = Event::Error { msg: text };
+            return self.send_to(from, &ev);
+        }
+        // Edit, not Preview: a content hit was matched against the file's
+        // source, and a rendered markdown preview has no line 412 to land on.
+        // `coerce_tab` still demotes anything that cannot be edited as text.
+        let want = Tab::File { rel: rel.clone(), mode: Mode::Edit };
+        // Checked before the `OpenTab` below reactivates it: `apply_layout`'s
+        // `OpenTab` arm only applies `mode` when it creates a fresh tab
+        // (see `find_tab`'s early return in that arm) — reactivating an
+        // already-open tab leaves whatever mode it already had (Preview,
+        // from a tree click or a terminal link) untouched. A content hit
+        // needs Edit regardless, so that case gets an explicit `SetMode`
+        // below, the same path the ✎ toggle uses.
+        let already_open = self.ws.find_tab(&want).is_some();
+        let intent = Intent::OpenTab { pane, tab: want };
+        self.handle(from, intent);
+        // `pane` is client-controlled and never bounds-checked (`do_open_path`
+        // sidesteps this by hardcoding `MIDDLE`); an out-of-range value makes
+        // `apply_layout` fail with "no pane N", which `handle` has already
+        // reported to `from` above. Confirming the tab actually exists before
+        // broadcasting `RevealLine` — rather than assuming the `OpenTab` above
+        // succeeded — means a failed open never tells every other browser to
+        // scroll a tab that was never created.
+        if self.ws.find_tab(&Tab::File { rel: rel.clone(), mode: Mode::Edit }).is_none() {
+            return;
+        }
+        if already_open {
+            self.handle(from, Intent::SetMode { rel: rel.clone(), mode: Mode::Edit });
+        }
+        let ev = Event::RevealLine { rel, line };
+        self.broadcast(&ev);
     }
 
     /// Resolves `rel` against this project's directory before it ever
@@ -5061,6 +5160,238 @@ mod tests {
         h.handle(&a, Intent::RemoveWorktree { key });
         let got = rx.try_recv().unwrap();
         assert!(got.contains("not a worktree of this project"), "the main checkout is never removable: {got}");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn open_at_line_opens_the_file_and_reveals_the_line() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.rs"), "one\ntwo\nthree\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        let (_other, rx_other) = h.subscribe();
+        drain(&rx);
+        drain(&rx_other);
+
+        h.handle(&c, Intent::OpenAtLine { pane: proto::MIDDLE, rel: "a.rs".into(), line: 2 });
+
+        let mine = drain(&rx);
+        assert!(mine.iter().any(|m| m.contains(r#""t":"State""#) && m.contains("a.rs")), "{mine:?}");
+        assert!(
+            mine.iter().any(|m| m.contains(r#""t":"RevealLine""#) && m.contains(r#""line":2"#)),
+            "{mine:?}"
+        );
+        // Broadcast, not send_to: a second browser mirroring this tab follows
+        // it to the same line. Asserted explicitly so the choice cannot flip
+        // silently in either direction.
+        assert!(
+            drain(&rx_other).iter().any(|m| m.contains(r#""t":"RevealLine""#)),
+            "a mirroring browser must be told where to scroll"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn open_at_line_opening_a_file_twice_does_not_open_a_second_tab() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.rs"), "one\ntwo\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(&c, Intent::OpenAtLine { pane: proto::MIDDLE, rel: "a.rs".into(), line: 1 });
+        h.handle(&c, Intent::OpenAtLine { pane: proto::MIDDLE, rel: "a.rs".into(), line: 2 });
+
+        let tabs = h.ws.panes[proto::MIDDLE as usize]
+            .tabs
+            .iter()
+            .filter(|t| matches!(t, Tab::File { rel, .. } if rel == "a.rs"))
+            .count();
+        assert_eq!(tabs, 1, "a second hit in an open file must re-scroll it, not clone the tab");
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// `rel` arrives from a browser. `apply_layout` validates nothing, so the
+    /// confinement check has to be here — the same reasoning `OpenPath`
+    /// carries. Asserts on the *message*, not merely that something failed:
+    /// an intent rejected for the wrong reason would pass an `is_err`-style
+    /// check while leaving the escape open.
+    #[test]
+    fn open_at_line_refuses_a_path_outside_the_project() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(&c, Intent::OpenAtLine {
+            pane: proto::MIDDLE,
+            rel: "../../etc/passwd".into(),
+            line: 1,
+        });
+
+        let got = drain(&rx);
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("outside project")),
+            "must refuse by confinement and say so, got {got:?}"
+        );
+        assert!(
+            !got.iter().any(|m| m.contains("passwd")),
+            "nothing outside the project may reach the layout, got {got:?}"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn a_terminal_link_with_a_line_number_reveals_that_line() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.rs"), "one\ntwo\nthree\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(&c, Intent::OpenPath { text: "a.rs:3".into() });
+
+        let got = drain(&rx);
+        assert!(got.iter().any(|m| m.contains(r#""t":"State""#) && m.contains("a.rs")), "{got:?}");
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"RevealLine""#) && m.contains(r#""line":3"#)),
+            "a link that named a line must land on it, got {got:?}"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    #[test]
+    fn a_terminal_link_without_a_line_number_reveals_nothing() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.rs"), "one\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(&c, Intent::OpenPath { text: "a.rs".into() });
+
+        assert!(
+            !drain(&rx).iter().any(|m| m.contains(r#""t":"RevealLine""#)),
+            "a plain path must not scroll anywhere"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// Fix round 1, finding 1: `apply_layout`'s `OpenTab` arm only applies
+    /// `mode` when it creates a fresh tab — reactivating an already-open one
+    /// just flips `pane.active` and leaves the stored tab's mode alone. A
+    /// file opened from the tree or a terminal link lands in Preview; taking
+    /// a content hit inside it must still land the reader in Edit, since
+    /// that's the whole reason `do_open_at_line` asks for Edit in the first
+    /// place (a rendered preview has no line 412 to scroll to).
+    ///
+    /// Revert-checked: removing the `if already_open { self.handle(...,
+    /// SetMode...) }` call reproduces the bug this test exists to catch —
+    /// see the fix-round-1 report for the verbatim failure.
+    #[test]
+    fn open_at_line_switches_an_already_open_preview_tab_to_edit() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.md"), "one\ntwo\nthree\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(
+            &c,
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::File { rel: "a.md".into(), mode: Mode::Preview } },
+        );
+        h.handle(&c, Intent::OpenAtLine { pane: proto::MIDDLE, rel: "a.md".into(), line: 2 });
+
+        let tabs: Vec<_> = h.ws.panes[proto::MIDDLE as usize]
+            .tabs
+            .iter()
+            .filter(|t| matches!(t, Tab::File { rel, .. } if rel == "a.md"))
+            .collect();
+        assert_eq!(tabs.len(), 1, "must reuse the tab, not clone it");
+        assert!(
+            matches!(tabs[0], Tab::File { mode: Mode::Edit, .. }),
+            "a content hit must flip an already-open Preview tab to Edit, got {:?}",
+            tabs[0]
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// Fix round 1, finding 2: `pane` is a client-controlled `u8` that
+    /// nothing bounds-checks before this point (`do_open_path` sidesteps the
+    /// question entirely by hardcoding `MIDDLE`). An out-of-range pane makes
+    /// the `OpenTab` this method issues fail — reported to the asker alone —
+    /// and the fix confirms the tab exists before broadcasting `RevealLine`,
+    /// so a second browser is never told to scroll a tab that was never
+    /// created.
+    ///
+    /// Revert-checked: removing the post-`OpenTab` `find_tab` guard (so
+    /// `RevealLine` always broadcasts) reproduces the leak this test exists
+    /// to catch — see the fix-round-1 report for the verbatim failure.
+    #[test]
+    fn open_at_line_with_an_out_of_range_pane_reports_an_error_and_broadcasts_nothing() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::fs::write(d.path().join("a.rs"), "one\ntwo\n").unwrap();
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        let (_other, rx_other) = h.subscribe();
+        drain(&rx);
+        drain(&rx_other);
+
+        h.handle(&c, Intent::OpenAtLine { pane: 99, rel: "a.rs".into(), line: 1 });
+
+        let got = drain(&rx);
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"Error""#)),
+            "the asker must be told the pane was rejected, got {got:?}"
+        );
+        assert!(
+            !drain(&rx_other).iter().any(|m| m.contains(r#""t":"RevealLine""#)),
+            "nobody may be told to scroll a tab that was never created"
+        );
+        std::env::remove_var("RESH_STATE_DIR");
+    }
+
+    /// Fix round 1, finding 3: `safe_resolve` keeps "confidently outside the
+    /// project" distinct from "canonicalize failed for any other reason"
+    /// (missing file, permission denied, ...) — collapsing both into a flat
+    /// refusal would report a file merely deleted since a search ran as
+    /// having escaped the project, the exact false-claim shape CLAUDE.md's
+    /// eleven-defect table describes.
+    ///
+    /// Revert-checked: collapsing the two branches back to `.is_err()`
+    /// reproduces the false claim this test exists to catch — see the
+    /// fix-round-1 report for the verbatim failure.
+    #[test]
+    fn open_at_line_on_a_missing_but_in_bounds_path_is_not_reported_as_outside() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        // Never created: `gone.rs` resolves inside the project but isn't there.
+        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(&c, Intent::OpenAtLine { pane: proto::MIDDLE, rel: "gone.rs".into(), line: 1 });
+
+        let got = drain(&rx);
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"Error""#) && !m.contains("outside")),
+            "a missing-but-confined path must not be reported as outside the project, got {got:?}"
+        );
         std::env::remove_var("RESH_STATE_DIR");
     }
 }

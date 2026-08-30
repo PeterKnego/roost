@@ -62,13 +62,12 @@ header .proj { font-weight: 500; }
 #gitstatus .gmod    { color: var(--warn, #d79921); font-family: var(--mono); font-size: 11px; }
 #gitstatus .gahead  { color: var(--add-fg); font-family: var(--mono); font-size: 11px; }
 #gitstatus .gbehind { color: var(--muted); font-family: var(--mono); font-size: 11px; }
-/* Honest placeholder: looks like the control it will become, and the help
-   cursor + tooltip say it is not one yet. A div, not an input — nothing to
-   focus, nothing to submit. */
+/* A real, focusable control now, rather than the honest placeholder it
+   replaces — the wiring arrives with the overlay's JavaScript. */
 #searchbox { display: flex; align-items: center; gap: 8px; width: 400px; height: 26px;
              margin-left: auto; margin-right: auto; padding: 0 8px 0 9px; border-radius: 6px;
              border: 1px solid var(--border); background: var(--tool); color: var(--muted);
-             cursor: help; }
+             font: inherit; cursor: pointer; }
 #searchbox .hintline { flex: 1 1 auto; overflow: hidden; white-space: nowrap; }
 #searchbox kbd { border: 1px solid var(--border); border-radius: 3px; padding: 0 4px;
                  font: 11px/16px var(--mono); }
@@ -267,7 +266,15 @@ main { flex: 1; min-height: 0; }
 .editwrap .editor { flex: 1 1 auto; height: auto; min-height: 0; }
 /* A code file's editor is a <code-input>: the same textarea, with a
    highlighted <pre> painted under it (static/vendor/code-input.min.css does
-   the stacking and the scroll sync). Everything here is undoing that
+   the stacking and the scroll sync — the sync is stylesheet-only, not
+   script: that file gives the <code-input> host `display: grid; overflow:
+   auto` and stacks the textarea and the <pre> at `grid-area: 1/1`, neither
+   of them scrollable (the textarea is `overflow: hidden`, the <pre>
+   `overflow: visible`), so the host is the only thing that scrolls and the
+   two layers cannot drift. Do not go looking for a scroll listener in
+   code-input.min.js; there is none, and that is the point. scrollEditorTo()
+   in static/app.js sets `host.scrollTop` for exactly this reason — scrolling
+   the textarea instead would move nothing). Everything here is undoing that
    stylesheet's standalone defaults — an 8px margin, a 250px height, a white
    background, 16px padding and `monospace` — so the editor sits in the pane
    exactly where the plain textarea did, with the same metrics. Font and
@@ -749,3 +756,27 @@ ul.picker li .git:hover { text-decoration: underline; }
 .ovall { color: var(--accent); text-decoration: none; }
 .ovall:hover { text-decoration: underline; }
 .ovempty { color: var(--muted); padding: 6px 8px; }
+
+/* The overlay. resh's first modal — deliberately minimal, so the popup pass
+   docs/backlog.md wants can absorb it rather than having to undo it. */
+#searchoverlay { position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.35);
+                 display: flex; align-items: flex-start; justify-content: center; }
+#searchoverlay[hidden] { display: none; }
+.searchpanel { margin-top: 12vh; width: min(720px, 92vw); max-height: 70vh;
+               display: flex; flex-direction: column;
+               background: var(--bg2); border: 1px solid var(--border);
+               border-radius: 8px; overflow: hidden; }
+#searchinput { border: none; border-bottom: 1px solid var(--border); background: var(--tool);
+               color: var(--fg); font: inherit; padding: 10px 12px; outline: none; }
+#searchresults { overflow-y: auto; }
+.searchgroup { padding: 4px 12px; font-size: 11px; color: var(--muted);
+               border-bottom: 1px solid var(--border); }
+.searchrow { display: flex; gap: 8px; align-items: baseline; padding: 4px 12px;
+             cursor: pointer; white-space: nowrap; overflow: hidden; }
+.searchrow.sel { background: var(--tool); }
+.searchrow .where { color: var(--muted); font-size: 11px; }
+.searchrow .line { font: 12px/1.4 var(--mono); overflow: hidden; text-overflow: ellipsis; }
+/* The honesty line: truncation, unreadable directories, outright failure. */
+#searchnote { padding: 6px 12px; font-size: 11px; color: var(--muted);
+              border-top: 1px solid var(--border); }
+#searchnote:empty { display: none; }

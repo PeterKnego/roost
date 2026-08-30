@@ -488,6 +488,14 @@ function onEvent(ev) {
       // silent no-op. console.warn stays too, for anyone actually watching devtools.
       console.warn("resh:", ev.msg);
       showError(ev.msg);
+      // do_open_at_line's own confinement check (src/hub.rs) refuses here,
+      // never with a RevealLine — so a flag armed for it would otherwise
+      // stay armed forever, ready to steal focus (and via wireEditor's blur
+      // listener, trigger an autosave) on some *other* browser's later,
+      // unrelated RevealLine. Clearing unconditionally on every Error is
+      // safe even when this Error has nothing to do with a reveal: the flag
+      // only ever changes whether the next RevealLine focuses.
+      focusNextReveal = false;
       break;
     case "PathRefused":
       // Not showError: that funnels to the workspace banner, which is the
@@ -495,6 +503,11 @@ function onEvent(ev) {
       // back to the terminal that was clicked. This does, via the click still
       // in flight.
       console.warn("resh:", ev.msg);
+      // Same reasoning as the Error case above: a link that doesn't resolve
+      // (the comment below calls this "the common case, not an edge case")
+      // armed focusNextReveal in openTermPath and will never get the
+      // RevealLine that would otherwise have cleared it.
+      focusNextReveal = false;
       if (pendingLink && pendingLink.text === ev.text) {
         termFlash(pendingLink.entry, ev.msg);
         // Cleared only on a match. A mismatch means a DIFFERENT click is
@@ -506,6 +519,29 @@ function onEvent(ev) {
         pendingLink = null;
       }
       break;
+    case "SearchResults":
+      // A late answer to a query the user has typed past must not paint over
+      // what they are looking at now. The server drops most of these; this is
+      // the client half of the same rule, for the ones already in flight.
+      if (ev.seq !== searchSeq) break;
+      renderSearch(ev.results);
+      break;
+    case "RevealLine": {
+      // Consumed once, immediately: focusNextReveal marks "the intent I just
+      // sent (OpenAtLine or a line-suffixed OpenPath) is mine", and this
+      // RevealLine may be that broadcast coming back, or it may be a
+      // completely different browser's action mirrored to this one — the
+      // only way to tell them apart client-side. No requestAnimationFrame:
+      // an Edit tab mounts synchronously inside the State handler that runs
+      // before this event is even queued, and a Preview tab's fetch can take
+      // far longer than one frame anyway — revealLine()/tryReveal() below
+      // handle that race by retrying from the fetch's own completion, not by
+      // guessing at a delay.
+      const focus = focusNextReveal;
+      focusNextReveal = false;
+      revealLine(ev.rel, ev.line, focus);
+      break;
+    }
   }
 }
 
@@ -862,6 +898,12 @@ function mountTab(content, t) {
       const mb = modeButton(t.rel, t.mode);
       const path = content.querySelector(".path");
       if (mb && path) path.appendChild(mb);
+      // A RevealLine can arrive before this fetch resolves — the State event
+      // that creates this tab only starts the fetch, it does not wait for
+      // it. tryReveal() is a no-op unless something is still waiting on
+      // exactly this rel, so calling it unconditionally on every File mount
+      // is cheap and correct either way.
+      tryReveal();
     }
     // Tree fragments carry lazy <details hx-get="...tree?dir=..."
     // hx-trigger="toggle once"> nodes (render::tree_level). htmx only binds
@@ -1246,11 +1288,24 @@ let pendingLink = null;
 
 function openTermPath(entry, raw) {
   pendingLink = { entry, text: raw };
-  // The line number is matched so the whole reference underlines, then dropped
-  // — the viewer has no line addressing to spend it on. Saying so is the only
-  // thing between "we ignored part of what you clicked" and silence.
+  // The line is no longer dropped: the server sends a RevealLine alongside
+  // the tab it opens (hub::do_open_path), and revealLine() scrolls there —
+  // except when the tab lands on a rendered form with no line surface (a
+  // markdown preview, an image), in which case revealLine() finds nothing
+  // and does nothing. The label still names the line the link pointed at
+  // either way; it is not a promise that the view will jump.
   const line = raw.match(/:(\d+)(?::\d+)?$/);
-  if (line) termFlash(entry, `line ${line[1]} — opening file`);
+  if (line) {
+    termFlash(entry, `line ${line[1]}`);
+    // do_open_path (src/hub.rs) opens the target in Preview, not Edit, so
+    // revealInPreview — which never focuses anything — is what usually runs
+    // for this click, not revealInEditor. This flag still only ever matters
+    // for the Edit case: the incidental one where this rel also happens to
+    // have an Edit-mode pane open elsewhere. Armed here regardless, since
+    // openTermPath cannot know which case it will be before the reply
+    // arrives — see revealLine()'s focus parameter.
+    focusNextReveal = true;
+  }
   // Verbatim. The client does no parsing; resolution and confinement are one
   // function in projects.rs.
   send({ t: "OpenPath", text: raw });
@@ -2691,3 +2746,618 @@ document.addEventListener("paste", (e) => {
   e.preventDefault();
   uploadFiles(files, dir);
 }, true);
+
+// --- project search (⇧⇧) ---------------------------------------------------
+//
+// Double-tap Shift, IntelliJ-style. Two properties make it safe to arm on the
+// document even while a terminal has focus, which is where focus usually is:
+//
+//   - Shift alone emits nothing to a shell, so intercepting it steals no
+//     keystroke. Any Ctrl-/Cmd- chord would have to be taken away from the
+//     program running in the terminal instead.
+//   - The two presses must be consecutive. Typing "HI" presses Shift twice in
+//     quick succession, but the H lands between them and resets the pending
+//     state, so ordinary typing cannot open this.
+const SHIFT_GAP_MS = 400;
+let shiftPending = 0;
+let searchSeq = 0;
+let searchRows = [];      // [{kind, rel, line, session}] parallel to the DOM rows
+let searchSel = 0;
+let searchDebounce = null;
+let searchReturnFocus = null;
+// #searchbox is a <button>, and a browser focuses a button on mousedown —
+// before its click handler runs. Captured here, on mousedown, so openSearch
+// still sees whatever had focus before the click (usually a terminal)
+// instead of the button itself.
+let searchboxMousedownFocus = null;
+
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Shift") { shiftPending = 0; return; }
+  if (e.repeat) return;   // holding Shift down is one press, not many
+  const now = Date.now();
+  if (shiftPending && now - shiftPending < SHIFT_GAP_MS) {
+    shiftPending = 0;
+    openSearch();
+    return;
+  }
+  shiftPending = now;
+});
+
+function openSearch(returnFocus) {
+  const ov = document.getElementById("searchoverlay");
+  if (!ov || !ov.hidden) return;
+  // Remembered before focus moves: closing must give the terminal back, or
+  // every dismissal costs the user their shell focus. A caller that already
+  // captured the pre-click target (the searchbox mousedown handler below)
+  // passes it in, because by the time a click handler runs, a <button> has
+  // already taken focus for itself.
+  searchReturnFocus = returnFocus !== undefined ? returnFocus : document.activeElement;
+  ov.hidden = false;
+  const input = document.getElementById("searchinput");
+  input.value = "";
+  renderSearch(null);
+  input.focus();
+}
+
+function closeSearch() {
+  const ov = document.getElementById("searchoverlay");
+  if (!ov || ov.hidden) return;
+  ov.hidden = true;
+  searchRows = [];
+  // Dismissing mid-debounce must not let the pending Search still fire: its
+  // reply would repopulate searchRows and the (now hidden) result list from
+  // a query the user no longer has open.
+  clearTimeout(searchDebounce);
+  searchSeq++;
+  // .focus() on an element no longer in the document does not throw — it
+  // silently no-ops and focus falls to <body>. A State broadcast can detach
+  // the remembered terminal node while the overlay is open (a tabstrip
+  // re-render), so this has to be checked explicitly rather than trusted to
+  // fail loudly.
+  if (searchReturnFocus && document.contains(searchReturnFocus)) searchReturnFocus.focus();
+  searchReturnFocus = null;
+}
+
+document.getElementById("searchbox")?.addEventListener("mousedown", () => {
+  searchboxMousedownFocus = document.activeElement;
+});
+document.getElementById("searchbox")?.addEventListener("click", () => openSearch(searchboxMousedownFocus));
+
+document.getElementById("searchinput")?.addEventListener("input", (e) => {
+  const q = e.target.value;
+  clearTimeout(searchDebounce);
+  // Debounced, because every keystroke is a walk. The server drops answers to
+  // queries the user has already typed past, but not sending them at all is
+  // cheaper than cancelling them.
+  searchDebounce = setTimeout(() => {
+    // Erasing the query bumps searchSeq too: a reply to the just-abandoned
+    // query must not paint over the now-empty box, the same reason the send
+    // branch below bumps it.
+    if (!q) { searchSeq++; renderSearch(null); return; }
+    if (!ctrl || ctrl.readyState !== 1) {
+      // send() would silently no-op here; without this the box would just
+      // sit there showing stale rows (or nothing), which reads as "no
+      // matches" when the truth is "never asked".
+      searchSeq++;
+      renderSearchDisconnected();
+      return;
+    }
+    send({ t: "Search", q, seq: ++searchSeq });
+  }, 120);
+});
+
+// Bound to the document, not to #searchoverlay, and gated on the overlay
+// being open. The overlay contains exactly one focusable element (the input),
+// so focus leaves it trivially — one Tab, or a click on any non-row part of
+// the panel, which the backdrop handler below deliberately does not treat as
+// a dismissal. With the listener scoped to the overlay, focus landing on
+// <body> took Escape, ↑/↓ and Enter with it, and `openSearch` early-returns
+// on an already-open overlay, so ⇧⇧ could not recover either: the modal was
+// stranded open with only a backdrop click left to close it. Trapping Tab
+// instead would have fixed only the first of those two routes.
+document.addEventListener("keydown", (e) => {
+  const ov = document.getElementById("searchoverlay");
+  if (!ov || ov.hidden) return;
+  if (e.key === "Escape") { e.preventDefault(); closeSearch(); return; }
+  if (e.key === "ArrowDown") { e.preventDefault(); moveSearchSel(1); return; }
+  if (e.key === "ArrowUp") { e.preventDefault(); moveSearchSel(-1); return; }
+  if (e.key === "Enter") { e.preventDefault(); activateSearchRow(searchSel); }
+});
+
+// Clicking the backdrop closes; clicking the panel does not.
+document.getElementById("searchoverlay")?.addEventListener("mousedown", (e) => {
+  if (e.target.id === "searchoverlay") closeSearch();
+});
+
+function moveSearchSel(d) {
+  if (!searchRows.length) return;
+  searchSel = (searchSel + d + searchRows.length) % searchRows.length;
+  paintSearchSel();
+}
+
+function paintSearchSel() {
+  const rows = document.querySelectorAll("#searchresults .searchrow");
+  rows.forEach((n, i) => n.classList.toggle("sel", i === searchSel));
+  rows[searchSel]?.scrollIntoView({ block: "nearest" });
+}
+
+/// Builds one result row. Every dynamic part is a text node: a matched line is
+/// arbitrary file content and a path is arbitrary filesystem content, which
+/// makes these the most attacker-influenced strings this client renders. The
+/// innerHTML rule at the top of this file (constant markup only) is the whole
+/// defence, and it only holds if nothing here interpolates.
+function searchRow(primary, secondary) {
+  const row = document.createElement("div");
+  row.className = "searchrow";
+  const a = document.createElement("span");
+  a.textContent = primary;
+  row.appendChild(a);
+  if (secondary !== null && secondary !== undefined) {
+    const b = document.createElement("span");
+    b.className = "where";
+    b.textContent = secondary;
+    row.appendChild(b);
+  }
+  return row;
+}
+
+// The "socket is down" case send() handles by silently dropping the intent —
+// right for most callers, wrong here, where silence reads as "no matches"
+// instead of "never asked".
+function renderSearchDisconnected() {
+  const host = document.getElementById("searchresults");
+  const note = document.getElementById("searchnote");
+  if (host) host.textContent = "";
+  searchRows = [];
+  searchSel = 0;
+  if (note) note.textContent = "not connected";
+}
+
+function renderSearch(results) {
+  const host = document.getElementById("searchresults");
+  const note = document.getElementById("searchnote");
+  if (!host) return;
+  host.textContent = "";
+  note.textContent = "";
+  searchRows = [];
+  searchSel = 0;
+  if (!results) return;
+
+  const group = (label) => {
+    const g = document.createElement("div");
+    g.className = "searchgroup";
+    g.textContent = label;
+    host.appendChild(g);
+  };
+
+  if (results.files.length) {
+    group(`Files (${results.files.length})`);
+    for (const f of results.files) {
+      const row = searchRow(f.rel.split("/").pop(), f.rel);
+      host.appendChild(row);
+      searchRows.push({ kind: "file", rel: f.rel });
+    }
+  }
+  if (results.sessions.length) {
+    group(`Sessions (${results.sessions.length})`);
+    for (const s of results.sessions) {
+      host.appendChild(searchRow(s, "terminal"));
+      searchRows.push({ kind: "session", session: s });
+    }
+  }
+  if (results.lines.length) {
+    group(`Contents (${results.lines.length})`);
+    for (const l of results.lines) {
+      const row = searchRow(`${l.rel}:${l.line}`, null);
+      const code = document.createElement("span");
+      code.className = "line";
+      code.textContent = l.text.trim();   // textContent: this is file content
+      row.appendChild(code);
+      host.appendChild(row);
+      searchRows.push({ kind: "line", rel: l.rel, line: l.line });
+    }
+  }
+
+  // The honesty line. "No matches" and "I could not look everywhere" are
+  // different answers, and only this element can tell them apart — which is
+  // the whole reason `Results` carries an outcome instead of being a list.
+  const parts = [];
+  if (results.outcome.state === "Failed") parts.push(`search failed: ${results.outcome.msg}`);
+  if (results.outcome.state === "Truncated") parts.push(`partial results — ${results.outcome.reason}`);
+  if (results.unreadable) {
+    parts.push(`${results.unreadable} ${results.unreadable === 1 ? "place" : "places"} could not be read`);
+  }
+  if (!parts.length && !searchRows.length) parts.push("no matches");
+  // The other half of the honesty line, and the one the server cannot supply:
+  // below three characters wsconn.rs sets `Query::contents = false`, so the
+  // walk never opens a single file — yet it truthfully reports `Complete` for
+  // the categories it *did* search, and the note above would therefore be
+  // empty. That is "I chose not to look" rendered as completeness, which is
+  // the one thing this line exists to prevent. Appended rather than
+  // substituted, so it composes with a Truncated reason or an unreadable
+  // count instead of hiding one.
+  //
+  // Counted in code points, matching the server's `q.chars().count() >= 3`
+  // exactly — a threshold that disagreed with the server's would announce the
+  // wrong thing for an emoji or an accented query. Not shown for an empty
+  // box: nothing was searched there at all, and the erase path renders
+  // through `renderSearch(null)` above anyway.
+  const q = document.getElementById("searchinput")?.value || "";
+  if (q && [...q].length < 3) parts.push("contents searched from 3 characters");
+  note.textContent = parts.join(" · ");
+
+  if (searchRows.length) paintSearchSel();
+}
+
+function activateSearchRow(i) {
+  const r = searchRows[i];
+  if (!r) return;
+  closeSearch();
+  if (r.kind === "session") {
+    send({ t: "OpenTab", pane: 3, tab: { k: "Terminal", session: r.session } });
+  } else if (r.kind === "line") {
+    // Only the client that pressed Enter on this row gets focus stolen into
+    // the editor once RevealLine comes back — see revealLine()'s focus
+    // parameter.
+    focusNextReveal = true;
+    send({ t: "OpenAtLine", pane: 2, rel: r.rel, line: r.line });
+  } else {
+    // Same rule the file tree uses (defaultMode, line 145): a rendered form
+    // opens in Preview, everything else opens in Edit. Hardcoding Preview
+    // here would open the same file differently depending on which path the
+    // user clicked it from, and the server does not correct it — coerce_tab
+    // only ever demotes Edit to Preview, never promotes back.
+    send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: r.rel, mode: defaultMode(r.rel) } });
+  }
+}
+
+document.getElementById("searchresults")?.addEventListener("click", (e) => {
+  const row = e.target.closest(".searchrow");
+  if (!row) return;
+  const rows = [...document.querySelectorAll("#searchresults .searchrow")];
+  activateSearchRow(rows.indexOf(row));
+});
+
+// Set true by whichever intent (OpenAtLine from a search row, or a
+// line-suffixed OpenPath from a terminal link) is about to provoke a
+// RevealLine broadcast from this client, and consumed exactly once by the
+// "RevealLine" case in onEvent. RevealLine is broadcast to every browser on
+// the tab on purpose (a second browser mirroring the view follows the
+// scroll), but focus is not scroll: a mirroring browser's user may be typing
+// in an unrelated terminal or editor right now, and wireEditor's blur
+// listener would autosave whatever they were in the moment focus is yanked
+// away. Everyone gets scrolled and selected; only the client that actually
+// asked gets focus.
+let focusNextReveal = false;
+
+// {rel, line, focus} for a reveal that has not finished landing anywhere yet,
+// or null. Armed by revealLine(), consumed by tryReveal() — which is called
+// again from mountTab's fetch completion, because a Preview pane's fetch can
+// still be in flight when RevealLine arrives (the State event that creates
+// the tab only starts that fetch, it does not wait for it).
+//
+// A single slot, last-wins: a second RevealLine that arrives before the
+// first one's target pane finishes mounting replaces it outright, and the
+// first is never applied anywhere. Deliberate, not an oversight — RevealLine
+// only ever follows a user-driven OpenAtLine or line-suffixed OpenPath, so
+// two in flight on one client at once means two of those landed back to
+// back, and jumping to wherever the most recent one points is the same
+// "whatever the user is looking at now wins" rule SearchResults' own `seq`
+// guard already applies elsewhere in this file — not a queue holding onto
+// something the user has moved past.
+let pendingReveal = null;
+let pendingRevealTimer = null;
+// Sweep-scoped, not per-pane: scrollEditorTo() runs once per still-unrevealed
+// pane in a single tryReveal() sweep, and without this a frame with k panes
+// stuck on an unsynced <pre> schedules k retries, each of which schedules k
+// more on its own next sweep — a runaway that a hung tab's unsaved buffers
+// would ride along with. Cleared at the top of tryReveal() so a retry that
+// is actually still needed after this sweep can still be scheduled once.
+let revealRetryScheduled = false;
+function scheduleRevealRetry() {
+  if (revealRetryScheduled) return;
+  revealRetryScheduled = true;
+  requestAnimationFrame(() => tryReveal());
+}
+
+/// Scroll whichever pane holds `rel` to `line`, and select it where the
+/// surface has a selection to give it (the editor). There is no flash here:
+/// the editor's selection and the preview's centered scroll are the only
+/// feedback either surface has — search's own result list and the
+/// terminal's line flash (termFlash, in openTermPath) cover the rest.
+///
+/// Three surfaces, and only two of them have lines. A code preview is a
+/// single <pre class="codeview"> with no per-line elements, but `.codeview`
+/// sets no white-space override, so <pre>'s default `white-space: pre`
+/// applies and one source line is exactly one visual line — which is what
+/// makes the arithmetic in revealInPreview() exact. A *rendered* form —
+/// markdown, an image, a read-error placeholder — has no line mapping at
+/// all: tryReveal() finds neither a textarea nor a `pre.codeview` for that
+/// pane and leaves it alone rather than guessing at a scroll position that
+/// would be meaningless there.
+///
+/// `focus` is per-caller, not per-event: see the comment on
+/// `focusNextReveal` above.
+function revealLine(rel, line, focus) {
+  pendingReveal = { rel, line, focus };
+  clearTimeout(pendingRevealTimer);
+  // Reached only when tryReveal() below (and every retry from mountTab's
+  // fetch completion) never got every matching pane to a `pre.codeview` or
+  // `textarea.editor` within this window — the ordinary cases (a fetch that
+  // lands, or a rendered form with genuinely no line mapping) clear
+  // pendingReveal themselves, well before this fires. Reaching here means
+  // some pane matching `rel` is still stuck empty: closed before its fetch
+  // landed, or some other path this client cannot observe. Silence here
+  // would be exactly the failure mode CLAUDE.md calls out — treating "I
+  // could not tell" as nothing having gone wrong — so it says so instead.
+  // 4000ms is not measured against any real fetch latency; it is an
+  // arbitrary, generously long backstop, chosen only so a stale target
+  // can't sit armed indefinitely (see the comment above pendingReveal).
+  pendingRevealTimer = setTimeout(() => {
+    // Not in a hidden tab. RevealLine is broadcast, so a browser that is
+    // merely mirroring someone else's navigation arms this timer too — and
+    // in a background tab code-input's rAF loop is throttled to a stop, so
+    // scrollEditorTo's sync guard (`pre.textContent.length < ta.value.length`)
+    // never clears, the retry never lands, and this fires every time. The
+    // result was a user who did nothing being shown an error about someone
+    // else's navigation. `pendingReveal` is still cleared either way: the
+    // target is stale regardless of who can see the banner.
+    if (!document.hidden) {
+      showBanner(`couldn't scroll to line ${line} of ${rel} — its tab may have closed, or never finished opening`);
+    }
+    pendingReveal = null;
+  }, 4000);
+  tryReveal();
+}
+
+/// Applies `pendingReveal`, if any, to every currently-mounted pane that
+/// matches — every pane, not just the first: a file open in two panes at
+/// once must scroll both, and which one a DOM-order `return` would have hit
+/// first is an implementation detail no user should have to think about.
+///
+/// Marks each pane it actually reveals into (`content._revealedFor`) so a
+/// later call for the *same* pendingReveal — mountTab calls this again once
+/// some other, still-loading pane's fetch finally lands — does not re-apply
+/// to a pane that already got it, which would otherwise re-snap the scroll
+/// (and, for the focused client, re-select) out from under a user who
+/// scrolled away in the meantime. A new revealLine() call always creates a
+/// fresh pendingReveal object, so this marker never blocks a genuinely new
+/// reveal of the same pane later.
+function tryReveal() {
+  revealRetryScheduled = false;
+  if (!pendingReveal) return;
+  const { rel, line, focus } = pendingReveal;
+  let stillWaiting = false;
+  for (const content of document.querySelectorAll(".pane .content")) {
+    if (content._revealedFor === pendingReveal) continue;
+    const ta = content.querySelector("textarea.editor");
+    if (ta && editorRel(content) === rel) {
+      // A highlighted file's <pre> can still be one animation frame behind a
+      // fresh mount (see scrollEditorTo's doc comment) — revealInEditor
+      // reports that back rather than silently landing wherever a stale
+      // layout happened to be, and schedules its own retry. Leaving
+      // _revealedFor unset here (and stillWaiting true) means the 4s banner
+      // in revealLine() still fires if that retry never lands, instead of
+      // this pane sitting unrevealed forever with no visible sign of it.
+      if (revealInEditor(ta, line, focus)) {
+        content._revealedFor = pendingReveal;
+      } else {
+        stillWaiting = true;
+      }
+      continue;
+    }
+    if (!matchesRel(content, rel)) continue;
+    const pre = content.querySelector("pre.codeview");
+    if (pre) {
+      revealInPreview(content, pre, line);
+      content._revealedFor = pendingReveal;
+      continue;
+    }
+    // This pane's fragment is rel's, but neither surface is mounted. An
+    // empty innerHTML means mountTab's fetch hasn't landed yet — worth
+    // another pass once it does (mountTab calls tryReveal() itself when it
+    // finishes). A non-empty one means the fetch already landed on a
+    // rendered form with no line mapping (markdown, an image, a read-error
+    // placeholder) — nothing will ever match here, and there is nothing
+    // further to wait for.
+    if (!content.innerHTML.trim()) stillWaiting = true;
+  }
+  if (!stillWaiting) {
+    pendingReveal = null;
+    clearTimeout(pendingRevealTimer);
+  }
+}
+
+/// Sets the selection and, if `focus` is set, steals focus — then scrolls
+/// via scrollEditorTo(), reporting back whether that scroll actually landed
+/// (see there) so tryReveal() knows whether to retry rather than mark this
+/// pane done.
+///
+/// Selection and focus are unconditional and immediate: neither depends on
+/// any layout being settled, so there is nothing to gain by deferring them,
+/// and setting them right away means the caret is in the right place even in
+/// the one frame before a highlighted file's scroll catches up.
+///
+/// Native focus-driven scrolling used to be this function's only mechanism
+/// for the focused case, on the theory that focusing a textarea with an
+/// active selection makes the browser scroll it into view for free. Measured
+/// two ways this turned out not to hold: it only fires on an actual focus
+/// *transition* (searching within a file that is already open and focused —
+/// a real, common case, not an edge case — calls focus() on an element that
+/// is already document.activeElement, so no such event exists to trigger
+/// it), and even when a transition does happen, a freshly mounted highlighted
+/// file's <pre> may not have finished laying out yet (see scrollEditorTo).
+/// scrollEditorTo replaces it with something that does not depend on focus
+/// at all.
+function revealInEditor(ta, line, focus) {
+  const lines = ta.value.split("\n");
+  const upto = lines.slice(0, Math.max(0, line - 1)).join("\n").length + (line > 1 ? 1 : 0);
+  const end = upto + (lines[line - 1] || "").length;
+  ta.setSelectionRange(upto, end);
+  if (focus) ta.focus();
+  return scrollEditorTo(ta, upto);
+}
+
+/// Scrolls `ta`'s scrollable ancestor so the character at `offset` is
+/// visible, roughly a third of the way down. Returns whether it actually
+/// could — false means "try again next frame", not "gave up".
+///
+/// Two branches, not one, because only a highlighted file has something to
+/// measure. `.editor` sets no white-space override (static/style.css) so a
+/// plain textarea soft-wraps by default, and `.editwrap code-input`
+/// explicitly sets `white-space: pre-wrap`, which the vendor stylesheet's
+/// `code-input textarea, code-input pre { white-space: inherit }` pushes
+/// onto both of its layers — so in *both* editor shapes one logical line is
+/// not reliably one visual row, unlike the preview's <pre> (see
+/// revealInPreview for why that one is exact).
+///
+/// For a highlighted file, code-input's own host (the `<code-input>` element
+/// itself) has a `<pre>` beneath the textarea as a light-DOM child — not
+/// shadow DOM; code-input.min.js never calls attachShadow — containing the
+/// same text, wrapped identically (both layers share the same white-space
+/// rule and width). Walking that `<pre>`'s rendered text to `offset` and
+/// measuring a collapsed Range there answers the wrapping question exactly,
+/// instead of guessing at visual rows from a character count the way the
+/// plain-textarea branch below has to; `getBoundingClientRect()` forces a
+/// synchronous layout, so the measurement is never stale relative to
+/// whatever is currently in the DOM.
+///
+/// "Currently in the DOM" is the catch: code-input highlights on the *next*
+/// animation frame after a value is set (its scheduleHighlight() only flips
+/// a flag; the actual `<pre>` update happens in its own perpetual
+/// requestAnimationFrame loop, confirmed by reading code-input.min.js), so a
+/// reveal landing in the same tick as a fresh mount can walk a `<pre>` that
+/// has no text in it yet — caretRect() returns null. Scheduling a retry
+/// through tryReveal() itself, not a closure over this specific pane, means
+/// a pane that closed or moved on to a different file before the retry fires
+/// re-resolves cleanly (tryReveal re-checks `rel` and mounted elements from
+/// scratch) instead of scrolling stale state. revealLine()'s 4-second banner
+/// is still the backstop if code-input's own frame loop never runs — the
+/// tab closed, say.
+function scrollEditorTo(ta, offset) {
+  const host = ta.closest("code-input");
+  const pre = host && host.querySelector("pre");
+  if (pre) {
+    // code-input's own update() appends one "\n" to the value before
+    // highlighting, so a fully-synced <pre> has exactly one more character
+    // than the textarea. Anything short of that means a fresh mount's
+    // highlight genuinely has not landed yet, and caretRect() cannot tell
+    // that apart from "the target is the very last character of the file" —
+    // both look like "the walk ran out of text before reaching offset".
+    // Checked here, independently of the walk, with a signal caretRect has
+    // no way to get right on its own: without it, a reveal that lands in
+    // the same tick as a fresh mount walks a <pre> holding only its initial
+    // near-empty state, silently measures *that*, and reports success at
+    // the wrong position instead of asking to be retried — which is exactly
+    // how this looked from the outside before this check existed: `tryReveal`
+    // marked the pane done and cleared `pendingReveal` on the first, bogus
+    // measurement, so the correct one a frame later never got a chance to run.
+    if (pre.textContent.length < ta.value.length) {
+      scheduleRevealRetry();
+      return false;
+    }
+    const rect = caretRect(pre, offset);
+    if (rect && rect.height > 0) {
+      const hostRect = host.getBoundingClientRect();
+      host.scrollTop = Math.max(0, host.scrollTop + (rect.top - hostRect.top) - host.clientHeight / 3);
+      return true;
+    }
+    scheduleRevealRetry();
+    return false;
+  }
+  // No <pre> to measure: a plain (unhighlighted) textarea, which is its own
+  // scroll container. This is the same wrap-blind approximation the
+  // mirroring branch used to be alone in accepting — it assumes one logical
+  // line is one visual row, which is false the moment a line wraps, and
+  // that is not fixable without something to measure. Judged better than
+  // leaving the viewport unscrolled, but it is not exact, and no comment
+  // here should claim otherwise.
+  const lh = parseFloat(getComputedStyle(ta).lineHeight) || 20;
+  const pad = parseFloat(getComputedStyle(ta).paddingTop) || 0;
+  const rows = ta.value.slice(0, offset).split("\n").length - 1;
+  ta.scrollTop = Math.max(0, pad + rows * lh - ta.clientHeight / 3);
+  return true;
+}
+
+/// The bounding rect of the character at `offset` within `pre`'s rendered
+/// text, walking its text nodes rather than its markup: hljs wraps tokens in
+/// nested `<span>`s, so a Range built against a raw offset into innerHTML
+/// would land inside a tag rather than on a character. Returns null if
+/// `offset` is past everything `pre` currently holds (see scrollEditorTo for
+/// when that happens).
+///
+/// Spans exactly one character (`[at, at+1)`), never a collapsed point
+/// (`[at, at)`). Measured directly: Chromium reports a degenerate
+/// `{top:0,left:0,height:0,width:0}` rect for a range collapsed exactly at a
+/// text node's own boundary — which `offset` lands on whenever the target
+/// line starts a fresh hljs span, i.e. on most lines — while a range
+/// spanning one real character never comes back degenerate. This is what
+/// broke the first version of this function: it always fell exactly on that
+/// boundary, so it read as "not laid out yet" on every measurement, real or
+/// not, and scrollEditorTo retried forever without ever fixing anything.
+function caretRect(pre, offset) {
+  const walker = document.createTreeWalker(pre, NodeFilter.SHOW_TEXT);
+  let node;
+  let consumed = 0;
+  let last = null;
+  while ((node = walker.nextNode())) {
+    const len = node.nodeValue.length;
+    if (len === 0) continue;
+    last = node;
+    if (offset < consumed + len) return oneCharRect(node, offset - consumed);
+    consumed += len;
+  }
+  // `offset` lands exactly at (or past) the end of everything walked so far
+  // — the last line of the file, say. Anchor to the last real character
+  // instead of the boundary past it, for the same reason as above.
+  return last ? oneCharRect(last, last.nodeValue.length - 1) : null;
+}
+
+function oneCharRect(node, at) {
+  const start = Math.max(0, Math.min(at, node.nodeValue.length - 1));
+  const range = document.createRange();
+  range.setStart(node, start);
+  range.setEnd(node, start + 1);
+  return range.getBoundingClientRect();
+}
+
+function revealInPreview(content, pre, line) {
+  // .codeview (static/style.css) sets padding and font but no height or
+  // max-height, so it grows to fit its content: pre.scrollHeight ===
+  // pre.clientHeight always, and pre.scrollTop is permanently clamped to 0.
+  // The element that actually scrolls is `.content` itself — `flex: 1 1
+  // auto; overflow: auto`, made a definite size by `.pane`'s
+  // `display:flex; flex-direction:column; overflow:hidden` — offset by the
+  // <pre>'s own position within it (content.querySelector("pre.codeview")
+  // was never the whole story) plus the <pre>'s own top padding, for the
+  // same reason the editor branch above adds one.
+  const lh = parseFloat(getComputedStyle(pre).lineHeight) || 20;
+  const pad = parseFloat(getComputedStyle(pre).paddingTop) || 0;
+  content.scrollTop = Math.max(0, pre.offsetTop + pad + (line - 1) * lh - content.clientHeight / 3);
+}
+
+/// The rel an editor pane is showing. The path is already in the breadcrumb
+/// as a text node, which is the only place it exists client-side once the
+/// textarea is mounted.
+function editorRel(content) {
+  const n = content.querySelector(".editwrap .path .rel");
+  return n ? n.textContent : null;
+}
+
+/// Whether `content`'s fetched fragment is a File preview of exactly `rel` —
+/// an exact match on the `path` query parameter, never a substring.
+/// `encodeURIComponent("main.rs")` is a substring of `?path=src%2Fmain.rs`,
+/// and `src%2Fapp.js` is a substring of `src%2Fapp.js.bak`; either direction
+/// of a substring test can scroll a pane that is not showing `rel` at all.
+/// The `/file` suffix check matters too: a Diff tab's fragment URL
+/// (`/frag/{project}/diff?path=...`) carries the same `path` param naming
+/// for a different rel-adjacent thing entirely — a Diff never has a
+/// `pre.codeview` to match, but without this check a Diff on the same rel
+/// could still count as "still waiting" in tryReveal() and stall the 4s
+/// timeout for no reason.
+function matchesRel(content, rel) {
+  if (!content.dataset.url) return false;
+  const [path, query] = content.dataset.url.split("?");
+  if (!path.endsWith("/file")) return false;
+  return new URLSearchParams(query || "").get("path") === rel;
+}
