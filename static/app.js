@@ -2761,11 +2761,24 @@ document.addEventListener("paste", (e) => {
 //
 // 400 ms was the first guess and it was too tight to use: measured against a
 // real browser through CDP's input pipeline, a 350 ms gap opened the overlay
-// and a 450 ms gap did not, while a deliberate — rather than hurried —
-// double-tap runs past that. It read as "the shortcut does not work", which is
-// how it was reported. 700 ms is roughly a Windows double-click default with
-// room to spare, and it costs no safety: the intervening-key reset above is
-// what stops ordinary typing from reaching here, not the length of the window.
+// and a 450 ms gap did not. 700 ms is roughly a Windows double-click default
+// with room to spare, and it costs no safety: the intervening-key reset above
+// is what stops ordinary typing from reaching here, not the length of the
+// window.
+//
+// **This shortcut cannot be relied on, and ⌘⇧F / Ctrl+Shift+F is the one the
+// header advertises.** On the deploy host's own browser a lone Shift keydown
+// never reaches the page at all: a capture-phase listener on `document` —
+// which sees every event the page receives, before anything could stop it —
+// printed nothing for Shift, while Ctrl+Shift+F worked in the same tab, so
+// Shift *as a modifier* arrives normally. Something between the keyboard and
+// the browser (a remapper, an extension, an input setting) swallows standalone
+// modifier presses there.
+//
+// Widening this window was a wasted fix aimed at that report; the window was
+// genuinely too small, but it was never the cause. Left bound because it works
+// wherever it can be tested and cannot false-fire, but do not spend time on it
+// again without first checking that a bare Shift produces a keydown at all.
 const SHIFT_GAP_MS = 700;
 let shiftPending = 0;
 let searchSeq = 0;
