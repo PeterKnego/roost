@@ -822,3 +822,7 @@ body.searching header { position: relative; z-index: 41; }
 #searchnote { padding: 6px 12px; font-size: 11px; color: var(--muted);
               border-top: 1px solid var(--border); }
 #searchnote:empty { display: none; }
+/* Same hue as the match chip, deliberately: inside this panel, warm means the
+   search is telling you something — whether that is "your word is here" or "I
+   could not look there". */
+#searchnote.skipped { border-left: 2px solid var(--warn); padding-left: 10px; }

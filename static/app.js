@@ -3194,6 +3194,12 @@ function renderSearch(results) {
   if (q && [...q].length < 3) parts.push("contents searched from 3 characters");
   note.textContent = parts.join(" · ");
 
+  // The mark means "something is missing from this answer", so the one note
+  // that is a complete answer — nothing found, nothing skipped, nothing
+  // failed — must not carry it.
+  const gap = parts.length > 0 && !(parts.length === 1 && parts[0] === "no matches");
+  note.classList.toggle("skipped", gap);
+
   if (searchRows.length) paintSearchSel();
 }
 

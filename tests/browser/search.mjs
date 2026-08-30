@@ -905,6 +905,42 @@ try {
         "(b)+(c@1) a query with rows AND an unreadable place says both — singular 'place'",
       );
 
+      // "I could not look there" is the one thing this line exists to say, and
+      // it used to say it in the same grey as everything else. A search that
+      // found nothing is an answer, not a gap, and must NOT wear the mark.
+      ok(await evalIn(`document.getElementById("searchnote").classList.contains("skipped")`),
+         "a note reporting an unreadable place is marked");
+      ok(await evalIn(`parseFloat(getComputedStyle(document.getElementById("searchnote")).borderLeftWidth) > 0`),
+         "and the mark is a rendered edge, not just a class");
+
+      // locked1 is still chmod 000 here, and the walk descends into every
+      // directory regardless of the query — so a query run while it is locked
+      // always reports an unreadable place, never a clean "no matches". Lift
+      // the lock for this one query, then restore it: the (c@2) case below
+      // needs locked1 AND locked2 both unreadable to reach "2 places".
+      await Deno.chmod(locked1, 0o755);
+      await freshSearch(evalIn, "zzzzznotfoundzzzzz");
+      ok(
+        await until(() => evalIn(`document.getElementById("searchnote").textContent.includes("no matches")`), 10, "no-matches note"),
+        "setup: an unmatched query with nothing unreadable really does answer 'no matches'",
+      );
+      ok(await evalIn(`!document.getElementById("searchnote").classList.contains("skipped")`),
+         "a clean 'no matches' is not marked — it is an answer, not a gap");
+      // Both reverts applied to app.js's `gap` and re-run directly (not a
+      // thought experiment):
+      //   const gap = false;
+      //     -> FAIL "a note reporting an unreadable place is marked"
+      //     -> FAIL "and the mark is a rendered edge, not just a class"
+      //     -> ok   "a clean 'no matches' is not marked"      (2 FAILED)
+      //   const gap = parts.length > 0;
+      //     -> ok   "a note reporting an unreadable place is marked"
+      //     -> ok   "and the mark is a rendered edge, not just a class"
+      //     -> FAIL "a clean 'no matches' is not marked — it is an answer, not a gap"
+      //                                                        (1 FAILED)
+      // The second revert is the one that matters: it shows the class tracks
+      // the gap/answer distinction, not merely "some class got set somewhere".
+      await Deno.chmod(locked1, 0o000);
+
       await Deno.chmod(locked2, 0o000);
       if (!(await isBlocked(locked2))) {
         console.log("  SKIP  running as root — chmod 000 does not block reads, so (c@2) would be vacuous");
