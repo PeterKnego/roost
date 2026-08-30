@@ -110,20 +110,66 @@ async function realShift(page) {
   await page.cmd("Input.dispatchKeyEvent", { type: "keyUp", modifiers: 0, ...k });
 }
 
-/// Two of them `gap` ms apart, answering whether the overlay opened.
+// A real, persistently-focusable element to park focus on between trigger
+// checks in section A. `document.body` cannot serve this role: it carries no
+// tabIndex, so `.focus()` on it is a silent no-op — and body is exactly
+// where focus sits by default before anything on the page has been clicked,
+// which is the state every one of these checks starts from. Without
+// somewhere real to put focus back, the first successful open leaves it
+// permanently stuck on #searchinput (closeSearch's restore attempt no-ops
+// forever after), and every check after the first stops being able to fail:
+// activeElement.id === "searchinput" would already be true before the
+// shortcut under test ever ran.
+const focusCatcher = `(() => {
+  let el = document.getElementById("__focuscatcher");
+  if (!el) {
+    el = document.createElement("input");
+    el.id = "__focuscatcher";
+    el.style.cssText = "position:fixed;opacity:0;pointer-events:none";
+    document.body.appendChild(el);
+  }
+  el.focus();
+})()`;
+
+/// Two of them `gap` ms apart, answering whether the shortcut fired.
+///
+/// Checked via FOCUS, not panel visibility: openSearch() now only shows the
+/// panel when the field already holds a query (`if (input.value)
+/// showSearchPanel()`), and this helper is used before any query exists, so
+/// checking `#searchoverlay.hidden` would fail even when the shortcut worked
+/// perfectly. Moving focus into the field is what openSearch() unconditionally
+/// does, so it is the contract this can actually check — and parking on
+/// `focusCatcher` first, rather than trusting wherever focus already was,
+/// is what keeps the check a real before/after delta instead of a question
+/// that was already true.
 async function realShiftTwice(page, gap) {
+  await page.evalIn(focusCatcher);
   await realShift(page);
   await sleep(gap);
   await realShift(page);
   await sleep(150);
-  return !(await page.evalIn(`document.getElementById("searchoverlay").hidden`));
+  return await page.evalIn(`document.activeElement && document.activeElement.id === "searchinput"`);
 }
 
 // Closes whatever is open (idempotent) and reopens with a fresh query, so
 // each section starts from a known state instead of layering onto whatever
 // the previous one left behind.
+//
+// openSearch() deliberately no longer clears the query when it opens (that
+// is the point of the redesign: refining after a miss should not mean
+// retyping), and closeSearch()'s hideSearchPanel() only hides the panel — it
+// does not repaint #searchresults, so the previous section's rows are still
+// sitting in the DOM. Reopening with that leftover value would show THOSE
+// stale rows for a moment before this section's query round-trips, which is
+// real product behaviour but not something a test section — asserting
+// immediately after freshSearch — should have to account for. So this helper
+// clears the field and repaints empty directly (mirroring what the app's own
+// empty-query path does via renderSearch(null), just without waiting out the
+// debounce) before reopening. That is a test-only shortcut, not a product
+// change.
 async function freshSearch(evalIn, q) {
   await evalIn(`closeSearch()`);
+  await evalIn(`(() => { document.getElementById("searchinput").value = ""; renderSearch(null); })()`);
   await evalIn(shiftTwice);
   await evalIn(setQuery(q));
 }
@@ -205,18 +251,28 @@ try {
   // land microseconds apart, it cannot see the double-tap window at all. It
   // passed green while ⇧⇧ was unusable in a real browser at a human tapping
   // speed, which is how the bug was reported rather than caught here.
-  ok(await realShiftTwice(page1, 90), "⇧⇧ (real key events, fast tap) opens the overlay");
+  ok(await realShiftTwice(page1, 90), "⇧⇧ (real key events, fast tap) focuses the search field");
   await evalIn(`closeSearch()`);
   // The gap a person actually produces when they mean it, rather than the
   // hurried one. 400 ms used to be the window and this failed at 450.
   ok(await realShiftTwice(page1, 520), "…and at a deliberate 520 ms tap, not just a hurried one");
+  // Forced into a genuinely open state first (via the global showSearchPanel,
+  // not by re-running a shift-tap) so this checks closeSearch's own hide
+  // logic specifically — by this point in the section neither trigger has
+  // ever shown the panel (an empty query never does), so `closeSearch();
+  // return hidden` on its own would be checking a state that was already
+  // true, which is true whether or not closeSearch does anything at all.
   ok(
-    await evalIn(`(() => { closeSearch(); return document.getElementById("searchoverlay").hidden; })()`),
+    await evalIn(`(() => { showSearchPanel(); const wasOpen = !document.getElementById("searchoverlay").hidden;
+      closeSearch(); return wasOpen && document.getElementById("searchoverlay").hidden; })()`),
     "closeSearch() is callable as a global, and hides the overlay",
   );
   // A Shift with a key between two Shifts must not open it — that is what stops
   // typing "HI" from opening search. Real events again: the whole question is
-  // whether the H reaches the same listener the Shifts do.
+  // whether the H reaches the same listener the Shifts do. Parked on the
+  // catcher explicitly, rather than trusting wherever the check above left
+  // focus, so this block does not depend on that chain.
+  await evalIn(focusCatcher);
   await realShift(page1);
   await page1.cmd("Input.dispatchKeyEvent", { type: "keyDown", key: "H", code: "KeyH", text: "H", windowsVirtualKeyCode: 72 });
   await page1.cmd("Input.dispatchKeyEvent", { type: "keyUp", key: "H", code: "KeyH", windowsVirtualKeyCode: 72 });
@@ -230,8 +286,13 @@ try {
   // ⌘⇧F / Ctrl+Shift+F — the second way in, added because ⇧⇧ was reported as
   // not working in a real browser for reasons still unknown. Real key events
   // again: a synthetic dispatch would not exercise the modifier state at all.
+  // Checked via focus for the same reason realShiftTwice is: an empty field
+  // never shows the panel, and re-parking on the catcher before each attempt
+  // is what keeps this a real delta rather than a question already answered
+  // by wherever a previous attempt left focus.
   const chordF = async (mods) => {
     await evalIn(`closeSearch()`);
+    await evalIn(focusCatcher);
     await sleep(100);
     for (const type of ["keyDown", "keyUp"]) {
       await page1.cmd("Input.dispatchKeyEvent", {
@@ -239,20 +300,20 @@ try {
       });
     }
     await sleep(150);
-    return !(await evalIn(`document.getElementById("searchoverlay").hidden`));
+    return await evalIn(`document.activeElement && document.activeElement.id === "searchinput"`);
   };
   // CDP modifier bits: 1 alt, 2 ctrl, 4 meta/cmd, 8 shift.
   // Both modifiers, on every platform: the handler accepts either, so a
   // browser whose `navigator.platform` misreports cannot silently lose the
   // shortcut. Asserting only the "right" one for this host would not have
   // caught the platform-sniff gate this replaced.
-  ok(await chordF(2 | 8), "Ctrl+Shift+F opens the overlay");
+  ok(await chordF(2 | 8), "Ctrl+Shift+F focuses the search field");
   ok(await chordF(4 | 8), "…and \u2318\u21e7F does too, without depending on platform detection");
   // The unshifted chord must NOT be bound: that is the whole reason for
   // choosing the shifted one. A terminal encodes Ctrl-F and Ctrl-Shift-F
   // identically, so leaving plain Ctrl-F alone is what keeps readline's
-  // forward-char working at a shell prompt. If this ever opens the overlay,
-  // ^F has been taken from every terminal in the app.
+  // forward-char working at a shell prompt. If this ever moves focus into the
+  // field, ^F has been taken from every terminal in the app.
   ok(
     !(await chordF(2)) && !(await chordF(4)),
     "…and the UNshifted chord is left alone, so ^F still reaches the shell",
@@ -296,6 +357,46 @@ try {
     await evalIn(`document.getElementById("searchoverlay").hidden`),
     "Escape still closes the overlay once focus has left it — otherwise only a backdrop click can, and ⇧⇧ cannot reopen",
   );
+
+  console.log("\nB2. one field, and it is not dimmed");
+  // The querySelectorAll("input") count from the plan is wrong here: it counts
+  // EVERY input in the page, and code-input is vendored and may inject its
+  // own, so that assertion could fail for a reason that has nothing to do
+  // with search. #searchinput specifically, and specifically not inside the
+  // overlay, says what this task actually changed.
+  ok(await evalIn(`document.querySelectorAll("#searchinput").length === 1`),
+     "exactly one search field in the page");
+  ok(await evalIn(`document.querySelectorAll("#searchoverlay input").length === 0`),
+     "and it is not the overlay's — the overlay carries no field of its own");
+  ok(await evalIn(`!!document.querySelector("header #searchinput")`),
+     "and it is in the header");
+
+  await evalIn(`closeSearch()`);
+  await evalIn(`(() => { const i = document.getElementById("searchinput");
+    i.focus(); i.value = "marker"; i.dispatchEvent(new Event("input",{bubbles:true})); return 1; })()`);
+  ok(await until(() => evalIn(`!document.getElementById("searchoverlay").hidden`), 10, "panel opens"),
+     "typing in the header field opens the panel");
+
+  // The assertion that catches the stacking bug behaviourally: with the
+  // backdrop above the header, the point at the centre of the field belongs to
+  // #searchoverlay and the user types into a dimmed control.
+  ok(await evalIn(`(() => {
+      const r = document.getElementById("searchinput").getBoundingClientRect();
+      const el = document.elementFromPoint(r.left + r.width/2, r.top + r.height/2);
+      return el && el.id === "searchinput";
+    })()`),
+     "the field is above the backdrop, not behind it");
+
+  ok(await evalIn(`(() => {
+      const p = document.querySelector(".searchpanel").getBoundingClientRect();
+      return p.top >= document.querySelector("header").getBoundingClientRect().bottom - 1;
+    })()`),
+     "the panel hangs below the header rather than over it");
+
+  await evalIn(`(() => { const i = document.getElementById("searchinput");
+    i.value = ""; i.dispatchEvent(new Event("input",{bubbles:true})); return 1; })()`);
+  ok(await until(() => evalIn(`document.getElementById("searchoverlay").hidden`), 10, "panel closes"),
+     "emptying the field closes the panel");
 
   console.log("\nC0. a content hit lands on its line");
   await freshSearch(evalIn, "marker");
@@ -481,8 +582,17 @@ try {
   })()`);
   ok(await evalIn(`!document.getElementById("searchoverlay").hidden`), "⇧⇧ opens search from inside a focused editor");
   await evalIn(setQuery("editortarget_9f3"));
+  // `searchRows.length`, not just a DOM row count: section F leaves a query
+  // sitting in the field, and the ⇧⇧ above reopens the panel showing THAT
+  // section's still-rendered rows (hideSearchPanel only hides — it does not
+  // repaint #searchresults, the same leftover-DOM trap freshSearch works
+  // around elsewhere in this file). A DOM-only check can resolve on those
+  // stale rows before this query's own reply lands, so the Enter below fires
+  // on an empty searchRows array and activateSearchRow's `if (!r) return;`
+  // silently does nothing. searchRows itself is cleared and repopulated
+  // atomically by renderSearch(), so it cannot be satisfied by stale markup.
   ok(
-    await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "editortarget row"),
+    await until(() => evalIn(`searchRows.length > 0 && document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "editortarget row"),
     "the near-the-end marker is found",
   );
   await evalIn(`document.getElementById("searchoverlay")

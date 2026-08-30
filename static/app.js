@@ -2793,11 +2793,6 @@ let searchRows = [];      // [{kind, rel, line, session}] parallel to the DOM ro
 let searchSel = 0;
 let searchDebounce = null;
 let searchReturnFocus = null;
-// #searchbox is a <button>, and a browser focuses a button on mousedown —
-// before its click handler runs. Captured here, on mousedown, so openSearch
-// still sees whatever had focus before the click (usually a terminal)
-// instead of the button itself.
-let searchboxMousedownFocus = null;
 
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Shift") { shiftPending = 0; return; }
@@ -2848,32 +2843,49 @@ document.addEventListener("keydown", (e) => {
   openSearch();
 });
 
-function openSearch(returnFocus) {
+/// Panel visibility only — no focus effects. Separate from openSearch because
+/// the field now lives in the header and is focusable on its own: a user can
+/// have focus in it with no panel showing, and emptying the box must close the
+/// panel without yanking focus away mid-edit.
+function showSearchPanel() {
   const ov = document.getElementById("searchoverlay");
   if (!ov || !ov.hidden) return;
-  // Remembered before focus moves: closing must give the terminal back, or
-  // every dismissal costs the user their shell focus. A caller that already
-  // captured the pre-click target (the searchbox mousedown handler below)
-  // passes it in, because by the time a click handler runs, a <button> has
-  // already taken focus for itself.
-  searchReturnFocus = returnFocus !== undefined ? returnFocus : document.activeElement;
   ov.hidden = false;
-  const input = document.getElementById("searchinput");
-  input.value = "";
-  renderSearch(null);
-  input.focus();
+  document.body.classList.add("searching");
 }
 
-function closeSearch() {
+function hideSearchPanel() {
   const ov = document.getElementById("searchoverlay");
   if (!ov || ov.hidden) return;
   ov.hidden = true;
+  document.body.classList.remove("searching");
   searchRows = [];
   // Dismissing mid-debounce must not let the pending Search still fire: its
-  // reply would repopulate searchRows and the (now hidden) result list from
-  // a query the user no longer has open.
+  // reply would repopulate searchRows and the (now hidden) result list from a
+  // query the user no longer has open.
   clearTimeout(searchDebounce);
   searchSeq++;
+}
+
+/// The chord and a click both land here. The query is deliberately NOT
+/// cleared — it is selected instead, so typing replaces it but refining after
+/// a miss does not mean retyping.
+function openSearch(returnFocus) {
+  const input = document.getElementById("searchinput");
+  if (!input) return;
+  // Guarded: pressing the chord while already in the field must not remember
+  // the field itself as the place to give focus back to, which would strand
+  // focus here forever.
+  if (document.activeElement !== input) {
+    searchReturnFocus = returnFocus !== undefined ? returnFocus : document.activeElement;
+  }
+  input.focus();
+  input.select();
+  if (input.value) showSearchPanel();
+}
+
+function closeSearch() {
+  hideSearchPanel();
   // .focus() on an element no longer in the document does not throw — it
   // silently no-ops and focus falls to <body>. A State broadcast can detach
   // the remembered terminal node while the overlay is open (a tabstrip
@@ -2883,10 +2895,14 @@ function closeSearch() {
   searchReturnFocus = null;
 }
 
-document.getElementById("searchbox")?.addEventListener("mousedown", () => {
-  searchboxMousedownFocus = document.activeElement;
+// `focusin` carries relatedTarget: the element that just lost focus, which is
+// exactly what closing must give back. The <button> needed a mousedown handler
+// to capture this before it stole focus for itself; a real input receives
+// focus directly, so that bookkeeping goes away.
+document.getElementById("searchinput")?.addEventListener("focusin", (e) => {
+  if (e.relatedTarget && e.relatedTarget !== e.target) searchReturnFocus = e.relatedTarget;
+  if (e.target.value) showSearchPanel();
 });
-document.getElementById("searchbox")?.addEventListener("click", () => openSearch(searchboxMousedownFocus));
 
 document.getElementById("searchinput")?.addEventListener("input", (e) => {
   const q = e.target.value;
@@ -2898,7 +2914,7 @@ document.getElementById("searchinput")?.addEventListener("input", (e) => {
     // Erasing the query bumps searchSeq too: a reply to the just-abandoned
     // query must not paint over the now-empty box, the same reason the send
     // branch below bumps it.
-    if (!q) { searchSeq++; renderSearch(null); return; }
+    if (!q) { searchSeq++; renderSearch(null); hideSearchPanel(); return; }
     if (!ctrl || ctrl.readyState !== 1) {
       // send() would silently no-op here; without this the box would just
       // sit there showing stale rows (or nothing), which reads as "no
@@ -2908,23 +2924,31 @@ document.getElementById("searchinput")?.addEventListener("input", (e) => {
       return;
     }
     searchSentQuery = q;
+    showSearchPanel();
     send({ t: "Search", q, seq: ++searchSeq });
   }, 120);
 });
 
-// Bound to the document, not to #searchoverlay, and gated on the overlay
-// being open. The overlay contains exactly one focusable element (the input),
-// so focus leaves it trivially — one Tab, or a click on any non-row part of
-// the panel, which the backdrop handler below deliberately does not treat as
-// a dismissal. With the listener scoped to the overlay, focus landing on
-// <body> took Escape, ↑/↓ and Enter with it, and `openSearch` early-returns
-// on an already-open overlay, so ⇧⇧ could not recover either: the modal was
-// stranded open with only a backdrop click left to close it. Trapping Tab
-// instead would have fixed only the first of those two routes.
+// Bound to the document, not to #searchoverlay, and gated on the panel being
+// open OR on focus being in the field. The overlay contains exactly one
+// focusable element (the input), so focus leaves it trivially — one Tab, or a
+// click on any non-row part of the panel, which the backdrop handler below
+// deliberately does not treat as a dismissal. With the listener scoped to the
+// overlay, focus landing on <body> took Escape, ↑/↓ and Enter with it, and
+// `openSearch` early-returns on an already-open overlay, so ⇧⇧ could not
+// recover either: the modal was stranded open with only a backdrop click left
+// to close it. Trapping Tab instead would have fixed only the first of those
+// two routes. The field now lives in the header, outside the overlay by
+// construction, so focus starting there — with no panel open yet — is a
+// reachable state that Escape must still cover.
 document.addEventListener("keydown", (e) => {
   const ov = document.getElementById("searchoverlay");
-  if (!ov || ov.hidden) return;
+  const input = document.getElementById("searchinput");
+  const open = ov && !ov.hidden;
+  const inField = input && document.activeElement === input;
+  if (!open && !inField) return;
   if (e.key === "Escape") { e.preventDefault(); closeSearch(); return; }
+  if (!open) return;
   if (e.key === "ArrowDown") { e.preventDefault(); moveSearchSel(1); return; }
   if (e.key === "ArrowUp") { e.preventDefault(); moveSearchSel(-1); return; }
   if (e.key === "Enter") { e.preventDefault(); activateSearchRow(searchSel); }
