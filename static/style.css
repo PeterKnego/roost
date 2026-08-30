@@ -783,9 +783,11 @@ ul.picker li .git:hover { text-decoration: underline; }
    the panel hangs from it rather than floating centred on the screen. */
 #searchoverlay { position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.35); }
 #searchoverlay[hidden] { display: none; }
-/* Hangs from the header, centred on the bar, and wider than it: a 400px
-   column cannot hold a path and a line of code side by side. */
-.searchpanel { position: absolute; top: var(--header-h, 38px); left: 50%;
+/* Hangs from the header, centred on the FIELD it belongs to (not the
+   viewport — see anchorSearchPanel() in app.js, which sets --search-cx),
+   and wider than the field: a 400px column cannot hold a path and a line of
+   code side by side. */
+.searchpanel { position: absolute; top: var(--header-h, 38px); left: var(--search-cx, 50%);
                transform: translateX(-50%); width: min(880px, 92vw); max-height: 60vh;
                display: flex; flex-direction: column;
                background: var(--bg2); border: 1px solid var(--border);

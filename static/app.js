@@ -2843,6 +2843,23 @@ document.addEventListener("keydown", (e) => {
   openSearch();
 });
 
+/// The panel hangs from the search field, so it has to be centred on the
+/// FIELD — not the viewport. `#searchbox` uses `margin: auto` inside a flex
+/// header, which centres it in whatever space the left and right button
+/// groups leave over; those groups are different widths, so the field sits
+/// ~55px left of centre and a viewport-centred panel is visibly lopsided
+/// against it. Clamped so the panel cannot run off either edge on a narrow
+/// window.
+function anchorSearchPanel() {
+  const box = document.getElementById("searchbox");
+  const panel = document.querySelector(".searchpanel");
+  if (!box || !panel) return;
+  const half = panel.offsetWidth / 2;
+  const cx = box.getBoundingClientRect().left + box.offsetWidth / 2;
+  const clamped = Math.min(Math.max(cx, half + 8), window.innerWidth - half - 8);
+  document.documentElement.style.setProperty("--search-cx", `${Math.round(clamped)}px`);
+}
+
 /// Panel visibility only — no focus effects. Separate from openSearch because
 /// the field now lives in the header and is focusable on its own: a user can
 /// have focus in it with no panel showing, and emptying the box must close the
@@ -2852,7 +2869,20 @@ function showSearchPanel() {
   if (!ov || !ov.hidden) return;
   ov.hidden = false;
   document.body.classList.add("searching");
+  // anchorSearchPanel() needs the panel laid out (offsetWidth) to measure
+  // it, which is only true after un-hiding — measuring before this line
+  // would read the old, possibly-zero width from while it was `hidden`.
+  anchorSearchPanel();
 }
+
+// Re-anchor live while the panel is open: the field's on-screen position is
+// a function of viewport width (the header's flex layout reflows it), so a
+// resize without this would leave the panel pointing at where the field
+// used to be.
+window.addEventListener("resize", () => {
+  if (!document.body.classList.contains("searching")) return;
+  anchorSearchPanel();
+});
 
 function hideSearchPanel() {
   const ov = document.getElementById("searchoverlay");

@@ -435,18 +435,30 @@ try {
   // normal viewport height — so `p.top >= header.bottom` is true either way.
   // What this task actually changed, measurably: the panel got wider
   // (880px, up from 720px) and pinned tight under the header instead of
-  // floating ~12vh down. Horizontal centre-on-the-field was considered and
-  // dropped — measured in a real browser, #searchbox itself is NOT centred
-  // on the viewport (its margin:auto splits whatever space the header's
-  // asymmetric left/right button groups leave over, a pre-existing property
-  // of the header unrelated to this task), so a field-centred check would
-  // fail against the correct implementation, not just the broken one.
+  // floating ~12vh down.
   ok(await evalIn(`(() => {
       const p = document.querySelector(".searchpanel").getBoundingClientRect();
       const h = document.querySelector("header").getBoundingClientRect();
       return p.width > 800 && (p.top - h.bottom) < 10;
     })()`),
      "the panel is the wider, header-anchored one this task introduces — not the old floating, 12vh-down modal");
+
+  // Centred on the FIELD, not the viewport: `#searchbox` sits ~55px left of
+  // viewport centre because the header's two button groups are different
+  // widths, so a bare `left: 50%` put the panel visibly off the control it
+  // hangs from (measured directly: field centre x≈637-649, panel centre
+  // x=700 on a 1400px viewport — ~51-63px off, which on an 880px panel is
+  // ~177px of panel to the field's left and ~303px to its right). Fixed by
+  // anchorSearchPanel() in app.js, which measures #searchbox and publishes
+  // its centre as --search-cx. Measured here too, not assumed.
+  const anchored = JSON.parse(await evalIn(`(() => {
+    const b = document.getElementById("searchbox").getBoundingClientRect();
+    const p = document.querySelector(".searchpanel").getBoundingClientRect();
+    return JSON.stringify({ field: Math.round(b.left + b.width/2),
+                            panel: Math.round(p.left + p.width/2) });
+  })()`));
+  ok(Math.abs(anchored.field - anchored.panel) <= 2,
+     `the panel is centred on the field, not the viewport (field ${anchored.field}, panel ${anchored.panel})`);
 
   await evalIn(`(() => { const i = document.getElementById("searchinput");
     i.value = ""; i.dispatchEvent(new Event("input",{bubbles:true})); return 1; })()`);
