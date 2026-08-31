@@ -200,9 +200,20 @@ fn link_open(dest: &str, title: &str, from_rel: &str) -> String {
     // Deliberately no href — `wireFileLinks` opens it as a tab, and an href
     // would race that handler by navigating the workspace away.
     if let Dest::Local(p) = &resolved {
+        // The fragment is not part of the path on disk — `resolve_dest` split
+        // it off precisely so it could resolve one — but it *is* part of where
+        // the link points: `deploy.md#running` means open that file and go to
+        // that heading. It rides as its own attribute rather than staying glued
+        // to the path, because `data-rel` is how `wireFileLinks` looks a tab
+        // up: a rel with a `#` on the end would match no open tab and no file.
+        let hash = match dest.split_once('#') {
+            Some((_, h)) if !h.is_empty() => format!(" data-hash=\"{}\"", esc(h)),
+            _ => String::new(),
+        };
         return format!(
-            "<a class=\"mdlink\" data-rel=\"{}\"{}>",
+            "<a class=\"mdlink\" data-rel=\"{}\"{}{}>",
             esc(p),
+            hash,
             title_attr(title)
         );
     }
@@ -227,6 +238,88 @@ fn link_open(dest: &str, title: &str, from_rel: &str) -> String {
         // `Dest::Data` (already refused by the allowlist, since "data" is not
         // on it) and `Dest::Broken`. `Dest::Local` returned above.
         _ => INERT.to_string(),
+    }
+}
+
+/// GitHub's heading-anchor slug, so a `#section` link written against GitHub
+/// resolves in the preview too.
+///
+/// Deliberately mirrors `github-slugger` rather than being tidier than it:
+/// lowercase, drop every character that is not alphanumeric, `-`, `_` or a
+/// space, then turn each surviving space into `-`. It does not collapse runs,
+/// so "Files & folders" slugs to `files--folders` — two hyphens — on GitHub and
+/// therefore here. A neater algorithm would disagree with every link anyone
+/// copied off a GitHub page, which is the only reason this function exists.
+///
+/// The ids are bare rather than namespaced, which is what lets a link written
+/// for GitHub work unchanged. That cost is accepted, not overlooked: a preview
+/// fragment is injected into the live workspace document, which already owns
+/// ids like `#settings`, `#content` and `#refresh`, so a heading with one of
+/// those names emits a duplicate — and a same-document jump then lands on
+/// whichever comes first in document order, which is the chrome, because the
+/// header is rendered before the panes.
+fn slug(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == ' ' {
+            out.push('-');
+        } else if ch.is_alphanumeric() || ch == '-' || ch == '_' {
+            // `to_lowercase` yields a sequence rather than a char — 'İ' becomes
+            // two code points — so taking only the first would corrupt it.
+            out.extend(ch.to_lowercase());
+        }
+    }
+    out
+}
+
+/// Fills each heading's `id` with its slug, in place.
+///
+/// A second pass over materialised events rather than a step in the streaming
+/// `filter_map` in `markdown_html`, because a heading's text arrives in the
+/// events *after* its `Start` — the same constraint that makes the image arm
+/// there rewrite a tag instead of emitting raw HTML. `push_html` writes and
+/// escapes the attribute itself, so nothing here builds markup.
+fn fill_heading_ids(events: &mut [pulldown_cmark::Event<'_>]) {
+    use pulldown_cmark::{CowStr, Event, Tag, TagEnd};
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < events.len() {
+        if !matches!(events[i], Event::Start(Tag::Heading { .. })) {
+            i += 1;
+            continue;
+        }
+        // Headings cannot nest, so the next End(Heading) always closes this one
+        // and no depth counter is needed.
+        let mut text = String::new();
+        let mut j = i + 1;
+        while j < events.len() && !matches!(events[j], Event::End(TagEnd::Heading(_))) {
+            // Code spans contribute their text: GitHub slugs the heading as
+            // rendered, so `## The `hub` module` is `the-hub-module`.
+            if let Event::Text(t) | Event::Code(t) = &events[j] {
+                text.push_str(t);
+            }
+            j += 1;
+        }
+        let base = slug(&text);
+        if !base.is_empty() {
+            // First occurrence takes the bare slug and each repeat takes the
+            // next number, matching GitHub. Without this a document with two
+            // "Notes" headings makes the second unreachable and the first
+            // swallows both links.
+            let n = seen.entry(base.clone()).or_insert(0);
+            let id = if *n == 0 { base } else { format!("{base}-{n}") };
+            *n += 1;
+            if let Event::Start(Tag::Heading { id: slot, .. }) = &mut events[i] {
+                // Only when the author gave none. Heading attributes are not
+                // enabled today so this is always None, but silently
+                // overwriting an explicit `{#id}` if they ever are would break
+                // exactly the links that went to the trouble of naming it.
+                if slot.is_none() {
+                    *slot = Some(CowStr::from(id));
+                }
+            }
+        }
+        i = j;
     }
 }
 
@@ -288,8 +381,13 @@ pub fn markdown_html(md: &str, project: &str, rel: &str) -> String {
 
         other => Some(other),
     });
+    // Collected rather than streamed, so `fill_heading_ids` can look ahead
+    // from a heading's Start to the text that names it. Bounded by the same
+    // 2 MB file cap every other read is.
+    let mut events: Vec<Event> = events.collect();
+    fill_heading_ids(&mut events);
     let mut out = String::new();
-    html::push_html(&mut out, events);
+    html::push_html(&mut out, events.into_iter());
     format!("<article class=\"markdown-body\">{out}</article>")
 }
 
@@ -1300,8 +1398,78 @@ mod tests {
     fn markdown_renders_wrapped() {
         let h = markdown_html("# Hi\n\n- a\n", "proj", "a.md");
         assert!(h.starts_with("<article class=\"markdown-body\">"));
-        assert!(h.contains("<h1>Hi</h1>"));
+        // The id is part of the heading's normal output now, so asserting the
+        // bare `<h1>Hi</h1>` would fail for the right reason but read like a
+        // regression. It is spelled out here rather than loosened to a
+        // `contains("Hi")` that could not tell a heading from a paragraph.
+        assert!(h.contains("<h1 id=\"hi\">Hi</h1>"));
         assert!(h.contains("<li>a</li>"));
+    }
+
+    /// A `#section` link written for GitHub has to land here too, which needs
+    /// the ids GitHub generates and `pulldown-cmark` does not.
+    ///
+    /// Verified this can fail: with the id-filling pass reverted every
+    /// assertion below fails against a bare `<h2>`.
+    #[test]
+    fn heading_ids_are_github_style_slugs() {
+        let h = markdown_html(
+            "## Running\n\n## The `hub` module\n\n## Files & folders\n\n## snake_case kept\n",
+            "proj",
+            "a.md",
+        );
+        assert!(h.contains(r#"<h2 id="running">"#), "{h}");
+        // A code span contributes its text: GitHub slugs the rendered heading,
+        // not the markdown source, so `hub` is part of the slug and the
+        // backticks are not.
+        assert!(h.contains(r#"<h2 id="the-hub-module">"#), "{h}");
+        // GitHub strips the punctuation and *then* turns each surviving space
+        // into a hyphen, without collapsing runs — so "Files & folders" is
+        // `files--folders`, with two. Asserting the doubled hyphen is what
+        // makes this test GitHub-compatible rather than merely reasonable; a
+        // single-hyphen expectation would pass with a tidier algorithm that
+        // silently disagreed with every link copied from GitHub.
+        assert!(h.contains(r#"<h2 id="files--folders">"#), "{h}");
+        // Underscores survive; they are word characters to GitHub's slugger.
+        assert!(h.contains(r#"<h2 id="snake_case-kept">"#), "{h}");
+    }
+
+    /// Two headings with the same text must not produce the same id, or the
+    /// second one is unreachable and the first swallows both links.
+    #[test]
+    fn repeated_headings_get_numbered_ids() {
+        let h = markdown_html("## Notes\n\n## Notes\n\n## Notes\n", "proj", "a.md");
+        assert!(h.contains(r#"<h2 id="notes">"#), "{h}");
+        assert!(h.contains(r#"<h2 id="notes-1">"#), "{h}");
+        assert!(h.contains(r#"<h2 id="notes-2">"#), "{h}");
+    }
+
+    /// `resolve_dest` splits the fragment off to find the path on disk, and
+    /// before this it was simply dropped — so every `deploy.md#section` link in
+    /// the README rendered as the byte-identical `data-rel="docs/deploy.md"`
+    /// and opened the file at the top.
+    #[test]
+    fn a_local_link_carries_its_fragment_beside_its_path() {
+        let h = markdown_html("[run](../docs/deploy.md#running)\n", "proj", "a/b.md");
+        assert!(
+            h.contains(r#"data-rel="docs/deploy.md" data-hash="running""#),
+            "the fragment must survive as its own attribute: {h}"
+        );
+        // A link with no fragment must not grow an empty attribute, or every
+        // plain link starts carrying a meaningless data-hash="".
+        let plain = markdown_html("[p](../docs/deploy.md)\n", "proj", "a/b.md");
+        assert!(!plain.contains("data-hash"), "{plain}");
+    }
+
+    /// The fragment is author-controlled text going into an attribute, exactly
+    /// like `data-rel` beside it.
+    ///
+    /// Verified this can fail: dropping the `esc()` around the fragment ends
+    /// the attribute early and emits `data-hash="a" onerror="y"`.
+    #[test]
+    fn a_link_fragment_is_escaped() {
+        let h = markdown_html("[x](<b.md#a\" onerror=\"y>)\n", "proj", "a.md");
+        assert!(h.contains(r#"data-hash="a&quot; onerror=&quot;y""#), "{h}");
     }
 
     #[test]

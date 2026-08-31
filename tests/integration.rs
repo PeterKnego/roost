@@ -417,7 +417,10 @@ fn fragments_render_and_errors_become_hints() {
     assert!(tree.contains("hello.md"));
     let file = ureq::get(&format!("{base}/frag/proj/file?path=hello.md"))
         .call().unwrap().into_string().unwrap();
-    assert!(file.contains("<h1>Hello</h1>"));
+    // The id is part of a heading's normal output now (render::fill_heading_ids),
+    // so this asserts the whole tag rather than being loosened to a
+    // `contains("Hello")` that could not tell a heading from a paragraph.
+    assert!(file.contains("<h1 id=\"hello\">Hello</h1>"), "{file}");
     // escape attempt: 200 + hint, and definitely no file content
     let esc = ureq::get(&format!("{base}/frag/proj/file?path=../../../etc/passwd"))
         .call().unwrap().into_string().unwrap();

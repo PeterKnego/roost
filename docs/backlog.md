@@ -73,10 +73,34 @@ answer, not a quiet vote for "unused".
   **Evidence: provenance, which is the strongest kind in this file.** This is
   the only UI/UX entry that came from someone hitting it in real use rather
   than from a spec's nice-to-have list. Nothing further to measure.
-- Heading anchors in markdown preview. `#section` links are inert because
-  pulldown-cmark emits no heading ids, so a link to a heading in the same
-  document lands on nothing. The stated non-goal of the preview-links work
-  (`2026-08-19-preview-links-and-images-design.md`).
+- ~~Heading anchors in markdown preview.~~ **Done (2026-08-31.)** Kept here
+  because the entry described half the bug, and acting on it as written would
+  have left every real anchor link in this repo still broken.
+  It said `#section` links are inert for want of heading ids. Two separate
+  things were wrong, and the *same-document* case it named was the unused one:
+  this repo had **0** same-document `#anchor` links and **3** cross-document
+  ones, all in `README.md`.
+  1. **No heading carried an id.** `pulldown-cmark`'s `push_html` emits a bare
+     `<h2>`. Measured before the fix: `docs/backlog.md` rendered 14 headings and
+     0 `id=` attributes. `render::slug` now emits GitHub's slug, deliberately
+     bug-compatible with `github-slugger` — it does not collapse runs, so
+     "Files & folders" is `files--folders`, with two hyphens.
+  2. **Cross-document fragments were discarded before the link was built.**
+     `resolve_dest` splits `?`/`#` off to find the path on disk, and `link_open`
+     then emitted only `data-rel` — so all five `docs/deploy.md#…` links in the
+     README rendered byte-identically and opened the file at the top. The
+     fragment now rides as `data-hash`, and `app.js`'s `revealAnchor` scrolls to
+     it once the tab's fragment mounts.
+  The link *element* was never the problem: `resolve_dest` has always returned
+  `Passthrough` for a bare `#foo`, so a real `<a href="#foo">` was being
+  emitted the whole time. Only the target was missing.
+  Ids are bare rather than namespaced, so a link copied from GitHub works
+  unchanged. The cost is accepted and worth not rediscovering: a preview is
+  injected into the live workspace document, which owns ids like `#settings`
+  and `#content`, so a heading with one of those names emits a duplicate.
+  `tryAnchor` scopes its lookup to the preview's own `article` for that reason;
+  a same-document jump is still the browser's own, and would land on the chrome.
+  Measured 2026-08-31: no heading in any doc in this repo collides.
 
   **Real but unused here — do not prioritise it on the strength of the
   argument it was first filed with.** That argument was "a README's table of
