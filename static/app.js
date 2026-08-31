@@ -910,6 +910,8 @@ function mountTab(content, t) {
       // exactly this rel, so calling it unconditionally on every File mount
       // is cheap and correct either way.
       tryReveal();
+      // Same argument for a pending #heading from a markdown link.
+      tryAnchor();
     }
     // Tree fragments carry lazy <details hx-get="...tree?dir=..."
     // hx-trigger="toggle once"> nodes (render::tree_level). htmx only binds
@@ -1184,6 +1186,12 @@ function wireFileLinks(root) {
         pane: 2,
         tab: isDiff ? { k: "Diff", rel: rel || null } : { k: "File", rel, mode: defaultMode(rel) },
       });
+      // `[run](deploy.md#running)` names a heading as well as a file
+      // (render.rs's link_open emits it as data-hash). Armed after the intent,
+      // never before: the tab's fragment is only fetched once the State
+      // broadcast lands, so at this instant there is nothing to scroll to. A
+      // Diff has no headings, so it never arms.
+      if (a.dataset.hash && !isDiff) revealAnchor(rel, a.dataset.hash);
     };
     a.oncontextmenu = (e) => { e.preventDefault(); fileMenu(e, a.dataset.rel); };
   });
@@ -3581,6 +3589,77 @@ function revealInPreview(content, pre, line) {
   const lh = parseFloat(getComputedStyle(pre).lineHeight) || 20;
   const pad = parseFloat(getComputedStyle(pre).paddingTop) || 0;
   content.scrollTop = Math.max(0, pre.offsetTop + pad + (line - 1) * lh - content.clientHeight / 3);
+}
+
+/// A `deploy.md#running` link's heading, waiting for the tab it names to mount.
+///
+/// Same shape as `pendingReveal` and for the same reason: the tab's fragment is
+/// fetched asynchronously, so the heading cannot be resolved at click time.
+/// Deliberately NOT folded into `pendingReveal`, which matches a pane by
+/// finding a `textarea.editor` or `pre.codeview` — a markdown preview is an
+/// `article.markdown-body` and has neither, so one merged function would test
+/// four shapes to serve two unrelated behaviours.
+let pendingAnchor = null;
+let pendingAnchorTimer = null;
+
+/// Scrolls `rel`'s preview to heading `hash` once that tab has mounted.
+function revealAnchor(rel, hash) {
+  pendingAnchor = { rel, hash };
+  clearTimeout(pendingAnchorTimer);
+  // The same generous 4s backstop revealLine uses, and the same reason for
+  // saying something when it fires: a link that silently does nothing is
+  // exactly the bug this feature exists to fix, so failing back into silence
+  // would reintroduce it in a new place. Which of the three things went wrong
+  // is worked out at that point, not guessed at here.
+  pendingAnchorTimer = setTimeout(() => {
+    if (!pendingAnchor) return;
+    pendingAnchor = null;
+    if (document.hidden) return;
+    const panes = [...document.querySelectorAll(".pane .content")].filter((c) => matchesRel(c, rel));
+    if (!panes.length) {
+      // Could not look: the tab never arrived.
+      showBanner(`couldn't open ${rel} to #${hash} — its tab may have closed, or never finished opening`);
+    } else if (!panes.some((c) => c.querySelector("article.markdown-body"))) {
+      // Looked, and there is nothing of this kind to look at: an Edit tab is a
+      // textarea, which has no headings. A distinct message because the fix is
+      // different — switch the tab to Preview, not go hunting for a typo.
+      showBanner(`opened ${rel}, but #${hash} is a heading — switch the tab to Preview to jump to it`);
+    } else {
+      // Looked and found nothing: the heading really is not there.
+      showBanner(`opened ${rel}, but it has no heading #${hash} — it may have been renamed or removed`);
+    }
+  }, 4000);
+  tryAnchor();
+}
+
+/// Applies `pendingAnchor` to the first mounted preview of its rel.
+///
+/// Scoped to the preview's own `article`, never `document.getElementById`.
+/// Heading ids are bare GitHub slugs (render.rs's `slug`), so a document with a
+/// `## Settings` emits an id the workspace chrome already owns — and a global
+/// lookup would scroll to the header button instead of the heading.
+function tryAnchor() {
+  if (!pendingAnchor) return;
+  const { rel, hash } = pendingAnchor;
+  for (const content of document.querySelectorAll(".pane .content")) {
+    if (!matchesRel(content, rel)) continue;
+    const body = content.querySelector("article.markdown-body");
+    if (!body) continue;
+    // A slug is author-controlled and can legally hold characters that are not
+    // valid in a selector — a heading called "1.2" slugs to `12`, but one with
+    // a stray character would throw and take the whole handler with it.
+    let target = null;
+    try {
+      target = body.querySelector(`#${CSS.escape(hash)}`);
+    } catch {
+      target = null;
+    }
+    if (!target) continue;
+    target.scrollIntoView({ block: "start", behavior: "auto" });
+    clearTimeout(pendingAnchorTimer);
+    pendingAnchor = null;
+    return;
+  }
 }
 
 /// The rel an editor pane is showing. The path is already in the breadcrumb

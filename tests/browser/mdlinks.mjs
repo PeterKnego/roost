@@ -87,7 +87,21 @@ await Deno.writeTextFile(`${fx.roots}/${fx.project}/docs/logo.svg`,
 await Deno.writeTextFile(
   `${fx.roots}/${fx.project}/docs/index.md`,
   "# index\n\n![local](shot.png)\n\n![remote](https://example.invalid/x.png)\n\n" +
-    "[to other](other.md)\n\n[danger](javascript:window.__xss=1)\n",
+    "[to other](other.md)\n\n[danger](javascript:window.__xss=1)\n" +
+    // Appended AFTER [to other], never before: assertion 3 clicks the *first*
+    // a.mdlink in the preview, so a new local link above it would silently
+    // retarget that test at a different file.
+    "\n[to running](long.md#running)\n",
+);
+// Long enough that the target heading is far below the fold. Without the
+// filler the pane never scrolls, scrollTop stays 0 whatever the code does, and
+// the anchor assertions below would pass with the whole feature deleted.
+const FILLER = Array.from({ length: 120 }, (_, i) => `filler line ${i}`).join("\n\n");
+await Deno.writeTextFile(
+  `${fx.roots}/${fx.project}/docs/long.md`,
+  `# Long\n\n[jump to running](#running)\n\n${FILLER}\n\n` +
+    "## Running\n\nthe running section\n\n## Files & folders\n\nx\n\n" +
+    "## Notes\n\na\n\n## Notes\n\nb\n",
 );
 
 const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
@@ -127,6 +141,54 @@ try {
   ok(opened, "clicking a local link opened it as a tab");
   ok(await evalIn("location.href") === urlBefore,
     "and the workspace page did not navigate away");
+
+  // ---- 3b. A link naming a heading lands ON that heading -------------------
+  // The discriminating measurement is scrollTop, not tab identity: `[to
+  // running](long.md#running)` opens long.md whether or not the fragment
+  // survives, so an assertion that only checked the tab would pass with
+  // link_open's data-hash and app.js's revealAnchor both deleted.
+  const paneContent = `document.querySelector('.pane[data-pane="2"] .content')`;
+  // Assertion 3 just navigated this pane to other.md, so index.md's preview —
+  // and the link about to be clicked — is no longer mounted. Re-open it.
+  await evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: "docs/index.md", mode: "Preview" } })`);
+  await until(() => evalIn(
+    `!!document.querySelector('.markdown-body a.mdlink[data-rel="docs/long.md"]')`), 15, "index preview back");
+  await evalIn(`document.querySelector('.markdown-body a.mdlink[data-rel="docs/long.md"]').click()`);
+  const landed = await until(() => evalIn(
+    `(() => { const c = ${paneContent}; if (!c) return false;
+       const h = c.querySelector("article.markdown-body #running");
+       if (!h) return false;
+       // Near the top of the pane, not merely present in the document.
+       const d = h.getBoundingClientRect().top - c.getBoundingClientRect().top;
+       return c.scrollTop > 0 && d >= -4 && d < 80; })()`), 15, "anchor landed");
+  ok(landed, "a deploy.md#running-style link scrolls the preview to that heading");
+  ok(await evalIn("location.href") === urlBefore,
+    "and it still did not navigate the workspace");
+
+  // ---- 3c. Heading ids are GitHub's slugs, not just any ids ----------------
+  const ids = await evalIn(
+    `JSON.stringify([...document.querySelectorAll("article.markdown-body h1[id],article.markdown-body h2[id]")]
+       .map(h => h.id))`).then(JSON.parse);
+  ok(ids.includes("running"), `a heading id is its slug (got ${JSON.stringify(ids)})`);
+  // Two hyphens: GitHub strips the "&" and turns both surviving spaces into
+  // hyphens without collapsing them. A single-hyphen result would mean a
+  // tidier algorithm that disagrees with every link copied from GitHub.
+  ok(ids.includes("files--folders"), `punctuation slugs GitHub's way (got ${JSON.stringify(ids)})`);
+  ok(ids.includes("notes") && ids.includes("notes-1"),
+    `a repeated heading gets a numbered id (got ${JSON.stringify(ids)})`);
+
+  // ---- 3d. A same-document #anchor needs no JS at all ----------------------
+  // It is a plain href, so this asserts the ids are reachable by the browser's
+  // own anchor handling — a different code path from 3b entirely.
+  await evalIn(`${paneContent}.scrollTop = 0`);
+  const pathBefore = await evalIn("location.pathname");
+  await evalIn(`document.querySelector('article.markdown-body a[href="#running"]').click()`);
+  const nativeLanded = await until(() => evalIn(
+    `(() => { const c = ${paneContent};
+       return c && c.scrollTop > 0; })()`), 10, "native anchor scroll");
+  ok(nativeLanded, "a same-document #anchor scrolls without any JS of ours");
+  ok(await evalIn("location.pathname") === pathBefore,
+    "and it changed only the fragment, not the workspace path");
 
   // ---- 4. An image tab shows a picture and offers no editor ----------------
   await evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: "docs/shot.png", mode: "Preview" } })`);
