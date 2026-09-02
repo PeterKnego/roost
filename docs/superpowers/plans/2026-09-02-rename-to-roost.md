@@ -85,7 +85,7 @@ deferred manual step, written out at the end.
 - Produces: crate `roost`, binary `target/debug/roost`, external test path
   `roost::…`.
 
-- [ ] **Step 1: Rename the package**
+- [x] **Step 1: Rename the package**
 
 In `Cargo.toml`, line 2:
 
@@ -93,13 +93,13 @@ In `Cargo.toml`, line 2:
 name = "roost"
 ```
 
-- [ ] **Step 2: Watch it fail**
+- [x] **Step 2: Watch it fail**
 
 Run: `cargo build 2>&1 | grep -E '^error' | head -3`
 Expected: `error[E0433]: failed to resolve: use of undeclared crate or module
 `resh`` (from `src/main.rs`).
 
-- [ ] **Step 3: Update the crate paths**
+- [x] **Step 3: Update the crate paths**
 
 Only the `resh::` form is a crate path. The `\b` keeps `refresh::` (which
 does not exist, but this is the habit every later sweep depends on).
@@ -108,14 +108,14 @@ does not exist, but this is the habit every later sweep depends on).
 grep -rlE '\bresh::' src/ tests/ | xargs sed -i -E 's/\bresh::/roost::/g'
 ```
 
-- [ ] **Step 4: Build, regenerate the lockfile, run the suite**
+- [x] **Step 4: Build, regenerate the lockfile, run the suite**
 
 Run: `cargo build 2>&1 | tail -1 && cargo test -- --test-threads=1 2>&1 | grep -E '^test result'`
 Expected: `Finished`, then four `test result: ok` lines — `677 passed` and
 `66 passed` on the two non-empty ones. `git diff --stat Cargo.lock` shows
 one hunk renaming the package.
 
-- [ ] **Step 5: Confirm the binary is renamed**
+- [x] **Step 5: Confirm the binary is renamed**
 
 ```bash
 T=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')
@@ -125,7 +125,7 @@ ls "$T/debug/roost" && echo ok
 Expected: the path, then `ok`. (`$T/debug/resh` may linger from the old
 build; cargo does not delete it. Ignore it.)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock src/main.rs tests/integration.rs
@@ -151,7 +151,7 @@ git commit -m "rename: crate and binary become roost"
 - Produces: `ROOST_*` for all fifteen names above. Later tasks and the host
   unit quote `ROOST_ROOTS` and `ROOST_STATE_DIR` exactly.
 
-- [ ] **Step 1: Rewrite the failing test**
+- [x] **Step 1: Rewrite the failing test**
 
 Replace the whole of `a_terminal_carries_the_resh_environment_contract` in
 `src/session.rs` (it starts at line 1840; keep it inside the same `mod tests`)
@@ -212,14 +212,14 @@ reads those three; they are only ever exported.
     }
 ```
 
-- [ ] **Step 2: Run it to see it fail**
+- [x] **Step 2: Run it to see it fail**
 
 Run: `cargo test --lib a_terminal_carries_the_roost -- --test-threads=1 2>&1 | grep -E 'panicked|lacked|test result'`
 Expected: FAIL — `attach` still reads `RESH_CMD`, so with only `ROOST_CMD`
 set it spawns the real `dtach`, nothing matching arrives within 10 s, and the
 first assertion reports `child env lacked ROOST_NOTIFY`.
 
-- [ ] **Step 3: Rename the prefix everywhere**
+- [x] **Step 3: Rename the prefix everywhere**
 
 `RESH_` is never a substring of anything else in this tree (checked: 532
 hits, all the prefix). `static/` had no hits on 2026-09-02 and is included
@@ -229,18 +229,18 @@ only so a comment added since cannot slip through.
 grep -rlI 'RESH_' src/ tests/ static/ | xargs sed -i 's/RESH_/ROOST_/g'
 ```
 
-- [ ] **Step 4: Verify no old prefix survives in code**
+- [x] **Step 4: Verify no old prefix survives in code**
 
 Run: `! grep -rI 'RESH_' src/ tests/ static/ && echo clean`
 Expected: `clean`. (The test's `concat!("RESH", "_")` is exactly why it is
 written that way.)
 
-- [ ] **Step 5: Run the suite**
+- [x] **Step 5: Run the suite**
 
 Run: `cargo test -- --test-threads=1 2>&1 | grep -E '^test result'`
 Expected: four `ok` lines, `677 passed` and `66 passed`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src tests static
@@ -281,7 +281,7 @@ git commit -m "rename: RESH_* environment contract becomes ROOST_*"
   prefixed `roost:`, page chrome reading `roost`. Task 5 quotes the config
   path and the `ideName`.
 
-- [ ] **Step 1: Repoint the two discriminating tests**
+- [x] **Step 1: Repoint the two discriminating tests**
 
 In `src/wsstate.rs`, replace the body of
 `the_default_state_dir_is_named_for_the_product` (line 333) with:
@@ -311,7 +311,7 @@ In `src/ide.rs` line 1327, change the assertion to:
         assert_eq!(out["result"]["serverInfo"]["name"], "roost");
 ```
 
-- [ ] **Step 2: Run both to see them fail**
+- [x] **Step 2: Run both to see them fail**
 
 Run: `cargo test --lib the_default_state_dir_is_named -- --test-threads=1 2>&1 | grep -E 'got|test result'`
 Expected: FAIL — `got ".../.local/state/resh"`.
@@ -320,7 +320,7 @@ Run: `cargo test --lib initialize_answers_with_resh_as_the_server_name -- --test
 Expected: FAIL — `left: String("resh")`, `right: "roost"`. (The test is
 still called by its old name at this point; Step 3 renames it.)
 
-- [ ] **Step 3: The whole-word sweep**
+- [x] **Step 3: The whole-word sweep**
 
 `-w` and `\b` are the whole point: `refresh_live_sessions`, `"refresh"`
 events in `app.js`, and `threshold` in the vendored JS must survive. Vendor
@@ -342,7 +342,7 @@ arbitrary *project* name (`src/notify.rs`, `src/errlog.rs`,
 are names, not references to the product, and the new spelling keeps them
 realistic.
 
-- [ ] **Step 4: Verify the sweep hit only what it should**
+- [x] **Step 4: Verify the sweep hit only what it should**
 
 ```bash
 ! git grep -nw resh -- src static tests && echo "no whole-word resh left"
@@ -355,12 +355,12 @@ git grep -n 'refroost\|Refroost\|throost' -- src static tests   # must print not
 Expected: both `left` lines; a non-zero count for `refresh_live_sessions`;
 nothing for the vendor diff; nothing for the corruption grep.
 
-- [ ] **Step 5: Run the suite, including the two tests from Step 2**
+- [x] **Step 5: Run the suite, including the two tests from Step 2**
 
 Run: `cargo test -- --test-threads=1 2>&1 | grep -E '^test result'`
 Expected: four `ok` lines, `677 passed` and `66 passed`.
 
-- [ ] **Step 6: Check the rendered chrome and the log prefix by eye**
+- [x] **Step 6: Check the rendered chrome and the log prefix by eye**
 
 Never against the live instance (it serves the user's real sessions, and a
 scratch client would clamp every terminal's geometry). A private one on a
@@ -381,7 +381,7 @@ kill %1; rm -rf "$S/chrome"
 Expected: `roost listening on http://127.0.0.1:8470`; a `<title>` containing
 `roost`; then `0` from the whole-word grep of the overview page.
 
-- [ ] **Step 7: Prove the browser harness still finds the binary**
+- [x] **Step 7: Prove the browser harness still finds the binary**
 
 `harness.mjs` spawns `${target_directory}/debug/roost` — the one line no
 Rust test reaches. One scenario is enough; this host has Chromium.
@@ -391,7 +391,7 @@ Expected: the scenario's own pass line, exit 0. If it fails on a timeout,
 run it once more before reading it as a regression — browser tests here
 flake under contention — and read the harness's error if it fails twice.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src static tests
@@ -412,7 +412,7 @@ git commit -m "rename: state dir, config paths, lock ideName, log prefix and chr
 - Consumes: `ROOST_*` from Task 2 and every path from Task 3 — the docs must
   quote them exactly.
 
-- [ ] **Step 1: Sweep the living docs**
+- [x] **Step 1: Sweep the living docs**
 
 ```bash
 sed -i -E 's/RESH_/ROOST_/g; s/\bresh\b/roost/g' \
@@ -424,7 +424,7 @@ hooks paragraph in `docs/notifications.md` into nonsense ("`deadlight` until
 2026-08-18 … has roost read `~/.config/roost/config.toml`"). The next two
 steps replace both by hand.
 
-- [ ] **Step 2: Rewrite the rename note in `docs/deploy.md`**
+- [x] **Step 2: Rewrite the rename note in `docs/deploy.md`**
 
 Find the paragraph beginning `**The project was called `deadlight` until
 2026-08-18.**` (after the sweep it reads `**The project was called
@@ -468,7 +468,7 @@ deploy host's roots has a `.resh` directory. Rename it by hand (`git mv .resh
 .roost` inside the project, if it's tracked) on any project that carries one.
 ```
 
-- [ ] **Step 3: Rewrite the hooks paragraph in `docs/notifications.md`**
+- [x] **Step 3: Rewrite the hooks paragraph in `docs/notifications.md`**
 
 Find the paragraph beginning `**Existing hooks and scripts must be updated by
 hand.**` and replace the whole paragraph (it ends `written against the old
@@ -490,12 +490,12 @@ script written against an old name. A host may leave a `resh` symlink to the
 old `$RESH_NOTIFY` *guard* in a terminal opened after the rename.
 ```
 
-- [ ] **Step 4: Verify the historical record is untouched**
+- [x] **Step 4: Verify the historical record is untouched**
 
 Run: `git diff --name-only | grep 'superpowers/' | grep -v '2026-09-02-rename-to-roost.md'; echo "exit=$?"`
 Expected: no filenames, `exit=1`.
 
-- [ ] **Step 5: Verify no stale instruction remains**
+- [x] **Step 5: Verify no stale instruction remains**
 
 Run: `git grep -nw resh -- README.md CLAUDE.md docs/deploy.md docs/notifications.md docs/backlog.md tests/browser/README.md`
 Expected: only lines inside the two rewritten notes above (they name the old
@@ -504,7 +504,7 @@ paths on purpose). Anything else is a leftover — fix it.
 Run: `git grep -n 'RESH_' -- README.md CLAUDE.md docs/deploy.md docs/notifications.md docs/backlog.md tests/browser/README.md`
 Expected: only the `$RESH_NOTIFY` mentions inside the notifications note.
 
-- [ ] **Step 6: Commit and push**
+- [x] **Step 6: Commit and push**
 
 The host is this machine, so nothing needs pulling — but Task 6 renames the
 repository and the push should land first.
@@ -530,7 +530,7 @@ host, which is this machine; there is no ssh.
   path; `~/.local/bin/resh` as a symlink to it; `~/.config/roost/`;
   `~/.config/roost/deploy-host.md` describing the new state.
 
-- [ ] **Step 1: Preflight — record what must survive, and a rollback copy**
+- [x] **Step 1: Preflight — record what must survive, and a rollback copy**
 
 ```bash
 S=/tmp/claude-1001/-home-claude-projects-resh/fe7e8267-91d6-4f28-b2bb-8f65b3b12507/scratchpad
@@ -549,7 +549,7 @@ destructive. If any `NO HOLDER` prints, stop and investigate before the
 cutover: it means a session is already unreachable and the after-check could
 not tell that from one the cutover broke.
 
-- [ ] **Step 2: Build and install the new binary**
+- [x] **Step 2: Build and install the new binary**
 
 ```bash
 cd /home/claude/projects/resh && git status --short && git log --oneline -1
@@ -563,7 +563,7 @@ Expected: clean status on the Task 4 commit; `Finished`; a count above zero
 (the release profile strips symbols, not string literals — this proves the
 installed file is the renamed build); `usage: roost notify <title> [body]`.
 
-- [ ] **Step 3: Write the new unit**
+- [x] **Step 3: Write the new unit**
 
 `%h` is the user's home in a user unit. The comment on the state dir is the
 one thing a future reader must not "clean up".
@@ -601,7 +601,7 @@ systemd-analyze --user verify ~/.config/systemd/user/roost.service && echo unit-
 Expected: `unit-ok` (the verifier prints nothing on success; a warning about
 the unit not being loaded yet is fine, an error is not).
 
-- [ ] **Step 4: Cut over, in one command so the gap is seconds**
+- [x] **Step 4: Cut over, in one command so the gap is seconds**
 
 The old service's four IDE lock files (`~/.claude/ide/*.lock`, all
 `"ideName": "resh"`, all pointing at the old main pid) must go by hand: the
@@ -637,7 +637,7 @@ sleep 4; systemctl --user is-active roost
 
 Expected: four `removed stale resh lock` lines, then `active`.
 
-- [ ] **Step 5: Verify the running binary, the sessions, and the front door**
+- [x] **Step 5: Verify the running binary, the sessions, and the front door**
 
 ```bash
 S=/tmp/claude-1001/-home-claude-projects-resh/fe7e8267-91d6-4f28-b2bb-8f65b3b12507/scratchpad
@@ -680,7 +680,7 @@ before anything else: `systemctl --user stop roost; mv ~/.config/roost
 systemctl --user daemon-reload; systemctl --user start resh`, then read the
 journal.
 
-- [ ] **Step 6: Update the host notes**
+- [x] **Step 6: Update the host notes**
 
 `~/.config/roost/deploy-host.md` is the host-local file `docs/deploy.md`
 points to. Sweep it, then add the override to its Identity table and its
@@ -717,7 +717,7 @@ Also correct the two lines the sweep got wrong: the socket check in
 it into `roost`), and the Checkout row stays `/home/claude/projects/resh`
 until the deferred step below is taken.
 
-- [ ] **Step 7: Check the user's hooks**
+- [x] **Step 7: Check the user's hooks**
 
 The global settings carried no `resh notify` on 2026-09-01; per-project
 settings were not checked.
@@ -739,7 +739,7 @@ Expected: nothing. If a file prints, edit it to `roost notify` /
 the two worktrees under `.claude/worktrees/` (which share this checkout's
 remote config) keep working either way.
 
-- [ ] **Step 1: Rename on GitHub**
+- [x] **Step 1: Rename on GitHub**
 
 ```bash
 gh repo rename roost --repo PeterKnego/resh --yes
@@ -747,7 +747,7 @@ gh repo rename roost --repo PeterKnego/resh --yes
 
 Expected: `✓ Renamed repository PeterKnego/roost`.
 
-- [ ] **Step 2: Update the local remote and prove push works**
+- [x] **Step 2: Update the local remote and prove push works**
 
 ```bash
 git remote set-url origin git@github.com:PeterKnego/roost.git
@@ -758,7 +758,7 @@ git fetch origin && git push origin master
 Expected: both remote lines show `PeterKnego/roost.git`; the push reports
 `Everything up-to-date`.
 
-- [ ] **Step 3: Tick this plan's boxes and commit it**
+- [x] **Step 3: Tick this plan's boxes and commit it**
 
 ```bash
 git add docs/superpowers/plans/2026-09-02-rename-to-roost.md
