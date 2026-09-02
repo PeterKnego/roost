@@ -30,12 +30,12 @@ const NESTED = "docs/deep/nested.md";
 await Deno.mkdir(`${fx.roots}/proj/docs/deep`, { recursive: true });
 await Deno.writeTextFile(`${fx.roots}/proj/${NESTED}`, "nested\n");
 
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
 try {
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/proj`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/proj`);
   const { cmd, evalIn } = page;
   // The default headless window is 800x600, which is narrower than the left
   // (260px) and right (520px) panes together: the middle pane — the one every
@@ -138,7 +138,7 @@ try {
     10, "note.md reopened in Edit"),
     "note.md is back in Edit mode with its saved text, ready for the second browser");
 
-  const second = await openPage(browser.port, `http://127.0.0.1:${resh.port}/proj`);
+  const second = await openPage(browser.port, `http://127.0.0.1:${roost.port}/proj`);
   try {
     // Same override as the first page and for the same reason (see the
     // README's traps): the default 800x600 window collapses the middle
@@ -154,7 +154,7 @@ try {
 } finally {
   try { page?.close(); } catch {}
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 

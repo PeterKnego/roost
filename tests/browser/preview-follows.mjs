@@ -15,12 +15,12 @@ const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) 
 
 const fx = await fixture();
 
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
 try {
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/proj`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/proj`);
   const { cmd, evalIn } = page;
   // The default headless window is 800x600, which is narrower than the left
   // (260px) and right (520px) panes together: the middle pane — the one every
@@ -35,8 +35,8 @@ try {
   ok(await until(async () => (await shown()).includes("before"), 10, "the preview"),
      "the file is on screen");
 
-  // Written by something other than resh, which is the whole case: an edit
-  // resh itself made is suppressed as a self-write.
+  // Written by something other than roost, which is the whole case: an edit
+  // roost itself made is suppressed as a self-write.
   await Deno.writeTextFile(`${fx.roots}/proj/watched.md`, "# after\n");
   ok(await until(async () => (await shown()).includes("after"), 15, "the update"),
      "it updates without a reload");
@@ -44,7 +44,7 @@ try {
 } finally {
   try { page?.close(); } catch {}
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 

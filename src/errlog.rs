@@ -1,6 +1,6 @@
-//! One file for problems resh detects but nobody would otherwise see.
+//! One file for problems roost detects but nobody would otherwise see.
 //!
-//! Some of resh's detectors have nowhere useful to complain. A hook or other
+//! Some of roost's detectors have nowhere useful to complain. A hook or other
 //! non-service caller can exit 0 unconditionally, and its stderr is shown
 //! only when it fails or is slow — so a warning written there on a successful
 //! run is discarded, which is indistinguishable from never having detected
@@ -18,7 +18,7 @@
 //! ordinary use.
 use std::path::Path;
 
-/// Append one stamped line. Best effort: nothing resh does may fail because a
+/// Append one stamped line. Best effort: nothing roost does may fail because a
 /// log line could not be written, least of all a session starting.
 pub fn record(text: &str, now_secs: u64) {
     record_to(&crate::wsstate::state_dir(), text, now_secs)
@@ -54,10 +54,10 @@ mod tests {
     #[test]
     fn findings_are_appended_stamped_and_only_when_there_is_one() {
         let d = tempfile::tempdir().unwrap();
-        record_to(d.path(), "duplicate session name in resh: resh-f8", 1_787_400_000);
+        record_to(d.path(), "duplicate session name in roost: roost-f8", 1_787_400_000);
         record_to(d.path(), "roots disagree", 1_787_400_060);
         let text = std::fs::read_to_string(d.path().join("error.log")).expect("the log must exist");
-        assert!(text.contains("resh-f8"), "the finding is recorded: {text:?}");
+        assert!(text.contains("roost-f8"), "the finding is recorded: {text:?}");
         assert!(text.contains("1787400000"), "stamped, so a reader can order events: {text:?}");
         assert_eq!(text.lines().count(), 2, "appended, never truncated: {text:?}");
 

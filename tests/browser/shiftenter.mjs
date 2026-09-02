@@ -3,7 +3,7 @@
 //!
 //! xterm sends a bare `\r` for Enter *and* for Shift+Enter, so an application
 //! cannot tell the two apart — which is why Claude Code submits on Shift+Enter
-//! in resh and leaves `\` + Enter as the only way to write a second line.
+//! in roost and leaves `\` + Enter as the only way to write a second line.
 //! Claude binds its `chat:newline` action to Ctrl+J, and Ctrl+J *is* `\n`, so
 //! sending LF for Shift+Enter is all it takes. Nothing here detects Claude:
 //! everything that does not deliberately distinguish LF from CR treats them
@@ -27,12 +27,12 @@ let fail = 0;
 const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) fail++; };
 
 const fx = await fixture();
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
 try {
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   const { cmd, evalIn } = page;
   await until(() => evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "app.js");
 
@@ -110,7 +110,7 @@ try {
 } finally {
   page?.close();
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 console.log(fail ? `\n${fail} FAILED` : "\nall ok");

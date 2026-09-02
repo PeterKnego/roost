@@ -30,7 +30,7 @@ const fx = await fixture({ autosave: false });
 await Deno.writeTextFile(`${fx.roots}/proj/notes.rs`, "fn one() {}\nfn two() {}\n");
 await Deno.writeTextFile(`${fx.roots}/proj/draft.rs`, "fn draft() {}\n");
 
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
@@ -68,7 +68,7 @@ const wire = (p) => {
 };
 
 try {
-  page = wire(await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`));
+  page = wire(await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`));
   await page.evalIn(`1`);
   ok(await page.ready(), "the workspace is up");
 
@@ -105,7 +105,7 @@ try {
 
   console.log("\nC. and after a reload, which is where the empty editor was seen");
   await page.close();
-  page = wire(await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`));
+  page = wire(await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`));
   ok(await page.ready(), "the reloaded page is up");
   {
     const settled = await until(async () => /not found/.test((await page.pane()).text), 10, "the not-found pane");
@@ -146,7 +146,7 @@ try {
 } finally {
   try { await page?.close(); } catch { /* already gone */ }
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 

@@ -53,7 +53,7 @@ const AUTOSAVE_MS = 1000;
 // buffer cap is 2 MB, and hljs re-runs over the whole text on every pause in
 // typing. Past this the editor stays a plain textarea rather than becoming a
 // laggy one. Chosen as roughly the largest source file anyone edits by hand;
-// resh's own biggest is a quarter of it.
+// roost's own biggest is a quarter of it.
 const MAX_HIGHLIGHT_BYTES = 100_000;
 // Known to hljs but deliberately left plain — see codeLanguage.
 const PLAIN_EXTS = new Set(["md", "markdown", "txt", "text"]);
@@ -437,7 +437,7 @@ function onEvent(ev) {
         // schedules connectTerm on backoff, `entry.gone` is unset so onclose
         // does not bail, and a retry landing after the server clears
         // `closing` is accepted and spawns. Observed on the deploy host as a
-        // fresh dtach whose parent was resh itself, started in the same
+        // fresh dtach whose parent was roost itself, started in the same
         // second as the close, surviving with nothing attached to it.
         e.gone = true;
         clearTimeout(e.timer);
@@ -486,7 +486,7 @@ function onEvent(ev) {
       // no-buffer-for-X, save I/O errors, malformed intents...) — without a
       // visible banner, e.g. deleting a non-empty directory looks like a
       // silent no-op. console.warn stays too, for anyone actually watching devtools.
-      console.warn("resh:", ev.msg);
+      console.warn("roost:", ev.msg);
       showError(ev.msg);
       // do_open_at_line's own confinement check (src/hub.rs) refuses here,
       // never with a RevealLine — so a flag armed for it would otherwise
@@ -502,7 +502,7 @@ function onEvent(ev) {
       // wrong shape here and — as the Error case above notes — carries no way
       // back to the terminal that was clicked. This does, via the click still
       // in flight.
-      console.warn("resh:", ev.msg);
+      console.warn("roost:", ev.msg);
       // Same reasoning as the Error case above: a link that doesn't resolve
       // (the comment below calls this "the common case, not an edge case")
       // armed focusNextReveal in openTermPath and will never get the
@@ -1123,7 +1123,7 @@ function reconcileList(ul, html) {
 }
 
 // TreeChanged fires on every filesystem write — including every file Claude
-// edits from a terminal pane, which is resh's core use case — so this
+// edits from a terminal pane, which is roost's core use case — so this
 // must NOT do what refreshKind("Tree") does: a full re-fetch replaces the
 // whole tree with a fresh one-level render that only pre-expands the
 // currently open file's path, collapsing everything else the user had
@@ -1330,7 +1330,7 @@ function openTermPath(entry, raw) {
 // _removeIntersectingLinks, so registration order is the entire mechanism.
 // xterm's own OscLinkProvider is registered at construction, ahead of both,
 // which is the ordering this wants for free: a link an application declared
-// beats anything resh would have guessed over the same cells.
+// beats anything roost would have guessed over the same cells.
 let warnedProvider = false;
 
 function matchProvider(term, re, activate) {
@@ -1377,7 +1377,7 @@ function matchProvider(term, re, activate) {
         }
         cb(out.length ? out : undefined);
       } catch (e) {
-        if (!warnedProvider) { warnedProvider = true; console.warn("resh: link provider failed:", e); }
+        if (!warnedProvider) { warnedProvider = true; console.warn("roost: link provider failed:", e); }
         cb(undefined);
       }
     },
@@ -1524,7 +1524,7 @@ function ensureTerm(session) {
     // chooses it, which makes it exactly as trustworthy as plain text.
     // This vendored OscLinkProvider happens to drop non-http(s) URIs before
     // offering them, so today that check is the second of two — but it is
-    // the only one resh owns, and it is what covers every other link route
+    // the only one roost owns, and it is what covers every other link route
     // in this file as well.
     linkHandler: {
       activate: (ev, uri) => openUrl(uri),
@@ -1544,7 +1544,7 @@ function ensureTerm(session) {
   // goes to the app, context menu and all. Selecting in a terminal running
   // Claude Code therefore copied nothing, silently, and the next paste
   // inserted whatever the clipboard still held from before — an image, if that
-  // is what was last copied, which resh's own paste route then dutifully typed
+  // is what was last copied, which roost's own paste route then dutifully typed
   // into the app.
   //
   // Debounced because onSelectionChange fires continuously while a drag grows;
@@ -1658,7 +1658,7 @@ function connectTerm(entry, session) {
     //             the handshake was refused. Reconnecting would call
     //             session::attach again, and attach *creates* when absent —
     //             so typing `exit` would silently fork a fresh shell.
-    //   unclean — the connection died under us: laptop slept, resh
+    //   unclean — the connection died under us: laptop slept, roost
     //             restarted, network blip. Nothing is wrong with the
     //             session; dtach still holds it. This is the case to heal.
     // The two are otherwise indistinguishable from here — both just stop.
@@ -1734,7 +1734,7 @@ function codeLanguage(rel, text) {
   return ext;
 }
 
-/// Attaches resh's editing behaviour to whichever textarea ends up on screen.
+/// Attaches roost's editing behaviour to whichever textarea ends up on screen.
 /// Which one that is depends on the file: a plain editor makes its own, while
 /// a code editor gets the one <code-input> builds for itself. Registering the
 /// wrong one is silent and total — the text still types and still highlights,
@@ -2316,7 +2316,7 @@ if (wtBtn && wtPanel) {
       e.preventDefault();
       const key = rm.dataset.key;
       const name = rm.closest(".wtrow")?.textContent.trim().split(/\s+/)[1] || key;
-      if (confirm(`Remove worktree ${name} and its branch? resh re-checks that it is clean, idle and merged first.`)) send({ t: "RemoveWorktree", key });
+      if (confirm(`Remove worktree ${name} and its branch? roost re-checks that it is clean, idle and merged first.`)) send({ t: "RemoveWorktree", key });
       return;
     }
     if (e.target.closest("a")) wtPanel.hidden = true;
@@ -2403,7 +2403,7 @@ const canNotify = () => window.isSecureContext && "Notification" in window;
 if (canNotify() && "serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").then(
     (r) => { swReg = r; },
-    (e) => console.warn("resh: service worker registration failed", e)
+    (e) => console.warn("roost: service worker registration failed", e)
   );
   navigator.serviceWorker.addEventListener("message", (e) => {
     if (e.data && e.data.kind === "focus") focusSession(e.data.session);

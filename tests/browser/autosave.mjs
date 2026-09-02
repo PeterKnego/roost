@@ -39,13 +39,13 @@ await Deno.writeTextFile(manualFile, "start\n");
 const slowFile = `${fx.roots}/proj/slowstate.md`;
 await Deno.writeTextFile(slowFile, "start\n");
 
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page, manualPage;
 
 // One page's editor: open a file, type into it, read its header state.
 const wire = async (project, rel) => {
-  const p = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${project}`);
+  const p = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${project}`);
   await until(() => p.evalIn(`typeof state !== "undefined" && !!(state && state.panes)`), 15, "state");
   await p.evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: ${JSON.stringify(rel)}, mode: "Edit" } })`);
   await until(() => p.evalIn(`!!document.querySelector("textarea.editor")`), 10, "editor");
@@ -246,7 +246,7 @@ try {
   try { page?.close(); } catch {}
   try { manualPage?.close(); } catch {}
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 

@@ -16,7 +16,7 @@ pub enum SaveOutcome {
 fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
     let dir = path.parent().ok_or("no parent directory")?;
     let tmp = dir.join(format!(
-        ".{}.resh.tmp",
+        ".{}.roost.tmp",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("buf")
     ));
     std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
@@ -179,7 +179,7 @@ impl UploadTemp {
         must_not_exist(&dest, &rel)?;
         let parent = dest.parent().ok_or("no parent directory")?;
         let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = parent.join(format!(".{name}.{}-{seq}.resh.tmp", std::process::id()));
+        let tmp = parent.join(format!(".{name}.{}-{seq}.roost.tmp", std::process::id()));
         let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
         Ok(UploadTemp { tmp: Some(tmp), dest, rel, file })
     }
@@ -470,7 +470,7 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.contains("resh.tmp"))
+            .filter(|n| n.contains("roost.tmp"))
             .collect()
     }
 

@@ -233,7 +233,7 @@ pub fn coerce_tab(tab: &Tab) -> Tab {
 /// Tabs whose counterparty did not survive the process that created them.
 ///
 /// A `Tab::Proposal` is one half of a JSON-RPC request Claude is blocked on;
-/// the other half is a websocket that died when resh exited. Restoring it
+/// the other half is a websocket that died when roost exited. Restoring it
 /// from the persisted layout would draw a proposal nobody can answer —
 /// Accept and Reject would both find no pending request, and the tab would
 /// sit there forever looking live. Dropping it is the honest reload: Claude's

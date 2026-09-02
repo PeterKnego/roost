@@ -31,12 +31,12 @@ await Deno.writeTextFile(`${fx.roots}/proj/big.rs`, "// filler line\n".repeat(90
 await Deno.writeTextFile(`${fx.roots}/proj/wide.rs`,
   `fn main() {}\n// ${"a very long comment ".repeat(30)}\nconst B: &str = "${"QUJDRA".repeat(70)}";\n`);
 
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
 try {
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   const { cmd, evalIn } = page;
   await cmd("Emulation.setDeviceMetricsOverride", { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
   await until(() => evalIn(`typeof state !== "undefined" && !!(state && state.panes)`), 15, "workspace state");
@@ -154,7 +154,7 @@ try {
 } finally {
   page?.close();
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 console.log(fail ? `\n${fail} FAILED` : "\nall ok");

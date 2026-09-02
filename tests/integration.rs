@@ -23,8 +23,8 @@ fn fixture() -> (tempfile::TempDir, u16) {
     let d = tempfile::tempdir().unwrap();
     std::fs::create_dir(d.path().join("proj")).unwrap();
     std::fs::write(d.path().join("proj/hello.md"), "# Hello\n").unwrap();
-    std::fs::create_dir(d.path().join("proj/.resh")).unwrap();
-    std::fs::write(d.path().join("proj/.resh/config.toml"), "theme = \"light\"\n").unwrap();
+    std::fs::create_dir(d.path().join("proj/.roost")).unwrap();
+    std::fs::write(d.path().join("proj/.roost/config.toml"), "theme = \"light\"\n").unwrap();
     let port = start(vec![d.path().to_path_buf()]);
     (d, port)
 }
@@ -233,7 +233,7 @@ fn upload_refuses_a_body_past_the_aggregate_limit() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.contains("resh.tmp"))
+        .filter(|n| n.contains("roost.tmp"))
         .collect();
     assert!(leftovers.is_empty(), "a cap breach left a partial file: {leftovers:?}");
 }
@@ -405,7 +405,7 @@ fn workspace_page_applies_project_settings() {
     let (_d, port) = fixture();
     let body = ureq::get(&format!("http://127.0.0.1:{port}/proj"))
         .call().unwrap().into_string().unwrap();
-    assert!(body.contains("/static/themes/light.css")); // .resh config read per request
+    assert!(body.contains("/static/themes/light.css")); // .roost config read per request
     assert!(body.contains("data-project=\"proj\""));
 }
 
@@ -528,7 +528,7 @@ fn static_assets_served_with_type() {
 #[cfg(unix)]
 #[test]
 fn theme_css_symlink_escaping_the_project_is_refused() {
-    // A cloned repo controls .resh/theme.css. If the fragment handler
+    // A cloned repo controls .roost/theme.css. If the fragment handler
     // did a bare fs::read of that path, a symlink planted there pointing at
     // e.g. ~/.ssh/id_rsa would be served straight to the browser as
     // text/css. serve_frag must resolve it through safe_resolve like every
@@ -536,10 +536,10 @@ fn theme_css_symlink_escaping_the_project_is_refused() {
     // traversal already is.
     let d = tempfile::tempdir().unwrap();
     std::fs::create_dir(d.path().join("themeleak")).unwrap();
-    std::fs::create_dir(d.path().join("themeleak/.resh")).unwrap();
+    std::fs::create_dir(d.path().join("themeleak/.roost")).unwrap();
     let secret = d.path().join("secret.txt");
     std::fs::write(&secret, "top secret\n").unwrap();
-    std::os::unix::fs::symlink(&secret, d.path().join("themeleak/.resh/theme.css")).unwrap();
+    std::os::unix::fs::symlink(&secret, d.path().join("themeleak/.roost/theme.css")).unwrap();
     let port = start(vec![d.path().to_path_buf()]);
 
     match ureq::get(&format!("http://127.0.0.1:{port}/frag/themeleak/theme.css")).call() {
@@ -562,7 +562,7 @@ fn theme_css_symlink_escaping_the_project_is_refused() {
 #[test]
 fn frag_theme_directory_serves_presentation_and_refuses_code_over_http() {
     let (d, port) = fixture_named("themedir");
-    let t = d.path().join("themedir/.resh/theme");
+    let t = d.path().join("themedir/.roost/theme");
     std::fs::create_dir_all(&t).unwrap();
     std::fs::write(t.join("style.css"), "body{color:red}").unwrap();
     std::fs::write(t.join("app.js"), "alert('pwned')").unwrap();
@@ -686,8 +686,8 @@ fn the_header_toggle_overrides_the_config_file_in_both_directions() {
     assert!(shown.contains(r#"data-rel="hello.md""#), "ordinary rows are unaffected");
 
     // Now the other direction: config on, toggle off.
-    std::fs::create_dir(proj.join(".resh")).unwrap();
-    std::fs::write(proj.join(".resh/config.toml"), "show_hidden = true").unwrap();
+    std::fs::create_dir(proj.join(".roost")).unwrap();
+    std::fs::write(proj.join(".roost/config.toml"), "show_hidden = true").unwrap();
     c.send(tungstenite::Message::Text(r#"{"t":"SetShowHidden","on":false}"#.into())).unwrap();
     read_until(&mut c, r#""show_hidden":false"#);
     let hidden = tree();
@@ -700,7 +700,7 @@ fn the_header_toggle_overrides_the_config_file_in_both_directions() {
 
 // The setting has to survive the whole request path — config cascade, route,
 // renderer — and it is per project, so the test asserts the same server serves
-// the hidden row only once that project's `.resh/config.toml` asks for it. A
+// the hidden row only once that project's `.roost/config.toml` asks for it. A
 // filter wired to a constant would pass one half and fail the other.
 // Own project name: this test writes into the project directory (see
 // `fixture_named`).
@@ -715,11 +715,11 @@ fn show_hidden_is_read_per_project_on_every_tree_request() {
     assert!(!before.contains(".gitignore"), "hidden by default");
 
     // Settings are re-read per request, so no restart between these two.
-    std::fs::create_dir(proj.join(".resh")).unwrap();
-    std::fs::write(proj.join(".resh/config.toml"), "show_hidden = true").unwrap();
+    std::fs::create_dir(proj.join(".roost")).unwrap();
+    std::fs::write(proj.join(".roost/config.toml"), "show_hidden = true").unwrap();
     let after = ureq::get(&url).call().unwrap().into_string().unwrap();
     assert!(after.contains("data-rel=\".gitignore\""), "the setting took effect");
-    assert!(after.contains("data-rel=\".resh\""), "including the config dir itself");
+    assert!(after.contains("data-rel=\".roost\""), "including the config dir itself");
     // The lazy-expand endpoint reads the same setting, not a cached one.
     let lazy = ureq::get(&format!("{url}?dir=")).call().unwrap().into_string().unwrap();
     assert!(lazy.contains("data-rel=\".gitignore\""));
@@ -790,7 +790,7 @@ fn ws_rejects_foreign_and_missing_origin() {
 /// The reader half of these sockets can no longer write, so the `Pong` that
 /// tungstenite queues on it is discarded — the read loop has to forward the
 /// reply through the one writer instead. If that forwarding is dropped, the
-/// structural fix silently turns resh into a server that never answers a
+/// structural fix silently turns roost into a server that never answers a
 /// ping, and nothing else in the suite notices.
 ///
 /// Revert-checked: deleting the `Ok(Message::Ping(p))` arm in `term.rs` makes
@@ -2113,7 +2113,7 @@ fn close_project_ends_sessions_and_isolates_other_projects() {
 }
 
 /// Minimal, test-only "is anything holding this path" check via `ps`.
-/// Deliberately not resh's own internal machinery (private to its
+/// Deliberately not roost's own internal machinery (private to its
 /// `registry` module, and hardened for production against inputs this
 /// test's own known, plain tempdir paths don't need) — just enough to prove
 /// a real process is or isn't there.

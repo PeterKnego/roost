@@ -65,7 +65,7 @@ const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) 
 
 const fx = await fixture();               // creates a git project `proj` under fx.roots
 const browser = await startBrowser(profileDir(repoRoot));
-let page, page2, page3, ws, ws2, resh;
+let page, page2, page3, ws, ws2, roost;
 
 /// Opens `project`'s workspace, starts a terminal via pane 3's + button, and
 /// waits for it to attach. Returns the CDP client and the new session's
@@ -83,14 +83,14 @@ async function startTerminal(browserPort, reshPort, project) {
 }
 
 try {
-  resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+  roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
   // Start a real terminal in `proj` via the workspace, so the overview has a session to show.
-  const t1 = await startTerminal(browser.port, resh.port, fx.project);
+  const t1 = await startTerminal(browser.port, roost.port, fx.project);
   ws = t1.w;
   const sess = t1.sess;
 
   console.log("A. the overview lists the live session");
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/`);
   const sessionsText = () => page.evalIn(`document.getElementById("ovsessions")?.textContent || ""`);
   ok(await until(async () => (await sessionsText()).includes(fx.project) && (await sessionsText()).includes(sess), 15, "session row"),
      `the overview's right pane lists ${fx.project} · ${sess}`);
@@ -105,7 +105,7 @@ try {
   console.log("C. the directory picker is gone");
   // `?at=` was the picker's URL. The overview lists every project directory
   // under the roots, so browsing to find one had nothing left to add.
-  page2 = await openPage(browser.port, `http://127.0.0.1:${resh.port}/?at=`);
+  page2 = await openPage(browser.port, `http://127.0.0.1:${roost.port}/?at=`);
   ok(await until(() => page2.evalIn(`!!document.getElementById("overview")`), 10, "overview"),
      "?at= serves the overview");
   ok(!(await page2.evalIn(`!!document.getElementById("picker")`)), "there is no picker any more");
@@ -119,14 +119,14 @@ try {
   const proj2 = "proj2";
   await Deno.mkdir(`${fx.roots}/${proj2}`, { recursive: true });
   await new Deno.Command("git", { args: ["init", "-q"], cwd: `${fx.roots}/${proj2}`, stdout: "null", stderr: "null" }).output();
-  const t2 = await startTerminal(browser.port, resh.port, proj2);
+  const t2 = await startTerminal(browser.port, roost.port, proj2);
   ws2 = t2.w;
   const sess2 = t2.sess;
 
   // A fresh tab: `page` already navigated away in Section B. This
   // section's row click no longer navigates (the panes swap in place), but
   // it still needs a tab that is actually on the overview.
-  page3 = await openPage(browser.port, `http://127.0.0.1:${resh.port}/`);
+  page3 = await openPage(browser.port, `http://127.0.0.1:${roost.port}/`);
   const sessionsPane = () => page3.evalIn(`document.getElementById("ovsessions")?.textContent || ""`);
   ok(await until(async () => (await sessionsPane()).includes(sess) && (await sessionsPane()).includes(sess2), 15, "both sessions listed"),
      `before selecting, #ovsessions lists both ${fx.project} · ${sess} and ${proj2} · ${sess2}`);
@@ -186,7 +186,7 @@ try {
     await g("commit", "-qm", "init");
     await g("worktree", "add", "-q", "-b", `wt-${p.split("/").pop()}`, ".claude/worktrees/wt");
   }
-  const page4 = await openPage(browser.port, `http://127.0.0.1:${resh.port}/`);
+  const page4 = await openPage(browser.port, `http://127.0.0.1:${roost.port}/`);
   const tree = () => page4.evalIn(`document.getElementById("ovprojects")?.textContent || ""`);
   const kidsOf = (label) =>
     page4.evalIn(`(() => {
@@ -271,7 +271,7 @@ try {
   // it processes the node, so a selection that only rewrites `hx-get` never
   // reaches the poll — five seconds later the pane snaps back to whatever
   // the page was first opened with.
-  const page5 = await openPage(browser.port, `http://127.0.0.1:${resh.port}/`);
+  const page5 = await openPage(browser.port, `http://127.0.0.1:${roost.port}/`);
   const curRow = () =>
     page5.evalIn(`(document.querySelector('#ovprojects .ovrow.current')?.textContent || "").trim()`);
   const sessText = () => page5.evalIn(`document.getElementById("ovsessions")?.textContent || ""`);
@@ -320,7 +320,7 @@ try {
   // The reported dead end: the only link on the page that reached a
   // workspace was a session row, so a project with no sessions — every
   // project nobody has opened yet — could not be opened at all.
-  const page6 = await openPage(browser.port, `http://127.0.0.1:${resh.port}/`);
+  const page6 = await openPage(browser.port, `http://127.0.0.1:${roost.port}/`);
   const idle = "quiet-project";
   await Deno.mkdir(`${fx.roots}/${idle}`, { recursive: true });
   const pickRow = (label) =>
@@ -352,7 +352,7 @@ try {
 } finally {
   page?.close(); page2?.close(); page3?.close(); ws?.close(); ws2?.close();
   browser.close();
-  if (resh) await resh.close();
+  if (roost) await roost.close();
   await fx.cleanup();
 }
 console.log(fail ? `\n${fail} FAILED` : "\nall ok");

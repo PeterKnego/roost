@@ -2,7 +2,7 @@
 //!
 //! A full-screen app states its whole terminal contract in its first hundred
 //! bytes — bracketed paste, mouse reporting, focus reporting, cursor
-//! visibility — one sequence each, never repeated. resh's replay is a bounded
+//! visibility — one sequence each, never repeated. roost's replay is a bounded
 //! byte ring, so within a minute or two of the app running, none of that is in
 //! it any more, and a browser that reloads gets a terminal with every one of
 //! them back at its default while the app believes otherwise.
@@ -33,7 +33,7 @@
 //! re-declares anything.
 //!
 //! The restart path is deliberately not exercised: an app never re-states its
-//! modes, so a resh that restarts under one cannot know them, and this fixes
+//! modes, so a roost that restarts under one cannot know them, and this fixes
 //! attachments (reload, wake, second tab, ring turnover) rather than restarts.
 //!
 //! Run: deno run -A tests/browser/modes.mjs
@@ -45,9 +45,9 @@ let fail = 0;
 const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) fail++; };
 
 const fx = await fixture();
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const proxyPort = await freePort();
-const proxy = startProxy({ listenPort: proxyPort, upstreamPort: resh.port });
+const proxy = startProxy({ listenPort: proxyPort, upstreamPort: roost.port });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
@@ -108,7 +108,7 @@ try {
   page?.close();
   browser.close();
   proxy.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 

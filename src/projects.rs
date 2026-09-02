@@ -906,7 +906,7 @@ mod tests {
     }
 
     /// A hand-edited file invites `~/`. Left literal it would name a
-    /// directory that matches nothing, and resh would come up healthy showing
+    /// directory that matches nothing, and roost would come up healthy showing
     /// no projects at all — indistinguishable from every project having been
     /// deleted, which is the failure mode this codebase keeps relearning.
     #[test]
@@ -1031,7 +1031,7 @@ mod tests {
     fn existing_ascii_keys_are_unchanged_byte_for_byte() {
         for name in [
             "karpie",
-            "resh",
+            "roost",
             "ultima_db",
             "ultima",
             "ml",

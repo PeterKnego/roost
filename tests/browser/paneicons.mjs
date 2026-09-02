@@ -17,12 +17,12 @@ const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) 
 const fx = await fixture();
 await Deno.mkdir(`${fx.roots}/proj/src/inner`, { recursive: true });
 await Deno.writeTextFile(`${fx.roots}/proj/src/main.rs`, "fn main() {}\n");
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
 try {
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/proj`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/proj`);
   const { evalIn } = page;
   await until(() => evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "app");
   const icon = (pane, prefix, shift = false) =>
@@ -78,7 +78,7 @@ try {
 } finally {
   page?.close();
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 console.log(fail === 0 ? "\nALL PASS" : `\n${fail} FAILED`);

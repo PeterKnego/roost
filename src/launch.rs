@@ -19,7 +19,7 @@
 //! Whether the program is installed is checked once, at startup, in the
 //! background, and the ✻ button is hidden only when that check positively
 //! said no. It is asked of a login interactive shell — the shell a terminal
-//! gets — not of resh's own environment, because a service's `PATH` is not
+//! gets — not of roost's own environment, because a service's `PATH` is not
 //! the user's: here `claude` lives in `~/.local/bin`, which `.profile` adds
 //! and `systemd` does not.
 //!
@@ -36,7 +36,7 @@ use crate::proto::Launch;
 ///
 /// `session_id` is typed only when it is exactly a lowercase v4-shaped uuid:
 /// it lands on a command line, and the validation is the whole boundary
-/// between "resh chose this id" and "something typed a shell command". A
+/// between "roost chose this id" and "something typed a shell command". A
 /// malformed id degrades to the bare program, which still starts.
 pub fn keystrokes(launch: Launch, session_id: Option<&str>) -> Vec<u8> {
     match (launch, session_id) {
@@ -205,11 +205,11 @@ pub fn probe_all_in_background() {
             match a {
                 Availability::Present => {}
                 Availability::Absent => eprintln!(
-                    "resh: `{}` is not on {shell}'s login PATH; the ✻ button is hidden",
+                    "roost: `{}` is not on {shell}'s login PATH; the ✻ button is hidden",
                     program(l)
                 ),
                 Availability::Unknown => eprintln!(
-                    "resh: could not ask {shell} whether `{}` is installed; offering the ✻ button anyway",
+                    "roost: could not ask {shell} whether `{}` is installed; offering the ✻ button anyway",
                     program(l)
                 ),
             }
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn a_program_the_login_shell_cannot_find_is_absent() {
-        assert_eq!(probe("/bin/sh", "resh-no-such-program-4b1c", T), Availability::Absent);
+        assert_eq!(probe("/bin/sh", "roost-no-such-program-4b1c", T), Availability::Absent);
     }
 
     // "I could not determine X" is a third outcome, never folded into
@@ -314,7 +314,7 @@ mod tests {
     // round.
     #[test]
     fn a_shell_that_cannot_be_started_is_unknown_not_absent() {
-        assert_eq!(probe("/nonexistent/resh-test-shell", "sh", T), Availability::Unknown);
+        assert_eq!(probe("/nonexistent/roost-test-shell", "sh", T), Availability::Unknown);
     }
 
     #[test]

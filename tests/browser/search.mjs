@@ -100,9 +100,9 @@ await Deno.writeTextFile(`${fx.roots}/proj/src/search.rs`, "nothing to match her
 // truncated before it: the row comes back with nothing to chip.
 await Deno.writeTextFile(`${fx.roots}/proj/src/capped.txt`, "x".repeat(320) + "farpastthecap\n");
 
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
-const url = `http://127.0.0.1:${resh.port}/proj`;
+const url = `http://127.0.0.1:${roost.port}/proj`;
 let page1, page2;
 
 // A query typed into #searchinput, dispatched as a real input event.
@@ -1438,7 +1438,7 @@ console.log("\nK. the .skipped mark does not survive an erase");
   try { page1 && page1.close(); } catch { /* already gone */ }
   try { page2 && page2.close(); } catch { /* already gone */ }
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 

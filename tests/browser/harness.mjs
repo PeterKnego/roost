@@ -1,5 +1,5 @@
 //! Browser-test harness: a real Chromium, driven over CDP, against a real
-//! resh with real dtach.
+//! roost with real dtach.
 //!
 //! It exists because this project's worst defects have been invisible to a
 //! green `cargo test` — CLAUDE.md lists four of them, each hidden by a
@@ -7,7 +7,7 @@
 //! no browser at all). The terminal reconnect is the same shape: every line of
 //! it lives in static/app.js, where `cargo test` cannot reach.
 //!
-//! Everything here is deliberately hermetic. The harness builds resh, starts
+//! Everything here is deliberately hermetic. The harness builds roost, starts
 //! its *own* instance on a free port with its own state directory and a
 //! throwaway project, and tears the lot down afterwards. It never touches a
 //! deployed or development instance, so a test run cannot kill a session
@@ -43,7 +43,7 @@ export async function freePort() {
 /// /proc directly and skipping our own pid has no such hazard.
 /// SIGTERM, then SIGKILL whatever is still standing.
 ///
-/// Two `/tmp/resh-browser-*` trees were once found abandoned on a live host,
+/// Two `/tmp/roost-browser-*` trees were once found abandoned on a live host,
 /// one of them still holding a running `dtach` master and its login shell.
 /// Whether cleanup ran and failed, or never ran at all, was not established
 /// after the fact — a later TERM killed that same process first try, so it was
@@ -188,9 +188,9 @@ export async function attachTarget(webSocketDebuggerUrl) {
   return { cmd, evalIn, close };
 }
 
-// ------------------------------------------------------------------- resh
+// ------------------------------------------------------------------- roost
 
-/// Builds and starts a private resh. `ROOST_CMD` is never set: substituting a
+/// Builds and starts a private roost. `ROOST_CMD` is never set: substituting a
 /// plain command for dtach is exactly the trap that once let a broken socket
 /// directory reach production green (see CLAUDE.md, "The dev/prod
 /// substitution trap"). A browser test that skipped real dtach would be
@@ -201,7 +201,7 @@ export async function startResh({ repoRoot, stateDir, roots, port, extraEnv = {}
   ));
   const build = await new Deno.Command("cargo", { args: ["build", "-q"], cwd: repoRoot, stdout: "inherit", stderr: "inherit" }).output();
   if (!build.success) throw new Error("cargo build failed");
-  const bin = `${meta.target_directory}/debug/resh`;
+  const bin = `${meta.target_directory}/debug/roost`;
 
   const spawn = () => new Deno.Command(bin, {
     args: [String(port)],
@@ -244,8 +244,8 @@ export async function startResh({ repoRoot, stateDir, roots, port, extraEnv = {}
   let proc = spawn();
   const wait = () => until(async () => {
     try { return (await fetch(`http://127.0.0.1:${port}/`)).status === 200; } catch { return false; }
-  }, 30, "resh to listen");
-  if (!await wait()) throw new Error("resh never started listening");
+  }, 30, "roost to listen");
+  if (!await wait()) throw new Error("roost never started listening");
 
   return {
     port,
@@ -265,7 +265,7 @@ export async function startResh({ repoRoot, stateDir, roots, port, extraEnv = {}
 
 // ------------------------------------------------------------------ proxy
 
-/// A TCP proxy the test can sever, standing between the browser and resh.
+/// A TCP proxy the test can sever, standing between the browser and roost.
 ///
 /// This is the only way found to reproduce a sleeping laptop: Chrome's own
 /// `Network.emulateNetworkConditions {offline:true}` blocks *new* requests
@@ -310,7 +310,7 @@ export function startProxy({ listenPort, upstreamPort }) {
 /// A throwaway project for the run. Its own directory and its own state dir
 /// mean the sessions this test spawns cannot collide with a real one, and the
 /// teardown can identify its own dtach processes by that unique path.
-/// Turns autosave off for one project, by writing the `.resh/config.toml` the
+/// Turns autosave off for one project, by writing the `.roost/config.toml` the
 /// server reads (per batch, so it does not even need to exist before startup).
 ///
 /// Worth a helper because getting it wrong is invisible: `AUTOSAVE_MS` is 1000
@@ -321,16 +321,16 @@ export function startProxy({ listenPort, upstreamPort }) {
 /// should call this and then prove it took, by waiting out the window and
 /// requiring the file on disk to be untouched.
 export async function disableAutosave(dir) {
-  await Deno.mkdir(`${dir}/.resh`, { recursive: true });
-  await Deno.writeTextFile(`${dir}/.resh/config.toml`, "autosave = false\n");
+  await Deno.mkdir(`${dir}/.roost`, { recursive: true });
+  await Deno.writeTextFile(`${dir}/.roost/config.toml`, "autosave = false\n");
 }
 
 /// `autosave: false` writes the config above into the fixture's own project
-/// before the server starts. Default is autosave on, which is resh's own
+/// before the server starts. Default is autosave on, which is roost's own
 /// default — a test that wants the other one should have to say so, and
 /// `autosave.mjs` and `save.mjs` are about that machinery itself.
 export async function fixture({ autosave = true } = {}) {
-  const base = await Deno.makeTempDir({ prefix: "resh-browser-" });
+  const base = await Deno.makeTempDir({ prefix: "roost-browser-" });
   const roots = `${base}/roots`;
   const project = `${roots}/proj`;
   await Deno.mkdir(project, { recursive: true });
@@ -347,7 +347,7 @@ export async function fixture({ autosave = true } = {}) {
       await killByCmdline(stateDir);
       await sleep(300);
       // Reported, not swallowed. A bare `catch {}` here is how two abandoned
-      // /tmp/resh-browser-* trees and a live shell went unnoticed: the removal
+      // /tmp/roost-browser-* trees and a live shell went unnoticed: the removal
       // failed every run and said nothing, so the only symptom was litter
       // nobody was looking for. A cleanup that cannot clean up has to say so.
       try {
@@ -375,5 +375,5 @@ export async function fixture({ autosave = true } = {}) {
 /// checkout, not inside it.
 export function profileDir(_repoRoot) {
   const home = Deno.env.get("HOME") ?? "/tmp";
-  return `${home}/resh-browser-tmp/profile`;
+  return `${home}/roost-browser-tmp/profile`;
 }

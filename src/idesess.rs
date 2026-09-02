@@ -1,7 +1,7 @@
-//! Which resh terminal a process is running in, from its pid.
+//! Which roost terminal a process is running in, from its pid.
 //!
 //! `session_env` (`session.rs`) exports `ROOST_PROJECT` and `ROOST_SESSION`
-//! into every shell resh spawns, originally so a program in that terminal
+//! into every shell roost spawns, originally so a program in that terminal
 //! could attribute a `ROOST_NOTIFY` notification to its session. A `claude`
 //! started in that terminal inherits both, through dtach and through the
 //! shell — which makes the same two variables the answer to the opposite
@@ -9,11 +9,11 @@
 //! terminals is it sitting in?
 //!
 //! That question has no answer in the IDE protocol. `ide_connected` carries
-//! a pid and nothing else, so resh asks the kernel — the same move, for the
+//! a pid and nothing else, so roost asks the kernel — the same move, for the
 //! same reason, that `idecwd.rs` makes for the working directory.
 //!
 //! Three outcomes, not two. "I could not read this process's environment" is
-//! not "this process is not in a resh terminal". Only the second is evidence,
+//! not "this process is not in a roost terminal". Only the second is evidence,
 //! and only the second may exclude a connection from a mention: a mention
 //! that reaches one Claude too many is recoverable, one that reaches none
 //! looks like a broken keystroke.
@@ -25,10 +25,10 @@ pub enum Sess {
     /// project being asked about.
     In(String),
     /// The environment read cleanly and positively places this process
-    /// outside this project's terminals — either no resh variables at all,
+    /// outside this project's terminals — either no roost variables at all,
     /// or a different project's. Evidence, so it may exclude.
     Outside,
-    /// resh could not tell. Never a reason to exclude a connection.
+    /// roost could not tell. Never a reason to exclude a connection.
     Unknown,
 }
 
@@ -56,11 +56,11 @@ pub fn session_of_in(proc_root: &Path, pid: u32, project: &str) -> Sess {
         // Both present and this is the project: the only case that can name
         // a terminal. An unusable name is "cannot tell", not "not here" —
         // Outside would exclude the connection, which is the wrong direction
-        // for a value resh failed to make sense of.
+        // for a value roost failed to make sense of.
         (Some(s), Some(p)) if p == project => {
             if crate::session::valid_name(s) { Sess::In(s.to_string()) } else { Sess::Unknown }
         }
-        // A clean environment with neither variable: resh did not spawn this
+        // A clean environment with neither variable: roost did not spawn this
         // process. Positive evidence.
         (None, None) => Sess::Outside,
         // In this project, but the session name is gone. "Cannot tell which
@@ -76,7 +76,7 @@ pub fn session_of_in(proc_root: &Path, pid: u32, project: &str) -> Sess {
         (_, Some(_)) => Sess::Outside,
         // One variable without the other. Something scrubbed the
         // environment partially; the name cannot be trusted to mean this
-        // project, and resh cannot tell what it does mean.
+        // project, and roost cannot tell what it does mean.
         (Some(_), None) => Sess::Unknown,
     }
 }
@@ -106,7 +106,7 @@ mod tests {
     }
 
     #[test]
-    fn a_claude_in_a_resh_terminal_reports_its_session() {
+    fn a_claude_in_a_roost_terminal_reports_its_session() {
         let d = fake_proc(&["PATH=/usr/bin", "ROOST_PROJECT=karpie", "ROOST_SESSION=main"]);
         assert_eq!(session_of_in(d.path(), 4242, "karpie"), Sess::In("main".into()));
     }
@@ -114,7 +114,7 @@ mod tests {
     /// The distinction this whole enum exists for. A clean environment is
     /// evidence; an unreadable one is not.
     #[test]
-    fn a_claude_started_outside_resh_is_outside() {
+    fn a_claude_started_outside_roost_is_outside() {
         let d = fake_proc(&["PATH=/usr/bin", "HOME=/home/x"]);
         assert_eq!(session_of_in(d.path(), 4242, "karpie"), Sess::Outside);
     }

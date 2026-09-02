@@ -15,7 +15,7 @@
 //! programs this test gives it and none the developer has. The fake prints
 //! the `CLAUDE_CODE_SSE_PORT` it was handed, which is the whole reason the
 //! button needs no flags: that variable is how a claude started here finds
-//! this resh's IDE socket.
+//! this roost's IDE socket.
 //!
 //! The second server has a `$SHELL` whose `PATH` holds nothing, which is how
 //! the startup check (`launch::probe`) is shown to reach the page: the button
@@ -40,7 +40,7 @@ await Deno.mkdir(emptybin, { recursive: true });
 await Deno.writeFile(`${fakebin}/claude`, enc.encode(
   `#!/bin/sh\necho "FAKE-CLAUDE-STARTED sse=\${CLAUDE_CODE_SSE_PORT:-none}"\n`), { mode: 0o755 });
 // `--noprofile --norc` so the developer's real PATH (and real claude) cannot
-// leak in through ~/.profile; `-l`/`-i` from resh and from the probe are
+// leak in through ~/.profile; `-l`/`-i` from roost and from the probe are
 // still passed through, so this is still the login interactive shell both
 // of them ask for.
 const shellWith = async (name, path) => {
@@ -55,15 +55,15 @@ const shellAbsent = await shellWith("shell-absent", emptybin);
 const pageHtml = async (port) => (await fetch(`http://127.0.0.1:${port}/${fx.project}`)).text();
 
 const browser = await startBrowser(profileDir(repoRoot));
-let page, resh;
+let page, roost;
 
 try {
   // ---------------------------------------------------------- claude present
   console.log("A. claude is on the login shell's PATH");
-  resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shellPresent } });
-  ok(await until(async () => (await pageHtml(resh.port)).includes('data-launches="claude"'), 15, "page to offer claude"),
+  roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shellPresent } });
+  ok(await until(async () => (await pageHtml(roost.port)).includes('data-launches="claude"'), 15, "page to offer claude"),
      "the page offers the claude launch");
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   const { evalIn } = page;
   await until(() => evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "app.js");
   await evalIn(`window.__txt = (s) => { const e = terms.get(s); if (!e) return ""; const b = e.term.buffer.active; let o = "";
@@ -86,7 +86,7 @@ try {
   const started = await until(async () => (await evalIn(`__txt(${JSON.stringify(sess)})`)).includes("FAKE-CLAUDE-STARTED"), 60, "claude to start");
   ok(started, "claude was started without anyone typing");
   const line = (await evalIn(`__txt(${JSON.stringify(sess)})`)).split("\n").find((l) => l.includes("FAKE-CLAUDE-STARTED")) || "";
-  ok(/sse=\d+/.test(line), `it was handed this resh's IDE port (${line.trim()})`);
+  ok(/sse=\d+/.test(line), `it was handed this roost's IDE port (${line.trim()})`);
   ok(await until(async () => (await evalIn(`__last(${JSON.stringify(sess)})`)).trimEnd().endsWith("$"), 30, "a prompt after claude"),
      "the shell is still there when claude exits");
 
@@ -101,14 +101,14 @@ try {
   ok(!(await evalIn(`__txt(${JSON.stringify(plain)})`)).includes("FAKE-CLAUDE"), "and nothing was typed into it");
 
   page.close(); page = null;
-  await resh.close(); resh = null;
+  await roost.close(); roost = null;
 
   // ----------------------------------------------------------- claude absent
   console.log("\nC. claude is not on the login shell's PATH");
-  resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shellAbsent } });
-  ok(await until(async () => (await pageHtml(resh.port)).includes('data-launches=""'), 15, "the check to finish"),
+  roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shellAbsent } });
+  ok(await until(async () => (await pageHtml(roost.port)).includes('data-launches=""'), 15, "the check to finish"),
      "the startup check reaches the page: no launches offered");
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   await until(() => page.evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "app.js");
   const stars2 = Number(await page.evalIn(`document.querySelectorAll(".paneicons .newclaude").length`));
   const plus2 = Number(await page.evalIn(`document.querySelectorAll(".paneicons .newterm").length`));
@@ -117,7 +117,7 @@ try {
 } finally {
   page?.close();
   browser.close();
-  if (resh) await resh.close();
+  if (roost) await roost.close();
   await fx.cleanup();
 }
 console.log(fail ? `\n${fail} FAILED` : "\nall ok");

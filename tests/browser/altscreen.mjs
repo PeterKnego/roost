@@ -2,7 +2,7 @@
 //!
 //! Claude Code — like vim, less, htop — runs in the *alternate screen*: one
 //! `\e[?1049h` at startup, one `\e[?1049l` at exit, and nothing in between
-//! that says which buffer the frames belong in. resh's replay is a raw byte
+//! that says which buffer the frames belong in. roost's replay is a raw byte
 //! ring (session.rs, 1 MB): once that single startup sequence falls off the
 //! front, every browser that attaches afterwards paints the app's frames into
 //! the *normal* buffer while the app still believes it is on the alternate
@@ -21,9 +21,9 @@ let fail = 0;
 const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) fail++; };
 
 const fx = await fixture();
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const proxyPort = await freePort();
-const proxy = startProxy({ listenPort: proxyPort, upstreamPort: resh.port });
+const proxy = startProxy({ listenPort: proxyPort, upstreamPort: roost.port });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
@@ -72,7 +72,7 @@ try {
   console.log("\nC. a full-screen app opens the alternate screen and paints a frame");
   // `printf` rather than a real TUI: the whole of what a TUI does to the
   // terminal *state* is these two sequences, and a fake one can be driven
-  // deterministically. What is under test is resh's handling of them.
+  // deterministically. What is under test is roost's handling of them.
   await sh(`printf '\\033[?1049h\\033[H\\033[2Jframe-body-pk41\\r\\n'`);
   ok(await until(() => evalIn(`__buf() === "alternate"`), 25, "alt buffer"),
      "the browser followed the app onto the alternate screen");
@@ -106,7 +106,7 @@ try {
   page?.close();
   browser.close();
   proxy.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 

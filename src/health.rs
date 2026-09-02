@@ -44,7 +44,7 @@ pub fn check_in(ide_dir: &Path, proc_root: &Path) -> BTreeSet<String> {
             // Someone else's malformed file is not ours to grade.
             continue;
         };
-        if v.get("ideName").and_then(|x| x.as_str()) != Some("resh") {
+        if v.get("ideName").and_then(|x| x.as_str()) != Some("roost") {
             continue;
         }
         let Some(pid) = v.get("pid").and_then(|x| x.as_u64()).and_then(|p| u32::try_from(p).ok())
@@ -78,7 +78,7 @@ pub fn check_in(ide_dir: &Path, proc_root: &Path) -> BTreeSet<String> {
             // `claude` will find this lock, connect, and fail. Silent
             // otherwise — nothing else notices a listener that died.
             (Some(true), false) => {
-                out.insert(format!("ide lock {port}.lock advertises a port this resh no longer serves"));
+                out.insert(format!("ide lock {port}.lock advertises a port this roost no longer serves"));
             }
             _ => {}
         }
@@ -99,9 +99,9 @@ impl Latch {
     /// learn was transient.
     pub fn step(&mut self, now: BTreeSet<String>) -> Vec<String> {
         let mut lines: Vec<String> =
-            now.difference(&self.seen).map(|s| format!("resh: health — {s}")).collect();
+            now.difference(&self.seen).map(|s| format!("roost: health — {s}")).collect();
         lines.extend(
-            self.seen.difference(&now).map(|s| format!("resh: health — cleared: {s}")),
+            self.seen.difference(&now).map(|s| format!("roost: health — cleared: {s}")),
         );
         self.seen = now;
         lines
@@ -162,7 +162,7 @@ mod tests {
     fn a_stale_lock_of_ours_is_reported() {
         let d = tempfile::tempdir().unwrap();
         let p = proc_with(&[]);
-        lock(d.path(), 5601, "resh", 4242);
+        lock(d.path(), 5601, "roost", 4242);
         let f = check_in(d.path(), p.path());
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f.iter().next().unwrap().contains("stale ide lock 5601"));
@@ -177,16 +177,16 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         let me = std::process::id();
         let p = proc_with(&[me]);
-        lock(d.path(), port, "resh", me);
+        lock(d.path(), port, "roost", me);
         assert!(check_in(d.path(), p.path()).is_empty());
     }
 
     #[test]
-    fn a_live_resh_advertising_a_dead_port_is_reported() {
+    fn a_live_roost_advertising_a_dead_port_is_reported() {
         let d = tempfile::tempdir().unwrap();
         let me = std::process::id();
         let p = proc_with(&[me]);
-        lock(d.path(), 5602, "resh", me);
+        lock(d.path(), 5602, "roost", me);
         let f = check_in(d.path(), p.path());
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f.iter().next().unwrap().contains("no longer serves"));
@@ -207,7 +207,7 @@ mod tests {
         // "I could not tell" is not a fault to report, and reporting it every
         // pass on a host without /proc would be pure noise.
         let d = tempfile::tempdir().unwrap();
-        lock(d.path(), 5604, "resh", 4242);
+        lock(d.path(), 5604, "roost", 4242);
         assert!(check_in(d.path(), &d.path().join("no-proc")).is_empty());
     }
 

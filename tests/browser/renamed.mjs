@@ -1,4 +1,4 @@
-//! A file renamed inside the project, from outside resh: the tab follows it.
+//! A file renamed inside the project, from outside roost: the tab follows it.
 //!
 //! inotify gives both halves of a rename the same cookie and `notify` merges
 //! them into one `Modify(Name(Both))` carrying both paths, so the watcher is
@@ -31,7 +31,7 @@ await Deno.writeTextFile(`${fx.roots}/proj/draft.rs`, "fn draft() {}\n");
 await Deno.mkdir(`${fx.roots}/proj/sub`, { recursive: true });
 await Deno.writeTextFile(`${fx.roots}/proj/sub/deep.rs`, "fn deep() {}\n");
 
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
@@ -70,7 +70,7 @@ const wire = (p) => {
 };
 
 try {
-  page = wire(await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`));
+  page = wire(await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`));
   ok(await page.ready(), "the workspace is up");
 
   console.log("A. a clean file, renamed with `mv` from outside");
@@ -128,7 +128,7 @@ try {
 } finally {
   try { await page?.close(); } catch { /* already gone */ }
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 

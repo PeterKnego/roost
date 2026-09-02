@@ -7,7 +7,7 @@
 //! app that turns on mouse reporting takes the right button — and with it the
 //! context menu — for itself. So in a terminal running Claude Code, selecting
 //! and copying did nothing at all: the clipboard kept whatever it held, and
-//! the next paste inserted that instead. If what it held was an image, resh's
+//! the next paste inserted that instead. If what it held was an image, roost's
 //! own image-paste route then typed an image into the app.
 //!
 //! Both states are asserted, because the interesting one is the second: mouse
@@ -23,15 +23,15 @@ let fail = 0;
 const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) fail++; };
 
 const fx = await fixture();
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
 try {
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   const { evalIn, cmd } = page;
   await cmd("Browser.grantPermissions", {
-    origin: `http://127.0.0.1:${resh.port}`,
+    origin: `http://127.0.0.1:${roost.port}`,
     permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"],
   });
   await until(() => evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "app.js");
@@ -124,7 +124,7 @@ try {
   // application. Anything with a shell — or any file someone cats — could then
   // read what the user last copied.
   //
-  // Honest about what this one is: it does NOT fail against a resh without the
+  // Honest about what this one is: it does NOT fail against a roost without the
   // refusal, because an unhandled OSC 52 is ignored and a handled one throws on
   // `atob("?")` before it could answer. It is a property guard, not a proof —
   // it turns red the day someone adds a reply path, which is the only way this
@@ -141,7 +141,7 @@ try {
 } finally {
   page?.close();
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 

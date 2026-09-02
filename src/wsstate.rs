@@ -90,7 +90,7 @@ pub fn set_state_dir_for_test() {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let d = DIR.get_or_init(|| {
         let who = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-        let p = std::env::temp_dir().join(format!("resh-test-state-{who}"));
+        let p = std::env::temp_dir().join(format!("roost-test-state-{who}"));
         let _ = std::fs::create_dir_all(&p);
         p
     });
@@ -103,7 +103,7 @@ pub fn state_dir() -> PathBuf {
             return PathBuf::from(d);
         }
     }
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state/resh")
+    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state/roost")
 }
 
 pub(crate) fn path_for(project: &str) -> PathBuf {
@@ -305,7 +305,7 @@ mod tests {
             let text = std::fs::read_to_string(path_for("legacy_probe")).unwrap();
             assert!(text.contains("show_hidden"), "the key must be written at all");
 
-            // Strip it back out, the way a pre-toggle resh would have left it.
+            // Strip it back out, the way a pre-toggle roost would have left it.
             let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
             json.as_object_mut().unwrap().remove("show_hidden");
             std::fs::write(path_for("legacy_probe"), json.to_string()).unwrap();
@@ -335,11 +335,18 @@ mod tests {
         std::env::remove_var("ROOST_STATE_DIR");
         let d = state_dir();
         assert!(
-            d.ends_with(".local/state/resh"),
+            d.ends_with(".local/state/roost"),
             "default state dir must follow the product name, got {d:?}"
         );
+        // `state/`+old name, not a bare old name: $HOME could legitimately
+        // contain the substring (`/home/fresh`), and the old name is only
+        // wrong in the product's own segment. concat! keeps the literal out
+        // of the whole-repo sweep that verifies it is gone, so a future
+        // resweep can't silently turn this into the tautology it became once
+        // already (Step 3's mechanical sed rewrote this very literal).
+        let old_segment = concat!("state/", "re", "sh");
         assert!(
-            !d.to_string_lossy().contains("deadlight"),
+            !d.to_string_lossy().contains(old_segment),
             "the old name must not survive in a path users will find on disk: {d:?}"
         );
     }
@@ -498,7 +505,7 @@ mod tests {
             // file — `{"text": "saved", "dirty": false}`, no base_hash key at
             // all — and `Content::Clean` can no longer represent "clean, but
             // holding this text" in memory to hand to `save()`, so the fixture
-            // has to be the on-disk bytes an old resh actually wrote instead.
+            // has to be the on-disk bytes an old roost actually wrote instead.
             std::fs::create_dir_all(state_dir()).unwrap();
             let raw = serde_json::json!({
                 "sizes": {"left_w": 260, "right_w": 520, "left_split": 60},

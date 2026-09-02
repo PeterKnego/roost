@@ -53,7 +53,7 @@ pub fn isolate_ide_dir_for_test() {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let d = DIR.get_or_init(|| {
         let who = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-        let p = std::env::temp_dir().join(format!("resh-test-ide-{who}"));
+        let p = std::env::temp_dir().join(format!("roost-test-ide-{who}"));
         let _ = std::fs::create_dir_all(&p);
         p
     });
@@ -97,7 +97,7 @@ pub fn ide_dir() -> PathBuf {
 
 /// 128 bits from the OS CSPRNG, hex-encoded — the same shape the CLI's own
 /// extensions use. `/dev/urandom` rather than a dependency: this is the only
-/// randomness resh needs, and the deploy target is Linux.
+/// randomness roost needs, and the deploy target is Linux.
 pub fn new_token() -> Result<String, String> {
     let mut f = std::fs::File::open("/dev/urandom").map_err(|e| format!("no CSPRNG: {e}"))?;
     let mut buf = [0u8; 16];
@@ -106,9 +106,9 @@ pub fn new_token() -> Result<String, String> {
 }
 
 fn temp_name(port: u16) -> String {
-    // Pid-unique: two resh instances share this directory, and a shared temp
+    // Pid-unique: two roost instances share this directory, and a shared temp
     // name lets one truncate the other's in-flight write.
-    format!(".{}.{}.resh.tmp", port, std::process::id())
+    format!(".{}.{}.roost.tmp", port, std::process::id())
 }
 
 pub struct Lock {
@@ -162,20 +162,20 @@ fn port_busy(port: u16) -> bool {
     .is_ok()
 }
 
-/// Removes the lock files a *previous* resh left behind.
+/// Removes the lock files a *previous* roost left behind.
 ///
-/// systemd stops resh with `SIGTERM`, which unwinds nothing, so `Lock::drop`
+/// systemd stops roost with `SIGTERM`, which unwinds nothing, so `Lock::drop`
 /// never runs and every restart strands one lock file per open project. The
 /// `claude` CLI does reap stale entries by pid, but leaving our debris for it
 /// to clear puts this codebase's mess in a directory it shares with every
-/// other IDE on the host — so resh cleans up after itself.
+/// other IDE on the host — so roost cleans up after itself.
 ///
 /// Three conditions, all required, because this directory is not ours:
-/// the file says `ideName: resh`, its pid is *known* dead, and nothing is
+/// the file says `ideName: roost`, its pid is *known* dead, and nothing is
 /// listening on the port it advertises. Any doubt at all — an unparseable
 /// file, an unreadable `/proc`, a port that answers — and the file stays.
 /// A stale row is recoverable; deleting a live IntelliJ's registration is not,
-/// and neither is deleting the lock of a resh that is still serving.
+/// and neither is deleting the lock of a roost that is still serving.
 ///
 /// Deliberately *not* the CLI's rule: it unlinks lock files it cannot parse.
 /// That is right for the client, which owns the directory's hygiene; it is
@@ -200,7 +200,7 @@ pub fn sweep_strays_in(dir: &Path, proc_root: &Path) -> SweepReport {
         let ours_and_dead = (|| {
             let text = std::fs::read_to_string(&path).ok()?;
             let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-            if v.get("ideName").and_then(|x| x.as_str()) != Some("resh") {
+            if v.get("ideName").and_then(|x| x.as_str()) != Some("roost") {
                 return Some(false);
             }
             let pid = u32::try_from(v.get("pid")?.as_u64()?).ok()?;
@@ -232,7 +232,7 @@ pub fn write_in(dir: &Path, port: u16, token: &str, workspace: &Path) -> Result<
     let body = serde_json::json!({
         "pid": std::process::id(),
         "workspaceFolders": [workspace.to_string_lossy()],
-        "ideName": "resh",
+        "ideName": "roost",
         "transport": "ws",
         "authToken": token,
     })
@@ -285,7 +285,7 @@ mod tests {
     fn a_stray_of_ours_is_removed() {
         let d = tempfile::tempdir().unwrap();
         let proc = fake_proc(&[]);
-        let f = write_lock(d.path(), 5501, "resh", 4242);
+        let f = write_lock(d.path(), 5501, "roost", 4242);
         let r = sweep_strays_in(d.path(), proc.path());
         assert_eq!(r, SweepReport { removed: 1, kept: 0 });
         assert!(!f.exists());
@@ -307,12 +307,12 @@ mod tests {
     }
 
     #[test]
-    fn a_live_resh_keeps_its_lock() {
+    fn a_live_roost_keeps_its_lock() {
         // Deleting a serving instance's lock unregisters a working
         // integration: `claude` stops finding it, silently.
         let d = tempfile::tempdir().unwrap();
         let proc = fake_proc(&[4242]);
-        let f = write_lock(d.path(), 5503, "resh", 4242);
+        let f = write_lock(d.path(), 5503, "roost", 4242);
         let r = sweep_strays_in(d.path(), proc.path());
         assert_eq!(r, SweepReport { removed: 0, kept: 1 });
         assert!(f.exists());
@@ -338,7 +338,7 @@ mod tests {
         // `pid_state` returns None, which must not collapse into "dead".
         let d = tempfile::tempdir().unwrap();
         let absent = d.path().join("no-proc-here");
-        let f = write_lock(d.path(), 5505, "resh", 4242);
+        let f = write_lock(d.path(), 5505, "roost", 4242);
         let r = sweep_strays_in(d.path(), &absent);
         assert_eq!(r, SweepReport { removed: 0, kept: 1 });
         assert!(f.exists());
@@ -352,7 +352,7 @@ mod tests {
         let proc = fake_proc(&[]);
         let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = l.local_addr().unwrap().port();
-        let f = write_lock(d.path(), port, "resh", 4242);
+        let f = write_lock(d.path(), port, "roost", 4242);
         let r = sweep_strays_in(d.path(), proc.path());
         assert_eq!(r, SweepReport { removed: 0, kept: 1 });
         assert!(f.exists(), "a port that answers means the endpoint is live");
@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(v["pid"], serde_json::json!(std::process::id()));
         assert_eq!(v["transport"], "ws");
         assert_eq!(v["authToken"], "cafe");
-        assert_eq!(v["ideName"], "resh");
+        assert_eq!(v["ideName"], "roost");
         assert_eq!(v["workspaceFolders"], serde_json::json!([ws.path().to_str().unwrap()]));
     }
 
@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn the_temp_name_is_unique_per_process_so_two_resh_instances_cannot_collide() {
+    fn the_temp_name_is_unique_per_process_so_two_roost_instances_cannot_collide() {
         // Two processes writing the same port is impossible (the OS assigned
         // it), but two processes writing *different* ports into one directory
         // is the normal case, and a shared temp name would let one truncate
@@ -434,7 +434,7 @@ mod tests {
         assert!(!d.path().join("5599.lock").exists(), "our own lock must go on drop");
         // Reverting `Drop` to a directory sweep passes the line above and
         // fails this one. That sweep is the defect this test exists for.
-        assert!(foreign.exists(), "resh must never delete a lock file it did not write");
+        assert!(foreign.exists(), "roost must never delete a lock file it did not write");
     }
 
     #[test]

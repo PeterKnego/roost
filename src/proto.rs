@@ -98,7 +98,7 @@ pub enum Intent {
         force: bool,
     },
     /// A span matched in terminal output, sent **verbatim** —
-    /// `~/projects/resh/src/a.rs:42` and all. Deliberately not pre-parsed by
+    /// `~/projects/roost/src/a.rs:42` and all. Deliberately not pre-parsed by
     /// the client: the parser and the confinement it feeds belong together, in
     /// Rust, next to `safe_resolve`.
     ///
@@ -259,7 +259,7 @@ pub enum Event {
     /// nothing about it persists.
     RevealLine { rel: String, line: u32 },
     TerminalStarted { session: String },
-    /// A ✻ click in a project resh has positive evidence a Claude is
+    /// A ✻ click in a project roost has positive evidence a Claude is
     /// already running in. Sent to the clicker only; nothing was opened.
     ClaudeHere { pane: PaneId, terminals: Vec<String> },
     GitInit { ok: bool, msg: String },
@@ -315,7 +315,7 @@ mod tests {
     fn new_terminal_can_ask_for_claude_by_name() {
         let i = decode(r#"{"t":"NewTerminal","pane":3,"launch":"claude"}"#).unwrap();
         assert!(matches!(i, Intent::NewTerminal { pane: 3, launch: Some(Launch::Claude), .. }), "got {i:?}");
-        // A closed set: the client names a program resh knows, never a
+        // A closed set: the client names a program roost knows, never a
         // command line of its own.
         assert!(decode(r#"{"t":"NewTerminal","pane":3,"launch":"rm -rf /"}"#).is_err());
     }
@@ -458,11 +458,11 @@ mod tests {
 
     #[test]
     fn decodes_open_path_verbatim() {
-        let i = decode(r#"{"t":"OpenPath","text":"~/p/resh/src/a.rs:42"}"#).unwrap();
+        let i = decode(r#"{"t":"OpenPath","text":"~/p/roost/src/a.rs:42"}"#).unwrap();
         // Verbatim is the contract: the client does no parsing, so the suffix
         // and the tilde must both survive the wire intact.
         match i {
-            Intent::OpenPath { text } => assert_eq!(text, "~/p/resh/src/a.rs:42"),
+            Intent::OpenPath { text } => assert_eq!(text, "~/p/roost/src/a.rs:42"),
             other => panic!("decoded to {other:?}"),
         }
     }

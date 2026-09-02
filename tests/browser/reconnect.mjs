@@ -17,9 +17,9 @@ let fail = 0;
 const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) fail++; };
 
 const fx = await fixture();
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const proxyPort = await freePort();
-const proxy = startProxy({ listenPort: proxyPort, upstreamPort: resh.port });
+const proxy = startProxy({ listenPort: proxyPort, upstreamPort: roost.port });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
@@ -99,7 +99,7 @@ try {
   ok(after === before, `the scrollback replay repainted rather than appended (${before} -> ${after} copies)`);
 
   console.log("\nE2. and it survives the server restarting under it");
-  ok(await resh.restart(), "resh restarted");
+  ok(await roost.restart(), "roost restarted");
   ok(await until(() => evalIn("!!__t().sock && __t().sock.readyState === 1"), 40, "reconnect"),
      "reconnected across a server restart");
   await sh("echo again-$MARKER");
@@ -119,7 +119,7 @@ try {
   page?.close();
   browser.close();
   proxy.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 

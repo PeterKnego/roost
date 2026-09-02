@@ -1,6 +1,6 @@
-//! The `resh notify` subcommand.
+//! The `roost notify` subcommand.
 //!
-//! It runs *inside* the terminal resh is already reading, so there is no
+//! It runs *inside* the terminal roost is already reading, so there is no
 //! IPC here and no socket to connect to: printing the escape sequence to the
 //! controlling terminal IS the mechanism. That is also why this never binds a
 //! port or touches the notice store.
@@ -9,7 +9,7 @@ use std::io::{IsTerminal, Write};
 /// `/dev/tty` rather than stdout, because the intended caller is a Claude
 /// Code hook and Claude Code captures hook stdout — a hook printing to stdout
 /// would be swallowed before it ever reached the PTY. `/dev/tty` is the
-/// controlling terminal, which is the PTY resh owns.
+/// controlling terminal, which is the PTY roost owns.
 fn tty() -> Option<std::fs::File> {
     std::fs::OpenOptions::new().write(true).open("/dev/tty").ok()
 }
@@ -38,7 +38,7 @@ pub fn notify_sequence(title: &str, body: &str) -> String {
 /// Where the escape sequence can actually be delivered.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Sink {
-    /// The controlling terminal — the PTY resh is reading.
+    /// The controlling terminal — the PTY roost is reading.
     Tty,
     /// stdout, but *only* when it is itself a terminal.
     Stdout,
@@ -75,7 +75,7 @@ pub fn choose_sink(tty_available: bool, stdout_is_terminal: bool) -> Sink {
 
 pub fn run_notify(args: &[String]) -> i32 {
     let Some(title) = args.first() else {
-        eprintln!("usage: resh notify <title> [body]");
+        eprintln!("usage: roost notify <title> [body]");
         return 2;
     };
     let body = args.get(1).map(String::as_str).unwrap_or("");
@@ -88,7 +88,7 @@ pub fn run_notify(args: &[String]) -> i32 {
             if f.write_all(seq.as_bytes()).is_ok() && f.flush().is_ok() {
                 return 0;
             }
-            eprintln!("resh notify: could not write to the controlling terminal");
+            eprintln!("roost notify: could not write to the controlling terminal");
             1
         }
         Sink::Stdout => {
@@ -96,14 +96,14 @@ pub fn run_notify(args: &[String]) -> i32 {
             if out.write_all(seq.as_bytes()).is_ok() && out.flush().is_ok() {
                 return 0;
             }
-            eprintln!("resh notify: could not write to stdout");
+            eprintln!("roost notify: could not write to stdout");
             1
         }
         // Loud, not silent: a misconfigured hook that quietly did nothing would
         // look exactly like a feature that does not work.
         Sink::Nowhere => {
             eprintln!(
-                "resh notify: no controlling terminal, and stdout is not one either — \
+                "roost notify: no controlling terminal, and stdout is not one either — \
                  nothing would read the sequence, so no notification was sent. \
                  This is what a hook invoked without a terminal (e.g. a subagent) looks like."
             );

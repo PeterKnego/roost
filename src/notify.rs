@@ -4,7 +4,7 @@
 //! project must still learn that another one wants something.
 //!
 //! Persistence — not just in-memory queueing — is what makes a notice raised
-//! at 3am survive a resh restart rather than only a closed tab.
+//! at 3am survive a roost restart rather than only a closed tab.
 //!
 //! The mutex here is a leaf lock: taken for bookkeeping, released before any
 //! broadcast or hub lock. `record` deliberately does not broadcast for that
@@ -111,7 +111,7 @@ pub fn record(project: &str, session: &str, p: Parsed) -> Option<Notice> {
         // gains one permanent entry per session name ever seen — and this
         // server's whole job is spinning worktree sessions up and down, so
         // that is unbounded in practice, not merely in theory. Everything
-        // else in resh is capped; this must be too.
+        // else in roost is capped; this must be too.
         s.windows.retain(|_, w| ts.saturating_sub(w.started) < WINDOW_SECS || w.suppressed > 0);
         let key = format!("{project}/{session}");
         let w = s.windows.entry(key).or_default();
@@ -214,7 +214,7 @@ fn persist() {
     let snapshot: Vec<Notice> = list();
     let dir = dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        return eprintln!("resh: notifications dir: {e}");
+        return eprintln!("roost: notifications dir: {e}");
     }
     // The same hardening wsstate::save applies, and for a sharper reason:
     // a notice body is terminal output, so it must not be readable by other
@@ -229,7 +229,7 @@ fn persist() {
     let Ok(json) = serde_json::to_string(&snapshot) else { return };
     let tmp = path().with_extension("json.tmp");
     if let Err(e) = std::fs::write(&tmp, json) {
-        return eprintln!("resh: notifications write: {e}");
+        return eprintln!("roost: notifications write: {e}");
     }
     #[cfg(unix)]
     {
@@ -237,7 +237,7 @@ fn persist() {
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
     if let Err(e) = std::fs::rename(&tmp, path()) {
-        eprintln!("resh: notifications rename: {e}");
+        eprintln!("roost: notifications rename: {e}");
         #[cfg(test)]
         RENAME_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -264,7 +264,7 @@ pub fn load() {
         },
     };
     let Ok(list) = serde_json::from_str::<Vec<Notice>>(&text) else {
-        return eprintln!("resh: notice store unreadable, starting empty");
+        return eprintln!("roost: notice store unreadable, starting empty");
     };
     {
         let mut s = store().lock().unwrap_or_else(|e| e.into_inner());
@@ -289,13 +289,13 @@ pub fn load() {
         if path().exists() {
             match std::fs::remove_file(legacy_path()) {
                 Ok(()) => eprintln!(
-                    "resh: migrated notices to {} and removed the old file",
+                    "roost: migrated notices to {} and removed the old file",
                     path().display()
                 ),
-                Err(e) => eprintln!("resh: migrated notices, but the old file remains: {e}"),
+                Err(e) => eprintln!("roost: migrated notices, but the old file remains: {e}"),
             }
         } else {
-            eprintln!("resh: could not write the new notice store; leaving the old file");
+            eprintln!("roost: could not write the new notice store; leaving the old file");
         }
     }
 }
@@ -356,7 +356,7 @@ mod tests {
         static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         let d = DIR.get_or_init(|| {
             let who = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-            let p = std::env::temp_dir().join(format!("resh-test-state-{who}"));
+            let p = std::env::temp_dir().join(format!("roost-test-state-{who}"));
             let _ = std::fs::create_dir_all(&p);
             p
         });
@@ -370,11 +370,11 @@ mod tests {
     fn record_assigns_increasing_ids_and_keeps_server_side_attribution() {
         let _g = setup();
         let a = record("karpie", "claude", parsed("one")).unwrap();
-        let b = record("resh", "shell", parsed("two")).unwrap();
+        let b = record("roost", "shell", parsed("two")).unwrap();
         assert!(b.id > a.id, "ids must increase: {} then {}", a.id, b.id);
         assert_eq!(a.project, "karpie");
         assert_eq!(a.session, "claude");
-        assert_eq!(b.project, "resh");
+        assert_eq!(b.project, "roost");
         assert!(!a.read);
         assert_eq!(list().len(), 2);
     }

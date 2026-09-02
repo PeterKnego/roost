@@ -1,4 +1,4 @@
-//! Filesystem watching. resh is for AI engineering: Claude edits files
+//! Filesystem watching. roost is for AI engineering: Claude edits files
 //! in the background, so a viewer that does not reflect that is showing
 //! something false. Classification is pure so the routing table is testable
 //! without an OS event or a sleep.
@@ -42,7 +42,7 @@ pub fn classify(rel: &str, open_buffers: &[String], filter: &crate::projects::Tr
     Class::Tree
 }
 
-/// True when this event was caused by resh's own save. Consumes the
+/// True when this event was caused by roost's own save. Consumes the
 /// record, so a later external edit that happens to reproduce the same
 /// content is not swallowed too.
 pub fn is_self_write(
@@ -71,7 +71,7 @@ pub fn is_self_write(
 const MAX_BATCH_EVENTS: usize = 10_000;
 
 /// inotify's default `max_user_watches` is commonly 8192–65536 depending on
-/// the distro (tunable via `fs.inotify.max_user_watches`, but resh
+/// the distro (tunable via `fs.inotify.max_user_watches`, but roost
 /// can't assume it was tuned). Once this many directories are watched, stop
 /// registering more instead of either erroring the walk out or silently
 /// eating the whole machine's inotify budget. VS Code's watcher backend and
@@ -151,14 +151,14 @@ fn watch_tree(watcher: &mut notify::RecommendedWatcher, project: &str, root: Pat
         // Only log the transition into degraded, not once per subsequent
         // directory discovered afterward — those all hit the same cap.
         eprintln!(
-            "resh: {project}: hit the {MAX_WATCHED_DIRS}-directory watch cap; \
+            "roost: {project}: hit the {MAX_WATCHED_DIRS}-directory watch cap; \
              file-change tracking is now incomplete for this project"
         );
     }
     let mut ok = !hit_cap;
     for d in dirs {
         if let Err(e) = watcher.watch(&d, RecursiveMode::NonRecursive) {
-            eprintln!("resh: {project}: failed to watch {}: {e}", d.display());
+            eprintln!("roost: {project}: failed to watch {}: {e}", d.display());
             ok = false;
             continue;
         }
@@ -173,14 +173,14 @@ fn watch_tree(watcher: &mut notify::RecommendedWatcher, project: &str, root: Pat
     match watcher.watch(&root, RecursiveMode::Recursive) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("resh: {project}: failed to watch {}: {e}", root.display());
+            eprintln!("roost: {project}: failed to watch {}: {e}", root.display());
             false
         }
     }
 }
 
 /// Reads are not changes. inotify reports them — `IN_OPEN` and `IN_ACCESS`
-/// arrive as `EventKind::Access` — and resh reads the directories it watches
+/// arrive as `EventKind::Access` — and roost reads the directories it watches
 /// constantly, because rendering the tree is a `read_dir` of exactly the
 /// directory the watcher is watching.
 ///
@@ -246,7 +246,7 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
     }) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("resh: watcher unavailable for {project}: {e}");
+            eprintln!("roost: watcher unavailable for {project}: {e}");
             return false;
         }
     };
@@ -298,7 +298,7 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                 Ok(ev) if is_access(&ev) => continue,
                 Ok(ev) => events.push(ev),
                 Err(e) => {
-                    eprintln!("resh: {project_name}: watch error: {e}");
+                    eprintln!("roost: {project_name}: watch error: {e}");
                     continue;
                 }
             }
@@ -306,7 +306,7 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                 match rx.recv_timeout(debounce) {
                     Ok(Ok(ev)) if is_access(&ev) => continue,
                     Ok(Ok(ev)) => events.push(ev),
-                    Ok(Err(e)) => eprintln!("resh: {project_name}: watch error: {e}"),
+                    Ok(Err(e)) => eprintln!("roost: {project_name}: watch error: {e}"),
                     // Quiet period reached (or sender gone, which the next
                     // outer `recv()` will notice and exit on) — either way,
                     // the batch collected so far is ready to process.
@@ -366,7 +366,7 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                 // Read before locking, never after: this is a filesystem
                 // read, and the Hub lock is not held across blocking I/O.
                 // Re-read per batch rather than captured at spawn, so
-                // editing `.resh/config.toml` takes effect on the next
+                // editing `.roost/config.toml` takes effect on the next
                 // change instead of at the next restart, matching the
                 // request path.
                 // Rename pairs, straight from the kernel. inotify gives both
@@ -502,7 +502,7 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
             }));
             if let Err(payload) = outcome {
                 eprintln!(
-                    "resh: {project_name}: watcher batch panicked, continuing: {}",
+                    "roost: {project_name}: watcher batch panicked, continuing: {}",
                     panic_message(payload.as_ref())
                 );
             }
@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn show_hidden_does_not_reopen_the_build_output_storm() {
         let on = TreeFilter { show_hidden: true, ..Default::default() };
-        assert!(matches!(classify("target/debug/resh", &bufs(), &on), Class::Ignore));
+        assert!(matches!(classify("target/debug/roost", &bufs(), &on), Class::Ignore));
         assert!(matches!(classify("node_modules/x/y.js", &bufs(), &on), Class::Ignore));
     }
 
@@ -591,7 +591,7 @@ mod tests {
     #[test]
     fn skip_dirs_and_hide_are_ignored_entirely() {
         // a cargo build must not generate a storm of tree refreshes
-        assert!(matches!(classify("target/debug/resh", &bufs(), &TreeFilter::default()), Class::Ignore));
+        assert!(matches!(classify("target/debug/roost", &bufs(), &TreeFilter::default()), Class::Ignore));
         assert!(matches!(classify("node_modules/x/y.js", &bufs(), &TreeFilter::default()), Class::Ignore));
         assert!(matches!(classify(".venv/lib/p.py", &bufs(), &TreeFilter::default()), Class::Ignore));
         let hide = vec!["dist".to_string()];
@@ -621,7 +621,7 @@ mod tests {
     fn self_writes_are_suppressed_once() {
         let mut seen = std::collections::HashMap::new();
         seen.insert("a.rs".to_string(), 42u64);
-        // resh just wrote this content; the resulting event is ours
+        // roost just wrote this content; the resulting event is ours
         assert!(is_self_write(&mut seen, "a.rs", 42));
         // and only once — a later external edit with other content is real
         assert!(!is_self_write(&mut seen, "a.rs", 43));
@@ -712,8 +712,8 @@ mod tests {
         std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
         std::fs::write(d.path().join("seed.txt"), "").unwrap();
         if let Some(text) = config {
-            std::fs::create_dir(d.path().join(".resh")).unwrap();
-            std::fs::write(d.path().join(".resh/config.toml"), text).unwrap();
+            std::fs::create_dir(d.path().join(".roost")).unwrap();
+            std::fs::write(d.path().join(".roost/config.toml"), text).unwrap();
         }
 
         let hub = Arc::new(Mutex::new(Hub::new("watch_show_hidden", d.path().to_path_buf())));

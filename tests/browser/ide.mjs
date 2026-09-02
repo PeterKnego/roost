@@ -11,7 +11,7 @@
 //! ShareSelection intent when the project has opted in. No Rust test can
 //! reach any of it.
 //!
-//! This drives a real resh, a real dtach-backed terminal (which is what
+//! This drives a real roost, a real dtach-backed terminal (which is what
 //! actually provisions the ide listener — see term.rs's `ide::for_project`
 //! call), and a real browser — but a **fake** Claude on the wire: a
 //! hand-rolled client that speaks exactly the handshake and JSON-RPC shapes
@@ -22,9 +22,9 @@
 //! see task-8-report.md for a *separate*, one-off verification against a
 //! real `claude` binary, following the pexpect+pyte technique documented in
 //! that plan's Task 4/5 reports. "A browser test driven by a fake Claude"
-//! is also why acceptance is asserted on the reply resh sends back over the
+//! is also why acceptance is asserted on the reply roost sends back over the
 //! ide socket (TAB_CLOSED) and on the file being untouched, not on the file
-//! changing: resh never writes the file itself (the brief's own words) — a
+//! changing: roost never writes the file itself (the brief's own words) — a
 //! real CLI is what would apply the edit, and this test never runs one.
 //!
 //! Run: deno run -A tests/browser/ide.mjs
@@ -208,15 +208,15 @@ await Deno.writeTextFile(`${projectDir}/${PREVIEW_FILE}`, "# Heading\n\nSome pro
 // this after openPage would not be seen without a reload. Off is the default
 // for every other browser-tested project in this repo — this is the one file
 // in the suite that deliberately turns it on, to exercise the wiring.
-await Deno.mkdir(`${projectDir}/.resh`, { recursive: true });
+await Deno.mkdir(`${projectDir}/.roost`, { recursive: true });
 // Global config, not the project's own: `share_selection` became
-// global-only on 2026-08-23, so a `.resh/config.toml` in the project can no
+// global-only on 2026-08-23, so a `.roost/config.toml` in the project can no
 // longer reach it — which is the point of the move. `ROOST_CONFIG` is how a
-// test points resh at a global file it owns.
-const globalConfig = `${fx.base}/resh-global.toml`;
+// test points roost at a global file it owns.
+const globalConfig = `${fx.base}/roost-global.toml`;
 await Deno.writeTextFile(globalConfig, "share_selection = true\n");
 
-const resh = await startResh({
+const roost = await startResh({
   repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(),
   extraEnv: { CLAUDE_CONFIG_DIR: claudeConfigDir, ROOST_CONFIG: globalConfig },
 });
@@ -224,7 +224,7 @@ const browser = await startBrowser(profileDir(repoRoot));
 let page, claude;
 
 try {
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   const { cmd, evalIn } = page;
   // See the README's traps: the default 800x600 headless window collapses
   // the middle pane, which every assertion below reads from.
@@ -235,7 +235,7 @@ try {
   // Starting the seeded "term" session is what makes term.rs call
   // ide::for_project (see its own comment there: the only other trigger is a
   // _workspace connect, which already happened above via openPage) — the
-  // same path a real `claude` running in a resh terminal takes.
+  // same path a real `claude` running in a roost terminal takes.
   const findTerm = `(() => { for (let pi = 0; pi < state.panes.length; pi++) {
     const ti = state.panes[pi].tabs.findIndex((t) => t.k === "Terminal");
     if (ti >= 0) return state.panes[pi].tabs[ti].session; } return null; })()`;
@@ -264,7 +264,7 @@ try {
   claude = await connectFakeClaude(idePort, lockJson.authToken);
   console.log(`    fake Claude connected on ide port ${idePort}`);
 
-  console.log("\nB. Claude proposes an edit, resh shows the changed hunk, and Accept resolves it");
+  console.log("\nB. Claude proposes an edit, roost shows the changed hunk, and Accept resolves it");
   const acceptAbs = `${projectDir}/${ACCEPT_FILE}`;
   const acceptReqId = await claude.call("tools/call", {
     name: "openDiff",
@@ -296,13 +296,13 @@ try {
   // A useful negative guard, not the discriminator for this section: this
   // passes just as well with the whole Accept feature deleted (no button,
   // no reply — the file was never going to change either way). The
-  // TAB_CLOSED assertion just above is what actually proves resh answered
-  // the accept; this one proves resh did not additionally do the CLI's own
+  // TAB_CLOSED assertion just above is what actually proves roost answered
+  // the accept; this one proves roost did not additionally do the CLI's own
   // job of writing the file (the CLI applies the edit with the content
   // this answer returns — a browser test driven by a fake Claude can never
   // see the file change, since no CLI is running to make that write).
   ok((await Deno.readTextFile(acceptAbs)) === acceptOld,
-     "resh itself never wrote the file — only the reply above says the proposal was accepted");
+     "roost itself never wrote the file — only the reply above says the proposal was accepted");
   ok(await until(() => evalIn(`!state.panes.some((p) => p.tabs.some((t) => t.k === "Proposal"))`), 10, "tab closed"),
      "the proposal tab closes once it has been answered");
 
@@ -358,7 +358,7 @@ try {
   ok(editReply?.result?.content?.[1]?.text === mine,
      `and carries the text the human typed, got ${JSON.stringify(editReply?.result?.content?.[1])}`);
   ok((await Deno.readTextFile(editAbs)) !== mine,
-     "resh still never writes the file — the CLI applies the edited content itself");
+     "roost still never writes the file — the CLI applies the edited content itself");
 
   console.log("\nC. Reject leaves the file untouched and reports DIFF_REJECTED");
   const rejectAbs = `${projectDir}/${REJECT_FILE}`;
@@ -473,7 +473,7 @@ try {
   ok(!!mentioned, "Claude's ide socket receives an at_mentioned notification for the selection");
   ok(mentioned?.params?.lineStart === 2 && mentioned?.params?.lineEnd === 3,
      `it carries the selected line range (2-3), got ${JSON.stringify(mentioned?.params)}`);
-  ok(mentioned && !("id" in mentioned), "at_mentioned is a notification (no id), not something resh expects an answer to");
+  ok(mentioned && !("id" in mentioned), "at_mentioned is a notification (no id), not something roost expects an answer to");
 
   console.log("\nH. Alt+K mentions a markdown file from its Preview tab");
   // The regression this guards: mentionTarget used to require mode === "Edit"
@@ -622,7 +622,7 @@ try {
     shared?.params?.selection?.end?.character === 3,
     `it carries 0-based line/character bounds, got ${JSON.stringify(shared?.params?.selection)}`,
   );
-  ok(shared && !("id" in shared), "selection_changed is a notification (no id), not something resh expects an answer to");
+  ok(shared && !("id" in shared), "selection_changed is a notification (no id), not something roost expects an answer to");
 
   console.log("\nI. Alt+K aims at the terminal that actually has focus, not the lowest-indexed pane");
   // The one link in this feature with no automated coverage before this test:
@@ -726,7 +726,7 @@ try {
   try { claude?.close(); } catch {}
   try { page?.close(); } catch {}
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 

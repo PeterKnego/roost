@@ -13,7 +13,7 @@
 //!    attribute is still set, the tab still looks like every other terminal,
 //!    and an attribute-only test would pass green — README trap 2.
 //! 3. That the watcher's `/proc` walk sees a Claude nobody launched through
-//!    resh. The command is typed by hand into an ordinary shell here,
+//!    roost. The command is typed by hand into an ordinary shell here,
 //!    which is precisely the case the in-process launch record cannot cover.
 //!
 //! The fake `claude` is a *copy of a real binary*, not a shell script, and
@@ -52,14 +52,14 @@ await Deno.writeFile(shell, enc.encode(
 ), { mode: 0o755 });
 
 const browser = await startBrowser(profileDir(repoRoot));
-let page, resh;
+let page, roost;
 
 try {
-  resh = await startResh({
+  roost = await startResh({
     repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(),
     extraEnv: { SHELL: shell },
   });
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   const { evalIn } = page;
   await until(() => evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "app.js");
 
@@ -119,7 +119,7 @@ try {
 } finally {
   page?.close();
   browser.close();
-  if (resh) await resh.close();
+  if (roost) await roost.close();
   await fx.cleanup();
 }
 console.log(fail ? `\n${fail} FAILED` : "\nall ok");

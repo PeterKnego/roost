@@ -42,7 +42,7 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
             path = req.uri().path().to_string();
             let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
             if !crate::origin::origin_allowed(origin, &allowed) {
-                eprintln!("resh: rejected ws origin={origin:?} (set allowed_origins)");
+                eprintln!("roost: rejected ws origin={origin:?} (set allowed_origins)");
                 return Err(tungstenite::http::Response::builder()
                     .status(403)
                     .body(Some("origin not allowed".to_string()))
@@ -70,11 +70,11 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // terminal that never starts — no error text reaches the UI, because a
     // closed socket carries none. So each one must say why on the way out, or
     // a user whose terminal silently refuses to start (and whoever reads
-    // `journalctl --user -u resh` afterwards) has nothing at all to go
+    // `journalctl --user -u roost` afterwards) has nothing at all to go
     // on. Diagnosing an intermittent "live_sessions stayed empty" needed
     // exactly this and did not have it.
     let Some(dir) = crate::projects::resolve_project(roots, &project) else {
-        eprintln!("resh: term socket refused — project {project:?} does not resolve under the roots");
+        eprintln!("roost: term socket refused — project {project:?} does not resolve under the roots");
         let _ = ws_read.close(None);
         return;
     };
@@ -133,7 +133,7 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     let att = match session::attach(&project, name, &dir) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("resh: term socket refused — attach {project}/{name} failed: {e}");
+            eprintln!("roost: term socket refused — attach {project}/{name} failed: {e}");
             // Flushed as well as closed: `close` only *enqueues* the frame,
             // and a Close that is never written reaches the browser as 1006,
             // which `onclose` reads as a dead connection and answers with a
@@ -154,7 +154,7 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     if let Some(l) = att.launch {
         let typed = crate::launch::keystrokes(l.launch, l.session_id.as_deref());
         if let Err(e) = session::write_input(&att.key, &typed) {
-            eprintln!("resh: could not start {:?} in {project}/{name}: {e}", l.launch);
+            eprintln!("roost: could not start {:?} in {project}/{name}: {e}", l.launch);
         }
     }
     let Ok(write_half) = ws_read.get_ref().try_clone_inner() else { return };

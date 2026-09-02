@@ -136,7 +136,7 @@ await git(projDir, "config", "user.email", "t@t"); await git(projDir, "config", 
 await git(projDir, "add", "."); await git(projDir, "commit", "-qm", "init");
 
 const browser = await startBrowser(profileDir(repoRoot));
-let page, page2, resh;
+let page, page2, roost;
 // __txt joins on a *hard* newline only (xterm's own isWrapped flag), not on
 // every row: the fake claude's argv line is long enough to soft-wrap inside
 // the right pane's narrow default width, and a plain per-row join broke the
@@ -154,9 +154,9 @@ const clickReal = async (pg, selector) => {
 };
 
 try {
-  resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shell } });
-  await until(async () => (await (await fetch(`http://127.0.0.1:${resh.port}/${project}`)).text()).includes('data-launches="claude"'), 15, "claude offered");
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${project}`);
+  roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shell } });
+  await until(async () => (await (await fetch(`http://127.0.0.1:${roost.port}/${project}`)).text()).includes('data-launches="claude"'), 15, "claude offered");
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${project}`);
   const { evalIn } = page;
   await until(() => evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "app.js");
   await evalIn(helpers);
@@ -271,7 +271,7 @@ try {
 } finally {
   page?.close(); page2?.close();
   browser.close();
-  if (resh) await resh.close();
+  if (roost) await roost.close();
   await fx.cleanup();
 }
 console.log(fail ? `\n${fail} FAILED` : "\nall ok");

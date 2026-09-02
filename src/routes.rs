@@ -9,7 +9,7 @@
 //!                        fragment kind (tree/file/changes/status/diff/theme.css),
 //!                        except /frag/{project}/theme/{rel}, whose {rel}
 //!                        after the last "theme" segment is itself a path
-//!                        into the project's `.resh/theme/` directory
+//!                        into the project's `.roost/theme/` directory
 //! Fragment errors render as 200 + hint (htmx ignores 4xx bodies).
 use crate::{config, gitio, http, launch, projects, registry, render};
 use std::io::{BufReader, Write};
@@ -51,7 +51,7 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
         // Logged, not silent: behind a proxy the effective host is not obvious,
         // and a misconfigured allowlist otherwise looks like an outage.
         eprintln!(
-            "resh: rejected host={:?} x-forwarded-host={:?} (set allowed_origins)",
+            "roost: rejected host={:?} x-forwarded-host={:?} (set allowed_origins)",
             req.headers.get("host"),
             req.headers.get("x-forwarded-host")
         );
@@ -150,7 +150,7 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
         // whether some earlier segment happens to say "theme": if it is,
         // this is an ordinary fragment (even one whose project path
         // contains "theme"); only otherwise does the "last theme segment"
-        // rule apply, to reach into `.resh/theme/{rel}`.
+        // rule apply, to reach into `.roost/theme/{rel}`.
         ["frag", rest @ ..] if rest.len() >= 2 => {
             let (what, proj_segs) =
                 rest.split_last().expect("len >= 2 guarantees a last element");
@@ -247,7 +247,7 @@ fn build_overview_sessions(roots: &[PathBuf], sel: &str) -> Vec<render::OvSessio
     };
     let ages = crate::session::ages_snapshot();
     // Who holds each socket: the dtach master is the oldest holder and is
-    // the session's real age; `child_pid` is only this resh's client.
+    // the session's real age; `child_pid` is only this roost's client.
     let holders = registry::holders_snapshot().unwrap_or_default();
     let scan = crate::claudes::claude_terminals(std::path::Path::new("/proc"));
     let mut rows = Vec::new();
@@ -401,14 +401,14 @@ fn serve_raw(w: &mut impl Write, dir: &Path, rel: &str) {
     }
 }
 
-/// `~/.config/resh/static`, the optional user overlay. Absent on a fresh
+/// `~/.config/roost/static`, the optional user overlay. Absent on a fresh
 /// install, which is not an error — the layer is simply skipped.
 fn user_static_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     if home.is_empty() {
         return None;
     }
-    Some(PathBuf::from(home).join(".config/resh/static"))
+    Some(PathBuf::from(home).join(".config/roost/static"))
 }
 
 /// Reads `rel` under `base`, confined. Returns `None` for "not there" and
@@ -430,7 +430,7 @@ fn read_confined(base: &Path, rel: &str) -> Option<Vec<u8>> {
 /// Layered lookup — see docs/superpowers/specs/2026-08-19-embedded-assets-design.md.
 ///
 ///   1. $ROOST_STATIC        any class   (operator runtime switch)
-///   2. ~/.config/resh/static  theme class only
+///   2. ~/.config/roost/static  theme class only
 ///   3. embedded            any class   (always present)
 ///
 /// The class restriction on layer 2 is the enforcement mechanism, not a
@@ -461,7 +461,7 @@ fn serve_static(w: &mut impl Write, rel: &str) {
 }
 
 /// Every fragment kind `serve_frag` matches on — the closed set `route()`
-/// consults to tell an ordinary fragment request from a `.resh/theme/{rel}`
+/// consults to tell an ordinary fragment request from a `.roost/theme/{rel}`
 /// request when the project path itself contains a "theme" segment.
 ///
 /// This list must be kept in sync with `serve_frag`'s match arms by hand:
@@ -587,7 +587,7 @@ fn serve_frag(
             }
         }
         // An `openDiff` proposal Claude is still blocked on. `id` is
-        // resh's own opaque key (`ide::new_pending_id`), not a path — there
+        // roost's own opaque key (`ide::new_pending_id`), not a path — there
         // is nothing here to confine, only a hub lookup that can miss (the
         // proposal was already answered or withdrawn by the time this
         // browser's fetch lands, or the id was never valid to begin with).
@@ -601,7 +601,7 @@ fn serve_frag(
             },
         },
         // Resolved through `safe_resolve`, not a bare `fs::read`, so a
-        // `.resh/theme.css` that is a symlink pointing outside the
+        // `.roost/theme.css` that is a symlink pointing outside the
         // project (planted by a cloned repo) is refused rather than served
         // to the browser as text/css. Every other file read in this module
         // already goes through this confinement; this one predates it.
@@ -610,7 +610,7 @@ fn serve_frag(
         // (NOSNIFF + SANDBOX): this is project-controlled CSS too, and an
         // attacker doesn't care which of the two theme routes they're
         // abusing.
-        ["theme.css"] => match projects::safe_resolve(&dir, ".resh/theme.css")
+        ["theme.css"] => match projects::safe_resolve(&dir, ".roost/theme.css")
             .and_then(|p| std::fs::read(&p).map_err(|e| e.to_string()))
         {
             Ok(css) => http::respond_with(
@@ -627,7 +627,7 @@ fn serve_frag(
     }
 }
 
-/// A project's own theme directory, `{project}/.resh/theme/`.
+/// A project's own theme directory, `{project}/.roost/theme/`.
 ///
 /// Not part of the `/static` overlay: `/static` carries no project context,
 /// and threading one through it would be the larger change. This route
@@ -643,7 +643,7 @@ fn serve_project_theme(w: &mut impl Write, dir: &Path, rel: &str) {
     if crate::assets::class_of(rel) != crate::assets::Class::Theme {
         return http::not_found(w, "no such asset");
     }
-    let Ok(path) = projects::safe_resolve(dir, &format!(".resh/theme/{rel}")) else {
+    let Ok(path) = projects::safe_resolve(dir, &format!(".roost/theme/{rel}")) else {
         return http::not_found(w, "no such asset");
     };
     // Stat before reading: a project directory is untrusted, and a bare
@@ -675,9 +675,9 @@ fn serve_project_theme(w: &mut impl Write, dir: &Path, rel: &str) {
 /// whether a stylesheet is linked, so the worst case is an unstyled page —
 /// recoverable, and not worth a `symlink_metadata` dance.
 fn theme_link_for(dir: &Path) -> Option<&'static str> {
-    if dir.join(".resh/theme/style.css").is_file() {
+    if dir.join(".roost/theme/style.css").is_file() {
         Some("theme/style.css")
-    } else if dir.join(".resh/theme.css").is_file() {
+    } else if dir.join(".roost/theme.css").is_file() {
         Some("theme.css")
     } else {
         None
@@ -736,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn resh_static_overrides_one_file_and_the_rest_fall_through() {
+    fn roost_static_overrides_one_file_and_the_rest_fall_through() {
         let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("style.css"), "/*OVERRIDDEN*/").unwrap();
@@ -759,7 +759,7 @@ mod tests {
         let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("ROOST_STATIC");
         let home = tempfile::tempdir().unwrap();
-        let userdir = home.path().join(".config/resh/static");
+        let userdir = home.path().join(".config/roost/static");
         std::fs::create_dir_all(&userdir).unwrap();
         std::fs::write(userdir.join("app.js"), "alert('pwned')").unwrap();
         std::fs::write(userdir.join("style.css"), "/*MINE*/").unwrap();
@@ -790,7 +790,7 @@ mod tests {
     fn traversal_is_refused_the_same_with_and_without_an_overlay() {
         let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
-        let userdir = home.path().join(".config/resh/static");
+        let userdir = home.path().join(".config/roost/static");
         // The empty `themes` dir is load-bearing, not decoration:
         // `canonicalize()` is realpath, which must walk into `themes` to
         // resolve back out of it — on a directory that doesn't exist on
@@ -833,7 +833,7 @@ mod tests {
     #[test]
     fn a_project_theme_serves_presentation_and_refuses_code() {
         let d = tempfile::tempdir().unwrap();
-        let t = d.path().join(".resh/theme");
+        let t = d.path().join(".roost/theme");
         std::fs::create_dir_all(&t).unwrap();
         std::fs::write(t.join("style.css"), "body{color:red}").unwrap();
         std::fs::write(t.join("logo.png"), [0x89, 0x50, 0x4e, 0x47]).unwrap();
@@ -868,7 +868,7 @@ mod tests {
         std::fs::write(secret_dir.path().join("secret.css"), "body{SECRET}").unwrap();
 
         let d = tempfile::tempdir().unwrap();
-        let t = d.path().join(".resh/theme");
+        let t = d.path().join(".roost/theme");
         std::fs::create_dir_all(&t).unwrap();
         std::os::unix::fs::symlink(secret_dir.path().join("secret.css"), t.join("leak.css"))
             .unwrap();
@@ -885,7 +885,7 @@ mod tests {
     #[test]
     fn an_oversize_theme_asset_is_refused_before_being_read_fully() {
         let d = tempfile::tempdir().unwrap();
-        let t = d.path().join(".resh/theme");
+        let t = d.path().join(".roost/theme");
         std::fs::create_dir_all(&t).unwrap();
         let oversize = vec![b'a'; (projects::MAX_FILE_BYTES + 1) as usize];
         std::fs::write(t.join("big.css"), &oversize).unwrap();
@@ -900,13 +900,13 @@ mod tests {
     #[test]
     fn a_theme_directory_wins_over_the_single_stylesheet() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(d.path().join(".resh/theme")).unwrap();
+        std::fs::create_dir_all(d.path().join(".roost/theme")).unwrap();
         assert_eq!(theme_link_for(d.path()), None, "neither present");
 
-        std::fs::write(d.path().join(".resh/theme.css"), "a{}").unwrap();
+        std::fs::write(d.path().join(".roost/theme.css"), "a{}").unwrap();
         assert_eq!(theme_link_for(d.path()), Some("theme.css"), "the legacy file still works");
 
-        std::fs::write(d.path().join(".resh/theme/style.css"), "b{}").unwrap();
+        std::fs::write(d.path().join(".roost/theme/style.css"), "b{}").unwrap();
         assert_eq!(
             theme_link_for(d.path()),
             Some("theme/style.css"),
@@ -1036,16 +1036,16 @@ mod tests {
 
         // Project "a": an ordinary project with its own theme directory.
         let a = root.path().join("a");
-        std::fs::create_dir_all(a.join(".resh/theme")).unwrap();
-        std::fs::write(a.join(".resh/theme/style.css"), "css-a-style").unwrap();
+        std::fs::create_dir_all(a.join(".roost/theme")).unwrap();
+        std::fs::write(a.join(".roost/theme/style.css"), "css-a-style").unwrap();
 
         // Project "a/theme": a nested project whose own name contains
         // "theme" — the case the regression broke.
         let a_theme = root.path().join("a/theme");
-        std::fs::create_dir_all(a_theme.join(".resh/theme")).unwrap();
+        std::fs::create_dir_all(a_theme.join(".roost/theme")).unwrap();
         std::fs::write(a_theme.join("inner.rs"), "fn main() {}").unwrap();
-        std::fs::write(a_theme.join(".resh/theme.css"), "css-a-theme-legacy").unwrap();
-        std::fs::write(a_theme.join(".resh/theme/style.css"), "css-a-theme-style").unwrap();
+        std::fs::write(a_theme.join(".roost/theme.css"), "css-a-theme-legacy").unwrap();
+        std::fs::write(a_theme.join(".roost/theme/style.css"), "css-a-theme-style").unwrap();
 
         // Project "theme": a top-level project literally named "theme".
         let theme_proj = root.path().join("theme");
@@ -1080,7 +1080,7 @@ mod tests {
         assert!(out.contains("css-a-theme-legacy"), "must resolve project a/theme, kind theme.css");
 
         // Last segment "style.css" is NOT a fragment kind: falls to the
-        // theme-asset rule, reading project "a"'s .resh/theme/style.css —
+        // theme-asset rule, reading project "a"'s .roost/theme/style.css —
         // not project "a/theme"'s.
         let out = frag_route(&roots, "/frag/a/theme/style.css");
         assert!(out.contains("css-a-style"), "must resolve project a, theme asset style.css: {out}");

@@ -1,7 +1,7 @@
 //! The POST endpoints: `/upload/{project}` and (Task 5) `/paste/{project}/{session}`.
 //!
-//! This is the only part of resh that accepts a request body, and the only
-//! exception to the GET-only rule — which exists because it is why resh has no
+//! This is the only part of roost that accepts a request body, and the only
+//! exception to the GET-only rule — which exists because it is why roost has no
 //! CSRF surface. A `multipart/form-data` POST is a CORS *simple* request, so any
 //! page the user visits can submit one cross-origin with no preflight and the
 //! browser will send it; nothing in the response reaches the attacker, but the
@@ -38,7 +38,7 @@ pub fn handle_post(
     if !crate::origin::origin_allowed(origin, &allowed) {
         // Logged for the same reason the router logs a rejected host: behind a
         // proxy a misconfigured allowlist otherwise looks like an outage.
-        eprintln!("resh: rejected upload origin={origin:?} (set allowed_origins)");
+        eprintln!("roost: rejected upload origin={origin:?} (set allowed_origins)");
         return crate::http::respond(w, 403, "Forbidden", "text/plain; charset=utf-8", b"origin not allowed");
     }
 

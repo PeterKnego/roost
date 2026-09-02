@@ -1,5 +1,5 @@
-//! Terminal session registry. resh owns the PTY; dtach owns survival
-//! across a resh restart. Multiple attachments to one session mirror.
+//! Terminal session registry. roost owns the PTY; dtach owns survival
+//! across a roost restart. Multiple attachments to one session mirror.
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -34,7 +34,7 @@ pub fn valid_name(name: &str) -> bool {
 /// to spawn a shell in. A nested project (`karpie/src`) is legitimate here.
 ///
 /// One dot-segment exception, mirroring `resolve_project`'s own worktree
-/// vouching: the sole dot-segment shape resh itself ever mints is
+/// vouching: the sole dot-segment shape roost itself ever mints is
 /// `.claude/worktrees/<name>` (`worktree::create`, `do_new_worktree`'s
 /// `WorktreeReady.url`), so that literal shape is let through without
 /// `roots` to re-derive real vouching — this was already vouched for once,
@@ -147,7 +147,7 @@ pub struct Attachment {
     pub launch: Option<LaunchRequest>,
 }
 
-/// What a ✻ click asked a terminal to start, and the session id resh chose
+/// What a ✻ click asked a terminal to start, and the session id roost chose
 /// for it. Kept on the `Session` after the keystrokes are typed — it is the
 /// only record that this terminal was handed `claude`, and `claudes.rs`
 /// reads it to answer "is a Claude already here?".
@@ -367,7 +367,7 @@ impl std::fmt::Display for AttachRefusal {
     }
 }
 
-/// The environment a resh shell is spawned with, factored out of `attach` so
+/// The environment a roost shell is spawned with, factored out of `attach` so
 /// it can be asserted on directly rather than through a real PTY spawn.
 fn session_env(
     project: &str,
@@ -686,7 +686,7 @@ pub struct SessionInfo {
 }
 
 /// Elapsed seconds for a pid, via `ps -o etime=`. Age is read from the OS
-/// rather than recorded in memory because dtach sessions outlive resh —
+/// rather than recorded in memory because dtach sessions outlive roost —
 /// an in-process timestamp would reset on every restart and report a
 /// days-old shell as brand new.
 ///
@@ -775,7 +775,7 @@ pub fn live_rows(project: &str) -> Vec<(String, u32, usize)> {
 }
 
 /// `live_rows` plus the sockets on disk. The in-memory map is only what
-/// THIS process attached; dtach sessions outlive resh, so after a restart
+/// THIS process attached; dtach sessions outlive roost, so after a restart
 /// every surviving session is missing from it while its socket is still on
 /// disk and its shell still running — the bug `live_names` documents, seen
 /// on the overview as a right pane listing two sessions under a left pane
@@ -808,9 +808,9 @@ pub fn ages_snapshot() -> HashMap<u32, u64> {
 }
 
 /// The age of a session is the age of the oldest process holding its socket
-/// — the dtach master, which outlives resh. `child_pid` is only the client
-/// *this* resh spawned, so after a restart it reports "10m" for an 18-hour
-/// shell (the time since resh reattached). `None` when no holder is known
+/// — the dtach master, which outlives roost. `child_pid` is only the client
+/// *this* roost spawned, so after a restart it reports "10m" for an 18-hour
+/// shell (the time since roost reattached). `None` when no holder is known
 /// or none has an age: unknown, never `0`.
 pub fn oldest_age_of(pids: &[u32], ages: &HashMap<u32, u64>) -> Option<u64> {
     pids.iter().filter_map(|p| ages.get(p).copied()).max()
@@ -847,7 +847,7 @@ pub fn live_names(project: &str) -> Vec<String> {
         map.keys().filter_map(|k| k.strip_prefix(&prefix)).map(str::to_string).collect()
     };
     // The in-memory map is only what THIS process attached. dtach sessions
-    // outlive resh, so after a restart every surviving session is absent
+    // outlive roost, so after a restart every surviving session is absent
     // from it while its socket is still on disk and its shell still running.
     // Reporting only the map made the workspace claim "No terminal sessions are
     // running" for a project holding two, and — because `kill_project` walked
@@ -905,11 +905,11 @@ pub fn has_session(project: &str, name: &str) -> bool {
 /// Prefix built from `storage_key` for the same reason as `list_sessions`.
 ///
 /// Killing `s.child` alone — the whole of what this function used to do —
-/// only ends dtach's *client*, the process resh itself spawned. In
+/// only ends dtach's *client*, the process roost itself spawned. In
 /// `-A` mode `dtach` forks a *master* that immediately detaches and
 /// reparents to init; killing the client is therefore just a *detach*, not
 /// an end. The master and the user's shell survive with a live socket,
-/// unreachable through resh and invisibly still running — exactly the
+/// unreachable through roost and invisibly still running — exactly the
 /// failure "Close Project" exists to prevent, silently doing what closing a
 /// tab already does while telling the user the session ended. So this now
 /// also kills whatever still holds each session's socket path (the master
@@ -940,7 +940,7 @@ fn end_socket(project: &str, name: &str, who: &str) -> bool {
         return true;
     }
     eprintln!(
-        "resh: {who} could not fully end session {project}/{name} — a process survived the kill attempt; its socket was left in place so it stays discoverable"
+        "roost: {who} could not fully end session {project}/{name} — a process survived the kill attempt; its socket was left in place so it stays discoverable"
     );
     false
 }
@@ -1091,7 +1091,7 @@ mod tests {
     // never inserted at all — failed only this test. See this task's report
     // for the exact command and output.
     fn a_spawned_shell_is_told_which_port_to_connect_to() {
-        // Without this a claude in a resh terminal has to path-match, which
+        // Without this a claude in a roost terminal has to path-match, which
         // is exactly the comparison that goes wrong for worktrees.
         let env = session_env("alpha", "main", Some(5599));
         assert_eq!(env.get("CLAUDE_CODE_SSE_PORT").map(String::as_str), Some("5599"));
@@ -1139,7 +1139,7 @@ mod tests {
     // sync with it.
     #[test]
     fn valid_project_accepts_only_the_exact_worktree_shape_as_a_dot_segment() {
-        assert!(valid_project("repo/.claude/worktrees/claude-1"), "the one shape resh itself mints");
+        assert!(valid_project("repo/.claude/worktrees/claude-1"), "the one shape roost itself mints");
         assert!(valid_project("karpie/src/.claude/worktrees/claude-2"), "a nested project's worktree too");
         assert!(!valid_project("repo/.claude"), "the parent dot-dir alone is still not a project");
         assert!(!valid_project("repo/.claude/worktrees"), "missing the worktree name");
@@ -1587,7 +1587,7 @@ mod tests {
     fn session_age_is_the_oldest_holder_never_zero_when_unknown() {
         let mut ages = HashMap::new();
         ages.insert(10u32, 64_000u64); // the master
-        ages.insert(11u32, 30u64);     // this resh's fresh client
+        ages.insert(11u32, 30u64);     // this roost's fresh client
         assert_eq!(oldest_age_of(&[10, 11], &ages), Some(64_000));
         assert_eq!(oldest_age_of(&[99], &ages), None, "no known holder: unknown, not 0");
         assert_eq!(oldest_age_of(&[], &ages), None);
@@ -1615,7 +1615,7 @@ mod tests {
         assert_eq!(m.len(), 1);
     }
 
-    /// After a resh restart the in-memory map is empty while the sockets
+    /// After a roost restart the in-memory map is empty while the sockets
     /// on disk still name every surviving shell. Revert-checked: without the
     /// socket-floor merge this failed with `left: [] right: [("term7", 0, 0)]`.
     #[test]
@@ -1736,7 +1736,7 @@ mod tests {
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
-    /// A session that outlived a resh restart: its dtach master and shell
+    /// A session that outlived a roost restart: its dtach master and shell
     /// are running and its socket is on disk, but this process never attached
     /// to it, so the in-memory map knows nothing about it.
     ///
@@ -1744,7 +1744,7 @@ mod tests {
     /// dtach exists to preserve, the workspace reported "No terminal sessions
     /// are running" and Close Project ended nothing — observed in production as
     /// a Close button that appeared dead. Simulated here by starting a real
-    /// dtach the way resh does and then clearing the map, which is what a
+    /// dtach the way roost does and then clearing the map, which is what a
     /// restart leaves behind.
     ///
     /// `ROOST_CMD=cat` cannot express this at all: a `cat` child leaves no
@@ -1843,7 +1843,7 @@ mod tests {
         // so it arrives back through this attachment's own subscriber channel.
         std::env::set_var("ROOST_CMD", "env");
         // The child inherits this process's environment, and a legacy
-        // terminal — one still running a not-yet-renamed `resh`, which on
+        // terminal — one still running a not-yet-renamed `roost`, which on
         // this host will exist for weeks after cutover — exports more than
         // the three names this crate itself sets: this host's old service
         // unit also sets a `ROOTS` variable under the old prefix, and any

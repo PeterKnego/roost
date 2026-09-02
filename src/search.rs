@@ -328,7 +328,7 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
                     continue;
                 }
                 // A directory holding its own `.git` is a different checkout —
-                // resh's own `.claude/worktrees/*`, a submodule, a vendored
+                // roost's own `.claude/worktrees/*`, a submodule, a vendored
                 // clone. Its files are somebody else's project, and for a
                 // worktree they are near-duplicates of the ones already being
                 // searched here, which is what made the results unreadable.

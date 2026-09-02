@@ -2,9 +2,9 @@
 //!
 //! Terminals carry out-of-band messages as OSC sequences (`ESC ] … BEL`), and
 //! notification sequences are the convention every other terminal already
-//! implements — which is why resh accepts them rather than inventing an
+//! implements — which is why roost accepts them rather than inventing an
 //! ingress of its own: anything that can already notify iTerm2 or kitty
-//! notifies resh unchanged, with no knowledge that resh exists.
+//! notifies roost unchanged, with no knowledge that roost exists.
 //!
 //! Stateful because a sequence can straddle a read boundary; the pump reads
 //! 8 KiB at a time and a notification is under no obligation to arrive whole.

@@ -28,7 +28,7 @@ pub struct Hub {
     pub ws: Workspace,
     pub subs: HashMap<ConnId, Sender<String>>,
     next_id: u64,
-    /// Paths resh itself just wrote, with the resulting hash. The watcher
+    /// Paths roost itself just wrote, with the resulting hash. The watcher
     /// (Task 8) drops matching events so a save does not echo back.
     pub self_writes: HashMap<String, u64>,
     /// Set once a filesystem watcher has been spawned for this hub, so
@@ -84,7 +84,7 @@ impl Hub {
     pub fn new(project: &str, dir: std::path::PathBuf) -> Hub {
         let (ws, warn) = crate::wsstate::load(project);
         if let Some(w) = warn {
-            eprintln!("resh: {w}");
+            eprintln!("roost: {w}");
         }
         let mut hub = Hub {
             project: project.to_string(),
@@ -113,7 +113,7 @@ impl Hub {
         hub
     }
 
-    /// Restored buffers describe what was true when resh last wrote the state
+    /// Restored buffers describe what was true when roost last wrote the state
     /// file; the disk may have moved since, and nothing records that — the
     /// state file cannot, because staleness is a fact about the file, not
     /// about the buffer. Left unanswered, a buffer whose file changed during
@@ -373,7 +373,7 @@ impl Hub {
 
     fn persist(&mut self) {
         if let Err(e) = crate::wsstate::save(&self.project.clone(), &self.ws) {
-            eprintln!("resh: state save failed: {e}");
+            eprintln!("roost: state save failed: {e}");
         }
     }
 
@@ -625,7 +625,7 @@ impl Hub {
                             if let Err(e) =
                                 crate::ide::answer(&self.project, id, crate::ide::Answer::Rejected)
                             {
-                                eprintln!("resh: closing proposal {id}: {e}");
+                                eprintln!("roost: closing proposal {id}: {e}");
                             }
                             // `apply_layout` removed the tab, not the content
                             // behind it.
@@ -983,7 +983,7 @@ impl Hub {
         }
     }
 
-    /// A rename resh did not perform — `mv` from a terminal, `git mv`, a
+    /// A rename roost did not perform — `mv` from a terminal, `git mv`, a
     /// Claude's own edit tool. `watch.rs` only calls this when the kernel
     /// paired the two halves itself (inotify's rename cookie, surfaced by
     /// `notify` as one `Modify(Name(Both))` event carrying both paths), so
@@ -1008,7 +1008,7 @@ impl Hub {
             return false;
         }
         // Handles a directory rename too, by `/`-boundary prefix: renaming
-        // `src` moves every open tab under it. That is the same method resh's
+        // `src` moves every open tab under it. That is the same method roost's
         // own rename intent uses, so both paths cannot drift apart.
         self.rekey_after_rename(old, new);
         self.ws.version += 1;
@@ -1296,7 +1296,7 @@ impl Hub {
                         }))
                         .unwrap_or_else(|_| {
                             eprintln!(
-                                "resh: end_session panicked ending {thread_project}/{thread_session}"
+                                "roost: end_session panicked ending {thread_project}/{thread_session}"
                             );
                             false
                         });
@@ -1312,7 +1312,7 @@ impl Hub {
                         broadcast_all(&Event::ProjectsChanged { project: thread_project });
                     });
                 if let Err(e) = spawned {
-                    eprintln!("resh: could not spawn end-session thread for {project}: {e}");
+                    eprintln!("roost: could not spawn end-session thread for {project}: {e}");
                     crate::session::end_session(&project, &session);
                     self.refresh_live_sessions();
                 }
@@ -1410,7 +1410,7 @@ impl Hub {
     /// check makes sure this project never even tries.
     ///
     /// The worktree is found from this repo's own `git worktree list`, not
-    /// `projects::roots()`/`resolve_project`: every worktree resh creates
+    /// `projects::roots()`/`resolve_project`: every worktree roost creates
     /// lives under `.claude/worktrees/{name}` inside this project's own
     /// directory, so asking git which linked worktrees it has and matching
     /// their storage key is exact, and the main checkout — never a non-main
@@ -1483,7 +1483,7 @@ impl Hub {
                 None => return Err(format!("{name}: git did not answer (rev-list)")),
             }
             let note = crate::worktree::remove(&repo, &dir, &name, &crate::worktree::real_git)?;
-            // Only after both git steps succeed: resh's own records about a
+            // Only after both git steps succeed: roost's own records about a
             // thing that, by this point, no longer exists.
             let _ = std::fs::remove_file(crate::worktree::base_file(&state_dir, &key));
             let _ = std::fs::remove_file(state_dir.join(format!("{key}.json")));
@@ -1859,7 +1859,7 @@ impl Hub {
         let Some(p) = self.ws.panes.get_mut(crate::proto::MIDDLE as usize) else {
             // A hand-edited state file could in principle leave fewer panes
             // than the layout has. Never index blind from a socket thread.
-            eprintln!("resh: no middle pane to open a proposal in");
+            eprintln!("roost: no middle pane to open a proposal in");
             return;
         };
         p.tabs.push(Tab::Proposal { id: id.to_string() });
@@ -1991,7 +1991,7 @@ impl Hub {
                         }))
                         .unwrap_or_else(|_| {
                             eprintln!(
-                                "resh: kill_project panicked while closing {thread_project}; reporting 0 ended"
+                                "roost: kill_project panicked while closing {thread_project}; reporting 0 ended"
                             );
                             0
                         });
@@ -2025,7 +2025,7 @@ impl Hub {
                 );
                 if let Err(e) = spawned {
                     self.closing = false;
-                    eprintln!("resh: could not spawn close-project thread for {project}: {e}");
+                    eprintln!("roost: could not spawn close-project thread for {project}: {e}");
                     let ev = Event::Error { msg: "could not close the project; try again".into() };
                     self.send_to(from, &ev);
                     // Nothing was ended, so nothing may be cleared: returning
@@ -2090,7 +2090,7 @@ fn open_hub(project: &str) -> Option<Arc<Mutex<Hub>>> {
     map.get(project).cloned()
 }
 
-/// Whether resh is holding unsaved edits to `rel`.
+/// Whether roost is holding unsaved edits to `rel`.
 ///
 /// `openDiff` asks this before parking a proposal: accepting one would let
 /// Claude write over text the user has typed and not saved, which is the one
@@ -2433,7 +2433,7 @@ mod tests {
     /// A restart reloads buffers from the state file, which records no
     /// staleness — it is a fact about the disk, not about the buffer. So the
     /// hub has to work it out at startup, or a buffer whose file changed
-    /// while resh was down comes back looking clean and current, and the
+    /// while roost was down comes back looking clean and current, and the
     /// first warning is a conflict banner at save time.
     #[test]
     fn a_restart_notices_a_file_that_changed_while_it_was_down() {
@@ -3801,7 +3801,7 @@ mod tests {
     }
 
 
-    /// A rename resh did not perform. The tab has to move with the file, and
+    /// A rename roost did not perform. The tab has to move with the file, and
     /// unsaved work has to arrive at the new name — app.js keys its editor
     /// text by rel, so a tab that changes rel with nothing sent for the new one
     /// mounts an empty textarea over the user's edit, which is the failure this
@@ -4982,7 +4982,7 @@ mod tests {
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
-    /// A repo with one resh-created worktree, both registered under a temp
+    /// A repo with one roost-created worktree, both registered under a temp
     /// state dir; returns (hub for the repo, worktree url, worktree dir).
     fn repo_with_worktree(root: &std::path::Path) -> (Hub, String, std::path::PathBuf) {
         let repo = root.join("repo");

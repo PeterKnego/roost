@@ -40,7 +40,7 @@ await disableAutosave(`${fx.roots}/noauto`);
 const file2 = `${fx.roots}/noauto/watched.rs`;
 await Deno.writeTextFile(file2, "fn main() {}\n");
 
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page, page2;
 
@@ -48,7 +48,7 @@ let page, page2;
 // helpers bound to that page. Not send(): the whole point of this file is
 // exercising the client's own event listeners, not the server directly.
 const openEditor = async (project, rel) => {
-  const p = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${project}`);
+  const p = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${project}`);
   const { cmd, evalIn } = p;
   // The default headless window is 800x600, narrower than the left (260px)
   // and right (520px) panes together, which collapses the middle pane this
@@ -125,7 +125,7 @@ try {
   try { page?.close(); } catch {}
   try { page2?.close(); } catch {}
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 

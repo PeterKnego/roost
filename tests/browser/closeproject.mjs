@@ -67,7 +67,7 @@ const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) 
 
 const fx = await fixture();
 const browser = await startBrowser(profileDir(repoRoot));
-let ws, after, resh;
+let ws, after, roost;
 
 /// The dtach sockets on disk for the fixture project — the evidence that the
 /// shells themselves ended, kept separate from what the page shows. `.origin`
@@ -89,10 +89,10 @@ const tabKinds = (p) =>
   p.evalIn(`JSON.stringify(state.panes.flatMap((q) => q.tabs).map((t) => t.k))`).then(JSON.parse);
 
 try {
-  resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+  roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 
   console.log("A. a project with live terminals");
-  ws = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  ws = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   await until(() => ws.evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "app.js");
   const newterm = `document.querySelector('.pane[data-pane="3"] .paneicons .newterm').click()`;
   // Two more on top of the default layout's own `term` tab, so the close has
@@ -122,7 +122,7 @@ try {
   await sleep(1500);
   // A close ends by navigating to `/`; reopen the project the way a user
   // would, which is the reload the report was about.
-  after = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  after = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   await until(() => after.evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "reopened app.js");
   const reopened = await terminalTabs(after);
   ok(reopened.length === 0, `the reopened project has no terminal tabs: ${JSON.stringify(reopened)}`);
@@ -148,7 +148,7 @@ try {
   console.log("D. a terminal still spawning when the close runs must not survive it");
   // The second reported failure, and a different bug from A-C: the close
   // ended the shells and cleared the tabs, and a shell appeared anyway. In
-  // production the survivor's dtach had resh itself as its parent and a start
+  // production the survivor's dtach had roost itself as its parent and a start
   // time in the same second as the close — a terminal websocket that reached
   // `session::attach` (which creates when absent) while `kill_project` was
   // reading a socket directory and a `ps` snapshot that could not show it yet.
@@ -157,7 +157,7 @@ try {
   // here waits for the socket to exist first, and that wait is exactly what
   // hides this. Both clicks go in one evaluation so the browser cannot
   // interleave a round trip between them.
-  const race = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  const race = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   await until(() => race.evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "race page");
   await race.evalIn(`
     window.confirm = () => true; window.alert = () => {};
@@ -187,14 +187,14 @@ try {
   // did neither — so a PTY killed by the close whose socket died unclean
   // scheduled `connectTerm` on backoff, and a retry landing after the server
   // cleared `closing` was accepted and spawned. Observed live as a dtach
-  // parented to resh, started in the same second as the close, with nothing
+  // parented to roost, started in the same second as the close, with nothing
   // attached to it.
   //
   // Asserts on the entries themselves rather than on a surviving socket: the
   // spawn needs a retry to land in a narrow window, so a socket check is a
   // coin flip that passes most runs whether or not the bug is there. `gone`
   // is what makes onclose bail, so it is the property, not a proxy for it.
-  const fin = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  const fin = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   await until(() => fin.evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "final page");
   await fin.evalIn(`document.querySelector('.pane[data-pane="3"] .paneicons .newterm').click()`);
   await until(async () => (await fin.evalIn(`terms.size`)) >= 1, 20, "a mounted terminal");
@@ -247,11 +247,11 @@ try {
   // stated as a rate (3-of-3 failing / 4-of-4 passing) because it depended on
   // a spawn landing inside a settle window. The invariant replaced the
   // window: no reservation, no session, no live socket → refused, always.
-  const back = await openPage(browser.port, `http://127.0.0.1:${resh.port}/`);
+  const back = await openPage(browser.port, `http://127.0.0.1:${roost.port}/`);
   await until(() => back.evalIn(`document.readyState === "complete"`), 20, "overview loaded");
   const ended = await back.evalIn(`
     new Promise((res) => {
-      const ws = new WebSocket("ws://127.0.0.1:${resh.port}/ws/${fx.project}/term/term1");
+      const ws = new WebSocket("ws://127.0.0.1:${roost.port}/ws/${fx.project}/term/term1");
       ws.onclose = (e) => res("closed:" + e.code + ":" + e.wasClean);
       ws.onopen = () => setTimeout(() => res("still-open"), 4000);
       setTimeout(() => res("no-answer"), 8000);
@@ -269,7 +269,7 @@ try {
 } finally {
   try { ws?.close(); } catch { /* already gone */ }
   try { after?.close(); } catch { /* already gone */ }
-  await resh?.close();
+  await roost?.close();
   browser.close();
   await fx.cleanup();
 }

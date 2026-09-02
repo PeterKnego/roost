@@ -43,18 +43,18 @@ pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
     // Notices raised while no browser was connected are the point of the
     // store; load them before anything can connect.
     crate::notify::load();
-    // Sessions outlive resh, so the registry must be rebuilt from disk
+    // Sessions outlive roost, so the registry must be rebuilt from disk
     // and live processes rather than assumed empty.
-    // Lock files a previous resh left behind. systemd stops it with SIGTERM,
+    // Lock files a previous roost left behind. systemd stops it with SIGTERM,
     // which unwinds nothing, so `idelock::Lock::drop` never runs and every
     // restart strands one file per open project. Swept before anything binds,
     // so this instance's own locks — written later, as projects open — are
-    // never candidates. Only files that say `ideName: resh`, whose pid is
+    // never candidates. Only files that say `ideName: roost`, whose pid is
     // known dead, and whose port answers nothing: `~/.claude/ide` belongs to
     // every IDE on the host, not to us.
     let swept = crate::idelock::sweep_strays();
     if swept.removed > 0 {
-        eprintln!("resh: startup reap — {} stale ide lock file(s) from a previous run", swept.removed);
+        eprintln!("roost: startup reap — {} stale ide lock file(s) from a previous run", swept.removed);
     }
     // Periodic, and it only ever logs — see health.rs for why it may not
     // repair anything and why it calls nothing that reaps.
@@ -62,7 +62,7 @@ pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
     let report = registry::reconcile(&roots);
     if report.dead_sockets > 0 || report.gone_projects > 0 {
         eprintln!(
-            "resh: startup reap — {} dead sockets, {} sessions for missing projects",
+            "roost: startup reap — {} dead sockets, {} sessions for missing projects",
             report.dead_sockets, report.gone_projects
         );
     }
@@ -73,7 +73,7 @@ pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
         let p = std::path::Path::new(&d);
         if !p.is_dir() {
             eprintln!(
-                "resh: ROOST_STATIC={} is not a readable directory; serving embedded assets",
+                "roost: ROOST_STATIC={} is not a readable directory; serving embedded assets",
                 p.display()
             );
         }

@@ -1,7 +1,7 @@
-//! The project registry: what resh knows about, and what is running.
+//! The project registry: what roost knows about, and what is running.
 //!
 //! Rebuilt at startup rather than accumulated in memory, because dtach
-//! sessions deliberately outlive resh. An in-memory-only registry would
+//! sessions deliberately outlive roost. An in-memory-only registry would
 //! forget every running shell on restart — which is exactly how nine
 //! orphaned sessions for deleted directories accumulated unnoticed in
 //! production on 2026-08-17.
@@ -52,9 +52,9 @@ pub struct WorktreeStatus {
     pub ahead: Option<u32>,
     /// The branch this worktree's ahead-count is measured against.
     pub base: String,
-    /// True when `base` came from the `.base` file resh wrote at
+    /// True when `base` came from the `.base` file roost wrote at
     /// `create` time; false when it fell back to the main worktree's
-    /// current branch (a worktree resh did not create, or a lost record).
+    /// current branch (a worktree roost did not create, or a lost record).
     pub base_recorded: bool,
 }
 
@@ -305,7 +305,7 @@ fn socket_has_process(path: &std::path::Path) -> bool {
 /// Shared by `reconcile`'s project-gone branch and `session::kill_project`
 /// (an explicit "Close Project" from the UI): both need to end whatever
 /// `dtach` *master* — and, through it, the user's shell — is still holding
-/// a socket, not merely the in-process *client* resh itself spawned.
+/// a socket, not merely the in-process *client* roost itself spawned.
 /// Killing only that client is just a detach: in `-A` mode `dtach` forks a
 /// master that immediately detaches and reparents to init, so the master
 /// and shell survive a client kill with a live socket, unreachable and
@@ -320,7 +320,7 @@ fn socket_has_process(path: &std::path::Path) -> bool {
 fn kill_and_unlink_with(sock_path: &std::path::Path, snapshot_fn: SnapshotFn) -> bool {
     let Some(snapshot) = snapshot_fn() else {
         eprintln!(
-            "resh: could not verify what holds {} (process listing unavailable) — leaving it in place",
+            "roost: could not verify what holds {} (process listing unavailable) — leaving it in place",
             sock_path.display()
         );
         return false;
@@ -330,7 +330,7 @@ fn kill_and_unlink_with(sock_path: &std::path::Path, snapshot_fn: SnapshotFn) ->
         // M6: pid 0 should be unreachable here in practice (pid 0 is the
         // kernel/swapper, whose command line can never contain a socket
         // path), but `kill -9 0` signals this whole process group — i.e.
-        // resh itself — so refuse it outright rather than trust that
+        // roost itself — so refuse it outright rather than trust that
         // impossibility.
         if *pid == 0 {
             continue;
@@ -388,7 +388,7 @@ fn origin_marker_path(key_dir: &std::path::Path) -> PathBuf {
 /// pass afterwards would read a false "gone" and reap a live session. These
 /// two helpers are the byte-exact round trip `String`/`read_to_string`
 /// cannot provide. The `not(unix)` halves exist only to keep the module
-/// compiling: resh is unix-only in practice (dtach, PTYs, `ps`).
+/// compiling: roost is unix-only in practice (dtach, PTYs, `ps`).
 #[cfg(unix)]
 fn marker_bytes(dir: &std::path::Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
@@ -418,7 +418,7 @@ fn path_from_marker(bytes: &[u8]) -> PathBuf {
 /// Atomic — temp file, then `rename` — rather than `fs::write`, which is
 /// `O_TRUNC` followed by a write. The file being truncated is the *only*
 /// record of where this project lives, and the whole reason it exists is
-/// that a *second*, differently-rooted resh sharing this state dir
+/// that a *second*, differently-rooted roost sharing this state dir
 /// reads it. That reader landing inside the truncate-then-write window would
 /// see `""` (or a prefix like `/home/pet`), conclude "gone", and SIGKILL the
 /// live session this mechanism was built to protect — a window reopened
@@ -443,7 +443,7 @@ fn write_origin(key_dir: &std::path::Path, dir: &std::path::Path) {
     if std::fs::read(&marker).map(|cur| cur == bytes).unwrap_or(false) {
         return;
     }
-    // Pid in the temp name: two resh instances sharing this state dir
+    // Pid in the temp name: two roost instances sharing this state dir
     // is the whole premise of the marker, and a *shared* temp name would
     // hand the truncate-then-write window straight back — one process's
     // `rename` could publish the other's half-written file. A crash can
@@ -533,15 +533,15 @@ fn recorded_path_is_gone(recorded: &[u8]) -> bool {
 /// conflates two situations that look identical from inside a single
 /// `reconcile` call — "the directory was deleted" and "the directory
 /// exists, just not under the roots *this particular process* happens to
-/// be configured with". Two resh processes — or the same one,
+/// be configured with". Two roost processes — or the same one,
 /// restarted with a different `ROOST_ROOTS` — can share one
 /// `ROOST_STATE_DIR`: `docs/deploy.md` tells users to override
 /// `ROOST_ROOTS` to run a second instance locally and says nothing
 /// about also separating `ROOST_STATE_DIR`, so the documented way to
-/// run resh locally reaches this. Reproduced directly against a real
+/// run roost locally reaches this. Reproduced directly against a real
 /// `dtach` session, outside the test suite entirely: a live session for
 /// `victimproj` was SIGKILLed and its socket unlinked simply because
-/// resh was started with different roots against the same state dir
+/// roost was started with different roots against the same state dir
 /// — logging "project directory is gone" about a directory that existed
 /// the whole time. This is the eighth instance in this feature of one
 /// shape: a false "gone" verdict destroying a live session. The rule the
@@ -639,7 +639,7 @@ fn reap_decision(project_gone: bool, held_before: bool, held_after_kill_attempt:
 /// The kill-then-confirm step for the project-gone case matters because this
 /// function's primary caller is startup: `session::kill_project` only ends
 /// sessions present in *this* process's in-memory map, which is empty right
-/// after a restart. A `dtach` session that outlived the previous resh
+/// after a restart. A `dtach` session that outlived the previous roost
 /// process has no map entry, so without directly signalling its pid, the
 /// socket file would be deleted while the process kept running — a shell
 /// that is now both unreachable (no socket to attach through) and
@@ -691,14 +691,14 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
     let roots_were_ok = ROOTS_WERE_OK.swap(roots_ok, std::sync::atomic::Ordering::Relaxed);
     if !roots_ok && roots_were_ok {
         eprintln!(
-            "resh: none of the configured roots could be read ({roots:?}) — \
+            "roost: none of the configured roots could be read ({roots:?}) — \
              reaping sessions for missing projects is suspended until this recovers"
         );
     } else if roots_ok && !roots_were_ok {
-        eprintln!("resh: configured roots are readable again — reaping resumed");
+        eprintln!("roost: configured roots are readable again — reaping resumed");
     }
 
-    // resh's own worktree markers: a `.base` whose directory is *positively*
+    // roost's own worktree markers: a `.base` whose directory is *positively*
     // gone (NotFound, nothing else) is a file about nothing. Same rule as
     // `.origin`: unreadable is "cannot tell", and cannot-tell keeps. Gated
     // on `roots_ok` for the same reason the project-gone sweep below is —
@@ -754,14 +754,14 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
     let Some(snapshot) = snapshot_opt else {
         if process_list_was_ok {
             eprintln!(
-                "resh: could not read the process list (ps failed, exited non-zero, or \
+                "roost: could not read the process list (ps failed, exited non-zero, or \
                  returned nothing) — reaping is suspended until this recovers"
             );
         }
         return report;
     };
     if !process_list_was_ok {
-        eprintln!("resh: process listing is readable again — reaping resumed");
+        eprintln!("roost: process listing is readable again — reaping resumed");
     }
     for entry in rd.flatten() {
         // Directory entry names under sock/ are storage keys (percent-encoded:
@@ -778,7 +778,7 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
         // newline inside the socket path splits one process's argv across two
         // lines, so a live holder is unfindable and its socket would be
         // unlinked as an orphan. `storage_key` escapes those bytes now, so this
-        // is unreachable for anything resh wrote — it guards a key written
+        // is unreachable for anything roost wrote — it guards a key written
         // by an older build, or one dropped in by hand. Skipping costs a stale
         // row; reaping costs a running shell.
         //
@@ -791,7 +791,7 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
         // `is_ascii_control` already covers 0x7F (DEL), so this is the whole set.
         if key.bytes().any(|b| b.is_ascii_control()) {
             eprintln!(
-                "resh: refusing to reap session key {key:?} — it contains a control byte, \
+                "roost: refusing to reap session key {key:?} — it contains a control byte, \
                  so who holds its socket cannot be determined from `ps` output"
             );
             continue;
@@ -805,7 +805,7 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
         // In-process sessions first, once per project rather than once per
         // socket file below: `session::kill_project` now ends each session's
         // dtach master too (via `kill_and_unlink`, the same helper the loop
-        // below uses), not just resh's own client, so any socket it
+        // below uses), not just roost's own client, so any socket it
         // fully cleans up is already gone by the time `read_dir` runs and
         // simply won't appear in `inner` — only a genuine failure (or a
         // session this process never knew about, e.g. one that outlived a
@@ -817,7 +817,7 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
             report.gone_projects += in_process_ended;
             if in_process_ended > 0 {
                 eprintln!(
-                    "resh: reaped {in_process_ended} in-process session(s) for {key} — its recorded directory no longer exists"
+                    "roost: reaped {in_process_ended} in-process session(s) for {key} — its recorded directory no longer exists"
                 );
             }
         }
@@ -846,11 +846,11 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
                 if kill_and_unlink_with(&sock.path(), snapshot_fn) {
                     report.gone_projects += 1;
                     eprintln!(
-                        "resh: reaped session {key}/{name} — its recorded directory no longer exists (pids {pids:?})"
+                        "roost: reaped session {key}/{name} — its recorded directory no longer exists (pids {pids:?})"
                     );
                 } else {
                     eprintln!(
-                        "resh: could not end session {key}/{name} for a missing project — pids {pids:?} did not fully die (or the process list was unverifiable); socket left in place so it stays discoverable"
+                        "roost: could not end session {key}/{name} for a missing project — pids {pids:?} did not fully die (or the process list was unverifiable); socket left in place so it stays discoverable"
                     );
                 }
                 continue;
@@ -876,7 +876,7 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
                     if !socket_has_process_with(&sock.path(), snapshot_fn) {
                         let _ = std::fs::remove_file(sock.path());
                         report.dead_sockets += 1;
-                        eprintln!("resh: reaped dead socket {}", sock.path().display());
+                        eprintln!("roost: reaped dead socket {}", sock.path().display());
                     }
                 }
                 ReapAction::Leave => {} // live process, project still exists: untouched
@@ -938,7 +938,7 @@ fn reconcile_throttled(roots: &[PathBuf]) {
     }
 }
 
-/// Every project resh knows about: those with a saved layout, those with
+/// Every project roost knows about: those with a saved layout, those with
 /// live sessions, and those with both.
 pub fn known_projects(roots: &[PathBuf]) -> Vec<ProjectStatus> {
     known_projects_inner(roots, true)
@@ -987,7 +987,7 @@ fn known_projects_inner(roots: &[PathBuf], group: bool) -> Vec<ProjectStatus> {
             // before its socket is removed. So the number of socket files under
             // this key is a truthful *lower bound* on how many sessions are
             // live — including ones this process knows nothing about, because
-            // dtach sessions outlive resh and a restart leaves the
+            // dtach sessions outlive roost and a restart leaves the
             // in-memory map empty while the shells keep running.
             //
             // Excludes `.origin` (see reconcile's identical skip): it is
@@ -1093,7 +1093,7 @@ pub fn head_branch(dir: &std::path::Path) -> String {
 }
 
 /// The overview's top level: every project directory under the roots, with
-/// the live counts and layouts resh knows, and no git subprocess at all.
+/// the live counts and layouts roost knows, and no git subprocess at all.
 ///
 /// Worktree-shaped keys are left out — a worktree is a child row, loaded by
 /// `worktree_rows` when its project is opened. Without that filter a saved
@@ -1797,7 +1797,7 @@ mod tests {
     /// synchronization point (no arbitrary sleep needed to wait for the
     /// socket to appear), and no in-memory `session::SESSIONS` entry is ever
     /// created, mirroring exactly what a session that outlived a previous
-    /// resh process leaves behind. Returns `None` (rather than
+    /// roost process leaves behind. Returns `None` (rather than
     /// panicking) if `dtach` genuinely isn't installed, since its own setup
     /// step could not have succeeded either. `dtach` is a hard runtime
     /// prerequisite of this project (see README.md, docs/deploy.md), so this
@@ -1814,7 +1814,7 @@ mod tests {
     }
 
     // Regression for the startup case: a session that outlived a previous
-    // resh process has no entry in `session`'s in-memory map, so
+    // roost process has no entry in `session`'s in-memory map, so
     // `session::kill_project` alone is a no-op. Uses a real `dtach` process
     // so this actually proves the OS-level pid is killed, not just forgotten
     // about by having its socket file deleted out from under it.
@@ -2206,7 +2206,7 @@ mod tests {
             );
 
             // A completely different root than the one victimproj actually
-            // lives under — simulating a second resh instance (or the
+            // lives under — simulating a second roost instance (or the
             // same one, restarted with an overridden ROOST_ROOTS)
             // sharing this state dir.
             let foreign_root = tempfile::tempdir().unwrap();

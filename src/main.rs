@@ -12,11 +12,11 @@ fn main() {
     let roots = roost::projects::roots();
     if roots.is_empty() {
         eprintln!(
-            "resh: no project roots configured.\n\
+            "roost: no project roots configured.\n\
              Set ROOST_ROOTS to a colon-separated list of directories to scan:\n\
-             \n    ROOST_ROOTS=$HOME/projects resh 8444\n\
+             \n    ROOST_ROOTS=$HOME/projects roost 8444\n\
              \nFor a service, set it in the unit file (Environment=ROOST_ROOTS=...).\n\
-             Or list them in ~/.config/resh/config.toml:\n\
+             Or list them in ~/.config/roost/config.toml:\n\
              \n    roots = [\"~/projects\"]"
         );
         std::process::exit(2);
@@ -30,7 +30,7 @@ fn main() {
         &roost::config::global_config_path(),
     ) {
         eprintln!(
-            "resh: ROOST_ROOTS and the global config's `roots` disagree.\n  \
+            "roost: ROOST_ROOTS and the global config's `roots` disagree.\n  \
              ROOST_ROOTS (used here): {env:?}\n  \
              config `roots` (used by anything without this environment): {cfg:?}\n  \
              Bring them into step, or callers outside this process will resolve different projects."
@@ -53,6 +53,6 @@ fn main() {
     // the host's real process table on a timer, which the test servers
     // `serve` starts have no business doing.
     roost::claudes::watch();
-    eprintln!("resh listening on http://127.0.0.1:{port}");
+    eprintln!("roost listening on http://127.0.0.1:{port}");
     roost::serve(listener, roots);
 }

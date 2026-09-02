@@ -3,7 +3,7 @@
 //!
 //! A full-screen app — Claude Code, `vim`, `less` — declares the alternate
 //! screen exactly once (`ESC [ ? 1049 h`), paints frames for as long as it
-//! runs, and gives it back exactly once at exit. resh reconstructs a client's
+//! runs, and gives it back exactly once at exit. roost reconstructs a client's
 //! screen from a byte log, and a byte log with a bounded head cannot carry a
 //! declaration made an arbitrary time ago: once that one sequence falls off
 //! the front of the ring, every browser that attaches paints the app's frames
@@ -32,7 +32,7 @@ pub const MAX_SCROLLBACK: usize = 1_000_000;
 
 /// Longest parameter run held for an in-flight CSI sequence. The ones this
 /// module cares about are at most `?1049;1000`; anything longer is either not
-/// ours or not real, and must not be a way to make resh allocate.
+/// ours or not real, and must not be a way to make roost allocate.
 pub const MAX_PARAMS: usize = 64;
 
 /// Sent in place of an alternate-screen exit whose entry this process never
@@ -218,7 +218,7 @@ impl Scanner {
 enum At {
     /// This process has never seen a switch for this session — it attached to
     /// a `dtach` socket that predates it. Not the same as `Normal`: what is
-    /// true is that every client resh has spoken to is on the normal buffer,
+    /// true is that every client roost has spoken to is on the normal buffer,
     /// not that the *app* is.
     Unknown,
     Normal,
@@ -262,7 +262,7 @@ impl Screens {
     ///
     /// That case: an exit whose entry this process never saw. After a restart
     /// the ring is empty, the entry is unrecoverable, and every attached
-    /// client is therefore on the normal buffer — resh has never sent them
+    /// client is therefore on the normal buffer — roost has never sent them
     /// anything else. Forwarding the exit verbatim is exactly what paints the
     /// app's parting words over its own leftover frame, so it is replaced with
     /// a clear. That is a degradation, not a repair: the pre-app screen went
@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn a_mode_never_mentioned_is_never_re_stated() {
         // Silence is not a value. Bracketed paste defaults off and wraparound
-        // defaults on; asserting either onto a fresh emulator would be resh
+        // defaults on; asserting either onto a fresh emulator would be roost
         // inventing state rather than restoring it.
         let mut p = Pump::new();
         p.feed(b"plain output\n");
@@ -715,7 +715,7 @@ mod tests {
         //
         // Measured after the ring has turned over, because until then the
         // app's own copy is still in the replay — as it should be, it is
-        // output. What is under test is what resh *re-states* on top.
+        // output. What is under test is what roost *re-states* on top.
         let mut p = Pump::new();
         p.feed(b"\x1b[?3h\x1b[?1048h\x1b[?6h\x1b[?2031h\x1b[?2004h");
         for _ in 0..(MAX_SCROLLBACK / 10_000 + 10) {

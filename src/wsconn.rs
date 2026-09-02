@@ -145,7 +145,7 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         |req: &WsRequest, resp: WsResponse| {
             let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
             if !crate::origin::origin_allowed(origin, &allowed) {
-                eprintln!("resh: rejected workspace ws origin={origin:?} (set allowed_origins)");
+                eprintln!("roost: rejected workspace ws origin={origin:?} (set allowed_origins)");
                 let body = Some("origin not allowed".to_string());
                 return Err(tungstenite::http::Response::builder()
                     .status(403)

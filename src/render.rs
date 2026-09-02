@@ -681,7 +681,7 @@ pub fn status_fragment(st: &Status) -> String {
     format!("<span id=\"gitstatus\" title=\"{title}\">{parts}</span>")
 }
 
-/// Breadcrumb for the directory picker: "resh" always links back to the
+/// Breadcrumb for the directory picker: "roost" always links back to the
 /// top level (`at=""`), every segment but the last is a clickable link to
 /// browsing that prefix, and the last segment is plain text (you're already
 /// there — the picker doesn't render a `..` row, this is the way up).
@@ -698,13 +698,13 @@ pub fn overview_page(sel: &str, roots_label: &str) -> String {
     // header switcher's `?current={qkey}`.
     let qsel = crate::http::percent_encode(sel);
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>resh</title>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>roost</title>\
          <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
          <link rel=\"stylesheet\" href=\"/static/style.css\">\
          <script src=\"/static/vendor/htmx.min.js\"></script>\
          </head><body class=\"overview-body\">\
          <header>\
-           <span class=\"home\">{SVG_DIAMOND}</span><span class=\"proj\">resh</span>\
+           <span class=\"home\">{SVG_DIAMOND}</span><span class=\"proj\">roost</span>\
            <span class=\"vsep\"></span>\
            <span class=\"roots\" title=\"{roots}\">{roots}</span>\
          </header>\
@@ -775,7 +775,7 @@ pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectSta
         if !p.reachable {
             cls.push_str(" unreachable");
             out.push_str(&format!(
-                "<span class=\"{}\" title=\"worktree outside resh's roots — cannot be opened\">{}{} {}{}</span>",
+                "<span class=\"{}\" title=\"worktree outside roost's roots — cannot be opened\">{}{} {}{}</span>",
                 cls,
                 indent,
                 marker,
@@ -829,7 +829,7 @@ fn worktree_chips(w: &crate::registry::WorktreeStatus, key: &str, live: usize, s
     let claude = match &w.claude {
         crate::claudes::ClaudeEvidence::Present(_) => "<span class=\"wtf on\" title=\"a Claude is running here\">✻</span>".to_string(),
         crate::claudes::ClaudeEvidence::Absent => "<span class=\"wtf\" title=\"no Claude here\">—</span>".to_string(),
-        crate::claudes::ClaudeEvidence::Unknown => "<span class=\"wtf\" title=\"IDE integration is off, so resh cannot tell\">?</span>".to_string(),
+        crate::claudes::ClaudeEvidence::Unknown => "<span class=\"wtf\" title=\"IDE integration is off, so roost cannot tell\">?</span>".to_string(),
     };
     let dirty = match w.dirty {
         Some(true) => "<span class=\"wtf on\">dirty</span>".to_string(),
@@ -837,9 +837,9 @@ fn worktree_chips(w: &crate::registry::WorktreeStatus, key: &str, live: usize, s
         None => "<span class=\"wtf\" title=\"git did not answer (status)\">?</span>".to_string(),
     };
     let against = if w.base_recorded {
-        format!("measured against {}, recorded when resh created this worktree", esc(&w.base))
+        format!("measured against {}, recorded when roost created this worktree", esc(&w.base))
     } else {
-        format!("measured against {}, the main worktree's branch — resh did not create this worktree", esc(&w.base))
+        format!("measured against {}, the main worktree's branch — roost did not create this worktree", esc(&w.base))
     };
     let ahead = match w.ahead {
         Some(n) => format!("<span class=\"wtf{}\" title=\"{against}. A squash-merged branch stays ahead forever; remove it by hand.\">{n} ahead</span>", if n > 0 { " on" } else { "" }),
@@ -926,7 +926,7 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
         if !p.reachable {
             cls.push_str(" unreachable");
             out.push_str(&format!(
-                "<span class=\"{cls}\" title=\"worktree outside resh's roots — cannot be opened\">{marker} {}{branch}</span>",
+                "<span class=\"{cls}\" title=\"worktree outside roost's roots — cannot be opened\">{marker} {}{branch}</span>",
                 esc(name)
             ));
             continue;
@@ -1003,7 +1003,7 @@ fn ov_row(p: &crate::registry::ProjectStatus, sel: &str, expanded: bool) -> Stri
         "<span class=\"ovcaret\" aria-hidden=\"true\">\u{25b8}</span>".to_string()
     };
     let name = if is_child { p.url.rsplit('/').next().unwrap_or(&p.url) } else { p.url.as_str() };
-    // A worktree resh made is checked out on a branch of the same name, so
+    // A worktree roost made is checked out on a branch of the same name, so
     // its row said `claude-1 ⎇ claude-1` — the same word twice, and wide
     // enough to push the name into an ellipsis in a narrow pane. Say it once.
     let branch = if p.branch.is_empty() || (is_child && p.branch == name) {
@@ -1022,7 +1022,7 @@ fn ov_row(p: &crate::registry::ProjectStatus, sel: &str, expanded: bool) -> Stri
         .unwrap_or_default();
     if !p.reachable {
         return format!(
-            "<li class=\"{cls} unreachable\" data-key=\"{}\"{parent_attr} title=\"worktree outside resh's roots — cannot be opened\">{caret}{marker} {}{branch}{chips}</li>",
+            "<li class=\"{cls} unreachable\" data-key=\"{}\"{parent_attr} title=\"worktree outside roost's roots — cannot be opened\">{caret}{marker} {}{branch}{chips}</li>",
             esc(&p.key),
             esc(name)
         );
@@ -1172,7 +1172,7 @@ const SVG_X: &str = r#"<svg width="12" height="12" viewBox="0 0 16 16" fill="non
 /// `sharing_on` is passed in rather than read here: it is a *global-only*
 /// setting (`config::share_selection`), and this function stays pure so its
 /// tests can drive both states without touching the developer's real
-/// `~/.config/resh/config.toml`.
+/// `~/.config/roost/config.toml`.
 pub fn workspace_page(
     project: &str,
     key: &str,
@@ -1226,7 +1226,7 @@ pub fn workspace_page(
     format!(
         r#"<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{proj_txt} — resh</title>
+<title>{proj_txt} — roost</title>
 <link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/vendor/hljs-github-dark.min.css">
 <link rel="stylesheet" href="/static/vendor/github-markdown.min.css">
@@ -2034,7 +2034,7 @@ mod tests {
     //
     // The flag is a parameter, not read in here, because `share_selection`
     // is global-only: reading it inside would make this test depend on the
-    // developer's real `~/.config/resh/config.toml`.
+    // developer's real `~/.config/roost/config.toml`.
     #[test]
     fn share_selection_is_off_by_default_and_the_indicator_appears_only_when_it_is_on() {
         let off = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
@@ -2620,7 +2620,7 @@ mod tests {
         assert!(!h.contains("target="), "no row may carry target=: {h}");
         // unreachable: a span with the tooltip, no href anywhere near it
         assert!(h.contains("unreachable"), "{h}");
-        assert!(h.contains("worktree outside resh's roots"), "{h}");
+        assert!(h.contains("worktree outside roost's roots"), "{h}");
         assert!(!h.contains(r#"href="/karpie/gone""#), "{h}");
     }
 
@@ -2735,7 +2735,7 @@ mod tests {
         assert!(!out.contains("wtremove"), "{out}");
     }
 
-    /// `claude-1 ⎇ claude-1` is the same word twice: a worktree resh made is
+    /// `claude-1 ⎇ claude-1` is the same word twice: a worktree roost made is
     /// on a branch named after it. Revert-checked: without the `is_child &&
     /// branch == name` guard the first assertion fails, the row carrying
     /// `⎇ claude-1` after the name.
@@ -2784,7 +2784,7 @@ mod tests {
         let rows = vec![
             OvSession { project_url: "ultima".into(), name: "term".into(), is_claude: true, age_secs: Some(14400), attached: 1 },
             OvSession { project_url: "ultima/.claude/worktrees/claude-1".into(), name: "term".into(), is_claude: true, age_secs: Some(1200), attached: 0 },
-            OvSession { project_url: "resh".into(), name: "shell".into(), is_claude: false, age_secs: None, attached: 0 },
+            OvSession { project_url: "roost".into(), name: "shell".into(), is_claude: false, age_secs: None, attached: 0 },
         ];
         let out = overview_sessions("", &rows);
         assert!(out.contains("claude") && out.contains("✻"), "claude row: {out}");

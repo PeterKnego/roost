@@ -1,7 +1,7 @@
-//! What resh can say about Claudes running in a project, from what resh
+//! What roost can say about Claudes running in a project, from what roost
 //! itself observed — never from Claude's own session files.
 //!
-//! Two signals: a terminal resh typed `claude` into (`session::launched_names`)
+//! Two signals: a terminal roost typed `claude` into (`session::launched_names`)
 //! and a connection on the project's IDE socket (`ide::connected_sessions`).
 //! Three answers, not two: with the IDE integration switched off, a `claude`
 //! typed by hand into a plain terminal is invisible, so "found nothing" is
@@ -18,7 +18,7 @@ use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeEvidence {
-    /// Terminal names resh could attribute, sorted, deduplicated. May be
+    /// Terminal names roost could attribute, sorted, deduplicated. May be
     /// empty when the only evidence is a connection it could not place.
     Present(Vec<String>),
     Absent,
@@ -46,12 +46,12 @@ pub fn evidence_from(launched: &[String], connected: &[Sess], ide_on: bool) -> C
 
 /// Terminals of `project` that a running `claude` process sits in, read from
 /// the process table. `session_env` exports `ROOST_PROJECT`/`ROOST_SESSION`
-/// into every resh shell and a `claude` started there inherits them, so a
+/// into every roost shell and a `claude` started there inherits them, so a
 /// `claude` process's environment names its terminal — `idesess.rs` reads
 /// exactly this for one pid; this walks every pid whose `comm` is `claude`.
 ///
 /// This is the restart-proof signal. The launch record and the IDE
-/// connection map are in-process memory: a resh restart (every deploy)
+/// connection map are in-process memory: a roost restart (every deploy)
 /// empties both, and the overview then showed every Claude as a plain
 /// shell until each one was restarted. A process that exists is evidence
 /// regardless of who remembers starting it.
@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn a_connection_resh_cannot_place_is_still_present_but_unnamed() {
+    fn a_connection_roost_cannot_place_is_still_present_but_unnamed() {
         // Revert-checked: not treating Sess::Unknown as evidence fails here — test panicked with `assertion 'left == right' failed: left: Absent, right: Present([])`.
         assert_eq!(evidence_from(&[], &[Sess::Unknown], true), ClaudeEvidence::Present(vec![]));
     }
@@ -334,7 +334,7 @@ mod tests {
         tick(d.path()); // leave the shared cache empty for other tests
     }
 
-    /// A `claude` in this project's terminal is evidence even when resh
+    /// A `claude` in this project's terminal is evidence even when roost
     /// remembers launching nothing (it just restarted). Built on a fake
     /// `/proc`: pid 100 is a claude in term3 of this project, pid 200 a
     /// claude in another project, pid 300 a bash in this project.

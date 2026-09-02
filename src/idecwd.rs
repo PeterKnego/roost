@@ -2,12 +2,12 @@
 //!
 //! The IDE protocol never sends a path. On connect the CLI sends exactly
 //! `ide_connected {pid}`, and MCP's `initialize` adds a client name and
-//! version — nothing that says where the process is. So resh asks the kernel.
+//! version — nothing that says where the process is. So roost asks the kernel.
 //!
 //! This matters for worktrees, which is the case that makes the question
 //! worth asking at all: `worktree.rs` records that the dominant worktree
 //! location is `{repo}/.claude/worktrees/{name}`, a directory Claude Code
-//! creates for itself. resh knows the directory it *spawned* a shell in
+//! creates for itself. roost knows the directory it *spawned* a shell in
 //! (`session.rs`), but that is where the session started, not where Claude is
 //! now. Every absolute path in an `openDiff` is relative to the latter.
 //!
@@ -20,7 +20,7 @@ pub enum Cwd {
     At(PathBuf),
     /// Positive evidence the process no longer exists.
     Gone,
-    /// resh cannot tell. Never a reason to destroy anything.
+    /// roost cannot tell. Never a reason to destroy anything.
     Unknown,
 }
 
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn a_missing_proc_filesystem_is_unknown() {
-        // Not Linux, or a container without /proc. resh cannot tell, so it
+        // Not Linux, or a container without /proc. roost cannot tell, so it
         // must not claim the process is gone.
         let d = tempfile::tempdir().unwrap();
         let absent = d.path().join("no-proc-here");

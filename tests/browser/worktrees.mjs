@@ -52,12 +52,12 @@ await git(proj, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "in
 // The path Claude Code itself uses for worktrees, which projects.rs vouches for.
 await git(proj, "worktree", "add", "-b", "feature-x", ".claude/worktrees/feat");
 
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
 try {
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/proj`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/proj`);
   const { evalIn } = page;
   await until(() => evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "app");
 
@@ -104,7 +104,7 @@ try {
   let navigated = await until(() => evalIn(`location.pathname.endsWith("/worktrees/feat")`), 15, "navigated");
   if (!navigated) {
     page.close();
-    page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/proj`);
+    page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/proj`);
     navigated = await until(() => page.evalIn(`location.pathname.endsWith("/worktrees/feat")`), 15, "navigated (reopened)");
   }
   ok(navigated, "the same tab now shows the worktree's workspace");
@@ -132,7 +132,7 @@ try {
 } finally {
   try { page?.close(); } catch {}
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 console.log(fail ? `\n${fail} FAILED` : "\nall ok");

@@ -104,12 +104,12 @@ await Deno.writeTextFile(
     "## Notes\n\na\n\n## Notes\n\nb\n",
 );
 
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
 try {
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   const { evalIn } = page;
   await until(() => evalIn("ctrl && ctrl.readyState === 1 && !!state"), 30, "app.js");
 
@@ -341,7 +341,7 @@ try {
 } finally {
   try { await page?.close?.(); } catch {}
   try { browser.close(); } catch {}
-  try { await resh.close(); } catch {}
+  try { await roost.close(); } catch {}
   await fx.cleanup();
 }
 

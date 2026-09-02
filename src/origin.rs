@@ -4,7 +4,7 @@
 //! this check that is drive-by RCE. See spec §Security.
 //!
 //! The allowlist comes from ROOST_ORIGINS or the *global* config only.
-//! Never from {project}/.resh/config.toml: a hostile repo must not be
+//! Never from {project}/.roost/config.toml: a hostile repo must not be
 //! able to allowlist its own domain.
 //!
 //! **This module is not the rule for every socket.** `src/ide.rs` deliberately

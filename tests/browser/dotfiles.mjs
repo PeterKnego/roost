@@ -28,9 +28,9 @@ await Deno.writeTextFile(`${fx.roots}/proj/.gitignore`, "target\n");
 await Deno.mkdir(`${fx.roots}/proj/.config`, { recursive: true });
 await Deno.writeTextFile(`${fx.roots}/proj/.config/notes.txt`, "hi\n");
 
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
-const url = `http://127.0.0.1:${resh.port}/proj`;
+const url = `http://127.0.0.1:${roost.port}/proj`;
 let one, two, three;
 
 // A page's tree pane, its rows, and its toggle. Every helper is scoped to one
@@ -138,7 +138,7 @@ try {
 } finally {
   [one, two, three].forEach((p) => p?.close());
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 console.log(fail === 0 ? "\nALL PASS" : `\n${fail} FAILED`);

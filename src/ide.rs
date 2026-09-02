@@ -1,9 +1,9 @@
 //! The socket Claude Code connects to, and the reason its rules differ from
 //! every other socket in this codebase.
 //!
-//! resh is the *server* here. The extension model has the IDE listening and
+//! roost is the *server* here. The extension model has the IDE listening and
 //! `claude` connecting out to it, which is what lets the integration work for
-//! a Claude attached to a dtach session resh did not spawn.
+//! a Claude attached to a dtach session roost did not spawn.
 //!
 //! The client is a Bun process, not a browser, so it sends no `Origin` — it
 //! sends a token from the lock file. `origin.rs` refuses a handshake with no
@@ -140,7 +140,7 @@ pub fn start(project: &str, workspace: PathBuf) -> Result<Arc<Ide>, String> {
 
 /// One listener per project, not one per connection to it — mirrors
 /// `Hub::for_project`'s registry, and is deliberately a *separate* map: a
-/// `claude` reconnecting to a project resh already has open must not be
+/// `claude` reconnecting to a project roost already has open must not be
 /// handed a second listener (a second port, a second lock file, and a stale
 /// one left behind that Claude Code would just as happily match against).
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Ide>>>> = OnceLock::new();
@@ -169,7 +169,7 @@ pub fn for_project_in(
     // is ever created — so `None` propagates to everything downstream at
     // once: no lock file (nothing to discover), no `CLAUDE_CODE_SSE_PORT`
     // (`port_for` finds no entry), and no socket. `claude` then never finds
-    // resh at all and uses its own terminal diffs, which is the only way a
+    // roost at all and uses its own terminal diffs, which is the only way a
     // kill switch can degrade gracefully: refusing an `openDiff` after the
     // CLI has already connected makes it log "Failed to show diff in IDE"
     // and rethrow, failing the edit instead of falling back.
@@ -232,7 +232,7 @@ pub fn for_project_in(
             // Degraded, never fatal: IDE integration is a convenience, and a
             // read-only home directory (or any other reason the lock file
             // could not be written) must not stop a project from opening.
-            eprintln!("resh: IDE integration unavailable for {project}: {e}");
+            eprintln!("roost: IDE integration unavailable for {project}: {e}");
             None
         }
     }
@@ -289,7 +289,7 @@ pub fn stop(project: &str) {
 /// One registered connection, as the fan-out sees it.
 ///
 /// A struct rather than the `(u64, Sender<String>)` tuple this used to be:
-/// routing a mention needs to know which resh terminal each Claude is in,
+/// routing a mention needs to know which roost terminal each Claude is in,
 /// and that fact has to live where the fan-out can read it. Putting it on
 /// `Conn` instead — where `cwd` lives — would hide it from `notify_selected`,
 /// and a second map keyed by conn id is a second lifetime to get right whose
@@ -299,7 +299,7 @@ struct Target {
     reply: std::sync::mpsc::Sender<String>,
     /// Learned from `ide_connected`'s pid. `Unknown` until that notification
     /// arrives — which is correct rather than merely convenient: between the
-    /// handshake and `ide_connected` resh genuinely cannot tell, and
+    /// handshake and `ide_connected` roost genuinely cannot tell, and
     /// `Unknown` is the value that leaves the connection eligible.
     session: crate::idesess::Sess,
 }
@@ -456,7 +456,7 @@ fn notify_selected(
                 .iter()
                 .filter(|t| match &t.session {
                     crate::idesess::Sess::In(s) => s == want,
-                    // resh could not place this Claude, so it cannot rule it
+                    // roost could not place this Claude, so it cannot rule it
                     // out. One notification too many is recoverable; none
                     // looks like a broken keystroke.
                     crate::idesess::Sess::Unknown => true,
@@ -468,10 +468,10 @@ fn notify_selected(
         if !matched.is_empty() {
             matched
         } else if total == 1 {
-            // One Claude is unambiguous whatever resh managed to learn about
+            // One Claude is unambiguous whatever roost managed to learn about
             // where it lives — including nothing at all. This is what keeps
             // the ordinary single-Claude case working when the environ read
-            // failed, or when Claude was started outside resh entirely.
+            // failed, or when Claude was started outside roost entirely.
             all.iter().map(|t| t.reply.clone()).collect()
         } else {
             return Err(match session {
@@ -522,7 +522,7 @@ pub fn mention_to(
 /// connected.
 ///
 /// `project_dir` is the project's own directory — what `config::for_project`
-/// needs to find `.resh/config.toml` — not the ide lock directory `Ide`
+/// needs to find `.roost/config.toml` — not the ide lock directory `Ide`
 /// itself is keyed by; the hub already holds it as `Hub::dir`.
 pub fn selection_changed(
     project: &str,
@@ -554,7 +554,7 @@ pub struct Conn {
     /// here can be reclaimed when this connection dies — see `ConnGuard`.
     pub id: u64,
     /// Claude's working directory, learned from `ide_connected`'s pid. `None`
-    /// until it connects, or when resh could not read it — those are different
+    /// until it connects, or when roost could not read it — those are different
     /// situations with the same representation here only because both mean
     /// "do not trust a path against it yet".
     pub cwd: Option<PathBuf>,
@@ -667,7 +667,7 @@ pub fn answer(project: &str, id: &str, a: Answer) -> Result<(), String> {
     };
     let content = match a {
         // Not `FILE_SAVED`: an unedited acceptance leaves Claude's own tool
-        // input correct, and resh must not write the file (see `open_diff`).
+        // input correct, and roost must not write the file (see `open_diff`).
         // These three strings are the CLI's whole vocabulary here — anything
         // else raises `Not accepted` on its side.
         Answer::Accepted => serde_json::json!([{"type": "text", "text": "TAB_CLOSED"}]),
@@ -771,7 +771,7 @@ fn confined_target(workspace: &Path, path: &str) -> Result<(String, Option<PathB
 
 /// Park a change Claude is asking permission to make, and answer nothing yet.
 ///
-/// **resh must not write the file.** On acceptance the CLI continues its own
+/// **roost must not write the file.** On acceptance the CLI continues its own
 /// tool call with the content this answer returns; a write here would be a
 /// second write, and would leave `hub.self_writes` hashing content that never
 /// reached disk.
@@ -791,7 +791,7 @@ fn open_diff(
     // `Hub::proposals` retains both sides for the life of the tab, and
     // `Event::Proposal` broadcasts a full copy to every connected browser, so
     // an 8 MB `new_file_contents` is 8 MB held plus 8 MB per browser — for a
-    // file resh would have refused to *read* at a quarter of the size.
+    // file roost would have refused to *read* at a quarter of the size.
     // Checked before the path work below so an oversized frame costs no
     // filesystem calls, and before the `to_string` that would copy it again.
     if new_raw.len() as u64 > crate::projects::MAX_FILE_BYTES {
@@ -811,7 +811,7 @@ fn open_diff(
     // directory Claude is *in*, which may be a subdirectory of the project (or
     // a worktree outside it entirely); resolving against it would either
     // produce a rel the hub cannot open — the hub's paths are relative to the
-    // project root — or widen the boundary past the project resh is serving.
+    // project root — or widen the boundary past the project roost is serving.
     // It stays useful for what it was learned for (knowing which project a
     // connection belongs to), not for confinement.
     let (rel, abs) = match confined_target(&conn.workspace, path) {
@@ -822,7 +822,7 @@ fn open_diff(
     // A missing file is not an error: an `openDiff` for a file that does not
     // exist yet is Claude creating one, and the left-hand side is simply
     // empty. A file that exists but cannot be read is a different answer —
-    // `confined_target` has already refused the case where resh could not
+    // `confined_target` has already refused the case where roost could not
     // even tell, and an unreadable or oversized one is refused here rather
     // than drawn as an empty original.
     let old_text = match &abs {
@@ -833,11 +833,11 @@ fn open_diff(
         },
     };
 
-    // resh may be holding unsaved edits to this very file. Accepting would
+    // roost may be holding unsaved edits to this very file. Accepting would
     // discard them silently, which is the one thing the whole conflict-guard
     // exists to prevent.
     if crate::hub::has_dirty_buffer(&conn.project, &rel) {
-        return Some(err(id, -32002, format!("{rel} has unsaved changes in resh")));
+        return Some(err(id, -32002, format!("{rel} has unsaved changes in roost")));
     }
 
     let pid = new_pending_id(&conn.project);
@@ -949,7 +949,7 @@ fn dispatch(msg: &serde_json::Value, conn: &mut Conn) -> Option<serde_json::Valu
             serde_json::json!({
                 "protocolVersion": "2025-03-26",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "resh", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "roost", "version": env!("CARGO_PKG_VERSION")},
             }),
         )),
         "tools/list" => Some(ok(
@@ -966,7 +966,7 @@ fn dispatch(msg: &serde_json::Value, conn: &mut Conn) -> Option<serde_json::Valu
         "tools/call" => {
             let name = msg["params"]["name"].as_str().unwrap_or("");
             match name {
-                // resh has no language server. An empty list is the honest
+                // roost has no language server. An empty list is the honest
                 // answer and is what Claude sees when nothing is wrong — so
                 // if a `cargo check` bridge ever lands, it lands here.
                 "getDiagnostics" => Some(ok(&id, text_result("[]"))),
@@ -974,7 +974,7 @@ fn dispatch(msg: &serde_json::Value, conn: &mut Conn) -> Option<serde_json::Valu
                 // minutes from now. See `open_diff`.
                 "openDiff" => open_diff(&id, &msg["params"]["arguments"], conn),
                 "close_tab" => close_tab(&id, &msg["params"]["arguments"], conn),
-                other => Some(err(&id, -32601, format!("resh does not implement {other}"))),
+                other => Some(err(&id, -32601, format!("roost does not implement {other}"))),
             }
         }
         "ping" => Some(ok(&id, serde_json::json!({}))),
@@ -1021,7 +1021,7 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
         stream,
         move |req: &WsRequest, mut resp: WsResponse| {
             let deny = |why: &str| {
-                eprintln!("resh: rejected ide ws handshake ({why})");
+                eprintln!("roost: rejected ide ws handshake ({why})");
                 tungstenite::http::Response::builder()
                     .status(403)
                     .body(Some("forbidden".to_string()))
@@ -1105,7 +1105,7 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
         // rest of this module's "IDE integration is a convenience" stance:
         // a `mention` for this connection now waits for the CLI's own next
         // frame (a periodic `ping` at minimum) instead of at most `POLL`.
-        eprintln!("resh: could not set a read timeout on an ide connection; mentions to it may be delayed");
+        eprintln!("roost: could not set a read timeout on an ide connection; mentions to it may be delayed");
     }
 
     let mut conn = Conn::new(project, workspace.to_path_buf(), reply_tx.clone(), conn_id);
@@ -1268,7 +1268,7 @@ mod tests {
     #[test]
     fn a_loopback_origin_is_refused_too() {
         // The workspace socket allows loopback origins. This one does not:
-        // resh's own page has no business here either, and allowing it would
+        // roost's own page has no business here either, and allowing it would
         // reopen the hole for anything that can forge an origin.
         let (_l, _w, ide) = started();
         let err = connect(ide.port, Some(&ide.token), Some("http://127.0.0.1:8444"))
@@ -1316,15 +1316,15 @@ mod tests {
     }
 
     #[test]
-    // Revert-checked: changing `"resh"` to `"BROKEN"` in dispatch's
+    // Revert-checked: changing `"roost"` to `"BROKEN"` in dispatch's
     // "initialize" arm failed only this test — `assertion `left == right`
-    // failed / left: String("BROKEN") / right: "resh"` — then restored.
-    fn initialize_answers_with_resh_as_the_server_name() {
+    // failed / left: String("BROKEN") / right: "roost"` — then restored.
+    fn initialize_answers_with_roost_as_the_server_name() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut c = Conn::new("t", PathBuf::from("/tmp"), tx, 1);
         let out = dispatch(&rpc(1, "initialize", serde_json::json!({})), &mut c).unwrap();
         assert_eq!(out["id"], 1);
-        assert_eq!(out["result"]["serverInfo"]["name"], "resh");
+        assert_eq!(out["result"]["serverInfo"]["name"], "roost");
         assert!(out["result"]["capabilities"]["tools"].is_object());
     }
 
@@ -1474,7 +1474,7 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(dir.path()).unwrap().count(),
             0,
-            "and no lock file, so `claude` cannot discover resh"
+            "and no lock file, so `claude` cannot discover roost"
         );
         // The same call enabled must succeed, or the assertions above would
         // hold for any reason at all.
@@ -1812,7 +1812,7 @@ mod tests {
     // std::fs::write(p, &new_text); }` to `open_diff` — the natural place a
     // second write would creep in — failed only this test — `left:
     // "proposed" / right: "original"` — then restored.
-    fn resh_never_writes_the_file_itself() {
+    fn roost_never_writes_the_file_itself() {
         let proj = "diff-4";
         let (_rx, _ide, _d, ws) = connected_fake_client_for(proj);
         let f = ws.path().join("a.rs");
@@ -1891,7 +1891,7 @@ mod tests {
     #[test]
     // The spec's cap, in the spirit of the existing <=16-session and
     // <=50-buffer caps. Queueing would let a Claude in a loop hold unbounded
-    // content in resh's memory; DIFF_REJECTED is a refusal Claude already
+    // content in roost's memory; DIFF_REJECTED is a refusal Claude already
     // knows how to handle.
     //
     // Revert-checked twice, because the cap has two halves. Making the check
@@ -2149,7 +2149,7 @@ mod tests {
 
     #[test]
     // An openDiff for a file that does not exist yet is Claude creating one.
-    // Refusing it would make "write a new file" the one edit resh cannot
+    // Refusing it would make "write a new file" the one edit roost cannot
     // show, and the left-hand side of the diff is simply empty.
     fn a_file_that_does_not_exist_yet_is_confined_but_has_no_disk_side() {
         let ws = tempfile::tempdir().unwrap();
@@ -2207,7 +2207,7 @@ mod tests {
 
     #[test]
     fn a_relative_path_is_refused_rather_than_joined_onto_the_project() {
-        // openDiff sends absolute paths. A relative one is a client resh does
+        // openDiff sends absolute paths. A relative one is a client roost does
         // not understand, and guessing at a base for it is how a confinement
         // check gets skipped.
         let ws = tempfile::tempdir().unwrap();
@@ -2342,11 +2342,11 @@ mod tests {
         );
     }
 
-    /// resh could not read one connection's environment. Excluding it would
+    /// roost could not read one connection's environment. Excluding it would
     /// silently drop the mention; including it costs one extra notification.
     /// The conservative direction is the one this asserts.
     #[test]
-    fn a_connection_resh_cannot_place_stays_eligible() {
+    fn a_connection_roost_cannot_place_stays_eligible() {
         let (rx1, _a, _d1, _w1) = connected_fake_client_for("mention-unknown");
         let (rx2, _b, _d2, _w2) = connected_fake_client_for("mention-unknown");
         {
@@ -2480,7 +2480,7 @@ mod tests {
         assert_eq!(
             t.session,
             crate::idesess::Sess::Unknown,
-            "a pid resh cannot read must land as Unknown, not left at its previous value"
+            "a pid roost cannot read must land as Unknown, not left at its previous value"
         );
     }
 
@@ -2492,7 +2492,7 @@ mod tests {
     /// global file that says so.
     ///
     /// It is a *global-only* setting as of 2026-08-23 — a project's own
-    /// `.resh/config.toml` can no longer reach it — so opting in by writing
+    /// `.roost/config.toml` can no longer reach it — so opting in by writing
     /// into the workspace, the way this helper used to, is exactly what must
     /// not work. The returned guard holds `STATE_ENV_LOCK` (the env var is
     /// process-global) and the `TempDir` (the file must outlive the call),
@@ -2546,7 +2546,7 @@ mod tests {
         let (_envg, _cfg) = opt_in(false);
         let proj = "selection-optout";
         let (rx, _ide, _d, _ws) = connected_fake_client_for(proj);
-        // No .resh/config.toml written: share_selection defaults to false.
+        // No .roost/config.toml written: share_selection defaults to false.
         let err = selection_changed(proj, Path::new("/w/a.rs"), "secret", (1, 0), (1, 6))
             .unwrap_err();
         assert!(err.contains("off"), "the refusal must say sharing is off: {err}");

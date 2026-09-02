@@ -8,7 +8,7 @@
 //! and `do_close` arms, flushed at the top of the next `read`). That is the
 //! reader's object — so a reply can land on the wire while the writer thread
 //! is part-way through a frame, splicing the two together. A `Pong` queues
-//! nothing, which is why resh, as the pinger, does not trip this constantly.
+//! nothing, which is why roost, as the pinger, does not trip this constantly.
 //!
 //! The fix is to leave the reader unable to write at all and let the writer
 //! send the reply the reader owed. It cannot simply be built write-blind:

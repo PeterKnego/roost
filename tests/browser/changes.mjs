@@ -13,7 +13,7 @@
 //! the client, and app.js is where that lands.
 //!
 //! Every edit here is made *outside* the browser — the file is written on
-//! disk, as a Claude in a terminal pane writes it, which is resh's core use
+//! disk, as a Claude in a terminal pane writes it, which is roost's core use
 //! case and the case with no user gesture to hang a refresh on.
 //!
 //! Run: deno run -A tests/browser/changes.mjs
@@ -40,12 +40,12 @@ await Deno.writeTextFile(`${fx.roots}/proj/opened.md`, "one\n");
 await git("add", "-A");
 await git("commit", "-qm", "baseline");
 
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
 try {
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   const { cmd, evalIn } = page;
   await cmd("Emulation.setDeviceMetricsOverride", { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
   await until(() => evalIn(`typeof state !== "undefined" && !!(state && state.panes)`), 15, "workspace state");
@@ -133,7 +133,7 @@ try {
 } finally {
   try { await page?.close(); } catch { /* already gone */ }
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 

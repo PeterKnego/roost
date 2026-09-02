@@ -52,7 +52,7 @@
 //!      providers, "a plain click stayed with the application" is true
 //!      because nothing could ever have been offered, and "the modifier
 //!      click is reported to the application" is true because that report is
-//!      xterm's own and owes resh nothing. Its two modifier-click
+//!      xterm's own and owes roost nothing. Its two modifier-click
 //!      assertions are what fail, and the mouse-report CONTROL beside them
 //!      goes on passing legitimately — the click really did land on the row.
 //!      Section I's second terminal has no providers either, so its click
@@ -256,13 +256,13 @@
 //!        window.open
 //!        FAIL  window.open was asked for the URL the application declared
 //!        (got [])
-//!        FAIL  resh's own handler took the activation, not xterm's
+//!        FAIL  roost's own handler took the activation, not xterm's
 //!        confirm() fallback
 //!   2. Deleted `if (!SAFE_URL.test(u)) return;` from openUrl. The obvious
 //!      assertion — "a javascript: OSC 8 destination opened nothing" — also
 //!      went on passing, and would have shipped as this project's third
 //!      vacuous javascript: check (mdlinks.mjs note 6 was the first). The
-//!      reason is two layers away from resh: the vendored OscLinkProvider
+//!      reason is two layers away from roost: the vendored OscLinkProvider
 //!      itself runs `new URL(uri)` and refuses to *offer* any link whose
 //!      protocol is not http(s), so no OSC 8 payload can carry a hostile
 //!      scheme as far as openUrl at all. That assertion is kept, and paired
@@ -309,7 +309,7 @@
 //!          FAIL  a click with no modifier on a still-marked link opens nothing
 //!   L1b. Deleted both halves — the provideLinks gate and the activate
 //!        re-check — which is the modifier gate gone entirely, and the state
-//!        in which resh would steal a plain click from a running
+//!        in which roost would steal a plain click from a running
 //!        application. Five failed:
 //!          FAIL  no link is offered with the modifier up (got 1: ["docs/backlog.md"])
 //!          FAIL  resting on the path marks nothing while disarmed
@@ -457,7 +457,7 @@ async function typeInTerm(page, cmd) {
   await page.evalIn(`__t().term.input(${JSON.stringify(cmd + "\r")})`);
 }
 
-// How many links xterm's own OscLinkProvider (plus resh's two) offer over
+// How many links xterm's own OscLinkProvider (plus roost's two) offer over
 // the row holding `needle` — see the __oscLinksAt comment above for why this
 // has to reach past entry.linkProviders to ask. -1 means it could not look
 // at all; callers must not read that as zero.
@@ -488,12 +488,12 @@ await Deno.writeTextFile(`${fx.base}/roots/proj/${PATH2}`, "# notes\n");
 await Deno.writeTextFile(`${fx.base}/roots/proj/${PATH3}`, "# todo\n");
 await Deno.writeTextFile(`${fx.base}/roots/proj/${PATH4}`, "# dotend\n");
 
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
 try {
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   const { evalIn, cmd } = page;
   // Section F measures real pointer geometry, and the default 800x600 headless
   // window collapses the middle column (README, trap 5).
@@ -517,7 +517,7 @@ try {
     // handler wedges the renderer, so CDP's own dispatchMouseEvent never
     // returns: with linkHandler removed, section K hung forever instead of
     // failing. Recording the call and returning false turns that hang into
-    // an assertion — "resh's handler ran, not xterm's fallback" — which is
+    // an assertion — "roost's handler ran, not xterm's fallback" — which is
     // the one thing in this section that actually discriminates linkHandler.
     //
     // Note for anyone extending this file: the stub is file-wide and always
@@ -587,11 +587,11 @@ try {
         if (++n === ps.length) res(hits);
       }));
     });
-    // __resolve above only asks entry.linkProviders — resh's own URL and
+    // __resolve above only asks entry.linkProviders — roost's own URL and
     // path matchers — because that is the pair section B-E's modifier gate
     // is about. Section K is about the *other* provider: xterm registers its
     // own OscLinkProvider on the terminal's private link-provider list ahead
-    // of either of resh's, so an OSC 8 answer has to be read from there, not
+    // of either of roost's, so an OSC 8 answer has to be read from there, not
     // from entry.linkProviders (which stays length 2 whether or not
     // linkHandler exists at all — that list is undiscriminating for this
     // section, which is exactly why this asks the terminal's full list
@@ -1012,10 +1012,10 @@ try {
      `window.open was asked for the URL the application declared (got ${JSON.stringify(legit)})`);
   // xterm's no-linkHandler fallback asks the user "do you want to navigate
   // to …?" through a native confirm(). Its silence is the positive evidence
-  // that resh's own handler took the activation, rather than resh merely
+  // that roost's own handler took the activation, rather than roost merely
   // benefiting from a default that happens to open the same URL.
   ok((await evalIn("window.__confirms")).length === 0,
-     "resh's own handler took the activation, not xterm's confirm() fallback");
+     "roost's own handler took the activation, not xterm's confirm() fallback");
 
   await clearOpens(page);
   await typeInTerm(page, String.raw`printf '\e]8;;javascript:alert(1)\e\\bad\e]8;;\e\\\n'`);
@@ -1030,7 +1030,7 @@ try {
     "a javascript: OSC 8 destination opened nothing",
     async () => (await windowOpenCalls(page)).length === 0,
   );
-  // …but not because of anything resh does. Read the vendored provider: it
+  // …but not because of anything roost does. Read the vendored provider: it
   // runs `new URL(uri)` and drops any link whose protocol is not http(s)
   // before it is ever offered, so there is nothing under the pointer to
   // activate and openUrl is never reached. Asserted rather than left
@@ -1074,7 +1074,7 @@ try {
   // the core's handler on `.xterm` calls cancel(e) as soon as
   // coreMouseService.areMouseEventsActive. Which of those two an activation
   // survives is a property of two listeners' targets and order, not something
-  // resh can assert about itself — so it is measured here, against a terminal
+  // roost can assert about itself — so it is measured here, against a terminal
   // that really has mouse reporting on and a path that really exists.
   ok(!(await openTabRels(page, 2)).includes(PATH2),
      `${PATH2} is not open yet, so assertion 11 below has something left to prove`);
@@ -1267,7 +1267,7 @@ try {
 } finally {
   page?.close();
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 

@@ -30,14 +30,14 @@ for (let i = 1; i <= 28; i++) {
   NAMES.push(n);
   await Deno.writeTextFile(`${fx.roots}/proj/${n}`, `# ${n}\n`);
 }
-const resh = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
 const PANE = 3; // the right pane: 520px wide, and it holds the default terminal
 
 try {
-  page = await openPage(browser.port, `http://127.0.0.1:${resh.port}/${fx.project}`);
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   const { cmd, evalIn } = page;
   // Headless Chromium opens 800x600, which is *narrower* than the default
   // left (260px) and right (520px) panes put together: the middle column
@@ -199,7 +199,7 @@ try {
 } finally {
   page?.close();
   browser.close();
-  await resh.close();
+  await roost.close();
   await fx.cleanup();
 }
 console.log(fail ? `\n${fail} FAILED` : "\nall ok");

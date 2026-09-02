@@ -1,6 +1,6 @@
 //! Scratch storage for images pasted onto a terminal.
 //!
-//! These files live deliberately *outside* the project. resh already keeps its
+//! These files live deliberately *outside* the project. roost already keeps its
 //! own state out of the working tree so that using it never shows up in `git
 //! status`; a paste directory inside the repo would undo that on the first
 //! screenshot.

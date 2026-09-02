@@ -1,5 +1,5 @@
-//! Settings cascade: global ~/.config/resh/config.toml, then
-//! {project}/.resh/config.toml. Re-read on every request — never cached.
+//! Settings cascade: global ~/.config/roost/config.toml, then
+//! {project}/.roost/config.toml. Re-read on every request — never cached.
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -32,7 +32,7 @@ pub struct Settings {
     /// whether the person editing that project's own files has to press ⌘S.
     pub autosave: bool,
     /// Off unless a project asks for it. This ships file contents to Claude
-    /// with no explicit user action, and resh has no permission system to
+    /// with no explicit user action, and roost has no permission system to
     /// scope it the way Claude Code's own `Read` deny rules do. Unlike
     /// `allowed_origins` and `max_upload_bytes`, this *is* allowed per
     /// project: sharing your own selection with your own Claude cannot raise
@@ -76,7 +76,7 @@ impl Default for Settings {
 
 /// `ROOST_CONFIG` overrides the location, which is what lets a test drive a
 /// *global-only* setting without touching the developer's real
-/// `~/.config/resh/config.toml` — the same reason `ROOST_STATE_DIR` exists.
+/// `~/.config/roost/config.toml` — the same reason `ROOST_STATE_DIR` exists.
 /// Operators get the same knob for free: a second instance can carry its own
 /// origins and caps without a second home directory.
 pub fn global_config_path() -> PathBuf {
@@ -86,7 +86,7 @@ pub fn global_config_path() -> PathBuf {
         }
     }
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".config/resh/config.toml")
+        .join(".config/roost/config.toml")
 }
 
 pub fn load(paths: &[&Path]) -> Settings {
@@ -126,7 +126,7 @@ pub fn load(paths: &[&Path]) -> Settings {
 /// Origins allowed to open a websocket or issue requests, from
 /// `ROOST_ORIGINS` (comma-separated) or the global config's
 /// `allowed_origins`. Deliberately **not** part of [`Settings`]: a per-project
-/// `.resh/config.toml` must never be able to allowlist an origin, or a
+/// `.roost/config.toml` must never be able to allowlist an origin, or a
 /// hostile repo could allowlist itself. Loopback is always allowed without
 /// configuration — see [`crate::origin`].
 pub fn allowed_origins() -> Vec<String> {
@@ -175,7 +175,7 @@ pub fn ping_interval() -> std::time::Duration {
 /// once.
 pub const DEFAULT_MAX_UPLOAD: u64 = 100_000_000;
 
-/// Not configurable, deliberately. This expresses a product decision — resh is
+/// Not configurable, deliberately. This expresses a product decision — roost is
 /// not a project transfer tool, `git` and `scp` are — rather than fitting a
 /// machine, and a tunable would only invite the decision to be configured away.
 pub const MAX_UPLOAD_PARTS: usize = 16;
@@ -183,7 +183,7 @@ pub const MAX_UPLOAD_PARTS: usize = 16;
 /// Aggregate bytes one upload request may carry.
 ///
 /// Global-only, exactly like [`allowed_origins`] and for the same reason: a
-/// per-project `.resh/config.toml` ships inside the repository, so a cloned
+/// per-project `.roost/config.toml` ships inside the repository, so a cloned
 /// hostile repo could otherwise raise its own disk ceiling. Deliberately **not**
 /// part of [`Settings`], which is the only thing a project file can reach.
 pub fn max_upload_bytes() -> u64 {
@@ -195,9 +195,9 @@ pub fn max_upload_bytes() -> u64 {
 /// which other tests are running against concurrently.
 /// Is the Claude Code IDE integration enabled? **Global config only.**
 ///
-/// Off means resh starts no ide listener, writes no lock file, and puts no
+/// Off means roost starts no ide listener, writes no lock file, and puts no
 /// `CLAUDE_CODE_SSE_PORT` in a spawned shell — so `claude` simply never
-/// discovers resh and falls back to its own terminal diffs. That is the only
+/// discovers roost and falls back to its own terminal diffs. That is the only
 /// shape a kill switch can take from this side: refusing an `openDiff` once
 /// the CLI has already found us makes it log "Failed to show diff in IDE" and
 /// rethrow, which fails the edit rather than degrading it. The graceful
@@ -325,7 +325,7 @@ fn max_upload_from(global: &Path) -> u64 {
 pub fn for_project(project_dir: &Path) -> Settings {
     load(&[
         &global_config_path(),
-        &project_dir.join(".resh/config.toml"),
+        &project_dir.join(".roost/config.toml"),
     ])
 }
 
@@ -547,7 +547,7 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The test that fails the moment someone "helpfully" moves this key into
-    /// `Settings`. A project's `.resh/config.toml` ships inside the repository,
+    /// `Settings`. A project's `.roost/config.toml` ships inside the repository,
     /// so a cloned hostile repo could otherwise raise its own disk ceiling and
     /// turn a mis-drag into a disk-fill — the same argument `allowed_origins`
     /// already makes for itself.
@@ -632,8 +632,8 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let global = d.path().join("global.toml");
         std::fs::write(&global, "theme = \"dawn\"\n").unwrap();
-        std::fs::create_dir_all(d.path().join(".resh")).unwrap();
-        let project = d.path().join(".resh/config.toml");
+        std::fs::create_dir_all(d.path().join(".roost")).unwrap();
+        let project = d.path().join(".roost/config.toml");
         std::fs::write(&project, "theme = \"midnight\"\nroots = [\"/etc\"]\n").unwrap();
 
         // The project file is genuinely read and genuinely wins on a key the
