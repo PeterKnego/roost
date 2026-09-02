@@ -1842,18 +1842,32 @@ mod tests {
         // `env` prints the child's environment to its stdout, which is the PTY —
         // so it arrives back through this attachment's own subscriber channel.
         std::env::set_var("ROOST_CMD", "env");
-        // The child inherits this process's environment, and on the author's
-        // host this suite runs *inside* a roost terminal — so the old and new
-        // prefixes may both already be present, exported by the terminal we
-        // are in rather than by the code under test. Clear them so the
-        // assertions below see only what `session_env` exports.
-        // concat! keeps the old prefix out of the whole-repo sweeps that
-        // verify it is gone; this loop needs the literal old prefix, not
-        // the renamed one, to actually clear a legacy terminal's exports.
-        for prefix in [concat!("RESH", "_"), "ROOST_"] {
-            for name in ["NOTIFY", "PROJECT", "SESSION"] {
-                std::env::remove_var(format!("{prefix}{name}"));
-            }
+        // The child inherits this process's environment, and a legacy
+        // terminal — one still running a not-yet-renamed `resh`, which on
+        // this host will exist for weeks after cutover — exports more than
+        // the three names this crate itself sets: this host's old service
+        // unit also sets a `ROOTS` variable under the old prefix, and any
+        // comparable install-specific variable could join it. Nothing in
+        // the crate reads the old prefix any more, so clearing every
+        // inherited variable that starts with it, whatever its suffix, is
+        // safe — collect the matching names first and remove them after,
+        // since removing while iterating `vars_os()` is unspecified.
+        // concat! keeps the literal old prefix out of the whole-repo sweeps
+        // that verify it is gone.
+        let old_prefix = concat!("RESH", "_");
+        let stale: Vec<std::ffi::OsString> = std::env::vars_os()
+            .map(|(k, _)| k)
+            .filter(|k| k.to_string_lossy().starts_with(old_prefix))
+            .collect();
+        for k in stale {
+            std::env::remove_var(k);
+        }
+        // The new prefix has no such legacy sprawl: `session_env` only ever
+        // exports these three, and a wildcard clear here would also take
+        // `ROOST_CMD` (set just above) and `ROOST_STATE_DIR` (set by the
+        // test harness), both of which this test and `attach` still need.
+        for name in ["NOTIFY", "PROJECT", "SESSION"] {
+            std::env::remove_var(format!("ROOST_{name}"));
         }
         let d = tempfile::tempdir().unwrap();
         let att = reserve_and_attach("envproj", "shell", d.path()).expect("attach");
