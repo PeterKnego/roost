@@ -174,8 +174,12 @@ configurable.
 - The allowlist is readable from the environment or global config only — never
   from a project's own `.roost/config.toml`, so a repo you clone cannot
   allowlist its own domain.
-- HTTP is **GET-only**. Every state change travels over the websocket, so there
-  is no state-changing verb for a hostile page to forge.
+- HTTP is **GET-only apart from two uploads** (`POST /upload` and
+  `POST /paste`). Every other state change travels over the websocket, so
+  there is no state-changing verb for a hostile page to forge. The two POSTs
+  check `Origin` exactly as the websocket handshakes do, and refuse a request
+  that carries none, because a `multipart/form-data` POST is a CORS simple
+  request that any page can submit cross-origin without a preflight.
 - Every filesystem path is confined to the project directory by canonicalising
   and prefix-checking; creation paths canonicalise the parent and validate the
   final component separately.
@@ -185,9 +189,21 @@ configurable.
 - [`docs/deploy.md`](docs/deploy.md) — running, environment, deployment traps
 - [`docs/notifications.md`](docs/notifications.md) — triggering, hooking up
   Claude Code, limits
-- `docs/superpowers/specs/` — design documents
-- `docs/superpowers/plans/` — implementation plans
 - [`CLAUDE.md`](CLAUDE.md) — conventions and constraints for working in this repo
+- [`SECURITY.md`](SECURITY.md) — what counts as a vulnerability here and how to
+  report one
+
+The rest of `docs/` is the working record, kept in the open because it
+explains why the code is the way it is:
+
+- `docs/superpowers/specs/` and `docs/superpowers/plans/` — every feature's
+  design document and the implementation plan that carried it out, dated,
+  including the ones later reversed. They were written for the AI-assisted
+  workflow the project is built for, so they read as briefs to an agent, not as
+  user documentation, and they describe the code as it was on their date.
+- [`docs/backlog.md`](docs/backlog.md) — everywhere a spec said "later",
+  gathered in one place. Not a roadmap; entries marked **Evidence** were
+  measured against a real deployment, the rest were only ever imagined.
 
 ## License
 

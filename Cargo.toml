@@ -25,6 +25,7 @@ include = [
     "LICENSE-MIT",
     "LICENSE-APACHE",
     "CLAUDE.md",
+    "SECURITY.md",
     "docs/deploy.md",
     "docs/notifications.md",
 ]
