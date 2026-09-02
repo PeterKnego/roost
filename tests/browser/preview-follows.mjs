@@ -6,7 +6,7 @@
 //! moment it was opened, even after the file changed underneath it.
 //!
 //! Run: deno run -A tests/browser/preview-follows.mjs
-import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -15,7 +15,7 @@ const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) 
 
 const fx = await fixture();
 
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 

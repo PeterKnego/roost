@@ -17,7 +17,7 @@
 //! this file asserts on: zero from autosave, one from an explicit ⌘S.
 //!
 //! Run: deno run -A tests/browser/autosave.mjs
-import { disableAutosave, fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
+import { disableAutosave, fixture, freePort, openPage, profileDir, sleep, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -39,7 +39,7 @@ await Deno.writeTextFile(manualFile, "start\n");
 const slowFile = `${fx.roots}/proj/slowstate.md`;
 await Deno.writeTextFile(slowFile, "start\n");
 
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page, manualPage;
 

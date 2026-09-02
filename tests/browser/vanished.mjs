@@ -17,7 +17,7 @@
 //! how it happens: a Claude in a terminal pane, or a `git mv`.
 //!
 //! Run: deno run -A tests/browser/vanished.mjs
-import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -30,7 +30,7 @@ const fx = await fixture({ autosave: false });
 await Deno.writeTextFile(`${fx.roots}/proj/notes.rs`, "fn one() {}\nfn two() {}\n");
 await Deno.writeTextFile(`${fx.roots}/proj/draft.rs`, "fn draft() {}\n");
 
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 

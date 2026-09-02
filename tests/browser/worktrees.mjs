@@ -30,7 +30,7 @@
 //!   this tab, which is exactly the bug the missing `target=` prevents.
 //!
 //! Run: deno run -A tests/browser/worktrees.mjs
-import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -52,7 +52,7 @@ await git(proj, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "in
 // The path Claude Code itself uses for worktrees, which projects.rs vouches for.
 await git(proj, "worktree", "add", "-b", "feature-x", ".claude/worktrees/feat");
 
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 

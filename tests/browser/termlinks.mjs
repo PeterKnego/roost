@@ -338,7 +338,7 @@
 //!   cannot be a wedged terminal misreading as a matcher bug.
 //!
 //! Run: deno run -A tests/browser/termlinks.mjs
-import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -488,7 +488,7 @@ await Deno.writeTextFile(`${fx.base}/roots/proj/${PATH2}`, "# notes\n");
 await Deno.writeTextFile(`${fx.base}/roots/proj/${PATH3}`, "# todo\n");
 await Deno.writeTextFile(`${fx.base}/roots/proj/${PATH4}`, "# dotend\n");
 
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 

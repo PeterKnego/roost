@@ -14,7 +14,7 @@
 //! freshly mounted editor happens to be focused.
 //!
 //! Run: deno run -A tests/browser/save.mjs
-import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -30,7 +30,7 @@ const NESTED = "docs/deep/nested.md";
 await Deno.mkdir(`${fx.roots}/proj/docs/deep`, { recursive: true });
 await Deno.writeTextFile(`${fx.roots}/proj/${NESTED}`, "nested\n");
 
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 

@@ -12,7 +12,7 @@
 //! cannot reach.
 //!
 //! Run: deno run -A tests/browser/tabwrap.mjs
-import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -30,7 +30,7 @@ for (let i = 1; i <= 28; i++) {
   NAMES.push(n);
   await Deno.writeTextFile(`${fx.roots}/proj/${n}`, `# ${n}\n`);
 }
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 

@@ -37,7 +37,7 @@
 //! attachments (reload, wake, second tab, ring turnover) rather than restarts.
 //!
 //! Run: deno run -A tests/browser/modes.mjs
-import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startProxy, startResh, until }
+import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startProxy, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -45,7 +45,7 @@ let fail = 0;
 const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) fail++; };
 
 const fx = await fixture();
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const proxyPort = await freePort();
 const proxy = startProxy({ listenPort: proxyPort, upstreamPort: roost.port });
 const browser = await startBrowser(profileDir(repoRoot));

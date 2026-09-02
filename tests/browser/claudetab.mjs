@@ -30,7 +30,7 @@
 //! becomes `sleep` again.
 //!
 //! Run: deno run -A tests/browser/claudetab.mjs
-import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -55,7 +55,7 @@ const browser = await startBrowser(profileDir(repoRoot));
 let page, roost;
 
 try {
-  roost = await startResh({
+  roost = await startRoost({
     repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(),
     extraEnv: { SHELL: shell },
   });

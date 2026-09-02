@@ -12,7 +12,7 @@
 //! colours land under the caret".
 //!
 //! Run: deno run -A tests/browser/hledit.mjs
-import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -31,7 +31,7 @@ await Deno.writeTextFile(`${fx.roots}/proj/big.rs`, "// filler line\n".repeat(90
 await Deno.writeTextFile(`${fx.roots}/proj/wide.rs`,
   `fn main() {}\n// ${"a very long comment ".repeat(30)}\nconst B: &str = "${"QUJDRA".repeat(70)}";\n`);
 
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 

@@ -24,7 +24,7 @@
 //! so both halves poll the HTML for the state they expect before opening it.
 //!
 //! Run: deno run -A tests/browser/claudeterm.mjs
-import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -60,7 +60,7 @@ let page, roost;
 try {
   // ---------------------------------------------------------- claude present
   console.log("A. claude is on the login shell's PATH");
-  roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shellPresent } });
+  roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shellPresent } });
   ok(await until(async () => (await pageHtml(roost.port)).includes('data-launches="claude"'), 15, "page to offer claude"),
      "the page offers the claude launch");
   page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
@@ -105,7 +105,7 @@ try {
 
   // ----------------------------------------------------------- claude absent
   console.log("\nC. claude is not on the login shell's PATH");
-  roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shellAbsent } });
+  roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shellAbsent } });
   ok(await until(async () => (await pageHtml(roost.port)).includes('data-launches=""'), 15, "the check to finish"),
      "the startup check reaches the page: no launches offered");
   page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);

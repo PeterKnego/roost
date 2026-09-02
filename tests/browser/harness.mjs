@@ -195,7 +195,7 @@ export async function attachTarget(webSocketDebuggerUrl) {
 /// directory reach production green (see CLAUDE.md, "The dev/prod
 /// substitution trap"). A browser test that skipped real dtach would be
 /// testing the same fiction from a different angle.
-export async function startResh({ repoRoot, stateDir, roots, port, extraEnv = {} }) {
+export async function startRoost({ repoRoot, stateDir, roots, port, extraEnv = {} }) {
   const meta = JSON.parse(new TextDecoder().decode(
     (await new Deno.Command("cargo", { args: ["metadata", "--format-version", "1", "--no-deps"], cwd: repoRoot, stdout: "piped" }).output()).stdout,
   ));

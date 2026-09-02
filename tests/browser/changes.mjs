@@ -17,7 +17,7 @@
 //! case and the case with no user gesture to hang a refresh on.
 //!
 //! Run: deno run -A tests/browser/changes.mjs
-import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -40,7 +40,7 @@ await Deno.writeTextFile(`${fx.roots}/proj/opened.md`, "one\n");
 await git("add", "-A");
 await git("commit", "-qm", "baseline");
 
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 

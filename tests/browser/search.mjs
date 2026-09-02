@@ -13,7 +13,7 @@
 //! code could be wrong — not because it looked thorough to include.
 //!
 //! Run: deno run -A tests/browser/search.mjs
-import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -100,7 +100,7 @@ await Deno.writeTextFile(`${fx.roots}/proj/src/search.rs`, "nothing to match her
 // truncated before it: the row comes back with nothing to chip.
 await Deno.writeTextFile(`${fx.roots}/proj/src/capped.txt`, "x".repeat(320) + "farpastthecap\n");
 
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 const url = `http://127.0.0.1:${roost.port}/proj`;
 let page1, page2;

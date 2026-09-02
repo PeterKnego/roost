@@ -58,7 +58,7 @@
 //! assertion, and is the one that stands for "even after reload".
 //!
 //! Run: deno run -A tests/browser/closeproject.mjs
-import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until, sleep }
+import { fixture, freePort, openPage, profileDir, startBrowser, startRoost, until, sleep }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -89,7 +89,7 @@ const tabKinds = (p) =>
   p.evalIn(`JSON.stringify(state.panes.flatMap((q) => q.tabs).map((t) => t.k))`).then(JSON.parse);
 
 try {
-  roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+  roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 
   console.log("A. a project with live terminals");
   ws = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);

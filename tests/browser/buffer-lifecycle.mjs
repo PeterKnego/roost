@@ -15,7 +15,7 @@
 //! than `Content::Edited(original_text)`.
 //!
 //! Run: deno run -A tests/browser/buffer-lifecycle.mjs
-import { disableAutosave, fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
+import { disableAutosave, fixture, freePort, openPage, profileDir, sleep, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -40,7 +40,7 @@ await disableAutosave(`${fx.roots}/noauto`);
 const file2 = `${fx.roots}/noauto/watched.rs`;
 await Deno.writeTextFile(file2, "fn main() {}\n");
 
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page, page2;
 

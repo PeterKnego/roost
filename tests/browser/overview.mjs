@@ -56,7 +56,7 @@
 //!       fail the way it originally did.
 //!
 //! Run: deno run -A tests/browser/overview.mjs
-import { fixture, freePort, openPage, attachTarget, profileDir, startBrowser, startResh, until, sleep }
+import { fixture, freePort, openPage, attachTarget, profileDir, startBrowser, startRoost, until, sleep }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -71,8 +71,8 @@ let page, page2, page3, ws, ws2, roost;
 /// waits for it to attach. Returns the CDP client and the new session's
 /// name. Same boilerplate the brief's Section A/B setup uses, factored out
 /// so Section D can run it a second time against a second project.
-async function startTerminal(browserPort, reshPort, project) {
-  const w = await openPage(browserPort, `http://127.0.0.1:${reshPort}/${project}`);
+async function startTerminal(browserPort, roostPort, project) {
+  const w = await openPage(browserPort, `http://127.0.0.1:${roostPort}/${project}`);
   await until(() => w.evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, `${project} workspace app.js`);
   await w.evalIn(`window.__sessions = (pi) => state.panes[pi].tabs.filter((t)=>t.k==="Terminal").map((t)=>t.session);`);
   await w.evalIn(`document.querySelector('.pane[data-pane="3"] .paneicons .newterm').click()`);
@@ -83,7 +83,7 @@ async function startTerminal(browserPort, reshPort, project) {
 }
 
 try {
-  roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+  roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
   // Start a real terminal in `proj` via the workspace, so the overview has a session to show.
   const t1 = await startTerminal(browser.port, roost.port, fx.project);
   ws = t1.w;

@@ -7,7 +7,7 @@
 //! MoveTab at all.
 //!
 //! Run: deno run -A tests/browser/paneicons.mjs
-import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -17,7 +17,7 @@ const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) 
 const fx = await fixture();
 await Deno.mkdir(`${fx.roots}/proj/src/inner`, { recursive: true });
 await Deno.writeTextFile(`${fx.roots}/proj/src/main.rs`, "fn main() {}\n");
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 

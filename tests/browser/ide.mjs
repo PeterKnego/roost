@@ -28,7 +28,7 @@
 //! real CLI is what would apply the edit, and this test never runs one.
 //!
 //! Run: deno run -A tests/browser/ide.mjs
-import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -216,7 +216,7 @@ await Deno.mkdir(`${projectDir}/.roost`, { recursive: true });
 const globalConfig = `${fx.base}/roost-global.toml`;
 await Deno.writeTextFile(globalConfig, "share_selection = true\n");
 
-const roost = await startResh({
+const roost = await startRoost({
   repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(),
   extraEnv: { CLAUDE_CONFIG_DIR: claudeConfigDir, ROOST_CONFIG: globalConfig },
 });

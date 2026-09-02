@@ -10,7 +10,7 @@
 //! static/app.js, and the Edit/Preview switch in the filename stripe too.
 //!
 //! Run: deno run -A tests/browser/edit-by-default.mjs
-import { disableAutosave, fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
+import { disableAutosave, fixture, freePort, openPage, profileDir, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -29,7 +29,7 @@ await Deno.writeTextFile(`${fx.roots}/proj/notes.md`, "# heading\n");
 await Deno.writeFile(`${fx.roots}/proj/blob.bin`, new Uint8Array([0x61, 0x00, 0x62]));
 await Deno.writeTextFile(`${fx.roots}/proj/logo.svg`, '<svg xmlns="http://www.w3.org/2000/svg"/>\n');
 
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 

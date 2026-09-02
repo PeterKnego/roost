@@ -12,7 +12,7 @@
 //! resolves the same value from a State snapshot instead of from an event.
 //!
 //! Run: deno run -A tests/browser/dotfiles.mjs
-import { fixture, freePort, openPage, profileDir, startBrowser, startResh, until }
+import { fixture, freePort, openPage, profileDir, startBrowser, startRoost, until }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -28,7 +28,7 @@ await Deno.writeTextFile(`${fx.roots}/proj/.gitignore`, "target\n");
 await Deno.mkdir(`${fx.roots}/proj/.config`, { recursive: true });
 await Deno.writeTextFile(`${fx.roots}/proj/.config/notes.txt`, "hi\n");
 
-const roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 const url = `http://127.0.0.1:${roost.port}/proj`;
 let one, two, three;

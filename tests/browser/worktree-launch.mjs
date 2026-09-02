@@ -100,7 +100,7 @@
 //!       passes again.
 //!
 //! Run: deno run -A tests/browser/worktree-launch.mjs
-import { fixture, freePort, openPage, attachTarget, profileDir, startBrowser, startResh, until, sleep }
+import { fixture, freePort, openPage, attachTarget, profileDir, startBrowser, startRoost, until, sleep }
   from "./harness.mjs";
 
 const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
@@ -154,7 +154,7 @@ const clickReal = async (pg, selector) => {
 };
 
 try {
-  roost = await startResh({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shell } });
+  roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shell } });
   await until(async () => (await (await fetch(`http://127.0.0.1:${roost.port}/${project}`)).text()).includes('data-launches="claude"'), 15, "claude offered");
   page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${project}`);
   const { evalIn } = page;
