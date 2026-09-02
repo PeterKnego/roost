@@ -1,226 +1,195 @@
+<div align="center">
+
+<img src="docs/img/logo.svg" alt="roost" width="120">
+
 # roost
 
-A per-project remote workspace in a single Rust binary: a four-pane IDE-style
-layout in the browser, backed by real terminals that survive you closing the
-tab.
+**Your coding agents run on the server. This is where you watch them.**
 
-It exists for AI-assisted development. Claude runs in a terminal pane and edits
-files; the viewer reflects those edits live, so what you see is what is on
-disk — not a stale snapshot.
+A single Rust binary that gives every project a four-pane workspace in the browser —
+file tree, editor, diffs and real terminals — backed by shells that survive the tab,
+the network and a restart of roost itself.
 
-## What it does
+[![Release](https://img.shields.io/github/v/release/PeterKnego/roost)](https://github.com/PeterKnego/roost/releases)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![Rust](https://img.shields.io/badge/rust-stable-orange)](https://www.rust-lang.org)
 
-**Four panes, universal tabs.** Left-top, left-bottom, middle and right, with
-draggable dividers. One flat tab type — file tree, git changes, file
-preview/editor, diff, terminal — and any tab can live in any pane.
+<img src="docs/img/hero.png" alt="roost workspace: file tree and git changes on the left, an editor in the middle, and Claude Code in a terminal on the right reviewing an uncommitted edit" width="900">
 
-**All state lives on the server and mirrors live.** Open a file in one browser
-and it opens in every connected browser, the way two clients attached to one
-terminal multiplexer mirror each other. Layout and unsaved buffers persist
-across restarts, outside the repo, so pane drags never appear in `git status`.
+</div>
 
-**Files go in through the browser.** Drag files from the desktop onto the file
-tree, or copy and paste them there, and they land in that directory. Paste a
-screenshot onto a terminal and it reaches the program running there as an
-actual image, not as a path — which is how you show Claude the thing you are
-looking at. Folders are refused on purpose: `git`, `rsync` and `scp` are what
-move a project, and an upload is capped per request rather than per file.
+---
 
-**Terminals survive.** Each terminal is a PTY owned by roost and wrapped in
-`dtach`, so sessions outlive both a dropped browser tab and a roost
-restart. roost keeps a 1 MB scrollback ring per session and fans output out
-to every attached client.
+## Why
 
-**Sessions are visible and deliberate.** Opening a project starts nothing — a
-terminal tab waits for you to press Enter — and the header shows which projects
-have shells running, with their count and age. Close Project ends them all,
-keeps your layout, and refuses while a buffer is unsaved. Sessions that outlive
-a restart are rediscovered at startup; sockets with no process, and shells whose
-directory is gone, are reaped.
+You moved Claude Code onto a real machine — a homelab box, a Hetzner server, a mini-PC
+in the closet — because your laptop is not where 16 cores live. Now you need a window
+into it that is not `ssh` + `tmux` + guessing what changed on disk.
 
-**Editing is conflict-guarded.** Save refuses if the file changed on disk since
-your buffer was opened, showing a diff of what differs — the changed hunks
-with their line numbers, not both files whole. A clean buffer follows external
-writes live; a buffer with unsaved changes is only flagged stale, never
-overwritten. Discarding yours reloads the file, and a restart re-checks every
-open buffer against the disk, so a file that moved while roost was down comes
-back flagged rather than looking current.
+roost is that window. Claude runs in a terminal pane and edits files; the viewer
+reflects those edits live, so what you see is what is on disk — not a stale snapshot.
+Close the lid, open it on the iPad, and the session is still running.
 
-**Autosave, and it knows when to stop.** A buffer is written out a second after
-you stop typing, and the moment the editor loses focus. It saves through the
-same conflict guard as ⌘S — never forcing — and takes its hands off a file
-that has diverged, rather than re-raising a banner every second; ⌘S is how you
-resolve that one. The pane header carries the state (`saved`, `saving…`, `not
-saved · changed on disk`), which is also where ⌘S is advertised when autosave
-is off. Turn it off with `autosave = false` in a global or per-project
-`.roost/config.toml` — see [`docs/deploy.md`](docs/deploy.md#autosave).
-
-**A projects/worktrees/sessions overview.** The front page (`/`) is a
-two-pane overview: known projects and their worktrees on the left (expand a
-project to see its worktrees, each with its Claude/dirty/ahead state), and the
-live terminal/Claude sessions on the right — filtered to a project's family
-when you select one, all of them otherwise. Clicking a session opens its
-workspace with that terminal focused. **＋ Open a directory** (or `/?at=`)
-reaches the directory picker to open a directory roost hasn't seen — single
-click selects, double click descends, Enter opens, git repos get a one-click
-shortcut.
-
-**Dot entries are hidden, until you say otherwise.** The tree leaves out
-`.git`, `.claude` and every other dot entry by default, along with build and
-vendor directories. The ◌ control in the tree pane's header brings them back —
-it mirrors to your other browsers and survives a restart, like any other
-workspace change. `show_hidden = true` in a global or per-project
-`.roost/config.toml` sets what a workspace starts out doing — see
-[`docs/deploy.md`](docs/deploy.md#hidden-files-in-the-tree).
-
-**Project-wide search that says what it did not look at.** `⇧⌃F` (or `⌘⇧F`)
-opens an overlay over the current project: file paths, file contents, and live
-session names, in one list. Enter on a content hit opens the file *at the
-matched line* — and the same machinery finally makes a terminal link like
-`hub.rs:412` land on line 412 instead of at the top. The overlay is local to
-the browser that opened it; only the tab it opens mirrors.
-
-The search is a bounded walk, not an index and not a subprocess, so it has
-nothing to keep in sync and nothing to install. That makes what it *skipped*
-the interesting part, and it is reported rather than implied: an unreadable
-directory is counted, a cap that fired names itself ("more than 50 lines
-matched"), a query under three characters says contents were not searched at
-all, and the note says `no matches` only when there genuinely were none and
-nothing went wrong. `.git` is never walked, and a directory holding its own
-`.git` — a worktree, a submodule — is skipped and counted, because its files
-belong to another checkout.
-
-Double-tapping Shift opens it too, where the browser delivers a lone Shift
-keypress; some environments do not, which is why the header advertises the
-chord.
-
-**Claude Code sees the workspace.** A `claude` running in a terminal pane
-connects back to roost as its IDE: it can point at a file instead of pasting a
-path, and a file it proposes to change opens as a diff tab with Accept /
-Reject rather than eighty columns of terminal ASCII. The ✻ next to a tab
-strip's + opens a new terminal with `claude` already typed into it — no
-flags, because the shell's environment is what links it to this roost. The
-button is there unless roost asked your login shell at startup and it could
-not find `claude` (a check that could not run keeps the button and says so on
-stderr). Off by default, and
-separate from all of that, roost can also send whatever you have highlighted in
-the editor to every connected Claude as ambient context: set
-`share_selection = true` in a global or per-project `.roost/config.toml`. It
-ships file contents with no explicit gesture, so read
-[`docs/deploy.md`](docs/deploy.md#sharing-the-editor-selection-with-claude)
-before turning it on; while it is on, the header says `⧉ sharing selection`.
-
-**Desktop notifications.** A process in a terminal — Claude finishing a task,
-a hook needing a decision — can raise a notification with one escape sequence
-or `roost notify`; it shows up as a bell across every project and, given a
-secure context, as an OS notification that clicks back to the terminal that
-raised it. See [`docs/notifications.md`](docs/notifications.md).
+|                          | roost | ttyd / Wetty | code-server | tmux + ssh |
+| ------------------------ | :---: | :----------: | :---------: | :--------: |
+| Terminals survive restart |  ✅   |      ❌      |     n/a     |     ✅     |
+| Editor + diffs + tree     |  ✅   |      ❌      |     ✅      |     ❌     |
+| Mirrors across browsers   |  ✅   |      ❌      |     ❌      |     ✅     |
+| Claude Code IDE protocol  |  ✅   |      ❌      |     ❌      |     ❌     |
+| Paste a screenshot to the agent | ✅ |    ❌      |     ❌      |     ❌     |
+| Single binary, no Node    |  ✅   |      ✅      |     ❌      |     ✅     |
 
 ## Install
 
-roost is one static-ish binary plus two things it expects on `PATH`:
-`dtach` (`apt install dtach` / `brew install dtach`), which is what lets a
-shell outlive the browser tab and the server itself, and `git`.
+```sh
+# dtach and git must be on PATH
+brew install dtach          # or: apt install dtach
 
-```bash
 cargo install --git https://github.com/PeterKnego/roost
-```
 
-Or take the Linux x86_64 binary from the
-[latest release](https://github.com/PeterKnego/roost/releases/latest) and put
-it on `PATH`. Other platforms build from source; macOS is used daily, Windows
-is untested.
-
-roost has **no authentication of its own**. It binds `127.0.0.1` and refuses
-to do otherwise, so to reach it from another machine put something that
-authenticates in front of it — `tailscale serve` is what it was built
-against. Read [Security model](#security-model) before exposing it.
-
-## Quick start
-
-```bash
 ROOST_ROOTS="$HOME/Projects" roost 8444
-# then open http://127.0.0.1:8444/
+# open http://127.0.0.1:8444/
 ```
 
-From a checkout, `ROOST_ROOTS="$HOME/Projects" cargo run --quiet 8444` does
-the same.
-Running the binary directly takes one CLI argument, the port. One
-subcommand binds nothing: `roost notify <title> [body]` raises a
-notification from inside a roost terminal — see
-[`docs/notifications.md`](docs/notifications.md). Everything else is
-environment — see [`docs/deploy.md`](docs/deploy.md).
+Prebuilt Linux x86_64 binaries are on the [releases page](https://github.com/PeterKnego/roost/releases).
+macOS is used daily; Windows is untested.
 
-## URL surface
+> **roost has no authentication of its own.** It binds `127.0.0.1` and refuses to do
+> otherwise. Put something that authenticates in front of it — `tailscale serve` is
+> what it was built against. Read [Security model](#security-model) before exposing it.
+
+## What it does
+
+### Four panes, universal tabs
+Left-top, left-bottom, middle and right, with draggable dividers. One flat tab type —
+file tree, git changes, editor, diff, terminal — and any tab can live in any pane.
+
+### Terminals that outlive everything
+Each terminal is a PTY owned by roost and wrapped in `dtach`, so sessions survive a
+dropped tab *and* a roost restart. 1 MB scrollback per session, fanned out to every
+attached client. Sessions that outlive a restart are rediscovered at startup; dead
+sockets are reaped.
+
+### All state lives on the server and mirrors live
+Open a file in one browser and it opens in every connected browser. Layout and unsaved
+buffers persist across restarts, stored outside the repo — so pane drags never show up
+in `git status`.
+
+### Claude Code sees the workspace
+A `claude` running in a terminal pane connects back to roost as its IDE. It can point
+at a file instead of pasting a path, and a file it proposes to change opens as a **diff
+tab with Accept / Reject** — not eighty columns of terminal ASCII. The ✻ button next to
+a tab strip's `+` opens a terminal with `claude` already typed in.
+
+<img src="docs/img/proposal.png" alt="A proposal tab showing the two lines Claude wants to delete, with Accept, Reject and Edit buttons, beside the terminal where Claude is asking for the same approval" width="900">
+
+### Files go in through the browser
+Drag files from the desktop onto the tree, or paste them there. Paste a **screenshot
+onto a terminal** and it reaches the program running there as an actual image — which is
+how you show Claude the thing you are looking at.
+
+### Editing is conflict-guarded
+Save refuses if the file changed on disk since your buffer opened, and shows a diff of
+the changed hunks. A clean buffer follows external writes live; a dirty one is flagged
+stale, never overwritten. Autosave writes a second after you stop typing and on blur,
+through the same guard — and takes its hands off a diverged file rather than nagging.
+
+### Project-wide search that reports what it skipped
+`⇧⌃F` searches paths, contents and live session names in one list. It is a bounded walk,
+not an index and not a subprocess — nothing to install, nothing to keep in sync. What it
+*skipped* is reported rather than implied: unreadable directories are counted, a cap that
+fired names itself, and "no matches" appears only when nothing went wrong.
+
+<img src="docs/img/search.png" alt="The search overlay: fifty content matches for 'first' across the project, each with its file, line and highlighted match, and a footer saying the results are partial" width="600">
+
+### Sessions are visible and deliberate
+Opening a project starts nothing. The header shows which projects have shells running,
+with count and age. `Close Project` ends them all, keeps your layout, and refuses while
+a buffer is unsaved.
+
+### Desktop notifications
+A process in a terminal — Claude finishing a task, a hook needing a decision — raises a
+notification with one escape sequence or `roost notify`. It shows as a bell across every
+project and, in a secure context, as an OS notification that clicks back to the terminal
+that raised it. See [docs/notifications.md](docs/notifications.md).
+
+<details>
+<summary><b>Also: dot entries, worktrees overview, selection sharing, URL surface</b></summary>
+
+**Dot entries are hidden until you say otherwise.** `.git`, `.claude`, build and vendor
+directories are left out. The ◌ control in the tree header brings them back; the choice
+mirrors and persists. `show_hidden = true` in `.roost/config.toml` sets the default.
+
+**Projects / worktrees / sessions overview.** `/` is a two-pane overview: projects and
+their worktrees on the left (each with Claude/dirty/ahead state), live sessions on the
+right. Clicking a session opens its workspace with that terminal focused. `＋ Open a
+directory` reaches the directory picker.
+
+<img src="docs/img/overview.png" alt="The overview page: three projects on the left, roost expanded to show its claude-1 worktree, and three live sessions on the right, one of them marked as running Claude" width="900">
+
+**Selection sharing (off by default).** `share_selection = true` sends whatever you have
+highlighted in the editor to every connected Claude as ambient context. It ships file
+contents with no explicit gesture — read [docs/deploy.md](docs/deploy.md) first. While on,
+the header says `⧉ sharing selection`.
+
+**URL surface**
 
 | Path | Purpose |
-|---|---|
+| --- | --- |
 | `/` | Projects/worktrees/sessions overview (`?at=` is the directory picker) |
 | `/{project}` | Workspace — may be nested, e.g. `/karpie/src` |
 | `/frag/{project}/…` | Server-rendered HTML fragments |
 | `/ws/{project}/_workspace` | Workspace state socket — JSON intents up, events down |
 | `/ws/{project}/term/{name}` | One raw-bytes socket per terminal |
 
+</details>
+
 ## Security model
 
-roost binds `127.0.0.1` only and is meant to be exposed by something that
-authenticates, such as `tailscale serve`. **The websocket spawns a shell**, so
-the loopback bind is the security boundary and is deliberately not
-configurable.
+roost binds `127.0.0.1` only and is meant to be exposed by something that authenticates,
+such as `tailscale serve`. The websocket spawns a shell, so the loopback bind is the
+security boundary and is deliberately not configurable.
 
-- WebSocket handshakes bypass the same-origin policy, so every socket checks
-  `Origin` against an allowlist; HTTP checks `Host`/`X-Forwarded-Host` against
-  the same list to defeat DNS rebinding.
-- The allowlist is readable from the environment or global config only — never
-  from a project's own `.roost/config.toml`, so a repo you clone cannot
-  allowlist its own domain.
-- HTTP is **GET-only apart from two uploads** (`POST /upload` and
-  `POST /paste`). Every other state change travels over the websocket, so
-  there is no state-changing verb for a hostile page to forge. The two POSTs
-  check `Origin` exactly as the websocket handshakes do, and refuse a request
-  that carries none, because a `multipart/form-data` POST is a CORS simple
-  request that any page can submit cross-origin without a preflight.
-- Every filesystem path is confined to the project directory by canonicalising
-  and prefix-checking; creation paths canonicalise the parent and validate the
-  final component separately.
+- WebSocket handshakes bypass the same-origin policy, so every socket checks `Origin`
+  against an allowlist; HTTP checks `Host`/`X-Forwarded-Host` against the same list to
+  defeat DNS rebinding.
+- The allowlist is readable from the environment or global config only — never from a
+  project's own `.roost/config.toml`, so a repo you clone cannot allowlist its own domain.
+- HTTP is GET-only apart from two uploads (`POST /upload`, `POST /paste`). Every other
+  state change travels over the websocket, so there is no state-changing verb for a
+  hostile page to forge. Both POSTs check `Origin` and refuse a request that carries none.
+- Every filesystem path is confined to the project directory by canonicalising and
+  prefix-checking; creation paths canonicalise the parent and validate the final
+  component separately.
 
 ## Documentation
 
-- [`docs/deploy.md`](docs/deploy.md) — running, environment, deployment traps
-- [`docs/notifications.md`](docs/notifications.md) — triggering, hooking up
-  Claude Code, limits
-- [`CLAUDE.md`](CLAUDE.md) — conventions and constraints for working in this repo
-- [`SECURITY.md`](SECURITY.md) — what counts as a vulnerability here and how to
-  report one
+- [docs/deploy.md](docs/deploy.md) — running, environment, deployment traps
+- [docs/notifications.md](docs/notifications.md) — triggering, hooking up Claude Code, limits
+- [CLAUDE.md](CLAUDE.md) — conventions and constraints for working in this repo
+- [SECURITY.md](SECURITY.md) — what counts as a vulnerability here, and how to report one
 
-The rest of `docs/` is the working record, kept in the open because it
-explains why the code is the way it is:
+<details>
+<summary><b>The working record — specs, plans and the backlog, kept in the open</b></summary>
 
-- `docs/superpowers/specs/` and `docs/superpowers/plans/` — every feature's
-  design document and the implementation plan that carried it out, dated,
-  including the ones later reversed. They were written for the AI-assisted
-  workflow the project is built for, so they read as briefs to an agent, not as
-  user documentation, and they describe the code as it was on their date.
-- [`docs/backlog.md`](docs/backlog.md) — everywhere a spec said "later",
-  gathered in one place. Not a roadmap; entries marked **Evidence** were
-  measured against a real deployment, the rest were only ever imagined.
+roost was built with the AI-assisted workflow it exists to serve, and the paper trail is
+part of the repo because it explains why the code is the way it is.
+
+- `docs/superpowers/specs/` and `docs/superpowers/plans/` — every feature's design
+  document and the implementation plan that carried it out, dated, including the ones
+  later reversed. They were written as briefs to an agent, not as user documentation,
+  and they describe the code as it was on their date.
+- `docs/backlog.md` — everywhere a spec said "later", gathered in one place. Not a
+  roadmap; entries marked **Evidence** were measured against a real deployment, the rest
+  were only ever imagined.
+
+</details>
 
 ## License
 
-Licensed under either of
+Dual-licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
+Bundled third-party front-end assets keep their own (permissive) licenses; attributions
+are in `docs/vendor.md`.
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
-  <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or
-  <http://opensource.org/licenses/MIT>)
-
-at your option.
-
-Bundled third-party front-end assets keep their own licenses (all permissive);
-their attributions are recorded in [`docs/vendor.md`](docs/vendor.md).
-
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
-dual licensed as above, without any additional terms or conditions.
+Unless you state otherwise, any contribution you intentionally submit for inclusion, as
+defined in the Apache-2.0 license, is dual licensed as above, with no additional terms.
