@@ -1,4 +1,4 @@
-# Working in resh
+# Working in roost
 
 Single Rust binary, no async runtime, thread per connection, hand-rolled
 HTTP (GET, plus two upload POSTs) with websockets, server-rendered HTML,
@@ -86,7 +86,7 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   scrollback it hands back), 2 MB file
   cap for reads *and* buffer writes. Uploads are bounded per **request**, not
   per file: ≤16 parts and `config::max_upload_bytes` (100 MB default, global
-  config or `RESH_MAX_UPLOAD` only — never per-project, or a cloned repo could
+  config or `ROOST_MAX_UPLOAD` only — never per-project, or a cloned repo could
   raise its own disk ceiling). On the IDE socket: ≤16 proposals parked per
   project (`ide::MAX_PENDING`) — per project, not global, so one Claude in a
   loop cannot starve every other project — and 8 MB per websocket frame
@@ -201,7 +201,7 @@ substitute something simpler for the real thing. Expect this class:
 
 | Substitution | What it hid |
 |---|---|
-| `RESH_CMD=cat` instead of `dtach` | The dtach socket directory was never created — terminals would have died at spawn in production |
+| `ROOST_CMD=cat` instead of `dtach` | The dtach socket directory was never created — terminals would have died at spawn in production |
 | macOS FSEvents instead of Linux inotify | Directories created after startup were never watched |
 | No browser | Saving was completely broken (`base_hash` never initialised, so every save conflicted) |
 | No systemd | `KillMode=control-group` killed every dtach session on restart, defeating the reason dtach is used |
@@ -212,7 +212,7 @@ caught defects that 100+ passing tests did not.
 
 Some of that browser check is now automated: `deno run -A
 tests/browser/reconnect.mjs` and `upload.mjs` drive a real Chromium against a
-real resh with real dtach. It is deliberately outside `cargo test` (it needs a browser and
+real roost with real dtach. It is deliberately outside `cargo test` (it needs a browser and
 takes tens of seconds) and it skips when no browser is present. Anything
 touching `static/app.js` should be checked there, since no Rust test can reach
 that file. See [tests/browser/README.md](tests/browser/README.md) — especially
@@ -229,11 +229,11 @@ the four traps that make a browser test pass while asserting nothing.
   its generated table. A `cargo build` from a second checkout of this repo — a
   git worktree, say — therefore rewrites that table with the other checkout's
   paths and leaves the shared binary built from the other checkout's source.
-  Nothing announces this: cargo reports `Fresh resh`, the browser tests go on
+  Nothing announces this: cargo reports `Fresh roost`, the browser tests go on
   passing, and they are testing the wrong tree. Recover with
-  `cargo clean -p resh`, and confirm with
+  `cargo clean -p roost`, and confirm with
   `grep -o '/home/[^\"]*static' $(cargo metadata --format-version 1 --no-deps |
-  python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/build/resh-*/out/assets_table.rs | head -1`.
+  python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/build/roost-*/out/assets_table.rs | head -1`.
   To compare against another branch, check it out in *this* directory.
 - Check which branch the deploy host is on. `git pull --ff-only` will report
   "Already up to date" while sitting on a stale feature branch.

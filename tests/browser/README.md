@@ -8,7 +8,7 @@ one of which ("no browser: saving was completely broken") was found by hand
 against a real browser after the suite was green.
 
 These tests drive a real Chromium over the DevTools Protocol against a real
-resh with real `dtach`.
+roost with real `dtach`.
 
 ## Running
 
@@ -43,7 +43,7 @@ deno run -A tests/browser/closeproject.mjs # Close Project ends the shells *and*
 deno run -A tests/browser/search.mjs     # the search overlay (⇧⌃F), its results, and landing on a line
 ```
 
-Each scenario is its own file and its own resh, so they can be run in any
+Each scenario is its own file and its own roost, so they can be run in any
 order or on their own.
 
 Needs `deno`, `dtach`, a Rust toolchain, and a Chromium. The browser is found,
@@ -56,7 +56,7 @@ tens of seconds, and the Rust suite has to stay runnable everywhere.
 
 ## What a run does
 
-Each run is hermetic. `harness.mjs` builds resh, creates a throwaway project
+Each run is hermetic. `harness.mjs` builds roost, creates a throwaway project
 and its own `ROOST_STATE_DIR`, starts a private server on a free port, and tears
 all of it down afterwards — including any `dtach` session it started, which it
 finds by that unique state-dir path. **It never touches the deployed or
@@ -80,7 +80,7 @@ and stops winning on a loaded box — or worse, passes for the opposite reason:
 `do_save` resets any successfully-saved buffer to `Content::Clean`, so an
 autosave can clean up a buffer that a broken hash rule wrongly dirtied.
 
-`fixture({ autosave: false })` writes `.resh/config.toml` into the fixture's own
+`fixture({ autosave: false })` writes `.roost/config.toml` into the fixture's own
 project before the server starts; `disableAutosave(dir)` does the same for a
 second project (`autosave.mjs` and `buffer-lifecycle.mjs` keep one of each, so
 both halves of the config cascade are exercised).

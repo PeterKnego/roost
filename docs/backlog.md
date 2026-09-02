@@ -2,7 +2,7 @@
 # Backlog
 
 A collection point for deferred, future-work, and nice-to-have items scattered
-across resh's specs and plans. This is not a commitment or a roadmap —
+across roost's specs and plans. This is not a commitment or a roadmap —
 just everywhere "later" was said, gathered so it's findable. Pull items out
 when they're actually picked up.
 
@@ -36,7 +36,7 @@ answer, not a quiet vote for "unused".
   just do" case a log view is usually reached for. Demand unmeasured.
 - Mobile layout — nice-to-have in both the v2 and v3 specs, no stated reason
   (`2026-08-16-deadlight-v2-design.md`, `2026-08-16-deadlight-v3-workspace-design.md`).
-  **Evidence (2026-08-20): unmeasurable, not unused.** resh never reads
+  **Evidence (2026-08-20): unmeasurable, not unused.** roost never reads
   `User-Agent` anywhere in `src/`, and nothing logs it, so this host cannot say
   whether anyone has ever opened the workspace on a phone. Establishing demand
   would mean adding that logging first — which is itself a decision.
@@ -45,8 +45,8 @@ answer, not a quiet vote for "unused".
   `2026-08-16-deadlight-v3-workspace-design.md`).
   **Evidence (2026-08-20): the feature it decorates is itself unused.** Five
   themes ship (`darcula`, `dark`, `gruvbox`, `light`, `solarized-dark`), but
-  there are **0 user themes** in `~/.config/resh/static/themes/`, **0 project
-  themes** in any `.resh/theme/`, and no `theme =` set in the global config —
+  there are **0 user themes** in `~/.config/roost/static/themes/`, **0 project
+  themes** in any `.roost/theme/`, and no `theme =` set in the global config —
   so every window is on the default. A favicon that varies by theme has nothing
   to vary with yet.
 - Drag-and-drop tab reordering — speculative idea in the v3 spec, noted as
@@ -149,7 +149,7 @@ answer, not a quiet vote for "unused".
   page — the notice store is already global, only the markup is missing
   (`2026-08-17-deadlight-notifications-design.md`).
   **Evidence (2026-08-20): the notification feature has never stored a notice.**
-  `notifications.json` **does not exist** in `~/.local/state/resh/` or in the
+  `notifications.json` **does not exist** in `~/.local/state/roost/` or in the
   dev state dir. This applies to the next three entries as well — the picker
   centre, per-project mute and quiet hours, Web Push, and a relay sink are four
   entries resting on a feature with no recorded use on this host. Web Push in
@@ -303,7 +303,7 @@ demand behind them.
   executes. Deferred 2026-08-23.
   **Demand unmeasured.** Nobody has asked.
 
-- Persisting a session's mode table across a resh restart — the one case
+- Persisting a session's mode table across a roost restart — the one case
   `2026-08-20-sticky-modes-design.md` deliberately does not fix. Modes are
   tracked in memory (`screen::Screens`), so a restart leaves an already-running
   full-screen app holding a contract the new process never saw, and the app
@@ -315,7 +315,7 @@ demand behind them.
   junk on the command line and clears on the next Ctrl-C — which is the whole
   argument for treating them differently.
   **Evidence (2026-08-20): this fires on every deploy, and today there were
-  nine.** `journalctl --user -u resh` records 9 restarts today, and **4 of the
+  nine.** `journalctl --user -u roost` records 9 restarts today, and **4 of the
   7** live sessions on this host are running Claude Code right now — so each
   restart desynchronised four terminals. Measured after one: a reattached
   browser reads `bracketedPaste: false, mouse: "none", focus: false`, and a
@@ -326,24 +326,24 @@ demand behind them.
   re-asserts its *mouse* modes on interaction so that half tends to heal by
   itself; `?2004h` it emits once at startup only, so paste does not.
 
-### Peer sessions (`resh peers`, 2026-08-23)
+### Peer sessions (`roost peers`, 2026-08-23)
 
 - **Nothing guarantees the group is told.** The hook informs the session that
   is starting and no one else; that session is instructed to announce itself to
   each peer, which is a convention carried out by a model, not a guarantee. A
   session that ignores it, or whose peer refuses inbound messages, leaves the
-  group as uninformed as before. A guarantee means resh pushing into running
+  group as uninformed as before. A guarantee means roost pushing into running
   sessions or re-checking on a timer — a lifecycle, where today there is one
   file read.
   **Evidence (2026-08-23): the one-way gap was measured before the change.**
-  `resh-2e` (started 09:52) was told about `resh-f8` at its own start and
-  quoted it back verbatim over `SendMessage`; `resh-f8` (started 05:44) was
-  never told about `resh-2e` and found it hours later by running `resh peers`
+  `roost-2e` (started 09:52) was told about `roost-f8` at its own start and
+  quoted it back verbatim over `SendMessage`; `roost-f8` (started 05:44) was
+  never told about `roost-2e` and found it hours later by running `roost peers`
   by hand. Whether the announcement instruction is actually followed in
   practice has **not** been measured — it was deployed the same day.
 
-- **Names can collide, and resh cannot print an unambiguous one.** A collision
-  is detected and warned about, but not prevented: resh can neither mint nor
+- **Names can collide, and roost cannot print an unambiguous one.** A collision
+  is detected and warned about, but not prevented: roost can neither mint nor
   read the short ref `ListAgents` uses to disambiguate, and `SendMessage`
   accepts no pid. A reader who ignores the warning still messages the wrong
   session.
@@ -352,7 +352,7 @@ demand behind them.
   been measured — it was deployed the same day, on a host where all nine live
   sessions then had distinct names.
 
-- **resh's own UI says nothing about peers.** The count is known per project at
+- **roost's own UI says nothing about peers.** The count is known per project at
   any moment, so the picker or project strip could badge a project more than
   one Claude is working in — reaching the person rather than only the arriving
   session, and sidestepping the asymmetry above entirely.
@@ -366,7 +366,7 @@ demand behind them.
   on this host, ~3ms each, and the hook entry carries `timeout: 10`, so even a
   fully wedged git costs ten seconds once and the session then starts anyway.
   The resolution is also lazy, so a session alone in a project spends none at
-  all. That backstop is Claude Code's, not resh's: a caller wiring `resh peers`
+  all. That backstop is Claude Code's, not roost's: a caller wiring `roost peers`
   without a timeout inherits the stall.
 
 - **A sibling whose liveness cannot be judged is dropped silently.** The
@@ -381,8 +381,8 @@ demand behind them.
   the path exists because it must, not because it has fired.
 
 - **`roots` lives in two places and must be kept in step by hand.**
-  `Environment=RESH_ROOTS` in the unit file and `roots` in
-  `~/.config/resh/config.toml`. Drift is detected and reported, not prevented;
+  `Environment=ROOST_ROOTS` in the unit file and `roots` in
+  `~/.config/roost/config.toml`. Drift is detected and reported, not prevented;
   the env var winning is deliberate, so the fix is not deleting one but
   teaching the unit to read the config.
   **Not measured.** Both entries were written on 2026-08-23 and have not
@@ -424,7 +424,7 @@ still open in another process, and the hook warning a session about itself.
   `kill-all-sessions` will not clear them: zellij sessions have reported
   themselves EXITED while the processes lived on, so they go by pid, with the
   `:8443` route dropped separately. Host-specific commands are in
-  `~/.config/resh/deploy-host.md`.
+  `~/.config/roost/deploy-host.md`.
 
 ## Code structure
 
@@ -500,9 +500,9 @@ Deferred review findings, each confirmed still present on 2026-08-22.
   `start(...)` calls plus 24 through `fixture()`, which calls it too (counted
   at `76b22c8`). `WS_TEST_LOCK` serialises the websocket tests against each
   other, but not against the 28 of 54 tests that do not take it, which freely
-  `start()` servers of their own and set/remove `RESH_STATE_DIR` as they go.
+  `start()` servers of their own and set/remove `ROOST_STATE_DIR` as they go.
   So one test's `load()` can read a *different* test's state dir — including,
-  if the timing lines up wrong, the developer's real `~/.local/state/resh/` — and
+  if the timing lines up wrong, the developer's real `~/.local/state/roost/` — and
   evict the notice another test just published out from under it. When that
   happens, `MarkNoticeRead` finds no such id, and `hub.rs` rebroadcasts
   unconditionally with a notice list in which nothing ended up marked read,
