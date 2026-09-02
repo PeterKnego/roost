@@ -1032,6 +1032,10 @@ mod tests {
         for name in [
             "karpie",
             "roost",
+            // Still a live project key on the host: the author's checkout
+            // directory keeps the product's old name, deliberately not
+            // renamed alongside it, so this old key stays in use.
+            concat!("re", "sh"),
             "ultima_db",
             "ultima",
             "ml",

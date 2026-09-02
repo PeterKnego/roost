@@ -36,6 +36,13 @@ alive but unreachable forever. Either end every session first and then move
 setting `ROOST_STATE_DIR=$HOME/.local/state/resh` in the unit. The author's
 own host does the latter.
 
+**A terminal opened before the rename is invisible to Claude detection until
+it is reopened.** Its shell still exports `RESH_PROJECT` and `RESH_SESSION`,
+and nothing in this build reads that prefix — so a Claude running in it
+carries no ✻ mark on its tab, and mention routing (Alt+K) treats it as
+outside the workspace. Nothing destructive keys on either signal; reopen the
+terminal (`claude -c` resumes the conversation) and it is seen again.
+
 **The per-project config and theme directory also moved**, from
 `{project}/.resh/` to `{project}/.roost/` (`config.toml` and `theme/`). A
 project still carrying only the old `.resh/` directory silently loses its

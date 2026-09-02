@@ -81,7 +81,7 @@ fn get_full(port: u16, path: &str) -> (u16, String, String) {
 /// Builds a `multipart/form-data` body by hand. Each part is a file part named
 /// `file`, which is what the client sends.
 fn multipart(parts: &[(&str, &[u8])]) -> (String, Vec<u8>) {
-    let boundary = "----reshtestboundary";
+    let boundary = "----roosttestboundary";
     let mut body = Vec::new();
     for (name, data) in parts {
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());

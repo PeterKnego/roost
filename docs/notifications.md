@@ -82,8 +82,8 @@ script written against an old name. A host may leave a `resh` symlink to the
 old `$RESH_NOTIFY` *guard* in a terminal opened after the rename.
 
 **The `/dev/tty` write is confirmed** (2026-08-17), including the shape a hook
-actually runs in: inside a roost terminal with stdout captured by a pipe,
-`roost notify` still reaches the terminal and the notice is delivered.
+actually runs in: inside a resh terminal with stdout captured by a pipe,
+`resh notify` still reaches the terminal and the notice is delivered.
 
 **A process with no terminal anywhere now fails loudly.** That is the subagent
 case: no `/dev/tty`, and stdout a pipe rather than a terminal. It used to write

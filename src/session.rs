@@ -1843,10 +1843,10 @@ mod tests {
         // so it arrives back through this attachment's own subscriber channel.
         std::env::set_var("ROOST_CMD", "env");
         // The child inherits this process's environment, and a legacy
-        // terminal — one still running a not-yet-renamed `roost`, which on
-        // this host will exist for weeks after cutover — exports more than
-        // the three names this crate itself sets: this host's old service
-        // unit also sets a `ROOTS` variable under the old prefix, and any
+        // terminal — one still running the previous binary, which on this
+        // host will exist for weeks after cutover — exports more than the
+        // three names this crate itself sets: this host's old service unit
+        // also sets a `ROOTS` variable under the old prefix, and any
         // comparable install-specific variable could join it. Nothing in
         // the crate reads the old prefix any more, so clearing every
         // inherited variable that starts with it, whatever its suffix, is
@@ -1864,8 +1864,9 @@ mod tests {
         }
         // The new prefix has no such legacy sprawl: `session_env` only ever
         // exports these three, and a wildcard clear here would also take
-        // `ROOST_CMD` (set just above) and `ROOST_STATE_DIR` (set by the
-        // test harness), both of which this test and `attach` still need.
+        // `ROOST_CMD` (set by this test, just above) and `ROOST_STATE_DIR`
+        // (left alone here, since other tests in this module own it), both
+        // of which this test and `attach` still need.
         for name in ["NOTIFY", "PROJECT", "SESSION"] {
             std::env::remove_var(format!("ROOST_{name}"));
         }
