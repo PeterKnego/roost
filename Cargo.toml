@@ -1,9 +1,15 @@
 [package]
 name = "roost"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Peter Knego <peter@knego.net>"]
+description = "A per-project remote workspace in one binary: browser IDE layout over real terminals that survive the tab, built for AI-assisted development"
+repository = "https://github.com/PeterKnego/roost"
+homepage = "https://github.com/PeterKnego/roost"
+readme = "README.md"
+keywords = ["terminal", "workspace", "remote", "ide", "claude"]
+categories = ["development-tools", "command-line-utilities"]
 # Explicit, because `include_bytes!` failing on a published crate would be
 # discovered from a user's bug report rather than from our own build. static/
 # is not gitignored so it packages by default today; this stops that being an
@@ -21,7 +27,6 @@ include = [
     "CLAUDE.md",
     "docs/deploy.md",
     "docs/notifications.md",
-    "docs/peers.md",
 ]
 
 [dependencies]

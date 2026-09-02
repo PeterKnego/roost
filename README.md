@@ -116,14 +116,35 @@ or `roost notify`; it shows up as a bell across every project and, given a
 secure context, as an OS notification that clicks back to the terminal that
 raised it. See [`docs/notifications.md`](docs/notifications.md).
 
+## Install
+
+roost is one static-ish binary plus two things it expects on `PATH`:
+`dtach` (`apt install dtach` / `brew install dtach`), which is what lets a
+shell outlive the browser tab and the server itself, and `git`.
+
+```bash
+cargo install --git https://github.com/PeterKnego/roost
+```
+
+Or take the Linux x86_64 binary from the
+[latest release](https://github.com/PeterKnego/roost/releases/latest) and put
+it on `PATH`. Other platforms build from source; macOS is used daily, Windows
+is untested.
+
+roost has **no authentication of its own**. It binds `127.0.0.1` and refuses
+to do otherwise, so to reach it from another machine put something that
+authenticates in front of it — `tailscale serve` is what it was built
+against. Read [Security model](#security-model) before exposing it.
+
 ## Quick start
 
 ```bash
-ROOST_ROOTS="$HOME/Projects" cargo run --quiet 8444
+ROOST_ROOTS="$HOME/Projects" roost 8444
 # then open http://127.0.0.1:8444/
 ```
 
-Requires `dtach` (`brew install dtach` / `apt install dtach`) and `git`.
+From a checkout, `ROOST_ROOTS="$HOME/Projects" cargo run --quiet 8444` does
+the same.
 Running the binary directly takes one CLI argument, the port. One
 subcommand binds nothing: `roost notify <title> [body]` raises a
 notification from inside a roost terminal — see
