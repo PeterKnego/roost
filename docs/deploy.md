@@ -83,9 +83,9 @@ secure context — `localhost` or an HTTPS origin such as `tailscale serve`;
 plain `http://` to a tailnet IP still shows the in-page notice panel but
 cannot ask the OS for permission.
 
-## Upgrading from a build that shipped `roost peers`
+## Upgrading from a build that shipped `resh peers`
 
-`roost peers` is gone (spec `docs/superpowers/specs/2026-08-25-worktree-launch-design.md`).
+`resh peers` is gone (spec `docs/superpowers/specs/2026-08-25-worktree-launch-design.md`).
 Remove its `SessionStart` entry from `~/.claude/settings.json` on every host that
 had it; left in place it prints `command not found` at every session start —
 loud, harmless, and the reason this note exists.

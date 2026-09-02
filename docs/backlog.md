@@ -45,8 +45,8 @@ answer, not a quiet vote for "unused".
   `2026-08-16-deadlight-v3-workspace-design.md`).
   **Evidence (2026-08-20): the feature it decorates is itself unused.** Five
   themes ship (`darcula`, `dark`, `gruvbox`, `light`, `solarized-dark`), but
-  there are **0 user themes** in `~/.config/roost/static/themes/`, **0 project
-  themes** in any `.roost/theme/`, and no `theme =` set in the global config —
+  there are **0 user themes** in `~/.config/resh/static/themes/`, **0 project
+  themes** in any `.resh/theme/`, and no `theme =` set in the global config —
   so every window is on the default. A favicon that varies by theme has nothing
   to vary with yet.
 - Drag-and-drop tab reordering — speculative idea in the v3 spec, noted as
@@ -149,7 +149,7 @@ answer, not a quiet vote for "unused".
   page — the notice store is already global, only the markup is missing
   (`2026-08-17-deadlight-notifications-design.md`).
   **Evidence (2026-08-20): the notification feature has never stored a notice.**
-  `notifications.json` **does not exist** in `~/.local/state/roost/` or in the
+  `notifications.json` **does not exist** in `~/.local/state/resh/` or in the
   dev state dir. This applies to the next three entries as well — the picker
   centre, per-project mute and quiet hours, Web Push, and a relay sink are four
   entries resting on a feature with no recorded use on this host. Web Push in
@@ -315,7 +315,7 @@ demand behind them.
   junk on the command line and clears on the next Ctrl-C — which is the whole
   argument for treating them differently.
   **Evidence (2026-08-20): this fires on every deploy, and today there were
-  nine.** `journalctl --user -u roost` records 9 restarts today, and **4 of the
+  nine.** `journalctl --user -u resh` records 9 restarts today, and **4 of the
   7** live sessions on this host are running Claude Code right now — so each
   restart desynchronised four terminals. Measured after one: a reattached
   browser reads `bracketedPaste: false, mouse: "none", focus: false`, and a
@@ -326,7 +326,7 @@ demand behind them.
   re-asserts its *mouse* modes on interaction so that half tends to heal by
   itself; `?2004h` it emits once at startup only, so paste does not.
 
-### Peer sessions (`roost peers`, 2026-08-23)
+### Peer sessions (`resh peers`, 2026-08-23)
 
 - **Nothing guarantees the group is told.** The hook informs the session that
   is starting and no one else; that session is instructed to announce itself to
@@ -336,9 +336,9 @@ demand behind them.
   sessions or re-checking on a timer — a lifecycle, where today there is one
   file read.
   **Evidence (2026-08-23): the one-way gap was measured before the change.**
-  `roost-2e` (started 09:52) was told about `roost-f8` at its own start and
-  quoted it back verbatim over `SendMessage`; `roost-f8` (started 05:44) was
-  never told about `roost-2e` and found it hours later by running `roost peers`
+  `resh-2e` (started 09:52) was told about `resh-f8` at its own start and
+  quoted it back verbatim over `SendMessage`; `resh-f8` (started 05:44) was
+  never told about `resh-2e` and found it hours later by running `resh peers`
   by hand. Whether the announcement instruction is actually followed in
   practice has **not** been measured — it was deployed the same day.
 
@@ -366,7 +366,7 @@ demand behind them.
   on this host, ~3ms each, and the hook entry carries `timeout: 10`, so even a
   fully wedged git costs ten seconds once and the session then starts anyway.
   The resolution is also lazy, so a session alone in a project spends none at
-  all. That backstop is Claude Code's, not roost's: a caller wiring `roost peers`
+  all. That backstop is Claude Code's, not roost's: a caller wiring `resh peers`
   without a timeout inherits the stall.
 
 - **A sibling whose liveness cannot be judged is dropped silently.** The
