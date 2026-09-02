@@ -6,32 +6,32 @@ fn main() {
         Some("notify") => std::process::exit(roost::cli::run_notify(&args[1..])),
         _ => {}
     }
-    // No compiled-in roots any more, so an unset RESH_ROOTS is a
+    // No compiled-in roots any more, so an unset ROOST_ROOTS is a
     // misconfiguration, not a default. Serving an empty root list would come
     // up healthy and show no projects at all, which reads as data loss.
     let roots = roost::projects::roots();
     if roots.is_empty() {
         eprintln!(
             "resh: no project roots configured.\n\
-             Set RESH_ROOTS to a colon-separated list of directories to scan:\n\
-             \n    RESH_ROOTS=$HOME/projects resh 8444\n\
-             \nFor a service, set it in the unit file (Environment=RESH_ROOTS=...).\n\
+             Set ROOST_ROOTS to a colon-separated list of directories to scan:\n\
+             \n    ROOST_ROOTS=$HOME/projects resh 8444\n\
+             \nFor a service, set it in the unit file (Environment=ROOST_ROOTS=...).\n\
              Or list them in ~/.config/resh/config.toml:\n\
              \n    roots = [\"~/projects\"]"
         );
         std::process::exit(2);
     }
     // Both sources naming roots and disagreeing is a misconfiguration that is
-    // otherwise invisible: RESH_ROOTS wins here, while a caller that inherits
+    // otherwise invisible: ROOST_ROOTS wins here, while a caller that inherits
     // none of this process's environment — a hook, say — silently resolves
     // the other set. Loud, on the server's stderr, which systemd captures.
     if let Some((env, cfg)) = roost::projects::roots_conflict(
-        std::env::var("RESH_ROOTS").ok().as_deref(),
+        std::env::var("ROOST_ROOTS").ok().as_deref(),
         &roost::config::global_config_path(),
     ) {
         eprintln!(
-            "resh: RESH_ROOTS and the global config's `roots` disagree.\n  \
-             RESH_ROOTS (used here): {env:?}\n  \
+            "resh: ROOST_ROOTS and the global config's `roots` disagree.\n  \
+             ROOST_ROOTS (used here): {env:?}\n  \
              config `roots` (used by anything without this environment): {cfg:?}\n  \
              Bring them into step, or callers outside this process will resolve different projects."
         );
@@ -39,7 +39,7 @@ fn main() {
         // than having to know which detector reports where. stderr stays
         // because journald already carries this process's startup messages.
         roost::errlog::record(
-            &format!("RESH_ROOTS {env:?} disagrees with the global config's roots {cfg:?}"),
+            &format!("ROOST_ROOTS {env:?} disagrees with the global config's roots {cfg:?}"),
             roost::errlog::now_secs(),
         );
     }

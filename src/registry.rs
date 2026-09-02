@@ -467,7 +467,7 @@ fn write_origin(key_dir: &std::path::Path, dir: &std::path::Path) {
 
 /// Records the resolved absolute directory a project maps to, so a *later*
 /// check for "is this project gone" can consult this exact path directly —
-/// independent of whatever `RESH_ROOTS` the process performing that
+/// independent of whatever `ROOST_ROOTS` the process performing that
 /// later check happens to be configured with. See `confirmed_gone`'s doc
 /// comment for why that independence matters.
 ///
@@ -534,10 +534,10 @@ fn recorded_path_is_gone(recorded: &[u8]) -> bool {
 /// `reconcile` call — "the directory was deleted" and "the directory
 /// exists, just not under the roots *this particular process* happens to
 /// be configured with". Two resh processes — or the same one,
-/// restarted with a different `RESH_ROOTS` — can share one
-/// `RESH_STATE_DIR`: `docs/deploy.md` tells users to override
-/// `RESH_ROOTS` to run a second instance locally and says nothing
-/// about also separating `RESH_STATE_DIR`, so the documented way to
+/// restarted with a different `ROOST_ROOTS` — can share one
+/// `ROOST_STATE_DIR`: `docs/deploy.md` tells users to override
+/// `ROOST_ROOTS` to run a second instance locally and says nothing
+/// about also separating `ROOST_STATE_DIR`, so the documented way to
 /// run resh locally reaches this. Reproduced directly against a real
 /// `dtach` session, outside the test suite entirely: a live session for
 /// `victimproj` was SIGKILLed and its socket unlinked simply because
@@ -651,7 +651,7 @@ fn reap_decision(project_gone: bool, held_before: bool, held_after_kill_attempt:
 /// "Cannot verify whether a project exists" must never be treated as
 /// "the project is gone": `resolve_project` returns `None` for every
 /// project alike when a root fails to canonicalize (a mount not up yet, a
-/// permissions problem, a `RESH_ROOTS` typo, or just running on a host
+/// permissions problem, a `ROOST_ROOTS` typo, or just running on a host
 /// where a configured root doesn't exist there). Without a guard, that
 /// transient condition would make this function SIGKILL every live session
 /// on the machine — strictly worse than doing nothing, for a tool whose
@@ -1327,9 +1327,9 @@ mod tests {
     fn with_state<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", d.path());
+        std::env::set_var("ROOST_STATE_DIR", d.path());
         let out = f(d.path());
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
         out
     }
 
@@ -1678,11 +1678,11 @@ mod tests {
             // sockets than that on disk. With an empty map both the old and new
             // logic fall through to the socket floor and agree — a fixture
             // without this attach passes either way and proves nothing.
-            // `RESH_CMD=cat` means this creates no socket of its own (that
+            // `ROOST_CMD=cat` means this creates no socket of its own (that
             // is gated on the command being dtach), which is exactly the shape
             // wanted: one in memory, two on disk.
             let _sg = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::set_var("RESH_CMD", "cat");
+            std::env::set_var("ROOST_CMD", "cat");
             let _att = crate::session::reserve_and_attach("proj", "shell", &root.path().join("proj")).unwrap();
             assert_eq!(
                 crate::session::list_sessions("proj").len(),
@@ -1697,7 +1697,7 @@ mod tests {
                 let _ = h.wait();
             }
             crate::session::kill_project("proj");
-            std::env::remove_var("RESH_CMD");
+            std::env::remove_var("ROOST_CMD");
             assert_eq!(
                 found,
                 Some(2),
@@ -1904,7 +1904,7 @@ mod tests {
 
     // C3: a root that cannot be verified must never be mistaken for "the
     // project is gone". Without this guard, a transiently unreadable mount
-    // or a RESH_ROOTS typo would make startup reconcile SIGKILL every
+    // or a ROOST_ROOTS typo would make startup reconcile SIGKILL every
     // live session on the machine.
     #[test]
     fn unreadable_roots_suspend_gone_project_reaping_but_dead_sockets_still_reap() {
@@ -2168,8 +2168,8 @@ mod tests {
     // C2: reproduced directly against real dtach, outside the test suite
     // entirely — a session for a project genuinely on disk was SIGKILLed
     // and its socket unlinked simply because reconcile was run with
-    // different RESH_ROOTS than what created the session, sharing the
-    // same RESH_STATE_DIR (exactly what docs/deploy.md tells users to
+    // different ROOST_ROOTS than what created the session, sharing the
+    // same ROOST_STATE_DIR (exactly what docs/deploy.md tells users to
     // do to run a second instance locally). "Not resolvable under my
     // roots" is not evidence of "gone"; only a key whose recorded
     // directory is confirmed missing counts.
@@ -2185,7 +2185,7 @@ mod tests {
     fn a_session_outside_the_configured_roots_survives_reconcile() {
         with_state(|state| {
             let _g = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::remove_var("RESH_CMD");
+            std::env::remove_var("ROOST_CMD");
             let real_root = tempfile::tempdir().unwrap();
             let project_dir = real_root.path().join("victimproj");
             fs::create_dir_all(&project_dir).unwrap();
@@ -2207,7 +2207,7 @@ mod tests {
 
             // A completely different root than the one victimproj actually
             // lives under — simulating a second resh instance (or the
-            // same one, restarted with an overridden RESH_ROOTS)
+            // same one, restarted with an overridden ROOST_ROOTS)
             // sharing this state dir.
             let foreign_root = tempfile::tempdir().unwrap();
             let report = reconcile(&[foreign_root.path().to_path_buf()]);
@@ -2236,7 +2236,7 @@ mod tests {
     fn attach_records_an_origin_that_lets_a_genuinely_deleted_project_be_reaped() {
         with_state(|state| {
             let _g = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::remove_var("RESH_CMD");
+            std::env::remove_var("ROOST_CMD");
             let root = tempfile::tempdir().unwrap();
             let project_dir = root.path().join("attachreap");
             fs::create_dir_all(&project_dir).unwrap();
@@ -2482,7 +2482,7 @@ mod tests {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
-        std::env::set_var("RESH_STATE_DIR", &state);
+        std::env::set_var("ROOST_STATE_DIR", &state);
         let roots = vec![root.path().to_path_buf()];
         std::fs::create_dir_all(root.path().join("repo/.claude/worktrees/claude-1")).unwrap();
         let live = crate::projects::storage_key("repo/.claude/worktrees/claude-1");
@@ -2525,7 +2525,7 @@ mod tests {
         if std::env::var("USER").as_deref() != Ok("root") {
             assert!(crate::worktree::read_base(&state, &blocked).is_some(), "cannot tell: kept");
         }
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// A layout file for a directory that no longer exists is not a
@@ -2537,7 +2537,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let state = d.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
-        std::env::set_var("RESH_STATE_DIR", &state);
+        std::env::set_var("ROOST_STATE_DIR", &state);
         let root = d.path().join("root");
         std::fs::create_dir_all(root.join("realproj")).unwrap();
         std::fs::write(state.join("ghost.json"), "{}").unwrap();
@@ -2558,7 +2558,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let state = d.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
-        std::env::set_var("RESH_STATE_DIR", &state);
+        std::env::set_var("ROOST_STATE_DIR", &state);
         let root = d.path().join("root");
         std::fs::create_dir_all(root.join("opened")).unwrap();
         std::fs::create_dir_all(root.join("neveropened")).unwrap();

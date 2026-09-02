@@ -211,14 +211,14 @@ await Deno.writeTextFile(`${projectDir}/${PREVIEW_FILE}`, "# Heading\n\nSome pro
 await Deno.mkdir(`${projectDir}/.resh`, { recursive: true });
 // Global config, not the project's own: `share_selection` became
 // global-only on 2026-08-23, so a `.resh/config.toml` in the project can no
-// longer reach it — which is the point of the move. `RESH_CONFIG` is how a
+// longer reach it — which is the point of the move. `ROOST_CONFIG` is how a
 // test points resh at a global file it owns.
 const globalConfig = `${fx.base}/resh-global.toml`;
 await Deno.writeTextFile(globalConfig, "share_selection = true\n");
 
 const resh = await startResh({
   repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(),
-  extraEnv: { CLAUDE_CONFIG_DIR: claudeConfigDir, RESH_CONFIG: globalConfig },
+  extraEnv: { CLAUDE_CONFIG_DIR: claudeConfigDir, ROOST_CONFIG: globalConfig },
 });
 const browser = await startBrowser(profileDir(repoRoot));
 let page, claude;

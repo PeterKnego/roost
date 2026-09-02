@@ -96,8 +96,8 @@ pub fn offered_for(a: Availability) -> bool {
     a != Availability::Absent
 }
 
-const FOUND: &str = "RESH_FOUND";
-const MISSING: &str = "RESH_MISSING";
+const FOUND: &str = "ROOST_FOUND";
+const MISSING: &str = "ROOST_MISSING";
 
 /// Asks `shell` (as a login interactive shell, the way a terminal gets it)
 /// whether `program` is on its `PATH`. The answer is a sentinel on stdout,

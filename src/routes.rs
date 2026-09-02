@@ -307,7 +307,7 @@ fn serve_workspace(w: &mut impl Write, roots: &[PathBuf], project: &str) {
     );
 }
 
-/// Serialises the tests that set the process-global `RESH_STATIC`/`HOME`.
+/// Serialises the tests that set the process-global `ROOST_STATIC`/`HOME`.
 /// cargo runs a binary's tests in parallel threads, so without this two of
 /// them interleave and one sees the other's environment mid-body — a
 /// flakiness this project has shipped once before (see SESSION_ENV_LOCK).
@@ -429,7 +429,7 @@ fn read_confined(base: &Path, rel: &str) -> Option<Vec<u8>> {
 
 /// Layered lookup — see docs/superpowers/specs/2026-08-19-embedded-assets-design.md.
 ///
-///   1. $RESH_STATIC        any class   (operator runtime switch)
+///   1. $ROOST_STATIC        any class   (operator runtime switch)
 ///   2. ~/.config/resh/static  theme class only
 ///   3. embedded            any class   (always present)
 ///
@@ -442,7 +442,7 @@ fn serve_static(w: &mut impl Write, rel: &str) {
     };
     let ctype = content_type(rel);
 
-    if let Some(dir) = std::env::var_os("RESH_STATIC") {
+    if let Some(dir) = std::env::var_os("ROOST_STATIC") {
         if let Some(body) = read_confined(Path::new(&dir), rel) {
             return http::respond_with(w, 200, "OK", ctype, &[NOSNIFF], &body);
         }
@@ -726,7 +726,7 @@ mod tests {
     #[test]
     fn an_absent_overlay_serves_the_embedded_copy() {
         let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("RESH_STATIC");
+        std::env::remove_var("ROOST_STATIC");
         let home = tempfile::tempdir().unwrap();
         let _home = HomeGuard::set(home.path());
         let out = serve("style.css");
@@ -740,7 +740,7 @@ mod tests {
         let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("style.css"), "/*OVERRIDDEN*/").unwrap();
-        std::env::set_var("RESH_STATIC", d.path());
+        std::env::set_var("ROOST_STATIC", d.path());
         let home = tempfile::tempdir().unwrap();
         let _home = HomeGuard::set(home.path());
 
@@ -748,7 +748,7 @@ mod tests {
         // Not present in the overlay dir, so it must still resolve.
         assert!(serve("app.js").starts_with("HTTP/1.1 200 OK"));
 
-        std::env::remove_var("RESH_STATIC");
+        std::env::remove_var("ROOST_STATIC");
     }
 
     /// The rule the whole class split exists for. A .js in the user dir must
@@ -757,7 +757,7 @@ mod tests {
     #[test]
     fn the_user_directory_may_not_replace_code() {
         let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("RESH_STATIC");
+        std::env::remove_var("ROOST_STATIC");
         let home = tempfile::tempdir().unwrap();
         let userdir = home.path().join(".config/resh/static");
         std::fs::create_dir_all(&userdir).unwrap();
@@ -808,15 +808,15 @@ mod tests {
             "themes/../style.css",
         ];
 
-        std::env::remove_var("RESH_STATIC");
+        std::env::remove_var("ROOST_STATIC");
         let without: Vec<String> = probes.iter().map(|p| serve(p)).collect();
 
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("themes")).unwrap();
         std::fs::write(d.path().join("style.css"), "/*LAYER1*/").unwrap();
-        std::env::set_var("RESH_STATIC", d.path());
+        std::env::set_var("ROOST_STATIC", d.path());
         let with: Vec<String> = probes.iter().map(|p| serve(p)).collect();
-        std::env::remove_var("RESH_STATIC");
+        std::env::remove_var("ROOST_STATIC");
 
         for (i, p) in probes.iter().enumerate() {
             assert!(without[i].starts_with("HTTP/1.1 404"), "{p} must 404");

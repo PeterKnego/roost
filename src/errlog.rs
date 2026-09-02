@@ -25,7 +25,7 @@ pub fn record(text: &str, now_secs: u64) {
 }
 
 /// Split from [`record`] so tests can point at a real directory instead of
-/// setting `RESH_STATE_DIR`, which other tests in this crate read concurrently.
+/// setting `ROOST_STATE_DIR`, which other tests in this crate read concurrently.
 pub fn record_to(dir: &Path, text: &str, now_secs: u64) {
     use std::io::Write;
     let _ = std::fs::create_dir_all(dir);

@@ -636,7 +636,7 @@ mod tests {
     fn symlink_loop_does_not_hang_the_walk() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let sd = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", sd.path());
+        std::env::set_var("ROOST_STATE_DIR", sd.path());
 
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "hi").unwrap();
@@ -656,7 +656,7 @@ mod tests {
             .expect("spawn must return promptly even with a symlink loop in the tree");
         assert!(ok);
 
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     // The watcher reads the project's settings itself, per batch of events —
@@ -709,7 +709,7 @@ mod tests {
     fn dotfile_refreshes_the_tree(config: Option<&str>, toggle: Option<bool>) -> bool {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
         std::fs::write(d.path().join("seed.txt"), "").unwrap();
         if let Some(text) = config {
             std::fs::create_dir(d.path().join(".resh")).unwrap();
@@ -733,7 +733,7 @@ mod tests {
              dotfile result is meaningless"
         );
 
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
         saw_dotfile
     }
 
@@ -747,7 +747,7 @@ mod tests {
     fn an_external_rename_moves_the_tab_through_a_live_watcher() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
         std::fs::write(d.path().join("old.rs"), "fn one() {}\n").unwrap();
 
         let hub = Arc::new(Mutex::new(Hub::new("watch_rename", d.path().to_path_buf())));
@@ -799,7 +799,7 @@ mod tests {
             }
         }
         assert!(saw_state, "a State naming the new rel has to reach the browser");
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// True if a TreeChanged arrives within the window. The window only has to
@@ -852,7 +852,7 @@ mod tests {
     fn writing_refreshes_the_status_pane(rel: &str, buffers: &[&str]) -> bool {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
         std::fs::write(d.path().join(rel), "before\n").unwrap();
 
         let hub = Arc::new(Mutex::new(Hub::new("watch_status", d.path().to_path_buf())));
@@ -874,7 +874,7 @@ mod tests {
         }
         assert!(saw_any, "the watcher delivered nothing at all for {rel}; the result below would mean nothing");
 
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
         saw_status
     }
 
@@ -895,7 +895,7 @@ mod tests {
     fn reading_a_watched_directory_is_not_a_change() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
         std::fs::create_dir(d.path().join("src")).unwrap();
         std::fs::write(d.path().join("src/main.rs"), "").unwrap();
         std::fs::write(d.path().join("seed.txt"), "").unwrap();
@@ -937,7 +937,7 @@ mod tests {
         }
         assert!(saw_write, "the watcher must still report a real write; silence above meant nothing otherwise");
 
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     // The per-directory (Linux) watch path must stop growing once it hits
@@ -1012,7 +1012,7 @@ mod tests {
     fn deleted_files_reach_the_ui_same_as_created_ones() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let sd = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", sd.path());
+        std::env::set_var("ROOST_STATE_DIR", sd.path());
 
         let d = tempfile::tempdir().unwrap();
         let hub = Arc::new(Mutex::new(Hub::new("watch-delete-regression", d.path().to_path_buf())));
@@ -1039,6 +1039,6 @@ mod tests {
             "a deleted file must be observed too — this is the debouncer's dropped Remove event"
         );
 
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 }

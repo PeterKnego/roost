@@ -74,13 +74,13 @@ impl Default for Settings {
     }
 }
 
-/// `RESH_CONFIG` overrides the location, which is what lets a test drive a
+/// `ROOST_CONFIG` overrides the location, which is what lets a test drive a
 /// *global-only* setting without touching the developer's real
-/// `~/.config/resh/config.toml` — the same reason `RESH_STATE_DIR` exists.
+/// `~/.config/resh/config.toml` — the same reason `ROOST_STATE_DIR` exists.
 /// Operators get the same knob for free: a second instance can carry its own
 /// origins and caps without a second home directory.
 pub fn global_config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("RESH_CONFIG") {
+    if let Ok(p) = std::env::var("ROOST_CONFIG") {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
@@ -124,13 +124,13 @@ pub fn load(paths: &[&Path]) -> Settings {
 }
 
 /// Origins allowed to open a websocket or issue requests, from
-/// `RESH_ORIGINS` (comma-separated) or the global config's
+/// `ROOST_ORIGINS` (comma-separated) or the global config's
 /// `allowed_origins`. Deliberately **not** part of [`Settings`]: a per-project
 /// `.resh/config.toml` must never be able to allowlist an origin, or a
 /// hostile repo could allowlist itself. Loopback is always allowed without
 /// configuration — see [`crate::origin`].
 pub fn allowed_origins() -> Vec<String> {
-    let from_env: Vec<String> = std::env::var("RESH_ORIGINS")
+    let from_env: Vec<String> = std::env::var("ROOST_ORIGINS")
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
@@ -158,10 +158,10 @@ pub fn allowed_origins() -> Vec<String> {
 /// the existing teardown path already handles.
 ///
 /// Thirty seconds is chosen to sit far below any NAT or tunnel idle timeout
-/// while costing nothing measurable. `RESH_PING_SECS` exists so a test need
+/// while costing nothing measurable. `ROOST_PING_SECS` exists so a test need
 /// not wait that long; one second is its practical floor.
 pub fn ping_interval() -> std::time::Duration {
-    let secs = std::env::var("RESH_PING_SECS")
+    let secs = std::env::var("ROOST_PING_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|s| *s > 0)
@@ -248,7 +248,7 @@ fn worktree_prompt_from(global: &Path) -> bool {
 /// not part of [`Settings`], which is the only thing a project file reaches.
 ///
 /// A leading `~/` expands against `HOME`. This file is hand-edited, unlike
-/// the unit file's `RESH_ROOTS`, and a literal `~` directory that matches
+/// the unit file's `ROOST_ROOTS`, and a literal `~` directory that matches
 /// nothing would fail as "no projects at all" — indistinguishable from every
 /// project having vanished.
 pub fn configured_roots() -> Vec<PathBuf> {
@@ -309,7 +309,7 @@ fn share_selection_from(global: &Path) -> bool {
 fn max_upload_from(global: &Path) -> u64 {
     // A zero or unparseable value falls back rather than disabling the limit:
     // the failure mode of reading a typo as "unlimited" is a full disk.
-    if let Ok(v) = std::env::var("RESH_MAX_UPLOAD") {
+    if let Ok(v) = std::env::var("ROOST_MAX_UPLOAD") {
         if let Some(n) = v.trim().parse::<u64>().ok().filter(|n| *n > 0) {
             return n;
         }
@@ -519,7 +519,7 @@ mod tests {
         assert!(s.warning.is_none());
     }
 
-    /// A zero or garbage `RESH_PING_SECS` must fall back to the default, not
+    /// A zero or garbage `ROOST_PING_SECS` must fall back to the default, not
     /// be taken literally: `recv_timeout(0)` would turn both writer threads
     /// into busy loops flooding their sockets with Pings, which is worse than
     /// the leak the ping exists to bound. Verified by deleting the guard and
@@ -527,22 +527,22 @@ mod tests {
     #[test]
     fn ping_interval_defaults_and_rejects_a_useless_value() {
         // No other test reads this var, so setting it here races nothing.
-        std::env::remove_var("RESH_PING_SECS");
+        std::env::remove_var("ROOST_PING_SECS");
         assert_eq!(ping_interval(), std::time::Duration::from_secs(30), "unset");
-        std::env::set_var("RESH_PING_SECS", "5");
+        std::env::set_var("ROOST_PING_SECS", "5");
         assert_eq!(ping_interval(), std::time::Duration::from_secs(5), "explicit override");
         for bad in ["0", "-1", "", "soon"] {
-            std::env::set_var("RESH_PING_SECS", bad);
+            std::env::set_var("ROOST_PING_SECS", bad);
             assert_eq!(
                 ping_interval(),
                 std::time::Duration::from_secs(30),
                 "{bad:?} must fall back to the default rather than disabling or busy-looping"
             );
         }
-        std::env::remove_var("RESH_PING_SECS");
+        std::env::remove_var("ROOST_PING_SECS");
     }
 
-    /// `RESH_MAX_UPLOAD` is process-global and these tests write it, so they
+    /// `ROOST_MAX_UPLOAD` is process-global and these tests write it, so they
     /// serialise. Without this they interleave and each sees another's value.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -574,7 +574,7 @@ mod tests {
     #[test]
     fn the_ceiling_comes_from_the_global_file_and_defaults_without_one() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("RESH_MAX_UPLOAD");
+        std::env::remove_var("ROOST_MAX_UPLOAD");
         let d = tempfile::tempdir().unwrap();
         let missing = d.path().join("nope.toml");
         assert_eq!(max_upload_from(&missing), DEFAULT_MAX_UPLOAD);
@@ -590,9 +590,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let global = d.path().join("config.toml");
         fs::write(&global, "max_upload_bytes = 5000\n").unwrap();
-        std::env::set_var("RESH_MAX_UPLOAD", "1234");
+        std::env::set_var("ROOST_MAX_UPLOAD", "1234");
         assert_eq!(max_upload_from(&global), 1234);
-        std::env::remove_var("RESH_MAX_UPLOAD");
+        std::env::remove_var("ROOST_MAX_UPLOAD");
     }
 
     /// A typo must not read as "no limit". Zero and garbage both fall back to
@@ -604,18 +604,18 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let global = d.path().join("config.toml");
         fs::write(&global, "max_upload_bytes = 0\n").unwrap();
-        std::env::remove_var("RESH_MAX_UPLOAD");
+        std::env::remove_var("ROOST_MAX_UPLOAD");
         assert_eq!(max_upload_from(&global), DEFAULT_MAX_UPLOAD, "0 must not mean unlimited");
 
         for bad in ["banana", "0", "-5"] {
-            std::env::set_var("RESH_MAX_UPLOAD", bad);
+            std::env::set_var("ROOST_MAX_UPLOAD", bad);
             assert_eq!(
                 max_upload_from(&global),
                 DEFAULT_MAX_UPLOAD,
-                "RESH_MAX_UPLOAD={bad} must fall back, not disable the ceiling"
+                "ROOST_MAX_UPLOAD={bad} must fall back, not disable the ceiling"
             );
         }
-        std::env::remove_var("RESH_MAX_UPLOAD");
+        std::env::remove_var("ROOST_MAX_UPLOAD");
     }
 
     /// The property that makes `roots` global-only, pinned rather than left

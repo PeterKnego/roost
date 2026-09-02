@@ -5,7 +5,7 @@
 //!
 //! Only a real browser + real dtach proves the session list reflects live
 //! PTYs (the Claude/shell mark and attached count are exactly the kind of
-//! thing a RESH_CMD=cat unit test renders without touching a real
+//! thing a ROOST_CMD=cat unit test renders without touching a real
 //! terminal). Assertions read DOM/State, never event order (README trap 2:
 //! client-visible ordering pipelines per connection and was proved
 //! non-discriminating once in reconnect.mjs). Every wait uses `until`, which

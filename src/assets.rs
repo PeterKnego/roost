@@ -40,7 +40,7 @@ pub fn get(rel: &str) -> Option<&'static [u8]> {
 pub enum Class {
     /// Replaceable by a project or by the user directory.
     Theme,
-    /// Replaceable only by the operator, via `$RESH_STATIC`.
+    /// Replaceable only by the operator, via `$ROOST_STATIC`.
     Code,
 }
 

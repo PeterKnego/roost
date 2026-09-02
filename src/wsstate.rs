@@ -1,11 +1,11 @@
-//! Workspace persistence. Lives in $RESH_STATE_DIR, never inside a
+//! Workspace persistence. Lives in $ROOST_STATE_DIR, never inside a
 //! project — following zellij, so pane drags never show up in git status.
 use crate::proto::{Sizes, Tab};
 use crate::workspace::{Buffer, Content, Pane, Workspace};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Tests mutate the process-global RESH_STATE_DIR; cargo runs them in
+/// Tests mutate the process-global ROOST_STATE_DIR; cargo runs them in
 /// parallel threads. Every test that touches that variable — here and in
 /// `hub` — must hold this lock.
 ///
@@ -72,12 +72,12 @@ struct Disk {
     show_hidden: Option<bool>,
 }
 
-/// Honours `RESH_STATE_DIR` for tests and operators who want state
+/// Honours `ROOST_STATE_DIR` for tests and operators who want state
 /// elsewhere; otherwise the XDG-ish default, never inside the project tree.
-/// Points `RESH_STATE_DIR` at one stable, reused directory for this user.
+/// Points `ROOST_STATE_DIR` at one stable, reused directory for this user.
 ///
 /// For tests that need *a* state directory rather than an isolated one.
-/// `RESH_STATE_DIR` is process-global and read on every `state_dir()` call,
+/// `ROOST_STATE_DIR` is process-global and read on every `state_dir()` call,
 /// so a test that points it at its own `TempDir` has that directory written
 /// into by whatever else is running — and the write can land while the
 /// directory is being removed. `TempDir::drop` ignores a failed removal, so
@@ -94,11 +94,11 @@ pub fn set_state_dir_for_test() {
         let _ = std::fs::create_dir_all(&p);
         p
     });
-    std::env::set_var("RESH_STATE_DIR", d);
+    std::env::set_var("ROOST_STATE_DIR", d);
 }
 
 pub fn state_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("RESH_STATE_DIR") {
+    if let Ok(d) = std::env::var("ROOST_STATE_DIR") {
         if !d.is_empty() {
             return PathBuf::from(d);
         }
@@ -286,9 +286,9 @@ mod tests {
     fn with_state_dir<T>(f: impl FnOnce() -> T) -> T {
         let _g = STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", d.path());
+        std::env::set_var("ROOST_STATE_DIR", d.path());
         let out = f();
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
         out
     }
 
@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn the_default_state_dir_is_named_for_the_product() {
         let _g = STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
         let d = state_dir();
         assert!(
             d.ends_with(".local/state/resh"),

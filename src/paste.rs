@@ -91,14 +91,14 @@ mod tests {
     /// wsstate keys by storage_key rather than the raw project string.
     #[test]
     fn a_nested_project_key_is_encoded_not_split() {
-        // `RESH_STATE_DIR` is process-global and read on every `state_dir()`
+        // `ROOST_STATE_DIR` is process-global and read on every `state_dir()`
         // call, so setting it without this lock clobbers it under a
         // concurrently-running test — whose writes then land in this test's
         // `TempDir` while it is being removed. `TempDir::drop` ignores the
         // failed removal, leaking the directory silently.
         let _envg = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", d.path());
+        std::env::set_var("ROOST_STATE_DIR", d.path());
         let p = scratch_dir("karpie/src");
         let leaf = p.file_name().unwrap().to_string_lossy().to_string();
         assert!(!leaf.contains('/'), "project key leaked a separator: {leaf}");

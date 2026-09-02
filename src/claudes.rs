@@ -45,7 +45,7 @@ pub fn evidence_from(launched: &[String], connected: &[Sess], ide_on: bool) -> C
 }
 
 /// Terminals of `project` that a running `claude` process sits in, read from
-/// the process table. `session_env` exports `RESH_PROJECT`/`RESH_SESSION`
+/// the process table. `session_env` exports `ROOST_PROJECT`/`ROOST_SESSION`
 /// into every resh shell and a `claude` started there inherits them, so a
 /// `claude` process's environment names its terminal — `idesess.rs` reads
 /// exactly this for one pid; this walks every pid whose `comm` is `claude`.
@@ -93,8 +93,8 @@ pub fn try_claude_terminals(proc_root: &std::path::Path) -> Option<Vec<(String, 
         let (mut proj, mut sess) = (None, None);
         for entry in raw.split(|b| *b == 0) {
             let Ok(kv) = std::str::from_utf8(entry) else { continue };
-            if let Some(v) = kv.strip_prefix("RESH_PROJECT=") { proj = Some(v.to_string()); }
-            else if let Some(v) = kv.strip_prefix("RESH_SESSION=") { sess = Some(v.to_string()); }
+            if let Some(v) = kv.strip_prefix("ROOST_PROJECT=") { proj = Some(v.to_string()); }
+            else if let Some(v) = kv.strip_prefix("ROOST_SESSION=") { sess = Some(v.to_string()); }
         }
         if let (Some(p), Some(s)) = (proj, sess) {
             if crate::session::valid_name(&s) {
@@ -209,7 +209,7 @@ pub(crate) fn fake_proc(dir: &std::path::Path, procs: &[(u32, &str, &str)]) {
         let p = dir.join(pid.to_string());
         std::fs::create_dir_all(&p).unwrap();
         std::fs::write(p.join("comm"), "claude\n").unwrap();
-        std::fs::write(p.join("environ"), format!("RESH_PROJECT={proj}\0RESH_SESSION={sess}\0")).unwrap();
+        std::fs::write(p.join("environ"), format!("ROOST_PROJECT={proj}\0ROOST_SESSION={sess}\0")).unwrap();
     }
 }
 
@@ -349,9 +349,9 @@ mod tests {
             std::fs::write(p.join("comm"), format!("{comm}\n")).unwrap();
             std::fs::write(p.join("environ"), env.replace('\n', "\0")).unwrap();
         };
-        mk(100, "claude", "RESH_PROJECT=karpie\nRESH_SESSION=term3\n");
-        mk(200, "claude", "RESH_PROJECT=other\nRESH_SESSION=term\n");
-        mk(300, "bash", "RESH_PROJECT=karpie\nRESH_SESSION=term1\n");
+        mk(100, "claude", "ROOST_PROJECT=karpie\nROOST_SESSION=term3\n");
+        mk(200, "claude", "ROOST_PROJECT=other\nROOST_SESSION=term\n");
+        mk(300, "bash", "ROOST_PROJECT=karpie\nROOST_SESSION=term1\n");
         std::fs::write(d.path().join("self"), b"").unwrap(); // a non-pid entry, skipped
         assert_eq!(claudes_in_proc(d.path(), "karpie"), vec!["term3".to_string()]);
         assert!(claudes_in_proc(d.path(), "nowhere").is_empty());

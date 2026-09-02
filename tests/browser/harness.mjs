@@ -3,7 +3,7 @@
 //!
 //! It exists because this project's worst defects have been invisible to a
 //! green `cargo test` — CLAUDE.md lists four of them, each hidden by a
-//! substitution the suite makes for the real thing (`RESH_CMD=cat` for dtach,
+//! substitution the suite makes for the real thing (`ROOST_CMD=cat` for dtach,
 //! no browser at all). The terminal reconnect is the same shape: every line of
 //! it lives in static/app.js, where `cargo test` cannot reach.
 //!
@@ -190,7 +190,7 @@ export async function attachTarget(webSocketDebuggerUrl) {
 
 // ------------------------------------------------------------------- resh
 
-/// Builds and starts a private resh. `RESH_CMD` is never set: substituting a
+/// Builds and starts a private resh. `ROOST_CMD` is never set: substituting a
 /// plain command for dtach is exactly the trap that once let a broken socket
 /// directory reach production green (see CLAUDE.md, "The dev/prod
 /// substitution trap"). A browser test that skipped real dtach would be
@@ -205,7 +205,7 @@ export async function startResh({ repoRoot, stateDir, roots, port, extraEnv = {}
 
   const spawn = () => new Deno.Command(bin, {
     args: [String(port)],
-    // clearEnv so nothing from the developer's shell — RESH_CMD above all —
+    // clearEnv so nothing from the developer's shell — ROOST_CMD above all —
     // leaks in and quietly changes what is under test.
     clearEnv: true,
     env: {
@@ -213,13 +213,13 @@ export async function startResh({ repoRoot, stateDir, roots, port, extraEnv = {}
       HOME: Deno.env.get("HOME") ?? "/tmp",
       SHELL: "/bin/bash",
       TERM: "xterm-256color",
-      RESH_ROOTS: roots,
-      RESH_STATE_DIR: stateDir,
-      RESH_STATIC: `${repoRoot}/static`,
+      ROOST_ROOTS: roots,
+      ROOST_STATE_DIR: stateDir,
+      ROOST_STATIC: `${repoRoot}/static`,
       // The one knob deliberately let through the clearEnv above: setting it
       // low turns a run into a soak test for the keepalive ping, so a browser
       // meets hundreds of them instead of two.
-      ...(Deno.env.get("RESH_PING_SECS") ? { RESH_PING_SECS: Deno.env.get("RESH_PING_SECS") } : {}),
+      ...(Deno.env.get("ROOST_PING_SECS") ? { ROOST_PING_SECS: Deno.env.get("ROOST_PING_SECS") } : {}),
       // Every run gets its own Claude config dir, not just ide.mjs's.
       // `idelock.rs` writes a lock file per open project into
       // `$CLAUDE_CONFIG_DIR/ide/` (falling back to `~/.claude/ide/`), and a

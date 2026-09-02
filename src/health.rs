@@ -111,7 +111,7 @@ impl Latch {
 /// Interval between passes. Long by default: this watches for drift, not for
 /// events, and a short period buys nothing but journal noise.
 pub fn interval() -> std::time::Duration {
-    let secs = std::env::var("RESH_HEALTH_SECS")
+    let secs = std::env::var("ROOST_HEALTH_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|s| *s >= 10)
@@ -230,10 +230,10 @@ mod tests {
     fn the_interval_refuses_a_useless_value() {
         // A one-second health pass would connect to every advertised port
         // every second. The floor is not a style choice.
-        std::env::set_var("RESH_HEALTH_SECS", "1");
+        std::env::set_var("ROOST_HEALTH_SECS", "1");
         assert_eq!(interval(), std::time::Duration::from_secs(300));
-        std::env::set_var("RESH_HEALTH_SECS", "30");
+        std::env::set_var("ROOST_HEALTH_SECS", "30");
         assert_eq!(interval(), std::time::Duration::from_secs(30));
-        std::env::remove_var("RESH_HEALTH_SECS");
+        std::env::remove_var("ROOST_HEALTH_SECS");
     }
 }

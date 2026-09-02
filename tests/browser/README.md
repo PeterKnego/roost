@@ -57,12 +57,12 @@ tens of seconds, and the Rust suite has to stay runnable everywhere.
 ## What a run does
 
 Each run is hermetic. `harness.mjs` builds resh, creates a throwaway project
-and its own `RESH_STATE_DIR`, starts a private server on a free port, and tears
+and its own `ROOST_STATE_DIR`, starts a private server on a free port, and tears
 all of it down afterwards — including any `dtach` session it started, which it
 finds by that unique state-dir path. **It never touches the deployed or
 development instance**, so a test run cannot kill a session someone is using.
 
-`RESH_CMD` is never set. Substituting a plain command for `dtach` is the trap
+`ROOST_CMD` is never set. Substituting a plain command for `dtach` is the trap
 that once let a missing socket directory reach production green; a browser test
 that skipped real `dtach` would be testing the same fiction from a new angle.
 

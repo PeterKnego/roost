@@ -64,7 +64,7 @@ pub fn is_text_extension(ext: &str) -> bool {
     TEXT_EXTENSIONS.contains(&ext)
 }
 
-/// Roots to scan for projects: `RESH_ROOTS` (colon-separated) when set and
+/// Roots to scan for projects: `ROOST_ROOTS` (colon-separated) when set and
 /// non-empty, otherwise the global config's `roots`. Empty when neither says
 /// anything; `main` refuses to start on that rather than guessing.
 ///
@@ -84,14 +84,14 @@ pub fn is_text_extension(ext: &str) -> bool {
 /// a project file must never reach this.
 pub fn roots() -> Vec<PathBuf> {
     roots_from(
-        std::env::var("RESH_ROOTS").ok().as_deref(),
+        std::env::var("ROOST_ROOTS").ok().as_deref(),
         &crate::config::global_config_path(),
     )
 }
 
 /// Both sources naming roots and disagreeing.
 ///
-/// `RESH_ROOTS` wins silently, which is correct — the unit file is
+/// `ROOST_ROOTS` wins silently, which is correct — the unit file is
 /// authoritative for the service — but silence is wrong when the two were
 /// meant to say the same thing. The config entry exists so callers that
 /// inherit none of the unit's environment (a hook, say) resolve the same
@@ -173,7 +173,7 @@ pub fn list_projects(roots: &[PathBuf]) -> Vec<Project> {
     }
     // Sorted once over the *merged* list, not per root: the picker's top level
     // presents one alphabetical list, and sorting each root separately made the
-    // concatenation order — an operator's `RESH_ROOTS` ordering, invisible in
+    // concatenation order — an operator's `ROOST_ROOTS` ordering, invisible in
     // the UI — the dominant sort, so a second root's `alpha` landed below the
     // first root's `zeta`. Which root a duplicate name comes from is settled
     // above by `seen`, so ordering here cannot disturb that precedence.
@@ -891,7 +891,7 @@ mod tests {
         assert_eq!(
             roots_from(Some(""), &cfg),
             vec![PathBuf::from("/from/config")],
-            "an empty RESH_ROOTS is 'unset', not 'deliberately no roots'"
+            "an empty ROOST_ROOTS is 'unset', not 'deliberately no roots'"
         );
 
         // No built-in fallback, still. A config file that says nothing about
@@ -1056,7 +1056,7 @@ mod tests {
 
     /// A conflict is both sources speaking and disagreeing — never one being
     /// silent, which is the ordinary case on every host that sets only the
-    /// unit file. Detected because `RESH_ROOTS` wins here while a caller that
+    /// unit file. Detected because `ROOST_ROOTS` wins here while a caller that
     /// inherits none of the server's environment, such as a hook, silently
     /// resolves the other set.
     #[test]

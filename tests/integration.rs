@@ -217,14 +217,14 @@ fn upload_refuses_more_parts_than_the_limit() {
 #[test]
 fn upload_refuses_a_body_past_the_aggregate_limit() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_MAX_UPLOAD", "4096");
+    std::env::set_var("ROOST_MAX_UPLOAD", "4096");
     let (d, port) = fixture_named("up_bytes");
     let origin = format!("http://127.0.0.1:{port}");
     let big = vec![b'x'; 8192];
     let (ct, body) = multipart(&[("big.bin", &big)]);
 
     let (status, resp) = post(port, "/upload/up_bytes", Some(&origin), &ct, &body);
-    std::env::remove_var("RESH_MAX_UPLOAD");
+    std::env::remove_var("ROOST_MAX_UPLOAD");
 
     assert_eq!(status, 413);
     assert!(resp.contains("too large"), "the size cap must name itself: {resp}");
@@ -261,19 +261,19 @@ fn upload_lands_in_the_named_subdirectory() {
     assert_eq!(std::fs::read(d.path().join("up_sub/src/logo.png")).unwrap(), b"PNG");
 }
 
-/// `RESH_MAX_UPLOAD` is process-global, so any test that writes it serialises.
+/// `ROOST_MAX_UPLOAD` is process-global, so any test that writes it serialises.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// With `RESH_CMD=cat` the PTY echoes what is written to it, so the terminal
+/// With `ROOST_CMD=cat` the PTY echoes what is written to it, so the terminal
 /// socket is a direct view of the injected bytes. Asserting the markers — not
 /// merely that the session survived — is the point: CLAUDE.md records a test
 /// whose subject was a call it never actually verified.
 #[test]
 fn a_pasted_image_injects_a_bracketed_path_into_the_pty() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let state = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", state.path());
+    std::env::set_var("ROOST_STATE_DIR", state.path());
     let (_d, port) = fixture();
     let origin = format!("http://127.0.0.1:{port}");
 
@@ -312,7 +312,7 @@ fn a_pasted_image_injects_a_bracketed_path_into_the_pty() {
         seen.contains(&state.path().join("pasted").to_string_lossy().to_string()),
         "the path must be absolute and under the state dir, not in the project: {seen:?}"
     );
-    std::env::remove_var("RESH_CMD");
+    std::env::remove_var("ROOST_CMD");
 }
 
 /// Differs from an accepted paste only in its *content* — same filename, same
@@ -322,9 +322,9 @@ fn a_pasted_image_injects_a_bracketed_path_into_the_pty() {
 #[test]
 fn a_paste_of_a_non_image_is_refused() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let state = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", state.path());
+    std::env::set_var("ROOST_STATE_DIR", state.path());
     let (_d, port) = fixture();
     let origin = format!("http://127.0.0.1:{port}");
     let _term = ws_connect(port, Some("http://127.0.0.1:8444")).unwrap();
@@ -339,7 +339,7 @@ fn a_paste_of_a_non_image_is_refused() {
         std::fs::read_dir(state.path().join("pasted")).map(|d| d.count()).unwrap_or(0) <= 1,
         "a refused paste must not have left an image behind"
     );
-    std::env::remove_var("RESH_CMD");
+    std::env::remove_var("ROOST_CMD");
 }
 
 #[test]
@@ -477,8 +477,8 @@ fn frag_projects_route_serves_the_cross_project_strip() {
 fn nested_project_websockets_connect() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_CMD", "cat");
     let (_d, port) = nested_fixture();
 
     // routes::route's `[project, rest @ ..]` change is only half the fix —
@@ -506,8 +506,8 @@ fn nested_project_websockets_connect() {
     assert!(seen.contains("hi"), "nested project's terminal must echo through the PTY");
     let _ = term.close(None);
 
-    std::env::remove_var("RESH_STATE_DIR");
-    std::env::remove_var("RESH_CMD");
+    std::env::remove_var("ROOST_STATE_DIR");
+    std::env::remove_var("ROOST_CMD");
 }
 
 #[test]
@@ -667,7 +667,7 @@ fn tree_dir_lazily_returns_a_subdirectorys_children() {
 fn the_header_toggle_overrides_the_config_file_in_both_directions() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (d, port) = fixture_named("toggleproj");
     let proj = d.path().join("toggleproj");
     std::fs::write(proj.join(".gitignore"), "target\n").unwrap();
@@ -695,7 +695,7 @@ fn the_header_toggle_overrides_the_config_file_in_both_directions() {
     assert!(hidden.contains(r#"data-rel="hello.md""#), "and must not empty the tree instead");
 
     let _ = c.close(None);
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_STATE_DIR");
 }
 
 // The setting has to survive the whole request path — config cascade, route,
@@ -743,7 +743,7 @@ fn tree_dir_with_empty_rel_returns_the_root_listing() {
     assert!(root_dir.contains("data-rel=\"sub\""));
 }
 
-// RESH_CMD is process-global; both ws tests set it, and if they ran in
+// ROOST_CMD is process-global; both ws tests set it, and if they ran in
 // parallel one could overwrite the other's value mid-connect. Serialize them.
 static WS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -774,7 +774,7 @@ fn ws_connect(
 #[test]
 fn ws_rejects_foreign_and_missing_origin() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let (_d, port) = fixture();
     // The drive-by attack: a page the user visits opens this socket for a shell.
     assert!(
@@ -815,7 +815,7 @@ fn ws_rejects_foreign_and_missing_origin() {
 #[test]
 fn one_ping_gets_exactly_one_pong_because_only_one_half_can_write() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let (_d, port) = fixture();
     let mut ws = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
     ws.send(tungstenite::Message::Ping(b"once".to_vec().into())).unwrap();
@@ -859,7 +859,7 @@ fn one_ping_gets_exactly_one_pong_because_only_one_half_can_write() {
 #[test]
 fn one_ping_to_a_terminal_gets_exactly_one_pong() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let (_d, port) = fixture();
     let mut ws = ws_connect(port, Some("http://127.0.0.1:8444")).unwrap();
     ws.send(tungstenite::Message::Ping(b"once".to_vec().into())).unwrap();
@@ -891,7 +891,7 @@ fn one_ping_to_a_terminal_gets_exactly_one_pong() {
 #[test]
 fn a_terminal_socket_still_answers_a_ping_after_the_reader_stops_writing() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let (_d, port) = fixture();
     let mut ws = ws_connect(port, Some("http://127.0.0.1:8444")).unwrap();
     ws.send(tungstenite::Message::Ping(b"marco".to_vec().into())).unwrap();
@@ -919,7 +919,7 @@ fn a_terminal_socket_still_answers_a_ping_after_the_reader_stops_writing() {
 #[test]
 fn a_workspace_socket_still_answers_a_ping_after_the_reader_stops_writing() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let (_d, port) = fixture();
     let mut ws = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
     ws.send(tungstenite::Message::Ping(b"polo".to_vec().into())).unwrap();
@@ -947,7 +947,7 @@ fn a_workspace_socket_still_answers_a_ping_after_the_reader_stops_writing() {
 #[test]
 fn terminal_ws_echoes_through_pty() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let (_d, port) = fixture();
     let mut ws = ws_connect(port, Some("http://127.0.0.1:8444")).unwrap();
     ws.send(tungstenite::Message::Text("resize:100x30".into())).unwrap();
@@ -1001,11 +1001,11 @@ fn assert_ws_closes(
 #[test]
 fn ws_closes_when_child_exits_first() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "true"); // exits immediately
+    std::env::set_var("ROOST_CMD", "true"); // exits immediately
     let (_d, port) = fixture();
     // Own session name: the process-global registry may already hold a live
     // "proj/shell" session from another test in this binary (e.g.
-    // terminal_ws_echoes_through_pty's `cat`), in which case RESH_CMD
+    // terminal_ws_echoes_through_pty's `cat`), in which case ROOST_CMD
     // would never be consulted for a fresh spawn and this test would prove
     // nothing about a child exiting first.
     let mut ws = ws_connect_term(port, "/ws/proj/term/exiter").unwrap();
@@ -1017,8 +1017,8 @@ fn ws_closes_when_child_exits_first() {
 fn child_exit_delivers_a_close_frame_not_a_bare_eof() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
-    std::env::set_var("RESH_CMD", "true"); // exits immediately
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_CMD", "true"); // exits immediately
     let (_d, port) = fixture_named("closeproj");
     let mut ws = ws_connect_term(port, "/ws/closeproj/term/exiter").unwrap();
 
@@ -1033,12 +1033,12 @@ fn child_exit_delivers_a_close_frame_not_a_bare_eof() {
     for _ in 0..50 {
         match ws.read() {
             Ok(tungstenite::Message::Close(_)) => {
-                std::env::remove_var("RESH_STATE_DIR");
+                std::env::remove_var("ROOST_STATE_DIR");
                 return;
             }
             Ok(m) => saw.push(format!("{m:?}")),
             Err(e) => {
-                std::env::remove_var("RESH_STATE_DIR");
+                std::env::remove_var("ROOST_STATE_DIR");
                 panic!(
                     "child exit must close the socket with a Close frame, not {e:?}; \
                      frames seen first: {saw:?}"
@@ -1046,7 +1046,7 @@ fn child_exit_delivers_a_close_frame_not_a_bare_eof() {
             }
         }
     }
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_STATE_DIR");
     panic!("no Close frame within the read budget; frames seen: {saw:?}");
 }
 
@@ -1080,9 +1080,9 @@ fn expect_ping(
 fn an_idle_terminal_socket_is_pinged() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
-    std::env::set_var("RESH_CMD", "cat"); // reads stdin, writes nothing unprompted
-    std::env::set_var("RESH_PING_SECS", "1");
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_CMD", "cat"); // reads stdin, writes nothing unprompted
+    std::env::set_var("ROOST_PING_SECS", "1");
     let (_d, port) = fixture_named("pingterm");
     let mut ws = ws_connect_term(port, "/ws/pingterm/term/idle").unwrap();
     // Nothing is sent from either side after the handshake. Without the
@@ -1091,29 +1091,29 @@ fn an_idle_terminal_socket_is_pinged() {
     // takes the *minimum* geometry across attachments, so a stale one
     // clamps the terminal for every live client.
     expect_ping(&mut ws, "idle terminal socket");
-    std::env::remove_var("RESH_PING_SECS");
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_PING_SECS");
+    std::env::remove_var("ROOST_STATE_DIR");
 }
 
 #[test]
 fn an_idle_workspace_socket_is_pinged() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_PING_SECS", "1");
+    std::env::set_var("ROOST_PING_SECS", "1");
     let (_d, port) = fixture_named("pingws");
     let mut ws = ws_connect_path(port, "/ws/pingws/_workspace").unwrap();
     // This socket matters more than the terminal one: hub::subscribe hands
     // out an *unbounded* channel, so a subscriber nobody drains accumulates
     // every broadcast in memory for as long as the process lives.
     expect_ping(&mut ws, "idle workspace socket");
-    std::env::remove_var("RESH_PING_SECS");
+    std::env::remove_var("ROOST_PING_SECS");
 }
 
 #[test]
 fn two_terminal_clients_mirror_one_session() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (_d, port) = fixture();
     let mut a = ws_connect_term(port, "/ws/proj/term/shell").unwrap();
     let mut b = ws_connect_term(port, "/ws/proj/term/shell").unwrap();
@@ -1135,7 +1135,7 @@ fn two_terminal_clients_mirror_one_session() {
     }
     let _ = a.close(None);
     let _ = b.close(None);
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_STATE_DIR");
 }
 
 /// A browser that connects *after* a proposal opened must be shown what it is
@@ -1159,7 +1159,7 @@ fn two_terminal_clients_mirror_one_session() {
 fn a_browser_that_connects_after_a_proposal_is_shown_both_sides_of_it() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (_d, port) = fixture();
     // The first connection is what builds the hub this proposal is opened on.
     let mut a = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
@@ -1181,7 +1181,7 @@ fn a_browser_that_connects_after_a_proposal_is_shown_both_sides_of_it() {
     roost::hub::close_proposal("proj", "late-1");
     let _ = a.close(None);
     let _ = b.close(None);
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_STATE_DIR");
 }
 
 /// The connect path must emit content before the tab that renders it, the
@@ -1209,7 +1209,7 @@ fn a_browser_that_connects_after_a_proposal_is_shown_both_sides_of_it() {
 fn a_late_browsers_first_frame_is_the_proposals_content_not_its_tab() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (_d, port) = fixture_named("proposal-order");
     let mut a = ws_connect_path(port, "/ws/proposal-order/_workspace").unwrap();
     let _ = read_until(&mut a, r#""t":"State""#);
@@ -1237,7 +1237,7 @@ fn a_late_browsers_first_frame_is_the_proposals_content_not_its_tab() {
     roost::hub::close_proposal("proposal-order", "order-1");
     let _ = a.close(None);
     let _ = b.close(None);
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_STATE_DIR");
 }
 
 /// The `/frag/{project}/proposal` route (added in review, replacing a
@@ -1251,7 +1251,7 @@ fn a_late_browsers_first_frame_is_the_proposals_content_not_its_tab() {
 fn proposal_fragment_route_shows_the_hunk_and_handles_a_missing_id() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (_d, port) = fixture_named("proposal-frag");
     // The first connection is what builds the hub this proposal opens on —
     // same reasoning as the other proposal tests above.
@@ -1291,13 +1291,13 @@ line three
 
     roost::hub::close_proposal("proposal-frag", "frag-1");
     let _ = a.close(None);
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_STATE_DIR");
 }
 
 #[test]
 fn invalid_session_name_is_refused() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let (_d, port) = fixture();
     // "bad%20name" is rejected because '%' is itself outside valid_name's
     // charset — req.uri().path() is never percent-decoded, so the server
@@ -1331,7 +1331,7 @@ fn invalid_session_name_is_refused() {
 #[test]
 fn an_unreserved_terminal_connect_creates_nothing_and_closes_cleanly() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let (_d, port) = fixture();
 
     // Deliberately `ws_connect_path`, not `ws_connect_term`: the point is a
@@ -1364,7 +1364,7 @@ fn an_unreserved_terminal_connect_creates_nothing_and_closes_cleanly() {
         roost::session::live_names("proj")
     );
     assert!(closed, "the refusal must arrive as a Close frame; read ended with {read_err:?}");
-    std::env::remove_var("RESH_CMD");
+    std::env::remove_var("ROOST_CMD");
 }
 
 /// Connect to a terminal socket the way a browser actually does: *after* an
@@ -1466,7 +1466,7 @@ fn extract_origin(json: &str) -> String {
 fn new_terminal_names_itself_and_ending_one_clears_only_its_own_tab() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     // Its own project, not the shared "proj": Hub is a process-global registry
     // keyed by project name, so a sibling test's tabs would otherwise show up
     // here and the seeded-`term` baseline below would be reading their state.
@@ -1504,7 +1504,7 @@ fn new_terminal_names_itself_and_ending_one_clears_only_its_own_tab() {
     assert!(cleared.contains(r#""session":"term2""#), "siblings must survive");
     assert!(cleared.contains(r#""session":"term""#), "siblings must survive");
 
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_STATE_DIR");
 }
 
 /// `TerminalStarted` tells a browser "attach to this session now", and the
@@ -1519,7 +1519,7 @@ fn new_terminal_names_itself_and_ending_one_clears_only_its_own_tab() {
 fn a_new_terminals_started_event_follows_the_snapshot_that_carries_its_tab() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (_d, port) = fixture_named("newtermorder");
     let mut a = ws_connect_path(port, "/ws/newtermorder/_workspace").unwrap();
     read_until(&mut a, r#""t":"State""#);
@@ -1541,20 +1541,20 @@ fn a_new_terminals_started_event_follows_the_snapshot_that_carries_its_tab() {
         vec!["state", "started"],
         "the browser must hold the tab before it is told to attach to it"
     );
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_STATE_DIR");
 }
 
 /// The ✻ button end to end: the intent names no session, the server allocates
 /// one, and the program is typed into that session's PTY by the socket that
 /// spawns it — not by the hub, which has no PTY yet, and not by the client,
-/// which a mirroring browser could race. `RESH_CMD=cat` makes the shell echo
+/// which a mirroring browser could race. `ROOST_CMD=cat` makes the shell echo
 /// its input, so the keystrokes come back out as proof they went in.
 #[test]
 fn a_claude_terminal_has_claude_typed_into_it_once_its_shell_exists() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (_d, port) = fixture_named("claudeterm");
     let mut a = ws_connect_path(port, "/ws/claudeterm/_workspace").unwrap();
     read_until(&mut a, r#""t":"State""#);
@@ -1609,14 +1609,14 @@ fn a_claude_terminal_has_claude_typed_into_it_once_its_shell_exists() {
 
     let _ = t.close(None);
     let _ = p.close(None);
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_STATE_DIR");
 }
 
 #[test]
 fn workspace_state_mirrors_between_two_clients() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (_d, port) = fixture();
     let mut a = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
     // a's own initial snapshot carries a's connection id in `origin`; capture
@@ -1650,7 +1650,7 @@ fn workspace_state_mirrors_between_two_clients() {
     );
     let _ = a.close(None);
     let _ = b.close(None);
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_STATE_DIR");
 }
 
 #[test]
@@ -1679,7 +1679,7 @@ fn workspace_socket_rejects_missing_origin() {
 fn workspace_socket_malformed_json_is_reported_not_fatal() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (_d, port) = fixture();
     let mut ws = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
     let _ = read_until(&mut ws, r#""t":"State""#); // the initial snapshot
@@ -1694,15 +1694,15 @@ fn workspace_socket_malformed_json_is_reported_not_fatal() {
     assert!(state.contains(r#""t":"State""#));
 
     let _ = ws.close(None);
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_STATE_DIR");
 }
 
 #[test]
 fn external_edit_updates_a_clean_buffer_live() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
-    std::env::set_var("RESH_DEBOUNCE_MS", "10");
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_DEBOUNCE_MS", "10");
     // Its OWN project name, not the shared "proj". `Hub` is a process-global
     // registry keyed by project name, so a "proj" hub created by any earlier
     // test outlives that test's TempDir — and this test would then bind to it,
@@ -1757,8 +1757,8 @@ fn external_edit_updates_a_clean_buffer_live() {
     let _ = read_until(&mut a, r#""t":"State""#);
 
     let _ = a.close(None);
-    std::env::remove_var("RESH_STATE_DIR");
-    std::env::remove_var("RESH_DEBOUNCE_MS");
+    std::env::remove_var("ROOST_STATE_DIR");
+    std::env::remove_var("ROOST_DEBOUNCE_MS");
 }
 
 #[test]
@@ -1769,7 +1769,7 @@ fn set_mode_edit_then_save_writes_the_file() {
     // and the file on disk never changes.
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (d, port) = fixture_named("editproj1");
     let mut a = ws_connect_path(port, "/ws/editproj1/_workspace").unwrap();
     let _ = read_until(&mut a, r#""t":"State""#); // a's own initial snapshot
@@ -1810,7 +1810,7 @@ fn set_mode_edit_then_save_writes_the_file() {
     );
 
     let _ = a.close(None);
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_STATE_DIR");
 }
 
 #[test]
@@ -1821,7 +1821,7 @@ fn reconnect_replays_buffer_text_for_open_edit_buffers() {
     // the same file again.
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (_d, port) = fixture_named("editproj2");
     let mut a = ws_connect_path(port, "/ws/editproj2/_workspace").unwrap();
     let _ = read_until(&mut a, r#""t":"State""#);
@@ -1844,7 +1844,7 @@ fn reconnect_replays_buffer_text_for_open_edit_buffers() {
 
     let _ = a.close(None);
     let _ = b.close(None);
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_STATE_DIR");
 }
 
 /// Reads and discards every frame currently queued on `ws`, using a short
@@ -1983,9 +1983,9 @@ fn wait_for_live_session(
 #[test]
 fn opening_a_project_spawns_no_terminal_session() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     // A name unique to this test: the session registry (session.rs's
     // `SESSIONS`) is a process-global map keyed by project name that
     // outlives any one test's TempDir, and several other tests in this
@@ -2032,8 +2032,8 @@ fn opening_a_project_spawns_no_terminal_session() {
 
     let _ = term.close(None);
     let _ = ws.close(None);
-    std::env::remove_var("RESH_STATE_DIR");
-    std::env::remove_var("RESH_CMD");
+    std::env::remove_var("ROOST_STATE_DIR");
+    std::env::remove_var("ROOST_CMD");
 }
 
 // CloseProject must end *every* session belonging to one project, report
@@ -2052,9 +2052,9 @@ fn opening_a_project_spawns_no_terminal_session() {
 #[test]
 fn close_project_ends_sessions_and_isolates_other_projects() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (_d, port) = two_project_fixture("closealpha", "closebeta");
 
     // Starting a terminal is what creates a session: connect its socket.
@@ -2108,8 +2108,8 @@ fn close_project_ends_sessions_and_isolates_other_projects() {
     let _ = term_b.close(None);
     let _ = ws_a.close(None);
     let _ = ws_b.close(None);
-    std::env::remove_var("RESH_STATE_DIR");
-    std::env::remove_var("RESH_CMD");
+    std::env::remove_var("ROOST_STATE_DIR");
+    std::env::remove_var("ROOST_CMD");
 }
 
 /// Minimal, test-only "is anything holding this path" check via `ps`.
@@ -2137,7 +2137,7 @@ fn any_process_holds(path: &std::path::Path) -> bool {
 
 // The end-to-end reproduction of the bug this task exists to fix, over a
 // real WebSocket connection exactly like a browser's: closing a project
-// with `RESH_CMD=cat` (every other close-project test, including the
+// with `ROOST_CMD=cat` (every other close-project test, including the
 // one just above) cannot exercise this at all, because a `cat` child has no
 // detached dtach master to leave behind — that gap is exactly why the rest
 // of this suite never caught it. Real, unoverridden `dtach` forks a master
@@ -2149,9 +2149,9 @@ fn any_process_holds(path: &std::path::Path) -> bool {
 #[test]
 fn close_project_ends_the_real_dtach_master_not_just_the_client() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("RESH_CMD");
+    std::env::remove_var("ROOST_CMD");
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (_d, port) = fixture_named("realclose");
 
     let mut term = ws_connect_term(port, "/ws/realclose/term/shell").unwrap();
@@ -2194,7 +2194,7 @@ fn close_project_ends_the_real_dtach_master_not_just_the_client() {
 
     let _ = term.close(None);
     let _ = ws.close(None);
-    std::env::remove_var("RESH_STATE_DIR");
+    std::env::remove_var("ROOST_STATE_DIR");
 }
 
 /// After a `CloseProject`, `term.rs`'s direct `ide::for_project` call is the
@@ -2238,9 +2238,9 @@ fn close_project_ends_the_real_dtach_master_not_just_the_client() {
 #[test]
 fn reopening_a_closed_project_rebuilds_its_ide_listener() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("RESH_CMD", "cat");
+    std::env::set_var("ROOST_CMD", "cat");
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (_d, port) = fixture_named("idereopen");
     let ide_dir = roost::idelock::ide_dir();
 
@@ -2289,8 +2289,8 @@ fn reopening_a_closed_project_rebuilds_its_ide_listener() {
     let _ = ws.close(None);
     let _ = ws2.close(None);
     roost::ide::stop("idereopen");
-    std::env::remove_var("RESH_STATE_DIR");
-    std::env::remove_var("RESH_CMD");
+    std::env::remove_var("ROOST_STATE_DIR");
+    std::env::remove_var("ROOST_CMD");
 }
 
 /// The ide listener is built on the connection thread, after the handshake has
@@ -2340,7 +2340,7 @@ fn http_rejects_rebinding_host() {
 fn a_notice_reaches_a_client_watching_a_different_project() {
     let _g = WS_TEST_LOCK.lock().unwrap();
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let d = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(d.path().join("alpha")).unwrap();
     std::fs::create_dir_all(d.path().join("beta")).unwrap();
@@ -2369,7 +2369,7 @@ fn a_notice_reaches_a_client_watching_a_different_project() {
 fn notices_are_replayed_on_connect_and_read_state_mirrors() {
     let _g = WS_TEST_LOCK.lock().unwrap();
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
     let (_d, port) = fixture();
 
     roost::hub::publish(
@@ -2410,9 +2410,9 @@ fn notices_are_replayed_on_connect_and_read_state_mirrors() {
 fn an_escape_sequence_from_a_terminal_becomes_a_notice() {
     let _g = WS_TEST_LOCK.lock().unwrap();
     let sd = tempfile::tempdir().unwrap();
-    std::env::set_var("RESH_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
 
-    // A single-token command: RESH_CMD splits on whitespace.
+    // A single-token command: ROOST_CMD splits on whitespace.
     let bin = tempfile::tempdir().unwrap();
     let script = bin.path().join("emit.sh");
     std::fs::write(
@@ -2425,7 +2425,7 @@ fn an_escape_sequence_from_a_terminal_becomes_a_notice() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    std::env::set_var("RESH_CMD", script.to_str().unwrap());
+    std::env::set_var("ROOST_CMD", script.to_str().unwrap());
 
     let (_d, port) = fixture_named("notifyproj");
     let mut ctrl = ws_connect_path(port, "/ws/notifyproj/_workspace").unwrap();
@@ -2441,7 +2441,7 @@ fn an_escape_sequence_from_a_terminal_becomes_a_notice() {
     assert!(seen.contains(r#""project":"notifyproj""#), "project missing: {seen}");
 
     let _ = term.close(None);
-    std::env::remove_var("RESH_CMD");
+    std::env::remove_var("ROOST_CMD");
 }
 
 #[test]
@@ -2451,7 +2451,7 @@ fn a_terminal_child_can_discover_that_notifications_exist() {
     let script = bin.path().join("env.sh");
     std::fs::write(
         &script,
-        "#!/bin/sh\necho \"NOTIFY=$RESH_NOTIFY PROJ=$RESH_PROJECT SESS=$RESH_SESSION\"\nsleep 5\n",
+        "#!/bin/sh\necho \"NOTIFY=$ROOST_NOTIFY PROJ=$ROOST_PROJECT SESS=$ROOST_SESSION\"\nsleep 5\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -2459,7 +2459,7 @@ fn a_terminal_child_can_discover_that_notifications_exist() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    std::env::set_var("RESH_CMD", script.to_str().unwrap());
+    std::env::set_var("ROOST_CMD", script.to_str().unwrap());
 
     let (_d, port) = fixture_named("envproj");
     let mut term = ws_connect_term(port, "/ws/envproj/term/envprobe").unwrap();
@@ -2478,7 +2478,7 @@ fn a_terminal_child_can_discover_that_notifications_exist() {
     assert!(seen.contains("PROJ=envproj"), "project missing: {seen:?}");
     assert!(seen.contains("SESS=envprobe"), "session missing: {seen:?}");
     let _ = term.close(None);
-    std::env::remove_var("RESH_CMD");
+    std::env::remove_var("ROOST_CMD");
 }
 
 /// Connects the terminal socket directly, with **no** prior `_workspace`
@@ -2503,7 +2503,7 @@ fn a_fresh_projects_first_terminal_already_carries_the_ide_port() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    std::env::set_var("RESH_CMD", script.to_str().unwrap());
+    std::env::set_var("ROOST_CMD", script.to_str().unwrap());
 
     let (_d, port) = fixture_named("sseportproj");
     // No `_workspace` connection anywhere above this line: this project's
@@ -2530,7 +2530,7 @@ fn a_fresh_projects_first_terminal_already_carries_the_ide_port() {
         "expected a nonzero CLAUDE_CODE_SSE_PORT in the spawned shell's env; got: {seen:?}"
     );
     let _ = term.close(None);
-    std::env::remove_var("RESH_CMD");
+    std::env::remove_var("ROOST_CMD");
     // Best-effort cleanup: this writes a real lock file into the shared
     // test ide directory (`isolate_ide_dir_for_tests`), and nothing else
     // ever closes "sseportproj"'s project to remove it. Not load-bearing —

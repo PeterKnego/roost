@@ -339,13 +339,13 @@ mod tests {
     }
 
     /// Every test here mutates process-global state (the store and
-    /// RESH_STATE_DIR); cargo runs tests in parallel threads.
+    /// ROOST_STATE_DIR); cargo runs tests in parallel threads.
     fn setup() -> std::sync::MutexGuard<'static, ()> {
         let g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A stable, reused directory rather than a fresh `TempDir` per test.
         // `TempDir::drop` removes the tree and *ignores* the error, and
         // `hub::publish` -> `notify::record` runs on the PTY pump thread
-        // (session.rs), which reads the process-global `RESH_STATE_DIR` at
+        // (session.rs), which reads the process-global `ROOST_STATE_DIR` at
         // write time and can hold no test's lock. So a pump writing while a
         // finished test's directory was being removed made the removal fail
         // silently, leaking the directory — reliably once per parallel `cargo
@@ -360,7 +360,7 @@ mod tests {
             let _ = std::fs::create_dir_all(&p);
             p
         });
-        std::env::set_var("RESH_STATE_DIR", d);
+        std::env::set_var("ROOST_STATE_DIR", d);
         let _ = std::fs::remove_dir_all(d.join("notify"));
         reset_for_test();
         g
@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn the_store_cannot_collide_with_a_project_named_notifications() {
         let _g = setup();
-        let d = std::path::PathBuf::from(std::env::var("RESH_STATE_DIR").unwrap());
+        let d = std::path::PathBuf::from(std::env::var("ROOST_STATE_DIR").unwrap());
         record("p", "s", parsed("a real notice")).unwrap();
 
         // What a project literally named "notifications" writes.
@@ -533,7 +533,7 @@ mod tests {
     #[test]
     fn a_pre_subdirectory_store_is_still_loaded() {
         let _g = setup();
-        let d = std::path::PathBuf::from(std::env::var("RESH_STATE_DIR").unwrap());
+        let d = std::path::PathBuf::from(std::env::var("ROOST_STATE_DIR").unwrap());
         let legacy = d.as_path().join("notifications.json");
         std::fs::write(
             &legacy,
@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn a_foreign_file_at_the_legacy_name_is_never_deleted() {
         let _g = setup();
-        let d = std::path::PathBuf::from(std::env::var("RESH_STATE_DIR").unwrap());
+        let d = std::path::PathBuf::from(std::env::var("ROOST_STATE_DIR").unwrap());
         let legacy = d.as_path().join("notifications.json");
         // A workspace, not a notice array.
         std::fs::write(&legacy, br#"{"sizes":{"left_w":260},"panes":[]}"#).unwrap();
@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn a_corrupt_state_file_is_ignored_rather_than_fatal() {
         let _g = setup();
-        let d = std::path::PathBuf::from(std::env::var("RESH_STATE_DIR").unwrap());
+        let d = std::path::PathBuf::from(std::env::var("ROOST_STATE_DIR").unwrap());
         std::fs::create_dir_all(d.as_path().join("notify")).unwrap();
         std::fs::write(d.as_path().join("notify/notices.json"), b"{ not json").unwrap();
         load(); // must not panic
@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn persisted_state_is_not_readable_by_other_users() {
         let _g = setup();
-        let d = std::path::PathBuf::from(std::env::var("RESH_STATE_DIR").unwrap());
+        let d = std::path::PathBuf::from(std::env::var("ROOST_STATE_DIR").unwrap());
         record("p", "s", parsed("private terminal output")).unwrap();
         #[cfg(unix)]
         {

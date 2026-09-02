@@ -159,7 +159,7 @@ pub fn for_project_in(
 ) -> Option<Arc<Ide>> {
     // The kill switch arrives as a parameter rather than being read here, so
     // a test can drive both states without touching the process-global
-    // `RESH_CONFIG`. That is not fastidiousness: `for_project_in` is called
+    // `ROOST_CONFIG`. That is not fastidiousness: `for_project_in` is called
     // by tests that do not hold `STATE_ENV_LOCK`, so a test that flipped the
     // env to `ide = false` would make *their* listeners fail to build for the
     // width of its own window — a failure that lands in whichever test loses
@@ -1459,7 +1459,7 @@ mod tests {
         // Found by revert-check: deleting the guard from `for_project_in`
         // passed the entire suite, so the switch shipped untested.
         //
-        // Drives the flag as a parameter, not through `RESH_CONFIG`: this
+        // Drives the flag as a parameter, not through `ROOST_CONFIG`: this
         // function is called by tests that hold no env lock, so flipping the
         // process-global here would break *their* listeners for the width of
         // this test — which is how a "flake" gets manufactured. The env
@@ -2089,7 +2089,7 @@ mod tests {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let proj = "diff-orphan";
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
         // The shared stable directory, not a per-test `TempDir`:
         // `set_ide_dir_for_test` sets a process-global `OnceLock`, so a
         // directory handed to it outlives this test and every later write
@@ -2126,7 +2126,7 @@ mod tests {
         );
         assert!(h.proposals.is_empty(), "and so did the content behind it");
         drop(h);
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     // --- confinement, which `openDiff` cannot express over the wire ---
@@ -2488,7 +2488,7 @@ mod tests {
     /// directory (`connected_fake_client_for`'s `ws`, which is what
     /// `Hub::dir` — and so this call's `project_dir` — actually is) so the
     /// opt-in check inside `selection_changed` passes.
-    /// Turns sharing on for this process by pointing `RESH_CONFIG` at a
+    /// Turns sharing on for this process by pointing `ROOST_CONFIG` at a
     /// global file that says so.
     ///
     /// It is a *global-only* setting as of 2026-08-23 — a project's own
@@ -2502,7 +2502,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("config.toml");
         std::fs::write(&f, if on { "share_selection = true\n" } else { "hide = []\n" }).unwrap();
-        std::env::set_var("RESH_CONFIG", &f);
+        std::env::set_var("ROOST_CONFIG", &f);
         (g, d)
     }
 
@@ -2540,7 +2540,7 @@ mod tests {
     /// the false-confidence this test exists to catch. Then restored.
     #[test]
     fn nothing_is_sent_when_sharing_is_off() {
-        // Pins the off state under the env lock: `RESH_CONFIG` is
+        // Pins the off state under the env lock: `ROOST_CONFIG` is
         // process-global, so without this a neighbouring test's "on" file is
         // still in effect and this passes for the wrong reason.
         let (_envg, _cfg) = opt_in(false);

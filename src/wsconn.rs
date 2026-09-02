@@ -557,7 +557,7 @@ mod tests {
     fn results_go_only_to_the_connection_that_asked() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
         std::fs::write(d.path().join("needle.rs"), "x\n").unwrap();
 
         let hub = Arc::new(Mutex::new(Hub::new("proj", d.path().to_path_buf())));
@@ -582,7 +582,7 @@ mod tests {
             !theirs.iter().any(|m| m.contains(r#""t":"SearchResults""#)),
             "another browser must not see this query's results, got {theirs:?}"
         );
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// The hard constraint, as a test. `wsconn` dispatches every other intent
@@ -620,7 +620,7 @@ mod tests {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = wide_project(12_000, 40);
         let state = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", state.path().join("state"));
+        std::env::set_var("ROOST_STATE_DIR", state.path().join("state"));
 
         let hub = Arc::new(Mutex::new(Hub::new("proj", d.path().to_path_buf())));
         let (asker, rx) = Hub::lock(&hub).subscribe();
@@ -657,7 +657,7 @@ mod tests {
             "the hub lock was free only {locked_during} times while the search ran — \
              it is being held across the walk"
         );
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// A query the user typed past *before it started* must not be answered.
@@ -670,7 +670,7 @@ mod tests {
     fn a_superseded_query_sends_nothing() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
         std::fs::write(d.path().join("needle.rs"), "x\n").unwrap();
 
         let hub = Arc::new(Mutex::new(Hub::new("proj", d.path().to_path_buf())));
@@ -687,7 +687,7 @@ mod tests {
             !got.iter().any(|m| m.contains(r#""t":"SearchResults""#)),
             "a superseded query must not answer, got {got:?}"
         );
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// A query superseded *while the walk is running* stops walking.
@@ -712,7 +712,7 @@ mod tests {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = wide_project(12_000, 40);
         let state = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", state.path().join("state"));
+        std::env::set_var("ROOST_STATE_DIR", state.path().join("state"));
 
         let hub = Arc::new(Mutex::new(Hub::new("proj", d.path().to_path_buf())));
         let (asker, rx) = Hub::lock(&hub).subscribe();
@@ -760,7 +760,7 @@ mod tests {
             !got.iter().any(|m| m.contains(r#""t":"SearchResults""#)),
             "a superseded query must not answer, got {got:?}"
         );
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     fn buf(content: Content, base_hash: u64) -> Buffer {
@@ -925,7 +925,7 @@ mod tests {
     fn replay_buffer_reads_the_hubs_current_state_not_the_snapshot() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
         let mut h = crate::hub::Hub::new("replay_wiring_probe", d.path().to_path_buf());
         let (id, rx) = h.subscribe();
 
@@ -964,7 +964,7 @@ mod tests {
     fn a_clean_buffers_failed_replay_read_is_reported_to_that_connection() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
-        std::env::set_var("RESH_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
         // Binary by the NUL sniff, so the read really is refused as policy —
         // the way a file that turned binary under an open clean buffer looks.
         std::fs::write(d.path().join("a.bin"), b"a\0b").unwrap();
@@ -988,6 +988,6 @@ mod tests {
         );
         let other: Vec<String> = std::iter::from_fn(|| rx_other.try_recv().ok()).collect();
         assert!(other.is_empty(), "one connection's failed read is not everyone's; got {other:?}");
-        std::env::remove_var("RESH_STATE_DIR");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 }

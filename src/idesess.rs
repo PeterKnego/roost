@@ -1,8 +1,8 @@
 //! Which resh terminal a process is running in, from its pid.
 //!
-//! `session_env` (`session.rs`) exports `RESH_PROJECT` and `RESH_SESSION`
+//! `session_env` (`session.rs`) exports `ROOST_PROJECT` and `ROOST_SESSION`
 //! into every shell resh spawns, originally so a program in that terminal
-//! could attribute a `RESH_NOTIFY` notification to its session. A `claude`
+//! could attribute a `ROOST_NOTIFY` notification to its session. A `claude`
 //! started in that terminal inherits both, through dtach and through the
 //! shell — which makes the same two variables the answer to the opposite
 //! question: given a connected Claude's pid, which of this project's
@@ -21,7 +21,7 @@ use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sess {
-    /// `RESH_SESSION` read, the name is valid, and `RESH_PROJECT` names the
+    /// `ROOST_SESSION` read, the name is valid, and `ROOST_PROJECT` names the
     /// project being asked about.
     In(String),
     /// The environment read cleanly and positively places this process
@@ -46,9 +46,9 @@ pub fn session_of_in(proc_root: &Path, pid: u32, project: &str) -> Sess {
     // first '=' via strip_prefix on the full key, never on every '='.
     for entry in raw.split(|b| *b == 0) {
         let Ok(s) = std::str::from_utf8(entry) else { continue };
-        if let Some(v) = s.strip_prefix("RESH_SESSION=") {
+        if let Some(v) = s.strip_prefix("ROOST_SESSION=") {
             session = Some(v);
-        } else if let Some(v) = s.strip_prefix("RESH_PROJECT=") {
+        } else if let Some(v) = s.strip_prefix("ROOST_PROJECT=") {
             proj = Some(v);
         }
     }
@@ -68,7 +68,7 @@ pub fn session_of_in(proc_root: &Path, pid: u32, project: &str) -> Sess {
         // below is Unknown for the same reason, and only positive evidence
         // may exclude a connection from a mention.
         (None, Some(p)) if p == project => Sess::Unknown,
-        // `RESH_PROJECT` is set and names a different project — with or
+        // `ROOST_PROJECT` is set and names a different project — with or
         // without a session name, since the arms above already claimed
         // every same-project case (named session, or the guard just above).
         // Positive evidence: this pid is accounted for by another project's
@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn a_claude_in_a_resh_terminal_reports_its_session() {
-        let d = fake_proc(&["PATH=/usr/bin", "RESH_PROJECT=karpie", "RESH_SESSION=main"]);
+        let d = fake_proc(&["PATH=/usr/bin", "ROOST_PROJECT=karpie", "ROOST_SESSION=main"]);
         assert_eq!(session_of_in(d.path(), 4242, "karpie"), Sess::In("main".into()));
     }
 
@@ -151,7 +151,7 @@ mod tests {
     /// This is defence in depth, not the only barrier — and the spec's
     /// framing of it was too strong. `CONNS` is keyed by project, so a
     /// mention for project A cannot reach a connection registered under B no
-    /// matter what this returns. What the RESH_PROJECT test actually buys is
+    /// matter what this returns. What the ROOST_PROJECT test actually buys is
     /// a correct answer for a Claude whose environment says one project
     /// while it is connected to another's socket (lock-file discovery by
     /// path, rather than the `CLAUDE_CODE_SSE_PORT` shortcut `session_env`
@@ -159,7 +159,7 @@ mod tests {
     /// honest answer for it.
     #[test]
     fn the_same_session_name_in_another_project_is_outside() {
-        let d = fake_proc(&["RESH_PROJECT=other", "RESH_SESSION=main"]);
+        let d = fake_proc(&["ROOST_PROJECT=other", "ROOST_SESSION=main"]);
         assert_eq!(session_of_in(d.path(), 4242, "karpie"), Sess::Outside);
     }
 
@@ -168,7 +168,7 @@ mod tests {
     /// connection from a mention; Unknown leaves it eligible.
     #[test]
     fn an_invalid_session_name_is_unknown_not_in() {
-        let d = fake_proc(&["RESH_PROJECT=karpie", "RESH_SESSION=../../etc/passwd"]);
+        let d = fake_proc(&["ROOST_PROJECT=karpie", "ROOST_SESSION=../../etc/passwd"]);
         assert_eq!(session_of_in(d.path(), 4242, "karpie"), Sess::Unknown);
     }
 
@@ -176,7 +176,7 @@ mod tests {
     /// project is not, so the name cannot be trusted to mean this project.
     #[test]
     fn a_session_without_a_project_is_unknown() {
-        let d = fake_proc(&["RESH_SESSION=main"]);
+        let d = fake_proc(&["ROOST_SESSION=main"]);
         assert_eq!(session_of_in(d.path(), 4242, "karpie"), Sess::Unknown);
     }
 
@@ -187,7 +187,7 @@ mod tests {
     /// above it only when a session name is also present.
     #[test]
     fn a_project_without_a_session_is_unknown_not_outside() {
-        let d = fake_proc(&["RESH_PROJECT=karpie"]);
+        let d = fake_proc(&["ROOST_PROJECT=karpie"]);
         assert_eq!(session_of_in(d.path(), 4242, "karpie"), Sess::Unknown);
     }
 
@@ -196,7 +196,7 @@ mod tests {
     /// silently truncates the name.
     #[test]
     fn a_value_containing_an_equals_sign_survives() {
-        let d = fake_proc(&["RESH_PROJECT=karpie", "RESH_SESSION=a-b", "OTHER=x=y=z"]);
+        let d = fake_proc(&["ROOST_PROJECT=karpie", "ROOST_SESSION=a-b", "OTHER=x=y=z"]);
         assert_eq!(session_of_in(d.path(), 4242, "karpie"), Sess::In("a-b".into()));
     }
 }
