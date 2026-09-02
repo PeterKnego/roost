@@ -665,7 +665,13 @@ Then open the workspace in a real browser and confirm the existing terminals
 are still there with their scrollback. A new terminal opened now must show
 `ROOST_PROJECT` in `env | grep ROOST_`, and a terminal from before the cutover
 still shows `RESH_PROJECT` — both are expected, and the second is why the
-`resh` symlink exists.
+`resh` symlink exists. One consequence the final review surfaced: a Claude
+running in a pre-cutover terminal exports only the old prefix, which this
+build does not read, so its tab loses the ✻ mark and mention routing treats
+it as outside the workspace until that terminal is reopened (`claude -c`
+resumes the conversation). Nothing destructive keys on either signal. The
+user reopens those tabs at their own pace; the cutover does not do it for
+them.
 
 If any line differs — especially a socket diff or a `NO HOLDER` — roll back
 before anything else: `systemctl --user stop roost; mv ~/.config/roost
@@ -700,8 +706,10 @@ or symlinking it makes the registry unlink every socket, see the comment in
 the unit); `~/.local/bin/resh` is a symlink to `roost` so hooks written as
 `resh notify` keep firing; and terminals opened before the cutover export
 `RESH_PROJECT`/`RESH_SESSION`/`RESH_NOTIFY`, not `ROOST_*`, until they are
-reopened. `~/.local/bin/resh.pre-roost` is the pre-cutover binary, kept for
-rollback; delete it once the new build has run for a while.
+reopened — and a Claude in such a terminal carries no ✻ mark and is skipped
+by mention routing until then. `~/.local/bin/resh.pre-roost` is the
+pre-cutover binary, kept for rollback; delete it once the new build has run
+for a while.
 ```
 
 Also correct the two lines the sweep got wrong: the socket check in
