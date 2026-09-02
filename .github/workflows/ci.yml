@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    name: cargo test (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # dtach is a runtime prerequisite, and one integration test deliberately
+      # runs the real thing rather than the ROOST_CMD substitute, because the
+      # substitute once hid a missing socket directory from a green suite.
+      - name: Install dtach
+        run: sudo apt-get update -q && sudo apt-get install -y -q dtach
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --locked
+
+      # Single-threaded on purpose. The suite shares one process-wide session
+      # registry and environment, and a bare `cargo test` has hung on it.
+      - name: Test
+        run: cargo test --locked -- --test-threads=1
+        env:
+          RUST_BACKTRACE: 1

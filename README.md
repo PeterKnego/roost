@@ -10,6 +10,7 @@ A single Rust binary that gives every project a four-pane workspace in the brows
 file tree, editor, diffs and real terminals — backed by shells that survive the tab,
 the network and a restart of roost itself.
 
+[![CI](https://github.com/PeterKnego/roost/actions/workflows/ci.yml/badge.svg)](https://github.com/PeterKnego/roost/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/PeterKnego/roost)](https://github.com/PeterKnego/roost/releases)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Rust](https://img.shields.io/badge/rust-stable-orange)](https://www.rust-lang.org)
