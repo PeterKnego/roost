@@ -38,6 +38,18 @@ Close the lid, open it on the iPad, and the session is still running.
 | Claude Code IDE protocol  |  ✅   |      ❌      |     ❌      |     ❌     |
 | Paste a screenshot to the agent | ✅ |    ❌      |     ❌      |     ❌     |
 | Single binary, no Node    |  ✅   |      ✅      |     ❌      |     ✅     |
+| Auto-reconnects after the laptop sleeps | ✅ |    ❌      |     ✅      |     ❌     |
+| Needed on the laptop      | browser | browser  |   browser   | ssh client + terminal |
+| Drag-and-drop files to upload | ✅ |     ❌      |     ✅      |     ❌     |
+| Multiple git worktrees, switchable | ✅ |   ❌      |     ❌      |     ❌     |
+| Server binary             | 4 MB  |    0.7 MB    | 235 MB download | 1.3 MB |
+| Server memory             | 16 MB (7 shells) | 9 MB (1 shell) | 770 MB (1 workspace) | 3 MB (1 shell) |
+
+<sub>Sizes: roost 0.3.0 release build; ttyd and tmux are Ubuntu package installed sizes; code-server is its
+4.135.0 linux-amd64 tarball. Memory is proportional set size (PSS, so shared pages are not double-counted)
+of the server's own process tree with a browser attached, measured on one Linux host on 2026-09-02: roost
+with seven live sessions (dtach and the shells are separate processes), ttyd 1.7.7 and tmux 3.6a each with one
+shell, code-server 4.135.0 with this repository open (seven processes).</sub>
 
 ## Install
 
