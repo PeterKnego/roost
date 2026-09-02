@@ -8,14 +8,14 @@ use std::path::PathBuf;
 /// across tests, not one per test, is the right shape — so `cargo test`
 /// never touches the real `~/.claude/ide` (Task 5 review, finding 2).
 fn isolate_ide_dir_for_tests() {
-    resh::idelock::isolate_ide_dir_for_test();
+    roost::idelock::isolate_ide_dir_for_test();
 }
 
 fn start(roots: Vec<PathBuf>) -> u16 {
     isolate_ide_dir_for_tests();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || resh::serve(listener, roots));
+    std::thread::spawn(move || roost::serve(listener, roots));
     port
 }
 
@@ -759,7 +759,7 @@ fn ws_connect(
     // no longer creates a session. Unconditional, including for the tests that
     // expect a refusal — the Origin check runs long before `attach`, so those
     // still fail exactly where they are meant to.
-    resh::session::reserve_if_absent("proj", "shell");
+    roost::session::reserve_if_absent("proj", "shell");
     let mut req = format!("ws://127.0.0.1:{port}/ws/proj/term/shell").into_client_request().unwrap();
     if let Some(o) = origin {
         req.headers_mut().insert("origin", o.parse().unwrap());
@@ -1165,7 +1165,7 @@ fn a_browser_that_connects_after_a_proposal_is_shown_both_sides_of_it() {
     let mut a = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
     let _ = read_until(&mut a, r#""t":"State""#);
 
-    resh::hub::open_proposal("proj", "late-1", "hello.md", "what is there", "what claude wants");
+    roost::hub::open_proposal("proj", "late-1", "hello.md", "what is there", "what claude wants");
 
     let mut b = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
     let seen = read_until(&mut b, r#""t":"Proposal""#);
@@ -1178,7 +1178,7 @@ fn a_browser_that_connects_after_a_proposal_is_shown_both_sides_of_it() {
     // The hub registry is process-global and keyed by project name, so this
     // proposal would otherwise sit in "proj"'s layout for every later test in
     // this binary.
-    resh::hub::close_proposal("proj", "late-1");
+    roost::hub::close_proposal("proj", "late-1");
     let _ = a.close(None);
     let _ = b.close(None);
     std::env::remove_var("RESH_STATE_DIR");
@@ -1214,7 +1214,7 @@ fn a_late_browsers_first_frame_is_the_proposals_content_not_its_tab() {
     let mut a = ws_connect_path(port, "/ws/proposal-order/_workspace").unwrap();
     let _ = read_until(&mut a, r#""t":"State""#);
 
-    resh::hub::open_proposal(
+    roost::hub::open_proposal(
         "proposal-order",
         "order-1",
         "hello.md",
@@ -1234,7 +1234,7 @@ fn a_late_browsers_first_frame_is_the_proposals_content_not_its_tab() {
         "the first frame after connecting must be the proposal's content, not \"State\": {first}"
     );
 
-    resh::hub::close_proposal("proposal-order", "order-1");
+    roost::hub::close_proposal("proposal-order", "order-1");
     let _ = a.close(None);
     let _ = b.close(None);
     std::env::remove_var("RESH_STATE_DIR");
@@ -1258,7 +1258,7 @@ fn proposal_fragment_route_shows_the_hunk_and_handles_a_missing_id() {
     let mut a = ws_connect_path(port, "/ws/proposal-frag/_workspace").unwrap();
     let _ = read_until(&mut a, r#""t":"State""#);
 
-    resh::hub::open_proposal(
+    roost::hub::open_proposal(
         "proposal-frag",
         "frag-1",
         "hello.md",
@@ -1289,7 +1289,7 @@ line three
         .unwrap();
     assert!(gone.contains("no longer open"), "got {gone}");
 
-    resh::hub::close_proposal("proposal-frag", "frag-1");
+    roost::hub::close_proposal("proposal-frag", "frag-1");
     let _ = a.close(None);
     std::env::remove_var("RESH_STATE_DIR");
 }
@@ -1359,9 +1359,9 @@ fn an_unreserved_terminal_connect_creates_nothing_and_closes_cleanly() {
     // `NotReserved` rule removed this now fails here, naming the session it
     // should not have made.
     assert!(
-        !resh::session::live_names("proj").iter().any(|n| n == "nosuchsession"),
+        !roost::session::live_names("proj").iter().any(|n| n == "nosuchsession"),
         "an unreserved connect must not create the session it was refused: {:?}",
-        resh::session::live_names("proj")
+        roost::session::live_names("proj")
     );
     assert!(closed, "the refusal must arrive as a Close frame; read ended with {read_err:?}");
     std::env::remove_var("RESH_CMD");
@@ -1383,7 +1383,7 @@ fn ws_connect_term(
 {
     if let Some(rest) = path.strip_prefix("/ws/") {
         if let Some((project, name)) = rest.rsplit_once("/term/") {
-            resh::session::reserve_if_absent(project, name);
+            roost::session::reserve_if_absent(project, name);
         }
     }
     ws_connect_path(port, path)
@@ -1583,7 +1583,7 @@ fn a_claude_terminal_has_claude_typed_into_it_once_its_shell_exists() {
         .nth(1)
         .and_then(|rest| rest.split(['\r', '\n']).next())
         .unwrap_or("");
-    assert!(resh::launch::valid_session_id(id), "the typed id must be a valid session id; got: {id:?}");
+    assert!(roost::launch::valid_session_id(id), "the typed id must be a valid session id; got: {id:?}");
 
     // The plain + button on the same project stays a plain shell: nothing is
     // typed into it, so nothing comes back out.
@@ -2161,7 +2161,7 @@ fn close_project_ends_the_real_dtach_master_not_just_the_client() {
     wait_for_live_session(&mut ws, &my_id, "shell");
 
     let sock =
-        sd.path().join("sock").join(resh::projects::storage_key("realclose")).join("shell");
+        sd.path().join("sock").join(roost::projects::storage_key("realclose")).join("shell");
     // Poll rather than a fixed sleep: dtach's own fork-and-detach takes an
     // unpredictable, usually-small amount of wall time to complete. The
     // budget is deliberately far larger than the ~50ms this normally needs,
@@ -2242,7 +2242,7 @@ fn reopening_a_closed_project_rebuilds_its_ide_listener() {
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("RESH_STATE_DIR", sd.path());
     let (_d, port) = fixture_named("idereopen");
-    let ide_dir = resh::idelock::ide_dir();
+    let ide_dir = roost::idelock::ide_dir();
 
     // Opening the workspace socket is what builds the hub, and the hub's
     // `or_insert_with` is what starts the listener the first time.
@@ -2257,7 +2257,7 @@ fn reopening_a_closed_project_rebuilds_its_ide_listener() {
     // `ide::stop` runs before `ProjectClosed` is broadcast, so this is ordered,
     // not raced.
     assert!(
-        resh::ide::port_for("idereopen").is_none(),
+        roost::ide::port_for("idereopen").is_none(),
         "CloseProject must have stopped the ide listener, or the rest of this test proves nothing"
     );
     assert!(!first_lock.exists(), "and removed exactly the lock file it wrote");
@@ -2267,7 +2267,7 @@ fn reopening_a_closed_project_rebuilds_its_ide_listener() {
     let mut ws2 = ws_connect_path(port, "/ws/idereopen/_workspace").unwrap();
     let _ = read_until(&mut ws2, r#""t":"State""#);
     assert!(
-        resh::ide::port_for("idereopen").is_none(),
+        roost::ide::port_for("idereopen").is_none(),
         "a reconnected _workspace socket must NOT be what brings the listener back — \
          if it is, this test has stopped covering term.rs and the comment there is wrong"
     );
@@ -2288,7 +2288,7 @@ fn reopening_a_closed_project_rebuilds_its_ide_listener() {
     let _ = term.close(None);
     let _ = ws.close(None);
     let _ = ws2.close(None);
-    resh::ide::stop("idereopen");
+    roost::ide::stop("idereopen");
     std::env::remove_var("RESH_STATE_DIR");
     std::env::remove_var("RESH_CMD");
 }
@@ -2299,7 +2299,7 @@ fn reopening_a_closed_project_rebuilds_its_ide_listener() {
 fn wait_for_ide_port(project: &str) -> Option<u16> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if let Some(p) = resh::ide::port_for(project) {
+        if let Some(p) = roost::ide::port_for(project) {
             return Some(p);
         }
         if std::time::Instant::now() >= deadline {
@@ -2352,10 +2352,10 @@ fn a_notice_reaches_a_client_watching_a_different_project() {
     read_until(&mut b, r#""t":"State""#);
 
     // Published against alpha; beta's client must still see it.
-    resh::hub::publish(
+    roost::hub::publish(
         "alpha",
         "claude",
-        resh::osc::Parsed { title: Some("build".into()), body: "green".into() },
+        roost::osc::Parsed { title: Some("build".into()), body: "green".into() },
     );
 
     let seen_b = read_until(&mut b, r#""t":"Notice""#);
@@ -2372,10 +2372,10 @@ fn notices_are_replayed_on_connect_and_read_state_mirrors() {
     std::env::set_var("RESH_STATE_DIR", sd.path());
     let (_d, port) = fixture();
 
-    resh::hub::publish(
+    roost::hub::publish(
         "proj",
         "claude",
-        resh::osc::Parsed { title: None, body: "waiting for you".into() },
+        roost::osc::Parsed { title: None, body: "waiting for you".into() },
     );
 
     // A client connecting *after* the fact still learns about it.
@@ -2539,6 +2539,6 @@ fn a_fresh_projects_first_terminal_already_carries_the_ide_port() {
     // `idelock::Lock`'s own `Drop` follows: `remove_file`, never a
     // directory scan.
     if let Some(p) = ide_port {
-        let _ = std::fs::remove_file(resh::idelock::ide_dir().join(format!("{p}.lock")));
+        let _ = std::fs::remove_file(roost::idelock::ide_dir().join(format!("{p}.lock")));
     }
 }

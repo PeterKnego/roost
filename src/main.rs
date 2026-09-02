@@ -3,13 +3,13 @@ fn main() {
     // Subcommands first. Everything else keeps the historical contract:
     // the single argument is the port.
     match args.first().map(String::as_str) {
-        Some("notify") => std::process::exit(resh::cli::run_notify(&args[1..])),
+        Some("notify") => std::process::exit(roost::cli::run_notify(&args[1..])),
         _ => {}
     }
     // No compiled-in roots any more, so an unset RESH_ROOTS is a
     // misconfiguration, not a default. Serving an empty root list would come
     // up healthy and show no projects at all, which reads as data loss.
-    let roots = resh::projects::roots();
+    let roots = roost::projects::roots();
     if roots.is_empty() {
         eprintln!(
             "resh: no project roots configured.\n\
@@ -25,9 +25,9 @@ fn main() {
     // otherwise invisible: RESH_ROOTS wins here, while a caller that inherits
     // none of this process's environment — a hook, say — silently resolves
     // the other set. Loud, on the server's stderr, which systemd captures.
-    if let Some((env, cfg)) = resh::projects::roots_conflict(
+    if let Some((env, cfg)) = roost::projects::roots_conflict(
         std::env::var("RESH_ROOTS").ok().as_deref(),
-        &resh::config::global_config_path(),
+        &roost::config::global_config_path(),
     ) {
         eprintln!(
             "resh: RESH_ROOTS and the global config's `roots` disagree.\n  \
@@ -38,9 +38,9 @@ fn main() {
         // Also to the one file, so a reader has a single place to look rather
         // than having to know which detector reports where. stderr stays
         // because journald already carries this process's startup messages.
-        resh::errlog::record(
+        roost::errlog::record(
             &format!("RESH_ROOTS {env:?} disagrees with the global config's roots {cfg:?}"),
-            resh::errlog::now_secs(),
+            roost::errlog::now_secs(),
         );
     }
     let port: u16 = args.first().and_then(|p| p.parse().ok()).unwrap_or(8444);
@@ -48,11 +48,11 @@ fn main() {
     // Here rather than in `serve`: the check asks the user's real login shell,
     // and the test servers `serve` starts must not depend on what that shell
     // has installed. Background, so listening does not wait on a profile.
-    resh::launch::probe_all_in_background();
+    roost::launch::probe_all_in_background();
     // Also here rather than in `serve`, and for the same reason: this walks
     // the host's real process table on a timer, which the test servers
     // `serve` starts have no business doing.
-    resh::claudes::watch();
+    roost::claudes::watch();
     eprintln!("resh listening on http://127.0.0.1:{port}");
-    resh::serve(listener, roots);
+    roost::serve(listener, roots);
 }
