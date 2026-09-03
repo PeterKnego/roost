@@ -1,5 +1,6 @@
 pub mod assets;
 pub mod cli;
+pub mod claudehooks;
 pub mod claudes;
 pub mod config;
 pub mod errlog;

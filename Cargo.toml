@@ -36,7 +36,7 @@ portable-pty = "0.8"
 pulldown-cmark = "0.13"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 notify = "8.2"
 multer = "3.1"
 futures-executor = "0.3"

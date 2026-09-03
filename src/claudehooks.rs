@@ -1,0 +1,393 @@
+//! The two hook entries roost owns in a project's `.claude/settings.local.json`.
+//!
+//! Claude Code raises no notification of its own; a hook has to run
+//! `roost claude-hook`. This module is the only code that reads or writes
+//! that file, and it touches exactly the entries whose command is that
+//! string — a user's other hooks, other keys and their order survive every
+//! write. It writes the *local* settings file, the one Claude Code keeps
+//! personal and gitignored, never the committed one and never the global
+//! one: a clone of the repo must not inherit a hook that runs roost.
+//!
+//! Reading has three outcomes, not two. A file that exists but cannot be
+//! parsed is `Unknown`, and `Unknown` refuses to write: rewriting a file we
+//! could not read is how a hand-edited settings file gets destroyed.
+
+use std::path::{Path, PathBuf};
+
+/// The command roost installs. Ownership is this exact string, nothing
+/// looser: a user who writes their own `roost notify` hook keeps it.
+pub const COMMAND: &str = "roost claude-hook";
+const EVENTS: [&str; 2] = ["Notification", "Stop"];
+const REL: &str = ".claude/settings.local.json";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookState {
+    /// Both events carry a roost entry.
+    Present,
+    /// No file, or fewer than both events carry one.
+    Absent,
+    /// The file exists but could not be read or is not the shape this
+    /// module knows how to rewrite. The string says why, for the UI.
+    Unknown(String),
+}
+
+fn path(project_dir: &Path) -> PathBuf {
+    project_dir.join(REL)
+}
+
+/// The parsed document, `None` for a missing file, `Err` for `Unknown`.
+fn load(project_dir: &Path) -> Result<Option<serde_json::Value>, String> {
+    let p = path(project_dir);
+    let text = match std::fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{REL}: cannot read: {e}")),
+    };
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("{REL}: not valid JSON: {e}"))?;
+    if !v.is_object() {
+        return Err(format!("{REL}: top level is not an object"));
+    }
+    if let Some(h) = v.get("hooks") {
+        if !h.is_object() {
+            return Err(format!("{REL}: \"hooks\" is not an object"));
+        }
+    }
+    Ok(Some(v))
+}
+
+fn is_ours(entry: &serde_json::Value) -> bool {
+    entry.get("command").and_then(|c| c.as_str()) == Some(COMMAND)
+}
+
+fn our_entry() -> serde_json::Value {
+    serde_json::json!({ "type": "command", "command": COMMAND, "timeout": 5 })
+}
+
+/// Whether `event`'s array in `hooks` holds a roost entry in any group.
+fn event_has_ours(hooks: &serde_json::Value, event: &str) -> bool {
+    hooks
+        .get(event)
+        .and_then(|a| a.as_array())
+        .map_or(false, |groups| {
+            groups.iter().any(|g| {
+                g.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map_or(false, |entries| entries.iter().any(is_ours))
+            })
+        })
+}
+
+pub fn state(project_dir: &Path) -> HookState {
+    match load(project_dir) {
+        Err(why) => HookState::Unknown(why),
+        Ok(None) => HookState::Absent,
+        Ok(Some(v)) => {
+            let hooks = v.get("hooks").cloned().unwrap_or(serde_json::Value::Null);
+            if EVENTS.iter().all(|e| event_has_ours(&hooks, e)) {
+                HookState::Present
+            } else {
+                HookState::Absent
+            }
+        }
+    }
+}
+
+/// Adds or removes roost's entries in `doc`, touching nothing else.
+fn merge(doc: &mut serde_json::Value, on: bool) {
+    let obj = doc.as_object_mut().expect("load guarantees an object");
+    if on {
+        let hooks = obj
+            .entry("hooks")
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        for event in EVENTS {
+            if event_has_ours(hooks, event) {
+                continue;
+            }
+            let groups = hooks
+                .as_object_mut()
+                .expect("load guarantees an object")
+                .entry(event)
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if let Some(arr) = groups.as_array_mut() {
+                // A group of our own, never an entry inside a foreign group:
+                // disabling then removes it without deciding what to do with
+                // a group we share.
+                arr.push(serde_json::json!({ "hooks": [our_entry()] }));
+            }
+        }
+        return;
+    }
+    let Some(hooks) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) else { return };
+    for event in EVENTS {
+        let Some(groups) = hooks.get_mut(event).and_then(|a| a.as_array_mut()) else { continue };
+        for g in groups.iter_mut() {
+            if let Some(entries) = g.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                entries.retain(|e| !is_ours(e));
+            }
+        }
+        groups.retain(|g| {
+            g.get("hooks").and_then(|h| h.as_array()).map_or(true, |e| !e.is_empty())
+        });
+        if groups.is_empty() {
+            hooks.remove(event);
+        }
+    }
+    if hooks.is_empty() {
+        obj.remove("hooks");
+    }
+}
+
+/// Enables or disables roost's hooks in the project's local settings.
+///
+/// Refuses on `Unknown`: the file is left byte-for-byte alone. Otherwise
+/// writes temp-then-rename in the same directory (a crash mid-write leaves
+/// the old file intact, and a reader never sees a half-written one), keeps
+/// an existing file's mode, and copies the pre-roost file to `.bak` the
+/// first time it replaces one — never again, so the backup stays the state
+/// before roost touched anything.
+pub fn set(project_dir: &Path, on: bool) -> Result<(), String> {
+    let mut doc = load(project_dir)?.unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    merge(&mut doc, on);
+    let mut text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    text.push('\n');
+
+    // Confined like every other creation path: the parent is canonicalised
+    // and the final component validated, because the file may not exist yet.
+    let dir = crate::projects::safe_resolve_parent(project_dir, ".claude")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{REL}: cannot create .claude: {e}"))?;
+    let target = crate::projects::safe_resolve_parent(project_dir, REL)?;
+    // `symlink_metadata`, not `exists()`: "cannot look" must not read as
+    // "absent" and skip the backup of a file that is there.
+    let existing = match std::fs::symlink_metadata(&target) {
+        Ok(m) => Some(m),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{REL}: cannot stat: {e}")),
+    };
+
+    // The pre-roost file, kept once and never overwritten.
+    if existing.is_some() {
+        let bak = dir.join("settings.local.json.bak");
+        if !bak.exists() {
+            std::fs::copy(&target, &bak).map_err(|e| format!("{REL}: cannot write backup: {e}"))?;
+        }
+    }
+
+    let tmp = dir.join(format!("settings.local.json.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, text).map_err(|e| format!("{REL}: cannot write: {e}"))?;
+    if let Some(meta) = &existing {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    std::fs::rename(&tmp, &target).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{REL}: cannot replace: {e}")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn proj() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p.join(".claude/settings.local.json")).unwrap()
+    }
+    fn write(p: &Path, s: &str) {
+        std::fs::create_dir_all(p.join(".claude")).unwrap();
+        std::fs::write(p.join(".claude/settings.local.json"), s).unwrap();
+    }
+
+    const OURS: &str = r#"{ "type": "command", "command": "roost claude-hook", "timeout": 5 }"#;
+
+    /// Verified this can fail: making `load`'s `NotFound` arm return `Err`
+    /// instead of `Ok(None)` failed the first assertion with `left: Unknown(
+    /// ".claude/settings.local.json: cannot read: No such file or directory
+    /// (os error 2)") right: Absent`.
+    #[test]
+    fn a_missing_file_is_absent_and_enable_writes_exactly_the_two_entries() {
+        let d = proj();
+        assert_eq!(state(d.path()), HookState::Absent);
+        set(d.path(), true).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"hooks":{{"Notification":[{{"hooks":[{OURS}]}}],"Stop":[{{"hooks":[{OURS}]}}]}}}}"#
+        )).unwrap();
+        let got: serde_json::Value = serde_json::from_str(&read(d.path())).unwrap();
+        assert_eq!(got, expected);
+        assert!(read(d.path()).ends_with("}\n"), "two-space pretty JSON with a trailing newline");
+        assert_eq!(state(d.path()), HookState::Present);
+    }
+
+    #[test]
+    fn enable_is_idempotent_byte_for_byte() {
+        let d = proj();
+        set(d.path(), true).unwrap();
+        let once = read(d.path());
+        set(d.path(), true).unwrap();
+        assert_eq!(read(d.path()), once);
+    }
+
+    /// Foreign content survives: other hooks on Stop, an unrelated event,
+    /// unrelated keys, and their order.
+    ///
+    /// Verified this can fail: dropping `features = ["preserve_order"]` from
+    /// `serde_json` in Cargo.toml failed the "top-level order kept" assertion
+    /// with `left: ["hooks", "permissions", "zeta"] right: ["permissions",
+    /// "hooks", "zeta"]` — serde_json's default map sorts keys alphabetically.
+    #[test]
+    fn enable_keeps_every_foreign_byte_of_content_and_key_order() {
+        let d = proj();
+        write(d.path(), r#"{
+  "permissions": { "allow": ["Bash(ls *)"] },
+  "hooks": {
+    "Stop": [ { "hooks": [ { "type": "command", "command": "say done" } ] } ],
+    "PreToolUse": [ { "matcher": "Bash", "hooks": [ { "type": "command", "command": "lint" } ] } ]
+  },
+  "zeta": 1
+}
+"#);
+        set(d.path(), true).unwrap();
+        let s = read(d.path());
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["permissions"]["allow"][0], "Bash(ls *)");
+        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "say done", "foreign Stop group first");
+        assert_eq!(v["hooks"]["Stop"][1]["hooks"][0]["command"], "roost claude-hook", "ours appended");
+        assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "Bash");
+        assert_eq!(v["hooks"]["Notification"][0]["hooks"][0]["command"], "roost claude-hook");
+        assert_eq!(v["zeta"], 1);
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["permissions", "hooks", "zeta"], "top-level order kept");
+        let hooks: Vec<&str> = v["hooks"].as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(hooks, ["Stop", "PreToolUse", "Notification"], "event order kept, new one last");
+        assert_eq!(state(d.path()), HookState::Present);
+    }
+
+    /// Verified this can fail: replacing `entries.retain(|e| !is_ours(e))`
+    /// with `entries.clear()` in `merge` panicked on the "foreign entry kept"
+    /// assertion's own `.unwrap()`: clearing the whole group (not just our
+    /// entry) emptied it, which then got pruned, so indexing
+    /// `v["hooks"]["Stop"][0]["hooks"]` returned `Null` and `.as_array()`
+    /// gave `None` — "called `Option::unwrap()` on a `None` value" at that
+    /// line.
+    #[test]
+    fn disable_removes_only_ours_and_prunes_what_it_empties() {
+        let d = proj();
+        write(d.path(), &format!(r#"{{
+  "hooks": {{
+    "Stop": [ {{ "hooks": [ {{ "type": "command", "command": "say done" }}, {OURS} ] }} ],
+    "Notification": [ {{ "hooks": [ {OURS} ] }} ]
+  }},
+  "other": true
+}}
+"#));
+        assert_eq!(state(d.path()), HookState::Present);
+        set(d.path(), false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&read(d.path())).unwrap();
+        assert_eq!(v["hooks"]["Stop"][0]["hooks"].as_array().unwrap().len(), 1, "foreign entry kept");
+        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "say done");
+        assert!(v["hooks"].get("Notification").is_none(), "an emptied event is dropped");
+        assert_eq!(v["other"], true);
+        assert_eq!(state(d.path()), HookState::Absent);
+
+        // Nothing but ours: `hooks` itself goes.
+        let d = proj();
+        set(d.path(), true).unwrap();
+        set(d.path(), false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&read(d.path())).unwrap();
+        assert!(v.get("hooks").is_none(), "{v}");
+    }
+
+    /// Verified this can fail: replacing `.all(` with `.any(` in `state`
+    /// failed the first assertion with `left: Present right: Absent`.
+    #[test]
+    fn one_event_present_is_absent_and_enable_adds_only_the_missing_one() {
+        let d = proj();
+        write(d.path(), &format!(r#"{{"hooks":{{"Stop":[{{"hooks":[{OURS}]}}]}}}}"#));
+        assert_eq!(state(d.path()), HookState::Absent);
+        set(d.path(), true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&read(d.path())).unwrap();
+        assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 1, "not duplicated");
+        assert_eq!(v["hooks"]["Notification"].as_array().unwrap().len(), 1);
+        assert_eq!(state(d.path()), HookState::Present);
+    }
+
+    /// Unknown refuses both directions and touches nothing.
+    #[test]
+    fn invalid_json_is_unknown_and_never_written() {
+        let d = proj();
+        write(d.path(), "{ not json");
+        assert!(matches!(state(d.path()), HookState::Unknown(_)));
+        let e = set(d.path(), true).unwrap_err();
+        assert!(e.contains("settings.local.json"), "{e}");
+        assert!(set(d.path(), false).is_err());
+        assert_eq!(read(d.path()), "{ not json");
+        assert!(!d.path().join(".claude/settings.local.json.bak").exists(), "no backup of a refused write");
+
+        let d = proj();
+        write(d.path(), r#"{"hooks": 5}"#);
+        assert!(matches!(state(d.path()), HookState::Unknown(_)), "hooks that is not an object");
+        let d = proj();
+        write(d.path(), r#"[]"#);
+        assert!(matches!(state(d.path()), HookState::Unknown(_)), "a top-level array");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_unknown_not_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = proj();
+        write(d.path(), "{}");
+        let p = d.path().join(".claude/settings.local.json");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads a mode-000 file anyway; then this test cannot
+        // arrange the condition and says so rather than passing vacuously.
+        let arranged = std::fs::read_to_string(&p).is_err();
+        let s = state(d.path());
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if !arranged {
+            eprintln!("skipped: running as a user that can read a mode-000 file");
+            return;
+        }
+        assert!(matches!(s, HookState::Unknown(_)), "{s:?}");
+    }
+
+    /// Verified this can fail: dropping the `if !bak.exists()` guard in
+    /// `set` failed the "still the pre-roost file" assertion with `left:
+    /// "{\n  \"pristine\": true\n}\n" right: "{\"pristine\": true}"` — the
+    /// backup got overwritten with the post-enable, pretty-printed file
+    /// instead of staying the original.
+    #[test]
+    fn the_backup_is_written_once_and_never_overwritten() {
+        let d = proj();
+        write(d.path(), r#"{"pristine": true}"#);
+        set(d.path(), true).unwrap();
+        let bak = d.path().join(".claude/settings.local.json.bak");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), r#"{"pristine": true}"#);
+        set(d.path(), false).unwrap();
+        set(d.path(), true).unwrap();
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), r#"{"pristine": true}"#, "still the pre-roost file");
+
+        // A file that did not exist has nothing to back up.
+        let d = proj();
+        set(d.path(), true).unwrap();
+        assert!(!d.path().join(".claude/settings.local.json.bak").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_are_atomic_and_keep_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = proj();
+        write(d.path(), "{}");
+        let p = d.path().join(".claude/settings.local.json");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        set(d.path(), true).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        let leftovers: Vec<_> = std::fs::read_dir(d.path().join(".claude")).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp")).collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+}
