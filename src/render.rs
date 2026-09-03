@@ -2112,24 +2112,27 @@ mod tests {
 
     /// Text and attribute values are escaped, never copied.
     ///
-    /// Verified this can fail: in `sanitize`, replacing
-    /// `out.push_str(&esc(&rest[..lt]))` with `out.push_str(&rest[..lt])`
-    /// made this fail on the `<img>` assertion (not the first one — the
-    /// text before the first `<` in `"a < b & c > d"` is just `"a "`, with
-    /// nothing to escape, and the trailing `esc(rest)` after the loop is
-    /// untouched by this change, so that assertion still passes) with
-    /// `left: "&lt;img src=\"x.png\" alt=\"x&quot;y&lt;z&quot;&gt;"` — the
-    /// quotes in the leading text before the embedded `<` came through
-    /// unescaped.
+    /// Verified this can fail: in `emit`, changing the `"alt" | "title"`
+    /// arm to push `v` unescaped (`format!(" {a}=\"{v}\"")` instead of
+    /// `esc(v)`) made this fail on the accepted-tag assertion with
+    /// `left: "<img src=\"/frag/proj/raw?path=x.png\" alt=\"x&quot;y>z\">"`
+    /// — the raw `&` and `>` came through instead of `&amp;` and `&gt;`.
     #[test]
     fn sanitizer_escapes_text_and_values() {
         assert_eq!(san("a < b & c > d"), "a &lt; b &amp; c &gt; d");
-        // A `<` before the closing quote of a quoted attribute value makes
-        // `parse_tag` refuse the whole tag (Finding A's fix), so this raw
-        // `<img>` — whose `alt` value has an unescaped `<` in it — now
-        // prints as text rather than parsing, same as any other malformed
-        // tag. Verified against `esc()` of the whole raw string: the two
-        // agree byte for byte.
+        // The accepted-tag case: this tag parses (a `>` inside a quoted
+        // value is fine; only `<` isn't), so its `alt` value must reach
+        // the output through `esc(v)` inside `emit`, not through
+        // `sanitize`'s fallback text-escaping path for a refused tag.
+        assert_eq!(
+            san(r#"<img src="x.png" alt="x&quot;y>z">"#),
+            r#"<img src="/frag/proj/raw?path=x.png" alt="x&amp;quot;y&gt;z">"#
+        );
+        // The refusal case: a `<` before the closing quote makes
+        // `parse_tag` refuse the whole tag (Finding A's fix), so this
+        // otherwise-identical fixture prints as text instead of parsing.
+        // Verified against `esc()` of the whole raw string: the two agree
+        // byte for byte.
         assert_eq!(
             san(r#"<img src="x.png" alt="x&quot;y<z">"#),
             r#"&lt;img src=&quot;x.png&quot; alt=&quot;x&amp;quot;y&lt;z&quot;&gt;"#
