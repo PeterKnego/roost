@@ -256,6 +256,13 @@ struct ParsedTag {
 /// caller treats the `<` as text. That covers comments, doctypes and
 /// processing instructions on purpose: the safe reading of markup this
 /// function does not understand is "print it".
+///
+/// Every scan inside here — an attribute name, a quoted value — stops at the
+/// next `<` even though HTML would let one appear unescaped in a quoted
+/// value. This is not HTML strictness; it bounds `sanitize`'s work. Without
+/// it, an unterminated `<` makes every scan run to the end of the input, and
+/// the caller retries one byte later, so an input with no `>` at all costs
+/// O(n^2): quadratic on a render thread, against a 2 MB file.
 fn parse_tag(s: &str) -> Option<ParsedTag> {
     let b = s.as_bytes();
     if b.first() != Some(&b'<') {
@@ -290,7 +297,7 @@ fn parse_tag(s: &str) -> Option<ParsedTag> {
         }
         let an = i;
         while b.get(i).map_or(false, |c| {
-            !c.is_ascii_whitespace() && !matches!(c, b'"' | b'\'' | b'>' | b'/' | b'=')
+            !c.is_ascii_whitespace() && !matches!(c, b'"' | b'\'' | b'>' | b'/' | b'=' | b'<')
         }) {
             i += 1;
         }
@@ -310,9 +317,18 @@ fn parse_tag(s: &str) -> Option<ParsedTag> {
             match b.get(i) {
                 Some(&q) if q == b'"' || q == b'\'' => {
                     let vs = i + 1;
-                    let end = s[vs..].find(q as char)? + vs;
-                    value = s[vs..end].to_string();
-                    i = end + 1;
+                    // Bounded by the next `<`, not by the end of the input: a
+                    // `<` before the closing quote makes the tag print as
+                    // text rather than paying for a scan to end-of-file.
+                    let rest = &s[vs..];
+                    match (rest.find(q as char), rest.find('<')) {
+                        (Some(end), Some(lt)) if lt < end => return None,
+                        (Some(end), _) => {
+                            value = s[vs..vs + end].to_string();
+                            i = vs + end + 1;
+                        }
+                        (None, _) => return None,
+                    }
                 }
                 Some(_) => {
                     let vs = i;
@@ -2032,6 +2048,29 @@ mod tests {
         assert_eq!(&s[t.len..], "z");
     }
 
+    /// `<` ends every scan inside a tag, including a quoted value, so a
+    /// `<` that never closes costs the sanitizer one bounded look, not a
+    /// scan to the end of the file for every `<` after it.
+    ///
+    /// Verified this can fail: removing `b'<'` from the attribute-name
+    /// exclusion list made the `<a x<b>` assertion panic with
+    /// `panicked at ...: lt inside an attribute name` — the assert message
+    /// itself, meaning `is_none()` returned `false`: without the exclusion
+    /// the name scan swallows `<b` as part of the attribute name and the
+    /// tag parses instead of being refused.
+    #[test]
+    fn parse_tag_stops_every_scan_at_the_next_lt() {
+        assert!(parse_tag("<a title=\"x < y\">").is_none(), "lt inside a quoted value");
+        assert!(parse_tag("<a x<b>").is_none(), "lt inside an attribute name");
+        // The unquoted-value scan already stopped at `<` before this fix (it
+        // was never the bug an unbounded scan would be). But that `<` is
+        // exactly what the next loop iteration dispatches on next, and a
+        // bare `<` there can never lead to a closing `>` — the same reason
+        // the line above is `None` — so this is `None` too, not a
+        // successful parse with a truncated `x=y` attribute.
+        assert!(parse_tag("<a x=y<b>").is_none(), "lt right after an unquoted value");
+    }
+
     /// Runs one instance over one string, `rel` = README.md at the project
     /// root, and closes what it left open.
     fn san(raw: &str) -> String {
@@ -2072,18 +2111,39 @@ mod tests {
     }
 
     /// Text and attribute values are escaped, never copied.
+    ///
+    /// Verified this can fail: in `sanitize`, replacing
+    /// `out.push_str(&esc(&rest[..lt]))` with `out.push_str(&rest[..lt])`
+    /// made this fail on the `<img>` assertion (not the first one — the
+    /// text before the first `<` in `"a < b & c > d"` is just `"a "`, with
+    /// nothing to escape, and the trailing `esc(rest)` after the loop is
+    /// untouched by this change, so that assertion still passes) with
+    /// `left: "&lt;img src=\"x.png\" alt=\"x&quot;y&lt;z&quot;&gt;"` — the
+    /// quotes in the leading text before the embedded `<` came through
+    /// unescaped.
     #[test]
     fn sanitizer_escapes_text_and_values() {
         assert_eq!(san("a < b & c > d"), "a &lt; b &amp; c &gt; d");
+        // A `<` before the closing quote of a quoted attribute value makes
+        // `parse_tag` refuse the whole tag (Finding A's fix), so this raw
+        // `<img>` — whose `alt` value has an unescaped `<` in it — now
+        // prints as text rather than parsing, same as any other malformed
+        // tag. Verified against `esc()` of the whole raw string: the two
+        // agree byte for byte.
         assert_eq!(
             san(r#"<img src="x.png" alt="x&quot;y<z">"#),
-            r#"<img src="/frag/proj/raw?path=x.png" alt="x&amp;quot;y&lt;z">"#
+            r#"&lt;img src=&quot;x.png&quot; alt=&quot;x&amp;quot;y&lt;z&quot;&gt;"#
         );
         assert_eq!(san("<!-- hidden -->"), "&lt;!-- hidden --&gt;");
     }
 
     /// Value rules: `align` is one of three words, `width`/`height` are
     /// short digit strings, `open` is bare, `br` takes nothing.
+    ///
+    /// Verified this can fail: in `emit`, dropping the
+    /// `matches!(v.as_str(), "left" | "center" | "right")` check (always
+    /// pushing `align`) made this fail on `<p align="middle">x</p>` with
+    /// `left: "<p align=\"middle\">x</p>"`.
     #[test]
     fn sanitizer_applies_value_rules() {
         assert_eq!(san("<p align=\"middle\">x</p>"), "<p>x</p>");
@@ -2129,6 +2189,12 @@ mod tests {
     /// The third emitter obeys the same table as the two markdown arms:
     /// a local path becomes the raw route, resolved against the file's own
     /// directory; a `data:` URI is kept.
+    ///
+    /// Verified this can fail: in `emit_img`, replacing
+    /// `resolve_dest(src, self.rel)` with `resolve_dest(src, "README.md")`
+    /// made this fail on the `docs/a.md` case with
+    /// `left: "<img src=\"/frag/proj/raw?path=img/x.png\" ...">` — resolved
+    /// against the project root instead of `docs/`.
     #[test]
     fn an_html_image_resolves_like_a_markdown_image() {
         assert_eq!(
@@ -2183,6 +2249,38 @@ mod tests {
             assert_eq!(san(&format!("<a href=\"{href}\">x</a>")), "<a class=\"mdbroken\">x</a>", "{href}");
         }
         assert_eq!(san("<a>x</a>"), "<a class=\"mdbroken\">x</a>");
+    }
+
+    /// A `<` that never closes must cost a bounded look, not a rescan of
+    /// everything after it. 50 000 unterminated tags is 350 kB, well under
+    /// the 2 MB file cap; the quadratic version of `sanitize` took tens of
+    /// seconds on it, the linear one takes milliseconds, so a five-second
+    /// bound separates them with a wide margin on any machine.
+    ///
+    /// Verified this can fail: restoring *both* pre-fix behaviors at once —
+    /// the attribute-name scan not excluding `<`, and the quoted-value
+    /// search running `s[vs..].find(q as char)?` to end of input instead of
+    /// stopping at the next `<` — made this fail with `took 176.79s` on this
+    /// machine, far over the five-second bound.
+    ///
+    /// Restoring only the quoted-value half, with the name-scan exclusion
+    /// left in place, does *not* reproduce the failure on this exact input:
+    /// after the value `"` fails to close, the very next byte in each block
+    /// is `<`, so the name-scan exclusion alone already forces `parse_tag`
+    /// to bail in O(1) before the quoted-value scan's own bound would ever
+    /// matter. The two fixes are independently sufficient for this
+    /// particular repeating pattern, so this timing test guards the
+    /// combined regression (either fix reverted alone is still caught by
+    /// `parse_tag_stops_every_scan_at_the_next_lt`'s correctness
+    /// assertions) rather than isolating the quoted-value bound by itself.
+    #[test]
+    fn sanitizer_is_linear_on_unterminated_tags() {
+        let raw = "<a x=\"".repeat(50_000);
+        let start = std::time::Instant::now();
+        let out = san(&raw);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "took {:?}", start.elapsed());
+        assert!(!out.contains('<'), "everything printed as text");
+        assert_eq!(out.matches("&lt;a x=&quot;").count(), 50_000);
     }
 
     #[test]
