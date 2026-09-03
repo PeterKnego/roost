@@ -589,12 +589,6 @@ fn sanitize_raw_html(events: &mut Vec<pulldown_cmark::Event<'_>>, project: &str,
     // whatever the block held rather than assume "never happens" means
     // "safe to discard"; see the CLAUDE.md rule this codebase learned that
     // rule from.
-    // A `Start(HtmlBlock)` never followed by its `End` — unreachable with
-    // pulldown-cmark today, since every block it opens it closes — would
-    // otherwise drop the accumulated text silently. Sanitize and emit
-    // whatever the block held rather than assume "never happens" means
-    // "safe to discard"; see the CLAUDE.md rule this codebase learned that
-    // rule from.
     if let Some(residue) = block.take() {
         out.push(Event::Html(CowStr::from(san.sanitize(&residue))));
     }
