@@ -121,10 +121,11 @@ with count and age. `Close Project` ends them all, keeps your layout, and refuse
 a buffer is unsaved.
 
 ### Desktop notifications
-A process in a terminal — Claude finishing a task, a hook needing a decision — raises a
-notification with one escape sequence or `roost notify`. It shows as a bell across every
-project and, in a secure context, as an OS notification that clicks back to the terminal
-that raised it. See [docs/notifications.md](docs/notifications.md).
+A process in a terminal raises a notification with one escape sequence or
+`roost notify`. For Claude, the bell has a switch: on, and a Claude Code
+hook in that project raises one when a turn finishes or Claude is waiting
+on you. It shows as a bell across every project and, in a secure context,
+as an OS notification that clicks back to the terminal that raised it. See [docs/notifications.md](docs/notifications.md).
 
 <details>
 <summary><b>Also: dot entries, worktrees overview, selection sharing, URL surface</b></summary>
