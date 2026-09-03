@@ -531,6 +531,19 @@ impl<'a> HtmlSanitizer<'a> {
 /// HTML block arrives one `Html` event per line, and a tag whose attributes
 /// continue on the next line (the `<img\n  src=…\n  width=…>` of a centred
 /// README header) is only whole once the block's lines are joined.
+///
+/// A bare `Event::Html` that reaches this loop with `block == None` falls to
+/// the `other` arm and is passed through raw, unsanitized. That is safe only
+/// because pulldown-cmark 0.13 never emits `Event::Html` outside a
+/// `Start(HtmlBlock)`/`End(HtmlBlock)` pair, so the only such event this
+/// function ever sees with `block` empty is the one `markdown_html` itself
+/// creates for a markdown link: built by `link_open` from already-escaped
+/// values, so sanitizing it again would double-escape it and strip the
+/// attributes (`data-rel`, `data-hash`) `link_open` set that are not on this
+/// module's allowlist. If a future pulldown-cmark version — or any other
+/// producer feeding this function — ever emits `Event::Html` for content
+/// that did not come from `link_open`, that event would need to be treated
+/// as untrusted raw input here, the same as a block's or inline tag's.
 fn sanitize_raw_html(events: &mut Vec<pulldown_cmark::Event<'_>>, project: &str, rel: &str) {
     use pulldown_cmark::{CowStr, Event, Tag, TagEnd};
     let mut san = HtmlSanitizer::new(project, rel);
@@ -1823,6 +1836,14 @@ mod tests {
     }
 
     /// Inline HTML in a paragraph goes through the same sanitizer.
+    ///
+    /// Verified this can fail: routing the `InlineHtml` arm to
+    /// `out.push(Event::Text(h))` instead of the sanitizer turns the whole
+    /// document into neutralized text — output contained
+    /// `&lt;b&gt;this&lt;/b&gt;` and `&lt;span onclick="x"&gt;that&lt;/span&gt;`
+    /// (quotes left unescaped, since `Event::Text` is escaped by
+    /// `push_html` with no awareness this was ever a tag), instead of
+    /// `<b>this</b>` and the allowlist-refused, fully escaped span.
     #[test]
     fn inline_html_is_sanitized_not_neutralized() {
         let h = markdown_html("see <b>this</b> and <span onclick=\"x\">that</span>\n", "proj", "a.md");
@@ -1832,6 +1853,13 @@ mod tests {
     }
 
     /// A document that never closes its `<details>` still ends balanced.
+    ///
+    /// Verified this can fail: dropping the `if !tail.is_empty() { … }`
+    /// block that appends `san.finish()`'s output (keeping the call to
+    /// `finish()` itself, so the stack still pops but the closing tags are
+    /// discarded) makes the output end `</p>\n</article>` instead of
+    /// `</details></article>` — `</details>` and `</summary>` never reach
+    /// the page.
     #[test]
     fn an_unclosed_tag_is_closed_at_the_end_of_the_document() {
         let h = markdown_html("<details>\n<summary>more</summary>\n\nhidden text\n", "proj", "a.md");
@@ -1843,12 +1871,36 @@ mod tests {
     /// reaches the sanitizer at all: on its own, `<img src="x.png"` with
     /// no `>` is not a complete tag, so CommonMark would never make it an
     /// HTML block and push_html would escape it without our help.
+    ///
+    /// Verified this can fail: changing `sanitize`'s `None` arm from
+    /// `out.push_str("&lt;");` to `out.push('<');` lets a live, unescaped
+    /// `<img src=&quot;x.png&quot;` reach the page instead of the fully
+    /// escaped `&lt;img src=&quot;x.png&quot;`.
     #[test]
     fn an_unterminated_tag_at_the_end_of_a_block_is_text() {
         let h = markdown_html("<div>\n<img src=\"x.png\"\n\ntext\n", "proj", "a.md");
         assert!(h.contains("&lt;img src=&quot;x.png&quot;"), "{h}");
         assert!(!h.contains("<img"), "{h}");
         assert!(h.trim_end().ends_with("</div></article>"), "{h}");
+    }
+
+    /// The one `Event::Html` this renderer emits itself — the anchor
+    /// `link_open` builds for a markdown link — must pass the sanitizing
+    /// pass untouched. Sanitizing it would double-escape a value that was
+    /// escaped once already, and the anchor would lose its `data-rel`.
+    ///
+    /// Verified this can fail: routing a bare `Event::Html` through
+    /// `san.sanitize` before the `other` arm (as if it were untrusted, the
+    /// way an `InlineHtml` or `HtmlBlock` event is treated) turns the anchor
+    /// into `<a class="mdbroken">t</a>`, because `href` is not among the
+    /// attributes `link_open` used (it used `data-rel`/`data-hash` instead),
+    /// so re-parsing the tag through the allowlist sees no `href` and treats
+    /// the link as broken.
+    #[test]
+    fn a_markdown_link_anchor_passes_the_html_pass_byte_for_byte() {
+        let h = markdown_html("[t](docs/deploy.md#running \"my title\")\n", "proj", "README.md");
+        assert!(h.contains(r#"<a class="mdlink" data-rel="docs/deploy.md" data-hash="running" title="my title">t</a>"#), "{h}");
+        assert!(!h.contains("&lt;a"), "{h}");
     }
 
     /// Both halves matter and each has its own caller: the message is what the
