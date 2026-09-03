@@ -1046,6 +1046,34 @@ pub fn status_fragment(st: &Status) -> String {
 /// `?at=` query and the "Open a directory" button here — no new reserved
 /// path, which would collide with a project of that name the way `static`
 /// and `frag` already can.
+/// The four favicon forms, each with a content hash as `?v=`. Firefox keeps
+/// a per-site icon cache that survives restarts and remembers a site as
+/// having no icon for days — this site had none until 2026-09-03 — and a
+/// changed URL is the only thing that makes it look again. The hash changes
+/// exactly when the icon bytes do, so the URL is stable across restarts and
+/// releases that do not touch the icon.
+fn icon_links() -> String {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let v = VERSION.get_or_init(|| {
+        // FNV-1a over the four files in link order; eight hex digits is
+        // plenty for "did it change", which is all a cache key needs.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for rel in ["favicon.ico", "favicon-32.png", "logo.svg", "apple-touch-icon.png"] {
+            for b in crate::assets::get(rel).unwrap_or(&[]) {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        format!("{:016x}", h)[..8].to_string()
+    });
+    format!(
+        "<link rel=\"icon\" href=\"/static/favicon.ico?v={v}\" sizes=\"32x32\">\n\
+         <link rel=\"icon\" type=\"image/png\" href=\"/static/favicon-32.png?v={v}\" sizes=\"32x32\">\n\
+         <link rel=\"icon\" type=\"image/svg+xml\" href=\"/static/logo.svg?v={v}\">\n\
+         <link rel=\"apple-touch-icon\" href=\"/static/apple-touch-icon.png?v={v}\">\n"
+    )
+}
+
 pub fn overview_page(sel: &str, roots_label: &str) -> String {
     // `sel` is already a percent-encoded storage key (e.g. `karpie%2Fsrc`);
     // encoding it again here means the server's single `percent_decode` of
@@ -1054,10 +1082,7 @@ pub fn overview_page(sel: &str, roots_label: &str) -> String {
     let qsel = crate::http::percent_encode(sel);
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>roost</title>\
-         <link rel=\"icon\" href=\"/static/favicon.ico\" sizes=\"32x32\">\
-         <link rel=\"icon\" type=\"image/png\" href=\"/static/favicon-32.png\" sizes=\"32x32\">\
-         <link rel=\"icon\" type=\"image/svg+xml\" href=\"/static/logo.svg\">\
-         <link rel=\"apple-touch-icon\" href=\"/static/apple-touch-icon.png\">\
+         {icons}\
          <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
          <link rel=\"stylesheet\" href=\"/static/style.css\">\
          <script src=\"/static/vendor/htmx.min.js\"></script>\
@@ -1081,6 +1106,7 @@ pub fn overview_page(sel: &str, roots_label: &str) -> String {
          </body></html>",
         roots = esc(roots_label),
         SVG_HOME = SVG_HOME,
+        icons = icon_links(),
     )
 }
 
@@ -1590,11 +1616,7 @@ pub fn workspace_page(
         r#"<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{proj_txt}</title>
-<link rel="icon" href="/static/favicon.ico" sizes="32x32">
-<link rel="icon" type="image/png" href="/static/favicon-32.png" sizes="32x32">
-<link rel="icon" type="image/svg+xml" href="/static/logo.svg">
-<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
-<link rel="stylesheet" href="/static/vendor/xterm.css">
+{icons}<link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/vendor/hljs-github-dark.min.css">
 <link rel="stylesheet" href="/static/vendor/github-markdown.min.css">
 <link rel="stylesheet" href="/static/vendor/code-input.min.css">
@@ -1650,6 +1672,7 @@ pub fn workspace_page(
         theme = esc(&s.theme),
         tab = esc(&s.default_tab),
         SVG_HOME = SVG_HOME,
+        icons = icon_links(),
         SVG_BRANCH = SVG_BRANCH,
         SVG_SEARCH = SVG_SEARCH,
         SVG_DIAMOND = SVG_DIAMOND,
@@ -2962,20 +2985,25 @@ mod tests {
         // Four icon forms, because browsers disagree: Chrome and Firefox take
         // the SVG, Safari ignores SVG favicons entirely and wants ICO or PNG
         // for the tab and the touch icon for bookmarks.
+        // Versioned, because Firefox's icon cache only re-looks at a URL it
+        // has not seen; the hash comes from the icon bytes, so it is the
+        // same on both pages and across restarts.
+        let v = ws.split("/static/favicon.ico?v=").nth(1).expect("versioned ico link")[..8].to_string();
+        assert!(v.len() == 8 && v.bytes().all(|b| b.is_ascii_hexdigit()), "version is not 8 hex digits: {v}");
         let icons = [
-            r#"<link rel="icon" href="/static/favicon.ico" sizes="32x32">"#,
-            r#"<link rel="icon" type="image/png" href="/static/favicon-32.png" sizes="32x32">"#,
-            r#"<link rel="icon" type="image/svg+xml" href="/static/logo.svg">"#,
-            r#"<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">"#,
+            format!(r#"<link rel="icon" href="/static/favicon.ico?v={v}" sizes="32x32">"#),
+            format!(r#"<link rel="icon" type="image/png" href="/static/favicon-32.png?v={v}" sizes="32x32">"#),
+            format!(r#"<link rel="icon" type="image/svg+xml" href="/static/logo.svg?v={v}">"#),
+            format!(r#"<link rel="apple-touch-icon" href="/static/apple-touch-icon.png?v={v}">"#),
         ];
-        for icon in icons {
+        for icon in &icons {
             assert!(ws.contains(icon), "workspace page lacks {icon}");
         }
         let home = ws.split(r#"<a class="home" href="/" title="all projects">"#).nth(1).expect("home anchor");
         assert!(home.starts_with(r#"<svg"#) && home[..home.find("</svg>").unwrap()].contains(r#"viewBox="0 0 14 12""#),
             "home anchor does not hold the owl: {}", &home[..120.min(home.len())]);
         let ov = overview_page("", "/home/x");
-        for icon in icons {
+        for icon in &icons {
             assert!(ov.contains(icon), "overview page lacks {icon}");
         }
         let ov_home = ov.split(r#"<span class="home">"#).nth(1).expect("overview home span");
