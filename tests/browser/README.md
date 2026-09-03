@@ -17,6 +17,7 @@ deno run -A tests/browser/reconnect.mjs   # terminal survives a dead connection
 deno run -A tests/browser/upload.mjs      # file upload and image paste
 deno run -A tests/browser/paneicons.mjs   # the per-pane header controls
 deno run -A tests/browser/mdlinks.mjs     # markdown preview links/images, and the image-tab edit refusal
+deno run -A tests/browser/mdhtml.mjs    # a GitHub-style README's raw HTML: images fetch, details fold, nothing executes
 deno run -A tests/browser/dotfiles.mjs    # the tree pane's dotfile toggle
 deno run -A tests/browser/altscreen.mjs  # a full-screen app's screen survives an attachment
 deno run -A tests/browser/modes.mjs      # and so do the modes it declared once
