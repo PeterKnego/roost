@@ -2650,8 +2650,12 @@ fn claude_hook_subcommand_exits_zero_and_silent_in_every_hands_off_case() {
             .expect("spawn roost claude-hook");
         // The write handle is a temporary: it is dropped (closing the pipe,
         // signalling EOF) at the end of this statement, before
-        // `wait_with_output` blocks on the child.
-        child.stdin.take().unwrap().write_all(stdin).expect("write stdin");
+        // `wait_with_output` blocks on the child. The result is ignored on
+        // purpose: case (a) exits without reading stdin, so a child that
+        // wins the race closes the pipe first and this write sees
+        // BrokenPipe — a flake, not a failure, since exit status and stdout
+        // are what the assertions below check.
+        let _ = child.stdin.take().unwrap().write_all(stdin);
         child.wait_with_output().expect("wait for roost claude-hook")
     };
 
@@ -2676,17 +2680,17 @@ fn claude_hook_subcommand_exits_zero_and_silent_in_every_hands_off_case() {
     // controlling terminal — the shape a subagent's hook runs in, and also
     // what this test binary itself may already be running under. `setsid`
     // gives the child its own session with no controlling terminal at all,
-    // which is the case that matters; `process_group(0)` is added on top so
-    // a host without `setsid` on PATH still detaches the child from this
-    // test process's own process group rather than inheriting whatever
-    // controlling terminal it has.
+    // which is the case that matters. Deliberately *not* combined with
+    // `process_group(0)`: util-linux `setsid` forks and exits 0 at once when
+    // it is already a group leader, discarding the child's status, which
+    // made the success assertion below unable to fail (verified: `setsid sh
+    // -c 'exit 3'` reports 3 normally and 0 in its own process group).
+    // `--wait` makes setsid report the child's status either way.
+    // Verified this can fail: with `std::process::exit(1)` inserted in
+    // `run_claude_hook`'s no-terminal arm, the success assertion below
+    // panicked; before `--wait` replaced `process_group(0)` it stayed green.
     let mut cmd = Command::new("setsid");
-    cmd.arg(bin).arg("claude-hook").env("ROOST_NOTIFY", "1");
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        cmd.process_group(0);
-    }
+    cmd.arg("--wait").arg(bin).arg("claude-hook").env("ROOST_NOTIFY", "1");
     let out = run(cmd, br#"{"hook_event_name":"Stop","last_assistant_message":"Done."}"#);
     assert!(out.status.success(), "{out:?}");
     assert!(out.stdout.is_empty(), "{out:?}");
