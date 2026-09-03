@@ -1054,13 +1054,16 @@ pub fn overview_page(sel: &str, roots_label: &str) -> String {
     let qsel = crate::http::percent_encode(sel);
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>roost</title>\
+         <link rel=\"icon\" href=\"/static/favicon.ico\" sizes=\"32x32\">\
+         <link rel=\"icon\" type=\"image/png\" href=\"/static/favicon-32.png\" sizes=\"32x32\">\
          <link rel=\"icon\" type=\"image/svg+xml\" href=\"/static/logo.svg\">\
+         <link rel=\"apple-touch-icon\" href=\"/static/apple-touch-icon.png\">\
          <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
          <link rel=\"stylesheet\" href=\"/static/style.css\">\
          <script src=\"/static/vendor/htmx.min.js\"></script>\
          </head><body class=\"overview-body\">\
          <header>\
-           <span class=\"home\">{SVG_DIAMOND}</span><span class=\"proj\">roost</span>\
+           <span class=\"home\">{SVG_HOME}</span><span class=\"proj\">roost</span>\
            <span class=\"vsep\"></span>\
            <span class=\"roots\" title=\"{roots}\">{roots}</span>\
          </header>\
@@ -1077,7 +1080,7 @@ pub fn overview_page(sel: &str, roots_label: &str) -> String {
          <script src=\"/static/overview.js\"></script>\
          </body></html>",
         roots = esc(roots_label),
-        SVG_DIAMOND = SVG_DIAMOND,
+        SVG_HOME = SVG_HOME,
     )
 }
 
@@ -1587,7 +1590,10 @@ pub fn workspace_page(
         r#"<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{proj_txt}</title>
+<link rel="icon" href="/static/favicon.ico" sizes="32x32">
+<link rel="icon" type="image/png" href="/static/favicon-32.png" sizes="32x32">
 <link rel="icon" type="image/svg+xml" href="/static/logo.svg">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
 <link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/vendor/hljs-github-dark.min.css">
 <link rel="stylesheet" href="/static/vendor/github-markdown.min.css">
@@ -2953,13 +2959,28 @@ mod tests {
         let ws = workspace_page("proj", "proj", &s, None, false, &[]);
         assert!(ws.contains("<title>proj</title>"), "{}", &ws[..400]);
         assert!(!ws.contains("— roost</title>"), "suffix still present");
-        let icon = r#"<link rel="icon" type="image/svg+xml" href="/static/logo.svg">"#;
-        assert!(ws.contains(icon), "workspace page has no favicon link");
+        // Four icon forms, because browsers disagree: Chrome and Firefox take
+        // the SVG, Safari ignores SVG favicons entirely and wants ICO or PNG
+        // for the tab and the touch icon for bookmarks.
+        let icons = [
+            r#"<link rel="icon" href="/static/favicon.ico" sizes="32x32">"#,
+            r#"<link rel="icon" type="image/png" href="/static/favicon-32.png" sizes="32x32">"#,
+            r#"<link rel="icon" type="image/svg+xml" href="/static/logo.svg">"#,
+            r#"<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">"#,
+        ];
+        for icon in icons {
+            assert!(ws.contains(icon), "workspace page lacks {icon}");
+        }
         let home = ws.split(r#"<a class="home" href="/" title="all projects">"#).nth(1).expect("home anchor");
         assert!(home.starts_with(r#"<svg"#) && home[..home.find("</svg>").unwrap()].contains(r#"viewBox="0 0 14 12""#),
             "home anchor does not hold the owl: {}", &home[..120.min(home.len())]);
         let ov = overview_page("", "/home/x");
-        assert!(ov.contains(icon), "overview page has no favicon link");
+        for icon in icons {
+            assert!(ov.contains(icon), "overview page lacks {icon}");
+        }
+        let ov_home = ov.split(r#"<span class="home">"#).nth(1).expect("overview home span");
+        assert!(ov_home[..ov_home.find("</svg>").unwrap()].contains(r#"viewBox="0 0 14 12""#),
+            "overview home span does not hold the owl");
         assert!(ov.contains("<title>roost</title>"), "overview title changed");
     }
 
