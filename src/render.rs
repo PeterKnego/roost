@@ -355,7 +355,6 @@ fn parse_tag(s: &str) -> Option<ParsedTag> {
 /// starting with this repository's own; anything else renders as text. A
 /// tag may be added with a test. `style`, `class` and `id` are refused
 /// rather than filtered: a CSS allowlist would be a second sanitizer.
-#[allow(dead_code)] // wired into markdown_html in the next task
 fn allowed_attrs(tag: &str) -> Option<&'static [&'static str]> {
     Some(match tag {
         "div" | "p" => &["align"],
@@ -370,7 +369,6 @@ fn allowed_attrs(tag: &str) -> Option<&'static [&'static str]> {
 /// The allowlist's `&'static` spelling of a tag name, so the open-tag stack
 /// holds no owned strings. Must list exactly the names `allowed_attrs`
 /// accepts.
-#[allow(dead_code)] // wired into markdown_html in the next task
 fn static_tag(tag: &str) -> Option<&'static str> {
     const TAGS: &[&str] = &[
         "div", "p", "img", "a", "details", "summary", "b", "strong", "i", "em", "sub", "sup",
@@ -379,7 +377,6 @@ fn static_tag(tag: &str) -> Option<&'static str> {
     TAGS.iter().copied().find(|t| *t == tag)
 }
 
-#[allow(dead_code)] // wired into markdown_html in the next task
 fn is_void(tag: &str) -> bool {
     matches!(tag, "img" | "br")
 }
@@ -390,14 +387,12 @@ fn is_void(tag: &str) -> bool {
 /// same resolver the markdown arms use. The stack is why one instance
 /// lives for the whole document — a `<div>` that opens a centred header
 /// closes twenty lines of markdown later, in a different HTML block.
-#[allow(dead_code)] // wired into markdown_html in the next task
 struct HtmlSanitizer<'a> {
     project: &'a str,
     rel: &'a str,
     open: Vec<&'static str>,
 }
 
-#[allow(dead_code)] // wired into markdown_html in the next task
 impl<'a> HtmlSanitizer<'a> {
     fn new(project: &'a str, rel: &'a str) -> Self {
         Self { project, rel, open: Vec::new() }
@@ -531,6 +526,35 @@ impl<'a> HtmlSanitizer<'a> {
     }
 }
 
+/// Replaces every raw-HTML event with its sanitized form. Runs on the
+/// collected vector rather than in the streaming `filter_map` because an
+/// HTML block arrives one `Html` event per line, and a tag whose attributes
+/// continue on the next line (the `<img\n  src=…\n  width=…>` of a centred
+/// README header) is only whole once the block's lines are joined.
+fn sanitize_raw_html(events: &mut Vec<pulldown_cmark::Event<'_>>, project: &str, rel: &str) {
+    use pulldown_cmark::{CowStr, Event, Tag, TagEnd};
+    let mut san = HtmlSanitizer::new(project, rel);
+    let mut out = Vec::with_capacity(events.len());
+    let mut block: Option<String> = None;
+    for ev in events.drain(..) {
+        match ev {
+            Event::Start(Tag::HtmlBlock) => block = Some(String::new()),
+            Event::Html(h) if block.is_some() => block.as_mut().unwrap().push_str(&h),
+            Event::End(TagEnd::HtmlBlock) => {
+                let joined = block.take().unwrap_or_default();
+                out.push(Event::Html(CowStr::from(san.sanitize(&joined))));
+            }
+            Event::InlineHtml(h) => out.push(Event::Html(CowStr::from(san.sanitize(&h)))),
+            other => out.push(other),
+        }
+    }
+    let tail = san.finish();
+    if !tail.is_empty() {
+        out.push(Event::Html(CowStr::from(tail)));
+    }
+    *events = out;
+}
+
 /// GitHub's heading-anchor slug, so a `#section` link written against GitHub
 /// resolves in the preview too.
 ///
@@ -621,16 +645,12 @@ pub fn markdown_html(md: &str, project: &str, rel: &str) -> String {
     // Start would leave push_html emitting a stray `" />` into the document.
     let mut dropped_image = false;
     let events = Parser::new_ext(md, opts).filter_map(|ev| match ev {
-        // raw HTML from repo content must never reach the page: render it as
-        // text. This arm and the link arm below match disjoint Event
-        // variants (Html/InlineHtml vs. Start(Tag::Link)), so their relative
-        // order does not matter for correctness. What matters: the
-        // Event::Html this function itself emits below is already built from
-        // escaped values via link_open, so it needs no neutralizing and
-        // nothing downstream re-examines it.
-        Event::Html(h) => Some(Event::Text(h)),
-        Event::InlineHtml(h) => Some(Event::Text(h)),
-
+        // Raw HTML is not handled here. It is sanitized by
+        // `sanitize_raw_html` on the collected vector below, because an
+        // HTML block's lines have to be joined before a tag split across
+        // them can be read. The Event::Html this function emits for links
+        // is built from escaped values by link_open and is untouched by
+        // that pass, which only rewrites HtmlBlock runs and InlineHtml.
         Event::Start(Tag::Link { ref dest_url, ref title, .. }) => {
             Some(Event::Html(CowStr::from(link_open(dest_url, title, rel))))
         }
@@ -675,6 +695,7 @@ pub fn markdown_html(md: &str, project: &str, rel: &str) -> String {
     // from a heading's Start to the text that names it. Bounded by the same
     // 2 MB file cap every other read is.
     let mut events: Vec<Event> = events.collect();
+    sanitize_raw_html(&mut events, project, rel);
     fill_heading_ids(&mut events);
     let mut out = String::new();
     html::push_html(&mut out, events.into_iter());
@@ -1772,6 +1793,62 @@ mod tests {
         assert!(!h.contains("<script>"));
         assert!(!h.contains("<iframe"));
         assert!(h.contains("&lt;script&gt;"));
+    }
+
+    /// The README shape: a centred header whose `<div>` closes after
+    /// twenty lines of markdown, with an `<img>` whose attributes continue
+    /// on the next line. Both halves are asserted: the tag survives with
+    /// both attributes (block lines were joined), and the close tag is a
+    /// tag, not text (the stack crossed the markdown in between).
+    ///
+    /// Verified this can fail: sanitizing each `Event::Html` line as it
+    /// arrives instead of joining the block first turns `<img\n  src=…`
+    /// into text, since its `>` is on a line the sanitizer never sees
+    /// joined to it — asserted `<img src="/frag/proj/raw?path=docs/img/hero.png" width="900">`,
+    /// got `&lt;img\n  src=&quot;docs/img/hero.png&quot;\n  width=&quot;900&quot;&gt;`.
+    #[test]
+    fn a_block_is_joined_and_balanced_across_the_document() {
+        // No blank line between the div and the img: that keeps the img's
+        // lines inside the div's HTML block, where they arrive one event
+        // per line. After a blank line, `<img` alone is not a complete tag,
+        // so CommonMark would make it a paragraph holding one inline tag —
+        // and that path never exercises the joining this test is for.
+        let md = "<div align=\"center\">\n<img\n  src=\"docs/img/hero.png\"\n  width=\"900\">\n\n# Title\n\nBody *text*.\n\n</div>\n";
+        let h = markdown_html(md, "proj", "README.md");
+        assert!(h.contains(r#"<div align="center">"#), "{h}");
+        assert!(h.contains(r#"<img src="/frag/proj/raw?path=docs/img/hero.png" width="900">"#), "{h}");
+        assert!(h.contains("<h1"), "markdown between the tags still renders: {h}");
+        assert!(h.contains("</div>"), "{h}");
+        assert!(!h.contains("&lt;/div&gt;"), "{h}");
+    }
+
+    /// Inline HTML in a paragraph goes through the same sanitizer.
+    #[test]
+    fn inline_html_is_sanitized_not_neutralized() {
+        let h = markdown_html("see <b>this</b> and <span onclick=\"x\">that</span>\n", "proj", "a.md");
+        assert!(h.contains("<b>this</b>"), "{h}");
+        assert!(h.contains("&lt;span onclick=&quot;x&quot;&gt;that&lt;/span&gt;"), "{h}");
+        assert!(!h.contains("<span"), "{h}");
+    }
+
+    /// A document that never closes its `<details>` still ends balanced.
+    #[test]
+    fn an_unclosed_tag_is_closed_at_the_end_of_the_document() {
+        let h = markdown_html("<details>\n<summary>more</summary>\n\nhidden text\n", "proj", "a.md");
+        assert!(h.trim_end().ends_with("</details></article>"), "{h}");
+    }
+
+    /// A block that ends inside a tag prints the fragment rather than
+    /// guessing at it. The fragment sits inside a `<div>` block so that it
+    /// reaches the sanitizer at all: on its own, `<img src="x.png"` with
+    /// no `>` is not a complete tag, so CommonMark would never make it an
+    /// HTML block and push_html would escape it without our help.
+    #[test]
+    fn an_unterminated_tag_at_the_end_of_a_block_is_text() {
+        let h = markdown_html("<div>\n<img src=\"x.png\"\n\ntext\n", "proj", "a.md");
+        assert!(h.contains("&lt;img src=&quot;x.png&quot;"), "{h}");
+        assert!(!h.contains("<img"), "{h}");
+        assert!(h.trim_end().ends_with("</div></article>"), "{h}");
     }
 
     /// Both halves matter and each has its own caller: the message is what the
