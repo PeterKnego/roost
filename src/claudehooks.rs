@@ -226,7 +226,7 @@ pub fn set(project_dir: &Path, on: bool) -> Result<(), String> {
     };
 
     // The pre-roost file, kept once and never overwritten.
-    if existing.is_some() {
+    if let Some(meta) = &existing {
         let bak = dir.join("settings.local.json.bak");
         match std::fs::symlink_metadata(&bak) {
             // Nothing at `bak` yet: write it by creating the destination
@@ -237,9 +237,20 @@ pub fn set(project_dir: &Path, on: bool) -> Result<(), String> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let orig = std::fs::read(&target)
                     .map_err(|e| format!("{REL}: cannot read for backup: {e}"))?;
-                let mut f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                // Set atomically at creation, not chmod'ed afterward: a
+                // window where the backup briefly sits at whatever mode
+                // `open` defaults to (typically world-readable) would leak
+                // a 0600 settings file's bytes to it, the same widening
+                // the temp-file `set_permissions` call above exists to
+                // avoid, one file over.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                    opts.mode(meta.permissions().mode());
+                }
+                let mut f = opts
                     .open(&bak)
                     .map_err(|e| format!("{REL}.bak: cannot create backup: {e}"))?;
                 use std::io::Write as _;
@@ -478,6 +489,38 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp")).collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// `fs::copy` used to carry the source's mode onto the backup; the
+    /// `OpenOptions::create_new` replacement (added for the symlink fix
+    /// above) defaults to the OS's own create mode — typically `0666 &
+    /// !umask`, world-readable — unless the source's mode is set on the
+    /// `OpenOptions` itself before `open`, atomically, so there is never a
+    /// window where a 0600 settings file's bytes sit in a more-permissive
+    /// `.bak`.
+    ///
+    /// Verified this can fail: dropping the `#[cfg(unix)] { .. opts.mode(..)
+    /// }` block so the backup was created with the `OpenOptions` default
+    /// failed with:
+    /// ```text
+    /// assertion `left == right` failed
+    ///   left: 436
+    ///  right: 384
+    /// ```
+    /// (436 = 0o664, 384 = 0o600 — this host's umask is `0002`, so
+    /// `OpenOptions`'s own default of 0o666 came out group- and
+    /// world-readable instead of matching the settings file's 0o600).
+    #[cfg(unix)]
+    #[test]
+    fn the_backup_is_created_with_the_source_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = proj();
+        write(d.path(), r#"{"pristine": true}"#);
+        let p = d.path().join(".claude/settings.local.json");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        set(d.path(), true).unwrap();
+        let bak = d.path().join(".claude/settings.local.json.bak");
+        assert_eq!(std::fs::metadata(&bak).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     /// A dangling symlink at the backup's own path is something that
