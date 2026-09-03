@@ -1054,6 +1054,7 @@ pub fn overview_page(sel: &str, roots_label: &str) -> String {
     let qsel = crate::http::percent_encode(sel);
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>roost</title>\
+         <link rel=\"icon\" type=\"image/svg+xml\" href=\"/static/logo.svg\">\
          <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
          <link rel=\"stylesheet\" href=\"/static/style.css\">\
          <script src=\"/static/vendor/htmx.min.js\"></script>\
@@ -1515,7 +1516,11 @@ pub fn overview_sessions(sel: &str, rows: &[OvSession]) -> String {
 // conventional toothed cog, not a stylised stand-in"). None of these are
 // interpolated into; anything dynamic stays in the surrounding markup and
 // goes through esc/percent_encode as ever.
-const SVG_HOME: &str = r#"<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1.5l6.5 6.5L8 14.5 1.5 8z"/></svg>"#;
+// The owl from docs/img/roost-logo.svg, inlined so it takes the header's
+// accent colour like the diamond it replaced; `static/logo.svg` is the same
+// drawing in the brand blue for the favicon, where there is no CSS to
+// inherit from. 14:12 drawn at 16px tall is 19px wide, not 16.
+const SVG_HOME: &str = r#"<svg width="19" height="16" viewBox="0 0 14 12" fill="currentColor" shape-rendering="crispEdges" aria-hidden="true"><rect x="1" y="0" width="1" height="1"/><rect x="3" y="0" width="1" height="1"/><rect x="9" y="0" width="1" height="1"/><rect x="11" y="0" width="1" height="1"/><rect x="1" y="1" width="4" height="1"/><rect x="9" y="1" width="3" height="1"/><rect x="2" y="2" width="3" height="1"/><rect x="9" y="2" width="4" height="1"/><rect x="3" y="3" width="3" height="1"/><rect x="9" y="3" width="5" height="1"/><rect x="4" y="4" width="3" height="1"/><rect x="9" y="4" width="2" height="1"/><rect x="12" y="4" width="1" height="1"/><rect x="5" y="5" width="6" height="1"/><rect x="4" y="6" width="7" height="1"/><rect x="4" y="7" width="7" height="1"/><rect x="5" y="8" width="5" height="1"/><rect x="6" y="9" width="1" height="1"/><rect x="9" y="9" width="1" height="1"/><rect x="6" y="10" width="1" height="1"/><rect x="9" y="10" width="1" height="1"/><rect x="5" y="11" width="6" height="1"/></svg>"#;
 const SVG_DIAMOND: &str = r#"<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1.5l6.5 6.5L8 14.5 1.5 8z"/></svg>"#;
 const SVG_BRANCH: &str = r#"<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true"><circle cx="5" cy="3.6" r="1.7"/><circle cx="5" cy="12.4" r="1.7"/><circle cx="11.4" cy="3.6" r="1.7"/><path d="M5 5.3v5.4M11.4 5.3v1.5a2.6 2.6 0 0 1-2.6 2.6H6.6"/></svg>"#;
 const SVG_SEARCH: &str = r#"<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>"#;
@@ -1581,7 +1586,8 @@ pub fn workspace_page(
     format!(
         r#"<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{proj_txt} — roost</title>
+<title>{proj_txt}</title>
+<link rel="icon" type="image/svg+xml" href="/static/logo.svg">
 <link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/vendor/hljs-github-dark.min.css">
 <link rel="stylesheet" href="/static/vendor/github-markdown.min.css">
@@ -2932,6 +2938,29 @@ mod tests {
         let s = Settings::default();
         let h = workspace_page("karpie/src", "karpie%2Fsrc", &s, None, false, &[]);
         assert!(h.contains("hx-get=\"/frag/_projects?current=karpie%252Fsrc\""));
+    }
+
+    /// The owl is the home mark and the favicon on both pages, and the
+    /// workspace tab is titled by the project alone: the favicon now says
+    /// which app a tab belongs to, so the "— roost" suffix only cost width
+    /// in a crowded tab strip.
+    ///
+    /// Verified this can fail: run before the change, it panicked on the
+    /// first assertion, the title still reading `<title>proj — roost</title>`.
+    #[test]
+    fn both_pages_carry_the_owl_and_the_workspace_title_is_the_project_alone() {
+        let s = crate::config::Settings::default();
+        let ws = workspace_page("proj", "proj", &s, None, false, &[]);
+        assert!(ws.contains("<title>proj</title>"), "{}", &ws[..400]);
+        assert!(!ws.contains("— roost</title>"), "suffix still present");
+        let icon = r#"<link rel="icon" type="image/svg+xml" href="/static/logo.svg">"#;
+        assert!(ws.contains(icon), "workspace page has no favicon link");
+        let home = ws.split(r#"<a class="home" href="/" title="all projects">"#).nth(1).expect("home anchor");
+        assert!(home.starts_with(r#"<svg"#) && home[..home.find("</svg>").unwrap()].contains(r#"viewBox="0 0 14 12""#),
+            "home anchor does not hold the owl: {}", &home[..120.min(home.len())]);
+        let ov = overview_page("", "/home/x");
+        assert!(ov.contains(icon), "overview page has no favicon link");
+        assert!(ov.contains("<title>roost</title>"), "overview title changed");
     }
 
     #[test]
