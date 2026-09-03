@@ -130,9 +130,10 @@ answer, not a quiet vote for "unused".
   (`Cargo.toml:26`) offers `into_offset_iter()`, which yields a byte range per
   event, so block-level source lines come from the parser rather than from
   hand-tracking. Two things make it more than a small change. It reshapes
-  every arm of `markdown_html` (`render.rs:234-295`) — this file's raw-HTML
-  neutralizing and link/image escaping surface, which CLAUDE.md's testing
-  notes single out. And it is block-accurate only: a selection of three words
+  every arm of `markdown_html` — including `sanitize_raw_html` in
+  `src/render.rs`, the pass that now handles raw HTML — and the link/image
+  escaping surface, which CLAUDE.md's testing notes single out. And it is
+  block-accurate only: a selection of three words
   inside a paragraph resolves to that paragraph's line span, not to the words,
   so the feature's ceiling is coarser than the editor's exact ranges.
 

@@ -263,6 +263,12 @@ struct ParsedTag {
 /// it, an unterminated `<` makes every scan run to the end of the input, and
 /// the caller retries one byte later, so an input with no `>` at all costs
 /// O(n^2): quadratic on a render thread, against a 2 MB file.
+///
+/// The name scan also stops at the first non-alphanumeric byte, so
+/// `<img-caption src="x.png">` is read as an `img` tag with a stray
+/// `-caption` attribute, and `</div-x>` as a close for `div`. This is a
+/// rendering divergence from a browser, deliberately accepted: it can only
+/// ever yield an allowlisted element with allowlisted attributes.
 fn parse_tag(s: &str) -> Option<ParsedTag> {
     let b = s.as_bytes();
     if b.first() != Some(&b'<') {
@@ -390,6 +396,9 @@ fn is_void(tag: &str) -> bool {
 struct HtmlSanitizer<'a> {
     project: &'a str,
     rel: &'a str,
+    // Bounded by the 2 MB preview file cap (`MAX_FILE_BYTES`): every entry
+    // costs at least three input bytes (`<b>`), so the worst case is under a
+    // million entries and no separate cap is needed.
     open: Vec<&'static str>,
 }
 
@@ -448,28 +457,37 @@ impl<'a> HtmlSanitizer<'a> {
             return;
         }
         let attr = |n: &str| tag.attrs.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str());
-        let mut attrs = String::new();
-        for &a in allowed {
-            let Some(v) = attr(a) else { continue };
-            match a {
-                "align" => {
-                    let v = v.to_ascii_lowercase();
-                    if matches!(v.as_str(), "left" | "center" | "right") {
-                        attrs.push_str(&format!(" align=\"{v}\""));
+        // `emit_a` builds every attribute of an anchor itself, `title`
+        // included, via `link_open` — skip the loop below for `a` so its
+        // result (which `emit_a` never reads) can't be mistaken for where
+        // `title` comes from.
+        let attrs = if name == "a" {
+            String::new()
+        } else {
+            let mut attrs = String::new();
+            for &a in allowed {
+                let Some(v) = attr(a) else { continue };
+                match a {
+                    "align" => {
+                        let v = v.to_ascii_lowercase();
+                        if matches!(v.as_str(), "left" | "center" | "right") {
+                            attrs.push_str(&format!(" align=\"{v}\""));
+                        }
                     }
-                }
-                "width" | "height" => {
-                    if !v.is_empty() && v.len() <= 4 && v.bytes().all(|c| c.is_ascii_digit()) {
-                        attrs.push_str(&format!(" {a}=\"{v}\""));
+                    "width" | "height" => {
+                        if !v.is_empty() && v.len() <= 4 && v.bytes().all(|c| c.is_ascii_digit()) {
+                            attrs.push_str(&format!(" {a}=\"{v}\""));
+                        }
                     }
+                    "open" => attrs.push_str(" open"),
+                    "alt" | "title" => attrs.push_str(&format!(" {a}=\"{}\"", esc(v))),
+                    // `src` and `href` are decided by the resolver in
+                    // `emit_img` and `emit_a`; they never take this path.
+                    _ => {}
                 }
-                "open" => attrs.push_str(" open"),
-                "alt" | "title" => attrs.push_str(&format!(" {a}=\"{}\"", esc(v))),
-                // `src` and `href` are decided by the resolver in
-                // `emit_img` and `emit_a`; they never take this path.
-                _ => {}
             }
-        }
+            attrs
+        };
         match name {
             "img" => self.emit_img(tag, &attrs, out),
             "a" => self.emit_a(tag, out),
@@ -552,7 +570,11 @@ fn sanitize_raw_html(events: &mut Vec<pulldown_cmark::Event<'_>>, project: &str,
     for ev in events.drain(..) {
         match ev {
             Event::Start(Tag::HtmlBlock) => block = Some(String::new()),
-            Event::Html(h) if block.is_some() => block.as_mut().unwrap().push_str(&h),
+            Event::Html(h) if block.is_some() => {
+                if let Some(b) = &mut block {
+                    b.push_str(&h);
+                }
+            }
             Event::End(TagEnd::HtmlBlock) => {
                 let joined = block.take().unwrap_or_default();
                 out.push(Event::Html(CowStr::from(san.sanitize(&joined))));
@@ -560,6 +582,21 @@ fn sanitize_raw_html(events: &mut Vec<pulldown_cmark::Event<'_>>, project: &str,
             Event::InlineHtml(h) => out.push(Event::Html(CowStr::from(san.sanitize(&h)))),
             other => out.push(other),
         }
+    }
+    // A `Start(HtmlBlock)` never followed by its `End` — unreachable with
+    // pulldown-cmark today, since every block it opens it closes — would
+    // otherwise drop the accumulated text silently. Sanitize and emit
+    // whatever the block held rather than assume "never happens" means
+    // "safe to discard"; see the CLAUDE.md rule this codebase learned that
+    // rule from.
+    // A `Start(HtmlBlock)` never followed by its `End` — unreachable with
+    // pulldown-cmark today, since every block it opens it closes — would
+    // otherwise drop the accumulated text silently. Sanitize and emit
+    // whatever the block held rather than assume "never happens" means
+    // "safe to discard"; see the CLAUDE.md rule this codebase learned that
+    // rule from.
+    if let Some(residue) = block.take() {
+        out.push(Event::Html(CowStr::from(san.sanitize(&residue))));
     }
     let tail = san.finish();
     if !tail.is_empty() {
@@ -1901,6 +1938,27 @@ mod tests {
         let h = markdown_html("[t](docs/deploy.md#running \"my title\")\n", "proj", "README.md");
         assert!(h.contains(r#"<a class="mdlink" data-rel="docs/deploy.md" data-hash="running" title="my title">t</a>"#), "{h}");
         assert!(!h.contains("&lt;a"), "{h}");
+    }
+
+    /// A `Start(HtmlBlock)` with no matching `End` — unreachable through
+    /// `pulldown_cmark` today, since it always closes a block it opens, but
+    /// the wrong default in this codebase is to drop the accumulated text
+    /// silently rather than sanitize and emit it. Built by hand rather than
+    /// from a markdown string, since there is no markdown input that leaves
+    /// `sanitize_raw_html` an unterminated block to react to.
+    ///
+    /// Verified this can fail: removing the residue flush (calling only
+    /// `san.finish()` after the loop, as the pre-fix code did) drops the
+    /// `<b>x` text entirely, and since `sanitize` — the only thing that
+    /// pushes onto the sanitizer's open-tag stack — is then never called,
+    /// `finish()` has nothing to close either: the result was `left: []`,
+    /// empty, against the expected two-element vector.
+    #[test]
+    fn an_unterminated_html_block_still_emits_its_text() {
+        use pulldown_cmark::{Event, Tag};
+        let mut events = vec![Event::Start(Tag::HtmlBlock), Event::Html("<b>x".into())];
+        sanitize_raw_html(&mut events, "proj", "a.md");
+        assert_eq!(events, vec![Event::Html("<b>x".into()), Event::Html("</b>".into())]);
     }
 
     /// Both halves matter and each has its own caller: the message is what the

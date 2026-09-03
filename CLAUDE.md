@@ -50,6 +50,20 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   empty is how work gets overwritten.
 - **Project storage keys are percent-encoded** (`karpie%2Fsrc`) while URLs keep
   readable slashes. Existing top-level keys must stay byte-for-byte identical.
+- **Raw HTML in a markdown preview is sanitized by an allowlist**,
+  `HtmlSanitizer` in `src/render.rs`. The output is only what the sanitizer
+  constructs: every attribute value is escaped, and every `src`/`href` is
+  decided by `resolve_dest`/`link_open`, never copied from the file. Two
+  things look like cleanups and are not: `sanitize_raw_html` passes a bare
+  `Event::Html` through unsanitized, which is safe only because pulldown-cmark
+  emits `Event::Html` solely inside an HTML block, and the only other one in
+  the stream is the anchor `link_open` built from already-escaped values —
+  "consistently" sanitizing it double-escapes the link, and a parser that
+  emitted `Html` outside a block would need that arm changed. And `parse_tag`
+  refuses a `<` anywhere inside a tag, including inside a quoted value; that
+  is not HTML strictness but the bound that keeps the sanitizer linear, each
+  parse stops at the next `<` — removing it reintroduces a quadratic scan
+  that took minutes on a few hundred kilobytes.
 - **Search shares the tree's filter but is not the tree.** `search.rs` walks
   with `projects::TreeFilter`, so `show_hidden` and the `hide` list mean the
   same thing in both — but it additionally refuses `.git` and any directory
