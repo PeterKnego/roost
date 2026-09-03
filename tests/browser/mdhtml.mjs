@@ -13,16 +13,22 @@
 //!      Some(Event::Text(h))`, `Event::InlineHtml(h) => Some(Event::Text(h))`)
 //!      in markdown_html's filter_map and commented out the
 //!      `sanitize_raw_html` call. Every tag — <div>, <img>, <details>, the
-//!      <script> — was escaped to text instead of sanitized, so:
+//!      <script> — was escaped to text instead of sanitized, so five
+//!      assertions failed:
 //!        FAIL  six images fetched their bytes through the raw route
+//!        FAIL  and no seventh image exists (the remote one was dropped)
+//!        FAIL  width survived on an image
+//!        FAIL  the centred div is a real div
+//!        FAIL  and its URL is nowhere in the page
 //!      (naturalWidth===1 count was 0, not 6 — no <img> element existed at
-//!      all) and three more failed alongside it: "no seventh image exists",
-//!      "width survived on an image", and "the centred div is a real div".
-//!      The header's original text named "five images"; the test itself
-//!      asserts six (there are six real <img> tags in the fixture, the
-//!      remote one is the seventh source that never becomes an element) —
-//!      corrected here to match what the test actually says and actually
-//!      failed.
+//!      all; and with the remote <img> escaped to text instead of dropped,
+//!      "example.invalid" survived in innerHTML as visible text). The
+//!      header's original text named "five images" and listed only four
+//!      failures; the test itself asserts six (there are six real <img>
+//!      tags in the fixture, the remote one is the seventh source that
+//!      never becomes an element) and the captured run failed five — both
+//!      corrected here to match what the test actually says and what
+//!      actually failed.
 //!   2. In HtmlSanitizer::emit, replaced the allowlist loop with pushing
 //!      every attribute through verbatim (`for (k, v) in &tag.attrs { … }`).
 //!      Only one assertion failed:
