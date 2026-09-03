@@ -341,6 +341,11 @@ impl Hub {
         // running host, not of the saved layout. Reading it back from disk
         // would mark tabs from a previous boot.
         ws.claude_sessions = crate::claudes::cached_sessions(&self.project);
+        ws.claude_hooks = match crate::claudehooks::state(&self.dir) {
+            crate::claudehooks::HookState::Present => Some(true),
+            crate::claudehooks::HookState::Absent => Some(false),
+            crate::claudehooks::HookState::Unknown(_) => None,
+        };
         Event::State { version: self.ws.version, origin: origin.clone(), ws }
     }
 
@@ -413,6 +418,19 @@ impl Hub {
             Intent::ClearNotices => {
                 crate::notify::clear();
                 self.notices_dirty = true;
+                return;
+            }
+            Intent::SetClaudeHooks { on } => {
+                // A file write under the hub lock, like CreateFile below:
+                // one small file, and the state it changes is what every
+                // client of this project is about to be sent.
+                if let Err(e) = crate::claudehooks::set(&self.dir, *on) {
+                    self.send_to(from, &Event::Error { msg: e });
+                    return;
+                }
+                self.ws.version += 1;
+                let snap = self.snapshot_event(from);
+                self.broadcast(&snap);
                 return;
             }
             Intent::EditBuffer { rel, text } => {

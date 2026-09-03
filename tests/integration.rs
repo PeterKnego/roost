@@ -698,6 +698,61 @@ fn the_header_toggle_overrides_the_config_file_in_both_directions() {
     std::env::remove_var("ROOST_STATE_DIR");
 }
 
+// The bell's switch: an intent over the workspace socket writes the
+// project's local Claude settings, and the next State reports what the
+// file says — read back from disk, not echoed from memory.
+//
+// Own project name: this test writes into the project directory and mutates
+// hub state (see `fixture_named`).
+//
+// Revert-checked: replacing the `snapshot_event` match with
+// `ws.claude_hooks = Some(false);` panicked at
+// `never saw "\"claude_hooks\":true" within the deadline` (the snapshot
+// never reported the write). Restored. Replacing `set(&self.dir, *on)`
+// with `Ok::<(), String>(())` in the `handle` arm panicked with the same
+// `never saw "\"claude_hooks\":true" within the deadline` — the stub never
+// writes the file, and `snapshot_event`'s real disk read of
+// `claudehooks::state` correctly keeps reporting `false`, so the client
+// never sees `true` and the test times out at that read_until rather than
+// reaching the file-content assertions below it. Restored.
+#[test]
+fn set_claude_hooks_writes_the_local_settings_and_state_reports_the_file() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
+    let (d, port) = fixture_named("hooksproj");
+    let proj = d.path().join("hooksproj");
+    let file = proj.join(".claude/settings.local.json");
+
+    let mut c = ws_connect_path(port, "/ws/hooksproj/_workspace").unwrap();
+    let first = read_until(&mut c, r#""t":"State""#);
+    assert!(first.contains(r#""claude_hooks":false"#), "no file yet is off: {first}");
+
+    c.send(tungstenite::Message::Text(r#"{"t":"SetClaudeHooks","on":true}"#.into())).unwrap();
+    read_until(&mut c, r#""claude_hooks":true"#);
+    let text = std::fs::read_to_string(&file).expect("the file was written");
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "roost claude-hook", "{text}");
+    assert_eq!(v["hooks"]["Notification"][0]["hooks"][0]["command"], "roost claude-hook", "{text}");
+
+    c.send(tungstenite::Message::Text(r#"{"t":"SetClaudeHooks","on":false}"#.into())).unwrap();
+    read_until(&mut c, r#""claude_hooks":false"#);
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert!(v.get("hooks").is_none(), "{v}");
+
+    // Unknown is reported as null and the intent is refused, file untouched.
+    std::fs::write(&file, "{ broken").unwrap();
+    c.send(tungstenite::Message::Text(r#"{"t":"RequestState"}"#.into())).unwrap();
+    read_until(&mut c, r#""claude_hooks":null"#);
+    c.send(tungstenite::Message::Text(r#"{"t":"SetClaudeHooks","on":true}"#.into())).unwrap();
+    let err = read_until(&mut c, r#""t":"Error""#);
+    assert!(err.contains("settings.local.json"), "{err}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "{ broken");
+
+    let _ = c.close(None);
+    std::env::remove_var("ROOST_STATE_DIR");
+}
+
 // The setting has to survive the whole request path — config cascade, route,
 // renderer — and it is per project, so the test asserts the same server serves
 // the hidden row only once that project's `.roost/config.toml` asks for it. A
