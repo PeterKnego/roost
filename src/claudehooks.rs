@@ -12,7 +12,7 @@
 //! parsed is `Unknown`, and `Unknown` refuses to write: rewriting a file we
 //! could not read is how a hand-edited settings file gets destroyed.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The command roost installs. Ownership is this exact string, nothing
 /// looser: a user who writes their own `roost notify` hook keeps it.
@@ -31,13 +31,34 @@ pub enum HookState {
     Unknown(String),
 }
 
-fn path(project_dir: &Path) -> PathBuf {
-    project_dir.join(REL)
-}
-
 /// The parsed document, `None` for a missing file, `Err` for `Unknown`.
 fn load(project_dir: &Path) -> Result<Option<serde_json::Value>, String> {
-    let p = path(project_dir);
+    // `.claude` may not exist yet for a project roost has never touched.
+    // `safe_resolve_parent` requires its parent to exist so it can
+    // canonicalize it, so that absence is checked here, first, and read as
+    // Absent rather than as Unknown (a directory that genuinely cannot be
+    // read — EACCES, say — falls through to the `Err` arm below instead).
+    match std::fs::symlink_metadata(project_dir.join(".claude")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{REL}: cannot stat .claude: {e}")),
+        Ok(_) => {}
+    }
+    // Confined like every other read of a project-relative path.
+    let p = crate::projects::safe_resolve_parent(project_dir, REL)
+        .map_err(|e| format!("{REL}: cannot confine: {e}"))?;
+    // A symlinked settings file is refused outright rather than followed:
+    // `set` below rewrites through this same path with `rename`, which
+    // would silently replace whatever the link points at — including a
+    // file outside the project — with roost's own, stamped with a fresh
+    // regular file's mode instead of the link target's.
+    match std::fs::symlink_metadata(&p) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(format!("{REL}: settings.local.json is a symlink"))
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{REL}: cannot stat: {e}")),
+    }
     let text = match std::fs::read_to_string(&p) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -51,6 +72,18 @@ fn load(project_dir: &Path) -> Result<Option<serde_json::Value>, String> {
     if let Some(h) = v.get("hooks") {
         if !h.is_object() {
             return Err(format!("{REL}: \"hooks\" is not an object"));
+        }
+        // An event key whose value isn't an array is refused, not skipped:
+        // `event_has_ours`/`merge` treat "absent" and "not an array" alike,
+        // so silently accepting this made enable a no-op `Ok` that
+        // installed nothing under that event.
+        let hobj = h.as_object().expect("checked is_object above");
+        for event in EVENTS {
+            if let Some(ev) = hobj.get(event) {
+                if !ev.is_array() {
+                    return Err(format!("{REL}: hooks.{event} is not an array"));
+                }
+            }
         }
     }
     Ok(Some(v))
@@ -138,17 +171,44 @@ fn merge(doc: &mut serde_json::Value, on: bool) {
     }
 }
 
+/// A per-process counter appended to the temp filename alongside the pid:
+/// roost is thread-per-connection, so two `set` calls racing in the same
+/// process (two browser tabs toggling the same project at once) must not
+/// collide on one `settings.local.json.tmp.<pid>` name.
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Enables or disables roost's hooks in the project's local settings.
 ///
-/// Refuses on `Unknown`: the file is left byte-for-byte alone. Otherwise
-/// writes temp-then-rename in the same directory (a crash mid-write leaves
-/// the old file intact, and a reader never sees a half-written one), keeps
-/// an existing file's mode, and copies the pre-roost file to `.bak` the
-/// first time it replaces one — never again, so the backup stays the state
-/// before roost touched anything.
+/// Refuses on `Unknown`: the file is left byte-for-byte alone (this
+/// includes a symlinked settings file, refused by `load`). Otherwise a
+/// no-op `merge` — already in the requested state, or nothing to remove —
+/// returns without touching the filesystem at all: no rewrite, no backup,
+/// no `.claude` directory conjured up for a `set(.., false)` that had
+/// nothing to disable. A real change writes temp-then-rename in the same
+/// directory (a crash mid-write leaves the old file intact, and a reader
+/// never sees a half-written one), keeps an existing file's mode, and
+/// copies the pre-roost file to `.bak` the first time it replaces one —
+/// never again, so the backup stays the state before roost touched
+/// anything, and never through a symlink planted at the backup's own path.
 pub fn set(project_dir: &Path, on: bool) -> Result<(), String> {
-    let mut doc = load(project_dir)?.unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    let original = load(project_dir)?;
+    let mut doc = original
+        .clone()
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
     merge(&mut doc, on);
+
+    // Nothing to write: either the file already carries what `on` asks
+    // for, or there was no file and `on` is `false`, which has nothing to
+    // remove. Comparing to `original` (not a freshly-loaded empty object)
+    // is what distinguishes "no file" from "file exists but empty".
+    let unchanged = match &original {
+        Some(v) => *v == doc,
+        None => !on,
+    };
+    if unchanged {
+        return Ok(());
+    }
+
     let mut text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
     text.push('\n');
 
@@ -168,15 +228,44 @@ pub fn set(project_dir: &Path, on: bool) -> Result<(), String> {
     // The pre-roost file, kept once and never overwritten.
     if existing.is_some() {
         let bak = dir.join("settings.local.json.bak");
-        if !bak.exists() {
-            std::fs::copy(&target, &bak).map_err(|e| format!("{REL}: cannot write backup: {e}"))?;
+        match std::fs::symlink_metadata(&bak) {
+            // Nothing at `bak` yet: write it by creating the destination
+            // ourselves (`create_new` never follows a symlink — unlike
+            // `fs::copy`, which opens the destination for writing and so
+            // would happily write through a symlink planted at `bak`,
+            // landing outside the project if the link pointed there).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let orig = std::fs::read(&target)
+                    .map_err(|e| format!("{REL}: cannot read for backup: {e}"))?;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&bak)
+                    .map_err(|e| format!("{REL}.bak: cannot create backup: {e}"))?;
+                use std::io::Write as _;
+                f.write_all(&orig)
+                    .map_err(|e| format!("{REL}.bak: cannot write backup: {e}"))?;
+            }
+            // Something is already there — an earlier backup, or a
+            // symlink (dangling or not) that isn't ours to touch: leave it
+            // exactly as it is either way.
+            Ok(_) => {}
+            Err(e) => return Err(format!("{REL}.bak: cannot stat backup: {e}")),
         }
     }
 
-    let tmp = dir.join(format!("settings.local.json.tmp.{}", std::process::id()));
+    let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!("settings.local.json.tmp.{}.{n}", std::process::id()));
     std::fs::write(&tmp, text).map_err(|e| format!("{REL}: cannot write: {e}"))?;
     if let Some(meta) = &existing {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        // Propagated, not swallowed: silently keeping the temp file's own
+        // (looser, umask-derived) mode would widen a 0600 settings file to
+        // whatever `create` defaults to on a write that was supposed to
+        // preserve it exactly.
+        std::fs::set_permissions(&tmp, meta.permissions()).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("{REL}: cannot set permissions: {e}")
+        })?;
     }
     std::fs::rename(&tmp, &target).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -389,5 +478,115 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp")).collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A dangling symlink at the backup's own path is something that
+    /// exists (`symlink_metadata` succeeds on the link itself, target or
+    /// no target), so `set` leaves it alone and proceeds rather than
+    /// following it — `fs::copy` would have opened it for writing and
+    /// created the link's target, possibly outside the project entirely.
+    ///
+    /// Verified this can fail: restoring the old `if !bak.exists()` guard
+    /// (which follows the symlink to check whether *its target* exists,
+    /// found nothing, and so proceeded to `fs::copy` through the link)
+    /// failed with "the symlink's target must never be created" — `escaped`
+    /// existed afterward, created through the link outside the project.
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_symlink_is_left_alone_not_followed() {
+        let d = proj();
+        write(d.path(), r#"{"pristine": true}"#);
+        let outside = tempfile::tempdir().unwrap();
+        let escaped = outside.path().join("escaped");
+        let bak = d.path().join(".claude/settings.local.json.bak");
+        std::os::unix::fs::symlink(&escaped, &bak).unwrap();
+
+        set(d.path(), true).unwrap();
+
+        assert!(!escaped.exists(), "the symlink's target must never be created");
+        let meta = std::fs::symlink_metadata(&bak).unwrap();
+        assert!(meta.file_type().is_symlink(), "the .bak path is still a symlink, untouched");
+        assert_eq!(state(d.path()), HookState::Present, "set still succeeded");
+    }
+
+    /// A symlinked settings file is refused, not followed: rewriting
+    /// through it via `rename` would replace whatever the link points at
+    /// (which could be outside the project) with roost's own file.
+    ///
+    /// Verified this can fail: dropping the symlink check in `load` (so it
+    /// fell straight through to `read_to_string`, which follows symlinks)
+    /// failed the first assertion — `state` returned `Absent` instead of
+    /// `Unknown`, panicking with just `Absent`, since the link's target
+    /// parsed fine as valid, empty JSON with no hooks at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_settings_file_is_unknown_and_never_replaced() {
+        let d = proj();
+        std::fs::create_dir_all(d.path().join(".claude")).unwrap();
+        let real = d.path().join("real-settings.json");
+        std::fs::write(&real, "{}").unwrap();
+        let link = d.path().join(".claude/settings.local.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let s = state(d.path());
+        assert!(matches!(&s, HookState::Unknown(msg) if msg.contains("symlink")), "{s:?}");
+        assert!(set(d.path(), true).is_err());
+
+        // Neither the link nor its target moved.
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "{}");
+    }
+
+    /// An event whose value under `hooks` isn't an array is refused, not
+    /// silently skipped: `merge`'s `entry(event).or_insert_with(..)` finds
+    /// the key already occupied by a non-array and does nothing with it,
+    /// so treating this shape as readable turned `set(.., true)` into a
+    /// silent no-op that reported `Ok` while installing nothing.
+    ///
+    /// Verified this can fail: dropping the per-event array check in `load`
+    /// failed the first assertion — `state` returned `Absent` instead of
+    /// `Unknown`, panicking with just `Absent` (the malformed `Notification`
+    /// value makes `event_has_ours` false, which reads exactly like a
+    /// project roost has never touched).
+    #[test]
+    fn a_non_array_event_is_unknown_and_never_written() {
+        let d = proj();
+        write(d.path(), r#"{"hooks": {"Notification": 5}}"#);
+        assert!(matches!(state(d.path()), HookState::Unknown(_)), "{:?}", state(d.path()));
+        assert!(set(d.path(), true).is_err());
+        assert_eq!(read(d.path()), r#"{"hooks": {"Notification": 5}}"#);
+    }
+
+    /// `set` is a no-op, filesystem untouched, when there is nothing to
+    /// change: disabling a project roost has never seen must not conjure
+    /// `.claude/settings.local.json` into existence, and enabling an
+    /// already-enabled project must not rewrite, back up, or bump the
+    /// file's mtime.
+    ///
+    /// Verified this can fail: dropping the `if unchanged { return Ok(())
+    /// }` early return failed case (a) with "no .claude directory created"
+    /// — `.claude` now existed, holding a freshly written `{}` from a
+    /// `set(.., false)` that had nothing to disable. (Case (b)'s mtime
+    /// check never got to run in that revert, since the panic in (a) stops
+    /// the test; the early return is what both cases share, so (a) alone
+    /// is enough to show the code path was reached.)
+    #[test]
+    fn a_no_op_set_touches_nothing() {
+        // (a) Disabling a project roost has never touched creates nothing.
+        let d = proj();
+        set(d.path(), false).unwrap();
+        assert!(!d.path().join(".claude").exists(), "no .claude directory created");
+
+        // (b) Enabling twice doesn't rewrite, back up, or bump mtime the
+        // second time.
+        let d = proj();
+        set(d.path(), true).unwrap();
+        let p = d.path().join(".claude/settings.local.json");
+        let before = std::fs::metadata(&p).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        set(d.path(), true).unwrap();
+        let after = std::fs::metadata(&p).unwrap().modified().unwrap();
+        assert_eq!(before, after, "mtime changed on a no-op enable");
+        assert!(!d.path().join(".claude/settings.local.json.bak").exists(), "no backup on a no-op enable");
     }
 }
