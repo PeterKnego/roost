@@ -183,6 +183,10 @@ impl Workspace {
             claude_sessions: vec![],
             is_git: self.is_git,
             show_hidden: self.show_hidden,
+            // Filled by `hub::snapshot_event`, same reasoning as
+            // `claude_sessions` above: it is a fact about the filesystem,
+            // not the workspace layout.
+            claude_hooks: None,
         }
     }
 }

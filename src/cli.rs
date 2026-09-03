@@ -112,6 +112,92 @@ pub fn run_notify(args: &[String]) -> i32 {
     }
 }
 
+/// What a Claude Code hook event says to the user, or `None` for the
+/// events and notification types this command deliberately ignores.
+///
+/// Pure, so the whole table is one unit test. The event shapes are Claude
+/// Code's documented hook input: `hook_event_name` on every event,
+/// `notification_type` on `Notification`, `last_assistant_message` on
+/// `Stop`. Anything not matched here is silence, not an error: a hook fires
+/// for every event it is registered on, and the ones registered are only
+/// `Notification` and `Stop`, but a future Claude Code may send types this
+/// table has never heard of.
+pub fn hook_message(v: &serde_json::Value) -> Option<(String, String)> {
+    let event = v.get("hook_event_name")?.as_str()?;
+    let (title, body) = match event {
+        "Notification" => {
+            let body = match v.get("notification_type")?.as_str()? {
+                "permission_prompt" => "wants permission to run a tool",
+                "idle_prompt" => "is waiting for your input",
+                "agent_needs_input" => "an agent needs your input",
+                "elicitation_dialog" | "elicitation_url_dialog" => "is asking a question",
+                _ => return None,
+            };
+            ("Claude needs you", body.to_string())
+        }
+        "Stop" => {
+            // First line only, then a hard cap: a notification is a glance.
+            // `sanitise` strips control characters and applies the parser's
+            // own cap; the 120 here is tighter on purpose.
+            let last = v.get("last_assistant_message").and_then(|m| m.as_str()).unwrap_or("");
+            let line = last.lines().next().unwrap_or("");
+            let clean = crate::osc::sanitise(line, crate::osc::MAX_BODY);
+            ("Claude finished", clean.chars().take(120).collect())
+        }
+        _ => return None,
+    };
+    Some((title.to_string(), body))
+}
+
+/// The `roost claude-hook` subcommand: Claude Code pipes the event as JSON on
+/// stdin; this turns it into one notification, or nothing.
+///
+/// Always exits 0. A `Stop` hook that exits non-zero shows an error in the
+/// transcript, and none of the ways this can have nothing to do is the
+/// user's mistake: a Claude run outside roost (no `ROOST_NOTIFY`), an event
+/// the table ignores, or a subagent's hook with no terminal (the `Nowhere`
+/// sink). `roost notify` keeps its loud exit 1 for the hand-written case;
+/// this command is installed into a project's settings by the bell and has
+/// to be silent wherever that project is opened without roost.
+pub fn run_claude_hook() -> i32 {
+    use std::io::Read;
+    if std::env::var_os("ROOST_NOTIFY").is_none() {
+        return 0;
+    }
+    let mut input = String::new();
+    // Bounded: this reads whatever Claude Code pipes in, a process this
+    // command does not control, and an unbounded read is a memory sink for
+    // no benefit — the largest legitimate payload (a `Stop` event's last
+    // assistant message) is capped to 120 characters long before it is ever
+    // used, so 1 MiB is already far more slack than any real event needs.
+    if std::io::stdin().take(1 << 20).read_to_string(&mut input).is_err() {
+        return 0;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) else { return 0 };
+    let Some((title, body)) = hook_message(&v) else { return 0 };
+    let seq = notify_sequence(&title, &body);
+    let mut tty_file = tty();
+    match choose_sink(tty_file.is_some(), std::io::stdout().is_terminal()) {
+        Sink::Tty => {
+            if let Some(f) = tty_file.as_mut() {
+                // Still exit 0 either way (see the doc above): this is
+                // logged, not surfaced as a hook failure, so a user who
+                // looks can see the notification did not land instead of
+                // it disappearing with no trace at all.
+                if f.write_all(seq.as_bytes()).and_then(|_| f.flush()).is_err() {
+                    eprintln!("roost claude-hook: could not write to the controlling terminal");
+                }
+            }
+        }
+        // Not stdout even when it is a terminal: Claude Code reads hook
+        // stdout as a decision, and a sequence there would be parsed as one.
+        Sink::Stdout | Sink::Nowhere => {
+            eprintln!("roost claude-hook: no controlling terminal to notify through; nothing sent");
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +283,72 @@ mod tests {
              must not be reported as delivered"
         );
     }
-}
 
+    fn msg(json: &str) -> Option<(String, String)> {
+        hook_message(&serde_json::from_str(json).unwrap())
+    }
+
+    /// The table from the spec, one row per assertion, so a row that
+    /// changes fails by name.
+    /// Verified this can fail: changing idle_prompt to return None produces
+    /// "assertion `left == right` failed: left: None, right: Some(...)".
+    #[test]
+    fn hook_message_maps_each_handled_event() {
+        assert_eq!(
+            msg(r#"{"hook_event_name":"Notification","notification_type":"permission_prompt"}"#),
+            Some(("Claude needs you".into(), "wants permission to run a tool".into()))
+        );
+        assert_eq!(
+            msg(r#"{"hook_event_name":"Notification","notification_type":"idle_prompt"}"#),
+            Some(("Claude needs you".into(), "is waiting for your input".into()))
+        );
+        assert_eq!(
+            msg(r#"{"hook_event_name":"Notification","notification_type":"agent_needs_input"}"#),
+            Some(("Claude needs you".into(), "an agent needs your input".into()))
+        );
+        for t in ["elicitation_dialog", "elicitation_url_dialog"] {
+            assert_eq!(
+                msg(&format!(r#"{{"hook_event_name":"Notification","notification_type":"{t}"}}"#)),
+                Some(("Claude needs you".into(), "is asking a question".into())),
+                "{t}"
+            );
+        }
+        assert_eq!(
+            msg(r#"{"hook_event_name":"Stop","last_assistant_message":"Done.\nSecond line."}"#),
+            Some(("Claude finished".into(), "Done.".into()))
+        );
+        assert_eq!(
+            msg(r#"{"hook_event_name":"Stop"}"#),
+            Some(("Claude finished".into(), String::new()))
+        );
+    }
+
+    /// Everything else is silence: unhandled types and events, and input
+    /// that is JSON but not an object.
+    #[test]
+    fn hook_message_is_none_for_everything_else() {
+        assert_eq!(msg(r#"{"hook_event_name":"Notification","notification_type":"auth_success"}"#), None);
+        assert_eq!(msg(r#"{"hook_event_name":"Notification","notification_type":"agent_completed"}"#), None);
+        assert_eq!(msg(r#"{"hook_event_name":"Notification"}"#), None);
+        assert_eq!(msg(r#"{"hook_event_name":"SubagentStop","last_assistant_message":"x"}"#), None);
+        assert_eq!(msg(r#"{"hook_event_name":"PreToolUse"}"#), None);
+        assert_eq!(msg(r#"{}"#), None);
+        assert_eq!(msg(r#"[1,2]"#), None);
+    }
+
+    /// A glance, not a transcript: first line, at most 120 characters,
+    /// control characters stripped by the same sanitiser `notify` uses.
+    /// Verified this can fail: changing take(120) to take(500) produces
+    /// "assertion `left == right` failed: left: 300, right: 120".
+    #[test]
+    fn stop_body_is_the_first_line_capped_and_sanitised() {
+        let long = "x".repeat(300);
+        let (_, body) = msg(&format!(r#"{{"hook_event_name":"Stop","last_assistant_message":"{long}"}}"#)).unwrap();
+        assert_eq!(body.chars().count(), 120);
+        let (_, body) = msg(r#"{"hook_event_name":"Stop","last_assistant_message":"a\u001b[31mb\tc"}"#).unwrap();
+        // `ESC` and `\t` are JSON escapes, so serde hands `hook_message`
+        // a real ESC and a real tab; the sanitiser must strip both.
+        assert!(!body.contains('\u{1b}') && !body.contains('\t'), "{body:?}");
+        assert!(body.starts_with('a'), "{body:?}");
+    }
+}

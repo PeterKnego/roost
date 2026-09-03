@@ -50,22 +50,44 @@ trying.
 
 ## Firing automatically from Claude Code
 
-The intended usage is a `Stop`/`Notification` hook in the project's
-`.claude/settings.json`, so you hear about a finished turn or a pending
-permission prompt without watching the tab:
+Open the bell in a project's workspace. Its first row says whether Claude
+notifications are on for that project and offers the switch. Enabling
+writes two hook entries into the project's `.claude/settings.local.json`
+(the personal, gitignored one; the committed `settings.json` and the
+global `~/.claude/settings.json` are never touched), each running
+`roost claude-hook`:
 
 ```json
 {
   "hooks": {
-    "Stop": [
-      { "hooks": [{ "type": "command", "command": "roost notify \"Claude\" \"finished\"" }] }
-    ],
-    "Notification": [
-      { "hooks": [{ "type": "command", "command": "roost notify \"Claude\" \"needs your input\"" }] }
-    ]
+    "Notification": [ { "hooks": [ { "type": "command", "command": "roost claude-hook", "timeout": 5 } ] } ],
+    "Stop":         [ { "hooks": [ { "type": "command", "command": "roost claude-hook", "timeout": 5 } ] } ]
   }
 }
 ```
+
+Disabling removes exactly those entries and nothing else; other hooks,
+other keys and their order survive. The first time roost replaces an
+existing file it copies it to `settings.local.json.bak` and never
+overwrites that copy. A file roost cannot parse shows on the bell as
+"cannot tell" and is never written.
+
+`roost claude-hook` reads the event Claude Code pipes on stdin and raises:
+
+| Event | Title | Body |
+|---|---|---|
+| `Notification` · `permission_prompt` | Claude needs you | wants permission to run a tool |
+| `Notification` · `idle_prompt` | Claude needs you | is waiting for your input |
+| `Notification` · `agent_needs_input` | Claude needs you | an agent needs your input |
+| `Notification` · `elicitation_dialog`, `elicitation_url_dialog` | Claude needs you | is asking a question |
+| `Stop` | Claude finished | the first line of Claude's last message |
+
+Anything else is ignored. Unlike `roost notify`, this command always exits
+0 and is silent when `ROOST_NOTIFY` is unset: the same project is used
+outside roost, and a `Stop` hook that exits non-zero shows an error in
+every such session. The snippet above is also what to paste by hand into
+any other settings file if you want the hooks somewhere roost will not
+write.
 
 **Existing hooks and scripts must be updated by hand.** A
 `.claude/settings.json` written before 2026-09-02 still says `resh notify`
@@ -75,11 +97,19 @@ permission prompt without watching the tab:
 `ROOST_NOTIFY` now — so `$RESH_NOTIFY` is always unset and the script's
 guard silently skips it. Either way the hook does nothing, and a hook that
 does nothing looks exactly like a hook that never fired — the same failure
-this command's loud-failure design exists to prevent. Update the command to
-`roost notify` and the variable check to `ROOST_NOTIFY` in every hook and
-script written against an old name. A host may leave a `resh` symlink to the
-`roost` binary so an old hook's *command* keeps working; nothing rescues an
-old `$RESH_NOTIFY` *guard* in a terminal opened after the rename.
+this command's loud-failure design exists to prevent. Which replacement
+command depends on what called `resh notify`: a hand-written script — one
+that passed a title and body as arguments, `resh notify "Build" "done"` —
+becomes `roost notify` with the same arguments; a Claude Code `Stop` or
+`Notification` hook entry (the JSON-on-stdin form Claude Code itself
+invokes) becomes `roost claude-hook` instead. Pointing a hand-written,
+argument-passing call at `roost claude-hook` is the same silent no-op this
+paragraph warns about: it ignores argv, reads stdin instead, and exits 0
+whether or not stdin holds anything it recognises. Either way, also update
+the variable check to `ROOST_NOTIFY` in every hook and script written
+against an old name. A host may leave a `resh` symlink to the `roost`
+binary so an old hook's *command* keeps working; nothing rescues an old
+`$RESH_NOTIFY` *guard* in a terminal opened after the rename.
 
 **The `/dev/tty` write is confirmed** (2026-08-17), including the shape a hook
 actually runs in: inside a resh terminal with stdout captured by a pipe,

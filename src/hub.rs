@@ -76,6 +76,23 @@ pub struct Hub {
     /// and `Mutex` is not reentrant — so the broadcast cannot happen inside
     /// `handle`.
     pub notices_dirty: bool,
+    /// Cached result of `claudehooks::state(&self.dir)`. Outer `None` means
+    /// "not computed since the last invalidation"; `snapshot_event` fills it
+    /// on demand and reuses it otherwise. Without this, a filesystem read
+    /// under the hub lock ran on every debounced keystroke — `snapshot_event`
+    /// is called from nearly every intent arm, including `EditBuffer` — which
+    /// is exactly the per-keystroke filesystem cost `WorkspaceView::show_hidden`'s
+    /// doc comment refuses for the same reason. It is set back to `None` in
+    /// exactly three places: the `SetClaudeHooks` arm (the write it just made
+    /// must be reflected immediately), the `RequestState` arm (a client's
+    /// explicit "tell me the truth now"), and `wsconn`'s initial snapshot for
+    /// a newly connecting client. That set covers every case CLAUDE.md's
+    /// design promises a refresh for — reconnect, an explicit refresh, and
+    /// the toggle's own write — while a hand edit made between those events
+    /// (Claude Code rewriting the file, say) is *not* one of them: it shows
+    /// up at the next refresh or reconnect, not sooner, exactly as the spec's
+    /// "Live following is deliberately not added" says.
+    pub claude_hooks: Option<Option<bool>>,
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<Hub>>>>> = OnceLock::new();
@@ -98,6 +115,7 @@ impl Hub {
             closing: false,
             notices_dirty: false,
             proposals: HashMap::new(),
+            claude_hooks: None,
         };
         // A freshly loaded hub must report reality, not whatever the
         // persisted layout happened to say last time: sessions may have
@@ -334,13 +352,23 @@ impl Hub {
         }
     }
 
-    pub fn snapshot_event(&self, origin: &ConnId) -> Event {
+    pub fn snapshot_event(&mut self, origin: &ConnId) -> Event {
         let mut ws = self.ws.view();
         // Derived here rather than kept in `WsState`: `wsstate::save` persists
         // that struct, and which terminal is running a Claude is true of the
         // running host, not of the saved layout. Reading it back from disk
         // would mark tabs from a previous boot.
         ws.claude_sessions = crate::claudes::cached_sessions(&self.project);
+        // See the doc comment on `claude_hooks` for why this is cached
+        // rather than read on every call.
+        let cached = *self.claude_hooks.get_or_insert_with(|| {
+            match crate::claudehooks::state(&self.dir) {
+                crate::claudehooks::HookState::Present => Some(true),
+                crate::claudehooks::HookState::Absent => Some(false),
+                crate::claudehooks::HookState::Unknown(_) => None,
+            }
+        });
+        ws.claude_hooks = cached;
         Event::State { version: self.ws.version, origin: origin.clone(), ws }
     }
 
@@ -389,6 +417,12 @@ impl Hub {
                 // is `session::live_names` rather than `list_sessions` (no
                 // `ps` fork per session).
                 self.refresh_live_sessions();
+                // This is the explicit "tell me the truth now": one of the
+                // three places `claude_hooks` is invalidated (see its doc
+                // comment) — a hand edit to the settings file made since the
+                // last snapshot must show up here even though it does not
+                // show up on every keystroke.
+                self.claude_hooks = None;
                 let ev = self.snapshot_event(from);
                 self.send_to(from, &ev);
                 return;
@@ -413,6 +447,24 @@ impl Hub {
             Intent::ClearNotices => {
                 crate::notify::clear();
                 self.notices_dirty = true;
+                return;
+            }
+            Intent::SetClaudeHooks { on } => {
+                // A file write under the hub lock, like CreateFile below:
+                // one small file, and the state it changes is what every
+                // client of this project is about to be sent.
+                if let Err(e) = crate::claudehooks::set(&self.dir, *on) {
+                    self.send_to(from, &Event::Error { msg: e });
+                    return;
+                }
+                self.ws.version += 1;
+                // The write above just changed what the file says; the
+                // cached read from before it must not be reused for the
+                // broadcast that reports it (see `claude_hooks`'s doc
+                // comment — this is one of its three invalidation sites).
+                self.claude_hooks = None;
+                let snap = self.snapshot_event(from);
+                self.broadcast(&snap);
                 return;
             }
             Intent::EditBuffer { rel, text } => {

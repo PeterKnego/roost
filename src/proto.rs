@@ -139,6 +139,10 @@ pub enum Intent {
     /// has never been toggled carries `None` and follows the config instead —
     /// see `WorkspaceView::show_hidden`.
     SetShowHidden { on: bool },
+    /// Enable or disable roost's two Claude Code hooks in this project's
+    /// `.claude/settings.local.json`. Applies to the project, not the
+    /// connection: every browser on it sees the new state.
+    SetClaudeHooks { on: bool },
     MarkNoticeRead { id: u64 },
     MarkAllNoticesRead,
     ClearNotices,
@@ -226,6 +230,18 @@ pub struct WorkspaceView {
     /// on every debounced keystroke. The page embeds the config value once,
     /// and the client resolves `show_hidden ?? SHOW_HIDDEN_DEFAULT`.
     pub show_hidden: Option<bool>,
+    /// Whether roost's Claude hooks are installed in the project's local
+    /// Claude settings: `Some(true)` present, `Some(false)` absent, `None`
+    /// when the file cannot be read or parsed. Derived in
+    /// `hub::snapshot_event` from `Hub::claude_hooks`, a cache read when it
+    /// is invalidated (a write through the toggle, an explicit refresh, or a
+    /// new connection — see that field's doc comment), not on every
+    /// snapshot: a snapshot goes out on every `EditBuffer`, i.e. every
+    /// debounced keystroke, and reading a file that often under the hub lock
+    /// is exactly the cost `show_hidden`'s comment above refuses for the
+    /// same reason. The file is still the truth; a hand edit shows at the
+    /// next invalidation, not necessarily the next snapshot.
+    pub claude_hooks: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

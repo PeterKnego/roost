@@ -64,6 +64,16 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   is not HTML strictness but the bound that keeps the sanitizer linear, each
   parse stops at the next `<` — removing it reintroduces a quadratic scan
   that took minutes on a few hundred kilobytes.
+- **roost writes exactly one Claude settings file**, the project's
+  `.claude/settings.local.json`, through `claudehooks::set`, and in it only
+  entries whose command is exactly `roost claude-hook`. Never the committed
+  `settings.json` (a clone would inherit a hook that runs roost) and never
+  `~/.claude/settings.json`. A file it cannot parse is `Unknown`, which
+  refuses to write: rewriting a settings file we could not read is how a
+  hand-edited one gets destroyed. And `roost claude-hook` always exits 0
+  and is silent without `ROOST_NOTIFY`, unlike `roost notify`'s deliberate
+  loud exit 1 — a `Stop` hook that exits non-zero shows an error in every
+  Claude session run outside roost in the same checkout.
 - **Search shares the tree's filter but is not the tree.** `search.rs` walks
   with `projects::TreeFilter`, so `show_hidden` and the `hide` list mean the
   same thing in both — but it additionally refuses `.git` and any directory

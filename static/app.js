@@ -222,6 +222,18 @@ function onEvent(ev) {
     case "State":
       myOrigin = myOrigin || ev.origin;
       state = ev.ws;
+      // Both: renderClaudeHooks() updates the bell's mark/tooltip even when
+      // the notice panel is closed (it reads `state` directly, not the
+      // panel's DOM), and renderNotices() is what keeps an *open* panel's
+      // hook row in step — it early-returns when the panel is hidden, so
+      // the per-keystroke cost (this fires on every debounced EditBuffer
+      // broadcast) is nil. Without the renderNotices() call here, an open
+      // panel kept a stale row after a confirm elsewhere in this tab or a
+      // flip from another browser: the mark and tooltip updated, but the
+      // row's "on"/"off" text and its Enable/Disable button did not, since
+      // nothing but renderNotices() rebuilds the panel's own children.
+      renderClaudeHooks();
+      renderNotices();
       // A rel missing from the fresh buffer list is gone server-side (the
       // last tab on it closed clean, or its edits were explicitly
       // discarded) — prune it here rather than let texts/editors grow for
@@ -2412,6 +2424,60 @@ if (canNotify() && "serviceWorker" in navigator) {
 
 function unread() { return notices.filter((n) => !n.read).length; }
 
+// The bell's Claude-hooks state. Three values, never two: `null` means the
+// server could not read or parse the settings file, and that gets a reason
+// and no button, not a guess.
+let hookConfirm = null; // "on" | "off" while a confirmation is showing
+function hookState() {
+  if (!state || state.claude_hooks === undefined) return "unknown";
+  return state.claude_hooks === null ? "unknown" : (state.claude_hooks ? "on" : "off");
+}
+function renderClaudeHooks() {
+  const bell = document.getElementById("bell");
+  if (!bell) return;
+  const s = hookState();
+  bell.dataset.claudeHooks = s;
+  const word = { on: "on", off: "off", unknown: "cannot tell" }[s];
+  bell.title = `notifications (n) · Claude notifications for this project: ${word}`;
+}
+// The panel's first row: state, and the switch behind a one-line
+// confirmation, because it writes into a file roost does not own.
+function hookRow() {
+  const row = document.createElement("div");
+  row.className = "hookrow";
+  const s = hookState();
+  const label = document.createElement("span");
+  if (s === "unknown") {
+    label.textContent = "Claude notifications: cannot tell — .claude/settings.local.json could not be read or parsed";
+    row.appendChild(label);
+    return row;
+  }
+  label.textContent = `Claude notifications for this project: ${s}`;
+  row.appendChild(label);
+  if (hookConfirm) {
+    const c = document.createElement("span");
+    c.className = "confirm";
+    const q = document.createElement("span");
+    q.textContent = hookConfirm === "on"
+      ? "Write two hooks to .claude/settings.local.json? "
+      : "Remove roost's hooks from .claude/settings.local.json? ";
+    const yes = document.createElement("button");
+    yes.textContent = hookConfirm === "on" ? "Enable" : "Disable";
+    yes.onclick = (e) => { e.stopPropagation(); send({ t: "SetClaudeHooks", on: hookConfirm === "on" }); hookConfirm = null; renderNotices(); };
+    const no = document.createElement("button");
+    no.textContent = "Cancel";
+    no.onclick = (e) => { e.stopPropagation(); hookConfirm = null; renderNotices(); };
+    c.append(q, yes, no);
+    row.appendChild(c);
+    return row;
+  }
+  const b = document.createElement("button");
+  b.textContent = s === "on" ? "Disable" : "Enable";
+  b.onclick = (e) => { e.stopPropagation(); hookConfirm = s === "on" ? "off" : "on"; renderNotices(); };
+  row.appendChild(b);
+  return row;
+}
+
 function renderNotices() {
   const n = unread();
   const count = document.getElementById("bellcount");
@@ -2423,6 +2489,7 @@ function renderNotices() {
   const panel = document.getElementById("noticepanel");
   if (!panel || panel.hidden) return;
   panel.replaceChildren();
+  panel.appendChild(hookRow());
   if (!notices.length) {
     const empty = document.createElement("div");
     empty.className = "notice-empty";
@@ -2481,6 +2548,7 @@ function renderNotices() {
     foot.appendChild(s);
   }
   panel.appendChild(foot);
+  renderClaudeHooks();
 }
 
 function ago(secs) {
