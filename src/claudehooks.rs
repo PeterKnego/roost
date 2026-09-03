@@ -11,6 +11,13 @@
 //! Reading has three outcomes, not two. A file that exists but cannot be
 //! parsed is `Unknown`, and `Unknown` refuses to write: rewriting a file we
 //! could not read is how a hand-edited settings file gets destroyed.
+//!
+//! The symlink checks in `load` and `set` are advisory, not the enforcement:
+//! a same-user race can swap a symlink in between the `symlink_metadata`
+//! check and the later open. What actually stops a write from landing
+//! outside the project is `OpenOptions::create_new` on the backup (and now
+//! the temp-file) path, which refuses to open through an existing symlink
+//! at all rather than trusting a stat taken moments earlier.
 
 use std::path::Path;
 
@@ -267,16 +274,27 @@ pub fn set(project_dir: &Path, on: bool) -> Result<(), String> {
 
     let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!("settings.local.json.tmp.{}.{n}", std::process::id()));
-    std::fs::write(&tmp, text).map_err(|e| format!("{REL}: cannot write: {e}"))?;
-    if let Some(meta) = &existing {
-        // Propagated, not swallowed: silently keeping the temp file's own
-        // (looser, umask-derived) mode would widen a 0600 settings file to
-        // whatever `create` defaults to on a write that was supposed to
-        // preserve it exactly.
-        std::fs::set_permissions(&tmp, meta.permissions()).map_err(|e| {
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        // Set atomically at creation, not chmod'ed afterward: `fs::write`
+        // followed by a separate `set_permissions` left a window where a
+        // 0600 settings file's bytes sat in a temp file at whatever mode
+        // `create` defaults to (typically world-readable) — the same
+        // widening the backup path above avoids the same way.
+        #[cfg(unix)]
+        if let Some(meta) = &existing {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            opts.mode(meta.permissions().mode());
+        }
+        let mut f = opts
+            .open(&tmp)
+            .map_err(|e| format!("{REL}: cannot create temp file: {e}"))?;
+        use std::io::Write as _;
+        if let Err(e) = f.write_all(text.as_bytes()) {
             let _ = std::fs::remove_file(&tmp);
-            format!("{REL}: cannot set permissions: {e}")
-        })?;
+            return Err(format!("{REL}: cannot write: {e}"));
+        }
     }
     std::fs::rename(&tmp, &target).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);

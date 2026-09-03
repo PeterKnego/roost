@@ -735,6 +735,30 @@ fn set_claude_hooks_writes_the_local_settings_and_state_reports_the_file() {
     assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "roost claude-hook", "{text}");
     assert_eq!(v["hooks"]["Notification"][0]["hooks"][0]["command"], "roost claude-hook", "{text}");
 
+    // Hub::claude_hooks is a cache, not a fresh read on every snapshot (see
+    // its doc comment): a hand edit to the file, followed by an unrelated
+    // intent that rebuilds a snapshot for its own reason, must still report
+    // the cached value — only an explicit RequestState (or a fresh
+    // connection) re-reads.
+    //
+    // Revert-checked: dropping the cache (making `snapshot_event` always
+    // recompute) failed the "still true" assertion below with
+    // `left: false` in the frame text instead of `true` — SetShowHidden's
+    // snapshot picked up the hand-edited file immediately rather than
+    // waiting for the RequestState that follows.
+    let mut hand_edited: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    hand_edited["hooks"].as_object_mut().unwrap().remove("Stop");
+    std::fs::write(&file, serde_json::to_string_pretty(&hand_edited).unwrap()).unwrap();
+    c.send(tungstenite::Message::Text(r#"{"t":"SetShowHidden","on":true}"#.into())).unwrap();
+    let still_cached = read_until(&mut c, r#""t":"State""#);
+    assert!(
+        still_cached.contains(r#""claude_hooks":true"#),
+        "the unrelated rebuild must reuse the cached value, not the just-edited file: {still_cached}"
+    );
+    c.send(tungstenite::Message::Text(r#"{"t":"RequestState"}"#.into())).unwrap();
+    read_until(&mut c, r#""claude_hooks":false"#);
+
     c.send(tungstenite::Message::Text(r#"{"t":"SetClaudeHooks","on":false}"#.into())).unwrap();
     read_until(&mut c, r#""claude_hooks":false"#);
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
@@ -2595,5 +2619,83 @@ fn a_fresh_projects_first_terminal_already_carries_the_ide_port() {
     // directory scan.
     if let Some(p) = ide_port {
         let _ = std::fs::remove_file(roost::idelock::ide_dir().join(format!("{p}.lock")));
+    }
+}
+
+/// `roost claude-hook` as `main.rs` actually dispatches it — the real
+/// built binary, not `cli::run_claude_hook` called in-process — asserting
+/// what a Claude Code hook entry actually sees: exit 0 and empty stdout in
+/// every one of the three ways it can have nothing to say. Claude Code
+/// reads a hook's stdout as a decision and treats nonzero exit as a
+/// failure shown in the transcript, so either one leaking here is user-
+/// visible in every Claude session on the project, not just a wrong log
+/// line.
+///
+/// Revert-checked: changing `run_claude_hook`'s first `return 0` (the
+/// missing-`ROOST_NOTIFY` path) to `return 1` failed case (a)'s
+/// `out.status.success()` assertion — `left: false` where a Claude
+/// running outside a roost terminal must see silent success. Restored.
+#[test]
+fn claude_hook_subcommand_exits_zero_and_silent_in_every_hands_off_case() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let bin = env!("CARGO_BIN_EXE_roost");
+
+    let run = |mut cmd: Command, stdin: &[u8]| -> std::process::Output {
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn roost claude-hook");
+        // The write handle is a temporary: it is dropped (closing the pipe,
+        // signalling EOF) at the end of this statement, before
+        // `wait_with_output` blocks on the child.
+        child.stdin.take().unwrap().write_all(stdin).expect("write stdin");
+        child.wait_with_output().expect("wait for roost claude-hook")
+    };
+
+    // (a) No ROOST_NOTIFY: this Claude is not running in a roost terminal
+    // (the project is also used outside roost), so the hook is a true
+    // no-op regardless of what is on stdin.
+    let mut cmd = Command::new(bin);
+    cmd.arg("claude-hook").env_remove("ROOST_NOTIFY");
+    let out = run(cmd, br#"{"hook_event_name":"Stop"}"#);
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+
+    // (b) ROOST_NOTIFY set, stdin not JSON at all: a parse failure must not
+    // surface as a hook failure either.
+    let mut cmd = Command::new(bin);
+    cmd.arg("claude-hook").env("ROOST_NOTIFY", "1");
+    let out = run(cmd, b"not json");
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+
+    // (c) ROOST_NOTIFY set and a valid Stop event, but the process has no
+    // controlling terminal — the shape a subagent's hook runs in, and also
+    // what this test binary itself may already be running under. `setsid`
+    // gives the child its own session with no controlling terminal at all,
+    // which is the case that matters; `process_group(0)` is added on top so
+    // a host without `setsid` on PATH still detaches the child from this
+    // test process's own process group rather than inheriting whatever
+    // controlling terminal it has.
+    let mut cmd = Command::new("setsid");
+    cmd.arg(bin).arg("claude-hook").env("ROOST_NOTIFY", "1");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    let out = run(cmd, br#"{"hook_event_name":"Stop","last_assistant_message":"Done."}"#);
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    // A tty-less test runner can legitimately hit the very same "no
+    // controlling terminal" path on its own, with no `setsid` involved — so
+    // this only checks stderr's *content* when there is any, not that it is
+    // empty.
+    if !out.stderr.is_empty() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("no controlling terminal"), "{stderr}");
     }
 }

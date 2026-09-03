@@ -97,11 +97,19 @@ write.
 `ROOST_NOTIFY` now — so `$RESH_NOTIFY` is always unset and the script's
 guard silently skips it. Either way the hook does nothing, and a hook that
 does nothing looks exactly like a hook that never fired — the same failure
-this command's loud-failure design exists to prevent. Update the command to
-`roost claude-hook` and the variable check to `ROOST_NOTIFY` in every hook and
-script written against an old name. A host may leave a `resh` symlink to the
-`roost` binary so an old hook's *command* keeps working; nothing rescues an
-old `$RESH_NOTIFY` *guard* in a terminal opened after the rename.
+this command's loud-failure design exists to prevent. Which replacement
+command depends on what called `resh notify`: a hand-written script — one
+that passed a title and body as arguments, `resh notify "Build" "done"` —
+becomes `roost notify` with the same arguments; a Claude Code `Stop` or
+`Notification` hook entry (the JSON-on-stdin form Claude Code itself
+invokes) becomes `roost claude-hook` instead. Pointing a hand-written,
+argument-passing call at `roost claude-hook` is the same silent no-op this
+paragraph warns about: it ignores argv, reads stdin instead, and exits 0
+whether or not stdin holds anything it recognises. Either way, also update
+the variable check to `ROOST_NOTIFY` in every hook and script written
+against an old name. A host may leave a `resh` symlink to the `roost`
+binary so an old hook's *command* keeps working; nothing rescues an old
+`$RESH_NOTIFY` *guard* in a terminal opened after the rename.
 
 **The `/dev/tty` write is confirmed** (2026-08-17), including the shape a hook
 actually runs in: inside a resh terminal with stdout captured by a pipe,

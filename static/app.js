@@ -222,7 +222,18 @@ function onEvent(ev) {
     case "State":
       myOrigin = myOrigin || ev.origin;
       state = ev.ws;
+      // Both: renderClaudeHooks() updates the bell's mark/tooltip even when
+      // the notice panel is closed (it reads `state` directly, not the
+      // panel's DOM), and renderNotices() is what keeps an *open* panel's
+      // hook row in step — it early-returns when the panel is hidden, so
+      // the per-keystroke cost (this fires on every debounced EditBuffer
+      // broadcast) is nil. Without the renderNotices() call here, an open
+      // panel kept a stale row after a confirm elsewhere in this tab or a
+      // flip from another browser: the mark and tooltip updated, but the
+      // row's "on"/"off" text and its Enable/Disable button did not, since
+      // nothing but renderNotices() rebuilds the panel's own children.
       renderClaudeHooks();
+      renderNotices();
       // A rel missing from the fresh buffer list is gone server-side (the
       // last tab on it closed clean, or its edits were explicitly
       // discarded) — prune it here rather than let texts/editors grow for

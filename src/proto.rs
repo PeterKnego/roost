@@ -233,8 +233,14 @@ pub struct WorkspaceView {
     /// Whether roost's Claude hooks are installed in the project's local
     /// Claude settings: `Some(true)` present, `Some(false)` absent, `None`
     /// when the file cannot be read or parsed. Derived in
-    /// `hub::snapshot_event` by reading the file, never stored: the file is
-    /// the truth and a hand edit must show on the next snapshot.
+    /// `hub::snapshot_event` from `Hub::claude_hooks`, a cache read when it
+    /// is invalidated (a write through the toggle, an explicit refresh, or a
+    /// new connection — see that field's doc comment), not on every
+    /// snapshot: a snapshot goes out on every `EditBuffer`, i.e. every
+    /// debounced keystroke, and reading a file that often under the hub lock
+    /// is exactly the cost `show_hidden`'s comment above refuses for the
+    /// same reason. The file is still the truth; a hand edit shows at the
+    /// next invalidation, not necessarily the next snapshot.
     pub claude_hooks: Option<bool>,
 }
 

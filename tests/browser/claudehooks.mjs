@@ -17,6 +17,17 @@
 //!      app.js). "the settings file now holds both events" failed.
 //!   2. Removed the `data-claude-hooks` assignment. "the bell is marked
 //!      off before enabling" failed.
+//!   3. Removed the `renderNotices()` call app.js's "State" handler makes
+//!      alongside `renderClaudeHooks()` (final-review item 1: without it,
+//!      an OPEN notice panel kept a stale hook row after a confirm or after
+//!      another browser flipped the switch — only the bell's mark/tooltip
+//!      updated, since nothing else rebuilds the panel's children). Three
+//!      assertions failed, all by `until` timeout (5s each) waiting on text
+//!      that never changed on the still-open panel:
+//!        "the still-open panel's row updates to on with no reopen"
+//!        "and its button now reads Disable"
+//!        "the other browser's already-open row followed, with no reopen"
+//!      Restored (all pass).
 import { fixture, freePort, openPage, profileDir, startBrowser, startRoost, until }
   from "./harness.mjs";
 
@@ -60,9 +71,24 @@ try {
   ok(/Claude notifications for this project: off/.test(await one.rowText()), "the panel's first row says off");
   ok(await one.buttonText() === "Enable", "and offers Enable");
 
+  // Opened before `one` confirms, and deliberately never reopened below:
+  // this is what proves the mirrored flip reaches an already-open panel,
+  // not just a freshly-opened one.
+  await two.openPanel();
+
   ok(await one.clickButton(), "Enable is clickable");
   ok(/settings\.local\.json/.test(await one.confirmText()), "the confirmation names the file it will write");
   ok(await one.confirmYes(), "and can be confirmed");
+
+  // No openPanel() call between the confirm and these two: `one`'s panel
+  // was already open (never closed since the assertions above), and it has
+  // to pick up the flip on its own — via the State handler's renderNotices()
+  // call, not by being reopened. See revert-check 3 in the file header.
+  ok(
+    await until(() => one.rowText().then((t) => /Claude notifications for this project: on/.test(t)), 5, "row on"),
+    "the still-open panel's row updates to on with no reopen"
+  );
+  ok(await until(() => one.buttonText().then((t) => t === "Disable"), 5, "button disable"), "and its button now reads Disable");
 
   const written = await until(async () => {
     try { const v = JSON.parse(await Deno.readTextFile(settings)); return !!(v.hooks && v.hooks.Stop && v.hooks.Notification); } catch { return false; }
@@ -70,6 +96,13 @@ try {
   ok(written, "the settings file now holds both events");
   ok(await until(() => one.mark().then((m) => m === "on"), 5, "mark on"), "the clicking browser's bell is unmarked (on)");
   ok(await until(() => two.mark().then((m) => m === "on"), 5, "mirror"), "the other browser's bell followed");
+
+  // `two`'s panel was opened above, before `one` ever confirmed, and is
+  // still open now — no reopen here either.
+  ok(
+    await until(() => two.rowText().then((t) => /Claude notifications for this project: on/.test(t)), 5, "two row on"),
+    "the other browser's already-open row followed, with no reopen"
+  );
 
   await one.openPanel();
   ok(await one.buttonText() === "Disable", "the row now offers Disable");

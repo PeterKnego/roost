@@ -165,7 +165,12 @@ pub fn run_claude_hook() -> i32 {
         return 0;
     }
     let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
+    // Bounded: this reads whatever Claude Code pipes in, a process this
+    // command does not control, and an unbounded read is a memory sink for
+    // no benefit — the largest legitimate payload (a `Stop` event's last
+    // assistant message) is capped to 120 characters long before it is ever
+    // used, so 1 MiB is already far more slack than any real event needs.
+    if std::io::stdin().take(1 << 20).read_to_string(&mut input).is_err() {
         return 0;
     }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) else { return 0 };
@@ -175,7 +180,13 @@ pub fn run_claude_hook() -> i32 {
     match choose_sink(tty_file.is_some(), std::io::stdout().is_terminal()) {
         Sink::Tty => {
             if let Some(f) = tty_file.as_mut() {
-                let _ = f.write_all(seq.as_bytes()).and_then(|_| f.flush());
+                // Still exit 0 either way (see the doc above): this is
+                // logged, not surfaced as a hook failure, so a user who
+                // looks can see the notification did not land instead of
+                // it disappearing with no trace at all.
+                if f.write_all(seq.as_bytes()).and_then(|_| f.flush()).is_err() {
+                    eprintln!("roost claude-hook: could not write to the controlling terminal");
+                }
             }
         }
         // Not stdout even when it is a terminal: Claude Code reads hook
@@ -335,7 +346,7 @@ mod tests {
         let (_, body) = msg(&format!(r#"{{"hook_event_name":"Stop","last_assistant_message":"{long}"}}"#)).unwrap();
         assert_eq!(body.chars().count(), 120);
         let (_, body) = msg(r#"{"hook_event_name":"Stop","last_assistant_message":"a\u001b[31mb\tc"}"#).unwrap();
-        // `` and `\t` are JSON escapes, so serde hands `hook_message`
+        // `ESC` and `\t` are JSON escapes, so serde hands `hook_message`
         // a real ESC and a real tab; the sanitiser must strip both.
         assert!(!body.contains('\u{1b}') && !body.contains('\t'), "{body:?}");
         assert!(body.starts_with('a'), "{body:?}");
