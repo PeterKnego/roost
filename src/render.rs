@@ -241,6 +241,101 @@ fn link_open(dest: &str, title: &str, from_rel: &str) -> String {
     }
 }
 
+/// One raw HTML tag as the sanitizer reads it. Names are lowercased here so
+/// the allowlist can be case-sensitive and still catch `<IMG>` and
+/// `<ScRiPt>`; values are left raw because the sanitizer escapes them.
+#[allow(dead_code)] // used by the sanitizer in the next task
+struct ParsedTag {
+    name: String,
+    close: bool,
+    attrs: Vec<(String, String)>,
+    len: usize,
+}
+
+/// Reads one open or close tag from the start of `s`, which must begin with
+/// `<`. Anything that is not a complete, well-formed tag is `None`, and the
+/// caller treats the `<` as text. That covers comments, doctypes and
+/// processing instructions on purpose: the safe reading of markup this
+/// function does not understand is "print it".
+#[allow(dead_code)] // used by the sanitizer in the next task
+fn parse_tag(s: &str) -> Option<ParsedTag> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'<') {
+        return None;
+    }
+    let mut i = 1;
+    let close = b.get(i) == Some(&b'/');
+    if close {
+        i += 1;
+    }
+    let name_start = i;
+    if !b.get(i).map_or(false, u8::is_ascii_alphabetic) {
+        return None;
+    }
+    while b.get(i).map_or(false, |c| c.is_ascii_alphanumeric()) {
+        i += 1;
+    }
+    let name = s[name_start..i].to_ascii_lowercase();
+    let mut attrs = Vec::new();
+    loop {
+        while b.get(i).map_or(false, u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        match b.get(i) {
+            None => return None,
+            Some(b'>') => return Some(ParsedTag { name, close, attrs, len: i + 1 }),
+            Some(b'/') => {
+                i += 1;
+                continue;
+            }
+            Some(_) => {}
+        }
+        let an = i;
+        while b.get(i).map_or(false, |c| {
+            !c.is_ascii_whitespace() && !matches!(c, b'"' | b'\'' | b'>' | b'/' | b'=')
+        }) {
+            i += 1;
+        }
+        if i == an {
+            return None;
+        }
+        let aname = s[an..i].to_ascii_lowercase();
+        while b.get(i).map_or(false, u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let mut value = String::new();
+        if b.get(i) == Some(&b'=') {
+            i += 1;
+            while b.get(i).map_or(false, u8::is_ascii_whitespace) {
+                i += 1;
+            }
+            match b.get(i) {
+                Some(&q) if q == b'"' || q == b'\'' => {
+                    let vs = i + 1;
+                    let end = s[vs..].find(q as char)? + vs;
+                    value = s[vs..end].to_string();
+                    i = end + 1;
+                }
+                Some(_) => {
+                    let vs = i;
+                    while b.get(i).map_or(false, |c| {
+                        !c.is_ascii_whitespace()
+                            && !matches!(c, b'"' | b'\'' | b'=' | b'<' | b'>' | b'`')
+                    }) {
+                        i += 1;
+                    }
+                    if i == vs {
+                        return None;
+                    }
+                    value = s[vs..i].to_string();
+                }
+                None => return None,
+            }
+        }
+        attrs.push((aname, value));
+    }
+}
+
 /// GitHub's heading-anchor slug, so a `#section` link written against GitHub
 /// resolves in the preview too.
 ///
@@ -1701,6 +1796,61 @@ mod tests {
         let start = h.find("path=").unwrap() + "path=".len();
         let end = h[start..].find('"').unwrap() + start;
         assert_eq!(crate::http::percent_decode(&h[start..end]), "my notes+drafts.png");
+    }
+
+    /// The parser is the one place the sanitizer trusts its own reading of
+    /// the input, so its edges are pinned individually.
+    #[test]
+    fn parse_tag_reads_open_close_and_attributes() {
+        let s = r#"<IMG SRC="a.png" width=9 alt='x y' open>rest"#;
+        let t = parse_tag(s).unwrap();
+        assert_eq!(t.name, "img");
+        assert!(!t.close);
+        assert_eq!(
+            t.attrs,
+            vec![
+                ("src".to_string(), "a.png".to_string()),
+                ("width".to_string(), "9".to_string()),
+                ("alt".to_string(), "x y".to_string()),
+                ("open".to_string(), String::new()),
+            ]
+        );
+        assert_eq!(&s[t.len..], "rest");
+
+        let c = parse_tag("</Div >tail").unwrap();
+        assert_eq!(c.name, "div");
+        assert!(c.close);
+        assert_eq!(&"</Div >tail"[c.len..], "tail");
+
+        let sc = parse_tag("<br/>").unwrap();
+        assert_eq!(sc.name, "br");
+        assert_eq!(sc.len, 5);
+    }
+
+    /// Everything the parser must refuse. Each refusal makes the `<` plain
+    /// text downstream, which is the safe default the spec asks for.
+    ///
+    /// Verified this can fail: changing the alphabetic check to `if false` made
+    /// this fail on the "comment" assertion.
+    #[test]
+    fn parse_tag_refuses_what_is_not_a_tag() {
+        assert!(parse_tag("<!-- c -->").is_none(), "comment");
+        assert!(parse_tag("<!DOCTYPE html>").is_none(), "doctype");
+        assert!(parse_tag("<?php ?>").is_none(), "processing instruction");
+        assert!(parse_tag("< b>").is_none(), "space before name");
+        assert!(parse_tag("<3 things").is_none(), "digit");
+        assert!(parse_tag("<img src=\"x.png\"").is_none(), "unterminated");
+        assert!(parse_tag("<img src=\"x.png>").is_none(), "unterminated quote");
+        assert!(parse_tag("a <b>").is_none(), "does not start at <");
+    }
+
+    /// An attribute value may hold a `>`; the parser must not stop there.
+    #[test]
+    fn parse_tag_keeps_a_gt_inside_a_quoted_value() {
+        let s = r#"<a title="x > y">z"#;
+        let t = parse_tag(s).unwrap();
+        assert_eq!(t.attrs[0].1, "x > y");
+        assert_eq!(&s[t.len..], "z");
     }
 
     #[test]
