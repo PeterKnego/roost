@@ -4,6 +4,7 @@ fn main() {
     // the single argument is the port.
     match args.first().map(String::as_str) {
         Some("notify") => std::process::exit(roost::cli::run_notify(&args[1..])),
+        Some("claude-hook") => std::process::exit(roost::cli::run_claude_hook()),
         _ => {}
     }
     // No compiled-in roots any more, so an unset ROOST_ROOTS is a
