@@ -689,7 +689,12 @@ git commit -m "render: HtmlSanitizer — allowlisted tags, escaped values, resol
     /// tag, not text (the stack crossed the markdown in between).
     #[test]
     fn a_block_is_joined_and_balanced_across_the_document() {
-        let md = "<div align=\"center\">\n\n<img\n  src=\"docs/img/hero.png\"\n  width=\"900\">\n\n# Title\n\nBody *text*.\n\n</div>\n";
+        // No blank line between the div and the img: that keeps the img's
+        // lines inside the div's HTML block, where they arrive one event
+        // per line. After a blank line, `<img` alone is not a complete tag,
+        // so CommonMark would make it a paragraph holding one inline tag —
+        // and that path never exercises the joining this test is for.
+        let md = "<div align=\"center\">\n<img\n  src=\"docs/img/hero.png\"\n  width=\"900\">\n\n# Title\n\nBody *text*.\n\n</div>\n";
         let h = markdown_html(md, "proj", "README.md");
         assert!(h.contains(r#"<div align="center">"#), "{h}");
         assert!(h.contains(r#"<img src="/frag/proj/raw?path=docs/img/hero.png" width="900">"#), "{h}");
@@ -703,7 +708,8 @@ git commit -m "render: HtmlSanitizer — allowlisted tags, escaped values, resol
     fn inline_html_is_sanitized_not_neutralized() {
         let h = markdown_html("see <b>this</b> and <span onclick=\"x\">that</span>\n", "proj", "a.md");
         assert!(h.contains("<b>this</b>"), "{h}");
-        assert!(h.contains("&lt;span onclick=\"x\"&gt;that&lt;/span&gt;"), "{h}");
+        assert!(h.contains("&lt;span onclick=&quot;x&quot;&gt;that&lt;/span&gt;"), "{h}");
+        assert!(!h.contains("<span"), "{h}");
     }
 
     /// A document that never closes its `<details>` still ends balanced.
@@ -714,22 +720,23 @@ git commit -m "render: HtmlSanitizer — allowlisted tags, escaped values, resol
     }
 
     /// A block that ends inside a tag prints the fragment rather than
-    /// guessing at it.
+    /// guessing at it. The fragment sits inside a `<div>` block so that it
+    /// reaches the sanitizer at all: on its own, `<img src="x.png"` with
+    /// no `>` is not a complete tag, so CommonMark would never make it an
+    /// HTML block and push_html would escape it without our help.
     #[test]
     fn an_unterminated_tag_at_the_end_of_a_block_is_text() {
-        let h = markdown_html("<img src=\"x.png\"\n\ntext\n", "proj", "a.md");
-        assert!(h.contains("&lt;img src=\"x.png\""), "{h}");
+        let h = markdown_html("<div>\n<img src=\"x.png\"\n\ntext\n", "proj", "a.md");
+        assert!(h.contains("&lt;img src=&quot;x.png&quot;"), "{h}");
         assert!(!h.contains("<img"), "{h}");
+        assert!(h.trim_end().ends_with("</div></article>"), "{h}");
     }
 ```
 
 Note on `inline_html_is_sanitized_not_neutralized`: pulldown-cmark emits
 `<span onclick="x">` and `</span>` as two `InlineHtml` events with `that`
-as `Text` between them; each is sanitized on its own and the assertion is
-on the concatenation `push_html` produces. Check the exact output in
-Step 4 and, if push_html escapes the `"` in the text differently from
-`esc` (`&quot;`), adjust the expected string to what appears; the point of
-the assertion is that no `<span` element survives and the text does.
+as `Text` between them; each is sanitized on its own, and `esc` turns the
+`"` into `&quot;`, which is what the expected string spells.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 

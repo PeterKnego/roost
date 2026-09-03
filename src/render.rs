@@ -241,6 +241,364 @@ fn link_open(dest: &str, title: &str, from_rel: &str) -> String {
     }
 }
 
+/// One raw HTML tag as the sanitizer reads it. Names are lowercased here so
+/// the allowlist can be case-sensitive and still catch `<IMG>` and
+/// `<ScRiPt>`; values are left raw because the sanitizer escapes them.
+struct ParsedTag {
+    name: String,
+    close: bool,
+    attrs: Vec<(String, String)>,
+    len: usize,
+}
+
+/// Reads one open or close tag from the start of `s`, which must begin with
+/// `<`. Anything that is not a complete, well-formed tag is `None`, and the
+/// caller treats the `<` as text. That covers comments, doctypes and
+/// processing instructions on purpose: the safe reading of markup this
+/// function does not understand is "print it".
+///
+/// Every scan inside here — an attribute name, a quoted value — stops at the
+/// next `<` even though HTML would let one appear unescaped in a quoted
+/// value. This is not HTML strictness; it bounds `sanitize`'s work. Without
+/// it, an unterminated `<` makes every scan run to the end of the input, and
+/// the caller retries one byte later, so an input with no `>` at all costs
+/// O(n^2): quadratic on a render thread, against a 2 MB file.
+///
+/// The name scan also stops at the first non-alphanumeric byte, so
+/// `<img-caption src="x.png">` is read as an `img` tag with a stray
+/// `-caption` attribute, and `</div-x>` as a close for `div`. This is a
+/// rendering divergence from a browser, deliberately accepted: it can only
+/// ever yield an allowlisted element with allowlisted attributes.
+fn parse_tag(s: &str) -> Option<ParsedTag> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'<') {
+        return None;
+    }
+    let mut i = 1;
+    let close = b.get(i) == Some(&b'/');
+    if close {
+        i += 1;
+    }
+    let name_start = i;
+    if !b.get(i).map_or(false, u8::is_ascii_alphabetic) {
+        return None;
+    }
+    while b.get(i).map_or(false, |c| c.is_ascii_alphanumeric()) {
+        i += 1;
+    }
+    let name = s[name_start..i].to_ascii_lowercase();
+    let mut attrs = Vec::new();
+    loop {
+        while b.get(i).map_or(false, u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        match b.get(i) {
+            None => return None,
+            Some(b'>') => return Some(ParsedTag { name, close, attrs, len: i + 1 }),
+            Some(b'/') => {
+                i += 1;
+                continue;
+            }
+            Some(_) => {}
+        }
+        let an = i;
+        while b.get(i).map_or(false, |c| {
+            !c.is_ascii_whitespace() && !matches!(c, b'"' | b'\'' | b'>' | b'/' | b'=' | b'<')
+        }) {
+            i += 1;
+        }
+        if i == an {
+            return None;
+        }
+        let aname = s[an..i].to_ascii_lowercase();
+        while b.get(i).map_or(false, u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let mut value = String::new();
+        if b.get(i) == Some(&b'=') {
+            i += 1;
+            while b.get(i).map_or(false, u8::is_ascii_whitespace) {
+                i += 1;
+            }
+            match b.get(i) {
+                Some(&q) if q == b'"' || q == b'\'' => {
+                    let vs = i + 1;
+                    // Bounded by the next `<`, not by the end of the input: a
+                    // `<` before the closing quote makes the tag print as
+                    // text rather than paying for a scan to end-of-file.
+                    let rest = &s[vs..];
+                    match (rest.find(q as char), rest.find('<')) {
+                        (Some(end), Some(lt)) if lt < end => return None,
+                        (Some(end), _) => {
+                            value = s[vs..vs + end].to_string();
+                            i = vs + end + 1;
+                        }
+                        (None, _) => return None,
+                    }
+                }
+                Some(_) => {
+                    let vs = i;
+                    while b.get(i).map_or(false, |c| {
+                        !c.is_ascii_whitespace()
+                            && !matches!(c, b'"' | b'\'' | b'=' | b'<' | b'>' | b'`')
+                    }) {
+                        i += 1;
+                    }
+                    if i == vs {
+                        return None;
+                    }
+                    value = s[vs..i].to_string();
+                }
+                None => return None,
+            }
+        }
+        attrs.push((aname, value));
+    }
+}
+
+/// The tags a markdown file's raw HTML may keep, and for each the
+/// attributes it may keep. Chosen from what GitHub-style READMEs use,
+/// starting with this repository's own; anything else renders as text. A
+/// tag may be added with a test. `style`, `class` and `id` are refused
+/// rather than filtered: a CSS allowlist would be a second sanitizer.
+fn allowed_attrs(tag: &str) -> Option<&'static [&'static str]> {
+    Some(match tag {
+        "div" | "p" => &["align"],
+        "img" => &["src", "alt", "width", "height", "align"],
+        "a" => &["href", "title"],
+        "details" => &["open"],
+        "summary" | "b" | "strong" | "i" | "em" | "sub" | "sup" | "kbd" | "code" | "br" => &[],
+        _ => return None,
+    })
+}
+
+/// The allowlist's `&'static` spelling of a tag name, so the open-tag stack
+/// holds no owned strings. Must list exactly the names `allowed_attrs`
+/// accepts.
+fn static_tag(tag: &str) -> Option<&'static str> {
+    const TAGS: &[&str] = &[
+        "div", "p", "img", "a", "details", "summary", "b", "strong", "i", "em", "sub", "sup",
+        "kbd", "code", "br",
+    ];
+    TAGS.iter().copied().find(|t| *t == tag)
+}
+
+fn is_void(tag: &str) -> bool {
+    matches!(tag, "img" | "br")
+}
+
+/// Rebuilds raw HTML from a markdown file out of allowlisted tags only.
+/// Output is only what this struct constructs: every text run and every
+/// attribute value goes through `esc`, and every `src`/`href` through the
+/// same resolver the markdown arms use. The stack is why one instance
+/// lives for the whole document — a `<div>` that opens a centred header
+/// closes twenty lines of markdown later, in a different HTML block.
+struct HtmlSanitizer<'a> {
+    project: &'a str,
+    rel: &'a str,
+    // Bounded by the 2 MB preview file cap (`MAX_FILE_BYTES`): every entry
+    // costs at least three input bytes (`<b>`), so the worst case is under a
+    // million entries and no separate cap is needed.
+    open: Vec<&'static str>,
+}
+
+impl<'a> HtmlSanitizer<'a> {
+    fn new(project: &'a str, rel: &'a str) -> Self {
+        Self { project, rel, open: Vec::new() }
+    }
+
+    fn sanitize(&mut self, raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len());
+        let mut rest = raw;
+        while let Some(lt) = rest.find('<') {
+            out.push_str(&esc(&rest[..lt]));
+            rest = &rest[lt..];
+            match parse_tag(rest) {
+                Some(tag) => {
+                    let consumed = &rest[..tag.len];
+                    rest = &rest[tag.len..];
+                    self.emit(&tag, consumed, &mut out);
+                }
+                None => {
+                    out.push_str("&lt;");
+                    rest = &rest[1..];
+                }
+            }
+        }
+        out.push_str(&esc(rest));
+        out
+    }
+
+    /// Closes whatever the document left open, innermost first.
+    fn finish(&mut self) -> String {
+        let mut out = String::new();
+        while let Some(t) = self.open.pop() {
+            out.push_str("</");
+            out.push_str(t);
+            out.push('>');
+        }
+        out
+    }
+
+    fn emit(&mut self, tag: &ParsedTag, raw: &str, out: &mut String) {
+        let (Some(allowed), Some(name)) = (allowed_attrs(&tag.name), static_tag(&tag.name)) else {
+            out.push_str(&esc(raw));
+            return;
+        };
+        if tag.close {
+            if is_void(name) || self.open.last() != Some(&name) {
+                out.push_str(&esc(raw));
+                return;
+            }
+            self.open.pop();
+            out.push_str("</");
+            out.push_str(name);
+            out.push('>');
+            return;
+        }
+        let attr = |n: &str| tag.attrs.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str());
+        // `emit_a` builds every attribute of an anchor itself, `title`
+        // included, via `link_open` — skip the loop below for `a` so its
+        // result (which `emit_a` never reads) can't be mistaken for where
+        // `title` comes from.
+        let attrs = if name == "a" {
+            String::new()
+        } else {
+            let mut attrs = String::new();
+            for &a in allowed {
+                let Some(v) = attr(a) else { continue };
+                match a {
+                    "align" => {
+                        let v = v.to_ascii_lowercase();
+                        if matches!(v.as_str(), "left" | "center" | "right") {
+                            attrs.push_str(&format!(" align=\"{v}\""));
+                        }
+                    }
+                    "width" | "height" => {
+                        if !v.is_empty() && v.len() <= 4 && v.bytes().all(|c| c.is_ascii_digit()) {
+                            attrs.push_str(&format!(" {a}=\"{v}\""));
+                        }
+                    }
+                    "open" => attrs.push_str(" open"),
+                    "alt" | "title" => attrs.push_str(&format!(" {a}=\"{}\"", esc(v))),
+                    // `src` and `href` are decided by the resolver in
+                    // `emit_img` and `emit_a`; they never take this path.
+                    _ => {}
+                }
+            }
+            attrs
+        };
+        match name {
+            "img" => self.emit_img(tag, &attrs, out),
+            "a" => self.emit_a(tag, out),
+            _ => {
+                out.push('<');
+                out.push_str(name);
+                out.push_str(&attrs);
+                out.push('>');
+                if !is_void(name) {
+                    self.open.push(name);
+                }
+            }
+        }
+    }
+
+    /// `src` is decided by the resolver, exactly as the markdown image arm
+    /// decides it: a local path becomes the raw route, a `data:` URI is
+    /// kept, and anything roost will not fetch drops the tag and leaves the
+    /// alt text, escaped, in its place. `attrs` already excludes `src`.
+    fn emit_img(&mut self, tag: &ParsedTag, attrs: &str, out: &mut String) {
+        let attr = |n: &str| tag.attrs.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str());
+        let src = attr("src").unwrap_or("");
+        let url = match resolve_dest(src, self.rel) {
+            Dest::Local(p) => format!(
+                "/frag/{}/raw?path={}",
+                crate::http::percent_encode(self.project),
+                crate::http::percent_encode(&p)
+            ),
+            Dest::Data => src.to_string(),
+            _ => {
+                out.push_str(&esc(attr("alt").unwrap_or("")));
+                return;
+            }
+        };
+        out.push_str("<img src=\"");
+        out.push_str(&esc(&url));
+        out.push('"');
+        out.push_str(attrs);
+        out.push('>');
+    }
+
+    /// The open tag is `link_open`'s, so an HTML link and a markdown link
+    /// to the same place are the same anchor: tab-opening for local,
+    /// `_blank`/`noopener` for `http(s)`, inert for every other scheme. A
+    /// missing or empty href is inert too, decided here rather than by
+    /// asking the resolver what an empty string means.
+    fn emit_a(&mut self, tag: &ParsedTag, out: &mut String) {
+        let attr = |n: &str| tag.attrs.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str());
+        match attr("href").filter(|h| !h.is_empty()) {
+            Some(href) => out.push_str(&link_open(href, attr("title").unwrap_or(""), self.rel)),
+            None => out.push_str("<a class=\"mdbroken\">"),
+        }
+        self.open.push("a");
+    }
+}
+
+/// Replaces every raw-HTML event with its sanitized form. Runs on the
+/// collected vector rather than in the streaming `filter_map` because an
+/// HTML block arrives one `Html` event per line, and a tag whose attributes
+/// continue on the next line (the `<img\n  src=…\n  width=…>` of a centred
+/// README header) is only whole once the block's lines are joined.
+///
+/// A bare `Event::Html` that reaches this loop with `block == None` falls to
+/// the `other` arm and is passed through raw, unsanitized. That is safe only
+/// because pulldown-cmark 0.13 never emits `Event::Html` outside a
+/// `Start(HtmlBlock)`/`End(HtmlBlock)` pair, so the only such event this
+/// function ever sees with `block` empty is the one `markdown_html` itself
+/// creates for a markdown link: built by `link_open` from already-escaped
+/// values, so sanitizing it again would double-escape it and strip the
+/// attributes (`data-rel`, `data-hash`) `link_open` set that are not on this
+/// module's allowlist. If a future pulldown-cmark version — or any other
+/// producer feeding this function — ever emits `Event::Html` for content
+/// that did not come from `link_open`, that event would need to be treated
+/// as untrusted raw input here, the same as a block's or inline tag's.
+fn sanitize_raw_html(events: &mut Vec<pulldown_cmark::Event<'_>>, project: &str, rel: &str) {
+    use pulldown_cmark::{CowStr, Event, Tag, TagEnd};
+    let mut san = HtmlSanitizer::new(project, rel);
+    let mut out = Vec::with_capacity(events.len());
+    let mut block: Option<String> = None;
+    for ev in events.drain(..) {
+        match ev {
+            Event::Start(Tag::HtmlBlock) => block = Some(String::new()),
+            Event::Html(h) if block.is_some() => {
+                if let Some(b) = &mut block {
+                    b.push_str(&h);
+                }
+            }
+            Event::End(TagEnd::HtmlBlock) => {
+                let joined = block.take().unwrap_or_default();
+                out.push(Event::Html(CowStr::from(san.sanitize(&joined))));
+            }
+            Event::InlineHtml(h) => out.push(Event::Html(CowStr::from(san.sanitize(&h)))),
+            other => out.push(other),
+        }
+    }
+    // A `Start(HtmlBlock)` never followed by its `End` — unreachable with
+    // pulldown-cmark today, since every block it opens it closes — would
+    // otherwise drop the accumulated text silently. Sanitize and emit
+    // whatever the block held rather than assume "never happens" means
+    // "safe to discard"; see the CLAUDE.md rule this codebase learned that
+    // rule from.
+    if let Some(residue) = block.take() {
+        out.push(Event::Html(CowStr::from(san.sanitize(&residue))));
+    }
+    let tail = san.finish();
+    if !tail.is_empty() {
+        out.push(Event::Html(CowStr::from(tail)));
+    }
+    *events = out;
+}
+
 /// GitHub's heading-anchor slug, so a `#section` link written against GitHub
 /// resolves in the preview too.
 ///
@@ -331,16 +689,12 @@ pub fn markdown_html(md: &str, project: &str, rel: &str) -> String {
     // Start would leave push_html emitting a stray `" />` into the document.
     let mut dropped_image = false;
     let events = Parser::new_ext(md, opts).filter_map(|ev| match ev {
-        // raw HTML from repo content must never reach the page: render it as
-        // text. This arm and the link arm below match disjoint Event
-        // variants (Html/InlineHtml vs. Start(Tag::Link)), so their relative
-        // order does not matter for correctness. What matters: the
-        // Event::Html this function itself emits below is already built from
-        // escaped values via link_open, so it needs no neutralizing and
-        // nothing downstream re-examines it.
-        Event::Html(h) => Some(Event::Text(h)),
-        Event::InlineHtml(h) => Some(Event::Text(h)),
-
+        // Raw HTML is not handled here. It is sanitized by
+        // `sanitize_raw_html` on the collected vector below, because an
+        // HTML block's lines have to be joined before a tag split across
+        // them can be read. The Event::Html this function emits for links
+        // is built from escaped values by link_open and is untouched by
+        // that pass, which only rewrites HtmlBlock runs and InlineHtml.
         Event::Start(Tag::Link { ref dest_url, ref title, .. }) => {
             Some(Event::Html(CowStr::from(link_open(dest_url, title, rel))))
         }
@@ -385,6 +739,7 @@ pub fn markdown_html(md: &str, project: &str, rel: &str) -> String {
     // from a heading's Start to the text that names it. Bounded by the same
     // 2 MB file cap every other read is.
     let mut events: Vec<Event> = events.collect();
+    sanitize_raw_html(&mut events, project, rel);
     fill_heading_ids(&mut events);
     let mut out = String::new();
     html::push_html(&mut out, events.into_iter());
@@ -1484,6 +1839,122 @@ mod tests {
         assert!(h.contains("&lt;script&gt;"));
     }
 
+    /// The README shape: a centred header whose `<div>` closes after
+    /// twenty lines of markdown, with an `<img>` whose attributes continue
+    /// on the next line. Both halves are asserted: the tag survives with
+    /// both attributes (block lines were joined), and the close tag is a
+    /// tag, not text (the stack crossed the markdown in between).
+    ///
+    /// Verified this can fail: sanitizing each `Event::Html` line as it
+    /// arrives instead of joining the block first turns `<img\n  src=…`
+    /// into text, since its `>` is on a line the sanitizer never sees
+    /// joined to it — asserted `<img src="/frag/proj/raw?path=docs/img/hero.png" width="900">`,
+    /// got `&lt;img\n  src=&quot;docs/img/hero.png&quot;\n  width=&quot;900&quot;&gt;`.
+    #[test]
+    fn a_block_is_joined_and_balanced_across_the_document() {
+        // No blank line between the div and the img: that keeps the img's
+        // lines inside the div's HTML block, where they arrive one event
+        // per line. After a blank line, `<img` alone is not a complete tag,
+        // so CommonMark would make it a paragraph holding one inline tag —
+        // and that path never exercises the joining this test is for.
+        let md = "<div align=\"center\">\n<img\n  src=\"docs/img/hero.png\"\n  width=\"900\">\n\n# Title\n\nBody *text*.\n\n</div>\n";
+        let h = markdown_html(md, "proj", "README.md");
+        assert!(h.contains(r#"<div align="center">"#), "{h}");
+        assert!(h.contains(r#"<img src="/frag/proj/raw?path=docs/img/hero.png" width="900">"#), "{h}");
+        assert!(h.contains("<h1"), "markdown between the tags still renders: {h}");
+        assert!(h.contains("</div>"), "{h}");
+        assert!(!h.contains("&lt;/div&gt;"), "{h}");
+    }
+
+    /// Inline HTML in a paragraph goes through the same sanitizer.
+    ///
+    /// Verified this can fail: routing the `InlineHtml` arm to
+    /// `out.push(Event::Text(h))` instead of the sanitizer turns the whole
+    /// document into neutralized text — output contained
+    /// `&lt;b&gt;this&lt;/b&gt;` and `&lt;span onclick="x"&gt;that&lt;/span&gt;`
+    /// (quotes left unescaped, since `Event::Text` is escaped by
+    /// `push_html` with no awareness this was ever a tag), instead of
+    /// `<b>this</b>` and the allowlist-refused, fully escaped span.
+    #[test]
+    fn inline_html_is_sanitized_not_neutralized() {
+        let h = markdown_html("see <b>this</b> and <span onclick=\"x\">that</span>\n", "proj", "a.md");
+        assert!(h.contains("<b>this</b>"), "{h}");
+        assert!(h.contains("&lt;span onclick=&quot;x&quot;&gt;that&lt;/span&gt;"), "{h}");
+        assert!(!h.contains("<span"), "{h}");
+    }
+
+    /// A document that never closes its `<details>` still ends balanced.
+    ///
+    /// Verified this can fail: dropping the `if !tail.is_empty() { … }`
+    /// block that appends `san.finish()`'s output (keeping the call to
+    /// `finish()` itself, so the stack still pops but the closing tags are
+    /// discarded) makes the output end `</p>\n</article>` instead of
+    /// `</details></article>` — `</details>` and `</summary>` never reach
+    /// the page.
+    #[test]
+    fn an_unclosed_tag_is_closed_at_the_end_of_the_document() {
+        let h = markdown_html("<details>\n<summary>more</summary>\n\nhidden text\n", "proj", "a.md");
+        assert!(h.trim_end().ends_with("</details></article>"), "{h}");
+    }
+
+    /// A block that ends inside a tag prints the fragment rather than
+    /// guessing at it. The fragment sits inside a `<div>` block so that it
+    /// reaches the sanitizer at all: on its own, `<img src="x.png"` with
+    /// no `>` is not a complete tag, so CommonMark would never make it an
+    /// HTML block and push_html would escape it without our help.
+    ///
+    /// Verified this can fail: changing `sanitize`'s `None` arm from
+    /// `out.push_str("&lt;");` to `out.push('<');` lets a live, unescaped
+    /// `<img src=&quot;x.png&quot;` reach the page instead of the fully
+    /// escaped `&lt;img src=&quot;x.png&quot;`.
+    #[test]
+    fn an_unterminated_tag_at_the_end_of_a_block_is_text() {
+        let h = markdown_html("<div>\n<img src=\"x.png\"\n\ntext\n", "proj", "a.md");
+        assert!(h.contains("&lt;img src=&quot;x.png&quot;"), "{h}");
+        assert!(!h.contains("<img"), "{h}");
+        assert!(h.trim_end().ends_with("</div></article>"), "{h}");
+    }
+
+    /// The one `Event::Html` this renderer emits itself — the anchor
+    /// `link_open` builds for a markdown link — must pass the sanitizing
+    /// pass untouched. Sanitizing it would double-escape a value that was
+    /// escaped once already, and the anchor would lose its `data-rel`.
+    ///
+    /// Verified this can fail: routing a bare `Event::Html` through
+    /// `san.sanitize` before the `other` arm (as if it were untrusted, the
+    /// way an `InlineHtml` or `HtmlBlock` event is treated) turns the anchor
+    /// into `<a class="mdbroken">t</a>`, because `href` is not among the
+    /// attributes `link_open` used (it used `data-rel`/`data-hash` instead),
+    /// so re-parsing the tag through the allowlist sees no `href` and treats
+    /// the link as broken.
+    #[test]
+    fn a_markdown_link_anchor_passes_the_html_pass_byte_for_byte() {
+        let h = markdown_html("[t](docs/deploy.md#running \"my title\")\n", "proj", "README.md");
+        assert!(h.contains(r#"<a class="mdlink" data-rel="docs/deploy.md" data-hash="running" title="my title">t</a>"#), "{h}");
+        assert!(!h.contains("&lt;a"), "{h}");
+    }
+
+    /// A `Start(HtmlBlock)` with no matching `End` — unreachable through
+    /// `pulldown_cmark` today, since it always closes a block it opens, but
+    /// the wrong default in this codebase is to drop the accumulated text
+    /// silently rather than sanitize and emit it. Built by hand rather than
+    /// from a markdown string, since there is no markdown input that leaves
+    /// `sanitize_raw_html` an unterminated block to react to.
+    ///
+    /// Verified this can fail: removing the residue flush (calling only
+    /// `san.finish()` after the loop, as the pre-fix code did) drops the
+    /// `<b>x` text entirely, and since `sanitize` — the only thing that
+    /// pushes onto the sanitizer's open-tag stack — is then never called,
+    /// `finish()` has nothing to close either: the result was `left: []`,
+    /// empty, against the expected two-element vector.
+    #[test]
+    fn an_unterminated_html_block_still_emits_its_text() {
+        use pulldown_cmark::{Event, Tag};
+        let mut events = vec![Event::Start(Tag::HtmlBlock), Event::Html("<b>x".into())];
+        sanitize_raw_html(&mut events, "proj", "a.md");
+        assert_eq!(events, vec![Event::Html("<b>x".into()), Event::Html("</b>".into())]);
+    }
+
     /// Both halves matter and each has its own caller: the message is what the
     /// user reads, and the breadcrumb is what app.js appends the Edit/Preview
     /// switch to (`mountTab` looks for `.path`). Dropping either one leaves a
@@ -1701,6 +2172,299 @@ mod tests {
         let start = h.find("path=").unwrap() + "path=".len();
         let end = h[start..].find('"').unwrap() + start;
         assert_eq!(crate::http::percent_decode(&h[start..end]), "my notes+drafts.png");
+    }
+
+    /// The parser is the one place the sanitizer trusts its own reading of
+    /// the input, so its edges are pinned individually.
+    #[test]
+    fn parse_tag_reads_open_close_and_attributes() {
+        let s = r#"<IMG SRC="a.png" width=9 alt='x y' open>rest"#;
+        let t = parse_tag(s).unwrap();
+        assert_eq!(t.name, "img");
+        assert!(!t.close);
+        assert_eq!(
+            t.attrs,
+            vec![
+                ("src".to_string(), "a.png".to_string()),
+                ("width".to_string(), "9".to_string()),
+                ("alt".to_string(), "x y".to_string()),
+                ("open".to_string(), String::new()),
+            ]
+        );
+        assert_eq!(&s[t.len..], "rest");
+
+        let c = parse_tag("</Div >tail").unwrap();
+        assert_eq!(c.name, "div");
+        assert!(c.close);
+        assert_eq!(&"</Div >tail"[c.len..], "tail");
+
+        let sc = parse_tag("<br/>").unwrap();
+        assert_eq!(sc.name, "br");
+        assert_eq!(sc.len, 5);
+    }
+
+    /// Everything the parser must refuse. Each refusal makes the `<` plain
+    /// text downstream, which is the safe default the spec asks for.
+    ///
+    /// Verified this can fail: changing the alphabetic check to `if false` made
+    /// this fail on the "comment" assertion.
+    #[test]
+    fn parse_tag_refuses_what_is_not_a_tag() {
+        assert!(parse_tag("<!-- c -->").is_none(), "comment");
+        assert!(parse_tag("<!DOCTYPE html>").is_none(), "doctype");
+        assert!(parse_tag("<?php ?>").is_none(), "processing instruction");
+        assert!(parse_tag("< b>").is_none(), "space before name");
+        assert!(parse_tag("<3 things").is_none(), "digit");
+        assert!(parse_tag("<img src=\"x.png\"").is_none(), "unterminated");
+        assert!(parse_tag("<img src=\"x.png>").is_none(), "unterminated quote");
+        assert!(parse_tag("a <b>").is_none(), "does not start at <");
+    }
+
+    /// An attribute value may hold a `>`; the parser must not stop there.
+    #[test]
+    fn parse_tag_keeps_a_gt_inside_a_quoted_value() {
+        let s = r#"<a title="x > y">z"#;
+        let t = parse_tag(s).unwrap();
+        assert_eq!(t.attrs[0].1, "x > y");
+        assert_eq!(&s[t.len..], "z");
+    }
+
+    /// `<` ends every scan inside a tag, including a quoted value, so a
+    /// `<` that never closes costs the sanitizer one bounded look, not a
+    /// scan to the end of the file for every `<` after it.
+    ///
+    /// Verified this can fail: removing `b'<'` from the attribute-name
+    /// exclusion list made the `<a x<b>` assertion panic with
+    /// `panicked at ...: lt inside an attribute name` — the assert message
+    /// itself, meaning `is_none()` returned `false`: without the exclusion
+    /// the name scan swallows `<b` as part of the attribute name and the
+    /// tag parses instead of being refused.
+    #[test]
+    fn parse_tag_stops_every_scan_at_the_next_lt() {
+        assert!(parse_tag("<a title=\"x < y\">").is_none(), "lt inside a quoted value");
+        assert!(parse_tag("<a x<b>").is_none(), "lt inside an attribute name");
+        // The unquoted-value scan already stopped at `<` before this fix (it
+        // was never the bug an unbounded scan would be). But that `<` is
+        // exactly what the next loop iteration dispatches on next, and a
+        // bare `<` there can never lead to a closing `>` — the same reason
+        // the line above is `None` — so this is `None` too, not a
+        // successful parse with a truncated `x=y` attribute.
+        assert!(parse_tag("<a x=y<b>").is_none(), "lt right after an unquoted value");
+    }
+
+    /// Runs one instance over one string, `rel` = README.md at the project
+    /// root, and closes what it left open.
+    fn san(raw: &str) -> String {
+        san_in("README.md", raw)
+    }
+    fn san_in(rel: &str, raw: &str) -> String {
+        let mut s = HtmlSanitizer::new("proj", rel);
+        let mut out = s.sanitize(raw);
+        out.push_str(&s.finish());
+        out
+    }
+
+    /// The allowlist in one test: an allowed tag keeps only its allowed
+    /// attributes, and a refused tag prints.
+    ///
+    /// Verified this can fail: printing `raw` unescaped in `emit`'s
+    /// not-allowed branch made this fail with `left: "<script>alert(1)</script>"`.
+    #[test]
+    fn sanitizer_keeps_allowed_tags_and_prints_the_rest() {
+        assert_eq!(
+            san(r#"<div align="center" class="x" style="color:red" id="i" onclick="f()">t</div>"#),
+            r#"<div align="center">t</div>"#
+        );
+        assert_eq!(san("<script>alert(1)</script>"), "&lt;script&gt;alert(1)&lt;/script&gt;");
+        assert_eq!(san("<iframe src=x></iframe>"), "&lt;iframe src=x&gt;&lt;/iframe&gt;");
+        assert_eq!(san("<b>x</b> <sub>y</sub> <kbd>k</kbd>"), "<b>x</b> <sub>y</sub> <kbd>k</kbd>");
+    }
+
+    /// Case must not be a bypass in either direction.
+    ///
+    /// Verified this can fail: dropping `.to_ascii_lowercase()` from `name`
+    /// in `parse_tag` made this fail with
+    /// `left: "&lt;DIV ALIGN=&quot;Center&quot;&gt;x&lt;/Div&gt;"`.
+    #[test]
+    fn sanitizer_is_case_insensitive() {
+        assert_eq!(san("<DIV ALIGN=\"Center\">x</Div>"), "<div align=\"center\">x</div>");
+        assert_eq!(san("<ScRiPt>x</ScRiPt>"), "&lt;ScRiPt&gt;x&lt;/ScRiPt&gt;");
+    }
+
+    /// Text and attribute values are escaped, never copied.
+    ///
+    /// Verified this can fail: in `emit`, changing the `"alt" | "title"`
+    /// arm to push `v` unescaped (`format!(" {a}=\"{v}\"")` instead of
+    /// `esc(v)`) made this fail on the accepted-tag assertion with
+    /// `left: "<img src=\"/frag/proj/raw?path=x.png\" alt=\"x&quot;y>z\">"`
+    /// — the raw `&` and `>` came through instead of `&amp;` and `&gt;`.
+    #[test]
+    fn sanitizer_escapes_text_and_values() {
+        assert_eq!(san("a < b & c > d"), "a &lt; b &amp; c &gt; d");
+        // The accepted-tag case: this tag parses (a `>` inside a quoted
+        // value is fine; only `<` isn't), so its `alt` value must reach
+        // the output through `esc(v)` inside `emit`, not through
+        // `sanitize`'s fallback text-escaping path for a refused tag.
+        assert_eq!(
+            san(r#"<img src="x.png" alt="x&quot;y>z">"#),
+            r#"<img src="/frag/proj/raw?path=x.png" alt="x&amp;quot;y&gt;z">"#
+        );
+        // The refusal case: a `<` before the closing quote makes
+        // `parse_tag` refuse the whole tag (Finding A's fix), so this
+        // otherwise-identical fixture prints as text instead of parsing.
+        // Verified against `esc()` of the whole raw string: the two agree
+        // byte for byte.
+        assert_eq!(
+            san(r#"<img src="x.png" alt="x&quot;y<z">"#),
+            r#"&lt;img src=&quot;x.png&quot; alt=&quot;x&amp;quot;y&lt;z&quot;&gt;"#
+        );
+        assert_eq!(san("<!-- hidden -->"), "&lt;!-- hidden --&gt;");
+    }
+
+    /// Value rules: `align` is one of three words, `width`/`height` are
+    /// short digit strings, `open` is bare, `br` takes nothing.
+    ///
+    /// Verified this can fail: in `emit`, dropping the
+    /// `matches!(v.as_str(), "left" | "center" | "right")` check (always
+    /// pushing `align`) made this fail on `<p align="middle">x</p>` with
+    /// `left: "<p align=\"middle\">x</p>"`.
+    #[test]
+    fn sanitizer_applies_value_rules() {
+        assert_eq!(san("<p align=\"middle\">x</p>"), "<p>x</p>");
+        assert_eq!(
+            san("<img src=\"x.png\" width=\"10px\" height=\"99999\">"),
+            "<img src=\"/frag/proj/raw?path=x.png\">"
+        );
+        assert_eq!(
+            san("<img src=\"x.png\" width=\"900\" height=\"1\">"),
+            "<img src=\"/frag/proj/raw?path=x.png\" width=\"900\" height=\"1\">"
+        );
+        assert_eq!(
+            san("<details open=\"open\"><summary>m</summary>x</details>"),
+            "<details open><summary>m</summary>x</details>"
+        );
+        assert_eq!(san("<br clear=\"right\"><br/>"), "<br><br>");
+    }
+
+    /// Balance: unmatched close tags print, unclosed open tags are closed
+    /// by `finish`, and the stack survives across `sanitize` calls because
+    /// a `<div>` and its `</div>` arrive in different HTML blocks.
+    ///
+    /// Verified this can fail: replacing `self.open.last() != Some(&name)`
+    /// with `false` in `emit` made this fail on the lone `</div>` with
+    /// `left: "</div>"`, `right: "&lt;/div&gt;"`.
+    #[test]
+    fn sanitizer_balances_across_calls() {
+        let mut s = HtmlSanitizer::new("proj", "README.md");
+        assert_eq!(s.sanitize("<div align=\"center\">"), "<div align=\"center\">");
+        assert_eq!(s.sanitize("</div>"), "</div>");
+        assert_eq!(s.finish(), "");
+
+        let mut s = HtmlSanitizer::new("proj", "README.md");
+        assert_eq!(s.sanitize("</div>"), "&lt;/div&gt;");
+        assert_eq!(s.sanitize("<details><summary>x</summary>"), "<details><summary>x</summary>");
+        assert_eq!(s.finish(), "</details>");
+
+        let mut s = HtmlSanitizer::new("proj", "README.md");
+        assert_eq!(s.sanitize("<b><i>x</b>"), "<b><i>x&lt;/b&gt;");
+        assert_eq!(s.finish(), "</i></b>");
+    }
+
+    /// The third emitter obeys the same table as the two markdown arms:
+    /// a local path becomes the raw route, resolved against the file's own
+    /// directory; a `data:` URI is kept.
+    ///
+    /// Verified this can fail: in `emit_img`, replacing
+    /// `resolve_dest(src, self.rel)` with `resolve_dest(src, "README.md")`
+    /// made this fail on the `docs/a.md` case with
+    /// `left: "<img src=\"/frag/proj/raw?path=img/x.png\" ...">` — resolved
+    /// against the project root instead of `docs/`.
+    #[test]
+    fn an_html_image_resolves_like_a_markdown_image() {
+        assert_eq!(
+            san_in("docs/a.md", "<img src=\"img/x.png\" alt=\"cat\" width=\"12\">"),
+            "<img src=\"/frag/proj/raw?path=docs/img/x.png\" alt=\"cat\" width=\"12\">"
+        );
+        assert_eq!(
+            san_in("docs/a.md", "<img src=\"../top.png\">"),
+            "<img src=\"/frag/proj/raw?path=top.png\">"
+        );
+        assert_eq!(
+            san("<img src=\"data:image/gif;base64,R0lGOD\">"),
+            "<img src=\"data:image/gif;base64,R0lGOD\">"
+        );
+    }
+
+    /// Remote, escaping and empty sources drop the tag to its alt text,
+    /// the fallback the markdown arm gives a remote image.
+    ///
+    /// Verified this can fail: replacing the `match resolve_dest(...)` in
+    /// `emit_img` with `let url = src.to_string();` made this fail with
+    /// `left: "<img src=\"https://e.com/b.png\" alt=\"a cat\">"`.
+    #[test]
+    fn an_html_image_roost_will_not_fetch_becomes_its_alt() {
+        for src in ["https://e.com/b.png", "//e.com/b.png", "../../etc/x.png", ""] {
+            let h = san(&format!("<img src=\"{src}\" alt=\"a cat\">"));
+            assert_eq!(h, "a cat", "{src}");
+        }
+        assert_eq!(san("<img src=\"x.png\" onerror=\"alert(1)\">"), "<img src=\"/frag/proj/raw?path=x.png\">");
+    }
+
+    /// Anchors are `link_open`'s: local opens a tab, remote opens a new
+    /// window with no opener, an unlisted or missing href is inert.
+    ///
+    /// Verified this can fail: replacing the `link_open(...)` call in
+    /// `emit_a` with `format!("<a href=\"{}\">", esc(href))` made this fail
+    /// on the local-link assertion first, with
+    /// `left: "<a href=\"docs/deploy.md#running\">d</a>"` in place of the
+    /// `mdlink`/`data-rel` form — before it even reaches the `javascript:`
+    /// case, since every branch here goes through the same replaced call.
+    #[test]
+    fn an_html_anchor_is_built_by_link_open() {
+        assert_eq!(
+            san("<a href=\"docs/deploy.md#running\" title=\"t\">d</a>"),
+            "<a class=\"mdlink\" data-rel=\"docs/deploy.md\" data-hash=\"running\" title=\"t\">d</a>"
+        );
+        assert_eq!(
+            san("<a href=\"https://e.com/\">e</a>"),
+            "<a href=\"https://e.com/\" target=\"_blank\" rel=\"noopener noreferrer\">e</a>"
+        );
+        for href in ["javascript:alert(1)", "data:text/html,x", "vbscript:x"] {
+            assert_eq!(san(&format!("<a href=\"{href}\">x</a>")), "<a class=\"mdbroken\">x</a>", "{href}");
+        }
+        assert_eq!(san("<a>x</a>"), "<a class=\"mdbroken\">x</a>");
+    }
+
+    /// A `<` that never closes must cost a bounded look, not a rescan of
+    /// everything after it. 50 000 unterminated tags is 350 kB, well under
+    /// the 2 MB file cap; the quadratic version of `sanitize` took tens of
+    /// seconds on it, the linear one takes milliseconds, so a five-second
+    /// bound separates them with a wide margin on any machine.
+    ///
+    /// Verified this can fail: restoring *both* pre-fix behaviors at once —
+    /// the attribute-name scan not excluding `<`, and the quoted-value
+    /// search running `s[vs..].find(q as char)?` to end of input instead of
+    /// stopping at the next `<` — made this fail with `took 176.79s` on this
+    /// machine, far over the five-second bound.
+    ///
+    /// Restoring only the quoted-value half, with the name-scan exclusion
+    /// left in place, does *not* reproduce the failure on this exact input:
+    /// after the value `"` fails to close, the very next byte in each block
+    /// is `<`, so the name-scan exclusion alone already forces `parse_tag`
+    /// to bail in O(1) before the quoted-value scan's own bound would ever
+    /// matter. The two fixes are independently sufficient for this
+    /// particular repeating pattern, so this timing test guards the
+    /// combined regression (either fix reverted alone is still caught by
+    /// `parse_tag_stops_every_scan_at_the_next_lt`'s correctness
+    /// assertions) rather than isolating the quoted-value bound by itself.
+    #[test]
+    fn sanitizer_is_linear_on_unterminated_tags() {
+        let raw = "<a x=\"".repeat(50_000);
+        let start = std::time::Instant::now();
+        let out = san(&raw);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "took {:?}", start.elapsed());
+        assert!(!out.contains('<'), "everything printed as text");
+        assert_eq!(out.matches("&lt;a x=&quot;").count(), 50_000);
     }
 
     #[test]
