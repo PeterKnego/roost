@@ -2708,3 +2708,69 @@ fn claude_hook_subcommand_exits_zero_and_silent_in_every_hands_off_case() {
         assert!(stderr.contains(roost::cli::NO_TERMINAL_NOTICE), "{stderr}");
     }
 }
+
+/// A child that declines the hangup must not survive `kill_and_unlink`.
+///
+/// This is the measured defect (2026-09-04): `kill -9` on the dtach master
+/// closes the pty, the kernel `SIGHUP`s the slave side, the foreground process
+/// and a plain background child die — and a `trap "" HUP` child does not. It
+/// reparents to init and keeps the project directory as its cwd, while the
+/// socket goes unheld and roost reports the session ended.
+///
+/// Deliberately a real `dtach`, not `ROOST_CMD=cat`: with `cat` there is no
+/// master, no pty and no hangup, so the whole mechanism is absent and the test
+/// would pass against the unfixed code.
+///
+/// Revert-checked: with the session sweep removed (delete the
+/// `kill_sessions(proc_root, &targets);` calls, replace `session_or_socket_alive(...)`
+/// with `socket_has_process_with(sock_path, snapshot_fn)` in `kill_and_unlink_with`)
+/// this fails — test panicked with "the HUP-ignoring child survived kill_and_unlink".
+/// Restored with `cp` from a pre-edit backup.
+#[test]
+fn a_hup_ignoring_child_does_not_survive_kill_and_unlink() {
+    if std::process::Command::new("dtach").arg("-h").output().is_err() {
+        eprintln!("skipping: dtach not installed");
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let sock = d.path().join("term");
+    // A unique name so the assertion cannot match another test's process, and
+    // so a survivor is identifiable in `ps` if this fails.
+    let marker = format!("roost_hup_survivor_{}", std::process::id());
+    let script = d.path().join("inner.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/bash\nbash -c 'trap \"\" HUP; exec -a {marker} sleep 600' &\nexec sleep 600\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let ok = std::process::Command::new("dtach")
+        .args(["-n", sock.to_str().unwrap(), "-E", "-r", "winch", "-z"])
+        .arg(&script)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "dtach -n must create the session this test is about");
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    let alive = |m: &str| {
+        let out = std::process::Command::new("ps").args(["-Ao", "args="]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().any(|l| l.contains(m))
+    };
+    // Asserts the setup state it later negates: without this the test would
+    // pass just as well if the child had never started.
+    assert!(alive(&marker), "the HUP-ignoring child must be running before the kill");
+
+    let confirmed = roost::registry::kill_and_unlink(&sock);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    assert!(!alive(&marker), "the HUP-ignoring child survived kill_and_unlink");
+    assert!(confirmed, "and the session must be reported as confirmed ended");
+    assert!(!sock.exists(), "and its socket unlinked");
+}
