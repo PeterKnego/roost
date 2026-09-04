@@ -353,6 +353,28 @@ main { flex: 1; min-height: 0; }
                  padding: 1px 6px; border-radius: 5px; border: 1px solid transparent;
                  background: none; color: var(--muted); cursor: pointer; }
 .path .modebtn:hover { color: var(--fg); background: var(--tab-hover); }
+/* The non-ASCII indicator/toggle beside it (app.js's nonAsciiButton): the
+   same quiet button, with two states drawn on top. `.has` — the buffer holds
+   something outside the allowed set — takes the warn colour whether or not
+   the toggle is on, since the point is to be noticed before anyone clicks
+   it. `.on` draws the border so the toggle reads as pressed. Disabled is the
+   over-the-cap case: still counted, still coloured, just not clickable. */
+.path .nonasciibtn { margin-left: 8px; display: flex; align-items: center; gap: 4px;
+                     padding: 1px 6px; border-radius: 5px; border: 1px solid transparent;
+                     background: none; color: var(--muted); cursor: pointer;
+                     font: inherit; font-size: 11px; line-height: 1.4; }
+.path .nonasciibtn:hover:not(:disabled) { color: var(--fg); background: var(--tab-hover); }
+.path .nonasciibtn.has { color: var(--warn, #d79921); }
+.path .nonasciibtn.on { border-color: currentColor; }
+.path .nonasciibtn:disabled { cursor: default; opacity: .6; }
+/* A marked run on the overlay layer under the textarea. Two rules, both about
+   not moving anything: a translucent background so the glyph stays legible
+   through the selection, and an outline — not a border, which would add
+   width — so a zero-width character (ZWSP, BOM) still shows as a hairline at
+   its position. Any width added here walks every glyph after it off the
+   caret in the textarea above. */
+.editwrap code-input pre .nonascii { background: color-mix(in oklab, var(--warn, #d79921) 35%, transparent);
+                                     outline: 1px solid var(--warn, #d79921); border-radius: 2px; }
 .conflict { border: 1px solid var(--warn, #d79921); padding: 8px; margin: 8px; background: var(--bg2); }
 .conflict button { margin: 8px 8px 0 0; font: inherit; cursor: pointer; }
 /* .proposal-actions (the Accept/Reject bar under a proposal's hunk view,
