@@ -9,9 +9,75 @@ use std::io::{IsTerminal, Write};
 /// `/dev/tty` rather than stdout, because the intended caller is a Claude
 /// Code hook and Claude Code captures hook stdout — a hook printing to stdout
 /// would be swallowed before it ever reached the PTY. `/dev/tty` is the
-/// controlling terminal, which is the PTY roost owns.
+/// controlling terminal, which is the PTY roost is reading.
+///
+/// But a hook has none. Claude Code (2.1.260) spawns hook commands in their
+/// own session, so `/dev/tty` fails with ENXIO from inside one — three real
+/// `Stop` runs in one session all landed on the `Nowhere` notice while the
+/// same bytes written to the pty by hand were delivered. The terminal the
+/// hook lost is still its ancestor's: the claude process sits on the dtach
+/// pty roost reads, so the fallback climbs `/proc` to the nearest ancestor
+/// with a controlling terminal and opens that device instead. Linux only;
+/// elsewhere the walk finds nothing and the outcome is as before.
 fn tty() -> Option<std::fs::File> {
-    std::fs::OpenOptions::new().write(true).open("/dev/tty").ok()
+    let open = |path: &str| std::fs::OpenOptions::new().write(true).open(path).ok();
+    if let Some(f) = open("/dev/tty") {
+        return Some(f);
+    }
+    let read_stat = |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+    ancestor_tty(std::process::id(), &read_stat).and_then(|p| open(&p))
+}
+
+/// `(ppid, tty_nr)` from one `/proc/<pid>/stat` line. The comm field is
+/// the process's own name in parentheses and may itself contain spaces and
+/// parentheses, so the fields are counted from the *last* `)`.
+pub fn parse_stat(stat: &str) -> Option<(u32, u64)> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace();
+    // After the comm: state, ppid, pgrp, session, tty_nr.
+    let ppid = fields.nth(1)?.parse().ok()?;
+    let tty = fields.nth(2)?.parse().ok()?;
+    Some((ppid, tty))
+}
+
+/// The device path for a `tty_nr`, if it is a Unix98 pty. The kernel writes
+/// the number with the major in bits 8-19 and the minor split between bits
+/// 0-7 and 20-31, so `/dev/pts/300` is *not* low-byte 44. Anything that is
+/// not a pty — a console, or 0 for none — is not a terminal roost is
+/// reading, so it is `None` rather than a path to write into.
+pub fn pts_path(tty_nr: u64) -> Option<String> {
+    const UNIX98_PTY_SLAVE_MAJOR: u64 = 136;
+    let major = (tty_nr >> 8) & 0xfff;
+    let minor = (tty_nr & 0xff) | ((tty_nr >> 12) & 0xff_f00);
+    (major == UNIX98_PTY_SLAVE_MAJOR).then(|| format!("/dev/pts/{minor}"))
+}
+
+/// The controlling terminal of the nearest ancestor of `pid` that has one,
+/// climbing parent by parent through `read_stat`. The starting process is
+/// skipped: this is called precisely because it has none.
+///
+/// The walk never guesses past a gap, and not by a guard: each parent is
+/// known only from its child's stat line, so an ancestor that cannot be
+/// read or parsed is also the last one reachable, and the answer is `None`.
+/// A notice in a stranger's session would be worse than none.
+pub fn ancestor_tty(pid: u32, read_stat: &dyn Fn(u32) -> Option<String>) -> Option<String> {
+    let (mut ppid, _) = parse_stat(&read_stat(pid)?)?;
+    // Bounded, and stopped at init or a self-parented row: a hook is a few
+    // levels below its terminal, never dozens.
+    for _ in 0..32 {
+        if ppid <= 1 {
+            return None;
+        }
+        let (next, tty) = parse_stat(&read_stat(ppid)?)?;
+        if let Some(path) = pts_path(tty) {
+            return Some(path);
+        }
+        if next == ppid {
+            return None;
+        }
+        ppid = next;
+    }
+    None
 }
 
 pub fn notify_sequence(title: &str, body: &str) -> String {
@@ -192,7 +258,7 @@ pub fn run_claude_hook() -> i32 {
         // Not stdout even when it is a terminal: Claude Code reads hook
         // stdout as a decision, and a sequence there would be parsed as one.
         Sink::Stdout | Sink::Nowhere => {
-            eprintln!("roost claude-hook: no controlling terminal to notify through; nothing sent");
+            eprintln!("roost claude-hook: no terminal on this process or any ancestor to notify through; nothing sent");
         }
     }
     0
@@ -350,5 +416,85 @@ mod tests {
         // a real ESC and a real tab; the sanitiser must strip both.
         assert!(!body.contains('\u{1b}') && !body.contains('\t'), "{body:?}");
         assert!(body.starts_with('a'), "{body:?}");
+    }
+
+    // --- finding the terminal from a detached hook ---
+    //
+    // Claude Code 2.1.260 spawns hook commands in their own session, so a
+    // hook has no controlling terminal and `/dev/tty` fails with ENXIO
+    // (three real `Stop` runs in one session all logged the `Nowhere`
+    // notice). The terminal the hook *would* have had is its ancestor's:
+    // the claude process sits on the dtach pty roost is reading. These
+    // pin the `/proc` walk that recovers it.
+
+    /// `new_encode_dev` as Linux writes it into `/proc/<pid>/stat`:
+    /// major in bits 8-19, minor split across bits 0-7 and 20-31.
+    fn tty_nr(major: u64, minor: u64) -> u64 {
+        (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
+    }
+
+    #[test]
+    fn stat_parse_survives_a_comm_with_spaces_and_parens() {
+        // comm is `(my prog))` — the only safe split is at the *last* ')'.
+        let line = format!("10 (my prog)) S 9 10 10 {} 10 0 0", tty_nr(136, 5));
+        assert_eq!(parse_stat(&line), Some((9, tty_nr(136, 5))));
+    }
+
+    #[test]
+    fn a_pts_number_above_255_decodes_from_the_split_minor() {
+        // pts/300 puts 44 in the low byte and 1 in bit 20; reading only the
+        // low byte would name pts/44, someone else's terminal.
+        assert_eq!(pts_path(tty_nr(136, 300)).as_deref(), Some("/dev/pts/300"));
+        assert_eq!(pts_path(tty_nr(136, 5)).as_deref(), Some("/dev/pts/5"));
+    }
+
+    #[test]
+    fn no_terminal_and_a_console_are_both_not_a_roost_terminal() {
+        assert_eq!(pts_path(0), None, "tty_nr 0 is no controlling terminal");
+        // /dev/tty1 is major 4: a console cannot be a pty roost is reading.
+        assert_eq!(pts_path(tty_nr(4, 1)), None);
+    }
+
+    /// A fake process table: pid → (ppid, tty_nr), rendered as stat lines.
+    fn table(rows: &[(u32, u32, u64)]) -> impl Fn(u32) -> Option<String> + '_ {
+        move |pid| {
+            rows.iter()
+                .find(|(p, _, _)| *p == pid)
+                .map(|(p, pp, t)| format!("{p} (x) S {pp} 1 1 {t} 0 0 0"))
+        }
+    }
+
+    #[test]
+    fn ancestor_walk_takes_the_nearest_terminal() {
+        // hook(10) → sh(9) → claude(8, pts/5) → bash(7, pts/3) → dtach(6)
+        let rows = [(10, 9, 0), (9, 8, 0), (8, 7, tty_nr(136, 5)), (7, 6, tty_nr(136, 3)), (6, 1, 0)];
+        assert_eq!(ancestor_tty(10, &table(&rows)).as_deref(), Some("/dev/pts/5"));
+    }
+
+    #[test]
+    fn ancestor_walk_starts_above_the_hook_itself() {
+        // The hook's own stat has no tty by construction; the walk must not
+        // return early on it. With only the hook in the table, nothing.
+        let rows = [(10, 1, 0)];
+        assert_eq!(ancestor_tty(10, &table(&rows)), None);
+    }
+
+    #[test]
+    fn an_unreadable_ancestor_ends_the_walk_with_nothing() {
+        // 9 is missing from the table, and 8 above it has a terminal. This
+        // pins the contract, not a branch: no mutation of the walk makes it
+        // reach 8, because 8 is only named by 9's line. (Revert-check: a
+        // version that treated an unparsable parent as "no tty, climb on"
+        // still passed — it could not learn 9's parent either.) It would
+        // fail only if the walk gained another way to find parents, which
+        // is the change that would need this test.
+        let rows = [(10, 9, 0), (8, 1, tty_nr(136, 5))];
+        assert_eq!(ancestor_tty(10, &table(&rows)), None);
+    }
+
+    #[test]
+    fn a_cycle_or_pid_1_ends_the_walk() {
+        assert_eq!(ancestor_tty(10, &table(&[(10, 10, 0)])), None, "self-parented");
+        assert_eq!(ancestor_tty(10, &table(&[(10, 1, 0), (1, 0, 0)])), None, "init has no tty");
     }
 }

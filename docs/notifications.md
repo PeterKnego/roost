@@ -20,8 +20,10 @@ be `BEL` (`\007`) or `ESC \`; in the `777` form only the first three `;` are
 structural (separating `777`, `notify`, title, and body), so a body
 containing `;` needs no escaping.
 
-`roost notify` writes to `/dev/tty`, falling back to stdout only when
-stdout is *itself a terminal*. A missing title is a usage error (exit 2); having
+`roost notify` writes to `/dev/tty`; when that cannot be opened it writes to
+the controlling terminal of the nearest ancestor process that has one (found
+through `/proc`, so Linux only), and falls back to stdout only when stdout
+is *itself a terminal*. A missing title is a usage error (exit 2); having
 no terminal to write to at all is a loud failure (exit 1) rather than a silent
 no-op — a misconfigured hook that did nothing would otherwise look exactly like
 a hook that never fired. The fallback deliberately does not accept a pipe:
@@ -114,6 +116,20 @@ binary so an old hook's *command* keeps working; nothing rescues an old
 **The `/dev/tty` write is confirmed** (2026-08-17), including the shape a hook
 actually runs in: inside a resh terminal with stdout captured by a pipe,
 `resh notify` still reaches the terminal and the notice is delivered.
+
+**Except that a Claude Code hook has no `/dev/tty`** (found 2026-09-04). The
+shape above was reproduced by hand; a hook Claude Code 2.1.260 actually
+spawns runs in its own session with no controlling terminal, so `/dev/tty`
+fails with `ENXIO` and `roost claude-hook` logged its "nothing sent" notice
+on three real `Stop` events in a row. The terminal is still there — the
+`claude` process two levels up sits on the dtach pty roost reads — so both
+commands now climb `/proc/<pid>/stat` to the nearest ancestor with a
+controlling terminal and write to that device. From a detached child of a
+`claude` in a roost terminal, `roost claude-hook` exits 0 silently and the
+notice is delivered; a process with no terminal anywhere in its ancestry
+behaves as before. Do not "verify" this path with `setsid` alone: that
+reproduces the missing `/dev/tty` but keeps the ancestry, which is exactly
+the case the walk handles.
 
 **A process with no terminal anywhere now fails loudly.** That is the subagent
 case: no `/dev/tty`, and stdout a pipe rather than a terminal. It used to write

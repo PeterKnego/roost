@@ -66,6 +66,13 @@ It always exits 0. Its stdout is never used (Claude Code reads hook stdout
 as decisions; this hook decides nothing), so the sequence goes to `/dev/tty`
 exactly as `roost notify` does, via the same `choose_sink`.
 
+*Amended 2026-09-04:* a hook has no `/dev/tty`. Claude Code spawns hooks in
+their own session, so the open fails and the sequence went nowhere on every
+real event; the manual check in the plan used `setsid` and never a real
+Claude. `tty()` now falls back to the controlling terminal of the nearest
+ancestor process (`cli::ancestor_tty`, via `/proc`), which is the `claude`
+process on the dtach pty roost reads. See *docs/notifications.md*.
+
 | Input | Title | Body |
 |---|---|---|
 | `Notification`, `notification_type` = `permission_prompt` | Claude needs you | wants permission to run a tool |
