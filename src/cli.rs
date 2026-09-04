@@ -215,6 +215,16 @@ pub fn hook_message(v: &serde_json::Value) -> Option<(String, String)> {
     Some((title.to_string(), body))
 }
 
+/// The one thing `roost claude-hook` may put on stderr, named so the
+/// integration test can assert on it without holding a second copy of the
+/// wording. It held one until 2026-09-04, and when the message grew the
+/// "any ancestor" clause the copies drifted: the assertion only runs where
+/// stderr is *not* empty, which is only where no ancestor has a pty — never
+/// on a dev box inside a roost terminal, always on CI. Green here, red
+/// there, for four commits.
+pub const NO_TERMINAL_NOTICE: &str =
+    "roost claude-hook: no terminal on this process or any ancestor to notify through; nothing sent";
+
 /// The `roost claude-hook` subcommand: Claude Code pipes the event as JSON on
 /// stdin; this turns it into one notification, or nothing.
 ///
@@ -258,7 +268,7 @@ pub fn run_claude_hook() -> i32 {
         // Not stdout even when it is a terminal: Claude Code reads hook
         // stdout as a decision, and a sequence there would be parsed as one.
         Sink::Stdout | Sink::Nowhere => {
-            eprintln!("roost claude-hook: no terminal on this process or any ancestor to notify through; nothing sent");
+            eprintln!("{NO_TERMINAL_NOTICE}");
         }
     }
     0

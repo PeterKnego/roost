@@ -2694,12 +2694,17 @@ fn claude_hook_subcommand_exits_zero_and_silent_in_every_hands_off_case() {
     let out = run(cmd, br#"{"hook_event_name":"Stop","last_assistant_message":"Done."}"#);
     assert!(out.status.success(), "{out:?}");
     assert!(out.stdout.is_empty(), "{out:?}");
-    // A tty-less test runner can legitimately hit the very same "no
-    // controlling terminal" path on its own, with no `setsid` involved — so
-    // this only checks stderr's *content* when there is any, not that it is
-    // empty.
+    // A test runner with no terminal anywhere in its *ancestry* legitimately
+    // hits the very same no-terminal path on its own, with no `setsid`
+    // involved — so this only checks stderr's *content* when there is any,
+    // not that it is empty. Which makes the branch environment-dependent:
+    // it is dead on a dev box inside a roost terminal (the walk finds the
+    // ancestor pty, stderr is empty) and live on CI, where nothing in the
+    // ancestry has one. So it must not hold its own copy of the wording —
+    // it did, and drifted, and CI alone saw it. Assert on the constant the
+    // binary prints.
     if !out.stderr.is_empty() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("no controlling terminal"), "{stderr}");
+        assert!(stderr.contains(roost::cli::NO_TERMINAL_NOTICE), "{stderr}");
     }
 }
