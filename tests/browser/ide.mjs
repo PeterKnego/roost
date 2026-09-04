@@ -216,7 +216,10 @@ await Deno.mkdir(`${projectDir}/.roost`, { recursive: true });
 const globalConfig = `${fx.base}/roost-global.toml`;
 await Deno.writeTextFile(globalConfig, "share_selection = true\n");
 
-const roost = await startRoost({
+// `let`, not `const`: section J restarts roost on a new port partway
+// through the run and reassigns this to the new instance, so the `finally`
+// below closes whichever one is actually still alive.
+let roost = await startRoost({
   repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(),
   extraEnv: { CLAUDE_CONFIG_DIR: claudeConfigDir, ROOST_CONFIG: globalConfig },
 });
@@ -722,6 +725,121 @@ try {
      `the intent names the terminal that actually has focus ("term"), not the other live terminal or null — got ${JSON.stringify(mentionIntents[0])}`);
   ok(mentionIntents[0]?.session !== session2,
      "and specifically not the other live terminal, which differs from \"term\" only by pane index");
+
+  console.log("\nJ. a terminal opened before a restart still names the live IDE port afterwards");
+  // Every assertion above runs against one long-lived roost process. This is
+  // the one property none of them can reach: `session_env` bakes
+  // CLAUDE_CODE_SSE_PORT into a shell at spawn time, and dtach sessions
+  // outlive roost, so proving the port stays *live* after a restart needs a
+  // real dtach master surviving a real process death — not an in-process
+  // `start_in_with_ports` call against an injected directory, which is all
+  // Tasks 1-2's own tests can exercise. `ROOST_CMD=cat` (CLAUDE.md's own
+  // substitution trap) would leave no master here to survive anything.
+  //
+  // Reuses the "term" session's socket from section A rather than opening a
+  // fresh terminal: `session` is that seeded session's name, so its dtach
+  // master has been alive, unattended, since this file's very first section.
+  const sockPath = `${fx.stateDir}/sock/${fx.project}/${session}`;
+
+  // Same technique as registry.rs's `pids_holding`/`line_has_whole_arg`: a
+  // whole-argument match against `ps`'s own listing, not `pkill -f` — a
+  // pattern that could also match this very Deno process's argv (this file's
+  // own path contains "ide.mjs", not the socket path, so the risk here is
+  // theoretical, but the rule this project learned the hard way is "never",
+  // not "not this time").
+  //
+  // `dtach -A` shows up as *two* matching processes while roost is still
+  // alive, not one: the process roost itself spawned (session.rs's own
+  // "client" — its ppid is roost's pid) and the child it forks to actually
+  // hold the pty and the shell (the true "master" — its ppid is the
+  // client's pid, not yet reparented to init because its original parent
+  // hasn't died yet). Measured directly against this fixture: capturing the
+  // *client*'s pid here looked identical before the restart (fork copies the
+  // environment `session_env` baked in, so both share it) and only failed
+  // the assertion after — the client dies with roost (its outer pty hangs
+  // up), while the master is exactly the one session.rs's own doc comment
+  // says survives. So: whichever matching pid is itself the *ppid* of
+  // another match is the deeper, persisting one.
+  const findMaster = async () => {
+    const p = new Deno.Command("ps", { args: ["-Aww", "-o", "pid=,ppid=,args="], stdout: "piped" });
+    const { stdout } = await p.output();
+    const matches = []; // {pid, ppid}
+    for (const line of new TextDecoder().decode(stdout).split("\n")) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+      if (!m) continue;
+      const [, pidStr, ppidStr, argsStr] = m;
+      if (argsStr.split(" ").includes(sockPath)) matches.push({ pid: Number(pidStr), ppid: Number(ppidStr) });
+    }
+    if (matches.length === 0) return null;
+    const pids = new Set(matches.map((x) => x.pid));
+    // Once the client has died (after a restart), only the master remains —
+    // exactly one match — and it stands on its own with no disambiguation
+    // needed.
+    return (matches.find((x) => pids.has(x.ppid)) ?? matches[0]).pid;
+  };
+  const masterPid = await poll(findMaster, 15, "the dtach master holding the seeded terminal's socket");
+  ok(!!masterPid, `found a dtach master holding ${sockPath}, got pid ${masterPid}`);
+
+  const bakedPort = async (pid) => {
+    try {
+      const environ = await Deno.readTextFile(`/proc/${pid}/environ`);
+      const kv = environ.split("\0").find((v) => v.startsWith("CLAUDE_CODE_SSE_PORT="));
+      return kv ? Number(kv.slice("CLAUDE_CODE_SSE_PORT=".length)) : null;
+    } catch { return null; }
+  };
+
+  // The setup state, asserted before negating anything: without this, a run
+  // where the terminal never actually came up (or came up against the wrong
+  // socket) would pass the restart assertions below for the wrong reason —
+  // CLAUDE.md's own example of a fixture that never entered the state its
+  // test claimed to cover.
+  const bakedBefore = masterPid ? await bakedPort(masterPid) : null;
+  ok(bakedBefore === idePort,
+     `the dtach master's baked CLAUDE_CODE_SSE_PORT (${bakedBefore}) equals the ide port in the lock file (${idePort}) before the restart`);
+
+  page.close(); page = null;
+  try { claude?.close(); } catch {}
+  claude = null;
+  await roost.close();
+  // A new HTTP port, same stateDir and roots — a same-port restart would
+  // never distinguish "the new process took the port back" from "nothing
+  // ever gave it up", since the old listener socket would still be
+  // TIME_WAIT-bound to begin with. `startRoost` under this name is a fresh
+  // process with a fresh in-memory `ide::REGISTRY`, so it has no memory of
+  // the old listener beyond `ideport`'s on-disk record.
+  roost = await startRoost({
+    repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(),
+    extraEnv: { CLAUDE_CONFIG_DIR: claudeConfigDir, ROOST_CONFIG: globalConfig },
+  });
+  // Reopening the page is what rebuilds the listener: `Hub::for_project`
+  // (reached by the `_workspace` connect every page load makes — see
+  // section A's own comment) calls `ide::for_project` on its own, with no
+  // need to reattach the terminal again.
+  page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
+  await until(() => page.evalIn(`typeof state !== "undefined" && !!(state && state.panes)`),
+    15, "workspace state after the restart");
+
+  const lockFileAfter = await poll(async () => {
+    try {
+      for await (const e of Deno.readDir(`${claudeConfigDir}/ide`)) {
+        if (e.name.endsWith(".lock")) return `${claudeConfigDir}/ide/${e.name}`;
+      }
+    } catch { /* directory not (re)created yet */ }
+    return null;
+  }, 15, "an ide lock file after the restart");
+  ok(!!lockFileAfter, "an ide lock file reappears once the reopened page reconnects");
+  const idePortAfter = lockFileAfter ? Number(lockFileAfter.match(/(\d+)\.lock$/)[1]) : null;
+
+  // The point of this whole section: assert the actual number carried
+  // forward, not merely that some lock file exists — a lock file naming any
+  // old port at all would still pass a weaker check, and would still leave
+  // the surviving master's baked env var pointing at a dead listener.
+  ok(idePortAfter === idePort,
+     `the ide port after restart (${idePortAfter}) is the very same port as before (${idePort}), not merely present`);
+
+  const bakedAfter = masterPid ? await bakedPort(masterPid) : null;
+  ok(bakedAfter !== null && bakedAfter === idePortAfter,
+     `the surviving dtach master's baked port (${bakedAfter}) still matches the live listener (${idePortAfter})`);
 } finally {
   try { claude?.close(); } catch {}
   try { page?.close(); } catch {}
