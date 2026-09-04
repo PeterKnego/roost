@@ -69,8 +69,12 @@ Each terminal is a PTY owned by `roost` and wrapped in `dtach`, so sessions surv
 ### All state lives on the server and mirrors live
 Open a file in one browser and it opens in every connected browser. Layout and unsaved buffers persist across restarts, stored outside the repoo pane drags never show up in `git status`.
 
+### Drag-n-drop files/images or paste images 
+Drag-n-drop files into file tree for instant upload to remote filesystem.
+As for images, you can drag them or paste them into `claude` terminal and they will be uploaded and pasted directly into `claude` as image - this is a must-have feature when you just want to quickly paste a screenshot into claude for analysis.
+
 ### Claude Code integrates with the project
-A `claude` running in a terminal pane connects back to `roost` via IDE protocol, same as VS Code or Jetbrains IDEs. This gives it unique integration abilities: paste image, links to @file, "live" links in terminal that open when clicking on it and `claude` initiated file diff viewer (if in manual permission mode).1
+A `claude` running in a terminal pane connects back to `roost` via IDE protocol, same as VS Code or Jetbrains IDEs. This gives it unique integration abilities: paste image, links to @file, "live" links in terminal that open when clicking on it and `claude` initiated file diff viewer (if in manual permission mode).
 
 <img src="docs/img/proposal.png" alt="A proposal tab showing the two lines Claude wants to delete, with Accept, Reject and Edit buttons, beside the terminal where Claude is asking for the same approval" width="900">
 
