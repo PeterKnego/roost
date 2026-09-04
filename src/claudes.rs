@@ -81,10 +81,10 @@ pub struct ClaudeProc {
 /// project. An entry whose environment cannot be read is skipped, never
 /// counted as "no Claude".
 pub fn claude_terminals(proc_root: &std::path::Path) -> Vec<ClaudeProc> {
-    // The three read-only callers (the overview's ✻, the worktree prompt)
-    // have always folded an unreadable root into "found none": a stale glyph
-    // is recoverable and nothing destructive hangs off it. `tick` may not —
-    // see `try_claude_terminals`.
+    // The four read-only callers (the overview's ✻, the worktree prompt,
+    // and Alt+K's no-connection message) have always folded an unreadable
+    // root into "found none": a stale glyph is recoverable and nothing
+    // destructive hangs off it. `tick` may not — see `try_claude_terminals`.
     try_claude_terminals(proc_root).unwrap_or_default()
 }
 
@@ -110,11 +110,11 @@ pub fn try_claude_terminals(proc_root: &std::path::Path) -> Option<Vec<ClaudePro
             // Absent and unparseable are different questions than "found no
             // Claude here" — `sse_port_in`'s doc comment explains why both
             // fold to the same `Some(None)` for a caller.
-            else if let Some(v) = kv.strip_prefix("CLAUDE_CODE_SSE_PORT=") { port = Some(v.parse::<u16>().ok()); }
+            else if let Some(v) = kv.strip_prefix("CLAUDE_CODE_SSE_PORT=") { port = v.parse::<u16>().ok(); }
         }
         if let (Some(p), Some(s)) = (proj, sess) {
             if crate::session::valid_name(&s) {
-                out.push(ClaudeProc { project: p, session: s, sse_port: port.flatten() });
+                out.push(ClaudeProc { project: p, session: s, sse_port: port });
             }
         }
     }

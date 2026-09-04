@@ -241,10 +241,7 @@ pub fn for_project_in(
         // drop triggers, are both real syscalls), rather than just letting
         // it leak a live accept thread until process exit.
         drop(map);
-        if let Ok(losing_ide) = built {
-            losing_ide.request_shutdown();
-        }
-        return Some(existing);
+        return Some(lost_the_race(project, existing, built));
     }
     match built {
         Ok(ide) => {
@@ -259,6 +256,36 @@ pub fn for_project_in(
             None
         }
     }
+}
+
+/// This call lost the registry race: `existing` is the `Ide` another caller
+/// already registered first, `built` is this call's own — shut down here,
+/// never handed back.
+///
+/// Final-review finding 1 (stable-ide-port): `start_in_with_ports` records
+/// its own port immediately after its own bind, before either side of this
+/// race knows who will win it — so whichever build merely *finishes last*
+/// is whatever the on-disk record names, entirely independent of which one
+/// wins the race below. `hub.rs`'s `_workspace` socket and `term.rs`'s
+/// terminal socket build these near-simultaneously for the same project
+/// (see the comment above this call), so a loser finishing last is the
+/// ordinary case, not a rare interleaving — and when it happens, the record
+/// is left naming a port nothing is listening on. The next roost start then
+/// re-offers exactly that dead port as its hint, fails to bind it, and
+/// re-records whatever it falls back to — which is itself only correct
+/// again by the same coin flip, so the draw this branch exists to remove
+/// comes back on roughly half of restarts instead of converging.
+///
+/// Re-recording `existing.port` here, after the race is decided rather than
+/// racing to record it, is what makes the two agree regardless of which
+/// build happened to finish last: `existing` is the one that stays alive,
+/// so it is the one worth a shell surviving a restart taking the hint from.
+fn lost_the_race(project: &str, existing: Arc<Ide>, built: Result<Arc<Ide>, String>) -> Arc<Ide> {
+    if let Ok(losing_ide) = built {
+        losing_ide.request_shutdown();
+    }
+    crate::ideport::record_in(&crate::ideport::ports_dir(), project, existing.port);
+    existing
 }
 
 pub fn for_project(project: &str, workspace: PathBuf) -> Option<Arc<Ide>> {
@@ -1474,6 +1501,60 @@ mod tests {
             .expect("a hint that cannot be bound must not fail the project");
         assert!(lockdir.path().join(format!("{}.lock", ide.port)).exists());
         ide.request_shutdown();
+    }
+
+    /// Finding 1 of the final whole-branch review: `for_project_in`'s own
+    /// fast path makes its loser branch unreachable from two literal,
+    /// sequential calls to `for_project_in` itself — the real defect only
+    /// shows up when two calls' fast-path checks *both* miss at once, which
+    /// needs genuine concurrency to reproduce. `lost_the_race` is the loser
+    /// branch's logic pulled out so it can be driven directly and
+    /// deterministically instead: build the winner and the loser with two
+    /// plain `start_in` calls (neither touches the registry), which
+    /// reproduces exactly the ordinary double-build `for_project_in`'s doc
+    /// comment describes — a page load's `_workspace` socket and terminal
+    /// socket for the same project, near-simultaneously — without needing
+    /// either call to actually race.
+    ///
+    /// Revert-checked: reverting `lost_the_race` to the pre-fix body (drop
+    /// the `record_in` call, return `existing` unchanged) failed this test —
+    /// `assertion `left == right` failed: the record must name the port the
+    /// survivor is actually listening on / left: Some(<loser's port>) /
+    /// right: Some(<winner's port>)` — then restored.
+    #[test]
+    fn losing_the_race_still_leaves_the_record_naming_the_winner() {
+        let lockdir = tempfile::tempdir().unwrap();
+        let ports = crate::ideport::ports_dir();
+        let project = "race-loser-still-recorded";
+        // First build: nothing recorded yet, so this one gets whatever the
+        // OS hands out and records it. This is the call that goes on to win
+        // the registry race in `for_project_in` — it stays alive throughout,
+        // exactly like `existing` there.
+        let winner =
+            start_in(lockdir.path(), project, PathBuf::from("/tmp")).expect("first listener");
+        // Second build: the recorded hint is now the winner's port, which
+        // the winner still holds, so this one falls back to an OS-assigned
+        // port of its own — and, per `start_in_with_ports`'s own contract,
+        // (correctly, on its own) overwrites the record with THAT port. This
+        // is the state the bug leaves behind if nothing runs after it: the
+        // record now names a port nothing but this about-to-be-shut-down
+        // listener ever held.
+        let loser =
+            start_in(lockdir.path(), project, PathBuf::from("/tmp")).expect("second listener");
+        assert_ne!(loser.port, winner.port, "the fallback must not reuse the winner's port");
+        assert_eq!(
+            crate::ideport::recorded_in(&ports, project),
+            Some(loser.port),
+            "start_in_with_ports's own contract: it must have just recorded its own port"
+        );
+        let result = lost_the_race(project, winner.clone(), Ok(loser));
+        assert_eq!(result.port, winner.port, "the winner must be what's handed back");
+        assert_eq!(
+            crate::ideport::recorded_in(&ports, project),
+            Some(winner.port),
+            "the record must name the port the survivor is actually listening on"
+        );
+        winner.request_shutdown();
     }
 
     #[test]
