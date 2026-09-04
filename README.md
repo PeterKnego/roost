@@ -67,7 +67,7 @@ Every tab represents project/worktree, and has panes in familiar IDE-like arrang
 Each terminal is a PTY owned by `roost` and wrapped in `dtach`, so sessions survive a tab relad, network disconnect, laptop sleep, and even a `roost` restart. 
 
 ### All state lives on the server and mirrors live
-Open a file in one browser and it opens in every connected browser. Layout and unsaved buffers persist across restarts, stored outside the repoo pane drags never show up in `git status`.
+Open a file in one browser and it opens in every connected browser. Layout and unsaved buffers persist across restarts, stored outside the repo — so pane drags never show up in `git status`.
 
 ### Drag-n-drop files/images or paste images 
 Drag-n-drop files into file tree for instant upload to remote filesystem.
