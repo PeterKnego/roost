@@ -57,13 +57,66 @@ const AUTOSAVE_MS = 1000;
 const MAX_HIGHLIGHT_BYTES = 100_000;
 // Known to hljs but deliberately left plain — see codeLanguage.
 const PLAIN_EXTS = new Set(["md", "markdown", "txt", "text"]);
+// What the non-ASCII indicator lets through: TAB, LF and the printable range.
+// Everything else it counts and marks — CR included (a stray one in an LF
+// file is exactly the kind of thing worth seeing; a wholly CRLF file lights
+// up at every line end and that is the strict reading, chosen on purpose),
+// DEL and the other C0 controls, and every code point from 0x80 up: smart
+// quotes, en/em dashes, NBSP, zero-width space, BOM, emoji, Cyrillic
+// look-alikes. `u` so an astral character counts as one, not two.
+const NON_ASCII_RE = /[^\t\n\x20-\x7E]+/gu;
+// The highlight toggle's home. One flag for the whole browser, not per file:
+// it is a way of looking, like a theme, and someone hunting smart quotes
+// wants it on in every prose file they open next.
+const NONASCII_KEY = "roost.nonascii";
 // code-input wraps a real <textarea> and paints a highlighted <pre> under it,
 // which is why it can be dropped in here at all: everything downstream —
 // `editors`, the edit debounce, autosave, ⌘S, the conflict patch, blur flush
 // — goes on talking to the same textarea it always did. Registered once; the
 // element carries template="hl" to select it.
+//
+// The second template is the same overlay put to a different use: for a
+// prose file, where hljs has nothing to colour, it marks non-ASCII runs
+// instead. Only the highlight function differs, so everything hledit.mjs
+// established about the two layers agreeing holds for it unchanged.
 if (window.codeInput && window.hljs) {
   codeInput.registerTemplate("hl", codeInput.templates.hljs(hljs, []));
+  // preElementStyled=false, as templates.hljs defaults it: that puts the
+  // padding on `pre code`, where style.css and hledit.mjs expect it. True
+  // moves it to the <pre>, and the marks land 10px off the glyphs.
+  codeInput.registerTemplate("nonascii", new codeInput.Template(markNonAscii, false, false, false, []));
+}
+
+/// code-input's highlight hook for the "nonascii" template. It arrives with
+/// the value already escaped into `el.innerHTML` and nothing else, so
+/// textContent is the raw text; rebuilt from that, escaping every piece
+/// ourselves, with each non-ASCII run wrapped. The characters themselves are
+/// never substituted for visible stand-ins: this layer must lay out glyph for
+/// glyph like the textarea over it, and a `␍` where a CR was would walk the
+/// rest of the line off the caret. Visibility is the stylesheet's job.
+function markNonAscii(el) {
+  const text = el.textContent;
+  let html = "", last = 0;
+  for (const m of text.matchAll(NON_ASCII_RE)) {
+    html += escapeHtml(text.slice(last, m.index)) + `<span class="nonascii">${escapeHtml(m[0])}</span>`;
+    last = m.index + m[0].length;
+  }
+  el.innerHTML = html + escapeHtml(text.slice(last));
+}
+
+/// How many characters of `text` fall outside NON_ASCII_RE's allowed set —
+/// characters, not runs, so "—" and "——" differ.
+function nonAsciiCount(text) {
+  let n = 0;
+  for (const m of text.matchAll(NON_ASCII_RE)) n += [...m[0]].length;
+  return n;
+}
+
+function nonAsciiOn() {
+  try { return localStorage.getItem(NONASCII_KEY) === "1"; } catch { return false; }
+}
+function setNonAsciiOn(on) {
+  try { if (on) localStorage.setItem(NONASCII_KEY, "1"); else localStorage.removeItem(NONASCII_KEY); } catch {}
 }
 const showHidden = () => (state && state.show_hidden != null ? state.show_hidden : SHOW_HIDDEN_DEFAULT);
 // What the tree was last rendered with, so a State that flips the setting
@@ -329,6 +382,7 @@ function onEvent(ev) {
         const host = ta.closest("code-input");
         if (host) host.value = ev.text; else ta.value = ev.text;
       }
+      paintNonAscii(ev.rel);
       break;
     }
     case "BufferStale": {
@@ -1734,8 +1788,17 @@ function sendResize(e) {
 /// The check is hljs's own — an extension it does not know would produce an
 /// unhighlighted overlay, which is all cost and no colour.
 function codeLanguage(rel, text) {
-  if (!window.codeInput || !window.hljs) return null;
   if (text.length > MAX_HIGHLIGHT_BYTES) return null;
+  return codeExt(rel);
+}
+
+/// The extension hljs would highlight `rel` as, or null where the file is
+/// prose to this editor — and so where the non-ASCII toggle applies instead.
+/// Split from codeLanguage so the size cap does not turn a code file into a
+/// prose one: a 200 KB .rs past the cap is still not a file to offer the
+/// prose toggle on.
+function codeExt(rel) {
+  if (!window.codeInput || !window.hljs) return null;
   const ext = rel.includes(".") ? rel.split(".").pop().toLowerCase() : "";
   // hljs's own answer, so an extension it cannot highlight never gets an
   // overlay that would paint nothing. Markdown and plaintext are excluded
@@ -1773,6 +1836,9 @@ function wireEditor(ta, rel) {
       pendingEdits.delete(rel);
       sentEdits.add(rel);
       send({ t: "EditBuffer", rel, text: ta.value });
+      // On the debounce, not the keystroke: a scan of the whole buffer per
+      // keypress is cheap on a page of notes and not on a 2 MB one.
+      paintNonAscii(rel);
     }, 200));
     // Restarted on every keystroke, so it measures the pause in typing
     // rather than the age of the edit.
@@ -1812,12 +1878,17 @@ function mountEditor(content, rel) {
   btn.title = "write this file out (⌘S / ctrl-S)";
   btn.onclick = () => saveNow(rel);
   const mb = modeButton(rel, "Edit");
-  if (mb) bar.append(name, st, mb, btn); else bar.append(name, st, btn);
+  const na = nonAsciiButton(content, rel);
+  bar.append(name, st, ...[na, mb, btn].filter(Boolean));
   const lang = codeLanguage(rel, text);
-  if (lang) {
+  // A prose file takes the overlay too while the non-ASCII toggle is on, under
+  // the same size cap and for the same reason: the whole layer repaints on
+  // every pause in typing.
+  const overlay = lang ? "hl" : (na && nonAsciiOn() && text.length <= MAX_HIGHLIGHT_BYTES ? "nonascii" : null);
+  if (overlay) {
     const host = document.createElement("code-input");
-    host.setAttribute("template", "hl");
-    host.setAttribute("language", lang);
+    host.setAttribute("template", overlay);
+    if (lang) host.setAttribute("language", lang);
     wrap.append(bar, host);
     content.appendChild(wrap);
     // Set after connecting, never before: with no textarea built yet,
@@ -1837,6 +1908,70 @@ function mountEditor(content, rel) {
     content.appendChild(wrap);
   }
   paintSaveState(content, rel);
+  paintNonAscii(rel);
+}
+
+/// The edit bar's non-ASCII control, for prose files only — a code file's
+/// overlay belongs to hljs, and its stray characters are the compiler's
+/// business. It is an indicator first: accented, with a count, whenever the
+/// buffer holds anything outside the allowed set, on or off. Clicking it
+/// turns the marks in the text on or off, for every prose file at once.
+/// Nothing here reaches the server: the flag is this browser's, like a
+/// theme, and the count is computed from `texts`.
+function nonAsciiButton(content, rel) {
+  if (codeExt(rel) || !window.codeInput) return null;
+  const b = document.createElement("button");
+  b.className = "nonasciibtn"; // NOT .savebtn or .modebtn: each of those is selected by name elsewhere
+  b.onclick = () => {
+    setNonAsciiOn(!nonAsciiOn());
+    remountEditor(content, rel);
+  };
+  return b;
+}
+
+/// Repaints the indicator for `rel`'s mounted editor from the current text.
+/// Called on mount, on the edit debounce, and when a BufferText lands — the
+/// three ways the text under the button changes.
+function paintNonAscii(rel) {
+  const ta = editors.get(rel);
+  const b = ta && ta.closest(".editwrap") && ta.closest(".editwrap").querySelector(".nonasciibtn");
+  if (!b) return;
+  const text = texts.get(rel) || "";
+  const n = nonAsciiCount(text);
+  const on = nonAsciiOn();
+  const big = text.length > MAX_HIGHLIGHT_BYTES;
+  b.classList.toggle("has", n > 0);
+  b.classList.toggle("on", on);
+  b.disabled = big;
+  // The count is in the label, not only the title: "the toggle did nothing"
+  // and "there was nothing to mark" have to look different.
+  b.textContent = n ? `ä ${n}` : "ä";
+  const what = n === 0 ? "no non-ASCII characters" : n === 1 ? "1 non-ASCII character" : `${n} non-ASCII characters`;
+  if (big) b.title = `${what} — too large to highlight (over ${Math.round(MAX_HIGHLIGHT_BYTES / 1000)} KB)`;
+  else if (on) b.title = `${what} — highlighted; click to stop`;
+  else b.title = `${what} (allowed: TAB, LF, 0x20–0x7E) — click to highlight`;
+}
+
+/// Rebuilds `rel`'s editor in place, keeping the caret, the scroll position
+/// and focus. The textarea a plain editor owns and the one <code-input> builds
+/// are different elements, so switching the overlay on or off means a fresh
+/// mount — the same thing a pane switch and back does, seeded from `texts`.
+/// The pane's mountedKey is untouched, so render() leaves the result alone.
+function remountEditor(content, rel) {
+  const old = editors.get(rel);
+  const focused = !!old && document.activeElement === old;
+  const sel = old ? [old.selectionStart, old.selectionEnd] : null;
+  // The scrolling element differs by kind: a plain textarea scrolls itself,
+  // a code-input host scrolls for both its layers (see scrollEditorTo).
+  const scroller = old && (old.closest("code-input") || old);
+  const top = scroller ? scroller.scrollTop : 0;
+  content.innerHTML = "";
+  mountEditor(content, rel);
+  const ta = editors.get(rel);
+  if (!ta) return;
+  if (sel) ta.setSelectionRange(sel[0], sel[1]);
+  (ta.closest("code-input") || ta).scrollTop = top;
+  if (focused) ta.focus();
 }
 
 /// The breadcrumb's right-hand side: what state this buffer is in, and — only
