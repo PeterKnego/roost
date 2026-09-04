@@ -151,11 +151,25 @@ read the sequence became an error.
 
 ## In the browser
 
-A bell in the header shows an unread count across **all** projects, and the
-same count prefixes the browser tab title so it is visible from a background
-tab; the favicon gets a small red-dot badge (not the count itself) when there
-is anything unread. Notices persist across a roost restart, so one raised
-overnight is still there in the morning.
+A bell in the header shows the unread count **for the project this tab is
+open on**, and the same count prefixes the browser tab title so it is visible
+from a background tab; the favicon gets a small red-dot badge (not the count
+itself) when there is anything unread. Notices persist across a roost restart,
+so one raised overnight is still there in the morning.
+
+The panel, the badge and the two buttons under it are all about that one
+project. A worktree counts as its own project here — `roost` and
+`roost/.claude/worktrees/claude-1` are separate workspaces with separate
+terminals, and they do not see each other's notices. "Clear" empties exactly
+the rows it is showing you and nothing else.
+
+This used to be machine-wide: every tab listed every project's notices. It was
+changed because a notice you were not working on could take the tab you *were*
+working in — clicking a `roost` row from an `ultima_cluster` workspace
+navigated that tab to `/roost`, and an OS-notification click did the same to
+whichever roost tab it found first. The cost of the change is worth stating:
+**a notice raised in a project with no tab open reaches nobody** until that
+project is opened. There is no notification centre on `/` yet to catch it.
 
 OS notifications need a secure context — `localhost` or `tailscale serve`
 HTTPS. Over plain `http://` to a tailnet IP the notice panel still works but

@@ -44,6 +44,7 @@ deno run -A tests/browser/renamed.mjs    # a file renamed *inside* the project: 
 deno run -A tests/browser/closeproject.mjs # Close Project ends the shells *and* clears their tabs, so reopening shows no ghosts
 deno run -A tests/browser/search.mjs     # the search overlay (⇧⌃F), its results, and landing on a line
 deno run -A tests/browser/nonascii.mjs   # the editor's non-ASCII indicator and highlight toggle: count, accent, marks under the glyphs, cap, persistence
+deno run -A tests/browser/notices.mjs    # the bell panel holds only this project's notices, and Clear empties only what it shows
 ```
 
 Each scenario is its own file and its own roost, so they can be run in any
@@ -125,6 +126,13 @@ performed.
   ⌘S). The obvious assertion, that the diverged file is not overwritten, passes
   with the pause deleted: that property comes from the server's `force: false`,
   not from the client, and asserting it proves nothing about the pause.
+- In `notices.mjs`: reverting `hub::publish` to `broadcast_all` fails 8. The
+  other two reverts each failed **nothing** as first written — the connect
+  replay had no coverage (both pages connect before any notice exists), and
+  the "other project's notice survived a Clear" assertion was reading the
+  other page's stale local array rather than the server, so it held while the
+  store was in fact emptied. Sections B2 and E were rewritten around that;
+  the same two reverts now fail 1 and 2.
 - Dropping the State-driven unpause in `autosave.mjs`'s D3 fails 2: the header
   goes on claiming the file changed underneath a buffer that was just
   discarded, and autosave never resumes for it again.

@@ -143,6 +143,23 @@ the OS notification centre.
 
 ## Egress — cross-project delivery
 
+> **Superseded 2026-09-04.** This section describes delivery as it originally
+> shipped and no longer describes the code. Notices are now delivered to the
+> clients of the project they belong to and nobody else
+> (`hub::broadcast_to_project`, `notify::list_for`), and `MarkAllNoticesRead`
+> and `ClearNotices` are scoped the same way (`mark_all_read_in`,
+> `clear_in`). The *store* is still machine-wide; only delivery changed.
+>
+> Why: a browser tab is opened on exactly one project key — and a worktree is
+> a key of its own — so a foreign notice had no tab there to focus and nothing
+> to do on a click but navigate the user away from the project they were
+> working in. Clicking a `roost` row from an `ultima_cluster` workspace
+> replaced that workspace; the service worker's "reuse any roost window"
+> fallback did the same from an OS banner. The known cost is that a notice
+> raised in a project with no tab open now reaches nobody until that project
+> is opened, and the "notification centre on `/`" listed under Future work
+> below is still not built. See `notify.rs`'s module doc.
+
 `Hub` is per project, but `hub::REGISTRY` holds every live hub. `publish`
 clones the `Arc`s under the registry lock, drops it, then broadcasts to each
 hub in turn. A browser sitting on `/karpie` therefore sees a notice fired in

@@ -2427,9 +2427,51 @@ fn http_rejects_rebinding_host() {
     assert!(resp.starts_with("HTTP/1.1 403"), "got: {}", &resp[..resp.len().min(60)]);
 }
 
+/// Reads for `window`, returning the first frame containing `needle`, or
+/// `None` if none arrived. The mirror image of `read_until`: that one proves
+/// something happened, this one proves something did not. Shortens the
+/// socket's read timeout so the loop actually polls within the window rather
+/// than blocking past it on the 5s default `ws_connect_path` sets.
+fn read_none(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    needle: &str,
+    window: std::time::Duration,
+) -> Option<String> {
+    if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+        s.set_read_timeout(Some(std::time::Duration::from_millis(50))).unwrap();
+    }
+    let deadline = std::time::Instant::now() + window;
+    while std::time::Instant::now() < deadline {
+        match ws.read() {
+            Ok(tungstenite::Message::Text(t)) if t.contains(needle) => return Some(t.to_string()),
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(e) => panic!("read_none({needle:?}): socket error rather than a timeout: {e:?}"),
+        }
+    }
+    None
+}
+
+/// Notices used to go to every project's clients. They no longer do: a
+/// browser tab is opened on one project key, so a notice from elsewhere has
+/// no tab there to focus, no honest place in a panel headed "for this
+/// project", and — the behaviour that prompted the change — nothing to do on
+/// a click but navigate the tab away from the project its user is working in.
+///
+/// Two connected clients on two projects, deliberately: with one, scoped and
+/// unscoped delivery are indistinguishable. Alpha's assertion carries the
+/// "still delivered" half — without it, a `publish` that reached nobody at
+/// all would satisfy beta's silence just as well — and it is read *first*,
+/// so beta's frame would already be queued behind it if the broadcast had
+/// gone wide. Revert-checked: with `publish` restored to `broadcast_all`,
+/// beta receives alpha's Notice frame and the assertion below fires.
 #[test]
-fn a_notice_reaches_a_client_watching_a_different_project() {
-    let _g = WS_TEST_LOCK.lock().unwrap();
+fn a_notice_reaches_only_its_own_projects_clients() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("ROOST_STATE_DIR", sd.path());
     let d = tempfile::tempdir().unwrap();
@@ -2442,18 +2484,21 @@ fn a_notice_reaches_a_client_watching_a_different_project() {
     read_until(&mut a, r#""t":"State""#);
     read_until(&mut b, r#""t":"State""#);
 
-    // Published against alpha; beta's client must still see it.
     roost::hub::publish(
         "alpha",
         "claude",
         roost::osc::Parsed { title: Some("build".into()), body: "green".into() },
     );
 
-    let seen_b = read_until(&mut b, r#""t":"Notice""#);
-    assert!(seen_b.contains(r#""project":"alpha""#), "beta got: {seen_b}");
-    assert!(seen_b.contains("green"), "beta got: {seen_b}");
     let seen_a = read_until(&mut a, r#""t":"Notice""#);
+    assert!(seen_a.contains(r#""project":"alpha""#), "alpha got: {seen_a}");
     assert!(seen_a.contains("green"), "alpha got: {seen_a}");
+
+    let leaked = read_none(&mut b, r#""t":"Notice""#, std::time::Duration::from_millis(500));
+    assert!(
+        leaked.is_none(),
+        "beta's tab must not be sent alpha's notice, got: {leaked:?}"
+    );
 }
 
 #[test]

@@ -71,10 +71,14 @@ self.addEventListener("notificationclick", (e) => {
           (c || onProject).postMessage({ kind: "focus", project, session });
         });
       }
-      // Otherwise reuse any roost window rather than opening a new tab.
-      if (wins.length) {
-        return wins[0].focus().then((c) => (c || wins[0]).navigate(target));
-      }
+      // Otherwise open a tab. Deliberately NOT `wins[0].navigate(target)`,
+      // which is what this did: with no tab on the notice's project, the
+      // "reuse a window" shortcut navigated whichever roost tab happened to
+      // be first away from the project its user was working in — a notice
+      // from roost silently replacing an open ultima_cluster workspace, tree,
+      // buffers and all. A notification is an interruption; it does not get
+      // to choose which window to consume. Every other tab is on some other
+      // project by definition here, so there is no window this may reuse.
       return self.clients.openWindow(target);
     })
   );
