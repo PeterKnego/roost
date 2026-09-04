@@ -18,9 +18,54 @@
 //! instead. Two roosts sharing a `ROOST_STATE_DIR` will alternate, which is
 //! the correct outcome for a hint.
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 fn record_path(dir: &Path, project: &str) -> PathBuf {
     dir.join(format!("{}.port", crate::projects::storage_key(project)))
+}
+
+/// Test-only redirect for `ports_dir()`, mirroring `idelock::TEST_IDE_DIR`.
+static TEST_PORTS_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Redirects `ports_dir()` for the remainder of this process. Idempotent, like
+/// `idelock::set_ide_dir_for_test` — any number of call sites can set it
+/// defensively without coordinating who goes first.
+pub fn set_ports_dir_for_test(dir: PathBuf) {
+    let _ = TEST_PORTS_DIR.set(dir);
+}
+
+/// Where port records live: `<state dir>/ide` in production, a redirected or
+/// stable per-user temp directory under test.
+///
+/// Unlike `idelock::ide_dir()`, the `cfg!(test)` branch here does not panic
+/// on a missing override — it falls back to a stable per-user temp directory
+/// instead. A panic earns its keep on the lock-file side because concurrent
+/// listeners in the same directory would otherwise fight over port numbers
+/// and lock filenames; a port record has no such cross-test hazard, since it
+/// is keyed by project name and is advisory (a wrong or stale value only
+/// costs a fallback bind, never a failure). So there is nothing here that
+/// needs every test to opt in, and forcing one anyway would just be churn on
+/// every existing `ide` test for no benefit. What still must never happen,
+/// under test or not, is writing into the *real* state directory a running
+/// roost instance is using — `ROOST_STATE_DIR` on this host points at the
+/// developer's live `~/.local/state/roost`, and a stray test write there is
+/// the same class of defect `idelock::ide_dir()` guards against (a test run
+/// once left 17 stale lock files behind on the lock-file side of this).
+pub fn ports_dir() -> PathBuf {
+    if let Some(d) = TEST_PORTS_DIR.get() {
+        return d.clone();
+    }
+    if cfg!(test) {
+        static DIR: OnceLock<PathBuf> = OnceLock::new();
+        let d = DIR.get_or_init(|| {
+            let who = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+            let p = std::env::temp_dir().join(format!("roost-test-ideport-{who}"));
+            let _ = std::fs::create_dir_all(&p);
+            p
+        });
+        return d.clone();
+    }
+    crate::wsstate::state_dir().join("ide")
 }
 
 /// The recorded port, or `None` when there is no usable hint.

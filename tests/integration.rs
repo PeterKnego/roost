@@ -7,8 +7,20 @@ use std::path::PathBuf;
 /// `idelock::set_ide_dir_for_test`'s doc comment for why a directory shared
 /// across tests, not one per test, is the right shape — so `cargo test`
 /// never touches the real `~/.claude/ide` (Task 5 review, finding 2).
+///
+/// Same reasoning applies to `ide::start_in`'s port record
+/// (`ideport::ports_dir()`): its own `cfg!(test)` fallback only covers this
+/// crate's own unit tests, not this binary, which links `roost` as an
+/// ordinary dependency with no `cfg(test)`. Measured directly: before this
+/// call existed, running this suite once left `pingws.port` and
+/// `sseportproj.port` behind in the developer's real
+/// `~/.local/state/roost/ide/` — the same class of leak Task 5 found on the
+/// lock-file side.
 fn isolate_ide_dir_for_tests() {
     roost::idelock::isolate_ide_dir_for_test();
+    let who = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+    let p = std::env::temp_dir().join(format!("roost-test-ideport-integration-{who}"));
+    roost::ideport::set_ports_dir_for_test(p);
 }
 
 fn start(roots: Vec<PathBuf>) -> u16 {

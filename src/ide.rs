@@ -101,10 +101,33 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 pub fn start_in(dir: &Path, project: &str, workspace: PathBuf) -> Result<Arc<Ide>, String> {
-    // Port 0: the OS picks, and the lock file must advertise what was actually
-    // bound, not what was asked for.
-    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
+    start_in_with_ports(dir, &crate::ideport::ports_dir(), project, workspace)
+}
+
+/// `start_in`, with the port-record directory injected. Production calls
+/// `start_in`; tests call this so they never write into the real state dir —
+/// the same reason `idelock::set_ide_dir_for_test` exists for the lock dir.
+pub(crate) fn start_in_with_ports(
+    dir: &Path,
+    ports: &Path,
+    project: &str,
+    workspace: PathBuf,
+) -> Result<Arc<Ide>, String> {
+    // The recorded port is a hint, not a requirement: taking it again is what
+    // keeps a surviving shell's baked `CLAUDE_CODE_SSE_PORT` pointing at *this*
+    // project instead of at whichever project the OS hands the number to next.
+    // Anything at all can be holding it by now — another roost, another
+    // service, or this project's own listener from a restart that has not
+    // finished closing — so a failure is ordinary and silent.
+    let listener = crate::ideport::recorded_in(ports, project)
+        .and_then(|p| TcpListener::bind(("127.0.0.1", p)).ok())
+        .map_or_else(|| TcpListener::bind(("127.0.0.1", 0)), Ok)
+        .map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    // Recorded after the bind, from `local_addr`, never from the hint: the
+    // record has to say what is true, and on the fallback path the hint is
+    // exactly what was not true.
+    crate::ideport::record_in(ports, project, port);
     let token = idelock::new_token()?;
     let lock = idelock::write_in(dir, port, &token, &workspace)?;
     let stopped = Arc::new(AtomicBool::new(false));
@@ -1284,6 +1307,73 @@ mod tests {
         assert_eq!(v["authToken"], ide.token.as_str());
         assert_eq!(v["workspaceFolders"], serde_json::json!([ws.path().to_str().unwrap()]));
         assert_ne!(ide.port, 0, "an OS-assigned port must be read back after bind");
+    }
+
+    /// The port a project bound is offered back to it on the next start, which
+    /// is what keeps a surviving shell's `CLAUDE_CODE_SSE_PORT` pointing at this
+    /// project rather than at whichever project the OS hands the number to next.
+    #[test]
+    fn a_second_start_rebinds_the_port_the_first_one_recorded() {
+        let lockdir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let first = start_in_with_ports(lockdir.path(), &state.path().join("ide"), "portsame", PathBuf::from("/tmp"))
+            .expect("first listener");
+        let port = first.port;
+        assert_ne!(port, 0, "an OS-assigned port must be read back after bind");
+        first.request_shutdown();
+        // Wait for the port to be released before asking for it again; a bind
+        // racing the old listener's close would fall back and hide the feature.
+        for _ in 0..40 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let second = start_in_with_ports(lockdir.path(), &state.path().join("ide"), "portsame", PathBuf::from("/tmp"))
+            .expect("second listener");
+        assert_eq!(second.port, port, "the recorded port must be taken again");
+        second.request_shutdown();
+    }
+
+    /// The fallback, which is the whole reason the record is advisory: something
+    /// else owns the recorded port, so the project gets an OS-assigned one and
+    /// the record is updated to match reality.
+    #[test]
+    fn a_recorded_port_that_is_taken_falls_back_and_re_records() {
+        let lockdir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        // Squat a real port and record it as this project's.
+        let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = squatter.local_addr().unwrap().port();
+        crate::ideport::record_in(&state.path().join("ide"), "portbusy", taken);
+        let ide = start_in_with_ports(lockdir.path(), &state.path().join("ide"), "portbusy", PathBuf::from("/tmp"))
+            .expect("a taken port must degrade, never fail the project");
+        assert_ne!(ide.port, taken, "must not claim to have bound a port someone else holds");
+        assert_ne!(ide.port, 0);
+        assert_eq!(
+            crate::ideport::recorded_in(&state.path().join("ide"), "portbusy"),
+            Some(ide.port),
+            "the record must be corrected to the port actually bound"
+        );
+        ide.request_shutdown();
+        drop(squatter);
+    }
+
+    /// A lock file always advertises the port actually bound — never the hint.
+    ///
+    /// Port 1 needs privilege this process does not have, which is how this
+    /// exercises the bind-failure path without depending on another process
+    /// squatting a port. If this ever runs as root it would bind successfully
+    /// and assert nothing.
+    #[test]
+    fn the_lock_file_names_the_port_actually_bound() {
+        let lockdir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        crate::ideport::record_in(&state.path().join("ide"), "portlock", 1); // privileged, will fail
+        let ide = start_in_with_ports(lockdir.path(), &state.path().join("ide"), "portlock", PathBuf::from("/tmp"))
+            .expect("a hint that cannot be bound must not fail the project");
+        assert!(lockdir.path().join(format!("{}.lock", ide.port)).exists());
+        ide.request_shutdown();
     }
 
     #[test]
