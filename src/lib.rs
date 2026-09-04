@@ -12,6 +12,7 @@ pub mod http;
 pub mod ide;
 pub mod idecwd;
 pub mod idelock;
+pub mod ideport;
 pub mod idesess;
 pub mod launch;
 pub mod notify;

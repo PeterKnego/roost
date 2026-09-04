@@ -101,10 +101,33 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 pub fn start_in(dir: &Path, project: &str, workspace: PathBuf) -> Result<Arc<Ide>, String> {
-    // Port 0: the OS picks, and the lock file must advertise what was actually
-    // bound, not what was asked for.
-    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
+    start_in_with_ports(dir, &crate::ideport::ports_dir(), project, workspace)
+}
+
+/// `start_in`, with the port-record directory injected. Production calls
+/// `start_in`; tests call this so they never write into the real state dir —
+/// the same reason `idelock::set_ide_dir_for_test` exists for the lock dir.
+pub(crate) fn start_in_with_ports(
+    dir: &Path,
+    ports: &Path,
+    project: &str,
+    workspace: PathBuf,
+) -> Result<Arc<Ide>, String> {
+    // The recorded port is a hint, not a requirement: taking it again is what
+    // keeps a surviving shell's baked `CLAUDE_CODE_SSE_PORT` pointing at *this*
+    // project instead of at whichever project the OS hands the number to next.
+    // Anything at all can be holding it by now — another roost, another
+    // service, or this project's own listener from a restart that has not
+    // finished closing — so a failure is ordinary and silent.
+    let listener = crate::ideport::recorded_in(ports, project)
+        .and_then(|p| TcpListener::bind(("127.0.0.1", p)).ok())
+        .map_or_else(|| TcpListener::bind(("127.0.0.1", 0)), Ok)
+        .map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    // Recorded after the bind, from `local_addr`, never from the hint: the
+    // record has to say what is true, and on the fallback path the hint is
+    // exactly what was not true.
+    crate::ideport::record_in(ports, project, port);
     let token = idelock::new_token()?;
     let lock = idelock::write_in(dir, port, &token, &workspace)?;
     let stopped = Arc::new(AtomicBool::new(false));
@@ -218,10 +241,7 @@ pub fn for_project_in(
         // drop triggers, are both real syscalls), rather than just letting
         // it leak a live accept thread until process exit.
         drop(map);
-        if let Ok(losing_ide) = built {
-            losing_ide.request_shutdown();
-        }
-        return Some(existing);
+        return Some(lost_the_race(project, existing, built));
     }
     match built {
         Ok(ide) => {
@@ -236,6 +256,36 @@ pub fn for_project_in(
             None
         }
     }
+}
+
+/// This call lost the registry race: `existing` is the `Ide` another caller
+/// already registered first, `built` is this call's own — shut down here,
+/// never handed back.
+///
+/// Final-review finding 1 (stable-ide-port): `start_in_with_ports` records
+/// its own port immediately after its own bind, before either side of this
+/// race knows who will win it — so whichever build merely *finishes last*
+/// is whatever the on-disk record names, entirely independent of which one
+/// wins the race below. `hub.rs`'s `_workspace` socket and `term.rs`'s
+/// terminal socket build these near-simultaneously for the same project
+/// (see the comment above this call), so a loser finishing last is the
+/// ordinary case, not a rare interleaving — and when it happens, the record
+/// is left naming a port nothing is listening on. The next roost start then
+/// re-offers exactly that dead port as its hint, fails to bind it, and
+/// re-records whatever it falls back to — which is itself only correct
+/// again by the same coin flip, so the draw this branch exists to remove
+/// comes back on roughly half of restarts instead of converging.
+///
+/// Re-recording `existing.port` here, after the race is decided rather than
+/// racing to record it, is what makes the two agree regardless of which
+/// build happened to finish last: `existing` is the one that stays alive,
+/// so it is the one worth a shell surviving a restart taking the hint from.
+fn lost_the_race(project: &str, existing: Arc<Ide>, built: Result<Arc<Ide>, String>) -> Arc<Ide> {
+    if let Ok(losing_ide) = built {
+        losing_ide.request_shutdown();
+    }
+    crate::ideport::record_in(&crate::ideport::ports_dir(), project, existing.port);
+    existing
 }
 
 pub fn for_project(project: &str, workspace: PathBuf) -> Option<Arc<Ide>> {
@@ -423,6 +473,65 @@ pub fn connected_sessions(project: &str) -> Vec<crate::idesess::Sess> {
     map.get(project).map(|v| v.iter().map(|t| t.session.clone()).collect()).unwrap_or_default()
 }
 
+/// What the lock-scoped part of `notify_selected` decided, before the
+/// `total == 0` case is allowed to do the blocking `/proc` walk that explains
+/// itself. Keeping this as a value (rather than returning the finished
+/// message from inside the lock) is the whole reason the scan can happen
+/// after the guard drops: see `notify_selected`'s comment.
+enum Choice {
+    Send(Vec<std::sync::mpsc::Sender<String>>),
+    NoConnections,
+}
+
+/// The `total == 0` case of `notify_selected`, factored out so the four
+/// sentences are testable without a socket or a `/proc` walk.
+///
+/// `scan_port` is `claudes::sse_port_in`'s result for this project/session:
+/// `None` means no Claude sits in that terminal at all — roost's fan-out
+/// registry and the process table agree, and the original single sentence is
+/// still true. `Some(None)` means a Claude is there but its port could not be
+/// read (environment without the variable, or an unparseable value).
+/// `Some(Some(p))` is a Claude whose port roost knows. `live_port` is this
+/// project's own IDE listener port (`ide::port_for`).
+///
+/// A port mismatch is the one case with an actual repair: the CLI does not
+/// redial, so a Claude holding a stale port is stuck until a new `claude`
+/// process picks up the live one via the workspace-path fallback — either a
+/// new terminal, or restarting the one it's in. That repair is measured,
+/// unlike whatever `/ide` would do if the CLI re-ran discovery, which was
+/// never observed — so it is not named here. A matching port and an
+/// unreadable one collapse to the same sentence: both mean "a Claude is
+/// there, but not connected right now," and roost has no more specific action
+/// to suggest either way. Calling a port "stale" requires a live one to be
+/// stale against — `live_port == None` (no listener at all: the kill switch
+/// is off, or the listener failed to build) must not take this branch, since
+/// "start a new terminal" is not a repair when there is nothing to connect
+/// to either.
+pub(crate) fn no_connection_message(
+    session: Option<&str>,
+    scan_port: Option<Option<u16>>,
+    live_port: Option<u16>,
+) -> String {
+    // `session` is None only when the browser had no terminal tab focused,
+    // which is also the only time `scan_port` should be None-from-absence
+    // rather than None-from-no-Claude — either way there is no terminal name
+    // to single out, so the original sentence is the true one.
+    let term = match (session, scan_port) {
+        (Some(t), Some(_)) => t,
+        _ => return "no Claude is connected to this project".into(),
+    };
+    match (scan_port, live_port) {
+        // Binding `live` here (rather than testing `live_port.is_some_and`
+        // and re-unwrapping) keeps this branch panic-free without an
+        // `expect`: the match itself is the only place that knows `live` is
+        // present.
+        (Some(Some(p)), Some(live)) if live != p => format!(
+            "Claude in \"{term}\" predates this roost (it has port {p}, this roost is on {live}) and cannot reconnect on its own — start a new terminal, or restart claude in that one"
+        ),
+        _ => format!("Claude is running in \"{term}\" but is not connected to roost"),
+    }
+}
+
 /// Sends `msg` to the connections a mention is aimed at, or reports why
 /// none were chosen. Never falls back to the whole fan-out: reaching a
 /// Claude the user was not looking at is the failure this exists to prevent,
@@ -436,52 +545,76 @@ fn notify_selected(
     msg: &serde_json::Value,
 ) -> Result<(), String> {
     let msg = msg.to_string();
-    // Every decision is made inside the one lock scope, and only the sends
-    // happen outside it. Taking the lock a second time for the lone-connection
-    // fallback would let a connection arrive or die between the two looks, so
-    // the fallback would act on a different registry than the filter saw.
-    let chosen: Vec<std::sync::mpsc::Sender<String>> = {
+    // Every decision that only needs the registry is made inside the one lock
+    // scope, and only the sends happen outside it — same as before. Taking
+    // the lock a second time for the lone-connection fallback would let a
+    // connection arrive or die between the two looks, so the fallback would
+    // act on a different registry than the filter saw.
+    //
+    // The `total == 0` case is the exception: explaining it needs a `/proc`
+    // walk (`claudes::claude_terminals`), which is blocking I/O, and this
+    // project has already shipped one deadlock from blocking I/O under a
+    // lock. So that branch returns a bare marker here and the walk — and the
+    // message it feeds — happens below, after `map` is dropped.
+    let choice = {
         let map = conns().lock().unwrap_or_else(|e| e.into_inner());
         let all: &[Target] = map.get(project).map(|v| v.as_slice()).unwrap_or(&[]);
         let total = all.len();
         if total == 0 {
-            // Unchanged wording: existing tests match on "no Claude".
-            return Err("no Claude is connected to this project".into());
-        }
-        let matched: Vec<std::sync::mpsc::Sender<String>> = match session {
-            // No terminal named, so nothing to match on; the lone-connection
-            // case below is the only way an unaimed mention gets delivered.
-            None => Vec::new(),
-            Some(want) => all
-                .iter()
-                .filter(|t| match &t.session {
-                    crate::idesess::Sess::In(s) => s == want,
-                    // roost could not place this Claude, so it cannot rule it
-                    // out. One notification too many is recoverable; none
-                    // looks like a broken keystroke.
-                    crate::idesess::Sess::Unknown => true,
-                    crate::idesess::Sess::Outside => false,
-                })
-                .map(|t| t.reply.clone())
-                .collect(),
-        };
-        if !matched.is_empty() {
-            matched
-        } else if total == 1 {
-            // One Claude is unambiguous whatever roost managed to learn about
-            // where it lives — including nothing at all. This is what keeps
-            // the ordinary single-Claude case working when the environ read
-            // failed, or when Claude was started outside roost entirely.
-            all.iter().map(|t| t.reply.clone()).collect()
+            Choice::NoConnections
         } else {
-            return Err(match session {
-                Some(want) => format!(
-                    "no Claude is running in terminal \"{want}\" ({total} connected to this project)"
-                ),
-                None => format!(
-                    "{total} Claudes are connected to this project — click the terminal you mean, then press Alt+K"
-                ),
+            let matched: Vec<std::sync::mpsc::Sender<String>> = match session {
+                // No terminal named, so nothing to match on; the lone-connection
+                // case below is the only way an unaimed mention gets delivered.
+                None => Vec::new(),
+                Some(want) => all
+                    .iter()
+                    .filter(|t| match &t.session {
+                        crate::idesess::Sess::In(s) => s == want,
+                        // roost could not place this Claude, so it cannot rule it
+                        // out. One notification too many is recoverable; none
+                        // looks like a broken keystroke.
+                        crate::idesess::Sess::Unknown => true,
+                        crate::idesess::Sess::Outside => false,
+                    })
+                    .map(|t| t.reply.clone())
+                    .collect(),
+            };
+            if !matched.is_empty() {
+                Choice::Send(matched)
+            } else if total == 1 {
+                // One Claude is unambiguous whatever roost managed to learn about
+                // where it lives — including nothing at all. This is what keeps
+                // the ordinary single-Claude case working when the environ read
+                // failed, or when Claude was started outside roost entirely.
+                Choice::Send(all.iter().map(|t| t.reply.clone()).collect())
+            } else {
+                return Err(match session {
+                    Some(want) => format!(
+                        "no Claude is running in terminal \"{want}\" ({total} connected to this project)"
+                    ),
+                    None => format!(
+                        "{total} Claudes are connected to this project — click the terminal you mean, then press Alt+K"
+                    ),
+                });
+            }
+        }
+    };
+    let chosen = match choice {
+        Choice::Send(v) => v,
+        Choice::NoConnections => {
+            // Lock is dropped by now: `choice` was computed and the match
+            // above already moved out of the block that held `map`.
+            let scan_port = session.map(|s| {
+                let scan = crate::claudes::claude_terminals(Path::new("/proc"));
+                crate::claudes::sse_port_in(&scan, project, s)
             });
+            // `session.map` gives `Option<Option<Option<u16>>>`; flatten the
+            // outer two, since "no terminal named" and "scan found nothing
+            // for it" both mean the same thing to `no_connection_message`.
+            let scan_port = scan_port.flatten();
+            let live_port = port_for(project);
+            return Err(no_connection_message(session, scan_port, live_port));
         }
     };
     for t in &chosen {
@@ -1284,6 +1417,144 @@ mod tests {
         assert_eq!(v["authToken"], ide.token.as_str());
         assert_eq!(v["workspaceFolders"], serde_json::json!([ws.path().to_str().unwrap()]));
         assert_ne!(ide.port, 0, "an OS-assigned port must be read back after bind");
+    }
+
+    /// The port a project bound is offered back to it on the next start, which
+    /// is what keeps a surviving shell's `CLAUDE_CODE_SSE_PORT` pointing at this
+    /// project rather than at whichever project the OS hands the number to next.
+    ///
+    /// Revert-checked: dropping the `recorded_in(...).and_then(...)` chain in
+    /// `start_in_with_ports` (binding `("127.0.0.1", 0)` unconditionally, the
+    /// pre-Task-2 body) failed this test — `assertion `left == right` failed:
+    /// the recorded port must be taken again` — then restored.
+    #[test]
+    fn a_second_start_rebinds_the_port_the_first_one_recorded() {
+        let lockdir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let first = start_in_with_ports(lockdir.path(), &state.path().join("ide"), "portsame", PathBuf::from("/tmp"))
+            .expect("first listener");
+        let port = first.port;
+        assert_ne!(port, 0, "an OS-assigned port must be read back after bind");
+        first.request_shutdown();
+        // Wait for the port to be released before asking for it again; a bind
+        // racing the old listener's close would fall back and hide the feature.
+        for _ in 0..40 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let second = start_in_with_ports(lockdir.path(), &state.path().join("ide"), "portsame", PathBuf::from("/tmp"))
+            .expect("second listener");
+        assert_eq!(second.port, port, "the recorded port must be taken again");
+        second.request_shutdown();
+    }
+
+    /// The fallback, which is the whole reason the record is advisory: something
+    /// else owns the recorded port, so the project gets an OS-assigned one and
+    /// the record is updated to match reality.
+    ///
+    /// Revert-checked: removing the fallback in `start_in_with_ports` (binding
+    /// directly to `recorded_in(...).unwrap_or(0)` and propagating any bind
+    /// error instead of retrying with an OS-assigned port) failed this test —
+    /// `a taken port must degrade, never fail the project: "Address already
+    /// in use (os error 98)"` — then restored.
+    #[test]
+    fn a_recorded_port_that_is_taken_falls_back_and_re_records() {
+        let lockdir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        // Squat a real port and record it as this project's.
+        let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = squatter.local_addr().unwrap().port();
+        crate::ideport::record_in(&state.path().join("ide"), "portbusy", taken);
+        let ide = start_in_with_ports(lockdir.path(), &state.path().join("ide"), "portbusy", PathBuf::from("/tmp"))
+            .expect("a taken port must degrade, never fail the project");
+        assert_ne!(ide.port, taken, "must not claim to have bound a port someone else holds");
+        assert_ne!(ide.port, 0);
+        assert_eq!(
+            crate::ideport::recorded_in(&state.path().join("ide"), "portbusy"),
+            Some(ide.port),
+            "the record must be corrected to the port actually bound"
+        );
+        ide.request_shutdown();
+        drop(squatter);
+    }
+
+    /// A lock file always advertises the port actually bound — never the hint.
+    ///
+    /// Port 1 needs privilege this process does not have, which is how this
+    /// exercises the bind-failure path without depending on another process
+    /// squatting a port. If this ever runs as root it would bind successfully
+    /// and assert nothing.
+    ///
+    /// Revert-checked: writing the lock file with the pre-bind hint instead of
+    /// the port actually bound (`idelock::write_in(dir, hint.unwrap_or(port),
+    /// ...)` in place of `write_in(dir, port, ...)`) failed this test —
+    /// `assertion failed: lockdir.path().join(format!("{}.lock", ide.port)).exists()`
+    /// — then restored.
+    #[test]
+    fn the_lock_file_names_the_port_actually_bound() {
+        let lockdir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        crate::ideport::record_in(&state.path().join("ide"), "portlock", 1); // privileged, will fail
+        let ide = start_in_with_ports(lockdir.path(), &state.path().join("ide"), "portlock", PathBuf::from("/tmp"))
+            .expect("a hint that cannot be bound must not fail the project");
+        assert!(lockdir.path().join(format!("{}.lock", ide.port)).exists());
+        ide.request_shutdown();
+    }
+
+    /// Finding 1 of the final whole-branch review: `for_project_in`'s own
+    /// fast path makes its loser branch unreachable from two literal,
+    /// sequential calls to `for_project_in` itself — the real defect only
+    /// shows up when two calls' fast-path checks *both* miss at once, which
+    /// needs genuine concurrency to reproduce. `lost_the_race` is the loser
+    /// branch's logic pulled out so it can be driven directly and
+    /// deterministically instead: build the winner and the loser with two
+    /// plain `start_in` calls (neither touches the registry), which
+    /// reproduces exactly the ordinary double-build `for_project_in`'s doc
+    /// comment describes — a page load's `_workspace` socket and terminal
+    /// socket for the same project, near-simultaneously — without needing
+    /// either call to actually race.
+    ///
+    /// Revert-checked: reverting `lost_the_race` to the pre-fix body (drop
+    /// the `record_in` call, return `existing` unchanged) failed this test —
+    /// `assertion `left == right` failed: the record must name the port the
+    /// survivor is actually listening on / left: Some(<loser's port>) /
+    /// right: Some(<winner's port>)` — then restored.
+    #[test]
+    fn losing_the_race_still_leaves_the_record_naming_the_winner() {
+        let lockdir = tempfile::tempdir().unwrap();
+        let ports = crate::ideport::ports_dir();
+        let project = "race-loser-still-recorded";
+        // First build: nothing recorded yet, so this one gets whatever the
+        // OS hands out and records it. This is the call that goes on to win
+        // the registry race in `for_project_in` — it stays alive throughout,
+        // exactly like `existing` there.
+        let winner =
+            start_in(lockdir.path(), project, PathBuf::from("/tmp")).expect("first listener");
+        // Second build: the recorded hint is now the winner's port, which
+        // the winner still holds, so this one falls back to an OS-assigned
+        // port of its own — and, per `start_in_with_ports`'s own contract,
+        // (correctly, on its own) overwrites the record with THAT port. This
+        // is the state the bug leaves behind if nothing runs after it: the
+        // record now names a port nothing but this about-to-be-shut-down
+        // listener ever held.
+        let loser =
+            start_in(lockdir.path(), project, PathBuf::from("/tmp")).expect("second listener");
+        assert_ne!(loser.port, winner.port, "the fallback must not reuse the winner's port");
+        assert_eq!(
+            crate::ideport::recorded_in(&ports, project),
+            Some(loser.port),
+            "start_in_with_ports's own contract: it must have just recorded its own port"
+        );
+        let result = lost_the_race(project, winner.clone(), Ok(loser));
+        assert_eq!(result.port, winner.port, "the winner must be what's handed back");
+        assert_eq!(
+            crate::ideport::recorded_in(&ports, project),
+            Some(winner.port),
+            "the record must name the port the survivor is actually listening on"
+        );
+        winner.request_shutdown();
     }
 
     #[test]
@@ -2275,6 +2546,66 @@ mod tests {
         // surface as a refusal the UI can show, never as a socket-thread panic.
         let err = mention_to("nobody-here", None, Path::new("/w/x.rs"), None).unwrap_err();
         assert!(err.contains("no Claude"), "the message must say what is missing: {err}");
+    }
+
+    // Revert-checked: making `no_connection_message` return the old single
+    // sentence in every case (unconditionally, ignoring all three
+    // parameters) failed the four-case test below, on
+    // `assert!(m.contains("term1") && m.contains("41011") && m.contains("46793"), "got: {m}")`
+    // — the first assert in that group, which short-circuits before the
+    // later `predates this roost` assert ever runs — with
+    // `got: no Claude is connected to this project`. That is exactly what a
+    // user with an outlived-roost Claude saw before this change: true, and
+    // unactionable. The pinned test right after it did NOT fail — the
+    // reverted code IS its expected string, which is the point of pinning
+    // it: a change to the other three cases has nothing there to catch it
+    // drifting. Then restored with `cp`.
+    #[test]
+    fn the_no_connection_message_says_which_of_the_four_things_happened() {
+        // Asserted on the rendered sentence, not an intermediate: CLAUDE.md
+        // records a message-formatting defect that every test in its module
+        // was structurally unable to see, because they all asserted on the
+        // same intermediate string.
+        let m = no_connection_message(Some("term1"), None, Some(46793));
+        assert_eq!(m, "no Claude is connected to this project");
+
+        let m = no_connection_message(Some("term1"), Some(Some(41011)), Some(46793));
+        assert!(m.contains("term1") && m.contains("41011") && m.contains("46793"), "got: {m}");
+        assert!(m.contains("predates this roost"), "got: {m}");
+        assert!(m.contains("start a new terminal") && m.contains("restart claude"), "got: {m}");
+        assert!(!m.contains("/ide"), "the /ide repair is unmeasured and must not be advised: {m}");
+
+        let same = no_connection_message(Some("term1"), Some(Some(46793)), Some(46793));
+        let unknown = no_connection_message(Some("term1"), Some(None), Some(46793));
+        assert_eq!(same, unknown, "roost cannot tell these apart in a way the user could act on");
+        assert!(same.contains("is not connected to roost"), "got: {same}");
+        assert!(!same.contains("predates"), "a matching port is not a stale one: {same}");
+
+        // Fifth case, not in the spec's table but reachable: no live listener
+        // at all (kill switch off, or the listener failed to build) while
+        // `/proc` still shows a Claude with a port. "Stale" needs a live port
+        // to be stale against — with none, this must fall to the generic
+        // sentence, not claim a mismatch nothing can be compared to.
+        let no_listener = no_connection_message(Some("term1"), Some(Some(41011)), None);
+        assert!(
+            no_listener.contains("is not connected to roost"),
+            "got: {no_listener}"
+        );
+        assert!(
+            !no_listener.contains("predates"),
+            "no live port means nothing to call this port stale against: {no_listener}"
+        );
+    }
+
+    #[test]
+    fn the_unchanged_row_is_pinned_so_a_fix_to_the_others_cannot_rewrite_it() {
+        // The one case that must NOT change wording: no Claude anywhere.
+        // Existing tests match on "no Claude", and rewriting it into a guess
+        // is the defect this whole change exists to remove.
+        assert_eq!(
+            no_connection_message(None, None, None),
+            "no Claude is connected to this project"
+        );
     }
 
     /// Two terminals, two claudes, one project, and no terminal named. The

@@ -62,17 +62,29 @@ pub fn claudes_in_proc(proc_root: &std::path::Path, project: &str) -> Vec<String
     names_for(project, &claude_terminals(proc_root))
 }
 
-/// Every `(project, terminal)` a running `claude` sits in, from ONE walk of
-/// `proc_root`. The overview polls every few seconds and asks about every
-/// project, so the walk is done once per request and shared — the same
-/// hoisting `ages_snapshot`/`holders_snapshot` do for `ps` — rather than
-/// once per project. An entry whose environment cannot be read is skipped,
-/// never counted as "no Claude".
-pub fn claude_terminals(proc_root: &std::path::Path) -> Vec<(String, String)> {
-    // The three read-only callers (the overview's ✻, the worktree prompt)
-    // have always folded an unreadable root into "found none": a stale glyph
-    // is recoverable and nothing destructive hangs off it. `tick` may not —
-    // see `try_claude_terminals`.
+/// One terminal a running `claude` sits in: which project and session
+/// (`ROOST_PROJECT`/`ROOST_SESSION`), plus `CLAUDE_CODE_SSE_PORT` read from
+/// the same `environ`. Ordered on the full tuple so a scan sorts and dedups
+/// deterministically; `changed_projects` deliberately projects the port back
+/// out before comparing — see its doc comment.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ClaudeProc {
+    pub project: String,
+    pub session: String,
+    pub sse_port: Option<u16>,
+}
+
+/// Every terminal a running `claude` sits in, from ONE walk of `proc_root`.
+/// The overview polls every few seconds and asks about every project, so the
+/// walk is done once per request and shared — the same hoisting
+/// `ages_snapshot`/`holders_snapshot` do for `ps` — rather than once per
+/// project. An entry whose environment cannot be read is skipped, never
+/// counted as "no Claude".
+pub fn claude_terminals(proc_root: &std::path::Path) -> Vec<ClaudeProc> {
+    // The four read-only callers (the overview's ✻, the worktree prompt,
+    // and Alt+K's no-connection message) have always folded an unreadable
+    // root into "found none": a stale glyph is recoverable and nothing
+    // destructive hangs off it. `tick` may not — see `try_claude_terminals`.
     try_claude_terminals(proc_root).unwrap_or_default()
 }
 
@@ -80,7 +92,7 @@ pub fn claude_terminals(proc_root: &std::path::Path) -> Vec<(String, String)> {
 /// itself failed, which is not "no Claude is running". Folding the two
 /// together is the mistake this codebase made eleven times; here it would
 /// empty the cache and tell every open workspace that every Claude exited.
-pub fn try_claude_terminals(proc_root: &std::path::Path) -> Option<Vec<(String, String)>> {
+pub fn try_claude_terminals(proc_root: &std::path::Path) -> Option<Vec<ClaudeProc>> {
     let Ok(rd) = std::fs::read_dir(proc_root) else { return None };
     let mut out = Vec::new();
     for e in rd.flatten() {
@@ -90,15 +102,19 @@ pub fn try_claude_terminals(proc_root: &std::path::Path) -> Option<Vec<(String, 
             continue;
         }
         let Ok(raw) = std::fs::read(e.path().join("environ")) else { continue };
-        let (mut proj, mut sess) = (None, None);
+        let (mut proj, mut sess, mut port) = (None, None, None);
         for entry in raw.split(|b| *b == 0) {
             let Ok(kv) = std::str::from_utf8(entry) else { continue };
             if let Some(v) = kv.strip_prefix("ROOST_PROJECT=") { proj = Some(v.to_string()); }
             else if let Some(v) = kv.strip_prefix("ROOST_SESSION=") { sess = Some(v.to_string()); }
+            // Absent and unparseable are different questions than "found no
+            // Claude here" — `sse_port_in`'s doc comment explains why both
+            // fold to the same `Some(None)` for a caller.
+            else if let Some(v) = kv.strip_prefix("CLAUDE_CODE_SSE_PORT=") { port = v.parse::<u16>().ok(); }
         }
         if let (Some(p), Some(s)) = (proj, sess) {
             if crate::session::valid_name(&s) {
-                out.push((p, s));
+                out.push(ClaudeProc { project: p, session: s, sse_port: port });
             }
         }
     }
@@ -107,8 +123,21 @@ pub fn try_claude_terminals(proc_root: &std::path::Path) -> Option<Vec<(String, 
     Some(out)
 }
 
-fn names_for(project: &str, scan: &[(String, String)]) -> Vec<String> {
-    scan.iter().filter(|(p, _)| p == project).map(|(_, s)| s.clone()).collect()
+fn names_for(project: &str, scan: &[ClaudeProc]) -> Vec<String> {
+    scan.iter().filter(|c| c.project == project).map(|c| c.session.clone()).collect()
+}
+
+/// This terminal's Claude's `CLAUDE_CODE_SSE_PORT`, if there is a Claude
+/// there at all.
+///
+/// Two `Option`s, and they answer different questions. `None` means no Claude
+/// in that terminal. `Some(None)` means a Claude is there but roost could not
+/// read a port from it — an environment without the variable (the integration
+/// was off when it started), or a value that is not a `u16`. `Some(Some(p))`
+/// is a Claude whose port roost knows. `ide::notify_selected` says something
+/// different for each, which is the whole reason this is not flattened.
+pub fn sse_port_in(scan: &[ClaudeProc], project: &str, session: &str) -> Option<Option<u16>> {
+    scan.iter().find(|c| c.project == project && c.session == session).map(|c| c.sse_port)
 }
 
 /// One project's evidence, walking `/proc` itself. For a single question —
@@ -119,7 +148,7 @@ pub fn claude_evidence(project: &str) -> ClaudeEvidence {
 }
 
 /// `claude_evidence` over an already-taken process scan.
-pub fn claude_evidence_with_scan(project: &str, scan: &[(String, String)]) -> ClaudeEvidence {
+pub fn claude_evidence_with_scan(project: &str, scan: &[ClaudeProc]) -> ClaudeEvidence {
     let mut launched: Vec<String> =
         crate::session::launched_names(project).into_iter().map(|(n, _)| n).collect();
     launched.extend(names_for(project, scan));
@@ -132,9 +161,9 @@ pub const POLL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The most recent `/proc` walk. One walk feeds every project's snapshot,
 /// the same hoisting `claude_evidence_with_scan` exists for.
-static SCAN: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+static SCAN: OnceLock<Mutex<Vec<ClaudeProc>>> = OnceLock::new();
 
-fn scan_cell() -> &'static Mutex<Vec<(String, String)>> {
+fn scan_cell() -> &'static Mutex<Vec<ClaudeProc>> {
     SCAN.get_or_init(|| Mutex::new(Vec::new()))
 }
 
@@ -157,12 +186,18 @@ pub fn cached_sessions(project: &str) -> Vec<String> {
     }
 }
 
-/// Projects whose set of Claude terminals differs between two scans — the
-/// only ones that need a fresh snapshot pushed. A project that gained *and*
-/// lost nothing is not woken.
-fn changed_projects(old: &[(String, String)], new: &[(String, String)]) -> Vec<String> {
-    let a: HashSet<&(String, String)> = old.iter().collect();
-    let b: HashSet<&(String, String)> = new.iter().collect();
+/// Projects whose set of (terminal, Claude) pairs differs between two scans.
+///
+/// Compares `(project, session)` only, never the port. `tick` broadcasts to
+/// every project this names, and a roost restart changes the port of every
+/// surviving Claude relative to the new listener — so including it here would
+/// wake every open workspace on the first tick after every restart, for a
+/// change no client renders. The port is carried on `ClaudeProc` for
+/// `ide::notify_selected` to read on an Alt+K, not for this.
+fn changed_projects(old: &[ClaudeProc], new: &[ClaudeProc]) -> Vec<String> {
+    let key = |c: &ClaudeProc| (c.project.clone(), c.session.clone());
+    let a: HashSet<(String, String)> = old.iter().map(key).collect();
+    let b: HashSet<(String, String)> = new.iter().map(key).collect();
     let mut out: Vec<String> = a.symmetric_difference(&b).map(|(p, _)| p.clone()).collect();
     out.sort();
     out.dedup();
@@ -358,7 +393,54 @@ mod tests {
         // The one-walk scan every loop shares: both claudes, neither the bash.
         assert_eq!(
             claude_terminals(d.path()),
-            vec![("karpie".to_string(), "term3".to_string()), ("other".to_string(), "term".to_string())]
+            vec![
+                ClaudeProc { project: "karpie".into(), session: "term3".into(), sse_port: None },
+                ClaudeProc { project: "other".into(), session: "term".into(), sse_port: None },
+            ]
         );
+    }
+
+    /// `sse_port_in`'s outer `Option` answers "is a Claude here at all";
+    /// the inner answers "could roost read its port". A missing variable
+    /// and an unparseable one both fold to `Some(None)` — deliberately, since
+    /// Task 4 renders one sentence for both, not two.
+    #[test]
+    fn the_walk_reads_the_sse_port_from_the_same_environ() {
+        let d = tempfile::tempdir().unwrap();
+        let mk = |pid: u32, comm: &str, env: &str| {
+            let p = d.path().join(pid.to_string());
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("comm"), format!("{comm}\n")).unwrap();
+            std::fs::write(p.join("environ"), env.replace('\n', "\0")).unwrap();
+        };
+        mk(100, "claude", "ROOST_PROJECT=karpie\nROOST_SESSION=term3\nCLAUDE_CODE_SSE_PORT=41011\n");
+        // No port at all: a claude started before the integration existed, or with
+        // the kill switch off. Distinct from a port roost could not parse.
+        mk(200, "claude", "ROOST_PROJECT=karpie\nROOST_SESSION=term4\n");
+        mk(300, "claude", "ROOST_PROJECT=karpie\nROOST_SESSION=term5\nCLAUDE_CODE_SSE_PORT=notanumber\n");
+        let scan = claude_terminals(d.path());
+        assert_eq!(sse_port_in(&scan, "karpie", "term3"), Some(Some(41011)));
+        assert_eq!(sse_port_in(&scan, "karpie", "term4"), Some(None), "present, port unknown");
+        assert_eq!(sse_port_in(&scan, "karpie", "term5"), Some(None), "unparseable is unknown, not absent");
+        assert_eq!(sse_port_in(&scan, "karpie", "term9"), None, "no Claude in that terminal at all");
+        assert_eq!(sse_port_in(&scan, "other", "term3"), None, "another project's terminal");
+    }
+
+    /// `tick` broadcasts to every project `changed_projects` names, and a
+    /// roost restart changes every surviving Claude's port relative to the
+    /// live listener. If the port entered the comparison, the first tick
+    /// after every restart would wake every open workspace for no visible
+    /// change.
+    ///
+    /// Revert-checked: comparing whole `ClaudeProc`s (port included) fails
+    /// here with `assertion failed: changed_projects(&before, &after).is_empty()`.
+    #[test]
+    fn a_port_change_alone_does_not_wake_a_project() {
+        let before = vec![ClaudeProc { project: "karpie".into(), session: "term".into(), sse_port: Some(1111) }];
+        let after = vec![ClaudeProc { project: "karpie".into(), session: "term".into(), sse_port: Some(2222) }];
+        assert!(changed_projects(&before, &after).is_empty());
+        // …but a terminal appearing or leaving still does.
+        let gone: Vec<ClaudeProc> = vec![];
+        assert_eq!(changed_projects(&before, &gone), vec!["karpie".to_string()]);
     }
 }
