@@ -1,7 +1,19 @@
-//! Server-side notice store. Bounded, persisted, and global rather than
-//! per-project: what needs your attention is a property of the machine, not
-//! of whichever project happens to be on screen, and a browser sitting on one
-//! project must still learn that another one wants something.
+//! Server-side notice store. Bounded, persisted, and machine-wide: notices
+//! from every project live in one ring, one file, one rate-limit map.
+//!
+//! *Delivery* is not machine-wide, though it once was. A browser tab is
+//! opened on exactly one project key — and a worktree is a key of its own,
+//! so `roost` and `roost/.claude/worktrees/claude-1` are as separate here as
+//! two unrelated projects — and a notice from anywhere else has no tab in
+//! that page to focus, no honest place in a panel headed "for this project",
+//! and nothing to do on a click but navigate the user away from the project
+//! they are working in. `list_for`/`mark_all_read_in`/`clear_in` are what
+//! every client-facing path goes through; the unscoped originals remain for
+//! `persist`, which snapshots the whole store.
+//!
+//! The cost of that, stated plainly: a notice raised in a project with no
+//! tab open reaches nobody until that project is opened. There is no
+//! notification centre on `/` yet to catch it.
 //!
 //! Persistence — not just in-memory queueing — is what makes a notice raised
 //! at 3am survive a roost restart rather than only a closed tab.
@@ -172,6 +184,21 @@ pub fn list() -> Vec<Notice> {
     s.notices.iter().cloned().collect()
 }
 
+/// The store is machine-wide, but a browser tab is not: it is opened on one
+/// project key, and a worktree is a key of its own (`registry` derives a
+/// `storage_key` per linked worktree), so `roost` and
+/// `roost/.claude/worktrees/claude-1` are distinct here and must not see each
+/// other's notices. Everything a client is sent or acts on goes through one
+/// of these three, so the panel, the badge, and the two footer buttons all
+/// mean the same project.
+///
+/// `list()` above stays whole-store: `persist` snapshots through it, and
+/// scoping *that* would truncate the file to one project on every write.
+pub fn list_for(project: &str) -> Vec<Notice> {
+    let s = store().lock().unwrap_or_else(|e| e.into_inner());
+    s.notices.iter().filter(|n| n.project == project).cloned().collect()
+}
+
 pub fn mark_read(id: u64) {
     {
         let mut s = store().lock().unwrap_or_else(|e| e.into_inner());
@@ -194,10 +221,39 @@ pub fn mark_all_read() {
     persist();
 }
 
+/// Scoped counterpart to `mark_all_read`, for a panel that shows one
+/// project.
+pub fn mark_all_read_in(project: &str) {
+    {
+        let mut s = store().lock().unwrap_or_else(|e| e.into_inner());
+        for n in s.notices.iter_mut().filter(|n| n.project == project) {
+            n.read = true;
+        }
+    }
+    persist();
+}
+
 pub fn clear() {
     {
         let mut s = store().lock().unwrap_or_else(|e| e.into_inner());
         s.notices.clear();
+    }
+    persist();
+}
+
+/// Clears one project's notices and no others.
+///
+/// This is the scoping that matters most, and the reason the filtering lives
+/// on this side rather than in the client's render. Once the panel shows one
+/// project, an unscoped `clear()` reached from that panel destroys history
+/// the user cannot see and does not know is there — the Clear button says
+/// "clear these five" and silently takes ninety-five more with it. Per
+/// CLAUDE.md, destruction needs positive evidence, and a button can only be
+/// evidence for what it displays.
+pub fn clear_in(project: &str) {
+    {
+        let mut s = store().lock().unwrap_or_else(|e| e.into_inner());
+        s.notices.retain(|n| n.project != project);
     }
     persist();
 }
@@ -464,6 +520,90 @@ mod tests {
         assert!(!all.iter().find(|n| n.id != a.id).unwrap().read, "only the named id");
         clear();
         assert!(list().is_empty());
+    }
+
+    /// Every assertion below names a *second* project deliberately. With one
+    /// project in the store, `list_for` and `list` return the same vector,
+    /// `clear_in` and `clear` empty the same store, and `mark_all_read_in`
+    /// and `mark_all_read` touch the same rows — so a single-project test
+    /// passes identically against the unscoped functions and proves nothing.
+    /// That is CLAUDE.md's "tests with a single subscriber" trap in another
+    /// coat. The worktree pair is the real shape: `roost` and
+    /// `roost/.claude/worktrees/claude-1` are separate project keys.
+    ///
+    /// Revert-checked: neutering each of the three scoped functions back into
+    /// its unscoped twin (`filter` dropped, `retain` back to `clear`) fails
+    /// all three, each on its own assertion — `list_for` returns 3 where 1
+    /// is expected, `clear_in` leaves 0 where 2 must survive, and
+    /// `mark_all_read_in` clears the other project's unread flags.
+    #[test]
+    fn list_for_returns_only_the_named_projects_notices() {
+        let _g = setup();
+        record("ultima_cluster", "term1", parsed("mine"));
+        record("roost", "term1", parsed("theirs"));
+        record("roost/.claude/worktrees/claude-1", "term1", parsed("a worktree of theirs"));
+
+        let mine = list_for("ultima_cluster");
+        assert_eq!(mine.len(), 1, "expected one, got {mine:?}");
+        assert_eq!(mine[0].body, "mine");
+
+        let theirs = list_for("roost");
+        assert_eq!(
+            theirs.len(),
+            1,
+            "a worktree is its own project key and must not fold into its parent: {theirs:?}"
+        );
+        assert_eq!(theirs[0].body, "theirs");
+
+        assert_eq!(list().len(), 3, "the store itself stays machine-wide");
+    }
+
+    #[test]
+    fn clear_in_leaves_every_other_projects_notices_intact() {
+        let _g = setup();
+        record("ultima_cluster", "term1", parsed("mine"));
+        record("roost", "term1", parsed("theirs"));
+        record("roost/.claude/worktrees/claude-1", "term1", parsed("a worktree of theirs"));
+
+        clear_in("ultima_cluster");
+
+        let left = list();
+        assert_eq!(
+            left.len(),
+            2,
+            "clearing one project must not empty the store; left: {left:?}"
+        );
+        assert!(
+            left.iter().all(|n| n.project != "ultima_cluster"),
+            "the named project's notices must be gone: {left:?}"
+        );
+        assert!(
+            left.iter().any(|n| n.project == "roost"),
+            "the other project's history must survive: {left:?}"
+        );
+        assert!(
+            left.iter().any(|n| n.project == "roost/.claude/worktrees/claude-1"),
+            "a worktree's history is not its parent's to clear: {left:?}"
+        );
+    }
+
+    #[test]
+    fn mark_all_read_in_leaves_every_other_projects_notices_unread() {
+        let _g = setup();
+        record("ultima_cluster", "term1", parsed("mine"));
+        record("roost", "term1", parsed("theirs"));
+
+        mark_all_read_in("ultima_cluster");
+
+        let all = list();
+        assert!(
+            all.iter().filter(|n| n.project == "ultima_cluster").all(|n| n.read),
+            "the named project must be marked: {all:?}"
+        );
+        assert!(
+            all.iter().filter(|n| n.project == "roost").all(|n| !n.read),
+            "another project's badge must not be cleared from here: {all:?}"
+        );
     }
 
     #[test]

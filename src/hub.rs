@@ -438,14 +438,21 @@ impl Hub {
                 return;
             }
             Intent::MarkAllNoticesRead => {
-                crate::notify::mark_all_read();
+                // Scoped to this hub's project, because the panel the button
+                // sits in is: "Mark all read" can only mean the rows it is
+                // under.
+                crate::notify::mark_all_read_in(&self.project);
                 // Same reasoning as MarkNoticeRead above: dirty-flag, don't
-                // broadcast_all from in here.
+                // broadcast from in here.
                 self.notices_dirty = true;
                 return;
             }
             Intent::ClearNotices => {
-                crate::notify::clear();
+                // Scoped for a sharper reason than the button above: an
+                // unscoped `clear()` from a panel showing one project
+                // destroys history the user cannot see and does not know is
+                // there. See `notify::clear_in`.
+                crate::notify::clear_in(&self.project);
                 self.notices_dirty = true;
                 return;
             }
@@ -2232,11 +2239,30 @@ pub fn broadcast_state_for(project: &str) {
     g.broadcast(&ev);
 }
 
-/// Record a parsed sequence and tell every client. Called from the PTY pump
-/// thread, which holds no lock at this point and must never panic.
+/// Send an event to the clients of one project and nobody else. Same lock
+/// order as `broadcast_all` — registry, then hub — but it clones a single
+/// `Arc` rather than the whole map.
+pub fn broadcast_to_project(project: &str, ev: &Event) {
+    let Some(reg) = REGISTRY.get() else { return };
+    let hub = {
+        let map = reg.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(project).cloned()
+    };
+    let Some(h) = hub else { return };
+    Hub::lock(&h).broadcast(ev);
+}
+
+/// Record a parsed sequence and tell that project's clients. Called from the
+/// PTY pump thread, which holds no lock at this point and must never panic.
+///
+/// Scoped rather than machine-wide: a browser tab is opened on exactly one
+/// project key — and a worktree is a key of its own — so a notice from
+/// another project has nothing to attach to there. It cannot be shown in a
+/// panel that is about this project, and routing a click on it away from the
+/// project the user is working in is the behaviour that prompted the change.
 pub fn publish(project: &str, session: &str, p: crate::osc::Parsed) {
     if let Some(notice) = crate::notify::record(project, session, p) {
-        broadcast_all(&Event::Notice { notice });
+        broadcast_to_project(project, &Event::Notice { notice });
     }
 }
 
@@ -3094,6 +3120,10 @@ mod tests {
         crate::notify::reset_for_test();
         crate::notify::record("proj", "claude", crate::osc::Parsed { title: None, body: "one".into() });
         crate::notify::record("proj", "shell", crate::osc::Parsed { title: None, body: "two".into() });
+        // A third project's notice, so this test also pins that the button
+        // is scoped: "Mark all read" sits in a panel showing one project and
+        // cannot mean rows the user is not being shown.
+        crate::notify::record("other", "shell", crate::osc::Parsed { title: None, body: "not mine".into() });
 
         let mut h = Hub::new("proj", d.path().to_path_buf());
         let (c, rx) = h.subscribe();
@@ -3102,10 +3132,72 @@ mod tests {
         assert!(!h.notices_dirty);
         h.handle(&c, Intent::MarkAllNoticesRead);
         assert!(h.notices_dirty, "the socket layer relies on this flag to broadcast Notices");
+        let all = crate::notify::list();
         assert!(
-            crate::notify::list().iter().all(|n| n.read),
-            "the store itself must be updated, not just the dirty flag"
+            all.iter().filter(|n| n.project == "proj").all(|n| n.read),
+            "the store itself must be updated, not just the dirty flag: {all:?}"
         );
+        assert!(
+            all.iter().filter(|n| n.project == "other").all(|n| !n.read),
+            "another project's unread notices must survive this button: {all:?}"
+        );
+    }
+
+    // Two registered hubs with a subscriber each, deliberately: `publish`
+    // used to call `broadcast_all`, so with a single hub the scoped and
+    // unscoped versions are indistinguishable and this passes either way —
+    // CLAUDE.md's "single subscriber" trap. B's receiver is what carries the
+    // whole claim.
+    //
+    // A browser tab is opened on one project key and a worktree is a key of
+    // its own, so `roost` and `roost/.claude/worktrees/claude-1` here are as
+    // separate as two unrelated projects; that pair is the case the panel
+    // actually gets wrong, not two strangers.
+    //
+    // Watched fail with `publish` restored to `broadcast_all`: B's receiver
+    // gets the Notice and the `is_err()` assertion below fires.
+    #[test]
+    fn a_notice_reaches_its_own_projects_clients_and_nobody_elses() {
+        isolate_ide_dir_for_tests();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        crate::notify::reset_for_test();
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+
+        let hub_a = Hub::for_project("notice-scope-a", dir_a.path().to_path_buf());
+        let hub_b =
+            Hub::for_project("notice-scope-a/.claude/worktrees/w1", dir_b.path().to_path_buf());
+        let (_ca, rxa) = Hub::lock(&hub_a).subscribe();
+        let (_cb, rxb) = Hub::lock(&hub_b).subscribe();
+        drain(&rxa);
+        drain(&rxb);
+
+        publish(
+            "notice-scope-a",
+            "term1",
+            crate::osc::Parsed { title: None, body: "for a only".into() },
+        );
+
+        // A's client must actually receive it, or the "nobody else" half
+        // below would also hold for a publish that reached no one at all.
+        let got = rxa
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the notice's own project must receive it");
+        assert!(got.contains(r#""t":"Notice""#), "expected a Notice, got {got}");
+        assert!(got.contains("for a only"), "wrong notice: {got}");
+
+        // Not merely "no Notice": nothing at all should arrive, and a
+        // timeout is the only outcome that proves the broadcast never
+        // reached this hub.
+        let leaked = rxb.recv_timeout(std::time::Duration::from_millis(300));
+        assert!(
+            leaked.is_err(),
+            "a worktree's tab must not be sent its parent project's notice, got {leaked:?}"
+        );
+
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     #[test]

@@ -286,23 +286,29 @@ pub enum Event {
     WorktreeReady { url: String, launch: Option<Launch> },
     /// The set of projects with live sessions changed — `project` started
     /// its first shell, ended its last, or was closed. Machine-wide, sent to
-    /// every project's clients via `hub::broadcast_all` like `Notice`, because
-    /// the ◆ "running projects" panel is shown in every workspace and is
+    /// every project's clients via `hub::broadcast_all` — unlike `Notice`,
+    /// which is scoped to its own project — because the ◆ "running
+    /// projects" panel is shown in every workspace and is
     /// otherwise refetched only by the tab that caused the change. Carries no
     /// roster: the client refetches the server-rendered fragment, which is
     /// the one place the count is computed (`registry::known_projects`).
     ProjectsChanged { project: String },
-    /// One live notice. Deliberately not folded into `WorkspaceView`: that
-    /// snapshot goes out on every workspace change, and history does not
-    /// belong on that path.
+    /// One live notice, sent only to the clients of the project it belongs
+    /// to (`hub::broadcast_to_project`). The store behind it is still
+    /// machine-wide; the delivery is not, because a browser tab is opened on
+    /// exactly one project key — and a worktree is a key of its own — so a
+    /// foreign notice has no tab to focus and no honest place in the panel.
+    ///
+    /// Deliberately not folded into `WorkspaceView`: that snapshot goes out
+    /// on every workspace change, and history does not belong on that path.
     Notice { notice: crate::notify::Notice },
     /// The two sides of a proposal tab, sent when the tab opens rather than
     /// carried in `WorkspaceView`: that snapshot goes out on every workspace
     /// change (every debounced keystroke, via `EditBuffer`), and two whole
     /// file bodies have no business on that path.
     Proposal { id: String, rel: String, old_text: String, new_text: String },
-    /// The whole store — every project's notices, not just this client's —
-    /// sent on connect and after any read-state change, so no two browsers
+    /// This project's notices — not the whole store — sent on connect and
+    /// after any read-state change, so no two browsers on the same project
     /// disagree about the badge count.
     Notices { list: Vec<crate::notify::Notice> },
 }

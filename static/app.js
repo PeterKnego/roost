@@ -2535,8 +2535,15 @@ if (location.hash.startsWith("#session=")) {
 connectControl();
 
 // ---- notifications ----------------------------------------------------
-// Notices are machine-wide, so this list spans projects; only the tab dot
-// below is scoped to what is on screen.
+// Scoped to this project by the server: `Notices` on connect and `Notice`
+// live both carry only this project's rows (hub::broadcast_to_project,
+// notify::list_for). So everything derived from this array — the panel, the
+// bell badge, the title prefix, the favicon dot — is about this project and
+// nothing else, and a click can always be answered in this tab.
+//
+// A worktree is its own project key, so a tab on `roost` gets none of
+// `roost/.claude/worktrees/claude-1`'s notices either. That is intended: the
+// two are separate workspaces with separate terminals.
 let notices = [];
 let swReg = null;
 const baseTitle = document.title;
@@ -2718,12 +2725,16 @@ function setFavicon(badged) {
 // send the browser to `/foo` with the rest swallowed as a fragment.
 const projectPath = (p) => p.split("/").map(encodeURIComponent).join("/");
 
+// Every notice in the panel belongs to this project, so a click always
+// resolves here. The old cross-project branch navigated this tab to the other
+// project — which is what made a notice from a project you were not looking
+// at destroy the workspace you were: one click and ultima_cluster was
+// replaced by roost. The guard stays as a guard, not a route: if a foreign
+// notice ever reaches this array again (a server regression), it is ignored
+// rather than silently hijacking the tab.
 function openNotice(x) {
+  if (x.project !== PROJECT) return;
   if (!x.read) send({ t: "MarkNoticeRead", id: x.id });
-  if (x.project !== PROJECT) {
-    location.href = `/${projectPath(x.project)}#session=${encodeURIComponent(x.session)}`;
-    return;
-  }
   focusSession(x.session);
 }
 
@@ -2760,8 +2771,11 @@ function focusSession(session) {
 // rather than maintained as a separate set, so it can never drift from the
 // server's read state in either direction (a dot that never lights because
 // nothing ever adds to a separate set, or one that never clears because
-// nothing ever removes from it — both were real bugs here). A session in
-// another project has no tab here; that is what the bell badge is for.
+// nothing ever removes from it — both were real bugs here). The PROJECT
+// check is belt-and-braces now that the server sends this project's notices
+// only, and kept because `notices` also feeds the badge and the title: a
+// foreign row leaking back in must light nothing rather than light
+// everything.
 function hasAttention(session) {
   return notices.some((n) => n.project === PROJECT && n.session === session && !n.read);
 }

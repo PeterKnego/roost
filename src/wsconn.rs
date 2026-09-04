@@ -201,7 +201,7 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         // inside the same lock acquisition as the snapshot, for the reason
         // the existing comment above gives — releasing in between lets a
         // foreign broadcast land first.
-        let ev = proto::Event::Notices { list: crate::notify::list() };
+        let ev = proto::Event::Notices { list: crate::notify::list_for(project) };
         h.send_to(&id, &ev);
         // State is metadata-only — it never carries buffer text — so a
         // client reconnecting onto a layout with open Edit buffers would
@@ -350,12 +350,17 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
                     std::mem::take(&mut h.notices_dirty)
                 };
                 // Outside the block above, so this hub's lock is released:
-                // broadcast_all locks every hub including this one, and a
-                // Mutex is not reentrant.
+                // broadcast_to_project locks this hub, and a Mutex is not
+                // reentrant.
+                //
+                // Scoped to this project both ways round: only its own
+                // clients are affected by a read/clear made here, and only
+                // its own notices belong in the list they are sent.
                 if dirty {
-                    crate::hub::broadcast_all(&proto::Event::Notices {
-                        list: crate::notify::list(),
-                    });
+                    crate::hub::broadcast_to_project(
+                        project,
+                        &proto::Event::Notices { list: crate::notify::list_for(project) },
+                    );
                 }
             }
             // The reply tungstenite queued on this object went into the
