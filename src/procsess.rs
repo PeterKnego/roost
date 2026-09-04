@@ -150,7 +150,7 @@ mod tests {
     }
 
     // Revert-checked: changing `Sid::Unknown => return None` to `Sid::Unknown
-    // => {}` makes this fail — test panicked at src/procsess.rs:164:9:
+    // => {}` makes this fail — test panicked at src/procsess.rs:168:9:
     // assertion `left == right` failed
     //   left: Some([100])
     //  right: None
