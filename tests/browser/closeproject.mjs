@@ -321,6 +321,23 @@ try {
   // — while every other section (A-F) still passes. Restored via `cp` from a
   // backup, never `git checkout`.
   await g.evalIn(`send({ t: "CloseProject" })`);
+  // The `ended` count is the number roost tells the user, and per the design
+  // spec "the `ended` number is half the defect" — the old confirmation used
+  // to call this session ended (the master died) while the HUP-ignoring
+  // child above was still running, which would have reported it here too.
+  // Read the banner `app.js`'s `ProjectClosed` handler renders
+  // (`showBanner(ev.ended + " terminal session(s) ended")`), not merely that
+  // one appeared: a presence-only check passes for any count, the same
+  // vacuous shape this branch's own plan already produced twice.
+  ok(
+    await until(() => g.evalIn(`!!document.querySelector(".error-banner")`), 30, "the close banner"),
+    "Close Project shows a banner reporting how many sessions ended"
+  );
+  const closedBanner = await g.evalIn(`(document.querySelector(".error-banner") || {}).textContent || ""`);
+  ok(
+    closedBanner.includes("1 terminal session(s) ended"),
+    `banner reports exactly the one session this section created: ${JSON.stringify(closedBanner)}`
+  );
   await sleep(4000);
   ok((await running()) === 0, `no HUP-ignoring child survived the close: ${await running()} left`);
   ok((await sockets()).length === 0, `and no socket was left behind: ${JSON.stringify(await sockets())}`);

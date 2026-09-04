@@ -363,15 +363,28 @@ fn kill_and_unlink_with(sock_path: &std::path::Path, snapshot_fn: SnapshotFn, pr
     // forever and never signalled, and the loop would time out on it.
     let mut still = session_or_socket_alive(sock_path, snapshot_fn, proc_root, &targets);
     for _ in 0..20 {
-        if !still {
+        if matches!(still, StillHeld::No) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
         kill_sessions(proc_root, &targets);
         still = session_or_socket_alive(sock_path, snapshot_fn, proc_root, &targets);
     }
-    if still {
-        return false;
+    match still {
+        StillHeld::No => {}
+        // Same doubt as the `target_sessions` bail above, just discovered
+        // later: a session's membership that never became readable during
+        // the confirm loop is not a survivor, and must not be reported with
+        // the same words as one — that is the wrong-label defect this arm
+        // exists to fix.
+        StillHeld::Undetermined => {
+            eprintln!(
+                "roost: could not determine whether {} has fully ended — leaving it in place",
+                sock_path.display()
+            );
+            return false;
+        }
+        StillHeld::Yes => return false,
     }
     let _ = std::fs::remove_file(sock_path);
     true
@@ -416,6 +429,24 @@ fn kill_sessions(proc_root: &std::path::Path, targets: &[u32]) {
     }
 }
 
+/// Finer than a bool on purpose: "held" and "could not tell" both block the
+/// unlink identically, but they must not print the same sentence — a
+/// survivor is something roost saw, doubt is something roost couldn't see
+/// through. Folding the two into `bool` is exactly the label bug Finding 1
+/// fixes.
+enum StillHeld {
+    /// Nothing holds the socket and every target session came back empty.
+    No,
+    /// A process holds the socket, or a target session still has a member —
+    /// confirmed, not merely undetermined.
+    Yes,
+    /// A target session's membership could not be read (`members_of`
+    /// returned `None`) and no *other* target was confirmed to still have a
+    /// member. Treated the same as `Yes` for the purpose of blocking the
+    /// unlink, but reported with different words.
+    Undetermined,
+}
+
 /// True while anything holds the socket **or** any target session still has a
 /// member, or either question could not be answered. Both halves must be
 /// clear before a socket is unlinked and a session reported ended.
@@ -424,15 +455,25 @@ fn session_or_socket_alive(
     snapshot_fn: SnapshotFn,
     proc_root: &std::path::Path,
     targets: &[u32],
-) -> bool {
+) -> StillHeld {
     if socket_has_process_with(sock_path, snapshot_fn) {
-        return true;
+        return StillHeld::Yes;
     }
-    targets.iter().any(|sid| match crate::procsess::members_of(proc_root, *sid) {
-        // Unknown counts as alive: this gates destruction and a report.
-        None => true,
-        Some(m) => !m.is_empty(),
-    })
+    // A confirmed member anywhere wins over doubt found elsewhere: it is the
+    // stronger, more specific claim, and it is what actually happened.
+    let mut undetermined = false;
+    for sid in targets {
+        match crate::procsess::members_of(proc_root, *sid) {
+            None => undetermined = true,
+            Some(m) if !m.is_empty() => return StillHeld::Yes,
+            Some(_) => {}
+        }
+    }
+    if undetermined {
+        StillHeld::Undetermined
+    } else {
+        StillHeld::No
+    }
 }
 
 /// The only public entry point for `kill_and_unlink_with`'s logic — see its
@@ -2272,6 +2313,58 @@ mod tests {
         // member must not be reported as ended".
         assert!(!ok, "a session with a live member must not be reported as ended");
         assert!(sock.exists(), "and its socket must stay, so the session stays discoverable");
+    }
+
+    #[test]
+    fn a_session_undeterminable_only_at_confirmation_time_is_reported_as_doubt_not_a_survivor() {
+        // Distinct from `an_undeterminable_session_leaves_the_socket_in_place`
+        // below: that one is undeterminable at *derivation* (`target_sessions`
+        // returns `None` before anything is killed), which was already
+        // labelled correctly. This fixture derives cleanly — the same target
+        // session (9000701) as the "member left alive" test above — and only
+        // trips `procsess::members_of` into `None` during the confirmation
+        // poll, via a stray `/proc` entry with an unparseable `stat` that
+        // nothing in derivation ever reads (derivation only reads the
+        // holder's own stat/children and its direct child's stat; `members_of`
+        // reads every entry in `/proc`). That asymmetry is exactly the
+        // `procsess::members_of` -> `None` path Finding 1 is about.
+        let d = tempfile::tempdir().unwrap();
+        let procd = tempfile::tempdir().unwrap();
+        proc_with_a_session(procd.path());
+        std::fs::create_dir_all(procd.path().join("9000703")).unwrap();
+        std::fs::write(procd.path().join("9000703").join("stat"), b"not a valid stat line\n").unwrap();
+
+        let sock = d.path().join("term");
+        std::fs::write(&sock, b"").unwrap();
+        let seen = std::cell::Cell::new(false);
+        let snap = || {
+            if seen.replace(true) {
+                Some(vec![])
+            } else {
+                Some(vec![(9000700, format!("dtach -A {} -E", sock.display()))])
+            }
+        };
+        let ok = kill_and_unlink_with(&sock, &snap, procd.path());
+        assert!(!ok, "undeterminable membership at confirmation time must not be reported as ended");
+        assert!(sock.exists());
+
+        // The distinction Finding 1 is about: a bare `!ok` is identical for
+        // "confirmed alive" and "could not tell" (both already returned
+        // `false` before this fix), so it cannot see a mislabelled message.
+        // Calling the confirmation check directly, against the same target
+        // session, pins down *why* — the one thing the return value alone
+        // never could.
+        let never_held = || Some(vec![]);
+        let result = session_or_socket_alive(&sock, &never_held, procd.path(), &[9000701]);
+        // Revert-checked: with the `None => undetermined = true` arm changed
+        // to `None => return StillHeld::Yes` (folding "could not tell" back
+        // into "confirmed alive", the pre-fix shape under the new type),
+        // this panics: "a session whose membership could not be read must be
+        // reported as undetermined doubt, not a confirmed survivor".
+        assert!(
+            matches!(result, StillHeld::Undetermined),
+            "a session whose membership could not be read must be reported as undetermined doubt, not a confirmed survivor"
+        );
     }
 
     #[test]
