@@ -74,7 +74,7 @@ mod tests {
     }
 
     // Revert-checked: changing rsplit_once(')') to split_once(')') makes this
-    // fail — test panicked at src/procsess.rs:88:9: assertion `left == right`
+    // fail — test panicked at src/procsess.rs:89:9: assertion `left == right`
     // failed
     //   left: In(1)
     //  right: In(77)
