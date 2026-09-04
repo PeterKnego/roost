@@ -1312,6 +1312,11 @@ mod tests {
     /// The port a project bound is offered back to it on the next start, which
     /// is what keeps a surviving shell's `CLAUDE_CODE_SSE_PORT` pointing at this
     /// project rather than at whichever project the OS hands the number to next.
+    ///
+    /// Revert-checked: dropping the `recorded_in(...).and_then(...)` chain in
+    /// `start_in_with_ports` (binding `("127.0.0.1", 0)` unconditionally, the
+    /// pre-Task-2 body) failed this test — `assertion `left == right` failed:
+    /// the recorded port must be taken again` — then restored.
     #[test]
     fn a_second_start_rebinds_the_port_the_first_one_recorded() {
         let lockdir = tempfile::tempdir().unwrap();
@@ -1338,6 +1343,12 @@ mod tests {
     /// The fallback, which is the whole reason the record is advisory: something
     /// else owns the recorded port, so the project gets an OS-assigned one and
     /// the record is updated to match reality.
+    ///
+    /// Revert-checked: removing the fallback in `start_in_with_ports` (binding
+    /// directly to `recorded_in(...).unwrap_or(0)` and propagating any bind
+    /// error instead of retrying with an OS-assigned port) failed this test —
+    /// `a taken port must degrade, never fail the project: "Address already
+    /// in use (os error 98)"` — then restored.
     #[test]
     fn a_recorded_port_that_is_taken_falls_back_and_re_records() {
         let lockdir = tempfile::tempdir().unwrap();
@@ -1365,6 +1376,12 @@ mod tests {
     /// exercises the bind-failure path without depending on another process
     /// squatting a port. If this ever runs as root it would bind successfully
     /// and assert nothing.
+    ///
+    /// Revert-checked: writing the lock file with the pre-bind hint instead of
+    /// the port actually bound (`idelock::write_in(dir, hint.unwrap_or(port),
+    /// ...)` in place of `write_in(dir, port, ...)`) failed this test —
+    /// `assertion failed: lockdir.path().join(format!("{}.lock", ide.port)).exists()`
+    /// — then restored.
     #[test]
     fn the_lock_file_names_the_port_actually_bound() {
         let lockdir = tempfile::tempdir().unwrap();
