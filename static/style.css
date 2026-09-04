@@ -633,13 +633,14 @@ ul.picker li .git:hover { text-decoration: underline; }
 .pickerbar button:disabled { opacity: .4; cursor: not-allowed; }
 /* ---- notification centre ---- */
 #bell { position: relative; }
-/* The Claude-hooks mark: the ✻ tabs wear for a running Claude, so the glyph
-   means "Claude" everywhere in the header. Accent = on, struck grey = off,
-   "?" = the settings file could not be read. On used to draw nothing, and
-   "nothing" cannot be told apart from a mark that failed to render. */
+/* The Claude-hooks mark: the ✻ tabs wear for a running Claude, in the same
+   Claude orange (`--ic-claude`'s fill, and the overview's `--claude`), so the
+   glyph means "Claude" everywhere in the header. Orange = on, struck grey =
+   off, "?" = the settings file could not be read. On used to draw nothing,
+   and "nothing" cannot be told apart from a mark that failed to render. */
 #bell[data-claude-hooks]::after {
   content: "✻"; position: absolute; right: 2px; bottom: 0; font-size: 9px; line-height: 1;
-  color: var(--accent);
+  color: var(--claude, #d97757);
 }
 #bell[data-claude-hooks="off"]::after { color: var(--muted); text-decoration: line-through; }
 #bell[data-claude-hooks="unknown"]::after { content: "?"; color: var(--warn); }

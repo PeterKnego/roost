@@ -49,14 +49,14 @@ const wire = (page) => {
   // strike, and its colour against the theme's own variables. `mark()` alone
   // passes with the stylesheet deleted (README trap: asserting the attribute
   // and calling it the picture). Revert-check 2026-09-04: with the previous
-  // rules, where on drew nothing, the "on draws an accent ✻" assertion fails
+  // rules, where on drew nothing, the "on draws a Claude-orange ✻" assertion fails
   // with content "none".
   const drawn = () => evalIn(`(() => {
     const b = document.getElementById("bell");
     const cs = getComputedStyle(b, "::after");
     const root = getComputedStyle(document.documentElement);
-    const probe = (v) => { const e = document.createElement("i"); e.style.color = "var(" + v + ")"; document.body.appendChild(e); const c = getComputedStyle(e).color; e.remove(); return c; };
-    return { content: cs.content, struck: /line-through/.test(cs.textDecorationLine || cs.textDecoration), color: cs.color, accent: probe("--accent"), muted: probe("--muted"), warn: probe("--warn") };
+    const probe = (v) => { const e = document.createElement("i"); e.style.color = v; document.body.appendChild(e); const c = getComputedStyle(e).color; e.remove(); return c; };
+    return { content: cs.content, struck: /line-through/.test(cs.textDecorationLine || cs.textDecoration), color: cs.color, claude: probe("var(--claude, #d97757)"), muted: probe("var(--muted)"), warn: probe("var(--warn)") };
   })()`);
   const openPanel = async () => {
     await evalIn(`document.getElementById("noticepanel").hidden = true`);
@@ -115,7 +115,7 @@ try {
   ok(await until(() => two.mark().then((m) => m === "on"), 5, "mirror"), "the other browser's bell followed");
   {
     const d = await one.drawn();
-    ok(d.content === '"✻"' && !d.struck && d.color === d.accent, `on draws an accent ✻, not struck (${JSON.stringify(d)})`);
+    ok(d.content === '"✻"' && !d.struck && d.color === d.claude, `on draws a Claude-orange ✻, not struck (${JSON.stringify(d)})`);
   }
 
   // `two`'s panel was opened above, before `one` ever confirmed, and is

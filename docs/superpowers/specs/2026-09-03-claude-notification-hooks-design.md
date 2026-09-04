@@ -193,8 +193,8 @@ shares. `timeout` is 5 seconds: the command writes one escape sequence.
 ### 4. UI
 
 - **The mark.** The bell gets a `data-claude-hooks` attribute of `on`,
-  `off` or `unknown`, and CSS draws a small mark on the bell for each: an
-  accent ✻ for `on`, a struck grey ✻ for `off`, a ? for `unknown`. (`on`
+  `off` or `unknown`, and CSS draws a small mark on the bell for each: a
+  Claude-orange ✻ for `on` (the tab mark's colour), a struck grey ✻ for `off`, a ? for `unknown`. (`on`
   originally drew nothing as "the quiet state"; amended 2026-09-04, because
   nothing cannot be told apart from a mark that failed to render, and the
   user asked to see enabled as well as disabled.) The existing unread badge
