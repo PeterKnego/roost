@@ -398,6 +398,12 @@ fn kill_pids(pids: &[u32]) {
 }
 
 /// `kill -9` every member of each target session, never roost itself.
+///
+/// A session this pass cannot enumerate is skipped rather than aborting the
+/// whole sweep for every other target: killing nothing from it is always
+/// safe, and `session_or_socket_alive` sees the same `None` afterwards and
+/// refuses to confirm the socket ended, so the doubt still blocks the
+/// unlink — it just doesn't block *other* sessions' members from dying too.
 fn kill_sessions(proc_root: &std::path::Path, targets: &[u32]) {
     for sid in targets {
         // A membership roost could not determine is not an empty one, and
@@ -2278,7 +2284,23 @@ mod tests {
         let procd = tempfile::tempdir().unwrap();
         let sock = d.path().join("term");
         std::fs::write(&sock, b"").unwrap();
-        let ok = kill_and_unlink_with(&sock, &|| Some(vec![(9000700, format!("dtach -A {} -E", sock.display()))]), procd.path());
+        // Stateful for the same reason as the test above: a mock that keeps
+        // reporting the holder on every call makes the socket check alone
+        // account for `!ok`, masking whether the `target_sessions == None`
+        // bail this test names ever ran at all.
+        let seen = std::cell::Cell::new(false);
+        let snap = || {
+            if seen.replace(true) {
+                Some(vec![])
+            } else {
+                Some(vec![(9000700, format!("dtach -A {} -E", sock.display()))])
+            }
+        };
+        let ok = kill_and_unlink_with(&sock, &snap, procd.path());
+        // Revert-checked: with the `target_sessions == None` bail replaced by
+        // `.unwrap_or_default()` (folding "cannot determine" into "nothing to
+        // sweep"), this panics: "an underivable session is doubt, not an
+        // empty sweep".
         assert!(!ok, "an underivable session is doubt, not an empty sweep");
         assert!(sock.exists());
     }
