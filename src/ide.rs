@@ -446,6 +446,60 @@ pub fn connected_sessions(project: &str) -> Vec<crate::idesess::Sess> {
     map.get(project).map(|v| v.iter().map(|t| t.session.clone()).collect()).unwrap_or_default()
 }
 
+/// What the lock-scoped part of `notify_selected` decided, before the
+/// `total == 0` case is allowed to do the blocking `/proc` walk that explains
+/// itself. Keeping this as a value (rather than returning the finished
+/// message from inside the lock) is the whole reason the scan can happen
+/// after the guard drops: see `notify_selected`'s comment.
+enum Choice {
+    Send(Vec<std::sync::mpsc::Sender<String>>),
+    NoConnections,
+}
+
+/// The `total == 0` case of `notify_selected`, factored out so the four
+/// sentences are testable without a socket or a `/proc` walk.
+///
+/// `scan_port` is `claudes::sse_port_in`'s result for this project/session:
+/// `None` means no Claude sits in that terminal at all — roost's fan-out
+/// registry and the process table agree, and the original single sentence is
+/// still true. `Some(None)` means a Claude is there but its port could not be
+/// read (environment without the variable, or an unparseable value).
+/// `Some(Some(p))` is a Claude whose port roost knows. `live_port` is this
+/// project's own IDE listener port (`ide::port_for`).
+///
+/// A port mismatch is the one case with an actual repair: the CLI does not
+/// redial, so a Claude holding a stale port is stuck until a new `claude`
+/// process picks up the live one via the workspace-path fallback — either a
+/// new terminal, or restarting the one it's in. That repair is measured,
+/// unlike whatever `/ide` would do if the CLI re-ran discovery, which was
+/// never observed — so it is not named here. A matching port and an
+/// unreadable one collapse to the same sentence: both mean "a Claude is
+/// there, but not connected right now," and roost has no more specific action
+/// to suggest either way.
+pub(crate) fn no_connection_message(
+    session: Option<&str>,
+    scan_port: Option<Option<u16>>,
+    live_port: Option<u16>,
+) -> String {
+    // `session` is None only when the browser had no terminal tab focused,
+    // which is also the only time `scan_port` should be None-from-absence
+    // rather than None-from-no-Claude — either way there is no terminal name
+    // to single out, so the original sentence is the true one.
+    let term = match (session, scan_port) {
+        (Some(t), Some(_)) => t,
+        _ => return "no Claude is connected to this project".into(),
+    };
+    match scan_port {
+        Some(Some(p)) if live_port != Some(p) => {
+            let live = live_port.map(|v| v.to_string()).unwrap_or_else(|| "none".into());
+            format!(
+                "Claude in \"{term}\" predates this roost (it has port {p}, this roost is on {live}) and cannot reconnect on its own — start a new terminal, or restart claude in that one"
+            )
+        }
+        _ => format!("Claude is running in \"{term}\" but is not connected to roost"),
+    }
+}
+
 /// Sends `msg` to the connections a mention is aimed at, or reports why
 /// none were chosen. Never falls back to the whole fan-out: reaching a
 /// Claude the user was not looking at is the failure this exists to prevent,
@@ -459,52 +513,76 @@ fn notify_selected(
     msg: &serde_json::Value,
 ) -> Result<(), String> {
     let msg = msg.to_string();
-    // Every decision is made inside the one lock scope, and only the sends
-    // happen outside it. Taking the lock a second time for the lone-connection
-    // fallback would let a connection arrive or die between the two looks, so
-    // the fallback would act on a different registry than the filter saw.
-    let chosen: Vec<std::sync::mpsc::Sender<String>> = {
+    // Every decision that only needs the registry is made inside the one lock
+    // scope, and only the sends happen outside it — same as before. Taking
+    // the lock a second time for the lone-connection fallback would let a
+    // connection arrive or die between the two looks, so the fallback would
+    // act on a different registry than the filter saw.
+    //
+    // The `total == 0` case is the exception: explaining it needs a `/proc`
+    // walk (`claudes::claude_terminals`), which is blocking I/O, and this
+    // project has already shipped one deadlock from blocking I/O under a
+    // lock. So that branch returns a bare marker here and the walk — and the
+    // message it feeds — happens below, after `map` is dropped.
+    let choice = {
         let map = conns().lock().unwrap_or_else(|e| e.into_inner());
         let all: &[Target] = map.get(project).map(|v| v.as_slice()).unwrap_or(&[]);
         let total = all.len();
         if total == 0 {
-            // Unchanged wording: existing tests match on "no Claude".
-            return Err("no Claude is connected to this project".into());
-        }
-        let matched: Vec<std::sync::mpsc::Sender<String>> = match session {
-            // No terminal named, so nothing to match on; the lone-connection
-            // case below is the only way an unaimed mention gets delivered.
-            None => Vec::new(),
-            Some(want) => all
-                .iter()
-                .filter(|t| match &t.session {
-                    crate::idesess::Sess::In(s) => s == want,
-                    // roost could not place this Claude, so it cannot rule it
-                    // out. One notification too many is recoverable; none
-                    // looks like a broken keystroke.
-                    crate::idesess::Sess::Unknown => true,
-                    crate::idesess::Sess::Outside => false,
-                })
-                .map(|t| t.reply.clone())
-                .collect(),
-        };
-        if !matched.is_empty() {
-            matched
-        } else if total == 1 {
-            // One Claude is unambiguous whatever roost managed to learn about
-            // where it lives — including nothing at all. This is what keeps
-            // the ordinary single-Claude case working when the environ read
-            // failed, or when Claude was started outside roost entirely.
-            all.iter().map(|t| t.reply.clone()).collect()
+            Choice::NoConnections
         } else {
-            return Err(match session {
-                Some(want) => format!(
-                    "no Claude is running in terminal \"{want}\" ({total} connected to this project)"
-                ),
-                None => format!(
-                    "{total} Claudes are connected to this project — click the terminal you mean, then press Alt+K"
-                ),
+            let matched: Vec<std::sync::mpsc::Sender<String>> = match session {
+                // No terminal named, so nothing to match on; the lone-connection
+                // case below is the only way an unaimed mention gets delivered.
+                None => Vec::new(),
+                Some(want) => all
+                    .iter()
+                    .filter(|t| match &t.session {
+                        crate::idesess::Sess::In(s) => s == want,
+                        // roost could not place this Claude, so it cannot rule it
+                        // out. One notification too many is recoverable; none
+                        // looks like a broken keystroke.
+                        crate::idesess::Sess::Unknown => true,
+                        crate::idesess::Sess::Outside => false,
+                    })
+                    .map(|t| t.reply.clone())
+                    .collect(),
+            };
+            if !matched.is_empty() {
+                Choice::Send(matched)
+            } else if total == 1 {
+                // One Claude is unambiguous whatever roost managed to learn about
+                // where it lives — including nothing at all. This is what keeps
+                // the ordinary single-Claude case working when the environ read
+                // failed, or when Claude was started outside roost entirely.
+                Choice::Send(all.iter().map(|t| t.reply.clone()).collect())
+            } else {
+                return Err(match session {
+                    Some(want) => format!(
+                        "no Claude is running in terminal \"{want}\" ({total} connected to this project)"
+                    ),
+                    None => format!(
+                        "{total} Claudes are connected to this project — click the terminal you mean, then press Alt+K"
+                    ),
+                });
+            }
+        }
+    };
+    let chosen = match choice {
+        Choice::Send(v) => v,
+        Choice::NoConnections => {
+            // Lock is dropped by now: `choice` was computed and the match
+            // above already moved out of the block that held `map`.
+            let scan_port = session.map(|s| {
+                let scan = crate::claudes::claude_terminals(Path::new("/proc"));
+                crate::claudes::sse_port_in(&scan, project, s)
             });
+            // `session.map` gives `Option<Option<Option<u16>>>`; flatten the
+            // outer two, since "no terminal named" and "scan found nothing
+            // for it" both mean the same thing to `no_connection_message`.
+            let scan_port = scan_port.flatten();
+            let live_port = port_for(project);
+            return Err(no_connection_message(session, scan_port, live_port));
         }
     };
     for t in &chosen {
@@ -2382,6 +2460,49 @@ mod tests {
         // surface as a refusal the UI can show, never as a socket-thread panic.
         let err = mention_to("nobody-here", None, Path::new("/w/x.rs"), None).unwrap_err();
         assert!(err.contains("no Claude"), "the message must say what is missing: {err}");
+    }
+
+    // Revert-checked: making `no_connection_message` return the old single
+    // sentence in every case (unconditionally, ignoring all three
+    // parameters) failed the four-case test below, on
+    // `assert!(m.contains("predates this roost"), "got: {m}")`, with
+    // `got: no Claude is connected to this project`. That is exactly what a
+    // user with an outlived-roost Claude saw before this change: true, and
+    // unactionable. The pinned test right after it did NOT fail — the
+    // reverted code IS its expected string, which is the point of pinning
+    // it: a change to the other three cases has nothing there to catch it
+    // drifting. Then restored with `cp`.
+    #[test]
+    fn the_no_connection_message_says_which_of_the_four_things_happened() {
+        // Asserted on the rendered sentence, not an intermediate: CLAUDE.md
+        // records a message-formatting defect that every test in its module
+        // was structurally unable to see, because they all asserted on the
+        // same intermediate string.
+        let m = no_connection_message(Some("term1"), None, Some(46793));
+        assert_eq!(m, "no Claude is connected to this project");
+
+        let m = no_connection_message(Some("term1"), Some(Some(41011)), Some(46793));
+        assert!(m.contains("term1") && m.contains("41011") && m.contains("46793"), "got: {m}");
+        assert!(m.contains("predates this roost"), "got: {m}");
+        assert!(m.contains("start a new terminal") && m.contains("restart claude"), "got: {m}");
+        assert!(!m.contains("/ide"), "the /ide repair is unmeasured and must not be advised: {m}");
+
+        let same = no_connection_message(Some("term1"), Some(Some(46793)), Some(46793));
+        let unknown = no_connection_message(Some("term1"), Some(None), Some(46793));
+        assert_eq!(same, unknown, "roost cannot tell these apart in a way the user could act on");
+        assert!(same.contains("is not connected to roost"), "got: {same}");
+        assert!(!same.contains("predates"), "a matching port is not a stale one: {same}");
+    }
+
+    #[test]
+    fn the_unchanged_row_is_pinned_so_a_fix_to_the_others_cannot_rewrite_it() {
+        // The one case that must NOT change wording: no Claude anywhere.
+        // Existing tests match on "no Claude", and rewriting it into a guess
+        // is the defect this whole change exists to remove.
+        assert_eq!(
+            no_connection_message(None, None, None),
+            "no Claude is connected to this project"
+        );
     }
 
     /// Two terminals, two claudes, one project, and no terminal named. The
