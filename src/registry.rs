@@ -317,7 +317,22 @@ fn socket_has_process(path: &std::path::Path) -> bool {
 /// left, file removed — including the vacuous case where nothing held it to
 /// begin with. Returns `false` if a kill failed, a process survived the
 /// wait, or the process listing was unverifiable.
-fn kill_and_unlink_with(sock_path: &std::path::Path, snapshot_fn: SnapshotFn) -> bool {
+///
+/// **Ends the session, not merely the socket's holders.** Killing the dtach
+/// master closes the pty, and the kernel turns that into a `SIGHUP` for the
+/// slave side — which anything that handles the hangup simply declines.
+/// Measured 2026-09-04: a `trap "" HUP` child survived exactly this and
+/// reparented to init, while the socket went unheld, so the old confirmation
+/// read "finished". Claude Code is that shape, so Close Project routinely left
+/// one running and reported it ended.
+///
+/// The sessions to sweep are derived *before* the holders are killed: once the
+/// master dies its children reparent and the link is gone. Anything that left
+/// the session on purpose — Claude's `daemon run` and `bg-pty-host` both do,
+/// measured — is out of scope by construction, and must stay that way: the
+/// daemon is shared across projects, so following it would end other projects'
+/// Claudes.
+fn kill_and_unlink_with(sock_path: &std::path::Path, snapshot_fn: SnapshotFn, proc_root: &std::path::Path) -> bool {
     let Some(snapshot) = snapshot_fn() else {
         eprintln!(
             "roost: could not verify what holds {} (process listing unavailable) — leaving it in place",
@@ -326,46 +341,139 @@ fn kill_and_unlink_with(sock_path: &std::path::Path, snapshot_fn: SnapshotFn) ->
         return false;
     };
     let pids = pids_holding(&snapshot, sock_path);
-    for pid in &pids {
-        // M6: pid 0 should be unreachable here in practice (pid 0 is the
-        // kernel/swapper, whose command line can never contain a socket
-        // path), but `kill -9 0` signals this whole process group — i.e.
-        // roost itself — so refuse it outright rather than trust that
-        // impossibility.
-        if *pid == 0 {
-            continue;
-        }
-        // stderr silenced: `snapshot` is a moment old, so a process that
-        // exited on its own in between makes `kill(1)` print
-        // "kill: <pid>: No such process" — noise about something that has
-        // already achieved exactly what was wanted, and noise that masks
-        // real output in the journal and the test suite alike.
-        let _ = std::process::Command::new("kill")
-            .arg("-9")
-            .arg(pid.to_string())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-    // Bounded wait for the kill(s) to take effect rather than an instant
-    // recheck: SIGKILL is not synchronous. Bounded so a process that
-    // refuses to die can't hang the caller forever. When `pids` was empty
-    // this loop runs zero iterations, and `still_alive`'s first read is
-    // itself the fresh, immediately-before-delete recheck (see R8 in this
-    // module's history: a stale "nothing held it" from an earlier snapshot
-    // must never be trusted at delete time without re-verifying).
-    let mut still_alive = socket_has_process_with(sock_path, snapshot_fn);
+
+    // Derived before any kill, for the reason in the doc comment above.
+    let own = match crate::procsess::session_of(proc_root, std::process::id()) {
+        crate::procsess::Sid::In(s) => Some(s),
+        _ => None,
+    };
+    let Some(targets) = crate::procsess::target_sessions(proc_root, &pids, own) else {
+        eprintln!(
+            "roost: could not determine which session holds {} — leaving it in place",
+            sock_path.display()
+        );
+        return false;
+    };
+
+    kill_pids(&pids);
+    kill_sessions(proc_root, &targets);
+
+    // Re-killed on every pass, not only re-checked: a process forked by the
+    // shell between the derivation and the kill would otherwise be seen
+    // forever and never signalled, and the loop would time out on it.
+    let mut still = session_or_socket_alive(sock_path, snapshot_fn, proc_root, &targets);
     for _ in 0..20 {
-        if !still_alive {
+        if matches!(still, StillHeld::No) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
-        still_alive = socket_has_process_with(sock_path, snapshot_fn);
+        kill_sessions(proc_root, &targets);
+        still = session_or_socket_alive(sock_path, snapshot_fn, proc_root, &targets);
     }
-    if still_alive {
-        return false;
+    match still {
+        StillHeld::No => {}
+        // Same doubt as the `target_sessions` bail above, just discovered
+        // later: a session's membership that never became readable during
+        // the confirm loop is not a survivor, and must not be reported with
+        // the same words as one — that is the wrong-label defect this arm
+        // exists to fix.
+        StillHeld::Undetermined => {
+            eprintln!(
+                "roost: could not determine whether {} has fully ended — leaving it in place",
+                sock_path.display()
+            );
+            return false;
+        }
+        StillHeld::Yes => return false,
     }
     let _ = std::fs::remove_file(sock_path);
     true
+}
+
+/// `kill -9` for a set of pids, in one invocation.
+///
+/// pid 0 is refused outright: `kill -9 0` signals this process's whole group,
+/// i.e. roost itself. It should be unreachable — the kernel's swapper cannot
+/// hold a socket and cannot lead a session — but an impossibility that costs
+/// one comparison to make impossible is worth the comparison. stderr is
+/// silenced because a pid that exited on its own in between has already
+/// achieved what was wanted, and "No such process" noise masks real output.
+fn kill_pids(pids: &[u32]) {
+    let args: Vec<String> = pids.iter().filter(|p| **p != 0).map(|p| p.to_string()).collect();
+    if args.is_empty() {
+        return;
+    }
+    let _ = std::process::Command::new("kill")
+        .arg("-9")
+        .args(&args)
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// `kill -9` every member of each target session, never roost itself.
+///
+/// A session this pass cannot enumerate is skipped rather than aborting the
+/// whole sweep for every other target: killing nothing from it is always
+/// safe, and `session_or_socket_alive` sees the same `None` afterwards and
+/// refuses to confirm the socket ended, so the doubt still blocks the
+/// unlink — it just doesn't block *other* sessions' members from dying too.
+fn kill_sessions(proc_root: &std::path::Path, targets: &[u32]) {
+    for sid in targets {
+        // A membership roost could not determine is not an empty one, and
+        // there is nothing safe to kill from it. The confirmation below sees
+        // the same `None` and refuses to finish, which is the outcome wanted.
+        let Some(members) = crate::procsess::members_of(proc_root, *sid) else { continue };
+        let me = std::process::id();
+        let victims: Vec<u32> = members.into_iter().filter(|p| *p != me).collect();
+        kill_pids(&victims);
+    }
+}
+
+/// Finer than a bool on purpose: "held" and "could not tell" both block the
+/// unlink identically, but they must not print the same sentence — a
+/// survivor is something roost saw, doubt is something roost couldn't see
+/// through. Folding the two into `bool` is exactly the label bug Finding 1
+/// fixes.
+enum StillHeld {
+    /// Nothing holds the socket and every target session came back empty.
+    No,
+    /// A process holds the socket, or a target session still has a member —
+    /// confirmed, not merely undetermined.
+    Yes,
+    /// A target session's membership could not be read (`members_of`
+    /// returned `None`) and no *other* target was confirmed to still have a
+    /// member. Treated the same as `Yes` for the purpose of blocking the
+    /// unlink, but reported with different words.
+    Undetermined,
+}
+
+/// True while anything holds the socket **or** any target session still has a
+/// member, or either question could not be answered. Both halves must be
+/// clear before a socket is unlinked and a session reported ended.
+fn session_or_socket_alive(
+    sock_path: &std::path::Path,
+    snapshot_fn: SnapshotFn,
+    proc_root: &std::path::Path,
+    targets: &[u32],
+) -> StillHeld {
+    if socket_has_process_with(sock_path, snapshot_fn) {
+        return StillHeld::Yes;
+    }
+    // A confirmed member anywhere wins over doubt found elsewhere: it is the
+    // stronger, more specific claim, and it is what actually happened.
+    let mut undetermined = false;
+    for sid in targets {
+        match crate::procsess::members_of(proc_root, *sid) {
+            None => undetermined = true,
+            Some(m) if !m.is_empty() => return StillHeld::Yes,
+            Some(_) => {}
+        }
+    }
+    if undetermined {
+        StillHeld::Undetermined
+    } else {
+        StillHeld::No
+    }
 }
 
 /// The only public entry point for `kill_and_unlink_with`'s logic — see its
@@ -375,7 +483,7 @@ fn kill_and_unlink_with(sock_path: &std::path::Path, snapshot_fn: SnapshotFn) ->
 /// in-process client, through one shared, confirm-before-unlink
 /// implementation.
 pub fn kill_and_unlink(sock_path: &std::path::Path) -> bool {
-    kill_and_unlink_with(sock_path, &process_snapshot)
+    kill_and_unlink_with(sock_path, &process_snapshot, std::path::Path::new("/proc"))
 }
 
 fn origin_marker_path(key_dir: &std::path::Path) -> PathBuf {
@@ -843,7 +951,7 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
                 // Covers a session this process never had in memory (one
                 // that outlived a restart) as well as a retry for one
                 // `kill_project` above tried and failed to fully end.
-                if kill_and_unlink_with(&sock.path(), snapshot_fn) {
+                if kill_and_unlink_with(&sock.path(), snapshot_fn, std::path::Path::new("/proc")) {
                     report.gone_projects += 1;
                     eprintln!(
                         "roost: reaped session {key}/{name} — its recorded directory no longer exists (pids {pids:?})"
@@ -2135,11 +2243,172 @@ mod tests {
             // be treated as "safe to delete" regardless.
             fs::write(&sock_path, "").unwrap();
 
-            let ok = kill_and_unlink_with(&sock_path, &|| None);
+            let ok = kill_and_unlink_with(&sock_path, &|| None, std::path::Path::new("/proc"));
 
             assert!(!ok, "an unverifiable process list must never report success");
             assert!(sock_path.exists(), "the socket must survive when the process list can't be trusted");
         });
+    }
+
+    /// A `/proc` fixture: a dtach master holding `sock`, its shell leading its
+    /// own session, and a HUP-ignoring child in that session but in a process
+    /// group of its own — the measured shape of the survivor this exists for.
+    fn proc_with_a_session(dir: &std::path::Path) {
+        let stat = |pid: u32, comm: &str, ppid: u32, pgrp: u32, sid: u32| {
+            let p = dir.join(pid.to_string());
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("stat"), format!("{pid} ({comm}) S {ppid} {pgrp} {sid} 0 1 0 0 0 0\n")).unwrap();
+        };
+        let children = |pid: u32, kids: &str| {
+            let p = dir.join(pid.to_string()).join("task").join(pid.to_string());
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("children"), format!("{kids} ")).unwrap();
+        };
+        // Pids above `/proc/sys/kernel/pid_max` (4194304 here), so the `kill -9`
+        // this test drives can never reach a real process on the host. A fixture
+        // using plausible pids would SIGKILL whatever happened to own them.
+        stat(9000700, "dtach", 1, 9000700, 9000700);
+        children(9000700, "9000701");
+        stat(9000701, "bash", 9000700, 9000701, 9000701);
+        children(9000701, "9000702");
+        stat(9000702, "claude", 9000701, 9000702, 9000701); // own pgrp, shell's session
+        children(9000702, "");
+        // roost itself, so `own_sid` resolves and the guard is exercised rather
+        // than short-circuited.
+        stat(std::process::id(), "roost", 1, std::process::id(), std::process::id());
+        children(std::process::id(), "");
+    }
+
+    #[test]
+    fn a_session_member_left_alive_is_not_confirmed_and_the_socket_stays() {
+        // The defect in one assertion: the socket's holder is gone, so the old
+        // confirmation ("does anything hold the socket") says yes, finished —
+        // while pid 702 is still in the shell's session. Reporting that as ended
+        // is what tells the user a number that is too large.
+        let d = tempfile::tempdir().unwrap();
+        let procd = tempfile::tempdir().unwrap();
+        proc_with_a_session(procd.path());
+        let sock = d.path().join("term");
+        std::fs::write(&sock, b"").unwrap();
+        // The master is reported as holding the socket exactly once — the
+        // read `kill_and_unlink_with` derives `pids`/`target_sessions` from —
+        // and gone on every read after, exactly what a real `kill -9` against
+        // a real dtach master leaves in `ps`. A closure that kept reporting
+        // it held on every call (the brief's literal fixture) made this test
+        // pass whether or not the session sweep below existed at all, since
+        // `socket_has_process_with` alone would then never clear — caught by
+        // the revert-check this comment documents.
+        let seen = std::cell::Cell::new(false);
+        let snap = || {
+            if seen.replace(true) {
+                Some(vec![])
+            } else {
+                Some(vec![(9000700, format!("dtach -A {} -E", sock.display()))])
+            }
+        };
+        let ok = kill_and_unlink_with(&sock, &snap, procd.path());
+        // Revert-checked: with `session_or_socket_alive` reverted to just
+        // `socket_has_process_with` (the pre-fix confirmation, blind to the
+        // session's surviving members), this panics: "a session with a live
+        // member must not be reported as ended".
+        assert!(!ok, "a session with a live member must not be reported as ended");
+        assert!(sock.exists(), "and its socket must stay, so the session stays discoverable");
+    }
+
+    #[test]
+    fn a_session_undeterminable_only_at_confirmation_time_is_reported_as_doubt_not_a_survivor() {
+        // Distinct from `an_undeterminable_session_leaves_the_socket_in_place`
+        // below: that one is undeterminable at *derivation* (`target_sessions`
+        // returns `None` before anything is killed), which was already
+        // labelled correctly. This fixture derives cleanly — the same target
+        // session (9000701) as the "member left alive" test above — and only
+        // trips `procsess::members_of` into `None` during the confirmation
+        // poll, via a stray `/proc` entry with an unparseable `stat` that
+        // nothing in derivation ever reads (derivation only reads the
+        // holder's own stat/children and its direct child's stat; `members_of`
+        // reads every entry in `/proc`). That asymmetry is exactly the
+        // `procsess::members_of` -> `None` path Finding 1 is about.
+        let d = tempfile::tempdir().unwrap();
+        let procd = tempfile::tempdir().unwrap();
+        proc_with_a_session(procd.path());
+        std::fs::create_dir_all(procd.path().join("9000703")).unwrap();
+        std::fs::write(procd.path().join("9000703").join("stat"), b"not a valid stat line\n").unwrap();
+
+        let sock = d.path().join("term");
+        std::fs::write(&sock, b"").unwrap();
+        let seen = std::cell::Cell::new(false);
+        let snap = || {
+            if seen.replace(true) {
+                Some(vec![])
+            } else {
+                Some(vec![(9000700, format!("dtach -A {} -E", sock.display()))])
+            }
+        };
+        let ok = kill_and_unlink_with(&sock, &snap, procd.path());
+        assert!(!ok, "undeterminable membership at confirmation time must not be reported as ended");
+        assert!(sock.exists());
+
+        // The distinction Finding 1 is about: a bare `!ok` is identical for
+        // "confirmed alive" and "could not tell" (both already returned
+        // `false` before this fix), so it cannot see a mislabelled message.
+        // Calling the confirmation check directly, against the same target
+        // session, pins down *why* — the one thing the return value alone
+        // never could.
+        let never_held = || Some(vec![]);
+        let result = session_or_socket_alive(&sock, &never_held, procd.path(), &[9000701]);
+        // Revert-checked: with the `None => undetermined = true` arm changed
+        // to `None => return StillHeld::Yes` (folding "could not tell" back
+        // into "confirmed alive", the pre-fix shape under the new type),
+        // this panics: "a session whose membership could not be read must be
+        // reported as undetermined doubt, not a confirmed survivor".
+        assert!(
+            matches!(result, StillHeld::Undetermined),
+            "a session whose membership could not be read must be reported as undetermined doubt, not a confirmed survivor"
+        );
+    }
+
+    #[test]
+    fn an_undeterminable_session_leaves_the_socket_in_place() {
+        // `target_sessions` returning None must reach the same "leave it" path as
+        // an unverifiable `ps`, not be treated as "no sessions to sweep".
+        let d = tempfile::tempdir().unwrap();
+        // Empty: neither the holder's children nor roost's own session can be
+        // read from it, which is the "cannot tell" state this asserts on.
+        let procd = tempfile::tempdir().unwrap();
+        let sock = d.path().join("term");
+        std::fs::write(&sock, b"").unwrap();
+        // Stateful for the same reason as the test above: a mock that keeps
+        // reporting the holder on every call makes the socket check alone
+        // account for `!ok`, masking whether the `target_sessions == None`
+        // bail this test names ever ran at all.
+        let seen = std::cell::Cell::new(false);
+        let snap = || {
+            if seen.replace(true) {
+                Some(vec![])
+            } else {
+                Some(vec![(9000700, format!("dtach -A {} -E", sock.display()))])
+            }
+        };
+        let ok = kill_and_unlink_with(&sock, &snap, procd.path());
+        // Revert-checked: with the `target_sessions == None` bail replaced by
+        // `.unwrap_or_default()` (folding "cannot determine" into "nothing to
+        // sweep"), this panics: "an underivable session is doubt, not an
+        // empty sweep".
+        assert!(!ok, "an underivable session is doubt, not an empty sweep");
+        assert!(sock.exists());
+    }
+
+    #[test]
+    fn nothing_holding_and_no_session_still_unlinks() {
+        // The vacuous case must stay vacuous: a socket nobody holds, with no
+        // session behind it, is cleaned up and reported as ended.
+        let d = tempfile::tempdir().unwrap();
+        let procd = tempfile::tempdir().unwrap();
+        let sock = d.path().join("term");
+        std::fs::write(&sock, b"").unwrap();
+        let ok = kill_and_unlink_with(&sock, &|| Some(vec![]), procd.path());
+        assert!(ok, "no holder and no session is ended, not doubt");
+        assert!(!sock.exists());
     }
 
     // C1, through the whole sweep: the same guarantee, exercised via

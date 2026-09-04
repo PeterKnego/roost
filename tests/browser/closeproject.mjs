@@ -41,6 +41,15 @@
 //! a terminal still spawning (D), and a close that leaves each terminal's
 //! reconnect armed (E). Each is revert-checked on its own below.
 //!
+//! Section G is a different bug from all of the above, and the one Tasks 1-5
+//! of this branch actually fixed: a shell that traps SIGHUP (Claude Code
+//! does) used to survive Close Project outright, because only the dtach
+//! master died and the child it guarded reparented and lived on. It proves
+//! the whole gesture end to end — a real browser click, a real dtach, a real
+//! child process that ignores the signal `kill_and_unlink`'s old behavior
+//! relied on — since this is also the only place the count roost reports to
+//! the user is visible, and no Rust test reaches app.js.
+//!
 //! D is kept for coverage but is no longer the primary guard. It could only
 //! ever be stated as a *rate* — 3-of-3 failing, 4-of-4 passing — because it
 //! depended on a spawn landing inside a timing window. F depends on a rule
@@ -266,6 +275,73 @@ try {
     .filter((l) => l.includes(`${fx.stateDir}/sock/${fx.project}/`) && l.includes("dtach -A"));
   ok(revived.length === 0, `and no dtach master appeared: ${revived.length}`);
   try { back.close(); } catch { /* already gone */ }
+
+  console.log("G. a child that ignores SIGHUP does not survive the close");
+  // A fresh project, because Sections A-F have already closed the fixture's.
+  const g = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
+  await until(() => g.evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "app.js");
+  // F's close wiped the layout's terminal tabs, so nothing auto-spawns here
+  // the way Section A's terminal did on a project that had never been
+  // closed — get one the same way C does after its own close: click
+  // new-terminal, then wait for its socket, rather than waiting for a socket
+  // that will never appear on its own.
+  await g.evalIn(newterm);
+  await until(async () => (await sockets()).length === 1, 30, "its socket");
+
+  // Typed over the terminal socket rather than the xterm: input on that socket
+  // is the raw bytes to type (`term.rs` writes a Binary frame straight to the
+  // pty), and the page supplies the Origin the handshake requires.
+  const marker = `roost_hup_survivor_${Date.now()}`;
+  await g.evalIn(`
+    new Promise((res) => {
+      const w = new WebSocket("ws://127.0.0.1:${roost.port}/ws/${fx.project}/term/term");
+      w.onopen = () => {
+        w.send(new TextEncoder().encode(
+          "bash -c 'trap \\"\\" HUP; exec -a ${marker} sleep 600' &\\n"));
+        setTimeout(() => { w.close(); res("sent"); }, 1500);
+      };
+      w.onerror = () => res("error");
+      setTimeout(() => res("timeout"), 8000);
+    })
+  `);
+  await sleep(1500);
+
+  const running = async () => {
+    const out = await new Deno.Command("ps", { args: ["-Ao", "args="], stdout: "piped" }).output();
+    return new TextDecoder().decode(out.stdout).split("\n").filter((l) => l.includes(marker)).length;
+  };
+  // Asserts the setup state it later negates: without this, a child that never
+  // started would make the assertion below pass for the wrong reason.
+  ok((await running()) > 0, "the HUP-ignoring child is running before the close");
+
+  // Revert-checked: with the two `kill_sessions(proc_root, &targets)` calls
+  // removed from `kill_and_unlink_with` and both `session_or_socket_alive`
+  // calls replaced by `socket_has_process_with(sock_path, snapshot_fn)`, this
+  // section fails — "FAIL  no HUP-ignoring child survived the close: 1 left"
+  // — while every other section (A-F) still passes. Restored via `cp` from a
+  // backup, never `git checkout`.
+  await g.evalIn(`send({ t: "CloseProject" })`);
+  // The `ended` count is the number roost tells the user, and per the design
+  // spec "the `ended` number is half the defect" — the old confirmation used
+  // to call this session ended (the master died) while the HUP-ignoring
+  // child above was still running, which would have reported it here too.
+  // Read the banner `app.js`'s `ProjectClosed` handler renders
+  // (`showBanner(ev.ended + " terminal session(s) ended")`), not merely that
+  // one appeared: a presence-only check passes for any count, the same
+  // vacuous shape this branch's own plan already produced twice.
+  ok(
+    await until(() => g.evalIn(`!!document.querySelector(".error-banner")`), 30, "the close banner"),
+    "Close Project shows a banner reporting how many sessions ended"
+  );
+  const closedBanner = await g.evalIn(`(document.querySelector(".error-banner") || {}).textContent || ""`);
+  ok(
+    closedBanner.includes("1 terminal session(s) ended"),
+    `banner reports exactly the one session this section created: ${JSON.stringify(closedBanner)}`
+  );
+  await sleep(4000);
+  ok((await running()) === 0, `no HUP-ignoring child survived the close: ${await running()} left`);
+  ok((await sockets()).length === 0, `and no socket was left behind: ${JSON.stringify(await sockets())}`);
+  try { g.close(); } catch { /* already gone */ }
 } finally {
   try { ws?.close(); } catch { /* already gone */ }
   try { after?.close(); } catch { /* already gone */ }
