@@ -47,6 +47,32 @@ pub fn session_of(proc_root: &Path, pid: u32) -> Sid {
     }
 }
 
+/// Every pid in `sid`'s session, or `None` when some entry could not be
+/// classified.
+///
+/// `None` is not "empty". This is the function a sweep asks "is the session
+/// gone yet", and the answer gates unlinking a socket and reporting a session
+/// ended — so a `/proc` entry roost could not read has to stop the sweep
+/// concluding, not be skipped past. A pid that vanished between the `read_dir`
+/// and the `stat` is a different matter: `Sid::Gone` is the outcome the sweep
+/// wants, so it is dropped rather than treated as doubt.
+pub fn members_of(proc_root: &Path, sid: u32) -> Option<Vec<u32>> {
+    let rd = std::fs::read_dir(proc_root).ok()?;
+    let mut out = Vec::new();
+    for e in rd.flatten() {
+        // `/proc` holds non-pid entries (`self`, `sys`, `uptime`); they are
+        // not processes and are not doubt either.
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
+        match session_of(proc_root, pid) {
+            Sid::In(s) if s == sid => out.push(pid),
+            Sid::In(_) | Sid::Gone => {}
+            Sid::Unknown => return None,
+        }
+    }
+    out.sort_unstable();
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +130,51 @@ mod tests {
         std::fs::create_dir_all(&p).unwrap();
         std::fs::write(p.join("stat"), "not a stat line at all\n").unwrap();
         assert_eq!(session_of(d.path(), 7), Sid::Unknown);
+    }
+
+    #[test]
+    fn members_of_finds_every_pid_in_the_session_and_no_others() {
+        let d = tempfile::tempdir().unwrap();
+        // The measured shape: a dtach master leading its own session, the shell
+        // leading a second one, and a backgrounded job in the shell's session but
+        // in a process group of its own — which is what makes the process group
+        // the wrong unit and the session the right one.
+        stat(d.path(), 1601266, "dtach", 1, 1601266, 1601266);
+        stat(d.path(), 1601267, "bash", 1601266, 1601267, 1601267);
+        stat(d.path(), 1601290, "claude", 1601267, 1601290, 1601267);
+        stat(d.path(), 999, "unrelated", 1, 999, 999);
+        assert_eq!(members_of(d.path(), 1601267), Some(vec![1601267, 1601290]));
+        // Asserted explicitly: an empty session and an undeterminable one are
+        // different answers, and only this one means "nothing left".
+        assert_eq!(members_of(d.path(), 555), Some(vec![]));
+    }
+
+    // Revert-checked: changing `Sid::Unknown => return None` to `Sid::Unknown
+    // => {}` makes this fail — test panicked at src/procsess.rs:164:9:
+    // assertion `left == right` failed
+    //   left: Some([100])
+    //  right: None
+    #[test]
+    fn one_unreadable_entry_makes_the_whole_membership_unknown() {
+        // A sweep uses this to decide it is finished. If an entry roost could not
+        // classify were skipped, an unreadable survivor would read as an empty
+        // session — the socket would be unlinked and the session reported ended
+        // while the shell was still running.
+        let d = tempfile::tempdir().unwrap();
+        stat(d.path(), 100, "bash", 1, 100, 100);
+        let p = d.path().join("101");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("stat"), "garbage\n").unwrap();
+        assert_eq!(members_of(d.path(), 100), None);
+    }
+
+    #[test]
+    fn a_non_pid_directory_entry_is_skipped_not_fatal() {
+        // /proc really contains these: `self`, `thread-self`, `sys`, `net`.
+        let d = tempfile::tempdir().unwrap();
+        stat(d.path(), 100, "bash", 1, 100, 100);
+        std::fs::create_dir_all(d.path().join("self")).unwrap();
+        std::fs::write(d.path().join("uptime"), "1 2\n").unwrap();
+        assert_eq!(members_of(d.path(), 100), Some(vec![100]));
     }
 }
