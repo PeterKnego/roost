@@ -475,7 +475,11 @@ enum Choice {
 /// never observed — so it is not named here. A matching port and an
 /// unreadable one collapse to the same sentence: both mean "a Claude is
 /// there, but not connected right now," and roost has no more specific action
-/// to suggest either way.
+/// to suggest either way. Calling a port "stale" requires a live one to be
+/// stale against — `live_port == None` (no listener at all: the kill switch
+/// is off, or the listener failed to build) must not take this branch, since
+/// "start a new terminal" is not a repair when there is nothing to connect
+/// to either.
 pub(crate) fn no_connection_message(
     session: Option<&str>,
     scan_port: Option<Option<u16>>,
@@ -489,13 +493,14 @@ pub(crate) fn no_connection_message(
         (Some(t), Some(_)) => t,
         _ => return "no Claude is connected to this project".into(),
     };
-    match scan_port {
-        Some(Some(p)) if live_port != Some(p) => {
-            let live = live_port.map(|v| v.to_string()).unwrap_or_else(|| "none".into());
-            format!(
-                "Claude in \"{term}\" predates this roost (it has port {p}, this roost is on {live}) and cannot reconnect on its own — start a new terminal, or restart claude in that one"
-            )
-        }
+    match (scan_port, live_port) {
+        // Binding `live` here (rather than testing `live_port.is_some_and`
+        // and re-unwrapping) keeps this branch panic-free without an
+        // `expect`: the match itself is the only place that knows `live` is
+        // present.
+        (Some(Some(p)), Some(live)) if live != p => format!(
+            "Claude in \"{term}\" predates this roost (it has port {p}, this roost is on {live}) and cannot reconnect on its own — start a new terminal, or restart claude in that one"
+        ),
         _ => format!("Claude is running in \"{term}\" but is not connected to roost"),
     }
 }
@@ -2465,7 +2470,9 @@ mod tests {
     // Revert-checked: making `no_connection_message` return the old single
     // sentence in every case (unconditionally, ignoring all three
     // parameters) failed the four-case test below, on
-    // `assert!(m.contains("predates this roost"), "got: {m}")`, with
+    // `assert!(m.contains("term1") && m.contains("41011") && m.contains("46793"), "got: {m}")`
+    // — the first assert in that group, which short-circuits before the
+    // later `predates this roost` assert ever runs — with
     // `got: no Claude is connected to this project`. That is exactly what a
     // user with an outlived-roost Claude saw before this change: true, and
     // unactionable. The pinned test right after it did NOT fail — the
@@ -2492,6 +2499,21 @@ mod tests {
         assert_eq!(same, unknown, "roost cannot tell these apart in a way the user could act on");
         assert!(same.contains("is not connected to roost"), "got: {same}");
         assert!(!same.contains("predates"), "a matching port is not a stale one: {same}");
+
+        // Fifth case, not in the spec's table but reachable: no live listener
+        // at all (kill switch off, or the listener failed to build) while
+        // `/proc` still shows a Claude with a port. "Stale" needs a live port
+        // to be stale against — with none, this must fall to the generic
+        // sentence, not claim a mismatch nothing can be compared to.
+        let no_listener = no_connection_message(Some("term1"), Some(Some(41011)), None);
+        assert!(
+            no_listener.contains("is not connected to roost"),
+            "got: {no_listener}"
+        );
+        assert!(
+            !no_listener.contains("predates"),
+            "no live port means nothing to call this port stale against: {no_listener}"
+        );
     }
 
     #[test]
