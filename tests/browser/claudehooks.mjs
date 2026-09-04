@@ -45,6 +45,19 @@ const wire = (page) => {
   const { evalIn } = page;
   const ready = () => until(() => evalIn("ctrl && ctrl.readyState === 1 && !!state"), 30, "app");
   const mark = () => evalIn(`document.getElementById("bell").dataset.claudeHooks`);
+  // What the CSS actually paints for that attribute: the ::after glyph, its
+  // strike, and its colour against the theme's own variables. `mark()` alone
+  // passes with the stylesheet deleted (README trap: asserting the attribute
+  // and calling it the picture). Revert-check 2026-09-04: with the previous
+  // rules, where on drew nothing, the "on draws an accent ✻" assertion fails
+  // with content "none".
+  const drawn = () => evalIn(`(() => {
+    const b = document.getElementById("bell");
+    const cs = getComputedStyle(b, "::after");
+    const root = getComputedStyle(document.documentElement);
+    const probe = (v) => { const e = document.createElement("i"); e.style.color = "var(" + v + ")"; document.body.appendChild(e); const c = getComputedStyle(e).color; e.remove(); return c; };
+    return { content: cs.content, struck: /line-through/.test(cs.textDecorationLine || cs.textDecoration), color: cs.color, accent: probe("--accent"), muted: probe("--muted"), warn: probe("--warn") };
+  })()`);
   const openPanel = async () => {
     await evalIn(`document.getElementById("noticepanel").hidden = true`);
     await evalIn(`document.getElementById("bell").click()`);
@@ -57,7 +70,7 @@ const wire = (page) => {
   const clickButton = () => evalIn(`(() => { const b = document.querySelector("#noticepanel .hookrow button"); if (!b) return false; b.click(); return true; })()`);
   const confirmYes = () => evalIn(`(() => { const b = [...document.querySelectorAll("#noticepanel .hookrow .confirm button")].find((x) => /^(Enable|Disable)$/.test(x.textContent)); if (!b) return false; b.click(); return true; })()`);
   const confirmText = () => evalIn(`(document.querySelector("#noticepanel .hookrow .confirm") || {}).textContent || ""`);
-  return { evalIn, ready, mark, openPanel, rowText, buttonText, clickButton, confirmYes, confirmText, close: page.close };
+  return { evalIn, ready, mark, drawn, openPanel, rowText, buttonText, clickButton, confirmYes, confirmText, close: page.close };
 };
 
 let one, two;
@@ -67,6 +80,10 @@ try {
   ok(await one.ready() && await two.ready(), "two pages are up on the same project");
 
   ok(await one.mark() === "off", "the bell is marked off before enabling");
+  {
+    const d = await one.drawn();
+    ok(d.content === '"✻"' && d.struck && d.color === d.muted, `off draws a struck muted ✻ (${JSON.stringify(d)})`);
+  }
   await one.openPanel();
   ok(/Claude notifications for this project: off/.test(await one.rowText()), "the panel's first row says off");
   ok(await one.buttonText() === "Enable", "and offers Enable");
@@ -96,6 +113,10 @@ try {
   ok(written, "the settings file now holds both events");
   ok(await until(() => one.mark().then((m) => m === "on"), 5, "mark on"), "the clicking browser's bell is unmarked (on)");
   ok(await until(() => two.mark().then((m) => m === "on"), 5, "mirror"), "the other browser's bell followed");
+  {
+    const d = await one.drawn();
+    ok(d.content === '"✻"' && !d.struck && d.color === d.accent, `on draws an accent ✻, not struck (${JSON.stringify(d)})`);
+  }
 
   // `two`'s panel was opened above, before `one` ever confirmed, and is
   // still open now — no reopen here either.
@@ -117,6 +138,10 @@ try {
   await Deno.writeTextFile(settings, "{ broken");
   await one.evalIn(`send({ t: "RequestState" })`);
   ok(await until(() => one.mark().then((m) => m === "unknown"), 5, "unknown"), "an unparseable file marks the bell unknown");
+  {
+    const d = await one.drawn();
+    ok(d.content === '"?"' && !d.struck && d.color === d.warn, `unknown draws a warn ? (${JSON.stringify(d)})`);
+  }
   await one.openPanel();
   ok(/cannot tell/.test(await one.rowText()), "the row says it cannot tell");
   ok(await one.buttonText() === "", "and offers no button");

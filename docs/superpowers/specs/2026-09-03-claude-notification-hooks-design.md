@@ -193,9 +193,12 @@ shares. `timeout` is 5 seconds: the command writes one escape sequence.
 ### 4. UI
 
 - **The mark.** The bell gets a `data-claude-hooks` attribute of `on`,
-  `off` or `unknown`, and CSS draws a small mark on the bell for `off` (a
-  struck ✻) and `unknown` (a ?). `on` draws nothing; enabled is the quiet
-  state. The existing unread badge is unaffected.
+  `off` or `unknown`, and CSS draws a small mark on the bell for each: an
+  accent ✻ for `on`, a struck grey ✻ for `off`, a ? for `unknown`. (`on`
+  originally drew nothing as "the quiet state"; amended 2026-09-04, because
+  nothing cannot be told apart from a mark that failed to render, and the
+  user asked to see enabled as well as disabled.) The existing unread badge
+  is unaffected.
 - **The row.** The notice panel's first row reads "Claude notifications for
   this project: on" or "… off" with one button, Disable or Enable. Clicking
   Enable swaps the row for a one-line confirmation, "Write two hooks to

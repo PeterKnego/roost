@@ -633,13 +633,16 @@ ul.picker li .git:hover { text-decoration: underline; }
 .pickerbar button:disabled { opacity: .4; cursor: not-allowed; }
 /* ---- notification centre ---- */
 #bell { position: relative; }
-/* The Claude-hooks mark. On is the quiet state and draws nothing. */
-#bell[data-claude-hooks="off"]::after,
-#bell[data-claude-hooks="unknown"]::after {
+/* The Claude-hooks mark: the ✻ tabs wear for a running Claude, so the glyph
+   means "Claude" everywhere in the header. Accent = on, struck grey = off,
+   "?" = the settings file could not be read. On used to draw nothing, and
+   "nothing" cannot be told apart from a mark that failed to render. */
+#bell[data-claude-hooks]::after {
   content: "✻"; position: absolute; right: 2px; bottom: 0; font-size: 9px; line-height: 1;
-  color: var(--muted); text-decoration: line-through;
+  color: var(--accent);
 }
-#bell[data-claude-hooks="unknown"]::after { content: "?"; text-decoration: none; color: var(--warn); }
+#bell[data-claude-hooks="off"]::after { color: var(--muted); text-decoration: line-through; }
+#bell[data-claude-hooks="unknown"]::after { content: "?"; color: var(--warn); }
 #noticepanel .hookrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 8px; border-bottom: 1px solid var(--border); color: var(--fg); }
 #noticepanel .hookrow .confirm { display: flex; gap: 6px; align-items: center; }
 #bellcount:not(:empty) {
