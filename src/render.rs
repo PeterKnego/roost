@@ -1545,7 +1545,7 @@ pub fn overview_sessions(sel: &str, rows: &[OvSession]) -> String {
 // conventional toothed cog, not a stylised stand-in"). None of these are
 // interpolated into; anything dynamic stays in the surrounding markup and
 // goes through esc/percent_encode as ever.
-// The owl from docs/img/roost-logo.svg, inlined so it takes the header's
+// The owl from docs/img/logo.svg, inlined so it takes the header's
 // accent colour like the diamond it replaced; `static/logo.svg` is the same
 // drawing in the brand blue for the favicon, where there is no CSS to
 // inherit from. 14:12 drawn at 16px tall is 19px wide, not 16.
