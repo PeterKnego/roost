@@ -64,7 +64,7 @@ macOS is used daily; Windows is untested.
 Every tab represents project/worktree, and has panes in familiar IDE-like arrangemet: file-tree, file-diffs, file priview/editor, terminal.
 
 ### Terminals that survive reload/re-attach/restart
-Each terminal is a PTY owned by `roost` and wrapped in `dtach`, so sessions survive a tab relad, network disconnect, laptop sleep, and even a `roost` restart. 
+Each terminal is a PTY owned by `roost` and wrapped in `dtach`, so sessions survive a tab reload, network disconnect, laptop sleep, and even a `roost` restart. 
 
 ### All state lives on the server and mirrors live
 Open a file in one browser and it opens in every connected browser. Layout and unsaved buffers persist across restarts, stored outside the repo — so pane drags never show up in `git status`.
