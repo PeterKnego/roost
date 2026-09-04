@@ -73,6 +73,78 @@ pub fn members_of(proc_root: &Path, sid: u32) -> Option<Vec<u32>> {
     Some(out)
 }
 
+/// A pid's direct children, or `None` when the list could not be read.
+///
+/// `None` covers a kernel built without `CONFIG_PROC_CHILDREN` as well as a
+/// process that exited. Both mean roost cannot see what this holder was
+/// parenting, which is not the same as it having parented nothing — and the
+/// caller must not proceed to kill on that.
+pub fn children_of(proc_root: &Path, pid: u32) -> Option<Vec<u32>> {
+    let p = proc_root.join(pid.to_string()).join("task").join(pid.to_string()).join("children");
+    let raw = std::fs::read_to_string(p).ok()?;
+    Some(raw.split_whitespace().filter_map(|w| w.parse().ok()).collect())
+}
+
+/// The sessions to sweep for a set of socket holders, or `None` when they
+/// could not be determined.
+///
+/// **Must be called before the holders are killed.** Once a dtach master dies
+/// its children reparent to init and the `children` file this reads is gone;
+/// deriving the target afterwards is deriving it from nothing.
+///
+/// A target is a holder's direct child that *leads its own session* — dtach
+/// `setsid`s the slave side, so the shell is a session leader in a session the
+/// master is not in. An ordinary child (same session as its parent) is not the
+/// slave side and is left alone. roost's own attach clients have no children
+/// at all and so contribute nothing, which is why they need no special case
+/// even though `pids_holding` returns them.
+///
+/// `own_sid` is roost's own session. `None` means roost could not establish
+/// it, and then there is no target this function is willing to name: it cannot
+/// promise the sweep would not kill the server answering the click.
+pub fn target_sessions(
+    proc_root: &Path,
+    holders: &[u32],
+    own_sid: Option<u32>,
+) -> Option<Vec<u32>> {
+    // Nothing held the socket, so there is nothing to derive and nothing this
+    // function could name to kill. Checked before `own_sid`, because refusing
+    // the vacuous case would make every kill fail whenever roost could not
+    // read its own `/proc` entry — including the ordinary "the session was
+    // already gone" path, which must stay a success.
+    if holders.is_empty() {
+        return Some(Vec::new());
+    }
+    let own = own_sid?;
+    let mut out = Vec::new();
+    for holder in holders {
+        let holder_sid = match session_of(proc_root, *holder) {
+            Sid::In(s) => s,
+            // Died between the snapshot and now: nothing to derive, and not a
+            // reason to abandon the other holders.
+            Sid::Gone => continue,
+            Sid::Unknown => return None,
+        };
+        let Some(kids) = children_of(proc_root, *holder) else { return None };
+        for kid in kids {
+            match session_of(proc_root, kid) {
+                Sid::In(s)
+                    // A session leader (`s == kid`), in a session that is
+                    // neither the holder's nor ours, and not init's.
+                    if s == kid && s != holder_sid && s != own && s > 1 =>
+                {
+                    out.push(s)
+                }
+                Sid::In(_) | Sid::Gone => {}
+                Sid::Unknown => return None,
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +248,122 @@ mod tests {
         std::fs::create_dir_all(d.path().join("self")).unwrap();
         std::fs::write(d.path().join("uptime"), "1 2\n").unwrap();
         assert_eq!(members_of(d.path(), 100), Some(vec![100]));
+    }
+
+    /// Writes a fake `/proc/<pid>/task/<pid>/children`.
+    fn children(dir: &Path, pid: u32, kids: &[u32]) {
+        let p = dir.join(pid.to_string()).join("task").join(pid.to_string());
+        std::fs::create_dir_all(&p).unwrap();
+        let list: Vec<String> = kids.iter().map(|k| k.to_string()).collect();
+        std::fs::write(p.join("children"), format!("{} ", list.join(" "))).unwrap();
+    }
+
+    #[test]
+    fn a_master_contributes_its_shells_session_and_a_client_contributes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        // Measured shape: master 1601266 -> shell 1601267 (its own session);
+        // roost's attach client 134273 for the same socket, with no children.
+        stat(d.path(), 1601266, "dtach", 1, 1601266, 1601266);
+        children(d.path(), 1601266, &[1601267]);
+        stat(d.path(), 1601267, "bash", 1601266, 1601267, 1601267);
+        children(d.path(), 1601267, &[]);
+        stat(d.path(), 134273, "dtach", 134227, 134273, 134227);
+        children(d.path(), 134273, &[]);
+        assert_eq!(
+            target_sessions(d.path(), &[1601266, 134273], Some(134227)),
+            Some(vec![1601267])
+        );
+    }
+
+    // Revert-checked: dropping `&& s != own` from the match guard makes this
+    // fail — test panicked at src/procsess.rs:292:9: assertion `left ==
+    // right` failed
+    //   left: Some([501])
+    //  right: Some([])
+    #[test]
+    fn roosts_own_session_is_never_a_target() {
+        // The guard that matters most: roost is itself a process with children,
+        // and a mis-derivation here would have it kill the server answering the
+        // click.
+        let d = tempfile::tempdir().unwrap();
+        stat(d.path(), 500, "dtach", 1, 500, 500);
+        children(d.path(), 500, &[501]);
+        stat(d.path(), 501, "bash", 500, 501, 501);
+        assert_eq!(target_sessions(d.path(), &[500], Some(501)), Some(vec![]));
+    }
+
+    #[test]
+    fn init_and_pid_zero_are_never_targets() {
+        let d = tempfile::tempdir().unwrap();
+        stat(d.path(), 500, "dtach", 1, 500, 500);
+        children(d.path(), 500, &[1]);
+        stat(d.path(), 1, "systemd", 0, 1, 1);
+        assert_eq!(target_sessions(d.path(), &[500], Some(999)), Some(vec![]));
+    }
+
+    #[test]
+    fn a_child_that_is_not_a_session_leader_is_not_a_target() {
+        // Only the slave side leads its own session. An ordinary child shares its
+        // parent's session and killing that session would be killing the holder's,
+        // which is a different and much wider thing.
+        let d = tempfile::tempdir().unwrap();
+        stat(d.path(), 500, "dtach", 1, 500, 500);
+        children(d.path(), 500, &[502]);
+        stat(d.path(), 502, "helper", 500, 500, 500);
+        assert_eq!(target_sessions(d.path(), &[500], Some(999)), Some(vec![]));
+    }
+
+    // Revert-checked: changing `let own = own_sid?;` to `let own =
+    // own_sid.unwrap_or(0);` makes this fail — test panicked at
+    // src/procsess.rs:329:9: assertion `left == right` failed
+    //   left: Some([501])
+    //  right: None
+    #[test]
+    fn an_unknown_own_session_refuses_every_target() {
+        // Without knowing which session is ours we cannot promise not to kill it,
+        // and the safe direction is to do nothing and report it.
+        let d = tempfile::tempdir().unwrap();
+        stat(d.path(), 500, "dtach", 1, 500, 500);
+        children(d.path(), 500, &[501]);
+        stat(d.path(), 501, "bash", 500, 501, 501);
+        assert_eq!(target_sessions(d.path(), &[500], None), None);
+    }
+
+    #[test]
+    fn an_unreadable_child_makes_the_whole_derivation_unknown() {
+        let d = tempfile::tempdir().unwrap();
+        stat(d.path(), 500, "dtach", 1, 500, 500);
+        children(d.path(), 500, &[501]);
+        let p = d.path().join("501");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("stat"), "garbage\n").unwrap();
+        assert_eq!(target_sessions(d.path(), &[500], Some(999)), None);
+    }
+
+    #[test]
+    fn no_holders_is_no_targets_even_with_an_unknown_own_session() {
+        // The vacuous case must stay a success: `kill_and_unlink` reaches here for
+        // a socket nothing holds, and refusing it would turn "already gone" into
+        // "could not determine" and leave the socket behind forever.
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(target_sessions(d.path(), &[], None), Some(vec![]));
+    }
+
+    #[test]
+    fn a_holder_that_already_exited_is_skipped_not_doubt() {
+        // The snapshot is a moment old; a holder that died on its own in between
+        // has achieved what was wanted and must not stall the sweep.
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(target_sessions(d.path(), &[404], Some(999)), Some(vec![]));
+    }
+
+    #[test]
+    fn a_missing_children_file_is_unknown_not_childless() {
+        // Some kernels build without CONFIG_PROC_CHILDREN. "No file" there means
+        // roost cannot see the shell at all, not that there is no shell.
+        let d = tempfile::tempdir().unwrap();
+        stat(d.path(), 500, "dtach", 1, 500, 500);
+        assert_eq!(children_of(d.path(), 500), None);
+        assert_eq!(target_sessions(d.path(), &[500], Some(999)), None);
     }
 }
