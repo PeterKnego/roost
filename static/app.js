@@ -2340,9 +2340,18 @@ async function closeTab(pi, ti, t, detach) {
     // The `< 0` branch is the point: not finding the tab is "I cannot tell",
     // never "close index ti anyway".
     //
-    // Revert-check (CLAUDE.md): replacing this re-resolution with the stale
-    // `send({ t: "CloseTab", pane: pi, idx: ti })` and running closetab.mjs
-    // produced, verbatim:
+    // This narrows the race, it does not close it: another client can still
+    // renumber the strip between this findIndex and the moment the server
+    // applies the CloseTab frame, because CloseTab is positional on the
+    // wire and nothing on the client can make "resolve, then send" atomic
+    // with the server's view. What the re-resolution buys is shrinking the
+    // exposure from "the whole time the dialog is open" (human-scale, the
+    // original bug) down to one network round trip. Closing it for real
+    // would need CloseTab to address a tab by identity, not position.
+    //
+    // Revert-check (CLAUDE.md), scenarios 1 and 2 (replacing this whole
+    // re-resolution with the stale `send({ t: "CloseTab", pane: pi, idx: ti
+    // })`) produced, verbatim:
     //   ok    scenario 1: three file tabs, in order
     //   ok    the dirty-close dialog opened
     //   ok    scenario 1: the strip moved while the dialog was open
@@ -2364,11 +2373,30 @@ async function closeTab(pi, ti, t, detach) {
     // leaving ["b.txt","c.txt"] where the fix leaves ["b.txt","d.txt"] --
     // under revert the tab the user actually clicked (c.txt) survived, and a
     // different, valid tab (d.txt) was silently closed instead, with no
-    // error shown. That is the real failure mode this fix closes: an index
-    // gathered before the wait no longer names the tab it did, and some
-    // other tab pays for it.
+    // error shown.
     const ti2 = state.panes[pi].tabs.findIndex((x) => x.k === "File" && x.rel === t.rel);
-    if (ti2 < 0) { showError(`${t.rel} is no longer open`); return; }
+    // Scenarios 1 and 2 never make ti2 negative -- their re-resolution
+    // always finds something, so this branch had no coverage until scenario
+    // 3, where the OTHER client closes c.txt itself (the tab under the
+    // dialog, not a neighbor). Revert-check for this branch specifically
+    // (replacing the line below with the stale fallback
+    // `send({ t: "CloseTab", pane: pi, idx: ti2 < 0 ? ti : ti2 })`) left
+    // scenarios 1 and 2 passing (ti2 was never negative for them) and
+    // produced, verbatim, for scenario 3:
+    //   ok    scenario 3: four file tabs, in order
+    //   ok    scenario 3: the dirty-close dialog opened
+    //   ok    scenario 3: the strip moved while the dialog was open
+    //   FAIL  scenario 3: re-resolution found nothing (c.txt was already gone), so nothing else was closed in its place
+    //   FAIL (1)
+    // The actual tab list at that assertion was ["a.txt","b.txt"] against an
+    // expected ["a.txt","b.txt","d.txt"]: c.txt's original slot (2) was
+    // reoccupied by d.txt once c.txt closed (a=0, b=1, d=2), and the stale
+    // fallback closed d.txt -- a tab nobody asked to close, silently, with
+    // no error -- instead of doing nothing. `rel` also does not disambiguate
+    // MoveTab from an actual close: `ti2 < 0` means "not in this pane
+    // anymore", which is also true of a tab moved to another pane, so the
+    // message below says only that, not that the tab is closed.
+    if (ti2 < 0) { showError(`${t.rel} is no longer in this pane`); return; }
     send({ t: "CloseTab", pane: pi, idx: ti2 });
     return;
   }
@@ -2378,6 +2406,16 @@ async function closeTab(pi, ti, t, detach) {
               "This kills the shell and anything running in it."],
       confirm: "End session", danger: true });
     if (!yes) return;
+    // This has its own, smaller staleness window: EndSession is addressed by
+    // NAME, not position, so a tab-strip reshuffle while the dialog was open
+    // does not misdirect it the way a stale index would. But names are freed
+    // and reused once a session ends (a scratch run for this task hit
+    // `session2 = term1` for exactly that reason), so if THIS session ends
+    // and a new session picks up the same name while the dialog is still
+    // open, confirming ends a shell the user never saw the name of. There is
+    // no cheap client-side fix -- the server would need to hand out an
+    // identity that outlives name reuse -- so this is a known, accepted
+    // residual, not something patched here.
     send({ t: "EndSession", session: t.session });
     return;
   }
