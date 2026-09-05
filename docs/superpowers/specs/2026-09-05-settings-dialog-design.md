@@ -48,11 +48,11 @@ value and the sentence "edit `~/.config/roost/config.toml`". There is no
 intent that can write them, not a disabled control: the allowlist in the hub
 (below) does not contain them, so a forged intent is refused too.
 
-**`default_tab` is excluded.** `config.rs` reads it and `render.rs` embeds it
-as `data-default-tab`, but nothing in `app.js` reads that attribute: the key
-does nothing. A settings dialog that offers a control with no effect is a
-visible defect. It stays out until it either does something or is removed,
-which is a separate change.
+**`default_tab` is gone.** It was a v2 setting (which single view a project
+opened in) that the four-pane client never read; `config.rs` and `render.rs`
+carried it anyway. Removed on 2026-09-05 (commit `1fd6a6d`), before this
+dialog, so it never has to be explained as a control that does nothing. Old
+files that still set it load silently.
 
 ## The write
 
@@ -259,5 +259,4 @@ it is trusted, per `tests/browser/README.md`.
 - Custom theme creation or editing; the user-directory theme files stay a
   by-hand feature.
 - Per-theme favicons, the overview page's fixed theme.
-- Reviving or removing `default_tab`.
 - Any change to the notice panel's hook row.
