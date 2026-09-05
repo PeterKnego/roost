@@ -245,7 +245,17 @@ export async function startRoost({ repoRoot, stateDir, roots, port, extraEnv = {
   const wait = () => until(async () => {
     try { return (await fetch(`http://127.0.0.1:${port}/`)).status === 200; } catch { return false; }
   }, 30, "roost to listen");
-  if (!await wait()) throw new Error("roost never started listening");
+  if (!await wait()) {
+    // Kill before throwing: the child is alive (it is what we were waiting
+    // for), and nothing else holds a handle to it — the caller never gets
+    // the `close` below. This was the harness's own leak: a roost that came
+    // up but never answered on this port outlived the run that abandoned
+    // it, and every later run's `fixture.cleanup` looks only for dtach
+    // masters under its own state dir, never for a stray server.
+    try { proc.kill("SIGKILL"); } catch {}
+    await proc.status;
+    throw new Error("roost never started listening");
+  }
 
   return {
     port,
