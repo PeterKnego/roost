@@ -2970,10 +2970,15 @@ mod tests {
             &h[head..tail]
         );
         let ov = h.find("id=\"searchoverlay\"").expect("the overlay");
-        // Bounded to the overlay's own markup, not the rest of the page: the
-        // dialog shells that now follow #searchoverlay legitimately carry an
-        // `<input>` of their own (`#dlg-input`), which is a different field
-        // for a different purpose, not a second search box.
+        // Bounded to the overlay's own markup, not the rest of the page. This
+        // used to scan `h[ov..]` to the end of the document, which broke the
+        // day the dialog shells landed right after #searchoverlay: `#dlg-text`
+        // legitimately carries its own `<input id="dlg-input">`, a different
+        // field for a different purpose, not a second search box. Widening
+        // this back to "no <input> anywhere after the overlay" will fail again
+        // the next time an unrelated <input> is added anywhere later in the
+        // page — narrow it to what the assertion message actually claims
+        // (the overlay itself), not back to the whole tail of the document.
         let ov_end = ov + h[ov..].find("  </div>\n</div>").expect("overlay closes") + "  </div>\n</div>".len();
         assert!(
             !h[ov..ov_end].contains("<input"),

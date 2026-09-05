@@ -41,22 +41,25 @@ function runDialog(el, fill, dismissed) {
       // Explicit rather than trusting the browser's own focus restoration:
       // roost's terminals are pooled DOM nodes moved between panes with
       // appendChild, and how showModal() interacts with a focused xterm is not
-      // something to assume. tests/browser/dialogs.mjs asserts this.
+      // something to assume. tests/browser/dialogs.mjs's assertion E does NOT
+      // cover this — it only proves the platform restores focus for a plain,
+      // still-attached button (see the comment on that assertion). This line
+      // is kept as insurance for the pooled-xterm case specifically: no
+      // automated test here exercises it (it needs a live dtach session), and
+      // it is checked by hand instead, in a later task. Do not remove this
+      // line on the strength of the revert-check below — that check does not
+      // reach the case the line is for.
       //
       // Revert-check (2026-09-05): commenting out the next line did NOT make
       // assertion E — or any assertion — fail; `deno run -A
       // tests/browser/dialogs.mjs` still printed 14/14 ok and PASS. A
       // standalone probe (bare `<dialog>`, no app code: focus a button,
-      // showModal(), close(), read document.activeElement) showed why:
+      // showModal(), close(), read document.activeElement) confirmed why:
       // Chromium's own <dialog> already restores focus to the element that
       // was focused before showModal() was called, with no JS involved at
-      // all. This line is redundant for a plain, still-attached element like
-      // #closeproj, which is all dialogs.mjs's assertion E exercises — so
-      // that assertion cannot discriminate for this line as written. The
-      // call stays for the case the first comment above names — an xterm
-      // node that was appendChild'd to a different pane while the dialog was
-      // open — which is untested here and where the native mechanism's
-      // behaviour was not verified.
+      // all, for a plain still-attached element like #closeproj. That is the
+      // only case dialogs.mjs exercises, so it cannot discriminate for this
+      // line as written.
       try { if (restore && restore.focus) restore.focus(); } catch { /* gone */ }
       resolve(v);
     };

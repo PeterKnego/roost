@@ -73,13 +73,27 @@ try {
   await evalIn(`document.querySelector("#dlg-confirm .dlg-cancel").click(); 0`);
   await until(async () => (await evalIn("window.__r")) === false, 5, "blocked cancel");
 
-  // E: focus returns to the exact element that had it.
+  // E: focus returns to the exact element that had it, for a plain button.
+  //
+  // This proves the platform behaviour roost's `runDialog` depends on
+  // (Chromium's own <dialog>.close() restores focus to the pre-showModal()
+  // element) — it does NOT prove that dialog.js's own `restore.focus()` call
+  // in `runDialog` does anything. Verified by reverting: commenting out that
+  // line and re-running this file still printed every `ok` including this
+  // one, because Chromium restores focus to a plain, still-attached element
+  // like #closeproj on its own, with no application code involved (confirmed
+  // separately with a bare `<dialog>` and no dialog.js at all). Keep the line
+  // in dialog.js anyway — it exists for roost's terminals, which are pooled
+  // DOM nodes moved between panes with appendChild, a case this assertion
+  // does not exercise and where the native restoration's behaviour is
+  // unverified. That case is a by-hand check in a later task, not an
+  // automated one here, because it needs a real dtach session.
   await evalIn(`document.getElementById("closeproj").focus();
      window.__r = null; askConfirm({ title: "T" }).then((v) => { window.__r = v; }); 0`);
   await evalIn(`document.querySelector("#dlg-confirm .dlg-cancel").click(); 0`);
   await until(async () => (await evalIn("window.__r")) === false, 5, "focus case");
   ok(await evalIn(`document.activeElement === document.getElementById("closeproj")`),
-     "focus returns to the element that had it, not merely to something");
+     "focus returns to the element that had it after the dialog closes (platform behaviour; does not by itself prove dialog.js's restore.focus() call does anything — see comment above)");
 
   // F: a value that would be markup if it were ever interpolated.
   await evalIn(`window.__r = null;
