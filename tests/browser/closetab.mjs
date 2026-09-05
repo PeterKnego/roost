@@ -81,9 +81,21 @@ try {
   // behind. Uses `until` per step rather than a fixed sleep: this fails
   // loudly on a genuine timeout instead of guessing a delay that happens to
   // work today. See the header comment for the false-PASS this replaced.
+  //
+  // Bounded at 10 attempts: an unbounded `while (n > 0)` here would only ever
+  // fail via each inner `until`'s own timeout-and-print, with nothing to stop
+  // the outer loop if a tab genuinely never closes -- turning a real failure
+  // to clear the pane into a hang rather than a failure, which is worse on
+  // this project's own terms (CLAUDE.md: a deadlock hangs rather than fails).
+  // This suite already flakes under contention, so a fixed cap that fails
+  // loudly, per its own doc comment, is not optional here.
   const clearPane = async (label) => {
     let n = JSON.parse(await tabs()).length;
-    while (n > 0) {
+    for (let attempt = 0; n > 0; attempt++) {
+      if (attempt >= 10) {
+        ok(false, `pane failed to clear after 10 attempts before ${label} (${n} tab(s) remain)`);
+        return;
+      }
       await evalIn(`send({ t: "CloseTab", pane: 2, idx: state.panes[2].tabs.findIndex((t) => t.k === "File") }); 0`);
       await until(async () => JSON.parse(await tabs()).length < n, 5, `a tab closed while clearing (${label})`);
       n = JSON.parse(await tabs()).length;

@@ -24,6 +24,18 @@ try {
   const evalIn = page.evalIn;
   await until(async () => await evalIn("typeof askConfirm === 'function'"), 10, "dialog.js loaded");
 
+  // Native dialogs are gone from app.js and must stay gone. A grep would
+  // match comments and strings; this fails only if a code path actually calls
+  // one. It cannot be a Rust test — no Rust test reaches static/app.js.
+  //
+  // Deliberately NOT applied in termlinks.mjs: xterm's own OSC 8 fallback
+  // legitimately calls confirm(), and that file asserts on its silence as
+  // positive evidence that roost's linkHandler took the activation instead.
+  await evalIn(`window.__native = [];
+     for (const k of ["confirm", "prompt", "alert"]) {
+       window[k] = (...a) => { window.__native.push([k, ...a]); return null; };
+     } 0`);
+
   // Record every intent, and prove the recorder works before relying on its
   // silence. Without this proof a "cancel sends nothing" assertion passes
   // just as well when send() was never wrapped at all.
@@ -189,6 +201,21 @@ try {
   await page.cmd("Input.dispatchKeyEvent",
     { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
   await until(async () => (await evalIn("window.__r")) === null, 5, "menu edge escape");
+
+  // M: drive each converted entry point once, so the guard above is armed
+  // against real call sites and not only against the primitive.
+  await evalIn(`fileMenu({ preventDefault(){}, clientX: 30, clientY: 30 }, "a.txt"); 0`);
+  ok(await evalIn(`document.getElementById("dlg-menu").open`), "the file menu opens in-page");
+  await evalIn(`document.querySelector("#dlg-menu .dlg-item").click(); 0`);
+  await until(async () => await evalIn(`document.getElementById("dlg-text").open`), 5, "text dialog");
+  await evalIn(`document.querySelector("#dlg-text .dlg-cancel").click(); 0`);
+  await evalIn(`document.getElementById("closeproj").click(); 0`);
+  await until(async () => await evalIn(`document.getElementById("dlg-confirm").open`), 5, "close dialog");
+  ok(true, "Close Project opens in-page");
+  await evalIn(`document.querySelector("#dlg-confirm .dlg-cancel").click(); 0`);
+
+  ok((await evalIn("window.__native.length")) === 0,
+     "no code path in this file reached a native browser dialog");
 } finally {
   try { await page?.close(); } catch { /* already gone */ }
   browser.close();

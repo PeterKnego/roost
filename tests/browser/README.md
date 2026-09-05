@@ -45,6 +45,8 @@ deno run -A tests/browser/closeproject.mjs # Close Project ends the shells *and*
 deno run -A tests/browser/search.mjs     # the search overlay (⇧⌃F), its results, and landing on a line
 deno run -A tests/browser/nonascii.mjs   # the editor's non-ASCII indicator and highlight toggle: count, accent, marks under the glyphs, cap, persistence
 deno run -A tests/browser/notices.mjs    # the bell panel holds only this project's notices, and Clear empties only what it shows
+deno run -A tests/browser/dialogs.mjs    # the dialog primitive: askConfirm/askText/askMenu's exits, focus restoration, and a guard that no code path reaches a native confirm/prompt/alert
+deno run -A tests/browser/closetab.mjs   # closing a dirty file tab: the confirmation must not let the tab strip renumber underneath a stale index
 ```
 
 Each scenario is its own file and its own roost, so they can be run in any
@@ -412,6 +414,34 @@ performed.
   before comparing, since `Math.abs(null - x)` is a real, positive number in
   JS and would otherwise satisfy a bare `> 5` check with no editor mounted
   at all.
+- In `dialogs.mjs`: the file's own native-dialog guard (window.confirm/
+  prompt/alert stubbed to record a call rather than block) was checked by
+  temporarily reverting `fileMenu`'s `delete` branch in `static/app.js` back
+  to a bare `confirm(...)`, and driving it by clicking the file menu's fourth
+  item (delete) instead of the first. That failed the guard's own assertion:
+  `FAIL  no code path in this file reached a native browser dialog`, with
+  every other assertion in the file still passing — a plain `FAIL (1)`, not a
+  crash or a hang, which is what says the guard actually observes a real call
+  site rather than only the stub existing. Restored, the file returns to a
+  clean PASS. This guard is deliberately not applied in `termlinks.mjs`,
+  which stubs `confirm()` for xterm's own OSC 8 fallback and asserts on its
+  silence as positive evidence that roost's `linkHandler`, not xterm's, took
+  the activation — applying this guard there would conflate two different
+  claims about the same primitive.
+- In `closetab.mjs`: `clearPane`'s loop is capped at 10 attempts specifically
+  so a genuine failure to close a tab fails loudly instead of hanging the
+  suite (its own header comment claims this; CLAUDE.md is explicit that a
+  hang is worse than a failure here). Checked by replacing the loop's
+  `send({ t: "CloseTab", ... })` with a no-op, so the pane can never actually
+  empty: the run terminated (it did not hang) with `FAIL  pane failed to
+  clear after 10 attempts before scenario 2 (1 tab(s) remain)`, then the same
+  failure again before scenario 3, then three more assertions failed as a
+  direct consequence (the never-cleared pane contaminates the next scenario's
+  setup) — `FAIL (6)` overall, exit code 1. That is the discriminating
+  behavior: an uncapped version of the same neutering has nothing to stop the
+  outer `while`, so it would spin forever inside `until`'s per-step timeout
+  instead of ever reaching that assertion. Restored, the file returns to a
+  clean PASS.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
