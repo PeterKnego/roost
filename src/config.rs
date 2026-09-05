@@ -496,6 +496,55 @@ pub fn raw_setting(path: &Path, key: &str) -> Option<SettingValue> {
     None
 }
 
+/// Everything the settings dialog renders from. A fresh read of both files:
+/// config is never cached, and this runs once per snapshot, not per
+/// keystroke (only `SetSetting` and the usual layout intents re-snapshot).
+pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
+    use crate::proto::{SettingRow, SettingsView, SettingValue as V};
+    let global = global_config_path();
+    let project = project_dir.join(".roost").join("config.toml");
+    let s = load(&[&global, &project]);
+    let defaults = Settings::default();
+    let raw = |key: &str| (raw_setting(&project, key), raw_setting(&global, key));
+    let mut keys = Vec::new();
+    let mut push = |key: &str, kind: &'static str, effective: V, default: V, reload: bool| {
+        let (p, g) = raw(key);
+        keys.push(SettingRow {
+            key: key.to_string(),
+            kind,
+            writable: writable_in(key).to_vec(),
+            effective,
+            project: p,
+            global: g,
+            default,
+            reload,
+        });
+    };
+    push("theme", "str", V::Str(s.theme.clone()), V::Str(defaults.theme.clone()), false);
+    push("hide", "list", V::List(s.hide.clone()), V::List(vec![]), false);
+    push("show_hidden", "bool", V::Bool(s.show_hidden), V::Bool(false), false);
+    push("autosave", "bool", V::Bool(s.autosave), V::Bool(true), true);
+    push("share_selection", "bool", V::Bool(share_selection()), V::Bool(false), true);
+    push("worktree_prompt", "bool", V::Bool(worktree_prompt()), V::Bool(true), false);
+    push("allowed_origins", "list", V::List(allowed_origins()), V::List(vec![]), false);
+    push("max_upload_bytes", "str", V::Str(max_upload_bytes().to_string()), V::Str(DEFAULT_MAX_UPLOAD.to_string()), false);
+    push("ide", "bool", V::Bool(ide_enabled()), V::Bool(true), false);
+    push(
+        "roots",
+        "list",
+        V::List(configured_roots().iter().map(|p| p.display().to_string()).collect()),
+        V::List(vec![]),
+        false,
+    );
+    SettingsView {
+        keys,
+        themes: crate::themes::catalogue(),
+        project_file: ".roost/config.toml".into(),
+        global_file: global.display().to_string(),
+        warning: s.warning,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,5 +1013,42 @@ mod tests {
         assert_eq!(raw_setting(&p, "max_upload_bytes"), Some(V::Str("5".into())));
         assert_eq!(raw_setting(&p, "show_hidden"), None);
         assert_eq!(raw_setting(&d.path().join("none.toml"), "theme"), None);
+    }
+
+    #[test]
+    fn the_settings_view_reports_effective_project_global_and_default_per_key() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        let global = d.path().join("global.toml");
+        fs::write(&global, "theme = \"dark\"\nworktree_prompt = false\nmax_upload_bytes = 7\n").unwrap();
+        std::env::set_var("ROOST_CONFIG", &global);
+        let proj = d.path().join("proj");
+        fs::create_dir_all(proj.join(".roost")).unwrap();
+        fs::write(proj.join(".roost/config.toml"), "theme = \"nord\"\n").unwrap();
+        let v = settings_view(&proj);
+        let row = |k: &str| v.keys.iter().find(|r| r.key == k).unwrap_or_else(|| panic!("no row {k}"));
+        let t = row("theme");
+        assert_eq!(t.effective, V::Str("nord".into()));
+        assert_eq!(t.project, Some(V::Str("nord".into())));
+        assert_eq!(t.global, Some(V::Str("dark".into())));
+        assert_eq!(t.default, V::Str("darcula".into()));
+        assert_eq!(t.writable, vec!["project", "global"]);
+        let w = row("worktree_prompt");
+        assert_eq!(w.effective, V::Bool(false));
+        assert_eq!(w.writable, vec!["global"]);
+        assert!(w.project.is_none());
+        let m = row("max_upload_bytes");
+        assert_eq!(m.effective, V::Str("7".into()));
+        assert!(m.writable.is_empty());
+        assert!(row("autosave").reload, "autosave is embedded at page load");
+        assert!(!row("theme").reload);
+        // Order: project keys, global-only keys, read-only keys.
+        let keys: Vec<&str> = v.keys.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["theme", "hide", "show_hidden", "autosave", "share_selection", "worktree_prompt", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
+        assert_eq!(v.themes.len(), 5 + 35);
+        assert!(v.global_file.ends_with("global.toml"));
+        assert_eq!(v.project_file, ".roost/config.toml");
+        assert!(v.warning.is_none());
+        std::env::remove_var("ROOST_CONFIG");
     }
 }
