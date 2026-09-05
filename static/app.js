@@ -1599,13 +1599,7 @@ function ensureTerm(session) {
     convertEol: false,
     fontSize: 13,
     fontFamily: v("--mono", "ui-monospace, Menlo, monospace"),
-    theme: {
-      background: v("--bg", "#1e1f22"),
-      foreground: v("--fg", "#dfe1e5"),
-      cursor: v("--accent", "#548af7"),
-      cursorAccent: v("--bg", "#1e1f22"),
-      selectionBackground: v("--sel-bg", "#2e436e"),
-    },
+    theme: termTheme(),
     // xterm already registers an OscLinkProvider, so OSC 8 sequences are
     // parsed and their ranges tracked; this option is the only thing missing,
     // and it defaults to null. Not gated on the modifier, unlike the matchers:
@@ -2709,6 +2703,30 @@ if (canNotify() && "serviceWorker" in navigator) {
 function unread() { return notices.filter((n) => !n.read).length; }
 
 // ---- themes -------------------------------------------------------------
+// The terminal's colours, read off :root now. xterm takes a theme *object*,
+// not CSS, so this is built at every terminal's creation and again, for
+// every live terminal, whenever the page's theme changes (rethemeTerminals).
+function termTheme() {
+  const css = getComputedStyle(document.documentElement);
+  const v = (name, fallback) => css.getPropertyValue(name).trim() || fallback;
+  return {
+    background: v("--bg", "#1e1f22"),
+    foreground: v("--fg", "#dfe1e5"),
+    cursor: v("--accent", "#548af7"),
+    cursorAccent: v("--bg", "#1e1f22"),
+    selectionBackground: v("--sel-bg", "#2e436e"),
+  };
+}
+function rethemeTerminals() {
+  const t = termTheme();
+  for (const entry of terms.values()) {
+    const term = entry && entry.term;
+    if (!term) continue;
+    // xterm 5 exposes `options`; older builds only setOption().
+    if (term.options) term.options.theme = t;
+    else if (term.setOption) term.setOption("theme", t);
+  }
+}
 // The theme the page is currently painted with. Initialised from the first
 // snapshot rather than a data- attribute: the snapshot is what a later
 // change arrives through, so both readings come from one place.
@@ -2770,6 +2788,15 @@ function applyTheme(name) {
     l.href = `/static/themes/${encodeURIComponent(name)}.css`;
   }
   appliedTheme = name;
+  // The variables change when the new stylesheet has *loaded*, which for a
+  // fresh or re-pointed <link> is later than now; a daisyUI-to-daisyUI
+  // switch (only data-theme changes) is immediate. Retheme now and again on
+  // every link's load — an extra pass costs nothing.
+  rethemeTerminals();
+  for (const id of ["theme-roost", "theme-daisy", "theme-bridge"]) {
+    const l = document.getElementById(id);
+    if (l) l.addEventListener("load", rethemeTerminals, { once: true });
+  }
 }
 
 // Called on every State: follow a theme change made elsewhere (another

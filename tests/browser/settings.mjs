@@ -27,11 +27,27 @@ try {
   for (const p of [one, two]) await until(() => p.evalIn("ctrl && ctrl.readyState === 1 && !!state && !!state.settings"), 30, "app");
 
   console.log("A. applyTheme switches the cascade in place, both directions");
+  // A terminal that exists BEFORE the switch: xterm reads the variables at
+  // creation, so one started afterwards would be born with the new colours
+  // and prove nothing (a first draft did exactly that and its assertion
+  // passed with the retheme removed). A Terminal tab is only a tab: the
+  // shell starts when the client asks.
+  await one.evalIn(`(() => { for (const [pi, p] of state.panes.entries()) { const ti = p.tabs.findIndex((t) => t.k === "Terminal");
+    if (ti >= 0) { send({ t: "ActivateTab", pane: pi, idx: ti }); send({ t: "StartTerminal", session: p.tabs[ti].session }); return; } } })(); 0`);
+  ok(await until(() => one.evalIn(`terms.size > 0 && [...terms.values()][0].term && !![...terms.values()][0].term.options`), 30, "a terminal"), "a terminal mounted with an xterm behind it, before any switch");
   const darkBg = await probe(one.evalIn, "var(--bg)");
   ok(darkBg === "rgb(13, 17, 23)", `the page opened on dark.css (${darkBg})`);
   await one.evalIn(`applyTheme("nord"); 0`);
   ok(await until(async () => (await one.evalIn(`document.documentElement.dataset.theme`)) === "nord", 5, "data-theme"), "a daisyUI name sets data-theme");
   ok(await until(async () => (await probe(one.evalIn, "var(--bg)")) === (await probe(one.evalIn, "var(--color-base-100)")), 10, "bridge"), "and --bg follows nord's base once the bridge loads");
+  // xterm takes a theme *object* at creation, read off the variables at that
+  // moment; a stylesheet swap never reaches it unless applyTheme hands every
+  // live terminal the new colours. Revert-check 2026-09-05: without
+  // rethemeTerminals() the terminal keeps dark.css's rgb(13, 17, 23).
+  ok(await until(async () => {
+    const tb = await one.evalIn(`[...terms.values()][0].term.options.theme.background`);
+    return (await probe(one.evalIn, tb)) === (await probe(one.evalIn, "var(--bg)"));
+  }, 10, "term retheme"), "the live terminal's background follows the theme");
   await one.evalIn(`applyTheme("light"); 0`);
   ok(await until(async () => (await one.evalIn(`document.documentElement.dataset.theme`)) === undefined, 5, "no data-theme"), "a roost name removes data-theme");
   ok(await until(async () => (await probe(one.evalIn, "var(--bg)")) === "rgb(255, 255, 255)", 10, "light"), "and light.css paints");
