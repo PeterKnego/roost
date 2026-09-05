@@ -74,6 +74,87 @@ try {
   // this too — light.css still owns --bg — so only --border catches it.
   // Restored (`false`), and it passes again.
   ok(!/^\d/.test(await one.evalIn(`getComputedStyle(document.documentElement).getPropertyValue("--border").trim()`)), "--border is a colour under a roost theme with the vendored file loaded");
+
+  console.log("\nB. the gear opens the dialog with the rows the snapshot describes");
+  await one.evalIn(`document.getElementById("settings").click(); 0`);
+  ok(await until(() => one.evalIn(`document.getElementById("dlg-settings").open`), 5, "dialog"), "the dialog opened in-page");
+  const labels = await one.evalIn(`[...document.querySelectorAll("#dlg-settings .dlg-row label")].map((l) => l.textContent).join(",")`);
+  ok(labels === "theme,hide,show_hidden,autosave,share_selection,worktree_prompt,allowed_origins,max_upload_bytes,ide,roots", `rows in the spec's order (${labels})`);
+  ok((await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="share_selection"]').classList.contains("disabled")`)), "a global-only row is disabled in Project scope");
+  ok((await one.evalIn(`document.querySelectorAll('#dlg-settings .dlg-row[data-key="allowed_origins"] input, #dlg-settings .dlg-row[data-key="allowed_origins"] textarea').length`)) === 0, "a read-only row has no control");
+  ok(/global config file/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="allowed_origins"] .hint').textContent`)), "and says to edit the file by hand");
+  ok(/from global/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="theme"] .hint').textContent`)), "theme's hint says it comes from global");
+
+  console.log("\nC. preview then Cancel leaves the page as it was");
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="theme"]').click(); 0`);
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-tile[data-name="nord"]').click(); 0`);
+  ok(await until(async () => (await one.evalIn(`document.documentElement.dataset.theme`)) === "nord", 5, "preview"), "clicking a tile previews it");
+  await one.evalIn(`document.querySelector("#dlg-settings .dlg-cancel").click(); 0`);
+  ok(await until(async () => (await probe(one.evalIn, "var(--bg)")) === "rgb(13, 17, 23)", 10, "reverted"), "Cancel restores the theme the dialog opened with");
+  ok((await one.evalIn(`document.documentElement.dataset.theme`)) === undefined, "and removes data-theme");
+
+  console.log("\nD. preview then Save writes the project file and the other browser follows");
+  await one.evalIn(`document.getElementById("settings").click(); 0`);
+  await until(() => one.evalIn(`document.getElementById("dlg-settings").open`), 5, "dialog again");
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="theme"]').click(); 0`);
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-tile[data-name="nord"]').click(); 0`);
+  await one.evalIn(`document.querySelector("#dlg-settings .dlg-ok").click(); 0`);
+  ok(await until(async () => { try { return /theme = "nord"/.test(await Deno.readTextFile(projToml)); } catch { return false; } }, 10, "file"), "the project file holds theme = \"nord\"");
+  ok(/# global\ntheme = "dark"/.test(await Deno.readTextFile(globalToml)), "the global file is untouched");
+  ok(await until(async () => (await two.evalIn(`document.documentElement.dataset.theme`)) === "nord", 10, "mirror"), "the other browser switched to nord without a reload");
+  ok(await until(async () => !(await one.evalIn(`document.getElementById("dlg-settings").open`)), 5, "closed"), "Save closed the dialog");
+
+  console.log("\nE. Clear removes the project key; the hint says the value now comes from global");
+  await one.evalIn(`document.getElementById("settings").click(); 0`);
+  await until(() => one.evalIn(`document.getElementById("dlg-settings").open`), 5, "dialog");
+  ok(/from project/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="theme"] .hint').textContent`)), "theme's hint now says from project");
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="theme"] .clear').click(); 0`);
+  await one.evalIn(`document.querySelector("#dlg-settings .dlg-ok").click(); 0`);
+  ok(await until(async () => !/theme/.test(await Deno.readTextFile(projToml)), 10, "cleared"), "the key is gone from the project file");
+  ok(await until(async () => (await two.evalIn(`document.documentElement.dataset.theme`)) === undefined, 10, "back"), "and both browsers are back on the global dark");
+
+  console.log("\nF. Global scope writes the global file, keeping its comment");
+  await one.evalIn(`document.getElementById("settings").click(); 0`);
+  await until(() => one.evalIn(`document.getElementById("dlg-settings").open`), 5, "dialog");
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-scope button[data-scope="global"]').click(); 0`);
+  ok(!(await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="worktree_prompt"]').classList.contains("disabled")`)), "worktree_prompt is enabled in Global scope");
+  await one.evalIn(`(() => { const c = document.querySelector('#dlg-settings .dlg-row[data-key="worktree_prompt"] input[type="checkbox"]'); c.checked = false; c.dispatchEvent(new Event("change")); })(); 0`);
+  await one.evalIn(`document.querySelector("#dlg-settings .dlg-ok").click(); 0`);
+  ok(await until(async () => /worktree_prompt = false/.test(await Deno.readTextFile(globalToml)), 10, "global"), "the global file gained worktree_prompt = false");
+  ok(/^# global\n/.test(await Deno.readTextFile(globalToml)), "and kept its comment");
+
+  console.log("\nG. a forged write to a read-only key is refused and changes nothing");
+  await one.evalIn(`window.__errs = []; const _oe = onEvent; window.onEvent = (ev) => { if (ev.t === "Error") window.__errs.push(ev.msg); return _oe(ev); };
+     ctrl.onmessage = (m) => window.onEvent(JSON.parse(m.data));
+     send({ t: "SetSetting", scope: "global", key: "allowed_origins", value: ["https://evil.example"] }); 0`);
+  ok(await until(async () => Number(await one.evalIn(`window.__errs.length`)) === 1, 5, "error"), "the server answered with an error");
+  ok(/allowed_origins/.test(await one.evalIn(`window.__errs[0]`)), "naming the key");
+  ok(!/evil/.test(await Deno.readTextFile(globalToml)), "and the file is unchanged");
+
+  // Revert-check 1: removing `if (previewTheme) applyTheme(themeBefore);`
+  // from `openSettings`'s cancelBtn.onclick failed exactly section C:
+  //   FAIL  Cancel restores the theme the dialog opened with
+  //   FAIL  and removes data-theme
+  // (a plain `FAIL (2)`, everything else — including D's Save-writes-nord and
+  // E's Clear, both of which run *after* this handler exists but never take
+  // its Cancel path — stayed green). Restored, and the file is byte-identical
+  // to before the revert.
+  //
+  // Revert-check 2: changing `okBtn.onclick`'s `send(...)` to fire only for
+  // `scope === "project"` failed exactly section F:
+  //   FAIL  the global file gained worktree_prompt = false
+  // ("and kept its comment" stayed green — it reads a file that was never
+  // touched by this revert, so it cannot discriminate on its own; the
+  // preceding assertion is the one that matters). Every other section
+  // (which only ever writes project scope) stayed green. Restored.
+  //
+  // Revert-check 3: making `hintFor` return `"default"` unconditionally
+  // failed exactly the two hint assertions in B and the one in E:
+  //   FAIL  and says to edit the file by hand
+  //   FAIL  theme's hint says it comes from global
+  //   FAIL  theme's hint now says from project
+  // (`FAIL (3)`; every non-hint assertion in those sections, and every other
+  // section, stayed green — including F's own hint-free checks). Restored.
 } finally {
   try { await one?.close(); } catch {}
   try { await two?.close(); } catch {}

@@ -248,3 +248,176 @@ function askMenu({ items, x, y }) {
     };
   }, null);
 }
+
+// The settings dialog. Unlike the ask* shapes it stays open across several
+// intents and snapshots, so it keeps its own state: which pane, which
+// scope, what has been edited, and the theme the page opened with (for
+// Cancel). `runDialog` still owns the modal mechanics. Everything rendered
+// here comes from the snapshot through textContent/createElement — a hide
+// entry or a root path is text from a config file in a cloned repository.
+function openSettings(settings) {
+  const el = document.getElementById("dlg-settings");
+  const themeBefore = appliedTheme;
+  let view = settings;
+  let pane = "settings";
+  let scope = "project";
+  // key → { value, clear } for this scope only; reset when the scope changes.
+  let edits = new Map();
+  let previewTheme = null;
+
+  const tabs = el.querySelector(".dlg-tabs");
+  const scopeBar = el.querySelector(".dlg-scope");
+  const rows = el.querySelector(".dlg-rows");
+  const themes = el.querySelector(".dlg-themes");
+  const okBtn = el.querySelector(".dlg-ok");
+  const cancelBtn = el.querySelector(".dlg-cancel");
+
+  const row = (k) => view.keys.find((r) => r.key === k);
+  const inScope = (r) => (scope === "project" ? r.project : r.global);
+  const fileName = () => (scope === "project" ? view.project_file : view.global_file);
+
+  function renderTabs() {
+    tabs.replaceChildren();
+    for (const [id, label] of [["settings", "Settings"], ["theme", "Theme"]]) {
+      const b = document.createElement("button");
+      b.type = "button"; b.className = "dlg-tab"; b.dataset.tab = id; b.textContent = label;
+      b.setAttribute("role", "tab"); b.setAttribute("aria-selected", String(pane === id));
+      b.onclick = () => { pane = id; render(); };
+      tabs.appendChild(b);
+    }
+  }
+  function renderScope() {
+    scopeBar.replaceChildren();
+    const lab = document.createElement("span"); lab.textContent = "Scope:"; scopeBar.appendChild(lab);
+    for (const [id, label] of [["project", "Project"], ["global", "Global"]]) {
+      const b = document.createElement("button");
+      b.type = "button"; b.dataset.scope = id; b.textContent = label;
+      b.setAttribute("aria-pressed", String(scope === id));
+      b.onclick = () => { if (scope !== id) { scope = id; edits = new Map(); render(); } };
+      scopeBar.appendChild(b);
+    }
+    const f = document.createElement("span"); f.className = "file"; f.textContent = fileName(); scopeBar.appendChild(f);
+  }
+  function hintFor(r) {
+    if (r.writable.length === 0) return "read-only — edit it by hand in the global config file";
+    if (scope === "project" && !r.writable.includes("project")) return "global only";
+    // Derive the source only from scopes this key is writable in: a key not
+    // writable in project scope must never claim "from project" merely
+    // because a project file happens to set it (a hand-edited or stale
+    // value there is not what's actually in effect).
+    const fromProject = r.writable.includes("project") && r.project !== null;
+    const src = fromProject ? "from project" : r.global !== null ? "from global" : "default";
+    const tail = r.reload ? " · other tabs pick this up on reload" : "";
+    return `${src}${tail}`;
+  }
+  function control(r) {
+    const cur = edits.has(r.key) ? edits.get(r.key).value : (inScope(r) ?? r.effective);
+    if (r.kind === "bool") {
+      const c = document.createElement("input"); c.type = "checkbox"; c.checked = cur === true;
+      c.onchange = () => { edits.set(r.key, { value: c.checked, clear: false }); };
+      return c;
+    }
+    if (r.kind === "list") {
+      const t = document.createElement("textarea"); t.value = (Array.isArray(cur) ? cur : []).join("\n");
+      t.oninput = () => { edits.set(r.key, { value: t.value.split("\n").map((s) => s.trim()).filter(Boolean), clear: false }); };
+      return t;
+    }
+    const i = document.createElement("input"); i.type = "text"; i.value = String(cur ?? "");
+    i.oninput = () => { edits.set(r.key, { value: i.value.trim(), clear: false }); };
+    return i;
+  }
+  function renderRows() {
+    rows.replaceChildren();
+    for (const r of view.keys) {
+      const div = document.createElement("div");
+      div.className = "dlg-row"; div.dataset.key = r.key;
+      const writable = r.writable.includes(scope);
+      if (!writable) div.classList.add("disabled");
+      const lab = document.createElement("label"); lab.textContent = r.key; div.appendChild(lab);
+      if (r.writable.length === 0) {
+        const ro = document.createElement("span"); ro.className = "ro";
+        ro.textContent = Array.isArray(r.effective) ? r.effective.join(", ") : String(r.effective);
+        div.appendChild(ro);
+        div.appendChild(document.createElement("span"));
+      } else {
+        const c = control(r); c.disabled = !writable; div.appendChild(c);
+        const side = document.createElement("span");
+        if (writable && inScope(r) !== null && !(edits.get(r.key) || {}).clear) {
+          const clr = document.createElement("button"); clr.type = "button"; clr.className = "clear"; clr.textContent = "Clear";
+          clr.title = `remove ${r.key} from ${fileName()} so the inherited value applies`;
+          clr.onclick = () => { edits.set(r.key, { value: null, clear: true }); render(); };
+          side.appendChild(clr);
+        }
+        div.appendChild(side);
+      }
+      const hint = document.createElement("div"); hint.className = "hint";
+      hint.textContent = (edits.get(r.key) || {}).clear ? "will be cleared on Save" : hintFor(r);
+      div.appendChild(hint);
+      rows.appendChild(div);
+    }
+  }
+  function renderThemes() {
+    themes.replaceChildren();
+    const current = previewTheme || (row("theme") || {}).effective;
+    for (const [kind, title] of [["roost", "roost"], ["daisy", "daisyUI"]]) {
+      const h = document.createElement("h3"); h.textContent = title; themes.appendChild(h);
+      const grid = document.createElement("div"); grid.className = "dlg-tiles";
+      for (const t of view.themes.filter((x) => x.kind === kind)) {
+        const b = document.createElement("button");
+        b.type = "button"; b.className = "dlg-tile"; b.dataset.name = t.name;
+        b.setAttribute("aria-pressed", String(t.name === current));
+        if (kind === "daisy") b.dataset.theme = t.name;
+        else { b.style.background = t.bg; b.style.color = t.fg; b.style.setProperty("--tile-accent", t.accent); }
+        const name = document.createElement("span"); name.textContent = t.name; b.appendChild(name);
+        const sw = document.createElement("span"); sw.className = "swatch"; b.appendChild(sw);
+        b.onclick = () => { previewTheme = t.name; applyTheme(t.name); edits.set("theme", { value: t.name, clear: false }); renderThemes(); };
+        grid.appendChild(b);
+      }
+      themes.appendChild(grid);
+    }
+    // daisyUI tiles resolve their colours from the vendored variables, which
+    // are only linked when a daisyUI theme is active; make sure they exist.
+    if (!document.getElementById("theme-daisy")) {
+      const l = document.createElement("link"); l.id = "theme-daisy"; l.rel = "stylesheet"; l.href = "/static/vendor/daisyui-themes.css";
+      document.head.insertBefore(l, document.head.firstChild);
+    }
+  }
+  function render() {
+    renderTabs(); renderScope();
+    rows.hidden = pane !== "settings"; themes.hidden = pane !== "theme";
+    if (pane === "settings") renderRows(); else renderThemes();
+  }
+
+  return runDialog(el, (finish) => {
+    settingsOpen = {
+      onSnapshot(s) {
+        view = s;
+        // Re-render only what is not being typed into: rows keep the
+        // person's edits (they live in `edits`, re-applied by control()),
+        // and hints/source labels are what a fresh snapshot changes.
+        render();
+      },
+    };
+    okBtn.textContent = "Save"; okBtn.disabled = false; okBtn.classList.remove("danger");
+    okBtn.onclick = () => {
+      for (const [key, e] of edits) {
+        const r = row(key);
+        if (!r || !r.writable.includes(scope)) continue;
+        send({ t: "SetSetting", scope, key, ...(e.clear ? {} : { value: e.value }) });
+      }
+      // The theme is now what was previewed (or unchanged); the snapshot
+      // that follows the write confirms it. Do not revert.
+      settingsOpen = null;
+      finish(true);
+    };
+    cancelBtn.onclick = () => { settingsOpen = null; if (previewTheme) applyTheme(themeBefore); finish(false); };
+    // Escape and the backdrop go through runDialog's own finish; hook the
+    // revert onto the dialog's close so every exit restores the preview.
+    el.addEventListener("close", function onClose() {
+      el.removeEventListener("close", onClose);
+      if (settingsOpen) { settingsOpen = null; if (previewTheme) applyTheme(themeBefore); }
+    });
+    render();
+    return () => tabs.querySelector(".dlg-tab").focus();
+  }, false);
+}

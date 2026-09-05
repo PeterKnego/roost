@@ -2732,6 +2732,14 @@ function applyTheme(name) {
   // The server-rendered roost link has no id; adopt it once.
   const rendered = head.querySelector('link[href^="/static/themes/"]');
   if (rendered && !rendered.id) rendered.id = "theme-roost";
+  // Same adoption for a daisyUI-initial page: `render::theme_head` rendered
+  // the vendor and bridge links with no id, so the first switch away from
+  // that theme would otherwise `ensure()` a second, id-less pair alongside
+  // the server-rendered ones instead of reusing them.
+  const renderedVendor = head.querySelector('link[href="/static/vendor/daisyui-themes.css"]');
+  if (renderedVendor && !renderedVendor.id) renderedVendor.id = "theme-daisy";
+  const renderedBridge = head.querySelector('link[href="/static/daisy-bridge.css"]');
+  if (renderedBridge && !renderedBridge.id) renderedBridge.id = "theme-bridge";
   if (daisy) {
     ensure("theme-daisy", "/static/vendor/daisyui-themes.css", true);
     ensure("theme-bridge", "/static/daisy-bridge.css", false);
