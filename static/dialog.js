@@ -367,36 +367,64 @@ function openSettings(settings) {
     warn.hidden = !view.warning;
     rows.appendChild(warn);
     for (const r of view.keys) {
+      // The theme is chosen on the Theme pane, which carries its source
+      // line and Clear; a text field for it here only invited typos.
+      if (r.key === "theme") continue;
       const div = document.createElement("div");
       div.className = "dlg-row"; div.dataset.key = r.key;
       const writable = r.writable.includes(scope);
       if (!writable) div.classList.add("disabled");
+      // Two short lines: name | control | source hint + Clear, then the
+      // one-sentence doc across the full width.
       const lab = document.createElement("label"); lab.textContent = r.key; div.appendChild(lab);
       if (r.writable.length === 0) {
         const ro = document.createElement("span"); ro.className = "ro";
         ro.textContent = Array.isArray(r.effective) ? r.effective.join(", ") : String(r.effective);
         div.appendChild(ro);
-        div.appendChild(document.createElement("span"));
       } else {
         const c = control(r); c.disabled = !writable; div.appendChild(c);
-        const side = document.createElement("span");
-        if (writable && inScope(r) !== null && !(edits.get(r.key) || {}).clear) {
-          const clr = document.createElement("button"); clr.type = "button"; clr.className = "clear"; clr.textContent = "Clear";
-          clr.title = `remove ${r.key} from ${fileName()} so the inherited value applies`;
-          clr.onclick = () => { edits.set(r.key, { value: null, clear: true }); render(); };
-          side.appendChild(clr);
-        }
-        div.appendChild(side);
       }
-      const hint = document.createElement("div"); hint.className = "hint";
+      const side = document.createElement("div"); side.className = "side";
+      const hint = document.createElement("span"); hint.className = "hint";
       hint.textContent = (edits.get(r.key) || {}).clear ? "will be cleared on Save" : hintFor(r);
-      div.appendChild(hint);
+      side.appendChild(hint);
+      if (writable && inScope(r) !== null && !(edits.get(r.key) || {}).clear) {
+        const clr = document.createElement("button"); clr.type = "button"; clr.className = "clear"; clr.textContent = "Clear";
+        clr.title = `remove ${r.key} from ${fileName()} so the inherited value applies`;
+        clr.onclick = () => { edits.set(r.key, { value: null, clear: true }); render(); };
+        side.appendChild(clr);
+      }
+      div.appendChild(side);
+      const doc = document.createElement("div"); doc.className = "doc"; doc.textContent = r.doc; div.appendChild(doc);
       rows.appendChild(div);
     }
   }
   function renderThemes() {
     themes.replaceChildren();
-    const current = previewTheme || (row("theme") || {}).effective;
+    const t = row("theme");
+    const current = previewTheme || (t || {}).effective;
+    // Where the current theme comes from, and Clear when this scope's file
+    // sets it — the Settings pane has no theme row, so this is its home.
+    if (t) {
+      const src = document.createElement("div"); src.className = "theme-source";
+      const cleared = (edits.get("theme") || {}).clear;
+      const txt = document.createElement("span");
+      const fmt = (v) => (v === null || v === undefined ? "—" : String(v));
+      txt.textContent = cleared
+        ? "theme will be cleared on Save"
+        : `${current} · ${hintFor(t)} · project: ${fmt(t.project)} · global: ${fmt(t.global)} · default: ${fmt(t.default)}`;
+      src.appendChild(txt);
+      if (t.writable.includes(scope) && inScope(t) !== null && !cleared) {
+        const clr = document.createElement("button"); clr.type = "button"; clr.className = "clear"; clr.textContent = "Clear";
+        clr.title = `remove theme from ${fileName()} so the inherited theme applies`;
+        clr.onclick = () => {
+          if (previewTheme) { applyTheme(themeBefore); previewTheme = null; }
+          edits.set("theme", { value: null, clear: true }); renderThemes();
+        };
+        src.appendChild(clr);
+      }
+      themes.appendChild(src);
+    }
     for (const [kind, title] of [["roost", "roost"], ["daisy", "daisyUI"]]) {
       const h = document.createElement("h3"); h.textContent = title; themes.appendChild(h);
       const grid = document.createElement("div"); grid.className = "dlg-tiles";

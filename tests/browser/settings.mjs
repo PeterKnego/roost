@@ -84,14 +84,29 @@ try {
   await one.evalIn(`document.getElementById("settings").click(); 0`);
   ok(await until(() => one.evalIn(`document.getElementById("dlg-settings").open`), 5, "dialog"), "the dialog opened in-page");
   const labels = await one.evalIn(`[...document.querySelectorAll("#dlg-settings .dlg-row label")].map((l) => l.textContent).join(",")`);
-  ok(labels === "theme,hide,show_hidden,autosave,share_selection,worktree_prompt,allowed_origins,max_upload_bytes,ide,roots", `rows in the spec's order (${labels})`);
+  // No theme row here: the theme is chosen on the Theme pane, which also
+  // carries its source line and Clear.
+  ok(labels === "hide,show_hidden,autosave,share_selection,worktree_prompt,allowed_origins,max_upload_bytes,ide,roots", `rows in the spec's order, without theme (${labels})`);
+  ok(/keystroke/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="autosave"] .doc').textContent`)), "each row explains what the setting does");
+  {
+    const h = await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="autosave"]').getBoundingClientRect().height`);
+    ok(h < 60, `a boolean row is one compact line (${h}px)`);
+  }
   ok((await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="share_selection"]').classList.contains("disabled")`)), "a global-only row is disabled in Project scope");
   ok((await one.evalIn(`document.querySelectorAll('#dlg-settings .dlg-row[data-key="allowed_origins"] input, #dlg-settings .dlg-row[data-key="allowed_origins"] textarea').length`)) === 0, "a read-only row has no control");
   ok(/global config file/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="allowed_origins"] .hint').textContent`)), "and says to edit the file by hand");
-  ok(/from global/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="theme"] .hint').textContent`)), "theme's hint says it comes from global");
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="theme"]').click(); 0`);
+  ok(/from global/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-themes .theme-source').textContent`)), "the Theme pane's source line says the theme comes from global");
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="settings"]').click(); 0`);
 
   console.log("\nC. preview then Cancel leaves the page as it was");
   await one.evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="theme"]').click(); 0`);
+  // The Theme tab shows only the tiles. style.css's `display: flex` on
+  // .dlg-rows outranked the UA's `[hidden] { display: none }`, so the
+  // Settings rows stayed visible above the tiles. Revert-check 2026-09-05:
+  // dropping the `[hidden] { display: none }` rule brings that back.
+  ok((await one.evalIn(`getComputedStyle(document.querySelector("#dlg-settings .dlg-rows")).display`)) === "none", "the Settings rows are hidden under the Theme tab");
+  ok((await one.evalIn(`getComputedStyle(document.querySelector("#dlg-settings .dlg-themes")).display`)) !== "none", "and the tiles are shown");
   await one.evalIn(`document.querySelector('#dlg-settings .dlg-tile[data-name="nord"]').click(); 0`);
   ok(await until(async () => (await one.evalIn(`document.documentElement.dataset.theme`)) === "nord", 5, "preview"), "clicking a tile previews it");
   await one.evalIn(`document.querySelector("#dlg-settings .dlg-cancel").click(); 0`);
@@ -112,8 +127,9 @@ try {
   console.log("\nE. Clear removes the project key; the hint says the value now comes from global");
   await one.evalIn(`document.getElementById("settings").click(); 0`);
   await until(() => one.evalIn(`document.getElementById("dlg-settings").open`), 5, "dialog");
-  ok(/from project/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="theme"] .hint').textContent`)), "theme's hint now says from project");
-  await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="theme"] .clear').click(); 0`);
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="theme"]').click(); 0`);
+  ok(/from project/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-themes .theme-source').textContent`)), "the Theme pane's source line now says from project");
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-themes .clear').click(); 0`);
   await one.evalIn(`document.querySelector("#dlg-settings .dlg-ok").click(); 0`);
   ok(await until(async () => !/theme/.test(await Deno.readTextFile(projToml)), 10, "cleared"), "the key is gone from the project file");
   ok(await until(async () => (await two.evalIn(`document.documentElement.dataset.theme`)) === undefined, 10, "back"), "and both browsers are back on the global dark");

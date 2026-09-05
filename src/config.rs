@@ -533,7 +533,7 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
     let defaults = Settings::default();
     let raw = |key: &str| (raw_setting(&project, key), raw_setting(&global, key));
     let mut keys = Vec::new();
-    let mut push = |key: &str, kind: &'static str, effective: V, default: V, reload: bool| {
+    let mut push = |key: &str, kind: &'static str, effective: V, default: V, reload: bool, doc: &'static str| {
         let (p, g) = raw(key);
         keys.push(SettingRow {
             key: key.to_string(),
@@ -544,23 +544,34 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
             global: g,
             default,
             reload,
+            doc,
         });
     };
-    push("theme", "str", V::Str(s.theme.clone()), V::Str(defaults.theme.clone()), false);
-    push("hide", "list", V::List(s.hide.clone()), V::List(vec![]), false);
-    push("show_hidden", "bool", V::Bool(s.show_hidden), V::Bool(false), false);
-    push("autosave", "bool", V::Bool(s.autosave), V::Bool(true), true);
-    push("share_selection", "bool", V::Bool(share_selection()), V::Bool(false), true);
-    push("worktree_prompt", "bool", V::Bool(worktree_prompt()), V::Bool(true), false);
-    push("allowed_origins", "list", V::List(allowed_origins()), V::List(vec![]), false);
-    push("max_upload_bytes", "str", V::Str(max_upload_bytes().to_string()), V::Str(DEFAULT_MAX_UPLOAD.to_string()), false);
-    push("ide", "bool", V::Bool(ide_enabled()), V::Bool(true), false);
+    push("theme", "str", V::Str(s.theme.clone()), V::Str(defaults.theme.clone()), false,
+        "Colour theme for this project's pages; pick it on the Theme tab.");
+    push("hide", "list", V::List(s.hide.clone()), V::List(vec![]), false,
+        "Names left out of the file tree and of search, one per line (dist, node_modules).");
+    push("show_hidden", "bool", V::Bool(s.show_hidden), V::Bool(false), false,
+        "Show dot-files and dot-directories in the file tree.");
+    push("autosave", "bool", V::Bool(s.autosave), V::Bool(true), true,
+        "Save an edited file a second after the last keystroke and on blur; off means ⌘S.");
+    push("share_selection", "bool", V::Bool(share_selection()), V::Bool(false), true,
+        "Let a Claude connected to this project read the text you select in the editor.");
+    push("worktree_prompt", "bool", V::Bool(worktree_prompt()), V::Bool(true), false,
+        "When a Claude is already running here, ✻ offers to start the next one in a new worktree.");
+    push("allowed_origins", "list", V::List(allowed_origins()), V::List(vec![]), false,
+        "Browser origins allowed to connect besides loopback, such as the tailnet address.");
+    push("max_upload_bytes", "str", V::Str(max_upload_bytes().to_string()), V::Str(DEFAULT_MAX_UPLOAD.to_string()), false,
+        "Ceiling for one upload request, in bytes.");
+    push("ide", "bool", V::Bool(ide_enabled()), V::Bool(true), false,
+        "Accept Claude Code's IDE connection, which gives it file context and diffs.");
     push(
         "roots",
         "list",
         V::List(configured_roots().iter().map(|p| p.display().to_string()).collect()),
         V::List(vec![]),
         false,
+        "Directories scanned for projects.",
     );
     SettingsView {
         keys,
@@ -1106,6 +1117,11 @@ mod tests {
         assert_eq!(m.effective, V::Str("7".into()));
         assert!(m.writable.is_empty());
         assert!(row("autosave").reload, "autosave is embedded at page load");
+        // Every row explains itself: the dialog shows `doc` under the key.
+        for r in &v.keys {
+            assert!(!r.doc.is_empty() && r.doc.ends_with('.'), "{}: doc {:?}", r.key, r.doc);
+        }
+        assert!(row("autosave").doc.contains("keystroke"), "{:?}", row("autosave").doc);
         assert!(!row("theme").reload);
         // Order: project keys, global-only keys, read-only keys.
         let keys: Vec<&str> = v.keys.iter().map(|r| r.key.as_str()).collect();

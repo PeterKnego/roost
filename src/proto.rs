@@ -247,6 +247,9 @@ pub struct SettingRow {
     pub default: SettingValue,
     /// True when the page only reads this key at load, so the row says so.
     pub reload: bool,
+    /// One sentence on what the key does, shown under its name. Lives here,
+    /// not in the client, so the dialog and any future doc read one source.
+    pub doc: &'static str,
 }
 
 /// A picker tile. roost themes carry their three colours; daisyUI tiles
@@ -694,6 +697,7 @@ mod tests {
             key: "theme".into(), kind: "str", writable: vec!["project", "global"],
             effective: SettingValue::Str("nord".into()), project: Some(SettingValue::Str("nord".into())),
             global: None, default: SettingValue::Str("darcula".into()), reload: false,
+            doc: "Colour theme.",
         };
         let j = serde_json::to_string(&row).unwrap();
         assert!(j.contains(r#""global":null"#), "{j}");
