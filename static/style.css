@@ -871,3 +871,30 @@ body.searching header { position: relative; z-index: 41; }
    search is telling you something — whether that is "your word is here" or "I
    could not look there". */
 #searchnote.skipped { border-left: 2px solid var(--warn); padding-left: 10px; }
+/* Modal dialogs. <dialog> supplies focus trapping, Escape, the top layer and
+   an inert background; these rules only override the UA stylesheet's border,
+   padding and `background: canvas`. No `hidden` attribute appears on a
+   <dialog> anywhere — one without `open` is already display:none, and copying
+   #searchoverlay[hidden] here would produce a dialog that can never show. */
+dialog.roost { background: var(--bg2); color: var(--fg);
+               border: 1px solid var(--border); border-radius: 8px;
+               padding: 0; width: min(420px, 92vw); font: inherit; }
+/* A literal, not var(): ::backdrop does not participate in inheritance, so a
+   custom property would not resolve here. Same value as #searchoverlay. */
+dialog.roost::backdrop { background: rgba(0,0,0,.35); }
+.dlg-title { font-size: 13px; font-weight: 600; padding: 10px 14px;
+             border-bottom: 1px solid var(--border); }
+.dlg-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+.dlg-body p { font-size: 12px; }
+.dlg-blocked { padding: 0 14px 12px; font-size: 12px; color: var(--warn); }
+.dlg-label { display: block; padding: 12px 14px 4px; font-size: 12px; color: var(--muted); }
+.dlg-input { width: calc(100% - 28px); margin: 0 14px; padding: 5px 7px;
+             background: var(--bg); color: var(--fg); font: inherit;
+             border: 1px solid var(--border); border-radius: 4px; }
+.dlg-buttons { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 14px; }
+.dlg-buttons button { padding: 5px 12px; border-radius: 4px; font: inherit;
+                      background: var(--bg3); color: var(--fg);
+                      border: 1px solid var(--border); cursor: pointer; }
+.dlg-buttons button:disabled { opacity: .5; cursor: default; }
+.dlg-buttons .danger:not(:disabled) { border-color: var(--del-fg); color: var(--del-fg); }
+.dlg-buttons button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }

@@ -1660,6 +1660,25 @@ pub fn workspace_page(
     <div id="searchnote"></div>
   </div>
 </div>
+<dialog id="dlg-confirm" class="roost">
+  <h2 class="dlg-title"></h2>
+  <div class="dlg-body"></div>
+  <p class="dlg-blocked" hidden></p>
+  <div class="dlg-buttons">
+    <button type="button" class="dlg-cancel">Cancel</button>
+    <button type="button" class="dlg-ok"></button>
+  </div>
+</dialog>
+<dialog id="dlg-text" class="roost">
+  <h2 class="dlg-title"></h2>
+  <label class="dlg-label" for="dlg-input"></label>
+  <input id="dlg-input" class="dlg-input" type="text" autocomplete="off" spellcheck="false">
+  <div class="dlg-buttons">
+    <button type="button" class="dlg-cancel">Cancel</button>
+    <button type="button" class="dlg-ok"></button>
+  </div>
+</dialog>
+<dialog id="dlg-menu" class="roost"><div class="dlg-items"></div></dialog>
 <!-- Empty by default and hidden: the slots exist so a future per-pane control
      (a split, a kebab, a pane menu) has somewhere to land without reopening
      the header's layout. app.js rebuilds .tabstrip wholesale on every render,
@@ -1667,6 +1686,7 @@ pub fn workspace_page(
      put inside the strip would be wiped on the next state broadcast. -->
 <footer id="statusbar" class="hidden"><span class="left"></span><span class="right"></span></footer>
 <div id="termpool" hidden></div>
+<script src="/static/dialog.js"></script>
 <script src="/static/app.js"></script>
 </body></html>"#,
         theme = esc(&s.theme),
@@ -2950,10 +2970,15 @@ mod tests {
             &h[head..tail]
         );
         let ov = h.find("id=\"searchoverlay\"").expect("the overlay");
+        // Bounded to the overlay's own markup, not the rest of the page: the
+        // dialog shells that now follow #searchoverlay legitimately carry an
+        // `<input>` of their own (`#dlg-input`), which is a different field
+        // for a different purpose, not a second search box.
+        let ov_end = ov + h[ov..].find("  </div>\n</div>").expect("overlay closes") + "  </div>\n</div>".len();
         assert!(
-            !h[ov..].contains("<input"),
+            !h[ov..ov_end].contains("<input"),
             "the overlay must not carry a second field: {}",
-            &h[ov..]
+            &h[ov..ov_end]
         );
     }
 
@@ -3022,6 +3047,29 @@ mod tests {
         // The panel is filled from JS with textContent; it must ship empty,
         // or notice text would be interpolated into HTML somewhere.
         assert!(html.contains(r#"<div id="noticepanel" hidden></div>"#), "panel must ship empty");
+    }
+
+    #[test]
+    fn the_workspace_page_ships_empty_dialog_shells() {
+        let s = crate::config::Settings::default();
+        let html = workspace_page("proj", "proj", &s, None, false, &[]);
+        for id in ["dlg-confirm", "dlg-text", "dlg-menu"] {
+            assert!(html.contains(&format!(r#"id="{id}""#)), "no {id} shell");
+        }
+        // Filled from JS with textContent, so they must ship empty — the same
+        // rule the notification centre follows above. A shell carrying text
+        // would mean a path was interpolated into HTML somewhere.
+        assert!(html.contains(r#"<dialog id="dlg-menu" class="roost"><div class="dlg-items"></div></dialog>"#),
+            "the menu shell must ship empty");
+        // A <dialog> is display:none without `open`. Marking one `hidden`
+        // (copying the #searchoverlay idiom) yields a dialog that can never
+        // be shown, so the attribute must never appear on one.
+        for frag in ["<dialog id=\"dlg-confirm\" class=\"roost\" hidden",
+                     "<dialog id=\"dlg-text\" class=\"roost\" hidden",
+                     "<dialog id=\"dlg-menu\" class=\"roost\" hidden"] {
+            assert!(!html.contains(frag), "a dialog must not carry `hidden`: {frag}");
+        }
+        assert!(html.contains(r#"<script src="/static/dialog.js"></script>"#), "dialog.js not loaded");
     }
 
     #[test]
