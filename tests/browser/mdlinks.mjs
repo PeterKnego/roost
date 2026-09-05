@@ -207,39 +207,71 @@ try {
   await evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: "docs/index.md", mode: "Preview" } })`);
   await until(() => evalIn(`!!document.querySelector(".markdown-body a.mdlink")`), 15, "preview reopened");
 
-  // ---- 5. A plain click never shows the file menu; a real right-click does --
-  // wireFileLinks wires oncontextmenu on every a[data-rel] anchor —
-  // .mdlink included, since a markdown link's target is a project file too
-  // (render.rs's link_open gives it the identical data-rel), and that wiring
-  // is untouched by this task. So a .mdlink anchor DOES open the file menu on
-  // a right-click, same as a tree row — asserting otherwise would just be
-  // wrong. What "clicking a markdown link does not open the file menu" checks
-  // instead is the *left*-click path exercised in section 3 above: the
-  // onclick handler that opens the link as a tab must not also pop the
-  // context menu as a side effect.
+  // ---- 5. Right-click on a markdown link opens the menu exactly once -------
+  // wireFileLinks assigns oncontextmenu per anchor with no stopPropagation().
+  // wireFragment's container handler is the only thing that stops a second
+  // fileMenu() firing, and it does that by testing
+  // e.target.closest("a[data-rel]") — a .mdlink anchor has no class="file",
+  // so a guard written as closest("a.file") misses it and fileMenu pops
+  // twice, the second time with rel="" (the project root, with
+  // create/rename/delete armed — a real destructive-action bug, not a cosmetic
+  // double-dialog).
   //
-  // The file menu is now #dlg-menu, not prompt(). Asserting on the dialog's
-  // `open` property rather than on a stubbed prompt matters: after the
-  // dialogs change, `window.prompt` is called by nothing, so the old
-  // `__prompts.length === 0` assertion was true no matter what this click
-  // did — green, and testing nothing.
-  const menuOpen = async () => await evalIn(`document.getElementById("dlg-menu").open`);
-  await evalIn(`document.querySelector(".markdown-body a.mdlink").click()`);
-  ok(!(await menuOpen()), "clicking a markdown link does not open the file menu");
+  // This can no longer be observed at the dialog level. `runDialog` (see
+  // static/dialog.js) sets `openDlg` synchronously before returning, so a
+  // second fileMenu() call during the same event's bubbling gets
+  // Promise.resolve(null) and opens nothing — the double-fire is invisible to
+  // any assertion about #dlg-menu, by design, forever. The old test counted
+  // prompt() calls as a proxy for fileMenu() calls because prompt() was the
+  // only observable; now fileMenu is directly observable, so wrap it instead
+  // of prompt() — the faithful analogue, not a dialog-open check.
+  //
+  // fileMenu is a top-level function declaration in a classic (non-module)
+  // script, so it is a property of `window`, and the oncontextmenu closures
+  // resolve the name through global scope at call time — wrapping
+  // window.fileMenu redirects them exactly as wrapping window.prompt used to.
+  await evalIn(`window.__realFileMenu = window.fileMenu;
+    window.__fileMenuCalls = [];
+    window.fileMenu = (e, rel) => { window.__fileMenuCalls.push(rel); return window.__realFileMenu(e, rel); };`);
+  const closeMenu = () => Promise.all([
+    page.cmd("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }),
+    page.cmd("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }),
+  ]);
 
-  // The positive assertion is what makes the negative one mean something: a
-  // selector that matched nothing (e.g. a typo'd id, or a tree with no rows)
-  // would satisfy "does not open" silently. Right-clicking an actual tree row
-  // must open the same #dlg-menu for the negative check above to be meaningful.
   await evalIn(`(() => {
-    const a = document.querySelector('a.file[data-rel]');
+    const a = document.querySelector(".markdown-body a.mdlink");
     a.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
   })()`);
-  ok(await menuOpen(), "but right-clicking the tree row does open it");
-  await page.cmd("Input.dispatchKeyEvent",
-    { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
-  await page.cmd("Input.dispatchKeyEvent",
-    { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  const linkCalls = await evalIn("window.__fileMenuCalls.length");
+  ok(linkCalls === 1,
+    `right-clicking a markdown link opened the file menu exactly once (got ${linkCalls})`);
+  await closeMenu();
+
+  // Blank space in the tree (not a row, not a link) must still reach the
+  // project-root menu — the widened guard must not swallow that fallback.
+  await evalIn(`window.__fileMenuCalls = []`);
+  await evalIn(`(() => {
+    const ul = [...document.querySelectorAll("ul.tree")][0];
+    ul.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+  })()`);
+  const treeCalls = await evalIn("JSON.stringify(window.__fileMenuCalls)").then(JSON.parse);
+  ok(treeCalls.length === 1 && treeCalls[0] === "",
+    `right-clicking blank tree space opened the file menu exactly once with rel="" (project root): ${JSON.stringify(treeCalls)}`);
+  // The old test proved "project root" by matching the prompt's text; the
+  // argument is directly observable now, so the assertion above checks
+  // rel === "" itself. Pin the other half of the project-root behaviour the
+  // plan specifies while the menu is open: no target means no Rename/Delete.
+  const rootItems = await evalIn(
+    `JSON.stringify([...document.querySelectorAll("#dlg-menu .dlg-item")].map(b => b.textContent))`
+  ).then(JSON.parse);
+  ok(rootItems.length === 2 && rootItems[0] === "New file…" && rootItems[1] === "New folder…",
+    `the project-root menu offers exactly New file and New folder, no Rename/Delete (got ${JSON.stringify(rootItems)})`);
+  await closeMenu();
+
+  // Restore the real fileMenu — a landmine otherwise: any assertion appended
+  // after this point would silently run against the wrapper instead of the
+  // real function, with no signal that it was doing so.
+  await evalIn(`window.fileMenu = window.__realFileMenu;`);
 
   // ---- 6. A raw OpenTab{mode:"Edit"} on an image is coerced to Preview -----
   // NO_TEXT_EDIT_EXT only gates the client's own ✎ toggle; a handcrafted intent
