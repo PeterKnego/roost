@@ -30,10 +30,14 @@ let pendingFocusDone = false;
 // when WorktreeReady arrives. Opened on the click because a window.open after
 // a websocket round trip is not reliably inside the user gesture.
 let pendingTab = null;
-// The config file's `show_hidden`, embedded by render.rs at page load. The
+// The config file's `show_hidden`, embedded by render.rs at page load and
+// kept live from the snapshot afterwards (followSettings), like AUTOSAVE. The
 // workspace's own toggle (state.show_hidden) overrides it when set; null
-// means nobody has touched the header button, so the file still decides.
-const SHOW_HIDDEN_DEFAULT = document.body.dataset.showHidden === "1";
+// means nobody has touched the header button, so the file still decides —
+// and writing this key from the settings dialog is what clears that override
+// server-side, so the file value is the *only* thing left deciding. A page
+// that froze this at load time therefore saw its own Save do nothing.
+let SHOW_HIDDEN_DEFAULT = document.body.dataset.showHidden === "1";
 // Whether the editor writes a buffer out by itself. Read once per page load,
 // like SHOW_HIDDEN_DEFAULT: it changes only when someone edits a config file,
 // which already needs a reload to take effect.
@@ -2769,6 +2773,10 @@ function followSettings() {
   }
   const auto = row("autosave");
   if (auto) AUTOSAVE = auto.effective === true;
+  // The tree re-fetches itself when showHidden() changes (see the State
+  // handler), so this one assignment is the whole of the visible effect.
+  const sh = row("show_hidden");
+  if (sh) SHOW_HIDDEN_DEFAULT = sh.effective === true;
   if (settingsOpen) settingsOpen.onSnapshot(s);
 }
 

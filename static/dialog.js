@@ -399,7 +399,7 @@ function openSettings(settings) {
       },
     };
     okBtn.textContent = "Save"; okBtn.disabled = false; okBtn.classList.remove("danger");
-    okBtn.onclick = () => {
+    const save = () => {
       for (const [key, e] of edits) {
         const r = row(key);
         if (!r || !r.writable.includes(scope)) continue;
@@ -410,11 +410,26 @@ function openSettings(settings) {
       settingsOpen = null;
       finish(true);
     };
+    okBtn.onclick = save;
+    // "Enter saves" (spec, *The dialog*): nothing in here destroys, so the
+    // key that means "yes" everywhere else means it here too. Not from a
+    // textarea, where Enter is the list separator the control is built
+    // around, and not from a button, which the browser already activates on
+    // Enter — routing those through Save would make Cancel save.
+    const onKeydown = (e) => {
+      if (e.key !== "Enter" || e.altKey || e.ctrlKey || e.metaKey) return;
+      const t = e.target;
+      if (t && (t.tagName === "TEXTAREA" || t.tagName === "BUTTON")) return;
+      e.preventDefault();
+      save();
+    };
+    el.addEventListener("keydown", onKeydown);
     cancelBtn.onclick = () => { settingsOpen = null; if (previewTheme) applyTheme(themeBefore); finish(false); };
     // Escape and the backdrop go through runDialog's own finish; hook the
     // revert onto the dialog's close so every exit restores the preview.
     el.addEventListener("close", function onClose() {
       el.removeEventListener("close", onClose);
+      el.removeEventListener("keydown", onKeydown);
       if (settingsOpen) { settingsOpen = null; if (previewTheme) applyTheme(themeBefore); }
     });
     render();

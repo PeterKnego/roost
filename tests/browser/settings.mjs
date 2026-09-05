@@ -131,6 +131,47 @@ try {
   ok(/allowed_origins/.test(await one.evalIn(`window.__errs[0]`)), "naming the key");
   ok(!/evil/.test(await Deno.readTextFile(globalToml)), "and the file is unchanged");
 
+  console.log("\nH. saving show_hidden takes effect in the browser that saved, and Enter is what saves");
+  // The starting state, asserted rather than assumed: without this the
+  // showHidden() check below would pass over a page that already had it on.
+  ok((await one.evalIn(`showHidden()`)) === false, "the tree is not showing hidden files yet");
+  await one.evalIn(`document.getElementById("settings").click(); 0`);
+  await until(() => one.evalIn(`document.getElementById("dlg-settings").open`), 5, "dialog");
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-scope button[data-scope="project"]').click(); 0`);
+  await one.evalIn(`(() => { const c = document.querySelector('#dlg-settings .dlg-row[data-key="show_hidden"] input[type="checkbox"]');
+     c.checked = true; c.dispatchEvent(new Event("change")); c.focus(); })(); 0`);
+  // Enter has to arrive from somewhere that is NOT the Save button, or the
+  // browser's own button activation would satisfy this assertion with no
+  // keydown handler at all.
+  ok(await one.evalIn(`document.activeElement === document.querySelector('#dlg-settings .dlg-row[data-key="show_hidden"] input[type="checkbox"]')`),
+     "focus is in the checkbox row, not on Save");
+  for (const type of ["keyDown", "keyUp"]) {
+    await one.cmd("Input.dispatchKeyEvent", { type, key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, ...(type === "keyDown" ? { text: "\r" } : {}) });
+  }
+  ok(await until(async () => /show_hidden = true/.test(await Deno.readTextFile(projToml)), 10, "file"), "Enter saved: the project file holds show_hidden = true");
+  // The hub clears the workspace override on a show_hidden write, so
+  // `state.show_hidden` is null here and showHidden() falls through to the
+  // page-load default — which is exactly the value that has to follow the
+  // snapshot rather than stay frozen at load time.
+  ok(await until(async () => (await one.evalIn(`showHidden()`)) === true, 10, "showHidden"), "and showHidden() is true in the browser that saved");
+
+  // Revert-check 4 (section H, 2026-09-05): putting `SHOW_HIDDEN_DEFAULT`
+  // back to a page-load `const` and dropping followSettings's assignment
+  // failed exactly one assertion —
+  //   FAIL  and showHidden() is true in the browser that saved
+  // — while "Enter saved: the project file holds show_hidden = true" stayed
+  // green, which is what says the two halves discriminate separately: the
+  // write landed, the saving browser just never learned. Restored.
+  //
+  // Revert-check 5 (section H): replacing `openSettings`'s keydown handler
+  // with a no-op failed both of H's write assertions —
+  //   FAIL  Enter saved: the project file holds show_hidden = true
+  //   FAIL  and showHidden() is true in the browser that saved
+  // — and nothing else in the file (every other section clicks Save). The
+  // focus assertion above is what keeps this honest: with focus on the Save
+  // button, Chromium's own button activation would have saved with no
+  // handler at all. Restored.
+  //
   // Revert-check 1: removing `if (previewTheme) applyTheme(themeBefore);`
   // from `openSettings`'s cancelBtn.onclick failed exactly section C:
   //   FAIL  Cancel restores the theme the dialog opened with
