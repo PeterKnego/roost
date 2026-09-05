@@ -103,6 +103,42 @@ try {
      "a path that looks like markup produces no element");
   ok((await evalIn("window.__pwned === undefined")), "and runs nothing");
   await evalIn(`document.querySelector("#dlg-confirm .dlg-cancel").click(); 0`);
+
+  // G: askText preselects the basename, so typing replaces the name and not
+  // the directory. prompt() could not do this, and a rename that silently
+  // ate the directory would be a data-loss bug, not a UX one.
+  await evalIn(`window.__r = null;
+     askText({ title: "Rename", value: "src/main.rs", confirm: "Rename" })
+       .then((v) => { window.__r = v; }); 0`);
+  ok((await evalIn(`document.getElementById("dlg-input").value`)) === "src/main.rs",
+     "askText prefills the whole path");
+  ok((await evalIn(`document.getElementById("dlg-input").selectionStart`)) === 4 &&
+     (await evalIn(`document.getElementById("dlg-input").selectionEnd`)) === 11,
+     "and selects only the basename");
+  ok(await evalIn(`document.activeElement === document.getElementById("dlg-input")`),
+     "with focus in the field");
+  await evalIn(`document.getElementById("dlg-input").value = "src/other.rs";
+     document.querySelector("#dlg-text .dlg-ok").click(); 0`);
+  ok(await until(async () => (await evalIn("window.__r")) === "src/other.rs", 5, "text ok"),
+     "confirming resolves the typed value");
+
+  // H: an empty field resolves null, never the empty string — every caller
+  // guards with `if (name)`, and "" would slip through a truthiness check as
+  // a create/rename of a path with no name.
+  await evalIn(`window.__r = "unset"; askText({ title: "New file", value: "x" }).then((v) => { window.__r = v; }); 0`);
+  await evalIn(`document.getElementById("dlg-input").value = "   ";
+     document.querySelector("#dlg-text .dlg-ok").click(); 0`);
+  ok(await until(async () => (await evalIn("window.__r")) === null, 5, "empty"),
+     "a blank field resolves null, not an empty string");
+
+  // I: Escape resolves null.
+  await evalIn(`window.__r = "unset"; askText({ title: "T", value: "y" }).then((v) => { window.__r = v; }); 0`);
+  await page.cmd("Input.dispatchKeyEvent",
+    { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await page.cmd("Input.dispatchKeyEvent",
+    { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  ok(await until(async () => (await evalIn("window.__r")) === null, 5, "text escape"),
+     "Escape resolves null");
 } finally {
   try { await page?.close(); } catch { /* already gone */ }
   browser.close();

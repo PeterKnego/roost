@@ -103,3 +103,36 @@ function askConfirm({ title, lines = [], confirm = "OK", danger = false, blocked
     return () => (danger || blocked ? cancelBtn : okBtn).focus();
   }, false);
 }
+
+function askText({ title, label = "", value = "", confirm = "OK" }) {
+  const el = document.getElementById("dlg-text");
+  return runDialog(el, (finish) => {
+    el.querySelector(".dlg-title").textContent = title;
+    const lab = el.querySelector(".dlg-label");
+    lab.textContent = label;
+    lab.hidden = !label;
+    const input = el.querySelector(".dlg-input");
+    input.value = value;
+    // Empty resolves null, never "": every caller guards with `if (name)`,
+    // and an empty string would pass a truthiness check as a create or
+    // rename of a path with no name.
+    const take = () => finish(input.value.trim() || null);
+    const okBtn = el.querySelector(".dlg-ok");
+    okBtn.textContent = confirm;
+    okBtn.disabled = false;
+    okBtn.classList.remove("danger");
+    okBtn.onclick = take;
+    el.querySelector(".dlg-cancel").onclick = () => finish(null);
+    // Enter confirms. A <form method="dialog"> would do this natively but
+    // would also make the shell submit-shaped, and a stray Enter elsewhere in
+    // the page then has a form to submit.
+    input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); take(); } };
+    return () => {
+      input.focus();
+      // Select the basename only, so typing replaces the name and leaves the
+      // directory. lastIndexOf returns -1 for a bare name, and -1 + 1 === 0
+      // selects the whole thing, which is what a new file wants.
+      input.setSelectionRange(value.lastIndexOf("/") + 1, value.length);
+    };
+  }, null);
+}
