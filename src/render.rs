@@ -1712,7 +1712,7 @@ pub fn workspace_page(
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/code-input.min.js"></script>
-</head><body data-project="{proj_txt}" data-key="{qkey}" data-default-tab="{tab}" data-show-hidden="{sh}" data-autosave="{autosave}" data-share-selection="{share_selection}" data-launches="{launches}">
+</head><body data-project="{proj_txt}" data-key="{qkey}" data-show-hidden="{sh}" data-autosave="{autosave}" data-share-selection="{share_selection}" data-launches="{launches}">
 <header>
   <a class="home" href="/" title="all projects">{SVG_HOME}</a><span class="proj">{proj_txt}</span>
   <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body, git from:body"></span><span id="wtlabel"></span></button>
@@ -1781,7 +1781,6 @@ pub fn workspace_page(
 <script src="/static/dialog.js"></script>
 <script src="/static/app.js"></script>
 </body></html>"#,
-        tab = esc(&s.default_tab),
         SVG_HOME = SVG_HOME,
         icons = icon_links(),
         SVG_BRANCH = SVG_BRANCH,
@@ -2977,7 +2976,9 @@ mod tests {
         assert!(h.contains("/static/themes/gruvbox.css"));
         assert!(h.contains("/frag/proj/theme.css")); // has_theme_css
         assert!(h.contains("data-project=\"proj\""));
-        assert!(h.contains("data-default-tab=\"terminal\""));
+        // default_tab was a v2 setting (which single view to open in); the
+        // four-pane client never read it, so it is gone from config and page.
+        assert!(!h.contains("data-default-tab"), "{h}");
         assert!(h.contains("htmx.min.js"));
         assert!(h.contains("data-pane=\"3\""));
         assert!(h.contains("id=\"termpool\""));

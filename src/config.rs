@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 #[serde(default)]
 struct RawConfig {
     theme: Option<String>,
-    default_tab: Option<String>,
     hide: Option<Vec<String>>,
     show_hidden: Option<bool>,
     autosave: Option<bool>,
@@ -22,7 +21,6 @@ struct RawConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub theme: String,
-    pub default_tab: String,
     pub hide: Vec<String>,
     pub show_hidden: bool,
     /// Whether the editor writes a buffer out on its own — a display-level
@@ -65,7 +63,6 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             theme: "darcula".into(),
-            default_tab: "terminal".into(),
             hide: vec![],
             show_hidden: false,
             autosave: true,
@@ -100,9 +97,6 @@ pub fn load(paths: &[&Path]) -> Settings {
             Ok(raw) => {
                 if let Some(v) = raw.theme {
                     s.theme = v;
-                }
-                if let Some(v) = raw.default_tab {
-                    s.default_tab = v;
                 }
                 if let Some(v) = raw.hide {
                     s.hide = v;
@@ -341,6 +335,19 @@ mod tests {
         assert_eq!(s, Settings::default());
     }
 
+    /// `default_tab` was removed on 2026-09-05 (a v2 "which view opens"
+    /// setting the four-pane client never read). Files that still set it
+    /// must keep loading silently: an unknown key is not a warning.
+    #[test]
+    fn a_removed_key_in_an_old_file_is_ignored_without_a_warning() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("old.toml");
+        fs::write(&p, "default_tab = \"files\"\ntheme = \"light\"").unwrap();
+        let s = load(&[&p]);
+        assert_eq!(s.theme, "light");
+        assert!(s.warning.is_none(), "{:?}", s.warning);
+    }
+
     #[test]
     fn project_overrides_global_per_key() {
         let d = tempfile::tempdir().unwrap();
@@ -351,7 +358,6 @@ mod tests {
         let s = load(&[&g, &p]);
         assert_eq!(s.theme, "gruvbox"); // project wins
         assert_eq!(s.hide, vec!["dist"]); // untouched key survives from global
-        assert_eq!(s.default_tab, "terminal"); // default fills the rest
         assert!(s.warning.is_none());
     }
 
