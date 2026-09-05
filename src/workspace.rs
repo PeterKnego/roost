@@ -187,6 +187,7 @@ impl Workspace {
             // `claude_sessions` above: it is a fact about the filesystem,
             // not the workspace layout.
             claude_hooks: None,
+            settings: proto::SettingsView::default(),
         }
     }
 }

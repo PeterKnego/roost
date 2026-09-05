@@ -54,7 +54,25 @@ pub enum Launch {
     Claude,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Which config file a `SetSetting` edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    Global,
+    Project,
+}
+
+/// A config value as the dialog carries it. Untagged: `true`, `"nord"` and
+/// `["dist"]` are unambiguous on the wire and in TOML.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SettingValue {
+    Bool(bool),
+    Str(String),
+    List(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "t")]
 pub enum Intent {
     OpenTab { pane: PaneId, tab: Tab },
@@ -143,6 +161,15 @@ pub enum Intent {
     /// `.claude/settings.local.json`. Applies to the project, not the
     /// connection: every browser on it sees the new state.
     SetClaudeHooks { on: bool },
+    /// Write one key into one config file, or clear it (`value: None`) so
+    /// inheritance resumes. Validated in `config::validate` before any
+    /// file is touched; see the settings-dialog spec.
+    SetSetting {
+        scope: Scope,
+        key: String,
+        #[serde(default)]
+        value: Option<SettingValue>,
+    },
     MarkNoticeRead { id: u64 },
     MarkAllNoticesRead,
     ClearNotices,
@@ -206,6 +233,43 @@ pub struct PaneView {
     pub active: usize,
 }
 
+/// One row of the settings dialog. `writable` is the scopes the hub will
+/// accept a write for (the same table `config::validate` refuses by), so
+/// the dialog cannot offer a control the server would refuse.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SettingRow {
+    pub key: String,
+    pub kind: &'static str,
+    pub writable: Vec<&'static str>,
+    pub effective: SettingValue,
+    pub project: Option<SettingValue>,
+    pub global: Option<SettingValue>,
+    pub default: SettingValue,
+    /// True when the page only reads this key at load, so the row says so.
+    pub reload: bool,
+}
+
+/// A picker tile. roost themes carry their three colours; daisyUI tiles
+/// carry empty strings and resolve their own through `data-theme`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ThemeEntry {
+    pub name: String,
+    pub kind: &'static str,
+    pub bg: String,
+    pub fg: String,
+    pub accent: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
+pub struct SettingsView {
+    pub keys: Vec<SettingRow>,
+    pub themes: Vec<ThemeEntry>,
+    pub project_file: String,
+    pub global_file: String,
+    /// `Settings::warning` — a config file that did not parse, named.
+    pub warning: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceView {
     pub sizes: Sizes,
@@ -242,6 +306,10 @@ pub struct WorkspaceView {
     /// same reason. The file is still the truth; a hand edit shows at the
     /// next invalidation, not necessarily the next snapshot.
     pub claude_hooks: Option<bool>,
+    /// Filled by `hub::snapshot_event` from a fresh `config::settings_view`;
+    /// never persisted (it is a read of the files, not workspace state).
+    #[serde(default)]
+    pub settings: SettingsView,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -606,5 +674,29 @@ mod tests {
             matches!(i, Intent::OpenTab { tab: Tab::File { ref rel, mode: Mode::Edit }, .. } if rel == "a.rs"),
             "got {i:?}"
         );
+    }
+
+    #[test]
+    fn set_setting_decodes_each_value_shape_and_a_clear() {
+        let b: Intent = serde_json::from_str(r#"{"t":"SetSetting","scope":"project","key":"autosave","value":false}"#).unwrap();
+        assert_eq!(b, Intent::SetSetting { scope: Scope::Project, key: "autosave".into(), value: Some(SettingValue::Bool(false)) });
+        let s: Intent = serde_json::from_str(r#"{"t":"SetSetting","scope":"global","key":"theme","value":"nord"}"#).unwrap();
+        assert_eq!(s, Intent::SetSetting { scope: Scope::Global, key: "theme".into(), value: Some(SettingValue::Str("nord".into())) });
+        let l: Intent = serde_json::from_str(r#"{"t":"SetSetting","scope":"project","key":"hide","value":["dist","out"]}"#).unwrap();
+        assert_eq!(l, Intent::SetSetting { scope: Scope::Project, key: "hide".into(), value: Some(SettingValue::List(vec!["dist".into(), "out".into()])) });
+        let c: Intent = serde_json::from_str(r#"{"t":"SetSetting","scope":"project","key":"theme"}"#).unwrap();
+        assert_eq!(c, Intent::SetSetting { scope: Scope::Project, key: "theme".into(), value: None });
+    }
+
+    #[test]
+    fn a_settings_view_serialises_nulls_for_absent_scopes() {
+        let row = SettingRow {
+            key: "theme".into(), kind: "str", writable: vec!["project", "global"],
+            effective: SettingValue::Str("nord".into()), project: Some(SettingValue::Str("nord".into())),
+            global: None, default: SettingValue::Str("darcula".into()), reload: false,
+        };
+        let j = serde_json::to_string(&row).unwrap();
+        assert!(j.contains(r#""global":null"#), "{j}");
+        assert!(j.contains(r#""effective":"nord""#), "{j}");
     }
 }

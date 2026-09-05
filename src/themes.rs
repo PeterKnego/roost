@@ -53,17 +53,17 @@ fn var_of(css: &str, name: &str) -> String {
     if hex.len() == 7 && hex.starts_with('#') { hex } else { String::new() }
 }
 
-/// (name, kind, [bg, fg, accent]) for every theme, roost first.
-pub fn catalogue() -> Vec<(String, &'static str, [String; 3])> {
+pub fn catalogue() -> Vec<crate::proto::ThemeEntry> {
+    use crate::proto::ThemeEntry;
     let mut out = Vec::new();
     for name in roost_names() {
         let css = crate::assets::get(&format!("themes/{name}.css"))
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default();
-        out.push((name, "roost", [var_of(&css, "--bg"), var_of(&css, "--fg"), var_of(&css, "--accent")]));
+        out.push(ThemeEntry { name, kind: "roost", bg: var_of(&css, "--bg"), fg: var_of(&css, "--fg"), accent: var_of(&css, "--accent") });
     }
     for name in DAISY_THEMES {
-        out.push((name.to_string(), "daisy", [String::new(), String::new(), String::new()]));
+        out.push(ThemeEntry { name: name.to_string(), kind: "daisy", bg: String::new(), fg: String::new(), accent: String::new() });
     }
     out
 }
@@ -89,17 +89,17 @@ mod tests {
     #[test]
     fn the_catalogue_lists_roost_first_then_daisyui_in_its_own_order() {
         let c = catalogue();
-        let names: Vec<&str> = c.iter().map(|e| e.0.as_str()).collect();
+        let names: Vec<&str> = c.iter().map(|e| e.name.as_str()).collect();
         let roost = roost_names();
         assert_eq!(&names[..roost.len()], roost.as_slice());
         assert_eq!(&names[roost.len()..], &DAISY_THEMES[..]);
         // Every roost entry carries the three tile colours read from its file;
         // every daisyUI entry carries none (the browser resolves them).
         for e in &c[..roost.len()] {
-            assert!(e.2.iter().all(|c| c.starts_with('#') && c.len() == 7), "{}: {:?}", e.0, e.2);
+            assert!([&e.bg, &e.fg, &e.accent].iter().all(|c| c.starts_with('#') && c.len() == 7), "{}: {:?}", e.name, [&e.bg, &e.fg, &e.accent]);
         }
         for e in &c[roost.len()..] {
-            assert!(e.2.iter().all(String::is_empty), "{}: {:?}", e.0, e.2);
+            assert!([&e.bg, &e.fg, &e.accent].iter().all(|c| c.is_empty()), "{}: {:?}", e.name, [&e.bg, &e.fg, &e.accent]);
         }
     }
 }
