@@ -275,6 +275,14 @@ two buttons — **Start in a new worktree** and *Start here anyway* — and
 dismiss. It is per-browser and not persisted: a second browser on the same
 project did not click.
 
+*Amended 2026-09-04:* the prompt is now an in-page `<dialog>` like every
+other question the workspace asks, `askChoice` in `dialog.js` (title, the
+terminal names in the body, the two choices and Cancel), not an inline box.
+The intents it sends and the per-browser, unpersisted nature are unchanged.
+The `window.open` for the worktree tab now runs a microtask after the
+click, still inside the browser's transient user activation; section C of
+`worktree-launch.mjs` clicks with a real mouse event to keep proving that.
+
 **The switcher** (`render::worktrees_strip`): the state fields above, and the
 remove control. All built in `render.rs`, everything escaped, as today.
 

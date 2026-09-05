@@ -68,9 +68,24 @@ const wire = (page) => {
   // Through the real elements, never send(): a button wired to nothing is
   // exactly the defect this file exists to catch.
   const clickButton = () => evalIn(`(() => { const b = document.querySelector("#noticepanel .hookrow button"); if (!b) return false; b.click(); return true; })()`);
-  const confirmYes = () => evalIn(`(() => { const b = [...document.querySelectorAll("#noticepanel .hookrow .confirm button")].find((x) => /^(Enable|Disable)$/.test(x.textContent)); if (!b) return false; b.click(); return true; })()`);
-  const confirmText = () => evalIn(`(document.querySelector("#noticepanel .hookrow .confirm") || {}).textContent || ""`);
-  return { evalIn, ready, mark, drawn, openPanel, rowText, buttonText, clickButton, confirmYes, confirmText, close: page.close };
+  // The confirmation is an in-page dialog (askConfirm), not a row swap.
+  // A REAL mouse click, not b.click(): the header's popup closer listens for
+  // mousedown, which a synthetic click never fires. Revert-check 2026-09-04:
+  // with b.click() here, removing the closer's dialog exemption left the
+  // "did not close the notice panel" assertion green — the panel could not
+  // have closed in the test at all. With a dispatched mousedown it fails.
+  const confirmYes = async () => {
+    const ready = await evalIn(`(() => { const d = document.getElementById("dlg-confirm"); const b = d.querySelector(".dlg-ok"); return !!(d.open && b && /^(Enable|Disable)$/.test(b.textContent)); })()`);
+    if (!ready) return false;
+    const r = JSON.parse(await evalIn(`JSON.stringify(document.querySelector("#dlg-confirm .dlg-ok").getBoundingClientRect())`));
+    const x = r.x + r.width / 2, y = r.y + r.height / 2;
+    await page.cmd("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+    await page.cmd("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+    return true;
+  };
+  const confirmText = () => evalIn(`(() => { const d = document.getElementById("dlg-confirm"); return d.open ? d.querySelector(".dlg-body").textContent : ""; })()`);
+  const panelOpen = () => evalIn(`!document.getElementById("noticepanel").hidden`);
+  return { evalIn, ready, mark, drawn, openPanel, rowText, buttonText, clickButton, confirmYes, confirmText, panelOpen, close: page.close };
 };
 
 let one, two;
@@ -96,6 +111,10 @@ try {
   ok(await one.clickButton(), "Enable is clickable");
   ok(/settings\.local\.json/.test(await one.confirmText()), "the confirmation names the file it will write");
   ok(await one.confirmYes(), "and can be confirmed");
+  // The header's popup closer treats any mousedown outside the panel as
+  // "close it"; a click inside a modal dialog is outside the panel in DOM
+  // terms but not in the user's, so the row must still be there to read.
+  ok(await one.panelOpen(), "confirming in the dialog did not close the notice panel");
 
   // No openPanel() call between the confirm and these two: `one`'s panel
   // was already open (never closed since the assertions above), and it has

@@ -402,9 +402,6 @@ main { flex: 1; min-height: 0; }
 /* showClaudeHere's prompt: .conflict already supplies the border/padding and
    the button margin, so this only overrides what makes the "start in a new
    worktree" choice read as the recommended one. */
-.claudehere { margin: 8px; }
-.claudehere button { margin: 8px 8px 0 0; font: inherit; cursor: pointer; }
-.claudehere .wt-new { font-weight: 600; }
 
 /* ---- fragment content shared by tree/changes/file/diff (rendered server-side) ---- */
 /* Indentation is a row property (--d, the depth render::tree_level stamps on
@@ -667,7 +664,6 @@ ul.picker li .git:hover { text-decoration: underline; }
 #bell[data-claude-hooks="off"]::after { color: var(--muted); text-decoration: line-through; }
 #bell[data-claude-hooks="unknown"]::after { content: "?"; color: var(--warn); }
 #noticepanel .hookrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 8px; border-bottom: 1px solid var(--border); color: var(--fg); }
-#noticepanel .hookrow .confirm { display: flex; gap: 6px; align-items: center; }
 #bellcount:not(:empty) {
   position: absolute; top: -2px; right: -4px;
   min-width: 14px; padding: 0 3px;
@@ -895,6 +891,7 @@ dialog.roost::backdrop { background: rgba(0,0,0,.35); }
 .dlg-input { width: calc(100% - 28px); margin: 0 14px; padding: 5px 7px;
              background: var(--bg); color: var(--fg); font: inherit;
              border: 1px solid var(--border); border-radius: 4px; }
+.dlg-detail { margin: 0 14px; max-height: 40vh; overflow: auto; border: 1px solid var(--border); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .dlg-buttons { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 14px; }
 .dlg-buttons button { padding: 5px 12px; border-radius: 4px; font: inherit;
                       background: var(--bg3); color: var(--fg);

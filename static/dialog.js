@@ -155,6 +155,54 @@ function askText({ title, label = "", value = "", confirm = "OK" }) {
   }, null);
 }
 
+// Several positive answers and a Cancel: "start in a new worktree / start
+// here anyway / dismiss". Not a menu, because a menu is positioned at a
+// pointer and has no title or body to say what is being asked; not a
+// confirm, because a confirm has exactly one OK and the structural CSS locks
+// that shape. Resolves the chosen id, or null for Cancel, Escape and the
+// backdrop. The first choice takes focus, as a non-destructive confirm's OK
+// does — unless `focus: "cancel"`, for a question where every answer destroys
+// something (the save conflict: overwrite discards the disk's changes,
+// discard-mine discards yours), so Enter destroys nothing.
+//
+// `detailHtml` is the one exception to "nothing here builds an HTML string":
+// it is set as innerHTML, and the only caller passes the diff render.rs
+// produced, which escapes every line before wrapping it. Never pass anything
+// that came from the DOM or from a path here.
+function askChoice({ title, lines = [], choices, detailHtml = "", focus = "first" }) {
+  const el = document.getElementById("dlg-choice");
+  return runDialog(el, (finish) => {
+    el.querySelector(".dlg-title").textContent = title;
+    const body = el.querySelector(".dlg-body");
+    body.replaceChildren();
+    for (const line of lines) {
+      const p = document.createElement("p");
+      p.textContent = line;
+      body.appendChild(p);
+    }
+    const detail = el.querySelector(".dlg-detail");
+    detail.innerHTML = detailHtml;
+    detail.hidden = !detailHtml;
+    const buttons = el.querySelector(".dlg-buttons");
+    // Cancel is in the shell; the choices are rebuilt around it each time.
+    buttons.querySelectorAll(".dlg-choice").forEach((b) => b.remove());
+    const cancelBtn = el.querySelector(".dlg-cancel");
+    cancelBtn.onclick = () => finish(null);
+    let first = null;
+    for (const c of choices) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "dlg-choice";
+      b.dataset.choice = c.id;
+      b.textContent = c.label;
+      b.onclick = () => finish(c.id);
+      buttons.appendChild(b);
+      first = first || b;
+    }
+    return () => (focus === "cancel" ? cancelBtn : first || cancelBtn).focus();
+  }, null);
+}
+
 function askMenu({ items, x, y }) {
   const el = document.getElementById("dlg-menu");
   return runDialog(el, (finish) => {

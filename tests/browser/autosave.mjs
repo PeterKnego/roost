@@ -85,11 +85,13 @@ const wire = async (project, rel) => {
     },
     blur: () => p.evalIn(`document.activeElement.blur(); document.body.focus()`),
     dirty: () => p.evalIn(`!!(state.buffers.find((b) => b.rel === ${JSON.stringify(rel)}) || {}).dirty`),
-    banners: () => p.evalIn(`document.querySelectorAll('.pane[data-pane="2"] .conflict').length`),
+    // The conflict is an in-page dialog now (askChoice); "one banner" is
+    // "the choice dialog is open and is the conflict".
+    banners: () => p.evalIn(`(document.getElementById("dlg-choice").open
+        && /changed on disk/.test(document.querySelector("#dlg-choice .dlg-title").textContent)) ? 1 : 0`),
     editorText: () => p.evalIn(`(document.querySelector("textarea.editor") || {}).value`),
     discard: () => p.evalIn(
-      `(() => { const b = [...document.querySelectorAll('.conflict button')]
-          .find((x) => /discard/i.test(x.textContent)); if (!b) return false; b.click(); return true; })()`),
+      `(() => { const b = document.querySelector('#dlg-choice .dlg-choice[data-choice="discard"]'); if (!b) return false; b.click(); return true; })()`),
     savestate: () => p.evalIn(`(document.querySelector('.pane[data-pane="2"] .savestate') || {}).textContent || ""`),
     saveButtonShown: () => p.evalIn(
       `(() => { const b = document.querySelector('.pane[data-pane="2"] .savebtn'); return !!b && !b.hidden; })()`),

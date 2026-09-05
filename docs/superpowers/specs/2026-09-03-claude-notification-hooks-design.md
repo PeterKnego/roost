@@ -210,6 +210,12 @@ shares. `timeout` is 5 seconds: the command writes one escape sequence.
 - The bell's tooltip gains the state so it is readable without opening the
   panel.
 
+  *Amended 2026-09-04:* the confirmation is an in-page `askConfirm` dialog
+  rather than a row swap: same wording, Enable or Disable as its button,
+  Disable in the danger variant, Cancel otherwise. The header's popup closer
+  exempts clicks inside a roost dialog, so the panel stays open under it and
+  the row is still there to show the new state.
+
 ### 5. Tests
 
 Unit, `claudehooks.rs`:

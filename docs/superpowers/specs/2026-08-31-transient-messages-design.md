@@ -6,8 +6,8 @@ they do not agree about what they are:
 
 | Call site | Placement today | Lifetime | What it actually is |
 |---|---|---|---|
-| `showConflict` `app.js:2105` | prepended into pane 2's `.content` | until answered | a **question** |
-| `showClaudeHere` `app.js:2123` | prepended into a pane | until answered | a **question** |
+| `showConflict` `app.js:2105` | prepended into pane 2's `.content` (since 2026-09-04: an in-page dialog, `askChoice` with the diff in its detail slot, focus on Cancel) | until answered | a **question** |
+| `showClaudeHere` `app.js:2123` | prepended into a pane (since 2026-09-04: an in-page dialog, `askChoice`) | until answered | a **question** |
 | `showBanner` / `showError` `app.js:2155` | `.error-banner` → `position: fixed` | 8s | a **notice** |
 | `setUploadProgress` `app.js:2645` | `document.body.appendChild`, no positioning class | the upload | a **status** |
 

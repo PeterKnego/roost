@@ -218,6 +218,53 @@ try {
     { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
   await until(async () => (await evalIn("window.__r")) === null, 5, "menu edge escape");
 
+  // N: askChoice — several positive answers plus Cancel. The ✻ prompt ("a
+  // Claude is already here": new worktree / here anyway / dismiss) needs it;
+  // askConfirm has one OK, and its .dlg-ok/.dlg-cancel are what the
+  // structural CSS locks, so a third button cannot be bolted onto it.
+  await evalIn(`window.__r = "unset";
+     askChoice({ title: "T", lines: ["L"], choices: [{ id: "wt", label: "New worktree" }, { id: "here", label: "Here" }] })
+       .then((v) => { window.__r = v; }); 0`);
+  ok(await evalIn(`document.getElementById("dlg-choice").open`), "askChoice opens its own shell");
+  ok((await evalIn(`[...document.querySelectorAll("#dlg-choice .dlg-choice")].map((b) => b.textContent).join("|")`)) === "New worktree|Here",
+     "one button per choice, labelled, in order");
+  ok(await evalIn(`document.activeElement === document.querySelector('#dlg-choice .dlg-choice[data-choice="wt"]')`),
+     "the first choice has focus, so Enter takes it");
+  ok((await evalIn(`document.querySelector("#dlg-choice .dlg-body").textContent`)) === "L", "the body carries the lines");
+  await evalIn(`document.querySelector('#dlg-choice .dlg-choice[data-choice="here"]').click(); 0`);
+  ok(await until(async () => (await evalIn("window.__r")) === "here", 5, "choice pick"), "clicking a choice resolves its id");
+  ok(!(await evalIn(`document.getElementById("dlg-choice").open`)), "and closes the dialog");
+
+  ok(await evalIn(`document.querySelector("#dlg-choice .dlg-detail").hidden`), "with no detail the slot is hidden");
+
+  await evalIn(`window.__r = "unset"; askChoice({ title: "T", choices: [{ id: "a", label: "A" }] }).then((v) => { window.__r = v; }); 0`);
+  await evalIn(`document.querySelector("#dlg-choice .dlg-cancel").click(); 0`);
+  ok(await until(async () => (await evalIn("window.__r")) === null, 5, "choice cancel"), "Cancel resolves null");
+
+  // A detail slot for server-rendered HTML (the save conflict's diff, which
+  // render.rs escapes line by line), and focus on Cancel when every choice
+  // destroys something.
+  await evalIn(`window.__r = "unset";
+     askChoice({ title: "T", detailHtml: '<div class="dl add">+x</div>', focus: "cancel",
+                 choices: [{ id: "a", label: "A" }, { id: "b", label: "B" }] })
+       .then((v) => { window.__r = v; }); 0`);
+  ok((await evalIn(`document.querySelectorAll("#dlg-choice .dlg-detail .dl.add").length`)) === 1
+     && !(await evalIn(`document.querySelector("#dlg-choice .dlg-detail").hidden`)),
+     "detailHtml renders into the visible detail slot");
+  ok(await evalIn(`document.activeElement === document.querySelector("#dlg-choice .dlg-cancel")`),
+     "focus: 'cancel' puts focus on Cancel, so Enter destroys nothing");
+  await evalIn(`document.querySelector("#dlg-choice .dlg-cancel").click(); 0`);
+  await until(async () => (await evalIn("window.__r")) === null, 5, "detail cancel");
+
+  await evalIn(`window.__r = "unset"; askChoice({ title: "T", choices: [{ id: "a", label: '<b>bold</b>' }] }).then((v) => { window.__r = v; }); 0`);
+  ok((await evalIn(`document.querySelectorAll("#dlg-choice .dlg-choice b").length`)) === 0,
+     "a choice label that looks like markup produces no element");
+  await page.cmd("Input.dispatchKeyEvent",
+    { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await page.cmd("Input.dispatchKeyEvent",
+    { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  ok(await until(async () => (await evalIn("window.__r")) === null, 5, "choice escape"), "Escape resolves null");
+
   // M: drive each converted entry point once, so the guard above is armed
   // against real call sites and not only against the primitive.
   await evalIn(`fileMenu({ preventDefault(){}, clientX: 30, clientY: 30 }, "a.txt"); 0`);
@@ -229,6 +276,31 @@ try {
   await until(async () => await evalIn(`document.getElementById("dlg-confirm").open`), 5, "close dialog");
   ok(true, "Close Project opens in-page");
   await evalIn(`document.querySelector("#dlg-confirm .dlg-cancel").click(); 0`);
+  await evalIn(`showClaudeHere(3, ["term1"]); 0`);
+  ok(await until(async () => await evalIn(`document.getElementById("dlg-choice").open`), 5, "claude-here dialog"),
+     "the ✻ 'a Claude is already here' prompt opens in-page");
+  ok((await evalIn(`document.querySelector("#dlg-choice .dlg-body").textContent`)).includes("term1"), "and names the terminal");
+  ok((await evalIn("window.__sent.length")) === 0, "and sends nothing until answered");
+  await evalIn(`document.querySelector("#dlg-choice .dlg-cancel").click(); 0`);
+  await evalIn(`showConflict({ rel: "a.txt", diff_html: '<div class="dl del">-old</div><div class="dl add">+new</div>' }); 0`);
+  ok(await until(async () => await evalIn(`document.getElementById("dlg-choice").open`), 5, "conflict dialog"),
+     "the save conflict opens in-page");
+  ok((await evalIn(`document.querySelector("#dlg-choice .dlg-title").textContent`)).includes("a.txt"), "titled with the file");
+  ok((await evalIn(`document.querySelectorAll("#dlg-choice .dlg-detail .dl").length`)) === 2, "showing the diff");
+  ok(await evalIn(`document.activeElement === document.querySelector("#dlg-choice .dlg-cancel")`),
+     "with focus on Cancel: both answers discard someone's work");
+  ok((await evalIn("window.__sent.length")) === 0, "and sends nothing until answered");
+  await evalIn(`document.querySelector("#dlg-choice .dlg-cancel").click(); 0`);
+  await evalIn(`document.getElementById("bell").click(); 0`);
+  await until(async () => await evalIn(`!document.getElementById("noticepanel").hidden`), 5, "notice panel");
+  await evalIn(`document.querySelector("#noticepanel .hookrow button").click(); 0`);
+  ok(await until(async () => await evalIn(`document.getElementById("dlg-confirm").open`), 5, "hook dialog"),
+     "the bell's hook switch asks in-page");
+  ok((await evalIn(`document.querySelector("#dlg-confirm .dlg-body").textContent`)).includes("settings.local.json"),
+     "and names the file it would write");
+  ok((await evalIn("window.__sent.length")) === 0, "and sends nothing until answered");
+  await evalIn(`document.querySelector("#dlg-confirm .dlg-cancel").click(); 0`);
+  await evalIn(`document.getElementById("noticepanel").hidden = true; 0`);
 
   ok((await evalIn("window.__native.length")) === 0,
      "no code path in this file reached a native browser dialog");

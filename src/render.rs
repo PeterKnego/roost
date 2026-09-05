@@ -1591,13 +1591,17 @@ dialog.roost, .dlg-title, .dlg-blocked { display: revert !important; visibility:
    dialog's layout. Lock the known-good value explicitly instead, the same
    way .dlg-body/.dlg-buttons/.dlg-items do below. */
 .dlg-label { display: block !important; visibility: visible !important; opacity: 1 !important; }
+/* The detail slot holds the diff a save conflict is about to overwrite; hiding
+   it would hide what "Overwrite" destroys. Hidden by attribute when empty. */
+.dlg-detail:not([hidden]) { display: block !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
 .dlg-body, .dlg-buttons, .dlg-items { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
 .dlg-body, .dlg-items { flex-direction: column !important; }
 .dlg-buttons { flex-direction: row !important; order: 0 !important; }
 .dlg-buttons button, .dlg-item { transform: none !important; font-size: 13px !important; order: 0 !important; }
 .dlg-title::before, .dlg-title::after, .dlg-body::before, .dlg-body::after,
 .dlg-buttons::before, .dlg-buttons::after, .dlg-ok::before, .dlg-ok::after,
-.dlg-cancel::before, .dlg-cancel::after, .dlg-item::before, .dlg-item::after { content: normal !important; }
+.dlg-cancel::before, .dlg-cancel::after, .dlg-item::before, .dlg-item::after,
+.dlg-choice::before, .dlg-choice::after { content: normal !important; }
 </style>"#;
 
 /// `sharing_on` is passed in rather than read here: it is a *global-only*
@@ -1722,6 +1726,14 @@ pub fn workspace_page(
   </div>
 </dialog>
 <dialog id="dlg-menu" class="roost"><div class="dlg-items"></div></dialog>
+<dialog id="dlg-choice" class="roost">
+  <h2 class="dlg-title"></h2>
+  <div class="dlg-body"></div>
+  <div class="dlg-detail" hidden></div>
+  <div class="dlg-buttons">
+    <button type="button" class="dlg-cancel">Cancel</button>
+  </div>
+</dialog>
 <!-- Empty by default and hidden: the slots exist so a future per-pane control
      (a split, a kebab, a pane menu) has somewhere to land without reopening
      the header's layout. app.js rebuilds .tabstrip wholesale on every render,
@@ -3101,7 +3113,7 @@ mod tests {
     fn the_workspace_page_ships_empty_dialog_shells() {
         let s = crate::config::Settings::default();
         let html = workspace_page("proj", "proj", &s, None, false, &[]);
-        for id in ["dlg-confirm", "dlg-text", "dlg-menu"] {
+        for id in ["dlg-confirm", "dlg-text", "dlg-menu", "dlg-choice"] {
             assert!(html.contains(&format!(r#"id="{id}""#)), "no {id} shell");
         }
         // Filled from JS with textContent, so they must ship empty — the same
@@ -3109,12 +3121,18 @@ mod tests {
         // would mean a path was interpolated into HTML somewhere.
         assert!(html.contains(r#"<dialog id="dlg-menu" class="roost"><div class="dlg-items"></div></dialog>"#),
             "the menu shell must ship empty");
+        // The choice shell's detail slot is the one place server-rendered
+        // HTML (a save conflict's escaped diff) is set as innerHTML, so it
+        // too must ship empty.
+        assert!(html.contains("<div class=\"dlg-body\"></div>\n  <div class=\"dlg-detail\" hidden></div>"),
+            "the choice shell must carry an empty, hidden .dlg-detail slot");
         // A <dialog> is display:none without `open`. Marking one `hidden`
         // (copying the #searchoverlay idiom) yields a dialog that can never
         // be shown, so the attribute must never appear on one.
         for frag in ["<dialog id=\"dlg-confirm\" class=\"roost\" hidden",
                      "<dialog id=\"dlg-text\" class=\"roost\" hidden",
-                     "<dialog id=\"dlg-menu\" class=\"roost\" hidden"] {
+                     "<dialog id=\"dlg-menu\" class=\"roost\" hidden",
+                     "<dialog id=\"dlg-choice\" class=\"roost\" hidden"] {
             assert!(!html.contains(frag), "a dialog must not carry `hidden`: {frag}");
         }
         assert!(html.contains(r#"<script src="/static/dialog.js"></script>"#), "dialog.js not loaded");
@@ -3147,6 +3165,15 @@ mod tests {
         // only a per-project `.roost/theme.css`.
         let no_theme = workspace_page("proj", "proj", &s, None, false, &[]);
         assert!(no_theme.contains(DIALOG_STRUCTURAL_CSS));
+        // askChoice's buttons are neither .dlg-ok nor .dlg-cancel, so the
+        // generated-content lock has to name them too, or a theme could
+        // relabel "Start here anyway" with a ::after.
+        assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-choice::before") && DIALOG_STRUCTURAL_CSS.contains(".dlg-choice::after"),
+            "the structural CSS does not lock .dlg-choice's generated content");
+        // The detail slot shows the diff a conflict is about to overwrite;
+        // a theme must not be able to hide it.
+        assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-detail:not([hidden])"),
+            "the structural CSS does not lock .dlg-detail's visibility");
     }
 
     #[test]

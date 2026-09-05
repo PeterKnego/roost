@@ -53,7 +53,7 @@
 //!
 //! Revert-checks (CLAUDE.md: "would this fail if I deleted the code it
 //! covers?"), applied and watched failing, then restored:
-//!   (a) removing `force: true` from `.wt-here`'s intent: section D's "force
+//!   (a) removing `force: true` from the "Start here anyway" intent: section D's "force
 //!       opens a second terminal in the original project" FAILED — the
 //!       prompt reappeared instead (server saw a Claude already there and
 //!       re-asked) and the session count stayed at 2 instead of reaching 3.
@@ -173,7 +173,7 @@ try {
 
   console.log("\nB. second ✻ asks instead of opening");
   await evalIn(`document.querySelector('.pane[data-pane="3"] .paneicons .newclaude').click()`);
-  ok(await until(() => evalIn(`!!document.querySelector('.pane[data-pane="3"] .claudehere')`), 10, "the prompt"), "the prompt appeared in the pane");
+  ok(await until(() => evalIn(`document.getElementById("dlg-choice").open`), 10, "the prompt"), "the prompt opened as an in-page dialog");
   // Wrap `send` (a plain top-level function in this non-module script, so it
   // hangs off `window` and is interceptable) to count anything the prompt
   // fires on its own, with no click. `showClaudeHere` calling `newTerminal`
@@ -187,10 +187,14 @@ try {
   await sleep(1500);
   ok(Number(await evalIn(`window.__sendCount`)) === 0, "the prompt sent nothing on its own");
   ok(JSON.parse(await evalIn(`JSON.stringify(__sessions(3))`)).length === 2, "and no terminal was opened (State snapshot unchanged)");
-  ok((await evalIn(`document.querySelector('.claudehere').textContent`)).includes(first), `it names the terminal (${first})`);
+  ok((await evalIn(`document.querySelector('#dlg-choice .dlg-body').textContent`)).includes(first), `it names the terminal (${first})`);
 
   console.log("\nC. start in a new worktree → a second tab on claude-1 with claude started");
-  await clickReal(page, ".claudehere .wt-new");
+  // A real click: "Start in a new worktree" calls window.open, and the popup
+  // blocker only allows that inside a user activation. The dialog resolves a
+  // promise, so the open happens a microtask after the click — still inside
+  // Chromium's transient activation, which this section is what proves.
+  await clickReal(page, '#dlg-choice .dlg-choice[data-choice="worktree"]');
   // `until` reports only true/false, never the value fn() computed — so the
   // matching target has to be re-read from the list after it resolves rather
   // than trusted to come out of the poll itself (an earlier draft did that
@@ -220,8 +224,8 @@ try {
 
   console.log("\nD. start here anyway");
   await evalIn(`document.querySelector('.pane[data-pane="3"] .paneicons .newclaude').click()`);
-  await until(() => evalIn(`!!document.querySelector('.pane[data-pane="3"] .claudehere')`), 10, "the prompt again");
-  await evalIn(`document.querySelector('.claudehere .wt-here').click()`);
+  await until(() => evalIn(`document.getElementById("dlg-choice").open`), 10, "the prompt again");
+  await evalIn(`document.querySelector('#dlg-choice .dlg-choice[data-choice="here"]').click()`);
   ok(await until(async () => JSON.parse(await evalIn(`JSON.stringify(__sessions(3))`)).length === 3, 20, "a third terminal"), "force opens a second terminal in the original project");
 
   console.log("\nE. the switcher shows state, and removal waits for the terminal to end");

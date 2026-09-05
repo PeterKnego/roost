@@ -2256,51 +2256,51 @@ function saveNow(rel) {
   send({ t: "SaveBuffer", rel, force: false });
 }
 
-function showConflict(ev) {
-  const box = document.createElement("div");
-  box.className = "conflict";
-  box.innerHTML =
-    `<b>${escapeHtml(ev.rel)} changed on disk since you opened it.</b>` + ev.diff_html;
-  const over = document.createElement("button");
-  over.textContent = "overwrite";
-  over.onclick = () => { send({ t: "SaveBuffer", rel: ev.rel, force: true }); box.remove(); };
-  const reload = document.createElement("button");
-  reload.textContent = "discard mine";
-  reload.onclick = () => { send({ t: "CloseBuffer", rel: ev.rel }); box.remove(); };
-  box.append(over, reload);
-  document.querySelector('.pane[data-pane="2"] .content').prepend(box);
+// A save found the file changed on disk. Both answers discard someone's
+// work — overwrite the disk's, discard-mine yours — so neither is accented
+// and focus sits on Cancel, which keeps the buffer dirty for a later look.
+// The diff is server-rendered and escaped (render::diff_html); see askChoice.
+async function showConflict(ev) {
+  const pick = await askChoice({
+    title: `${ev.rel} changed on disk since you opened it`,
+    lines: ["Overwrite replaces what is on disk with your buffer; Discard mine reloads the file and drops your edits."],
+    detailHtml: ev.diff_html,
+    focus: "cancel",
+    choices: [
+      { id: "overwrite", label: "Overwrite" },
+      { id: "discard", label: "Discard mine" },
+    ],
+  });
+  if (pick === "overwrite") send({ t: "SaveBuffer", rel: ev.rel, force: true });
+  else if (pick === "discard") send({ t: "CloseBuffer", rel: ev.rel });
 }
 
 // The "a Claude is already here" prompt. Per-browser and transient: it is a
-// question to the person who clicked, not a state of the project.
-function showClaudeHere(pane, terminals) {
-  document.querySelectorAll(".claudehere").forEach((n) => n.remove());
-  const box = document.createElement("div");
-  box.className = "conflict claudehere";
-  const b = document.createElement("b");
-  b.textContent = terminals.length
-    ? `A Claude is already working in this project (${terminals.join(", ")}).`
-    : "A Claude is already working in this project.";
-  const wt = document.createElement("button");
-  wt.className = "wt-new";
-  wt.textContent = "Start in a new worktree";
-  wt.onclick = () => {
-    // Opened synchronously, inside this click's user-gesture, so the popup
-    // blocker allows it; WorktreeReady navigates it once the server responds.
+// question to the person who clicked, not a state of the project. It used to
+// be a banner prepended to the pane; now the same in-page dialog every other
+// question goes through.
+async function showClaudeHere(pane, terminals) {
+  const who = terminals.length
+    ? `${terminals.join(", ")} ${terminals.length === 1 ? "is" : "are"} running a Claude in this project.`
+    : "A terminal in this project is running a Claude.";
+  const pick = await askChoice({
+    title: "A Claude is already working here",
+    lines: [who, "Two Claudes in one checkout step on each other's edits."],
+    choices: [
+      { id: "worktree", label: "Start in a new worktree" },
+      { id: "here", label: "Start here anyway" },
+    ],
+  });
+  if (pick === "worktree") {
+    // Opened right after the click's promise resolves — still inside the
+    // browser's transient user activation, so the popup blocker allows it;
+    // worktree-launch.mjs section C clicks with a real mouse event to prove
+    // that. WorktreeReady navigates the tab once the server responds.
     pendingTab = window.open("about:blank");
     send({ t: "NewWorktree", launch: "claude" });
-    box.remove();
-  };
-  const here = document.createElement("button");
-  here.className = "wt-here";
-  here.textContent = "Start here anyway";
-  here.onclick = () => { send({ t: "NewTerminal", pane, launch: "claude", force: true }); box.remove(); };
-  const dismiss = document.createElement("button");
-  dismiss.textContent = "dismiss";
-  dismiss.onclick = () => box.remove();
-  box.append(b, wt, here, dismiss);
-  const host = document.querySelector(`.pane[data-pane="${pane}"]`) || document.body;
-  host.prepend(box);
+  } else if (pick === "here") {
+    send({ t: "NewTerminal", pane, launch: "claude", force: true });
+  }
 }
 
 // Transient, dismissible: reuses .conflict's border/padding/button styling
@@ -2616,6 +2616,10 @@ document.addEventListener(
     for (const [btnId, panelId] of HEADER_POPUPS) {
       const panel = document.getElementById(panelId);
       const btn = document.getElementById(btnId);
+      // A click inside a modal dialog is outside the panel in DOM terms but
+      // not in the user's: the hook row's confirmation opens one, and closing
+      // the panel under it would take away the row the answer changes.
+      if (e.target.closest && e.target.closest("dialog.roost")) continue;
       if (panel && !panel.hidden && !panel.contains(e.target) && btn && !btn.contains(e.target)) {
         panel.hidden = true;
       }
@@ -2677,7 +2681,6 @@ function unread() { return notices.filter((n) => !n.read).length; }
 // The bell's Claude-hooks state. Three values, never two: `null` means the
 // server could not read or parse the settings file, and that gets a reason
 // and no button, not a guess.
-let hookConfirm = null; // "on" | "off" while a confirmation is showing
 function hookState() {
   if (!state || state.claude_hooks === undefined) return "unknown";
   return state.claude_hooks === null ? "unknown" : (state.claude_hooks ? "on" : "off");
@@ -2690,8 +2693,9 @@ function renderClaudeHooks() {
   const word = { on: "on", off: "off", unknown: "cannot tell" }[s];
   bell.title = `notifications (n) · Claude notifications for this project: ${word}`;
 }
-// The panel's first row: state, and the switch behind a one-line
-// confirmation, because it writes into a file roost does not own.
+// The panel's first row: state, and the switch behind a confirmation,
+// because it writes into a file roost does not own. Disable is the danger
+// variant: it removes entries from that file.
 function hookRow() {
   const row = document.createElement("div");
   row.className = "hookrow";
@@ -2704,26 +2708,20 @@ function hookRow() {
   }
   label.textContent = `Claude notifications for this project: ${s}`;
   row.appendChild(label);
-  if (hookConfirm) {
-    const c = document.createElement("span");
-    c.className = "confirm";
-    const q = document.createElement("span");
-    q.textContent = hookConfirm === "on"
-      ? "Write two hooks to .claude/settings.local.json? "
-      : "Remove roost's hooks from .claude/settings.local.json? ";
-    const yes = document.createElement("button");
-    yes.textContent = hookConfirm === "on" ? "Enable" : "Disable";
-    yes.onclick = (e) => { e.stopPropagation(); send({ t: "SetClaudeHooks", on: hookConfirm === "on" }); hookConfirm = null; renderNotices(); };
-    const no = document.createElement("button");
-    no.textContent = "Cancel";
-    no.onclick = (e) => { e.stopPropagation(); hookConfirm = null; renderNotices(); };
-    c.append(q, yes, no);
-    row.appendChild(c);
-    return row;
-  }
   const b = document.createElement("button");
   b.textContent = s === "on" ? "Disable" : "Enable";
-  b.onclick = (e) => { e.stopPropagation(); hookConfirm = s === "on" ? "off" : "on"; renderNotices(); };
+  b.onclick = async (e) => {
+    e.stopPropagation();
+    const on = s !== "on";
+    const yes = await askConfirm({
+      title: "Claude notifications for this project",
+      lines: [on ? "Write two hooks (Notification, Stop) to .claude/settings.local.json?"
+                 : "Remove roost's hooks from .claude/settings.local.json?"],
+      confirm: on ? "Enable" : "Disable",
+      danger: !on,
+    });
+    if (yes) send({ t: "SetClaudeHooks", on });
+  };
   row.appendChild(b);
   return row;
 }
