@@ -392,7 +392,30 @@ pub fn set_setting(scope: Scope, project_dir: &Path, key: &str, value: Option<&S
     validate(scope, key, value)?;
     match scope {
         Scope::Project => {
-            let p = project_dir.join(".roost").join("config.toml");
+            // Confined exactly as `claudehooks::set` confines
+            // `.claude/settings.local.json`, and for the same reason: roost
+            // opens cloned repositories, and a clone can ship `.roost` as a
+            // symlink. A plain `join` follows it and writes roost's config
+            // wherever it points.
+            //
+            // The directory is resolved and created *before* the file,
+            // because `safe_resolve_parent` canonicalises the parent — it
+            // cannot resolve `.roost/config.toml` while `.roost` is absent.
+            // Resolving `.roost` itself only validates the component (its
+            // parent, the project directory, is what gets canonicalised), so
+            // a symlinked `.roost` survives that step and is caught by the
+            // second call, where it *is* the parent being canonicalised.
+            let dir = crate::projects::safe_resolve_parent(project_dir, ".roost")?;
+            // Only this one level, never `create_dir_all`: a project
+            // directory that is itself gone must fail rather than be
+            // resurrected from a path the hub still holds (the same rule
+            // `write_setting` states below).
+            match std::fs::create_dir(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(format!("{}: {e}", dir.display())),
+            }
+            let p = crate::projects::safe_resolve_parent(project_dir, ".roost/config.toml")?;
             write_setting(&p, key, value)?;
             Ok(p)
         }
@@ -983,6 +1006,45 @@ mod tests {
         // makes this fail — the whole `gone/.roost` chain gets created and
         // `write_setting` succeeds instead of erroring.
         assert!(!d.path().join("gone").exists(), "a deleted project directory must not be resurrected");
+    }
+
+    /// roost opens cloned repositories, and a clone can ship a `.roost`
+    /// *symlink*. `project_dir.join(".roost").join("config.toml")` follows it,
+    /// so a repository could redirect roost's own config write to any file the
+    /// user can write — reproduced before the fix with `.roost -> {base}/outside`,
+    /// which gained `theme = "nord"`. CLAUDE.md's rule is that every creation
+    /// destination goes through `projects::safe_resolve_parent`, which
+    /// canonicalises the parent and validates the final component; this is the
+    /// same idiom `claudehooks::set` uses for `.claude/settings.local.json`.
+    ///
+    /// Revert-check (performed 2026-09-05): restoring the unconfined
+    /// `project_dir.join(".roost").join("config.toml")` in `set_setting`'s
+    /// Project arm fails it —
+    ///   called `Result::unwrap_err()` on an `Ok` value:
+    ///   "/tmp/.tmpiO34Fk/proj/.roost/config.toml"
+    /// — the write succeeded, and that path *is* `outside/config.toml` through
+    /// the link. The panic is on the first half, so the directory listing below
+    /// never runs under the revert; it is there because a leaked temp file has
+    /// escaped the project just as much as the final one has. Restored, and it
+    /// passes again.
+    #[test]
+    fn a_symlinked_roost_directory_cannot_redirect_the_write() {
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join("proj");
+        let outside = d.path().join("outside");
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, proj.join(".roost")).unwrap();
+        let e = set_setting(Scope::Project, &proj, "theme", Some(&V::Str("nord".into()))).unwrap_err();
+        assert!(e.contains("outside project"), "the refusal must name the confinement: {e}");
+        // Read the directory rather than probe one guessed name: a temp file
+        // left mid-write escaped the project just as much as the final one.
+        let escaped: Vec<String> = fs::read_dir(&outside)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(escaped.is_empty(), "the write escaped the project: {escaped:?}");
     }
 
     #[test]
