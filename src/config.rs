@@ -382,6 +382,109 @@ pub fn for_project(project_dir: &Path) -> Settings {
     ])
 }
 
+/// One process-wide lock for the global file: every project's hub can
+/// reach it, and two hubs editing it at once would race the rename.
+static GLOBAL_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Validate, pick the file for `scope`, write. Returns the path written so
+/// the caller can name it. The project file is `{project}/.roost/config.toml`.
+pub fn set_setting(scope: Scope, project_dir: &Path, key: &str, value: Option<&SettingValue>) -> Result<PathBuf, String> {
+    validate(scope, key, value)?;
+    match scope {
+        Scope::Project => {
+            let p = project_dir.join(".roost").join("config.toml");
+            write_setting(&p, key, value)?;
+            Ok(p)
+        }
+        Scope::Global => {
+            let p = global_config_path();
+            let _g = GLOBAL_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+            write_setting(&p, key, value)?;
+            Ok(p)
+        }
+    }
+}
+
+/// Set or remove one top-level key, keeping every other byte of the file:
+/// comments, order, formatting. `toml_edit` is what makes that possible; a
+/// `RawConfig` round-trip would drop all of it. A file that does not parse
+/// is refused and left alone — rewriting a file we could not read is how a
+/// hand-edited one gets destroyed. Atomic via temp file and rename.
+pub fn write_setting(path: &Path, key: &str, value: Option<&SettingValue>) -> Result<(), String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{}: {e}", path.display()))?;
+    match value {
+        None => {
+            doc.as_table_mut().remove(key);
+        }
+        Some(v) => {
+            let new_value = match v {
+                SettingValue::Bool(b) => toml_edit::Value::from(*b),
+                SettingValue::Str(s) => toml_edit::Value::from(s.as_str()),
+                SettingValue::List(l) => {
+                    let mut a = toml_edit::Array::new();
+                    for s in l {
+                        a.push(s.as_str());
+                    }
+                    toml_edit::Value::Array(a)
+                }
+            };
+            // Replacing the whole `Item` drops its decor — the inline
+            // comment trailing the old value — because the freshly built
+            // one carries none. Keeping it means editing an existing
+            // value's content in place rather than swapping the `Item`.
+            match doc.get_mut(key).and_then(toml_edit::Item::as_value_mut) {
+                Some(existing) => *existing = new_value.decorated(
+                    existing.decor().prefix().cloned().unwrap_or_default(),
+                    existing.decor().suffix().cloned().unwrap_or_default(),
+                ),
+                None => doc[key] = toml_edit::Item::Value(new_value),
+            }
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, doc.to_string()).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
+}
+
+/// The raw value of one key in one file, no cascade, no defaults: what the
+/// dialog shows as "project: …" and "global: …". Integers come back as
+/// their decimal text (only read-only keys carry them). A file that does
+/// not parse reads as absent; `Settings::warning` reports the parse error
+/// separately.
+pub fn raw_setting(path: &Path, key: &str) -> Option<SettingValue> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let doc: toml_edit::DocumentMut = text.parse().ok()?;
+    let item = doc.get(key)?;
+    let v = item.as_value()?;
+    if let Some(b) = v.as_bool() {
+        return Some(SettingValue::Bool(b));
+    }
+    if let Some(s) = v.as_str() {
+        return Some(SettingValue::Str(s.to_string()));
+    }
+    if let Some(i) = v.as_integer() {
+        return Some(SettingValue::Str(i.to_string()));
+    }
+    if let Some(a) = v.as_array() {
+        return Some(SettingValue::List(a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,4 +860,78 @@ mod tests {
         assert_eq!(writable_in("nope"), &[] as &[&str]);
     }
 
+    #[test]
+    fn writing_a_key_keeps_comments_and_other_keys_byte_for_byte() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        let before = "# my config\ntheme = \"dark\"   # the old one\nhide = [\"dist\"]\n\n[unrelated]\nx = 1\n";
+        fs::write(&p, before).unwrap();
+        write_setting(&p, "theme", Some(&V::Str("nord".into()))).unwrap();
+        let after = fs::read_to_string(&p).unwrap();
+        // Revert-check: replacing the toml_edit body with
+        // `toml::to_string(&RawConfig{..})` loses the comment and the table.
+        assert_eq!(after, "# my config\ntheme = \"nord\"   # the old one\nhide = [\"dist\"]\n\n[unrelated]\nx = 1\n");
+        write_setting(&p, "autosave", Some(&V::Bool(false))).unwrap();
+        assert!(fs::read_to_string(&p).unwrap().contains("autosave = false"));
+        write_setting(&p, "hide", Some(&V::List(vec!["a".into(), "b".into()]))).unwrap();
+        assert!(fs::read_to_string(&p).unwrap().contains("hide = [\"a\", \"b\"]"));
+    }
+
+    #[test]
+    fn clearing_removes_the_key_and_a_missing_file_is_created() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("sub").join("config.toml");
+        write_setting(&p, "theme", Some(&V::Str("nord".into()))).unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "theme = \"nord\"\n");
+        write_setting(&p, "theme", None).unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap().trim(), "");
+        // Clearing an absent key is a no-op, not an error.
+        write_setting(&p, "theme", None).unwrap();
+    }
+
+    #[test]
+    fn an_unparsable_file_is_refused_and_untouched() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        fs::write(&p, "theme = \"dark\"\nthis is not toml\n").unwrap();
+        let e = write_setting(&p, "theme", Some(&V::Str("nord".into()))).unwrap_err();
+        assert!(e.contains("config.toml"), "{e}");
+        // Revert-check: swapping `?` on the parse for `.unwrap_or_default()`
+        // writes a one-line file here and this compare fails.
+        assert_eq!(fs::read_to_string(&p).unwrap(), "theme = \"dark\"\nthis is not toml\n");
+        assert!(!d.path().join("config.toml.tmp.0").exists());
+    }
+
+    #[test]
+    fn set_setting_picks_the_file_by_scope_and_validates_first() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        let global = d.path().join("global.toml");
+        std::env::set_var("ROOST_CONFIG", &global);
+        let proj = d.path().join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        let written = set_setting(Scope::Project, &proj, "theme", Some(&V::Str("nord".into()))).unwrap();
+        assert_eq!(written, proj.join(".roost/config.toml"));
+        assert!(fs::read_to_string(&written).unwrap().contains("theme = \"nord\""));
+        assert!(!global.exists(), "a project write must not touch the global file");
+        let written = set_setting(Scope::Global, &proj, "worktree_prompt", Some(&V::Bool(false))).unwrap();
+        assert_eq!(written, global);
+        let e = set_setting(Scope::Project, &proj, "worktree_prompt", Some(&V::Bool(false))).unwrap_err();
+        assert!(e.contains("global"), "{e}");
+        assert!(!fs::read_to_string(proj.join(".roost/config.toml")).unwrap().contains("worktree_prompt"));
+        std::env::remove_var("ROOST_CONFIG");
+    }
+
+    #[test]
+    fn raw_setting_reads_one_file_without_the_cascade() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.toml");
+        fs::write(&p, "theme = \"nord\"\nautosave = false\nhide = [\"x\"]\nmax_upload_bytes = 5\n").unwrap();
+        assert_eq!(raw_setting(&p, "theme"), Some(V::Str("nord".into())));
+        assert_eq!(raw_setting(&p, "autosave"), Some(V::Bool(false)));
+        assert_eq!(raw_setting(&p, "hide"), Some(V::List(vec!["x".into()])));
+        assert_eq!(raw_setting(&p, "max_upload_bytes"), Some(V::Str("5".into())));
+        assert_eq!(raw_setting(&p, "show_hidden"), None);
+        assert_eq!(raw_setting(&d.path().join("none.toml"), "theme"), None);
+    }
 }
