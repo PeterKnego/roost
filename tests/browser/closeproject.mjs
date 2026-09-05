@@ -25,9 +25,15 @@
 //!     against a project that never had any.
 //!   - B asserts the tree/changes tabs *survive*, so wiping the layout
 //!     outright would fail rather than pass.
-//!   - `confirm()` is stubbed rather than answered over CDP: a native dialog
-//!     with no `Page.javascriptDialogOpening` handler wedges the renderer,
-//!     which is the harness's documented 30s-timeout hang, not a failure.
+//!   - Close Project used to raise a native `confirm()`/`alert()`, stubbed
+//!     rather than answered over CDP because a native dialog with no
+//!     `Page.javascriptDialogOpening` handler wedges the renderer (the
+//!     harness's documented 30s-timeout hang, not a failure). The in-page
+//!     dialog replaced both with a real `<dialog>`, so every site below now
+//!     clicks `#dlg-confirm .dlg-ok` instead of stubbing anything.
+//!   - The confirm() stub is gone: after the in-page dialogs change,
+//!     `window.confirm = () => true` is a no-op, and a test that kept it
+//!     would be clicking a button whose dialog nothing ever answers.
 //!
 //! Section F is the reported bug reduced to its mechanism, and the one to read
 //! first: after a close, a websocket to /ws/{project}/term/{name} must be
@@ -117,8 +123,8 @@ try {
   ok((await sockets()).length >= 2, `and real shells behind them: ${JSON.stringify(await sockets())}`);
 
   console.log("B. after Close Project, reopening shows no terminals");
-  // Stubbed, not answered over CDP — see the header note on wedged renderers.
-  await ws.evalIn(`window.confirm = () => true; window.alert = () => {}; document.getElementById("closeproj").click()`);
+  await ws.evalIn(`document.getElementById("closeproj").click(); 0`);
+  await ws.evalIn(`document.querySelector("#dlg-confirm .dlg-ok").click(); 0`);
   ok(await until(async () => (await sockets()).length === 0, 30, "every socket unlinked"),
      `the shells themselves ended: ${JSON.stringify(await sockets())}`);
   // The sockets go early in the close, but the close is not over: it sweeps a
@@ -169,10 +175,10 @@ try {
   const race = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   await until(() => race.evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "race page");
   await race.evalIn(`
-    window.confirm = () => true; window.alert = () => {};
     document.querySelector('.pane[data-pane="3"] .paneicons .newterm').click();
     document.getElementById("closeproj").click();
   `);
+  await race.evalIn(`document.querySelector("#dlg-confirm .dlg-ok").click(); 0`);
   await sleep(9000);   // past CLOSE_SETTLE and the second sweep, with margin
   const savedAfter = JSON.parse(await Deno.readTextFile(`${fx.stateDir}/${fx.project}.json`));
   const raceTerms = savedAfter.panes.flatMap((p) => p.tabs).filter((t) => t.k === "Terminal");
@@ -218,8 +224,8 @@ try {
   ok(held > 0, `setup: ${held} live terminal(s) captured to inspect after the close`);
   ok(await fin.evalIn(`window.__entries.every((e) => !e.gone)`),
      "setup: none of them is marked gone before the close");
-  await fin.evalIn(`window.confirm = () => true; window.alert = () => {};
-    document.getElementById("closeproj").click();`);
+  await fin.evalIn(`document.getElementById("closeproj").click();`);
+  await fin.evalIn(`document.querySelector("#dlg-confirm .dlg-ok").click(); 0`);
   // Read at 25ms before the handler's 1200ms navigation destroys the page,
   // keeping the last reading that actually saw the array. After navigation
   // `window.__entries` is undefined and the map yields `[]` — which is "I

@@ -2485,20 +2485,26 @@ if (refreshBtn) refreshBtn.onclick = () => {
 // so the intent is never even sent when it's certain to be refused: the
 // user gets one clear message instead of a round trip that undoes nothing.
 const closeBtn = document.getElementById("closeproj");
-if (closeBtn) closeBtn.onclick = () => {
+if (closeBtn) closeBtn.onclick = async () => {
   const live = (state && state.live_sessions) || [];
   const dirty = ((state && state.buffers) || []).filter((b) => b.dirty).map((b) => b.rel);
-  let msg = `Close ${PROJECT}?\n\n`;
-  msg += live.length
-    ? `${live.length} terminal session(s) will be ended:\n  ${live.join(", ")}\n`
-    : "No terminal sessions are running.\n";
-  if (dirty.length) {
-    // Mirrors the server's own refusal, but told before sending anything
-    // rather than after a round trip that would have changed nothing.
-    alert(msg + `\nUnsaved changes in:\n  ${dirty.join("\n  ")}\n\nSave or discard them first.`);
-    return;
-  }
-  if (confirm(msg + "\nEnd sessions?")) send({ t: "CloseProject" });
+  const lines = [live.length
+    ? `${live.length} terminal session(s) will be ended: ${live.join(", ")}`
+    : "No terminal sessions are running."];
+  if (dirty.length) lines.push(`Unsaved changes in: ${dirty.join(", ")}`);
+  // One dialog in both states. The alert/confirm split existed only because a
+  // native dialog cannot disable its OK button; `blocked` can. The check still
+  // mirrors the server's own CloseRefused rather than making its own ruling —
+  // it is told before sending anything, rather than after a round trip that
+  // would have changed nothing.
+  const yes = await askConfirm({
+    title: `Close ${PROJECT}?`,
+    lines,
+    confirm: "End sessions",
+    danger: true,
+    blocked: dirty.length ? "Save or discard them first." : "",
+  });
+  if (yes) send({ t: "CloseProject" });
 };
 
 // The projects popup, mirroring the bell/noticepanel pair below. It used to be
