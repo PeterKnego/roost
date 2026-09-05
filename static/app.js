@@ -559,6 +559,18 @@ function onEvent(ev) {
       // silent no-op. console.warn stays too, for anyone actually watching devtools.
       console.warn("roost:", ev.msg);
       showError(ev.msg);
+      // The settings dialog waits for its write to be confirmed before it
+      // closes, so a refusal has to reach it — the banner alone would leave
+      // it hung on a snapshot that is never coming. Guarded like the
+      // onSnapshot call in followSettings, and for the same reason.
+      if (settingsOpen) {
+        try {
+          settingsOpen.onError(ev.msg);
+        } catch (e) {
+          console.error("roost: the settings dialog's onError threw", e);
+          settingsOpen = null;
+        }
+      }
       // do_open_at_line's own confinement check (src/hub.rs) refuses here,
       // never with a RevealLine — so a flag armed for it would otherwise
       // stay armed forever, ready to steal focus (and via wireEditor's blur
@@ -2766,6 +2778,23 @@ function followSettings() {
   const s = state && state.settings;
   if (!s) return;
   const row = (k) => s.keys.find((r) => r.key === k);
+  // The dialog's hook goes FIRST, because the snapshot that confirms its Save
+  // is what closes it — and the theme check below has to see the dialog as
+  // closed by then. Otherwise a Save that *cleared* the theme leaves this
+  // page painted with the preview the file no longer sets, forever: no
+  // further snapshot is coming to correct it.
+  //
+  // A throw here would abort the rest of this State handler — and, since
+  // nothing else clears `settingsOpen`, would do so on every snapshot for the
+  // life of the page. Surface it and drop the hook.
+  if (settingsOpen) {
+    try {
+      settingsOpen.onSnapshot(s);
+    } catch (e) {
+      console.error("roost: the settings dialog's onSnapshot threw", e);
+      settingsOpen = null;
+    }
+  }
   const theme = row("theme");
   if (theme) {
     if (appliedTheme === null) appliedTheme = theme.effective; // first snapshot: the page is already painted with it
@@ -2777,7 +2806,6 @@ function followSettings() {
   // handler), so this one assignment is the whole of the visible effect.
   const sh = row("show_hidden");
   if (sh) SHOW_HIDDEN_DEFAULT = sh.effective === true;
-  if (settingsOpen) settingsOpen.onSnapshot(s);
 }
 
 // The bell's Claude-hooks state. Three values, never two: `null` means the

@@ -255,8 +255,23 @@ function askMenu({ items, x, y }) {
 // Cancel). `runDialog` still owns the modal mechanics. Everything rendered
 // here comes from the snapshot through textContent/createElement — a hide
 // entry or a root path is text from a config file in a cloned repository.
+// Which `openSettings` call owns the dialog right now. A listener registered
+// by an earlier open compares against this and does nothing.
+//
+// It exists because the dialog's own `close` event cannot be relied on to tear
+// listeners down: measured 2026-09-05 against headless Chromium 151, a
+// programmatic `el.close()` fires no `close` event at all — not for this
+// shell and not for a bare `<dialog>` built in the page — so the teardown hook
+// below never ran. Without this token every Settings open left its Enter
+// handler on the element, and the next Enter re-sent a previous dialog's
+// edits: an earlier preview of a theme, discarded by Cancel, landed in the
+// config file on the next dialog's Enter.
+let settingsSession = null;
+
 function openSettings(settings) {
   const el = document.getElementById("dlg-settings");
+  const session = {};
+  settingsSession = session;
   const themeBefore = appliedTheme;
   let view = settings;
   let pane = "settings";
@@ -264,6 +279,10 @@ function openSettings(settings) {
   // key → { value, clear } for this scope only; reset when the scope changes.
   let edits = new Map();
   let previewTheme = null;
+  // Set between Save's intents going out and the snapshot that confirms
+  // them. Spec, *Errors*: a refused write leaves the dialog open with the
+  // person's values intact, so the close cannot happen on the click.
+  let awaitingSave = false;
 
   const tabs = el.querySelector(".dlg-tabs");
   const scopeBar = el.querySelector(".dlg-scope");
@@ -338,6 +357,15 @@ function openSettings(settings) {
   }
   function renderRows() {
     rows.replaceChildren();
+    // The parse error of a config file roost could not read, at the top of
+    // the pane. Without it the dialog silently shows the *other* file's
+    // values over a file nothing here can fix, and every Save is refused
+    // with no visible reason.
+    const warn = document.createElement("div");
+    warn.className = "dlg-warning";
+    warn.textContent = view.warning || "";
+    warn.hidden = !view.warning;
+    rows.appendChild(warn);
     for (const r of view.keys) {
       const div = document.createElement("div");
       div.className = "dlg-row"; div.dataset.key = r.key;
@@ -402,23 +430,51 @@ function openSettings(settings) {
     settingsOpen = {
       onSnapshot(s) {
         view = s;
+        if (awaitingSave) {
+          // This snapshot is what the write produced, which is the only
+          // confirmation there is that it landed.
+          endSession();
+          settingsOpen = null;
+          finish(true);
+          return;
+        }
         // Re-render only what is not being typed into: rows keep the
         // person's edits (they live in `edits`, re-applied by control()),
         // and hints/source labels are what a fresh snapshot changes.
         render();
       },
+      // app.js calls this from its `case "Error"`, beside the banner. A
+      // refused write must leave everything exactly as it was — the edits,
+      // the preview, the pane — so the fix is one correction away.
+      onError() {
+        if (!awaitingSave) return;
+        awaitingSave = false;
+        okBtn.disabled = false;
+      },
     };
     okBtn.textContent = "Save"; okBtn.disabled = false; okBtn.classList.remove("danger");
     const save = () => {
+      if (awaitingSave) return;
+      let sent = 0;
       for (const [key, e] of edits) {
         const r = row(key);
         if (!r || !r.writable.includes(scope)) continue;
         send({ t: "SetSetting", scope, key, ...(e.clear ? {} : { value: e.value }) });
+        sent++;
       }
-      // The theme is now what was previewed (or unchanged); the snapshot
-      // that follows the write confirms it. Do not revert.
-      settingsOpen = null;
-      finish(true);
+      // Nothing to wait for: no intent went out, so no snapshot is coming.
+      if (sent === 0) {
+        endSession();
+        settingsOpen = null;
+        finish(true);
+        return;
+      }
+      // Stay open until the snapshot confirms the write (onSnapshot above)
+      // or an Error refuses it (onError above). The theme stays as previewed
+      // either way — on success it is what was written, on refusal it is
+      // still what the person picked and can Save again.
+      awaitingSave = true;
+      okBtn.disabled = true;
     };
     okBtn.onclick = save;
     // "Enter saves" (spec, *The dialog*): nothing in here destroys, so the
@@ -427,6 +483,7 @@ function openSettings(settings) {
     // around, and not from a button, which the browser already activates on
     // Enter — routing those through Save would make Cancel save.
     const onKeydown = (e) => {
+      if (settingsSession !== session) return; // a listener that outlived its dialog
       if (e.key !== "Enter" || e.altKey || e.ctrlKey || e.metaKey) return;
       const t = e.target;
       if (t && (t.tagName === "TEXTAREA" || t.tagName === "BUTTON")) return;
@@ -434,12 +491,19 @@ function openSettings(settings) {
       save();
     };
     el.addEventListener("keydown", onKeydown);
-    cancelBtn.onclick = () => { settingsOpen = null; if (previewTheme) applyTheme(themeBefore); finish(false); };
+    // Every exit this file controls goes through here. The `close` listener
+    // below calls it too, for a browser that does fire the event; the token
+    // is what makes the exits it cannot see (Escape, the backdrop) harmless.
+    const endSession = () => {
+      if (settingsSession === session) settingsSession = null;
+      el.removeEventListener("keydown", onKeydown);
+    };
+    cancelBtn.onclick = () => { endSession(); settingsOpen = null; if (previewTheme) applyTheme(themeBefore); finish(false); };
     // Escape and the backdrop go through runDialog's own finish; hook the
     // revert onto the dialog's close so every exit restores the preview.
     el.addEventListener("close", function onClose() {
       el.removeEventListener("close", onClose);
-      el.removeEventListener("keydown", onKeydown);
+      endSession();
       if (settingsOpen) { settingsOpen = null; if (previewTheme) applyTheme(themeBefore); }
     });
     render();

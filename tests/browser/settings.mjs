@@ -173,6 +173,118 @@ try {
   ok((await probe(one.evalIn, "var(--bg)")) === bgBefore, "Cancel leaves it there");
   ok(!/theme/.test(await Deno.readTextFile(projToml)), "and the discarded pick was never written");
 
+  console.log("\nJ. a refused write keeps the dialog open with the values in it, and names the file");
+  const goodToml = await Deno.readTextFile(projToml);
+  // Hand-broken, the way a person editing this file by hand breaks it.
+  // Nothing the dialog can write will fix it, so every Save against it is
+  // refused — which is the one path where losing the typed values matters.
+  await Deno.writeTextFile(projToml, "{ broken\n");
+  const brokenBytes = await Deno.readTextFile(projToml);
+  await one.evalIn(`document.querySelectorAll(".error-banner").forEach((b) => b.remove()); document.getElementById("settings").click(); 0`);
+  await until(() => one.evalIn(`document.getElementById("dlg-settings").open`), 5, "dialog");
+  ok(await until(async () => /config\.toml/.test(await one.evalIn(`(document.querySelector("#dlg-settings .dlg-warning") || {}).textContent || ""`)), 10, "warning"),
+     "the dialog names the config file it could not parse");
+  ok((await one.evalIn(`(document.querySelector("#dlg-settings .dlg-warning") || {}).hidden`)) === false, "and that line is not hidden");
+  await one.evalIn(`(() => { const t = document.querySelector('#dlg-settings .dlg-row[data-key="hide"] textarea');
+     t.value = "dist"; t.dispatchEvent(new Event("input")); })(); 0`);
+  const errsBefore = Number(await one.evalIn(`window.__errs.length`));
+  await one.evalIn(`document.querySelector("#dlg-settings .dlg-ok").click(); 0`);
+  ok(await until(async () => Number(await one.evalIn(`window.__errs.length`)) > errsBefore, 10, "error"), "the refused write answered with an error");
+  ok((await one.evalIn(`document.querySelectorAll(".error-banner").length`)) >= 1, "and a banner is on screen");
+  ok((await one.evalIn(`document.getElementById("dlg-settings").open`)) === true, "the dialog is still open");
+  // Read through `.open`: the shell's textarea keeps its value after the
+  // dialog closes, so on its own this would hold just as well over a dialog
+  // that had thrown the edit away by closing.
+  ok((await one.evalIn(`document.getElementById("dlg-settings").open && document.querySelector('#dlg-settings .dlg-row[data-key="hide"] textarea').value`)) === "dist",
+     "with the typed value still in it");
+  ok((await one.evalIn(`document.querySelector("#dlg-settings .dlg-ok").disabled`)) === false, "and Save usable again");
+  ok((await Deno.readTextFile(projToml)) === brokenBytes, "the file is byte-identical");
+  await one.evalIn(`document.querySelector("#dlg-settings .dlg-cancel").click(); 0`);
+  await until(async () => !(await one.evalIn(`document.getElementById("dlg-settings").open`)), 5, "closed");
+  await Deno.writeTextFile(projToml, goodToml);
+
+  console.log("\nJ2. a throwing onSnapshot cannot wedge the rest of the State handler");
+  // `treeShownHidden` is assigned near the END of the State handler, well
+  // past followSettings — so a throw that escapes followSettings leaves the
+  // sentinel in place, and would for the life of the page.
+  await one.evalIn(`settingsOpen = { onSnapshot() { throw new Error("boom from settings.mjs"); } };
+     treeShownHidden = "sentinel"; send({ t: "RequestState" }); 0`);
+  ok(await until(async () => (await one.evalIn(`treeShownHidden`)) !== "sentinel", 10, "handler"), "the State handler ran on past followSettings");
+  ok((await one.evalIn(`settingsOpen`)) === null, "and the hook that threw was cleared, so it cannot throw again");
+
+  console.log("\nK. a dialog dismissed with Escape leaves no live Enter handler behind");
+  // Escape and the backdrop are runDialog's exits, not openSettings's, and
+  // this browser fires no `close` event for either (see `settingsSession` in
+  // dialog.js) — so the Enter handler such an exit leaves on the shared shell
+  // has to be inert, or the *next* dialog's Enter re-sends this one's edits.
+  ok(!/hide/.test(await Deno.readTextFile(projToml)), "the project file has no hide key to start with");
+  await one.evalIn(`document.getElementById("settings").click(); 0`);
+  await until(() => one.evalIn(`document.getElementById("dlg-settings").open`), 5, "dialog");
+  await one.evalIn(`(() => { const t = document.querySelector('#dlg-settings .dlg-row[data-key="hide"] textarea');
+     t.value = "escaped-edit"; t.dispatchEvent(new Event("input")); })(); 0`);
+  for (const type of ["keyDown", "keyUp"]) {
+    await one.cmd("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 });
+  }
+  ok(await until(async () => !(await one.evalIn(`document.getElementById("dlg-settings").open`)), 5, "escaped"), "Escape closed the dialog");
+  await one.evalIn(`document.getElementById("settings").click(); 0`);
+  await until(() => one.evalIn(`document.getElementById("dlg-settings").open`), 5, "dialog again");
+  // Nothing edited in this one, so its own Save has no intent to send and
+  // closes at once: any write that appears came from the escaped dialog.
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="show_hidden"] input[type="checkbox"]').focus(); 0`);
+  for (const type of ["keyDown", "keyUp"]) {
+    await one.cmd("Input.dispatchKeyEvent", { type, key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, ...(type === "keyDown" ? { text: "\r" } : {}) });
+  }
+  ok(await until(async () => !(await one.evalIn(`document.getElementById("dlg-settings").open`)), 5, "closed"), "Enter closed the second dialog with nothing to write");
+  ok(!/hide/.test(await Deno.readTextFile(projToml)), "and the escaped dialog's edit was not written behind it");
+
+  // Revert-check 7 (section J, 2026-09-05): restoring Save's old body —
+  // `settingsOpen = null; finish(true)` on the click, no `awaitingSave` —
+  // failed 2:
+  //   FAIL  the dialog is still open
+  //   FAIL  with the typed value still in it
+  // ("and Save usable again" and "the file is byte-identical" stayed green:
+  // the button is never disabled under the revert, and the server's refusal
+  // is what leaves the file alone, not the client. Those two prove nothing
+  // on their own, which is why the pair above exists.) Restored.
+  //
+  // Revert-check 8 (section J): deleting the `settingsOpen.onError(...)` call
+  // from app.js's `case "Error"` failed exactly 1:
+  //   FAIL  and Save usable again
+  // — the dialog stays open with its values, but Save is disabled forever and
+  // the only way out is Cancel. Restored.
+  //
+  // Revert-check 9 (section J): deleting the `.dlg-warning` block from
+  // renderRows failed exactly 2:
+  //   FAIL  the dialog names the config file it could not parse
+  //   FAIL  and that line is not hidden
+  // and nothing else — the refusal, the banner, and the file compare are all
+  // still green over a dialog that never says why. Restored.
+  //
+  // Revert-check 10 (section J2): removing the try/catch around
+  // `settingsOpen.onSnapshot(s)` failed both of J2's assertions:
+  //   FAIL  the State handler ran on past followSettings
+  //   FAIL  and the hook that threw was cleared, so it cannot throw again
+  // Restored.
+  //
+  // Revert-check 11 (section K): removing `if (settingsSession !== session)
+  // return;` from openSettings's keydown handler failed exactly 1:
+  //   FAIL  and the escaped dialog's edit was not written behind it
+  // This is the guard that exists because `close` never fires here (see the
+  // comment on `settingsSession`). Note the other three assertions in K stay
+  // green under the revert — the dialogs still open and close correctly; the
+  // only symptom is a write nobody asked for. Restored.
+  //
+  // Revert-check 12 (section I): moving followSettings's `settingsOpen`
+  // hook back to the END of the function, after the theme check, failed 2:
+  //   FAIL  and the page really repainted
+  //   FAIL  and data-theme is gone
+  // Not obvious, and it only appears once Save waits for its snapshot: the
+  // snapshot that closes the dialog is also the one that reports the new
+  // effective theme, and the theme check skips while `settingsOpen` is set.
+  // With the hook last, section E's Clear leaves *this* page painted with
+  // nord that the file no longer sets, and nothing later corrects it — which
+  // section I then reads as its opening theme. Restored.
+  //
   // Revert-check 6 (section I, 2026-09-05): deleting
   // `if (previewTheme) { applyTheme(themeBefore); previewTheme = null; }`
   // from the scope button's handler failed 3 —

@@ -926,6 +926,7 @@ dialog.roost.dlg-wide { width: min(680px, 96vw); }
 .dlg-scope button { font: inherit; padding: 3px 10px; border: 1px solid var(--border); border-radius: 4px; background: none; color: var(--muted); cursor: pointer; }
 .dlg-scope button[aria-pressed="true"] { color: var(--fg); border-color: var(--accent); }
 .dlg-rows { display: flex; flex-direction: column; max-height: 55vh; overflow: auto; padding: 0 14px 8px; }
+.dlg-warning { display: flex; gap: 6px; color: var(--warn, #d79921); font-size: 11px; padding: 8px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
 .dlg-row { display: grid; grid-template-columns: 140px 1fr auto; gap: 8px 12px; align-items: start; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
 .dlg-row label { color: var(--fg); padding-top: 3px; }
 .dlg-row .hint { grid-column: 2 / 4; color: var(--muted); font-size: 11px; }
