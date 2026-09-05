@@ -2328,14 +2328,50 @@ function showError(msg) {
 // running. A plain close ends the session, because a tab that quietly outlives
 // its × is how a project accumulates shells nothing can reach — there is no
 // session list, and the per-project cap is 16.
-function closeTab(pi, ti, t, detach) {
+async function closeTab(pi, ti, t, detach) {
   const meta = t.k === "File" ? state.buffers.find((x) => x.rel === t.rel) : null;
-  if (meta && meta.dirty && !confirm(`${t.rel} has unsaved changes. Close it?`)) return;
+  if (meta && meta.dirty) {
+    const yes = await askConfirm({ title: "Unsaved changes",
+      lines: [`${t.rel} has unsaved changes. Close it?`], confirm: "Close", danger: true });
+    if (!yes) return;
+    // The dialog did not block the event loop, so the tab strip may have been
+    // rebuilt from a State event while it was open and `ti` may now address a
+    // different tab. Re-resolve by rel — the idiom focusSession already uses.
+    // The `< 0` branch is the point: not finding the tab is "I cannot tell",
+    // never "close index ti anyway".
+    //
+    // Revert-check (CLAUDE.md): replacing this re-resolution with the stale
+    // `send({ t: "CloseTab", pane: pi, idx: ti })` and running closetab.mjs
+    // produced, verbatim:
+    //   ok    three file tabs, in order
+    //   ok    the dirty-close dialog opened
+    //   ok    the strip moved while the dialog was open
+    //     (timed out waiting for c.txt closed)
+    //   FAIL  the tab the user clicked was closed, not the one at its old index
+    //   FAIL  cancelling the dialog closes nothing
+    //   FAIL (2)
+    // c.txt's index shifted from 2 to 1 when a.txt closed (only 2 tabs left),
+    // so the stale idx 2 was out of range and the server silently dropped the
+    // CloseTab -- c.txt never closed at all. A differently-shaped symptom
+    // than "the wrong tab closes" (out-of-range no-op vs. closing whatever
+    // now sits at the old index), but the same root cause: an index gathered
+    // before the wait no longer names the tab it did.
+    const ti2 = state.panes[pi].tabs.findIndex((x) => x.k === "File" && x.rel === t.rel);
+    if (ti2 < 0) { showError(`${t.rel} is no longer open`); return; }
+    send({ t: "CloseTab", pane: pi, idx: ti2 });
+    return;
+  }
   if (t.k === "Terminal" && !detach) {
-    if (!confirm(`End session "${t.session}"? This kills the shell and anything running in it.`)) return;
+    const yes = await askConfirm({ title: "End session",
+      lines: [`End session "${t.session}"?`,
+              "This kills the shell and anything running in it."],
+      confirm: "End session", danger: true });
+    if (!yes) return;
     send({ t: "EndSession", session: t.session });
     return;
   }
+  // No dialog was shown on this path, so nothing awaited and `ti` is still
+  // the index the click was made against.
   send({ t: "CloseTab", pane: pi, idx: ti });
 }
 
