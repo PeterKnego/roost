@@ -1226,9 +1226,10 @@ function refreshTree() {
 // a `ul`/`details` oncontextmenu handler doesn't stop propagation, so
 // assigning one at every reconciled nesting level would make a blank-space
 // right-click inside a refreshed subdirectory bubble through each level's
-// own handler in turn and pop fileMenu's prompt() more than once. The single
-// container handler wireFragment sets once, at the pane's outer `.content`
-// mount, already catches blank clicks anywhere inside via bubbling.
+// own handler in turn and call fileMenu a second time, with rel="" — the
+// project root, with create/rename/delete armed. The single container
+// handler wireFragment sets once, at the pane's outer `.content` mount,
+// already catches blank clicks anywhere inside via bubbling.
 function wireFileLinks(root) {
   // Any anchor carrying data-rel, not just tree rows: markdown previews emit
   // <a class="mdlink" data-rel> for links to project files, and they want the
