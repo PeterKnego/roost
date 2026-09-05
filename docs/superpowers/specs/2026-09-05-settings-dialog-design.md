@@ -109,9 +109,13 @@ the kind of file the *claudehooks* rule was written for.
 
 ### After the write
 
-The hub bumps the workspace version, invalidates nothing (config is never
-cached — `load` runs per request), re-snapshots, and broadcasts to the
-project. A global change reaches other projects' open tabs on their next
+The hub bumps the workspace version, invalidates its cached settings block,
+re-snapshots, and broadcasts to the project. *Amended during implementation
+(Task 6 review):* snapshots go out on every debounced keystroke, and
+`settings_view` reads both files many times per call, so the hub caches the
+block exactly as it caches the hook state (`Hub::claude_hooks`), invalidated
+at the same sites plus `SetSetting`. A hand edit of a config file shows at
+the next invalidation; opening the dialog requests one. A global change reaches other projects' open tabs on their next
 page load, not live: those hubs are not told, and telling them is out of
 scope (see *Non-goals*).
 
