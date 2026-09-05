@@ -917,3 +917,28 @@ dialog#dlg-menu { position: fixed; margin: 0; width: max-content;
    the surface it is drawn on, so it lifts in a dark theme and darkens in a
    light one. See its rationale at the top of this file. */
 .dlg-item:hover, .dlg-item:focus { background: var(--row-on); outline: none; }
+/* ---- settings dialog ---- */
+dialog.roost.dlg-wide { width: min(680px, 96vw); }
+.dlg-tabs { display: flex; gap: 2px; padding: 8px 14px 0; border-bottom: 1px solid var(--border); }
+.dlg-tab { font: inherit; padding: 5px 12px; border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; background: none; color: var(--muted); cursor: pointer; }
+.dlg-tab[aria-selected="true"] { color: var(--fg); border-color: var(--border); background: var(--bg); }
+.dlg-scope { display: flex; gap: 8px; align-items: center; padding: 10px 14px; font-size: 12px; color: var(--muted); }
+.dlg-scope button { font: inherit; padding: 3px 10px; border: 1px solid var(--border); border-radius: 4px; background: none; color: var(--muted); cursor: pointer; }
+.dlg-scope button[aria-pressed="true"] { color: var(--fg); border-color: var(--accent); }
+.dlg-rows { display: flex; flex-direction: column; max-height: 55vh; overflow: auto; padding: 0 14px 8px; }
+.dlg-row { display: grid; grid-template-columns: 140px 1fr auto; gap: 8px 12px; align-items: start; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 12px; }
+.dlg-row label { color: var(--fg); padding-top: 3px; }
+.dlg-row .hint { grid-column: 2 / 4; color: var(--muted); font-size: 11px; }
+.dlg-row input[type="text"], .dlg-row textarea { width: 100%; font: inherit; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; }
+.dlg-row textarea { min-height: 3em; resize: vertical; font-family: var(--mono); }
+.dlg-row .ro { color: var(--muted); font-family: var(--mono); overflow-wrap: anywhere; }
+.dlg-row .clear { font: inherit; font-size: 11px; background: none; border: 1px solid var(--border); border-radius: 4px; color: var(--muted); cursor: pointer; padding: 2px 8px; }
+.dlg-row.disabled label, .dlg-row.disabled .hint { opacity: .5; }
+.dlg-themes { padding: 8px 14px; max-height: 55vh; overflow: auto; }
+.dlg-themes h3 { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin: 8px 0 6px; }
+.dlg-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+.dlg-tile { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border: 2px solid var(--border); border-radius: 6px; cursor: pointer; font: inherit; text-align: left; }
+.dlg-tile[data-theme] { background: var(--color-base-100); color: var(--color-base-content); }
+.dlg-tile .swatch { display: block; width: 100%; height: 6px; border-radius: 3px; background: var(--tile-accent, var(--color-primary)); }
+.dlg-tile[aria-pressed="true"] { border-color: var(--accent); }
+.dlg-tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }

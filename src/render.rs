@@ -1594,14 +1594,15 @@ dialog.roost, .dlg-title, .dlg-blocked { display: revert !important; visibility:
 /* The detail slot holds the diff a save conflict is about to overwrite; hiding
    it would hide what "Overwrite" destroys. Hidden by attribute when empty. */
 .dlg-detail:not([hidden]) { display: block !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
-.dlg-body, .dlg-buttons, .dlg-items { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
-.dlg-body, .dlg-items { flex-direction: column !important; }
+.dlg-body, .dlg-buttons, .dlg-items, .dlg-tabs, .dlg-scope, .dlg-rows:not([hidden]), .dlg-themes:not([hidden]), .dlg-row { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
+.dlg-body, .dlg-items, .dlg-rows { flex-direction: column !important; }
 .dlg-buttons { flex-direction: row !important; order: 0 !important; }
 .dlg-buttons button, .dlg-item { transform: none !important; font-size: 13px !important; order: 0 !important; }
+.dlg-tile { display: revert !important; visibility: visible !important; opacity: 1 !important; }
 .dlg-title::before, .dlg-title::after, .dlg-body::before, .dlg-body::after,
 .dlg-buttons::before, .dlg-buttons::after, .dlg-ok::before, .dlg-ok::after,
 .dlg-cancel::before, .dlg-cancel::after, .dlg-item::before, .dlg-item::after,
-.dlg-choice::before, .dlg-choice::after { content: normal !important; }
+.dlg-choice::before, .dlg-choice::after, .dlg-tile::before, .dlg-tile::after, .dlg-row::before, .dlg-row::after { content: normal !important; }
 </style>"#;
 
 /// The `<html>` open tag and the theme `<link>`s for a `theme` setting.
@@ -1707,7 +1708,7 @@ pub fn workspace_page(
   <label id="searchbox" for="searchinput" title="search this project (ctrl-shift-F or ⌘⇧F)">{SVG_SEARCH}<input id="searchinput" type="search" autocomplete="off" spellcheck="false" placeholder="Search files, contents, sessions" aria-label="Search files, contents, sessions"><kbd>⇧⌃F</kbd></label>
   <button id="projbtn" title="running projects">{SVG_DIAMOND}<span id="projcount"></span></button>
   <button id="bell" title="notifications (n)">{SVG_BELL}<span id="bellcount"></span></button>
-  <button id="settings" title="settings — not implemented yet">{SVG_GEAR}</button>
+  <button id="settings" title="settings">{SVG_GEAR}</button>
   <button id="refresh" title="refresh (r)">{SVG_REFRESH}</button>
   <span class="vsep"></span>
   <button id="closeproj" title="close project — ends all its terminal sessions">{SVG_X}<span>Close</span></button>
@@ -1755,6 +1756,17 @@ pub fn workspace_page(
   <div class="dlg-detail" hidden></div>
   <div class="dlg-buttons">
     <button type="button" class="dlg-cancel">Cancel</button>
+  </div>
+</dialog>
+<dialog id="dlg-settings" class="roost dlg-wide">
+  <h2 class="dlg-title">Settings</h2>
+  <div class="dlg-tabs" role="tablist"></div>
+  <div class="dlg-scope"></div>
+  <div class="dlg-rows" hidden></div>
+  <div class="dlg-themes" hidden></div>
+  <div class="dlg-buttons">
+    <button type="button" class="dlg-cancel">Cancel</button>
+    <button type="button" class="dlg-ok">Save</button>
   </div>
 </dialog>
 <!-- Empty by default and hidden: the slots exist so a future per-pane control
@@ -2984,8 +2996,6 @@ mod tests {
         assert!(h.contains("id=\"wtlabel\""), "{h}");
         assert!(h.contains("id=\"searchbox\""), "{h}");
         assert!(h.contains("id=\"settings\""), "{h}");
-        // Placeholders say plainly that they are inert.
-        assert!(h.contains("not implemented yet"), "{h}");
         // The emoji bell and the glyph buttons are gone from the header.
         assert!(!h.contains("🔔"), "{h}");
         assert!(!h.contains(">⟳<"), "{h}");
@@ -3171,7 +3181,7 @@ mod tests {
     fn the_workspace_page_ships_empty_dialog_shells() {
         let s = crate::config::Settings::default();
         let html = workspace_page("proj", "proj", &s, None, false, &[]);
-        for id in ["dlg-confirm", "dlg-text", "dlg-menu", "dlg-choice"] {
+        for id in ["dlg-confirm", "dlg-text", "dlg-menu", "dlg-choice", "dlg-settings"] {
             assert!(html.contains(&format!(r#"id="{id}""#)), "no {id} shell");
         }
         // Filled from JS with textContent, so they must ship empty — the same
@@ -3190,9 +3200,11 @@ mod tests {
         for frag in ["<dialog id=\"dlg-confirm\" class=\"roost\" hidden",
                      "<dialog id=\"dlg-text\" class=\"roost\" hidden",
                      "<dialog id=\"dlg-menu\" class=\"roost\" hidden",
-                     "<dialog id=\"dlg-choice\" class=\"roost\" hidden"] {
+                     "<dialog id=\"dlg-choice\" class=\"roost\" hidden",
+                     "<dialog id=\"dlg-settings\" class=\"roost\" hidden"] {
             assert!(!html.contains(frag), "a dialog must not carry `hidden`: {frag}");
         }
+        assert!(html.contains(r#"<button id="settings" title="settings">"#), "the gear is no longer 'not implemented'");
         assert!(html.contains(r#"<script src="/static/dialog.js"></script>"#), "dialog.js not loaded");
     }
 
@@ -3232,6 +3244,9 @@ mod tests {
         // a theme must not be able to hide it.
         assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-detail:not([hidden])"),
             "the structural CSS does not lock .dlg-detail's visibility");
+        for cls in [".dlg-tabs", ".dlg-scope", ".dlg-rows", ".dlg-row", ".dlg-themes", ".dlg-tile"] {
+            assert!(DIALOG_STRUCTURAL_CSS.contains(cls), "the structural CSS does not lock {cls}");
+        }
     }
 
     #[test]
