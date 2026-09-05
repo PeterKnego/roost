@@ -1583,22 +1583,23 @@ const SVG_X: &str = r#"<svg width="12" height="12" viewBox="0 0 16 16" fill="non
 /// hide/relabel no".
 const DIALOG_STRUCTURAL_CSS: &str = r#"<style>
 dialog.roost, .dlg-title, .dlg-blocked { display: revert !important; visibility: visible !important; opacity: 1 !important; }
-/* .dlg-label can't join the revert group above: it's a <label>, whose UA
-   default is `display: inline`, and style.css sets `display: block` on it
-   (it's the field caption above an askText input). `revert` discards ALL
-   author-origin declarations for the property, roost's own included, so it
-   would revert this one straight back to `inline` and break every askText
-   dialog's layout. Lock the known-good value explicitly instead, the same
-   way .dlg-body/.dlg-buttons/.dlg-items do below. */
+/* .dlg-label, .dlg-tile, and .dlg-row can't join the revert group above: revert
+   discards ALL author-origin declarations for the property, roost's own included.
+   .dlg-label is a <label> whose UA default is `inline` but style.css sets
+   `block`; revert would break it back to `inline`. .dlg-tile and .dlg-row are
+   elements whose style.css rules define specific layouts (flex+column, grid
+   respectively) that revert would discard. Lock the known-good values explicitly,
+   the same way .dlg-body/.dlg-buttons/.dlg-items do below. */
 .dlg-label { display: block !important; visibility: visible !important; opacity: 1 !important; }
 /* The detail slot holds the diff a save conflict is about to overwrite; hiding
    it would hide what "Overwrite" destroys. Hidden by attribute when empty. */
 .dlg-detail:not([hidden]) { display: block !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
-.dlg-body, .dlg-buttons, .dlg-items, .dlg-tabs, .dlg-scope, .dlg-rows:not([hidden]), .dlg-themes:not([hidden]), .dlg-row { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
-.dlg-body, .dlg-items, .dlg-rows { flex-direction: column !important; }
+.dlg-body, .dlg-buttons, .dlg-items, .dlg-tabs, .dlg-scope, .dlg-rows:not([hidden]), .dlg-themes:not([hidden]) { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
+.dlg-body, .dlg-items, .dlg-rows, .dlg-themes:not([hidden]) { flex-direction: column !important; }
 .dlg-buttons { flex-direction: row !important; order: 0 !important; }
 .dlg-buttons button, .dlg-item { transform: none !important; font-size: 13px !important; order: 0 !important; }
-.dlg-tile { display: revert !important; visibility: visible !important; opacity: 1 !important; }
+.dlg-row { display: grid !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
+.dlg-tile { display: flex !important; flex-direction: column !important; visibility: visible !important; opacity: 1 !important; }
 .dlg-title::before, .dlg-title::after, .dlg-body::before, .dlg-body::after,
 .dlg-buttons::before, .dlg-buttons::after, .dlg-ok::before, .dlg-ok::after,
 .dlg-cancel::before, .dlg-cancel::after, .dlg-item::before, .dlg-item::after,
@@ -3247,6 +3248,10 @@ mod tests {
         for cls in [".dlg-tabs", ".dlg-scope", ".dlg-rows", ".dlg-row", ".dlg-themes", ".dlg-tile"] {
             assert!(DIALOG_STRUCTURAL_CSS.contains(cls), "the structural CSS does not lock {cls}");
         }
+        assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-row { display: grid !important"),
+            "the structural CSS must lock .dlg-row to grid, not flex—flex would destroy the three-column layout");
+        assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-tile { display: flex !important; flex-direction: column !important"),
+            "the structural CSS must lock .dlg-tile to flex with column direction—revert discards style.css's own flex");
     }
 
     #[test]
