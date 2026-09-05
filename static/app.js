@@ -1273,28 +1273,36 @@ function wireFragment(content) {
   };
 }
 
-// Deliberately prompt-based: no menu widget to build, and every destructive
-// action gets a confirmation step for free.
-function fileMenu(e, rel) {
+// A real menu now, rather than a numbered prompt(). The prompt was never a
+// menu by choice — it was the only way prompt() could offer four options —
+// and it cost a second dialog for every action.
+async function fileMenu(e, rel) {
   const dir = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "";
-  const choice = prompt(
-    `${rel || "(project root)"}\n\n` +
-      "1 = new file   2 = new folder   3 = rename   4 = delete\n" +
-      "Enter a number:",
-    "1"
-  );
-  if (choice === "1") {
-    const name = prompt("New file path:", dir ? `${dir}/untitled.txt` : "untitled.txt");
+  const items = [
+    { id: "new", label: "New file…" },
+    { id: "newdir", label: "New folder…" },
+  ];
+  // Rename and Delete need a target. The prompt version offered them at the
+  // project root and then silently did nothing, because its guards were
+  // `choice === "3" && rel`. A menu can simply not offer them.
+  if (rel) items.push({ id: "rename", label: "Rename…" }, { id: "delete", label: "Delete" });
+  const choice = await askMenu({ items, x: e.clientX, y: e.clientY });
+  if (choice === "new") {
+    const name = await askText({ title: "New file", label: "Path",
+      value: dir ? `${dir}/untitled.txt` : "untitled.txt", confirm: "Create" });
     if (name) send({ t: "CreateFile", rel: name });
-  } else if (choice === "2") {
-    const name = prompt("New folder path:", dir ? `${dir}/newdir` : "newdir");
+  } else if (choice === "newdir") {
+    const name = await askText({ title: "New folder", label: "Path",
+      value: dir ? `${dir}/newdir` : "newdir", confirm: "Create" });
     if (name) send({ t: "CreateDir", rel: name });
-  } else if (choice === "3" && rel) {
-    const to = prompt("Rename to:", rel);
+  } else if (choice === "rename") {
+    const to = await askText({ title: "Rename", label: "New path", value: rel, confirm: "Rename" });
     if (to && to !== rel) send({ t: "RenamePath", from: rel, to });
-  } else if (choice === "4" && rel) {
+  } else if (choice === "delete") {
     // the server refuses non-empty directories regardless of what we ask
-    if (confirm(`Delete ${rel}?`)) send({ t: "DeleteFile", rel });
+    const yes = await askConfirm({ title: "Delete", lines: [`Delete ${rel}?`],
+      confirm: "Delete", danger: true });
+    if (yes) send({ t: "DeleteFile", rel });
   }
 }
 

@@ -207,42 +207,39 @@ try {
   await evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: "docs/index.md", mode: "Preview" } })`);
   await until(() => evalIn(`!!document.querySelector(".markdown-body a.mdlink")`), 15, "preview reopened");
 
-  // ---- 5. Right-click on a markdown link opens the menu exactly once -------
-  // wireFileLinks assigns oncontextmenu per anchor with no stopPropagation().
-  // wireFragment's container handler is the only thing that stops a second
-  // fileMenu() firing, and it does that by testing
-  // e.target.closest("a[data-rel]") — a .mdlink anchor has no class="file",
-  // so a guard written as closest("a.file") misses it and prompt() pops
-  // twice, the second time with rel="" (the project root, with
-  // create/rename/delete armed). fileMenu is prompt()-based and would
-  // otherwise block this headless run forever, so stub prompt with a counter
-  // instead of letting it show.
-  await evalIn(`window.__realPrompt = window.prompt;
-    window.__prompts = [];
-    window.prompt = (msg) => { window.__prompts.push(msg); return null; };`);
+  // ---- 5. A plain click never shows the file menu; a real right-click does --
+  // wireFileLinks wires oncontextmenu on every a[data-rel] anchor —
+  // .mdlink included, since a markdown link's target is a project file too
+  // (render.rs's link_open gives it the identical data-rel), and that wiring
+  // is untouched by this task. So a .mdlink anchor DOES open the file menu on
+  // a right-click, same as a tree row — asserting otherwise would just be
+  // wrong. What "clicking a markdown link does not open the file menu" checks
+  // instead is the *left*-click path exercised in section 3 above: the
+  // onclick handler that opens the link as a tab must not also pop the
+  // context menu as a side effect.
+  //
+  // The file menu is now #dlg-menu, not prompt(). Asserting on the dialog's
+  // `open` property rather than on a stubbed prompt matters: after the
+  // dialogs change, `window.prompt` is called by nothing, so the old
+  // `__prompts.length === 0` assertion was true no matter what this click
+  // did — green, and testing nothing.
+  const menuOpen = async () => await evalIn(`document.getElementById("dlg-menu").open`);
+  await evalIn(`document.querySelector(".markdown-body a.mdlink").click()`);
+  ok(!(await menuOpen()), "clicking a markdown link does not open the file menu");
+
+  // The positive assertion is what makes the negative one mean something: a
+  // selector that matched nothing (e.g. a typo'd id, or a tree with no rows)
+  // would satisfy "does not open" silently. Right-clicking an actual tree row
+  // must open the same #dlg-menu for the negative check above to be meaningful.
   await evalIn(`(() => {
-    const a = document.querySelector(".markdown-body a.mdlink");
+    const a = document.querySelector('a.file[data-rel]');
     a.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
   })()`);
-  const linkPrompts = await evalIn("window.__prompts.length");
-  ok(linkPrompts === 1,
-    `right-clicking a markdown link opened the file menu exactly once (got ${linkPrompts})`);
-
-  // Blank space in the tree (not a row, not a link) must still reach the
-  // project-root menu — the widened guard must not swallow that fallback.
-  await evalIn(`window.__prompts = []`);
-  await evalIn(`(() => {
-    const ul = [...document.querySelectorAll("ul.tree")][0];
-    ul.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
-  })()`);
-  const treePrompts = await evalIn("window.__prompts");
-  ok(treePrompts.length === 1 && treePrompts[0].includes("(project root)"),
-    `right-clicking blank tree space still opens the project-root menu: ${JSON.stringify(treePrompts)}`);
-
-  // Restore the real prompt() — a landmine otherwise: any assertion appended
-  // after this point would silently run against the stub instead of a real
-  // dialog, with no signal that it was doing so.
-  await evalIn(`window.prompt = window.__realPrompt;`);
+  ok(await menuOpen(), "but right-clicking the tree row does open it");
+  await page.cmd("Input.dispatchKeyEvent",
+    { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await page.cmd("Input.dispatchKeyEvent",
+    { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
 
   // ---- 6. A raw OpenTab{mode:"Edit"} on an image is coerced to Preview -----
   // NO_TEXT_EDIT_EXT only gates the client's own ✎ toggle; a handcrafted intent
