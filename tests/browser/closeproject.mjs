@@ -170,15 +170,19 @@ try {
   //
   // No wait between starting the terminal and closing: every other section
   // here waits for the socket to exist first, and that wait is exactly what
-  // hides this. Both clicks go in one evaluation so the browser cannot
-  // interleave a round trip between them.
+  // hides this. All three statements go in one evaluation so the browser
+  // cannot interleave a round trip between them — `closeBtn.onclick` is
+  // async, but `askConfirm(...)` runs up to its first `await`, and
+  // `runDialog` calls `el.showModal()` synchronously inside the Promise
+  // executor, so the dialog is already open and clickable by the time the
+  // third statement in this same evaluation runs.
   const race = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   await until(() => race.evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "race page");
   await race.evalIn(`
     document.querySelector('.pane[data-pane="3"] .paneicons .newterm').click();
     document.getElementById("closeproj").click();
+    document.querySelector("#dlg-confirm .dlg-ok").click();
   `);
-  await race.evalIn(`document.querySelector("#dlg-confirm .dlg-ok").click(); 0`);
   await sleep(9000);   // past CLOSE_SETTLE and the second sweep, with margin
   const savedAfter = JSON.parse(await Deno.readTextFile(`${fx.stateDir}/${fx.project}.json`));
   const raceTerms = savedAfter.panes.flatMap((p) => p.tabs).filter((t) => t.k === "Terminal");

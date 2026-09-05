@@ -95,11 +95,16 @@ try {
   // one, because Chromium restores focus to a plain, still-attached element
   // like #closeproj on its own, with no application code involved (confirmed
   // separately with a bare `<dialog>` and no dialog.js at all). Keep the line
-  // in dialog.js anyway — it exists for roost's terminals, which are pooled
-  // DOM nodes moved between panes with appendChild, a case this assertion
-  // does not exercise and where the native restoration's behaviour is
-  // unverified. That case is a by-hand check in a later task, not an
-  // automated one here, because it needs a real dtach session.
+  // in dialog.js anyway, but not for the reason once given here: roost's
+  // pooled xterm nodes are not a gap in Chromium's restoration either — they
+  // stay connected to the document the whole time (moved between panes with
+  // appendChild, never detached), so the platform restores focus to them the
+  // same way it does to #closeproj here, and this assertion's inability to
+  // discriminate is about the *browser engine*, not about xterm. The actual
+  // reason to keep the line is cross-browser: <dialog> focus restoration has
+  // historically been less reliable outside Chromium (Firefox, Safari around
+  // 15.4), and this suite only drives Chromium, so it cannot see that case
+  // either way.
   await evalIn(`document.getElementById("closeproj").focus();
      window.__r = null; askConfirm({ title: "T" }).then((v) => { window.__r = v; }); 0`);
   await evalIn(`document.querySelector("#dlg-confirm .dlg-cancel").click(); 0`);

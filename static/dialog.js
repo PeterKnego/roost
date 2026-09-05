@@ -38,17 +38,20 @@ function runDialog(el, fill, dismissed) {
       el.removeEventListener("cancel", onCancel);
       el.removeEventListener("click", onClick);
       el.close();
-      // Explicit rather than trusting the browser's own focus restoration:
-      // roost's terminals are pooled DOM nodes moved between panes with
-      // appendChild, and how showModal() interacts with a focused xterm is not
-      // something to assume. tests/browser/dialogs.mjs's assertion E does NOT
-      // cover this — it only proves the platform restores focus for a plain,
-      // still-attached button (see the comment on that assertion). This line
-      // is kept as insurance for the pooled-xterm case specifically: no
-      // automated test here exercises it (it needs a live dtach session), and
-      // it is checked by hand instead, in a later task. Do not remove this
-      // line on the strength of the revert-check below — that check does not
-      // reach the case the line is for.
+      // NOT insurance for roost's pooled xterm nodes — that reasoning does
+      // not hold up. This line runs *after* el.close(), by which point the
+      // platform's own focus restoration has already happened; a pooled
+      // xterm moved between panes via appendChild is still connected to the
+      // document throughout, so the platform restores focus to it exactly as
+      // it would to any other still-attached element, and a node that really
+      // had been removed could not be focused here either way. There is no
+      // gap in either direction for this line to fill.
+      //
+      // Kept anyway, and cheap to keep: three lines in a try/catch. The real
+      // reason is cross-browser, not xterm-specific — <dialog> focus
+      // restoration has historically been less reliable outside Chromium
+      // (Firefox, and Safari around 15.4), and roost runs in whatever browser
+      // the user has, not only the one this test suite drives.
       //
       // Revert-check (2026-09-05): commenting out the next line did NOT make
       // assertion E — or any assertion — fail; `deno run -A
@@ -58,8 +61,9 @@ function runDialog(el, fill, dismissed) {
       // Chromium's own <dialog> already restores focus to the element that
       // was focused before showModal() was called, with no JS involved at
       // all, for a plain still-attached element like #closeproj. That is the
-      // only case dialogs.mjs exercises, so it cannot discriminate for this
-      // line as written.
+      // only case dialogs.mjs exercises in Chromium, so it cannot
+      // discriminate for this line as written — the line's justification is
+      // the other engines this suite does not run against, not this one.
       try { if (restore && restore.focus) restore.focus(); } catch { /* gone */ }
       resolve(v);
     };
@@ -70,9 +74,23 @@ function runDialog(el, fill, dismissed) {
     const onClick = (e) => { if (e.target === el) finish(dismissed); };
     el.addEventListener("cancel", onCancel);
     el.addEventListener("click", onClick);
-    const ready = fill(finish);
-    el.showModal();
-    if (ready) ready();
+    // A throw here (from `fill` or from `showModal`) would otherwise leave
+    // `openDlg` set forever, since nothing past this point clears it: every
+    // later `runDialog` call would then take the early-return path above and
+    // silently resolve as dismissed — every confirmation answering "no" and
+    // every menu doing nothing, for the rest of the page's life, with no
+    // banner and no visible cause. A control that visibly does nothing is
+    // indistinguishable from a broken one, which is worse than surfacing the
+    // throw.
+    try {
+      const ready = fill(finish);
+      el.showModal();
+      if (ready) ready();
+    } catch (err) {
+      openDlg = null;
+      resolve(dismissed);
+      throw err;
+    }
   });
 }
 

@@ -1558,6 +1558,40 @@ const SVG_GEAR: &str = r#"<svg width="16" height="16" viewBox="0 0 24 24" fill="
 const SVG_REFRESH: &str = r#"<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.5-3.6"/><path d="M13 2.5v3h-3"/></svg>"#;
 const SVG_X: &str = r#"<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>"#;
 
+/// A destructive `askConfirm` used to be a native `confirm()` — browser
+/// chrome, entirely out of a project's CSS reach. It is now ordinary DOM
+/// (`dialog.roost`, `.dlg-*`), and `{theme_css}` links a stylesheet the
+/// *project* supplies (`.roost/theme.css`), which wins at equal specificity
+/// because it is emitted first. A hostile or merely careless theme could
+/// therefore ship `.dlg-buttons{flex-direction:row-reverse}` to swap Cancel
+/// and the danger button, `.dlg-title,.dlg-body{display:none}` to hide what
+/// is about to be destroyed, or `.dlg-ok{font-size:0}` plus a `content:`
+/// generated label to relabel it.
+///
+/// This block is the fix: it must be emitted in the page *after*
+/// `{theme_css}`, because equal-specificity CSS rules apply in the order
+/// they appear, and only being later lets its `!important` win over a
+/// theme's own `!important` (author-origin `!important` still cascades by
+/// source order among ties). Reordering the two silently undoes the whole
+/// protection, which is exactly why `dialog_structural_css_lands_after_theme_css`
+/// below pins the byte offsets rather than mere presence.
+///
+/// Deliberately narrow: only the properties that control position, order,
+/// visibility and generated content are locked. Colour, background,
+/// border-colour, radius and spacing are absent on purpose so a theme can
+/// still recolour these dialogs — the ruling is "recolour yes, rearrange/
+/// hide/relabel no".
+const DIALOG_STRUCTURAL_CSS: &str = r#"<style>
+dialog.roost, .dlg-title, .dlg-blocked, .dlg-label { display: revert !important; visibility: visible !important; opacity: 1 !important; }
+.dlg-body, .dlg-buttons, .dlg-items { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
+.dlg-body, .dlg-items { flex-direction: column !important; }
+.dlg-buttons { flex-direction: row !important; order: 0 !important; }
+.dlg-buttons button, .dlg-item { transform: none !important; font-size: 13px !important; order: 0 !important; }
+.dlg-title::before, .dlg-title::after, .dlg-body::before, .dlg-body::after,
+.dlg-buttons::before, .dlg-buttons::after, .dlg-ok::before, .dlg-ok::after,
+.dlg-cancel::before, .dlg-cancel::after, .dlg-item::before, .dlg-item::after { content: normal !important; }
+</style>"#;
+
 /// `sharing_on` is passed in rather than read here: it is a *global-only*
 /// setting (`config::share_selection`), and this function stays pure so its
 /// tests can drive both states without touching the developer's real
@@ -1623,6 +1657,7 @@ pub fn workspace_page(
 <link rel="stylesheet" href="/static/themes/{theme}.css">
 <link rel="stylesheet" href="/static/style.css">
 {theme_css}
+{DIALOG_STRUCTURAL_CSS}
 <script src="/static/vendor/htmx.min.js"></script>
 <script src="/static/vendor/xterm.js"></script>
 <script src="/static/vendor/xterm-addon-fit.js"></script>
@@ -3075,6 +3110,35 @@ mod tests {
             assert!(!html.contains(frag), "a dialog must not carry `hidden`: {frag}");
         }
         assert!(html.contains(r#"<script src="/static/dialog.js"></script>"#), "dialog.js not loaded");
+    }
+
+    // Finding 2 (branch review, in-page dialogs): a project's own
+    // `.roost/theme.css` is linked into every workspace page and wins over
+    // `style.css` at equal specificity, so it could restyle a destructive
+    // confirmation into something that lies about itself — reversed buttons,
+    // a hidden body, a relabelled OK. The fix is the structural `<style>`
+    // block emitted after `{theme_css}`, and "after" is the entire fix:
+    // equal-specificity CSS applies in source order, so this asserts byte
+    // offsets, not mere presence. A future edit that reorders the two would
+    // leave every other test in this file green while silently reopening the
+    // hole, which is exactly why this checks position rather than contains().
+    #[test]
+    fn dialog_structural_css_lands_after_theme_css() {
+        let s = crate::config::Settings::default();
+        let html = workspace_page("proj", "proj", &s, Some("theme.css"), false, &[]);
+        let theme_at = html.find("/frag/proj/theme.css").expect("theme_css not linked");
+        let structural_at = html.find(DIALOG_STRUCTURAL_CSS).expect("structural dialog CSS not emitted");
+        assert!(
+            structural_at > theme_at,
+            "the structural dialog CSS must come after theme_css in the emitted HTML \
+             (theme at {theme_at}, structural at {structural_at}) — otherwise a project \
+             theme's equal-specificity rule wins and can rearrange/hide/relabel a dialog"
+        );
+        // Also present with no project theme at all, since the block guards
+        // against `style.css`-level themes (config.toml's `theme` key), not
+        // only a per-project `.roost/theme.css`.
+        let no_theme = workspace_page("proj", "proj", &s, None, false, &[]);
+        assert!(no_theme.contains(DIALOG_STRUCTURAL_CSS));
     }
 
     #[test]

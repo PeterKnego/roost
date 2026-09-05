@@ -885,7 +885,11 @@ dialog.roost::backdrop { background: rgba(0,0,0,.35); }
 .dlg-title { font-size: 13px; font-weight: 600; padding: 10px 14px;
              border-bottom: 1px solid var(--border); }
 .dlg-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
-.dlg-body p { font-size: 12px; }
+/* Same idiom as .notice-body: this text can be an attacker-influenced path
+   (a filename or branch name from a cloned repo), and a single unbroken run
+   of it must not overflow the fixed-width dialog and hide what the user is
+   about to confirm. */
+.dlg-body p { font-size: 12px; overflow-wrap: anywhere; }
 .dlg-blocked { padding: 0 14px 12px; font-size: 12px; color: var(--warn); }
 .dlg-label { display: block; padding: 12px 14px 4px; font-size: 12px; color: var(--muted); }
 .dlg-input { width: calc(100% - 28px); margin: 0 14px; padding: 5px 7px;

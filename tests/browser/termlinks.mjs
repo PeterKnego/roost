@@ -520,13 +520,24 @@ try {
     // an assertion — "roost's handler ran, not xterm's fallback" — which is
     // the one thing in this section that actually discriminates linkHandler.
     //
-    // Note for anyone extending this file: the stub is file-wide and always
-    // answers false, so app.js's own confirms — deleting a file, closing a
-    // dirty buffer, ending a session — are silently *declined* in every
-    // section, including ones added after this one. That stops them wedging
-    // a run, but it also means an assertion like "the tab was closed" would
-    // be measuring the stub, not the feature. Read window.__confirms, or
-    // override the stub for the duration of such a section.
+    // Note for anyone extending this file: this stub exists ONLY for xterm's
+    // own OSC 8 fallback activation, and it must not be removed — see the
+    // comment above for why a section here would otherwise hang instead of
+    // failing. It does NOT stand in for app.js's own confirms any more.
+    // Since the in-page dialogs change, app.js raises no native confirm()
+    // at all — deleting a file, closing a dirty buffer, ending a session all
+    // go through askConfirm's dialog element — so this stub answers nothing
+    // for those, and window.__confirms staying empty is not evidence they
+    // were declined; it only ever proves roost's linkHandler took the
+    // activation instead of xterm's fallback (see the assertion near the end
+    // of this file). The actual trap for a future section: an in-page
+    // dialog is NOT declined by this stub — it opens for real, and
+    // showModal() makes the rest of the document inert, so any later
+    // Input.dispatchMouseEvent in that section silently hits nothing and
+    // every assertion after it fails for a reason that has nothing to do with
+    // what the section is testing. A section that can trigger one of app.js's
+    // own confirmations must drive #dlg-confirm .dlg-ok / .dlg-cancel
+    // itself, the way tests/browser/closetab.mjs and closeproject.mjs do.
     window.__confirms = [];
     window.confirm = (...args) => { window.__confirms.push(args); return false; };
     window.__t = () => [...terms.values()][0];

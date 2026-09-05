@@ -75,6 +75,14 @@ try {
   // Pane 2 is MIDDLE (proto.rs:8), where file tabs open (app.js:3482).
   const tabs = async () => await evalIn(
     `JSON.stringify(state.panes[2].tabs.filter((t) => t.k === "File").map((t) => t.rel))`);
+  // `tabs()` returns a JSON *string*; `.includes` on it is substring
+  // matching against that raw text, not array membership. Harmless with
+  // today's a/b/c/d.txt fixture, but "does b.txt exist" via
+  // `.includes("b.txt")` would false-positive the moment a name like
+  // "ab.txt" is ever added, since the JSON text `["ab.txt"]` contains the
+  // substring "b.txt" as a suffix of a different filename. Parse and check
+  // array membership instead.
+  const hasTab = async (f) => JSON.parse(await tabs()).includes(f);
 
   // Closes whatever File tab sits at index 0, repeatedly, until the pane is
   // empty -- regardless of what a previous (possibly-reverted) scenario left
@@ -106,7 +114,7 @@ try {
   for (const f of ["a.txt", "b.txt", "c.txt"]) {
     await evalIn(`send({ t: "OpenTab", pane: 2,
       tab: { k: "File", rel: ${JSON.stringify(f)}, mode: "Edit" } }); 0`);
-    await until(async () => (await tabs()).includes(f), 10, `${f} opened`);
+    await until(async () => (await hasTab(f)), 10, `${f} opened`);
   }
   // A: the setup this test later negates.
   ok((await tabs()) === '["a.txt","b.txt","c.txt"]', "scenario 1: three file tabs, in order");
@@ -122,11 +130,11 @@ try {
   ok(await evalIn(`document.getElementById("dlg-confirm").open`), "the dirty-close dialog opened");
   // a.txt closes while the dialog is up: every later tab shifts down one.
   await evalIn(`send({ t: "CloseTab", pane: 2, idx: state.panes[2].tabs.findIndex((t) => t.k === "File" && t.rel === "a.txt") }); 0`);
-  await until(async () => !(await tabs()).includes("a.txt"), 10, "a.txt gone");
+  await until(async () => !(await hasTab("a.txt")), 10, "a.txt gone");
   ok((await tabs()) === '["b.txt","c.txt"]', "scenario 1: the strip moved while the dialog was open");
 
   await evalIn(`document.querySelector("#dlg-confirm .dlg-ok").click(); 0`);
-  await until(async () => !(await tabs()).includes("c.txt"), 10, "c.txt closed");
+  await until(async () => !(await hasTab("c.txt")), 10, "c.txt closed");
   // C: WHICH tab remains. A count assertion passes just as well when the
   // wrong tab was closed.
   ok((await tabs()) === '["b.txt"]', "scenario 1: the tab the user clicked was closed, not the one at its old index");
@@ -138,7 +146,17 @@ try {
   const bi = await evalIn(`state.panes[2].tabs.findIndex((t) => t.k === "File" && t.rel === "b.txt")`);
   await evalIn(`closeTab(2, ${bi}, state.panes[2].tabs[${bi}], false); 0`);
   await evalIn(`document.querySelector("#dlg-confirm .dlg-cancel").click(); 0`);
-  await new Promise((r) => setTimeout(r, 500));
+  // A negative assertion resting on a fixed timer can pass under contention
+  // for the wrong reason: nothing had time to happen either way. Replace the
+  // timer with a positive round trip instead, the same shape as clearPane's
+  // fix above -- RequestState always gets an answer (hub.rs's RequestState
+  // arm), and app.js's `onEvent` replaces the `state` binding with a new
+  // object on every State event (`state = ev.ws`), so waiting for that
+  // reference to change is proof the window was open long enough for a
+  // CloseTab sent by the cancel handler to have arrived and been reflected,
+  // had one actually been sent.
+  await evalIn(`window.__beforeCancel = state; send({ t: "RequestState" }); 0`);
+  await until(async () => await evalIn(`state !== window.__beforeCancel`), 10, "RequestState round trip after cancel");
   ok((await tabs()) === '["b.txt"]', "scenario 1: cancelling the dialog closes nothing");
 
   await clearPane("scenario 2");
@@ -152,7 +170,7 @@ try {
   for (const f of ["a.txt", "b.txt", "c.txt", "d.txt"]) {
     await evalIn(`send({ t: "OpenTab", pane: 2,
       tab: { k: "File", rel: ${JSON.stringify(f)}, mode: "Edit" } }); 0`);
-    await until(async () => (await tabs()).includes(f), 10, `${f} opened (scenario 2)`);
+    await until(async () => (await hasTab(f)), 10, `${f} opened (scenario 2)`);
   }
   ok((await tabs()) === '["a.txt","b.txt","c.txt","d.txt"]', "scenario 2: four file tabs, in order");
 
@@ -169,7 +187,7 @@ try {
   // c=1, d=2 -- the stale index 2 (c.txt's original slot) now names d.txt,
   // which exists, instead of falling off the end.
   await evalIn(`send({ t: "CloseTab", pane: 2, idx: state.panes[2].tabs.findIndex((t) => t.k === "File" && t.rel === "a.txt") }); 0`);
-  await until(async () => !(await tabs()).includes("a.txt"), 10, "a.txt gone (scenario 2)");
+  await until(async () => !(await hasTab("a.txt")), 10, "a.txt gone (scenario 2)");
   ok((await tabs()) === '["b.txt","c.txt","d.txt"]', "scenario 2: the strip moved while the dialog was open");
 
   await evalIn(`document.querySelector("#dlg-confirm .dlg-ok").click(); 0`);
@@ -192,7 +210,7 @@ try {
   for (const f of ["a.txt", "b.txt", "c.txt", "d.txt"]) {
     await evalIn(`send({ t: "OpenTab", pane: 2,
       tab: { k: "File", rel: ${JSON.stringify(f)}, mode: "Edit" } }); 0`);
-    await until(async () => (await tabs()).includes(f), 10, `${f} opened (scenario 3)`);
+    await until(async () => (await hasTab(f)), 10, `${f} opened (scenario 3)`);
   }
   ok((await tabs()) === '["a.txt","b.txt","c.txt","d.txt"]', "scenario 3: four file tabs, in order");
 
@@ -210,7 +228,7 @@ try {
   // 2 (c.txt's original slot) now names d.txt, a tab that still exists but
   // is not the one anyone asked to close.
   await evalIn(`send({ t: "CloseTab", pane: 2, idx: state.panes[2].tabs.findIndex((t) => t.k === "File" && t.rel === "c.txt") }); 0`);
-  await until(async () => !(await tabs()).includes("c.txt"), 10, "c.txt gone (scenario 3)");
+  await until(async () => !(await hasTab("c.txt")), 10, "c.txt gone (scenario 3)");
   ok((await tabs()) === '["a.txt","b.txt","d.txt"]', "scenario 3: the strip moved while the dialog was open");
 
   await evalIn(`document.querySelector("#dlg-confirm .dlg-ok").click(); 0`);
