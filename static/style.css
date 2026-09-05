@@ -874,7 +874,14 @@ body.searching header { position: relative; z-index: 41; }
    #searchoverlay[hidden] here would produce a dialog that can never show. */
 dialog.roost { background: var(--bg2); color: var(--fg);
                border: 1px solid var(--border); border-radius: 8px;
-               padding: 0; width: min(420px, 92vw); font: inherit; }
+               padding: 0; width: min(420px, 92vw); font: inherit;
+               /* Top-centre. The `* { margin: 0 }` reset at the top of this
+                  file overrides the UA's `margin: auto` on a modal <dialog>,
+                  which is what centres it against `inset: 0` — without this
+                  every dialog opened at the top-left corner. Auto side
+                  margins centre it; the top margin wins over `bottom: 0`
+                  because the block axis is over-constrained. */
+               margin: 12vh auto 0; }
 /* A literal, not var(): ::backdrop does not participate in inheritance, so a
    custom property would not resolve here. Same value as #searchoverlay. */
 dialog.roost::backdrop { background: rgba(0,0,0,.35); }

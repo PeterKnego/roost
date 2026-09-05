@@ -50,6 +50,19 @@ try {
      askConfirm({ title: "T", lines: ["L"], confirm: "Go", danger: true })
        .then((v) => { window.__r = v; }); 0`);
   ok(await evalIn(`document.getElementById("dlg-confirm").open`), "the dialog opened");
+  // Placement: horizontally centred, in the top band of the viewport. The
+  // stylesheet's `* { margin: 0 }` reset used to override the UA's
+  // `margin: auto` on a modal <dialog>, which is what centres it against
+  // `inset: 0`, so every dialog opened at the top-left corner. Revert-check
+  // 2026-09-05: with `dialog.roost`'s margin rule removed this reads
+  // left=0, top=0 and fails.
+  {
+    const g = JSON.parse(await evalIn(`(() => { const r = document.getElementById("dlg-confirm").getBoundingClientRect();
+       return JSON.stringify({ left: r.left, top: r.top, width: r.width, vw: innerWidth, vh: innerHeight }); })()`));
+    const centred = Math.abs(g.left - (g.vw - g.width) / 2) <= 2;
+    const topBand = g.top >= 20 && g.top <= g.vh * 0.25;
+    ok(centred && topBand, `the dialog sits top-centre, not top-left (${JSON.stringify(g)})`);
+  }
   ok(await evalIn(`document.activeElement === document.querySelector("#dlg-confirm .dlg-cancel")`),
      "danger focuses Cancel, so Enter cancels rather than destroys");
   await evalIn(`document.querySelector("#dlg-confirm .dlg-cancel").click(); 0`);
