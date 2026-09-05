@@ -189,11 +189,13 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
             h.send_to(&id, &ev);
         }
         // A newly connecting client is the third of `claude_hooks`'s three
-        // invalidation sites (see its doc comment on `Hub`): a hand edit to
-        // the settings file made while nobody was connected must be visible
-        // to the client whose very first message this is, not stuck showing
-        // whatever some earlier connection's cache happened to hold.
+        // invalidation sites (see its doc comment on `Hub`) — matched here by
+        // `settings` for the same reason: a hand edit to a config file made
+        // while nobody was connected must be visible to the client whose
+        // very first message this is, not stuck showing whatever some
+        // earlier connection's cache happened to hold.
         h.claude_hooks = None;
+        h.settings = None;
         let ev = h.snapshot_event(&id);
         h.send_to(&id, &ev);
         // Replay the whole store to a fresh client: a notice raised while no

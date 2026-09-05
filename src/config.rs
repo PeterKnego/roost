@@ -496,9 +496,12 @@ pub fn raw_setting(path: &Path, key: &str) -> Option<SettingValue> {
     None
 }
 
-/// Everything the settings dialog renders from. A fresh read of both files:
-/// config is never cached, and this runs once per snapshot, not per
-/// keystroke (only `SetSetting` and the usual layout intents re-snapshot).
+/// Everything the settings dialog renders from. A fresh read of both files —
+/// this function itself caches nothing. It is called from one place,
+/// `hub::snapshot_event`, which does cache the result (`Hub::settings`; see
+/// that field's doc comment), so the roughly twenty file reads here are paid
+/// once per invalidation, not once per snapshot — a snapshot goes out on
+/// every debounced keystroke.
 pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
     use crate::proto::{SettingRow, SettingsView, SettingValue as V};
     let global = global_config_path();

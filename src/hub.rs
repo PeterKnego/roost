@@ -93,6 +93,21 @@ pub struct Hub {
     /// up at the next refresh or reconnect, not sooner, exactly as the spec's
     /// "Live following is deliberately not added" says.
     pub claude_hooks: Option<Option<bool>>,
+    /// Cached result of `config::settings_view(&self.dir)`, same shape and
+    /// same reason as `claude_hooks` above: that call is a `load` of both
+    /// config files plus a `raw_setting` read per key per file — on the
+    /// order of twenty file reads — and `snapshot_event` runs on every
+    /// debounced `EditBuffer`, so an uncached call there is exactly the
+    /// per-keystroke filesystem cost `claude_hooks` already exists to avoid.
+    /// Invalidated at the same three sites as `claude_hooks` (the
+    /// `SetClaudeHooks` arm, the `RequestState` arm, and `wsconn`'s initial
+    /// snapshot for a newly connecting client — see `claude_hooks`'s doc
+    /// comment for why each of those is a "tell the truth now" moment), plus
+    /// the `SetSetting` arm after a successful write, which is the one this
+    /// cache adds. A hand edit to a config file made between those events is
+    /// not reflected sooner, same as `claude_hooks`; the settings dialog
+    /// opening will ask for a fresh `RequestState` itself (a later task).
+    pub settings: Option<crate::proto::SettingsView>,
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<Hub>>>>> = OnceLock::new();
@@ -116,6 +131,7 @@ impl Hub {
             notices_dirty: false,
             proposals: HashMap::new(),
             claude_hooks: None,
+            settings: None,
         };
         // A freshly loaded hub must report reality, not whatever the
         // persisted layout happened to say last time: sessions may have
@@ -369,7 +385,9 @@ impl Hub {
             }
         });
         ws.claude_hooks = cached;
-        ws.settings = crate::config::settings_view(&self.dir);
+        // See the doc comment on `settings` for why this is cached rather
+        // than read on every call.
+        ws.settings = self.settings.get_or_insert_with(|| crate::config::settings_view(&self.dir)).clone();
         Event::State { version: self.ws.version, origin: origin.clone(), ws }
     }
 
@@ -419,11 +437,13 @@ impl Hub {
                 // `ps` fork per session).
                 self.refresh_live_sessions();
                 // This is the explicit "tell me the truth now": one of the
-                // three places `claude_hooks` is invalidated (see its doc
-                // comment) — a hand edit to the settings file made since the
-                // last snapshot must show up here even though it does not
-                // show up on every keystroke.
+                // three places `claude_hooks` (and, for the same reason,
+                // `settings`) is invalidated (see their doc comments) — a
+                // hand edit to the settings file made since the last
+                // snapshot must show up here even though it does not show
+                // up on every keystroke.
                 self.claude_hooks = None;
+                self.settings = None;
                 let ev = self.snapshot_event(from);
                 self.send_to(from, &ev);
                 return;
@@ -469,8 +489,10 @@ impl Hub {
                 // The write above just changed what the file says; the
                 // cached read from before it must not be reused for the
                 // broadcast that reports it (see `claude_hooks`'s doc
-                // comment — this is one of its three invalidation sites).
+                // comment — this is one of its three invalidation sites,
+                // matched here by `settings` for the same reason).
                 self.claude_hooks = None;
+                self.settings = None;
                 let snap = self.snapshot_event(from);
                 self.broadcast(&snap);
                 return;
@@ -484,6 +506,17 @@ impl Hub {
                     self.send_to(from, &Event::Error { msg: e });
                     return;
                 }
+                // The write above just changed what the config files say;
+                // the cached read from before it must not be reused for the
+                // broadcast that reports it (see `settings`'s doc comment —
+                // this is the one invalidation site that field adds beyond
+                // `claude_hooks`'s three).
+                self.settings = None;
+                // Bumped before the `show_hidden` block's `persist()` below,
+                // matching every other site in this file: the state written
+                // to disk must carry the version that describes it, not the
+                // one before.
+                self.ws.version += 1;
                 if key == "show_hidden" {
                     // The header toggle's override outranks the file in both
                     // directions (workspace.rs). Writing the file from the
@@ -493,7 +526,6 @@ impl Hub {
                     self.ws.show_hidden = None;
                     self.persist();
                 }
-                self.ws.version += 1;
                 let snap = self.snapshot_event(from);
                 self.broadcast(&snap);
                 return;
@@ -3327,6 +3359,67 @@ mod tests {
         assert!(to_b.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("allowed_origins")), "{to_b:?}");
         assert!(drain(&rx_a).is_empty(), "a refusal is not broadcast");
         assert!(!std::fs::read_to_string(proj.join(".roost/config.toml")).unwrap().contains("evil"));
+        std::env::remove_var("ROOST_CONFIG");
+    }
+
+    /// `Hub::settings` exists for the same reason `claude_hooks` does: reading
+    /// it fresh on every snapshot would mean the ~20 file reads inside
+    /// `settings_view` running on every debounced `EditBuffer`.
+    ///
+    /// Revert-check: with `self.settings` removed and `snapshot_event` calling
+    /// `crate::config::settings_view(&self.dir)` directly on every snapshot
+    /// (no cache), the first assertion below fails — the hand-edited `nord`
+    /// shows up immediately, on the `SetShowHidden` snapshot, instead of only
+    /// after the next invalidation. Restored.
+    #[test]
+    fn settings_in_the_snapshot_are_cached_until_invalidated() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_CONFIG", d.path().join("global.toml"));
+        let proj = d.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let mut h = Hub::new("settings_cache", proj.clone());
+        let (a, rx_a) = h.subscribe();
+        drain(&rx_a);
+
+        // First RequestState: populates the cache with the default theme —
+        // no project config file exists yet.
+        h.handle(&a, Intent::RequestState);
+        let first = drain(&rx_a);
+        assert!(
+            first.iter().any(|m| m.contains(r#""key":"theme""#) && m.contains(r#""effective":"darcula""#)),
+            "{first:?}"
+        );
+
+        // A hand edit, bypassing `SetSetting` entirely — the same kind of
+        // out-of-band change `claude_hooks`'s doc comment says is not
+        // reflected sooner than the next invalidation.
+        std::fs::create_dir_all(proj.join(".roost")).unwrap();
+        std::fs::write(proj.join(".roost/config.toml"), "theme = \"nord\"\n").unwrap();
+
+        // SetShowHidden snapshots (every layout intent does) but is not one
+        // of `settings`'s invalidation sites — it goes through `apply_layout`
+        // and the generic `_ => {}` arm, never touching `self.settings`.
+        h.handle(&a, Intent::SetShowHidden { on: true });
+        let stale = drain(&rx_a);
+        assert!(
+            stale.iter().any(|m| m.contains(r#""key":"theme""#) && m.contains(r#""effective":"darcula""#)),
+            "a snapshot that does not invalidate must still report the cached value; got {stale:?}"
+        );
+        assert!(
+            !stale.iter().any(|m| m.contains(r#""effective":"nord""#)),
+            "the hand edit must not appear before an invalidation; got {stale:?}"
+        );
+
+        // RequestState is one of the invalidation sites: the hand edit must
+        // now show.
+        h.handle(&a, Intent::RequestState);
+        let fresh = drain(&rx_a);
+        assert!(
+            fresh.iter().any(|m| m.contains(r#""key":"theme""#) && m.contains(r#""effective":"nord""#)),
+            "{fresh:?}"
+        );
         std::env::remove_var("ROOST_CONFIG");
     }
 
