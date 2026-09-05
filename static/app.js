@@ -2343,19 +2343,30 @@ async function closeTab(pi, ti, t, detach) {
     // Revert-check (CLAUDE.md): replacing this re-resolution with the stale
     // `send({ t: "CloseTab", pane: pi, idx: ti })` and running closetab.mjs
     // produced, verbatim:
-    //   ok    three file tabs, in order
+    //   ok    scenario 1: three file tabs, in order
     //   ok    the dirty-close dialog opened
-    //   ok    the strip moved while the dialog was open
+    //   ok    scenario 1: the strip moved while the dialog was open
     //     (timed out waiting for c.txt closed)
-    //   FAIL  the tab the user clicked was closed, not the one at its old index
-    //   FAIL  cancelling the dialog closes nothing
-    //   FAIL (2)
-    // c.txt's index shifted from 2 to 1 when a.txt closed (only 2 tabs left),
-    // so the stale idx 2 was out of range and the server silently dropped the
-    // CloseTab -- c.txt never closed at all. A differently-shaped symptom
-    // than "the wrong tab closes" (out-of-range no-op vs. closing whatever
-    // now sits at the old index), but the same root cause: an index gathered
-    // before the wait no longer names the tab it did.
+    //   FAIL  scenario 1: the tab the user clicked was closed, not the one at its old index
+    //   FAIL  scenario 1: cancelling the dialog closes nothing
+    //   ok    pane cleared before scenario 2
+    //   ok    scenario 2: four file tabs, in order
+    //   ok    scenario 2: the dirty-close dialog opened
+    //   ok    scenario 2: the strip moved while the dialog was open
+    //   FAIL  scenario 2: the tab the user clicked (c.txt) was closed, not whichever tab shifted into its old index (d.txt)
+    //   FAIL (3)
+    // With only three tabs (scenario 1), closing a.txt always pushes the
+    // stale index past the end of the shrunk strip, so the server refuses
+    // the out-of-range CloseTab and c.txt is simply never closed -- a no-op,
+    // not the hazard this fix exists for. Scenario 2 adds a fourth tab so the
+    // stale index (2, c.txt's original slot) stays in range after a.txt
+    // closes (b=0, c=1, d=2): reverted code closed d.txt instead of c.txt,
+    // leaving ["b.txt","c.txt"] where the fix leaves ["b.txt","d.txt"] --
+    // under revert the tab the user actually clicked (c.txt) survived, and a
+    // different, valid tab (d.txt) was silently closed instead, with no
+    // error shown. That is the real failure mode this fix closes: an index
+    // gathered before the wait no longer names the tab it did, and some
+    // other tab pays for it.
     const ti2 = state.panes[pi].tabs.findIndex((x) => x.k === "File" && x.rel === t.rel);
     if (ti2 < 0) { showError(`${t.rel} is no longer open`); return; }
     send({ t: "CloseTab", pane: pi, idx: ti2 });
