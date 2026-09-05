@@ -259,7 +259,17 @@ an overridden `style.css`, a custom font, a logo — is picked up in place of th
 embedded file, restricted only by extension (`css`, `svg`, `png`, `jpg`,
 `jpeg`, `gif`, `webp`, `ico`, `woff`, `woff2`, `ttf`, `otf`); a theme is
 selected with `theme = "{name}"`, which resolves to
-`~/.config/roost/static/themes/{name}.css`. A project theme goes in
+`~/.config/roost/static/themes/{name}.css`. A name that is not one of roost's
+own theme files but is one of daisyUI 5's 35 built-in themes (`nord`,
+`dracula`, `night`, `cupcake`, … — the list is `render::DAISY_THEMES`) is
+served instead from the vendored `static/vendor/daisyui-themes.css` through
+`data-theme` on `<html>`, with `static/daisy-bridge.css` mapping daisyUI's
+`--color-*` variables onto roost's own; only the variables are vendored, no
+components and no Tailwind runtime. roost's own files win where the names
+collide (`dark`, `light`), and a user-directory theme file that happens to
+carry a daisyUI name is shadowed — rename it. daisyUI themes reach the
+terminal's background and foreground like any theme, but not the code
+highlighter, which is a fixed stylesheet. A project theme goes in
 `{project}/.roost/theme/`, entered through `style.css`; the older single
 `.roost/theme.css` still works and the directory wins where both exist. Neither
 the user directory nor a project may supply JavaScript or HTML — only

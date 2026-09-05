@@ -149,6 +149,35 @@ mod tests {
     /// Revert-checked: dropping the `--warn` line from light.css alone fails
     /// this with "light.css: --warn is not defined"; setting it back to
     /// #d79921 fails with the 2.48 ratio.
+    /// The bridge (`static/daisy-bridge.css`) is what makes a daisyUI theme reach
+    /// roost's own stylesheet: it must define every variable a roost theme
+    /// file defines, or the missing one silently falls back to whatever
+    /// `var(--x, fallback)` says at each site. dark.css is the reference set.
+    /// It must also re-declare `--border`, which daisyUI's themes file sets
+    /// to a *width* on every theme and roost reads as a colour.
+    #[test]
+    fn the_daisyui_bridge_defines_every_roost_theme_variable() {
+        let names = |css: &str| -> Vec<String> {
+            let mut v: Vec<String> = css
+                .split("--")
+                .skip(1)
+                .filter_map(|rest| rest.split(':').next().map(|n| n.trim().to_string()))
+                .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let reference = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/static/themes/dark.css")).unwrap();
+        let bridge = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/static/daisy-bridge.css"))
+            .expect("static/daisy-bridge.css missing");
+        let have = names(&bridge);
+        let missing: Vec<String> = names(&reference).into_iter().filter(|n| !have.contains(n)).collect();
+        assert!(missing.is_empty(), "the bridge does not define: {missing:?}");
+        assert!(get("vendor/daisyui-themes.css").is_some(), "daisyUI themes not embedded");
+        assert!(get("daisy-bridge.css").is_some(), "bridge not embedded");
+    }
+
     #[test]
     fn every_theme_defines_a_legible_warn_colour() {
         /// WCAG 2.x relative luminance.

@@ -1,0 +1,31 @@
+/* The bridge from daisyUI's theme variables to roost's own. Linked only when
+   `theme` names a daisyUI theme (render.rs), after vendor/daisyui-themes.css
+   and before style.css. Not under themes/: everything there is a theme file
+   with literal colours (assets.rs checks each one's --warn contrast), and
+   this is neither. Overridable from the user directory like any stylesheet, so style.css sees the same --bg/--fg/… a roost theme
+   file would have given it. Every variable dark.css defines is defined here
+   (assets.rs tests that), and derived ones use color-mix against the theme's
+   own base so they read on light and dark bases alike.
+
+   `:root[data-theme]` outranks daisyUI's `[data-theme=x]` rules. That matters
+   for --border: daisyUI sets `--border` to a *width* on every theme, and
+   roost reads it as a colour. */
+:root[data-theme] {
+  --bg: var(--color-base-100);
+  --bg2: var(--color-base-200);
+  --bg3: var(--color-base-300);
+  --fg: var(--color-base-content);
+  --muted: color-mix(in oklab, var(--color-base-content) 62%, var(--color-base-100));
+  --accent: var(--color-primary);
+  --border: color-mix(in oklab, var(--color-base-content) 18%, var(--color-base-100));
+  --guide: color-mix(in oklab, var(--color-base-content) 12%, var(--color-base-100));
+  --hairline: color-mix(in oklab, var(--color-base-100) 85%, black);
+  --sel-bg: color-mix(in oklab, var(--color-primary) 30%, transparent);
+  --sel-fg: var(--color-base-content);
+  --add-fg: var(--color-success);
+  --add-bg: color-mix(in oklab, var(--color-success) 18%, var(--color-base-100));
+  --del-fg: var(--color-error);
+  --del-bg: color-mix(in oklab, var(--color-error) 18%, var(--color-base-100));
+  --hunk: var(--color-secondary);
+  --warn: var(--color-warning);
+}

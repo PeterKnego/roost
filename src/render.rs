@@ -1608,6 +1608,42 @@ dialog.roost, .dlg-title, .dlg-blocked { display: revert !important; visibility:
 /// setting (`config::share_selection`), and this function stays pure so its
 /// tests can drive both states without touching the developer's real
 /// `~/.config/roost/config.toml`.
+/// daisyUI 5's built-in themes, in its own order. A `theme` naming one of
+/// these — and not a roost theme file — is served from the vendored daisyUI
+/// themes stylesheet through `data-theme` on <html> and the bridge in
+/// `static/daisy-bridge.css`. Kept as a list rather than "anything that is
+/// not a file" so an unknown name still links a file, which is how a theme
+/// in the user directory (`~/.config/roost/static/themes/`) is reached.
+pub const DAISY_THEMES: [&str; 35] = [
+    "light", "dark", "cupcake", "bumblebee", "emerald", "corporate", "synthwave", "retro",
+    "cyberpunk", "valentine", "halloween", "garden", "forest", "aqua", "lofi", "pastel",
+    "fantasy", "wireframe", "black", "luxury", "dracula", "cmyk", "autumn", "business",
+    "acid", "lemonade", "night", "coffee", "winter", "dim", "nord", "sunset", "caramellatte",
+    "abyss", "silk",
+];
+
+/// The `<html>` open tag and the theme `<link>`s for a `theme` setting.
+///
+/// An embedded roost theme file wins over a daisyUI name: "dark" and "light"
+/// exist on both sides, and an existing config must keep meaning what it
+/// meant. (A theme file in the user directory with a daisyUI name is
+/// shadowed — rename it; this is checked against the embedded set only, so
+/// rendering never touches the filesystem.) The daisyUI links go in the
+/// cascade order the bridge needs: variables, then bridge, then style.css.
+fn theme_head(theme: &str) -> (String, String) {
+    let is_file = crate::assets::get(&format!("themes/{theme}.css")).is_some();
+    if !is_file && DAISY_THEMES.contains(&theme) {
+        (
+            format!("<html data-theme=\"{theme}\">"),
+            "<link rel=\"stylesheet\" href=\"/static/vendor/daisyui-themes.css\">\n\
+             <link rel=\"stylesheet\" href=\"/static/daisy-bridge.css\">"
+                .into(),
+        )
+    } else {
+        ("<html>".into(), format!("<link rel=\"stylesheet\" href=\"/static/themes/{}.css\">", esc(theme)))
+    }
+}
+
 pub fn workspace_page(
     project: &str,
     key: &str,
@@ -1616,6 +1652,7 @@ pub fn workspace_page(
     sharing_on: bool,
     launches: &[&str],
 ) -> String {
+    let (html_open, theme_links) = theme_head(&s.theme);
     let warn = s
         .warning
         .as_deref()
@@ -1660,13 +1697,13 @@ pub fn workspace_page(
     };
     format!(
         r#"<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+{html_open}<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{proj_txt}</title>
 {icons}<link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/vendor/hljs-github-dark.min.css">
 <link rel="stylesheet" href="/static/vendor/github-markdown.min.css">
 <link rel="stylesheet" href="/static/vendor/code-input.min.css">
-<link rel="stylesheet" href="/static/themes/{theme}.css">
+{theme_links}
 <link rel="stylesheet" href="/static/style.css">
 {theme_css}
 {DIALOG_STRUCTURAL_CSS}
@@ -1744,7 +1781,6 @@ pub fn workspace_page(
 <script src="/static/dialog.js"></script>
 <script src="/static/app.js"></script>
 </body></html>"#,
-        theme = esc(&s.theme),
         tab = esc(&s.default_tab),
         SVG_HOME = SVG_HOME,
         icons = icon_links(),
@@ -2969,6 +3005,41 @@ mod tests {
         assert!(!h.contains("✕ Close"), "{h}");
         let no_custom = workspace_page("proj", "proj", &s, None, false, &[]);
         assert!(!no_custom.contains("theme.css\">"));
+    }
+
+    /// `theme = "nord"` names one of daisyUI's 35 built-in themes, none of
+    /// which is a file under static/themes. Those come from the vendored
+    /// daisyUI themes stylesheet, keyed by `data-theme` on <html>, plus the
+    /// bridge that maps daisyUI's variables onto roost's own.
+    #[test]
+    fn a_daisyui_theme_name_sets_data_theme_and_links_the_vendored_themes() {
+        let s = Settings { theme: "nord".into(), ..Settings::default() };
+        let h = workspace_page("proj", "proj", &s, None, false, &[]);
+        assert!(h.contains(r#"<html data-theme="nord">"#), "no data-theme: {h}");
+        let vendored = h.find("/static/vendor/daisyui-themes.css").expect("daisyUI themes not linked");
+        let bridge = h.find("/static/daisy-bridge.css").expect("bridge not linked");
+        let style = h.find("/static/style.css").expect("style.css not linked");
+        // Order is the cascade: daisyUI defines --color-*, the bridge turns
+        // them into --bg/--fg/…, style.css consumes them. The bridge also
+        // has to come after daisyUI's file to win back `--border`, which
+        // daisyUI defines as a width on every theme.
+        assert!(vendored < bridge && bridge < style, "link order wrong: {h}");
+        assert!(!h.contains("/static/themes/nord.css"), "a daisyUI theme is not a theme file: {h}");
+    }
+
+    /// roost's own five theme files win over daisyUI's names — "dark" and
+    /// "light" exist on both sides and an existing config must keep meaning
+    /// what it meant. An unknown name is linked as a file exactly as before,
+    /// which is how a user-directory theme is reached.
+    #[test]
+    fn roost_theme_files_and_unknown_names_are_linked_as_files_with_no_data_theme() {
+        for name in ["dark", "light", "darcula", "someones-own"] {
+            let s = Settings { theme: name.into(), ..Settings::default() };
+            let h = workspace_page("proj", "proj", &s, None, false, &[]);
+            assert!(h.contains(&format!("/static/themes/{name}.css")), "{name}: file not linked");
+            assert!(!h.contains("data-theme="), "{name}: data-theme must not be set");
+            assert!(!h.contains("daisyui-themes.css"), "{name}: daisyUI must not be linked");
+        }
     }
 
     #[test]
