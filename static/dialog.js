@@ -293,7 +293,17 @@ function openSettings(settings) {
       const b = document.createElement("button");
       b.type = "button"; b.dataset.scope = id; b.textContent = label;
       b.setAttribute("aria-pressed", String(scope === id));
-      b.onclick = () => { if (scope !== id) { scope = id; edits = new Map(); render(); } };
+      b.onclick = () => {
+        if (scope === id) return;
+        scope = id;
+        edits = new Map();
+        // A theme pick lives in `edits` like every other row, so the switch
+        // discards it — but unlike the others it has already repainted the
+        // page. Undo the paint here or Save writes nothing and the dialog
+        // closes over a preview it never kept.
+        if (previewTheme) { applyTheme(themeBefore); previewTheme = null; }
+        render();
+      };
       scopeBar.appendChild(b);
     }
     const f = document.createElement("span"); f.className = "file"; f.textContent = fileName(); scopeBar.appendChild(f);

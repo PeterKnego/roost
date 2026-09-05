@@ -155,6 +155,37 @@ try {
   // snapshot rather than stay frozen at load time.
   ok(await until(async () => (await one.evalIn(`showHidden()`)) === true, 10, "showHidden"), "and showHidden() is true in the browser that saved");
 
+  console.log("\nI. switching scope after a preview discards the pick, and says so on the page");
+  await one.evalIn(`document.getElementById("settings").click(); 0`);
+  await until(() => one.evalIn(`document.getElementById("dlg-settings").open`), 5, "dialog");
+  const bgBefore = await probe(one.evalIn, "var(--bg)");
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="theme"]').click(); 0`);
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-tile[data-name="nord"]').click(); 0`);
+  ok(await until(async () => (await one.evalIn(`document.documentElement.dataset.theme`)) === "nord", 5, "preview"), "the tile previews nord");
+  // The preview has to have actually repainted, or "the page went back" below
+  // would be true of a page that never left.
+  ok(await until(async () => (await probe(one.evalIn, "var(--bg)")) !== bgBefore, 10, "repaint"), "and the page really repainted");
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-scope button[data-scope="global"]').click(); 0`);
+  ok(await until(async () => (await probe(one.evalIn, "var(--bg)")) === bgBefore, 10, "reverted"), "switching scope puts the page back on the theme the dialog opened with");
+  ok((await one.evalIn(`document.documentElement.dataset.theme`)) === undefined, "and data-theme is gone");
+  await one.evalIn(`document.querySelector("#dlg-settings .dlg-cancel").click(); 0`);
+  await until(async () => !(await one.evalIn(`document.getElementById("dlg-settings").open`)), 5, "closed");
+  ok((await probe(one.evalIn, "var(--bg)")) === bgBefore, "Cancel leaves it there");
+  ok(!/theme/.test(await Deno.readTextFile(projToml)), "and the discarded pick was never written");
+
+  // Revert-check 6 (section I, 2026-09-05): deleting
+  // `if (previewTheme) { applyTheme(themeBefore); previewTheme = null; }`
+  // from the scope button's handler failed 3 —
+  //   FAIL  switching scope puts the page back on the theme the dialog opened with
+  //   FAIL  and data-theme is gone
+  //   FAIL  Cancel leaves it there
+  // — and nothing outside this section. The first two are the discriminating
+  // pair; the third fails only incidentally, because under the revert Cancel
+  // has a real repaint to do and the probe immediately after it can read
+  // before the restored stylesheet has applied. With the fix in place Cancel
+  // is a no-op here (the page is already back), so that probe is stable, and
+  // it is what says the fix did not leave the dialog mid-revert. Restored.
+  //
   // Revert-check 4 (section H, 2026-09-05): putting `SHOW_HIDDEN_DEFAULT`
   // back to a page-load `const` and dropping followSettings's assignment
   // failed exactly one assertion —
