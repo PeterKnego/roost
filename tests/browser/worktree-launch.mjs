@@ -240,7 +240,7 @@ try {
   ok(!(await evalIn(`!!document.querySelector("#wtstrip .wtremove")`)), "no remove control while its Claude terminal is attached");
   if (page2) {
     const s2 = JSON.parse(await page2.evalIn(`JSON.stringify(__sessions(3))`)).find((s) => s !== "term");
-    await page2.evalIn(`window.confirm = () => true; send({ t: "EndSession", session: ${JSON.stringify(s2)} })`);
+    await page2.evalIn(`send({ t: "EndSession", session: ${JSON.stringify(s2)} })`);
     // Ending it drops the tab, leaving only the untouched default "term" one.
     await until(async () => JSON.parse(await page2.evalIn(`JSON.stringify(__sessions(3))`)).length === 1, 20, "worktree terminal ended");
   }
@@ -260,7 +260,8 @@ try {
     sawRemove = await until(() => evalIn(`!!document.querySelector("#wtstrip .wtremove")`), 1, null);
   }
   ok(sawRemove, "the remove control appears once the worktree is idle and clean");
-  await evalIn(`window.confirm = () => true; document.querySelector("#wtstrip .wtremove").click()`);
+  await evalIn(`document.querySelector("#wtstrip .wtremove").click(); 0`);
+  await evalIn(`document.querySelector("#dlg-confirm .dlg-ok").click(); 0`);
   ok(await until(async () => !(await git(projDir, "worktree", "list", "--porcelain")).out.includes("claude-1"), 20, "worktree gone"), "clicking it removes the worktree");
   // `until`, like its neighbours: the branch goes in git step 2 of the same
   // closure that removed the worktree in step 1, so an immediate check can

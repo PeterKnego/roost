@@ -2556,13 +2556,21 @@ if (wtBtn && wtPanel) {
   // A plain click through to a worktree navigates away anyway; this is for
   // the ⌘-click case, which stays on this page with the panel open. The
   // remove control is the other thing this popup's clicks can mean.
-  wtPanel.onclick = (e) => {
+  wtPanel.onclick = async (e) => {
     const rm = e.target.closest(".wtremove");
     if (rm) {
+      // Everything the event carries is read before the first await: e is
+      // still valid afterward, but the panel's own re-fetches (hx-trigger on
+      // "projects"/"refresh") can replace this DOM out from under us while
+      // the dialog is open.
       e.preventDefault();
       const key = rm.dataset.key;
       const name = rm.closest(".wtrow")?.textContent.trim().split(/\s+/)[1] || key;
-      if (confirm(`Remove worktree ${name} and its branch? roost re-checks that it is clean, idle and merged first.`)) send({ t: "RemoveWorktree", key });
+      const yes = await askConfirm({ title: "Remove worktree",
+        lines: [`Remove worktree ${name} and its branch?`,
+                "roost re-checks that it is clean, idle and merged first."],
+        confirm: "Remove", danger: true });
+      if (yes) send({ t: "RemoveWorktree", key });
       return;
     }
     if (e.target.closest("a")) wtPanel.hidden = true;
