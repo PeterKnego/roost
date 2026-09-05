@@ -30,6 +30,11 @@ pub fn get(rel: &str) -> Option<&'static [u8]> {
     ASSETS.binary_search_by(|(k, _)| (*k).cmp(rel)).ok().map(|i| ASSETS[i].1)
 }
 
+/// Every embedded asset path, for callers that enumerate a directory of them.
+pub fn names() -> impl Iterator<Item = &'static str> {
+    ASSETS.iter().map(|(k, _)| *k)
+}
+
 /// What authority a layer needs to serve a path.
 ///
 /// JavaScript served from `/static/` runs same-origin with every terminal

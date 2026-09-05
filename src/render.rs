@@ -1607,40 +1607,18 @@ dialog.roost, .dlg-title, .dlg-blocked { display: revert !important; visibility:
 /// `sharing_on` is passed in rather than read here: it is a *global-only*
 /// setting (`config::share_selection`), and this function stays pure so its
 /// tests can drive both states without touching the developer's real
-/// `~/.config/roost/config.toml`.
-/// daisyUI 5's built-in themes, in its own order. A `theme` naming one of
-/// these — and not a roost theme file — is served from the vendored daisyUI
-/// themes stylesheet through `data-theme` on <html> and the bridge in
-/// `static/daisy-bridge.css`. Kept as a list rather than "anything that is
-/// not a file" so an unknown name still links a file, which is how a theme
-/// in the user directory (`~/.config/roost/static/themes/`) is reached.
-pub const DAISY_THEMES: [&str; 35] = [
-    "light", "dark", "cupcake", "bumblebee", "emerald", "corporate", "synthwave", "retro",
-    "cyberpunk", "valentine", "halloween", "garden", "forest", "aqua", "lofi", "pastel",
-    "fantasy", "wireframe", "black", "luxury", "dracula", "cmyk", "autumn", "business",
-    "acid", "lemonade", "night", "coffee", "winter", "dim", "nord", "sunset", "caramellatte",
-    "abyss", "silk",
-];
 
-/// The `<html>` open tag and the theme `<link>`s for a `theme` setting.
-///
-/// An embedded roost theme file wins over a daisyUI name: "dark" and "light"
-/// exist on both sides, and an existing config must keep meaning what it
-/// meant. (A theme file in the user directory with a daisyUI name is
-/// shadowed — rename it; this is checked against the embedded set only, so
-/// rendering never touches the filesystem.) The daisyUI links go in the
-/// cascade order the bridge needs: variables, then bridge, then style.css.
 fn theme_head(theme: &str) -> (String, String) {
-    let is_file = crate::assets::get(&format!("themes/{theme}.css")).is_some();
-    if !is_file && DAISY_THEMES.contains(&theme) {
-        (
+    match crate::themes::kind(theme) {
+        Some(crate::themes::ThemeKind::Daisy) => (
             format!("<html data-theme=\"{theme}\">"),
             "<link rel=\"stylesheet\" href=\"/static/vendor/daisyui-themes.css\">\n\
              <link rel=\"stylesheet\" href=\"/static/daisy-bridge.css\">"
                 .into(),
-        )
-    } else {
-        ("<html>".into(), format!("<link rel=\"stylesheet\" href=\"/static/themes/{}.css\">", esc(theme)))
+        ),
+        // A roost file, or an unknown name linked as a file: that is how a
+        // theme in the user directory is reached.
+        _ => ("<html>".into(), format!("<link rel=\"stylesheet\" href=\"/static/themes/{}.css\">", esc(theme))),
     }
 }
 

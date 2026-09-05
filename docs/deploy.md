@@ -261,7 +261,7 @@ embedded file, restricted only by extension (`css`, `svg`, `png`, `jpg`,
 selected with `theme = "{name}"`, which resolves to
 `~/.config/roost/static/themes/{name}.css`. A name that is not one of roost's
 own theme files but is one of daisyUI 5's 35 built-in themes (`nord`,
-`dracula`, `night`, `cupcake`, … — the list is `render::DAISY_THEMES`) is
+`dracula`, `night`, `cupcake`, … — the list is `themes::DAISY_THEMES`) is
 served instead from the vendored `static/vendor/daisyui-themes.css` through
 `data-theme` on `<html>`, with `static/daisy-bridge.css` mapping daisyUI's
 `--color-*` variables onto roost's own; only the variables are vendored, no

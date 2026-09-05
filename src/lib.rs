@@ -30,6 +30,7 @@ pub mod search;
 pub mod session;
 pub mod term;
 pub mod textdiff;
+pub mod themes;
 pub mod upload;
 pub mod watch;
 pub mod workspace;
