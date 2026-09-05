@@ -37,7 +37,7 @@ const SHOW_HIDDEN_DEFAULT = document.body.dataset.showHidden === "1";
 // Whether the editor writes a buffer out by itself. Read once per page load,
 // like SHOW_HIDDEN_DEFAULT: it changes only when someone edits a config file,
 // which already needs a reload to take effect.
-const AUTOSAVE = document.body.dataset.autosave === "1";
+let AUTOSAVE = document.body.dataset.autosave === "1";
 // Whether the editor's current selection is sent to Claude as ambient
 // context, embedded once per page load like AUTOSAVE and SHOW_HIDDEN_DEFAULT.
 // Off unless the project's config opted in (Settings::share_selection); the
@@ -287,6 +287,7 @@ function onEvent(ev) {
       // nothing but renderNotices() rebuilds the panel's own children.
       renderClaudeHooks();
       renderNotices();
+      followSettings();
       // A rel missing from the fresh buffer list is gone server-side (the
       // last tab on it closed clean, or its edits were explicitly
       // discarded) — prune it here rather than let texts/editors grow for
@@ -2587,6 +2588,19 @@ if (bell) {
   };
 }
 
+// RequestState before opening: the hub caches the settings block like
+// claude_hooks and only recomputes it on RequestState, so a hand-edited
+// config file is picked up when the dialog opens rather than showing what
+// was cached at the last unrelated broadcast.
+const settingsBtn = document.getElementById("settings");
+if (settingsBtn) {
+  settingsBtn.onclick = () => {
+    if (!state || !state.settings) return;
+    send({ t: "RequestState" });
+    if (typeof openSettings === "function") openSettings(state.settings);
+  };
+}
+
 // Header control buttons must not steal keyboard focus from the terminal or
 // the editor. Glancing at notifications, or opening the worktree switcher,
 // should leave you still typing where you were — but a <button> grabs focus
@@ -2677,6 +2691,78 @@ if (canNotify() && "serviceWorker" in navigator) {
 }
 
 function unread() { return notices.filter((n) => !n.read).length; }
+
+// ---- themes -------------------------------------------------------------
+// The theme the page is currently painted with. Initialised from the first
+// snapshot rather than a data- attribute: the snapshot is what a later
+// change arrives through, so both readings come from one place.
+let appliedTheme = null;
+// The settings dialog while it is open (dialog.js sets and clears this).
+// While open, a theme in the snapshot is not applied over the preview.
+let settingsOpen = null;
+
+// Which of the two mechanisms `render::theme_head` would have used for
+// `name`, expressed in the client so a preview matches a reload: a roost
+// file is one <link>; a daisyUI name is data-theme on <html> plus the
+// vendored variables and the bridge. The vendored file goes FIRST in
+// <head>: its `:root` block defines --border as a width, and only a roost
+// theme file linked after it wins that back (the bridge does for daisyUI).
+function applyTheme(name) {
+  const head = document.head;
+  const styleLink = head.querySelector('link[href="/static/style.css"]');
+  const ensure = (id, href, first) => {
+    let l = document.getElementById(id);
+    if (!l) {
+      l = document.createElement("link");
+      l.id = id; l.rel = "stylesheet"; l.href = href;
+      if (first) head.insertBefore(l, head.firstChild); else head.insertBefore(l, styleLink);
+    }
+    return l;
+  };
+  const drop = (id) => { const l = document.getElementById(id); if (l) l.remove(); };
+  // `catalogue()` lists roost entries first, then all 35 daisyUI names
+  // unfiltered — so "dark" and "light" (embedded roost files that are also
+  // daisyUI names) appear TWICE, once per kind. `find` takes the first
+  // match, which is the roost entry for those two, matching the same
+  // roost-wins precedence `themes::kind` uses server-side; `.some(kind ===
+  // "daisy")` would find the later daisy duplicate for both names and paint
+  // them as daisyUI themes instead.
+  const match = state && state.settings && state.settings.themes.find((t) => t.name === name);
+  const daisy = !!match && match.kind === "daisy";
+  // The server-rendered roost link has no id; adopt it once.
+  const rendered = head.querySelector('link[href^="/static/themes/"]');
+  if (rendered && !rendered.id) rendered.id = "theme-roost";
+  if (daisy) {
+    ensure("theme-daisy", "/static/vendor/daisyui-themes.css", true);
+    ensure("theme-bridge", "/static/daisy-bridge.css", false);
+    drop("theme-roost");
+    document.documentElement.dataset.theme = name;
+  } else {
+    delete document.documentElement.dataset.theme;
+    drop("theme-bridge");
+    // The vendored variables stay if present: harmless behind a roost file
+    // (which wins --border by coming later), and the picker's tiles need it.
+    const l = ensure("theme-roost", `/static/themes/${encodeURIComponent(name)}.css`, false);
+    l.href = `/static/themes/${encodeURIComponent(name)}.css`;
+  }
+  appliedTheme = name;
+}
+
+// Called on every State: follow a theme change made elsewhere (another
+// browser's Save), and keep AUTOSAVE live for this page.
+function followSettings() {
+  const s = state && state.settings;
+  if (!s) return;
+  const row = (k) => s.keys.find((r) => r.key === k);
+  const theme = row("theme");
+  if (theme) {
+    if (appliedTheme === null) appliedTheme = theme.effective; // first snapshot: the page is already painted with it
+    else if (!settingsOpen && theme.effective !== appliedTheme) applyTheme(theme.effective);
+  }
+  const auto = row("autosave");
+  if (auto) AUTOSAVE = auto.effective === true;
+  if (settingsOpen) settingsOpen.onSnapshot(s);
+}
 
 // The bell's Claude-hooks state. Three values, never two: `null` means the
 // server could not read or parse the settings file, and that gets a reason
