@@ -375,6 +375,22 @@ happened, autosave stops for that buffer instead of re-raising the conflict
 banner every second. An explicit ⌘S is what resolves it, and a save that
 actually lands is what starts autosave again.
 
+### The settings dialog
+
+The header's gear opens it. Two panes, **Settings** and **Theme**, and a
+scope switch, **Project** (`{project}/.roost/config.toml`) or **Global**
+(`~/.config/roost/config.toml`, or `$ROOST_CONFIG`). It writes the display
+keys only — `theme`, `hide`, `show_hidden`, `autosave`, and in Global scope
+also `share_selection` and `worktree_prompt`. `allowed_origins`,
+`max_upload_bytes`, `ide` and `roots` are shown read-only and have no write
+path from a page at all: the hub refuses them by name. Writes go through
+`toml_edit`, so comments and layout in a hand-edited file survive; a file
+that does not parse is refused with its error and left alone. A theme
+click previews at once in that browser; Save keeps it and every browser on
+the project follows without a reload. A global change reaches other
+projects on their next load. The dialog requests a fresh snapshot when it
+opens, so a file edited by hand shows up then.
+
 ### Turning the Claude Code integration off
 
 **Global config only.** On by default. To switch it off:

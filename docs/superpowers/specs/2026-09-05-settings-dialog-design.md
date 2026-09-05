@@ -1,6 +1,6 @@
 # Settings dialog
 
-*2026-09-05. Status: design, awaiting review.*
+*2026-09-05. Status: implemented (see the plan of the same date).*
 
 ## What and why
 

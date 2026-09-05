@@ -44,6 +44,7 @@ deno run -A tests/browser/renamed.mjs    # a file renamed *inside* the project: 
 deno run -A tests/browser/closeproject.mjs # Close Project ends the shells *and* clears their tabs, so reopening shows no ghosts
 deno run -A tests/browser/search.mjs     # the search overlay (⇧⌃F), its results, and landing on a line
 deno run -A tests/browser/themes.mjs     # a daisyUI theme name reaches paint through data-theme and the bridge; a roost theme is untouched
+deno run -A tests/browser/settings.mjs   # the settings dialog: live theme preview, Save/Cancel, both scopes, read-only keys refused
 deno run -A tests/browser/nonascii.mjs   # the editor's non-ASCII indicator and highlight toggle: count, accent, marks under the glyphs, cap, persistence
 deno run -A tests/browser/notices.mjs    # the bell panel holds only this project's notices, and Clear empties only what it shows
 deno run -A tests/browser/dialogs.mjs    # the dialog primitive: askConfirm/askText/askMenu's exits, focus restoration, and a guard that no code path reaches a native confirm/prompt/alert
