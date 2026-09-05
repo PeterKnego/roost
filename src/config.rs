@@ -1,5 +1,6 @@
 //! Settings cascade: global ~/.config/roost/config.toml, then
 //! {project}/.roost/config.toml. Re-read on every request — never cached.
+use crate::proto::{Scope, SettingValue};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -68,6 +69,64 @@ impl Default for Settings {
             autosave: true,
             warning: None,
         }
+    }
+}
+
+/// Keys a project file may set — display-level, nothing a hostile checkout
+/// could widen a boundary with. In this order in the dialog.
+pub const PROJECT_KEYS: &[&str] = &["theme", "hide", "show_hidden", "autosave"];
+/// Keys only the global file may set; see the readers below for why each.
+pub const GLOBAL_ONLY_KEYS: &[&str] = &["share_selection", "worktree_prompt"];
+/// Keys no page may write. Shown read-only; not in any allowlist, so a
+/// forged intent is refused too.
+pub const READ_ONLY_KEYS: &[&str] = &["allowed_origins", "max_upload_bytes", "ide", "roots"];
+
+/// The scopes a write is accepted for. The dialog's scope column and the
+/// hub's refusal both read this, so they cannot disagree.
+pub fn writable_in(key: &str) -> &'static [&'static str] {
+    if PROJECT_KEYS.contains(&key) {
+        &["project", "global"]
+    } else if GLOBAL_ONLY_KEYS.contains(&key) {
+        &["global"]
+    } else {
+        &[]
+    }
+}
+
+/// Everything checked before a file is touched. Errors name the key and say
+/// what would have been accepted, because they land in a banner.
+pub fn validate(scope: Scope, key: &str, value: Option<&SettingValue>) -> Result<(), String> {
+    let allowed = writable_in(key);
+    if allowed.is_empty() {
+        if READ_ONLY_KEYS.contains(&key) {
+            return Err(format!("{key} can only be changed by hand, in the global config file"));
+        }
+        return Err(format!("{key} is not a setting"));
+    }
+    if scope == Scope::Project && !allowed.contains(&"project") {
+        return Err(format!("{key} is a global setting; switch the scope to global"));
+    }
+    let Some(v) = value else { return Ok(()) };
+    match (key, v) {
+        ("theme", SettingValue::Str(name)) => match crate::themes::kind(name) {
+            Some(_) => Ok(()),
+            None => Err(format!("{name} is not a theme roost knows")),
+        },
+        ("theme", _) => Err("theme takes a name".into()),
+        ("hide", SettingValue::List(items)) => {
+            for it in items {
+                if it.is_empty() {
+                    return Err("hide: an empty entry".into());
+                }
+                if it.contains('/') || it.contains('\\') || it == "." || it == ".." {
+                    return Err(format!("hide: {it} is not a single name"));
+                }
+            }
+            Ok(())
+        }
+        ("hide", _) => Err("hide takes a list of names".into()),
+        ("show_hidden" | "autosave" | "share_selection" | "worktree_prompt", SettingValue::Bool(_)) => Ok(()),
+        (k, _) => Err(format!("{k} takes true or false")),
     }
 }
 
@@ -326,6 +385,7 @@ pub fn for_project(project_dir: &Path) -> Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{Scope, SettingValue as V};
     use std::fs;
 
     #[test]
@@ -653,6 +713,48 @@ mod tests {
             crate::projects::roots_from(None, &global).is_empty(),
             "the project file declared /etc as a root and it must not appear"
         );
+    }
+
+    #[test]
+    fn the_allowlist_refuses_by_name_and_scope() {
+        // Revert-checked: changing `if scope == Scope::Project &&` to `if false &&`
+        // failed this test when it tried to validate(Scope::Project, "share_selection", ...)
+        // with `thread panicked at ... called Result::unwrap_err() on an Ok value: ()`.
+        // This confirms the scope check is essential for rejecting project-level writes
+        // to global-only keys. Then restored.
+        assert!(validate(Scope::Project, "theme", Some(&V::Str("nord".into()))).is_ok());
+        assert!(validate(Scope::Global, "share_selection", Some(&V::Bool(true))).is_ok());
+        let e = validate(Scope::Project, "share_selection", Some(&V::Bool(true))).unwrap_err();
+        assert!(e.contains("share_selection") && e.contains("global"), "{e}");
+        for scope in [Scope::Project, Scope::Global] {
+            let e = validate(scope, "allowed_origins", Some(&V::List(vec!["https://x".into()]))).unwrap_err();
+            assert!(e.contains("allowed_origins") && e.contains("by hand"), "{e}");
+            let e = validate(scope, "no_such_key", None).unwrap_err();
+            assert!(e.contains("no_such_key"), "{e}");
+        }
+    }
+
+    #[test]
+    fn values_must_match_the_key_and_a_theme_must_exist() {
+        let e = validate(Scope::Project, "autosave", Some(&V::Str("yes".into()))).unwrap_err();
+        assert!(e.contains("autosave") && e.contains("true or false"), "{e}");
+        let e = validate(Scope::Project, "theme", Some(&V::Str("not-a-theme".into()))).unwrap_err();
+        assert!(e.contains("not-a-theme"), "{e}");
+        let e = validate(Scope::Project, "hide", Some(&V::List(vec!["a/b".into()]))).unwrap_err();
+        assert!(e.contains("a/b") && e.contains("single name"), "{e}");
+        let e = validate(Scope::Project, "hide", Some(&V::List(vec!["".into()]))).unwrap_err();
+        assert!(e.contains("empty"), "{e}");
+        assert!(validate(Scope::Project, "hide", Some(&V::List(vec!["dist".into(), ".cache".into()]))).is_ok());
+        // Clearing needs no value check, only the allowlist.
+        assert!(validate(Scope::Global, "worktree_prompt", None).is_ok());
+    }
+
+    #[test]
+    fn writable_in_mirrors_the_allowlist() {
+        assert_eq!(writable_in("theme"), &["project", "global"]);
+        assert_eq!(writable_in("worktree_prompt"), &["global"]);
+        assert_eq!(writable_in("roots"), &[] as &[&str]);
+        assert_eq!(writable_in("nope"), &[] as &[&str]);
     }
 
 }
