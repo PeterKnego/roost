@@ -125,10 +125,21 @@ try {
   // the directory. prompt() could not do this, and a rename that silently
   // ate the directory would be a data-loss bug, not a UX one.
   await evalIn(`window.__r = null;
-     askText({ title: "Rename", value: "src/main.rs", confirm: "Rename" })
+     askText({ title: "Rename", label: "New path", value: "src/main.rs", confirm: "Rename" })
        .then((v) => { window.__r = v; }); 0`);
   ok((await evalIn(`document.getElementById("dlg-input").value`)) === "src/main.rs",
      "askText prefills the whole path");
+  // Regression: DIALOG_STRUCTURAL_CSS once put .dlg-label in its `revert`
+  // group alongside dialog.roost/.dlg-title/.dlg-blocked. `revert` discards
+  // ALL author-origin declarations for the property, not just the theme's, so
+  // it wiped out style.css's own `.dlg-label { display: block; }` too and
+  // fell back to <label>'s UA default of `inline` — breaking the layout of
+  // every askText dialog that passes a label (all three real call sites do).
+  // Asserted on computed style, not a class or attribute, because a class
+  // toggling correctly says nothing about what the structural CSS actually
+  // resolves to in the cascade.
+  ok((await evalIn(`getComputedStyle(document.querySelector("#dlg-text .dlg-label")).display`)) === "block",
+     "the label keeps its block layout (not reverted to <label>'s inline default)");
   ok((await evalIn(`document.getElementById("dlg-input").selectionStart`)) === 4 &&
      (await evalIn(`document.getElementById("dlg-input").selectionEnd`)) === 11,
      "and selects only the basename");

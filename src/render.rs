@@ -1582,7 +1582,15 @@ const SVG_X: &str = r#"<svg width="12" height="12" viewBox="0 0 16 16" fill="non
 /// still recolour these dialogs — the ruling is "recolour yes, rearrange/
 /// hide/relabel no".
 const DIALOG_STRUCTURAL_CSS: &str = r#"<style>
-dialog.roost, .dlg-title, .dlg-blocked, .dlg-label { display: revert !important; visibility: visible !important; opacity: 1 !important; }
+dialog.roost, .dlg-title, .dlg-blocked { display: revert !important; visibility: visible !important; opacity: 1 !important; }
+/* .dlg-label can't join the revert group above: it's a <label>, whose UA
+   default is `display: inline`, and style.css sets `display: block` on it
+   (it's the field caption above an askText input). `revert` discards ALL
+   author-origin declarations for the property, roost's own included, so it
+   would revert this one straight back to `inline` and break every askText
+   dialog's layout. Lock the known-good value explicitly instead, the same
+   way .dlg-body/.dlg-buttons/.dlg-items do below. */
+.dlg-label { display: block !important; visibility: visible !important; opacity: 1 !important; }
 .dlg-body, .dlg-buttons, .dlg-items { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
 .dlg-body, .dlg-items { flex-direction: column !important; }
 .dlg-buttons { flex-direction: row !important; order: 0 !important; }
