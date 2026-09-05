@@ -447,9 +447,20 @@ pub fn write_setting(path: &Path, key: &str, value: Option<&SettingValue>) -> Re
         }
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        // Only the immediate parent (`.roost/`) may be created here, not
+        // `create_dir_all`'s whole chain above it: a project write whose
+        // project directory is itself gone must fail, not resurrect it from
+        // a stale path the hub still holds.
+        match std::fs::create_dir(parent) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("{}: {e}", parent.display())),
+        }
     }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    // Full filename plus suffix, matching the temp-file convention used by
+    // every other atomic write in this repo (claudehooks, registry, worktree).
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
     std::fs::write(&tmp, doc.to_string()).map_err(|e| format!("{}: {e}", tmp.display()))?;
     if let Ok(meta) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
@@ -899,7 +910,27 @@ mod tests {
         // Revert-check: swapping `?` on the parse for `.unwrap_or_default()`
         // writes a one-line file here and this compare fails.
         assert_eq!(fs::read_to_string(&p).unwrap(), "theme = \"dark\"\nthis is not toml\n");
-        assert!(!d.path().join("config.toml.tmp.0").exists());
+        // The literal "config.toml.tmp.0" never existed regardless of
+        // whether a temp file leaked, since the real one carries this
+        // process's actual pid — check the directory instead of one guessed
+        // name, or a leaked temp file with a different pid would pass silently.
+        let leaked = fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with("config.toml.tmp."));
+        assert!(!leaked, "a temp file was left behind after a refused write");
+    }
+
+    #[test]
+    fn a_missing_project_directory_is_not_recreated() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("gone").join(".roost").join("config.toml");
+        let e = write_setting(&p, "theme", Some(&V::Str("nord".into()))).unwrap_err();
+        assert!(e.contains("gone"), "{e}");
+        // Revert-check: putting `create_dir_all` back in place of `create_dir`
+        // makes this fail — the whole `gone/.roost` chain gets created and
+        // `write_setting` succeeds instead of erroring.
+        assert!(!d.path().join("gone").exists(), "a deleted project directory must not be resurrected");
     }
 
     #[test]
