@@ -1604,10 +1604,14 @@ dialog.roost, .dlg-title, .dlg-blocked { display: revert !important; visibility:
 .dlg-choice::before, .dlg-choice::after { content: normal !important; }
 </style>"#;
 
-/// `sharing_on` is passed in rather than read here: it is a *global-only*
-/// setting (`config::share_selection`), and this function stays pure so its
-/// tests can drive both states without touching the developer's real
-
+/// The `<html>` open tag and the theme `<link>`s for a `theme` setting.
+///
+/// An embedded roost theme file wins over a daisyUI name: "dark" and "light"
+/// exist on both sides, and an existing config must keep meaning what it
+/// meant. (A theme file in the user directory with a daisyUI name is
+/// shadowed — rename it; this is checked against the embedded set only, so
+/// rendering never touches the filesystem.) The daisyUI links go in the
+/// cascade order the bridge needs: variables, then bridge, then style.css.
 fn theme_head(theme: &str) -> (String, String) {
     match crate::themes::kind(theme) {
         Some(crate::themes::ThemeKind::Daisy) => (
@@ -1622,6 +1626,10 @@ fn theme_head(theme: &str) -> (String, String) {
     }
 }
 
+/// `sharing_on` is passed in rather than read here: it is a *global-only*
+/// setting (`config::share_selection`), and this function stays pure so its
+/// tests can drive both states without touching the developer's real
+/// `~/.config/roost/config.toml`.
 pub fn workspace_page(
     project: &str,
     key: &str,
