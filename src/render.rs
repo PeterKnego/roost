@@ -1594,16 +1594,28 @@ dialog.roost, .dlg-title, .dlg-blocked { display: revert !important; visibility:
 /* The detail slot holds the diff a save conflict is about to overwrite; hiding
    it would hide what "Overwrite" destroys. Hidden by attribute when empty. */
 .dlg-detail:not([hidden]) { display: block !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
-.dlg-body, .dlg-buttons, .dlg-items, .dlg-tabs, .dlg-scope, .dlg-rows:not([hidden]), .dlg-themes:not([hidden]) { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
+.dlg-body, .dlg-buttons, .dlg-items, .dlg-tabs, .dlg-scope, .dlg-rows:not([hidden]), .dlg-themes:not([hidden]), .dlg-warning:not([hidden]) { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
 .dlg-body, .dlg-items, .dlg-rows, .dlg-themes:not([hidden]) { flex-direction: column !important; }
 .dlg-buttons { flex-direction: row !important; order: 0 !important; }
 .dlg-buttons button, .dlg-item { transform: none !important; font-size: 13px !important; order: 0 !important; }
 .dlg-row { display: grid !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
 .dlg-tile { display: flex !important; flex-direction: column !important; visibility: visible !important; opacity: 1 !important; }
+/* The grid each pane of tiles lives in. Locking .dlg-themes alone is not
+   enough: collapsing this container empties the theme pane while the pane
+   itself stays visible. Grid, explicitly, for .dlg-row's reason — style.css
+   defines the columns and `revert` would discard them. */
+.dlg-tiles:not([hidden]) { display: grid !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
+/* The tabs themselves, not just the strip: hiding the Theme tab hides the only
+   way into the theme pane. No display here on purpose — a .dlg-tab is a
+   <button> wearing its own UA display, which style.css never overrides, so
+   there is no known-good value to pin and `revert` (see .dlg-label above)
+   would be pinning one anyway. */
+.dlg-tab { visibility: visible !important; opacity: 1 !important; }
 .dlg-title::before, .dlg-title::after, .dlg-body::before, .dlg-body::after,
 .dlg-buttons::before, .dlg-buttons::after, .dlg-ok::before, .dlg-ok::after,
 .dlg-cancel::before, .dlg-cancel::after, .dlg-item::before, .dlg-item::after,
-.dlg-choice::before, .dlg-choice::after, .dlg-tile::before, .dlg-tile::after, .dlg-row::before, .dlg-row::after { content: normal !important; }
+.dlg-choice::before, .dlg-choice::after, .dlg-tile::before, .dlg-tile::after, .dlg-row::before, .dlg-row::after,
+.dlg-tab::before, .dlg-tab::after { content: normal !important; }
 </style>"#;
 
 /// The `<html>` open tag and the theme `<link>`s for a `theme` setting.
@@ -3245,13 +3257,47 @@ mod tests {
         // a theme must not be able to hide it.
         assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-detail:not([hidden])"),
             "the structural CSS does not lock .dlg-detail's visibility");
-        for cls in [".dlg-tabs", ".dlg-scope", ".dlg-rows", ".dlg-row", ".dlg-themes", ".dlg-tile"] {
+        for cls in [".dlg-tabs", ".dlg-scope", ".dlg-rows", ".dlg-row", ".dlg-themes", ".dlg-tile",
+                    ".dlg-tiles", ".dlg-tab", ".dlg-warning"] {
             assert!(DIALOG_STRUCTURAL_CSS.contains(cls), "the structural CSS does not lock {cls}");
         }
         assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-row { display: grid !important"),
             "the structural CSS must lock .dlg-row to grid, not flex—flex would destroy the three-column layout");
         assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-tile { display: flex !important; flex-direction: column !important"),
             "the structural CSS must lock .dlg-tile to flex with column direction—revert discards style.css's own flex");
+        // The tiles' own container. `.dlg-themes` being locked is not enough:
+        // every tile lives in a `.dlg-tiles` grid, so a theme that collapsed
+        // *that* would empty the theme pane while the pane itself stayed
+        // visible. It is a CSS grid in style.css, so it is locked to grid for
+        // the same reason `.dlg-row` is — `revert` would discard the layout.
+        assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-tiles:not([hidden]) { display: grid !important"),
+            "the structural CSS must lock .dlg-tiles to grid, not flex or revert");
+        // The tabs themselves, not only the `.dlg-tabs` strip that holds them:
+        // hiding the Theme tab hides the pane it is the only way into. Their
+        // display is a <button>'s own, which style.css does not override, so
+        // this locks visibility and opacity and deliberately leaves display
+        // alone — pinning a display value here would be inventing one.
+        assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-tab { visibility: visible !important; opacity: 1 !important; }"),
+            "the structural CSS must lock .dlg-tab's visibility and opacity, and must not invent a display for it");
+        assert!(!DIALOG_STRUCTURAL_CSS.contains(".dlg-tab { display"),
+            "a .dlg-tab display lock would override style.css's own button layout");
+        assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-tab::before, .dlg-tab::after"),
+            "the structural CSS does not lock .dlg-tab's generated content—a theme could relabel the Theme tab");
+        // The parse error of a config file roost could not read. A theme that
+        // hid it would leave the dialog silently showing stale values over a
+        // file nothing it writes can fix.
+        assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-warning:not([hidden])"),
+            "the structural CSS does not lock .dlg-warning's visibility");
+        // Revert-checks performed 2026-09-05, one lock at a time, each
+        // failing exactly its own assertion and nothing else:
+        //   .dlg-tiles grid -> flex          "must lock .dlg-tiles to grid, not flex or revert"
+        //   .dlg-tab gains display:inline-block
+        //                                    "must lock .dlg-tab's visibility and opacity, and
+        //                                     must not invent a display for it"
+        //   .dlg-tab::before/::after dropped "does not lock .dlg-tab's generated content"
+        //   .dlg-warning dropped from the flex group
+        //                                    "does not lock .dlg-warning"
+        // All restored, and the test passes again.
     }
 
     #[test]
