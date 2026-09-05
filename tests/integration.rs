@@ -2692,6 +2692,56 @@ fn a_fresh_projects_first_terminal_already_carries_the_ide_port() {
 /// missing-`ROOST_NOTIFY` path) to `return 1` failed case (a)'s
 /// `out.status.success()` assertion — `left: false` where a Claude
 /// running outside a roost terminal must see silent success. Restored.
+/// `roost --version` used to fall into the server path: an unrecognised
+/// first argument parsed as the port, failed, defaulted to 8444, and either
+/// started a server nobody asked for or panicked at the bind where one
+/// already ran. Both halves here: the flag prints the crate version and
+/// exits 0; a non-numeric port is refused with exit 2 rather than defaulted
+/// past. The bad-port child is waited on with a deadline, because the old
+/// behaviour on an idle host is a server that never exits — a hang, not a
+/// failure, is what the deadline turns into a failure.
+///
+/// Revert-check (2026-09-05): with `unwrap_or(8444)` restored, the bad-port
+/// half failed — on this host with exit 101 at the bind (8444 busy), and the
+/// version half with the same panic. On an idle host the deadline fires.
+#[test]
+fn version_flag_prints_the_version_and_a_bad_port_is_refused() {
+    use std::process::{Command, Stdio};
+    let bin = env!("CARGO_BIN_EXE_roost");
+    for flag in ["--version", "-V"] {
+        let out = Command::new(bin).arg(flag).output().expect("run roost --version");
+        assert!(out.status.success(), "{flag}: {out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("roost {}\n", env!("CARGO_PKG_VERSION")),
+            "{flag}"
+        );
+    }
+    let roots = tempfile::tempdir().unwrap();
+    let mut child = Command::new(bin)
+        .arg("notaport")
+        .env("ROOST_ROOTS", roots.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn roost notaport");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("`roost notaport` did not exit: it started a server instead of refusing the argument");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(status.code(), Some(2), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("notaport") && err.contains("port"), "stderr must name the bad argument: {err}");
+}
+
 #[test]
 fn claude_hook_subcommand_exits_zero_and_silent_in_every_hands_off_case() {
     use std::io::Write as _;

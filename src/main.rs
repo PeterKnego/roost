@@ -5,6 +5,10 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("notify") => std::process::exit(roost::cli::run_notify(&args[1..])),
         Some("claude-hook") => std::process::exit(roost::cli::run_claude_hook()),
+        Some("--version" | "-V") => {
+            println!("roost {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
         _ => {}
     }
     // No compiled-in roots any more, so an unset ROOST_ROOTS is a
@@ -44,7 +48,23 @@ fn main() {
             roost::errlog::now_secs(),
         );
     }
-    let port: u16 = args.first().and_then(|p| p.parse().ok()).unwrap_or(8444);
+    // A first argument that is not a port is refused, not defaulted past:
+    // `roost --versoin` (or any typo) used to start a server on 8444, or
+    // panic at the bind where one already ran, with no word about the
+    // argument it ignored.
+    let port: u16 = match args.first() {
+        None => 8444,
+        Some(p) => p.parse().unwrap_or_else(|_| {
+            eprintln!(
+                "roost: `{p}` is not a port number\n\
+                 usage: roost [PORT]        (default 8444)\n\
+                        roost notify <title> [body]\n\
+                        roost claude-hook\n\
+                        roost --version"
+            );
+            std::process::exit(2);
+        }),
+    };
     let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind 127.0.0.1");
     // Here rather than in `serve`: the check asks the user's real login shell,
     // and the test servers `serve` starts must not depend on what that shell
