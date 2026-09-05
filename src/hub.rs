@@ -369,6 +369,7 @@ impl Hub {
             }
         });
         ws.claude_hooks = cached;
+        ws.settings = crate::config::settings_view(&self.dir);
         Event::State { version: self.ws.version, origin: origin.clone(), ws }
     }
 
@@ -470,6 +471,29 @@ impl Hub {
                 // broadcast that reports it (see `claude_hooks`'s doc
                 // comment — this is one of its three invalidation sites).
                 self.claude_hooks = None;
+                let snap = self.snapshot_event(from);
+                self.broadcast(&snap);
+                return;
+            }
+            Intent::SetSetting { scope, key, value } => {
+                // A file write under the hub lock, like SetClaudeHooks: one
+                // small file, and what it says next is what every client of
+                // this project is about to be sent. The global file takes a
+                // process-wide lock inside set_setting as well.
+                if let Err(e) = crate::config::set_setting(*scope, &self.dir, key, value.as_ref()) {
+                    self.send_to(from, &Event::Error { msg: e });
+                    return;
+                }
+                if key == "show_hidden" {
+                    // The header toggle's override outranks the file in both
+                    // directions (workspace.rs). Writing the file from the
+                    // dialog is the one gesture that means "follow the file
+                    // again"; without this a person who set the file to
+                    // true and sees no change has no way to find out why.
+                    self.ws.show_hidden = None;
+                    self.persist();
+                }
+                self.ws.version += 1;
                 let snap = self.snapshot_event(from);
                 self.broadcast(&snap);
                 return;
@@ -3249,6 +3273,61 @@ mod tests {
         let (reloaded, _) = crate::wsstate::load("show_hidden_mirror");
         assert_eq!(reloaded.show_hidden, Some(true), "the toggle must survive a restart");
         std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Two subscribers, deliberately: with one, `broadcast` and `send_to`
+    /// are indistinguishable, and a setting that reached only the saving
+    /// browser would look right in every single-client test.
+    ///
+    /// Revert-checked twice: dropping the `if key == "show_hidden"` block in
+    /// `handle` fails the override assertion (`left: Some(false), right:
+    /// None`); changing the arm's final `self.broadcast(&snap)` to
+    /// `self.send_to(from, &snap)` fails "the other client must see the new
+    /// effective value; got []". Both restored.
+    #[test]
+    fn set_setting_writes_the_project_file_and_every_client_sees_the_new_value() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_CONFIG", d.path().join("global.toml"));
+        let proj = d.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let mut h = Hub::new("set_setting", proj.clone());
+        h.ws.show_hidden = Some(false); // the header toggle's override
+        let (_a, rx_a) = h.subscribe();
+        let (b, rx_b) = h.subscribe();
+        drain(&rx_a);
+        drain(&rx_b);
+        let before = h.ws.version;
+
+        h.handle(&b, Intent::SetSetting {
+            scope: crate::proto::Scope::Project,
+            key: "show_hidden".into(),
+            value: Some(crate::proto::SettingValue::Bool(true)),
+        });
+
+        let file = std::fs::read_to_string(proj.join(".roost/config.toml")).unwrap();
+        assert!(file.contains("show_hidden = true"), "{file}");
+        assert_eq!(h.ws.show_hidden, None, "writing the file clears the toggle's override");
+        assert!(h.ws.version > before);
+        for (who, msgs) in [("the other client", drain(&rx_a)), ("the saving client", drain(&rx_b))] {
+            assert!(
+                msgs.iter().any(|m| m.contains(r#""key":"show_hidden""#) && m.contains(r#""effective":true"#)),
+                "{who} must see the new effective value; got {msgs:?}"
+            );
+        }
+
+        // A refused write: error to the sender only, file untouched.
+        h.handle(&b, Intent::SetSetting {
+            scope: crate::proto::Scope::Project,
+            key: "allowed_origins".into(),
+            value: Some(crate::proto::SettingValue::List(vec!["https://evil".into()])),
+        });
+        let to_b = drain(&rx_b);
+        assert!(to_b.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("allowed_origins")), "{to_b:?}");
+        assert!(drain(&rx_a).is_empty(), "a refusal is not broadcast");
+        assert!(!std::fs::read_to_string(proj.join(".roost/config.toml")).unwrap().contains("evil"));
+        std::env::remove_var("ROOST_CONFIG");
     }
 
     // The tree fragment asks this on every render, including for projects

@@ -343,9 +343,8 @@ pub fn apply_layout(w: &mut Workspace, intent: &Intent) -> Result<bool, String> 
         }
         Intent::SetShowHidden { on } => {
             // Always `Some`, never back to `None`: the header toggle has two
-            // positions, and there is no gesture in the UI that means "go
-            // back to following the config file". Deleting the state file is
-            // that gesture, and it is not one a button should perform.
+            // positions. The settings dialog writing show_hidden is that
+            // gesture: hub.rs clears this override when it does.
             w.show_hidden = Some(*on);
             Ok(true)
         }
