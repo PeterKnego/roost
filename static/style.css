@@ -605,7 +605,6 @@ details[open] > summary { background-image: var(--twisty-open); }
    margin of its own to land against the header's edge. */
 #projbtn, #bell, #settings, #refresh { display: flex; align-items: center; gap: 5px; background:none; border:1px solid transparent; border-radius:6px; color:var(--muted); padding:3px 8px; cursor:pointer; font:inherit; }
 #projbtn:hover, #bell:hover, #settings:hover, #refresh:hover { color: var(--fg); }
-#settings { cursor: help; }
 #projcount { margin-left:4px; }
 /* header .proj already sets font-weight:600 on every strip anchor (.projstrip
    sits inside header), so without this reset .current's own 600 would

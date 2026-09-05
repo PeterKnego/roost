@@ -76,6 +76,11 @@ try {
   ok(!/^\d/.test(await one.evalIn(`getComputedStyle(document.documentElement).getPropertyValue("--border").trim()`)), "--border is a colour under a roost theme with the vendored file loaded");
 
   console.log("\nB. the gear opens the dialog with the rows the snapshot describes");
+  // The gear kept `cursor: help` (the question-mark pointer) from its
+  // "not implemented yet" days after it became a real button. Revert-check
+  // 2026-09-05: with `#settings { cursor: help; }` back in style.css this
+  // reads "help" and fails.
+  ok((await one.evalIn(`getComputedStyle(document.getElementById("settings")).cursor`)) === "pointer", "the gear shows the pointer cursor, not the help question mark");
   await one.evalIn(`document.getElementById("settings").click(); 0`);
   ok(await until(() => one.evalIn(`document.getElementById("dlg-settings").open`), 5, "dialog"), "the dialog opened in-page");
   const labels = await one.evalIn(`[...document.querySelectorAll("#dlg-settings .dlg-row label")].map((l) => l.textContent).join(",")`);
