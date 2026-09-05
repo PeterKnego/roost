@@ -898,3 +898,14 @@ dialog.roost::backdrop { background: rgba(0,0,0,.35); }
 .dlg-buttons button:disabled { opacity: .5; cursor: default; }
 .dlg-buttons .danger:not(:disabled) { border-color: var(--del-fg); color: var(--del-fg); }
 .dlg-buttons button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* Anchored at the pointer by askMenu; margin:0 defeats the UA stylesheet's
+   auto-centring, and the top layer means there is no z-index to coordinate. */
+dialog#dlg-menu { position: fixed; margin: 0; width: max-content;
+                  min-width: 160px; padding: 4px; }
+.dlg-items { display: flex; flex-direction: column; }
+.dlg-item { text-align: left; padding: 5px 12px; font: inherit; cursor: pointer;
+            background: none; color: var(--fg); border: 0; border-radius: 4px; }
+/* --row-on is the token added for a modal's keyboard selection: mixed against
+   the surface it is drawn on, so it lifts in a dark theme and darkens in a
+   light one. See its rationale at the top of this file. */
+.dlg-item:hover, .dlg-item:focus { background: var(--row-on); outline: none; }

@@ -139,6 +139,56 @@ try {
     { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
   ok(await until(async () => (await evalIn("window.__r")) === null, 5, "text escape"),
      "Escape resolves null");
+
+  // J: the menu renders one button per item and resolves the chosen id.
+  await evalIn(`window.__r = "unset";
+     askMenu({ x: 40, y: 60, items: [{ id: "a", label: "Alpha" }, { id: "b", label: "Beta" }] })
+       .then((v) => { window.__r = v; }); 0`);
+  ok((await evalIn(`document.querySelectorAll("#dlg-menu .dlg-item").length`)) === 2,
+     "one button per item");
+  ok(await evalIn(`document.activeElement === document.querySelector("#dlg-menu .dlg-item")`),
+     "the first item takes focus");
+  // ArrowDown moves focus. Asserted on the focused element, not on a class:
+  // a highlight class with no focus move leaves Enter activating the wrong row.
+  await page.cmd("Input.dispatchKeyEvent",
+    { type: "keyDown", key: "ArrowDown", code: "ArrowDown", windowsVirtualKeyCode: 40 });
+  ok(await evalIn(`document.activeElement === document.querySelectorAll("#dlg-menu .dlg-item")[1]`),
+     "ArrowDown moves focus to the next item");
+  await page.cmd("Input.dispatchKeyEvent",
+    { type: "keyDown", key: "ArrowUp", code: "ArrowUp", windowsVirtualKeyCode: 38 });
+  ok(await evalIn(`document.activeElement === document.querySelectorAll("#dlg-menu .dlg-item")[0]`),
+     "and ArrowUp back again");
+  await evalIn(`document.querySelectorAll("#dlg-menu .dlg-item")[1].click(); 0`);
+  ok(await until(async () => (await evalIn("window.__r")) === "b", 5, "menu pick"),
+     "clicking an item resolves its id");
+
+  // K: a label that would be markup if it were ever interpolated.
+  await evalIn(`window.__r = "unset";
+     askMenu({ x: 10, y: 10, items: [{ id: "x", label: '<b>bold</b>' }] })
+       .then((v) => { window.__r = v; }); 0`);
+  ok((await evalIn(`document.querySelectorAll("#dlg-menu .dlg-item b").length`)) === 0,
+     "a menu label that looks like markup produces no element");
+  await page.cmd("Input.dispatchKeyEvent",
+    { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await page.cmd("Input.dispatchKeyEvent",
+    { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  ok(await until(async () => (await evalIn("window.__r")) === null, 5, "menu escape"),
+     "Escape resolves null");
+
+  // L: a menu opened at the far edge is clamped back on screen. Without the
+  // clamp the last item is unreachable, which is not visible in any test that
+  // only asserts the menu opened.
+  await evalIn(`window.__r = "unset";
+     askMenu({ x: innerWidth - 4, y: innerHeight - 4, items: [{ id: "a", label: "Alpha" }] })
+       .then((v) => { window.__r = v; }); 0`);
+  ok(await evalIn(`(() => { const r = document.getElementById("dlg-menu").getBoundingClientRect();
+     return r.right <= innerWidth && r.bottom <= innerHeight; })()`),
+     "a menu at the viewport edge is clamped back on screen");
+  await page.cmd("Input.dispatchKeyEvent",
+    { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await page.cmd("Input.dispatchKeyEvent",
+    { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await until(async () => (await evalIn("window.__r")) === null, 5, "menu edge escape");
 } finally {
   try { await page?.close(); } catch { /* already gone */ }
   browser.close();

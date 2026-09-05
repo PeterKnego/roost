@@ -136,3 +136,49 @@ function askText({ title, label = "", value = "", confirm = "OK" }) {
     };
   }, null);
 }
+
+function askMenu({ items, x, y }) {
+  const el = document.getElementById("dlg-menu");
+  return runDialog(el, (finish) => {
+    const list = el.querySelector(".dlg-items");
+    list.replaceChildren();
+    for (const it of items) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "dlg-item";
+      b.textContent = it.label;
+      b.onclick = () => finish(it.id);
+      list.appendChild(b);
+    }
+    // Focus IS the selection here — no separate highlight class. A class that
+    // moves without focus leaves Enter activating whatever the browser still
+    // considers focused, which is the wrong row.
+    el.onkeydown = (e) => {
+      if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+      e.preventDefault();
+      const btns = [...list.querySelectorAll(".dlg-item")];
+      const i = btns.indexOf(document.activeElement);
+      const n = (e.key === "ArrowDown" ? i + 1 : i - 1 + btns.length) % btns.length;
+      btns[n].focus();
+    };
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+    return () => {
+      // Clamped after showModal: getBoundingClientRect reads 0 while the
+      // dialog is still display:none, so measuring in fill() would clamp
+      // against a zero-sized box and never move anything.
+      //
+      // Revert-check (2026-09-05): deleting the next two lines and re-running
+      // `deno run -A tests/browser/dialogs.mjs` produced exactly one failure —
+      // "FAIL  a menu at the viewport edge is clamped back on screen" — with
+      // every other assertion (including the other menu ones) still ok,
+      // confirming this clamp is what assertion L exercises and nothing else
+      // depends on it.
+      const r = el.getBoundingClientRect();
+      if (r.right > innerWidth - 8) el.style.left = `${Math.max(8, innerWidth - r.width - 8)}px`;
+      if (r.bottom > innerHeight - 8) el.style.top = `${Math.max(8, innerHeight - r.height - 8)}px`;
+      const first = list.querySelector(".dlg-item");
+      if (first) first.focus();
+    };
+  }, null);
+}
