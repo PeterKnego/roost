@@ -297,7 +297,7 @@ function openSettings(settings) {
 
   function renderTabs() {
     tabs.replaceChildren();
-    for (const [id, label] of [["settings", "Settings"], ["theme", "Theme"]]) {
+    for (const [id, label] of [["settings", "General"], ["theme", "Theme"]]) {
       const b = document.createElement("button");
       b.type = "button"; b.className = "dlg-tab"; b.dataset.tab = id; b.textContent = label;
       b.setAttribute("role", "tab"); b.setAttribute("aria-selected", String(pane === id));
@@ -336,7 +336,7 @@ function openSettings(settings) {
     // value there is not what's actually in effect).
     const fromProject = r.writable.includes("project") && r.project !== null;
     const src = fromProject ? "from project" : r.global !== null ? "from global" : "default";
-    const tail = r.reload ? " · other tabs pick this up on reload" : "";
+    const tail = r.reload ? " · applies elsewhere on reload" : "";
     return `${src}${tail}`;
   }
   function control(r) {
@@ -355,6 +355,55 @@ function openSettings(settings) {
     i.oninput = () => { edits.set(r.key, { value: i.value.trim(), clear: false }); };
     return i;
   }
+  // Human labels for the keys. The key itself stays visible beside the label
+  // in the mono face: it is what you would type into the file.
+  const LABELS = {
+    hide: "Hidden names", show_hidden: "Show dot-files", autosave: "Autosave",
+    share_selection: "Share selection with Claude", worktree_prompt: "Offer a worktree for a second Claude",
+    allowed_origins: "Allowed origins", max_upload_bytes: "Upload limit", ide: "IDE connection", roots: "Project roots",
+  };
+  function rowFor(r) {
+    const div = document.createElement("div");
+    div.className = "dlg-row"; div.dataset.key = r.key; div.dataset.kind = r.kind;
+    const writable = r.writable.includes(scope);
+    // Dimmed only when a control exists and cannot be used in this scope;
+    // a read-only row is information, and reads at full strength.
+    if (!writable && r.writable.length > 0) div.classList.add("disabled");
+    // Text column: label + key, the source tag and Clear on the same line,
+    // then the one-sentence doc. Control column: the switch or field.
+    const text = document.createElement("div"); text.className = "text";
+    const line = document.createElement("div"); line.className = "line";
+    const lab = document.createElement("label"); lab.textContent = LABELS[r.key] || r.key; line.appendChild(lab);
+    const key = document.createElement("code"); key.className = "key"; key.textContent = r.key; line.appendChild(key);
+    const cleared = (edits.get(r.key) || {}).clear;
+    const hintText = cleared ? "will be cleared on Save" : hintFor(r);
+    // "default" is the quiet state and says nothing; a tag marks anything else.
+    if (r.writable.length > 0 && hintText !== "default") {
+      const hint = document.createElement("span"); hint.className = "hint"; hint.textContent = hintText; line.appendChild(hint);
+    }
+    if (writable && inScope(r) !== null && !cleared) {
+      const clr = document.createElement("button"); clr.type = "button"; clr.className = "clear"; clr.textContent = "Clear";
+      clr.title = `remove ${r.key} from ${fileName()} so the inherited value applies`;
+      clr.onclick = () => { edits.set(r.key, { value: null, clear: true }); render(); };
+      line.appendChild(clr);
+    }
+    text.appendChild(line);
+    const doc = document.createElement("div"); doc.className = "doc"; doc.textContent = r.doc; text.appendChild(doc);
+    div.appendChild(text);
+    if (r.writable.length === 0) {
+      // A read-only value reads better under its doc than squeezed into the
+      // control column: origins and paths are long.
+      div.classList.add("ro-row");
+      const ro = document.createElement("div"); ro.className = "ro";
+      const v = Array.isArray(r.effective) ? r.effective.join("\n") : String(r.effective);
+      ro.textContent = v || "none set";
+      if (!v) ro.classList.add("empty");
+      text.appendChild(ro);
+    } else {
+      const c = control(r); c.disabled = !writable; div.appendChild(c);
+    }
+    return div;
+  }
   function renderRows() {
     rows.replaceChildren();
     // The parse error of a config file roost could not read, at the top of
@@ -366,38 +415,20 @@ function openSettings(settings) {
     warn.textContent = view.warning || "";
     warn.hidden = !view.warning;
     rows.appendChild(warn);
-    for (const r of view.keys) {
-      // The theme is chosen on the Theme pane, which carries its source
-      // line and Clear; a text field for it here only invited typos.
-      if (r.key === "theme") continue;
-      const div = document.createElement("div");
-      div.className = "dlg-row"; div.dataset.key = r.key;
-      const writable = r.writable.includes(scope);
-      if (!writable) div.classList.add("disabled");
-      // Two short lines: name | control | source hint + Clear, then the
-      // one-sentence doc across the full width.
-      const lab = document.createElement("label"); lab.textContent = r.key; div.appendChild(lab);
-      if (r.writable.length === 0) {
-        const ro = document.createElement("span"); ro.className = "ro";
-        ro.textContent = Array.isArray(r.effective) ? r.effective.join(", ") : String(r.effective);
-        div.appendChild(ro);
-      } else {
-        const c = control(r); c.disabled = !writable; div.appendChild(c);
-      }
-      const side = document.createElement("div"); side.className = "side";
-      const hint = document.createElement("span"); hint.className = "hint";
-      hint.textContent = (edits.get(r.key) || {}).clear ? "will be cleared on Save" : hintFor(r);
-      side.appendChild(hint);
-      if (writable && inScope(r) !== null && !(edits.get(r.key) || {}).clear) {
-        const clr = document.createElement("button"); clr.type = "button"; clr.className = "clear"; clr.textContent = "Clear";
-        clr.title = `remove ${r.key} from ${fileName()} so the inherited value applies`;
-        clr.onclick = () => { edits.set(r.key, { value: null, clear: true }); render(); };
-        side.appendChild(clr);
-      }
-      div.appendChild(side);
-      const doc = document.createElement("div"); doc.className = "doc"; doc.textContent = r.doc; div.appendChild(doc);
-      rows.appendChild(div);
-    }
+    // The theme is chosen on the Theme pane, which carries its source line
+    // and Clear; a text field for it here only invited typos.
+    const editable = view.keys.filter((r) => r.key !== "theme" && r.writable.length > 0);
+    const readOnly = view.keys.filter((r) => r.writable.length === 0);
+    for (const r of editable) rows.appendChild(rowFor(r));
+    // One note for the read-only group instead of the same sentence on
+    // every row: these protect the host, so no page may write them.
+    const group = document.createElement("div"); group.className = "dlg-group";
+    const gh = document.createElement("div"); gh.className = "title"; gh.textContent = "Set by hand"; group.appendChild(gh);
+    const gn = document.createElement("div"); gn.className = "hint";
+    gn.textContent = `These protect the host, so no page can change them: edit ${view.global_file} — the global config file.`;
+    group.appendChild(gn);
+    rows.appendChild(group);
+    for (const r of readOnly) rows.appendChild(rowFor(r));
   }
   function renderThemes() {
     themes.replaceChildren();
@@ -410,9 +441,14 @@ function openSettings(settings) {
       const cleared = (edits.get("theme") || {}).clear;
       const txt = document.createElement("span");
       const fmt = (v) => (v === null || v === undefined ? "—" : String(v));
+      // What is in effect and where it comes from; the other scopes only
+      // when they set something, so the line is not a table of dashes.
+      const others = [];
+      if (t.project !== null && t.project !== current) others.push(`project sets ${fmt(t.project)}`);
+      if (t.global !== null && t.global !== current) others.push(`global sets ${fmt(t.global)}`);
       txt.textContent = cleared
         ? "theme will be cleared on Save"
-        : `${current} · ${hintFor(t)} · project: ${fmt(t.project)} · global: ${fmt(t.global)} · default: ${fmt(t.default)}`;
+        : `${current} — ${hintFor(t)}${others.length ? " (" + others.join(", ") + ")" : ""}`;
       src.appendChild(txt);
       if (t.writable.includes(scope) && inScope(t) !== null && !cleared) {
         const clr = document.createElement("button"); clr.type = "button"; clr.className = "clear"; clr.textContent = "Clear";
@@ -425,7 +461,7 @@ function openSettings(settings) {
       }
       themes.appendChild(src);
     }
-    for (const [kind, title] of [["roost", "roost"], ["daisy", "daisyUI"]]) {
+    for (const [kind, title] of [["roost", "roost themes"], ["daisy", "daisyUI themes"]]) {
       const h = document.createElement("h3"); h.textContent = title; themes.appendChild(h);
       const grid = document.createElement("div"); grid.className = "dlg-tiles";
       for (const t of view.themes.filter((x) => x.kind === kind)) {

@@ -99,7 +99,7 @@ try {
   ok((await one.evalIn(`getComputedStyle(document.getElementById("settings")).cursor`)) === "pointer", "the gear shows the pointer cursor, not the help question mark");
   await one.evalIn(`document.getElementById("settings").click(); 0`);
   ok(await until(() => one.evalIn(`document.getElementById("dlg-settings").open`), 5, "dialog"), "the dialog opened in-page");
-  const labels = await one.evalIn(`[...document.querySelectorAll("#dlg-settings .dlg-row label")].map((l) => l.textContent).join(",")`);
+  const labels = await one.evalIn(`[...document.querySelectorAll("#dlg-settings .dlg-row")].map((l) => l.dataset.key).join(",")`);
   // No theme row here: the theme is chosen on the Theme pane, which also
   // carries its source line and Clear.
   ok(labels === "hide,show_hidden,autosave,share_selection,worktree_prompt,allowed_origins,max_upload_bytes,ide,roots", `rows in the spec's order, without theme (${labels})`);
@@ -110,7 +110,7 @@ try {
   }
   ok((await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="share_selection"]').classList.contains("disabled")`)), "a global-only row is disabled in Project scope");
   ok((await one.evalIn(`document.querySelectorAll('#dlg-settings .dlg-row[data-key="allowed_origins"] input, #dlg-settings .dlg-row[data-key="allowed_origins"] textarea').length`)) === 0, "a read-only row has no control");
-  ok(/global config file/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="allowed_origins"] .hint').textContent`)), "and says to edit the file by hand");
+  ok(/global config file/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-group .hint').textContent`)), "and the read-only group says to edit the file by hand");
   await one.evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="theme"]').click(); 0`);
   ok(/from global/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-themes .theme-source').textContent`)), "the Theme pane's source line says the theme comes from global");
   await one.evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="settings"]').click(); 0`);
