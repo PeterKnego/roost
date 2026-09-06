@@ -126,6 +126,9 @@ enum RootsIntent {
 
 /// `/ws/_roots`: the front page's one write. One exchange per connection.
 pub fn handle_ws(stream: TcpStream) {
+    // One exchange, then closed: a client that completes the handshake and
+    // then sends nothing must not pin this thread for the process's life.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
     // WebSocket handshakes bypass the same-origin policy: without this check
     // any page the user visits could extend the directories roost serves.
     // Same check as wsconn.rs and term.rs.
@@ -222,12 +225,31 @@ mod tests {
         let spelled = format!("{}/./projects", d.path().display());
         let e = add_root(&spelled, &[canon.clone()], None, &global(&d)).unwrap_err();
         assert!(e.contains("already a root"), "{e}");
-        // `~/` expands against HOME.
+        // `~/` expands against HOME. `set_var` is process-wide and every
+        // test in this binary shares that process, so this both takes the
+        // lock the other env-setting tests take and puts HOME back on the
+        // way out — an escaped tempdir HOME sends any later test that reads
+        // it (or expands a `~`) at a directory that no longer exists.
+        let _envg = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home_guard = HomeGuard(std::env::var_os("HOME"));
         let home = d.path().join("home");
         fs::create_dir_all(home.join("work")).unwrap();
         std::env::set_var("HOME", &home);
         let list = add_root("~/work", &[canon.clone()], None, &global(&d)).unwrap();
         assert_eq!(list.last().unwrap(), &home.join("work").canonicalize().unwrap());
+    }
+
+    /// Restores `HOME` however the test leaves — including on a panicking
+    /// assertion, which is exactly when an early `set_var` back would be
+    /// skipped.
+    struct HomeGuard(Option<std::ffi::OsString>);
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
     // A `./` dot segment is not a strong enough fixture to prove
     // `canonicalize()` is doing anything: Rust's own `Path` equality already
