@@ -13,6 +13,7 @@ So I created a lightweight Rust tool that gives any coding project its own brows
 
 [![CI](https://github.com/PeterKnego/roost/actions/workflows/ci.yml/badge.svg)](https://github.com/PeterKnego/roost/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/PeterKnego/roost)](https://github.com/PeterKnego/roost/releases)
+[![crates.io](https://img.shields.io/crates/v/roost)](https://crates.io/crates/roost)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Rust](https://img.shields.io/badge/rust-stable-orange)](https://www.rust-lang.org)
 
@@ -45,7 +46,8 @@ Because you want a simpler way to have remote access to your server box. Roost i
 # dtach and git must be on PATH
 brew install dtach          # or: apt install dtach
 
-cargo install --git https://github.com/PeterKnego/roost
+cargo install roost         # from crates.io
+# or, from source: cargo install --git https://github.com/PeterKnego/roost
 
 ROOST_ROOTS="$HOME/Projects" roost 8444
 # open http://127.0.0.1:8444/
