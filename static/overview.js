@@ -142,24 +142,17 @@
   // Adding a root. The front page has no socket of its own, so the one write
   // it makes travels on /ws/_roots — one exchange, then closed. Everything
   // shown comes back through textContent: a path is data.
-  function banner(text) {
-    const box = document.createElement("div");
-    box.className = "conflict error-banner";
-    const b = document.createElement("b"); b.textContent = text;
-    const dismiss = document.createElement("button"); dismiss.textContent = "dismiss"; dismiss.onclick = () => box.remove();
-    box.append(b, dismiss);
-    document.body.appendChild(box);
-    setTimeout(() => box.remove(), 8000);
-  }
   function renderRoots(list) {
     const span = document.querySelector("header .roots");
     if (!span) return;
-    span.querySelectorAll(".root").forEach((r) => r.remove());
-    const add = document.getElementById("addroot");
+    span.replaceChildren();
     for (const r of list) {
       const s = document.createElement("span"); s.className = "root"; s.textContent = r;
-      span.insertBefore(s, add);
+      span.appendChild(s);
     }
+    // The list shows as one truncated line; the whole of it is the tooltip,
+    // exactly as the server renders it (render.rs's `roots_title`).
+    span.title = list.join(":");
   }
   function sendAddRoot(path) {
     return new Promise((resolve) => {
@@ -172,8 +165,13 @@
       ws.onclose = () => finish({ t: "Error", msg: "connection closed before a reply" });
     });
   }
-  async function addRootFlow(prefill = "") {
-    const path = await askText({ title: "Add a project root", label: "Directory to scan for projects", value: prefill, confirm: "Add" });
+  // `reason` is the previous attempt's refusal. It goes in the reopened
+  // dialog's own label rather than a banner: the dialog is modal and covers
+  // the banner (it cannot even be clicked), so a banner said why exactly
+  // where it could not be read.
+  async function addRootFlow(prefill = "", reason = "") {
+    const label = reason ? `${reason} — try another path` : "Directory to scan for projects";
+    const path = await askText({ title: "Add a project root", label, value: prefill, confirm: "Add" });
     if (!path) return;
     const reply = await sendAddRoot(path);
     if (reply.t === "Roots") {
@@ -182,9 +180,10 @@
       refresh("proj", sel);
       refresh("sess", sel);
     } else {
-      banner(`Error: ${reply.msg}`);
-      // A typo is one edit away: reopen with the text kept.
-      addRootFlow(path);
+      // A typo is one edit away: reopen with the text kept, and with the
+      // reason on the label. Returned, so a caller awaiting this flow waits
+      // for the retry rather than resolving while the dialog is still up.
+      return addRootFlow(path, reply.msg);
     }
   }
   document.addEventListener("click", (e) => {

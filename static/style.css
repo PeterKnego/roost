@@ -744,10 +744,18 @@ ul.picker li .git:hover { text-decoration: underline; }
    application. */
 /* Each root is its own span now (was one title-ellipsised string), so the
    header shows several short paths rather than truncating one long one. */
-header .roots { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+/* One line, truncated, whatever the roots are named. Wrapping looks like the
+   generous choice and is not: the header is a fixed 38px with no overflow of
+   its own, so a second line pushed #addroot out of the header and *under* the
+   pane below — still painted, still hit-testable in the DOM, and unclickable
+   (elementFromPoint at its centre returned #ovprojects). The whole list is in
+   the span's title instead. min-width: 0 is what lets a flex item shrink
+   below its content and so lets the ellipsis happen at all. */
+header .roots { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--muted); font-size: 12px; }
 header .roots .root { font-family: var(--mono); }
-header .roots .root + .root::before { content: ""; display: inline-block; width: 1px; height: 12px; background: var(--border); margin-right: 6px; vertical-align: -2px; }
-#addroot { font: inherit; font-size: 14px; line-height: 1; width: 22px; height: 22px; border: 1px solid var(--border); border-radius: 6px; background: none; color: var(--muted); cursor: pointer; }
+header .roots .root + .root::before { content: ""; display: inline-block; width: 1px; height: 12px; background: var(--border); margin: 0 6px; vertical-align: -2px; }
+/* Never the thing that shrinks: the + is the only way to add a root. */
+#addroot { flex: 0 0 auto; font: inherit; font-size: 14px; line-height: 1; width: 22px; height: 22px; border: 1px solid var(--border); border-radius: 6px; background: none; color: var(--muted); cursor: pointer; }
 #addroot:hover { color: var(--fg); border-color: var(--accent); }
 
 #overview { display: grid; padding: 6px; gap: var(--divider, 8px);

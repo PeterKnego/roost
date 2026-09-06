@@ -1081,6 +1081,10 @@ pub fn overview_page(sel: &str, roots: &[String]) -> String {
     // header switcher's `?current={qkey}`.
     let qsel = crate::http::percent_encode(sel);
     let roots_html: String = roots.iter().map(|r| format!("<span class=\"root\">{}</span>", esc(r))).collect();
+    // The list is one truncated line in a 38px header (see `header .roots`),
+    // so the whole of it has to be readable somewhere: the tooltip, joined
+    // the way `ROOST_ROOTS` spells a list.
+    let roots_title = esc(&roots.join(":"));
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>roost</title>\
          {icons}\
@@ -1092,7 +1096,8 @@ pub fn overview_page(sel: &str, roots: &[String]) -> String {
          <header>\
            <span class=\"home\">{SVG_HOME}</span><span class=\"proj\">roost</span>\
            <span class=\"vsep\"></span>\
-           <span class=\"roots\">{roots_html}<button id=\"addroot\" type=\"button\" title=\"add a project root\">+</button></span>\
+           <span class=\"roots\" title=\"{roots_title}\">{roots_html}</span>\
+           <button id=\"addroot\" type=\"button\" title=\"add a project root\">+</button>\
          </header>\
          <main id=\"overview\">\
            <section class=\"pane ovpane tool\">\
@@ -3375,7 +3380,16 @@ mod tests {
         let h = overview_page("", &["/home/x/projects".into(), "/srv/<code>".into()]);
         assert!(h.contains(r#"<span class="root">/home/x/projects</span>"#), "{h}");
         assert!(h.contains("/srv/&lt;code&gt;"), "escaped: {h}");
-        assert!(h.contains(r#"<button id="addroot" type="button" title="add a project root">+</button>"#), "{h}");
+        // The + is the roots list's *sibling*, not its last child: inside it
+        // the wrapping list carried the button off the 38px header and under
+        // the pane below, where it could not be clicked (roots.mjs section
+        // E). The list truncates on one line and the whole of it is the
+        // tooltip — also escaped, since a root is a path off the filesystem.
+        assert!(
+            h.contains(r#"<span class="roots" title="/home/x/projects:/srv/&lt;code&gt;">"#),
+            "the full list is the escaped tooltip: {h}"
+        );
+        assert!(h.contains(r#"</span><button id="addroot" type="button" title="add a project root">+</button>"#), "{h}");
         assert!(h.contains(r#"<script src="/static/dialog.js"></script>"#), "{h}");
         for id in ["dlg-confirm", "dlg-text"] {
             assert!(h.contains(&format!(r#"id="{id}""#)), "no {id} shell on the front page");
