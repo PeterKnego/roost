@@ -58,7 +58,7 @@ Tests: `cargo test` (never `--release`). Everything else is environment:
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `ROOST_ROOTS` | Colon-separated project roots | global config `roots`, else none — roost exits 2 |
+| `ROOST_ROOTS` | Colon-separated project roots | global config `roots`, else none — roost starts anyway and the front page offers **Add path** |
 | `ROOST_STATE_DIR` | Workspace state + dtach sockets | `~/.local/state/roost/` |
 | `ROOST_ORIGINS` | Comma-separated origin allowlist | global config, else loopback only |
 | `ROOST_CMD` | Terminal command override — **test hook, never set in production** | `dtach -A … -E -r winch -z $SHELL -l` |
@@ -68,13 +68,17 @@ Tests: `cargo test` (never `--release`). Everything else is environment:
 | `ROOST_CONFIG` | Path to the global config file, overriding `~/.config/roost/config.toml` | unset |
 | `ROOST_STATIC` | Serve web assets from this directory instead of the embedded copies (development) | unset — assets are compiled in |
 
-`ROOST_ROOTS` is required unless the global config supplies `roots`: the binary
-carries no compiled-in default, and starting with neither exits 2 with a
-message rather than serving an empty project list — which would come up healthy
-and look exactly like every project had vanished. One host's paths used to be
-the default, which put that machine's layout into every binary. The env var
-wins when both are set, so the unit file stays authoritative for the service;
-the config entry exists for callers that inherit none of the unit's
+The binary carries no compiled-in default for `ROOST_ROOTS`, and starting with
+neither it nor the global config's `roots` no longer refuses to start: roost
+starts, prints a one-line notice to stderr, and the front page explains the
+empty state and offers **Add path**. A root added there lands in
+`~/.config/roost/config.toml`'s `roots` list. When `ROOST_ROOTS` is set, that
+env var is the authoritative source and the front page refuses to add a root,
+telling you to add it there (the unit file, for a service) instead. One host's
+paths used to be the default, which put that machine's layout into every
+binary. The env var wins when both are set, so the unit file stays
+authoritative for the service; the config entry exists for callers that
+inherit none of the unit's
 environment, which today means nothing shipped with roost, but the key stays
 so a second instance's tooling can read it. Give a second instance its own
 `ROOST_STATE_DIR` too — sharing one is safe as of the `.origin` marker (see

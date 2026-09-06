@@ -600,7 +600,7 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
         V::List(configured_roots().iter().map(|p| p.display().to_string()).collect()),
         V::List(vec![]),
         false,
-        "Directories scanned for projects.",
+        "Directories scanned for projects. Add one from the front page.",
     );
     SettingsView {
         keys,

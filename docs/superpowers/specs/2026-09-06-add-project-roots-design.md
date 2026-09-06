@@ -1,6 +1,6 @@
 # Adding project roots from the front page
 
-*2026-09-06. Status: design, awaiting review.*
+*2026-09-06. Status: implemented (see the plan of the same date).*
 
 ## What and why
 

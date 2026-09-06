@@ -50,6 +50,7 @@ cargo install roost         # from crates.io
 # or, from source: cargo install --git https://github.com/PeterKnego/roost
 
 ROOST_ROOTS="$HOME/Projects" roost 8444
+# or just: roost 8444 — then add your projects directory on the front page
 # open http://127.0.0.1:8444/
 ```
 
