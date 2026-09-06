@@ -463,6 +463,12 @@ pub fn write_setting(path: &Path, key: &str, value: Option<&SettingValue>) -> Re
                     toml_edit::Value::Array(a)
                 }
             };
+            // A file holding nothing but a header comment (no key/value
+            // pairs at all) has that comment recorded as the *document's*
+            // trailing trivia, not as any item's leading decor — there is
+            // no item yet to hang it off. Noted before the insert below,
+            // because inserting the first key changes `is_empty()`'s answer.
+            let was_empty = doc.as_table().is_empty();
             // Replacing the whole `Item` drops its decor — the inline
             // comment trailing the old value — because the freshly built
             // one carries none. Keeping it means editing an existing
@@ -472,7 +478,23 @@ pub fn write_setting(path: &Path, key: &str, value: Option<&SettingValue>) -> Re
                     existing.decor().prefix().cloned().unwrap_or_default(),
                     existing.decor().suffix().cloned().unwrap_or_default(),
                 ),
-                None => doc[key] = toml_edit::Item::Value(new_value),
+                None => {
+                    doc[key] = toml_edit::Item::Value(new_value);
+                    // Without this, the header above becomes a footer: the
+                    // new key renders before the document's trailing
+                    // trivia, so the comment that used to open the file
+                    // ends up after it instead.
+                    if was_empty && !doc.trailing().as_str().unwrap_or("").is_empty() {
+                        let header = doc.trailing().clone();
+                        doc.set_trailing(toml_edit::RawString::default());
+                        if let Some(mut k) = doc.as_table_mut().key_mut(key) {
+                            let rest = k.leaf_decor().prefix().and_then(|p| p.as_str()).unwrap_or("").to_string();
+                            let mut combined = header.as_str().unwrap_or("").to_string();
+                            combined.push_str(&rest);
+                            k.leaf_decor_mut().set_prefix(combined);
+                        }
+                    }
+                }
             }
         }
     }
@@ -979,6 +1001,29 @@ mod tests {
         assert!(fs::read_to_string(&p).unwrap().contains("autosave = false"));
         write_setting(&p, "hide", Some(&V::List(vec!["a".into(), "b".into()]))).unwrap();
         assert!(fs::read_to_string(&p).unwrap().contains("hide = [\"a\", \"b\"]"));
+    }
+
+    /// A file holding nothing but a header comment: toml_edit has no item to
+    /// hang that comment off, so it stores it as the *document's* trailing
+    /// trivia — indistinguishable, to a naive insert, from a footer. Adding
+    /// the first key must not push the header below it.
+    ///
+    /// Revert-check: deleting the `was_empty` special case in `write_setting`
+    /// (falling back to plain `doc[key] = ...`) makes the first assertion
+    /// fail — `after` comes back as `"roots = [\"/a\"]\n# roots live here\n"`,
+    /// the header demoted to a footer. Restored.
+    #[test]
+    fn a_header_comment_on_an_otherwise_empty_file_stays_a_header() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        fs::write(&p, "# roots live here\n").unwrap();
+        write_setting(&p, "roots", Some(&V::List(vec!["/a".into()]))).unwrap();
+        let after = fs::read_to_string(&p).unwrap();
+        assert_eq!(after, "# roots live here\nroots = [\"/a\"]\n");
+        // A second write to the same (now non-empty) key is the ordinary
+        // path and must not re-touch the header.
+        write_setting(&p, "roots", Some(&V::List(vec!["/a".into(), "/b".into()]))).unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "# roots live here\nroots = [\"/a\", \"/b\"]\n");
     }
 
     #[test]

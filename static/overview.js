@@ -139,6 +139,58 @@
     }
   });
 
+  // Adding a root. The front page has no socket of its own, so the one write
+  // it makes travels on /ws/_roots — one exchange, then closed. Everything
+  // shown comes back through textContent: a path is data.
+  function banner(text) {
+    const box = document.createElement("div");
+    box.className = "conflict error-banner";
+    const b = document.createElement("b"); b.textContent = text;
+    const dismiss = document.createElement("button"); dismiss.textContent = "dismiss"; dismiss.onclick = () => box.remove();
+    box.append(b, dismiss);
+    document.body.appendChild(box);
+    setTimeout(() => box.remove(), 8000);
+  }
+  function renderRoots(list) {
+    const span = document.querySelector("header .roots");
+    if (!span) return;
+    span.querySelectorAll(".root").forEach((r) => r.remove());
+    const add = document.getElementById("addroot");
+    for (const r of list) {
+      const s = document.createElement("span"); s.className = "root"; s.textContent = r;
+      span.insertBefore(s, add);
+    }
+  }
+  function sendAddRoot(path) {
+    return new Promise((resolve) => {
+      const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/_roots`);
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } try { ws.close(); } catch {} };
+      ws.onopen = () => ws.send(JSON.stringify({ t: "AddRoot", path }));
+      ws.onmessage = (e) => { try { finish(JSON.parse(e.data)); } catch { finish({ t: "Error", msg: "unreadable reply" }); } };
+      ws.onerror = () => finish({ t: "Error", msg: "could not reach roost" });
+      ws.onclose = () => finish({ t: "Error", msg: "connection closed before a reply" });
+    });
+  }
+  async function addRootFlow(prefill = "") {
+    const path = await askText({ title: "Add a project root", label: "Directory to scan for projects", value: prefill, confirm: "Add" });
+    if (!path) return;
+    const reply = await sendAddRoot(path);
+    if (reply.t === "Roots") {
+      renderRoots(reply.roots);
+      const sel = selNow();
+      refresh("proj", sel);
+      refresh("sess", sel);
+    } else {
+      banner(`Error: ${reply.msg}`);
+      // A typo is one edit away: reopen with the text kept.
+      addRootFlow(path);
+    }
+  }
+  document.addEventListener("click", (e) => {
+    if (e.target.closest("#addroot, .addroot")) { e.preventDefault(); addRootFlow(); }
+  });
+
   // Double-click opens, the way a double click has always meant "go in" —
   // the picker this page replaced used it to descend.
   document.addEventListener("dblclick", (e) => {
