@@ -798,10 +798,18 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
     let roots_ok = !roots.is_empty() && roots.iter().all(|r| r.canonicalize().is_ok());
     let roots_were_ok = ROOTS_WERE_OK.swap(roots_ok, std::sync::atomic::Ordering::Relaxed);
     if !roots_ok && roots_were_ok {
-        eprintln!(
-            "roost: none of the configured roots could be read ({roots:?}) — \
-             reaping sessions for missing projects is suspended until this recovers"
-        );
+        // Two different states wear the same suspension. An empty list is
+        // not a broken one: roost now starts with no roots at all, and
+        // "none of the configured roots could be read ([])" reads as a
+        // failure to whoever has simply not added one yet.
+        if roots.is_empty() {
+            eprintln!("roost: no project roots configured — session reaping is suspended until one is added");
+        } else {
+            eprintln!(
+                "roost: none of the configured roots could be read ({roots:?}) — \
+                 reaping sessions for missing projects is suspended until this recovers"
+            );
+        }
     } else if roots_ok && !roots_were_ok {
         eprintln!("roost: configured roots are readable again — reaping resumed");
     }

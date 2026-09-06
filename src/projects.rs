@@ -66,7 +66,8 @@ pub fn is_text_extension(ext: &str) -> bool {
 
 /// Roots to scan for projects: `ROOST_ROOTS` (colon-separated) when set and
 /// non-empty, otherwise the global config's `roots`. Empty when neither says
-/// anything; `main` refuses to start on that rather than guessing.
+/// anything: roost starts anyway and the front page explains the state and
+/// offers **Add path**, which writes one here (`crate::roots::add_root`).
 ///
 /// There is still deliberately no compiled-in default. One machine's paths
 /// used to live here, which put that host's layout into every binary and into

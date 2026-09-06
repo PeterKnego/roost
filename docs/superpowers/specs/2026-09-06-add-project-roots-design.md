@@ -100,7 +100,10 @@ are two roots.
 ### The settings dialog
 
 `roots` stays read-only there; its description becomes "Directories scanned
-for projects. Add one from the front page."
+for projects — add one from the front page, any directory including / or your
+home, which widens what a browser here reaches to exactly what a shell from the
+same origin already reaches; removing one is a hand edit of
+~/.config/roost/config.toml."
 
 ## Security
 
@@ -113,6 +116,17 @@ nothing here creates, follows into, or lists a directory: validation reads
 metadata and canonicalises, and the scan that follows is the existing one.
 `allowed_origins`, `max_upload_bytes` and `ide` remain unwritable from any
 page.
+
+A root may be **any** directory, including `/` or `$HOME`; nothing here
+restricts the choice, and the tree, search and the editor then reach
+everything under it. That is a widening worth stating plainly, and it is
+bounded by what already holds: whoever can complete the handshake can also
+open a terminal on the same origin, and a shell reaches the whole filesystem
+already. So adding a root widens what the *browser* reaches to exactly what a
+shell from the same origin reaches — it grants no reach the origin did not
+already have. Removing one is deliberately not offered here: it is a hand edit
+of `roots` in `~/.config/roost/config.toml` (a live session under a removed
+root would otherwise be reaped by the next sweep, which is not an undo).
 
 ## Testing
 
