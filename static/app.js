@@ -54,11 +54,14 @@ const SHARE_SELECTION = document.body.dataset.shareSelection === "1";
 // and comfortably longer than the 200ms EditBuffer debounce it depends on.
 const AUTOSAVE_MS = 1000;
 // Highlighting an editor is worth it up to a point and then it is not: the
-// buffer cap is 2 MB, and hljs re-runs over the whole text on every pause in
-// typing. Past this the editor stays a plain textarea rather than becoming a
-// laggy one. Chosen as roughly the largest source file anyone edits by hand;
-// roost's own biggest is a quarter of it.
-const MAX_HIGHLIGHT_BYTES = 100_000;
+// buffer cap is 2 MB, and the highlighted overlay is rebuilt over the whole
+// text on every pause in typing. Past this the editor stays a plain textarea
+// rather than becoming a laggy one. Measured 2026-09-06 in headless Chromium
+// on a real <code-input>: the textarea takes the keystroke in single-digit
+// milliseconds regardless, and the overlay repaint costs ~100 ms at 140 KB
+// and ~150–170 ms at 290 KB (10k spans). 300 KB covers every file in roost
+// itself (hub.rs is 293 KB); the old 100 KB left three of them plain.
+const MAX_HIGHLIGHT_BYTES = 300_000;
 // Known to hljs but deliberately left plain — see codeLanguage.
 const PLAIN_EXTS = new Set(["md", "markdown", "txt", "text"]);
 // What the non-ASCII indicator lets through: TAB, LF and the printable range.

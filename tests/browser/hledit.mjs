@@ -25,7 +25,7 @@ await Deno.writeTextFile(`${fx.roots}/proj/main.rs`, CODE);
 await Deno.writeTextFile(`${fx.roots}/proj/notes.md`, "# heading\n\nprose\n");
 // Past MAX_HIGHLIGHT_BYTES, where highlighting every keystroke would cost
 // more than it is worth.
-await Deno.writeTextFile(`${fx.roots}/proj/big.rs`, "// filler line\n".repeat(9000));
+await Deno.writeTextFile(`${fx.roots}/proj/big.rs`, "// filler line\n".repeat(22000));
 // A line far wider than the pane, plus one long unbroken token: the first
 // must wrap, the second cannot, and the two layers have to agree either way.
 await Deno.writeTextFile(`${fx.roots}/proj/wide.rs`,
@@ -115,7 +115,7 @@ try {
   ok(await open("notes.md"), "notes.md opens in an editor");
   ok(!(await q("code-input")), "markdown stays a plain textarea");
   ok(await q("textarea.editor"), "and it is still an editor");
-  ok(await open("big.rs"), "a 126KB source file opens");
+  ok(await open("big.rs"), "a 330KB source file opens");
   ok(!(await q("code-input")), "past the cap it stays a plain textarea too");
   // The failure mode if that fallback ever went wrong: code-input paints the
   // textarea's own glyphs transparent, so a plain textarea that kept those
