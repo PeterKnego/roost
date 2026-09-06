@@ -88,8 +88,11 @@ pub fn serve(listener: TcpListener, startup_roots: Vec<PathBuf>) {
     // cost the rest of config already pays per request.
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let roots = projects::roots();
         std::thread::spawn(move || {
+            // Resolved on the connection's own thread: on the accept thread
+            // a slow or blocking config read would stall every other
+            // pending connection behind it.
+            let roots = projects::roots();
             if is_ws(&stream) {
                 route_ws(stream, &roots);
             } else {
