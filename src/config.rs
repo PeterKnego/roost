@@ -486,12 +486,17 @@ pub fn write_setting(path: &Path, key: &str, value: Option<&SettingValue>) -> Re
                     // ends up after it instead.
                     if was_empty && !doc.trailing().as_str().unwrap_or("").is_empty() {
                         let header = doc.trailing().clone();
-                        doc.set_trailing(toml_edit::RawString::default());
                         if let Some(mut k) = doc.as_table_mut().key_mut(key) {
                             let rest = k.leaf_decor().prefix().and_then(|p| p.as_str()).unwrap_or("").to_string();
                             let mut combined = header.as_str().unwrap_or("").to_string();
                             combined.push_str(&rest);
                             k.leaf_decor_mut().set_prefix(combined);
+                            // Cleared only now that the comment has a new
+                            // home. Clearing it first would destroy the
+                            // user's header if the lookup ever came back
+                            // `None` — moving text is two steps, and the
+                            // deleting one goes second.
+                            doc.set_trailing(toml_edit::RawString::default());
                         }
                     }
                 }
@@ -600,7 +605,9 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
         V::List(configured_roots().iter().map(|p| p.display().to_string()).collect()),
         V::List(vec![]),
         false,
-        "Directories scanned for projects. Add one from the front page.",
+        "Directories scanned for projects — add one from the front page, any directory including / or your home, \
+         which widens what a browser here reaches to exactly what a shell from the same origin already reaches; \
+         removing one is a hand edit of ~/.config/roost/config.toml.",
     );
     SettingsView {
         keys,
