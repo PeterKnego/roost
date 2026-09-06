@@ -133,6 +133,14 @@ try {
   o = wire(await openPage(browser.port, `http://127.0.0.1:${roost.port}/other`), "other");
   ok(await p.ready() && await o.ready(), "two pages are up, one per project");
 
+  // The favicon is the logo the server links until something is unread;
+  // app.js used to replace it with a drawn ◆ glyph unconditionally, so a
+  // workspace tab never showed the bird the front page did. Revert-check
+  // 2026-09-06: with `setFavicon(false)` back to writing the ◆ SVG this
+  // first assertion fails (the runtime link exists with a data:image/svg URL).
+  const fav = () => p.evalIn(`(() => { const l = document.querySelector("link#dlfav"); return l ? l.href.slice(0, 14) : ""; })()`);
+  ok((await fav()) === "", "with nothing unread the workspace keeps the server's logo favicon");
+
   console.log("A. each project raises a notice from a real shell");
   const sessP = await p.raise("Build done", "proj-notice");
   const sessO = await o.raise("Build done", "other-notice");
@@ -145,6 +153,9 @@ try {
     await until(() => o.stored().then((s) => s.some((x) => x.includes("other-notice"))), 20, "other notice"),
     "other's page received its own notice",
   );
+  // Unread: the badge is drawn onto the real 32px favicon (a PNG from a
+  // canvas), not onto a stand-in glyph.
+  ok(await until(async () => (await fav()) === "data:image/png", 10, "badged favicon"), "an unread notice badges the logo favicon itself");
 
   console.log("B. and neither page holds the other's");
   // Only meaningful *after* both arrivals above: checked earlier, "no
@@ -225,6 +236,7 @@ try {
   );
   ok(/no notifications/.test(await p.emptyNote()), "and says so");
   ok(await p.badge() === "", "proj's badge is gone");
+  ok(await until(async () => (await fav()) === "", 5, "logo back"), "and the favicon is the logo again");
 
   // Asked of a FRESH page, not of `o`. This is the whole point of the
   // section and it took a revert to find: with `clear_in` reverted to

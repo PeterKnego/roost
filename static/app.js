@@ -2964,20 +2964,50 @@ function ago(secs) {
   return `${Math.floor(d / 86400)}d`;
 }
 
-// A badged favicon, drawn rather than shipped as a second asset so it follows
-// whatever the page's icon already is.
+// The favicon. With nothing unread the page keeps the icons the server
+// linked — the logo, the same as the front page — so this only ever ADDS a
+// link, for the badged state, and removes it again. The badge is drawn onto
+// the real 32px favicon on a canvas rather than onto a stand-in glyph: an
+// earlier version replaced the icon with a drawn ◆ unconditionally, which is
+// why a workspace tab never showed the bird the front page did.
+// State lives on the function, not in `let`s: the first call is made above,
+// at page load, before this point in the file, and a `let` declared here
+// would be in its temporal dead zone there — the whole script would abort
+// before the websocket ever opened. A function declaration is hoisted whole.
 function setFavicon(badged) {
-  let link = document.querySelector("link#dlfav");
-  if (!link) {
-    link = document.createElement("link");
-    link.id = "dlfav";
-    link.rel = "icon";
-    document.head.appendChild(link);
+  setFavicon.epoch = (setFavicon.epoch || 0) + 1; // ignore a load that lands after a later call
+  const epoch = setFavicon.epoch;
+  const existing = document.querySelector("link#dlfav");
+  if (!badged) {
+    if (existing) existing.remove();
+    return;
   }
-  const svg = badged
-    ? `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><text y="13" font-size="13">◆</text><circle cx="12.5" cy="3.5" r="3.5" fill="#e5534b"/></svg>`
-    : `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><text y="13" font-size="13">◆</text></svg>`;
-  link.href = "data:image/svg+xml," + encodeURIComponent(svg);
+  const apply = (href) => {
+    if (epoch !== setFavicon.epoch) return;
+    let link = document.querySelector("link#dlfav");
+    if (!link) {
+      link = document.createElement("link");
+      link.id = "dlfav";
+      link.rel = "icon";
+      document.head.appendChild(link);
+    }
+    link.href = href;
+  };
+  if (setFavicon.cache) return apply(setFavicon.cache); // the composed data URL, built once
+  const base = document.querySelector('link[rel="icon"][type="image/png"]');
+  if (!base) return; // no PNG favicon linked: nothing to badge, keep the logo
+  const img = new Image();
+  img.onload = () => {
+    const c = document.createElement("canvas");
+    c.width = 32; c.height = 32;
+    const g = c.getContext("2d");
+    g.drawImage(img, 0, 0, 32, 32);
+    g.fillStyle = "#e5534b";
+    g.beginPath(); g.arc(25, 7, 7, 0, Math.PI * 2); g.fill();
+    try { setFavicon.cache = c.toDataURL("image/png"); } catch { return; }
+    apply(setFavicon.cache);
+  };
+  img.src = base.href;
 }
 
 // Mirrors http::percent_encode on the Rust side: encode each segment but keep
