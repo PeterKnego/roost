@@ -6,7 +6,13 @@
 //! shell-spawning socket has. Validation reads metadata and canonicalises;
 //! it never creates, lists or follows into anything — the scan that follows
 //! is the existing one.
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+use tungstenite::handshake::server::{Request as WsRequest, Response as WsResponse};
+use tungstenite::protocol::WebSocketConfig;
+use tungstenite::Message;
 
 use crate::proto::SettingValue;
 
@@ -62,6 +68,50 @@ pub fn add_root(path: &str, current: &[PathBuf], env_roots: Option<&str>, global
     let mut out = current.to_vec();
     out.push(canon);
     Ok(out)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "t")]
+enum RootsIntent {
+    AddRoot { path: String },
+}
+
+/// `/ws/_roots`: the front page's one write. One exchange per connection.
+pub fn handle_ws(stream: TcpStream) {
+    // WebSocket handshakes bypass the same-origin policy: without this check
+    // any page the user visits could extend the directories roost serves.
+    // Same check as wsconn.rs and term.rs.
+    let allowed = crate::config::allowed_origins();
+    let config = WebSocketConfig { max_message_size: Some(64 * 1024), ..Default::default() };
+    let accepted = tungstenite::accept_hdr_with_config(
+        stream,
+        |req: &WsRequest, resp: WsResponse| {
+            let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
+            if !crate::origin::origin_allowed(origin, &allowed) {
+                eprintln!("roost: rejected roots ws origin={origin:?} (set allowed_origins)");
+                return Err(tungstenite::http::Response::builder().status(403).body(Some("origin not allowed".to_string())).expect("static 403 response"));
+            }
+            Ok(resp)
+        },
+        Some(config),
+    );
+    let Ok(mut ws) = accepted else { return };
+    let reply = match ws.read() {
+        Ok(Message::Text(t)) => match serde_json::from_str::<RootsIntent>(&t) {
+            Ok(RootsIntent::AddRoot { path }) => {
+                let current = crate::projects::roots();
+                let env = std::env::var("ROOST_ROOTS").ok();
+                match add_root(&path, &current, env.as_deref(), &crate::config::global_config_path()) {
+                    Ok(list) => serde_json::json!({ "t": "Roots", "roots": list.iter().map(|p| p.display().to_string()).collect::<Vec<_>>() }),
+                    Err(msg) => serde_json::json!({ "t": "Error", "msg": msg }),
+                }
+            }
+            Err(e) => serde_json::json!({ "t": "Error", "msg": format!("bad intent: {e}") }),
+        },
+        _ => return,
+    };
+    let _ = ws.send(Message::Text(reply.to_string().into()));
+    let _ = ws.close(None);
 }
 
 #[cfg(test)]

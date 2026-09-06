@@ -11,20 +11,18 @@ fn main() {
         }
         _ => {}
     }
-    // No compiled-in roots any more, so an unset ROOST_ROOTS is a
-    // misconfiguration, not a default. Serving an empty root list would come
-    // up healthy and show no projects at all, which reads as data loss.
+    // No compiled-in roots any more, so an unset ROOST_ROOTS used to be
+    // treated as a misconfiguration fatal at startup. It no longer is: the
+    // front page now offers Add Path, so an empty list is a state to explain,
+    // not to refuse to serve.
     let roots = roost::projects::roots();
     if roots.is_empty() {
+        // Not fatal any more: the front page explains the state and offers
+        // Add path. The notice stays for whoever reads the log first.
         eprintln!(
-            "roost: no project roots configured.\n\
-             Set ROOST_ROOTS to a colon-separated list of directories to scan:\n\
-             \n    ROOST_ROOTS=$HOME/projects roost 8444\n\
-             \nFor a service, set it in the unit file (Environment=ROOST_ROOTS=...).\n\
-             Or list them in ~/.config/roost/config.toml:\n\
-             \n    roots = [\"~/projects\"]"
+            "roost: no project roots configured — add one from the front page, \
+             or set ROOST_ROOTS / `roots` in ~/.config/roost/config.toml"
         );
-        std::process::exit(2);
     }
     // Both sources naming roots and disagreeing is a misconfiguration that is
     // otherwise invisible: ROOST_ROOTS wins here, while a caller that inherits

@@ -23,8 +23,30 @@ fn isolate_ide_dir_for_tests() {
     roost::ideport::set_ports_dir_for_test(p);
 }
 
+/// `serve`'s accept loop now re-reads `projects::roots()` on every connection
+/// instead of using its `startup_roots` argument after boot (so a root added
+/// from the front page is visible to the very next request, not just after a
+/// restart) — see `lib.rs`. `ROOST_ROOTS` is the source that wins over the
+/// config file (`projects::roots_from`), so setting it here, process-wide, is
+/// what makes every connection *this* test makes see exactly the roots it
+/// asked for rather than whatever the developer's real global config says.
+/// Safe under this suite's mandatory `--test-threads=1`: test bodies run one
+/// at a time, and each sets this before making its own requests, so an
+/// earlier test's still-listening (but now idle) server thread never reads it
+/// concurrently. An empty list clears the var instead of setting it to `""`,
+/// because `roots_from` treats a set-but-empty value as unset and falls
+/// through to the config file — setting it to empty would be indistinguishable
+/// from that, not from "no roots".
 fn start(roots: Vec<PathBuf>) -> u16 {
     isolate_ide_dir_for_tests();
+    if roots.is_empty() {
+        std::env::remove_var("ROOST_ROOTS");
+    } else {
+        std::env::set_var(
+            "ROOST_ROOTS",
+            roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(":"),
+        );
+    }
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || roost::serve(listener, roots));
@@ -2880,4 +2902,64 @@ fn a_hup_ignoring_child_does_not_survive_kill_and_unlink() {
     assert!(!alive(&marker), "the HUP-ignoring child survived kill_and_unlink");
     assert!(confirmed, "and the session must be reported as confirmed ended");
     assert!(!sock.exists(), "and its socket unlinked");
+}
+
+/// Connect to `/ws/_roots`, the way `ws_connect` connects to a terminal: a
+/// fixed path, an optional `Origin`. A separate helper rather than a `path`
+/// parameter on `ws_connect` because that one also reserves a terminal name
+/// before connecting (see its doc comment) — a concern this socket has none
+/// of.
+fn ws_connect_roots(
+    port: u16,
+    origin: Option<&str>,
+) -> Result<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, tungstenite::Error>
+{
+    use tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://127.0.0.1:{port}/ws/_roots").into_client_request().unwrap();
+    if let Some(o) = origin {
+        req.headers_mut().insert("origin", o.parse().unwrap());
+    }
+    let (ws, _resp) = tungstenite::connect(req)?;
+    if let tungstenite::stream::MaybeTlsStream::Plain(s) = ws.get_ref() {
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    }
+    Ok(ws)
+}
+
+/// `/ws/_roots`: one exchange, Origin-checked. A missing Origin is refused at
+/// the handshake like every browser-facing socket; a loopback Origin gets one
+/// reply and the file changes; a second connection sees the new root.
+///
+/// Revert-checked twice. Restoring `let roots = roots.clone();` in `serve`'s
+/// accept loop (in place of `projects::roots()`) fails the last assertion —
+/// "roots are re-read per connection" — because the front page then keeps
+/// answering with the roots list `serve` started with. Removing the Origin
+/// check from `handle_ws`'s handshake callback (accepting unconditionally)
+/// fails the first assertion — "a handshake without Origin must be refused".
+/// Both restored.
+#[test]
+fn roots_socket_adds_a_root_and_refuses_a_handshake_without_origin() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let d = tempfile::tempdir().unwrap();
+    let global = d.path().join("config.toml");
+    std::env::set_var("ROOST_CONFIG", &global);
+    std::env::remove_var("ROOST_ROOTS");
+    let dir = d.path().join("projects");
+    std::fs::create_dir(&dir).unwrap();
+    let port = start(vec![]); // empty root list: `start` clears ROOST_ROOTS so `roots_from` falls through to `global`
+    // No Origin: refused.
+    assert!(ws_connect_roots(port, None).is_err(), "a handshake without Origin must be refused");
+    // Loopback Origin: one exchange.
+    let mut ws = ws_connect_roots(port, Some(&format!("http://127.0.0.1:{port}"))).unwrap();
+    ws.send(tungstenite::Message::Text(format!(r#"{{"t":"AddRoot","path":"{}"}}"#, dir.display()).into())).unwrap();
+    let reply = ws.read().unwrap().into_text().unwrap();
+    assert!(
+        reply.contains(r#""t":"Roots""#) && reply.contains(&dir.canonicalize().unwrap().display().to_string()),
+        "{reply}"
+    );
+    assert!(std::fs::read_to_string(&global).unwrap().contains("roots = ["), "the global file gained the list");
+    // The next request sees it: the front page's roots label names it.
+    let page = ureq::get(&format!("http://127.0.0.1:{port}/")).call().unwrap().into_string().unwrap();
+    assert!(page.contains(&dir.canonicalize().unwrap().display().to_string()), "roots are re-read per connection");
+    std::env::remove_var("ROOST_CONFIG");
 }

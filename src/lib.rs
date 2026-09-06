@@ -44,7 +44,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
+pub fn serve(listener: TcpListener, startup_roots: Vec<PathBuf>) {
     // Notices raised while no browser was connected are the point of the
     // store; load them before anything can connect.
     crate::notify::load();
@@ -64,7 +64,7 @@ pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
     // Periodic, and it only ever logs — see health.rs for why it may not
     // repair anything and why it calls nothing that reaps.
     crate::health::spawn();
-    let report = registry::reconcile(&roots);
+    let report = registry::reconcile(&startup_roots);
     if report.dead_sockets > 0 || report.gone_projects > 0 {
         eprintln!(
             "roost: startup reap — {} dead sockets, {} sessions for missing projects",
@@ -83,9 +83,12 @@ pub fn serve(listener: TcpListener, roots: Vec<PathBuf>) {
             );
         }
     }
+    // Per connection, not once: a root added from the front page must be
+    // seen by the next request. An env read and one small file parse, the
+    // cost the rest of config already pays per request.
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let roots = roots.clone();
+        let roots = projects::roots();
         std::thread::spawn(move || {
             if is_ws(&stream) {
                 route_ws(stream, &roots);
@@ -129,6 +132,9 @@ fn route_ws(stream: TcpStream, roots: &[PathBuf]) {
     // unlike static/ws/frag (checked by projects::RESERVED because they sit
     // on the plain-HTTP URL surface too), "_workspace" isn't reserved
     // there, since it belongs only to this websocket surface.
+    if segs == ["_roots"] {
+        return roots::handle_ws(stream);
+    }
     let is_workspace_request =
         segs.len() >= 2 && segs[segs.len() - 1] == "_workspace";
     if is_workspace_request {
