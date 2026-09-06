@@ -1074,23 +1074,25 @@ fn icon_links() -> String {
     )
 }
 
-pub fn overview_page(sel: &str, roots_label: &str) -> String {
+pub fn overview_page(sel: &str, roots: &[String]) -> String {
     // `sel` is already a percent-encoded storage key (e.g. `karpie%2Fsrc`);
     // encoding it again here means the server's single `percent_decode` of
     // the query value lands back on that exact key — same pattern as the
     // header switcher's `?current={qkey}`.
     let qsel = crate::http::percent_encode(sel);
+    let roots_html: String = roots.iter().map(|r| format!("<span class=\"root\">{}</span>", esc(r))).collect();
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>roost</title>\
          {icons}\
          <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
          <link rel=\"stylesheet\" href=\"/static/style.css\">\
+         {DIALOG_STRUCTURAL_CSS}\
          <script src=\"/static/vendor/htmx.min.js\"></script>\
          </head><body class=\"overview-body\">\
          <header>\
            <span class=\"home\">{SVG_HOME}</span><span class=\"proj\">roost</span>\
            <span class=\"vsep\"></span>\
-           <span class=\"roots\" title=\"{roots}\">{roots}</span>\
+           <span class=\"roots\">{roots_html}<button id=\"addroot\" type=\"button\" title=\"add a project root\">+</button></span>\
          </header>\
          <main id=\"overview\">\
            <section class=\"pane ovpane tool\">\
@@ -1102,9 +1104,27 @@ pub fn overview_page(sel: &str, roots_label: &str) -> String {
              <div id=\"ovsessions\" class=\"ovbody\" hx-get=\"/frag/_overview_sessions?sel={qsel}\" hx-trigger=\"load\"></div>\
            </section>\
          </main>\
+         <dialog id=\"dlg-confirm\" class=\"roost\">\
+           <h2 class=\"dlg-title\"></h2>\
+           <div class=\"dlg-body\"></div>\
+           <p class=\"dlg-blocked\" hidden></p>\
+           <div class=\"dlg-buttons\">\
+             <button type=\"button\" class=\"dlg-cancel\">Cancel</button>\
+             <button type=\"button\" class=\"dlg-ok\"></button>\
+           </div>\
+         </dialog>\
+         <dialog id=\"dlg-text\" class=\"roost\">\
+           <h2 class=\"dlg-title\"></h2>\
+           <label class=\"dlg-label\" for=\"dlg-input\"></label>\
+           <input id=\"dlg-input\" class=\"dlg-input\" type=\"text\" autocomplete=\"off\" spellcheck=\"false\">\
+           <div class=\"dlg-buttons\">\
+             <button type=\"button\" class=\"dlg-cancel\">Cancel</button>\
+             <button type=\"button\" class=\"dlg-ok\"></button>\
+           </div>\
+         </dialog>\
+         <script src=\"/static/dialog.js\"></script>\
          <script src=\"/static/overview.js\"></script>\
          </body></html>",
-        roots = esc(roots_label),
         SVG_HOME = SVG_HOME,
         icons = icon_links(),
     )
@@ -1344,7 +1364,15 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
 /// Selection (`sel`, a storage key) marks the current row; expansion is the
 /// client's job (`overview.js`). A reachable row is a link to `/<url>` (open
 /// the project); an unreachable worktree is inert text.
-pub fn overview_projects(sel: &str, projects: &[crate::registry::ProjectStatus]) -> String {
+///
+/// `roots_empty` distinguishes "no roots configured" (a setup step is
+/// missing — offer `Add path`) from "roots exist but hold no projects" (an
+/// ordinary empty list, nothing to explain): the same empty `projects` slice
+/// arises both ways, so the caller has to say which.
+pub fn overview_projects(sel: &str, projects: &[crate::registry::ProjectStatus], roots_empty: bool) -> String {
+    if roots_empty {
+        return "<div class=\"ovempty\"><p>Roost has no defined paths where to look for projects. Add a path where your projects live; roost will search it for git repositories and list them here.</p><button class=\"addroot\" type=\"button\">Add path</button></div>".to_string();
+    }
     let mut out = String::from("<ul class=\"ovtree\">");
     for p in projects {
         // Children are present exactly when their project is open, which is
@@ -3168,7 +3196,7 @@ mod tests {
         let home = ws.split(r#"<a class="home" href="/" title="all projects">"#).nth(1).expect("home anchor");
         assert!(home.starts_with(r#"<svg"#) && home[..home.find("</svg>").unwrap()].contains(r#"viewBox="0 0 14 12""#),
             "home anchor does not hold the owl: {}", &home[..120.min(home.len())]);
-        let ov = overview_page("", "/home/x");
+        let ov = overview_page("", &["/home/x".into()]);
         for icon in &icons {
             assert!(ov.contains(icon), "overview page lacks {icon}");
         }
@@ -3302,7 +3330,7 @@ mod tests {
 
     #[test]
     fn overview_page_wires_both_fragment_panes() {
-        let h = overview_page("", "/home/claude/projects");
+        let h = overview_page("", &["/home/claude/projects".into()]);
         assert!(h.contains("id=\"overview\""));
         // sel="" still emits `?sel=` (empty, unfiltered) — the URL always
         // carries the param so htmx has a consistent shape to trigger from.
@@ -3337,9 +3365,25 @@ mod tests {
         assert_eq!(encoded, "karpie%252Fsrc", "{encoded}");
         assert_eq!(crate::http::percent_decode(&encoded), sel);
 
-        let h = overview_page(sel, "/roots");
+        let h = overview_page(sel, &["/roots".into()]);
         assert!(h.contains("/frag/_overview_projects?sel=karpie%252Fsrc"), "{h}");
         assert!(h.contains("/frag/_overview_sessions?sel=karpie%252Fsrc"), "{h}");
+    }
+
+    #[test]
+    fn the_front_page_lists_roots_with_an_add_control_and_carries_the_dialogs() {
+        let h = overview_page("", &["/home/x/projects".into(), "/srv/<code>".into()]);
+        assert!(h.contains(r#"<span class="root">/home/x/projects</span>"#), "{h}");
+        assert!(h.contains("/srv/&lt;code&gt;"), "escaped: {h}");
+        assert!(h.contains(r#"<button id="addroot" type="button" title="add a project root">+</button>"#), "{h}");
+        assert!(h.contains(r#"<script src="/static/dialog.js"></script>"#), "{h}");
+        for id in ["dlg-confirm", "dlg-text"] {
+            assert!(h.contains(&format!(r#"id="{id}""#)), "no {id} shell on the front page");
+        }
+        assert!(h.contains(DIALOG_STRUCTURAL_CSS), "the lock guards the front page's dialogs too");
+        // No roots: the header still carries the control, so the page has two ways in.
+        let none = overview_page("", &[]);
+        assert!(none.contains(r#"id="addroot""#), "{none}");
     }
 
     // A picker row for a directory that is also a known project carries the
@@ -3821,7 +3865,7 @@ mod tests {
             ps_row("ultima", "ultima", 1, "main", None, None),
             ps_row("ultima%2F.claude%2Fworktrees%2Fclaude-1", "ultima/.claude/worktrees/claude-1", 1, "claude-1", Some("ultima"), Some(wt)),
         ];
-        let out = overview_projects("ultima", &ps);
+        let out = overview_projects("ultima", &ps, false);
         // Revert-checked: rendering the chip span as empty (chips not reused
         // from worktree_chips) fails the "3 ahead"/"dirty"/"✻" assertion below.
         // Parent row carries an expansion caret and is current; child row is present with its chips.
@@ -3849,7 +3893,7 @@ mod tests {
             ps_row("ultima%2F.claude%2Fworktrees%2Fclaude-1", "ultima/.claude/worktrees/claude-1", 0, "claude-1", Some("ultima"), Some(wt)),
         ];
         assert!(crate::registry::removable(ps[1].wt.as_ref().unwrap(), ps[1].live), "fixture must actually be removable");
-        let out = overview_projects("ultima", &ps);
+        let out = overview_projects("ultima", &ps, false);
         assert!(!out.contains("wtremove"), "{out}");
     }
 
@@ -3868,11 +3912,11 @@ mod tests {
             wt: Some(WorktreeStatus { claude: crate::claudes::ClaudeEvidence::Absent,
                 dirty: Some(false), ahead: Some(0), base: "main".into(), base_recorded: true }),
         };
-        let same = overview_projects("", &[row("claude-1", "claude-1")]);
+        let same = overview_projects("", &[row("claude-1", "claude-1")], false);
         assert!(!same.contains("\u{2387} claude-1"), "the branch is not repeated: {same}");
         assert!(same.contains("claude-1</a>"), "the name is still there: {same}");
         // A worktree on a differently-named branch still says which.
-        let diff = overview_projects("", &[row("wt", "feature/x")]);
+        let diff = overview_projects("", &[row("wt", "feature/x")], false);
         assert!(diff.contains("\u{2387} feature/x"), "{diff}");
     }
 
@@ -3887,8 +3931,19 @@ mod tests {
                 r.reachable = false; r
             },
         ];
-        let out = overview_projects("", &ps);
+        let out = overview_projects("", &ps, false);
         assert!(out.contains("unreachable"), "{out}");
+    }
+
+    #[test]
+    fn the_projects_fragment_explains_an_empty_root_list_and_offers_add_path() {
+        let h = overview_projects("", &[], true);
+        assert!(h.contains("Roost has no defined paths where to look for projects."), "{h}");
+        assert!(h.contains("search it for git repositories"), "{h}");
+        assert!(h.contains(r#"<button class="addroot" type="button">Add path</button>"#), "{h}");
+        // Roots exist but hold no projects: no explanation, an ordinary empty list.
+        let empty = overview_projects("", &[], false);
+        assert!(!empty.contains("Add path"), "{empty}");
     }
 
     #[test]

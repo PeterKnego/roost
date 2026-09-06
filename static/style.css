@@ -742,8 +742,13 @@ ul.picker li .git:hover { text-decoration: underline; }
    workspace would not recognise is a bug, not a style choice — the first cut
    drew two flush columns of unstyled UA-blue links and read as a different
    application. */
-.overview-body header .roots { color: var(--muted); min-width: 0; overflow: hidden;
-                               text-overflow: ellipsis; white-space: nowrap; }
+/* Each root is its own span now (was one title-ellipsised string), so the
+   header shows several short paths rather than truncating one long one. */
+header .roots { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+header .roots .root { font-family: var(--mono); }
+header .roots .root + .root::before { content: ""; display: inline-block; width: 1px; height: 12px; background: var(--border); margin-right: 6px; vertical-align: -2px; }
+#addroot { font: inherit; font-size: 14px; line-height: 1; width: 22px; height: 22px; border: 1px solid var(--border); border-radius: 6px; background: none; color: var(--muted); cursor: pointer; }
+#addroot:hover { color: var(--fg); border-color: var(--accent); }
 
 #overview { display: grid; padding: 6px; gap: var(--divider, 8px);
             grid-template-columns: var(--ov-left, 360px) 1fr;
@@ -808,6 +813,14 @@ ul.picker li .git:hover { text-decoration: underline; }
 .ovall { color: var(--accent); text-decoration: none; }
 .ovall:hover { text-decoration: underline; }
 .ovempty { color: var(--muted); padding: 6px 8px; }
+/* The projects pane's "no roots configured yet" state reuses `.ovempty`
+   (the sessions pane's one-line note above) but is a block with a heading
+   and a button, not a line item — this comes second so its box-model
+   properties (`padding`, `max-width`) win the cascade over the rule above
+   for that shared class, on both usages. */
+.ovempty { padding: 24px 16px; max-width: 46em; }
+.ovempty p { color: var(--muted); line-height: 1.5; margin: 0 0 14px; }
+.ovempty .addroot { font: inherit; padding: 6px 14px; border: 1px solid var(--accent); border-radius: 6px; background: none; color: var(--fg); cursor: pointer; }
 
 /* The overlay is now just a backdrop — the field lives in the header, and
    the panel hangs from it rather than floating centred on the screen. */

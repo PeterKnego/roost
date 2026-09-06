@@ -107,7 +107,7 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
             if !sel.is_empty() && !open.contains(&sel) {
                 open.push(sel);
             }
-            http::html(w, &render::overview_projects(sel, &build_overview_projects(roots, &open)));
+            http::html(w, &render::overview_projects(sel, &build_overview_projects(roots, &open), roots.is_empty()));
         }
         // Same shape as _overview_projects above, same reason it sits before
         // the general frag arm.
@@ -282,9 +282,9 @@ fn build_overview_sessions(roots: &[PathBuf], sel: &str) -> Vec<render::OvSessio
 /// one had nothing left to add, and the button that reached it was pointing
 /// at a page that answered a question the front page already answers.
 fn serve_index(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
-    let label = roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(":");
+    let root_labels: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
     let sel = req.query.get("sel").map(String::as_str).unwrap_or("");
-    http::html(w, &render::overview_page(sel, &label));
+    http::html(w, &render::overview_page(sel, &root_labels));
 }
 
 fn serve_workspace(w: &mut impl Write, roots: &[PathBuf], project: &str) {
