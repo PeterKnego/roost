@@ -51,9 +51,11 @@ The front page therefore loads `dialog.js` and carries the `dlg-text` and
 since the overview also applies a project-independent theme stylesheet.
 
 On success the page refreshes both fragments (the existing refresh function)
-and rewrites the header's roots list from the reply. On refusal the reason
-shows as a banner and the dialog's text is kept, so a typo is one edit away —
-`askText` resolves on confirm, so the page re-opens it prefilled.
+and rewrites the header's roots list from the reply. On refusal the dialog
+re-opens prefilled with the text, carrying the reason as its label
+("<reason> — try another path"), so a typo is one edit away. Not a banner: the
+dialog is modal and covers one, which put the reason exactly where it could not
+be read.
 
 ### The write: a roots socket
 
@@ -146,8 +148,9 @@ Browser, `tests/browser/roots.mjs`: start roost with `ROOST_ROOTS` empty and
 `ROOST_CONFIG` on an empty file; the front page shows the sentence and the
 button; **Add path** with the fixture's roots directory lists its project,
 the header shows the root, the global file holds it; **+** adds a second
-directory and both appear; a nonexistent path is refused with a banner and
-the dialog reopens with the text kept. The Rust origin tests already cover a
+directory and both appear; a nonexistent path reopens the dialog with the
+reason on its label and the text kept; and four long roots keep the **+** in
+the header and clickable. The Rust origin tests already cover a
 handshake without `Origin`; `roots.mjs` sends one from the page's own
 origin, which is the positive case.
 
