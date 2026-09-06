@@ -31,9 +31,16 @@ fn workspace_state_mirrors_between_two_clients() {
     ))
     .unwrap();
 
-    // the *other* browser must learn about it without asking
-    let seen = read_until(&mut b, "hello.md");
-    assert!(seen.contains(r#""t":"State""#));
+    // The *other* browser must learn about it without asking. Read to the
+    // next State frame, not to the first frame naming the file: a fresh hub
+    // broadcasts the buffer's BufferText before the State that carries the
+    // tab, and matching on "hello.md" caught that one. This test only ever
+    // passed in the monolithic binary because an earlier test had left a hub
+    // for "proj" pointing at its own deleted tempdir, so the disk read
+    // failed silently and no BufferText was ever sent — a vacuous pass
+    // exposed the day the suite was split into one binary per area.
+    let seen = read_until(&mut b, r#""t":"State""#);
+    assert!(seen.contains("hello.md"), "the mirrored State must carry the tab: {seen}");
     // ...and it must be attributed to *a*, the client that actually acted —
     // not something b could have produced from its own state.
     assert!(
