@@ -47,12 +47,18 @@ pub fn add_root(path: &str, current: &[PathBuf], env_roots: Option<&str>, global
     if env_roots.map(|v| !v.trim().is_empty()).unwrap_or(false) {
         return Err("this roost's roots come from ROOST_ROOTS; add it there (the unit file, for a service)".into());
     }
-    let mut list: Vec<String> = match crate::config::raw_setting(global, "roots") {
-        Some(SettingValue::List(l)) => l,
-        _ => Vec::new(),
-    };
-    list.push(canon.display().to_string());
-    crate::config::with_global_write_lock(|| crate::config::write_setting(global, "roots", Some(&SettingValue::List(list))))?;
+    // Read-modify-write, all under one lock acquisition: reading the list
+    // outside the lock would let two concurrent adds each read the
+    // pre-write list, and the second writer's write would then drop the
+    // first writer's entry.
+    crate::config::with_global_write_lock(|| {
+        let mut list: Vec<String> = match crate::config::raw_setting(global, "roots") {
+            Some(SettingValue::List(l)) => l,
+            _ => Vec::new(),
+        };
+        list.push(canon.display().to_string());
+        crate::config::write_setting(global, "roots", Some(&SettingValue::List(list)))
+    })?;
     let mut out = current.to_vec();
     out.push(canon);
     Ok(out)
@@ -71,6 +77,8 @@ mod tests {
         let e = add_root("projects", &[], None, &global(&d)).unwrap_err();
         assert!(e.contains("projects") && e.contains("absolute"), "{e}");
         assert!(!global(&d).exists(), "nothing written");
+        let e = add_root("  ", &[], None, &global(&d)).unwrap_err();
+        assert!(e.contains("enter a directory path"), "{e}");
     }
 
     #[test]
@@ -123,18 +131,45 @@ mod tests {
         let list = add_root("~/work", &[canon.clone()], None, &global(&d)).unwrap();
         assert_eq!(list.last().unwrap(), &home.join("work").canonicalize().unwrap());
     }
-    // Revert-check (recorded, not reproduced here): swapping `canon` for
-    // `expanded` in `list.push(...)` — the entry written to the file — did
-    // NOT fail this test on this host. Rust's `Path` equality already
-    // discards a mid-path "." component (confirmed: `PathBuf::from("/tmp/foo")
-    // == PathBuf::from("/tmp/./foo")`), and this host's temp directory is not
-    // itself a symlink, so `expanded` and `canon` agree here even without a
-    // real `canonicalize()`. The substitution would surface on a host where
-    // the temp root is a symlink (e.g. macOS's `/tmp` -> `/private/tmp`),
-    // where only `canonicalize()` resolves it. A separate ad hoc probe with a
-    // real symlink (not checked in) confirmed canonicalize is load-bearing:
-    // without it, a symlink alias of an existing root is not caught as a
-    // duplicate.
+    // A `./` dot segment is not a strong enough fixture to prove
+    // `canonicalize()` is doing anything: Rust's own `Path` equality already
+    // discards a mid-path "." component, so this test's duplicate check would
+    // pass even comparing un-canonicalized paths. The real case — a symlink
+    // alias, which only `canonicalize()` resolves — is covered separately by
+    // `a_symlinked_alias_of_a_root_is_the_same_root` below.
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_alias_of_a_root_is_the_same_root() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let canon = real.canonicalize().unwrap();
+        let alias = d.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        // The real path first, then its alias is refused as the same root.
+        let list = add_root(real.to_str().unwrap(), &[], None, &global(&d)).unwrap();
+        assert_eq!(list, vec![canon.clone()]);
+        let e = add_root(alias.to_str().unwrap(), &[canon.clone()], None, &global(&d)).unwrap_err();
+        assert!(e.contains("already a root"), "{e}");
+
+        // The alias added first (fresh global file): the entry written is the
+        // resolved real path, never the alias's own spelling.
+        let global2 = d.path().join("config2.toml");
+        let list = add_root(alias.to_str().unwrap(), &[], None, &global2).unwrap();
+        assert_eq!(list, vec![canon.clone()]);
+        let text = fs::read_to_string(&global2).unwrap();
+        assert!(text.contains(&real.canonicalize().unwrap().display().to_string()), "{text}");
+        assert!(!text.contains("alias"), "the alias's own path must not appear: {text}");
+    }
+    // Revert-check: replacing `canon` with `expanded` in both the duplicate
+    // check and the written entry (`add_root`'s body) made this test fail —
+    // the alias-second case returned `Ok` instead of `Err` (an
+    // un-canonicalized alias path never equals the canonical real path, so
+    // "already a root" never fires), so `.unwrap_err()` panicked on `Ok(..)`;
+    // separately the alias-first case wrote the alias's own path, and
+    // `assert!(!text.contains("alias"))` failed. Restored.
 
     #[test]
     fn appending_keeps_the_existing_list_comments_and_other_keys() {
