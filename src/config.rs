@@ -324,7 +324,7 @@ pub fn roots_from_global(global: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn expand_home(s: &str) -> PathBuf {
+pub(crate) fn expand_home(s: &str) -> PathBuf {
     match s.strip_prefix("~/") {
         Some(rest) => match std::env::var_os("HOME") {
             Some(h) => PathBuf::from(h).join(rest),
@@ -385,6 +385,13 @@ pub fn for_project(project_dir: &Path) -> Settings {
 /// One process-wide lock for the global file: every project's hub can
 /// reach it, and two hubs editing it at once would race the rename.
 static GLOBAL_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the same lock [`set_setting`] takes for `Scope::Global`, for callers
+/// outside this module that write the global file directly (`roots::add_root`).
+pub(crate) fn with_global_write_lock<T>(f: impl FnOnce() -> T) -> T {
+    let _g = GLOBAL_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
 
 /// Validate, pick the file for `scope`, write. Returns the path written so
 /// the caller can name it. The project file is `{project}/.roost/config.toml`.

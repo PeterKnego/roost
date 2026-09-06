@@ -24,6 +24,7 @@ pub mod projects;
 pub mod proto;
 pub mod registry;
 pub mod render;
+pub mod roots;
 pub mod routes;
 pub mod screen;
 pub mod search;
