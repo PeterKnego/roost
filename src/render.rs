@@ -1371,7 +1371,7 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
 /// arises both ways, so the caller has to say which.
 pub fn overview_projects(sel: &str, projects: &[crate::registry::ProjectStatus], roots_empty: bool) -> String {
     if roots_empty {
-        return "<div class=\"ovempty\"><p>Roost has no defined paths where to look for projects. Add a path where your projects live; roost will search it for git repositories and list them here.</p><button class=\"addroot\" type=\"button\">Add path</button></div>".to_string();
+        return "<div class=\"ovnoroots\"><p>Roost has no defined paths where to look for projects. Add a path where your projects live; roost will search it for git repositories and list them here.</p><button class=\"addroot\" type=\"button\">Add path</button></div>".to_string();
     }
     let mut out = String::from("<ul class=\"ovtree\">");
     for p in projects {
@@ -3938,6 +3938,7 @@ mod tests {
     #[test]
     fn the_projects_fragment_explains_an_empty_root_list_and_offers_add_path() {
         let h = overview_projects("", &[], true);
+        assert!(h.contains(r#"<div class="ovnoroots">"#), "own class, not the Sessions pane's .ovempty: {h}");
         assert!(h.contains("Roost has no defined paths where to look for projects."), "{h}");
         assert!(h.contains("search it for git repositories"), "{h}");
         assert!(h.contains(r#"<button class="addroot" type="button">Add path</button>"#), "{h}");

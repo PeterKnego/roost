@@ -813,14 +813,14 @@ header .roots .root + .root::before { content: ""; display: inline-block; width:
 .ovall { color: var(--accent); text-decoration: none; }
 .ovall:hover { text-decoration: underline; }
 .ovempty { color: var(--muted); padding: 6px 8px; }
-/* The projects pane's "no roots configured yet" state reuses `.ovempty`
-   (the sessions pane's one-line note above) but is a block with a heading
-   and a button, not a line item — this comes second so its box-model
-   properties (`padding`, `max-width`) win the cascade over the rule above
-   for that shared class, on both usages. */
-.ovempty { padding: 24px 16px; max-width: 46em; }
-.ovempty p { color: var(--muted); line-height: 1.5; margin: 0 0 14px; }
-.ovempty .addroot { font: inherit; padding: 6px 14px; border: 1px solid var(--accent); border-radius: 6px; background: none; color: var(--fg); cursor: pointer; }
+/* The projects pane's "no roots configured yet" state: a setup step is
+   missing, not an ordinary empty list, so it gets its own class rather than
+   reusing `.ovempty` above — that one is the Sessions pane's one-line note,
+   and sharing a bare class here once let this block's larger padding win
+   the cascade for both usages. */
+.ovnoroots { padding: 24px 16px; max-width: 46em; }
+.ovnoroots p { color: var(--muted); line-height: 1.5; margin: 0 0 14px; }
+.ovnoroots .addroot { font: inherit; padding: 6px 14px; border: 1px solid var(--accent); border-radius: 6px; background: none; color: var(--fg); cursor: pointer; }
 
 /* The overlay is now just a backdrop — the field lives in the header, and
    the panel hangs from it rather than floating centred on the screen. */
