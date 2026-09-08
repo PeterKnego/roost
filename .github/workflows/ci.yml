@@ -56,3 +56,10 @@ jobs:
 
       - name: Package tests
         run: scripts/test/packages.sh
+
+      # Runners have docker and the musl target is a rustup add away.
+      - name: Install the musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Package install tests
+        run: scripts/test/install.sh

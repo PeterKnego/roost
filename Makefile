@@ -1,6 +1,6 @@
 # A command index, not a build graph. See the spec: the real dependency edges
 # differ between a local run and CI, so they live in the scripts, once.
-.PHONY: help preflight release verify deb rpm test-scripts
+.PHONY: help preflight release verify deb rpm test-scripts test-install
 
 help:
 	@echo 'make preflight              run every pre-tag check'
@@ -9,6 +9,7 @@ help:
 	@echo 'make deb BIN=<path> VERSION=<v> ARCH=<amd64|arm64>'
 	@echo 'make rpm BIN=<path> VERSION=<v> ARCH=<x86_64|aarch64>'
 	@echo 'make test-scripts           shellcheck + package tests'
+	@echo 'make test-install           install the packages in containers'
 
 preflight:
 	@scripts/preflight.sh
@@ -30,3 +31,6 @@ rpm:
 test-scripts:
 	@shellcheck scripts/*.sh scripts/test/*.sh
 	@scripts/test/packages.sh
+
+test-install:
+	@scripts/test/install.sh
