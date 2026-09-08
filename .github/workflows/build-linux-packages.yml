@@ -1,8 +1,6 @@
-# Stub. Task 1 exists only to answer one question: are a custom
-# global-artifacts job's uploads collected by dist's `host` job and attached to
-# the release? The documented contract ("uploaded to an artifact named
-# artifacts") is stated for `build-local-artifacts = false`, which is not our
-# configuration, so it is assumed rather than known.
+# Builds the .deb and .rpm from the binaries the release already produced —
+# never from a fresh compile. A package built separately would contain
+# different bytes from the tarball of the same version.
 name: Build Linux packages
 
 on:
@@ -16,16 +14,47 @@ jobs:
   build-linux-packages:
     runs-on: ubuntu-22.04
     steps:
-      - name: Produce a marker file
-        run: |
-          mkdir -p target/distrib
-          echo "contract probe" > target/distrib/CONTRACT-PROBE.txt
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
-      # Upload version tracks what dist's generated workflow downloads with:
-      # v7 matches the v8 download-artifact in release.yml. A version mismatch
-      # fails silently as a missing artifact rather than erroring, which would
-      # make the probe lie about the contract.
+      - name: Install packaging tools
+        run: cargo install cargo-deb cargo-generate-rpm --locked
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: dist-in/
+          merge-multiple: true
+
+      - name: Build packages from the released binaries
+        run: |
+          set -euo pipefail
+          VERSION=$(echo '${{ inputs.plan }}' | jq -r '.releases[0].app_version')
+
+          for pair in "x86_64-unknown-linux-musl amd64 x86_64" \
+                      "aarch64-unknown-linux-musl arm64 aarch64"; do
+            set -- $pair
+            triple=$1; debarch=$2; rpmarch=$3
+            tar -xJf "dist-in/roost-${triple}.tar.xz" -C dist-in
+            bin="dist-in/roost-${triple}/roost"
+            scripts/package-deb.sh "$bin" "$VERSION" "$debarch"
+            scripts/package-rpm.sh "$bin" "$VERSION" "$rpmarch"
+          done
+
+          ls -la target/distrib/
+
+      # This repo's generated release.yml (dist's output) uploads every
+      # artifact with actions/upload-artifact@v7 and downloads with
+      # actions/download-artifact@v8; those two versions interoperate, v4
+      # does not (upload-artifact v4's zip layout is not what a v8 download
+      # expects, and the artifact silently fails to materialize rather than
+      # erroring). So this has to track whatever version release.yml uploads
+      # with, not a fixed version chosen here — if a future `dist` bump
+      # changes release.yml's upload-artifact version, this must move with it.
       - uses: actions/upload-artifact@v7
         with:
           name: artifacts-linux-packages
-          path: target/distrib/CONTRACT-PROBE.txt
+          path: |
+            target/distrib/*.deb
+            target/distrib/*.rpm
