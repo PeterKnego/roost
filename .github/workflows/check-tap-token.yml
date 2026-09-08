@@ -1,0 +1,34 @@
+# Answers one question in about fifteen seconds: is HOMEBREW_TAP_TOKEN a
+# credential the tap will accept?
+#
+# It exists because a credential used only by CI can only be tested by CI, and
+# the release script needs that answer before a tag exists. On v0.5.1 the
+# answer arrived after all four targets had built and the GitHub release had
+# been created: `Bad credentials`, a 401 on the token value itself. Everything
+# upstream of the publish jobs is content-addressed and re-runnable; the
+# publish steps are the only ones carrying a human-entered secret, and they are
+# the only ones that failed.
+#
+# Never part of a release. workflow_dispatch only.
+name: Check tap token
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check-tap-token:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: "peterknego/homebrew-tap"
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      # Checkout proves read. The formula push needs write, and a fine-grained
+      # token can carry one without the other, so probe write without leaving
+      # anything behind: a push of an unchanged ref is accepted by a token with
+      # Contents: write and rejected by a read-only one.
+      - name: Probe write access
+        working-directory: tap
+        run: git push origin HEAD:refs/heads/"$(git branch --show-current)"
