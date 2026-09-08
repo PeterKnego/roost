@@ -62,10 +62,21 @@ ok "ships /usr/bin/roost"
 # Same reasoning as the .deb's byte-identity check above, and the assertion
 # that actually catches the staging bug this task's brief walks straight into:
 # rpm -qpl only proves a path exists in the archive, not whose binary it is.
+# One extraction covers both the binary and the unit checked below.
 RPMEXTRACT="$TMP/rpmextract"; mkdir -p "$RPMEXTRACT"
 RPMABS="$(pwd)/$RPM"
-(cd "$RPMEXTRACT" && rpm2cpio "$RPMABS" | cpio -idm --quiet ./usr/bin/roost) \
-  || die "could not extract /usr/bin/roost from the .rpm"
+(cd "$RPMEXTRACT" && rpm2cpio "$RPMABS" | cpio -idm --quiet \
+  ./usr/bin/roost ./usr/lib/systemd/user/roost.service) \
+  || die "could not extract the .rpm payload"
 [ "$(sha256sum < "$RPMEXTRACT/usr/bin/roost" | cut -d' ' -f1)" = "$(sha256sum < "$FIXTURE" | cut -d' ' -f1)" ] \
   || die "the .rpm contains a different binary than the one passed in"
 ok "the packaged binary is byte-identical to the input"
+
+# The unit could ship empty or with the default kill mode and every path check
+# above would still pass. Both packages embed the same packaging/roost.service,
+# but the embedding tool differs (cargo-deb vs cargo-generate-rpm), so this is
+# not redundant with the deb block's equivalent check — each proves its own
+# tool actually put the file's real content in, not just a path.
+grep -q '^KillMode=process$' "$RPMEXTRACT/usr/lib/systemd/user/roost.service" \
+  || die "the packaged unit lacks KillMode=process"
+ok "the packaged unit sets KillMode=process"
