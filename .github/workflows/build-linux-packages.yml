@@ -1,0 +1,27 @@
+# Stub. Task 1 exists only to answer one question: are a custom
+# global-artifacts job's uploads collected by dist's `host` job and attached to
+# the release? The documented contract ("uploaded to an artifact named
+# artifacts") is stated for `build-local-artifacts = false`, which is not our
+# configuration, so it is assumed rather than known.
+name: Build Linux packages
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  build-linux-packages:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Produce a marker file
+        run: |
+          mkdir -p target/distrib
+          echo "contract probe" > target/distrib/CONTRACT-PROBE.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-linux-packages
+          path: target/distrib/CONTRACT-PROBE.txt

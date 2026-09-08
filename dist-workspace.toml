@@ -63,6 +63,11 @@ github-attestations = true
 tap = "peterknego/homebrew-tap"
 publish-jobs = ["homebrew"]
 
+# Runs in the global phase, not the local one: the local phase is a matrix, so
+# a job there sees one target's output. The global phase is the first point at
+# which all four binaries exist and can be downloaded.
+global-artifacts-jobs = ["./build-linux-packages"]
+
 # dtach is a *runtime* prerequisite, not a build one — roost spawns it, it is
 # not linked against. `stage = ["run"]` is what turns this into a `depends_on`
 # in the formula rather than a `brew install` on the build runner. This is the
