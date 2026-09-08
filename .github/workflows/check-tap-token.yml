@@ -23,6 +23,11 @@ jobs:
         with:
           repository: "peterknego/homebrew-tap"
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # Explicit ref, and the push target below names the same branch. Without
+          # it checkout detaches HEAD, `git branch --show-current` is empty, and the
+          # refspec is malformed — which fails before the token is ever tried, so a
+          # good token and a read-only one are indistinguishable.
+          ref: main
           path: tap
 
       # Checkout proves read. The formula push needs write, and a fine-grained
@@ -31,4 +36,7 @@ jobs:
       # Contents: write and rejected by a read-only one.
       - name: Probe write access
         working-directory: tap
-        run: git push origin HEAD:refs/heads/"$(git branch --show-current)"
+        # Pushing HEAD to the branch it already points at is a no-op fast-forward:
+        # accepted by a token with Contents:write, rejected by a read-only one, and
+        # it leaves the tap byte-for-byte unchanged either way.
+        run: git push origin HEAD:refs/heads/main
