@@ -18,12 +18,23 @@ phase "deb"
 DEB=$(scripts/package-deb.sh "$FIXTURE" 9.9.9 amd64 | tail -1)
 [ -f "$DEB" ] || die "no .deb produced at $DEB"
 
+# dpkg-deb -I's output embeds the package Description, which pulls in the
+# full README (Cargo.toml's `description` metadata) — long enough that
+# `dpkg-deb -I | grep -q ...` races grep's early exit (it matches
+# "Architecture" on line 7) against dpkg-deb still writing the rest.
+# Reproduced directly: under `set -o pipefail`, ~1 run in 15 died with
+# pipeline exit 141 (SIGPIPE) even though the .deb on disk was correct and
+# grep had already found its match — a false failure, not an architecture
+# bug. Capturing the output into a variable first reads it to completion
+# before anything greps it, so there is nothing left to race.
+DEB_INFO=$(dpkg-deb -I "$DEB")
+
 # cargo-deb's default Architecture is the *host's* arch, not the arch passed
 # in, so a build that never sets --target looks correct here — amd64 in,
 # amd64 out — even with the bug fully restored, because this runner is
 # amd64. That is exactly how this drifted invisibly: only amd64 was ever
 # built. The arm64 build just below is what actually exercises the fix.
-dpkg-deb -I "$DEB" | grep -qE '^ Architecture: amd64$' \
+echo "$DEB_INFO" | grep -qE '^ Architecture: amd64$' \
   || die "the .deb's declared Architecture does not match the amd64 arch passed in"
 ok "declares Architecture: amd64"
 
@@ -33,11 +44,12 @@ ok "declares Architecture: amd64"
 # amd64" while amd64 was requested — proven below, see verification output.
 ARM_DEB=$(scripts/package-deb.sh "$FIXTURE" 9.9.9 arm64 | tail -1)
 [ -f "$ARM_DEB" ] || die "no arm64 .deb produced at $ARM_DEB"
-dpkg-deb -I "$ARM_DEB" | grep -qE '^ Architecture: arm64$' \
+ARM_DEB_INFO=$(dpkg-deb -I "$ARM_DEB")
+echo "$ARM_DEB_INFO" | grep -qE '^ Architecture: arm64$' \
   || die "the arm64 .deb's declared Architecture does not match the arm64 arch passed in"
 ok "declares Architecture: arm64"
 
-dpkg-deb -I "$DEB" | grep -qE '^ Depends: .*\bdtach\b' \
+echo "$DEB_INFO" | grep -qE '^ Depends: .*\bdtach\b' \
   || die "the .deb does not declare Depends: dtach"
 ok "declares Depends: dtach"
 

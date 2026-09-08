@@ -21,8 +21,30 @@ ok "required tools present"
 # the tag check) "is $1 a commit release.sh itself already made for exactly
 # this version bump", so a resume can tell that apart from a genuine
 # collision, without weakening either check for a fresh release.
+#
+# "Looks like a release bump" (right subject, right Cargo.toml) is not
+# narrow enough on its own: a commit with that shape sitting on top of other
+# unpushed work would still read as resumable, and `git push origin master`
+# would carry that other work along with it — exactly the collision this
+# check exists to prevent, just moved one commit deeper. So $1 must be
+# EITHER origin/master itself OR exactly one commit ahead of it (its parent
+# must BE origin/master, not merely some ancestor of it) — not "some commit
+# whose tip happens to look right".
+#
+# Both shapes are real: the tag-side caller can be asked about a commit
+# after master's own push already succeeded (tag push is what failed), at
+# which point origin/master (fetched fresh above) now points AT the bump
+# commit rather than at its parent — "$1 == $ORIGIN_SHA" catches that case.
+# Checked by reverting to a parent-only comparison and reproducing: it dies
+# claiming a genuine resume "is not this release's own bump commit" the
+# moment master has already been pushed, which is exactly the resumable
+# state this whole check exists to let through.
 is_release_bump_commit() {
   [ -n "$VERSION" ] || return 1
+  if [ "$1" != "$ORIGIN_SHA" ]; then
+    PARENT_SHA=$(git rev-parse -q --verify "$1^" 2>/dev/null) || return 1
+    [ "$PARENT_SHA" = "$ORIGIN_SHA" ] || return 1
+  fi
   git show "$1:Cargo.toml" 2>/dev/null | grep -qx "version = \"$VERSION\"" \
     && [ "$(git log -1 --format=%s "$1" 2>/dev/null)" = "release: $VERSION" ]
 }
@@ -50,6 +72,14 @@ elif is_release_bump_commit "$HEAD_SHA"; then
   # through; anything else ahead of origin for any other reason still dies.
   ok "on master, HEAD is $VERSION's own unpushed release commit — resuming"
 else
+  # Distinguish "HEAD looks like a release commit but fails the ancestry
+  # test" from a plain unrelated divergence, so the message names what was
+  # actually found instead of the generic mismatch both cases share.
+  if [ -n "$VERSION" ] && git show "$HEAD_SHA:Cargo.toml" 2>/dev/null | grep -qx "version = \"$VERSION\"" \
+     && [ "$(git log -1 --format=%s "$HEAD_SHA" 2>/dev/null)" = "release: $VERSION" ]; then
+    AHEAD=$(git rev-list --count "origin/master..$HEAD_SHA")
+    die "HEAD looks like $VERSION's release commit but is $AHEAD commit(s) ahead of origin/master, not 1 — something else is riding along, resolve by hand"
+  fi
   die "master differs from origin/master"
 fi
 
