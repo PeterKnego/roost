@@ -38,14 +38,21 @@ DRAFT=$(gh release view "$TAG" --json isDraft --jq .isDraft) \
 [ "$DRAFT" = false ] || die "$TAG is still a draft"
 ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name') \
   || die "could not list assets on $TAG"
+# Exact names, not extensions: `grep -qE '\.deb$'` passed with one of the two
+# expected .deb present and the other silently missing or wrong-arch — which,
+# given the arm64 .deb Architecture bug this same review round found, is
+# exactly the asset most likely to be absent or wrong. dist's own artifacts
+# each get a matching name here too; only the .deb/.rpm pairs are new.
 for want in \
-  roost-x86_64-unknown-linux-musl.tar.xz roost-aarch64-unknown-linux-musl.tar.xz \
-  roost-x86_64-apple-darwin.tar.xz roost-aarch64-apple-darwin.tar.xz \
-  roost-installer.sh roost.rb sha256.sum; do
+  roost-x86_64-unknown-linux-musl.tar.xz roost-x86_64-unknown-linux-musl.tar.xz.sha256 \
+  roost-aarch64-unknown-linux-musl.tar.xz roost-aarch64-unknown-linux-musl.tar.xz.sha256 \
+  roost-x86_64-apple-darwin.tar.xz roost-x86_64-apple-darwin.tar.xz.sha256 \
+  roost-aarch64-apple-darwin.tar.xz roost-aarch64-apple-darwin.tar.xz.sha256 \
+  roost-installer.sh roost.rb sha256.sum source.tar.gz source.tar.gz.sha256 \
+  "roost_${VERSION}_amd64.deb" "roost_${VERSION}_arm64.deb" \
+  "roost-${VERSION}.x86_64.rpm" "roost-${VERSION}.aarch64.rpm"; do
   echo "$ASSETS" | grep -qx "$want" || die "release is missing $want"
 done
-echo "$ASSETS" | grep -qE '\.deb$' || die "release has no .deb"
-echo "$ASSETS" | grep -qE '\.rpm$' || die "release has no .rpm"
 ok "release published with every expected asset"
 
 FORMULA=$(gh api repos/PeterKnego/homebrew-tap/contents/Formula/roost.rb --jq .content | base64 -d) \
