@@ -89,11 +89,14 @@ done <<< "$FORMULA"
 gh release download "$TAG" -D "$TMP" -p 'sha256.sum' >/dev/null \
   || die "could not download sha256.sum from $TAG"
 declare -A RELEASE_SHA=()
-# `sha256sum`'s own output ends with a trailing newline, which `read` turns
-# into one final empty $LINE — and `ARRAY[""]=` is not a failing command bash
-# reports through $?, so `set -e` does not stop it: it prints "bad array
-# subscript" to stderr and the loop just carries on. Skipping blank lines
-# avoids relying on errexit to catch something it silently does not.
+# `read` returns false at EOF rather than yielding one final empty $LINE, so
+# a well-formed sha256.sum (trailing newline and all) never hits this guard.
+# It is here for the file that is not well-formed: a hand-edited or
+# corrupted sha256.sum with a genuine blank line would assign into
+# ARRAY[""], which does abort the script under `set -e` — but with bash's
+# own "bad array subscript", naming neither this script nor what was wrong
+# with the input. The guard buys a clearer failure, not protection from one
+# that would otherwise slip through.
 while IFS= read -r LINE; do
   [ -n "$LINE" ] || continue
   HASH=${LINE%% *}
