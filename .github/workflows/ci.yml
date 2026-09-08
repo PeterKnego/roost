@@ -57,6 +57,13 @@ jobs:
       - name: Package tests
         run: scripts/test/packages.sh
 
+      # `cargo publish --dry-run` needs no credential and builds the crate from
+      # the PACKAGED tree rather than the working tree — the only thing that
+      # catches Cargo.toml's `include` list drifting away from what build.rs
+      # needs. On every push, rather than only on a release nobody can take back.
+      - name: Verify the crate packages
+        run: cargo publish --locked --dry-run
+
       # Runners have docker and the musl target is a rustup add away.
       - name: Install the musl target
         run: rustup target add x86_64-unknown-linux-musl
