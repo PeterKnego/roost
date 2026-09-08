@@ -61,7 +61,7 @@ github-attestations = true
 # its own tap, so a user who has tapped both must install by the fully
 # qualified name. See handover 6.1 — the collision is permanent and known.
 tap = "peterknego/homebrew-tap"
-publish-jobs = ["homebrew"]
+publish-jobs = ["homebrew", "./publish-crates-io"]
 
 # Runs in the global phase, not the local one: the local phase is a matrix, so
 # a job there sees one target's output. The global phase is the first point at

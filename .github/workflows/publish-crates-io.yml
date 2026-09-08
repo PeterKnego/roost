@@ -1,0 +1,65 @@
+# dist has no built-in crates.io job — its PublishStyle enum is Homebrew, Npm
+# and User(String) only — so this is a custom publish-jobs entry.
+#
+# No API token. crates.io Trusted Publishing exchanges GitHub's OIDC identity
+# for a 30-minute credential that its own post-step revokes, so nothing
+# long-lived is stored and there is no secret to mangle on the way in — which
+# is exactly how the v0.5.1 formula push failed (`Bad credentials`, a 401 on a
+# secret whose value was not a valid token).
+#
+# The trusted publisher on crates.io must be registered against this
+# top-level workflow's filename (release.yml), not this reusable file's own
+# name. crates.io matches the OIDC `workflow_ref` claim — its `GitHubClaims`
+# struct carries `workflow_ref` and has no `job_workflow_ref` — and GitHub
+# sets `workflow_ref` to the top-level workflow, not the reusable one that
+# actually runs. Registering `publish-crates-io.yml` is the intuitive choice
+# and it is rejected at exchange time.
+name: Publish to crates.io
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish-crates-io:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      # dist grants custom publish jobs id-token: write by default; stated here
+      # so the job cannot silently lose it if those defaults change.
+      id-token: write
+    env:
+      PLAN: ${{ inputs.plan }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+
+      # A crates.io version can never be reused — not after a yank, not ever.
+      # So a prerelease verifies the package the whole way up to the upload and
+      # stops, rather than burning a version to discover that `include` missed
+      # a file. Skipping outright would leave this path untested until the
+      # release that matters, which is precisely the blind spot that let the
+      # tap token through.
+      - name: Decide publish or dry run
+        id: mode
+        run: |
+          if [ "$(echo "$PLAN" | jq -r '.announcement_is_prerelease')" = "true" ]; then
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify the package builds (prerelease)
+        if: steps.mode.outputs.dry_run == 'true'
+        run: cargo publish --locked --dry-run
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        if: steps.mode.outputs.dry_run == 'false'
+        id: auth
+
+      - name: Publish
+        if: steps.mode.outputs.dry_run == 'false'
+        run: cargo publish --locked --token '${{ steps.auth.outputs.token }}'
