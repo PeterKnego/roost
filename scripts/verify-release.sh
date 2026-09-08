@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Reads every channel back from the outside. A green CI run says the jobs
+# exited 0; it does not say the shipped binary can load on the machines it is
+# aimed at. Only running the published artifact says that.
+#
+# Every `[ ]` below tests a variable, never a bare `$(...)`. Under
+# `set -euo pipefail`, a command substitution that fails still lets the `[ ]`
+# it sits inside run against whatever it produced (empty, or partial output) —
+# errexit does not see a failing substitution unless it is the whole of a
+# simple command. Splitting each into `VAR=$(cmd) || die ...` then `[ "$VAR" =
+# ... ]` turns "gh/curl failed" into "script stops with a reason", not "check
+# silently reads the failure as a pass". preflight.sh has the same rule, with
+# the same three failures being the reason it exists there.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+. scripts/lib.sh
+
+VERSION=${1:?usage: verify-release.sh <version>}
+TAG="v$VERSION"
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+
+phase verify
+need gh "install the GitHub CLI"; need jq "apt install jq"
+need curl "apt install curl"; need tar "apt install tar"
+need sha256sum "apt install coreutils"
+need readelf "apt install binutils"; need objdump "apt install binutils"
+
+DRAFT=$(gh release view "$TAG" --json isDraft --jq .isDraft) \
+  || die "could not read $TAG from GitHub — does it exist?"
+[ "$DRAFT" = false ] || die "$TAG is still a draft"
+ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name') \
+  || die "could not list assets on $TAG"
+for want in \
+  roost-x86_64-unknown-linux-musl.tar.xz roost-aarch64-unknown-linux-musl.tar.xz \
+  roost-x86_64-apple-darwin.tar.xz roost-aarch64-apple-darwin.tar.xz \
+  roost-installer.sh roost.rb sha256.sum; do
+  echo "$ASSETS" | grep -qx "$want" || die "release is missing $want"
+done
+echo "$ASSETS" | grep -qE '\.deb$' || die "release has no .deb"
+echo "$ASSETS" | grep -qE '\.rpm$' || die "release has no .rpm"
+ok "release published with every expected asset"
+
+FORMULA=$(gh api repos/PeterKnego/homebrew-tap/contents/Formula/roost.rb --jq .content | base64 -d) \
+  || die "could not fetch the tap formula"
+echo "$FORMULA" | grep -qx "  version \"$VERSION\"" || die "the tap formula is not at $VERSION"
+echo "$FORMULA" | grep -qx '  depends_on "dtach"' || die "the formula lost depends_on dtach"
+ok "tap formula at $VERSION, still declaring dtach"
+
+# A prerelease publishes to neither crates.io nor the tap — release.sh only
+# calls this script for non-prereleases, so running it by hand against a
+# prerelease tag is expected to die here. That is the checks working, not a
+# bug in them.
+NEWEST=$(curl -sS -H 'User-Agent: roost-release (peter@knego.net)' \
+  https://crates.io/api/v1/crates/roost | jq -r '.crate.newest_version') \
+  || die "could not determine crates.io's newest version — curl or jq failed"
+[ "$NEWEST" = "$VERSION" ] || die "crates.io newest is $NEWEST, not $VERSION"
+ok "crates.io at $VERSION"
+
+gh release download "$TAG" -D "$TMP" \
+  -p 'roost-x86_64-unknown-linux-musl.tar.xz*' >/dev/null \
+  || die "could not download the linux-musl tarball from $TAG"
+( cd "$TMP" && sha256sum -c roost-x86_64-unknown-linux-musl.tar.xz.sha256 >/dev/null ) \
+  || die "published checksum does not match the published tarball"
+ok "published checksum verifies"
+
+# gh 2.46 has no `attestation` subcommand, so this goes through the REST API.
+# It confirms an attestation exists and covers this artifact; it does NOT
+# verify the signature — that needs a newer gh or cosign, neither present here.
+DIGEST=$(sha256sum "$TMP/roost-x86_64-unknown-linux-musl.tar.xz" | cut -d' ' -f1) \
+  || die "could not hash the downloaded tarball"
+# gh api exits nonzero on a 404, which is exactly what "no attestation for
+# this digest" looks like — so a failed query and a genuinely missing
+# attestation both land here. Both mean "cannot show this artifact came from
+# the release workflow", so both die; there is no case where treating the
+# query failure as a pass would be correct.
+COUNT=$(gh api "repos/PeterKnego/roost/attestations/sha256:$DIGEST" --jq '.attestations | length') \
+  || die "no attestation covers the published tarball (query failed or none exist)"
+[ "$COUNT" -ge 1 ] || die "no attestation covers the published tarball"
+ok "attestation covers the published tarball (existence, not signature)"
+
+tar -xJf "$TMP/roost-x86_64-unknown-linux-musl.tar.xz" -C "$TMP" \
+  || die "could not extract the published tarball"
+BIN="$TMP/roost-x86_64-unknown-linux-musl/roost"
+[ -f "$BIN" ] || die "extracted archive has no roost binary at the expected path"
+
+# readelf -d exits 0 on a genuinely static binary (it just reports no dynamic
+# section) and only exits nonzero when it could not read the file at all — so
+# capturing its exit status distinguishes "checked, and it is static" from
+# "could not check". Piping straight into `grep -q needed && die`, as an
+# earlier draft of this script did, would not: a failed readelf produces no
+# output, grep finds no "needed" in nothing, and `&&` never fires — a broken
+# tool or an unreadable binary would silently read as "verified static".
+READELF_OUT=$(readelf -d "$BIN" 2>&1) || die "readelf could not read the extracted binary"
+echo "$READELF_OUT" | grep -qi needed && die "the published binary is dynamically linked"
+
+# objdump -T is the opposite shape: it exits 1 on a *genuinely static* binary
+# ("not a dynamic object" — the case this check wants to see), so treating its
+# exit status as failure the way readelf's is above would die on every clean
+# build. The readelf check just above already proved $BIN is a real, readable
+# ELF file, so the only thing objdump's exit status could still be flagging by
+# this point is "static", not "unreadable" — safe to judge this one on its
+# output alone.
+OBJDUMP_OUT=$(objdump -T "$BIN" 2>&1) || true
+echo "$OBJDUMP_OUT" | grep -q GLIBC && die "the published binary references GLIBC"
+
+BIN_VERSION=$("$BIN" --version 2>&1) || die "the published binary failed to run: $BIN_VERSION"
+[ "$BIN_VERSION" = "roost $VERSION" ] || die "the published binary reports the wrong version (got: $BIN_VERSION)"
+ok "published binary is static, GLIBC-free, and reports $VERSION"
