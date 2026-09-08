@@ -344,11 +344,40 @@ discovering each cost at submission time.
 - **Show HN.** Comparison questions will come in the first comments. Prepare an
   answer, not a correction.
 
-**6.2 — License metadata.**
-`Cargo.toml` declares `MIT OR Apache-2.0`. Both `LICENSE-MIT` and
-`LICENSE-APACHE` are in the repository. The GitHub API reports the license as
-Apache-2.0 only. Distribution packagers read the GitHub field. Correct the
-detection, or the packages will state the wrong license.
+**6.2 — License metadata. Investigated 2026-09-08: do not "correct the
+detection". It is not correctable, and every peer reads the same way.**
+
+The mechanism is confirmed: `gh api repos/PeterKnego/roost/license` resolves to
+`LICENSE-APACHE` alone. GitHub's detector matches one `LICENSE-*` file and
+drops the other silently — the alphabetically first, here.
+
+The instinct to fix the field is wrong, and this is what changed the advice.
+Every major dual-licensed Rust project reads exactly the same way:
+
+| Repository | GitHub reports | detected from | root files |
+|---|---|---|---|
+| `serde-rs/serde` | Apache-2.0 | `LICENSE-APACHE` | `LICENSE-APACHE`, `LICENSE-MIT` |
+| `rust-lang/regex` | Apache-2.0 | `LICENSE-APACHE` | `LICENSE-APACHE`, `LICENSE-MIT` |
+| `clap-rs/clap` | Apache-2.0 | `LICENSE-APACHE` | `LICENSE-APACHE`, `LICENSE-MIT` |
+| `rust-lang/cargo` | Apache-2.0 | `LICENSE-APACHE` | `LICENSE-APACHE`, `LICENSE-MIT`, … |
+
+Both ways of changing the field make it differently wrong. Adding a root
+`LICENSE` naming both licences reports as "Other"/`NOASSERTION`. Renaming
+`LICENSE-MIT` to `LICENSE` reports MIT and drops Apache instead. Either
+diverges from the layout every Rust packager already recognises, in exchange
+for a field that is still not `MIT OR Apache-2.0`.
+
+**What was actually wrong, and is now fixed.** The README carried a licence
+badge linking to `#license` and had no `## License` section at all — a dead
+anchor at the one place a human looks. A `## License` section now states both
+licences, links both files, and says in as many words that the GitHub sidebar
+is not authoritative and why.
+
+**What is still to do, at Step 5.** `Cargo.toml`'s `MIT OR Apache-2.0` is what
+crates.io shows and is already what the generated formula carries — verified:
+`roost.rb` contains `license any_of: ["MIT", "Apache-2.0"]`. The AUR PKGBUILD
+and any future deb/rpm must declare **both** explicitly rather than copying the
+GitHub field; that is the only place this can still go wrong.
 
 **6.3 — macOS Gatekeeper.**
 Binaries that a browser downloads are quarantined. Binaries that `curl` fetches

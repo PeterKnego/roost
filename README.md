@@ -90,6 +90,16 @@ Also, Roost can install hooks into `claude` to enable notification every time `c
 `roost` only binds to `127.0.0.1` and is meant to be fronted by an auth layer,
 such as `tailscale`. More about it in [SECURITY.md](SECURITY.md)
 
+## License
 
+Dual-licensed under either of
 
+- MIT ([LICENSE-MIT](LICENSE-MIT))
+- Apache License 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+
+at your option — the Rust ecosystem's usual `MIT OR Apache-2.0`, and what
+`Cargo.toml` declares. Note that GitHub's sidebar reports "Apache License 2.0"
+alone: its detector picks a single `LICENSE-*` file and drops the other. serde,
+regex, clap and cargo itself all read the same way. `Cargo.toml` and this
+section are authoritative; the sidebar is not.
 
