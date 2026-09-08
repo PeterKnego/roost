@@ -72,3 +72,15 @@ assets = [
     ["packaging/roost.service", "usr/lib/systemd/user/roost.service", "644"],
 ]
 maintainer-scripts = "packaging/debian/"
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/roost", dest = "/usr/bin/roost", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/roost/README.md", mode = "644" },
+    { source = "LICENSE-MIT", dest = "/usr/share/doc/roost/LICENSE-MIT", mode = "644" },
+    { source = "LICENSE-APACHE", dest = "/usr/share/doc/roost/LICENSE-APACHE", mode = "644" },
+    { source = "packaging/roost.service", dest = "/usr/lib/systemd/user/roost.service", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+dtach = "*"

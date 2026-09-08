@@ -7,6 +7,7 @@ cd "$(dirname "$0")/../.."
 . scripts/lib.sh
 
 need dpkg-deb "apt install dpkg"
+need rpm "apt install rpm"
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 FIXTURE="$TMP/roost"
@@ -42,3 +43,29 @@ ok "the packaged binary is byte-identical to the input"
 dpkg-deb --fsys-tarfile "$DEB" | tar -xO ./usr/lib/systemd/user/roost.service \
   | grep -q '^KillMode=process$' || die "the packaged unit lacks KillMode=process"
 ok "the packaged unit sets KillMode=process"
+
+phase "rpm"
+RPM=$(scripts/package-rpm.sh "$FIXTURE" 9.9.9 x86_64 | tail -1)
+[ -f "$RPM" ] || die "no .rpm produced at $RPM"
+
+rpm -qp --requires "$RPM" 2>/dev/null | grep -qx 'dtach' \
+  || die "the .rpm does not require dtach"
+ok "requires dtach"
+
+rpm -qpl "$RPM" 2>/dev/null | grep -qx '/usr/lib/systemd/user/roost.service' \
+  || die "the unit is missing from the .rpm"
+ok "ships the systemd user unit"
+
+rpm -qpl "$RPM" 2>/dev/null | grep -qx '/usr/bin/roost' || die "no /usr/bin/roost in the .rpm"
+ok "ships /usr/bin/roost"
+
+# Same reasoning as the .deb's byte-identity check above, and the assertion
+# that actually catches the staging bug this task's brief walks straight into:
+# rpm -qpl only proves a path exists in the archive, not whose binary it is.
+RPMEXTRACT="$TMP/rpmextract"; mkdir -p "$RPMEXTRACT"
+RPMABS="$(pwd)/$RPM"
+(cd "$RPMEXTRACT" && rpm2cpio "$RPMABS" | cpio -idm --quiet ./usr/bin/roost) \
+  || die "could not extract /usr/bin/roost from the .rpm"
+[ "$(sha256sum < "$RPMEXTRACT/usr/bin/roost" | cut -d' ' -f1)" = "$(sha256sum < "$FIXTURE" | cut -d' ' -f1)" ] \
+  || die "the .rpm contains a different binary than the one passed in"
+ok "the packaged binary is byte-identical to the input"
