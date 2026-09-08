@@ -18,23 +18,67 @@ case "$VERSION" in *-*) PRERELEASE=true ;; *) PRERELEASE=false ;; esac
 scripts/preflight.sh "$VERSION"
 
 phase release
-# Matches the first `version = "..."` line regardless of what it currently
-# holds — Cargo.toml has exactly one (checked above), the package's own, so
-# there is nothing here that assumes a particular prior version. The grep
-# below is the real guarantee: it re-reads the file afterward instead of
-# trusting the sed matched.
-sed -i "0,/^version = \".*\"$/s//version = \"$VERSION\"/" Cargo.toml
+# The sed below matches the first `version = "..."` line and assumes it is
+# the only one — the package's own. Checked here rather than assumed: a
+# second match earlier in the file would make `0,/re/` touch the wrong line
+# and this whole block would bump, commit and tag against unchanged content.
+VERSION_LINES=$(grep -c '^version = "' Cargo.toml)
+[ "$VERSION_LINES" = 1 ] || die "Cargo.toml has $VERSION_LINES lines matching '^version = \"...\"', expected exactly 1"
+
+# Bump, commit and tag are each made idempotent so a re-run after a partial
+# failure (tag push rejected, network drop, the operator's Ctrl-C) resumes
+# instead of dying at a `git commit` with nothing staged or a `git tag` that
+# already exists — which is the exact recovery story this script exists to
+# provide. Each branch below says which it did.
+CARGO_LINE=$(grep -m1 '^version = "' Cargo.toml)
+if [ "$CARGO_LINE" = "version = \"$VERSION\"" ]; then
+  ok "Cargo.toml already at $VERSION"
+else
+  sed -i "0,/^version = \".*\"$/s//version = \"$VERSION\"/" Cargo.toml
+  grep -qx "version = \"$VERSION\"" Cargo.toml || die "the version bump did not take"
+  ok "Cargo.toml bumped to $VERSION"
+fi
 cargo check --quiet
-grep -qx "version = \"$VERSION\"" Cargo.toml || die "the version bump did not take"
 # `ci.yml` runs `cargo build --locked`, which fails on a lock file that has
 # drifted from Cargo.toml — and by the time that happens the tag pushed below
 # is already public. `cargo check` just above refreshes the lock as a side
 # effect; this confirms it actually landed rather than trusting that it did.
 cargo metadata --locked --format-version 1 >/dev/null 2>&1 || die "Cargo.lock did not stay in sync after the version bump"
-ok "Cargo.toml and Cargo.lock at $VERSION"
+ok "Cargo.lock in sync"
+
 git add Cargo.toml Cargo.lock
-git commit -q -m "release: $VERSION"
-git tag -a "$TAG" -m "roost $VERSION"
+if git diff --cached --quiet; then
+  # Nothing staged: either a prior run already made the bump commit, or
+  # something else put Cargo.toml at this version. Only the former is safe
+  # to resume from, so check HEAD itself rather than assume.
+  HEAD_CARGO_LINE=$(git show HEAD:Cargo.toml | grep -m1 '^version = "')
+  if [ "$HEAD_CARGO_LINE" = "version = \"$VERSION\"" ]; then
+    ok "release: $VERSION already committed"
+  else
+    die "Cargo.toml is at $VERSION but nothing is staged and HEAD is not the release commit — resolve by hand"
+  fi
+else
+  git commit -q -m "release: $VERSION"
+  ok "committed the version bump"
+fi
+
+if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+  TAG_SHA=$(git rev-parse "$TAG^{commit}")
+  HEAD_SHA=$(git rev-parse HEAD)
+  if [ "$TAG_SHA" = "$HEAD_SHA" ]; then
+    ok "tag $TAG already exists locally and points at HEAD"
+  else
+    die "tag $TAG already exists but points at $TAG_SHA, not HEAD ($HEAD_SHA) — re-pointing a tag is forbidden, resolve by hand"
+  fi
+else
+  git tag -a "$TAG" -m "roost $VERSION"
+  ok "tagged $TAG"
+fi
+
+# `git push` of a ref the remote already has at the same commit is a no-op
+# (exit 0, "Everything up-to-date") rather than an error — confirmed against
+# a real remote while writing this fix, not assumed. So re-running after
+# master was already pushed does not fail here.
 git push -q origin master
 ok "master pushed"
 
