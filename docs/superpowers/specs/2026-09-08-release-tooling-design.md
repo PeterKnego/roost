@@ -115,13 +115,23 @@ Any failure stops the run before a tag exists.
 | `cargo test --locked -- --test-threads=1` passes | The obvious one. Single-threaded is deliberate; a bare `cargo test` has hung on the shared registry |
 | `dtach` and `git` on `PATH` | Tests that silently substitute their way past a missing runtime dependency |
 | Tap token valid (dispatched, ~15s) | Exactly v0.5.1: four targets built, release created, then `Bad credentials` |
-| crates.io trusted publisher registered | The same failure shape on the other publish job |
 | Working tree builds for both musl targets | A cross-compile break found on the tag rather than before it |
 
 The last check is the one with a real cost — two musl builds — and it is
 deliberate: the `aarch64` cross-link fails outright on an x86_64 host without
 `.cargo/config.toml`'s `linker = "rust-lld"`, and that file is exactly the kind
 of thing a refactor deletes as unused.
+
+**Not automated: crates.io trusted publisher registered.** crates.io does
+expose `/api/v1/trusted_publishing/github_configs?crate=<name>`, which could in
+principle answer this — but it requires an authenticated request (measured:
+unauthenticated, it returns 403 "this action requires authentication", not a
+public read). Automating it means preflight holding a crates.io API token,
+which is exactly the stored, mistypeable secret Trusted Publishing was chosen
+over for the publish job itself (see "crates.io" above — the whole point was
+no secret to mistype). Confirm this by hand, in the crates.io UI, before
+cutting a release; `scripts/preflight.sh` documents this in a comment rather
+than silently omitting the row.
 
 ### Prereleases
 

@@ -123,6 +123,16 @@ if [ -n "$VERSION" ]; then
   ok "$VERSION is free on crates.io"
 fi
 
+# NOT CHECKED HERE: that the crates.io Trusted Publisher is registered for
+# this repo/workflow. crates.io does have an API for it
+# (/api/v1/trusted_publishing/github_configs?crate=roost), but unlike the
+# plain version-lookup above it requires an authenticated request — measured:
+# unauthenticated, it 403s with "this action requires authentication".
+# Automating this check would mean preflight holding a crates.io API token,
+# which is exactly the stored, mistypeable secret Trusted Publishing was
+# adopted to avoid for the publish job itself. Confirm this by hand, in the
+# crates.io UI, before cutting a release.
+
 # The aarch64 cross-link dies without .cargo/config.toml's linker = "rust-lld",
 # and that file looks exactly like dead configuration to anyone tidying up.
 for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
