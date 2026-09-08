@@ -14,19 +14,25 @@ ARCH=${3:?usage: package-deb.sh <binary> <version> <arch>}
 need cargo-deb "cargo install cargo-deb"
 [ -f "$BIN" ] || die "no binary at $BIN"
 
-# cargo-deb reads assets relative to the target dir, so the binary is placed
-# where the metadata says rather than passed as a path.
-STAGE=target/release
-mkdir -p "$STAGE"
-install -m 755 "$BIN" "$STAGE/roost"
+# The Cargo.toml asset "target/release/roost" is not a literal relative path:
+# cargo-deb resolves it through `cargo metadata`'s real target directory, which
+# on a host with a shared target-dir (see CLAUDE.md) is NOT ./target. Staging
+# into ./target/release therefore both misses — cargo-deb packs whatever is
+# already sitting in the real target dir, silently stale — and, on a host
+# where ./target/release *is* the real one, clobbers a developer's own build
+# (and a later `cargo build --release` won't repair it: cargo trusts its
+# fingerprint, not file content). A private CARGO_TARGET_DIR sidesteps both.
+STAGE=$(mktemp -d); trap 'rm -rf "$STAGE"' EXIT
+mkdir -p "$STAGE/release"
+install -m 755 "$BIN" "$STAGE/release/roost"
 
 mkdir -p target/distrib
 # --no-strip because the binary is already stripped ([profile.release] strip =
 # true) and because the host `strip` cannot process a cross-built aarch64
 # binary anyway.
-cargo deb --no-build --no-strip \
+CARGO_TARGET_DIR="$STAGE" cargo deb --no-build --no-strip \
   --deb-version "$VERSION" \
-  --output "target/distrib/roost_${VERSION}_${ARCH}.deb" \
+  --output "$(pwd)/target/distrib/roost_${VERSION}_${ARCH}.deb" \
   >/dev/null
 
 ok "built roost_${VERSION}_${ARCH}.deb"

@@ -28,6 +28,15 @@ ok "ships the systemd user unit"
 dpkg-deb -c "$DEB" | grep -q './usr/bin/roost' || die "no /usr/bin/roost in the .deb"
 ok "ships /usr/bin/roost"
 
+# Path existence cannot distinguish the right binary from a stale one sitting
+# wherever cargo-deb actually resolved its target dir to. This is the
+# assertion that would have caught the shared-target-dir bug: the packed
+# binary must be the exact bytes handed to package-deb.sh, not merely present.
+dpkg-deb --fsys-tarfile "$DEB" | tar -xO ./usr/bin/roost > "$TMP/packed"
+[ "$(sha256sum < "$TMP/packed" | cut -d' ' -f1)" = "$(sha256sum < "$FIXTURE" | cut -d' ' -f1)" ] \
+  || die "the .deb contains a different binary than the one passed in"
+ok "the packaged binary is byte-identical to the input"
+
 # The unit could ship empty or with the default kill mode and every path check
 # above would still pass. Assert the property, not the file's existence.
 dpkg-deb --fsys-tarfile "$DEB" | tar -xO ./usr/lib/systemd/user/roost.service \
