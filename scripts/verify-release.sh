@@ -11,6 +11,14 @@
 # ... ]` turns "gh/curl failed" into "script stops with a reason", not "check
 # silently reads the failure as a pass". preflight.sh has the same rule, with
 # the same three failures being the reason it exists there.
+#
+# This script opens the actual contents of exactly one of the release's
+# artifacts: the x86_64 linux-musl tarball. The aarch64 linux-musl binary and
+# both macOS binaries are checked by filename and by the sha256 the tap
+# formula and sha256.sum claim for them, never by running them — aarch64
+# would need qemu-user-static, and macOS cannot run here at all. A pass below
+# is a verdict on the release's metadata and on one real binary, not a verdict
+# that every published binary loads on its target.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/lib.sh
@@ -22,7 +30,7 @@ TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 phase verify
 need gh "install the GitHub CLI"; need jq "apt install jq"
 need curl "apt install curl"; need tar "apt install tar"
-need sha256sum "apt install coreutils"
+need sha256sum "apt install coreutils"; need base64 "apt install coreutils"
 need readelf "apt install binutils"; need objdump "apt install binutils"
 
 DRAFT=$(gh release view "$TAG" --json isDraft --jq .isDraft) \
@@ -45,6 +53,64 @@ FORMULA=$(gh api repos/PeterKnego/homebrew-tap/contents/Formula/roost.rb --jq .c
 echo "$FORMULA" | grep -qx "  version \"$VERSION\"" || die "the tap formula is not at $VERSION"
 echo "$FORMULA" | grep -qx '  depends_on "dtach"' || die "the formula lost depends_on dtach"
 ok "tap formula at $VERSION, still declaring dtach"
+
+# The version line and depends_on are not what `brew install` fetches — the
+# per-platform `url`/`sha256` pairs are, and a stale or wrong sha256 there
+# breaks installation for every Homebrew user while every check above still
+# passes. Verified against the real cargo-dist-generated formula (fetched
+# during this fix) that each `sha256` line is the line immediately following
+# its `url` line, for all four platform blocks, with nothing else between
+# them — so pairing "most recently seen url" with "next sha256" is exact for
+# this generator's output, not a guess. If a future formula ever breaks that
+# adjacency, an artifact would end up with no paired hash and the die below
+# for a missing entry catches it, rather than silently pairing the wrong url.
+declare -A FORMULA_SHA=()
+URL_LINE=
+while IFS= read -r LINE; do
+  case "$LINE" in
+    *'url "'*)
+      URL_LINE=$LINE
+      ;;
+    *'sha256 "'*)
+      if [ -n "$URL_LINE" ]; then
+        ARTIFACT=${URL_LINE##*/}; ARTIFACT=${ARTIFACT%\"}
+        SHA=${LINE#*sha256 \"}; SHA=${SHA%\"}
+        FORMULA_SHA["$ARTIFACT"]=$SHA
+        URL_LINE=
+      fi
+      ;;
+  esac
+done <<< "$FORMULA"
+
+# sha256.sum is the release's own authoritative hash list, and downloading it
+# — one small text asset — is what lets this check cover all four platform
+# artifacts without fetching and re-hashing four tarballs just to check a
+# hash the release already publishes.
+gh release download "$TAG" -D "$TMP" -p 'sha256.sum' >/dev/null \
+  || die "could not download sha256.sum from $TAG"
+declare -A RELEASE_SHA=()
+# `sha256sum`'s own output ends with a trailing newline, which `read` turns
+# into one final empty $LINE — and `ARRAY[""]=` is not a failing command bash
+# reports through $?, so `set -e` does not stop it: it prints "bad array
+# subscript" to stderr and the loop just carries on. Skipping blank lines
+# avoids relying on errexit to catch something it silently does not.
+while IFS= read -r LINE; do
+  [ -n "$LINE" ] || continue
+  HASH=${LINE%% *}
+  RELEASE_SHA["${LINE#*\*}"]=$HASH
+done < "$TMP/sha256.sum"
+
+for artifact in \
+  roost-x86_64-unknown-linux-musl.tar.xz roost-aarch64-unknown-linux-musl.tar.xz \
+  roost-x86_64-apple-darwin.tar.xz roost-aarch64-apple-darwin.tar.xz; do
+  WANT=${RELEASE_SHA[$artifact]:-}
+  GOT=${FORMULA_SHA[$artifact]:-}
+  [ -n "$WANT" ] || die "sha256.sum has no entry for $artifact"
+  [ -n "$GOT" ] || die "tap formula has no url/sha256 pair for $artifact"
+  [ "$WANT" = "$GOT" ] \
+    || die "tap formula sha256 for $artifact is $GOT, but the release's sha256.sum says $WANT"
+done
+ok "tap formula hashes match the release's sha256.sum for all four platform artifacts"
 
 # A prerelease publishes to neither crates.io nor the tap — release.sh only
 # calls this script for non-prereleases, so running it by hand against a
