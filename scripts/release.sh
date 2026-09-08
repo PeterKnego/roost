@@ -85,18 +85,28 @@ ok "master pushed"
 phase ci
 # `gh run list --limit 1` returns the newest run of the workflow, which need
 # not be the one this push triggers — a concurrent or leftover run would be
-# picked and its unrelated conclusion trusted instead. Recording the time
-# before the tag goes up, then filtering to runs created at or after it and
-# taking the newest of those, ties every poll below to the run this push
-# actually caused. Same defect and same fix as preflight.sh's tap-token check.
-DISPATCHED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# picked and its unrelated conclusion trusted instead. `headBranch` for a
+# tag-triggered run is the tag itself (measured: `gh run list --json
+# headBranch` against this repo's own v0.5.2-rc.1 run reports headBranch
+# "v0.5.2-rc.1"), so filtering on it — not on when the run was created —
+# ties every poll below to the run this specific tag caused, and does so
+# whether that run was dispatched by this invocation or an earlier one.
+#
+# That second case is what makes this resumable: `git push` of a ref the
+# remote already has at the same commit is a no-op (confirmed against a real
+# remote), so on a re-run after the tag was already pushed, this push does
+# not dispatch a new run — there is no new run to wait for. A DISPATCHED_AT
+# timestamp captured now, after that earlier run started, would filter the
+# existing run out and this would wait 3 minutes for one that never comes.
+# Matching on the tag instead finds the run that already exists and
+# re-attaches to it, whatever its status.
 git push -q origin "$TAG"
-ok "tagged $TAG and pushed"
+ok "tag $TAG pushed (or already up to date)"
 
 list_release_run() {
   gh run list --workflow=Release --limit 10 \
-    --json databaseId,conclusion,status,createdAt \
-    --jq "[.[] | select(.createdAt >= \"$DISPATCHED_AT\")] | sort_by(.createdAt) | last"
+    --json databaseId,conclusion,status,createdAt,headBranch \
+    --jq "[.[] | select(.headBranch == \"$TAG\")] | sort_by(.createdAt) | last"
 }
 
 sleep 10

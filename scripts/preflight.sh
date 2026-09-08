@@ -11,8 +11,21 @@ EXPECTED_TARGETS='aarch64-apple-darwin aarch64-unknown-linux-musl x86_64-apple-d
 
 phase preflight
 need git "install git"; need gh "install the GitHub CLI"; need dist "cargo install cargo-dist"
-need jq "apt install jq"; need dtach "apt install dtach"
+need jq "apt install jq"; need dtach "apt install dtach"; need curl "apt install curl"
+need cargo "install rust"
 ok "required tools present"
+
+# release.sh's bump/commit/tag block is idempotent so a re-run after a
+# partial push resumes instead of dying — but only if preflight lets it
+# reach that block at all. This tells the two checks below (master-sync and
+# the tag check) "is $1 a commit release.sh itself already made for exactly
+# this version bump", so a resume can tell that apart from a genuine
+# collision, without weakening either check for a fresh release.
+is_release_bump_commit() {
+  [ -n "$VERSION" ] || return 1
+  git show "$1:Cargo.toml" 2>/dev/null | grep -qx "version = \"$VERSION\"" \
+    && [ "$(git log -1 --format=%s "$1" 2>/dev/null)" = "release: $VERSION" ]
+}
 
 [ "$(git rev-parse --abbrev-ref HEAD)" = master ] || die "not on master"
 
@@ -28,8 +41,17 @@ DIRTY=$(git status --porcelain)
 git fetch --quiet origin
 HEAD_SHA=$(git rev-parse HEAD)
 ORIGIN_SHA=$(git rev-parse origin/master)
-[ "$HEAD_SHA" = "$ORIGIN_SHA" ] || die "master differs from origin/master"
-ok "on master, clean, in sync with origin"
+if [ "$HEAD_SHA" = "$ORIGIN_SHA" ]; then
+  ok "on master, clean, in sync with origin"
+elif is_release_bump_commit "$HEAD_SHA"; then
+  # HEAD is ahead of origin/master by exactly $VERSION's own bump commit —
+  # the state release.sh leaves things in if it dies before "master pushed"
+  # completes. That is the master-push partial failure this check must let
+  # through; anything else ahead of origin for any other reason still dies.
+  ok "on master, HEAD is $VERSION's own unpushed release commit — resuming"
+else
+  die "master differs from origin/master"
+fi
 
 # `cargo build --locked` rejects a lock file that has drifted from Cargo.toml,
 # and in CI that failure lands on the tag, after the tag is public.
@@ -60,10 +82,34 @@ ACTUAL=$(dist plan --output-format=json | jq -r '[.artifacts[] | select(.kind=="
 ok "dist builds exactly the four expected targets"
 
 if [ -n "$VERSION" ]; then
-  git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null && die "tag v$VERSION already exists locally"
+  # A local tag is not automatically a collision: release.sh creates the tag
+  # before either push, so both partial-failure windows (master push failed,
+  # tag push failed) leave one behind for the release currently in
+  # progress. Distinguish that from a genuine collision by what the tag
+  # actually points at, not by whether it exists.
+  TAG_IS_OWN_BUMP=false
+  if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+    TAG_SHA=$(git rev-parse "refs/tags/v$VERSION^{commit}")
+    if is_release_bump_commit "$TAG_SHA"; then
+      TAG_IS_OWN_BUMP=true
+    else
+      die "tag v$VERSION already exists locally but is not this release's own bump commit — re-pointing a tag is forbidden, resolve by hand"
+    fi
+  fi
+
   REMOTE_TAG=$(git ls-remote --tags origin "refs/tags/v$VERSION")
-  [ -z "$REMOTE_TAG" ] || die "tag v$VERSION already exists on origin"
-  ok "tag v$VERSION is free"
+  if [ -n "$REMOTE_TAG" ] && [ "$TAG_IS_OWN_BUMP" != true ]; then
+    # Origin has this tag but our local repo either has no tag at all or one
+    # that didn't match above (and already died there) — either way this
+    # push did not come from resuming a release in this checkout.
+    die "tag v$VERSION already exists on origin — resolve by hand"
+  fi
+
+  if [ "$TAG_IS_OWN_BUMP" = true ]; then
+    ok "tag v$VERSION already exists and is this release's own bump commit — resuming"
+  else
+    ok "tag v$VERSION is free"
+  fi
 
   # A crates.io version can never be reused, not even after a yank.
   PUBLISHED=$(curl -sS -H 'User-Agent: roost-release (peter@knego.net)' \
