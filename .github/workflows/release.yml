@@ -301,7 +301,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: true
-          repository: "peterknego/homebrew-roost"
+          repository: "peterknego/homebrew-tap"
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
       # So we have access to the formula
       - name: Fetch homebrew formulae

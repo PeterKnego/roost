@@ -38,16 +38,21 @@ checksum = "sha256"
 github-attestations = true
 
 # The tap dist pushes the generated formula to on each tagged release. This is
-# the *repository* name, and Homebrew requires the `homebrew-` prefix on it
-# (tap.rb: `full_repository = "homebrew-#{repository}"`), so the repository
-# `homebrew-roost` is the tap `peterknego/roost` and the install command is
-# `brew install peterknego/roost/roost`. There is no shorthand that collapses
-# the repeat — a tap named after its one formula still names the formula.
+# the *repository* name; Homebrew requires the `homebrew-` prefix on it
+# (tap.rb: `full_repository = "homebrew-#{repository}"`), so this repository is
+# the tap `peterknego/tap` and the command is `brew install peterknego/tap/roost`.
 #
-# Lower case deliberately, and it is not merely cosmetic: Homebrew downcases a
-# tap name (`tap.rb`: `@name = "#{user}/#{repository}".downcase`) and GitHub
-# resolves the path case-insensitively, so this and `PeterKnego/...` are the
-# same repository and the same tap. Written the way a user types it.
+# A tap named for the formula — `homebrew-roost`, giving
+# `peterknego/roost/roost` — was tried and reverted. Homebrew has no shorthand
+# collapsing a tap onto a same-named formula, so the repeat buys nothing, and a
+# per-formula tap is a dead end: every future binary in this account would need
+# its own repository and its own `brew tap` from the user, where one tap carries
+# them all to anyone who has already tapped it.
+#
+# Lower case deliberately, and not merely cosmetic: Homebrew downcases a tap
+# name (`tap.rb`: `@name = "#{user}/#{repository}".downcase`) and GitHub resolves
+# the path case-insensitively, so this and `PeterKnego/...` are the same
+# repository and the same tap. Written the way a user types it.
 #
 # The repository must already exist and the publishing token must have write
 # access to it, or the publish job fails after every artifact has been built.
@@ -55,7 +60,7 @@ github-attestations = true
 # Namespaced on purpose: `navbytes/roost` ships a binary of the same name from
 # its own tap, so a user who has tapped both must install by the fully
 # qualified name. See handover 6.1 — the collision is permanent and known.
-tap = "peterknego/homebrew-roost"
+tap = "peterknego/homebrew-tap"
 publish-jobs = ["homebrew"]
 
 # dtach is a *runtime* prerequisite, not a build one — roost spawns it, it is

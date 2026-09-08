@@ -196,14 +196,14 @@ and the `ubuntu-22.04-arm` runner. The first tag is the test.
 
 ### Step 2 — Publish a Homebrew tap — **done 2026-09-08, blocked on one secret**
 
-`PeterKnego/homebrew-roost` exists, is public, and holds a seed `README.md` — a
+`PeterKnego/homebrew-tap` exists, is public, and holds a seed `README.md` — a
 tap must not be an empty repository, because dist checks it out to push the
 formula and an empty repository has no default branch to check out. The README
 carries the 6.4 loopback warning and the 6.1 `PATH` collision, per the rule that
 every package description states both.
 
 `dist-workspace.toml` gained `installers = ["shell", "homebrew"]`,
-`tap = "peterknego/homebrew-roost"`, `publish-jobs = ["homebrew"]`, and:
+`tap = "peterknego/homebrew-tap"`, `publish-jobs = ["homebrew"]`, and:
 
 ```toml
 [dist.dependencies.homebrew]
@@ -219,18 +219,32 @@ Verified by generating the formula, not by reading the configuration:
 `depends_on "dtach"`, `license any_of: ["MIT", "Apache-2.0"]`, and macOS/Linux
 × arm/intel URLs pointing at the four release artifacts. `dist generate` wrote
 a `publish-homebrew-formula` job with
-`repository: "peterknego/homebrew-roost"`.
+`repository: "peterknego/homebrew-tap"`.
 
-**The tap is `peterknego/roost`, so the install command is
-`brew install peterknego/roost/roost`.** Homebrew requires the repository to
-carry a `homebrew-` prefix — `tap.rb`:
-`full_repository = "homebrew-#{repository}"` — so tap `peterknego/roost` is
-repository `homebrew-roost`, and no shorthand collapses a tap onto a formula of
-the same name. Case is irrelevant: `tap.rb` sets
+**The install command is `brew install peterknego/tap/roost`.** Homebrew
+requires the repository to carry a `homebrew-` prefix — `tap.rb`:
+`full_repository = "homebrew-#{repository}"` — so the repository
+`homebrew-tap` is the tap `peterknego/tap`. Case is irrelevant: `tap.rb` sets
 `@name = "#{user}/#{repository}".downcase`, and GitHub resolves the path
-case-insensitively (`gh api repos/peterknego/homebrew-roost` answers with
-`PeterKnego/homebrew-roost`). Lower case is used throughout because that is how
-a user types it.
+case-insensitively (`gh api repos/peterknego/homebrew-tap` answers with
+`PeterKnego/homebrew-tap`). Lower case is used throughout because that is how a
+user types it.
+
+**A per-formula tap was tried on 2026-09-08 and reverted.** Naming the
+repository `homebrew-roost` makes the tap `peterknego/roost` and the command
+`brew install peterknego/roost/roost` — Homebrew has no shorthand collapsing a
+tap onto a same-named formula, so the repeat buys nothing and reads as a typo
+in the one venue (Show HN) where 6.1 already guarantees a naming conversation.
+The deciding cost is future: `ultima_cluster`, `ultima_db`, `kondi` and
+`gomatch` are all binaries in this account, and one tap carries every one of
+them to a user who has tapped once, where a per-formula tap needs a fresh
+repository and a fresh `brew tap` for each.
+
+**The tap name is nowhere in the formula** — it only names the repository
+`actions/checkout` clones. Regenerating across the rename produced a
+byte-identical `roost.rb` (`diff` clean). That is why the name is still free to
+change today and will not be after the first release: once a user has run
+`brew tap`, a rename leaves their clone on a GitHub redirect.
 
 **Outstanding — needs a browser, so it could not be done here.** That job
 authenticates with `secrets.HOMEBREW_TAP_TOKEN`, and
@@ -300,7 +314,7 @@ The package namespaces are **not** unclaimed:
 
 - **Homebrew.** `navbytes/roost` already ships
   `brew install navbytes/tap/roost` from an existing `navbytes/homebrew-tap`.
-  Taps are namespaced, so `peterknego/roost` is still available, but a user
+  Taps are namespaced, so `peterknego/tap` is still available, but a user
   who taps both gets a formula-name collision. homebrew-core `roost` is free
   and now contested.
 - **AUR.** `roost` is taken — by a *third* project: `roost 0.2.5-1`, a
@@ -319,7 +333,7 @@ discovering each cost at submission time.
 - **`PATH` conflict.** Both binaries are called `roost`. A user with both gets
   whichever comes first on `PATH`. This is now permanent — state it in every
   package description.
-- **Homebrew: no action.** `peterknego/roost/roost` is namespaced and
+- **Homebrew: no action.** `peterknego/tap/roost` is namespaced and
   unaffected. A user who has already tapped `navbytes/tap` must install by the
   fully-qualified name.
 - **AUR: needs `conflicts=('roost')`.** See Step 5. The existing package
