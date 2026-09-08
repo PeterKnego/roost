@@ -42,11 +42,16 @@ Because you want a simpler way to have remote access to your server box. Roost i
 
 ## Install
 
-```sh
-# dtach and git must be on PATH
-brew install dtach          # or: apt install dtach
+**Install roost on the box your code lives on — the remote dev machine, not your
+laptop.** Your laptop only ever needs a browser.
 
-cargo install roost         # from crates.io
+```sh
+# Homebrew — installs dtach for you
+brew install peterknego/tap/roost
+
+# or with cargo — dtach and git must already be on PATH
+apt install dtach           # or: brew install dtach
+cargo install roost
 # or, from source: cargo install --git https://github.com/PeterKnego/roost
 
 ROOST_ROOTS="$HOME/Projects" roost 8444
@@ -54,7 +59,11 @@ ROOST_ROOTS="$HOME/Projects" roost 8444
 # open http://127.0.0.1:8444/
 ```
 
-Prebuilt Linux x86_64 binaries are on the [releases page](https://github.com/PeterKnego/roost/releases).
+Prebuilt binaries for Linux (x86_64 and aarch64, statically linked — no glibc
+version to match) and macOS (Intel and Apple Silicon) are on the
+[releases page](https://github.com/PeterKnego/roost/releases), with checksums and
+build attestations. `cargo binstall roost` fetches them directly.
+
 macOS is used daily; Windows is untested.
 
 > **roost has no authentication of its own.** It only binds to `127.0.0.1`. 
