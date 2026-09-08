@@ -21,7 +21,11 @@ jobs:
           mkdir -p target/distrib
           echo "contract probe" > target/distrib/CONTRACT-PROBE.txt
 
-      - uses: actions/upload-artifact@v4
+      # Upload version tracks what dist's generated workflow downloads with:
+      # v7 matches the v8 download-artifact in release.yml. A version mismatch
+      # fails silently as a missing artifact rather than erroring, which would
+      # make the probe lie about the contract.
+      - uses: actions/upload-artifact@v7
         with:
           name: artifacts-linux-packages
           path: target/distrib/CONTRACT-PROBE.txt
