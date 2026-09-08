@@ -50,3 +50,8 @@ tempfile = "3"
 
 [profile.release]
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
