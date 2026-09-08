@@ -93,13 +93,19 @@ BIN="$TMP/roost-x86_64-unknown-linux-musl/roost"
 READELF_OUT=$(readelf -d "$BIN" 2>&1) || die "readelf could not read the extracted binary"
 echo "$READELF_OUT" | grep -qi needed && die "the published binary is dynamically linked"
 
-# objdump -T is the opposite shape: it exits 1 on a *genuinely static* binary
-# ("not a dynamic object" — the case this check wants to see), so treating its
-# exit status as failure the way readelf's is above would die on every clean
-# build. The readelf check just above already proved $BIN is a real, readable
-# ELF file, so the only thing objdump's exit status could still be flagging by
-# this point is "static", not "unreadable" — safe to judge this one on its
-# output alone.
+# Measured on the published v0.5.1 roost-x86_64-unknown-linux-musl binary —
+# the exact artifact this check examines: it is static-pie linked (`file`
+# reports "static-pie linked"), and `objdump -T` on it exits 0 with an empty
+# dynamic symbol table, same as `readelf -d` above. A plain (non-PIE) static
+# binary is a different shape: the published aarch64 artifact, which this
+# script does not check, is "statically linked" (no PIE) and `objdump -T`
+# exits 1 on it ("not a dynamic object"), while `readelf -d` still exits 0.
+# So objdump's exit status is not a reliable signal for "static" in general —
+# it varies with how the binary was linked, not just whether it's dynamic —
+# and `|| true` is defensive against that variance on artifacts this check
+# might grow to cover, not a workaround for anything seen on this one. The
+# readelf check just above already proved $BIN is a real, readable ELF file;
+# `grep -q GLIBC` below is what actually decides this check.
 OBJDUMP_OUT=$(objdump -T "$BIN" 2>&1) || true
 echo "$OBJDUMP_OUT" | grep -q GLIBC && die "the published binary references GLIBC"
 
