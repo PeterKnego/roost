@@ -15,9 +15,20 @@ need jq "apt install jq"; need dtach "apt install dtach"
 ok "required tools present"
 
 [ "$(git rev-parse --abbrev-ref HEAD)" = master ] || die "not on master"
-[ -z "$(git status --porcelain)" ] || die "working tree is dirty"
+
+# Assigned first, then tested: `[ -z "$(cmd)" ]` does NOT abort under `set -e`
+# when cmd fails — a failing command substitution nested inside `[ ]` is not a
+# simple command, so errexit does not see it, and the test just runs against
+# an empty string. A plain assignment DOES abort on a failing substitution, so
+# splitting the assignment out of the `[ ]` turns "git failed" into "script
+# stops", not "check silently reads as passing". Do not fold this back into
+# `[ -z "$(git status --porcelain)" ]` — that reintroduces the fail-open bug.
+DIRTY=$(git status --porcelain)
+[ -z "$DIRTY" ] || die "working tree is dirty"
 git fetch --quiet origin
-[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)" ] || die "master differs from origin/master"
+HEAD_SHA=$(git rev-parse HEAD)
+ORIGIN_SHA=$(git rev-parse origin/master)
+[ "$HEAD_SHA" = "$ORIGIN_SHA" ] || die "master differs from origin/master"
 ok "on master, clean, in sync with origin"
 
 # `cargo build --locked` rejects a lock file that has drifted from Cargo.toml,
@@ -42,20 +53,27 @@ ok "Cargo.lock in sync"
 # would pass with a gnu Linux binary in the build, which is the exact
 # regression it exists to catch. This is compared for exact set equality, not
 # "each expected target is present", so it also catches an *added* target.
-ACTUAL=$(dist plan --output-format=json | jq -r '[.artifacts[] | select(.kind=="executable-zip") | .target_triples[]] | sort | join(" ")')
+ACTUAL=$(dist plan --output-format=json | jq -r '[.artifacts[] | select(.kind=="executable-zip") | .target_triples[]] | sort | join(" ")') \
+  || die "could not determine dist's target list — dist plan failed"
 [ "$ACTUAL" = "$EXPECTED_TARGETS" ] \
   || die "dist is building [$ACTUAL], expected [$EXPECTED_TARGETS] — check dist-workspace.toml"
 ok "dist builds exactly the four expected targets"
 
 if [ -n "$VERSION" ]; then
   git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null && die "tag v$VERSION already exists locally"
-  [ -z "$(git ls-remote --tags origin "refs/tags/v$VERSION")" ] || die "tag v$VERSION already exists on origin"
+  REMOTE_TAG=$(git ls-remote --tags origin "refs/tags/v$VERSION")
+  [ -z "$REMOTE_TAG" ] || die "tag v$VERSION already exists on origin"
   ok "tag v$VERSION is free"
 
   # A crates.io version can never be reused, not even after a yank.
   PUBLISHED=$(curl -sS -H 'User-Agent: roost-release (peter@knego.net)' \
-    "https://crates.io/api/v1/crates/roost" | jq -r '.versions[].num')
-  case "$PUBLISHED" in *"$VERSION"*) die "$VERSION is already on crates.io" ;; esac
+    "https://crates.io/api/v1/crates/roost" | jq -r '.versions[].num') \
+    || die "could not determine published crates.io versions — curl or jq failed"
+  # Whole-line match, not substring: `case "$PUBLISHED" in *"$VERSION"*)` would
+  # match VERSION=0.5.1 against a published 0.5.10, refusing a version that is
+  # genuinely free. jq emits one version per line, so grep -Fxq (fixed string,
+  # whole line) is exact.
+  echo "$PUBLISHED" | grep -Fxq "$VERSION" && die "$VERSION is already on crates.io"
   ok "$VERSION is free on crates.io"
 fi
 
@@ -72,13 +90,37 @@ TMPDIR=/tmp cargo test --locked -- --test-threads=1 >/dev/null 2>&1 || die "test
 ok "tests pass"
 
 # A credential used only by CI can only be tested by CI.
+#
+# This whole block is unreachable from a branch other than master:
+# workflow_dispatch 404s unless the workflow is on the repository's default
+# branch. It cannot be exercised until this branch merges.
+DISPATCHED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 gh workflow run check-tap-token.yml >/dev/null
 say "dispatched tap token check…"
 sleep 20
-RUN=$(gh run list --workflow=check-tap-token.yml --limit 1 --json databaseId,conclusion,status --jq '.[0]')
+
+# `gh run list --limit 1` returns the newest run of the workflow, which need
+# not be the one just dispatched — a concurrent or leftover run would be
+# picked and its stale conclusion trusted instead. Filtering to runs created
+# at or after DISPATCHED_AT, then taking the newest of those, ties the poll
+# to the run this invocation actually triggered.
+list_dispatched_run() {
+  gh run list --workflow=check-tap-token.yml --limit 10 \
+    --json databaseId,conclusion,status,createdAt \
+    --jq "[.[] | select(.createdAt >= \"$DISPATCHED_AT\")] | sort_by(.createdAt) | last"
+}
+RUN=$(list_dispatched_run)
+if [ -z "$RUN" ] || [ "$RUN" = null ]; then die "could not find the dispatched tap token check run"; fi
+
+# Bounded: an unattended release (Task 10) must not hang forever if the run
+# never completes. 60 tries at 5s apart is 5 minutes.
+TRIES=0
 while [ "$(echo "$RUN" | jq -r .status)" != completed ]; do
+  TRIES=$((TRIES + 1))
+  [ "$TRIES" -le 60 ] || die "tap token check did not complete within 5 minutes — see run $(echo "$RUN" | jq -r .databaseId)"
   sleep 5
-  RUN=$(gh run list --workflow=check-tap-token.yml --limit 1 --json databaseId,conclusion,status --jq '.[0]')
+  RUN=$(list_dispatched_run)
+  if [ -z "$RUN" ] || [ "$RUN" = null ]; then die "could not find the dispatched tap token check run"; fi
 done
 [ "$(echo "$RUN" | jq -r .conclusion)" = success ] || die "tap token check failed — see run $(echo "$RUN" | jq -r .databaseId)"
 ok "tap token valid"
