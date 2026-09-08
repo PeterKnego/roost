@@ -279,6 +279,25 @@ highlighter, which is a fixed stylesheet. A project theme goes in
 the user directory nor a project may supply JavaScript or HTML — only
 `$ROOST_STATIC` can, and only whoever starts the process can set it.
 
+## Cutting a release
+
+```sh
+make release VERSION=0.5.2
+```
+
+Preflight refuses to tag when any of eleven known failures is present — the
+wrong branch, a dirty tree, drifted `dist` targets, a stale `Cargo.lock`, a
+version already on crates.io, a broken cross-link, failing tests, or a tap
+token the tap will not accept. It then bumps, tags, pushes, watches the release
+run, and reads every channel back.
+
+It never deletes a tag or a release. If CI fails after the tag is pushed it
+prints `gh run rerun <id> --failed`, which is what recovered v0.5.1.
+
+A version with a `-` in it is a prerelease: it builds all four targets and the
+packages, and publishes to neither the tap nor crates.io. Use one to exercise
+a change to the release itself.
+
 ## The development instance
 
 Because the deployed binary ignores the checkout, iterating on the UI needs a
