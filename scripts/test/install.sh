@@ -63,6 +63,7 @@ docker run --rm -v "$TMP:/pkgs:ro" fedora:41 sh -euc '
   dnf install -y -q /pkgs/*.rpm >/dev/null
   command -v dtach >/dev/null || { echo "dtach was not installed"; exit 1; }
   test -f /usr/lib/systemd/user/roost.service || { echo "unit missing"; exit 1; }
+  grep -qx "KillMode=process" /usr/lib/systemd/user/roost.service || { echo "unit lost KillMode"; exit 1; }
   roost --version
 ' | tail -1 | grep -qx "roost $PKG_VERSION" || die "fedora install failed"
 ok "dnf resolved dtach, unit placed, binary runs"
