@@ -31,3 +31,28 @@ jobs:
         run: cargo test --locked -- --test-threads=1
         env:
           RUST_BACKTRACE: 1
+
+  scripts:
+    name: shellcheck + package tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # rpm is not on ubuntu runners by default; dpkg-deb is.
+      - name: Install packaging tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck rpm
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deb and cargo-generate-rpm
+        run: cargo install cargo-deb cargo-generate-rpm --locked
+
+      # None of this bash is reachable by `cargo test`, and a quoting bug in a
+      # release script surfaces at the worst possible moment.
+      - name: shellcheck
+        run: shellcheck scripts/*.sh scripts/test/*.sh
+
+      - name: Package tests
+        run: scripts/test/packages.sh

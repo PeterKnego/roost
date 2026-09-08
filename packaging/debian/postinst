@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+# Not enabled on install, deliberately: roost binds a port and spawns the
+# invoking user's shell. A package install that starts that without being asked
+# is a surprise nobody wants.
+cat <<'MSG'
+roost binds 127.0.0.1 and has no authentication of its own — put an auth layer
+in front of it before exposing it (see /usr/share/doc/roost/README.md).
+
+Start it with:  systemctl --user enable --now roost
+MSG
+exit 0

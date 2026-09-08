@@ -55,3 +55,20 @@ strip = true
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# The package exists to do the one thing a tarball cannot: install dtach. Of
+# roost's four Linux install paths only Homebrew declares it today, and
+# Linuxbrew is a rounding error on Linux — so every realistic Linux install
+# currently leaves the dependency unmet until a terminal fails to spawn.
+[package.metadata.deb]
+depends = "dtach"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/roost", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/roost/README.md", "644"],
+    ["LICENSE-MIT", "usr/share/doc/roost/LICENSE-MIT", "644"],
+    ["LICENSE-APACHE", "usr/share/doc/roost/LICENSE-APACHE", "644"],
+    ["packaging/roost.service", "usr/lib/systemd/user/roost.service", "644"],
+]
+maintainer-scripts = "packaging/debian/"
