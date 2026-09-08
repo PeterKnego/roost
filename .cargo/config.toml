@@ -1,0 +1,14 @@
+# Cross-compiling aarch64 from an x86_64 host, cargo defaults the linker driver
+# to the host `cc`, and `x86_64-linux-gnu-ld.bfd` then rejects the objects with
+# "Relocations in generic ELF (EM: 183) ... file in wrong format". rust-lld
+# ships with the toolchain, so this needs no cross-gcc, `cross` or `zig`.
+#
+# `linker`, not `rustflags`: a `[target.*].rustflags` table is discarded whole
+# the moment a RUSTFLAGS environment variable is set, which would take the
+# linker with it and reinstate the error inside CI only.
+#
+# CI does not depend on this — dist builds this target on a native
+# `ubuntu-22.04-arm` runner, where the host cc links it fine. It is here so a
+# local build links the same way CI's does rather than failing outright.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
