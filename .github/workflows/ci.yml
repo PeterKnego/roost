@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, develop]
   pull_request:
 
 jobs:
@@ -46,7 +46,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      - name: Cache cargo-deb and cargo-generate-rpm
+        id: cache-pkg-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deb
+            ~/.cargo/bin/cargo-generate-rpm
+          key: pkg-tools-${{ runner.os }}-cargo-deb-3.8.0-generate-rpm-0.21.0
+
       - name: Install cargo-deb and cargo-generate-rpm
+        if: steps.cache-pkg-tools.outputs.cache-hit != 'true'
         run: cargo install cargo-deb cargo-generate-rpm --locked
 
       # None of this bash is reachable by `cargo test`, and a quoting bug in a
