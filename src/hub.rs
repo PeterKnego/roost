@@ -4703,13 +4703,24 @@ mod tests {
     #[test]
     fn share_selection_outside_the_project_is_refused_before_reaching_ide() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("ROOST_STATE_DIR", dir.path().join("state"));
-        let mut h = Hub::new("shareselectionescape", dir.path().to_path_buf());
+        // The project root sits INSIDE a parent temp dir, with a real file
+        // beside it. `../secret.txt` therefore always names something that
+        // exists and is always outside the project — where the old
+        // `../../etc/passwd` only reached a real file when the temp dir
+        // happened to sit two levels above `/etc`, so `safe_resolve` returned
+        // `not found` and the confinement arm this test exists for was never
+        // executed. Same shape as `projects.rs`'s
+        // `terminal_path_refuses_a_real_file_outside_the_project`.
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(parent.path().join("secret.txt"), b"real file, really there").unwrap();
+        std::env::set_var("ROOST_STATE_DIR", parent.path().join("state"));
+        let mut h = Hub::new("shareselectionescape", root);
         let (asker, rx) = h.subscribe();
 
         h.handle(&asker, Intent::ShareSelection {
-            rel: "../../etc/passwd".into(),
+            rel: "../secret.txt".into(),
             text: "root:x:0:0".into(),
             start_line: 0,
             start_col: 0,
@@ -4738,14 +4749,17 @@ mod tests {
     #[test]
     fn share_selection_refusal_reaches_only_the_client_that_asked() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("ROOST_STATE_DIR", dir.path().join("state"));
-        let mut h = Hub::new("shareselectionrefuse", dir.path().to_path_buf());
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(parent.path().join("secret.txt"), b"real file, really there").unwrap();
+        std::env::set_var("ROOST_STATE_DIR", parent.path().join("state"));
+        let mut h = Hub::new("shareselectionrefuse", root);
         let (asker, rx_asker) = h.subscribe();
         let (_other, rx_other) = h.subscribe();
 
         h.handle(&asker, Intent::ShareSelection {
-            rel: "../../etc/passwd".into(),
+            rel: "../secret.txt".into(),
             text: "secret".into(),
             start_line: 0,
             start_col: 0,
@@ -5539,15 +5553,18 @@ mod tests {
     #[test]
     fn open_at_line_refuses_a_path_outside_the_project() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let d = tempfile::tempdir().unwrap();
-        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
-        let mut h = Hub::new("proj", d.path().to_path_buf());
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(parent.path().join("secret.txt"), b"real file, really there").unwrap();
+        std::env::set_var("ROOST_STATE_DIR", parent.path().join("state"));
+        let mut h = Hub::new("proj", root);
         let (c, rx) = h.subscribe();
         drain(&rx);
 
         h.handle(&c, Intent::OpenAtLine {
             pane: proto::MIDDLE,
-            rel: "../../etc/passwd".into(),
+            rel: "../secret.txt".into(),
             line: 1,
         });
 
@@ -5556,8 +5573,11 @@ mod tests {
             got.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("outside project")),
             "must refuse by confinement and say so, got {got:?}"
         );
+        // `hub.rs`'s confinement arm replaces the message with the bare
+        // "path outside project" instead of echoing the caller's path. This
+        // assertion is what holds that in place.
         assert!(
-            !got.iter().any(|m| m.contains("passwd")),
+            !got.iter().any(|m| m.contains("secret.txt")),
             "nothing outside the project may reach the layout, got {got:?}"
         );
         std::env::remove_var("ROOST_STATE_DIR");
