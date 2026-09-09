@@ -41,7 +41,7 @@ jobs:
 
       # rpm is not on ubuntu runners by default; dpkg-deb is.
       - name: Install packaging tools
-        run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck rpm
+        run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck rpm cpio
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

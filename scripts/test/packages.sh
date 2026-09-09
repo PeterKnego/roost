@@ -10,11 +10,8 @@ need dpkg-deb "apt install dpkg"
 need rpm "apt install rpm"
 need tar "apt install tar"
 need sha256sum "apt install coreutils"
-# rpm2archive ships in the rpm2cpio package, which the rpm package Depends
-# on — so `need rpm` above already guarantees it transitively on any host
-# that installed rpm through apt. Guarded separately anyway: that guarantee
-# is a fact about the package graph, not about this PATH.
-need rpm2archive "apt install rpm2cpio (installed automatically as a Depends of rpm)"
+need rpm2cpio "apt install rpm2cpio"
+need cpio "apt install cpio"
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 FIXTURE="$TMP/roost"
@@ -102,22 +99,22 @@ ok "ships /usr/bin/roost"
 # rpm -qpl only proves a path exists in the archive, not whose binary it is.
 # One extraction covers both the binary and the unit checked below.
 #
-# rpm2archive, not rpm2cpio | cpio: it converts the .rpm to a tar stream, so
-# extraction reuses `tar`, already required above for the .deb checks, instead
-# of adding cpio as a second archive tool this script depends on. Piping its
-# output to `tar -xzf -` extracts specific paths exactly as `cpio -idm` did —
-# verified directly against a real cargo-generate-rpm .rpm: same two paths
-# come out, same bytes.
-#
-# `need` above only proves rpm2archive and tar resolve on PATH, not that they
-# run correctly — a present-but-broken tool (truncated install, a shim, a
-# changed interface) fails right here too. The die() message below names
-# both possibilities rather than picking one.
+# rpm2cpio | cpio, not rpm2archive: measured on this host (rpm 6.0.1),
+# `rpm2archive t.rpm` writes its archive to stdout and creates no file —
+# convenient for piping, but ubuntu-22.04's older rpm2archive does the
+# opposite (CI run 34325648104): it writes `t.rpm.tgz` beside the input and
+# puts nothing on stdout, so piping it into tar there reads an empty stream
+# ("gzip: stdin: unexpected end of file"). Two rpm versions, two different
+# defaults, no invocation works on both. `rpm2cpio t.rpm`, measured on this
+# host, writes its cpio stream to stdout — that interface has been the
+# documented behaviour for a very long time and is what this project already
+# depended on before the rpm2archive detour, so this reverts to it and pays
+# for `cpio` as an explicit apt dependency instead.
 RPMEXTRACT="$TMP/rpmextract"; mkdir -p "$RPMEXTRACT"
 RPMABS="$(pwd)/$RPM"
-(cd "$RPMEXTRACT" && rpm2archive "$RPMABS" | tar -xzf - \
+(cd "$RPMEXTRACT" && rpm2cpio "$RPMABS" | cpio -idm --quiet \
   ./usr/bin/roost ./usr/lib/systemd/user/roost.service) \
-  || die "could not extract the .rpm payload — rpm2archive and tar are both on PATH, so either the .rpm payload is malformed or one of those tools is present but not working"
+  || die "could not extract the .rpm payload — rpm2cpio and cpio are both on PATH, so either the .rpm payload is malformed or one of those tools is present but not working"
 [ "$(sha256sum < "$RPMEXTRACT/usr/bin/roost" | cut -d' ' -f1)" = "$(sha256sum < "$FIXTURE" | cut -d' ' -f1)" ] \
   || die "the .rpm contains a different binary than the one passed in"
 ok "the packaged binary is byte-identical to the input"
