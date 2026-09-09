@@ -49,10 +49,11 @@ laptop.** Your laptop only ever needs a browser.
 # Homebrew — installs dtach for you
 brew install peterknego/tap/roost
 
-# or Linux packages — includes dtach and systemd user unit
-sudo apt install ./roost_*.deb      # on Debian, Ubuntu
-sudo dnf install ./roost-*.rpm      # on Fedora, RHEL
-systemctl --user enable --now roost
+# or Linux packages — these install dtach for you and ship a systemd user unit.
+# Grab the .deb or .rpm for your architecture from the releases page first:
+sudo apt install ./roost_*.deb          # Debian, Ubuntu
+sudo dnf install ./roost-*.rpm          # Fedora, RHEL
+systemctl --user enable --now roost     # packages only; starts roost
 
 # or with cargo — dtach and git must already be on PATH
 apt install dtach           # or: brew install dtach
