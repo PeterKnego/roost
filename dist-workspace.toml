@@ -61,7 +61,22 @@ github-attestations = true
 # its own tap, so a user who has tapped both must install by the fully
 # qualified name. See handover 6.1 — the collision is permanent and known.
 tap = "peterknego/homebrew-tap"
-publish-jobs = ["homebrew"]
+publish-jobs = ["homebrew", "./publish-crates-io"]
+
+# dist's default grant for a custom publish job is `{id-token, packages}`, and
+# permissions can only be reduced going down a reusable-workflow chain, never
+# elevated — so the callee's `contents: read` (needed for actions/checkout and
+# for `cargo publish` to read the crate) made GitHub reject the whole release
+# workflow at startup rather than just fail the job. Overriding this key
+# *replaces* dist's defaults rather than adding to them, so `id-token` has to
+# be restated here too; `packages` is dropped since nothing in this job
+# publishes a container or npm package.
+github-custom-job-permissions = { "publish-crates-io" = { "id-token" = "write", "contents" = "read" } }
+
+# Runs in the global phase, not the local one: the local phase is a matrix, so
+# a job there sees one target's output. The global phase is the first point at
+# which all four binaries exist and can be downloaded.
+global-artifacts-jobs = ["./build-linux-packages"]
 
 # dtach is a *runtime* prerequisite, not a build one — roost spawns it, it is
 # not linked against. `stage = ["run"]` is what turns this into a `depends_on`

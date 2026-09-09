@@ -1,0 +1,17 @@
+[Unit]
+Description=roost — remote web workspace
+Documentation=https://github.com/PeterKnego/roost
+After=network.target
+
+[Service]
+# KillMode=process is load-bearing: roost spawns dtach sessions as children so
+# shells survive a restart. systemd's default control-group KillMode kills the
+# whole cgroup on stop and takes every session with it, defeating the entire
+# reason dtach is used. Verified in production: with the default, a restart
+# took `pgrep -c dtach` to 0.
+KillMode=process
+ExecStart=/usr/bin/roost
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
