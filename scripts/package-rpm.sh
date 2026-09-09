@@ -26,9 +26,15 @@ mkdir -p "$STAGE/release"
 install -m 755 "$BIN" "$STAGE/release/roost"
 
 mkdir -p target/distrib
+# The RPM Version tag forbids '-' outright (see pkg_version in lib.sh); the
+# filename does not. The filename stays on the project's own version so this
+# .rpm sorts and greps next to the .tar.xz and the git tag from the same
+# release, all three named "0.5.2-rc.2" — only the tag a package manager
+# actually parses needs the escape.
+RPM_VERSION=$(pkg_version "$VERSION")
 OUT="target/distrib/roost-${VERSION}.${ARCH}.rpm"
 CARGO_TARGET_DIR="$STAGE" cargo generate-rpm --payload-compress none \
-  --set-metadata "version = '${VERSION}'" \
+  --set-metadata "version = '${RPM_VERSION}'" \
   --arch "$ARCH" \
   --output "$(pwd)/$OUT" \
   >/dev/null

@@ -46,11 +46,17 @@ mkdir -p "$STAGE/$TRIPLE/release"
 install -m 755 "$BIN" "$STAGE/$TRIPLE/release/roost"
 
 mkdir -p target/distrib
+# The Debian Version field needs the '~' encoding (see pkg_version in
+# lib.sh); the filename does not. Filenames stay on the project's own
+# version so this .deb sorts and greps next to the .tar.xz and the git tag
+# from the same release, all three named "0.5.2-rc.2" — only the field a
+# package manager actually parses needs the escape.
+DEB_VERSION=$(pkg_version "$VERSION")
 # --no-strip because the binary is already stripped ([profile.release] strip =
 # true) and because the host `strip` cannot process a cross-built aarch64
 # binary anyway.
 CARGO_TARGET_DIR="$STAGE" cargo deb --no-build --no-strip --target "$TRIPLE" \
-  --deb-version "$VERSION" \
+  --deb-version "$DEB_VERSION" \
   --output "$(pwd)/target/distrib/roost_${VERSION}_${ARCH}.deb" \
   >/dev/null
 

@@ -150,3 +150,39 @@ ok "the packaged binary is byte-identical to the input"
 grep -q '^KillMode=process$' "$RPMEXTRACT/usr/lib/systemd/user/roost.service" \
   || die "the packaged unit lacks KillMode=process"
 ok "the packaged unit sets KillMode=process"
+
+phase "prerelease version encoding"
+# Every case above uses 9.9.9, which has no '-' to mistranslate — it is the
+# one version shape that never exercised the bug this suite is here to
+# catch. dist hands both scripts a real prerelease like "0.5.2-rc.2"
+# (scripts/release.sh's own PRERELEASE check matches on '-'), so build one
+# of each package from that shape and read back what each format actually
+# declares, not just whether the script exited 0.
+PRE_VERSION="0.5.2-rc.2"
+
+PRE_DEB=$(scripts/package-deb.sh "$FIXTURE" "$PRE_VERSION" amd64 | tail -1)
+[ -f "$PRE_DEB" ] || die "no prerelease .deb produced at $PRE_DEB"
+
+# Filenames are for humans matching artifacts across one release (the
+# .tar.xz and the git tag are both literally "0.5.2-rc.2"); only the field
+# a package manager parses needs the '~' escape. See package-deb.sh.
+[ "$(basename "$PRE_DEB")" = "roost_${PRE_VERSION}_amd64.deb" ] \
+  || die "prerelease .deb filename does not carry the project's own version ($PRE_VERSION)"
+ok "prerelease .deb filename keeps the project version ($PRE_VERSION)"
+
+PRE_DEB_VERSION=$(dpkg-deb -I "$PRE_DEB" | grep -E '^ Version:' | awk '{print $2}')
+[ "$PRE_DEB_VERSION" = "0.5.2~rc.2" ] \
+  || die "prerelease .deb declares Version: $PRE_DEB_VERSION, want 0.5.2~rc.2"
+ok "prerelease .deb declares Version: 0.5.2~rc.2"
+
+PRE_RPM=$(scripts/package-rpm.sh "$FIXTURE" "$PRE_VERSION" x86_64 | tail -1)
+[ -f "$PRE_RPM" ] || die "no prerelease .rpm produced at $PRE_RPM"
+
+[ "$(basename "$PRE_RPM")" = "roost-${PRE_VERSION}.x86_64.rpm" ] \
+  || die "prerelease .rpm filename does not carry the project's own version ($PRE_VERSION)"
+ok "prerelease .rpm filename keeps the project version ($PRE_VERSION)"
+
+PRE_RPM_VERSION=$(rpm -qp --qf '%{VERSION}' "$PRE_RPM" 2>/dev/null)
+[ "$PRE_RPM_VERSION" = "0.5.2~rc.2" ] \
+  || die "prerelease .rpm declares Version: $PRE_RPM_VERSION, want 0.5.2~rc.2"
+ok "prerelease .rpm declares Version: 0.5.2~rc.2"
