@@ -8,6 +8,13 @@ cd "$(dirname "$0")/../.."
 
 need dpkg-deb "apt install dpkg"
 need rpm "apt install rpm"
+need tar "apt install tar"
+need sha256sum "apt install coreutils"
+# rpm2archive ships in the rpm2cpio package, which the rpm package Depends
+# on — so `need rpm` above already guarantees it transitively on any host
+# that installed rpm through apt. Guarded separately anyway: that guarantee
+# is a fact about the package graph, not about this PATH.
+need rpm2archive "apt install rpm2cpio (installed automatically as a Depends of rpm)"
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 FIXTURE="$TMP/roost"
@@ -94,11 +101,18 @@ ok "ships /usr/bin/roost"
 # that actually catches the staging bug this task's brief walks straight into:
 # rpm -qpl only proves a path exists in the archive, not whose binary it is.
 # One extraction covers both the binary and the unit checked below.
+#
+# rpm2archive, not rpm2cpio | cpio: it converts the .rpm to a tar stream, so
+# extraction reuses `tar`, already required above for the .deb checks, instead
+# of adding cpio as a second archive tool this script depends on. Piping its
+# output to `tar -xzf -` extracts specific paths exactly as `cpio -idm` did —
+# verified directly against a real cargo-generate-rpm .rpm: same two paths
+# come out, same bytes.
 RPMEXTRACT="$TMP/rpmextract"; mkdir -p "$RPMEXTRACT"
 RPMABS="$(pwd)/$RPM"
-(cd "$RPMEXTRACT" && rpm2cpio "$RPMABS" | cpio -idm --quiet \
+(cd "$RPMEXTRACT" && rpm2archive "$RPMABS" | tar -xzf - \
   ./usr/bin/roost ./usr/lib/systemd/user/roost.service) \
-  || die "could not extract the .rpm payload"
+  || die "rpm2archive/tar are present but failed to extract the .rpm payload — the payload itself is suspect, not the toolchain"
 [ "$(sha256sum < "$RPMEXTRACT/usr/bin/roost" | cut -d' ' -f1)" = "$(sha256sum < "$FIXTURE" | cut -d' ' -f1)" ] \
   || die "the .rpm contains a different binary than the one passed in"
 ok "the packaged binary is byte-identical to the input"
