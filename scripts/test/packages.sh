@@ -108,11 +108,16 @@ ok "ships /usr/bin/roost"
 # output to `tar -xzf -` extracts specific paths exactly as `cpio -idm` did —
 # verified directly against a real cargo-generate-rpm .rpm: same two paths
 # come out, same bytes.
+#
+# `need` above only proves rpm2archive and tar resolve on PATH, not that they
+# run correctly — a present-but-broken tool (truncated install, a shim, a
+# changed interface) fails right here too. The die() message below names
+# both possibilities rather than picking one.
 RPMEXTRACT="$TMP/rpmextract"; mkdir -p "$RPMEXTRACT"
 RPMABS="$(pwd)/$RPM"
 (cd "$RPMEXTRACT" && rpm2archive "$RPMABS" | tar -xzf - \
   ./usr/bin/roost ./usr/lib/systemd/user/roost.service) \
-  || die "rpm2archive/tar are present but failed to extract the .rpm payload — the payload itself is suspect, not the toolchain"
+  || die "could not extract the .rpm payload — rpm2archive and tar are both on PATH, so either the .rpm payload is malformed or one of those tools is present but not working"
 [ "$(sha256sum < "$RPMEXTRACT/usr/bin/roost" | cut -d' ' -f1)" = "$(sha256sum < "$FIXTURE" | cut -d' ' -f1)" ] \
   || die "the .rpm contains a different binary than the one passed in"
 ok "the packaged binary is byte-identical to the input"
