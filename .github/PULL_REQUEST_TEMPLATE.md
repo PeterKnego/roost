@@ -9,8 +9,8 @@
 
 ## Hard constraints
 
-<!-- CLAUDE.md lists constraints that are load-bearing rather than stylistic:
-     the loopback bind, Origin checks, path confinement, the caps, the
+<!-- CLAUDE.md lists constraints that are load-bearing rather than stylistic —
+     among them: the loopback bind, Origin checks, path confinement, the caps, the
      settings-file rules. Does this PR touch any of them? If so, which, and
      why does the reason recorded there no longer hold? -->
 
