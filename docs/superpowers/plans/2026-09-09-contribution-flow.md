@@ -12,8 +12,9 @@
 
 ## Global Constraints
 
-- **`master` protection is "restrict who can push" only** — no PR requirement, no required status checks. Both break `make release`, which pushes the version bump directly at `scripts/release.sh:82`.
-- **`develop` protection is: require a pull request, require both CI checks** (`cargo test (Linux)`, `shellcheck + package tests`). Not "require branches up to date".
+- **`enforce_admins` is `true` on BOTH branches.** GitHub's docs: "the restrictions of a branch protection rule do not apply to people with admin permissions" — all of them, force-push and deletion included. With a single admin and fork-only contributors, protection that exempts admins protects nobody.
+- **`master` protection blocks force-push and deletion, and nothing else.** No PR requirement, no required status checks: both reject the version bump `scripts/release.sh:82` pushes directly. A plain fast-forward push violates neither remaining rule.
+- **`develop` protection is: require a pull request (0 approvals), require both CI checks** (`cargo test (Linux)`, `shellcheck + package tests`). Not "require branches up to date".
 - **Merge strategy differs by direction:** PR→`develop` squash; `develop`→`master` merge commit, never squash.
 - **Tests run `cargo test --locked -- --test-threads=1`.** Never `cargo test --release`, never a bare `cargo test`.
 - **The confinement tests must pass under BOTH a shallow and a deep `TMPDIR`.** A fix verified only under `/tmp` proves nothing — that is the case that already works.
@@ -238,6 +239,10 @@ afternoon, and opinionated enough that the reasons matter.
 
 Branch off `develop`, open a pull request against `develop`. Accepted PRs are
 squash-merged. Releases are cut by the maintainer.
+
+`develop` requires a pull request and green CI, and that applies to the
+maintainer too — including the merge of `master` back into `develop` after each
+release, which therefore goes through a PR like anything else.
 
 ## Before you open a PR
 
@@ -559,27 +564,43 @@ gh workflow list --all --json name,path --jq '.[] | "\(.name)\t\(.path)"'
 
 Expected: all five workflows still listed, including `Check tap token`.
 
-- [ ] **Step 5: Protect `master` — restrict pushes only**
+- [ ] **Step 5: Protect `master` — block force-push and deletion, nothing else**
 
-No PR requirement and no required status checks: both reject the version-bump commit `scripts/release.sh:82` pushes directly, after preflight has passed and the tag exists locally.
+The reasoning here is the opposite of what it looks like. Fork contributors have
+no push access to this repository at all, so "restrict who can push" defends
+against nobody. The only realistic risk is the maintainer's own mistake — a
+mistyped `git push --force` losing release history, or deleting the branch.
+
+That means `enforce_admins` must be **true**: GitHub's documentation is explicit
+that "the restrictions of a branch protection rule do not apply to people with
+admin permissions", *all* of them, force-push and deletion included. With it
+false, every rule below is bypassed by the only person who can push, and the
+branch would look protected while stopping nothing.
+
+A PR requirement and required status checks stay **null**, because those are what
+reject the version-bump commit `scripts/release.sh:82` pushes directly. A plain
+fast-forward push violates none of the remaining rules, so `make release` still
+works.
 
 ```bash
 gh api -X PUT repos/PeterKnego/roost/branches/master/protection \
   --input - <<'JSON'
 {
   "required_status_checks": null,
-  "enforce_admins": false,
+  "enforce_admins": true,
   "required_pull_request_reviews": null,
-  "restrictions": { "users": ["PeterKnego"], "teams": [], "apps": [] },
+  "restrictions": null,
   "allow_force_pushes": false,
   "allow_deletions": false
 }
 JSON
 ```
 
-`enforce_admins: false` is deliberate and load-bearing — with it true, the maintainer's own release push is rejected too.
+- [ ] **Step 6: Protect `develop` — PR plus both checks, also enforced on admins**
 
-- [ ] **Step 6: Protect `develop` — PR plus both checks**
+Same reasoning: the maintainer is the only person who can merge, so protection
+that exempts admins protects nothing. With `enforce_admins: true` a red PR cannot
+be merged into `develop` even in a hurry.
 
 ```bash
 gh api -X PUT repos/PeterKnego/roost/branches/develop/protection \
@@ -589,7 +610,7 @@ gh api -X PUT repos/PeterKnego/roost/branches/develop/protection \
     "strict": false,
     "contexts": ["cargo test (Linux)", "shellcheck + package tests"]
   },
-  "enforce_admins": false,
+  "enforce_admins": true,
   "required_pull_request_reviews": { "required_approving_review_count": 0 },
   "restrictions": null,
   "allow_force_pushes": false,
@@ -598,9 +619,17 @@ gh api -X PUT repos/PeterKnego/roost/branches/develop/protection \
 JSON
 ```
 
-`"strict": false` is the "do not require branches to be up to date" decision — on a low-traffic repository, strict forces a rebase for every unrelated merge.
+`"strict": false` is the "do not require branches to be up to date" decision — on
+a low-traffic repository, strict forces a rebase for every unrelated merge.
 
-`required_approving_review_count: 0` requires a PR without requiring someone else to approve it, which matters for a solo maintainer: with 1, you could never merge your own work.
+`required_approving_review_count: 0` requires a pull request without requiring
+someone else to approve it, which is what a solo maintainer needs: with 1, you
+could never merge your own work.
+
+**Accepted consequence:** step 8 of the flow — merging `master` back into
+`develop` after a release — now goes through a pull request, because `develop`
+requires one and `enforce_admins: true` means you cannot bypass it. One extra PR
+per release, chosen deliberately rather than discovered.
 
 - [ ] **Step 7: Verify protection took, on both branches**
 
@@ -609,7 +638,10 @@ gh api repos/PeterKnego/roost/branches/master/protection --jq '{restrictions: .r
 gh api repos/PeterKnego/roost/branches/develop/protection --jq '{pr: .required_pull_request_reviews.required_approving_review_count, checks: .required_status_checks.contexts, strict: .required_status_checks.strict}'
 ```
 
-Expected: master shows the user restriction with `pr: null` and `checks: null`; develop shows `0`, both check names, and `strict: false`.
+Expected: master shows `enforce_admins: true`, `pr: null`, `checks: null`, and force-push and deletion both disallowed; develop shows `enforce_admins: true`, `0` required approvals, both check names, and `strict: false`.
+
+If `master` shows `enforce_admins: false`, stop — the protection is inert and the
+next step will pass for the wrong reason.
 
 - [ ] **Step 8: Prove `make release` still works against the protected master**
 
@@ -628,6 +660,16 @@ git checkout master && git push --dry-run origin master
 ```
 
 Expected: `Everything up-to-date` — not a rejection. A rejection means the protection is wrong and `make release` will fail at `release.sh:82`.
+
+Then prove the protection is not inert, which is the half that would otherwise
+pass silently:
+
+```bash
+git push --force --dry-run origin master
+```
+
+Expected: **rejected**. If a force-push dry run succeeds, `enforce_admins` did not
+take and the branch is unprotected against the only risk it is guarding.
 
 - [ ] **Step 9: Update CONTRIBUTING with the now-real flow**
 
