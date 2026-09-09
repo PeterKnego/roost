@@ -110,11 +110,34 @@ ok "ships /usr/bin/roost"
 # documented behaviour for a very long time and is what this project already
 # depended on before the rpm2archive detour, so this reverts to it and pays
 # for `cpio` as an explicit apt dependency instead.
+#
+# rpm2cpio to a file, and not gated on rpm2cpio's own exit status: measured
+# in a container running ubuntu:22.04 (rpm 4.17.0), `rpm2cpio t.rpm` exits 1
+# on every package cargo-generate-rpm produces — with no pipe involved at
+# all, redirected straight to a file — while writing the complete, correct
+# payload (confirmed: `cpio -tv` on that same file lists all five archive
+# members at their right sizes). rpm2cpio's own source explains why
+# (tools/rpm2cpio.c in the rpm-4.17.0-release tag): it compares the bytes it
+# copied against header tag LONGARCHIVESIZE, defaulting to 0 if the tag is
+# absent, and returns EXIT_FAILURE on any mismatch. `rpm -qp --qf` on our
+# .rpm shows both ARCHIVESIZE and LONGARCHIVESIZE as "(none)" — cargo-
+# generate-rpm never sets either — so that comparison is `actual_bytes == 0`,
+# unconditionally false, on every package it builds, independent of whether
+# the payload is actually intact. (A real rpmbuild-produced .rpm, fetched
+# and tried the same way, sets both tags and rpm2cpio exits 0 against it.)
+# rpm2cpio's exit status is therefore not a usable signal for this project's
+# own packages; a genuine read failure (tried against a non-.rpm file) still
+# shows up honestly as an empty payload, and cpio finding both requested
+# paths below plus the byte-identity check further down are what actually
+# prove the payload is good.
 RPMEXTRACT="$TMP/rpmextract"; mkdir -p "$RPMEXTRACT"
 RPMABS="$(pwd)/$RPM"
-(cd "$RPMEXTRACT" && rpm2cpio "$RPMABS" | cpio -idm --quiet \
-  ./usr/bin/roost ./usr/lib/systemd/user/roost.service) \
-  || die "could not extract the .rpm payload — rpm2cpio and cpio are both on PATH, so either the .rpm payload is malformed or one of those tools is present but not working"
+PAYLOAD="$TMP/payload.cpio"
+rpm2cpio "$RPMABS" > "$PAYLOAD" || true
+[ -s "$PAYLOAD" ] || die "rpm2cpio produced no output reading the .rpm payload"
+(cd "$RPMEXTRACT" && cpio -idm --quiet \
+  ./usr/bin/roost ./usr/lib/systemd/user/roost.service < "$PAYLOAD") \
+  || die "cpio could not extract the expected paths from the .rpm payload"
 [ "$(sha256sum < "$RPMEXTRACT/usr/bin/roost" | cut -d' ' -f1)" = "$(sha256sum < "$FIXTURE" | cut -d' ' -f1)" ] \
   || die "the .rpm contains a different binary than the one passed in"
 ok "the packaged binary is byte-identical to the input"
