@@ -66,4 +66,5 @@ release notes if you want it.
 
 ## Supported versions
 
-Only the latest tagged release and `master` receive fixes.
+Only the latest tagged release receives fixes. A fix lands on `develop` and
+reaches `master` — and a tagged release — at the next release cut.

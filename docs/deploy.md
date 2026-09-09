@@ -298,6 +298,14 @@ A version with a `-` in it is a prerelease: it builds all four targets and the
 packages, and publishes to neither the tap nor crates.io. Use one to exercise
 a change to the release itself.
 
+**Merge `master` back into `develop`.** The version bump lands on `master`
+directly (`release.sh` pushes it there), so `develop` is now behind by exactly
+that commit. Open a PR merging `master` into `develop` and merge it with a
+merge commit, never squash — squashing would put master's content on `develop`
+under a new SHA and make the next release merge conflict. Skipping this step
+is the one part of a release that does not fail loudly at the time; it only
+surfaces as a conflict at the *next* release.
+
 ## The development instance
 
 Because the deployed binary ignores the checkout, iterating on the UI needs a
