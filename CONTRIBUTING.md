@@ -40,6 +40,19 @@ If you touch anything under `scripts/` or `packaging/`, also run:
 make test-scripts
 ```
 
+If you touch `static/app.js`, also run the browser tests — no Rust test can
+reach that file, so `cargo test` alone verifies nothing about a change there:
+
+```sh
+deno run -A tests/browser/reconnect.mjs
+deno run -A tests/browser/upload.mjs
+```
+
+See [tests/browser/README.md](tests/browser/README.md) for the rest of the
+suite. They drive a real Chromium against a real roost with real `dtach`, and
+they skip silently rather than failing when no browser is found — a skip is
+not a pass.
+
 ## Read CLAUDE.md first
 
 [CLAUDE.md](CLAUDE.md) lists this project's hard constraints — the loopback
