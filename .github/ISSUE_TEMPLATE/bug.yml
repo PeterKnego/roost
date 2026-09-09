@@ -1,0 +1,49 @@
+name: Bug report
+description: Something roost does wrong
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got.
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install roost?
+      description: The channels differ — only Homebrew and the .deb/.rpm install dtach for you, and only the packages ship the systemd unit.
+      options:
+        - .deb or .rpm package
+        - Homebrew (peterknego/tap/roost)
+        - Shell installer (roost-installer.sh)
+        - cargo install / cargo binstall
+        - Downloaded tarball
+        - Built from source
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Output of `roost --version`
+    validations:
+      required: true
+  - type: input
+    id: dtach
+    attributes:
+      label: Output of `dtach -V` (or "not installed")
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and version
+      placeholder: Debian 12, Ubuntu 24.04, macOS 15…
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Anything roost printed
+      render: text

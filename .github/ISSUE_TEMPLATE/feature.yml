@@ -1,0 +1,17 @@
+name: Feature request
+description: Something roost should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that roost makes hard? Describe the problem before the solution — the best answer is often not the one either of us thought of first.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you had in mind
+    validations:
+      required: false
