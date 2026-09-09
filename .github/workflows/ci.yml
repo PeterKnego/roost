@@ -46,6 +46,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # Swatinem/rust-cache above already restores ~/.cargo/bin by default, so
+      # by the time this step runs, a run predating a version bump may have
+      # already put the OLD cargo-deb/cargo-generate-rpm binaries back — this
+      # was observed in job logs on real runs, including one from before this
+      # cache step existed. This step is kept anyway: it names the two
+      # versions explicitly rather than relying on rust-cache's implicit
+      # behavior, and it survives rust-cache's own cache being evicted (10 GB
+      # cap, staleness pruning) or its defaults changing.
       - name: Cache cargo-deb and cargo-generate-rpm
         id: cache-pkg-tools
         uses: actions/cache@v4
@@ -55,9 +63,16 @@ jobs:
             ~/.cargo/bin/cargo-generate-rpm
           key: pkg-tools-${{ runner.os }}-cargo-deb-3.8.0-generate-rpm-0.21.0
 
+      # --force is required even though this only runs on a miss of the key
+      # above: rust-cache may have already restored an old binary into
+      # ~/.cargo/bin, and without --force `cargo install` silently no-ops on
+      # an already-present binary regardless of version. The `if` guard means
+      # --force costs nothing on a hit; on a miss it is the difference between
+      # installing the version the key names and silently keeping whatever
+      # rust-cache happened to restore.
       - name: Install cargo-deb and cargo-generate-rpm
         if: steps.cache-pkg-tools.outputs.cache-hit != 'true'
-        run: cargo install cargo-deb cargo-generate-rpm --locked
+        run: cargo install cargo-deb cargo-generate-rpm --locked --force
 
       # None of this bash is reachable by `cargo test`, and a quoting bug in a
       # release script surfaces at the worst possible moment.
