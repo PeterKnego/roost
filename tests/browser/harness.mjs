@@ -237,19 +237,33 @@ const COVERAGE = Deno.env.get("ROOST_JS_COV") ?? null;
 /// browser kills that must wait for them.
 const pendingCoverage = [];
 const deferredKills = [];
+/// Every fixture this process created, so none can be forgotten.
+const fixtureCleanups = [];
 
-if (COVERAGE) {
-  // The tests are not written to know about any of this, and should not have
-  // to be: `Deno.exit` is their last statement and it is synchronous, so a
-  // report that has not landed by then is simply lost. Wrapping it lets the
-  // event loop drain the takes first and keeps the 40 test files untouched.
-  const realExit = Deno.exit.bind(Deno);
-  Deno.exit = (code) => {
-    Promise.allSettled(pendingCoverage)
-      .then(() => { for (const k of deferredKills) k(); })
-      .finally(() => realExit(code));
-  };
-}
+// `Deno.exit` is every test's last statement, and it is synchronous — so
+// anything not already done by then is simply lost. Wrapping it lets the event
+// loop drain first, and keeps all 45 test files unchanged.
+//
+// Unconditional now, not gated on coverage, because the fixture cleanup rides
+// on it. Five separate test files shipped without `await fx.cleanup()`, each
+// leaving a live `dtach` master and a `/tmp/roost-browser-*` tree behind —
+// 74 trees and 9 shells were found on this host in one day. The reason it kept
+// happening is that **nothing fails when you forget it**: the test passes, the
+// suite is green, and the only symptom is litter nobody is looking for. A line
+// every future author has to remember is not a fix; this is.
+//
+// It also closes the no-browser path, which no per-test line could: every test
+// calls `startRoost` *before* `startBrowser`, so on a host with no Chromium the
+// skip below called `Deno.exit(0)` with a roost already spawned and listening —
+// leaking a server per file, which `fixture.cleanup` from a later run can never
+// find because it matches only dtach cmdlines under its own state dir.
+const realExit = Deno.exit.bind(Deno);
+Deno.exit = (code) => {
+  Promise.allSettled(pendingCoverage)
+    .then(() => { for (const k of deferredKills) k(); })
+    .then(() => Promise.allSettled(fixtureCleanups.map((f) => f())))
+    .finally(() => realExit(code));
+};
 
 /// Appends the entries for this project's own scripts. Everything else — the
 /// vendored libraries, the CDP shim, `about:blank` — is dropped here rather
@@ -423,24 +437,36 @@ export async function fixture({ autosave = true } = {}) {
   if (!autosave) await disableAutosave(project);
   const stateDir = `${base}/state`;
   await Deno.mkdir(stateDir, { recursive: true });
-  return {
-    base, roots, project: "proj", dir: project, stateDir,
-    cleanup: async () => {
-      // The shells this run started are dtach masters holding sockets under
-      // our state dir; nothing else on the machine can match that path.
-      await killByCmdline(stateDir);
-      await sleep(300);
-      // Reported, not swallowed. A bare `catch {}` here is how two abandoned
-      // /tmp/roost-browser-* trees and a live shell went unnoticed: the removal
-      // failed every run and said nothing, so the only symptom was litter
-      // nobody was looking for. A cleanup that cannot clean up has to say so.
-      try {
-        await Deno.remove(base, { recursive: true });
-      } catch (e) {
-        console.log(`    (cleanup: ${base} not removed — ${e.message})`);
-      }
-    },
+  let cleaned = false;
+  const cleanup = async () => {
+    // Idempotent, because it is now called from two places: the test's own
+    // `finally` (the fast path, which tears the tree down while the process is
+    // still healthy) and the exit drain above (the backstop). Running the
+    // removal twice would report a spurious failure from the second.
+    if (cleaned) return;
+    cleaned = true;
+    return doCleanup();
   };
+  fixtureCleanups.push(cleanup);
+  return {
+    base, roots, project: "proj", dir: project, stateDir, cleanup,
+  };
+
+  async function doCleanup() {
+    // The shells this run started are dtach masters holding sockets under our
+    // state dir; nothing else on the machine can match that path.
+    await killByCmdline(stateDir);
+    await sleep(300);
+    // Reported, not swallowed. A bare `catch {}` here is how two abandoned
+    // /tmp/roost-browser-* trees and a live shell went unnoticed: the removal
+    // failed every run and said nothing, so the only symptom was litter nobody
+    // was looking for. A cleanup that cannot clean up has to say so.
+    try {
+      await Deno.remove(base, { recursive: true });
+    } catch (e) {
+      console.log(`    (cleanup: ${base} not removed — ${e.message})`);
+    }
+  }
 }
 
 /// Where the browser profile goes. Snap-packaged Chromium is confined to
