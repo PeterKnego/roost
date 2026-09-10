@@ -484,10 +484,76 @@ try {
   await evalIn(`${term}.write("\u001b[?1l\u001b[?1049l")`);
   await sleep(300);
 
+  console.log("E6b. the keys do not summon a keyboard; one button does");
+  // Reported: pressing an arrow brought the keyboard up over the half of the
+  // screen you were reading. Focusing xterm's hidden textarea is what opens a
+  // soft keyboard, and the handler used to call `term.focus()` after every
+  // key — while the whole point of these keys is to drive a menu *without*
+  // typing.
+  //
+  // Asserted through `document.activeElement`, which is the thing a keyboard
+  // actually follows. There is no way to observe the keyboard itself from
+  // here, and saying so is better than a test that implies otherwise.
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="3"]').click()`);
+  await sleep(300);
+  const helper = `document.querySelector('.pane[data-pane="3"] textarea')`;
+  const focused = async () => await evalIn(`document.activeElement === ${helper}`);
+  await evalIn(`${helper}.blur(); document.body.focus();`);
+  ok(!(await focused()), "setup: nothing is focused, so no keyboard would be up");
+
+  const pressKey = async (k) => {
+    await evalIn(`(() => { const b = document.querySelector('#termkeys button[data-k="${k}"]');
+      b.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerType: "touch" })); })()`);
+    await sleep(150);
+  };
+  await pressKey("up");
+  await pressKey("down");
+  await pressKey("enter");
+  ok(!(await focused()),
+     "pressing the arrows and Enter leaves the terminal unfocused — no keyboard");
+
+  // And the one button whose whole job is to ask for it.
+  await pressKey("keyboard");
+  ok(await focused(), "the keyboard button focuses the terminal, which is what raises one");
+  ok((await evalIn(`document.querySelector('#termkeys button[data-k="keyboard"]').getAttribute("aria-pressed")`)) === "true",
+     "and says so");
+  await pressKey("keyboard");
+  ok(!(await focused()), "pressing it again blurs, which is what puts the keyboard away");
+
+  console.log("E6c. the frame follows the visible viewport");
+  // A keyboard cannot be raised in headless, so what is checked here is the
+  // wiring it depends on, and the test says as much rather than implying the
+  // keyboard itself was exercised. Two numbers matter: `height`, which is how
+  // much is visible, and `offsetTop` — iOS does not shrink the layout
+  // viewport, it *scrolls* it, so the visible window slides down the page.
+  // The first version of this fix used only `height`, which is why it left
+  // the header off the top of the screen.
+  const vvars = await evalIn(`(() => {
+    const cs = getComputedStyle(document.documentElement);
+    return { h: cs.getPropertyValue("--vvh").trim(), top: cs.getPropertyValue("--vvtop").trim(),
+             realH: Math.round(window.visualViewport.height),
+             realTop: Math.round(window.visualViewport.offsetTop),
+             bodyPos: getComputedStyle(document.body).position }; })()`);
+  ok(vvars.h === `${vvars.realH}px`, `--vvh tracks the visible height (${vvars.h})`);
+  ok(vvars.top === `${vvars.realTop}px`, `--vvtop tracks how far it scrolled (${vvars.top})`);
+  ok(vvars.bodyPos === "fixed",
+     "and the workspace is a fixed frame, so nothing scrolls the document under it");
+  // The standards-track half of the same fix, and the reason the JS above is
+  // still needed: `interactive-widget=resizes-content` tells the browser to
+  // shrink the *layout* viewport for a keyboard, which makes `dvh` correct on
+  // its own — on Chromium. Safari has not shipped it. Both, therefore.
+  ok((await evalIn(`document.querySelector('meta[name="viewport"]').content`)).includes("interactive-widget=resizes-content"),
+     "and the viewport meta asks the browser to resize the layout viewport too");
+
   console.log("E6. names, the close target, and the keyboard");
   // A ✻ click is handed a name that says what the terminal is for, so the
   // strip reports which tab has an agent in it rather than making you guess
   // between term1 and term2.
+  // Asserted rather than assumed: an earlier section leaving a `claude` behind
+  // would shift every name here by one and make the failure look like the
+  // naming being wrong.
+  ok(!(await evalIn(`state.panes[3].tabs.some(t => /^claude/.test(t.session))`)),
+     "setup: no Claude terminal yet, so the first one is `claude`");
   await evalIn(`send({ t: "NewTerminal", pane: 3, launch: "claude" })`);
   await until(async () => (await evalIn(`state.panes[3].tabs.some(t => t.session === "claude")`)), 10, "the claude tab");
   // `force`, because a second ✻ with a Claude already running answers with the

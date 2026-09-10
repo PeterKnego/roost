@@ -3429,6 +3429,26 @@ function targetTerm() {
   return byPane || terms.get(lastFocusedSession) || null;
 }
 
+/// Shows or hides the soft keyboard.
+///
+/// There is no API for this: a keyboard appears because something focusable is
+/// focused and goes away when it is blurred, so this focuses and blurs xterm's
+/// helper textarea. Which is exactly why the other keys must not focus —
+/// see the handler below.
+function toggleKeyboard(entry, btn) {
+  const ta = entry.node && entry.node.querySelector("textarea");
+  const on = btn.getAttribute("aria-pressed") === "true";
+  try {
+    if (on) {
+      if (ta) ta.blur();
+    } else {
+      entry.term.focus();
+      if (ta) ta.focus();
+    }
+  } catch { /* a terminal that went away between tap and handler */ }
+  btn.setAttribute("aria-pressed", String(!on));
+}
+
 function initTermKeys() {
   const bar = document.getElementById("termkeys");
   if (!bar) return;
@@ -3438,12 +3458,23 @@ function initTermKeys() {
     // keyboard the user is about to type into. preventDefault keeps focus where
     // it is, which is the terminal.
     b.addEventListener("pointerdown", (e) => {
-      e.preventDefault();
+      // Not for ⌨: its whole job is to move focus, and `preventDefault` here
+      // is what stops focus moving. Every other key wants exactly that — a
+      // click would take focus first, and on iOS focusing a button dismisses
+      // the keyboard, so an arrow press would close the keyboard it is meant
+      // to be independent of.
+      if (b.dataset.k !== "keyboard") e.preventDefault();
       const entry = targetTerm();
+      if (!entry) return;
+      if (b.dataset.k === "keyboard") return toggleKeyboard(entry, b);
       const make = TERM_KEYS[b.dataset.k];
-      if (!entry || !make) return;
+      if (!make) return;
       entry.term.input(make(entry.term));
-      entry.term.focus();
+      // Deliberately no `focus()`. Focusing xterm's hidden textarea is what
+      // opens the soft keyboard, so every arrow press used to summon one over
+      // the half of the screen you were trying to read — while the whole point
+      // of these keys is to drive a menu *without* typing. The ⌨ button is
+      // the way to ask for a keyboard, and it is the only way.
     });
   }
 }
@@ -3483,12 +3514,23 @@ function initMobileBar() {
 function watchKeyboard() {
   const vv = window.visualViewport;
   if (!vv) return; // every current browser has it; an old one keeps `dvh`
+  const root = document.documentElement;
   const apply = () => {
-    document.documentElement.style.setProperty("--vvh", `${Math.round(vv.height)}px`);
-    // The workspace is a fixed frame, so the page itself should never be
-    // scrolled. If the browser scrolled it to reveal a field, put it back and
-    // let the shrunken frame do the revealing instead.
-    if (window.scrollY !== 0) window.scrollTo(0, 0);
+    // Two numbers, and the first version of this used only the first.
+    //
+    // `height` is how much is visible, and it is what shrinks when a keyboard
+    // opens — `dvh` does not follow it. `interactive-widget=resizes-content`
+    // in the viewport meta makes the *layout* viewport follow it too, which
+    // fixes this outright, but only on Chromium: Safari has not shipped it,
+    // and iOS is where this was reported.
+    //
+    // `offsetTop` is the half that was missing. iOS does not shrink the layout
+    // viewport at all; it scrolls it, so the visible window slides down the
+    // document. Sizing to `height` alone therefore left the frame the right
+    // size in the wrong place — header above the top of the screen, footer
+    // still under the keyboard.
+    root.style.setProperty("--vvh", `${Math.round(vv.height)}px`);
+    root.style.setProperty("--vvtop", `${Math.round(vv.offsetTop)}px`);
     fitTerminals();
   };
   vv.addEventListener("resize", apply);

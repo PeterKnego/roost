@@ -1123,7 +1123,7 @@ pub fn overview_page(sel: &str, roots: &[String]) -> String {
         // intended size. Measured before adding it — `window.innerWidth` 980
         // on a 390px device.
         "<!doctype html><html><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1,interactive-widget=resizes-content\">\
          <title>roost</title>\
          {icons}\
          <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
@@ -1782,7 +1782,7 @@ pub fn workspace_page(
     let (sv, dv, av_js) = (av("style.css"), av("dialog.js"), av("app.js"));
     format!(
         r#"<!doctype html>
-{html_open}<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+{html_open}<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
 <title>{proj_txt}</title>
 {icons}<link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/vendor/hljs-github-dark.min.css">
@@ -1837,6 +1837,7 @@ pub fn workspace_page(
   <button type="button" data-k="down" aria-label="down">&#8595;</button>
   <button type="button" data-k="enter" aria-label="enter">&#9166;</button>
   <button type="button" data-k="ctrlc">^C</button>
+  <button type="button" data-k="keyboard" aria-pressed="false" aria-label="keyboard">&#9000;</button>
 </div>
 <nav id="mobilebar" aria-label="pane">
   <button type="button" data-mpane="0" aria-pressed="false">{SVG_M_TREE}<span>Files</span></button>

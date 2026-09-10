@@ -1132,6 +1132,24 @@ header button.proj:hover svg { opacity: 1; }
    two things that can happen to it: the alternative, measured above, is a 2px
    pane and a sideways scrollbar. */
 @media (max-width: 900px) {
+  /* The whole workspace is a frame pinned to what is *visible*, not to the
+     page. On iOS the layout viewport does not shrink for the keyboard — it is
+     scrolled instead, so the visible window slides down the document — and a
+     frame sized to the page therefore has its header above the top of the
+     screen and its footer under the keyboard at the same time.
+     `--vvtop` is `visualViewport.offsetTop`, which is how far it slid;
+     `--vvh` is how much is left. Both are written by `watchKeyboard`.
+     `position: fixed` so nothing here scrolls the document underneath. */
+  html { overscroll-behavior: none; }
+  body {
+    position: fixed;
+    top: var(--vvtop, 0px);
+    left: 0;
+    right: 0;
+    height: var(--vvh, 100dvh);
+    overflow: hidden;
+  }
+
   /* One cell. Every pane is placed in it and all but the chosen one is
      removed from the layout, so nothing depends on --left-w/--right-w — which
      `render()` still writes on every State broadcast, harmlessly. */
@@ -1168,6 +1186,10 @@ header button.proj:hover svg { opacity: 1; }
   #grid > .divider { display: none; }
 
   #mobilebar { display: flex; }
+  /* Six keys plus ⌨. The keyboard one is set apart and does not stretch, so a
+     thumb reaching for an arrow cannot summon a keyboard by a pixel. */
+  #termkeys button[data-k="keyboard"] { flex: 0 0 auto; min-width: 52px; margin-left: 6px; }
+  #termkeys button[aria-pressed="true"] { background: var(--row-on); color: var(--fg); }
   /* Only with the terminal in front: these keys mean nothing over a file tree,
      and the screen is the scarcest thing here. */
   body[data-mpane="3"] #termkeys { display: flex; }
