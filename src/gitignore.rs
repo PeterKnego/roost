@@ -21,11 +21,17 @@
 //! - A pattern this module cannot evaluate (`**`, a `[class]`, a backslash
 //!   escape) contributes no rule. The walk descends, exactly as it does
 //!   today.
-//! - A file containing **any** negation (`!`) contributes *nothing at all*.
-//!   A negation can only ever make a broader pattern narrower, so dropping it
-//!   while keeping its neighbours is the one mistake that over-ignores:
-//!   `*` plus `!src/` would become "ignore everything". Dropping the whole
-//!   file is the only safe reading of a file with a `!` in it.
+//! - A file containing **any** negation (`!`), or one that exists and cannot
+//!   be read, makes its whole subtree **opaque**: nothing there is ignored,
+//!   by it or by any *ancestor*. Suppressing ancestors is the point, and it
+//!   follows from git's precedence — a deeper `.gitignore` outranks a
+//!   shallower one, so a `!` here exists precisely to cancel a parent's rule.
+//!   Dropping the `!` and keeping the parent's rule is the one mistake that
+//!   over-ignores, and it shipped once: `parse` returned an empty list for
+//!   both "no rules" and "no usable rules", so a `!dist/` in `.gitignore`
+//!   vanished while `.git/info/exclude`'s `dist/` survived in the same merged
+//!   scope. Descendants are deliberately unaffected — they outrank the
+//!   bailing file too.
 //!
 //! # Directories only
 //!
@@ -106,7 +112,7 @@ impl Ignore {
         // what `.git/info/exclude` excluded — turned into a directory roost
         // skipped and git does not.
         let own = parse_file(&root.join(".gitignore"));
-        let excl = parse_file(&root.join(".git").join("info").join("exclude"));
+        let excl = read_exclude(root);
         let (Some(mut rules), Some(more)) = (own, excl) else {
             return Rc::new(Ignore { scope: None, opaque: true, parent: None });
         };
@@ -212,21 +218,64 @@ impl Scope {
     }
 }
 
-/// Reads one ignore file into rules. Every failure — missing, unreadable,
-/// oversized — is an empty list, which means "ignore nothing" and leaves the
-/// walk behaving exactly as it does without this module.
+/// `.git/info/exclude`, when there is such a file to read.
+///
+/// `.git` is probed first, and that probe is the whole point. In a **git
+/// worktree or a submodule, `.git` is a regular file** holding a `gitdir:`
+/// pointer — so `stat(".git/info/exclude")` fails with `ENOTDIR`, which is
+/// not `NotFound`. Reading that as "cannot tell" made the entire root opaque
+/// and switched gitignore filtering off for the whole tree, silently,
+/// reinstating the 20 000-file budget exhaustion this module exists to
+/// prevent. roost treats worktrees as a first-class feature, so that is not
+/// an exotic layout.
+///
+/// A `.git` that is a file, or absent, is a *definite* answer that no
+/// `<root>/.git/info/exclude` exists — the same kind of answer `NotFound` is,
+/// and it must not be folded into "unknown". Probing the parent says so
+/// portably, without `ErrorKind::NotADirectory`, which needs a newer
+/// toolchain than this crate asks for (`search.rs` already refuses a method
+/// for that reason).
+fn read_exclude(root: &Path) -> Option<Vec<Rule>> {
+    match std::fs::symlink_metadata(root.join(".git")) {
+        Ok(m) if m.is_dir() => parse_file(&root.join(".git").join("info").join("exclude")),
+        // A worktree's or submodule's `.git` file: no exclude to read.
+        Ok(_) => Some(Vec::new()),
+        // Not a repository at all. Also a definite answer.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+        // Something is wrong with `.git` itself — unreadable, a broken mount.
+        // Whether an exclude file exists, and whether it negates, is unknown.
+        Err(_) => None,
+    }
+}
+
+/// Reads one ignore file into rules.
+///
+/// Three answers, not two. `Some(rules)` is what the file says; `Some(empty)`
+/// is a file that is *definitely* not there, or is not an ignore file at all,
+/// and contributes nothing; `None` is a file that exists and might say
+/// something this cannot read — which makes its subtree opaque, because
+/// "cannot tell whether it negates" may not be folded into "it does not".
 fn parse_file(path: &Path) -> Option<Vec<Rule>> {
-    match std::fs::symlink_metadata(path) {
-        // Positively absent: it has nothing to say, which is not the same as
-        // being unable to say. This is the ordinary case for almost every
-        // directory and must not disable anything.
+    // `metadata`, which follows symlinks, rather than `symlink_metadata`.
+    // This is project content and git reads it the same way — and refusing to
+    // follow became disproportionate once a refusal meant *opacity*: a
+    // monorepo that symlinks one shared `.gitignore` into `web/` would have
+    // switched off every ancestor rule for that whole subtree. The target is
+    // still bounded, and it still only ever decides which directories to skip.
+    match std::fs::metadata(path) {
+        // Positively absent: nothing to say, which is not the same as being
+        // unable to say. The ordinary case for almost every directory, and it
+        // must not disable anything.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
         // Present and usable.
         Ok(m) if m.is_file() && m.len() <= MAX_BYTES => {}
-        // Present but unusable — a symlink, a directory, a fifo, something
-        // too large — or an error that is not NotFound. Either way this
-        // cannot be read, so whether it holds a negation is unknown, and
-        // "unknown" may not be folded into "no negation". Opaque.
+        // A directory or a fifo where the file should be is not an ignore
+        // file to git either, so it contributes nothing rather than
+        // suppressing every ancestor rule below it.
+        Ok(m) if !m.is_file() => return Some(Vec::new()),
+        // A regular file too large to parse, or an error that is not
+        // NotFound. git *would* read this one, so whether it holds a negation
+        // is genuinely unknown.
         _ => return None,
     }
     let Ok(text) = std::fs::read_to_string(path) else { return None };
@@ -454,6 +503,70 @@ mod tests {
     }
 
     #[test]
+    fn a_worktree_or_submodule_root_still_ignores_anything() {
+        // In a git worktree and in a submodule, `.git` is a regular *file*
+        // holding a `gitdir:` pointer. `stat(".git/info/exclude")` then fails
+        // with ENOTDIR, which is not `NotFound` — and reading that as "cannot
+        // tell" made the whole root opaque, switching gitignore filtering off
+        // for the entire tree. Silently: nothing fails, search just quietly
+        // walks `node_modules` again and the 20 000-file budget goes back to
+        // being exhausted by build output.
+        //
+        // roost creates worktrees itself (`.claude/worktrees/`), so this is
+        // the normal layout for a large share of the trees it searches.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".gitignore"), b"dist\n").unwrap();
+        std::fs::write(d.path().join(".git"), b"gitdir: /elsewhere/.git/worktrees/x\n").unwrap();
+        assert!(
+            Ignore::for_root(d.path()).skips_dir("dist"),
+            "a `.git` file is a definite 'no exclude file', not an unknown"
+        );
+    }
+
+    #[test]
+    fn a_repository_with_no_git_at_all_still_ignores_anything() {
+        // The other definite absence, and the ordinary case for a plain
+        // directory that is not a checkout.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".gitignore"), b"dist\n").unwrap();
+        assert!(Ignore::for_root(d.path()).skips_dir("dist"));
+    }
+
+    #[test]
+    fn a_symlinked_ignore_file_is_read_rather_than_blanking_its_subtree() {
+        // Sharing one `.gitignore` across a monorepo by symlink is ordinary,
+        // and git reads it. Refusing to follow it cost nothing while a
+        // refusal meant "no rules"; once a refusal meant *opacity* it
+        // switched off every ancestor rule for that whole subtree.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("shared-ignore"), b"build\n").unwrap();
+        std::fs::create_dir_all(d.path().join("web")).unwrap();
+        std::os::unix::fs::symlink(
+            d.path().join("shared-ignore"),
+            d.path().join("web/.gitignore"),
+        )
+        .unwrap();
+        std::fs::write(d.path().join(".gitignore"), b"dist\n").unwrap();
+
+        let root = Ignore::for_root(d.path());
+        let web = root.enter(&d.path().join("web"), "web");
+        assert!(web.skips_dir("web/build"), "the symlinked file's own rule applies");
+        assert!(web.skips_dir("dist"), "and the root's rule is not suppressed under it");
+    }
+
+    #[test]
+    fn a_directory_where_the_ignore_file_belongs_contributes_nothing() {
+        // Not an ignore file to git either, so it has nothing to say — which
+        // is different from having something unreadable to say.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".gitignore"), b"dist\n").unwrap();
+        std::fs::create_dir_all(d.path().join("web/.gitignore")).unwrap();
+        let root = Ignore::for_root(d.path());
+        let web = root.enter(&d.path().join("web"), "web");
+        assert!(web.skips_dir("dist"), "an ancestor rule survives it");
+    }
+
+    #[test]
     fn a_negation_cannot_be_cancelled_by_the_other_file_in_the_same_scope() {
         // The reported defect. `for_root` merges `.gitignore` and
         // `.git/info/exclude` into one scope, and `parse` used to bail to an
@@ -512,25 +625,34 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_ignore_file_is_opaque_rather_than_empty() {
+    fn an_ignore_file_that_exists_and_cannot_be_parsed_is_opaque() {
         // "Could not read it" says nothing about whether it holds a
         // negation, and CLAUDE.md's rule is that a failed check may never be
         // folded into a definite answer. Degrading to "ignore nothing here"
-        // is the safe direction — it is exactly the behaviour before this
-        // module existed.
+        // is the safe direction — it is the behaviour before this module
+        // existed.
+        //
+        // Oversized, not a directory and not a mode-000 file. A directory is
+        // now (correctly) "not an ignore file at all", which is a definite
+        // answer rather than an unknown — the first version of this test used
+        // one and started passing for the wrong reason the moment that
+        // distinction was drawn. A mode-000 file would be readable anyway
+        // when the suite runs as root, which this project has hit before.
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join(".gitignore"), b"dist\n").unwrap();
         std::fs::create_dir_all(d.path().join("web")).unwrap();
-        // A directory where the file belongs: present, and unreadable as a
-        // file. `parse_file` must not report this as "no rules".
-        std::fs::create_dir_all(d.path().join("web/.gitignore")).unwrap();
+        let mut huge = String::from("build\n");
+        while huge.len() <= MAX_BYTES as usize {
+            huge.push_str("filler\n");
+        }
+        std::fs::write(d.path().join("web/.gitignore"), huge.as_bytes()).unwrap();
 
         let root = Ignore::for_root(d.path());
         assert!(root.skips_dir("dist"), "setup: the root rule works");
         let web = root.enter(&d.path().join("web"), "web");
         assert!(
             !web.skips_dir("web/dist"),
-            "an unusable file suspends ignoring below it instead of being read as silence"
+            "a file git would read but this cannot suspends ignoring below it"
         );
     }
 
