@@ -207,6 +207,84 @@ try {
   ok((await evalIn(`getComputedStyle(document.getElementById("searchinput")).fontSize`)) === "16px",
      "the search field is 16px, so focusing it does not zoom the page");
 
+  console.log("E3. the header popups open where the finger is");
+  // #projpanel has two triggers (HEADER_POPUPS in app.js: `projbtn` and
+  // `projname`) and is anchored `right: 8px` for the first of them. The phone
+  // trim hides `projbtn`, so the only thing left to tap is the project name on
+  // the LEFT while the panel opened hard against the right edge — measured at
+  // 390px, the name at x 35-85 and the panel at x 151-382, with nothing
+  // connecting them. Reported from a phone.
+  //
+  // Asserted against the viewport rather than against the trigger: the fix is
+  // that these span the screen, so "aligned with the button" is the wrong
+  // question. All three are checked because they are anchored to *different*
+  // sides, and a rule that caught one would be equally wrong about the others.
+  for (const [panel, trigger] of [["projpanel", "projname"], ["noticepanel", "bell"], ["wtpanel", "wtbtn"]]) {
+    await evalIn(`(() => { const t = document.getElementById(${JSON.stringify(trigger)});
+      t.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); t.click(); })()`);
+    await sleep(300);
+    const r = await evalIn(`(() => { const e = document.getElementById(${JSON.stringify(panel)});
+      if (!e || !e.offsetParent) return null; const b = e.getBoundingClientRect();
+      return { l: Math.round(b.left), r: Math.round(b.right) }; })()`);
+    ok(r && r.l <= 8 && r.r >= PHONE.width - 8,
+       `#${panel} spans the screen instead of hanging off one edge (${JSON.stringify(r)})`);
+    await evalIn(`document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }))`);
+    await sleep(150);
+  }
+
+  console.log("E4. the terminal scrolls under a finger");
+  // Reported from a phone as "sticking". `.xterm-viewport` is a real
+  // scrollable div, so it scrolls — and then hands the leftover delta to the
+  // page the moment it hits an end, which stalls the gesture and starts the
+  // next drag somewhere else.
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="3"]').click()`);
+  await sleep(300);
+  await evalIn(`[...terms.values()][0].term.input(${JSON.stringify("seq 1 300" + String.fromCharCode(13))})`);
+  ok(await until(async () => (await evalIn(screenText)).includes("300"), 20, "output"),
+     "a terminal with more output than fits");
+  const vp = `document.querySelector('.pane[data-pane="3"] .xterm-viewport')`;
+  ok(await until(async () => (await evalIn(`${vp} ? ${vp}.scrollHeight - ${vp}.clientHeight : 0`)) > 50, 10, "scrollback"),
+     "and it has somewhere to scroll to");
+  await evalIn(`${vp}.scrollTop = ${vp}.scrollHeight`);
+  const atBottom = await evalIn(`${vp}.scrollTop`);
+  const mid = await evalIn(`(() => { const r = ${vp}.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`);
+  // Raw touch events, not `Input.synthesizeScrollGesture`. Its touch path is
+  // inert in chrome-headless-shell — measured: a 400px touch gesture moved the
+  // viewport 3900 -> 3900 while the same gesture as `mouse` moved it to 3770,
+  // and a hand-dispatched touch sequence to 3700. A test built on it would
+  // have reported "the terminal does not scroll" forever, about a terminal
+  // that scrolls.
+  const touch = (type, y) => page.cmd("Input.dispatchTouchEvent",
+    { type, touchPoints: type === "touchEnd" ? [] : [{ x: mid.x, y }] });
+  const drag = async (from, steps) => {
+    await touch("touchStart", from);
+    for (let i = 1; i <= steps; i++) { await touch("touchMove", from + i * 25); await sleep(16); }
+    await touch("touchEnd", 0);
+    await sleep(500);
+  };
+  await drag(mid.y - 150, 8);
+  const scrolled = await evalIn(`${vp}.scrollTop`);
+  ok(scrolled < atBottom, `a finger dragged down scrolls the terminal back (${atBottom} -> ${scrolled})`);
+
+  // The half that was reported as sticking. `.xterm-viewport` is a real
+  // scrollable div, so it always scrolled; what it also did was hand the
+  // leftover delta to the page on reaching an end, which stalls the gesture
+  // and starts the next drag from somewhere else.
+  //
+  // Asserted on the computed property as well as the behaviour, and the
+  // distinction is worth being plain about: the drag above is a real gesture,
+  // while `overscroll-behavior` is checked as a *style* because the page in
+  // this layout has nothing to scroll anyway — so a behavioural check of the
+  // chaining would pass with the property removed. It is a regression guard
+  // on the fix, not a demonstration of it.
+  ok((await evalIn(`getComputedStyle(${vp}).overscrollBehaviorY`)) === "contain",
+     "and the gesture is kept inside the terminal rather than chaining to the page");
+  ok((await evalIn(`getComputedStyle(${vp}).touchAction`)) === "pan-y",
+     "with the browser told up front that a vertical drag is a scroll");
+  await drag(mid.y - 200, 16);
+  ok((await evalIn(`window.scrollY`)) === 0, "dragging past the top leaves the page where it was");
+
   console.log("F. a desktop is untouched");
   // The negative control, and the reason any of the above means anything: all
   // of it is scoped to a media query, and a rule that leaked would show here
