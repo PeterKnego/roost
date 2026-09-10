@@ -577,6 +577,13 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                 launched: launch.clone(),
             },
         );
+        // Written down as well as held in memory: the in-memory record dies
+        // with the process, and #17 step 3 is entirely about the case where
+        // the process is gone. Recorded at the spawn, not at the request, so
+        // it says what actually started rather than what was asked for.
+        if let Some(req) = launch.as_ref() {
+            crate::relaunch::record(project, name, req.launch);
+        }
         let pump_key = key.clone();
         let pump_project = project.to_string();
         let pump_session = name.to_string();
@@ -1054,6 +1061,7 @@ pub fn end_session(project: &str, name: &str) -> bool {
     // the user their close, and each is re-validated where it is read.
     crate::cwds::forget(project, name);
     crate::claudesess::forget(project, name);
+    crate::relaunch::forget(project, name);
     end_socket(project, name, "End session")
 }
 

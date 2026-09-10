@@ -102,7 +102,7 @@ try {
   const labels = await one.evalIn(`[...document.querySelectorAll("#dlg-settings .dlg-row")].map((l) => l.dataset.key).join(",")`);
   // No theme row here: the theme is chosen on the Theme pane, which also
   // carries its source line and Clear.
-  ok(labels === "hide,show_hidden,autosave,follow_tree,share_selection,worktree_prompt,allowed_origins,max_upload_bytes,ide,roots", `rows in the spec's order, without theme (${labels})`);
+  ok(labels === "hide,show_hidden,autosave,follow_tree,share_selection,worktree_prompt,relaunch,allowed_origins,max_upload_bytes,ide,roots", `rows in the spec's order, without theme (${labels})`);
   ok(/keystroke/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="autosave"] .doc').textContent`)), "each row explains what the setting does");
   {
     const h = await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="autosave"]').getBoundingClientRect().height`);

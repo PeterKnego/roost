@@ -18,6 +18,7 @@ struct RawConfig {
     ide: Option<bool>,
     roots: Option<Vec<String>>,
     worktree_prompt: Option<bool>,
+    relaunch: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,7 +98,11 @@ impl Default for Settings {
 /// could widen a boundary with. In this order in the dialog.
 pub const PROJECT_KEYS: &[&str] = &["theme", "hide", "show_hidden", "autosave", "follow_tree"];
 /// Keys only the global file may set; see the readers below for why each.
-pub const GLOBAL_ONLY_KEYS: &[&str] = &["share_selection", "worktree_prompt"];
+/// `relaunch` is here for the sharpest reason any key has been: it decides
+/// whether opening a project *starts an agent*. A cloned repository that could
+/// set it would be arranging to run `claude` on a machine it has just arrived
+/// on.
+pub const GLOBAL_ONLY_KEYS: &[&str] = &["share_selection", "worktree_prompt", "relaunch"];
 /// Keys no page may write. Shown read-only; not in any allowlist, so a
 /// forged intent is refused too.
 pub const READ_ONLY_KEYS: &[&str] = &["allowed_origins", "max_upload_bytes", "ide", "roots"];
@@ -147,7 +152,8 @@ pub fn validate(scope: Scope, key: &str, value: Option<&SettingValue>) -> Result
         }
         ("hide", _) => Err("hide takes a list of names".into()),
         (
-            "show_hidden" | "autosave" | "follow_tree" | "share_selection" | "worktree_prompt",
+            "show_hidden" | "autosave" | "follow_tree" | "share_selection" | "worktree_prompt"
+            | "relaunch",
             SettingValue::Bool(_),
         ) => Ok(()),
         (k, _) => Err(format!("{k} takes true or false")),
@@ -315,6 +321,25 @@ fn worktree_prompt_from(global: &Path) -> bool {
         .and_then(|s| toml::from_str::<RawConfig>(&s).ok())
         .and_then(|r| r.worktree_prompt)
         .unwrap_or(true)
+}
+
+/// Whether opening a project restarts the agents roost itself launched in it.
+///
+/// Global only (see `GLOBAL_ONLY_KEYS`) and **off** unless asked for. #17 is
+/// careful about this for good reason — a relaunch starts an agent in a
+/// checkout whose state it does not know — so absent, unreadable and
+/// unparseable all mean off, which is the one direction where being wrong
+/// costs nothing.
+pub fn relaunch() -> bool {
+    relaunch_from(&global_config_path())
+}
+
+fn relaunch_from(global: &Path) -> bool {
+    std::fs::read_to_string(global)
+        .ok()
+        .and_then(|s| toml::from_str::<RawConfig>(&s).ok())
+        .and_then(|r| r.relaunch)
+        .unwrap_or(false)
 }
 
 /// The directories scanned for projects, from the global config's `roots`.
@@ -637,6 +662,8 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
         "Let a Claude connected to this project read the text you select in the editor.");
     push("worktree_prompt", "bool", V::Bool(worktree_prompt()), V::Bool(true), false,
         "When a Claude is already running here, ✻ offers to start the next one in a new worktree.");
+    push("relaunch", "bool", V::Bool(relaunch()), V::Bool(false), false,
+        "When you open a project, restart the agents roost had launched in it before a reboot. Never resumes a conversation \u{2014} it starts a fresh one.");
     push("allowed_origins", "list", V::List(allowed_origins()), V::List(vec![]), false,
         "Browser origins allowed to connect besides loopback, such as the tailnet address.");
     push("max_upload_bytes", "str", V::Str(max_upload_bytes().to_string()), V::Str(DEFAULT_MAX_UPLOAD.to_string()), false,
@@ -1303,7 +1330,7 @@ mod tests {
         assert!(!row("theme").reload);
         // Order: project keys, global-only keys, read-only keys.
         let keys: Vec<&str> = v.keys.iter().map(|r| r.key.as_str()).collect();
-        assert_eq!(keys, ["theme", "hide", "show_hidden", "autosave", "follow_tree", "share_selection", "worktree_prompt", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
+        assert_eq!(keys, ["theme", "hide", "show_hidden", "autosave", "follow_tree", "share_selection", "worktree_prompt", "relaunch", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
         assert_eq!(v.themes.len(), 5 + 35);
         assert!(v.global_file.ends_with("global.toml"));
         assert_eq!(v.project_file, ".roost/config.toml");
