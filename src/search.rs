@@ -376,9 +376,27 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
                 // completeness is the defect this module's whole result type
                 // exists to prevent.
                 if ignoring {
+                    // Spelled exactly as the file branch spells it. The
+                    // `\` → `/` rewrite here was both pointless on this
+                    // platform and wrong: `\` is a legal character in a
+                    // Linux filename, so a directory literally named `a\b`
+                    // was rewritten to `a/b` and matched an anchored
+                    // two-segment pattern — a silent over-ignore. It also
+                    // meant the two halves of the walk disagreed about what
+                    // a path is called.
                     let rel = match path.strip_prefix(root) {
-                        Ok(p) => p.to_string_lossy().replace('\\', "/"),
-                        Err(_) => continue,
+                        Ok(p) => p.to_string_lossy().into_owned(),
+                        Err(e) => {
+                            // Unreachable today — every path here is
+                            // `root.join(...)` — but this is the one branch
+                            // in the walk that could drop a whole subtree
+                            // without saying so, and "a search that skipped
+                            // something says so" is the rule this module is
+                            // built around. Counted rather than trusted.
+                            debug_assert!(false, "rel under root failed: {e}");
+                            r.unreadable += 1;
+                            continue;
+                        }
                     };
                     if inherited.skips_dir(&rel) {
                         r.skipped_ignored += 1;
@@ -563,6 +581,29 @@ mod tests {
             r.skipped_ignored, 1,
             "but only `dist` is attributed to the ignore rule — the other two were already gone"
         );
+    }
+
+    #[test]
+    fn a_backslash_in_a_directory_name_is_not_a_path_separator() {
+        // `\` is a legal character in a Linux filename. The directory branch
+        // used to rewrite it to `/` before matching, so a directory literally
+        // named `a\b` was spelled `a/b` and matched an anchored two-segment
+        // pattern that was never about it — a silent over-ignore. The file
+        // branch never did that rewrite, so the two halves of the walk also
+        // disagreed about what the same path is called.
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join(".gitignore"), "/a/b\n").unwrap();
+        let odd = d.path().join("a\\b");
+        fs::create_dir_all(&odd).unwrap();
+        fs::write(odd.join("x.rs"), "the needle is here\n").unwrap();
+
+        let r = run(d.path(), &query("needle", TreeFilter::default()), &never());
+        assert_eq!(
+            r.lines.iter().map(|l| l.rel.as_str()).collect::<Vec<_>>(),
+            ["a\\b/x.rs"],
+            "a directory named `a\\b` is not the path `a/b`"
+        );
+        assert_eq!(r.skipped_ignored, 0, "and nothing was skipped for it");
     }
 
     #[test]
