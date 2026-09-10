@@ -63,7 +63,23 @@ fn main() {
             std::process::exit(2);
         }),
     };
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind 127.0.0.1");
+    // The one place this codebase permits a non-loopback bind, and only
+    // through an explicit environment gate. See `bind.rs` for why it is a
+    // boolean rather than an address, and why an unrecognised value exits
+    // rather than falling back.
+    let bind = match roost::bind::decide(std::env::var(roost::bind::VAR).ok().as_deref()) {
+        Ok(b) => b,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    };
+    let addr = bind.addr();
+    let listener =
+        std::net::TcpListener::bind((addr, port)).unwrap_or_else(|e| panic!("bind {addr}: {e}"));
+    if bind == roost::bind::Bind::AllInterfaces {
+        eprintln!("{}", roost::bind::notice());
+    }
     // Here rather than in `serve`: the check asks the user's real login shell,
     // and the test servers `serve` starts must not depend on what that shell
     // has installed. Background, so listening does not wait on a profile.
@@ -76,6 +92,6 @@ fn main() {
     // one that makes a terminal come back from a reboot in the directory it
     // was working in.
     roost::cwds::watch();
-    eprintln!("roost listening on http://127.0.0.1:{port}");
+    eprintln!("roost listening on http://{addr}:{port}");
     roost::serve(listener, roots);
 }
