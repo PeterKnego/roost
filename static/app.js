@@ -933,6 +933,12 @@ function render() {
   if (!state) return;
   const header = document.querySelector("header");
   if (header) document.documentElement.style.setProperty("--header-h", header.offsetHeight + "px");
+  // Measured for the same reason as the header: #grid subtracts both from the
+  // viewport, and the bar's height is a function of the font the theme picked.
+  // `offsetHeight` is 0 while it is display:none above the breakpoint, which
+  // is the right contribution there — nothing is taking up that space.
+  const mbar = document.getElementById("mobilebar");
+  if (mbar) document.documentElement.style.setProperty("--mobilebar-h", mbar.offsetHeight + "px");
   // htmx swaps into #gitinfo/#wtlabel and the #projcount/#bellcount writes
   // below all change the header's width while the panel is open, and
   // #searchbox uses margin:auto, so the field (and the panel anchored to it)
@@ -976,8 +982,10 @@ function render() {
       // Terminal tabs route through focusSession, not a bare ActivateTab, so
       // the obvious gesture of clicking a dotted tab is what clears its dot
       // — see hasAttention/focusSession below.
-      b.onclick = () =>
+      b.onclick = () => {
+        revealPane(pi);
         t.k === "Terminal" ? focusSession(t.session) : send({ t: "ActivateTab", pane: pi, idx: ti });
+      };
       const x = document.createElement("span");
       x.className = "x";
       x.title =
@@ -1772,6 +1780,9 @@ function wireFileLinks(root) {
         pane: 2,
         tab: isDiff ? { k: "Diff", rel: rel || null } : { k: "File", rel, mode: defaultMode(rel) },
       });
+      // Tapping a file in the tree is the clearest "show me this" there is,
+      // and on a phone the tree and the editor are never on screen together.
+      revealPane(2);
       // `[run](deploy.md#running)` names a heading as well as a file
       // (render.rs's link_open emits it as data-hash). Armed after the intent,
       // never before: the tab's fragment is only fetched once the State
@@ -3133,7 +3144,89 @@ window.onmousemove = (e) => {
   render();
 };
 
-window.addEventListener("resize", () => terms.forEach((e) => { try { e.fit.fit(); sendResize(e); } catch {} }));
+const fitTerminals = () => terms.forEach((e) => { try { e.fit.fit(); sendResize(e); } catch {} });
+window.addEventListener("resize", fitTerminals);
+
+// ------------------------------------------------------ phone layout
+// #15: three panes side by side is not a layout that shrinks, it is the wrong
+// shape. One pane at a time with a switcher is the shape, and which pane is
+// showing is the only state this needs — the panes themselves are the same
+// panes, rendered by the same code, with the other three taken out of the
+// layout by CSS.
+//
+// The breakpoint lives in the stylesheet AND here, which is a duplication
+// worth its keep: CSS decides what is drawn, and this decides whether a tap on
+// a file should also change which pane is on screen. `matchMedia` with the
+// same query is what keeps the two from drifting silently — a stylesheet-only
+// answer cannot be read from JS, and a JS-only answer cannot lay out.
+// Kept in step with the stylesheet's own breakpoint — see the comment on that
+// block for why the number is 900 and why it is a measurement, not a
+// convention.
+const PHONE_QUERY = "(max-width: 900px)";
+const phone = window.matchMedia(PHONE_QUERY);
+const MPANE_KEY = "roost.mpane";
+
+/// Which pane the switcher opens on. Terminal, deliberately: #15's whole
+/// argument is that the phone job is talking to Claude, not driving an IDE.
+const DEFAULT_MPANE = "3";
+
+function mobileBar() { return document.getElementById("mobilebar"); }
+
+/// Shows one pane and re-fits the terminals in it.
+///
+/// The fit has to happen *after* the attribute change, and it is the reason
+/// the CSS hides panes with `display:none` rather than `visibility`: a pane
+/// that still occupies layout would keep an xterm measured at the old size,
+/// and one that occupies none measures zero — so every switch re-fits, and
+/// a terminal mounted while its pane was hidden gets its real size here.
+function showMobilePane(pi) {
+  const n = String(pi);
+  if (!["0", "1", "2", "3"].includes(n)) return;
+  document.body.dataset.mpane = n;
+  const bar = mobileBar();
+  if (bar) {
+    for (const b of bar.querySelectorAll("button")) {
+      b.setAttribute("aria-pressed", String(b.dataset.mpane === n));
+    }
+  }
+  // Stored, not derived from the layout: reopening the project on the phone
+  // should land where you left it, and the workspace's own `active` tab
+  // indices say nothing about which *pane* was in front.
+  try { localStorage.setItem(MPANE_KEY, n); } catch { /* private mode */ }
+  fitTerminals();
+}
+
+/// The gesture route: a tap that means "show me this" has to also bring the
+/// pane it lives in to the front, or on a phone it does nothing visible at all
+/// — the tab activates in a pane that is not on screen.
+///
+/// A no-op above the breakpoint, where all four panes are already visible and
+/// yanking the layout around would be the bug rather than the fix.
+function revealPane(pi) {
+  if (!phone.matches) return;
+  showMobilePane(pi);
+}
+
+function initMobileBar() {
+  const bar = mobileBar();
+  if (!bar) return;
+  for (const b of bar.querySelectorAll("button")) {
+    b.onclick = () => showMobilePane(b.dataset.mpane);
+  }
+  let start = DEFAULT_MPANE;
+  try { start = localStorage.getItem(MPANE_KEY) || DEFAULT_MPANE; } catch { /* private mode */ }
+  showMobilePane(start);
+}
+
+// Crossing the breakpoint in either direction. A desktop window dragged narrow
+// has to grow a switcher without a reload, and one dragged wide has to stop
+// hiding three panes — the attribute is harmless above the breakpoint (no rule
+// reads it), but the terminals still need re-fitting because their pane just
+// changed width by several hundred pixels.
+phone.addEventListener("change", () => {
+  if (phone.matches) showMobilePane(document.body.dataset.mpane || DEFAULT_MPANE);
+  fitTerminals();
+});
 
 // A directory's first expand is driven by real htmx (hx-get + hx-trigger
 // "toggle once" on the <details>, see render::tree_level) rather than the
@@ -3341,6 +3434,13 @@ if (location.hash.startsWith("#session=")) {
   };
   tryFocus();
 }
+
+// Before `connectControl`, so the first State broadcast renders into a layout
+// that has already decided which pane is in front. After it, the first
+// `render()` would measure the switcher and fit terminals against a body with
+// no `data-mpane` at all — which on a phone is all four panes stacked in one
+// grid cell, for as long as the socket takes to answer.
+initMobileBar();
 
 connectControl();
 
@@ -3728,10 +3828,12 @@ function focusSession(session) {
     const ti = state.panes[pi].tabs.findIndex((t) => t.k === "Terminal" && t.session === session);
     if (ti >= 0) {
       send({ t: "ActivateTab", pane: pi, idx: ti });
+      revealPane(pi);
       return;
     }
   }
   send({ t: "OpenTab", pane: 3, tab: { k: "Terminal", session } });
+  revealPane(3);
 }
 
 // The tab-strip dot for a session in THIS project: derived from `notices`
@@ -4580,6 +4682,7 @@ function activateSearchRow(i) {
     // parameter.
     focusNextReveal = true;
     send({ t: "OpenAtLine", pane: 2, rel: r.rel, line: r.line });
+    revealPane(2);
   } else {
     // Same rule the file tree uses (defaultMode, line 145): a rendered form
     // opens in Preview, everything else opens in Edit. Hardcoding Preview
@@ -4587,6 +4690,7 @@ function activateSearchRow(i) {
     // user clicked it from, and the server does not correct it — coerce_tab
     // only ever demotes Edit to Preview, never promotes back.
     send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: r.rel, mode: defaultMode(r.rel) } });
+    revealPane(2);
   }
 }
 

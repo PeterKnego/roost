@@ -1593,6 +1593,14 @@ const SVG_REFRESH: &str = r#"<svg width="15" height="15" viewBox="0 0 16 16" fil
 /// so it inherits `currentColor` and the header's stroke weight like every
 /// other glyph up there.
 const SVG_CARET: &str = r#"<svg width="9" height="9" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>"#;
+/// The four icons in the mobile pane switcher. Line art at 20px rather than
+/// the header's 12-16px: this is a tap target, read at arm's length, and the
+/// header's icons disappear at that size on a phone screen.
+const SVG_M_TREE: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h6l1.5 2H20v12H4z"/></svg>"#;
+const SVG_M_CHANGES: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h10M4 7l3-3M4 7l3 3"/><path d="M20 17H10m10 0l-3-3m3 3l-3 3"/></svg>"#;
+const SVG_M_EDIT: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h9l5 5v11H5z"/><path d="M14 4v5h5"/><path d="M9 13h6M9 16.5h4"/></svg>"#;
+const SVG_M_TERM: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9.5l3 2.5-3 2.5M13 15h4"/></svg>"#;
+
 const SVG_X: &str = r#"<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>"#;
 
 /// A destructive `askConfirm` used to be a native `confirm()` — browser
@@ -1783,6 +1791,12 @@ pub fn workspace_page(
   <div class="divider" data-div="right-w"></div>
   <section class="pane" data-pane="3"><div class="panehead"><div class="tabstrip"></div><div class="paneicons"></div></div><div class="content"></div></section>
 </main>
+<nav id="mobilebar" aria-label="pane">
+  <button type="button" data-mpane="0" aria-pressed="false">{SVG_M_TREE}<span>Files</span></button>
+  <button type="button" data-mpane="1" aria-pressed="false">{SVG_M_CHANGES}<span>Changes</span></button>
+  <button type="button" data-mpane="2" aria-pressed="false">{SVG_M_EDIT}<span>Editor</span></button>
+  <button type="button" data-mpane="3" aria-pressed="false">{SVG_M_TERM}<span>Terminal</span></button>
+</nav>
 <div id="searchoverlay" hidden>
   <div class="searchpanel">
     <div id="searchresults"></div>
