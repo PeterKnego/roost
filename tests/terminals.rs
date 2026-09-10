@@ -433,6 +433,13 @@ fn a_hup_ignoring_child_does_not_survive_kill_and_unlink() {
 /// "the restored contract never arrived".
 #[test]
 fn a_session_that_outlived_roost_gets_its_mode_contract_back() {
+    // `ROOST_CMD` and `ROOST_STATE_DIR` are process-global and this file's
+    // other tests set them; without the lock a `remove_var` here can strip
+    // `ROOST_CMD=cat` out from under a test running on another thread, which
+    // then spawns a real login shell and fails its echo assertion. That is
+    // the flake class CLAUDE.md records — one test's state reaching into
+    // another's — and `tests/common/mod.rs` spells out the same reason.
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if std::process::Command::new("dtach").arg("-h").output().is_err() {
         eprintln!("skipping: dtach not installed");
         return;
@@ -506,6 +513,13 @@ fn a_session_that_outlived_roost_gets_its_mode_contract_back() {
 /// fail with "the pump never recorded the contract".
 #[test]
 fn the_pump_records_a_declared_mode_where_the_next_roost_will_find_it() {
+    // `ROOST_CMD` and `ROOST_STATE_DIR` are process-global and this file's
+    // other tests set them; without the lock a `remove_var` here can strip
+    // `ROOST_CMD=cat` out from under a test running on another thread, which
+    // then spawns a real login shell and fails its echo assertion. That is
+    // the flake class CLAUDE.md records — one test's state reaching into
+    // another's — and `tests/common/mod.rs` spells out the same reason.
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if std::process::Command::new("dtach").arg("-h").output().is_err() {
         eprintln!("skipping: dtach not installed");
         return;
@@ -536,19 +550,27 @@ fn the_pump_records_a_declared_mode_where_the_next_roost_will_find_it() {
     assert!(common::wait_for_path(&sock), "and its socket must appear");
 
     let att = roost::session::attach(&project, &name, d.path()).expect("attach must rejoin");
-    // Asserts the pre-state it later negates: without this the test would
-    // pass just as well if the file had been left over from another run.
-    assert!(!sidecar.exists(), "no sidecar before the app declares anything");
+
+    // Mouse reporting is the marker, not bracketed paste, and the difference
+    // matters. `/bin/sh` is bash on several distros, and bash 4.4+ emits
+    // `?2004h` at every prompt — so on those hosts the sidecar already holds
+    // `2004 1` before this test types anything, the main assertion is
+    // satisfied by the shell rather than by the `printf` under test, and it
+    // passes while proving nothing. No shell declares mouse reporting.
+    //
+    // The pre-state is cleared rather than asserted absent, for the same
+    // reason: the shell may legitimately have written one already.
+    let _ = std::fs::remove_file(&sidecar);
 
     // The app declares its contract, the way Claude does at startup.
-    roost::session::write_input(&att.key, b"printf '\\033[?2004h\\033[?1000h'\n")
+    roost::session::write_input(&att.key, b"printf '\\033[?1000h\\033[?1006h'\n")
         .expect("the shell must accept input");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut body = String::new();
     while std::time::Instant::now() < deadline {
         if let Ok(t) = std::fs::read_to_string(&sidecar) {
-            if t.contains("2004 1") {
+            if t.contains("1000 1") {
                 body = t;
                 break;
             }
@@ -557,10 +579,114 @@ fn the_pump_records_a_declared_mode_where_the_next_roost_will_find_it() {
     }
     let _ = roost::registry::kill_and_unlink(&sock);
 
-    assert!(body.contains("2004 1"), "the pump never recorded the contract; got {body:?}");
-    assert!(body.contains("1000 1"), "and mouse reporting with it; got {body:?}");
+    assert!(body.contains("1000 1"), "the pump never recorded the contract; got {body:?}");
+    assert!(body.contains("1006 1"), "and the coordinate encoding with it; got {body:?}");
     // 25 is tracked in memory and deliberately never written: it is the one
     // mode a repainting app changes constantly, so persisting it would put a
     // disk write on every frame for a value that repairs itself in a second.
     assert!(!body.contains("25 "), "cursor visibility must not be written; got {body:?}");
+}
+
+/// A brand-new session must never be handed a dead app's mode contract.
+///
+/// The sidecar routinely outlives its session: when the user types `exit`,
+/// **dtach unlinks its own socket**, so neither `kill_and_unlink` nor
+/// `reconcile`'s dead-socket arm runs and the file is orphaned. Verified on
+/// this host — `dtach -n <sock> … bash -c 'exit 0'` leaves no socket behind.
+/// `next_free_name` then hands the same name out again, and the restore was
+/// gated on `spawned`, which is true for a genuinely new session too.
+///
+/// What that cost the user: run Claude in `term`, exit it, exit the shell,
+/// click + — the fresh `bash` was replayed the dead Claude's table, so mouse
+/// reporting was asserted at a shell prompt and every click typed
+/// `\x1b[<0;12;5M` junk while the wheel stopped scrolling.
+///
+/// Revert-checked: dropping the `if rejoining` guard in `session::attach`
+/// fails this with the stale table replayed into the new session.
+#[test]
+fn a_new_session_does_not_inherit_an_orphaned_mode_contract() {
+    if std::process::Command::new("dtach").arg("-h").output().is_err() {
+        eprintln!("skipping: dtach not installed");
+        return;
+    }
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("ROOST_CMD");
+    roost::wsstate::set_state_dir_for_test();
+
+    let d = tempfile::tempdir().unwrap();
+    let project = format!("orphan{}", std::process::id() % 100_000);
+    let name = "reused".to_string();
+    let sock = roost::session::socket_path(&project, &name);
+    let sidecar = roost::modes::path_for(&project, &name);
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&sock);
+
+    // Exactly the state a shell that exited on its own leaves: a contract on
+    // disk and no socket at all.
+    // Mouse reporting, not bracketed paste. `save` refuses when the socket is
+    // absent (it must not resurrect a sidecar for an ended session), so the
+    // orphan is written directly — which is what dtach's own unlink leaves
+    // behind.
+    //
+    // 2004 deliberately is *not* asserted on below: bash emits `?2004h` at
+    // its own prompt, so it appears in this session's output whether or not
+    // anything was restored, and an assertion on it fails against correct
+    // code. The first draft of this test did exactly that. No shell declares
+    // mouse reporting, so 1000 is the only byte here that can only have come
+    // from a restore.
+    std::fs::write(&sidecar, b"1000 1\n1006 1\n").unwrap();
+    assert!(sidecar.exists(), "setup: an orphaned contract is on disk");
+    assert!(!sock.exists(), "setup: and its session is gone");
+
+    // A new session, same name. Reserved first, because creation is
+    // reservation-gated — this is the `Decision::Spawn` path, which is
+    // exactly the one that must not restore.
+    roost::session::reserve(&project, &name, None);
+    let att = roost::session::attach(&project, &name, d.path()).expect("a new session spawns");
+
+    let mut seen = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        match att.rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(chunk) => seen.extend_from_slice(&chunk),
+            Err(_) => {}
+        }
+    }
+    let _ = roost::registry::kill_and_unlink(&sock);
+
+    let has = |needle: &[u8]| seen.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        !has(b"\x1b[?1000h"),
+        "a fresh shell must not be told to report mouse events: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        !has(b"\x1b[?1006h"),
+        "nor its coordinate encoding: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+}
+
+/// The orphan itself is collected, so the sidecars do not accumulate for the
+/// life of the state dir — and so an emptied key directory can be removed.
+#[test]
+fn an_orphaned_sidecar_is_swept_but_a_live_one_is_not() {
+    let d = tempfile::tempdir().unwrap();
+    let key = d.path().join("proj");
+    std::fs::create_dir_all(&key).unwrap();
+
+    // A live session: socket present.
+    std::fs::write(key.join("live"), b"").unwrap();
+    std::fs::write(key.join(".modes.live"), b"2004 1\n").unwrap();
+    // An orphan: contract, no socket.
+    std::fs::write(key.join(".modes.dead"), b"2004 1\n").unwrap();
+    // An interrupted write.
+    std::fs::write(key.join(".modes.dead.tmp.999"), b"2004 1\n").unwrap();
+
+    roost::modes::sweep_orphans(&key);
+
+    assert!(key.join(".modes.live").exists(), "a held session keeps its contract");
+    assert!(!key.join(".modes.dead").exists(), "an orphan is collected");
+    assert!(!key.join(".modes.dead.tmp.999").exists(), "and so is an interrupted write");
+    assert!(key.join("live").exists(), "the socket itself is untouched");
 }

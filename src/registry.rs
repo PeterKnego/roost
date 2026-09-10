@@ -1006,6 +1006,13 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
                 ReapAction::RemoveKilled => unreachable!("only reached via the project_gone branch above"),
             }
         }
+        // Sidecars whose session is positively gone. dtach unlinks its own
+        // socket when the program exits, so the two `forget` call sites miss
+        // the commonest ending and these would otherwise accumulate for the
+        // life of the state dir — and keep the `remove_dir` below from ever
+        // succeeding. Done here because this is where the key directory is
+        // already in hand and already being swept.
+        crate::modes::sweep_orphans(&entry.path());
         // An emptied directory is noise; ignore failure when it is not empty
         // (a live session for a project that still exists must survive).
         let _ = std::fs::remove_dir(entry.path());
