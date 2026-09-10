@@ -50,6 +50,10 @@ deno run -A tests/browser/nonascii.mjs   # the editor's non-ASCII indicator and 
 deno run -A tests/browser/notices.mjs    # the bell panel holds only this project's notices, and Clear empties only what it shows
 deno run -A tests/browser/dialogs.mjs    # the dialog primitive: askConfirm/askText/askMenu's exits, focus restoration, and a guard that no code path reaches a native confirm/prompt/alert
 deno run -A tests/browser/closetab.mjs   # closing a dirty file tab: the confirmation must not let the tab strip renumber underneath a stale index
+deno run -A tests/browser/tabdrag.mjs    # dragging a tab between panes and within one, the drop indicator, and coexistence with the file-upload drag
+deno run -A tests/browser/popups.mjs     # the header's popups: one open at a time, and the trigger toggles its own shut
+deno run -A tests/browser/treefollow.mjs # the tree expands to the active file and marks it, without collapsing what the user opened
+deno run -A tests/browser/treemention.mjs # ctrl/shift-click picks tree rows and Alt+K mentions them, in tree order and bounded
 deno run -A tests/browser/watchdog.mjs   # the workspace connection's visible state, and send() refusing instead of silently dropping
 ```
 

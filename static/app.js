@@ -960,6 +960,12 @@ function render() {
         t.k === "Terminal" ? "end session (alt-click to detach, leaving it running)" : "close";
       x.textContent = "×";
       x.onclick = (e) => { e.stopPropagation(); closeTab(pi, ti, t, e.altKey); };
+      // The tab is draggable and this sits inside it, so without this a
+      // mousedown on × plus a few pixels of pointer drift starts a tab drag
+      // instead of firing the click — the tab does not close and the user
+      // has to aim again. `draggable=false` stops the ancestor walk that
+      // resolves a drag source.
+      x.draggable = false;
       b.appendChild(x);
       // Drag is a second route to MoveTab, never a new operation: the same
       // intent the ⇄ button sends, with `at` taken from where the pointer is
@@ -969,6 +975,7 @@ function render() {
       b.draggable = true;
       b.dataset.pane = String(pi);
       b.dataset.idx = String(ti);
+      b.dataset.key = tabKey(t);
       b.ondragstart = (e) => {
         // A private type rather than text/plain: it is what keeps this drag
         // and a file drag distinguishable. `dragHasFiles` already declines
@@ -976,7 +983,15 @@ function render() {
         // document-level handlers below can never swallow each other's drop.
         // (`getData` is unreadable during dragover for security — only
         // `types` is — which is exactly what the type is being used for.)
-        e.dataTransfer.setData(TAB_MIME, `${pi}:${ti}`);
+        // The tab's *identity*, not its index. A drag is a human-scale
+        // interval and render() rebuilds this strip on every State
+        // broadcast — a terminal exiting, a proposal tab opening, another
+        // browser closing a tab — so an index captured here can address a
+        // different tab by the time the drop lands, silently and in range,
+        // where the server's `idx >= len` guard never fires. This is the
+        // stale-index defect `closeTab` was already fixed for; see its
+        // comment about re-resolving by rel and the `< 0` branch.
+        e.dataTransfer.setData(TAB_MIME, JSON.stringify({ from: pi, key: tabKey(t) }));
         e.dataTransfer.effectAllowed = "move";
         b.classList.add("dragging");
       };
@@ -3934,10 +3949,19 @@ document.addEventListener("drop", (e) => {
   const payload = e.dataTransfer.getData(TAB_MIME);
   clearDropMarker();
   if (!strip || !payload) return;
-  const [from, idx] = payload.split(":").map(Number);
+  let from, key;
+  try { ({ from, key } = JSON.parse(payload)); } catch { return; }
   const to = Number(strip.closest(".pane").dataset.pane);
-  if (!Number.isInteger(from) || !Number.isInteger(idx) || !mayDrop(from, to)) return;
+  if (!Number.isInteger(from) || typeof key !== "string" || !mayDrop(from, to)) return;
+  // Re-resolved against the strip as it is *now*, not as it was when the
+  // drag began. A tab that has gone in the meantime is refused out loud
+  // rather than moving whichever tab has inherited its index.
+  const pane = state && state.panes[from];
+  const idx = pane ? pane.tabs.findIndex((t) => tabKey(t) === key) : -1;
   e.preventDefault();
+  if (idx < 0) {
+    return showError("that tab moved or closed while you were dragging it — nothing was moved");
+  }
   let at = dropIndexIn(strip, e.clientX, e.clientY);
   // workspace.rs removes from the source *before* inserting, so within one
   // pane `at` indexes the already-shortened list. Dropping a tab to the right

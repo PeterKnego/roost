@@ -49,9 +49,6 @@ answer, not a quiet vote for "unused".
   themes** in any `.resh/theme/`, and no `theme =` set in the global config —
   so every window is on the default. A favicon that varies by theme has nothing
   to vary with yet.
-- Drag-and-drop tab reordering — speculative idea in the v3 spec, noted as
-  partly moot since v3 already ships a "move to pane" command as the
-  mechanism for relocating tabs (`2026-08-16-deadlight-v3-workspace-design.md`).
 - Nothing prunes `state_dir()/pasted/`, where images pasted into a terminal
   are kept. Left open by the upload work
   (`2026-08-19-file-upload-design.md`).
