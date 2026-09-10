@@ -52,6 +52,10 @@ impl Default for Sizes {
 #[serde(rename_all = "lowercase")]
 pub enum Launch {
     Claude,
+    /// A Claude put on this repository's open pull requests, looping until
+    /// they are finished. See `launch::PR_LOOP_PROMPT` for what it is told,
+    /// including the bounds that stop it. #52.
+    PrLoop,
 }
 
 /// Which config file a `SetSetting` edits.

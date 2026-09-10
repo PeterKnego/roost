@@ -227,6 +227,9 @@ const PANE_ICONS = {
   // detached arrowhead.
   maximize: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2.5h4.5V7M7 13.5H2.5V9M13.5 2.5L9 7M2.5 13.5L7 9"/></svg>',
   restore: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 7H9V2.5M2.5 9H7v4.5M9 7l4.5-4.5M7 9l-4.5 4.5"/></svg>',
+  // Two arrows meeting a check: a review that comes back round. Drawn at the
+  // same 15px weight as `newterm` beside it.
+  prloop: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.6 6.4a5.6 5.6 0 0 1 9.3-2.2l1.5 1.4"/><path d="M13.4 9.6a5.6 5.6 0 0 1-9.3 2.2L2.6 10.4"/><path d="M13.6 2.4v3.2h-3.2M2.4 13.6v-3.2h3.2"/></svg>',
   newterm: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="10.5" height="9.5" rx="1.2"/><path d="M4 6.8l1.7 1.5L4 9.8M8 10.6h2.6"/><path d="M13.3 2.2v3.6M11.5 4h3.6"/></svg>',
 };
 // The official Claude mark (lobehub packaging of Anthropic's starburst,
@@ -1172,6 +1175,28 @@ function buildPaneIcons(host, pi, pane, active, content) {
   // into the shell it spawns.
   if (LAUNCHES.includes("claude")) {
     icon(CLAUDE_MARK, "new terminal running Claude", () => newTerminal(pi, "claude"), "newclaude");
+  }
+  // #52: the same gesture, pointed at this repository's open pull requests.
+  // Deliberately its own button rather than a mode of the one above — it
+  // starts something that commits and pushes, and that should never be one
+  // misread icon away from "a terminal running Claude".
+  //
+  // Confirmed first, and the confirmation names the bounds, because a control
+  // whose consequence is "an agent starts pushing to my branches" has to say
+  // so before it runs and not in a tooltip nobody opens.
+  if (LAUNCHES.includes("prloop")) {
+    icon(PANE_ICONS.prloop, "review the open pull requests, and keep at them", async () => {
+      const yes = await askConfirm({
+        title: "Put Claude on the open PRs",
+        lines: [
+          "It reviews each open pull request, comments, and answers what comes back — committing to their branches as it goes.",
+          "It stops after 5 pushes to any one PR, after 2 hours, when a finding comes back twice, or when every thread is dealt with and CI is green.",
+          "It never touches the default branch. Interrupt it like any other terminal.",
+        ],
+        confirm: "Start",
+      });
+      if (yes) newTerminal(pi, "prloop");
+    }, "newprloop");
   }
   if (active && active.k === "Tree") {
     const hidden = showHidden();
