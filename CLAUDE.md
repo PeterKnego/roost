@@ -83,14 +83,29 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   result list of `.git` internals and source triplicated across worktrees, and
   the 20 000-file cap firing before the real files were reached. Making the two
   "consistent" by dropping those refusals brings all of that back.
+
+  A third refusal, and the only one that *is* overridable: a directory git
+  ignores. `src/gitignore.rs` is a deliberately partial matcher, and its
+  failure direction is chosen — an unsupported construct contributes no rule,
+  and a file containing any negation (`!`) contributes nothing at all, because
+  dropping `!src/` while honouring `*` is the one mistake that hides a whole
+  project. It tests directories only, and `show_hidden` turns it off, which is
+  what makes a partial matcher safe to ship: a directory it skips wrongly is
+  still reachable. `TreeFilter` runs first, so `target`, `node_modules` and
+  every dotfile never reach it — which is what keeps the reported count rare
+  enough to be worth reading.
 - **A search that skipped something says so.** `Results` carries an `Outcome`
-  and two counters (`unreadable`, `skipped_nested`) rather than being a bare
-  list, and the client renders every one of them. The distinction that matters
-  is three-way, not two: *could not look* (an unreadable directory — a gap),
-  *chose not to look* (a nested checkout, contents below three characters — a
-  decision), and *looked and found nothing*. All three used to render as an
-  empty note, which is the same defect as the table below wearing a quieter
-  coat: no crash, no lost shell, and no way for the user to tell.
+  and three counters (`unreadable`, `skipped_nested`, `skipped_ignored`) rather
+  than being a bare list, and the client renders every one of them. The
+  distinction that matters is three-way, not two: *could not look* (an
+  unreadable directory — a gap), *chose not to look* (a nested checkout, a
+  gitignored directory, contents below three characters — a decision), and
+  *looked and found nothing*. The two "chose not to" counters stay apart
+  because the answer to "where is my build output" is a different answer from
+  "where is my submodule", and only one of them names an override. All three
+  used to render as an empty note, which is the same defect as the table below
+  wearing a quieter coat: no crash, no lost shell, and no way for the user to
+  tell.
 - **Never hold a lock across blocking I/O.** This project has already shipped
   one deadlock that way (the global session registry held across a PTY write,
   which wedged every session in every project).

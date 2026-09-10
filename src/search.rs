@@ -18,9 +18,11 @@
 //! count rather than being a bare `Vec`. "I could not look" is a third
 //! answer here, and it is rendered as one.
 
+use crate::gitignore::Ignore;
 use crate::projects::TreeFilter;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub const MAX_PER_CATEGORY: usize = 50;
@@ -71,6 +73,12 @@ pub struct Results {
     /// one is a decision rather than a gap, but the user cannot tell the
     /// difference from an answer that simply does not mention them.
     pub skipped_nested: usize,
+    /// Directories the walk declined because git ignores them. A third
+    /// decision alongside `skipped_nested`, reported separately because the
+    /// answer to "why is my build output missing" is different from the
+    /// answer to "why is my submodule missing" — and because this one has an
+    /// override the other does not (`show_hidden`).
+    pub skipped_ignored: usize,
 }
 
 impl Results {
@@ -82,6 +90,7 @@ impl Results {
             outcome: Outcome::Complete,
             unreadable: 0,
             skipped_nested: 0,
+            skipped_ignored: 0,
         }
     }
 }
@@ -196,7 +205,15 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
     }
 
     let mut scored: Vec<(i32, String)> = vec![];
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    // Gitignore rules are inherited, and the walk is a DFS over an explicit
+    // stack, so every pending directory carries its own chain. Skipped
+    // entirely under `show_hidden`: that switch already means "show me what
+    // is normally out of the way", and it is the escape hatch that makes a
+    // deliberately partial ignore matcher safe to ship — a directory wrongly
+    // skipped is still reachable, by the same switch that reveals dotfiles.
+    let ignoring = !q.filter.show_hidden;
+    let root_ignore = if ignoring { Ignore::for_root(root) } else { Ignore::none() };
+    let mut stack: Vec<(PathBuf, Rc<Ignore>)> = vec![(root.to_path_buf(), root_ignore)];
     let mut scanned = 0usize;
     let mut truncated: Option<String> = None;
     let mut is_root = true;
@@ -227,7 +244,7 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
     // scan is not, so the copy pays for itself.
     let mut lowered = String::new();
 
-    'walk: while let Some(dir) = stack.pop() {
+    'walk: while let Some((dir, inherited)) = stack.pop() {
         if cancelled() {
             r.outcome = Outcome::Truncated { reason: "superseded by a newer query".into() };
             return r;
@@ -352,7 +369,26 @@ pub fn run(root: &Path, q: &Query, cancelled: &dyn Fn() -> bool) -> Results {
                     // unreadable-directory test catches it.
                     Err(_) => {}
                 }
-                stack.push(path);
+                // Last of the three refusals, and the only one with an
+                // override: git already treats this directory as generated,
+                // so descending spends the file budget on output nobody
+                // wrote. Counted, because "I chose not to look" rendered as
+                // completeness is the defect this module's whole result type
+                // exists to prevent.
+                if ignoring {
+                    let rel = match path.strip_prefix(root) {
+                        Ok(p) => p.to_string_lossy().replace('\\', "/"),
+                        Err(_) => continue,
+                    };
+                    if inherited.skips_dir(&rel) {
+                        r.skipped_ignored += 1;
+                        continue;
+                    }
+                    let child = inherited.enter(&path, &rel);
+                    stack.push((path, child));
+                    continue;
+                }
+                stack.push((path, Rc::clone(&inherited)));
                 continue;
             }
             if !meta.is_file() {
@@ -473,6 +509,137 @@ mod tests {
 
     fn never() -> impl Fn() -> bool {
         || false
+    }
+
+    #[test]
+    fn a_gitignored_directory_is_not_walked_and_says_so() {
+        // The measured failure: a gitignored build directory consumed the
+        // file budget and a search came back truncated before reaching the
+        // source. Here the ignored tree holds the only *other* match, so a
+        // walk that still descends returns two hits rather than one — the
+        // assertion cannot pass by finding nothing.
+        let d = proj(&[
+            (".gitignore", "/dist/\n"),
+            ("src/app.rs", "the needle is here\n"),
+            ("dist/bundle.js", "the needle is here too\n"),
+        ]);
+        let r = run(d.path(), &query("needle", TreeFilter::default()), &never());
+        assert_eq!(
+            r.lines.iter().map(|l| l.rel.as_str()).collect::<Vec<_>>(),
+            ["src/app.rs"],
+            "the ignored tree must not be searched"
+        );
+        // A decision, not a gap, and the user cannot tell those apart from an
+        // answer that simply does not mention them.
+        assert_eq!(r.skipped_ignored, 1);
+        assert_eq!(r.unreadable, 0, "nothing failed; this was a choice");
+        assert_eq!(r.outcome, Outcome::Complete);
+    }
+
+    #[test]
+    fn a_directory_the_tree_filter_already_hides_is_not_counted_twice() {
+        // `TreeFilter::skips` runs before the ignore check, and that ordering
+        // is what keeps this counter quiet. `target`, `node_modules`,
+        // `__pycache__` and `.venv` are in `SKIP_DIRS`, and dotfiles are
+        // hidden by default — so the common gitignore entries never reach the
+        // ignore matcher at all, and the honesty line stays rare enough to be
+        // worth reading. If they were counted here, every search in every
+        // repository would carry a caveat, which is how a warning becomes
+        // furniture.
+        let d = proj(&[
+            (".gitignore", "/target\n/node_modules\n/dist/\n"),
+            ("src/app.rs", "needle\n"),
+            ("target/debug/x.rs", "needle\n"),
+            ("node_modules/p/i.js", "needle\n"),
+            ("dist/out.js", "needle\n"),
+        ]);
+        let r = run(d.path(), &query("needle", TreeFilter::default()), &never());
+        assert_eq!(
+            r.lines.iter().map(|l| l.rel.as_str()).collect::<Vec<_>>(),
+            ["src/app.rs"],
+            "all three generated trees stay out"
+        );
+        assert_eq!(
+            r.skipped_ignored, 1,
+            "but only `dist` is attributed to the ignore rule — the other two were already gone"
+        );
+    }
+
+    #[test]
+    fn show_hidden_is_the_override_and_brings_it_back() {
+        // The escape hatch that makes a deliberately partial ignore matcher
+        // safe to ship: a directory it wrongly skips is still reachable, by
+        // the same switch that reveals dotfiles. Without this the only way to
+        // find a wrongly-hidden file would be to edit `.gitignore`.
+        let d = proj(&[
+            (".gitignore", "/dist/\n"),
+            ("src/app.rs", "the needle is here\n"),
+            ("dist/bundle.js", "the needle is here too\n"),
+        ]);
+        let f = TreeFilter { hide: &[], show_hidden: true };
+        let r = run(d.path(), &query("needle", f), &never());
+        let mut got: Vec<&str> = r.lines.iter().map(|l| l.rel.as_str()).collect();
+        got.sort();
+        assert_eq!(got, ["dist/bundle.js", "src/app.rs"]);
+        assert_eq!(r.skipped_ignored, 0, "nothing was skipped, so nothing may be reported");
+    }
+
+    #[test]
+    fn a_nested_gitignore_is_read_on_the_way_down() {
+        // The case the issue names as where build output usually hides: not
+        // the repository root's file, but one several levels in. A walk that
+        // only read the root's `.gitignore` would return both hits.
+        let d = proj(&[
+            ("packages/ui/.gitignore", "build/\n"),
+            ("packages/ui/src/x.rs", "the needle is here\n"),
+            ("packages/ui/build/out.js", "the needle is here too\n"),
+        ]);
+        let r = run(d.path(), &query("needle", TreeFilter::default()), &never());
+        assert_eq!(
+            r.lines.iter().map(|l| l.rel.as_str()).collect::<Vec<_>>(),
+            ["packages/ui/src/x.rs"]
+        );
+        assert_eq!(r.skipped_ignored, 1);
+    }
+
+    #[test]
+    fn an_ignore_file_full_of_negations_hides_nothing() {
+        // Over-ignoring is the failure mode worth being afraid of: a search
+        // that silently omits real source is worse than one that includes
+        // build output. Honouring `*` while discarding `!src/` would hide the
+        // entire project, so a file with any `!` in it contributes nothing
+        // and the walk behaves exactly as it does today.
+        let d = proj(&[
+            (".gitignore", "*\n!src/\n"),
+            ("src/app.rs", "the needle is here\n"),
+            ("dist/bundle.js", "the needle is here too\n"),
+        ]);
+        let r = run(d.path(), &query("needle", TreeFilter::default()), &never());
+        assert_eq!(r.lines.len(), 2, "nothing may be hidden on a guess: {:?}", r.lines);
+        assert_eq!(r.skipped_ignored, 0);
+    }
+
+    #[test]
+    fn the_existing_refusals_still_fire_and_stay_separate() {
+        // Three refusals now, and they must not be conflated: `.git` is
+        // unconditional, a nested checkout counts as `skipped_nested`, and a
+        // gitignored directory counts as `skipped_ignored`. Folding the new
+        // one into either counter would make the honesty line say the wrong
+        // thing about why something is missing.
+        let d = proj(&[
+            (".gitignore", "/dist/\n"),
+            ("src/app.rs", "needle\n"),
+            ("dist/x.js", "needle\n"),
+            ("vendor/dep/.git/HEAD", "ref: refs/heads/main\n"),
+            ("vendor/dep/lib.rs", "needle\n"),
+        ]);
+        let r = run(d.path(), &query("needle", TreeFilter::default()), &never());
+        assert_eq!(
+            r.lines.iter().map(|l| l.rel.as_str()).collect::<Vec<_>>(),
+            ["src/app.rs"]
+        );
+        assert_eq!(r.skipped_nested, 1, "the checkout under vendor/");
+        assert_eq!(r.skipped_ignored, 1, "and the gitignored build directory");
     }
 
     #[test]

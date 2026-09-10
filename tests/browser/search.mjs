@@ -789,6 +789,7 @@ try {
   );
 
   console.log("\nI. the honesty line — every outcome renderSearch() can build a note from");
+  const noteTextEarly = `document.getElementById("searchnote").textContent`;
   async function isBlocked(path) {
     try { for await (const _e of Deno.readDir(path)) { /* just probing */ } return false; }
     catch { return true; }
@@ -846,6 +847,111 @@ try {
     await evalIn(`document.getElementById("searchnote").textContent`) === "",
     "(f) rows present and nothing wrong leaves the note empty, not padded with a spurious caveat",
   );
+
+  // The third "chose not to look" counter. It must be distinguishable from
+  // the other two in the rendered text, because the answer to "where is my
+  // build output" is a different answer from "where is my submodule" and from
+  // "that directory could not be read" — and only this one has an override,
+  // which the note has to name or the override is unfindable.
+  await evalIn(`onEvent({ t: "SearchResults", seq: ${JSON.stringify(honestySeq)}, results: {
+    files: [{ rel: "a.rs" }], lines: [], sessions: [], outcome: { state: "Complete" },
+    unreadable: 0, skipped_nested: 0, skipped_ignored: 1,
+  } })`);
+  ok(
+    await evalIn(`document.getElementById("searchnote").textContent`)
+      === "1 gitignored directory not searched — show hidden files to include them",
+    "(f2) a gitignored skip is reported, and names the override that undoes it",
+  );
+
+  await evalIn(`onEvent({ t: "SearchResults", seq: ${JSON.stringify(honestySeq)}, results: {
+    files: [{ rel: "a.rs" }], lines: [], sessions: [], outcome: { state: "Complete" },
+    unreadable: 0, skipped_nested: 0, skipped_ignored: 3,
+  } })`);
+  ok(
+    await evalIn(`document.getElementById("searchnote").textContent`)
+      === "3 gitignored directories not searched — show hidden files to include them",
+    "(f3) and it agrees with itself about plurals",
+  );
+
+  // The one that would catch a regression folding the new counter into an
+  // existing one: all three at once must produce three distinct clauses. A
+  // test using only `skipped_ignored` would pass just as well if the renderer
+  // printed it with `skipped_nested`'s wording.
+  await evalIn(`onEvent({ t: "SearchResults", seq: ${JSON.stringify(honestySeq)}, results: {
+    files: [{ rel: "a.rs" }], lines: [], sessions: [], outcome: { state: "Complete" },
+    unreadable: 2, skipped_nested: 1, skipped_ignored: 1,
+  } })`);
+  ok(
+    await evalIn(`document.getElementById("searchnote").textContent`)
+      === "2 places could not be read · 1 nested checkout not searched · 1 gitignored directory not searched — show hidden files to include them",
+    "(f4) could-not-look, nested-checkout and gitignored stay three separate answers",
+  );
+
+  // Zero must stay silent, or every complete search grows a caveat about
+  // nothing — the (f) failure in a new coat.
+  await evalIn(`onEvent({ t: "SearchResults", seq: ${JSON.stringify(honestySeq)}, results: {
+    files: [{ rel: "a.rs" }], lines: [], sessions: [], outcome: { state: "Complete" },
+    unreadable: 0, skipped_nested: 0, skipped_ignored: 0,
+  } })`);
+  ok(
+    await evalIn(`document.getElementById("searchnote").textContent`) === "",
+    "(f5) nothing skipped says nothing",
+  );
+
+  // End to end, against the real walk rather than an injected event: the
+  // server has to read `.gitignore`, refuse the directory, and report it.
+  //
+  // Built here and torn down immediately after, rather than in the shared
+  // fixture at the top of this file. A `.gitignore` sitting in the project
+  // for the whole run makes *every* query in every other section report a
+  // skipped directory, which broke nine unrelated assertions when it was
+  // tried — and would have hidden that breakage behind "well, the note
+  // changed". The walk has no index (see search.rs's header), so a directory
+  // that exists only for these four assertions is searched exactly when it
+  // is there.
+  await Deno.writeTextFile(`${fx.roots}/proj/.gitignore`, "/buildout/\n");
+  await Deno.mkdir(`${fx.roots}/proj/buildout`, { recursive: true });
+  // Both copies, deliberately. With only the ignored copy a broken filter
+  // passes by returning nothing; with only the source copy the test cannot
+  // tell "ignored" from "never there".
+  await Deno.writeTextFile(`${fx.roots}/proj/src/keeper.rs`, "let ignoredmarker_7k2 = 1;\n");
+  await Deno.writeTextFile(`${fx.roots}/proj/buildout/bundle.js`, "var ignoredmarker_7k2 = 2;\n");
+
+  await freshSearch(evalIn, "ignoredmarker_7k2");
+  ok(
+    await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "gitignore rows"),
+    "(f6) setup: the source copy of the marker is found",
+  );
+  const rels = await evalIn(`JSON.stringify(searchRows.map(r => r.rel))`);
+  ok(
+    !JSON.parse(rels).some((r) => r.includes("buildout")),
+    `(f6) the gitignored directory is not searched — got ${rels}`,
+  );
+  ok(
+    JSON.parse(rels).some((r) => r.includes("keeper.rs")),
+    `(f6) but the source file beside it still is — got ${rels}`,
+  );
+  ok(
+    (await evalIn(noteTextEarly)).includes("gitignored"),
+    `(f6) and the walk says it skipped something — got ${JSON.stringify(await evalIn(noteTextEarly))}`,
+  );
+
+  // The control: with the same query and no `.gitignore`, the generated copy
+  // *is* found. Without this the four assertions above would pass just as
+  // well against a walk that could not see `buildout/` for some unrelated
+  // reason — a fixture that never landed, a path typo — which is the
+  // "correctly skipped" versus "wrongly absent" confusion CLAUDE.md records.
+  await Deno.remove(`${fx.roots}/proj/.gitignore`);
+  await freshSearch(evalIn, "ignoredmarker_7k2");
+  ok(
+    await until(async () => {
+      const r = JSON.parse(await evalIn(`JSON.stringify(searchRows.map(x => x.rel))`));
+      return r.some((x) => x.includes("buildout"));
+    }, 10, "buildout visible without .gitignore"),
+    "(f7) with the ignore file gone the same directory is searched — it was the rule, not an accident",
+  );
+  await Deno.remove(`${fx.roots}/proj/buildout`, { recursive: true });
+  await Deno.remove(`${fx.roots}/proj/src/keeper.rs`);
 
   // Contents are not searched below three characters (wsconn.rs sets
   // Query::contents from `q.chars().count() >= 3`). That is a decision, not a

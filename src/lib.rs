@@ -5,6 +5,7 @@ pub mod claudes;
 pub mod config;
 pub mod errlog;
 pub mod fileops;
+pub mod gitignore;
 pub mod gitio;
 pub mod health;
 pub mod hub;
