@@ -51,19 +51,26 @@ it is forgotten twice.
 
 ## Branch protection
 
-**`master`: restrict who can push (maintainer only). No PR requirement, no
-required status checks.**
+**`master`, as implemented: `enforce_admins: true`, force-push and branch
+deletion blocked. No push restriction, no PR requirement, no required status
+checks.**
 
-This is deliberate and looks under-protected. `release.sh:82` pushes the version
-bump straight to `master`; "require a pull request" rejects it, and required
-status checks reject it too, because that commit has never been through CI at the
-moment it is pushed. Turning either on breaks `make release` after preflight has
-passed and the tag exists locally.
+This section originally specified "restrict who can push (maintainer only)"
+instead of `enforce_admins`. The plan overrode that during implementation:
+with fork-only contributors, nobody but the maintainer has push access to
+begin with, so a push restriction defends against nobody. The actual risk is
+the maintainer's own mistake — a stray force-push or branch deletion — and
+GitHub's own docs are explicit that branch protection rules do not apply to
+users with admin permissions unless `enforce_admins` is on, so a push
+restriction alone would not even have covered that risk for the maintainer's
+own admin account. `enforce_admins` plus blocking force-push and deletion
+covers it directly.
 
-The protection actually needed is *contributors cannot push to master*, which
-"restrict who can push" provides exactly. Master's content is only ever a merge
-of already-tested `develop`, or a bump produced by a script that has just run the
-full suite, both musl builds, and the tap-token check.
+A PR requirement and required status checks are still absent, deliberately:
+`release.sh:82` pushes the version bump straight to `master` as a fast-forward,
+and that commit has never been through CI at the moment it is pushed. Turning
+either on breaks `make release` after preflight has passed and the tag exists
+locally.
 
 **`develop`: require a pull request, and require both CI checks
 (`cargo test (Linux)`, `shellcheck + package tests`) to pass.**
@@ -80,6 +87,10 @@ a rebase for every unrelated merge and buys little.
   commit on `master` that `develop` does not have, and every merge-back then
   conflicts. That is the same duplication trap as cherry-picking, arrived at from
   the other direction.
+- **`master` → `develop` (the post-release merge-back): merge commit, never
+  squash**, for the same reason in the other direction — squashing it puts
+  master's content on `develop` under a new SHA, and the next release merge
+  sees it twice.
 
 ## Fix the confinement tests first
 

@@ -63,6 +63,28 @@ github-attestations = true
 tap = "peterknego/homebrew-tap"
 publish-jobs = ["homebrew", "./publish-crates-io"]
 
+# release.yml is hand-edited, so dist must stop checking it against its own
+# generator — without this, `dist plan` fails every CI run with "has out of date
+# contents".
+#
+# The single edit is `environment: release` on `publish-homebrew-formula`.
+# HOMEBREW_TAP_TOKEN is an environment secret rather than a repo secret,
+# because a repo secret is readable by any workflow file on any ref and a
+# pull_request run from a same-repo branch supplies its own copies — so the
+# token was reachable from any branch pushed here. dist 0.32 has no config key
+# for a job environment (`github-custom-job-permissions` covers permissions
+# only), and GitHub offers no way to attach an environment to a job from
+# outside the workflow file, so editing the generated file is the only route.
+# The crates.io job needs no exemption: it is a *custom* publish job living in
+# its own file, which dist does not police.
+#
+# THE COST, since it is silent: dist no longer regenerates or verifies
+# release.yml, so a change to `targets`, `installers`, or anything else here
+# will not reach the workflow and nothing will say so. On a dist upgrade:
+# remove this key, run `dist init`, re-add `environment: release` to
+# publish-homebrew-formula, then restore this key.
+allow-dirty = ["ci"]
+
 # dist's default grant for a custom publish job is `{id-token, packages}`, and
 # permissions can only be reduced going down a reusable-workflow chain, never
 # elevated — so the callee's `contents: read` (needed for actions/checkout and

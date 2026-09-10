@@ -18,6 +18,10 @@ on:
 jobs:
   check-tap-token:
     runs-on: ubuntu-22.04
+    # Same environment gate as the real publish job. Consequence: dispatch this
+    # from master. The environment does not allow develop, which permits a
+    # self-merged PR at zero approvals and so is not a trusted ref for a token.
+    environment: release
     steps:
       - uses: actions/checkout@v6
         with:

@@ -58,7 +58,9 @@ systemctl --user enable --now roost     # packages only; starts roost
 # or with cargo — dtach and git must already be on PATH
 apt install dtach           # or: brew install dtach
 cargo install roost
-# or, from source: cargo install --git https://github.com/PeterKnego/roost
+# or, to build unreleased work off `develop` rather than a release — the
+# channels above install a tagged version, this one does not:
+cargo install --git https://github.com/PeterKnego/roost
 
 ROOST_ROOTS="$HOME/Projects" roost 8444
 # or just: roost 8444 — then add your projects directory on the front page
@@ -104,6 +106,12 @@ Also, Roost can install hooks into `claude` to enable notification every time `c
 
 `roost` only binds to `127.0.0.1` and is meant to be fronted by an auth layer,
 such as `tailscale`. More about it in [SECURITY.md](SECURITY.md)
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch flow and how to run the
+test suite, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for the project's
+conduct expectations.
 
 ## License
 

@@ -14,12 +14,15 @@ squash-merged. Releases are cut by the maintainer.
 
 `develop` requires a pull request and green CI, and that applies to the
 maintainer too — including the merge of `master` back into `develop` after each
-release, which therefore goes through a PR like anything else.
+release, which therefore goes through a PR like anything else. That merge-back
+PR is merged with a merge commit, never squashed: squashing it would put
+master's content on `develop` under a new SHA, and every later `develop` →
+`master` release merge would see it twice and conflict.
 
 ## Before you open a PR
 
-Install `dtach` and `git` — the test suite needs both, because one integration
-test deliberately runs the real `dtach` rather than a substitute:
+Install `dtach` and `git` — the test suite needs both, because two integration
+tests deliberately run the real `dtach` rather than a substitute:
 
 ```sh
 apt install dtach    # or: brew install dtach
@@ -39,6 +42,21 @@ If you touch anything under `scripts/` or `packaging/`, also run:
 ```sh
 make test-scripts
 ```
+
+If you touch `static/app.js`, also run the browser tests — no Rust test can
+reach that file, so `cargo test` alone verifies nothing about a change there.
+They need `deno` on `PATH`; see <https://docs.deno.com/runtime/getting_started/installation/>
+if you don't have it:
+
+```sh
+deno run -A tests/browser/reconnect.mjs
+deno run -A tests/browser/upload.mjs
+```
+
+See [tests/browser/README.md](tests/browser/README.md) for the rest of the
+suite. They drive a real Chromium against a real roost with real `dtach`, and
+they skip silently rather than failing when no browser is found — a skip is
+not a pass.
 
 ## Read CLAUDE.md first
 

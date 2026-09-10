@@ -41,6 +41,23 @@ on:
 jobs:
   publish-crates-io:
     runs-on: ubuntu-22.04
+    # Gated even though this job stores no secret. "Nothing to steal" is not the
+    # same as "nothing to abuse": the OIDC exchange below mints a live publish
+    # credential on demand, and the caller-side `publishing == 'true'` gate that
+    # keeps a pull_request from reaching it lives in release.yml — a file a
+    # collaborator's PR branch supplies its own copy of. The `release`
+    # environment allows only tags v*/*.*.* and master, so refs/pull/N/merge is
+    # refused before the job starts.
+    #
+    # This must be declared here rather than on the caller: a job that uses
+    # `uses:` cannot set `environment`. It also adds an `environment` claim to
+    # the OIDC token, so the crates.io trusted publisher must have the same
+    # environment registered, or the claim set no longer matches at exchange
+    # time. A crates.io publish cannot be undone — yank hides a version, it does
+    # not remove it — and per the note above a prerelease tag skips this job
+    # entirely, so there is no dry run: the first exercise of this pairing is a
+    # real release. Land both halves together.
+    environment: release
     permissions:
       contents: read
       # dist grants custom publish jobs id-token: write by default; stated here

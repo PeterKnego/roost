@@ -1,5 +1,7 @@
+# No contact_links here on purpose. GitHub already renders a "Report a security
+# vulnerability" entry in the issue picker, generated from SECURITY.md with
+# private vulnerability reporting enabled — and that one opens a real private
+# disclosure form. A contact_link pointing at the security policy sat beside it
+# saying nearly the same thing, so a reporter had to guess between two entries
+# where the wrong guess led to a document instead of a form.
 blank_issues_enabled: false
-contact_links:
-  - name: Security vulnerability
-    url: https://github.com/PeterKnego/roost/security/policy
-    about: Please report security issues privately, not as a public issue.
