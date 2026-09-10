@@ -918,13 +918,27 @@ function iconExt(rel) {
   return ext.toLowerCase();
 }
 
+/// How a session name reads in a tab.
+///
+/// The server hands out `claude`, `claude2`, `prloop` — names that have to
+/// stay inside `^[A-Za-z0-9_-]{1,32}$`, since they land in a dtach socket path
+/// and on a command line. "Claude 2" is the same name said out loud, and only
+/// the strip needs it; everything that addresses a session still uses the real
+/// one.
+function sessionLabel(session) {
+  const m = /^(claude|prloop)([0-9]*)$/.exec(session || "");
+  if (!m) return session;
+  const base = m[1] === "claude" ? "Claude" : "PR loop";
+  return m[2] ? `${base} ${m[2]}` : base;
+}
+
 function tabLabel(t) {
   switch (t.k) {
     case "Tree": return "Files";
     case "Changes": return "Changes";
     case "File": return t.rel.split("/").pop();
     case "Diff": return t.rel ? t.rel.split("/").pop() : "full diff";
-    case "Terminal": return t.session;
+    case "Terminal": return sessionLabel(t.session);
     case "Proposal": {
       const p = state && state.proposals && state.proposals[t.id];
       return p ? p.rel.split("/").pop() : "proposal";
@@ -987,10 +1001,32 @@ function render() {
       // Terminal tabs route through focusSession, not a bare ActivateTab, so
       // the obvious gesture of clicking a dotted tab is what clears its dot
       // — see hasAttention/focusSession below.
-      b.onclick = () => {
+      const activate = () => {
         revealPane(pi);
         t.k === "Terminal" ? focusSession(t.session) : send({ t: "ActivateTab", pane: pi, idx: ti });
       };
+      b.onclick = activate;
+      // On a touch screen the first tap is routinely spent somewhere else.
+      // With a terminal focused the soft keyboard is up, and tapping outside
+      // it goes to dismissing the keyboard — the `click` never reaches the
+      // tab, so switching took two taps where a mouse takes one. Reported
+      // from a phone for file tabs and terminal tabs alike.
+      //
+      // `pointerdown` fires on the first touch whatever the focus does with
+      // it. `preventDefault` there suppresses the compatibility mouse events
+      // *and* the click that would follow, so this activates once rather than
+      // twice — and, as a bonus, keeps focus where it is, so the keyboard does
+      // not close underneath a tap that was only changing tabs.
+      //
+      // Touch only: a mouse keeps the click path, because `mousedown` on a
+      // tab is where the drag-between-panes gesture starts and preventing its
+      // default would break it. The × has its own handler and is skipped here
+      // for the same reason.
+      b.addEventListener("pointerdown", (e) => {
+        if (e.pointerType !== "touch" || e.target.closest(".x")) return;
+        e.preventDefault();
+        activate();
+      });
       const x = document.createElement("span");
       x.className = "x";
       x.title =
@@ -2201,6 +2237,114 @@ addEventListener("keydown", (e) => { if (linkModifier(e)) setArmed(true); });
 addEventListener("keyup", (e) => { if (!linkModifier(e)) setArmed(false); });
 addEventListener("blur", () => setArmed(false));
 
+/// Touch scrolling that behaves the way a desktop wheel already does.
+///
+/// The problem, from a phone: dragging inside a running Claude did nothing.
+/// `.xterm-viewport` is a real scrollable div, so on the *normal* buffer a
+/// finger has always worked — but a full-screen TUI switches to the alternate
+/// screen, where xterm keeps no scrollback by design, so there is nothing for
+/// the viewport to move. A desktop mouse gets past this without anyone
+/// noticing: xterm translates a wheel event into whatever the program asked
+/// for, and a finger produces no wheel event.
+///
+/// So this makes one. Confirmed against the vendored xterm rather than
+/// assumed — with a TUI running, `term.modes.mouseTrackingMode` reads
+/// `"vt200"`, and a synthetic `WheelEvent` on `.xterm-screen` comes back out
+/// of `onData` as `ESC [ < 64 ; 24 ; 21 M`, a correctly encoded SGR mouse
+/// report. xterm does the encoding; this only has to supply the event.
+///
+/// Three cases, and only the last two are ours:
+///
+///   * mouse reporting on — the program scrolls itself, and wants wheel
+///     reports. This is Claude.
+///   * alternate screen, no mouse reporting — the standard emulation every
+///     terminal does: send the arrow keys, in whichever cursor mode is set.
+///   * normal buffer — hands off. The browser's own scrolling has momentum
+///     that nothing written here would match.
+function wireTouchScroll(node, term) {
+  const screen = () => node.querySelector(".xterm-screen");
+  let last = null, at = 0, velocity = 0, glide = 0;
+
+  /// Whether this terminal wants us to translate.
+  ///
+  /// Only two answers, and the second draft of this had three. The first
+  /// distinguished "mouse reporting on, send wheel" from "alternate screen,
+  /// send arrow keys", and hand-rolled the arrow keys — DECCKM and all. A
+  /// revert-check showed the distinction made no difference: xterm *already*
+  /// turns a wheel into cursor keys on the alternate screen when the program
+  /// is not asking for mouse reports. That is precisely what a desktop wheel
+  /// does, so supplying the wheel and letting xterm decide is both smaller and
+  /// more faithful than deciding here.
+  const translate = () => {
+    try {
+      if (term.modes.mouseTrackingMode !== "none") return true;
+      // The alternate screen keeps no scrollback, so the viewport has nothing
+      // to move and a finger does nothing at all without this.
+      return term.buffer.active.type === "alternate";
+    } catch {
+      return false; // an xterm without `modes` translates nothing
+    }
+  };
+
+  /// One notch of scrolling, `dy` pixels' worth. Positive is a finger moving
+  /// down, which shows earlier output — the direction a wheel-up gives.
+  const emit = (dy) => {
+    const el = screen();
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    el.dispatchEvent(new WheelEvent("wheel", {
+      deltaY: -dy, deltaMode: 0, bubbles: true, cancelable: true,
+      clientX: Math.round(r.left + r.width / 2),
+      clientY: Math.round(r.top + r.height / 2),
+    }));
+  };
+
+  node.addEventListener("touchstart", (e) => {
+    glide = 0;
+    if (!translate() || e.touches.length !== 1) { last = null; return; }
+    last = e.touches[0].clientY;
+    at = e.timeStamp;
+    velocity = 0;
+  }, { passive: true });
+
+  node.addEventListener("touchmove", (e) => {
+    if (last === null || e.touches.length !== 1) return;
+    if (!translate()) { last = null; return; }
+    const y = e.touches[0].clientY;
+    const dy = y - last;
+    const dt = Math.max(1, e.timeStamp - at);
+    // Weighted so a flick is read from its end rather than its whole length.
+    velocity = velocity * 0.6 + (dy / dt) * 0.4;
+    last = y; at = e.timeStamp;
+    emit(dy);
+    // Only once we are actually translating: an unconditional preventDefault
+    // would also stop the page scrolling in the cases we hand back.
+    if (e.cancelable) e.preventDefault();
+  }, { passive: false });
+
+  node.addEventListener("touchend", () => {
+    if (last === null) return;
+    last = null;
+    if (!translate()) return;
+    // Momentum. The browser supplies it for a real scrollable div and for
+    // nothing else, so a translated gesture stops dead at the fingertip
+    // unless it is continued here — which is most of what "really bad" meant.
+    // Decayed per frame rather than per pixel so it lasts the same time at
+    // any refresh rate.
+    let v = velocity * 16;
+    if (Math.abs(v) < 1.5) return;
+    const token = ++glide;
+    const step = () => {
+      if (token !== glide) return;
+      v *= 0.94;
+      if (Math.abs(v) < 0.6) return;
+      emit(v);
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }, { passive: true });
+}
+
 function ensureTerm(session) {
   // No "the socket died, rebuild it" branch any more: an entry now heals its
   // own socket (see connectTerm), so a caller cannot find a dead one here.
@@ -2346,6 +2490,11 @@ function ensureTerm(session) {
     const s = entry.sock;
     if (s && s.readyState === 1) s.send(new TextEncoder().encode(d));
   });
+  // After the terminal exists, not beside the focus listener above: `term` is
+  // a `const` declared further down this function, so wiring it up there threw
+  // `Cannot access 'term' before initialization` — inside `onEvent`, which
+  // swallowed it into a terminal that simply never mounted.
+  wireTouchScroll(node, term);
   terms.set(session, entry);
   connectTerm(entry, session);
   return entry;
@@ -3303,11 +3452,48 @@ function initMobileBar() {
   const bar = mobileBar();
   if (!bar) return;
   for (const b of bar.querySelectorAll("button")) {
+    // `pointerdown`, for the reason the tab strip's handler explains at
+    // length: with a terminal focused the soft keyboard is up, and the first
+    // tap outside it is spent closing the keyboard rather than reaching the
+    // control. Switching panes is the gesture that must never cost two taps.
+    b.addEventListener("pointerdown", (e) => {
+      if (e.pointerType !== "touch") return;
+      e.preventDefault();
+      showMobilePane(b.dataset.mpane);
+    });
     b.onclick = () => showMobilePane(b.dataset.mpane);
   }
   let start = DEFAULT_MPANE;
   try { start = localStorage.getItem(MPANE_KEY) || DEFAULT_MPANE; } catch { /* private mode */ }
   showMobilePane(start);
+}
+
+// ---- the soft keyboard ------------------------------------------------
+// A phone keyboard covers the bottom of the screen without the layout
+// viewport noticing: `100dvh` is the viewport with the *browser's* chrome
+// retracted, which is a different question, and on iOS it does not shrink for
+// the keyboard at all. So the pane kept its full height, and everything at the
+// bottom — the key bar, and whatever you were typing into — sat underneath it.
+//
+// `window.visualViewport` is the API that does know. Its height is what is
+// actually visible, and it changes as the keyboard opens and closes.
+// `offsetTop` matters too: iOS scrolls the layout viewport up to keep a
+// focused field visible, and without accounting for it the header ends up
+// above the top of the screen.
+function watchKeyboard() {
+  const vv = window.visualViewport;
+  if (!vv) return; // every current browser has it; an old one keeps `dvh`
+  const apply = () => {
+    document.documentElement.style.setProperty("--vvh", `${Math.round(vv.height)}px`);
+    // The workspace is a fixed frame, so the page itself should never be
+    // scrolled. If the browser scrolled it to reveal a field, put it back and
+    // let the shrunken frame do the revealing instead.
+    if (window.scrollY !== 0) window.scrollTo(0, 0);
+    fitTerminals();
+  };
+  vv.addEventListener("resize", apply);
+  vv.addEventListener("scroll", apply);
+  apply();
 }
 
 // Crossing the breakpoint in either direction. A desktop window dragged narrow
@@ -3564,6 +3750,7 @@ if (location.hash.startsWith("#session=")) {
 // grid cell, for as long as the socket takes to answer.
 initMobileBar();
 initTermKeys();
+watchKeyboard();
 
 connectControl();
 

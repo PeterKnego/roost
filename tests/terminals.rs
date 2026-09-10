@@ -236,10 +236,12 @@ fn a_claude_terminal_has_claude_typed_into_it_once_its_shell_exists() {
     let mut a = ws_connect_path(port, "/ws/claudeterm/_workspace").unwrap();
     read_until(&mut a, r#""t":"State""#);
     a.send(tungstenite::Message::Text(r#"{"t":"NewTerminal","pane":3,"launch":"claude"}"#.into())).unwrap();
-    // default_layout seeds `term`, so the click is handed `term1`.
-    read_until(&mut a, r#""session":"term1""#);
+    // A ✻ click is handed `claude`, not the next free `termN`: the name says
+    // what the terminal is for, so the tab strip reports which one has an
+    // agent in it. `default_layout`'s seeded `term` is untouched.
+    read_until(&mut a, r#""session":"claude""#);
 
-    let mut t = ws_connect_term(port, "/ws/claudeterm/term/term1").unwrap();
+    let mut t = ws_connect_term(port, "/ws/claudeterm/term/claude").unwrap();
     let mut seen = String::new();
     for _ in 0..100 {
         match t.read() {
@@ -264,9 +266,12 @@ fn a_claude_terminal_has_claude_typed_into_it_once_its_shell_exists() {
 
     // The plain + button on the same project stays a plain shell: nothing is
     // typed into it, so nothing comes back out.
+    // `term1`, not `term2`: the ✻ above took `claude`, so the plain + is
+    // handed the next free name in its own sequence rather than in a single
+    // shared one. `term` is `default_layout`'s seeded tab.
     a.send(tungstenite::Message::Text(r#"{"t":"NewTerminal","pane":3}"#.into())).unwrap();
-    read_until(&mut a, r#""session":"term2""#);
-    let mut p = ws_connect_term(port, "/ws/claudeterm/term/term2").unwrap();
+    read_until(&mut a, r#""session":"term1""#);
+    let mut p = ws_connect_term(port, "/ws/claudeterm/term/term1").unwrap();
     p.send(tungstenite::Message::Binary(b"marker\r".to_vec())).unwrap();
     let mut plain = String::new();
     for _ in 0..100 {

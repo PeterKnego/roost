@@ -728,6 +728,29 @@ impl Hub {
                 }),
             _ => None,
         };
+        // A terminal tab closed before any browser attached leaves a
+        // reservation behind — permission for the *next* attach on that name
+        // to spawn, carrying whichever launch the click asked for. It used to
+        // be cleaned up by accident: the next allocation reserved over it, and
+        // names were handed out in one sequence, so `term2` came back round.
+        // Now that ✻ is given `claude`/`claude2` and + is given `term`/`term1`
+        // they no longer collide, and nothing overwrote it.
+        //
+        // Released explicitly instead, which is what `session::release` is
+        // for. Read before `apply_layout`, which has removed the tab by the
+        // time the answer is sent.
+        let closing_session: Option<String> = match &intent {
+            Intent::CloseTab { pane, idx } => self
+                .ws
+                .panes
+                .get(*pane as usize)
+                .and_then(|p| p.tabs.get(*idx))
+                .and_then(|t| match t {
+                    Tab::Terminal { session } => Some(session.clone()),
+                    _ => None,
+                }),
+            _ => None,
+        };
         // Same reason as `closing_rel` above: `apply_layout` has removed the
         // tab by the time the answer has to be sent, so the id it carried has
         // to be read out first.
@@ -743,6 +766,9 @@ impl Hub {
                 }),
             _ => None,
         };
+        if let Some(name) = closing_session.as_deref() {
+            crate::session::release(&self.project, name);
+        }
         match workspace::apply_layout(&mut self.ws, &intent) {
             Ok(true) => {
                 // A layout change can add a terminal tab (OpenTab, MoveTab
@@ -1791,7 +1817,17 @@ impl Hub {
                 _ => None,
             })
             .collect();
-        let Some(name) = crate::session::next_free_name(&self.project, &on_tabs) else {
+        // The prefix says what the terminal is for. A ✻ click gets `claude`,
+        // `claude2`, … so the strip says which tab has an agent in it; a plain
+        // + keeps `term`. #52's `prloop` gets its own for the same reason —
+        // that one is pushing commits, and "which tab is that" should not need
+        // a guess.
+        let prefix = match launch.as_ref().copied() {
+            Some(crate::proto::Launch::Claude) => "claude",
+            Some(crate::proto::Launch::PrLoop) => "prloop",
+            None => "term",
+        };
+        let Some(name) = crate::session::next_free_name_with(&self.project, &on_tabs, prefix) else {
             let ev = Event::Error { msg: "too many terminal sessions".into() };
             return self.send_to(from, &ev);
         };
@@ -3768,33 +3804,40 @@ mod tests {
         h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
         h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
         drain(&rx);
-        let first = crate::session::reserve_and_attach("newterm_launch", "term", d.path()).unwrap();
+        // ✻ is allocated `claude`, not whichever `termN` was free: a strip
+        // reading `term, term1, term2` says nothing about which tab has an
+        // agent in it. The plain + that followed keeps `term`.
+        let first = crate::session::reserve_and_attach("newterm_launch", "claude", d.path()).unwrap();
         assert_eq!(
             first.launch.as_ref().map(|l| l.launch),
             Some(proto::Launch::Claude),
-            "✻ got `term`, so `term` starts claude"
+            "✻ got `claude`, so `claude` starts claude"
         );
         assert!(
             first.launch.as_ref().and_then(|l| l.session_id.as_deref()).is_some_and(crate::launch::valid_session_id),
             "the hub minted an id"
         );
-        let second = crate::session::reserve_and_attach("newterm_launch", "term1", d.path()).unwrap();
-        assert_eq!(second.launch, None, "+ got `term1`, which stays a plain shell");
+        let second = crate::session::reserve_and_attach("newterm_launch", "term", d.path()).unwrap();
+        assert_eq!(second.launch, None, "+ got `term`, which stays a plain shell");
         crate::session::kill_project("newterm_launch");
 
-        // The stale case: ✻ allocates `term2`, its tab is closed before any
-        // browser attaches, and + is then handed `term2` back. The click that
-        // made it a claude shell is gone, so the shell must be plain.
+        // The stale case: ✻ allocates `claude2` (the first `claude` is taken),
+        // its tab is closed before any browser attaches, and a later ✻ is
+        // handed `claude2` back. The click that made it a claude shell is
+        // gone, so its own reservation must not survive the close.
         h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
         let idx = h.ws.panes[proto::RIGHT as usize]
             .tabs
             .iter()
-            .position(|t| matches!(t, Tab::Terminal { session } if session == "term2"))
-            .expect("✻ was handed term2");
+            .position(|t| matches!(t, Tab::Terminal { session } if session == "claude2"))
+            .expect("✻ was handed claude2");
         h.handle(&c, Intent::CloseTab { pane: proto::RIGHT, idx });
         h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
         drain(&rx);
-        let reused = crate::session::reserve_and_attach("newterm_launch", "term2", d.path()).unwrap();
+        // The plain + that followed took `term1`; `claude2` is free again, and
+        // attaching it directly is what a browser that never saw the close
+        // would do.
+        let reused = crate::session::reserve_and_attach("newterm_launch", "claude2", d.path()).unwrap();
         assert_eq!(reused.launch, None, "a reallocated name must not inherit the old click");
         crate::session::kill_project("newterm_launch");
         std::env::remove_var("ROOST_CMD");
@@ -3815,17 +3858,19 @@ mod tests {
         let (a, rxa) = h.subscribe();
         let (_b, rxb) = h.subscribe();
         for p in h.ws.panes.iter_mut() { p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. })); p.active = 0; }
-        // First ✻: allocates `term`; spawn it the way a browser would, so the
-        // launch is consumed and recorded on the session.
+        // First ✻: allocates `claude`; spawn it the way a browser would, so
+        // the launch is consumed and recorded on the session.
         h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
-        let _att = crate::session::reserve_and_attach("prompt_second", "term", d.path()).unwrap();
+        let _att = crate::session::reserve_and_attach("prompt_second", "claude", d.path()).unwrap();
         assert_eq!(crate::session::launched_names("prompt_second").len(), 1, "fixture: a launched terminal exists");
         drain(&rxa); drain(&rxb);
         let version = h.ws.version;
 
         h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
         let got = rxa.try_recv().expect("the clicker hears back");
-        assert!(got.contains(r#""t":"ClaudeHere""#) && got.contains(r#""terminals":["term"]"#), "{got}");
+        // `claude`, not `term`: a ✻ click is allocated a name that says what
+        // the terminal is for.
+        assert!(got.contains(r#""t":"ClaudeHere""#) && got.contains(r#""terminals":["claude"]"#), "{got}");
         assert!(rxb.try_recv().is_err(), "nobody else hears anything");
         assert_eq!(h.ws.version, version, "no layout change");
         assert_eq!(crate::session::live_names("prompt_second").len(), 1, "no session allocated");

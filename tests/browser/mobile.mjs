@@ -408,6 +408,121 @@ try {
      `and a TUI in DECCKM gets the application ones: ${JSON.stringify(appSent)}`);
   await evalIn(`[...terms.values()][0].term.write("\u001b[?1l")`);
 
+  console.log("E7. scrolling a running TUI");
+  // Last of the terminal sections on purpose: it puts the terminal on the
+  // alternate screen, and the normal-buffer scroll checked above wants its
+  // scrollback intact.
+  // The reported one: dragging inside a running Claude did nothing. The
+  // viewport is a real scrollable div, so on the *normal* buffer a finger has
+  // always worked — but a full-screen TUI switches to the alternate screen,
+  // where xterm keeps no scrollback by design, so there is nothing for the
+  // viewport to move. A desktop mouse gets past this without anyone noticing:
+  // xterm turns a wheel event into whatever the program asked for. A finger
+  // produces no wheel event, so app.js makes one.
+  //
+  // Recorded at `onData`, which is what the terminal actually sends, so this
+  // asserts the bytes rather than that a handler ran.
+  const term = `[...terms.values()][0].term`;
+  await evalIn(`window.__wire = []; ${term}.onData((d) => window.__wire.push(d));`);
+  // The modes a full-screen TUI turns on: alternate screen, application
+  // cursor keys, and SGR mouse reporting. Claude sets all three.
+  await evalIn(`${term}.write("\u001b[?1049h\u001b[?1h\u001b[?1000h\u001b[?1006h")`);
+  await until(() => evalIn(`${term}.modes.mouseTrackingMode !== "none"`), 10, "mouse reporting");
+  ok(await evalIn(`${term}.buffer.active.type === "alternate"`), "the terminal is on the alternate screen");
+  ok((await evalIn(`${term}.buffer.active.length - ${term}.rows`)) <= 0,
+     "which has no scrollback for a viewport drag to move — the reason a finger did nothing");
+
+  const termHost = `document.querySelector('.pane[data-pane="3"] .termhost')`;
+  const at = await evalIn(`(() => { const r = ${termHost}.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`);
+  const dragOn = async (steps) => {
+    await page.cmd("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: at.x, y: at.y - 120 }] });
+    for (let i = 1; i <= steps; i++) {
+      await page.cmd("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: at.x, y: at.y - 120 + i * 20 }] });
+      await sleep(16);
+    }
+    await page.cmd("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await sleep(500);
+  };
+  await evalIn(`window.__wire = []`);
+  await dragOn(6);
+  const wire = await evalIn(`window.__wire.join("")`);
+  // SGR mouse reports: ESC [ < 64 ; col ; row M is a wheel-up. This is what a
+  // desktop wheel produces, and now what a finger produces.
+  ok(/\u001b\[<6[45];\d+;\d+M/.test(wire),
+     `the drag reaches the program as wheel reports: ${JSON.stringify(wire.slice(0, 60))}`);
+
+  // Momentum, which is most of what "really bad" meant. The browser supplies
+  // inertia for a real scrollable div and for nothing else, so a translated
+  // gesture stops dead at the fingertip unless it is continued — a flick that
+  // moves six lines and halts does not read as scrolling.
+  //
+  // Measured across `touchend`: the count at the moment the finger lifts,
+  // against the count a few frames later.
+  await evalIn(`window.__wire = []`);
+  await page.cmd("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: at.x, y: at.y - 150 }] });
+  for (let i = 1; i <= 8; i++) {
+    await page.cmd("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: at.x, y: at.y - 150 + i * 30 }] });
+    await sleep(8);
+  }
+  await page.cmd("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  const atLift = await evalIn(`window.__wire.length`);
+  await sleep(700);
+  const afterGlide = await evalIn(`window.__wire.length`);
+  ok(afterGlide > atLift,
+     `a flick keeps scrolling after the finger lifts (${atLift} -> ${afterGlide} reports)`);
+
+  // With mouse reporting off but still on the alternate screen, the standard
+  // emulation every terminal does is arrow keys — in whichever cursor mode is
+  // set, since the wrong one moves nothing.
+  await evalIn(`${term}.write("\u001b[?1006l\u001b[?1000l"); window.__wire = [];`);
+  await until(async () => (await evalIn(`${term}.modes.mouseTrackingMode`)) === "none", 10, "reporting off");
+  await dragOn(6);
+  const keys = await evalIn(`window.__wire.join("")`);
+  ok(keys.includes("\u001bOA"),
+     `without mouse reporting it sends application cursor keys: ${JSON.stringify(keys.slice(0, 40))}`);
+  await evalIn(`${term}.write("\u001b[?1l\u001b[?1049l")`);
+  await sleep(300);
+
+  console.log("E6. names, the close target, and the keyboard");
+  // A ✻ click is handed a name that says what the terminal is for, so the
+  // strip reports which tab has an agent in it rather than making you guess
+  // between term1 and term2.
+  await evalIn(`send({ t: "NewTerminal", pane: 3, launch: "claude" })`);
+  await until(async () => (await evalIn(`state.panes[3].tabs.some(t => t.session === "claude")`)), 10, "the claude tab");
+  // `force`, because a second ✻ with a Claude already running answers with the
+  // worktree prompt instead of opening — which is `worktree_prompt` doing its
+  // job, and a different feature from this one.
+  await evalIn(`send({ t: "NewTerminal", pane: 3, launch: "claude", force: true })`);
+  ok(await until(() => evalIn(`state.panes[3].tabs.some(t => t.session === "claude2")`), 10, "the second"),
+     "a second one is claude2, not the next free termN");
+  const labels = await evalIn(`[...document.querySelectorAll('.pane[data-pane="3"] .tabstrip .tab')]
+    .map((t) => t.textContent.replace("\u00d7", "").trim())`);
+  // The name has to stay inside ^[A-Za-z0-9_-]{1,32}$ — it lands in a dtach
+  // socket path and on a command line — so "Claude 2" is the strip's business.
+  ok(labels.includes("Claude") && labels.includes("Claude 2"),
+     `and reads as Claude / Claude 2 (${JSON.stringify(labels)})`);
+
+  // Reported: the × was not centred. It is a span holding one glyph, so width
+  // and height alone leave it wherever the line box put it.
+  const x = await evalIn(`(() => {
+    const el = document.querySelector('.pane[data-pane="3"] .tab .x');
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return { w: Math.round(r.width), h: Math.round(r.height), d: cs.display,
+             a: cs.alignItems, j: cs.justifyContent }; })()`);
+  ok(x.w >= 24 && x.h >= 24, `the close target is finger-sized (${x.w}x${x.h})`);
+  ok(x.d.includes("flex") && x.a === "center" && x.j === "center",
+     `and the glyph is centred in it, not merely inside it (${JSON.stringify(x)})`);
+
+  // The soft keyboard. `dvh` is the viewport with the browser's chrome
+  // retracted, a different question, and on iOS it does not shrink for the
+  // keyboard at all — so the pane kept its full height and the key bar sat
+  // underneath it. `visualViewport` is the API that knows.
+  ok((await evalIn(`getComputedStyle(document.documentElement).getPropertyValue("--vvh").trim()`))
+       === `${Math.round(await evalIn(`window.visualViewport.height`))}px`,
+     "the layout follows the visual viewport, which is what a keyboard changes");
+
   console.log("F. a desktop is untouched");
   // The negative control, and the reason any of the above means anything: all
   // of it is scoped to a media query, and a rule that leaked would show here
