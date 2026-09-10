@@ -191,6 +191,28 @@ nothing is running), for the same reason.
 Both are logged, so `journalctl --user -u roost | grep -i reap` after a
 restart tells you what the startup sweep decided.
 
+**A terminal whose shell a reboot took can offer to resume its Claude.**
+roost records the Claude Code session id of every terminal in a project that
+has the hooks on (the bell), from the hook that already fires — so after a
+reboot, that tab's placeholder carries a *Resume the Claude that was here*
+button beside the usual "press Enter". The button starts the shell and types
+`claude --resume <id>`; Enter still starts a plain one, and nothing resumes on
+its own. #17 is the reason it is offered rather than automatic: a resume
+continues a conversation whose last turn may have been mid-edit.
+
+Three things it deliberately does not do. It says nothing when there is no
+record — hooks are per-project and opt-in, so "nothing recorded" means
+*unknown*, never "no Claude ran here". It covers Claude terminals only: a
+shell that was running a build, a `tail -f` or an editor comes back with
+nothing, and so does the scrollback, which lives in memory and dies with the
+process. And `relaunch` (the setting that restarts an agent when you open a
+project) still starts a **fresh** conversation, never a resume, for the same
+#17 reason.
+
+The id never reaches the browser: the page is told which tabs have one, and
+asks for the resume by session name. It lands on a command line, which is the
+same reason session names are the server's to choose.
+
 **Closing a terminal tab ends that session.** Its × kills the shell and its
 `dtach` **master** — the part that matters: in `-A` mode dtach forks a master
 that reparents to init, so killing only roost's own client is a *detach*, not an

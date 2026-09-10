@@ -32,16 +32,61 @@ use std::time::{Duration, Instant};
 
 use crate::proto::Launch;
 
+/// Which Claude conversation a launch is about, and therefore which flag
+/// carries it.
+///
+/// An enum rather than an `Option<String>` beside a `resume: bool`, because
+/// those two make "resume an id roost just minted" representable — a launch
+/// that can only ever fail with *no conversation found*. Here the id and what
+/// it means travel together and cannot be paired wrongly.
+///
+/// Server-side only. The browser is told *that* a resume is on offer and never
+/// the value: the id lands on a command line, and CLAUDE.md already reserves
+/// that class of choice to the server for session names, for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeSession {
+    /// Minted by roost for a fresh launch, and passed as `--session-id` so
+    /// roost knows the id of the conversation it just started.
+    Fresh(String),
+    /// Learned from a Claude Code hook (`claudesess`), and passed as
+    /// `--resume` to continue that conversation. #18 step 2.
+    Resume(String),
+}
+
+impl ClaudeSession {
+    /// The id, if it still passes the check that applies to *this* kind.
+    ///
+    /// The two checks are deliberately different and the difference is the
+    /// substance. A `Fresh` id is one roost minted, so the strict v4 form is
+    /// free to demand. A `Resume` id came out of another program's JSON, and
+    /// `claudesess` chose on purpose not to pin Claude Code's format — so
+    /// gating it on the strict form would mean roost recording ids it then
+    /// silently refuses to type, turning a resume into a bare `claude` and
+    /// losing the conversation with no message. Same rule at both ends: an id
+    /// `claudesess` was willing to store is an id this is willing to resume.
+    fn usable(&self) -> Option<&str> {
+        match self {
+            ClaudeSession::Fresh(id) if valid_session_id(id) => Some(id),
+            ClaudeSession::Resume(id) if crate::claudesess::valid_session_id(id) => Some(id),
+            _ => None,
+        }
+    }
+}
+
 /// The bytes typed into the shell for a launch. `\r` is Enter on a PTY.
 ///
-/// `session_id` is typed only when it is exactly a lowercase v4-shaped uuid:
-/// it lands on a command line, and the validation is the whole boundary
-/// between "roost chose this id" and "something typed a shell command". A
-/// malformed id degrades to the bare program, which still starts.
-pub fn keystrokes(launch: Launch, session_id: Option<&str>) -> Vec<u8> {
-    match (launch, session_id) {
-        (Launch::Claude, Some(id)) if valid_session_id(id) => {
+/// The id is typed only when it passes the check for its kind (see
+/// `ClaudeSession::usable`): it lands on a command line, and the validation is
+/// the whole boundary between "roost chose this id" and "something typed a
+/// shell command". An id that fails degrades to the bare program, which still
+/// starts — never to a truncated or half-quoted argument.
+pub fn keystrokes(launch: Launch, session: Option<&ClaudeSession>) -> Vec<u8> {
+    match (launch, session.and_then(|s| s.usable().map(|id| (s, id)))) {
+        (Launch::Claude, Some((ClaudeSession::Fresh(_), id))) => {
             format!("claude --session-id {id}\r").into_bytes()
+        }
+        (Launch::Claude, Some((ClaudeSession::Resume(_), id))) => {
+            format!("claude --resume {id}\r").into_bytes()
         }
         (Launch::Claude, _) => b"claude\r".to_vec(),
         // The prompt goes on the command line rather than being typed after
@@ -368,9 +413,80 @@ mod tests {
         // right: [99, 108, 97, 117, 100, 101, 32, 45, 45, 115, ...] (claude --session-id ...\r).
         let id = "0123abcd-0123-4abc-8abc-0123456789ab";
         assert_eq!(
-            keystrokes(Launch::Claude, Some(id)),
+            keystrokes(Launch::Claude, Some(&ClaudeSession::Fresh(id.into()))),
             format!("claude --session-id {id}\r").into_bytes()
         );
+    }
+
+    /// #18 step 2. The same id, the other flag — and the flag is chosen by
+    /// the variant, so no caller can pair a minted id with `--resume` or a
+    /// recorded one with `--session-id`.
+    ///
+    /// Revert-checked: with the `Resume` arm deleted, both kinds fall through
+    /// to the bare-command arm rather than to `Fresh` — so the failure is
+    /// left: `claude\r`, right: `claude --resume 0123abcd-…\r`. Worth
+    /// recording, because the obvious guess (that it would type
+    /// `--session-id`) is wrong: the variant is matched, not the presence of
+    /// an id, so a missing arm loses the launch entirely rather than
+    /// mislabelling it.
+    #[test]
+    fn a_recorded_session_is_typed_as_a_resume() {
+        let id = "0123abcd-0123-4abc-8abc-0123456789ab";
+        assert_eq!(
+            keystrokes(Launch::Claude, Some(&ClaudeSession::Resume(id.into()))),
+            format!("claude --resume {id}\r").into_bytes()
+        );
+    }
+
+    /// The two validators disagree on purpose, and this is the row that
+    /// would otherwise rot: `claudesess` accepts ids that are not v4 uuids
+    /// because they come out of another program's JSON and #18 chose not to
+    /// pin Claude Code's format. `abc123` is the id `claudesess`'s own
+    /// `a_session_start_carries_an_id_and_no_transcript_yet` records.
+    ///
+    /// If this arm used `launch::valid_session_id` instead, roost would store
+    /// that id and then silently refuse to type it: the resume would degrade
+    /// to a bare `claude` and the conversation would be lost with no message.
+    ///
+    /// Revert-checked: with `usable`'s `Resume` arm switched to
+    /// `valid_session_id`, this fails with left: `claude\r`,
+    /// right: `claude --resume abc123\r`.
+    #[test]
+    fn an_id_claudesess_would_store_is_an_id_this_will_resume() {
+        assert!(
+            !valid_session_id("abc123"),
+            "setup: the strict uuid check rejects it, which is the whole point"
+        );
+        assert!(crate::claudesess::valid_session_id("abc123"), "setup: claudesess stores it");
+        assert_eq!(
+            keystrokes(Launch::Claude, Some(&ClaudeSession::Resume("abc123".into()))),
+            b"claude --resume abc123\r".to_vec()
+        );
+    }
+
+    /// A recorded id is not roost's string — it arrived as JSON from another
+    /// program — so the resume arm needs its own version of the injection
+    /// test, not merely the `Fresh` one above.
+    ///
+    /// The leading-dash case is the one `claudesess`'s own comment calls out:
+    /// `--dangerously-skip-permissions` passes a bare character-class check
+    /// and stops being a value the moment it reaches `claude --resume <id>`.
+    ///
+    /// Revert-checked: with `usable`'s `Resume` guard removed, this fails on
+    /// the first assertion with left: `claude --resume x; rm -rf ~\r`,
+    /// right: `claude\r`.
+    #[test]
+    fn a_recorded_id_that_could_be_an_argument_is_never_typed() {
+        for bad in ["x; rm -rf ~", "--dangerously-skip-permissions", "a b", ""] {
+            let typed = keystrokes(Launch::Claude, Some(&ClaudeSession::Resume(bad.into())));
+            assert_eq!(typed, b"claude\r".to_vec(), "{bad:?} must degrade to the bare command");
+            // Not merely "the whole thing was refused": no fragment of the
+            // rejected id may survive into what is typed.
+            assert!(
+                !String::from_utf8_lossy(&typed).contains("resume"),
+                "{bad:?} left a --resume behind"
+            );
+        }
     }
 
     #[test]
@@ -392,7 +508,7 @@ mod tests {
         // left: [99, 108, 97, 117, 100, 101, 32, 45, 45, 115, 101, 115, 115, 105, 111, 110, 45, 105, 100, 32, ..., 59, ...] (contains injected semicolon),
         // right: [99, 108, 97, 117, 100, 101, 13] (claude\r).
         let bad = "0123abcd-0123-4abc-8abc-0123456789ab; rm -rf ~";
-        let typed = keystrokes(Launch::Claude, Some(bad));
+        let typed = keystrokes(Launch::Claude, Some(&ClaudeSession::Fresh(bad.into())));
         assert_eq!(typed, b"claude\r".to_vec());
         assert!(!String::from_utf8_lossy(&typed).contains(';'));
         assert!(!valid_session_id(bad));

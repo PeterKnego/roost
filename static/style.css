@@ -1070,6 +1070,14 @@ header button.proj:hover svg { opacity: 1; }
    something you had is not there any more, and nothing else on the page says
    so. */
 .termstart .termlost { color: #d29922; max-width: 46ch; margin: 0 0 10px; }
+/* The resume offer (#18 step 2). Sized as a real tap target rather than
+   matching .initgit's padding: this one appears on the phone, where the tab
+   whose shell a reboot took is exactly the thing you come back to. */
+.termstart .termresume { font: inherit; min-height: 44px; padding: 6px 16px; border-radius: 6px;
+                         border: 1px solid var(--border); background: var(--bg2); color: var(--fg);
+                         cursor: pointer; }
+.termstart .termresume:hover { border-color: var(--accent); color: var(--accent); }
+.termstart .termresume:active { background: var(--tab-hover); }
 
 /* The switcher itself. Present in the DOM at every width — a desktop window
    dragged narrow has to grow one without a reload — and shown only by the

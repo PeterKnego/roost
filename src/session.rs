@@ -154,7 +154,9 @@ pub struct Attachment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchRequest {
     pub launch: crate::proto::Launch,
-    pub session_id: Option<String>,
+    /// Which conversation, and therefore which flag — see
+    /// `launch::ClaudeSession`. `None` is a plain `claude`.
+    pub session: Option<crate::launch::ClaudeSession>,
 }
 
 /// Permission for the *next* attach on this key to spawn a shell, placed by
@@ -1560,13 +1562,13 @@ mod tests {
         reserve(
             "launchproj",
             "term",
-            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session_id: None }),
+            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session: None }),
         );
 
         let first = reserve_and_attach("launchproj", "term", d.path()).unwrap();
         assert_eq!(
             first.launch,
-            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session_id: None }),
+            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session: None }),
             "the attach that spawns carries it"
         );
         let mirror = reserve_and_attach("launchproj", "term", d.path()).unwrap();
@@ -1590,7 +1592,7 @@ mod tests {
         reserve(
             "launchproj2",
             "term",
-            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session_id: None }),
+            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session: None }),
         );
         // The plain + click that got the same name back.
         reserve("launchproj2", "term", None);
@@ -1607,7 +1609,10 @@ mod tests {
         let _s = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ROOST_CMD", "cat");
         let d = tempfile::tempdir().unwrap();
-        let req = LaunchRequest { launch: crate::proto::Launch::Claude, session_id: Some("0123abcd-0123-4abc-8abc-0123456789ab".into()) };
+        let req = LaunchRequest {
+            launch: crate::proto::Launch::Claude,
+            session: Some(crate::launch::ClaudeSession::Fresh("0123abcd-0123-4abc-8abc-0123456789ab".into())),
+        };
         reserve("launched", "term", Some(req.clone()));
         let a = reserve_and_attach("launched", "term", d.path()).unwrap();
         assert_eq!(a.launch, Some(req.clone()), "the spawning attach carries it");

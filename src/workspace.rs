@@ -103,6 +103,21 @@ pub struct Workspace {
     /// Computed once, when the hub loads the layout, and only from positive
     /// evidence; never persisted, because it is a fact about this moment.
     pub lost_sessions: Vec<String>,
+    /// Of the lost ones, those roost recorded a Claude session id for, so the
+    /// placeholder can offer `claude --resume <id>` (#18 step 2). The id
+    /// itself never leaves the server — this is only *which tabs* have one.
+    ///
+    /// Computed beside `lost_sessions` and filtered by the same rule, for the
+    /// same reason and one more: it is a read per terminal off the state
+    /// directory, and `WorkspaceView::claude_sessions` and `show_hidden` both
+    /// record why a snapshot is the wrong place for that — a snapshot goes out
+    /// on every debounced keystroke.
+    ///
+    /// A subset of `lost_sessions` by construction, not by coincidence:
+    /// `session::end_session` calls `claudesess::forget`, so a record can only
+    /// outlive a session nobody ended — one lost to a reboot or a reaped
+    /// socket.
+    pub resumable_sessions: Vec<String>,
     /// Whether the project root is a git repository, cached here so the
     /// hub doesn't re-stat the filesystem on every view.
     pub is_git: bool,
@@ -140,6 +155,7 @@ impl Workspace {
             live_sessions: vec![],
             sessions_seen: vec![],
             lost_sessions: vec![],
+            resumable_sessions: vec![],
             is_git: false,
             show_hidden: None,
         }
@@ -196,6 +212,7 @@ impl Workspace {
             watch_degraded: self.watch_degraded,
             live_sessions: self.live_sessions.clone(),
             lost_sessions: self.lost_sessions.clone(),
+            resumable_sessions: self.resumable_sessions.clone(),
             // Filled by `hub::snapshot_event`; `WsState` deliberately has no
             // such field (see the doc on `WorkspaceView::claude_sessions`).
             claude_sessions: vec![],

@@ -1493,8 +1493,21 @@ function terminalPlaceholder(session) {
     ? `<p class="termlost">The shell in this tab did not survive — roost can outlive its
         own restart, but not a reboot of the machine.</p>`
     : "";
+  // #18 step 2. The server says which tabs it recorded a Claude for; the id
+  // stays there, and this asks for it by session name. Gated on LAUNCHES too
+  // — the same startup probe the ✻ button uses — because offering a resume on
+  // a machine without `claude` on PATH buys a `command not found`.
+  //
+  // Absence offers nothing and *says* nothing. Hooks are per-project and
+  // opt-in, so "no record" means unknown, never "no Claude ran here"; the
+  // note above makes no claim about Claude and stays as it is.
+  const resumable = (state.resumable_sessions || []).includes(session)
+    && LAUNCHES.includes("claude");
+  const resume = resumable
+    ? `<p><button class="termresume">Resume the Claude that was here</button></p>`
+    : "";
   box.innerHTML = isGit
-    ? `${gone}<p>Press <kbd>Enter</kbd> to start a terminal</p>`
+    ? `${gone}${resume}<p>Press <kbd>Enter</kbd> to start a terminal</p>`
     : `${gone}<p>Not a git repository.</p>
        <p><button class="initgit">Initialize git repo</button></p>
        <p><a class="nogit" href="#">start without git</a></p>`;
@@ -1508,11 +1521,14 @@ function terminalPlaceholder(session) {
   // timeout a refused start would leave the placeholder permanently inert.
   // 2s is well past any held-Enter repeat rate, so the burst-suppression
   // this guard exists for is unaffected.
-  const start = () => {
+  const start = (resumeIt) => {
     if (box.dataset.sent) return;
     box.dataset.sent = "1";
     setTimeout(() => { delete box.dataset.sent; }, 2000);
-    send({ t: "StartTerminal", session });
+    // `resume` omitted rather than sent as false for a plain start: the field
+    // is `#[serde(default)]` server-side, so the message a plain Enter sends
+    // is byte-for-byte the one it has always sent.
+    send(resumeIt ? { t: "StartTerminal", session, resume: true } : { t: "StartTerminal", session });
   };
   if (isGit) {
     // Only this branch behaves like a control — tabIndex, the pointer
@@ -1521,8 +1537,35 @@ function terminalPlaceholder(session) {
     // handler wired to the box itself.
     box.classList.add("termstart-live");
     box.tabIndex = 0;
-    box.onclick = start;
-    box.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); start(); } };
+    // `() => start(false)`, not a bare `start`: as a bare handler the DOM passes the
+    // event as the first argument, and an Event object is truthy — so every
+    // plain click on the box would have asked for a resume.
+    box.onclick = () => start(false);
+    // `e.target === box` guards the resume button, which is a child: a
+    // <button> turns Enter into a click itself, but the keydown reaches this
+    // handler *first*, so without the check the plain start wins the
+    // `dataset.sent` race and a user who tabbed to Resume and pressed Enter
+    // gets a bare shell — silently, with the button gone. Load-bearing, not
+    // defensive: `tests/browser/resume.mjs` section C fails without it, with
+    // the intent it caught printed.
+    box.onkeydown = (e) => {
+      if (e.key === "Enter" && e.target === box) { e.preventDefault(); start(false); }
+    };
+    if (resumable) {
+      box.querySelector(".termresume").onclick = (e) => {
+        // Defensive rather than demonstrated: removing this does not fail
+        // `resume.mjs`, because the button's own handler runs before the
+        // bubbled one and `dataset.sent` swallows the second. It stays
+        // because that ordering is the only thing making it true, and the
+        // guard releases itself after 2s.
+        e.stopPropagation();
+        start(true);
+      };
+    }
+    // The box, not the button: the resume is offered, never automatic (#17 —
+    // it continues a conversation whose last turn may have been mid-edit), so
+    // the key that is already under the user's fingers must keep starting a
+    // plain shell.
     requestAnimationFrame(() => box.focus());
   } else {
     box.querySelector(".initgit").onclick = () => send({ t: "InitGit" });
