@@ -1187,9 +1187,46 @@ header button.proj:hover svg { opacity: 1; }
      state, or it is invisible until it is already activated. */
   .paneicon:active, header button:active, .tab:active { background: var(--tab-hover); color: var(--fg); }
 
+  /* The three header popups are anchored to the control that opens them:
+     #projpanel and #noticepanel to the right, #wtpanel to the left. At this
+     width that anchoring is not merely tight, it is wrong — #projpanel has two
+     triggers (`projbtn` and `projname`, see HEADER_POPUPS in app.js) and the
+     phone trim above hides `projbtn`, so the only thing left to tap is the
+     project name on the *left* while the panel opens hard against the right
+     edge. Measured at 390px: the name occupies x 35-85, the panel x 151-382.
+     Nothing connects them.
+
+     Spanning the viewport removes the question rather than answering it
+     twice. It is also what these are: vertical lists, not menus that want to
+     hang off a corner. */
+  #projpanel, #wtpanel, #noticepanel {
+    left: 4px; right: 4px; width: auto; max-width: none;
+  }
+  /* No hover to reveal a row under a finger. */
+  .projstrip .proj:active, .wtstrip .wt:active, .notice:active { background: var(--bg); }
+
   /* The search results panel is anchored under the search field on desktop.
      At this width there is nothing to anchor to — it fills the screen. */
   #searchoverlay .searchpanel { left: 4px !important; right: 4px !important; width: auto !important; max-width: none; }
+  /* Terminal scrolling under a finger.
+     `.xterm-viewport` is a real scrollable div, so it scrolls — and then hands
+     the leftover delta to whatever is behind it the moment it reaches an end,
+     which here is the page. That hand-off is what reads as sticking: the
+     scroll stalls at the boundary, the page moves instead, and the next drag
+     starts from somewhere else. `overscroll-behavior: contain` keeps the
+     gesture inside the terminal; `touch-action: pan-y` stops the browser
+     waiting to see whether a vertical drag was meant as a pinch or a
+     horizontal pan before it scrolls anything, which is the delay felt at the
+     start of each drag. */
+  .xterm-viewport {
+    overscroll-behavior: contain;
+    touch-action: pan-y;
+    -webkit-overflow-scrolling: touch;
+  }
+  /* And nothing behind it to move: the workspace is a fixed frame, not a
+     document, so a rubber-band on the body is only ever an accident. */
+  body { overscroll-behavior: none; }
+
   /* A dialog sized for a 1400px window has to stop being one. */
   dialog.roost { width: calc(100vw - 24px); max-width: none; }
   .dlg-row { grid-template-columns: minmax(0, 1fr); }
