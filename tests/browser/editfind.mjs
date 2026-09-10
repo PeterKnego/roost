@@ -226,6 +226,12 @@ try {
   if (page) page.close();
   browser.close();
   await roost.close();
+  // `fixture()`'s cleanup kills the dtach master the default layout's
+  // Terminal tab starts, and removes the temp tree. Without it both outlive
+  // the run: 74 abandoned trees and 9 live shells were found on this host
+  // after a day of these suites, which is the failure harness.mjs already
+  // documents.
+  await fx.cleanup();
 }
 console.log(fail ? `\n${fail} FAILED` : "\nALL PASS");
 Deno.exit(fail ? 1 : 0);
