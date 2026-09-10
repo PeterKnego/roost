@@ -1044,3 +1044,23 @@ header button.proj {
 header button.proj:hover { background: var(--tab-hover); }
 header button.proj svg { opacity: .55; }
 header button.proj:hover svg { opacity: 1; }
+
+/* code-input's keyboard-navigation banner, suppressed.
+   The Indent plugin calls setKeyboardNavInstructions on every focus, and the
+   library then paints a black 3em bar across the top of the editor and adds
+   `padding-top: calc(16px + 3em)` to both layers — unless the element is
+   focused by a mousedown on the code-input itself. roost focuses editors
+   programmatically (revealInEditor for a search hit or a file:line terminal
+   link, and remountEditor), so landing on a search result dropped a black bar
+   over the editor and shifted its text down ~48px until the user clicked in
+   it.
+   Hidden rather than switched off: `escTabToChangeFocus` stays on, so
+   Esc-then-Tab still moves focus out of the textarea and keyboard users keep
+   their escape hatch. Only the banner goes. The padding override needs
+   `!important` because the library's own rule carries one. */
+.editwrap code-input .code-input_keyboard-navigation-instructions { display: none; }
+.editwrap code-input textarea,
+.editwrap code-input pre code {
+  padding-top: var(--padding-top, 16px) !important;
+  min-height: auto;
+}

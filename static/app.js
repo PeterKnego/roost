@@ -118,6 +118,16 @@ function codePlugins() {
   const p = [];
   const P = window.codeInput && codeInput.plugins;
   if (!P) return p;
+  // `in`, never a truthiness test. `codeInput.plugins` is a Proxy whose `get`
+  // trap *throws* `ReferenceError` for any name it does not know, so
+  // `if (P.Indent)` does not evaluate to false when the plugin file is
+  // missing — it throws. This function is called at app.js's top level, so
+  // that throw aborts evaluation of the entire file: no `send`, no `state`,
+  // no websocket, no editors, no terminals. A dead workspace, from one
+  // `<script>` that 404'd mid-deploy — or from a future `codePlugins()` entry
+  // added without its script tag. The doc below promised graceful
+  // degradation and delivered the opposite.
+  const has = (name) => name in P;
   // A tab character, not spaces, and the asymmetry is the reason. Roost's
   // editor has no per-language configuration and cannot know a file's
   // convention, so it will sometimes be wrong either way — but the two
@@ -128,8 +138,22 @@ function codePlugins() {
   //
   // `escTabToChangeFocus` (the plugin's own default) keeps Esc-then-Tab
   // moving focus, so the keyboard is not trapped in the textarea.
-  if (P.Indent) p.push(new P.Indent(false, 1));
-  if (P.AutoCloseBrackets) p.push(new P.AutoCloseBrackets());
+  if (has("Indent")) p.push(new P.Indent(false, 1, { "(": ")", "[": "]", "{": "}" }));
+  // `{` is deliberately absent from the auto-close pairs while `Indent`
+  // keeps it. The two plugins disagree about braces: AutoCloseBrackets
+  // inserts the `}`, `Indent.checkEnter` splits it onto its own line, and
+  // then `Indent.checkCloseBracket` dedents when the user types `}` while
+  // AutoCloseBrackets cannot step over a closer that is no longer the next
+  // character. Measured with real keystrokes:
+  //
+  //     `if (x) ` → `{` → `if (x) {}` → Enter → `if (x) {\n\t\n}`
+  //                → `}` → `if (x) {\n}\n}`
+  //
+  // Typing the closing brace by habit — which most people do — produced a
+  // syntax error in every code file. Dropping `{` here keeps `Indent`'s
+  // brace-aware Enter, which is the half the issue actually asked for, and
+  // leaves `(`, `[` and `"` closing themselves.
+  if (has("AutoCloseBrackets")) p.push(new P.AutoCloseBrackets({ "(": ")", "[": "]", '"': '"' }));
   // Find within the buffer, and go to a line.
   //
   // `alwaysCtrl: false` is what keeps the two searches apart on both
@@ -143,8 +167,8 @@ function codePlugins() {
   // Both plugins bind on the code-input's own textarea, never on `document`,
   // so neither can take a keystroke away from a terminal pane. That matters
   // more than it looks: Ctrl+F and Ctrl+G are both readline bindings.
-  if (P.FindAndReplace) p.push(new P.FindAndReplace(true, true, {}, false));
-  if (P.GoToLine) p.push(new P.GoToLine());
+  if (has("FindAndReplace")) p.push(new P.FindAndReplace(true, true, {}, false));
+  if (has("GoToLine")) p.push(new P.GoToLine());
   return p;
 }
 

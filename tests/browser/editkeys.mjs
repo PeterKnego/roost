@@ -157,7 +157,13 @@ try {
   await tab();
   await sleep(200);
   ok(await evalIn(`${ANY_TA}.value`) === before,
-    "Tab inserts nothing into prose — it still moves focus, as it always did");
+    "Tab inserts nothing into prose");
+  // The header calls this section the control for B, and B asserts focus
+  // *stayed*. Without the matching assertion here, a build where Tab in prose
+  // were swallowed outright — preventDefault, no insert, no focus move —
+  // passes this section unchanged, which is the half that makes it a control.
+  ok(await evalIn(`document.activeElement !== ${ANY_TA}`),
+    "and focus really moved out of the textarea, as it always did");
   // Focus is put back deliberately: the Tab above moved it out of the
   // textarea, which is the point of that assertion — but it also means a
   // quote typed straight afterwards lands nowhere, and "the buffer contains
@@ -204,6 +210,54 @@ try {
     `and a bracket in prose still does not close itself — got ${JSON.stringify((await evalIn(`${TA}.value`)).slice(-20))}`,
   );
   await evalIn(`setNonAsciiOn(false); 0`);
+
+  console.log("\nD6. a missing plugin file cannot take the whole app down");
+  // `codeInput.plugins` is a Proxy whose `get` trap throws ReferenceError for
+  // any name it does not know, so a truthiness guard on a missing plugin does
+  // not evaluate to false — it throws. `codePlugins()` runs at app.js's top
+  // level, so that throw aborts the entire file: no send, no state, no
+  // websocket, no editors, no terminals.
+  //
+  // This section pins the *reason* rather than the fix, and the difference is
+  // worth stating: with every plugin file present, `codePlugins()` never
+  // reaches an absent name, so swapping `in` back for a truthiness test still
+  // passes here. Reproducing the failure needs a page served without one of
+  // the `<script>` tags, which the fragment shape does not let a test arrange.
+  // What these three assertions do guarantee is that the hazard is real, that
+  // `in` is the operator that answers it, and that app.js evaluated to
+  // completion — so if the guard is ever reverted, this comment is where the
+  // next reader lands.
+  const probe = await evalIn(`(() => {
+    try { return codeInput.plugins.NoSuchPluginXyz ? "truthy" : "falsy"; }
+    catch (e) { return "THREW:" + e.name; } })()`);
+  ok(probe.startsWith("THREW"), `a truthiness test on an absent plugin throws — got ${probe}`);
+  ok(
+    await evalIn(`("NoSuchPluginXyz" in codeInput.plugins) === false`),
+    "while `in` answers false, which is why the guard uses it",
+  );
+  // And the consequence the guard protects: app.js finished evaluating.
+  ok(await evalIn(`typeof send === "function" && typeof state !== "undefined"`),
+    "app.js evaluated to completion, so the workspace exists at all");
+
+  console.log("\nD7. typing a closing brace does not duplicate it");
+  // AutoCloseBrackets inserts the `}`, Indent.checkEnter splits it onto its
+  // own line, and Indent.checkCloseBracket then dedents when the user types
+  // `}` — while AutoCloseBrackets cannot step over a closer that is no longer
+  // the next character. Measured before the fix:
+  //   `if (x) ` → `{` → Enter → `}`  gave  `if (x) {\n}\n}`
+  ok(await open("keys.rs"), "keys.rs reopens");
+  await evalIn(`(() => { const t = ${TA}; t.focus();
+    t.selectionStart = t.selectionEnd = t.value.length; return 0; })()`);
+  await cmd("Input.insertText", { text: "\nif (x) " });
+  await type("{");
+  await enter();
+  await type("}");
+  await sleep(250);
+  const braces = (await val()).slice(-14);
+  ok(
+    !/\}\s*\n\s*\}/.test(await val()),
+    `no duplicated closing brace — tail was ${JSON.stringify(braces)}`,
+  );
 
   console.log("\nE. the bytes are not touched — the constraint this all sits under");
   // Nothing is typed before this check. Opening a file must not change it,

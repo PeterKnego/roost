@@ -73,9 +73,28 @@ Its optional plugins are separate files under `plugins/` in the same package,
 and are vendored one at a time as they are used. Two are, both prefixed
 `code-input-` so the directory still sorts by package:
 
-- `indent.min.js` — Tab inserts an indent, Enter carries it onto the next
-  line, Backspace deletes a whole one.
+- `indent.min.js` — Tab inserts an indent and Enter carries it onto the next
+  line. *Not* "Backspace deletes a whole indent": that branch is guarded on
+  `indentationNumChars != 1`, and the tab-character configuration leaves it at
+  1, so Backspace is plain Backspace here.
 - `auto-close-brackets.min.js` — brackets and quotes close themselves.
+  Constructed **without** `{`: the two plugins disagree about braces, and
+  leaving both to handle them made `{` Enter `}` produce `{\n}\n}` — a
+  syntax error from the most ordinary typing there is. `Indent` keeps its
+  brace-aware Enter; only the auto-inserted `}` is gone.
+
+Two upstream behaviours are known and deliberately not patched, because a
+vendored dist file has to stay byte-identical to the published one for
+"fetch the new dist over the old file" to remain the update procedure:
+
+- Typing a quote or bracket over a *selection* that begins with that same
+  character discards the keystroke instead of replacing the selection —
+  `checkClosingBracket` tests `data == value[selectionStart]` without
+  requiring a collapsed selection.
+- One `Indent` instance is shared by every code editor, because the plugin
+  array lives on the single registered `hl` template. Its `escJustPressed`
+  flag therefore carries across panes: Esc in one editor, then Tab in
+  another, moves focus instead of indenting.
 - `find-and-replace.min.js` — ⌘F / Ctrl+F finds within the buffer, Ctrl+H
   replaces. Constructed with `alwaysCtrl: false`, which is what keeps it off
   roost's own ⇧⌘F / ⇧⌃F project search: that one requires Shift, this one
