@@ -387,6 +387,12 @@ fn kill_and_unlink_with(sock_path: &std::path::Path, snapshot_fn: SnapshotFn, pr
         StillHeld::Yes => return false,
     }
     let _ = std::fs::remove_file(sock_path);
+    // The mode sidecar is a sidecar of the socket, so it goes when the socket
+    // goes — here and in `reconcile`'s dead-socket arm, the only two places
+    // that unlink one. Never from the pump's exit path: that also fires on a
+    // detach, where the shell is still alive behind its dtach master and its
+    // contract is still true.
+    crate::modes::forget(sock_path);
     true
 }
 
@@ -991,6 +997,7 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
                     // failing mid-sweep can never cause a delete here either.
                     if !socket_has_process_with(&sock.path(), snapshot_fn) {
                         let _ = std::fs::remove_file(sock.path());
+                        crate::modes::forget(&sock.path());
                         report.dead_sockets += 1;
                         eprintln!("roost: reaped dead socket {}", sock.path().display());
                     }

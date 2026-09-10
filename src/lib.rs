@@ -15,6 +15,7 @@ pub mod idelock;
 pub mod ideport;
 pub mod idesess;
 pub mod launch;
+pub mod modes;
 pub mod notify;
 pub mod origin;
 pub mod osc;
