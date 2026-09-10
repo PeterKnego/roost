@@ -1060,8 +1060,20 @@ function render() {
   // under them each time.
   const nowActive = activeFileRel();
   if (nowActive !== lastFollowed) {
-    lastFollowed = nowActive;
-    followTreeTo(nowActive);
+    // Committed only when a follow actually issued. `followTreeTo` bails when
+    // no pane shows a Tree tab, or when its fragment is still in flight and
+    // `ul.tree` does not exist yet — which is precisely the fresh-load and
+    // reconnect case where Claude opens a file for you. Recording the file
+    // anyway meant the follow was dropped and never retried, so the tree
+    // never expanded to it: the exact case this feature exists for.
+    if (followTreeTo(nowActive) || !nowActive) lastFollowed = nowActive;
+    // No file open at all: the mark has to go, or the tree goes on claiming
+    // you are looking at a file that is no longer there.
+    if (!nowActive) {
+      document.querySelectorAll(".content").forEach((c) => {
+        c.querySelectorAll("a.file.sel").forEach((a) => a.classList.remove("sel"));
+      });
+    }
   } else if (nowActive) {
     // The tab did not change, but this render may have rebuilt the tree's
     // pane (a Tree tab activated, a fragment re-fetched). Re-marking is local
@@ -1070,7 +1082,13 @@ function render() {
       const a = pane.tabs[pane.active];
       if (!a || a.k !== "Tree") return;
       const content = document.querySelector(`.pane[data-pane="${pi}"] .content`);
-      if (content && followTree()) markTreeRow(content, nowActive);
+      // Marked, never scrolled. This branch runs on *every* State — including
+      // the debounce of the user's own typing — and `scrollIntoView` here
+      // snapped the tree back to the edited file about once a second while
+      // someone scrolled the pane to look somewhere else. `block: "nearest"`
+      // does not help: it is a no-op only while the row is already visible,
+      // which is exactly the state the user just left.
+      if (content && followTree()) markTreeRow(content, nowActive, false);
     });
   }
 }
@@ -1513,22 +1531,43 @@ function activeFileRel() {
 /// `<ul>` holds nothing, and swapping it for the server's expanded copy
 /// cannot lose a single expanded descendant.
 function followTreeTo(rel) {
-  if (!followTree() || !rel || !state) return;
+  if (!followTree() || !rel || !state) return false;
+  const gen = ++followGen;
+  let issued = false;
   state.panes.forEach((pane, pi) => {
     const active = pane.tabs[pane.active];
     if (!active || active.k !== "Tree") return;
     const content = document.querySelector(`.pane[data-pane="${pi}"] .content`);
     const root = content && content.querySelector(":scope > ul.tree");
     if (!root) return;
+    issued = true;
     fetch(`/frag/${PROJECT}/tree?dir=&open=${encodeURIComponent(rel)}`)
-      .then((r) => r.text())
+      .then((r) => {
+        // `r.text()` alone accepts a 404's `no such project` and a 500's
+        // hint fragment as a tree listing. Neither yields any `<li>`, so the
+        // merge below would empty `ul.tree` — the whole pane, and every
+        // expansion in it — and call that a follow. "I could not look"
+        // rendered as "there is nothing there".
+        if (!r.ok) throw new Error(`tree fragment: ${r.status}`);
+        return r.text();
+      })
       .then((html) => {
+        // A superseded response must not land. Two quick tab switches issue
+        // two overlapping fetches with no ordering; if the first resolves
+        // last it marks and scrolls to the file you already left, and on an
+        // idle workspace nothing ever corrects it.
+        if (gen !== followGen) return;
         mergeTreePath(root, html, rel);
         markTreeRow(content, rel);
       })
-      .catch(() => {}); // a failed follow is a tree that did not move, not an error
+      .catch(() => {}); // a failed follow is a tree that did not move
   });
+  return issued;
 }
+
+/// Bumped per follow, so a response that arrives after a newer one has been
+/// issued can be dropped rather than applied.
+let followGen = 0;
 
 /// Ancestors of `rel` plus `rel` itself: "a/b/c.rs" -> a, a/b, a/b/c.rs.
 function relChain(rel) {
@@ -1555,10 +1594,20 @@ function mergeTreePath(ul, html, rel) {
     const oldDetails = old.querySelector(":scope > details[data-rel]");
     const newDetails = li.querySelector(":scope > details[data-rel]");
     if (oldDetails && newDetails && onPath.has(oldDetails.dataset.rel)) {
-      if (!oldDetails.open) {
-        // Never fetched, so nothing to lose: take the expanded copy whole.
+      const oldUlPeek = oldDetails.querySelector(":scope > ul");
+      // Emptiness, not closedness. "A closed <details> has never been
+      // fetched" is false: `hx-trigger="toggle once"` fetches on first
+      // expand, and collapsing afterwards leaves the children in place —
+      // nested expansions and all. Swapping such a node for the server's
+      // copy silently discarded them, which is exactly the "never collapses
+      // anything" invariant this function claims.
+      if (!oldUlPeek || !oldUlPeek.children.length) {
+        // Genuinely never fetched, so nothing to lose.
         return li;
       }
+      // Loaded, whether or not it is open. Expand it (it is on the path) and
+      // recurse, so its own descendants survive.
+      oldDetails.open = true;
       // Already open and possibly holding the user's own expansions further
       // down. Keep it and recurse, so this level's descent continues without
       // touching anything off the path.
@@ -1582,12 +1631,12 @@ function mergeTreePath(ul, html, rel) {
 /// directory. The class is the same `.sel` the server already puts on the
 /// `?open=` row, so there is one appearance for "this is the current file"
 /// rather than two that can drift.
-function markTreeRow(content, rel) {
+function markTreeRow(content, rel, scroll = true) {
   content.querySelectorAll("a.file.sel").forEach((a) => a.classList.remove("sel"));
   const row = content.querySelector(`a.file[data-rel="${cssEscape(rel)}"]`);
   if (!row) return;
   row.classList.add("sel");
-  row.scrollIntoView({ block: "nearest" });
+  if (scroll) row.scrollIntoView({ block: "nearest" });
 }
 
 /// A filename can contain a quote, a bracket, anything — it comes off the

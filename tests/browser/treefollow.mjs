@@ -129,7 +129,119 @@ try {
   // And the previous file's path is not collapsed either.
   ok(await isOpen("a/b/c"), "the previously-followed path is left expanded too");
 
+  console.log("\nD2. a collapsed directory keeps what was expanded inside it");
+  // The invariant this feature claims — "only ever expands and scrolls, never
+  // collapses" — rested on "a closed <details> has never been fetched, so its
+  // <ul> is empty and swapping it loses nothing". That is only true of a
+  // *never-opened* one. `hx-trigger="toggle once"` fetches on first expand;
+  // collapsing afterwards leaves the children in place, nested expansions and
+  // all. Replacing such a node wholesale silently discards them.
+  ok(await expand("x"), "setup: x is expanded");
+  ok(await expand("x/y"), "setup: and x/y inside it");
+  await evalIn(`(() => { const d = ${TREE}.querySelector('details[data-rel="x"]');
+    if (d) d.open = false; return 0; })()`);
+  ok(!(await isOpen("x")), "setup: x is collapsed again, with x/y still loaded inside it");
+  ok(
+    await evalIn(`!!${TREE}.querySelector('details[data-rel="x/y"]')`),
+    "setup: x/y's node is still there — collapsing does not unload it",
+  );
+
+  // Follow to something under x, so x is on the path and gets re-expanded.
+  await Deno.writeTextFile(`${fx.roots}/proj/x/deep.rs`, "fn deep() {}\n");
+  await openFile("x/deep.rs");
+  ok(await until(async () => (await marked()) === '["x/deep.rs"]', 10, "followed into x"),
+    `following into x marks the file — got ${await marked()}`);
+  ok(
+    await evalIn(`!!${TREE}.querySelector('a.file[data-rel="x/y/unrelated.rs"]')`),
+    "and x/y's loaded children survive being on the followed path",
+  );
+
+  console.log("\nD3. the mark clears when the last file tab closes");
+  // Otherwise the tree goes on claiming the user is looking at a file that is
+  // no longer open.
+  ok(
+    await evalIn(`state.panes[2].tabs.some((t) => t.k === "File")`),
+    "setup: at least one file tab is open",
+  );
+  // One at a time, waiting for each. A batch of `CloseTab` intents addresses
+  // tabs by index against a list the server is renumbering as it goes, and
+  // reading the pane straight after sending them reports the state before any
+  // of them landed — which is what made the first draft of this diagnose the
+  // wrong thing.
+  for (let n = 0; n < 8; n++) {
+    const idx = await evalIn(`state.panes[2].tabs.findIndex((t) => t.k === "File")`);
+    if (idx < 0) break;
+    await evalIn(`send({ t: "CloseTab", pane: 2, idx: ${idx} }); 0`);
+    await until(async () => await evalIn(
+      `state.panes[2].tabs.filter((t) => t.k === "File").length`) < 8 - n, 10, "one closed");
+  }
+  ok(
+    await evalIn(`!state.panes[2].tabs.some((t) => t.k === "File")`),
+    `setup: every file tab is closed — panes ${await evalIn(`JSON.stringify(state.panes.map((p) => p.tabs.map((t) => t.rel ?? t.k)))`)}`,
+  );
+  ok(
+    await until(async () => (await marked()) === "[]", 10, "mark cleared"),
+    `with no file open the tree marks nothing — got ${await marked()}`,
+  );
+
+  console.log("\nD4. a stale follow response cannot land on top of a newer one");
+  // Two quick tab switches issue two overlapping fetches with no ordering. If
+  // the first resolves last it marks and scrolls to the file you already
+  // left, and on an idle workspace nothing ever corrects it. The ordering is
+  // forced here rather than raced for: a real race would pass most runs.
+  await openFile("a/b/c/deep.rs");
+  await openFile("p/q/r/second.rs");
+  await until(async () => (await marked()) === '["p/q/r/second.rs"]', 10, "settled");
+
+  await evalIn(`(() => {
+    window.__realFetch = window.fetch;
+    // Hold back the *first* tree fetch from here on, and let the second pass.
+    let n = 0;
+    window.fetch = (u, o) => {
+      const p = window.__realFetch(u, o);
+      if (typeof u === "string" && u.includes("/tree?dir=&open=") && n++ === 0) {
+        return p.then((r) => new Promise((res) => setTimeout(() => res(r), 1500)));
+      }
+      return p;
+    };
+    return 0; })()`);
+  await openFile("a/b/c/deep.rs");   // its response is delayed 1.5s
+  await openFile("p/q/r/second.rs"); // this one lands first
+  await sleep(2500);                 // long enough for the stale one to arrive
+  ok(
+    (await marked()) === '["p/q/r/second.rs"]',
+    `the superseded response is dropped — got ${await marked()}`,
+  );
+  await evalIn(`window.fetch = window.__realFetch; 0`);
+
+  console.log("\nD5. a failed follow leaves the tree alone");
+  // `r.text()` alone accepts a 404's `no such project` body as a listing.
+  // It yields no <li>, so the merge empties `ul.tree` — the whole pane and
+  // every expansion in it — and calls that a follow. "I could not look"
+  // rendered as "there is nothing there".
+  ok(await expand("p"), "setup: p is expanded");
+  const before404 = await evalIn(`${TREE}.querySelectorAll("li").length`);
+  ok(before404 > 0, `setup: the tree has ${before404} rows`);
+  await evalIn(`(() => {
+    window.__realFetch = window.fetch;
+    window.fetch = (u, o) =>
+      (typeof u === "string" && u.includes("/tree?dir=&open="))
+        ? Promise.resolve(new Response("no such project", { status: 404 }))
+        : window.__realFetch(u, o);
+    return 0; })()`);
+  await openFile("a/b/c/deep.rs");
+  await sleep(1200);
+  ok(
+    await evalIn(`${TREE}.querySelectorAll("li").length`) >= before404,
+    `a 404 does not empty the tree — ${before404} rows before, ${await evalIn(`${TREE}.querySelectorAll("li").length`)} after`,
+  );
+  await evalIn(`window.fetch = window.__realFetch; 0`);
+
   console.log("\nE. with the setting off, nothing follows");
+  // Its own file: D3 deliberately closes every file tab, so without this E
+  // would be asserting about a mark it had just cleared.
+  await openFile("a/b/c/deep.rs");
+  await until(async () => (await marked()) === '["a/b/c/deep.rs"]', 10, "re-marked for E");
   await evalIn(`document.body.dataset.followTree = "0"; 0`);
   const before = await marked();
   await openFile("top.rs");
