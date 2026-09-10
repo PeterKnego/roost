@@ -50,7 +50,7 @@ const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.root
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 try {
-  for (const f of ["a.txt", "b.txt", "c.txt"]) {
+  for (const f of ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt", "g.txt"]) {
     await Deno.writeTextFile(`${fx.roots}/proj/${f}`, `${f}\n`);
   }
   page = await openPage(browser.port, `http://127.0.0.1:${port}/proj`);
@@ -213,6 +213,83 @@ try {
     "the dropped tab becomes active, matching what the ⇄ button already does",
   );
 
+  console.log("\nC2. the strip renumbering mid-drag does not move the wrong tab");
+  // A drag is a human-scale interval and render() rebuilds the strip on every
+  // State broadcast, so an index captured at dragstart can address a
+  // different tab by the time the drop lands — in range, so the server's
+  // `idx >= len` guard never fires, and silently, so nothing says the wrong
+  // tab moved. This is the stale-index defect `closeTab` was already fixed
+  // for, and it is reproduced here by closing an earlier tab *between*
+  // dragstart and drop rather than by simulating one.
+  // Its own files. Sections B and C reorder and move a/b/c around, so
+  // reusing them here would make this section's setup depend on exactly what
+  // those left behind — and an earlier draft failed its own setup assertion
+  // for that reason, having found two tabs where it wanted three.
+  for (const f of ["d.txt", "e.txt", "f.txt"]) {
+    await evalIn(`send({ t: "OpenTab", pane: ${MIDDLE},
+      tab: { k: "File", rel: ${JSON.stringify(f)}, mode: "Edit" } }); 0`);
+    await until(async () => (await relsIn(MIDDLE)).includes(f), 10, `${f} open`);
+  }
+  const before = await relsIn(MIDDLE);
+  ok(before.length >= 3, `setup: the middle pane holds ${JSON.stringify(before)}`);
+  const victimIdx = before.length - 1;
+  const victim = before[victimIdx];
+
+  await evalIn(`(() => {
+    const strip = document.querySelector('.pane[data-pane="${MIDDLE}"] .tabstrip');
+    window.__dt = new DataTransfer();
+    const src = strip.querySelectorAll('.tab')[${victimIdx}];
+    src.dispatchEvent(new DragEvent("dragstart",
+      { dataTransfer: window.__dt, bubbles: true, cancelable: true }));
+    return 0; })()`);
+  // Now the strip changes under the drag: close the first tab.
+  await evalIn(`send({ t: "CloseTab", pane: ${MIDDLE}, idx: 0 }); 0`);
+  ok(
+    await until(async () => (await relsIn(MIDDLE)).length === before.length - 1, 10, "renumbered"),
+    "setup: a tab closed while the drag was in flight, renumbering the strip",
+  );
+  await evalIn(`(() => {
+    const strip = document.querySelector('.pane[data-pane="${MIDDLE}"] .tabstrip');
+    const r = strip.getBoundingClientRect();
+    for (const ty of ["dragover", "drop"]) {
+      strip.dispatchEvent(new DragEvent(ty, { dataTransfer: window.__dt, bubbles: true,
+        cancelable: true, clientX: r.left + 2, clientY: r.top + 8 }));
+    }
+    return 0; })()`);
+  // Waited for, not read straight after the drop: the move travels to the
+  // server and comes back as a State broadcast, so an immediate read sees the
+  // strip as it was and the assertion fails about ordering that is correct.
+  ok(
+    await until(async () => (await relsIn(MIDDLE))[0] === victim, 10, "the dragged tab moved"),
+    `the tab that was picked up is the one that moved — got ${JSON.stringify(await relsIn(MIDDLE))}, dragged ${victim}`,
+  );
+
+  console.log("\nC3. the × still closes the tab rather than starting a drag");
+  // The tab is draggable and the × sits inside it, so without draggable=false
+  // on the close button a mousedown plus a few pixels of drift starts a tab
+  // drag and the click never fires.
+  ok(
+    await evalIn(`[...document.querySelectorAll('.pane[data-pane="${MIDDLE}"] .tabstrip .tab .x')]
+      .every((x) => x.draggable === false)`),
+    "the close button is explicitly not draggable",
+  );
+  const preClose = await relsIn(MIDDLE);
+  await evalIn(`(() => {
+    const x = document.querySelector('.pane[data-pane="${MIDDLE}"] .tabstrip .tab .x');
+    x.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    return 0; })()`);
+  ok(
+    await until(async () => (await relsIn(MIDDLE)).length === preClose.length - 1, 10, "closed"),
+    `clicking × closes the tab — was ${JSON.stringify(preClose)}, now ${JSON.stringify(await relsIn(MIDDLE))}`,
+  );
+  // Section D drags a tab over this strip, so leave it something to pick up.
+  await evalIn(`send({ t: "OpenTab", pane: ${MIDDLE},
+    tab: { k: "File", rel: "g.txt", mode: "Edit" } }); 0`);
+  ok(
+    await until(async () => (await relsIn(MIDDLE)).includes("g.txt"), 10, "g.txt open"),
+    "setup: a tab is left in the strip for the section below",
+  );
+
   console.log("\nD. the file-upload drag still works, over the same target");
   // The direction that matters. A tab-drop handler that does not check the
   // type swallows a file drop, and uploads stop working with no error
@@ -294,6 +371,13 @@ try {
   if (page) page.close();
   browser.close();
   await roost.close();
+  // Not optional. The default layout gives the right pane a Terminal tab, so
+  // this test starts a real dtach master and its login shell; `fixture()`'s
+  // cleanup is what kills it and removes the temp tree. harness.mjs records
+  // what happens without it: "Two /tmp/roost-browser-* trees were once found
+  // abandoned on a live host, one of them still holding a running dtach
+  // master and its login shell."
+  await fx.cleanup();
 }
 console.log(fail ? `\n${fail} FAILED` : "\nALL PASS");
 Deno.exit(fail ? 1 : 0);
