@@ -11,6 +11,7 @@ struct RawConfig {
     hide: Option<Vec<String>>,
     show_hidden: Option<bool>,
     autosave: Option<bool>,
+    follow_tree: Option<bool>,
     allowed_origins: Option<Vec<String>>,
     max_upload_bytes: Option<u64>,
     share_selection: Option<bool>,
@@ -30,6 +31,25 @@ pub struct Settings {
     /// hostile checkout could set here widens a boundary: it only decides
     /// whether the person editing that project's own files has to press ⌘S.
     pub autosave: bool,
+    /// Whether the file tree expands to the active file and marks it.
+    ///
+    /// Project-scoped, and that is a decision rather than a copy of whichever
+    /// neighbour was nearest. `GLOBAL_ONLY_KEYS` exists for keys where a
+    /// checkout must not get a vote, and the test is what the key can do: a
+    /// hostile project setting this one moves a scrollbar and expands a
+    /// directory the user can already see. It grants nothing, reveals
+    /// nothing, and raises no ceiling — the same argument `autosave` and
+    /// `show_hidden` are project-scoped under. A project you always work in
+    /// one deep subtree of is exactly where the answer differs from your
+    /// other projects, which is what per-project is for.
+    ///
+    /// On by default. The case it exists for is a file *Claude* opened —
+    /// where "where am I?" is the question you most want answered and the
+    /// tree is the only thing that can answer it — and that case is invisible
+    /// unless it is on. The usual reason to default an auto-expanding tree
+    /// off is that it discards your navigation; following here never
+    /// collapses anything, so the cost of being wrong is a scroll.
+    pub follow_tree: bool,
     /// Off unless a project asks for it. This ships file contents to Claude
     /// with no explicit user action, and roost has no permission system to
     /// scope it the way Claude Code's own `Read` deny rules do. Unlike
@@ -67,6 +87,7 @@ impl Default for Settings {
             hide: vec![],
             show_hidden: false,
             autosave: true,
+            follow_tree: true,
             warning: None,
         }
     }
@@ -74,7 +95,7 @@ impl Default for Settings {
 
 /// Keys a project file may set — display-level, nothing a hostile checkout
 /// could widen a boundary with. In this order in the dialog.
-pub const PROJECT_KEYS: &[&str] = &["theme", "hide", "show_hidden", "autosave"];
+pub const PROJECT_KEYS: &[&str] = &["theme", "hide", "show_hidden", "autosave", "follow_tree"];
 /// Keys only the global file may set; see the readers below for why each.
 pub const GLOBAL_ONLY_KEYS: &[&str] = &["share_selection", "worktree_prompt"];
 /// Keys no page may write. Shown read-only; not in any allowlist, so a
@@ -125,7 +146,10 @@ pub fn validate(scope: Scope, key: &str, value: Option<&SettingValue>) -> Result
             Ok(())
         }
         ("hide", _) => Err("hide takes a list of names".into()),
-        ("show_hidden" | "autosave" | "share_selection" | "worktree_prompt", SettingValue::Bool(_)) => Ok(()),
+        (
+            "show_hidden" | "autosave" | "follow_tree" | "share_selection" | "worktree_prompt",
+            SettingValue::Bool(_),
+        ) => Ok(()),
         (k, _) => Err(format!("{k} takes true or false")),
     }
 }
@@ -165,6 +189,9 @@ pub fn load(paths: &[&Path]) -> Settings {
                 }
                 if let Some(v) = raw.autosave {
                     s.autosave = v;
+                }
+                if let Some(v) = raw.follow_tree {
+                    s.follow_tree = v;
                 }
             }
             Err(e) => warnings.push(format!("{}: {}", path.display(), e.message())),
@@ -589,6 +616,8 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
         "Show dot-files and dot-directories in the file tree.");
     push("autosave", "bool", V::Bool(s.autosave), V::Bool(true), true,
         "Save an edited file a second after the last keystroke and on blur; off means ⌘S.");
+    push("follow_tree", "bool", V::Bool(s.follow_tree), V::Bool(true), true,
+        "Expand the file tree to the file you are looking at, and mark it.");
     push("share_selection", "bool", V::Bool(share_selection()), V::Bool(false), true,
         "Let a Claude connected to this project read the text you select in the editor.");
     push("worktree_prompt", "bool", V::Bool(worktree_prompt()), V::Bool(true), false,
@@ -1176,6 +1205,14 @@ mod tests {
         assert_eq!(m.effective, V::Str("7".into()));
         assert!(m.writable.is_empty());
         assert!(row("autosave").reload, "autosave is embedded at page load");
+        // Project-scoped on purpose, and asserted so the choice is a decision
+        // rather than whichever list a later edit happened to land in. A
+        // checkout setting this one moves a scrollbar; it grants nothing and
+        // raises no ceiling, which is the test `GLOBAL_ONLY_KEYS` exists for.
+        let f = row("follow_tree");
+        assert_eq!(f.writable, vec!["project", "global"], "follow_tree is not global-only");
+        assert_eq!(f.default, V::Bool(true), "it follows unless something turns it off");
+        assert!(f.reload, "it is embedded at page load, like autosave");
         // Every row explains itself: the dialog shows `doc` under the key.
         for r in &v.keys {
             assert!(!r.doc.is_empty() && r.doc.ends_with('.'), "{}: doc {:?}", r.key, r.doc);
@@ -1184,7 +1221,7 @@ mod tests {
         assert!(!row("theme").reload);
         // Order: project keys, global-only keys, read-only keys.
         let keys: Vec<&str> = v.keys.iter().map(|r| r.key.as_str()).collect();
-        assert_eq!(keys, ["theme", "hide", "show_hidden", "autosave", "share_selection", "worktree_prompt", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
+        assert_eq!(keys, ["theme", "hide", "show_hidden", "autosave", "follow_tree", "share_selection", "worktree_prompt", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
         assert_eq!(v.themes.len(), 5 + 35);
         assert!(v.global_file.ends_with("global.toml"));
         assert_eq!(v.project_file, ".roost/config.toml");

@@ -1708,6 +1708,7 @@ pub fn workspace_page(
     // override against it: `ws.show_hidden ?? SHOW_HIDDEN_DEFAULT`.
     let sh = if s.show_hidden { "1" } else { "0" };
     let autosave = if s.autosave { "1" } else { "0" };
+    let follow_tree = if s.follow_tree { "1" } else { "0" };
     let share_selection = if sharing_on { "1" } else { "0" };
     // The launch buttons the tab strip may show, space-separated so a second
     // program is one more word, not one more attribute. Names are the wire
@@ -1745,7 +1746,7 @@ pub fn workspace_page(
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/code-input.min.js"></script>
-</head><body data-project="{proj_txt}" data-key="{qkey}" data-show-hidden="{sh}" data-autosave="{autosave}" data-share-selection="{share_selection}" data-launches="{launches}">
+</head><body data-project="{proj_txt}" data-key="{qkey}" data-show-hidden="{sh}" data-autosave="{autosave}" data-follow-tree="{follow_tree}" data-share-selection="{share_selection}" data-launches="{launches}">
 <header>
   <a class="home" href="/" title="all projects">{SVG_HOME}</a><span class="proj">{proj_txt}</span>
   <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body, git from:body"></span><span id="wtlabel"></span></button>
