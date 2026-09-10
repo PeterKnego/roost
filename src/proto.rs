@@ -271,6 +271,29 @@ pub struct SettingsView {
     pub global_file: String,
     /// `Settings::warning` — a config file that did not parse, named.
     pub warning: Option<String>,
+    /// What this binary is, for the About panel. Constant for the life of the
+    /// process, and carried here rather than fetched separately because it is
+    /// a server fact and this snapshot is already how server facts reach the
+    /// dialog.
+    pub build: BuildInfo,
+}
+
+/// The identity of the running binary.
+///
+/// Every field can be the string `unknown`, and that is a real answer rather
+/// than a gap to paper over: a release tarball has no `.git`, and a build box
+/// may have no `git`. See `build.rs::git_hash` — a display that can be quietly
+/// wrong is worse than one that says it does not know.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub struct BuildInfo {
+    pub version: String,
+    /// Short commit, with `-dirty` when the tree had uncommitted changes and a
+    /// trailing `?` when `git status` itself could not be trusted.
+    pub commit: String,
+    /// Unix seconds. Formatted by the client, which knows the reader's
+    /// timezone; 0 means unknown.
+    pub built_epoch: u64,
+    pub repository: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
