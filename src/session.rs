@@ -1169,6 +1169,64 @@ pub static SESSION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
+    /// Ending a session drops *every* per-session record roost keeps.
+    ///
+    /// There are two now — `cwds` (where the shell was working) and
+    /// `claudesess` (which Claude was in it) — written by different features,
+    /// landing in the same three lines of `end_session`, and they met there as
+    /// a merge conflict. Each module tests its own `forget` directly, so
+    /// resolving that conflict by keeping one call and losing the other would
+    /// have left both suites green. This is the test that would not be.
+    ///
+    /// It matters because the name is reused: `next_free_name` hands `term`
+    /// straight back out after a close, so a record left behind is not stale
+    /// data sitting harmlessly on disk — it is attributed to whatever opens
+    /// next under that name.
+    #[test]
+    fn ending_a_session_drops_every_record_kept_about_it() {
+        crate::wsstate::set_state_dir_for_test();
+        let project = format!("endrecords{}", std::process::id());
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        crate::cwds::record(&project, "term", &sub);
+        crate::claudesess::record(
+            &project,
+            "term",
+            &crate::claudesess::Recorded {
+                session_id: "aaaa1111-2222-3333-4444-555555555555".into(),
+                transcript_path: Some("/tmp/t.jsonl".into()),
+                event: "Stop".into(),
+            },
+        );
+        // Asserts the state it then negates. Without this the two assertions
+        // below hold just as well over a pair of records that were never
+        // written — which is how a test for a deletion passes vacuously.
+        assert_eq!(
+            crate::cwds::restore_dir(&project, "term", dir.path()),
+            sub.canonicalize().unwrap(),
+            "setup: the cwd is recorded"
+        );
+        assert!(
+            crate::claudesess::recorded(&project, "term").is_some(),
+            "setup: the Claude session is recorded"
+        );
+
+        end_session(&project, "term");
+
+        assert_eq!(
+            crate::cwds::restore_dir(&project, "term", dir.path()),
+            dir.path(),
+            "the recorded cwd is gone, so the next `term` starts where a new terminal starts"
+        );
+        assert_eq!(
+            crate::claudesess::recorded(&project, "term"),
+            None,
+            "and the next `term` is not reported as running the closed session's Claude"
+        );
+    }
+
     use super::*;
 
     #[test]
