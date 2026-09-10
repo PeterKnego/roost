@@ -314,7 +314,10 @@ function openSettings(settings) {
   }
   function renderScope() {
     scopeBar.replaceChildren();
-    const lab = document.createElement("span"); lab.textContent = "Scope:"; scopeBar.appendChild(lab);
+    const lab = document.createElement("span"); lab.textContent = "Writing to"; scopeBar.appendChild(lab);
+    // One segmented control, not two buttons with a gap between them: they are
+    // two states of one choice, and the styling says so.
+    const seg = document.createElement("div"); seg.className = "seg"; scopeBar.appendChild(seg);
     for (const [id, label] of [["project", "Project"], ["global", "Global"]]) {
       const b = document.createElement("button");
       b.type = "button"; b.dataset.scope = id; b.textContent = label;
@@ -330,7 +333,7 @@ function openSettings(settings) {
         if (previewTheme) { applyTheme(themeBefore); previewTheme = null; }
         render();
       };
-      scopeBar.appendChild(b);
+      seg.appendChild(b);
     }
     const f = document.createElement("span"); f.className = "file"; f.textContent = fileName(); scopeBar.appendChild(f);
   }
@@ -367,6 +370,7 @@ function openSettings(settings) {
   const LABELS = {
     hide: "Hidden names", show_hidden: "Show dot-files", autosave: "Autosave", follow_tree: "Tree follows the open file",
     share_selection: "Share selection with Claude", worktree_prompt: "Offer a worktree for a second Claude",
+    relaunch: "Restart agents when a project opens",
     allowed_origins: "Allowed origins", max_upload_bytes: "Upload limit", ide: "IDE connection", roots: "Project roots",
   };
   function rowFor(r) {
@@ -496,34 +500,48 @@ function openSettings(settings) {
   /// built?" — a question this project has already got wrong twice (CLAUDE.md,
   /// "Verify, don't trust") and once more on 2026-09-10, when a phone was
   /// reported as still broken after a fix it had never fetched.
+  /// The four rows are `.dlg-row`s like every other pane's, so the label
+  /// column, the doc line under it and the fixed right-hand column all line up
+  /// with General — a settings dialog with a pane that lays itself out
+  /// differently reads as a different dialog. The values are values, not
+  /// settings, so the right column carries text rather than a control.
+  const ABOUT_ROWS = [
+    ["Version", "version", "The release this binary was built from."],
+    ["Commit", "commit", "Marked -dirty when the tree had uncommitted changes, and ? when git could not say."],
+    ["Built", "built", "When this binary was compiled, in your timezone."],
+    ["Repository", "repository", "Where the source is."],
+  ];
+
   function renderAbout() {
     about.replaceChildren();
     const b = (view && view.build) || {};
-    const rowsOut = [
-      ["Version", b.version || "unknown", null],
-      // `-dirty` and a trailing `?` come from build.rs and are shown verbatim:
-      // "built from a1b2c3d" is false in the common case of a local build with
-      // edits in the tree, and this panel exists to be trusted.
-      ["Commit", b.commit || "unknown", null],
-      ["Built", fmtBuilt(b.built_epoch), null],
-      ["Repository", b.repository || "unknown", b.repository || null],
-    ];
-    for (const [label, value, href] of rowsOut) {
+    const value = (kind) =>
+      kind === "built" ? fmtBuilt(b.built_epoch) : (b[kind] || "unknown");
+    for (const [label, kind, doc] of ABOUT_ROWS) {
       const r = document.createElement("div");
-      r.className = "dlg-row ro-row";
-      const t = document.createElement("div"); t.className = "text";
-      const l = document.createElement("label"); l.textContent = label; t.appendChild(l);
-      const v = document.createElement("div");
-      v.className = "ro" + (value === "unknown" ? " empty" : "");
-      if (href) {
+      r.className = "dlg-row";
+      const text = document.createElement("div"); text.className = "text";
+      const line = document.createElement("div"); line.className = "line";
+      const l = document.createElement("label"); l.textContent = label; line.appendChild(l);
+      text.appendChild(line);
+      const d = document.createElement("div"); d.className = "doc"; d.textContent = doc;
+      text.appendChild(d);
+
+      const v = value(kind);
+      const cell = document.createElement("div");
+      // `unknown` is a real answer here — a release tarball has no `.git` —
+      // so it is set back like a placeholder rather than shown as a value.
+      cell.className = "aboutval" + (v === "unknown" ? " empty" : "");
+      if (kind === "repository" && v !== "unknown") {
         const a = document.createElement("a");
-        a.href = href; a.textContent = value;
+        a.href = v; a.textContent = "GitHub";
         a.target = "_blank"; a.rel = "noopener noreferrer";
-        v.appendChild(a);
+        a.title = v;
+        cell.appendChild(a);
       } else {
-        v.textContent = value;
+        cell.textContent = v;
       }
-      r.append(t, v);
+      r.append(text, cell);
       about.appendChild(r);
     }
   }
@@ -540,9 +558,13 @@ function openSettings(settings) {
     rows.hidden = pane !== "settings";
     themes.hidden = pane !== "theme";
     about.hidden = pane !== "about";
-    // Nothing on this pane is editable, so the scope switch (which chooses
-    // *which file* a change is written to) has nothing to say about it.
+    // Nothing on this pane is editable, so the two controls that exist for
+    // editing have nothing to say: the scope switch chooses which file a
+    // change is written to, and Save writes it. Offering "Save" over four
+    // read-only values invites the question of what it would save.
     scopeBar.hidden = pane === "about";
+    cancelBtn.textContent = pane === "about" ? "Close" : "Cancel";
+    okBtn.hidden = pane === "about";
     if (pane === "settings") renderRows();
     else if (pane === "theme") renderThemes();
     else renderAbout();
