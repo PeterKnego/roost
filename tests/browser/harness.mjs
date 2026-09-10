@@ -116,7 +116,18 @@ export async function startBrowser(profileDir) {
     try { return (await fetch(`http://127.0.0.1:${port}/json/version`)).ok; } catch { return false; }
   }, 30, "chromium's debug port");
   if (!up) { try { proc.kill("SIGKILL"); } catch {} throw new Error(`${bin} never opened its debug port`); }
-  return { bin, port, close: () => { try { proc.kill("SIGKILL"); } catch {} } };
+  const kill = () => { try { proc.kill("SIGKILL"); } catch { /* already gone */ } };
+  return {
+    bin,
+    port,
+    // Every test calls this immediately after `page.close()` and awaits
+    // neither, so under coverage the browser was being SIGKILLed while the
+    // `takePreciseCoverage` round-trip was still in flight — the take then
+    // timed out after 30s and collected nothing, which is what the first two
+    // runs of this reported. The kill is deferred into the same drain the
+    // exit wrapper runs.
+    close: () => (COVERAGE ? deferredKills.push(kill) : kill()),
+  };
 }
 
 /// Opens a tab and returns a thin CDP client for it. `evalIn` runs an
@@ -178,14 +189,77 @@ export async function attachTarget(webSocketDebuggerUrl) {
     return r.result?.result?.value;
   };
   await cmd("Runtime.enable");
+  // Coverage, when asked for. Off by default and entirely absent from a
+  // normal run: instrumentation changes what V8 does with the code under
+  // test, and this suite's whole value is that it drives the real thing.
+  //
+  // It has to be armed here rather than around a whole run because the
+  // counters live in the *page*, and every test closes its own page — so a
+  // collector that waited until the end would find nothing to read.
+  if (COVERAGE) {
+    await cmd("Profiler.enable");
+    await cmd("Profiler.startPreciseCoverage", { callCount: false, detailed: true });
+  }
   // Outstanding timers are cleared on close, or a 30s timer left armed by an
   // in-flight command keeps the process alive well past the last assertion.
+  //
+  // Async only when collecting: `close()` is called from a `finally` in every
+  // test and most do not await it, so the take below is fired and the socket
+  // is closed after it resolves. Tests that do await get the same behaviour.
   const close = () => {
-    for (const p of pending.values()) clearTimeout(p.timer);
-    pending.clear();
-    try { ws.close(); } catch { /* already gone */ }
+    const finish = () => {
+      for (const p of pending.values()) clearTimeout(p.timer);
+      pending.clear();
+      try { ws.close(); } catch { /* already gone */ }
+    };
+    if (!COVERAGE) return finish();
+    // Registered as well as returned. Every test calls `close()` from a
+    // `finally` without awaiting it and then calls `Deno.exit`, which would
+    // kill the process mid-round-trip and collect nothing — the first run of
+    // this reported 0 bytes for exactly that reason. `Deno.exit` is wrapped
+    // below to drain these first.
+    const taken = cmd("Profiler.takePreciseCoverage")
+      .then((r) => appendCoverage(r.result?.result ?? []))
+      .catch(() => {}) // a page that has already gone contributes nothing
+      .finally(finish);
+    pendingCoverage.push(taken);
+    return taken;
   };
   return { cmd, evalIn, close };
+}
+
+/// Set `ROOST_JS_COV=<file>` to append every page's V8 precise-coverage
+/// report to that file, one JSON object per line. `tests/browser/coverage.mjs`
+/// runs the suite this way and unions the result.
+const COVERAGE = Deno.env.get("ROOST_JS_COV") ?? null;
+
+/// Coverage takes still in flight when a test decides it is done, and the
+/// browser kills that must wait for them.
+const pendingCoverage = [];
+const deferredKills = [];
+
+if (COVERAGE) {
+  // The tests are not written to know about any of this, and should not have
+  // to be: `Deno.exit` is their last statement and it is synchronous, so a
+  // report that has not landed by then is simply lost. Wrapping it lets the
+  // event loop drain the takes first and keeps the 40 test files untouched.
+  const realExit = Deno.exit.bind(Deno);
+  Deno.exit = (code) => {
+    Promise.allSettled(pendingCoverage)
+      .then(() => { for (const k of deferredKills) k(); })
+      .finally(() => realExit(code));
+  };
+}
+
+/// Appends the entries for this project's own scripts. Everything else — the
+/// vendored libraries, the CDP shim, `about:blank` — is dropped here rather
+/// than at report time so the file stays small across forty test processes.
+async function appendCoverage(entries) {
+  const ours = entries.filter((e) => /\/static\/[^/]+\.js(\?|$)/.test(e.url ?? "")
+    && !/\/static\/vendor\//.test(e.url));
+  if (!ours.length) return;
+  await Deno.writeTextFile(COVERAGE, ours.map((e) => JSON.stringify(e)).join("\n") + "\n",
+    { append: true });
 }
 
 // ------------------------------------------------------------------- roost
