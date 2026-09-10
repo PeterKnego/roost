@@ -95,11 +95,12 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   parent's rule is the one mistake that hides a whole project, and it shipped
   once: `parse` returned an empty list for both "no rules" and "no usable
   rules", so a `!dist/` in `.gitignore` vanished while `.git/info/exclude`'s
-  `dist/` survived in the same merged scope. It tests directories only, and `show_hidden` turns it off, which is
-  what makes a partial matcher safe to ship: a directory it skips wrongly is
-  still reachable. `TreeFilter` runs first, so `target`, `node_modules` and
-  every dotfile never reach it — which is what keeps the reported count rare
-  enough to be worth reading.
+  `dist/` survived in the same merged scope. Descendants are deliberately
+  unaffected — they outrank the bailing file too. It tests directories only,
+  and `show_hidden` turns it off, which is what makes a partial matcher safe
+  to ship: a directory it skips wrongly is still reachable. `TreeFilter` runs
+  first, so `target`, `node_modules` and every dotfile never reach it — which
+  is what keeps the reported count rare enough to be worth reading.
 - **A search that skipped something says so.** `Results` carries an `Outcome`
   and three counters (`unreadable`, `skipped_nested`, `skipped_ignored`) rather
   than being a bare list, and the client renders every one of them. The
