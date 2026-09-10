@@ -551,11 +551,10 @@ fn notify_selected(
     // connection arrive or die between the two looks, so the fallback would
     // act on a different registry than the filter saw.
     //
-    // The `total == 0` case is the exception: explaining it needs a `/proc`
-    // walk (`claudes::claude_terminals`), which is blocking I/O, and this
-    // project has already shipped one deadlock from blocking I/O under a
-    // lock. So that branch returns a bare marker here and the walk — and the
-    // message it feeds — happens below, after `map` is dropped.
+    // The `total == 0` case is the exception: explaining it needs the Claude
+    // scan, so that branch returns a bare marker here and the message it
+    // feeds is built below, after `map` is dropped. The scan itself is the
+    // watcher's cached one rather than a fresh `/proc` walk — see there.
     let choice = {
         let map = conns().lock().unwrap_or_else(|e| e.into_inner());
         let all: &[Target] = map.get(project).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -606,7 +605,19 @@ fn notify_selected(
             // Lock is dropped by now: `choice` was computed and the match
             // above already moved out of the block that held `map`.
             let scan_port = session.map(|s| {
-                let scan = crate::claudes::claude_terminals(Path::new("/proc"));
+                // The watcher's cached walk, not a fresh one. This runs
+                // inside `Hub::handle`, which `wsconn.rs` calls with the hub
+                // mutex held — so a `/proc` walk here is blocking I/O under a
+                // lock every other browser on the project needs, which
+                // CLAUDE.md forbids and which `Search` was diverted to a
+                // worker thread to avoid.
+                //
+                // It was tolerable while a mention was one intent. Alt+K on a
+                // tree selection sends up to sixteen, so it became sixteen
+                // serial walks holding that lock. Up to `POLL` stale is the
+                // right trade for a message that explains why a mention could
+                // not be delivered.
+                let scan = crate::claudes::cached_scan();
                 crate::claudes::sse_port_in(&scan, project, s)
             });
             // `session.map` gives `Option<Option<Option<u16>>>`; flatten the

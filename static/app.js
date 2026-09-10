@@ -1568,7 +1568,13 @@ function wireFileLinks(root) {
       // A modified click picks rows to mention instead of opening one. Plain
       // click still opens, untouched: opening a file is the tree's primary
       // job and making it worse to gain a secondary one is a bad trade.
-      if (a.classList.contains("file") && (e.ctrlKey || e.metaKey || e.shiftKey)) {
+      // Tree rows only. `class="file"` is emitted by `changes_fragment` as
+      // well as by the tree, so keying on it alone made every row in the
+      // Changes pane pickable — and its first row carries `data-rel=""`, so
+      // a modified click on "full diff" entered `pickTreeRow`, hit the empty
+      // -rel guard, and did nothing at all: no diff opened, nothing picked,
+      // no feedback.
+      if (a.closest("ul.tree") && (e.ctrlKey || e.metaKey || e.shiftKey)) {
         return pickTreeRow(a, e.shiftKey && !e.ctrlKey && !e.metaKey);
       }
       const rel = a.dataset.rel;
@@ -1621,8 +1627,11 @@ const MAX_MENTIONS = 16;
 
 function pickTreeRow(a, range) {
   const rel = a.dataset.rel;
-  if (!rel) return;
-  const rows = [...a.closest(".content").querySelectorAll("a.file[data-rel]")];
+  const box = a.closest(".content");
+  if (!rel || !box) return;
+  // Scoped to the tree itself, matching what the gesture is allowed on, so a
+  // Changes row in the same pane can never join a range.
+  const rows = [...box.querySelectorAll("ul.tree a.file[data-rel]")];
   if (range && lastPickedRel) {
     const from = rows.findIndex((r) => r.dataset.rel === lastPickedRel);
     const to = rows.indexOf(a);
@@ -1634,17 +1643,24 @@ function pickTreeRow(a, range) {
       return paintTreePicked(a.closest(".content"));
     }
   }
-  if (treePicked.has(rel)) treePicked.delete(rel);
-  else treePicked.add(rel);
-  lastPickedRel = rel;
-  paintTreePicked(a.closest(".content"));
+  if (treePicked.has(rel)) {
+    treePicked.delete(rel);
+    // Not left as the anchor: ctrl-click to pick, ctrl-click again to
+    // un-pick, then shift-click elsewhere would run the range from the row
+    // just removed and silently bring it back.
+    lastPickedRel = null;
+  } else {
+    treePicked.add(rel);
+    lastPickedRel = rel;
+  }
+  paintTreePicked(box);
 }
 
 /// Repaints the picked rows. Called after every tree render as well as on
 /// every pick, because the set outlives the DOM nodes it marks.
 function paintTreePicked(root) {
   if (!root) return;
-  root.querySelectorAll("a.file[data-rel]").forEach((a) => {
+  root.querySelectorAll("ul.tree a.file[data-rel]").forEach((a) => {
     a.classList.toggle("picked", treePicked.has(a.dataset.rel));
   });
 }
@@ -1660,15 +1676,21 @@ function clearTreePicked() {
 /// order the user sees rather than in the order they happened to click.
 function pickedInTreeOrder() {
   if (!treePicked.size) return [];
+  // A `Set` alongside the list, because `MAX_MENTIONS` bounds only the send:
+  // `treePicked` itself is unbounded, and one shift-range over an expanded
+  // `node_modules` can put thousands in it. With `seen.includes` this ran
+  // quadratically on every Alt+K.
   const seen = [];
-  document.querySelectorAll(".content a.file[data-rel]").forEach((a) => {
-    if (treePicked.has(a.dataset.rel) && !seen.includes(a.dataset.rel)) seen.push(a.dataset.rel);
+  const have = new Set();
+  document.querySelectorAll("ul.tree a.file[data-rel]").forEach((a) => {
+    const rel = a.dataset.rel;
+    if (treePicked.has(rel) && !have.has(rel)) { have.add(rel); seen.push(rel); }
   });
   // A pick whose row has since disappeared (a directory collapsed, a file
   // renamed under us) is still a path the user chose. Kept, at the end,
   // rather than silently dropped — dropping it would turn "mention these
   // four" into "mention these three" with nothing saying so.
-  treePicked.forEach((rel) => { if (!seen.includes(rel)) seen.push(rel); });
+  treePicked.forEach((rel) => { if (!have.has(rel)) { have.add(rel); seen.push(rel); } });
   return seen;
 }
 
@@ -2599,12 +2621,23 @@ document.addEventListener("keydown", (e) => {
     for (const rel of send_n) {
       send({ t: "MentionPath", rel, line_start: null, line_end: null, session });
     }
-    clearTreePicked();
+    // Only what actually went out is spent. Clearing the whole set discarded
+    // the remainder too, so the banner's "the first 16 of 24" read as an
+    // invitation to press Alt+K again — and the second press found nothing
+    // picked, fell through to `mentionTarget()`, and mentioned whatever was
+    // in the active tab instead. That is the silent wrong-file mention this
+    // binding is supposed to be careful about.
+    for (const rel of send_n) treePicked.delete(rel);
+    lastPickedRel = null;
+    document.querySelectorAll(".content").forEach(paintTreePicked);
     // The cap names itself, like every other bound in this codebase. Silence
-    // here would mean four of twenty files arriving with nothing to say the
-    // other sixteen were dropped.
+    // here would mean sixteen of twenty-five files arriving with nothing to
+    // say the rest were dropped.
     if (picked.length > MAX_MENTIONS) {
-      showError(`mentioned the first ${MAX_MENTIONS} of ${picked.length} selected files`);
+      showError(
+        `mentioned the first ${MAX_MENTIONS} of ${picked.length} selected files — ` +
+        `the rest are still selected, press Alt+K again`,
+      );
     }
     return;
   }
@@ -2739,8 +2772,23 @@ async function showClaudeHere(pane, terminals) {
 // that are reporting a failure prepend "Error: " themselves (see showError);
 // a success notice like ProjectClosed's session count should not look like one.
 function showBanner(text) {
+  // One banner per distinct message, with a count. Alt+K on a tree selection
+  // sends up to sixteen separate `MentionPath` intents, and every one that
+  // cannot be delivered answers with its own `Event::Error` — so a single
+  // keystroke with no Claude attached stacked sixteen identical banners down
+  // the page, each with its own dismiss button and its own 8s timer. The
+  // information in the sixteenth is the same as in the first.
+  const existing = [...document.querySelectorAll(".error-banner")]
+    .find((el) => el.dataset.text === text);
+  if (existing) {
+    const n = Number(existing.dataset.count || "1") + 1;
+    existing.dataset.count = String(n);
+    existing.querySelector("b").textContent = `${text} (${n}×)`;
+    return;
+  }
   const box = document.createElement("div");
   box.className = "conflict error-banner";
+  box.dataset.text = text;
   const b = document.createElement("b");
   b.textContent = text;
   const dismiss = document.createElement("button");

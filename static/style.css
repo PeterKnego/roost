@@ -993,11 +993,31 @@ dialog.roost.dlg-wide { width: min(760px, 96vw); }
 .dlg-tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* Rows picked to be mentioned. A different question from `.sel` — which file
-   you are looking at — so a different mark: an accent bar on the leading edge
-   rather than a filled row, so a picked row that is *also* the current one
-   still reads as both. --row-on, not --tool: a highlight has to be mixed
-   against the surface it is drawn on. */
-.content a.file.picked { background-color: var(--row-on); box-shadow: inset 2px 0 0 var(--accent); }
+   you are looking at — so a different mark: an accent bar on the leading
+   edge, which composes with a filled row instead of replacing it.
+
+   The bar is on `.picked` alone; the background is only applied when the row
+   is *not* also `.sel` and not hovered. All three selectors have identical
+   specificity (0,3,1), so whichever came last simply won — and this one did,
+   which meant a picked row that was also the current file lost its
+   `--sel-bg` fill and a picked row gave no hover feedback at all, both
+   contradicting the design this comment describes.
+
+   Mixed against `--tool`, not `--row-on`. The tree pane's surface is
+   `--tool`, while `--row-on` is mixed against `--bg2` — which the theme
+   header warns is set *lighter* than `--bg` — so a picked row read
+   noticeably lighter than the tree around it in the dark themes. A highlight
+   has to be mixed against the surface it is actually drawn on.
+
+   `user-select: none` because shift-click is a range gesture here:
+   `preventDefault` on `click` does not undo the native text selection the
+   browser already made on `mousedown`, so extending a range painted the
+   blue selection across every row in between, over the pick highlight. */
+.content a.file, .content summary { user-select: none; }
+.content a.file.picked { box-shadow: inset 2px 0 0 var(--accent); }
+.content a.file.picked:not(.sel):not(:hover) {
+  background-color: color-mix(in oklab, var(--fg) 12%, var(--tool));
+}
 /* The tab being dragged, and where it would land. A drop indicator is not
    optional here: `at` is a position, and without a visible gap the user
    cannot tell where the tab will go — a wrong guess means dragging again. */
