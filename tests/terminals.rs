@@ -416,3 +416,151 @@ fn a_hup_ignoring_child_does_not_survive_kill_and_unlink() {
     assert!(confirmed, "and the session must be reported as confirmed ended");
     assert!(!sock.exists(), "and its socket unlinked");
 }
+
+/// The restart the sidecar exists for, driven end to end against a real
+/// `dtach` master this process never spawned.
+///
+/// Deliberately not `ROOST_CMD=cat`: with `cat` there is no master and no
+/// socket, so `attach` never reaches the `Decision::Probe` branch — the one
+/// whose doc says "this process never attached, but the dtach master is alive
+/// and `dtach -A` will rejoin it". That branch *is* the restart, and it is the
+/// only path on which a restored mode table can be observed. A `cat`
+/// substitution would make this test pass against completely unfixed code,
+/// which is the dev/prod trap CLAUDE.md records four instances of.
+///
+/// Revert-checked: deleting the `sc.restore(&crate::modes::load(project, name))`
+/// line in `session::attach`'s `Screens` construction makes this fail with
+/// "the restored contract never arrived".
+#[test]
+fn a_session_that_outlived_roost_gets_its_mode_contract_back() {
+    if std::process::Command::new("dtach").arg("-h").output().is_err() {
+        eprintln!("skipping: dtach not installed");
+        return;
+    }
+    std::env::remove_var("ROOST_CMD");
+    roost::wsstate::set_state_dir_for_test();
+
+    let d = tempfile::tempdir().unwrap();
+    // A rel key, not a path: `valid_project` rejects an absolute one.
+    let project = format!("modeproj{}", std::process::id() % 100_000);
+    let name = "restarted".to_string();
+    let sock = roost::session::socket_path(&project, &name);
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&sock);
+
+    // A master roost did not spawn — exactly what a restart leaves behind.
+    let ok = std::process::Command::new("dtach")
+        .args(["-n", sock.to_str().unwrap(), "-E", "-r", "winch", "-z", "sleep", "600"])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "dtach -n must create the session this test is about");
+    assert!(common::wait_for_path(&sock), "and its socket must appear");
+
+    // What the previous roost recorded before it went away.
+    roost::modes::save(&project, &name, &[(2004, true), (1000, true)]);
+    assert!(
+        roost::modes::path_for(&project, &name).exists(),
+        "the sidecar must exist, or this test proves nothing about reading it"
+    );
+
+    let att = roost::session::attach(&project, &name, d.path()).expect("attach must rejoin");
+    let mut seen = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match att.rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(chunk) => {
+                seen.extend_from_slice(&chunk);
+                if seen.windows(8).any(|w| w == b"\x1b[?2004h") {
+                    break;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    let _ = roost::registry::kill_and_unlink(&sock);
+
+    assert!(
+        seen.windows(8).any(|w| w == b"\x1b[?2004h"),
+        "the restored contract never arrived — a paste here submits its first line. Got {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        seen.windows(8).any(|w| w == b"\x1b[?1000h"),
+        "and mouse reporting with it: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    // The refusal, on the same path: nothing may put this client on the
+    // alternate screen, because no live app declared it to *this* process.
+    assert!(
+        !seen.windows(8).any(|w| w == b"\x1b[?1049h"),
+        "the screen bit must never be restored: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+}
+
+/// The writing half, against a real shell: a mode an app declares must reach
+/// the sidecar without anyone asking it to.
+///
+/// Revert-checked: removing the `modes::save` call from the pump makes this
+/// fail with "the pump never recorded the contract".
+#[test]
+fn the_pump_records_a_declared_mode_where_the_next_roost_will_find_it() {
+    if std::process::Command::new("dtach").arg("-h").output().is_err() {
+        eprintln!("skipping: dtach not installed");
+        return;
+    }
+    std::env::remove_var("ROOST_CMD");
+    roost::wsstate::set_state_dir_for_test();
+
+    let d = tempfile::tempdir().unwrap();
+    let project = format!("modewrite{}", std::process::id() % 100_000);
+    let name = "declaring".to_string();
+    let sock = roost::session::socket_path(&project, &name);
+    let sidecar = roost::modes::path_for(&project, &name);
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&sidecar);
+    let _ = std::fs::remove_file(&sock);
+
+    // Created with `dtach -n` rather than by `attach`, because session
+    // *creation* is reservation-gated (see the `Decision` enum) and a bare
+    // `attach` is refused. Rejoining an existing master is the path this
+    // needs anyway, and it is a real shell so the mode really is declared by
+    // a process rather than injected into the ring by the test.
+    let ok = std::process::Command::new("dtach")
+        .args(["-n", sock.to_str().unwrap(), "-E", "-r", "winch", "-z", "sh"])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "dtach -n must create the session this test is about");
+    assert!(common::wait_for_path(&sock), "and its socket must appear");
+
+    let att = roost::session::attach(&project, &name, d.path()).expect("attach must rejoin");
+    // Asserts the pre-state it later negates: without this the test would
+    // pass just as well if the file had been left over from another run.
+    assert!(!sidecar.exists(), "no sidecar before the app declares anything");
+
+    // The app declares its contract, the way Claude does at startup.
+    roost::session::write_input(&att.key, b"printf '\\033[?2004h\\033[?1000h'\n")
+        .expect("the shell must accept input");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut body = String::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(t) = std::fs::read_to_string(&sidecar) {
+            if t.contains("2004 1") {
+                body = t;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = roost::registry::kill_and_unlink(&sock);
+
+    assert!(body.contains("2004 1"), "the pump never recorded the contract; got {body:?}");
+    assert!(body.contains("1000 1"), "and mouse reporting with it; got {body:?}");
+    // 25 is tracked in memory and deliberately never written: it is the one
+    // mode a repainting app changes constantly, so persisting it would put a
+    // disk write on every frame for a value that repairs itself in a second.
+    assert!(!body.contains("25 "), "cursor visibility must not be written; got {body:?}");
+}

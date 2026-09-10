@@ -89,6 +89,31 @@ pub enum Event {
 /// does its *reset* do?
 const TRACKED: [u16; 13] = [1, 7, 25, 66, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 2004];
 
+/// The subset of `TRACKED` worth writing to disk so it survives a roost
+/// restart — every tracked mode except cursor visibility (25).
+///
+/// The exclusion is the whole design, and it is an asymmetry rather than a
+/// compromise. The modes that *need* persisting are declared once, in an
+/// app's first few hundred bytes, and never mentioned again: after a restart
+/// roost will never see them, so if it did not record them it cannot know
+/// them. Cursor visibility is the exact opposite — it is re-declared
+/// constantly, because a full-screen app hides the cursor to repaint and
+/// shows it again afterwards.
+///
+/// Measured on this host before choosing: idle Claude Code flipped `?25`
+/// eleven times in twelve seconds and every other mode exactly once; `vim`
+/// flipped it six times over ten keystrokes; `htop`, repainting continuously
+/// for six seconds, flipped it once. So 25 is simultaneously the only mode
+/// that would make this a hot write path and the only one that repairs itself
+/// within a second of a restart. Persisting it would buy a stale value at the
+/// cost of a write per repaint.
+///
+/// Re-applied when *reading*, not only when writing: a file naming a mode
+/// outside this list is ignored, so a stale, hand-edited or
+/// future-version file can never talk this process into replaying a mode
+/// whose reset does something (`?3l` clears the screen — see `TRACKED`).
+pub const PERSISTED: [u16; 12] = [1, 7, 66, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 2004];
+
 #[derive(Default, PartialEq, Eq, Clone, Copy)]
 enum State {
     #[default]
@@ -238,6 +263,12 @@ pub struct Screens {
     /// modelling them per buffer would be modelling a terminal that is not the
     /// one on the other end.
     modes: [Option<bool>; TRACKED.len()],
+    /// A mode in `PERSISTED` has changed value since this was last cleared,
+    /// so the on-disk copy is behind. Only `PERSISTED` sets it: 25 changes
+    /// constantly and is deliberately not written (see `PERSISTED`), so
+    /// letting it mark the table dirty would produce a write per repaint for
+    /// a value nobody stores.
+    persist_dirty: bool,
 }
 
 impl Default for Screens {
@@ -253,7 +284,48 @@ impl Screens {
             alt: VecDeque::new(),
             at: At::Unknown,
             modes: [None; TRACKED.len()],
+            persist_dirty: false,
         }
+    }
+
+    /// Seeds the table from a previous roost process's record. Used once, at
+    /// the moment a `Session` is built for a dtach socket that already
+    /// existed — the app behind it declared its contract to a roost that is
+    /// no longer running.
+    ///
+    /// Entries outside `PERSISTED` are dropped rather than trusted; see that
+    /// constant. Restoring does not mark the table dirty — it came *from*
+    /// the file, so writing it straight back would be pure churn.
+    pub fn restore(&mut self, saved: &[(u16, bool)]) {
+        for (mode, set) in saved {
+            if !PERSISTED.contains(mode) {
+                continue;
+            }
+            if let Some(i) = TRACKED.iter().position(|m| m == mode) {
+                self.modes[i] = Some(*set);
+            }
+        }
+    }
+
+    /// The persistable half of the table, in `TRACKED` order, omitting modes
+    /// no app has mentioned — a mode never declared is not the same as one
+    /// turned off (7 defaults to *on*), and writing a guess would be worse
+    /// than writing nothing.
+    pub fn persisted(&self) -> Vec<(u16, bool)> {
+        TRACKED
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| PERSISTED.contains(m))
+            .filter_map(|(i, m)| self.modes[i].map(|set| (*m, set)))
+            .collect()
+    }
+
+    /// True once per change to a persisted mode, clearing the flag. The pump
+    /// calls this while holding the session registry, and does the write
+    /// after releasing it: this project has already shipped one deadlock from
+    /// blocking I/O under a lock.
+    pub fn take_persist_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.persist_dirty)
     }
 
     /// Files a chunk of PTY output under the screen it was written on, and
@@ -280,6 +352,13 @@ impl Screens {
                 // for whoever attaches later.
                 Event::Mode { mode, set } => {
                     if let Some(i) = TRACKED.iter().position(|m| m == mode) {
+                        // On a *change*, not on every declaration: an app
+                        // that re-states a mode it already set has not
+                        // changed the contract, and re-writing the file for
+                        // it would turn every repaint into disk traffic.
+                        if self.modes[i] != Some(*set) && PERSISTED.contains(mode) {
+                            self.persist_dirty = true;
+                        }
                         self.modes[i] = Some(*set);
                     }
                     continue;
@@ -667,6 +746,138 @@ mod tests {
         let last_reset = replay.windows(8).rposition(|w| w == b"\x1b[?2004l");
         assert!(last_set.is_some(), "the ring still carries the old value: {replay:?}");
         assert!(last_reset > last_set, "the tracked value must be the last word: {replay:?}");
+    }
+
+    #[test]
+    fn a_restart_is_survived_by_carrying_the_table_across_a_fresh_screens() {
+        // The whole point of `modes.rs`, expressed against `Screens` alone:
+        // the second `Pump` is a stand-in for the process that comes back
+        // after a restart, holding empty rings and an unknown screen. What it
+        // is handed is exactly what `modes::save`/`load` moves — the
+        // persistable table — and the paste contract has to come back with it.
+        let mut before = Pump::new();
+        before.feed(b"\x1b[?2004h\x1b[?1004h\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?25l");
+        let carried = before.screens.persisted();
+
+        let mut after = Pump::new();
+        assert!(!has(&after.replay(), b"\x1b[?2004h"), "the new process starts knowing nothing");
+        after.screens.restore(&carried);
+        let replay = after.replay();
+        assert!(has(&replay, b"\x1b[?2004h"), "bracketed paste must come back: {replay:?}");
+        assert!(has(&replay, b"\x1b[?1000h"), "mouse reporting must come back");
+        assert!(has(&replay, b"\x1b[?1006h"), "and its encoding");
+        assert!(has(&replay, b"\x1b[?1004h"), "focus reporting must come back");
+    }
+
+    #[test]
+    fn the_alternate_screen_bit_is_never_carried_across_a_restart() {
+        // The deliberate refusal: modes persist, the screen bit does not. A
+        // stale "you are on the alternate screen" leaves a blank buffer with
+        // the shell's output going somewhere invisible, and unlike a mode
+        // there is no later event to reconcile it against.
+        //
+        // Asserted through the *consequence*, not through `persisted()`'s
+        // contents. The first draft checked that no carried entry named
+        // 47/1047/1049, which is unfalsifiable: the screen bit lives in
+        // `Screens::at` and has never been in `modes`, so no change to the
+        // mode allowlist can put it in the carried table. That assertion
+        // could not fail, which is the failure mode this codebase keeps
+        // catching in review.
+        //
+        // What does discriminate is `ingest`'s reconcile arm: a process that
+        // never saw the entry must replace a bare `?1049l` with a clear, or
+        // it paints the app's parting words over its own leftover frame.
+        // Both regressions worth catching were applied and watched to fail —
+        // breaking the reconcile arm, and a plausible "improvement" that
+        // carries `at` through `persisted`/`restore` so the exit is forwarded
+        // raw instead.
+        let mut before = Pump::new();
+        before.feed(b"\x1b[?2004h\x1b[?1049h");
+        let carried = before.screens.persisted();
+
+        let mut after = Pump::new();
+        after.screens.restore(&carried);
+        assert!(has(&after.replay(), b"\x1b[?2004h"), "the mode contract did come back");
+        assert!(
+            !has(&after.replay(), b"\x1b[?1049h"),
+            "but nothing may put the client on the alternate screen: {:?}",
+            after.replay()
+        );
+
+        // The app that outlived the restart now exits.
+        let out = after.feed(b"\x1b[?1049lbye");
+        assert!(has(&out, RECONCILE), "an unseen entry's exit must be reconciled: {out:?}");
+        assert!(!has(&out, b"\x1b[?1049l"), "and never forwarded raw: {out:?}");
+    }
+
+    #[test]
+    fn cursor_visibility_is_tracked_in_memory_but_never_persisted() {
+        // 25 is in `TRACKED` and out of `PERSISTED`, and both halves matter.
+        // In memory it must still be replayed, or a browser attaching mid-app
+        // gets a cursor the app has hidden. On disk it must not be, because
+        // it is the one mode that changes constantly — so persisting it would
+        // buy a stale value at the price of a write per repaint.
+        let mut p = Pump::new();
+        p.feed(b"\x1b[?25l");
+        assert!(has(&p.replay(), b"\x1b[?25l"), "still replayed to a live attach");
+        assert!(
+            !p.screens.persisted().iter().any(|(m, _)| *m == 25),
+            "but never written: {:?}",
+            p.screens.persisted()
+        );
+    }
+
+    #[test]
+    fn only_a_real_change_to_a_persisted_mode_asks_for_a_write() {
+        // The flag is what keeps this off the hot path. A repainting app
+        // re-hides the cursor constantly and re-states modes it already set;
+        // neither has changed the contract, and neither may cost a disk
+        // write.
+        let mut p = Pump::new();
+        assert!(!p.screens.take_persist_dirty(), "nothing seen yet");
+
+        p.feed(b"\x1b[?2004h");
+        assert!(p.screens.take_persist_dirty(), "a new contract must be written");
+        assert!(!p.screens.take_persist_dirty(), "and the flag clears");
+
+        p.feed(b"\x1b[?2004h");
+        assert!(!p.screens.take_persist_dirty(), "re-stating the same value changes nothing");
+
+        for _ in 0..50 {
+            p.feed(b"\x1b[?25l");
+            p.feed(b"\x1b[?25h");
+        }
+        assert!(
+            !p.screens.take_persist_dirty(),
+            "a hundred cursor flips must not produce a single write"
+        );
+
+        p.feed(b"\x1b[?2004l");
+        assert!(p.screens.take_persist_dirty(), "an actual change must be written");
+    }
+
+    #[test]
+    fn restoring_does_not_immediately_ask_to_be_written_back() {
+        // A table that came from the file is not news. Marking it dirty would
+        // make every session rewrite its sidecar on attach for nothing.
+        let mut p = Pump::new();
+        p.screens.restore(&[(2004, true), (1000, true)]);
+        assert!(!p.screens.take_persist_dirty());
+    }
+
+    #[test]
+    fn restore_refuses_anything_outside_the_persisted_allowlist() {
+        // Enforced here as well as in `modes::load`, because this is the
+        // function a future caller would reach for. 3 clears the screen in
+        // this emulator and 1049 belongs to the screen logic; a table naming
+        // either must not be able to talk this process into replaying it.
+        let mut p = Pump::new();
+        p.screens.restore(&[(3, false), (1049, true), (25, false), (2004, true)]);
+        let replay = p.replay();
+        assert!(has(&replay, b"\x1b[?2004h"), "the legitimate entry lands");
+        for seq in [&b"\x1b[?3l"[..], b"\x1b[?1049h", b"\x1b[?25l"] {
+            assert!(!has(&replay, seq), "{seq:?} must be refused: {replay:?}");
+        }
     }
 
     #[test]

@@ -533,7 +533,17 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                 master: pair.master,
                 child,
                 child_pid,
-                screens: crate::screen::Screens::new(),
+                screens: {
+                    // Seeded from disk, because this may be an attach to a
+                    // session that outlived a previous roost: the app behind
+                    // it declared its mode contract once, to a process that
+                    // is gone, and will never declare it again. Only the
+                    // modes — never the alternate-screen bit, which has no
+                    // safe stale value. See `crate::modes`.
+                    let mut sc = crate::screen::Screens::new();
+                    sc.restore(&crate::modes::load(project, name));
+                    sc
+                },
                 subs: HashMap::new(),
                 sizes: HashMap::new(),
                 next_id: 0,
@@ -563,6 +573,9 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                         // deadlock this project has already shipped once.
                         let notices = osc.feed(&buf[..n]);
                         let switches = screen.feed(&buf[..n]);
+                        // Carries the mode table out of the critical section
+                        // below, so the write happens with the lock released.
+                        let mut modes_to_write: Option<Vec<(u16, bool)>> = None;
                         {
                             let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
                             let map = &mut guard.map;
@@ -575,6 +588,16 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                             // full (frozen tab, dead socket) is dropped rather
                             // than backing up the whole fan-out (I4).
                             s.subs.retain(|_, tx| tx.try_send(chunk.clone()).is_ok());
+                            // Read under the lock, written outside it, for
+                            // the same reason `publish` is: this project has
+                            // already shipped one deadlock from blocking I/O
+                            // held under the session registry.
+                            if s.screens.take_persist_dirty() {
+                                modes_to_write = Some(s.screens.persisted());
+                            }
+                        }
+                        if let Some(m) = modes_to_write {
+                            crate::modes::save(&pump_project, &pump_session, &m);
                         }
                         for p in notices {
                             crate::hub::publish(&pump_project, &pump_session, p);
