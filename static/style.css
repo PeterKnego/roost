@@ -1186,10 +1186,6 @@ header button.proj:hover svg { opacity: 1; }
   #grid > .divider { display: none; }
 
   #mobilebar { display: flex; }
-  /* Six keys plus ⌨. The keyboard one is set apart and does not stretch, so a
-     thumb reaching for an arrow cannot summon a keyboard by a pixel. */
-  #termkeys button[data-k="keyboard"] { flex: 0 0 auto; min-width: 52px; margin-left: 6px; }
-  #termkeys button[aria-pressed="true"] { background: var(--row-on); color: var(--fg); }
   /* Only with the terminal in front: these keys mean nothing over a file tree,
      and the screen is the scarcest thing here. */
   body[data-mpane="3"] #termkeys { display: flex; }
@@ -1263,12 +1259,22 @@ header button.proj:hover svg { opacity: 1; }
   header button, #mobilebar button { min-height: 44px; min-width: 44px; }
   .paneicon { width: 32px; height: 32px; }
   .tab { padding: 10px 12px; }
-  /* A bigger target for a finger. `.x` is an inline span holding a single
-     glyph, so width and height alone leave the × sitting wherever the line box
-     put it — off-centre in a 28px box, which is what it looked like. Made a
-     flex box so the glyph is centred in the target rather than near it. */
-  .tab .x { display: inline-flex; align-items: center; justify-content: center;
-            width: 28px; height: 28px; margin-left: 4px; line-height: 1; }
+  /* A bigger target for a finger, inside a tab big enough to hold it.
+     Reported twice, and the second time was the useful one: the tab is
+     `height: 24px` from `.tabstrip .tab`, which is two selectors and beats a
+     bare `.tab` — so the padding written here never applied, and a 28px close
+     control was *taller than the tab containing it*. It overflowed by two
+     pixels top and bottom, which is what "still not aligned" looks like.
+     A browser test missed it because both boxes share a centre line while one
+     hangs out of the other; the screenshot did not.
+     Matching the original selector so the height can actually give way. */
+  .tabstrip .tab { height: auto; min-height: 44px; padding: 4px 10px; gap: 4px; }
+  .tabstrip .tab .x { display: inline-flex; align-items: center; justify-content: center;
+                      width: 28px; height: 28px; margin-left: 4px; padding: 0;
+                      line-height: 1; flex: 0 0 auto;
+                      /* No hover on a phone, so the control cannot be
+                         revealed by one — it is always legible. */
+                      opacity: .75; }
 
   /* A phone has no hover. Every affordance revealed by one needs a press
      state, or it is invisible until it is already activated. */

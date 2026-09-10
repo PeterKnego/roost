@@ -1837,7 +1837,6 @@ pub fn workspace_page(
   <button type="button" data-k="down" aria-label="down">&#8595;</button>
   <button type="button" data-k="enter" aria-label="enter">&#9166;</button>
   <button type="button" data-k="ctrlc">^C</button>
-  <button type="button" data-k="keyboard" aria-pressed="false" aria-label="keyboard">&#9000;</button>
 </div>
 <nav id="mobilebar" aria-label="pane">
   <button type="button" data-mpane="0" aria-pressed="false">{SVG_M_TREE}<span>Files</span></button>

@@ -2286,14 +2286,43 @@ function wireTouchScroll(node, term) {
     }
   };
 
+  /// A row's height in CSS pixels, measured from the rendered rows rather
+  /// than from `options.fontSize` — the theme's line height is not part of
+  /// that number, and this has to match what a row actually occupies.
+  const rowHeight = () => {
+    const el = term.element && term.element.querySelector(".xterm-rows > div");
+    const h = el && el.getBoundingClientRect().height;
+    return h && h > 1 ? h : 17;
+  };
+
   /// One notch of scrolling, `dy` pixels' worth. Positive is a finger moving
   /// down, which shows earlier output — the direction a wheel-up gives.
+  ///
+  /// The pixels are accumulated and spent a whole row at a time, and that is
+  /// the difference between this feeling like scrolling and feeling like
+  /// stuttering. A terminal on the alternate screen can only move by whole
+  /// rows — the program redraws, there is no sub-pixel anything — so the most
+  /// it can do is put those steps where the finger asks for them.
+  ///
+  /// Handing xterm each touchmove's raw delta does not: measured, a 120px drag
+  /// in twenty even 6px steps produced eight row-steps on eight arbitrary
+  /// frames and nothing on the other twelve, because each 6px delta was
+  /// rounded on its own and 6/15 of a row rounds to nothing. Carrying the
+  /// remainder here, and sending an exact multiple of the row height, makes
+  /// the same drag step once every two and a half frames — evenly, which is
+  /// what reads as smooth.
+  let carry = 0;
   const emit = (dy) => {
     const el = screen();
     if (!el) return;
+    carry += dy;
+    const h = rowHeight();
+    const rows = Math.trunc(carry / h);
+    if (!rows) return;
+    carry -= rows * h;
     const r = el.getBoundingClientRect();
     el.dispatchEvent(new WheelEvent("wheel", {
-      deltaY: -dy, deltaMode: 0, bubbles: true, cancelable: true,
+      deltaY: -rows * h, deltaMode: 0, bubbles: true, cancelable: true,
       clientX: Math.round(r.left + r.width / 2),
       clientY: Math.round(r.top + r.height / 2),
     }));
@@ -2301,6 +2330,7 @@ function wireTouchScroll(node, term) {
 
   node.addEventListener("touchstart", (e) => {
     glide = 0;
+    carry = 0;
     if (!translate() || e.touches.length !== 1) { last = null; return; }
     last = e.touches[0].clientY;
     at = e.timeStamp;
@@ -3429,26 +3459,6 @@ function targetTerm() {
   return byPane || terms.get(lastFocusedSession) || null;
 }
 
-/// Shows or hides the soft keyboard.
-///
-/// There is no API for this: a keyboard appears because something focusable is
-/// focused and goes away when it is blurred, so this focuses and blurs xterm's
-/// helper textarea. Which is exactly why the other keys must not focus —
-/// see the handler below.
-function toggleKeyboard(entry, btn) {
-  const ta = entry.node && entry.node.querySelector("textarea");
-  const on = btn.getAttribute("aria-pressed") === "true";
-  try {
-    if (on) {
-      if (ta) ta.blur();
-    } else {
-      entry.term.focus();
-      if (ta) ta.focus();
-    }
-  } catch { /* a terminal that went away between tap and handler */ }
-  btn.setAttribute("aria-pressed", String(!on));
-}
-
 function initTermKeys() {
   const bar = document.getElementById("termkeys");
   if (!bar) return;
@@ -3458,23 +3468,26 @@ function initTermKeys() {
     // keyboard the user is about to type into. preventDefault keeps focus where
     // it is, which is the terminal.
     b.addEventListener("pointerdown", (e) => {
-      // Not for ⌨: its whole job is to move focus, and `preventDefault` here
-      // is what stops focus moving. Every other key wants exactly that — a
-      // click would take focus first, and on iOS focusing a button dismisses
-      // the keyboard, so an arrow press would close the keyboard it is meant
-      // to be independent of.
-      if (b.dataset.k !== "keyboard") e.preventDefault();
+      // `preventDefault` is what stops the press moving focus, which is the
+      // whole point: a click would focus the button first, and on iOS
+      // focusing a button dismisses the keyboard — so an arrow press would
+      // close the keyboard it is supposed to be independent of.
+      e.preventDefault();
       const entry = targetTerm();
       if (!entry) return;
-      if (b.dataset.k === "keyboard") return toggleKeyboard(entry, b);
       const make = TERM_KEYS[b.dataset.k];
       if (!make) return;
       entry.term.input(make(entry.term));
       // Deliberately no `focus()`. Focusing xterm's hidden textarea is what
       // opens the soft keyboard, so every arrow press used to summon one over
       // the half of the screen you were trying to read — while the whole point
-      // of these keys is to drive a menu *without* typing. The ⌨ button is
-      // the way to ask for a keyboard, and it is the only way.
+      // of these keys is to drive a menu *without* typing.
+      //
+      // Nothing here replaces it, and nothing needs to: tapping the terminal
+      // focuses it and raises the keyboard, which is the gesture people
+      // already use. A dedicated ⌨ button was tried and removed — it was one
+      // more control competing for a row that is already six wide, for a job
+      // the terminal itself does.
     });
   }
 }
