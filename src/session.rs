@@ -923,6 +923,32 @@ pub fn launched_names(project: &str) -> Vec<(String, LaunchRequest)> {
 
 /// Session names with a socket on disk for this project. Dotfiles are skipped:
 /// `.origin` is metadata about the project key, not a session.
+/// `socket_names`, but able to say "I could not look".
+///
+/// Three answers, not two. `Some(names)` is what the directory holds; an
+/// absent directory is `Some(empty)` — it is created on a project's first
+/// attach, so its absence positively means no session has ever run here; and
+/// any other error is `None`.
+///
+/// The distinction exists because one caller does more than render a list.
+/// `hub` uses this to tell a user that the shell a restored tab held is
+/// **gone**, and an unreadable directory folded into "no sessions" would say
+/// that about shells that are still running. `socket_names` may keep folding
+/// it — it feeds listings, where the cost is a missing row for one refresh.
+pub fn socket_names_checked(project: &str) -> Option<Vec<String>> {
+    let dir = crate::wsstate::state_dir().join("sock").join(crate::projects::storage_key(project));
+    match std::fs::read_dir(&dir) {
+        Ok(rd) => Some(
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| !n.starts_with('.'))
+                .collect(),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+        Err(_) => None,
+    }
+}
+
 fn socket_names(project: &str) -> Vec<String> {
     let dir = crate::wsstate::state_dir().join("sock").join(crate::projects::storage_key(project));
     // An unreadable socket dir reads as "no sessions" here. Display-only:
