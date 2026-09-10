@@ -2946,10 +2946,18 @@ if (closeBtn) closeBtn.onclick = async () => {
 const projBtn = document.getElementById("projbtn");
 const projPanel = document.getElementById("projpanel");
 if (projBtn && projPanel) {
-  projBtn.onclick = () => {
+  // Two triggers, one panel. The header names the project you are in and the
+  // control that changes it was somewhere else entirely, so the thing you
+  // look at was the thing that did nothing. The ◆ stays: it is a reasonable
+  // muscle-memory target, and removing it is a separate decision from adding
+  // the obvious one.
+  const toggleProjects = () => {
     projPanel.hidden = !projPanel.hidden;
     if (!projPanel.hidden && window.htmx) htmx.trigger(document.body, "refresh");
   };
+  projBtn.onclick = toggleProjects;
+  const projName = document.getElementById("projname");
+  if (projName) projName.onclick = toggleProjects;
   // Clicking through to a project should not leave the panel hanging open
   // behind the tab switch.
   projPanel.onclick = (e) => { if (e.target.closest("a")) projPanel.hidden = true; };
@@ -3038,7 +3046,7 @@ if (settingsBtn) {
 // fires, and Tab-to-focus is untouched, so keyboard users are not locked out.
 // (The pane-header icons are <span>s, which are not focusable, so they never
 // had this problem — only these real buttons do.)
-for (const id of ["projbtn", "wtbtn", "bell", "settings", "refresh", "closeproj"]) {
+for (const id of ["projbtn", "projname", "wtbtn", "bell", "settings", "refresh", "closeproj"]) {
   const b = document.getElementById(id);
   if (b) b.addEventListener("mousedown", (e) => e.preventDefault());
 }
@@ -3048,24 +3056,32 @@ for (const id of ["projbtn", "wtbtn", "bell", "settings", "refresh", "closeproj"
 // can stopPropagation the event, and it runs before the trigger's own click
 // toggles the panel — so a click on the trigger is seen as "inside the
 // trigger" and left alone, and opening a popup never immediately re-closes it.
+//
+// A panel may have more than one trigger — the projects panel is opened by
+// the ◆ button and by the project name — and every one of them has to count
+// as "inside". With a single trigger per entry, a click on the second one is
+// outside the first: mousedown closes the panel and the click reopens it, so
+// the panel could be opened but never closed from that trigger.
 const HEADER_POPUPS = [
-  ["projbtn", "projpanel"],
-  ["wtbtn", "wtpanel"],
-  ["bell", "noticepanel"],
+  ["projpanel", ["projbtn", "projname"]],
+  ["wtpanel", ["wtbtn"]],
+  ["noticepanel", ["bell"]],
 ];
 document.addEventListener(
   "mousedown",
   (e) => {
-    for (const [btnId, panelId] of HEADER_POPUPS) {
+    for (const [panelId, btnIds] of HEADER_POPUPS) {
       const panel = document.getElementById(panelId);
-      const btn = document.getElementById(btnId);
       // A click inside a modal dialog is outside the panel in DOM terms but
       // not in the user's: the hook row's confirmation opens one, and closing
       // the panel under it would take away the row the answer changes.
       if (e.target.closest && e.target.closest("dialog.roost")) continue;
-      if (panel && !panel.hidden && !panel.contains(e.target) && btn && !btn.contains(e.target)) {
-        panel.hidden = true;
-      }
+      if (!panel || panel.hidden || panel.contains(e.target)) continue;
+      const onTrigger = btnIds.some((id) => {
+        const b = document.getElementById(id);
+        return b && b.contains(e.target);
+      });
+      if (!onTrigger) panel.hidden = true;
     }
   },
   true,

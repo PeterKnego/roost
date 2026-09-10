@@ -87,6 +87,47 @@ try {
   await clickSel("#wtbtn");
   ok(await until(async () => (await hidden("noticepanel")) === true && (await hidden("wtpanel")) === false, 10, "swap"),
      "opening the worktree switcher closes the notifications panel");
+  console.log("\nE. the project name is the switcher's other trigger");
+  // The header names the project you are in; until now the control that
+  // changed it was the ◆ button somewhere else, so the thing you look at was
+  // the thing that did nothing.
+  const projPanelHidden = () => evalIn(`document.getElementById("projpanel").hidden`);
+  await evalIn(`(() => { const p = document.getElementById("projpanel");
+    if (!p.hidden) document.getElementById("projbtn").click(); return 0; })()`);
+  ok(await until(projPanelHidden, 5, "closed"), "setup: the projects panel starts closed");
+
+  await evalIn(`document.getElementById("projname").click(); 0`);
+  ok(await until(async () => !(await projPanelHidden()), 5, "opened"),
+    "clicking the project name opens the projects panel");
+
+  // The half that a single-trigger registry gets wrong. The outside-click
+  // handler closes a panel on mousedown when the click is not on *its*
+  // trigger; with only ◆ registered, a mousedown on the name closed the panel
+  // and the click reopened it, so it could be opened from here but never
+  // closed. Driven as a real mousedown+click, because that ordering is the
+  // whole bug.
+  await evalIn(`(() => { const b = document.getElementById("projname");
+    b.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    b.click(); return 0; })()`);
+  ok(await until(projPanelHidden, 5, "closed again"),
+    "and clicking it again closes it, rather than closing and reopening");
+
+  // The ◆ is a second trigger, not a replacement, and still drives the same
+  // panel.
+  await evalIn(`document.getElementById("projbtn").click(); 0`);
+  ok(await until(async () => !(await projPanelHidden()), 5, "diamond opens"),
+    "the ◆ button still opens the same panel");
+  await evalIn(`(() => { const b = document.getElementById("projname");
+    b.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    b.click(); return 0; })()`);
+  ok(await until(projPanelHidden, 5, "name closes diamond's"),
+    "and the name closes a panel the ◆ opened — one panel, two triggers");
+
+  ok(
+    await evalIn(`!!document.querySelector("#projname svg")`),
+    "the name carries a disclosure caret, so it reads as a control",
+  );
+
 } finally {
   page?.close();
   browser.close();

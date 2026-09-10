@@ -1589,6 +1589,10 @@ const SVG_SEARCH: &str = r#"<svg width="14" height="14" viewBox="0 0 16 16" fill
 const SVG_BELL: &str = r#"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true"><path d="M4 11V7.5a4 4 0 0 1 8 0V11l1 1.5H3z"/><path d="M6.5 13.5a1.5 1.5 0 0 0 3 0"/></svg>"#;
 const SVG_GEAR: &str = r#"<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>"#;
 const SVG_REFRESH: &str = r#"<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.5-3.6"/><path d="M13 2.5v3h-3"/></svg>"#;
+/// The disclosure caret on the project name. Drawn rather than a character
+/// so it inherits `currentColor` and the header's stroke weight like every
+/// other glyph up there.
+const SVG_CARET: &str = r#"<svg width="9" height="9" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>"#;
 const SVG_X: &str = r#"<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>"#;
 
 /// A destructive `askConfirm` used to be a native `confirm()` — browser
@@ -1754,7 +1758,7 @@ pub fn workspace_page(
 <script src="/static/vendor/code-input-go-to-line.min.js"></script>
 </head><body data-project="{proj_txt}" data-key="{qkey}" data-show-hidden="{sh}" data-autosave="{autosave}" data-follow-tree="{follow_tree}" data-share-selection="{share_selection}" data-launches="{launches}">
 <header>
-  <a class="home" href="/" title="all projects">{SVG_HOME}</a><span class="proj">{proj_txt}</span>
+  <a class="home" href="/" title="all projects">{SVG_HOME}</a><button id="projname" class="proj" title="switch project">{proj_txt}{SVG_CARET}</button>
   <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body, git from:body"></span><span id="wtlabel"></span></button>
   {warn}
   <span id="connstate" hidden></span>
@@ -3019,6 +3023,28 @@ mod tests {
         let without = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
         assert!(without.contains(r#"data-launches="""#), "an empty list is an explicit empty attribute");
         assert!(!without.contains(r#"data-launches="claude""#));
+    }
+
+    #[test]
+    fn the_project_name_is_a_control_not_a_label() {
+        // The header named the project you were in, and the control that
+        // changed it was the ◆ button somewhere to the right — so the thing
+        // you look at was the thing that did nothing. The name is now the
+        // switcher's other trigger, which app.js keys off this id.
+        let s = Settings::default();
+        let h = workspace_page("proj", "proj", &s, None, false, &[]);
+        assert!(
+            h.contains(r#"<button id="projname" class="proj""#),
+            "the name is a button carrying the id app.js wires: {}",
+            &h[..400.min(h.len())]
+        );
+        // And it says so: a click target that does not look like one is the
+        // same defect wearing a quieter coat.
+        let name = h.split(r#"<button id="projname""#).nth(1).expect("the button");
+        let name = name.split("</button>").next().expect("its end");
+        assert!(name.contains("<svg"), "it carries a disclosure caret: {name}");
+        // The ◆ stays — a second trigger, not a replacement.
+        assert!(h.contains(r#"id="projbtn""#), "the diamond button is still there");
     }
 
     #[test]
