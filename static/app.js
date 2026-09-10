@@ -3725,6 +3725,16 @@ function renderSearch(results) {
     const n = results.skipped_nested;
     parts.push(`${n} nested ${n === 1 ? "checkout" : "checkouts"} not searched`);
   }
+  // The third decision, kept apart from the two above because the answer to
+  // "where is my build output" is a different answer from "where is my
+  // submodule" — and because this one has an override the others do not.
+  // Naming it is what makes the override findable: a directory the ignore
+  // matcher skipped wrongly is invisible otherwise, and this module's ignore
+  // support is deliberately partial.
+  if (results.skipped_ignored) {
+    const n = results.skipped_ignored;
+    parts.push(`${n} gitignored ${n === 1 ? "directory" : "directories"} not searched — show hidden files to include them`);
+  }
   if (!parts.length && !searchRows.length) parts.push("no matches");
   // The other half of the honesty line, and the one the server cannot supply:
   // below three characters wsconn.rs sets `Query::contents = false`, so the
