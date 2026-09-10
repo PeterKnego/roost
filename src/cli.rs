@@ -250,6 +250,12 @@ pub fn run_claude_hook() -> i32 {
         return 0;
     }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) else { return 0 };
+    // Before the `hook_message` gate, deliberately. `SessionStart` produces no
+    // notification and so returns `None` below — and `SessionStart` is the one
+    // event that carries the id of a session which may never finish a turn,
+    // which is exactly the session a crash interrupts. Recording after the
+    // gate would record every session except the ones worth recovering.
+    crate::claudesess::record_from_hook(&v);
     let Some((title, body)) = hook_message(&v) else { return 0 };
     let seq = notify_sequence(&title, &body);
     let mut tty_file = tty();

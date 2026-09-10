@@ -139,3 +139,104 @@ fn claude_hook_subcommand_exits_zero_and_silent_in_every_hands_off_case() {
         assert!(stderr.contains(roost::cli::NO_TERMINAL_NOTICE), "{stderr}");
     }
 }
+
+/// The wiring no unit test reaches: `roost claude-hook` really being handed a
+/// payload on stdin, by the real binary, with the environment a hook inherits.
+///
+/// The parse and the write have their own tests in `claudesess`. What only the
+/// real binary can show is the *ordering* in `cli::run_claude_hook` — the
+/// record has to be taken before `hook_message`'s gate, because `SessionStart`
+/// produces no notification and returns `None` there, and `SessionStart` is
+/// the one event carrying the id of a session that may never finish a turn.
+/// Record after the gate and every recoverable session is the one you lose.
+#[test]
+fn the_hook_records_a_session_start_even_though_it_notifies_nothing() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let bin = env!("CARGO_BIN_EXE_roost");
+    let state = tempfile::tempdir().expect("state dir");
+    let project = "hookrec";
+
+    let fire = |event: &str, id: &str| {
+        let payload = format!(
+            r#"{{"hook_event_name":"{event}","session_id":"{id}",
+                 "transcript_path":"/tmp/{id}.jsonl","cwd":"/tmp"}}"#
+        );
+        let mut child = Command::new(bin)
+            .arg("claude-hook")
+            .env("ROOST_NOTIFY", "1")
+            .env("ROOST_STATE_DIR", state.path())
+            .env("ROOST_PROJECT", project)
+            .env("ROOST_SESSION", "term")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn roost claude-hook");
+        let _ = child.stdin.take().unwrap().write_all(payload.as_bytes());
+        let out = child.wait_with_output().expect("wait");
+        // Exit 0 and nothing on stdout, always: Claude Code reads hook stdout
+        // as a decision, and a non-zero exit shows an error in the transcript.
+        assert!(out.status.success(), "{event}: {out:?}");
+        assert!(out.stdout.is_empty(), "{event}: {out:?}");
+    };
+
+    let marker = state.path().join("claude").join(project).join("term.json");
+    assert!(!marker.exists(), "setup: nothing recorded yet");
+
+    fire("SessionStart", "aaaa1111-2222-3333-4444-555555555555");
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker).expect("SessionStart was recorded")).unwrap();
+    assert_eq!(v["session_id"], "aaaa1111-2222-3333-4444-555555555555");
+    assert_eq!(v["event"], "SessionStart", "and it knows which event taught it that");
+
+    // A later Stop for the same terminal replaces it, so the record follows
+    // the session actually running rather than the first one ever seen.
+    fire("Stop", "bbbb1111-2222-3333-4444-555555555555");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(v["session_id"], "bbbb1111-2222-3333-4444-555555555555");
+    assert_eq!(v["event"], "Stop");
+}
+
+/// A hook that is not running in a roost terminal records nothing, and the
+/// name it would have recorded under comes from an environment a user can set
+/// by hand.
+#[test]
+fn a_hook_outside_a_roost_terminal_records_nothing() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let bin = env!("CARGO_BIN_EXE_roost");
+    let state = tempfile::tempdir().expect("state dir");
+
+    let fire = |session: &str| {
+        let mut child = Command::new(bin)
+            .arg("claude-hook")
+            .env("ROOST_NOTIFY", "1")
+            .env("ROOST_STATE_DIR", state.path())
+            .env("ROOST_PROJECT", "hooknone")
+            .env("ROOST_SESSION", session)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        let _ = child.stdin.take().unwrap().write_all(
+            br#"{"hook_event_name":"Stop","session_id":"cccc1111-2222","transcript_path":"/tmp/c.jsonl"}"#,
+        );
+        assert!(child.wait_with_output().expect("wait").status.success());
+    };
+
+    // Asserts the state it negates: a well-formed name does record, so the
+    // refusals below are not a binary that records nothing at all.
+    fire("term");
+    assert!(
+        state.path().join("claude").join("hooknone").join("term.json").exists(),
+        "setup: a well-formed terminal name records"
+    );
+
+    fire("../escape");
+    assert!(
+        !state.path().join("claude").join("escape.json").exists(),
+        "a terminal name that is not a session name writes nothing, and nothing outside the directory"
+    );
+}
