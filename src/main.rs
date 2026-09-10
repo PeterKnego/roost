@@ -72,6 +72,10 @@ fn main() {
     // the host's real process table on a timer, which the test servers
     // `serve` starts have no business doing.
     roost::claudes::watch();
+    // Same reasoning again: another timer over the real process table, and the
+    // one that makes a terminal come back from a reboot in the directory it
+    // was working in.
+    roost::cwds::watch();
     eprintln!("roost listening on http://127.0.0.1:{port}");
     roost::serve(listener, roots);
 }

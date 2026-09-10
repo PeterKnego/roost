@@ -41,7 +41,7 @@ pub fn valid_name(name: &str) -> bool {
 /// by `resolve_project`, before this project had a `dir` to reach here with.
 /// Without this, no worktree's terminal can ever start: `attach` rejects
 /// the project string before it gets anywhere near a shell.
-fn valid_project(project: &str) -> bool {
+pub(crate) fn valid_project(project: &str) -> bool {
     if project.is_empty() {
         return false;
     }
@@ -519,7 +519,15 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
             .map_err(|e| e.to_string())?;
         let mut cb = CommandBuilder::new(&cmd[0]);
         cb.args(&cmd[1..]);
-        cb.cwd(dir);
+        // The dtach *client's* cwd, which matters only when there is no socket
+        // to attach to: in that case dtach forks a master and the shell
+        // inherits this. So this is where a reboot gets undone — a session
+        // being created starts where its shell was last seen, a session being
+        // rejoined already has a cwd of its own and `dir` is inert.
+        //
+        // Gated on `rejoining` anyway. It costs nothing and it keeps the two
+        // cases legible: only a *new* shell is being placed anywhere.
+        cb.cwd(if rejoining { dir.to_path_buf() } else { crate::cwds::restore_dir(project, name, dir) });
         for (k, v) in session_env(project, name, crate::ide::port_for(project)) {
             cb.env(k, v);
         }
@@ -1010,6 +1018,11 @@ pub fn end_session(project: &str, name: &str) -> bool {
             let _ = s.child.wait();
         }
     } // lock released before any blocking socket work — see `attach`
+    // The name is now free for reuse (`next_free_name` hands `term` back out),
+    // and a stale marker would drop the *next* shell of that name into the
+    // ended one's directory. Best-effort: a marker that will not unlink must
+    // not cost the user their close, and `restore_dir` re-validates anyway.
+    crate::cwds::forget(project, name);
     end_socket(project, name, "End session")
 }
 
