@@ -1268,13 +1268,22 @@ header button.proj:hover svg { opacity: 1; }
      A browser test missed it because both boxes share a centre line while one
      hangs out of the other; the screenshot did not.
      Matching the original selector so the height can actually give way. */
-  .tabstrip .tab { height: auto; min-height: 44px; padding: 4px 10px; gap: 4px; }
+  .tabstrip .tab { height: auto; min-height: 44px; padding: 2px 4px 2px 8px; gap: 4px; }
+  /* The target is 28px because a finger needs one; the *glyph* has to stay
+     next to the label it closes. Centring a 13px × in a 28px box puts seven
+     pixels of nothing on each side, and with the tab's own gap and a margin on
+     top of that the × ended up some twenty pixels adrift — attached to
+     nothing, which is what it looked like. Negative margin pulls the box back
+     over that padding: the hit area keeps its size, the glyph moves in. */
   .tabstrip .tab .x { display: inline-flex; align-items: center; justify-content: center;
-                      width: 28px; height: 28px; margin-left: 4px; padding: 0;
+                      width: 28px; height: 28px; margin: 0 -6px 0 -4px; padding: 0;
                       line-height: 1; flex: 0 0 auto;
-                      /* No hover on a phone, so the control cannot be
-                         revealed by one — it is always legible. */
-                      opacity: .75; }
+                      /* No hover on a phone, so a control that only appears
+                         under one never appears. `.active` carries a higher
+                         specificity than a bare `.tab .x`, so both are named
+                         or the open tab keeps the desktop's faded value. */
+                      opacity: .8; }
+  .tabstrip .tab.active .x, .tabstrip .tab:hover .x { opacity: .8; }
 
   /* A phone has no hover. Every affordance revealed by one needs a press
      state, or it is invisible until it is already activated. */

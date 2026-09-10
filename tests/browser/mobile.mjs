@@ -609,6 +609,33 @@ try {
   ok(fits.over === 0,
      `and it is inside the tab, not overflowing it (tab ${fits.tabH}px, × ${fits.xH}px, over ${fits.over}px)`);
   ok(fits.tabH >= 44, `with the tab itself finger-sized too (${fits.tabH}px)`);
+
+  // Found by reading the measurements rather than the assertions: on the
+  // desktop the × is `opacity: 0` until the tab is hovered or active. A phone
+  // has no hover, so on every *inactive* tab the control was simply not there
+  // — and no test had ever asked whether it could be seen, only where it was.
+  //
+  // A second tab is opened for exactly that reason: with one tab it is always
+  // the active one, and the active tab was never the broken case.
+  await evalIn(`send({ t: "NewTerminal", pane: 3 })`);
+  ok(await until(async () => (await evalIn(
+       `document.querySelectorAll('.pane[data-pane="3"] .tabstrip .tab').length`)) >= 2, 15, "a second tab"),
+     "setup: a second tab, so one of them is inactive");
+  const seen = await evalIn(`[...document.querySelectorAll('.pane[data-pane="3"] .tabstrip .tab .x')]
+    .map((e) => Number(getComputedStyle(e).opacity))`);
+  ok(seen.length >= 2 && seen.every((o) => o > 0.5),
+     `every tab's × is legible without a hover (${JSON.stringify(seen)})`);
+
+  // And the cost of making the tabs finger-sized: two 44px tabs plus the pane
+  // icons stopped fitting across 390px and wrapped to a second row, which took
+  // 44 more pixels off a pane that has 16% of the screen already. Asserted as
+  // rows rather than pixels — the fix was to stop the × floating twenty pixels
+  // from its label, and the row count is what that bought.
+  const tabRows = await evalIn(`(() => {
+    const tops = [...document.querySelectorAll('.pane[data-pane="3"] .tabstrip .tab')]
+      .map((t) => Math.round(t.getBoundingClientRect().top));
+    return new Set(tops).size; })()`);
+  ok(tabRows === 1, `two tabs and the pane icons still share one row (${tabRows} rows)`);
   ok(x.d.includes("flex") && x.a === "center" && x.j === "center",
      `and the glyph is centred in it, not merely inside it (${JSON.stringify(x)})`);
   // Reported twice, the second time with a screenshot: centring the glyph
