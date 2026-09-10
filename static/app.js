@@ -1266,6 +1266,12 @@ function wireFileLinks(root) {
       // or htmx's own delegated listener would also fire and log a swap
       // error trying to target it.
       e.stopPropagation();
+      // A modified click picks rows to mention instead of opening one. Plain
+      // click still opens, untouched: opening a file is the tree's primary
+      // job and making it worse to gain a secondary one is a bad trade.
+      if (a.classList.contains("file") && (e.ctrlKey || e.metaKey || e.shiftKey)) {
+        return pickTreeRow(a, e.shiftKey && !e.ctrlKey && !e.metaKey);
+      }
       const rel = a.dataset.rel;
       const isDiff = a.getAttribute("hx-get")?.includes("/diff");
       send({
@@ -1282,6 +1288,89 @@ function wireFileLinks(root) {
     };
     a.oncontextmenu = (e) => { e.preventDefault(); fileMenu(e, a.dataset.rel); };
   });
+  paintTreePicked(root);
+}
+
+// --- picking files in the tree, to mention several at once ----------------
+//
+// A separate state from the tree's `.sel` row, and deliberately so. `.sel` is
+// the server's answer to "which file are you looking at" (`?open=`); this is
+// the user's answer to "which files do I want to hand to Claude next". They
+// are different questions with different lifetimes — one follows your tabs,
+// the other is a gesture you make and then spend — and collapsing them would
+// mean opening a file silently changed what Alt+K is about to send.
+//
+// Client-local, and not mirrored. roost mirrors workspace state across
+// browsers because it is shared *document* state; a pick is one viewer's
+// intent about what to do in the next second. Mirroring it would mean a
+// second browser's Alt+K sending files this one had chosen, which is the
+// "silently mentioning the wrong file" failure the binding is already
+// careful about.
+//
+// Held as rels rather than as DOM classes because the tree is re-rendered
+// under it — every TreeChanged reconciles the listing — so a class alone
+// would be dropped by the next filesystem write Claude makes.
+const treePicked = new Set();
+let lastPickedRel = null;
+
+/// At most this many paths from one Alt+K. A shift-range over a large
+/// directory is one gesture away, and each pick becomes a line typed into a
+/// terminal — an unbounded mention is a self-inflicted flood, not a feature.
+/// Sixteen, matching this codebase's other per-request bounds, and it names
+/// itself when it fires.
+const MAX_MENTIONS = 16;
+
+function pickTreeRow(a, range) {
+  const rel = a.dataset.rel;
+  if (!rel) return;
+  const rows = [...a.closest(".content").querySelectorAll("a.file[data-rel]")];
+  if (range && lastPickedRel) {
+    const from = rows.findIndex((r) => r.dataset.rel === lastPickedRel);
+    const to = rows.indexOf(a);
+    if (from >= 0 && to >= 0) {
+      for (let i = Math.min(from, to); i <= Math.max(from, to); i++) {
+        treePicked.add(rows[i].dataset.rel);
+      }
+      lastPickedRel = rel;
+      return paintTreePicked(a.closest(".content"));
+    }
+  }
+  if (treePicked.has(rel)) treePicked.delete(rel);
+  else treePicked.add(rel);
+  lastPickedRel = rel;
+  paintTreePicked(a.closest(".content"));
+}
+
+/// Repaints the picked rows. Called after every tree render as well as on
+/// every pick, because the set outlives the DOM nodes it marks.
+function paintTreePicked(root) {
+  if (!root) return;
+  root.querySelectorAll("a.file[data-rel]").forEach((a) => {
+    a.classList.toggle("picked", treePicked.has(a.dataset.rel));
+  });
+}
+
+function clearTreePicked() {
+  if (!treePicked.size) return;
+  treePicked.clear();
+  lastPickedRel = null;
+  document.querySelectorAll(".content").forEach(paintTreePicked);
+}
+
+/// The picked paths in tree order, so what arrives at Claude reads in the
+/// order the user sees rather than in the order they happened to click.
+function pickedInTreeOrder() {
+  if (!treePicked.size) return [];
+  const seen = [];
+  document.querySelectorAll(".content a.file[data-rel]").forEach((a) => {
+    if (treePicked.has(a.dataset.rel) && !seen.includes(a.dataset.rel)) seen.push(a.dataset.rel);
+  });
+  // A pick whose row has since disappeared (a directory collapsed, a file
+  // renamed under us) is still a path the user chose. Kept, at the end,
+  // rather than silently dropped — dropping it would turn "mention these
+  // four" into "mention these three" with nothing saying so.
+  treePicked.forEach((rel) => { if (!seen.includes(rel)) seen.push(rel); });
+  return seen;
 }
 
 function wireFragment(content) {
@@ -2192,6 +2281,34 @@ function mentionSelection(rel) {
 // character literal.
 document.addEventListener("keydown", (e) => {
   if (!e.altKey || (e.code !== "KeyK" && e.key.toLowerCase() !== "k" && e.key !== "˚")) return;
+  // A tree pick outranks the active tab, and the reason is visibility. The
+  // active tab is ambient — it is whatever you last opened — while a pick is
+  // a gesture you just made and can see highlighted, so it is the one you
+  // are more likely to have meant. The ambiguity the issue warns about is
+  // resolved by that plus two things below: the picks are painted, so what
+  // will be sent is on screen, and they are cleared once spent, so a
+  // forgotten selection cannot hijack a later Alt+K.
+  const picked = pickedInTreeOrder();
+  if (picked.length) {
+    e.preventDefault();
+    const session = activeTerminalSession();
+    // One `MentionPath` per path rather than a batched intent. The protocol
+    // already carries exactly this, the socket delivers in order, and a
+    // second wire shape for "the same thing, plural" is a cost with no
+    // matching gain — the receiving end sees a list either way.
+    const send_n = picked.slice(0, MAX_MENTIONS);
+    for (const rel of send_n) {
+      send({ t: "MentionPath", rel, line_start: null, line_end: null, session });
+    }
+    clearTreePicked();
+    // The cap names itself, like every other bound in this codebase. Silence
+    // here would mean four of twenty files arriving with nothing to say the
+    // other sixteen were dropped.
+    if (picked.length > MAX_MENTIONS) {
+      showError(`mentioned the first ${MAX_MENTIONS} of ${picked.length} selected files`);
+    }
+    return;
+  }
   const target = mentionTarget();
   if (target === null) {
     // Alt+K is Meta-k in readline, so a keystroke aimed at a shell must not
@@ -2200,7 +2317,7 @@ document.addEventListener("keydown", (e) => {
     if (e.target && e.target.closest && e.target.closest(".xterm")) return;
     // Silence here is indistinguishable from a broken binding, which is how
     // this was reported in the first place.
-    showError("Alt+K mentions the file in the active tab — open a file first.");
+    showError("Alt+K mentions the file in the active tab, or the files picked in the tree — open a file, or ctrl/⌘-click some.");
     return;
   }
   e.preventDefault();

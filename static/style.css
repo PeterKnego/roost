@@ -991,3 +991,10 @@ dialog.roost.dlg-wide { width: min(760px, 96vw); }
 .dlg-tile .swatch { display: block; width: 100%; height: 6px; border-radius: 3px; background: var(--tile-accent, var(--color-primary)); }
 .dlg-tile[aria-pressed="true"] { border-color: var(--accent); }
 .dlg-tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Rows picked to be mentioned. A different question from `.sel` — which file
+   you are looking at — so a different mark: an accent bar on the leading edge
+   rather than a filled row, so a picked row that is *also* the current one
+   still reads as both. --row-on, not --tool: a highlight has to be mixed
+   against the surface it is drawn on. */
+.content a.file.picked { background-color: var(--row-on); box-shadow: inset 2px 0 0 var(--accent); }
