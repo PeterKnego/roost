@@ -458,6 +458,34 @@ site; do not "simplify" them away:
 | Content that fits one screen | `dtach`'s redraw opens with `\e[H\e[J`, which hides duplicated output all by itself — the no-duplication assertion passes with the reset deleted. Scroll past one screen first. |
 | The default 800x600 headless window | Narrower than the default left (260px) and right (520px) panes together: the middle column collapses and the right pane hangs off the viewport. A layout assertion then measures *that*, and `elementFromPoint` returns null off-screen, so a reachability test fails (or passes) for the wrong reason. Override the metrics — see `tabwrap.mjs` and `save.mjs`, where a layout assertion measured 1px of overshoot instead of the real 26px until the viewport was widened. |
 
+## Measuring what they cover
+
+`cargo llvm-cov` measures `src/` and cannot see a line of `static/*.js` —
+which is a fifth of the shipped code. This does:
+
+```sh
+deno run -A tests/browser/coverage.mjs            # every test
+deno run -A tests/browser/coverage.mjs --only search,dotfiles
+```
+
+It runs each test with `ROOST_JS_COV` set, which makes the harness dump each
+page's V8 precise-coverage report as it closes, then **unions the covered byte
+ranges across every test**. The union is the point: each test drives a narrow
+slice and they all share the same startup path, so averaging per-test
+percentages would count that path forty times over.
+
+Two things to know before reading a number from it:
+
+- **Instrumentation is not free.** `altscreen.mjs` is throughput-bound — it
+  pushes 1 MB of output to turn the ring over — and times out under coverage
+  while passing in 8 seconds without it. A failure in a coverage run is not
+  automatically a regression, and the total is a slight under-estimate.
+- **Bytes, not lines.** V8 reports offsets. Converting to lines would call a
+  line covered because one expression on it ran.
+
+Coverage is off unless `ROOST_JS_COV` is set, so an ordinary run of any test
+is completely unaffected.
+
 ## What these cannot prove
 
 A real browser on this host is still one browser on one platform. Safari and
