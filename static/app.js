@@ -809,7 +809,32 @@ function render() {
     // so a pendingLink still pointing at it must not outlive it.
     if (pendingLink && pendingLink.entry === e) pendingLink = null;
   });
+
+  // Following runs on a *change* of active file, not on every State. A State
+  // snapshot arrives on every EditBuffer — including the debounce of the
+  // user's own typing — so following unconditionally here would fire a tree
+  // fetch a few times a second while someone edits, and re-scroll the pane
+  // under them each time.
+  const nowActive = activeFileRel();
+  if (nowActive !== lastFollowed) {
+    lastFollowed = nowActive;
+    followTreeTo(nowActive);
+  } else if (nowActive) {
+    // The tab did not change, but this render may have rebuilt the tree's
+    // pane (a Tree tab activated, a fragment re-fetched). Re-marking is local
+    // and costs no request; expanding is what we skip.
+    state.panes.forEach((pane, pi) => {
+      const a = pane.tabs[pane.active];
+      if (!a || a.k !== "Tree") return;
+      const content = document.querySelector(`.pane[data-pane="${pi}"] .content`);
+      if (content && followTree()) markTreeRow(content, nowActive);
+    });
+  }
 }
+
+/// The file the tree was last expanded to, so following costs a request only
+/// when the answer actually changes.
+let lastFollowed = "";
 
 // Per-pane header controls. Everything here drives an existing intent, so the
 // result mirrors to other browsers and survives a restart exactly like a drag
@@ -976,7 +1001,7 @@ function mountTab(content, t) {
   if (t.k === "File" && t.mode === "Edit") { mountEditor(content, t.rel); return; }
   if (t.k === "Proposal") { renderProposal(content, t); return; }
   const url =
-    t.k === "Tree" ? `/frag/${PROJECT}/tree`
+    t.k === "Tree" ? `/frag/${PROJECT}/tree${followTree() && activeFileRel() ? `?open=${encodeURIComponent(activeFileRel())}` : ""}`
     : t.k === "Changes" ? `/frag/${PROJECT}/changes`
     : t.k === "File" ? `/frag/${PROJECT}/file?path=${encodeURIComponent(t.rel)}`
     : `/frag/${PROJECT}/diff${t.rel ? "?path=" + encodeURIComponent(t.rel) : ""}`;
@@ -1206,6 +1231,126 @@ function reconcileList(ul, html) {
   ordered.forEach((li) => ul.appendChild(li));
   wireFileLinks(ul); // see wireFileLinks: no container oncontextmenu here
   window.htmx && htmx.process(ul);
+}
+
+/// Whether the tree follows the file you are looking at. Project-scoped; see
+/// `Settings::follow_tree` for why that is safe and why it defaults on.
+function followTree() {
+  return document.body.dataset.followTree !== "0";
+}
+
+/// The file the user is looking at, or "" — the active `File` tab of the
+/// middle or right pane, middle first. Deliberately the same shape of
+/// question `mentionTarget()` asks, and deliberately *not* the focused
+/// editor: the tree should follow a file opened by a Claude link too, and
+/// that lands in a tab without taking focus.
+function activeFileRel() {
+  for (const pi of [MIDDLE, RIGHT]) {
+    const p = state && state.panes[pi];
+    const t = p && p.tabs[p.active];
+    if (t && t.k === "File" && t.rel) return t.rel;
+  }
+  return "";
+}
+
+/// Expands the tree to `rel` and marks its row, without collapsing anything.
+///
+/// One request, not one per level. `tree_level` already expands every
+/// ancestor of `?open=` inline and recursively — "so the file is visible on
+/// load with no extra round trip" — so the whole path arrives together and
+/// the four sequential fetches a naive `data-rel` walk would cost never
+/// happen.
+///
+/// The merge is where the care is. A wholesale replace would land the path
+/// and collapse everything else the user had opened, which is the thing that
+/// makes an auto-expanding tree hostile. `mergeTreePath` keeps every existing
+/// node instead, and only *descends* into the ones that are open — with one
+/// exception that is safe precisely because it is empty: a **closed**
+/// `<details>` has never been fetched (`hx-trigger="toggle once"`), so its
+/// `<ul>` holds nothing, and swapping it for the server's expanded copy
+/// cannot lose a single expanded descendant.
+function followTreeTo(rel) {
+  if (!followTree() || !rel || !state) return;
+  state.panes.forEach((pane, pi) => {
+    const active = pane.tabs[pane.active];
+    if (!active || active.k !== "Tree") return;
+    const content = document.querySelector(`.pane[data-pane="${pi}"] .content`);
+    const root = content && content.querySelector(":scope > ul.tree");
+    if (!root) return;
+    fetch(`/frag/${PROJECT}/tree?dir=&open=${encodeURIComponent(rel)}`)
+      .then((r) => r.text())
+      .then((html) => {
+        mergeTreePath(root, html, rel);
+        markTreeRow(content, rel);
+      })
+      .catch(() => {}); // a failed follow is a tree that did not move, not an error
+  });
+}
+
+/// Ancestors of `rel` plus `rel` itself: "a/b/c.rs" -> a, a/b, a/b/c.rs.
+function relChain(rel) {
+  const parts = rel.split("/");
+  return parts.map((_, i) => parts.slice(0, i + 1).join("/"));
+}
+
+/// Merges one level, preferring existing nodes everywhere except along the
+/// path to `rel`, where a closed (and therefore empty) node is replaced by
+/// the server's expanded one and an open one is recursed into.
+function mergeTreePath(ul, html, rel) {
+  const onPath = new Set(relChain(rel));
+  const fresh = document.createElement("ul");
+  fresh.innerHTML = html;
+  const existing = new Map();
+  Array.from(ul.children).forEach((li) => {
+    const id = treeItemId(li);
+    if (id) existing.set(id, li);
+  });
+  const ordered = Array.from(fresh.children).map((li) => {
+    const id = treeItemId(li);
+    const old = id && existing.get(id);
+    if (!old) return li;
+    const oldDetails = old.querySelector(":scope > details[data-rel]");
+    const newDetails = li.querySelector(":scope > details[data-rel]");
+    if (oldDetails && newDetails && onPath.has(oldDetails.dataset.rel)) {
+      if (!oldDetails.open) {
+        // Never fetched, so nothing to lose: take the expanded copy whole.
+        return li;
+      }
+      // Already open and possibly holding the user's own expansions further
+      // down. Keep it and recurse, so this level's descent continues without
+      // touching anything off the path.
+      const oldUl = oldDetails.querySelector(":scope > ul");
+      const newUl = newDetails.querySelector(":scope > ul");
+      if (oldUl && newUl) mergeTreePath(oldUl, newUl.innerHTML, rel);
+      return old;
+    }
+    return old;
+  });
+  ul.innerHTML = "";
+  ordered.forEach((li) => ul.appendChild(li));
+  wireFileLinks(ul);
+  window.htmx && htmx.process(ul);
+}
+
+/// Marks `rel`'s row as the current one and scrolls it into view.
+///
+/// `block: "nearest"` never scrolls a row that is already visible, which is
+/// what keeps following from yanking the pane on every tab switch within one
+/// directory. The class is the same `.sel` the server already puts on the
+/// `?open=` row, so there is one appearance for "this is the current file"
+/// rather than two that can drift.
+function markTreeRow(content, rel) {
+  content.querySelectorAll("a.file.sel").forEach((a) => a.classList.remove("sel"));
+  const row = content.querySelector(`a.file[data-rel="${cssEscape(rel)}"]`);
+  if (!row) return;
+  row.classList.add("sel");
+  row.scrollIntoView({ block: "nearest" });
+}
+
+/// A filename can contain a quote, a bracket, anything — it comes off the
+/// filesystem, not from us — so it cannot go into a selector raw.
+function cssEscape(s) {
+  return window.CSS && CSS.escape ? CSS.escape(s) : s.replace(/["\\]/g, "\\$&");
 }
 
 // TreeChanged fires on every filesystem write — including every file Claude
