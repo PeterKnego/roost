@@ -1070,3 +1070,145 @@ header button.proj:hover svg { opacity: 1; }
    something you had is not there any more, and nothing else on the page says
    so. */
 .termstart .termlost { color: #d29922; max-width: 46ch; margin: 0 0 10px; }
+
+/* The switcher itself. Present in the DOM at every width — a desktop window
+   dragged narrow has to grow one without a reload — and shown only by the
+   block above. */
+#mobilebar { display: none; align-items: stretch; gap: 2px; padding: 4px;
+             background: var(--tool); border-top: 1px solid var(--border); }
+#mobilebar button { flex: 1; display: flex; flex-direction: column; align-items: center;
+                    justify-content: center; gap: 2px; padding: 4px 0; border: 0; border-radius: 8px;
+                    background: none; color: var(--muted); font: inherit; font-size: 11px;
+                    cursor: pointer; -webkit-tap-highlight-color: transparent; }
+#mobilebar button[aria-pressed="true"] { color: var(--fg); background: var(--tab-hover); }
+#mobilebar button:active { background: var(--tab-hover); }
+/* Kept legible when a pane has something waiting in it: the same dot the tab
+   strip uses, because "there is a change you have not looked at" is the one
+   thing a switcher has to say that a plain tab bar does not. */
+#mobilebar button .dot { position: absolute; margin: -14px 0 0 18px; width: 6px; height: 6px;
+                         border-radius: 50%; background: var(--accent, #d29922); }
+
+/* ============================ phone layout ============================ */
+/* Until this block existed there was no phone layout at all — not a cramped
+   one. The grid asks for ~790px of fixed columns before the middle pane gets a
+   single pixel, on a viewport that is 390px wide, and the viewport meta tells
+   the browser to lay out at device width and then try. So the workspace was
+   reachable from a phone (the tunnel works, the login works) and unusable on
+   arrival.
+
+   These are overrides on a desktop stylesheet rather than a mobile-first
+   rewrite, which is a deliberate trade: inverting 1000 lines of working CSS
+   blind, on a project whose every affordance is hover- or drag-driven, risks
+   far more than it buys.
+
+   The organising decision is #15's: a phone is not a small desktop, it is a
+   different job. Three panes side by side is not a layout that shrinks — it is
+   the wrong shape. One pane at a time, with a switcher, is the shape.
+
+   The number is a measurement rather than a convention. The fixed columns
+   cost 260 + 8 + 8 + 520 plus 12px of padding = 808px before the middle pane
+   gets one pixel, so the three-pane layout has nothing left to give well
+   before a phone width: measured on a real page, 768px (every tablet) put the
+   middle pane at **2px** and made the document scroll horizontally —
+   `scrollWidth` 804 against a 768 viewport — which the workspace rules forbid
+   by name. A landscape phone at 844px was the same.
+
+   `pointer: coarse` was tried here first, to catch a landscape phone without
+   claiming a narrow desktop window. It is not verifiable in this project's
+   own browser tests — chrome-headless-shell answers `coarse` at every size,
+   so a run cannot tell the two apart — and a layout rule nobody can test is
+   worth less than a blunter one that every run checks. A desktop window
+   dragged below 900px gets the phone layout, and that is the better of the
+   two things that can happen to it: the alternative, measured above, is a 2px
+   pane and a sideways scrollbar. */
+@media (max-width: 900px) {
+  /* One cell. Every pane is placed in it and all but the chosen one is
+     removed from the layout, so nothing depends on --left-w/--right-w — which
+     `render()` still writes on every State broadcast, harmlessly. */
+  #grid {
+    padding: 4px;
+    gap: 0;
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr;
+    /* dvh, not vh: a soft keyboard shrinks the visual viewport and `100vh`
+       does not notice, which puts the pane switcher under the keyboard —
+       exactly where the terminal's send affordance must not be. The vh line
+       is the fallback for anything without dvh, and must stay first. */
+    height: calc(100vh - var(--header-h, 36px) - var(--mobilebar-h, 56px));
+    height: calc(100dvh - var(--header-h, 36px) - var(--mobilebar-h, 56px));
+  }
+  #grid > .pane { grid-column: 1; grid-row: 1; }
+  /* `display:none`, not `visibility`/`hidden`: an xterm in a pane that still
+     occupies layout would keep being measured and fitted at the wrong size.
+     A hidden pane measures zero instead, which app.js's switch handler then
+     re-fits — see `showMobilePane`. */
+  body[data-mpane="0"] #grid > .pane:not([data-pane="0"]),
+  body[data-mpane="1"] #grid > .pane:not([data-pane="1"]),
+  body[data-mpane="2"] #grid > .pane:not([data-pane="2"]),
+  body[data-mpane="3"] #grid > .pane:not([data-pane="3"]) { display: none; }
+  /* No pointer to drag them with, and nothing to resize when one pane fills
+     the screen. */
+  #grid > .divider { display: none; }
+
+  #mobilebar { display: flex; }
+
+  /* The header is a single row of a dozen controls at desktop width. Here it
+     wraps rather than pushing the project name off-screen, and the search
+     field — which uses margin:auto to centre — takes the full second row. */
+  header { flex-wrap: wrap; height: auto; padding: 4px 6px; row-gap: 4px; }
+  header .vsep { display: none; }
+  #searchbox { order: 99; flex: 1 0 100%; margin: 0; }
+  /* 16px is not a style choice: iOS zooms the whole page when a focused input
+     is smaller, and the zoom does not come back on blur. Every field the
+     workspace can focus needs it, not just this one. */
+  #searchbox input, #dlg-input, .dlg-row input, .dlg-row textarea,
+  .content textarea, .codeinput textarea { font-size: 16px; }
+  #searchbox kbd { display: none; }
+  /* Text, not a shortcut hint nobody can type. */
+  #closeproj span { display: none; }
+  /* Measured before trimming: the header wrapped to FOUR rows at 390px and
+     header plus switcher took 22% of the screen — before a soft keyboard takes
+     half of what is left. Two controls go, and both have another route on a
+     phone: `refresh` is what the browser's own reload does, and `projbtn`
+     opens the running-projects strip that the home link reaches anyway. The
+     rest stay, because nothing else here can be got to another way. */
+  #refresh, #projbtn { display: none; }
+
+  /* Tap targets. 44px is the floor Apple and Android both publish, and the
+     desktop sizes here are 20px. Widened rather than made taller where the
+     row height is load-bearing (the tab strip sets the pane's header height),
+     via padding, so the strip does not grow four rows deep. */
+  header button, #mobilebar button { min-height: 44px; min-width: 44px; }
+  .paneicon { width: 32px; height: 32px; }
+  .tab { padding: 10px 12px; }
+  .tab .x { width: 28px; height: 28px; margin-left: 4px; }
+
+  /* A phone has no hover. Every affordance revealed by one needs a press
+     state, or it is invisible until it is already activated. */
+  .paneicon:active, header button:active, .tab:active { background: var(--tab-hover); color: var(--fg); }
+
+  /* The search results panel is anchored under the search field on desktop.
+     At this width there is nothing to anchor to — it fills the screen. */
+  #searchoverlay .searchpanel { left: 4px !important; right: 4px !important; width: auto !important; max-width: none; }
+  /* A dialog sized for a 1400px window has to stop being one. */
+  dialog.roost { width: calc(100vw - 24px); max-width: none; }
+  .dlg-row { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ---- the band just above the phone breakpoint ---- */
+/* At 1000px the middle pane is 192px — not broken, but the narrowest useful
+   thing on the screen is the one holding the file you are reading. `min()`
+   against the var rather than a replacement for it, so above this band a
+   drag-resized width is used untouched and nothing here can cap how wide a
+   person may drag a pane on a real screen. Inside it, the side columns give
+   way before the middle pane does. */
+@media (min-width: 901px) and (max-width: 1100px) {
+  #grid {
+    grid-template-columns:
+      minmax(0, min(var(--left-w, 260px), 22vw))
+      var(--divider)
+      minmax(200px, 1fr)
+      var(--divider)
+      minmax(0, min(var(--right-w, 520px), 38vw));
+  }
+}
