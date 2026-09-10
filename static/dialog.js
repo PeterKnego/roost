@@ -288,6 +288,7 @@ function openSettings(settings) {
   const scopeBar = el.querySelector(".dlg-scope");
   const rows = el.querySelector(".dlg-rows");
   const themes = el.querySelector(".dlg-themes");
+  const about = el.querySelector(".dlg-about");
   const okBtn = el.querySelector(".dlg-ok");
   const cancelBtn = el.querySelector(".dlg-cancel");
 
@@ -297,7 +298,7 @@ function openSettings(settings) {
 
   function renderTabs() {
     tabs.replaceChildren();
-    for (const [id, label] of [["settings", "General"], ["theme", "Theme"]]) {
+    for (const [id, label] of [["settings", "General"], ["theme", "Theme"], ["about", "About"]]) {
       const b = document.createElement("button");
       b.type = "button"; b.className = "dlg-tab"; b.dataset.tab = id; b.textContent = label;
       b.setAttribute("role", "tab"); b.setAttribute("aria-selected", String(pane === id));
@@ -484,10 +485,61 @@ function openSettings(settings) {
       document.head.insertBefore(l, document.head.firstChild);
     }
   }
+  /// What this binary is. `#56`: roost is deployed by building it and copying
+  /// a binary about, and nothing in the UI could answer "is this the thing I
+  /// built?" — a question this project has already got wrong twice (CLAUDE.md,
+  /// "Verify, don't trust") and once more on 2026-09-10, when a phone was
+  /// reported as still broken after a fix it had never fetched.
+  function renderAbout() {
+    about.replaceChildren();
+    const b = (view && view.build) || {};
+    const rowsOut = [
+      ["Version", b.version || "unknown", null],
+      // `-dirty` and a trailing `?` come from build.rs and are shown verbatim:
+      // "built from a1b2c3d" is false in the common case of a local build with
+      // edits in the tree, and this panel exists to be trusted.
+      ["Commit", b.commit || "unknown", null],
+      ["Built", fmtBuilt(b.built_epoch), null],
+      ["Repository", b.repository || "unknown", b.repository || null],
+    ];
+    for (const [label, value, href] of rowsOut) {
+      const r = document.createElement("div");
+      r.className = "dlg-row ro-row";
+      const t = document.createElement("div"); t.className = "text";
+      const l = document.createElement("label"); l.textContent = label; t.appendChild(l);
+      const v = document.createElement("div");
+      v.className = "ro" + (value === "unknown" ? " empty" : "");
+      if (href) {
+        const a = document.createElement("a");
+        a.href = href; a.textContent = value;
+        a.target = "_blank"; a.rel = "noopener noreferrer";
+        v.appendChild(a);
+      } else {
+        v.textContent = value;
+      }
+      r.append(t, v);
+      about.appendChild(r);
+    }
+  }
+
+  /// A build time as the reader's own local time. `0` means the build script
+  /// could not tell, which is a real answer and must not render as 1970.
+  function fmtBuilt(epoch) {
+    if (!epoch) return "unknown";
+    try { return new Date(epoch * 1000).toLocaleString(); } catch { return "unknown"; }
+  }
+
   function render() {
     renderTabs(); renderScope();
-    rows.hidden = pane !== "settings"; themes.hidden = pane !== "theme";
-    if (pane === "settings") renderRows(); else renderThemes();
+    rows.hidden = pane !== "settings";
+    themes.hidden = pane !== "theme";
+    about.hidden = pane !== "about";
+    // Nothing on this pane is editable, so the scope switch (which chooses
+    // *which file* a change is written to) has nothing to say about it.
+    scopeBar.hidden = pane === "about";
+    if (pane === "settings") renderRows();
+    else if (pane === "theme") renderThemes();
+    else renderAbout();
   }
 
   return runDialog(el, (finish) => {

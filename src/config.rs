@@ -586,6 +586,21 @@ pub fn raw_setting(path: &Path, key: &str) -> Option<SettingValue> {
 /// that field's doc comment), so the roughly twenty file reads here are paid
 /// once per invalidation, not once per snapshot — a snapshot goes out on
 /// every debounced keystroke.
+/// What the running binary is, from values `build.rs` baked in.
+///
+/// The repository URL comes from `Cargo.toml`'s `repository` field rather than
+/// a literal here, so there is one place it can be wrong.
+pub fn build_info() -> crate::proto::BuildInfo {
+    crate::proto::BuildInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        commit: option_env!("ROOST_GIT_HASH").unwrap_or("unknown").to_string(),
+        built_epoch: option_env!("ROOST_BUILD_EPOCH")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        repository: option_env!("CARGO_PKG_REPOSITORY").unwrap_or("").to_string(),
+    }
+}
+
 pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
     use crate::proto::{SettingRow, SettingsView, SettingValue as V};
     let global = global_config_path();
@@ -639,6 +654,7 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
          removing one is a hand edit of ~/.config/roost/config.toml.",
     );
     SettingsView {
+        build: build_info(),
         keys,
         themes: crate::themes::catalogue(),
         project_file: ".roost/config.toml".into(),
@@ -649,6 +665,72 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_build_info_never_reports_a_plausible_looking_unknown() {
+        // #56 exists because roost is deployed by building it and copying a
+        // binary about, and nothing in the UI could answer "is this the thing
+        // I built?". A panel that can be quietly wrong is worse than none, so
+        // every field either says something true or says `unknown` — never an
+        // empty string, which reads as a real value in a table.
+        let b = super::build_info();
+        assert_eq!(b.version, env!("CARGO_PKG_VERSION"));
+        assert!(!b.commit.is_empty(), "a blank commit reads as a real one");
+        // Built in this repo, from a checkout with git available, so the
+        // commit must be a real one — this is what fails if `build.rs` stops
+        // emitting it, which is the silent-degradation case: `unknown` is
+        // correct on a release tarball and wrong here.
+        assert_ne!(b.commit, "unknown", "built in a git checkout, so the hash is knowable");
+        let core = b.commit.trim_end_matches('?').trim_end_matches("-dirty");
+        assert!(
+            core.len() >= 7 && core.chars().all(|c| c.is_ascii_hexdigit()),
+            "not a commit hash: {}",
+            b.commit
+        );
+
+        // The `-dirty` suffix, checked against the tree it describes rather
+        // than allowed either way. "Built from a1b2c3d" is false in the common
+        // case of a local build with edits in the tree, and this panel exists
+        // to be trusted — so the assertion has to be able to see the suffix go
+        // missing. Written this way after a revert-check: dropping the whole
+        // `git status` branch from `build.rs` left an earlier version of this
+        // test green, because it accepted a bare hash as readily as a marked
+        // one.
+        //
+        // Skipped where the answer is not knowable — a release tarball, or a
+        // box with no `git` — because there the *right* answer is `unknown`
+        // and this assertion has nothing to say.
+        if b.commit != "unknown" && !b.commit.ends_with('?') {
+            let st = std::process::Command::new("git")
+                .args(["status", "--porcelain", "--untracked-files=no"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .output();
+            if let Ok(st) = st {
+                if st.status.success() {
+                    let tree_dirty = !st.stdout.is_empty();
+                    assert_eq!(
+                        b.commit.ends_with("-dirty"),
+                        tree_dirty,
+                        "the commit says dirty={} while the tree says dirty={}: {}",
+                        b.commit.ends_with("-dirty"),
+                        tree_dirty,
+                        b.commit
+                    );
+                }
+            }
+        }
+        assert!(b.built_epoch > 1_600_000_000, "a build time of {} is not a time", b.built_epoch);
+        assert!(b.repository.starts_with("https://"), "repository: {:?}", b.repository);
+    }
+
+    #[test]
+    fn the_settings_snapshot_carries_the_build_info() {
+        // The dialog reads this off the snapshot it already gets; without it
+        // the About pane renders four `unknown`s and nothing says why.
+        let d = tempfile::tempdir().unwrap();
+        let v = super::settings_view(d.path());
+        assert_eq!(v.build, super::build_info());
+    }
+
     use super::*;
     use crate::proto::{Scope, SettingValue as V};
     use std::fs;

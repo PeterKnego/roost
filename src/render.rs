@@ -1677,8 +1677,8 @@ dialog.roost, .dlg-title, .dlg-blocked { display: revert !important; visibility:
 /* The detail slot holds the diff a save conflict is about to overwrite; hiding
    it would hide what "Overwrite" destroys. Hidden by attribute when empty. */
 .dlg-detail:not([hidden]) { display: block !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
-.dlg-body, .dlg-buttons, .dlg-items, .dlg-tabs, .dlg-scope, .dlg-rows:not([hidden]), .dlg-themes:not([hidden]), .dlg-warning:not([hidden]) { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
-.dlg-body, .dlg-items, .dlg-rows, .dlg-themes:not([hidden]) { flex-direction: column !important; }
+.dlg-body, .dlg-buttons, .dlg-items, .dlg-tabs, .dlg-scope, .dlg-rows:not([hidden]), .dlg-themes:not([hidden]), .dlg-about:not([hidden]), .dlg-warning:not([hidden]) { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
+.dlg-body, .dlg-items, .dlg-rows, .dlg-themes:not([hidden]), .dlg-about:not([hidden]) { flex-direction: column !important; }
 .dlg-buttons { flex-direction: row !important; order: 0 !important; }
 .dlg-buttons button, .dlg-item { transform: none !important; font-size: 13px !important; order: 0 !important; }
 .dlg-row { display: grid !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
@@ -1883,6 +1883,7 @@ pub fn workspace_page(
   <div class="dlg-scope"></div>
   <div class="dlg-rows" hidden></div>
   <div class="dlg-themes" hidden></div>
+  <div class="dlg-about" hidden></div>
   <div class="dlg-buttons">
     <button type="button" class="dlg-cancel">Cancel</button>
     <button type="button" class="dlg-ok">Save</button>

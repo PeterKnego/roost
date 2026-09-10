@@ -1212,10 +1212,9 @@ header button.proj:hover svg { opacity: 1; }
   header .vsep { display: none; }
   #searchbox { order: 99; flex: 1 0 100%; margin: 0; }
   /* 16px is not a style choice: iOS zooms the whole page when a focused input
-     is smaller, and the zoom does not come back on blur. Every field the
-     workspace can focus needs it, not just this one. */
-  #searchbox input, #dlg-input, .dlg-row input, .dlg-row textarea,
-  .content textarea, .codeinput textarea { font-size: 16px; }
+     is smaller, and the zoom does not come back on blur. Applied in the
+     narrower block below, with the dialog rules, since it is a phone problem
+     rather than a narrow-window one. */
   #searchbox kbd { display: none; }
   /* Text, not a shortcut hint nobody can type. */
   #closeproj span { display: none; }
@@ -1312,9 +1311,25 @@ header button.proj:hover svg { opacity: 1; }
      document, so a rubber-band on the body is only ever an accident. */
   body { overscroll-behavior: none; }
 
-  /* A dialog sized for a 1400px window has to stop being one. */
+}
+
+/* ---- dialogs, at genuinely small widths only ---- */
+/* Deliberately 640 and not the 900 above. The workspace breakpoint is a
+   measurement about the three-pane grid (808px of fixed columns); a dialog is
+   `min(760px, 96vw)` and has room for its two-column rows well below that. At
+   900 these rules reached an 800px desktop window and stacked every settings
+   row — caught by `tests/browser/settings.mjs`, which runs at the browser's
+   default 800px and asserts a boolean row is one compact line. It measured
+   81px.
+
+   The 16px input size is here for the same reason: it exists because iOS zooms
+   a focused field smaller than that and does not zoom back, which is a phone
+   problem, not an 800px-window problem. */
+@media (max-width: 640px) {
   dialog.roost { width: calc(100vw - 24px); max-width: none; }
   .dlg-row { grid-template-columns: minmax(0, 1fr); }
+  #searchbox input, #dlg-input, .dlg-row input, .dlg-row textarea,
+  .content textarea, .codeinput textarea { font-size: 16px; }
 }
 
 /* ---- the band just above the phone breakpoint ---- */
