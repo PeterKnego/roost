@@ -939,6 +939,8 @@ function render() {
   // is the right contribution there — nothing is taking up that space.
   const mbar = document.getElementById("mobilebar");
   if (mbar) document.documentElement.style.setProperty("--mobilebar-h", mbar.offsetHeight + "px");
+  const tkeys = document.getElementById("termkeys");
+  if (tkeys) document.documentElement.style.setProperty("--termkeys-h", tkeys.offsetHeight + "px");
   // htmx swaps into #gitinfo/#wtlabel and the #projcount/#bellcount writes
   // below all change the header's width while the panel is open, and
   // #searchbox uses margin:auto, so the field (and the panel anchored to it)
@@ -3193,6 +3195,13 @@ function showMobilePane(pi) {
   // should land where you left it, and the workspace's own `active` tab
   // indices say nothing about which *pane* was in front.
   try { localStorage.setItem(MPANE_KEY, n); } catch { /* private mode */ }
+  // The key bar only has a height once the terminal pane is in front, and
+  // #grid subtracts that height. Measured here rather than in `render()`
+  // alone, because switching panes does not go through a State broadcast —
+  // without this the grid keeps the previous pane's arithmetic and the
+  // terminal is fitted to a frame the wrong size by exactly the bar.
+  const tk = document.getElementById("termkeys");
+  if (tk) document.documentElement.style.setProperty("--termkeys-h", tk.offsetHeight + "px");
   fitTerminals();
 }
 
@@ -3205,6 +3214,64 @@ function showMobilePane(pi) {
 function revealPane(pi) {
   if (!phone.matches) return;
   showMobilePane(pi);
+}
+
+// ---- the terminal key bar -------------------------------------------
+// Claude's TUI is driven with arrows and Enter, and a phone soft keyboard has
+// neither: the menus it puts up — "1. yes  2. no", a file picker, a permission
+// prompt — are simply unreachable from a phone. That makes the terminal
+// readable there and not usable, which is the opposite of what #15 wants from
+// it.
+//
+// The sequences are asked of xterm rather than hard-coded, because an arrow is
+// not one byte string. A TUI that has set DECCKM (application cursor keys)
+// expects `ESC O A` where a shell at a prompt expects `ESC [ A`, and Claude
+// sets it — sending the wrong one moves nothing and looks like a dead button.
+const TERM_KEYS = {
+  esc: () => "\x1b",
+  tab: () => "\t",
+  enter: () => "\r",
+  ctrlc: () => "\x03",
+  up: (t) => (appCursor(t) ? "\x1bOA" : "\x1b[A"),
+  down: (t) => (appCursor(t) ? "\x1bOB" : "\x1b[B"),
+};
+
+/// Whether this terminal is in application-cursor-keys mode.
+///
+/// `term.modes` is xterm's own view of the modes the *program* set, so this
+/// follows Claude in and out of its menus without roost tracking anything.
+/// Guarded: a vendored xterm without `modes` degrades to the normal sequences,
+/// which is what a plain shell wants — never to a thrown error inside a click
+/// handler.
+function appCursor(t) {
+  try { return !!t.modes.applicationCursorKeysMode; } catch { return false; }
+}
+
+/// The terminal a key press should go to: the one showing in the pane the
+/// switcher has in front, falling back to the last focused session.
+function targetTerm() {
+  const host = document.querySelector('.pane[data-pane="3"] .termhost[data-session]');
+  const byPane = host && terms.get(host.dataset.session);
+  return byPane || terms.get(lastFocusedSession) || null;
+}
+
+function initTermKeys() {
+  const bar = document.getElementById("termkeys");
+  if (!bar) return;
+  for (const b of bar.querySelectorAll("button")) {
+    // pointerdown, not click: a click first moves focus, and on iOS focusing a
+    // button dismisses the soft keyboard — so every arrow press would close the
+    // keyboard the user is about to type into. preventDefault keeps focus where
+    // it is, which is the terminal.
+    b.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      const entry = targetTerm();
+      const make = TERM_KEYS[b.dataset.k];
+      if (!entry || !make) return;
+      entry.term.input(make(entry.term));
+      entry.term.focus();
+    });
+  }
 }
 
 function initMobileBar() {
@@ -3276,6 +3343,31 @@ if (closeBtn) closeBtn.onclick = async () => {
 // answered by the front page. The bell covers the one thing you do want
 // mid-task — what needs attention — so this became on-demand.
 const projBtn = document.getElementById("projbtn");
+/// Puts a header popup directly under the control that opened it.
+///
+/// These were anchored in CSS to a fixed edge — #projpanel and #noticepanel to
+/// the right, #wtpanel to the left — which is only ever correct for one
+/// trigger. #projpanel has two (`projbtn` on the right, `projname` on the
+/// left), so on a desktop it opened across the header from the project name,
+/// and on a phone, where the trim hides `projbtn`, it opened against the right
+/// edge with nothing there at all.
+///
+/// Left-aligned to the trigger and clamped to the viewport, which is what the
+/// branch switcher already does by being anchored to the only control that
+/// opens it. Written to `style.left` with `right` cleared, so it overrides
+/// whichever edge the stylesheet picked.
+function anchorPanel(panel, trigger) {
+  if (!panel || !trigger || !trigger.getBoundingClientRect) return;
+  const t = trigger.getBoundingClientRect();
+  if (!t.width && !t.height) return; // a hidden trigger anchors nothing
+  panel.style.right = "auto";
+  // Measured after clearing `right`, or the width read is the one the old
+  // anchoring produced.
+  const w = panel.getBoundingClientRect().width;
+  const max = Math.max(4, window.innerWidth - w - 4);
+  panel.style.left = `${Math.round(Math.min(Math.max(4, t.left), max))}px`;
+}
+
 const projPanel = document.getElementById("projpanel");
 if (projBtn && projPanel) {
   // Two triggers, one panel. The header names the project you are in and the
@@ -3283,13 +3375,16 @@ if (projBtn && projPanel) {
   // look at was the thing that did nothing. The ◆ stays: it is a reasonable
   // muscle-memory target, and removing it is a separate decision from adding
   // the obvious one.
-  const toggleProjects = () => {
+  const toggleProjects = (trigger) => {
     projPanel.hidden = !projPanel.hidden;
-    if (!projPanel.hidden && window.htmx) htmx.trigger(document.body, "refresh");
+    if (!projPanel.hidden) {
+      anchorPanel(projPanel, trigger);
+      if (window.htmx) htmx.trigger(document.body, "refresh");
+    }
   };
-  projBtn.onclick = toggleProjects;
+  projBtn.onclick = () => toggleProjects(projBtn);
   const projName = document.getElementById("projname");
-  if (projName) projName.onclick = toggleProjects;
+  if (projName) projName.onclick = () => toggleProjects(projName);
   // Clicking through to a project should not leave the panel hanging open
   // behind the tab switch.
   projPanel.onclick = (e) => { if (e.target.closest("a")) projPanel.hidden = true; };
@@ -3313,6 +3408,7 @@ const wtPanel = document.getElementById("wtpanel");
 if (wtBtn && wtPanel) {
   wtBtn.onclick = () => {
     wtPanel.hidden = !wtPanel.hidden;
+    if (!wtPanel.hidden) anchorPanel(wtPanel, wtBtn);
     if (!wtPanel.hidden && window.htmx) {
       // State costs two git calls per worktree; ask only while looking.
       // `document.body.dataset.key` is already the server's `percent_encode(key)`
@@ -3353,6 +3449,7 @@ if (bell) {
   bell.onclick = () => {
     const p = document.getElementById("noticepanel");
     p.hidden = !p.hidden;
+    if (!p.hidden) anchorPanel(p, bell);
     renderNotices();
   };
 }
@@ -3441,6 +3538,7 @@ if (location.hash.startsWith("#session=")) {
 // no `data-mpane` at all — which on a phone is all four panes stacked in one
 // grid cell, for as long as the socket takes to answer.
 initMobileBar();
+initTermKeys();
 
 connectControl();
 

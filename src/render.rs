@@ -1052,20 +1052,49 @@ pub fn status_fragment(st: &Status) -> String {
 /// changed URL is the only thing that makes it look again. The hash changes
 /// exactly when the icon bytes do, so the URL is stable across restarts and
 /// releases that do not touch the icon.
+/// A content hash of `rels`, for use as a `?v=` cache key.
+///
+/// FNV-1a over the bytes in the order given; eight hex digits is plenty for
+/// "did it change", which is all a cache key needs. Not cached in a `OnceLock`
+/// per caller — `assets::get` is already a lookup into a table built at
+/// startup, and this runs once per page render.
+fn asset_hash(rels: &[&str]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for rel in rels {
+        for b in crate::assets::get(rel).unwrap_or(&[]) {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{:016x}", h)[..8].to_string()
+}
+
+/// The `?v=` for one asset, memoised per name.
+///
+/// Every stylesheet and script roost ships carries one. Without it a browser
+/// applies its own heuristic — roost sends no `Cache-Control` at all — and a
+/// phone goes on running the previous release's `app.js` and `style.css` for
+/// as long as that heuristic says. It is not a theoretical staleness: a
+/// deployed CSS fix for terminal scrolling was reported as "still broken" from
+/// a phone that had never fetched it. The favicons had this from 2026-09-03;
+/// the files that actually change every release did not.
+fn av(rel: &str) -> String {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = g.get(rel) {
+        return v.clone();
+    }
+    let v = asset_hash(&[rel]);
+    g.insert(rel.to_string(), v.clone());
+    v
+}
+
 fn icon_links() -> String {
     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let v = VERSION.get_or_init(|| {
-        // FNV-1a over the four files in link order; eight hex digits is
-        // plenty for "did it change", which is all a cache key needs.
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for rel in ["favicon.ico", "favicon-32.png", "logo.svg", "apple-touch-icon.png"] {
-            for b in crate::assets::get(rel).unwrap_or(&[]) {
-                h ^= u64::from(*b);
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        }
-        format!("{:016x}", h)[..8].to_string()
-    });
+    let v = VERSION
+        .get_or_init(|| asset_hash(&["favicon.ico", "favicon-32.png", "logo.svg", "apple-touch-icon.png"]));
     format!(
         "<link rel=\"icon\" href=\"/static/favicon.ico?v={v}\" sizes=\"32x32\">\n\
          <link rel=\"icon\" type=\"image/png\" href=\"/static/favicon-32.png?v={v}\" sizes=\"32x32\">\n\
@@ -1085,11 +1114,12 @@ pub fn overview_page(sel: &str, roots: &[String]) -> String {
     // so the whole of it has to be readable somewhere: the tooltip, joined
     // the way `ROOST_ROOTS` spells a list.
     let roots_title = esc(&roots.join(":"));
+    let (sv, dv, ov) = (av("style.css"), av("dialog.js"), av("overview.js"));
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>roost</title>\
          {icons}\
          <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
-         <link rel=\"stylesheet\" href=\"/static/style.css\">\
+         <link rel=\"stylesheet\" href=\"/static/style.css?v={sv}\">\
          {DIALOG_STRUCTURAL_CSS}\
          <script src=\"/static/vendor/htmx.min.js\"></script>\
          </head><body class=\"overview-body\">\
@@ -1127,8 +1157,8 @@ pub fn overview_page(sel: &str, roots: &[String]) -> String {
              <button type=\"button\" class=\"dlg-ok\"></button>\
            </div>\
          </dialog>\
-         <script src=\"/static/dialog.js\"></script>\
-         <script src=\"/static/overview.js\"></script>\
+         <script src=\"/static/dialog.js?v={dv}\"></script>\
+         <script src=\"/static/overview.js?v={ov}\"></script>\
          </body></html>",
         SVG_HOME = SVG_HOME,
         icons = icon_links(),
@@ -1741,6 +1771,7 @@ pub fn workspace_page(
         Some(rel) => format!("<link rel=\"stylesheet\" href=\"/frag/{proj_url}/{rel}\">"),
         None => String::new(),
     };
+    let (sv, dv, av_js) = (av("style.css"), av("dialog.js"), av("app.js"));
     format!(
         r#"<!doctype html>
 {html_open}<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1752,7 +1783,7 @@ pub fn workspace_page(
 <link rel="stylesheet" href="/static/vendor/code-input-find-and-replace.min.css">
 <link rel="stylesheet" href="/static/vendor/code-input-go-to-line.min.css">
 {theme_links}
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v={sv}">
 {theme_css}
 {DIALOG_STRUCTURAL_CSS}
 <script src="/static/vendor/htmx.min.js"></script>
@@ -1791,6 +1822,14 @@ pub fn workspace_page(
   <div class="divider" data-div="right-w"></div>
   <section class="pane" data-pane="3"><div class="panehead"><div class="tabstrip"></div><div class="paneicons"></div></div><div class="content"></div></section>
 </main>
+<div id="termkeys" aria-label="terminal keys">
+  <button type="button" data-k="esc">esc</button>
+  <button type="button" data-k="tab">tab</button>
+  <button type="button" data-k="up" aria-label="up">&#8593;</button>
+  <button type="button" data-k="down" aria-label="down">&#8595;</button>
+  <button type="button" data-k="enter" aria-label="enter">&#9166;</button>
+  <button type="button" data-k="ctrlc">^C</button>
+</div>
 <nav id="mobilebar" aria-label="pane">
   <button type="button" data-mpane="0" aria-pressed="false">{SVG_M_TREE}<span>Files</span></button>
   <button type="button" data-mpane="1" aria-pressed="false">{SVG_M_CHANGES}<span>Changes</span></button>
@@ -1848,8 +1887,8 @@ pub fn workspace_page(
      put inside the strip would be wiped on the next state broadcast. -->
 <footer id="statusbar" class="hidden"><span class="left"></span><span class="right"></span></footer>
 <div id="termpool" hidden></div>
-<script src="/static/dialog.js"></script>
-<script src="/static/app.js"></script>
+<script src="/static/dialog.js?v={dv}"></script>
+<script src="/static/app.js?v={av_js}"></script>
 </body></html>"#,
         SVG_HOME = SVG_HOME,
         icons = icon_links(),
@@ -3272,6 +3311,45 @@ mod tests {
     }
 
     #[test]
+    fn every_stylesheet_and_script_carries_a_cache_key_that_tracks_its_bytes() {
+        // roost sends no `Cache-Control` at all, so a browser falls back to its
+        // own heuristic and a phone goes on running the previous release's
+        // `app.js` and `style.css` for as long as that heuristic says. Not
+        // theoretical: a deployed CSS fix for terminal scrolling was reported
+        // as "still broken" from a phone that had never fetched it. The
+        // favicons have had a content hash since 2026-09-03; the two files
+        // that change every release did not.
+        let ws = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
+        let front = overview_page("", &["/home/x".into()]);
+        for (page, name, asset) in [
+            (&ws, "workspace", "style.css"),
+            (&ws, "workspace", "app.js"),
+            (&ws, "workspace", "dialog.js"),
+            (&front, "front", "style.css"),
+            (&front, "front", "dialog.js"),
+            (&front, "front", "overview.js"),
+        ] {
+            let want = format!("/static/{asset}?v=");
+            assert!(page.contains(&want), "{name} page loads {asset} with no cache key");
+            // Not merely *a* key: the one this asset's bytes produce. A
+            // hard-coded or shared constant would satisfy the line above and
+            // still never change when the file did.
+            let got = page.split(&want).nth(1).unwrap()[..8].to_string();
+            assert_eq!(got, av(asset), "{name}: {asset}'s key is not its content hash");
+        }
+
+        // And the property the whole thing rests on: different bytes, different
+        // key. Asserted across two real assets rather than by mutating one,
+        // since the table is built at startup — same technique, and it fails
+        // just as loudly if `av` ever returns a constant.
+        assert_ne!(
+            av("style.css"),
+            av("app.js"),
+            "two different files must not share a cache key"
+        );
+    }
+
+    #[test]
     fn the_workspace_page_ships_empty_dialog_shells() {
         let s = crate::config::Settings::default();
         let html = workspace_page("proj", "proj", &s, None, false, &[]);
@@ -3299,7 +3377,13 @@ mod tests {
             assert!(!html.contains(frag), "a dialog must not carry `hidden`: {frag}");
         }
         assert!(html.contains(r#"<button id="settings" title="settings">"#), "the gear is no longer 'not implemented'");
-        assert!(html.contains(r#"<script src="/static/dialog.js"></script>"#), "dialog.js not loaded");
+        // The `?v=` is a content hash, so the assertion is on the path plus the
+        // fact that it carries one — pinning the digits would make every edit to
+        // dialog.js fail this test for no reason.
+        assert!(
+            html.contains(r#"<script src="/static/dialog.js?v="#),
+            "dialog.js not loaded, or loaded without a cache key: {html}"
+        );
     }
 
     // Finding 2 (branch review, in-page dialogs): a project's own
@@ -3438,7 +3522,7 @@ mod tests {
             "the full list is the escaped tooltip: {h}"
         );
         assert!(h.contains(r#"</span><button id="addroot" type="button" title="add a project root">+</button>"#), "{h}");
-        assert!(h.contains(r#"<script src="/static/dialog.js"></script>"#), "{h}");
+        assert!(h.contains(r#"<script src="/static/dialog.js?v="#), "{h}");
         for id in ["dlg-confirm", "dlg-text"] {
             assert!(h.contains(&format!(r#"id="{id}""#)), "no {id} shell on the front page");
         }

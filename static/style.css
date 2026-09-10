@@ -1088,6 +1088,16 @@ header button.proj:hover svg { opacity: 1; }
 #mobilebar button .dot { position: absolute; margin: -14px 0 0 18px; width: 6px; height: 6px;
                          border-radius: 50%; background: var(--accent, #d29922); }
 
+/* The terminal key bar. Present in the DOM at every width, shown only on a
+   phone with the terminal pane in front — see the phone block below. */
+#termkeys { display: none; align-items: stretch; gap: 4px; padding: 4px 4px 0;
+            background: var(--tool); }
+#termkeys button { flex: 1; min-width: 0; min-height: 44px; border: 1px solid var(--border);
+                   border-radius: 8px; background: var(--bg2); color: var(--fg);
+                   font: inherit; font-size: 13px; cursor: pointer;
+                   -webkit-tap-highlight-color: transparent; }
+#termkeys button:active { background: var(--tab-hover); }
+
 /* ============================ phone layout ============================ */
 /* Until this block existed there was no phone layout at all — not a cramped
    one. The grid asks for ~790px of fixed columns before the middle pane gets a
@@ -1151,6 +1161,15 @@ header button.proj:hover svg { opacity: 1; }
   #grid > .divider { display: none; }
 
   #mobilebar { display: flex; }
+  /* Only with the terminal in front: these keys mean nothing over a file tree,
+     and the screen is the scarcest thing here. */
+  body[data-mpane="3"] #termkeys { display: flex; }
+  /* The keys sit inside the frame the grid measures, so the pane gives up
+     their height rather than the page growing past the viewport. */
+  body[data-mpane="3"] #grid {
+    height: calc(100vh - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
+    height: calc(100dvh - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
+  }
 
   /* The header is a single row of a dozen controls at desktop width. Here it
      wraps rather than pushing the project name off-screen, and the search
@@ -1199,8 +1218,12 @@ header button.proj:hover svg { opacity: 1; }
      Spanning the viewport removes the question rather than answering it
      twice. It is also what these are: vertical lists, not menus that want to
      hang off a corner. */
+  /* Full width, and both edges are !important because app.js's `anchorPanel`
+     writes an inline `left` for the desktop case. At this width there is no
+     room to sit under a trigger anyway: a 220px panel anchored to a 44px
+     button would still be mostly off one edge. */
   #projpanel, #wtpanel, #noticepanel {
-    left: 4px; right: 4px; width: auto; max-width: none;
+    left: 4px !important; right: 4px !important; width: auto; max-width: none;
   }
   /* No hover to reveal a row under a finger. */
   .projstrip .proj:active, .wtstrip .wt:active, .notice:active { background: var(--bg); }
