@@ -1746,6 +1746,8 @@ pub fn workspace_page(
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/code-input.min.js"></script>
+<script src="/static/vendor/code-input-indent.min.js"></script>
+<script src="/static/vendor/code-input-auto-close-brackets.min.js"></script>
 </head><body data-project="{proj_txt}" data-key="{qkey}" data-show-hidden="{sh}" data-autosave="{autosave}" data-follow-tree="{follow_tree}" data-share-selection="{share_selection}" data-launches="{launches}">
 <header>
   <a class="home" href="/" title="all projects">{SVG_HOME}</a><span class="proj">{proj_txt}</span>

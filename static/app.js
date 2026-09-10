@@ -87,11 +87,50 @@ const NONASCII_KEY = "roost.nonascii";
 // instead. Only the highlight function differs, so everything hledit.mjs
 // established about the two layers agreeing holds for it unchanged.
 if (window.codeInput && window.hljs) {
-  codeInput.registerTemplate("hl", codeInput.templates.hljs(hljs, []));
+  codeInput.registerTemplate("hl", codeInput.templates.hljs(hljs, codePlugins()));
   // preElementStyled=false, as templates.hljs defaults it: that puts the
   // padding on `pre code`, where style.css and hledit.mjs expect it. True
   // moves it to the <pre>, and the marks land 10px off the glyphs.
   codeInput.registerTemplate("nonascii", new codeInput.Template(markNonAscii, false, false, false, []));
+}
+
+/// The plugins a *code* file's editor gets: Tab inserts an indent and Enter
+/// keeps it, and brackets and quotes close themselves.
+///
+/// Code files only. A prose file uses the "nonascii" template and keeps Tab
+/// as focus movement — auto-closing a quote in a paragraph of English is
+/// wrong far more often than it is right, and prose has no indentation to
+/// carry onto the next line.
+///
+/// Neither plugin touches the buffer except where the user typed. Both act
+/// only on `keydown`/`beforeinput`/`input` and insert through
+/// `execCommand("insertText")`, which fires the same `input` event ordinary
+/// typing does — so the 200 ms debounce, `EditBuffer`, autosave, ⌘S and the
+/// conflict patch all see these edits exactly as they see a keystroke. That
+/// is the property that matters here: save is guarded against a hash of what
+/// was read from disk, so anything that rewrote the text wholesale — a
+/// whitespace normaliser, a line-ending fixer — would make a buffer conflict
+/// with itself. Nothing here does.
+///
+/// Returns an empty list rather than failing if the plugin files did not
+/// load, so an editor without them is the old editor rather than no editor.
+function codePlugins() {
+  const p = [];
+  const P = window.codeInput && codeInput.plugins;
+  if (!P) return p;
+  // A tab character, not spaces, and the asymmetry is the reason. Roost's
+  // editor has no per-language configuration and cannot know a file's
+  // convention, so it will sometimes be wrong either way — but the two
+  // wrongs are not equal. A tab landing in a spaces-indented file renders as
+  // a wide gap the moment it is typed, so it is seen and undone. Spaces
+  // landing in a Makefile — where the tab is load-bearing syntax — are
+  // invisible and break the build. Prefer the mistake that shows.
+  //
+  // `escTabToChangeFocus` (the plugin's own default) keeps Esc-then-Tab
+  // moving focus, so the keyboard is not trapped in the textarea.
+  if (P.Indent) p.push(new P.Indent(false, 1));
+  if (P.AutoCloseBrackets) p.push(new P.AutoCloseBrackets());
+  return p;
 }
 
 /// code-input's highlight hook for the "nonascii" template. It arrives with

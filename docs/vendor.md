@@ -22,6 +22,7 @@ only thing that exercises any of it.
 | `highlight.min.js`, `hljs-github-dark.min.css` | `highlight.js` | 11.9.0 | BSD-3-Clause |
 | `github-markdown.min.css` | `github-markdown-css` | 5.3.3 | MIT |
 | `code-input.min.js`, `code-input.min.css` | `@webcoder49/code-input` | 2.8.3 | MIT |
+| `code-input-indent.min.js`, `code-input-auto-close-brackets.min.js` | `@webcoder49/code-input` (`plugins/`) | 2.8.3 | MIT |
 | file-type/folder icons (data URIs in `static/style.css`) | `material-extensions/vscode-material-icon-theme` | 5.38.0 | MIT |
 
 ## The file-type icons
@@ -67,5 +68,21 @@ commented at their sites:
   falls back to assigning `innerHTML`, which parses a source file's own angle
   brackets as markup.
 
-Its optional plugins (indentation, bracket closing, find-and-replace) are
-separate files; none are vendored.
+Its optional plugins are separate files under `plugins/` in the same package,
+and are vendored one at a time as they are used. Two are, both prefixed
+`code-input-` so the directory still sorts by package:
+
+- `indent.min.js` — Tab inserts an indent, Enter carries it onto the next
+  line, Backspace deletes a whole one.
+- `auto-close-brackets.min.js` — brackets and quotes close themselves.
+
+They are passed to the **`hl` template only**, so they apply to code files and
+not to prose. Both act only on `keydown`/`beforeinput`/`input` and insert
+through `execCommand("insertText")`, which fires the same `input` event
+ordinary typing does — so the edit debounce, `EditBuffer`, autosave, ⌘S and
+the conflict patch see these edits exactly as they see a keystroke. That
+matters more here than anywhere else in this directory: save is guarded
+against a hash of what was read from disk, so a plugin that rewrote the text
+wholesale would make a buffer conflict with itself.
+
+`find-and-replace` and `go-to-line` are not vendored yet.
