@@ -700,8 +700,8 @@ impl Hub {
             Intent::EndSession { session } => return self.do_end_session(from, session.clone()),
             Intent::NewWorktree { launch } => return self.do_new_worktree(from, *launch),
             Intent::RemoveWorktree { key } => return self.do_remove_worktree(from, key.clone()),
-            Intent::NewTerminal { pane, launch, force } => {
-                return self.do_new_terminal(from, *pane, *launch, *force)
+            Intent::NewTerminal { pane, launch, force, resume } => {
+                return self.do_new_terminal(from, *pane, *launch, *force, resume.clone())
             }
             Intent::OpenPath { text } => return self.do_open_path(from, text.clone()),
             Intent::OpenAtLine { pane, rel, line } => {
@@ -1823,6 +1823,7 @@ impl Hub {
         pane: crate::proto::PaneId,
         launch: Option<crate::proto::Launch>,
         force: bool,
+        resume: Option<String>,
     ) {
         if self.closing {
             let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
@@ -1865,7 +1866,20 @@ impl Hub {
             &name,
             launch.map(|l| crate::session::LaunchRequest {
                 launch: l,
-                session: crate::launch::new_session_id().map(crate::launch::ClaudeSession::Fresh),
+                // A chosen row wins over a fresh mint, but only after the
+                // server has confirmed this project really has that
+                // conversation — the menu is a hint. A `resume` that does not
+                // survive that check falls through to a fresh launch rather
+                // than failing: the user asked for a Claude, and the worst
+                // case is they get a new one instead of an old one.
+                session: resume
+                    .filter(|id| {
+                        l == crate::proto::Launch::Claude && crate::claudehist::has(&self.dir, id)
+                    })
+                    .map(crate::launch::ClaudeSession::Resume)
+                    .or_else(|| {
+                        crate::launch::new_session_id().map(crate::launch::ClaudeSession::Fresh)
+                    }),
             }),
         );
         let intent = Intent::OpenTab { pane, tab: Tab::Terminal { session: name.clone() } };
@@ -2697,6 +2711,108 @@ mod tests {
         assert_eq!(att.launch, None, "Enter starts a shell, even where a resume was available");
         crate::session::kill_project(&project);
         std::env::remove_var("ROOST_CMD");
+    }
+
+    /// The ✻ menu's chosen row, end to end: the intent carries an id, the
+    /// server confirms this project has that conversation, and the shell that
+    /// spawns is handed `--resume <it>`.
+    ///
+    /// Revert-checked: dropping the `claudehist::has` filter still passes this
+    /// one — the id *is* valid here — which is why the refusal has its own test
+    /// below rather than being an extra assertion on this one.
+    #[test]
+    fn a_chosen_conversation_from_the_menu_is_what_the_new_terminal_resumes() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let home = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let project = format!("menupick{}", std::process::id());
+        let dir = d.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "864ee734-e3ab-434e-8278-745a850b16ad";
+        let tdir = crate::claudehist::transcript_dir(&dir).unwrap();
+        std::fs::create_dir_all(&tdir).unwrap();
+        std::fs::write(tdir.join(format!("{id}.jsonl")), "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}").unwrap();
+
+        let mut h = Hub::new(&project, dir.clone());
+        let (c, rx) = h.subscribe();
+        for p in h.ws.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+            p.active = 0;
+        }
+        drain(&rx);
+        h.handle(&c, Intent::NewTerminal {
+            pane: proto::RIGHT,
+            launch: Some(proto::Launch::Claude),
+            force: true,
+            resume: Some(id.to_string()),
+        });
+        let att = crate::session::reserve_and_attach(&project, "term", &dir).unwrap();
+        let l = att.launch.as_ref().expect("the menu's pick must be parked");
+        assert_eq!(
+            l.session.as_ref(),
+            Some(&crate::launch::ClaudeSession::Resume(id.to_string()))
+        );
+        assert_eq!(
+            crate::launch::keystrokes(l.launch, l.session.as_ref()),
+            format!("claude --resume {id}\r").into_bytes()
+        );
+        crate::session::kill_project(&project);
+        std::env::remove_var("ROOST_CMD");
+        match prev_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
+    }
+
+    /// A row the project does not have. The menu is a hint, not an
+    /// authorisation — the same rule `RemoveWorktree` states about its own —
+    /// so a stale, forged or cross-project id must not become a `--resume`.
+    ///
+    /// It falls through to a *fresh* Claude rather than failing: the user asked
+    /// for one, and the worst outcome should be a new conversation instead of
+    /// an old one, not a button that does nothing.
+    ///
+    /// Revert-checked: removing the `claudehist::has` filter fails this with
+    /// `Some(Resume("aaaa1111-…"))` against the expected `Fresh`.
+    #[test]
+    fn an_id_this_project_does_not_have_falls_through_to_a_fresh_claude() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let home = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let project = format!("menuforged{}", std::process::id());
+        let dir = d.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut h = Hub::new(&project, dir.clone());
+        let (c, rx) = h.subscribe();
+        for p in h.ws.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+            p.active = 0;
+        }
+        drain(&rx);
+        h.handle(&c, Intent::NewTerminal {
+            pane: proto::RIGHT,
+            launch: Some(proto::Launch::Claude),
+            force: true,
+            resume: Some("aaaa1111-2222-3333-4444-555555555555".to_string()),
+        });
+        let att = crate::session::reserve_and_attach(&project, "term", &dir).unwrap();
+        let l = att.launch.as_ref().expect("a Claude was still asked for");
+        assert!(
+            matches!(l.session.as_ref(), Some(crate::launch::ClaudeSession::Fresh(_))),
+            "an unauthorised id must not resume, and must not stop the launch: {:?}",
+            l.session
+        );
+        crate::session::kill_project(&project);
+        std::env::remove_var("ROOST_CMD");
+        match prev_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
     }
 
     /// #17's rule, now that there is something for it to rule out.
@@ -4014,8 +4130,8 @@ mod tests {
         }
         drain(&rx);
 
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
         drain(&rx);
 
         let names: Vec<String> = h.ws.panes[proto::RIGHT as usize]
@@ -4049,8 +4165,8 @@ mod tests {
         }
         drain(&rx);
 
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
         drain(&rx);
         let first = crate::session::reserve_and_attach("newterm_launch", "term", d.path()).unwrap();
         assert_eq!(
@@ -4071,14 +4187,14 @@ mod tests {
         // The stale case: ✻ allocates `term2`, its tab is closed before any
         // browser attaches, and + is then handed `term2` back. The click that
         // made it a claude shell is gone, so the shell must be plain.
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
         let idx = h.ws.panes[proto::RIGHT as usize]
             .tabs
             .iter()
             .position(|t| matches!(t, Tab::Terminal { session } if session == "term2"))
             .expect("✻ was handed term2");
         h.handle(&c, Intent::CloseTab { pane: proto::RIGHT, idx });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
         drain(&rx);
         let reused = crate::session::reserve_and_attach("newterm_launch", "term2", d.path()).unwrap();
         assert_eq!(reused.launch, None, "a reallocated name must not inherit the old click");
@@ -4103,20 +4219,20 @@ mod tests {
         for p in h.ws.panes.iter_mut() { p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. })); p.active = 0; }
         // First ✻: allocates `term`; spawn it the way a browser would, so the
         // launch is consumed and recorded on the session.
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
         let _att = crate::session::reserve_and_attach("prompt_second", "term", d.path()).unwrap();
         assert_eq!(crate::session::launched_names("prompt_second").len(), 1, "fixture: a launched terminal exists");
         drain(&rxa); drain(&rxb);
         let version = h.ws.version;
 
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
         let got = rxa.try_recv().expect("the clicker hears back");
         assert!(got.contains(r#""t":"ClaudeHere""#) && got.contains(r#""terminals":["term"]"#), "{got}");
         assert!(rxb.try_recv().is_err(), "nobody else hears anything");
         assert_eq!(h.ws.version, version, "no layout change");
         assert_eq!(crate::session::live_names("prompt_second").len(), 1, "no session allocated");
 
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: true });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: true, resume: None });
         assert!(h.ws.version > version, "force opens a terminal");
         assert!(rxb.try_recv().is_ok_and(|m| m.contains(r#""t":"State""#)), "…which everyone sees");
         crate::session::kill_project("prompt_second");
@@ -4135,11 +4251,11 @@ mod tests {
         let mut h = Hub::new("prompt_plus", d.path().to_path_buf());
         let (a, rxa) = h.subscribe();
         for p in h.ws.panes.iter_mut() { p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. })); p.active = 0; }
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
         let _att = crate::session::reserve_and_attach("prompt_plus", "term", d.path()).unwrap();
         drain(&rxa);
         let version = h.ws.version;
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
         assert!(h.ws.version > version, "a plain shell opens beside a Claude");
         crate::session::kill_project("prompt_plus");
     }

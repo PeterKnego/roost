@@ -1174,7 +1174,9 @@ function buildPaneIcons(host, pi, pane, active, content) {
   // program to type in: the server allocates the name and types `claude`
   // into the shell it spawns.
   if (LAUNCHES.includes("claude")) {
-    icon(CLAUDE_MARK, "new terminal running Claude", () => newTerminal(pi, "claude"), "newclaude");
+    // The handler takes the button so the menu can anchor under it; `icon`
+    // returns the element it made.
+    const cb = icon(CLAUDE_MARK, "new terminal running Claude", () => claudeMenu(pi, cb), "newclaude");
   }
   // #52: the same gesture, pointed at this repository's open pull requests.
   // Deliberately its own button rather than a mode of the one above — it
@@ -1272,7 +1274,67 @@ function maximizedSizes(pi) {
 
 function pool() { return document.getElementById("termpool"); }
 
-function newTerminal(pane, launch) {
+/// The ✻ button's menu: start fresh, or continue one of this project's past
+/// conversations (#18).
+///
+/// The rows are fetched on the click rather than kept in `state`. The list is
+/// a directory of another program's files, and a snapshot goes out on every
+/// debounced keystroke — putting it there would mean a filesystem walk per
+/// keystroke for a menu almost nobody opens.
+///
+/// **No history means no menu.** That is not an error path: it is what ✻ did
+/// before this existed, and it is also what a failed fetch does, and what a
+/// Claude Code that has moved its transcripts somewhere else does. The button
+/// keeps working in every case, which is the whole error model — see
+/// `claudehist`'s module doc.
+async function claudeMenu(pane, btn) {
+  let list = null;
+  try {
+    const html = await (await fetch(`/frag/${PROJECT}/claudehist`)).text();
+    const wrap = document.createElement("div");
+    wrap.innerHTML = html;
+    list = wrap.querySelector(".chist");
+  } catch { /* fall through to a fresh launch */ }
+  if (!list || list.dataset.empty === "1") return newTerminal(pane, "claude");
+
+  closeClaudeMenu();
+  list.tabIndex = -1;
+  document.body.appendChild(list);
+  anchorPanel(list, btn);
+  // Anchored under the button, like the header popups. `anchorPanel` only sets
+  // the horizontal edge; the vertical one is this menu's own, since its
+  // trigger is in a pane header rather than the top bar.
+  const r = btn.getBoundingClientRect();
+  list.style.top = `${Math.round(r.bottom + 4)}px`;
+  openClaudeMenu = list;
+  list.onclick = (e) => {
+    const row = e.target.closest(".chistrow");
+    if (!row) return;
+    closeClaudeMenu();
+    // "" is the New row. An id goes on the wire, and the server re-derives
+    // whether this project actually has that conversation before it types
+    // anything — the row is a hint, not an authorisation.
+    newTerminal(pane, "claude", row.dataset.resume || undefined);
+  };
+  // Focused so Escape reaches it and so a keyboard user lands in the menu they
+  // just opened, not behind it.
+  list.focus();
+  list.onkeydown = (e) => { if (e.key === "Escape") { e.preventDefault(); closeClaudeMenu(); } };
+}
+
+let openClaudeMenu = null;
+function closeClaudeMenu() {
+  if (openClaudeMenu) openClaudeMenu.remove();
+  openClaudeMenu = null;
+}
+// Capture, so a click anywhere else closes it before that click does its own
+// work — a menu that outlived the click that dismissed it would sit over the
+// pane it was opened from.
+document.addEventListener("mousedown", (e) => {
+  if (openClaudeMenu && !openClaudeMenu.contains(e.target)) closeClaudeMenu();
+}, true);
+
+function newTerminal(pane, launch, resume) {
   // No prompt: the server allocates term/term1/term2… from `live_names`, which
   // sees detached sessions the client has no tabs for. A name picked here could
   // collide with one of those, and since attaching creates only when absent,
@@ -1281,7 +1343,12 @@ function newTerminal(pane, launch) {
   // `launch` names a program (one of LAUNCHES), never a command line: the
   // server owns what is typed, this only says which. Omitted, not null, for
   // the plain + so its message stays the one it has always sent.
-  send(launch ? { t: "NewTerminal", pane, launch } : { t: "NewTerminal", pane });
+  //
+  // `resume` names a conversation the ✻ menu offered. Omitted unless one was
+  // chosen, so the plain and fresh-Claude messages stay the ones they have
+  // always been.
+  if (!launch) return send({ t: "NewTerminal", pane });
+  send(resume ? { t: "NewTerminal", pane, launch, resume } : { t: "NewTerminal", pane, launch });
 }
 
 // The Edit/Preview switch lives in the filename stripe (`.path`), not on the

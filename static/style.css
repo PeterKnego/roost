@@ -1069,6 +1069,27 @@ header button.proj:hover svg { opacity: 1; }
    Carries the config warning's colour because it is the same kind of news:
    something you had is not there any more, and nothing else on the page says
    so. */
+/* The ✻ menu (#18): start fresh, or continue a past conversation. Positioned
+   by app.js against the button that opened it, like the header popups. */
+.chist { position: fixed; z-index: 40; min-width: 260px; max-width: min(460px, 92vw);
+         max-height: 60vh; overflow-y: auto; background: var(--bg2);
+         border: 1px solid var(--border); border-radius: 4px; padding: 4px;
+         display: flex; flex-direction: column; gap: 1px; }
+.chist:focus { outline: none; }
+.chistrow { display: flex; align-items: baseline; gap: 8px; width: 100%;
+            /* 44px is the phone tap target the project rules ask for; a menu
+               row is exactly the control that gets mis-tapped. */
+            min-height: 44px; padding: 6px 8px; border: 0; border-radius: 3px;
+            background: none; color: var(--fg); font: inherit; text-align: left;
+            cursor: pointer; }
+.chistrow:hover { background: var(--tab-hover); }
+.chistrow:active { background: var(--tab-hover); }
+.chistnew { border-bottom: 1px solid var(--border); border-radius: 3px 3px 0 0; }
+/* The label is the only part allowed to grow; the age stays legible at any
+   width, which is what makes two rows comparable at a glance. */
+.chistlabel { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+              white-space: nowrap; }
+.chistwhen { flex: none; color: var(--muted); font-size: 11px; }
 .termstart .termlost { color: #d29922; max-width: 46ch; margin: 0 0 10px; }
 /* The resume offer (#18 step 2). Sized as a real tap target rather than
    matching .initgit's padding: this one appears on the phone, where the tab

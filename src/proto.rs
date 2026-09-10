@@ -130,6 +130,18 @@ pub enum Intent {
         /// was always one keystroke away.
         #[serde(default)]
         force: bool,
+        /// Continue this past conversation instead of starting a fresh one:
+        /// the id of a row in the ✻ menu (`claudehist`). Meaningful only with
+        /// `launch: Claude`.
+        ///
+        /// Unlike `StartTerminal`'s `resume`, this one *is* a value from the
+        /// client, because the menu is a list and the choice is which row. So
+        /// the server re-derives the authorisation at use — `claudehist::has`,
+        /// which validates the id and confirms this project actually has that
+        /// conversation. The row that offered the button is a hint, exactly as
+        /// `RemoveWorktree` says of its own.
+        #[serde(default)]
+        resume: Option<String>,
     },
     /// A span matched in terminal output, sent **verbatim** —
     /// `~/projects/roost/src/a.rs:42` and all. Deliberately not pre-parsed by

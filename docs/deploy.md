@@ -213,6 +213,29 @@ The id never reaches the browser: the page is told which tabs have one, and
 asks for the resume by session name. It lands on a command line, which is the
 same reason session names are the server's to choose.
 
+**The ✻ button offers this project's past conversations.** Clicking it opens a
+menu — *New conversation*, then the ten most recent, newest first, each labelled
+with the first thing you said in it — and picking one starts a terminal running
+`claude --resume <that id>`. A project with no history opens no menu: ✻ launches
+a fresh Claude exactly as it always did.
+
+The list is Claude Code's, not roost's: it reads
+`~/.claude/projects/<encoded-cwd>/*.jsonl`, which is that tool's private layout
+and can change in any of its releases. Everything about the feature is built so
+that the cost of it changing is an empty menu — nothing is written, nothing is
+deleted, and every failure (an unreadable directory, an unfamiliar record, a
+transcript whose first message is past the 64 KB label scan) means one absent
+row or one absent label. A chosen row is also **re-checked server-side** before
+anything is typed: the id must be one this project actually has, so a stale menu
+or a forged message falls through to a fresh Claude rather than resuming
+someone else's conversation.
+
+Two consequences worth knowing. The menu follows the *directory*, so a worktree
+has its own history, separate from its parent — which is usually what you want
+and occasionally surprising. And because the directory name is derived from the
+project's absolute path, moving a checkout leaves its conversations behind under
+the old name; they are not lost, they are simply not offered.
+
 **Closing a terminal tab ends that session.** Its × kills the shell and its
 `dtach` **master** — the part that matters: in `-A` mode dtach forks a master
 that reparents to init, so killing only roost's own client is a *detach*, not an
