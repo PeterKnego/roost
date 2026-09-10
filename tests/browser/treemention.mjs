@@ -149,6 +149,77 @@ try {
   ok(JSON.stringify(tabMentions) === '["src/beta.rs"]',
     `with nothing picked, Alt+K still mentions the active tab — got ${JSON.stringify(tabMentions)}`);
 
+  console.log("\nE2. the cap keeps what it could not send");
+  // The banner says "the first 16 of N", which reads as an invitation to
+  // press Alt+K again. Clearing the whole set discarded the remainder, so the
+  // second press found nothing picked, fell through to `mentionTarget()`, and
+  // mentioned whatever was in the active tab — the silent wrong-file mention
+  // this binding is supposed to be careful about.
+  await resetSent();
+  const allRows = JSON.parse(await evalIn(
+    `JSON.stringify([...${TREE}.querySelectorAll('a.file[data-rel]')].map((a) => a.dataset.rel))`));
+  ok(allRows.length > 16, `setup: ${allRows.length} rows, more than the cap`);
+  await clickRow(allRows[0], { ctrlKey: true });
+  await clickRow(allRows[allRows.length - 1], { shiftKey: true });
+  const pickedBefore = (await picked()).length;
+  ok(pickedBefore === allRows.length, `setup: every row picked (${pickedBefore})`);
+
+  await altK();
+  const firstBatch = await mentions();
+  ok(firstBatch.length === 16, `the first press sends the cap — got ${firstBatch.length}`);
+  const left = await picked();
+  ok(
+    left.length === pickedBefore - 16,
+    `and the rest stay selected — expected ${pickedBefore - 16}, got ${left.length}`,
+  );
+  ok(
+    !left.some((r) => firstBatch.includes(r)),
+    "with only the sent ones spent",
+  );
+
+  await resetSent();
+  await altK();
+  const secondBatch = await mentions();
+  ok(
+    secondBatch.length > 0 && !secondBatch.some((r) => firstBatch.includes(r)),
+    `a second press continues where the first stopped — got ${JSON.stringify(secondBatch)}`,
+  );
+  await evalIn(`clearTreePicked(); 0`);
+
+  console.log("\nE3. the gesture belongs to the tree, not the Changes list");
+  // `class="file"` is emitted by `changes_fragment` too, and its first row
+  // carries `data-rel=""` — so keying the gesture on the class alone made a
+  // modified click on "full diff" do nothing at all: no diff, no pick, no
+  // feedback.
+  await evalIn(`send({ t: "OpenTab", pane: 1, tab: { k: "Changes" } }); 0`);
+  const CHANGES = `document.querySelector('.pane[data-pane="1"] .content')`;
+  ok(
+    await until(async () => await evalIn(`!!${CHANGES}.querySelector('a.file[data-rel=""]')`), 10, "changes"),
+    "setup: the Changes pane has its full-diff row",
+  );
+  await resetSent();
+  await evalIn(`(() => {
+    const a = ${CHANGES}.querySelector('a.file[data-rel=""]');
+    a.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }));
+    return 0; })()`);
+  ok(
+    await until(async () => (await sent()).some((i) => i.t === "OpenTab" && i.tab && i.tab.k === "Diff"), 5, "diff opened"),
+    `a modified click on "full diff" still opens the diff — got ${JSON.stringify(await sent())}`,
+  );
+  ok((await picked()).length === 0, "and picks nothing");
+
+  console.log("\nE4. un-picking a row does not leave it as the range anchor");
+  await evalIn(`clearTreePicked(); 0`);
+  await clickRow("src/alpha.rs", { ctrlKey: true });
+  await clickRow("src/alpha.rs", { ctrlKey: true }); // un-picked
+  ok((await picked()).length === 0, "setup: the row is un-picked again");
+  await clickRow("src/delta.rs", { shiftKey: true });
+  ok(
+    !(await picked()).includes("src/alpha.rs"),
+    `a range after an un-pick does not resurrect it — got ${JSON.stringify(await picked())}`,
+  );
+  await evalIn(`clearTreePicked(); 0`);
+
   console.log("\nF. the cap names itself");
   await resetSent();
   await evalIn(`window.__errors = []; const __se = showError;
@@ -166,6 +237,19 @@ try {
   ok(
     errs.some((m) => m.includes("16") && m.includes(String(rows.length))),
     `and it says how many it dropped — got ${JSON.stringify(errs)}`,
+  );
+  // Sixteen intents, sixteen refusals, one banner. Each undeliverable
+  // `MentionPath` answers with its own `Event::Error`, so a single keystroke
+  // used to stack sixteen identical banners down the page, each with its own
+  // dismiss button and timer.
+  const banners = JSON.parse(await evalIn(`(() => {
+    const els = [...document.querySelectorAll(".error-banner")];
+    return JSON.stringify(els.map((e) => e.dataset.text));
+  })()`));
+  const dupes = banners.filter((t, i) => banners.indexOf(t) !== i);
+  ok(
+    dupes.length === 0,
+    `identical refusals collapse into one banner — got ${JSON.stringify(banners)}`,
   );
 } finally {
   if (page) page.close();
