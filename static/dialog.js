@@ -84,7 +84,13 @@ function runDialog(el, fill, dismissed) {
     // throw.
     try {
       const ready = fill(finish);
-      el.showModal();
+      // `showModal` on an already-open dialog throws InvalidStateError. That
+      // can happen even with the `openDlg` guard above, because `openDlg` is
+      // cleared by `finish` while the platform's `close` event is still only
+      // queued — so for one turn the element is open and `openDlg` says
+      // nothing is. Asking the element itself is the question that cannot be
+      // stale.
+      if (!el.open) el.showModal();
       if (ready) ready();
     } catch (err) {
       openDlg = null;
@@ -618,10 +624,36 @@ function openSettings(settings) {
     // Escape and the backdrop go through runDialog's own finish; hook the
     // revert onto the dialog's close so every exit restores the preview.
     el.addEventListener("close", function onClose() {
+      // The event may not be ours. A `close` queued by a *previous* session is
+      // delivered after this one has opened, and it dispatches to every
+      // listener attached by then — including this one, which is why guarding
+      // on the session token alone is not enough: this session's own handler
+      // answers "yes, mine" to the previous session's event.
+      //
+      // `el.open` is what separates them. If the dialog is open right now,
+      // this close is not about the session that is showing.
+      if (el.open) return;
       el.removeEventListener("close", onClose);
+      // `close` is delivered asynchronously — `el.close()` queues it rather
+      // than dispatching inline — so a close followed by a reopen inside the
+      // same turn runs THIS handler after the next session has already
+      // installed itself. Nulling `settingsOpen` there kills the live
+      // session: app.js gates both `onSnapshot` and `onError` on it, so the
+      // confirming snapshot never reaches the dialog and it sits open with
+      // Save disabled, for good.
+      //
+      // That is the mechanism behind #49. The symptom was a different
+      // assertion failing almost every run of settings.mjs, always in a later
+      // section, because the wedged dialog is only noticed by whatever the
+      // next section happens to do with it.
+      //
+      // `settingsSession` is the token that already exists for exactly this —
+      // `endSession` checks it — and it has to be read BEFORE `endSession`
+      // clears it.
+      const mine = settingsSession === session;
       endSession();
-      if (settingsOpen) { settingsOpen = null; if (previewTheme) applyTheme(themeBefore); }
-    });
+      if (mine && settingsOpen) { settingsOpen = null; if (previewTheme) applyTheme(themeBefore); }
+    }, { once: false });
     render();
     return () => tabs.querySelector(".dlg-tab").focus();
   }, false);
