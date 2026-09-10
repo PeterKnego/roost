@@ -1737,6 +1737,8 @@ pub fn workspace_page(
 <link rel="stylesheet" href="/static/vendor/hljs-github-dark.min.css">
 <link rel="stylesheet" href="/static/vendor/github-markdown.min.css">
 <link rel="stylesheet" href="/static/vendor/code-input.min.css">
+<link rel="stylesheet" href="/static/vendor/code-input-find-and-replace.min.css">
+<link rel="stylesheet" href="/static/vendor/code-input-go-to-line.min.css">
 {theme_links}
 <link rel="stylesheet" href="/static/style.css">
 {theme_css}
@@ -1748,6 +1750,8 @@ pub fn workspace_page(
 <script src="/static/vendor/code-input.min.js"></script>
 <script src="/static/vendor/code-input-indent.min.js"></script>
 <script src="/static/vendor/code-input-auto-close-brackets.min.js"></script>
+<script src="/static/vendor/code-input-find-and-replace.min.js"></script>
+<script src="/static/vendor/code-input-go-to-line.min.js"></script>
 </head><body data-project="{proj_txt}" data-key="{qkey}" data-show-hidden="{sh}" data-autosave="{autosave}" data-follow-tree="{follow_tree}" data-share-selection="{share_selection}" data-launches="{launches}">
 <header>
   <a class="home" href="/" title="all projects">{SVG_HOME}</a><span class="proj">{proj_txt}</span>
