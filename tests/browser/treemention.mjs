@@ -171,6 +171,15 @@ try {
   if (page) page.close();
   browser.close();
   await roost.close();
+  // Not optional, and not tidiness. `fixture()`'s cleanup is what runs
+  // `killByCmdline(stateDir)` and removes the temp tree, and the default
+  // layout gives the right pane a Terminal tab — so this test starts a real
+  // dtach master and its login shell, and without this they outlive it.
+  // harness.mjs records what that looks like: "Two /tmp/roost-browser-* trees
+  // were once found abandoned on a live host, one of them still holding a
+  // running dtach master and its login shell." Measured on this host after a
+  // day of runs: 74 abandoned trees and 9 live shells.
+  await fx.cleanup();
 }
 console.log(fail ? `\n${fail} FAILED` : "\nALL PASS");
 Deno.exit(fail ? 1 : 0);
