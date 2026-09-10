@@ -652,6 +652,24 @@ try {
   ok(Math.abs(centres.tab - centres.x) <= 1,
      `and it sits on the tab's own centre line (${JSON.stringify(centres)})`);
 
+  // The one the previous three attempts could not make. Every assertion so far
+  // measured the close control's *box*; the mark inside it was drawn with the
+  // character `×`, which sits on the font's math axis — so a flex box centred
+  // a line box around a glyph that is not in the middle of it, and the mark
+  // rode visibly high in a 28px target while every box measurement said
+  // "centred". It is an SVG now, and this compares the drawn thing to the box
+  // that holds it.
+  const glyph = await evalIn(`(() => {
+    const el = document.querySelector('.pane[data-pane="3"] .tab .x');
+    const g = el.querySelector("svg");
+    if (!g) return null;
+    const b = el.getBoundingClientRect(), r = g.getBoundingClientRect();
+    return { dy: Math.round((r.top + r.height / 2) - (b.top + b.height / 2)),
+             dx: Math.round((r.left + r.width / 2) - (b.left + b.width / 2)) }; })()`);
+  ok(glyph !== null, "the close mark is drawn, not a character with its own baseline opinion");
+  ok(glyph && Math.abs(glyph.dy) <= 1 && Math.abs(glyph.dx) <= 1,
+     `and it is centred in its box, not merely inside it (${JSON.stringify(glyph)})`);
+
   // The soft keyboard. `dvh` is the viewport with the browser's chrome
   // retracted, a different question, and on iOS it does not shrink for the
   // keyboard at all — so the pane kept its full height and the key bar sat

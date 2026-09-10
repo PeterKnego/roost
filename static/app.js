@@ -229,6 +229,12 @@ const PANE_ICONS = {
   restore: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 7H9V2.5M2.5 9H7v4.5M9 7l4.5-4.5M7 9l-4.5 4.5"/></svg>',
   // Two arrows meeting a check: a review that comes back round. Drawn at the
   // same 15px weight as `newterm` beside it.
+  // The tab's close control. Drawn, not typed: `×` (U+00D7) is placed on the
+  // font's math axis, so a flex box centres the *line box* around a glyph that
+  // is not in the middle of it — visibly high in a 28px target, which is how
+  // this was reported. Two crossing lines have no such opinion. Same geometry
+  // as the header's own close button (`SVG_X` in render.rs).
+  close: '<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>',
   prloop: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.6 6.4a5.6 5.6 0 0 1 9.3-2.2l1.5 1.4"/><path d="M13.4 9.6a5.6 5.6 0 0 1-9.3 2.2L2.6 10.4"/><path d="M13.6 2.4v3.2h-3.2M2.4 13.6v-3.2h3.2"/></svg>',
   newterm: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="10.5" height="9.5" rx="1.2"/><path d="M4 6.8l1.7 1.5L4 9.8M8 10.6h2.6"/><path d="M13.3 2.2v3.6M11.5 4h3.6"/></svg>',
 };
@@ -1031,7 +1037,10 @@ function render() {
       x.className = "x";
       x.title =
         t.k === "Terminal" ? "end session (alt-click to detach, leaving it running)" : "close";
-      x.textContent = "×";
+      // innerHTML from PANE_ICONS, which is constant markup in this file —
+      // the same rule the pane icons above follow. A tab label is
+      // attacker-influenced (a filename, a branch name); this is not.
+      x.innerHTML = PANE_ICONS.close;
       x.onclick = (e) => { e.stopPropagation(); closeTab(pi, ti, t, e.altKey); };
       // The tab is draggable and this sits inside it, so without this a
       // mousedown on × plus a few pixels of pointer drift starts a tab drag

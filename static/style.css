@@ -209,7 +209,14 @@ main { flex: 1; min-height: 0; }
    tail was the ✎ *and* the × together; the right fix was moving the ✎ to the
    filename stripe (.modebtn below), which it was, so a single reserved × is
    modest and the jumping is gone. */
-.tabstrip .tab .x { opacity: 0; margin-left: 2px; padding: 0 2px; border-radius: 3px; transition: opacity .1s; }
+/* An inline-flex box around the drawn × (PANE_ICONS.close in app.js), because
+   an inline SVG otherwise sits on the text baseline and rides low next to the
+   label. The glyph used to be the character `×`, which has the opposite
+   problem — U+00D7 is placed on the font's math axis, so centring its line box
+   leaves the mark visibly high. Two crossing lines have no such opinion. */
+.tabstrip .tab .x { display: inline-flex; align-items: center; justify-content: center;
+                    opacity: 0; margin-left: 2px; padding: 0 2px; border-radius: 3px;
+                    line-height: 0; transition: opacity .1s; }
 .tabstrip .tab:hover .x, .tabstrip .tab.active .x { opacity: .55; }
 .tabstrip .tab .x:hover { opacity: 1; background: var(--bg3, var(--bg2)); }
 /* The create pair lives with the pane controls now (see buildPaneIcons), so
@@ -1277,7 +1284,7 @@ header button.proj:hover svg { opacity: 1; }
      over that padding: the hit area keeps its size, the glyph moves in. */
   .tabstrip .tab .x { display: inline-flex; align-items: center; justify-content: center;
                       width: 28px; height: 28px; margin: 0 -6px 0 -4px; padding: 0;
-                      line-height: 1; flex: 0 0 auto;
+                      line-height: 0; flex: 0 0 auto;
                       /* No hover on a phone, so a control that only appears
                          under one never appears. `.active` carries a higher
                          specificity than a bare `.tab .x`, so both are named
