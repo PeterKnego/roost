@@ -109,6 +109,17 @@ fn read_from(path: &Path) -> Vec<(u16, bool)> {
 /// collide on the temp. The temp is itself dotted, so an interrupted write
 /// leaves something the sweep skips rather than something it reaps.
 pub fn save(project: &str, name: &str, modes: &[(u16, bool)]) {
+    // The pump reads the table under the registry lock and writes it after
+    // releasing — so a Close Tab or Close Project can unlink the socket in
+    // between, and a write that went ahead anyway would re-create the
+    // directory and the sidecar for a session that was explicitly ended.
+    // Only a socket the filesystem positively reports as present is evidence
+    // the session is still there; gone or unreadable both mean do nothing,
+    // which is safe here because not writing costs at most one restart's
+    // paste behaviour.
+    if std::fs::symlink_metadata(crate::session::socket_path(project, name)).is_err() {
+        return;
+    }
     let path = path_for(project, name);
     let Some(dir) = path.parent() else { return };
     if std::fs::create_dir_all(dir).is_err() {
@@ -133,13 +144,52 @@ pub fn save(project: &str, name: &str, modes: &[(u16, bool)]) {
 
 /// Drops the sidecar for a socket that has just been unlinked.
 ///
-/// Called only from the two places that remove a socket, both of which have
+/// Called from the two places that remove a socket, both of which have
 /// already established positive evidence that the session is over. It is
 /// never called from the pump's exit path: that fires on a *detach* too,
 /// where the shell is still running behind its dtach master and the contract
 /// is still true.
+///
+/// Those two are **not** every way a session ends, which an earlier version
+/// of this doc claimed. The commonest way is the user typing `exit`, and
+/// **dtach unlinks its own socket** when the program exits — so neither of
+/// them runs and the sidecar is orphaned. `sweep_orphans` collects those, and
+/// until it existed the orphans were also what let a brand-new session
+/// inherit a dead app's mode table.
 pub fn forget(sock: &Path) {
     let _ = std::fs::remove_file(sidecar_of(sock));
+}
+
+/// Removes every `.modes.*` in a project's socket directory whose session is
+/// positively gone, and any interrupted `.modes.*.tmp.<pid>`.
+///
+/// Needed because dtach unlinks its own socket on a normal exit, so the two
+/// `forget` call sites miss the commonest ending. Without this the files
+/// accumulate for the life of the state dir, and they also stop `reconcile`'s
+/// `remove_dir` of an emptied key directory from ever succeeding.
+///
+/// *Positively* gone: `symlink_metadata` returning `NotFound` for the socket,
+/// never `exists()`. An unreadable directory must not read as an absent
+/// session — that conflation is the whole subject of CLAUDE.md's table, and
+/// here it would delete the contract of a shell that is still running.
+pub fn sweep_orphans(key_dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(key_dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(".modes.") else { continue };
+        // An interrupted write: nothing will ever finish it, and no reader
+        // looks at it.
+        if rest.contains(".tmp.") {
+            let _ = std::fs::remove_file(e.path());
+            continue;
+        }
+        match std::fs::symlink_metadata(key_dir.join(rest)) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_file(e.path());
+            }
+            _ => {} // present, or cannot tell: keep
+        }
+    }
 }
 
 #[cfg(test)]

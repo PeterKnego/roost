@@ -101,12 +101,26 @@ const TRACKED: [u16; 13] = [1, 7, 25, 66, 1000, 1002, 1003, 1004, 1005, 1006, 10
 /// shows it again afterwards.
 ///
 /// Measured on this host before choosing: idle Claude Code flipped `?25`
-/// eleven times in twelve seconds and every other mode exactly once; `vim`
+/// eleven times in twelve seconds and declared every other mode once; `vim`
 /// flipped it six times over ten keystrokes; `htop`, repainting continuously
-/// for six seconds, flipped it once. So 25 is simultaneously the only mode
-/// that would make this a hot write path and the only one that repairs itself
-/// within a second of a restart. Persisting it would buy a stale value at the
-/// cost of a write per repaint.
+/// for six seconds, flipped it once. So excluding 25 removes the mode that
+/// changes most and loses nothing, since it repairs itself within a second of
+/// a restart.
+///
+/// **"Every other mode exactly once" is not true of the default shell**, and
+/// an earlier version of this comment claimed it was. Measured under a real
+/// pty: `bash -l` emits `?2004h` at every prompt and `?2004l` when the line
+/// is accepted — four `h` and three `l` across three commands. Since 2004 is
+/// persisted, an interactive shell writes the sidecar about twice per command
+/// entered.
+///
+/// That cost is accepted rather than designed away. The write is ~30 bytes
+/// through `write` + `rename`, its rate is bounded by how fast a person types
+/// commands, and the alternative — dropping 2004 — would remove the one mode
+/// this whole feature exists for: bracketed paste is what stops a pasted
+/// three-line prompt submitting its first line on its own. Restoring a
+/// mid-command `2004 0` is also self-healing, because the shell re-asserts it
+/// at the next prompt.
 ///
 /// Re-applied when *reading*, not only when writing: a file naming a mode
 /// outside this list is ignored, so a stale, hand-edited or

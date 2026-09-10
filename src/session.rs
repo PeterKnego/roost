@@ -436,6 +436,11 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
         guard.decide(&skey, &key)
     };
+    // Only a `Probe` is a session that outlived a previous roost: it requires
+    // a socket that still exists *and* is held. A `Spawn` is a brand-new
+    // session, and replaying a mode table into one is replaying a dead app's
+    // contract at a fresh shell — see the restore below.
+    let rejoining = matches!(decision, Decision::Probe);
     let reservation = match decision {
         Decision::Join => None,
         Decision::Spawn(r) => Some(r),
@@ -534,14 +539,28 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                 child,
                 child_pid,
                 screens: {
-                    // Seeded from disk, because this may be an attach to a
-                    // session that outlived a previous roost: the app behind
-                    // it declared its mode contract once, to a process that
-                    // is gone, and will never declare it again. Only the
-                    // modes — never the alternate-screen bit, which has no
-                    // safe stale value. See `crate::modes`.
+                    // Seeded from disk only when *rejoining*: the app behind
+                    // a surviving session declared its mode contract once, to
+                    // a process that is gone, and will never declare it
+                    // again. Only the modes — never the alternate-screen bit,
+                    // which has no safe stale value. See `crate::modes`.
+                    //
+                    // Gated on `Decision::Probe`, and that gate is the whole
+                    // correctness of this. `spawned` is true for a genuinely
+                    // new session too, and a sidecar routinely outlives its
+                    // session: when the user types `exit`, **dtach unlinks
+                    // its own socket**, so neither `kill_and_unlink` nor
+                    // `reconcile`'s dead-socket arm ever runs and the file is
+                    // orphaned. `next_free_name` then hands `term` back out,
+                    // and without this gate the fresh `bash` was replayed the
+                    // dead Claude's table — mouse reporting asserted at a
+                    // shell prompt, so every click types `\x1b[<0;12;5M` junk
+                    // and the wheel stops scrolling. A `Probe` cannot see an
+                    // orphan: it requires the socket to exist and be held.
                     let mut sc = crate::screen::Screens::new();
-                    sc.restore(&crate::modes::load(project, name));
+                    if rejoining {
+                        sc.restore(&crate::modes::load(project, name));
+                    }
                     sc
                 },
                 subs: HashMap::new(),
