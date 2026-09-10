@@ -1677,10 +1677,13 @@ dialog.roost, .dlg-title, .dlg-blocked { display: revert !important; visibility:
 /* The detail slot holds the diff a save conflict is about to overwrite; hiding
    it would hide what "Overwrite" destroys. Hidden by attribute when empty. */
 .dlg-detail:not([hidden]) { display: block !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
-.dlg-body, .dlg-buttons, .dlg-items, .dlg-tabs, .dlg-scope, .dlg-rows:not([hidden]), .dlg-themes:not([hidden]), .dlg-about:not([hidden]), .dlg-warning:not([hidden]) { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
+.dlg-body, .dlg-buttons, .dlg-items, .dlg-tabs, .dlg-scope:not([hidden]), .dlg-rows:not([hidden]), .dlg-themes:not([hidden]), .dlg-about:not([hidden]), .dlg-warning:not([hidden]) { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
 .dlg-body, .dlg-items, .dlg-rows, .dlg-themes:not([hidden]), .dlg-about:not([hidden]) { flex-direction: column !important; }
 .dlg-buttons { flex-direction: row !important; order: 0 !important; }
-.dlg-buttons button, .dlg-item { transform: none !important; font-size: 13px !important; order: 0 !important; }
+.dlg-buttons button:not([hidden]), .dlg-item { transform: none !important; font-size: 13px !important; order: 0 !important; }
+/* The About pane has nothing to save, so its OK button is hidden by
+   attribute. Without this the lock above would keep showing it. */
+.dlg-buttons button[hidden] { display: none !important; }
 .dlg-row { display: grid !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
 .dlg-tile { display: flex !important; flex-direction: column !important; visibility: visible !important; opacity: 1 !important; }
 /* The grid each pane of tiles lives in. Locking .dlg-themes alone is not
