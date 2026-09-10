@@ -1044,11 +1044,16 @@ pub fn end_session(project: &str, name: &str) -> bool {
             let _ = s.child.wait();
         }
     } // lock released before any blocking socket work — see `attach`
-    // The name is now free for reuse (`next_free_name` hands `term` back out),
-    // and a stale marker would drop the *next* shell of that name into the
-    // ended one's directory. Best-effort: a marker that will not unlink must
-    // not cost the user their close, and `restore_dir` re-validates anyway.
+    // Both per-session records roost keeps, dropped for the same reason:
+    // `next_free_name` hands `term` straight back out after a close, so
+    // anything left behind here is attributed to whatever opens next under
+    // that name — a brand-new terminal starting in the closed session's
+    // directory, or reported as running the closed session's Claude.
+    //
+    // Best-effort, both of them: a marker that will not unlink must not cost
+    // the user their close, and each is re-validated where it is read.
     crate::cwds::forget(project, name);
+    crate::claudesess::forget(project, name);
     end_socket(project, name, "End session")
 }
 
