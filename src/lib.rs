@@ -27,6 +27,7 @@ pub mod procsess;
 pub mod projects;
 pub mod proto;
 pub mod registry;
+pub mod relaunch;
 pub mod render;
 pub mod roots;
 pub mod routes;

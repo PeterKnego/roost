@@ -185,6 +185,16 @@ const ALL: &[Launch] = &[Launch::Claude];
 /// The name `proto::Launch` deserializes from. Spelled out rather than
 /// derived, so the page and the wire cannot drift apart without
 /// `a_wire_name_round_trips_through_the_intent` noticing.
+/// The inverse of [`wire_name`], for a name read back from disk.
+///
+/// `None` for anything this build does not know, which is a real case rather
+/// than a defensive one: a marker written by a newer roost, read by an older
+/// one sharing the same state directory. The caller's safe action is to do
+/// nothing, which is what `None` gets.
+pub fn from_wire(name: &str) -> Option<Launch> {
+    ALL.iter().copied().find(|l| wire_name(*l) == name)
+}
+
 pub fn wire_name(launch: Launch) -> &'static str {
     match launch {
         Launch::Claude => "claude",

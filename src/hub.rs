@@ -129,6 +129,53 @@ static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<Hub>>>>> = OnceLock::n
 /// claim about a shell that is still running — the same conflation
 /// CLAUDE.md's table is entirely about, here in its "says something untrue"
 /// form rather than its destructive one.
+/// Parks a launch on every lost terminal roost had itself launched an agent
+/// in, so the shell that replaces it comes back running the same thing.
+///
+/// Step 3 of #17, and everything careful about it is in `relaunch`'s module
+/// doc: off unless asked for, global-only, the launch kind and never a resume.
+/// One more restraint lives here rather than there — this runs when a project
+/// is *opened*, not at boot. #17 asks for boot and this deliberately does
+/// less: a boot-time relaunch is the version with nobody in front of it, and
+/// doing it here keeps a person at the screen while an agent starts.
+///
+/// It arms rather than spawns. A `reserve` is permission for the next attach,
+/// which happens when the browser mounts the tab and asks — so nothing starts
+/// in a project nobody opened, and a tab the user closes first never fires.
+fn rearm_launches(lost: &[String], project: &str) {
+    for (name, launch) in launches_to_rearm(lost, project, crate::config::relaunch()) {
+        // `session_id: None` on purpose. #17: resuming would continue a
+        // conversation whose last turn may have been mid-edit, which it calls
+        // worse rather than better. A fresh one, in the same terminal.
+        crate::session::reserve(
+            project,
+            &name,
+            Some(crate::session::LaunchRequest { launch, session_id: None }),
+        );
+    }
+}
+
+/// The decision, separated from the reserving so it can be tested without the
+/// process-global config path.
+///
+/// `enabled` is passed in rather than read here for the same reason: a test
+/// that had to write `~/.config/roost/config.toml` to check "off means
+/// nothing happens" would be racing every other test in the binary for one
+/// environment variable — and "off means nothing happens" is the property this
+/// whole feature's safety rests on.
+fn launches_to_rearm(
+    lost: &[String],
+    project: &str,
+    enabled: bool,
+) -> Vec<(String, crate::proto::Launch)> {
+    if !enabled {
+        return Vec::new();
+    }
+    lost.iter()
+        .filter_map(|n| crate::relaunch::recorded(project, n).map(|l| (n.clone(), l)))
+        .collect()
+}
+
 fn lost_terminal_sessions(ws: &crate::workspace::Workspace, project: &str) -> Vec<String> {
     let Some(on_disk) = crate::session::socket_names_checked(project) else {
         return Vec::new(); // could not look: claim nothing
@@ -185,6 +232,7 @@ impl Hub {
         // shell is gone is indistinguishable a second later, because by then
         // the user may simply not have started it yet.
         hub.ws.lost_sessions = lost_terminal_sessions(&hub.ws, project);
+        rearm_launches(&hub.ws.lost_sessions, project);
         hub.reconcile_buffers_with_disk();
         // The restored layout's terminal tabs are as much a request for those
         // sessions as a fresh click is — including `default_layout`'s own
@@ -2385,6 +2433,49 @@ fn has_prefix_boundary(path: &str, prefix: &str) -> bool {
 /// classifier in `render`, so the conflict view looks like every other diff.
 #[cfg(test)]
 mod tests {
+    use super::launches_to_rearm;
+
+    #[test]
+    fn nothing_relaunches_unless_the_setting_asks_for_it() {
+        // The property this whole feature's safety rests on, and the reason
+        // the decision is a separate function: #17 is careful about relaunch
+        // because it starts an agent in a checkout whose state it does not
+        // know, so an install that never opted in must see no difference at
+        // all — even with a launch recorded and the tab lost, which is exactly
+        // the state that would otherwise fire.
+        crate::wsstate::set_state_dir_for_test();
+        let project = format!("rearm{}", std::process::id());
+        crate::relaunch::record(project.as_str(), "term", crate::proto::Launch::Claude);
+        let lost = vec!["term".to_string()];
+
+        // Asserts the state it then negates: with the setting on this *is* a
+        // relaunch, so the empty result below is the setting talking and not a
+        // missing marker.
+        assert_eq!(
+            launches_to_rearm(&lost, &project, true),
+            vec![("term".to_string(), crate::proto::Launch::Claude)],
+            "setup: opted in, a recorded launch comes back"
+        );
+        assert!(
+            launches_to_rearm(&lost, &project, false).is_empty(),
+            "opted out, nothing is armed"
+        );
+    }
+
+    #[test]
+    fn a_lost_tab_roost_never_launched_anything_in_is_left_alone() {
+        // Most terminals are plain shells. Relaunching one would be starting
+        // something the user never asked roost to start — and `default_layout`
+        // ships a `term` tab in every project, so this is the common case
+        // rather than an edge.
+        crate::wsstate::set_state_dir_for_test();
+        let project = format!("rearmplain{}", std::process::id());
+        assert!(
+            launches_to_rearm(&[String::from("term")], &project, true).is_empty(),
+            "no recorded launch, nothing to relaunch"
+        );
+    }
+
     use super::lost_terminal_sessions;
 
     fn ws_with_terminals(names: &[&str]) -> crate::workspace::Workspace {
