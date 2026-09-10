@@ -1,6 +1,8 @@
 # A container image for roost
 
 *2026-09-10. Issue #53. Spec: `docs/superpowers/specs/2026-09-10-container-image-design.md`.*
+*Status: **Part one implemented and verified 2026-09-10**; Part two is the next*
+*commit on the same branch.*
 *Order set by Dean: **a usable image first, then the security that fits this
 kind of project**. That is not a sequencing preference — it changes answers. A
 hardening-first reading picks Alpine, and Alpine cannot run `claude`.*
@@ -112,3 +114,36 @@ Pinning the *existing* workflows' actions (its own change; `release.yml` is
 hand-edited and exempted from `dist` regeneration), CodeQL/Scorecard/fuzzing
 (about the repository, not the image), a Home Assistant add-on, and rootless
 Docker (a host posture, documented not configured).
+
+
+## What Part one actually proved, on the real thing
+
+`scripts/test/container.sh` builds the image and drives it. Everything below was
+observed, not argued:
+
+- a websocket opened a session, the shell ran a command, and the file it wrote
+  landed in a bind-mounted checkout **owned by the host uid** — the PTY works
+  with `--cap-drop ALL` (`CapEff=0000000000000000`), which the spec said to
+  verify rather than assert;
+- a real `dtach` holds a real socket under the state volume — the `ROOST_CMD=cat`
+  row of CLAUDE.md's table, reproduced in the new environment;
+- `git worktree list` inside the container sees a worktree created on the host,
+  which is the whole reason the mount mirrors the host path;
+- `ROOST_BIND_ALL` unset ⇒ the published port refuses the connection;
+  `=yes` ⇒ exit 2 naming the value;
+- no setuid binaries left apart from `sudo`;
+- `claude` installs into the persistent `$HOME` (exit 0), and **a brand-new
+  container on the same volume still finds it on a login shell's PATH and runs
+  it** — `claude --version` → 2.1.268. That is the base-image decision confirmed
+  end to end: it is a glibc binary and this is why the image is not Alpine.
+
+Two defects the test found by being written first, both in the test rather than
+the image, and both invisible to a green run:
+
+- **`set -e` killed the script at the first failing assertion**, so the first
+  failure hid every one after it. `check <message> <command…>` now runs the
+  assertion as the helper's own argument.
+- **keystrokes are `Message::Binary`; `Message::Text` is the resize channel.**
+  The first client sent text, which `term.rs` correctly ignored — so the session
+  spawned, dtach held its socket, everything looked healthy, and nothing was
+  ever typed. Exactly the shape of a test that passes for the wrong reason.

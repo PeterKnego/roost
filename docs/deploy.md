@@ -324,6 +324,143 @@ highlighter, which is a fixed stylesheet. A project theme goes in
 the user directory nor a project may supply JavaScript or HTML — only
 `$ROOST_STATIC` can, and only whoever starts the process can set it.
 
+## Running it in a container
+
+**A container sits beside the systemd unit; it does not replace it.** The one
+thing it gives up is the reason dtach exists, so read the last part of this
+section before deploying it.
+
+```bash
+cp .env.example .env      # UID, GID, ROOST_PROJECTS
+docker compose up -d --build
+# http://127.0.0.1:8123
+```
+
+### The bind, which is the decision the rest follows from
+
+roost binds `127.0.0.1` everywhere else and that bind **is** the security
+boundary — the websocket spawns a shell. Inside a container `127.0.0.1` is the
+*container's* loopback, which nothing on the host can reach, so the image binds
+`0.0.0.0` and the **network namespace** becomes the boundary instead. That is a
+substitution, not a relaxation, and it is sound only with all three of:
+
+- `ROOST_BIND_ALL=1`, which is the only thing that permits the bind at all. It
+  is a boolean rather than an address on purpose, so no host build can reach
+  `0.0.0.0` by typing a preference; an unrecognised value exits rather than
+  falling back, so a typo cannot leave a container listening where nothing can
+  reach it;
+- the port published to the host's **loopback only** — `127.0.0.1:8123:8123`,
+  never `8123:8123`, which Docker renders as `0.0.0.0` and which on most daemons
+  also opens the host firewall;
+- one service on its own network. The `Origin` check refuses a client that
+  *sends* one; a curl from another container on the same network sends none, and
+  gets a shell.
+
+Published on host loopback, the browser's `Host` and `Origin` are both
+`127.0.0.1:8123`, which passes unlisted — so **the container needs no
+`allowed_origins` entry to work**. You need one for exactly the same reason a
+host does: putting a name in front of it.
+
+### Mount the checkouts at their own path
+
+`ROOST_PROJECTS` is mounted at the *same absolute path* inside the container.
+Not `/projects`. Three separate things record absolute paths and break silently
+under a remapped mount:
+
+- **git worktrees.** A worktree's `.git` is a file saying
+  `gitdir: /abs/path/.git/worktrees/<name>`, and the repository points back the
+  same way. roost finds worktrees by asking `git worktree list`, so a remapped
+  mount has none — no error, just an empty switcher.
+- **roost's `.origin` markers**, which record where a project resolved to and
+  are what stops reaping from killing a session it cannot otherwise account for.
+- **Claude Code's transcripts**, keyed by an encoding of the working directory.
+  A remapped path silently orphans every past conversation, so the ✻ menu is
+  empty and a resume finds nothing.
+
+The UID matters for the same reason: files roost writes into a mounted checkout
+must be owned by whoever owns it on the host, so `APP_UID`/`APP_GID` are build
+args (`id -u`, `id -g`), not a fixed 65532.
+
+### Where things must live to survive an upgrade
+
+**A writable rootfs is not what makes an install survive.** Anything written to
+`/usr` is gone at the next `docker compose up` after an image change — which is
+the moment you are most likely to expect your toolchain to still be there. The
+durable place is `$HOME`, which is a volume, and `rustup`, the Go tarball,
+`nvm`, `npm --prefix` and the `claude` installer all install there natively as
+the app user, needing no root at all.
+
+`sudo` is in the image because sometimes you do need `apt-get`. The
+*reproducible* way to add tooling is a derived image:
+
+```dockerfile
+FROM roost:local
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends golang-go
+USER 1000:1000
+```
+
+### `claude` is not in the image
+
+Baking it would pin a version that is stale within days. Install it once, from a
+terminal inside the container, into the persistent `$HOME`:
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash
+```
+
+It lands in `~/.local/bin/claude`, which Debian's own `~/.profile` puts on a
+login shell's `PATH` — and roost's terminals are login shells. It survives every
+restart and upgrade, it updates itself, and it shares one `$HOME` with roost,
+which is the condition `idelock.rs` needs: it writes
+`$CLAUDE_CONFIG_DIR/ide/<port>.lock` and the CLI scans that same directory.
+Verified in the image, 2026-09-10: installer exit 0, `claude --version` reports
+2.1.268 from a brand-new container on the same volume.
+
+**Any arrangement where `claude` runs on the host while roost runs in the
+container is silently broken** — the lock file lands where the CLI never looks,
+and the integration is simply off, with no error.
+
+You can instead mount the host's real `~/.claude` to share auth and history.
+That is a real grant, not a convenience: it holds the OAuth token and every
+transcript, and hands them to whatever runs in that container.
+
+### What a container costs: sessions
+
+`KillMode=process` exists so that stopping roost leaves its dtach masters
+running. **There is no container equivalent**: when roost is the container's
+main process, roost exiting *is* the container exiting, and no volume changes
+that — a dtach socket is worthless without the process holding it.
+
+| Event | Shells |
+|---|---|
+| browser tab closed, laptop asleep, network dropped | **survive** — roost never stopped |
+| `docker compose restart`, image upgrade, daemon restart, host reboot | **die** |
+
+From roost's point of view a container restart is the same event as a host
+reboot, and the answer is the same one (#17, #18): the layout, tabs, unsaved
+buffers and each terminal's working directory come back, and a terminal that was
+running a Claude offers to resume that conversation. What does not come back is
+the shell itself, its scrollback, and anything running in a terminal that was
+not a Claude.
+
+**Never point the container's state directory at one a roost on the host is also
+using.** The container's `ps` cannot see the host's dtach masters, so reconcile
+would read the host's live sockets as held by nothing and unlink them — leaving
+live shells running and unreachable forever.
+
+### Testing it
+
+```bash
+make test-container            # builds the image and drives a real PTY through it
+ROOST_TEST_CLAUDE=1 make test-container   # also installs claude, needs network
+```
+
+It is deliberately outside `cargo test`: it needs a docker daemon and takes
+minutes, and it skips with a message when there is none. It exists because
+CLAUDE.md's dev/prod substitution table has four rows and three are this class —
+a container is a fourth substitution nothing else in the suite can see.
+
 ## Cutting a release
 
 ```sh
