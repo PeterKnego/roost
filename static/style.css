@@ -1011,7 +1011,7 @@ dialog.roost.dlg-wide { width: min(760px, 96vw); }
    setConnState — so it costs no header width in the ordinary case, and it
    borrows the config warning's colour because it is the same kind of news. */
 #connstate { color: #d29922; cursor: help; font-weight: 500; white-space: nowrap; }
-#connstate[data-state="offline"] { color: var(--err, #f85149); }
+#connstate[data-state="offline"] { color: var(--del-fg, #cf222e); }
 /* The project name is the switcher's other trigger, so it has to look like a
    control rather than a label — a click target that does not look like one is
    the same problem in a quieter coat. It keeps the header's text colour and

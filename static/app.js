@@ -336,6 +336,17 @@ const proposals = {};
 let ctrlTries = 0;
 let ctrlTimer = null;
 let ctrlWarned = false;
+/// When the in-flight connect attempt started, so a socket wedged in
+/// CONNECTING can be told from one that is merely still trying.
+let ctrlAttemptAt = 0;
+/// Buffers whose `EditBuffer` was refused because the socket was down. The
+/// text itself is not held here — `texts` already has it, updated on the
+/// keystroke rather than on the debounce — only the fact that roost has not
+/// seen it.
+const unsentEdits = new Set();
+/// Past this, a socket still in CONNECTING is not "trying", it is wedged: a
+/// SYN into a network that went away leaves Chrome in state 0 for minutes.
+const STALE_CONNECT_MS = 4000;
 
 /// Shown only when something is wrong. A permanent "connected" badge is
 /// clutter that stops being read, and the honest signal here is the absence
@@ -375,14 +386,27 @@ function send(intent) {
 function connectControl() {
   myOrigin = null; // a reconnect must not keep a stale id from the last socket
   clearTimeout(ctrlTimer);
-  ctrl = new WebSocket(wsUrl(`/ws/${PROJECT}/_workspace`));
-  ctrl.onopen = () => {
+  ctrlAttemptAt = Date.now();
+  // Every handler is tied to the socket that installed it. Without this a
+  // superseded socket — one still in CLOSING while a fresh connect is already
+  // up, which is what a `systemctl restart roost` produces — fires its
+  // `onclose` against the new socket's world: it drags the state back to
+  // reconnecting over a live connection and schedules a second
+  // `connectControl`, leaving the intermediate socket open forever with its
+  // `onmessage` still attached, so every server event is applied twice.
+  // `connectTerm` avoids the same trap by reading `entry.sock`.
+  const sock = new WebSocket(wsUrl(`/ws/${PROJECT}/_workspace`));
+  ctrl = sock;
+  sock.onopen = () => {
+    if (ctrl !== sock) return;
     ctrlTries = 0;
     ctrlWarned = false;
     setConnState("live");
+    flushUnsentEdits();
   };
-  ctrl.onmessage = (e) => onEvent(JSON.parse(e.data));
-  ctrl.onclose = () => {
+  sock.onmessage = (e) => { if (ctrl === sock) onEvent(JSON.parse(e.data)); };
+  sock.onclose = () => {
+    if (ctrl !== sock) return;
     // Capped backoff, matching what `connectTerm` already does rather than
     // the flat 1s this used to use: a roost that is genuinely down was being
     // hit once a second, forever, by every open tab. Never gives up, for the
@@ -394,19 +418,63 @@ function connectControl() {
   };
 }
 
+/// Re-sends what roost never received. `texts` holds the current text of every
+/// buffer, updated on the keystroke rather than on the debounce, so this can
+/// always reconstruct the edit.
+///
+/// Without it, typing during an outage is silently discarded: the refused
+/// `EditBuffer` never reaches roost, whose buffer stays `Clean` with an
+/// unchanged `base_hash`, so `resolve_replay` hands back the *disk* text on
+/// reconnect and the `BufferText` handler assigns it straight into the
+/// textarea. Making the outage visible (above) made that worse rather than
+/// better: the header clears to live at the same moment, saying it landed.
+///
+/// Re-sending a buffer that happens to match its base is harmless — the
+/// server treats an edit equal to the base as clean, which
+/// `an_edit_that_matches_the_base_leaves_the_buffer_clean` pins.
+function flushUnsentEdits() {
+  if (!unsentEdits.size) return;
+  for (const rel of [...unsentEdits]) {
+    const text = texts.get(rel);
+    if (text === undefined) { unsentEdits.delete(rel); continue; }
+    sentEdits.add(rel);
+    // Deliberately not cleared here. A successful `send` means the bytes left
+    // this browser, not that roost has applied them — and the reconnect's own
+    // replay can still be in flight behind it, carrying the disk text. The
+    // flag is cleared by confirmation: a State that reports the buffer dirty,
+    // or a BufferText that already matches what we hold.
+    send({ t: "EditBuffer", rel, text });
+  }
+}
+
 /// A wake, a tab coming back to the foreground, or the OS reporting the
 /// network back. Each is a reason to try *now* rather than sit out the rest
 /// of a backoff that may have grown to eight seconds — which is the
 /// difference between a workspace that feels instant on wake and one that
 /// looks broken for a moment first.
 function probeControl() {
-  if (ctrl && (ctrl.readyState === 0 || ctrl.readyState === 1)) return;
+  // Already up. The state is re-asserted rather than assumed: nothing else
+  // clears a stale badge on this path, and a badge that says "nothing you do
+  // here is being saved" over a working connection is worse than none.
+  if (ctrl && ctrl.readyState === 1) return setConnState("live");
+  // Still connecting, and recently enough to be believed. Past that it is
+  // wedged — a SYN into a network that has gone away sits in CONNECTING for
+  // minutes, no `onclose` fires, and no retry is scheduled, so the wake this
+  // function exists for would otherwise do nothing at all.
+  if (ctrl && ctrl.readyState === 0 && Date.now() - ctrlAttemptAt < STALE_CONNECT_MS) return;
+  if (ctrl) { try { ctrl.close(); } catch { /* already gone */ } }
   ctrlTries = 0;
   connectControl();
 }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) probeControl(); });
+// `online` is a reason to *try*, never a verdict. Deliberately no `offline`
+// handler: roost binds 127.0.0.1, so `navigator.onLine` going false says
+// nothing about this socket — an ethernet unplug on the machine running roost
+// would paint "nothing you do here is being saved" over a connection that is
+// working perfectly, and nothing would clear it, because `online` finds the
+// socket already open and returns. The socket's own close is the only
+// evidence that the socket is down.
 addEventListener("online", probeControl);
-addEventListener("offline", () => setConnState("offline"));
 
 function onEvent(ev) {
   switch (ev.t) {
@@ -438,6 +506,11 @@ function onEvent(ev) {
         for (const rel of texts.keys()) if (!openRels.has(rel)) texts.delete(rel);
         for (const rel of editors.keys()) if (!openRels.has(rel)) editors.delete(rel);
         for (const rel of sentEdits) if (!openRels.has(rel)) sentEdits.delete(rel);
+        // roost calling a buffer dirty is positive evidence it received the
+        // edit — the only confirmation available, since an EditBuffer is
+        // echoed to other clients and never back to its author.
+        for (const b of state.buffers) if (b.dirty) unsentEdits.delete(b.rel);
+        for (const rel of [...unsentEdits]) if (!openRels.has(rel)) unsentEdits.delete(rel);
         // Autosave resumes as soon as the server says this buffer has nothing
         // outstanding — saved, discarded, or gone. SaveOk is the common route
         // and clears it sooner, but not the only one: the banner's "discard
@@ -505,6 +578,22 @@ function onEvent(ev) {
       // case, so a client-side dirty check here would be redundant at best
       // and would break the two legitimate cases above at worst.
       if (ev.origin && ev.origin === myOrigin) break;
+      // The one case the reasoning above does not cover, because it assumes
+      // the server *knows* this buffer is dirty. During an outage it does
+      // not: the `EditBuffer` never arrived, so roost's buffer is still
+      // `Clean` with an unchanged `base_hash`, and `resolve_replay` therefore
+      // answers the reconnect with the **disk** text. Applying that would
+      // discard everything typed while offline — measured, and the reason
+      // this arm exists.
+      //
+      // Equality is what clears it rather than the send: our own `EditBuffer`
+      // is broadcast to every *other* client and never echoed back here, so
+      // waiting for an echo would pin this flag forever and make a later
+      // external write invisible for that file.
+      if (!ev.origin && unsentEdits.has(ev.rel)) {
+        if (texts.get(ev.rel) === ev.text) unsentEdits.delete(ev.rel);
+        else break; // ours is newer than anything roost has seen
+      }
       // An empty origin is the server telling us what the file now says — a
       // discard, a reload, an external write. Whatever this client had
       // outstanding is superseded by it, and holding the flag past that would
@@ -2420,7 +2509,10 @@ function pushEdit(rel) {
   const ta = editors.get(rel);
   if (ta) {
     sentEdits.add(rel);
-    send({ t: "EditBuffer", rel, text: ta.value });
+    // Remembered when it does not go out, and re-sent on reconnect. Ignoring
+    // this answer is how text typed during an outage was discarded.
+    if (send({ t: "EditBuffer", rel, text: ta.value })) unsentEdits.delete(rel);
+    else unsentEdits.add(rel);
   }
 }
 
