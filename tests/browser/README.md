@@ -50,6 +50,7 @@ deno run -A tests/browser/nonascii.mjs   # the editor's non-ASCII indicator and 
 deno run -A tests/browser/notices.mjs    # the bell panel holds only this project's notices, and Clear empties only what it shows
 deno run -A tests/browser/dialogs.mjs    # the dialog primitive: askConfirm/askText/askMenu's exits, focus restoration, and a guard that no code path reaches a native confirm/prompt/alert
 deno run -A tests/browser/closetab.mjs   # closing a dirty file tab: the confirmation must not let the tab strip renumber underneath a stale index
+deno run -A tests/browser/watchdog.mjs   # the workspace connection's visible state, and send() refusing instead of silently dropping
 ```
 
 Each scenario is its own file and its own roost, so they can be run in any

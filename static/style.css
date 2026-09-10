@@ -1006,3 +1006,9 @@ dialog.roost.dlg-wide { width: min(760px, 96vw); }
   flex: 0 0 auto; align-self: center; width: 2px; height: 20px; border-radius: 1px;
   background: var(--accent, var(--fg)); pointer-events: none;
 }
+
+/* The connection state. Only ever visible when something is wrong — see
+   setConnState — so it costs no header width in the ordinary case, and it
+   borrows the config warning's colour because it is the same kind of news. */
+#connstate { color: #d29922; cursor: help; font-weight: 500; white-space: nowrap; }
+#connstate[data-state="offline"] { color: var(--err, #f85149); }
