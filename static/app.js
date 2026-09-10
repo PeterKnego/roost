@@ -130,6 +130,21 @@ function codePlugins() {
   // moving focus, so the keyboard is not trapped in the textarea.
   if (P.Indent) p.push(new P.Indent(false, 1));
   if (P.AutoCloseBrackets) p.push(new P.AutoCloseBrackets());
+  // Find within the buffer, and go to a line.
+  //
+  // `alwaysCtrl: false` is what keeps the two searches apart on both
+  // platforms: this takes ⌘F on a Mac and Ctrl+F elsewhere, while roost's
+  // project search is ⇧⌘F / ⇧⌃F and requires Shift (see the `KeyF` handler
+  // near the search overlay). They answer different questions — one searches
+  // files on disk, the other the buffer in front of you, *including unsaved
+  // changes the disk has never seen* — so they want different keys rather
+  // than one key that guesses.
+  //
+  // Both plugins bind on the code-input's own textarea, never on `document`,
+  // so neither can take a keystroke away from a terminal pane. That matters
+  // more than it looks: Ctrl+F and Ctrl+G are both readline bindings.
+  if (P.FindAndReplace) p.push(new P.FindAndReplace(true, true, {}, false));
+  if (P.GoToLine) p.push(new P.GoToLine());
   return p;
 }
 

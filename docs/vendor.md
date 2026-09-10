@@ -23,6 +23,7 @@ only thing that exercises any of it.
 | `github-markdown.min.css` | `github-markdown-css` | 5.3.3 | MIT |
 | `code-input.min.js`, `code-input.min.css` | `@webcoder49/code-input` | 2.8.3 | MIT |
 | `code-input-indent.min.js`, `code-input-auto-close-brackets.min.js` | `@webcoder49/code-input` (`plugins/`) | 2.8.3 | MIT |
+| `code-input-find-and-replace.min.{js,css}`, `code-input-go-to-line.min.{js,css}` | `@webcoder49/code-input` (`plugins/`) | 2.8.3 | MIT |
 | file-type/folder icons (data URIs in `static/style.css`) | `material-extensions/vscode-material-icon-theme` | 5.38.0 | MIT |
 
 ## The file-type icons
@@ -75,6 +76,16 @@ and are vendored one at a time as they are used. Two are, both prefixed
 - `indent.min.js` — Tab inserts an indent, Enter carries it onto the next
   line, Backspace deletes a whole one.
 - `auto-close-brackets.min.js` — brackets and quotes close themselves.
+- `find-and-replace.min.js` — ⌘F / Ctrl+F finds within the buffer, Ctrl+H
+  replaces. Constructed with `alwaysCtrl: false`, which is what keeps it off
+  roost's own ⇧⌘F / ⇧⌃F project search: that one requires Shift, this one
+  must not.
+- `go-to-line.min.js` — Ctrl+G asks for a line number.
+
+The last two ship stylesheets as well, which is why the head gained two more
+`<link>`s. Both bind on the code-input's own textarea rather than on
+`document`, so neither can take Ctrl+F or Ctrl+G away from a terminal pane —
+both are readline bindings.
 
 They are passed to the **`hl` template only**, so they apply to code files and
 not to prose. Both act only on `keydown`/`beforeinput`/`input` and insert
@@ -85,4 +96,8 @@ matters more here than anywhere else in this directory: save is guarded
 against a hash of what was read from disk, so a plugin that rewrote the text
 wholesale would make a buffer conflict with itself.
 
-`find-and-replace` and `go-to-line` are not vendored yet.
+No line-number gutter: this editor soft-wraps (`white-space: pre-wrap` on
+`.editwrap code-input`), so a logical line can occupy several visual rows and
+a gutter has to measure each one on every edit and every pane resize. That is
+a design question rather than a file to vendor, and code-input has no plugin
+for it.
