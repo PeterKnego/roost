@@ -1116,7 +1116,15 @@ pub fn overview_page(sel: &str, roots: &[String]) -> String {
     let roots_title = esc(&roots.join(":"));
     let (sv, dv, ov) = (av("style.css"), av("dialog.js"), av("overview.js"));
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>roost</title>\
+        // The viewport meta the workspace page has always had and this one
+        // never did. Without it a phone lays the front page out at its default
+        // 980px and scales the result down: every width rule below the
+        // breakpoint is skipped, and the text arrives about a third of its
+        // intended size. Measured before adding it — `window.innerWidth` 980
+        // on a 390px device.
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>roost</title>\
          {icons}\
          <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
          <link rel=\"stylesheet\" href=\"/static/style.css?v={sv}\">\

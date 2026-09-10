@@ -1172,9 +1172,43 @@ header button.proj:hover svg { opacity: 1; }
   }
 
   /* The header is a single row of a dozen controls at desktop width. Here it
-     wraps rather than pushing the project name off-screen, and the search
-     field — which uses margin:auto to centre — takes the full second row. */
+     wraps, and the search field — which uses margin:auto to centre — takes the
+     full second row. Two rows is the budget; it took three.
+
+     Measured with a real project and branch (`mitsubishi2mqtt` on
+     `power-cycle-detection`) rather than the browser test's `proj` on `main`:
+     the two chips came to 131px and 194px, so they filled the first row by
+     themselves and pushed every icon onto a third. Header 130px, 28% of the
+     screen gone before the terminal. With the short fixture names the same
+     code measured 82px and 16%, which is why the test was green and the phone
+     was not — the fixture never entered the state that breaks. */
   header { flex-wrap: wrap; height: auto; padding: 4px 6px; row-gap: 4px; }
+  /* Share what is left after the icons and truncate, rather than taking the
+     width the name happens to be. `flex: 1 1 0` with `min-width: 0` is what
+     lets a flex item shrink below its content — without the `min-width` the
+     default `auto` floors it at the text width and the wrap comes back. */
+  #projname { flex: 1 1 0; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  #wtbtn { flex: 0 1 auto; min-width: 0; white-space: nowrap; }
+  /* The branch button is an icon plus two spans, and inside `#gitinfo` the
+     branch name is followed by the dirty bullet and the ± counts. Clipping the
+     whole span therefore hides the *status* — the thing the button is there to
+     report — while keeping the part of the name that fits, which is backwards:
+     `power-cycle-detection` truncated still reads, a missing ● does not say
+     "clean". So the ellipsis goes on the name alone and the bullet keeps its
+     width. */
+  /* The branch button is an icon plus `#gitinfo` (the branch name, then the
+     dirty bullet and the counts) plus `#wtlabel`. Capping the *name* rather
+     than clipping the button is what keeps the status visible: a truncated
+     `power-cycle-detect…` still reads, while a missing ● does not say "clean".
+     So the button sizes to its content and only the name is bounded. */
+  #wtbtn { overflow: visible; }
+  #wtbtn #branch {
+    display: inline-block; max-width: 22vw; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom;
+  }
+  /* The icons keep their 44px and never shrink: a tap target that gave way
+     under pressure would be the wrong thing to trade. */
+  header > .home, #bell, #settings, #closeproj { flex: 0 0 auto; }
   header .vsep { display: none; }
   #searchbox { order: 99; flex: 1 0 100%; margin: 0; }
   /* 16px is not a style choice: iOS zooms the whole page when a focused input
@@ -1227,6 +1261,34 @@ header button.proj:hover svg { opacity: 1; }
   }
   /* No hover to reveal a row under a finger. */
   .projstrip .proj:active, .wtstrip .wt:active, .notice:active { background: var(--bg); }
+
+  /* ---- the project list (the front page) ---- */
+  /* Two fixed-ish columns, 360px of which is the project list, on a 390px
+     screen: the Sessions pane got about twenty pixels. Stacked instead, and
+     each pane gets its own scroll. */
+  #overview {
+    grid-template-columns: 1fr;
+    grid-auto-rows: minmax(0, 1fr);
+    padding: 4px;
+    height: calc(100vh - var(--header-h, 38px));
+    height: calc(100dvh - var(--header-h, 38px));
+  }
+  /* Rows are 3px of padding and 13px of text on a desktop, driven by a
+     pointer. Under a finger they are neither reachable nor readable. */
+  #overview .ovrow, #overview .ovsession a {
+    min-height: 44px; padding: 6px 10px; font-size: 15px;
+  }
+  #overview .ovbody { padding: 4px 2px; }
+  /* The one that actually stops you getting in. `.ovgo` — the link that opens
+     a project — is `visibility: hidden` until `:hover`, and a phone has no
+     hover: on a touch screen the way into a project was invisible on every row
+     but the selected one. Nothing here is a substitute for tapping it. */
+  #overview .ovgo { visibility: visible; font-size: 14px; padding: 0 8px; min-height: 44px;
+                    display: inline-flex; align-items: center; }
+  #overview .ovcaret { width: 1.6em; min-height: 44px; display: inline-flex;
+                       align-items: center; justify-content: center; }
+  #overview .ovkind { width: auto; min-width: 4.5em; }
+  #overview .ovrow:active, #overview .ovsession a:active { background: var(--tab-hover); }
 
   /* The search results panel is anchored under the search field on desktop.
      At this width there is nothing to anchor to — it fills the screen. */

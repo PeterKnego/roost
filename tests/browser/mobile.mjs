@@ -37,12 +37,28 @@ const PHONE = { width: 390, height: 844, deviceScaleFactor: 3, mobile: true };
 const fx = await fixture();
 await Deno.writeTextFile(`${fx.dir}/notes.md`, "# notes\n\nsome text\n");
 
+// A second project with a *realistic* name, on a realistic branch. The header
+// section below opens this one rather than `proj` on `main`, and that is the
+// whole point of it existing: with the short fixture names the header measured
+// 82px over two rows and this file was green, while a phone showed 130px over
+// three — the project and branch chips came to 131px and 194px and filled the
+// first row by themselves. The fixture never entered the state that breaks,
+// which is the failure mode CLAUDE.md names by name.
+const LONG_PROJECT = "mitsubishi2mqtt";
+const LONG_BRANCH = "power-cycle-detection";
+const longDir = `${fx.roots}/${LONG_PROJECT}`;
+await Deno.mkdir(longDir, { recursive: true });
+await Deno.writeTextFile(`${longDir}/a.md`, "# a\n");
+for (const args of [["init", "-q"], ["checkout", "-q", "-b", LONG_BRANCH]]) {
+  await new Deno.Command("git", { args, cwd: longDir, stdout: "null", stderr: "null" }).output();
+}
+
 const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
 let page;
 
-const load = async (metrics) => {
-  const p = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
+const load = async (metrics, project = fx.project) => {
+  const p = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${project}`);
   await p.cmd("Emulation.setDeviceMetricsOverride", { ...metrics, screenOrientation: undefined });
   if (metrics.mobile) {
     await p.cmd("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
@@ -109,26 +125,89 @@ try {
   await page.cmd("Emulation.setDeviceMetricsOverride", PHONE);
   await sleep(250);
 
-  console.log("B3. how much of the screen the chrome takes");
-  // A budget, not a pixel count. Measured at 22% before the header was
-  // trimmed — it wrapped to four rows at 390px — and that is before a soft
-  // keyboard takes half of what is left, which is the state the pane you are
-  // actually working in has to survive. Asserted as a ceiling so that adding a
-  // control to the header cannot quietly spend the screen: the number moving
-  // is fine, nobody noticing is not.
-  const chrome = await evalIn(`(() => {
-    const h = document.querySelector("header").getBoundingClientRect().height;
-    const b = document.getElementById("mobilebar").getBoundingClientRect().height;
-    return { header: Math.round(h), bar: Math.round(b), pct: Math.round(((h + b) / window.innerHeight) * 100) }; })()`);
-  ok(chrome.pct <= 20,
-     `header (${chrome.header}px) plus switcher (${chrome.bar}px) is ${chrome.pct}% of the screen`);
+  console.log("B3. the header with a real project and branch name");
+  // Measured on a phone against `mitsubishi2mqtt` on `power-cycle-detection`:
+  // 130px over three rows, 28% of the screen gone before the terminal. The
+  // same code with this file's old `proj` on `main` measured 82px and 16%,
+  // which is why it was green while the phone was not.
+  const longPage = await load(PHONE, LONG_PROJECT);
+  const hdr = await longPage.evalIn(`(() => {
+    const h = document.querySelector("header");
+    // Visual rows, by clustering tops rather than counting distinct ones:
+    // controls of different heights are centred differently inside the same
+    // line, so the home icon sits 14px below the project name while plainly
+    // beside it. The first attempt counted three rows over an 82px header.
+    // (No backticks in here: this comment lives inside a template literal.)
+    const tops = [...h.children].map((c) => c.getBoundingClientRect())
+      .filter((r) => r.height).map((r) => r.top).sort((a, b) => a - b);
+    let rows = 0, last = -1e9;
+    for (const t of tops) { if (t - last > 24) { rows++; last = t; } }
+    const bar = document.getElementById("mobilebar").getBoundingClientRect().height;
+    const keys = document.getElementById("termkeys").getBoundingClientRect().height;
+    const wb = document.getElementById("wtbtn").getBoundingClientRect();
+    const bullet = h.querySelector(".gbullet");
+    const br = bullet && bullet.getBoundingClientRect();
+    return { h: Math.round(h.getBoundingClientRect().height), rows,
+             pct: Math.round(((h.getBoundingClientRect().height + bar + keys) / window.innerHeight) * 100),
+             bullet: !!br && br.width > 0 && br.right <= wb.right + 1 }; })()`);
+  ok(hdr.rows <= 2, `the header stays within two rows, got ${hdr.rows} (${hdr.h}px)`);
+  ok(hdr.h <= 100, `and under 100px, got ${hdr.h}px`);
+  // A budget, not a pixel count, so a control added to the header cannot
+  // quietly spend the screen: the number moving is fine, nobody noticing is
+  // not.
+  ok(hdr.pct <= 24, `header plus switcher plus keys is ${hdr.pct}% of the screen`);
+  // The branch *name* is what gives way, never the status beside it: a
+  // truncated `power-cycle-detect…` still reads, a missing dirty bullet does
+  // not say "clean". This is the assertion that fails if the whole button is
+  // clipped instead, which is what the first attempt did.
+  ok(hdr.bullet, "and the git status bullet survives the truncation");
   // The two controls the phone layout drops, and the reason each is safe to
   // drop: this asserts the trim actually happened, because a rule that stopped
   // matching would show up here and nowhere else.
-  ok((await evalIn(`["refresh", "projbtn"].filter((id) => !!document.getElementById(id)?.offsetParent)`)).length === 0,
+  ok((await longPage.evalIn(`["refresh", "projbtn"].filter((id) => !!document.getElementById(id)?.offsetParent)`)).length === 0,
      "refresh and the projects strip are dropped — the browser reload and the home link are their routes");
-  ok(await evalIn(`!!document.getElementById("bell")?.offsetParent && !!document.getElementById("settings")?.offsetParent`),
+  ok(await longPage.evalIn(`!!document.getElementById("bell")?.offsetParent && !!document.getElementById("settings")?.offsetParent`),
      "while the ones with no other route stay");
+  try { await longPage.close(); } catch { /* already gone */ }
+
+  console.log("B4. the front page, which is where you arrive");
+  // Reported from a phone: tiny text, hard to open a project. Two causes, and
+  // the first one hid the second.
+  //
+  // The front page had no `<meta name="viewport">` at all — the workspace page
+  // has always had one. So a phone laid it out at its default 980px and scaled
+  // the result down: every width rule was skipped and the text arrived about a
+  // third of its intended size. Measured before the fix: window.innerWidth 980
+  // on a 390px device.
+  const front = await openPage(browser.port, `http://127.0.0.1:${roost.port}/`);
+  await front.cmd("Emulation.setDeviceMetricsOverride", PHONE);
+  await front.cmd("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
+  await until(() => front.evalIn(`!!document.querySelector("#ovprojects .ovrow")`), 20, "the project list");
+  const fm = await front.evalIn(`(() => {
+    const row = document.querySelector("#ovprojects .ovrow");
+    const go = row.querySelector(".ovgo");
+    const gr = go && go.getBoundingClientRect();
+    return { vw: window.innerWidth, docW: document.documentElement.scrollWidth,
+             rowH: Math.round(row.getBoundingClientRect().height),
+             font: parseInt(getComputedStyle(row).fontSize, 10),
+             goShown: !!gr && getComputedStyle(go).visibility === "visible",
+             goH: gr ? Math.round(gr.height) : 0,
+             panes: [...document.querySelectorAll("#overview > .ovpane")]
+               .map((e) => Math.round(e.getBoundingClientRect().width)) }; })()`);
+  ok(fm.vw === PHONE.width,
+     `the page lays out at device width, not the 980px default (got ${fm.vw})`);
+  ok(fm.docW <= PHONE.width, `and does not scroll sideways (${fm.docW})`);
+  ok(fm.font >= 15, `rows are readable, ${fm.font}px`);
+  ok(fm.rowH >= 44, `and tappable, ${fm.rowH}px tall`);
+  // The one that actually stopped you getting in: `.ovgo`, the link that opens
+  // a project, is `visibility: hidden` until `:hover` — and a phone has no
+  // hover, so on a touch screen the way in was invisible on every row but the
+  // selected one.
+  ok(fm.goShown && fm.goH >= 44,
+     `the open link is visible and tappable without a hover (shown ${fm.goShown}, ${fm.goH}px)`);
+  ok(fm.panes.length === 2 && fm.panes.every((w) => w > PHONE.width * 0.9),
+     `both panes get the full width instead of 360px + a sliver (${JSON.stringify(fm.panes)})`);
+  try { await front.close(); } catch { /* already gone */ }
 
   console.log("C. switching panes");
   await evalIn(`document.querySelector('#mobilebar button[data-mpane="0"]').click()`);
