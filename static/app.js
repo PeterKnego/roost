@@ -4470,7 +4470,12 @@ function renderSearch(results) {
   // support is deliberately partial.
   if (results.skipped_ignored) {
     const n = results.skipped_ignored;
-    parts.push(`${n} gitignored ${n === 1 ? "directory" : "directories"} not searched — show hidden files to include them`);
+    // Named as the control is actually labelled. The clause exists so the
+    // override is *findable*, and the only control is the tree pane's icon,
+    // whose title is "show dotfiles" — a user hunting for "show hidden
+    // files" has no string to look for, which defeats the whole point of
+    // saying it.
+    parts.push(`${n} gitignored ${n === 1 ? "directory" : "directories"} not searched — turn on "show dotfiles" to include them`);
   }
   if (!parts.length && !searchRows.length) parts.push("no matches");
   // The other half of the honesty line, and the one the server cannot supply:

@@ -283,6 +283,15 @@ fn parse_file(path: &Path) -> Option<Vec<Rule>> {
 }
 
 fn parse(text: &str) -> Option<Vec<Rule>> {
+    // The negation scan runs over the whole file, before any cap. It used to
+    // share the loop below, so a file with `MAX_RULES` patterns ahead of its
+    // `!` hit `break` and never saw it — and the remaining patterns were then
+    // honoured alone. The shape that reaches is exactly the one this module
+    // is built to refuse: `*` kept, `!src/` dropped, the entire project
+    // invisible to search, reported as one skipped directory.
+    if text.lines().any(|l| l.trim_end().starts_with('!')) {
+        return None;
+    }
     let mut out = Vec::new();
     for raw in text.lines() {
         // Trailing spaces are not part of a pattern unless escaped; escapes
@@ -427,6 +436,26 @@ mod tests {
         assert!(s.matches("tests/browser/a/tmp"), "unanchored, so any depth below");
         assert!(!s.matches("tmp"), "not above itself");
         assert!(!s.matches("src/tmp"), "nor in a sibling");
+    }
+
+    #[test]
+    fn the_rule_cap_cannot_hide_a_negation_further_down_the_file() {
+        // The `!` guard used to sit inside the same loop as the rule cap, so
+        // a file with `MAX_RULES` patterns before its negation hit `break`
+        // and never saw it. The remaining patterns were then honoured alone —
+        // and the shape that reaches is exactly the one the module header
+        // names as the thing that must never happen: `*` kept, `!src/`
+        // dropped, so the entire project becomes invisible to search and the
+        // note calls it "1 gitignored directory not searched".
+        let mut text = String::new();
+        for i in 0..MAX_RULES {
+            text.push_str(&format!("junk{i}/\n"));
+        }
+        text.push_str("*\n!src/\n");
+        assert!(
+            parse(&text).is_none(),
+            "a negation past the rule cap must still poison the file"
+        );
     }
 
     #[test]

@@ -859,7 +859,7 @@ try {
   } })`);
   ok(
     await evalIn(`document.getElementById("searchnote").textContent`)
-      === "1 gitignored directory not searched — show hidden files to include them",
+      === "1 gitignored directory not searched — turn on \"show dotfiles\" to include them",
     "(f2) a gitignored skip is reported, and names the override that undoes it",
   );
 
@@ -869,7 +869,7 @@ try {
   } })`);
   ok(
     await evalIn(`document.getElementById("searchnote").textContent`)
-      === "3 gitignored directories not searched — show hidden files to include them",
+      === "3 gitignored directories not searched — turn on \"show dotfiles\" to include them",
     "(f3) and it agrees with itself about plurals",
   );
 
@@ -883,7 +883,7 @@ try {
   } })`);
   ok(
     await evalIn(`document.getElementById("searchnote").textContent`)
-      === "2 places could not be read · 1 nested checkout not searched · 1 gitignored directory not searched — show hidden files to include them",
+      === "2 places could not be read · 1 nested checkout not searched · 1 gitignored directory not searched — turn on \"show dotfiles\" to include them",
     "(f4) could-not-look, nested-checkout and gitignored stay three separate answers",
   );
 
