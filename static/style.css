@@ -1182,6 +1182,13 @@ header button.proj:hover svg { opacity: 1; }
        is the fallback for anything without dvh, and must stay first. */
     height: calc(100vh - var(--header-h, 36px) - var(--mobilebar-h, 56px));
     height: calc(100dvh - var(--header-h, 36px) - var(--mobilebar-h, 56px));
+    /* `--vvh` is `window.visualViewport.height`, written by app.js while a
+       soft keyboard is up. `dvh` does not shrink for the keyboard on iOS —
+       it is the viewport with the *browser* chrome retracted, which is a
+       different question — so without this the pane keeps its full height and
+       everything below the fold, the key bar included, sits under the
+       keyboard. Last, so it wins when it is set, and absent otherwise. */
+    height: calc(var(--vvh, 100dvh) - var(--header-h, 36px) - var(--mobilebar-h, 56px));
   }
   #grid > .pane { grid-column: 1; grid-row: 1; }
   /* `display:none`, not `visibility`/`hidden`: an xterm in a pane that still
@@ -1205,6 +1212,7 @@ header button.proj:hover svg { opacity: 1; }
   body[data-mpane="3"] #grid {
     height: calc(100vh - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
     height: calc(100dvh - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
+    height: calc(var(--vvh, 100dvh) - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
   }
 
   /* The header is a single row of a dozen controls at desktop width. Here it
@@ -1269,7 +1277,12 @@ header button.proj:hover svg { opacity: 1; }
   header button, #mobilebar button { min-height: 44px; min-width: 44px; }
   .paneicon { width: 32px; height: 32px; }
   .tab { padding: 10px 12px; }
-  .tab .x { width: 28px; height: 28px; margin-left: 4px; }
+  /* A bigger target for a finger. `.x` is an inline span holding a single
+     glyph, so width and height alone leave the × sitting wherever the line box
+     put it — off-centre in a 28px box, which is what it looked like. Made a
+     flex box so the glyph is centred in the target rather than near it. */
+  .tab .x { display: inline-flex; align-items: center; justify-content: center;
+            width: 28px; height: 28px; margin-left: 4px; line-height: 1; }
 
   /* A phone has no hover. Every affordance revealed by one needs a press
      state, or it is invisible until it is already activated. */
