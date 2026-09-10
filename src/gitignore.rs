@@ -81,6 +81,17 @@ struct Scope {
 /// every ancestor's rules.
 pub struct Ignore {
     scope: Option<Scope>,
+    /// This directory's ignore file could not be reasoned about — it carried
+    /// a negation, or could not be read — so **nothing** is ignored at or
+    /// below it by any *ancestor* rule.
+    ///
+    /// Suppressing ancestors is the whole point, and it follows from git's
+    /// precedence: a deeper `.gitignore` outranks a shallower one, so a `!`
+    /// here can re-include something a parent excluded. Dropping the `!` and
+    /// keeping the parent's rule is exactly the over-ignore this module is
+    /// shaped to avoid. Descendants are *not* suppressed: they outrank this
+    /// file too, and were parsed on their own terms.
+    opaque: bool,
     parent: Option<Rc<Ignore>>,
 }
 
@@ -89,11 +100,21 @@ impl Ignore {
     /// repository-local `.git/info/exclude`, which is not committed and so is
     /// where a developer puts their own machine's build output.
     pub fn for_root(root: &Path) -> Rc<Ignore> {
-        let mut rules = parse_file(&root.join(".gitignore"));
-        rules.extend(parse_file(&root.join(".git").join("info").join("exclude")));
+        // Both files, and either one bailing poisons the pair. They are
+        // merged into one scope here, so honouring one while discarding the
+        // other is how `!dist/` in `.gitignore` — which git lets re-include
+        // what `.git/info/exclude` excluded — turned into a directory roost
+        // skipped and git does not.
+        let own = parse_file(&root.join(".gitignore"));
+        let excl = parse_file(&root.join(".git").join("info").join("exclude"));
+        let (Some(mut rules), Some(more)) = (own, excl) else {
+            return Rc::new(Ignore { scope: None, opaque: true, parent: None });
+        };
+        rules.extend(more);
         rules.truncate(MAX_RULES);
         Rc::new(Ignore {
             scope: (!rules.is_empty()).then(|| Scope { base: String::new(), rules }),
+            opaque: false,
             parent: None,
         })
     }
@@ -102,13 +123,18 @@ impl Ignore {
     /// off. Cheaper and clearer than an `Option<Rc<Ignore>>` threaded through
     /// the walk, and it cannot accidentally start matching.
     pub fn none() -> Rc<Ignore> {
-        Rc::new(Ignore { scope: None, parent: None })
+        Rc::new(Ignore { scope: None, opaque: false, parent: None })
     }
 
     /// The chain for a subdirectory about to be walked. `rel` is its path
     /// relative to the search root.
     pub fn enter(self: &Rc<Self>, dir: &Path, rel: &str) -> Rc<Ignore> {
-        let rules = parse_file(&dir.join(".gitignore"));
+        let Some(rules) = parse_file(&dir.join(".gitignore")) else {
+            // A `!` in here can re-include what an ancestor excluded, and
+            // this file outranks every ancestor. Since it cannot be
+            // evaluated, nothing below may be ignored on an ancestor's word.
+            return Rc::new(Ignore { scope: None, opaque: true, parent: Some(Rc::clone(self)) });
+        };
         if rules.is_empty() {
             // Nothing of its own: share the parent's chain rather than
             // lengthening it. Most directories take this path, which is what
@@ -118,6 +144,7 @@ impl Ignore {
         }
         Rc::new(Ignore {
             scope: Some(Scope { base: rel.to_string(), rules }),
+            opaque: false,
             parent: Some(Rc::clone(self)),
         })
     }
@@ -126,15 +153,20 @@ impl Ignore {
     /// search root, `/`-separated).
     pub fn skips_dir(&self, rel: &str) -> bool {
         let mut node = Some(self);
-        let mut owned;
         while let Some(n) = node {
+            // This node's own rules first: they outrank everything above,
+            // so a scope that matches wins even when an ancestor is opaque.
             if let Some(s) = &n.scope {
                 if s.matches(rel) {
                     return true;
                 }
             }
-            owned = n.parent.as_deref();
-            node = owned;
+            // Then the stop. An unevaluable file here means no ancestor may
+            // speak for anything at or below it.
+            if n.opaque {
+                return false;
+            }
+            node = n.parent.as_deref();
         }
         false
     }
@@ -183,16 +215,25 @@ impl Scope {
 /// Reads one ignore file into rules. Every failure — missing, unreadable,
 /// oversized — is an empty list, which means "ignore nothing" and leaves the
 /// walk behaving exactly as it does without this module.
-fn parse_file(path: &Path) -> Vec<Rule> {
+fn parse_file(path: &Path) -> Option<Vec<Rule>> {
     match std::fs::symlink_metadata(path) {
+        // Positively absent: it has nothing to say, which is not the same as
+        // being unable to say. This is the ordinary case for almost every
+        // directory and must not disable anything.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        // Present and usable.
         Ok(m) if m.is_file() && m.len() <= MAX_BYTES => {}
-        _ => return Vec::new(),
+        // Present but unusable — a symlink, a directory, a fifo, something
+        // too large — or an error that is not NotFound. Either way this
+        // cannot be read, so whether it holds a negation is unknown, and
+        // "unknown" may not be folded into "no negation". Opaque.
+        _ => return None,
     }
-    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(path) else { return None };
     parse(&text)
 }
 
-fn parse(text: &str) -> Vec<Rule> {
+fn parse(text: &str) -> Option<Vec<Rule>> {
     let mut out = Vec::new();
     for raw in text.lines() {
         // Trailing spaces are not part of a pattern unless escaped; escapes
@@ -206,7 +247,12 @@ fn parse(text: &str) -> Vec<Rule> {
             // The one construct that cannot be dropped in isolation: it
             // narrows something else, so honouring its neighbours without it
             // over-ignores. See the module header.
-            return Vec::new();
+            //
+            // `None`, not an empty list. The two are different answers — "no
+            // rules" and "no usable rules" — and folding them together is
+            // what let an ancestor's rule survive a `!` that was there to
+            // cancel it.
+            return None;
         }
         if line.contains('\\') || line.contains('[') || line.contains("**") {
             continue; // cannot decide it; do not ignore on a guess
@@ -229,7 +275,7 @@ fn parse(text: &str) -> Vec<Rule> {
             break;
         }
     }
-    out
+    Some(out)
 }
 
 /// `*` and `?` against a single path segment. No character classes and no
@@ -271,7 +317,11 @@ mod tests {
     use super::*;
 
     fn scope(base: &str, text: &str) -> Scope {
-        Scope { base: base.into(), rules: parse(text) }
+        Scope { base: base.into(), rules: parse(text).expect("fixture must not bail") }
+    }
+
+    fn rules(text: &str) -> Vec<Rule> {
+        parse(text).expect("fixture must not bail")
     }
 
     #[test]
@@ -336,25 +386,29 @@ mod tests {
         // discarding `!src/` would hide the entire project — over-ignoring is
         // the failure this module is shaped to avoid, so a file with any `!`
         // in it contributes nothing.
-        assert!(parse("*\n!src/\n").is_empty(), "the classic allowlist shape");
-        assert!(parse("build/\n!build/keep/\n").is_empty(), "and a narrow one");
-        assert!(!parse("build/\n").is_empty(), "the same file without it still works");
+        // `None`, not an empty list: "no usable rules" is a different answer
+        // from "no rules", and the caller has to be able to tell, or an
+        // ancestor's rule survives a `!` that existed to cancel it.
+        assert!(parse("*\n!src/\n").is_none(), "the classic allowlist shape");
+        assert!(parse("build/\n!build/keep/\n").is_none(), "and a narrow one");
+        assert!(!rules("build/\n").is_empty(), "the same file without it still works");
+        assert_eq!(parse("# just a comment\n").as_deref(), Some(&[][..]), "empty is not the same as bailed");
     }
 
     #[test]
     fn an_undecidable_pattern_is_dropped_and_its_neighbours_survive() {
         // Dropping one pattern under-ignores, which is the safe direction:
         // the walk descends exactly as it does today.
-        let r = parse("a/**/b\nlogs[0-9]\nesc\\ ape\ndist\n");
+        let r = rules("a/**/b\nlogs[0-9]\nesc\\ ape\ndist\n");
         assert_eq!(r.len(), 1, "only the decidable one: {r:?}");
         assert_eq!(r[0].segs, vec!["dist".to_string()]);
     }
 
     #[test]
     fn comments_and_blank_lines_are_not_patterns() {
-        assert!(parse("# a comment\n\n   \n").is_empty());
+        assert!(rules("# a comment\n\n   \n").is_empty());
         // But a `#` inside a pattern is a literal, not a comment.
-        let r = parse("we#ird\n");
+        let r = rules("we#ird\n");
         assert_eq!(r.len(), 1);
     }
 
@@ -387,8 +441,97 @@ mod tests {
 
     #[test]
     fn an_empty_or_absent_file_ignores_nothing() {
-        assert!(parse("").is_empty());
-        assert!(parse_file(Path::new("/nonexistent/.gitignore")).is_empty());
+        assert!(rules("").is_empty());
+        // Absent is the ordinary state of almost every directory, and it is
+        // *determinable* — NotFound is an answer. It must read as "nothing to
+        // say", never as "cannot say", or entering any directory without a
+        // `.gitignore` would switch ignoring off for everything below it.
+        assert_eq!(
+            parse_file(Path::new("/nonexistent/.gitignore")).as_deref(),
+            Some(&[][..]),
+            "a missing file has nothing to say, and that is not the same as being unable to say"
+        );
+    }
+
+    #[test]
+    fn a_negation_cannot_be_cancelled_by_the_other_file_in_the_same_scope() {
+        // The reported defect. `for_root` merges `.gitignore` and
+        // `.git/info/exclude` into one scope, and `parse` used to bail to an
+        // empty list — so `.gitignore`'s `!dist/`, which in git re-includes
+        // what `exclude` excluded, vanished while `exclude`'s `dist/`
+        // survived. roost then skipped a directory git does not ignore, which
+        // is the over-ignore direction this whole module is shaped against.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".git/info")).unwrap();
+        std::fs::write(d.path().join(".git/info/exclude"), b"dist/\n").unwrap();
+
+        // Control first, so the assertion below cannot pass by the rule never
+        // having worked.
+        let before = Ignore::for_root(d.path());
+        assert!(before.skips_dir("dist"), "setup: exclude alone really does ignore dist");
+
+        std::fs::write(d.path().join(".gitignore"), b"!dist/\n").unwrap();
+        let after = Ignore::for_root(d.path());
+        assert!(
+            !after.skips_dir("dist"),
+            "a negation in either file poisons the pair — git does not ignore this"
+        );
+    }
+
+    #[test]
+    fn a_bailing_child_suppresses_its_ancestors_but_not_its_descendants() {
+        // Precedence is what makes this the right shape: a deeper
+        // `.gitignore` outranks a shallower one, so a `!` in the child can
+        // re-include what the root excluded — and therefore the root may not
+        // speak for anything at or below that child. Descendants are
+        // untouched: they outrank the bailing file too.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".gitignore"), b"dist\n").unwrap();
+        std::fs::create_dir_all(d.path().join("web/inner")).unwrap();
+        std::fs::write(d.path().join("web/.gitignore"), b"*\n!keep/\n").unwrap();
+        std::fs::write(d.path().join("web/inner/.gitignore"), b"build\n").unwrap();
+
+        let root = Ignore::for_root(d.path());
+        assert!(root.skips_dir("dist"), "setup: the root rule works where nothing bails");
+
+        let web = root.enter(&d.path().join("web"), "web");
+        assert!(
+            !web.skips_dir("web/dist"),
+            "the root's rule must not reach past a file it cannot be reconciled with"
+        );
+
+        let inner = web.enter(&d.path().join("web/inner"), "web/inner");
+        assert!(
+            inner.skips_dir("web/inner/build"),
+            "but a descendant's own rule still applies — it outranks the bailing file"
+        );
+        assert!(
+            !inner.skips_dir("web/inner/dist"),
+            "while the root's still does not"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_ignore_file_is_opaque_rather_than_empty() {
+        // "Could not read it" says nothing about whether it holds a
+        // negation, and CLAUDE.md's rule is that a failed check may never be
+        // folded into a definite answer. Degrading to "ignore nothing here"
+        // is the safe direction — it is exactly the behaviour before this
+        // module existed.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".gitignore"), b"dist\n").unwrap();
+        std::fs::create_dir_all(d.path().join("web")).unwrap();
+        // A directory where the file belongs: present, and unreadable as a
+        // file. `parse_file` must not report this as "no rules".
+        std::fs::create_dir_all(d.path().join("web/.gitignore")).unwrap();
+
+        let root = Ignore::for_root(d.path());
+        assert!(root.skips_dir("dist"), "setup: the root rule works");
+        let web = root.enter(&d.path().join("web"), "web");
+        assert!(
+            !web.skips_dir("web/dist"),
+            "an unusable file suspends ignoring below it instead of being read as silence"
+        );
     }
 
     #[test]

@@ -87,9 +87,15 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   A third refusal, and the only one that *is* overridable: a directory git
   ignores. `src/gitignore.rs` is a deliberately partial matcher, and its
   failure direction is chosen — an unsupported construct contributes no rule,
-  and a file containing any negation (`!`) contributes nothing at all, because
-  dropping `!src/` while honouring `*` is the one mistake that hides a whole
-  project. It tests directories only, and `show_hidden` turns it off, which is
+  and a file carrying any negation (`!`), or one that cannot be read at all,
+  makes its whole subtree **opaque**: nothing there is ignored, by it or by
+  any ancestor. Suppressing ancestors is the point, and it follows from git's
+  precedence — a deeper `.gitignore` outranks a shallower one, so a `!` here
+  can re-include what a parent excluded. Dropping the `!` and keeping the
+  parent's rule is the one mistake that hides a whole project, and it shipped
+  once: `parse` returned an empty list for both "no rules" and "no usable
+  rules", so a `!dist/` in `.gitignore` vanished while `.git/info/exclude`'s
+  `dist/` survived in the same merged scope. It tests directories only, and `show_hidden` turns it off, which is
   what makes a partial matcher safe to ship: a directory it skips wrongly is
   still reachable. `TreeFilter` runs first, so `target`, `node_modules` and
   every dotfile never reach it — which is what keeps the reported count rare
