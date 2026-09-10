@@ -285,6 +285,50 @@ try {
   await drag(mid.y - 200, 16);
   ok((await evalIn(`window.scrollY`)) === 0, "dragging past the top leaves the page where it was");
 
+  console.log("E5. the terminal key bar");
+  // Claude's TUI is driven with arrows and Enter, and a phone soft keyboard has
+  // neither — so its menus ("1. yes / 2. no", a file picker, a permission
+  // prompt) were simply unreachable. Reported from a phone.
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="3"]').click()`);
+  await sleep(400);
+  ok(await evalIn(`!!document.getElementById("termkeys")?.offsetParent`),
+     "the key bar is on screen with the terminal in front");
+  ok(await evalIn(`document.querySelector('#mobilebar button[data-mpane="0"]').click(), true`)
+     && await until(async () => !(await evalIn(`!!document.getElementById("termkeys")?.offsetParent`)), 5, "hidden"),
+     "and not over the file tree, where those keys mean nothing");
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="3"]').click()`);
+  await sleep(400);
+
+  // What the buttons actually send. Recorded at `term.input`, because the
+  // bytes are the whole point: an arrow is not one byte string, and a TUI that
+  // has set DECCKM expects ESC O A where a shell expects ESC [ A. Sending the
+  // wrong one moves nothing and looks like a dead button.
+  await evalIn(`window.__sent = []; (() => { const e = ${JSON.stringify("x")} && null; })();
+    (function () { const t = [...terms.values()][0].term; const orig = t.input.bind(t);
+      t.input = (d) => { window.__sent.push(d); return orig(d); }; })()`);
+  const press = async (k) => {
+    await evalIn(`(() => { const b = document.querySelector('#termkeys button[data-k="${k}"]');
+      b.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true })); })()`);
+    await sleep(120);
+  };
+  await press("up"); await press("down"); await press("enter"); await press("esc");
+  const sent = await evalIn(`window.__sent`);
+  ok(JSON.stringify(sent) === JSON.stringify(["\u001b[A", "\u001b[B", "\r", "\u001b"]),
+     `a shell at a prompt gets the normal cursor sequences: ${JSON.stringify(sent)}`);
+
+  // The mode-aware half. Putting the terminal into application-cursor-keys
+  // mode is what Claude's menus do, and the same button must then send a
+  // different sequence — this is the assertion that fails if the bytes are
+  // hard-coded, which is how the buttons would be dead exactly where they are
+  // needed.
+  await evalIn(`window.__sent = []; [...terms.values()][0].term.write("\u001b[?1h")`);
+  await sleep(400);
+  await press("up"); await press("down");
+  const appSent = await evalIn(`window.__sent`);
+  ok(JSON.stringify(appSent) === JSON.stringify(["\u001bOA", "\u001bOB"]),
+     `and a TUI in DECCKM gets the application ones: ${JSON.stringify(appSent)}`);
+  await evalIn(`[...terms.values()][0].term.write("\u001b[?1l")`);
+
   console.log("F. a desktop is untouched");
   // The negative control, and the reason any of the above means anything: all
   // of it is scoped to a media query, and a rule that leaked would show here
@@ -302,6 +346,25 @@ try {
   // media query passes the whole file without this line.
   ok((await page.evalIn(`["refresh", "projbtn"].filter((id) => !!document.getElementById(id)?.offsetParent)`)).length === 2,
      "and both controls the phone drops are back — the trim is scoped to the phone, not global");
+
+  // Reported from the desktop as well as the phone: the project dropdown
+  // opened across the header from the name you clicked. #projpanel has two
+  // triggers and was anchored in CSS to the right edge for one of them, so
+  // clicking the project name on the left opened a panel on the right.
+  for (const trigger of ["projname", "projbtn"]) {
+    await page.evalIn(`(() => { const p = document.getElementById("projpanel");
+      if (!p.hidden) { p.hidden = true; } })()`);
+    await page.evalIn(`document.getElementById(${JSON.stringify(trigger)}).click()`);
+    await sleep(250);
+    const g = await page.evalIn(`(() => {
+      const p = document.getElementById("projpanel"), t = document.getElementById(${JSON.stringify(trigger)});
+      if (!p || p.hidden) return null;
+      const pr = p.getBoundingClientRect(), tr = t.getBoundingClientRect();
+      return { dx: Math.round(pr.left - tr.left), below: Math.round(pr.top - tr.bottom) }; })()`);
+    ok(g && Math.abs(g.dx) <= 8 && g.below >= 0 && g.below < 40,
+       `opened from #${trigger} it sits under it (${JSON.stringify(g)})`);
+  }
+  await page.evalIn(`document.getElementById("projpanel").hidden = true`);
 
   console.log("F2. the band just above the breakpoint");
   // Not broken before, but the narrowest useful thing on a 1000px screen was
