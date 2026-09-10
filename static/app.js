@@ -741,6 +741,29 @@ function render() {
       x.textContent = "×";
       x.onclick = (e) => { e.stopPropagation(); closeTab(pi, ti, t, e.altKey); };
       b.appendChild(x);
+      // Drag is a second route to MoveTab, never a new operation: the same
+      // intent the ⇄ button sends, with `at` taken from where the pointer is
+      // instead of always being the destination's length. So reordering
+      // inside a pane and moving between two are one gesture, and the server
+      // needs no change at all.
+      b.draggable = true;
+      b.dataset.pane = String(pi);
+      b.dataset.idx = String(ti);
+      b.ondragstart = (e) => {
+        // A private type rather than text/plain: it is what keeps this drag
+        // and a file drag distinguishable. `dragHasFiles` already declines
+        // this one, and `dragHasTab` declines a file drag, so the two
+        // document-level handlers below can never swallow each other's drop.
+        // (`getData` is unreadable during dragover for security — only
+        // `types` is — which is exactly what the type is being used for.)
+        e.dataTransfer.setData(TAB_MIME, `${pi}:${ti}`);
+        e.dataTransfer.effectAllowed = "move";
+        b.classList.add("dragging");
+      };
+      // Also clears the marker: render() rebuilds this strip's innerHTML on
+      // every State broadcast, so the node this fires on may already be gone
+      // and the marker is not in it anyway.
+      b.ondragend = () => { b.classList.remove("dragging"); clearDropMarker(); };
       strip.appendChild(b);
     });
 
@@ -3473,6 +3496,122 @@ function droppedDirectories(dt) {
   }
   return dirs;
 }
+
+// ---------------------------------------------------------------- tab drag
+//
+// Moving a tab is already `Intent::MoveTab { from, idx, to, at }`, and `at` is
+// already a position — the ⇄ button simply always passes the destination's
+// length. So a drop at a position needs no protocol change and no server
+// change, and reordering within a pane falls out of the same intent.
+//
+// roost already uses drag-and-drop for file upload (the two document-level
+// handlers below). The two coexist because each declines the other's drag by
+// type, and the direction that matters is this one: a tab handler that did not
+// check would swallow a *file* drop and uploads would silently stop working.
+const TAB_MIME = "application/x-roost-tab";
+
+function dragHasTab(dt) {
+  return !!dt && Array.prototype.includes.call(dt.types || [], TAB_MIME);
+}
+
+let dropMarker = null;
+
+// The source of the drag in flight, for `dragover` — which can read
+// `dataTransfer.types` but never `getData`, so the pane a tab came from is
+// not available there. `drop` reads the real payload and does not trust this.
+let dragTabSource = null;
+document.addEventListener("dragstart", (e) => {
+  const tab = e.target.closest && e.target.closest(".tab");
+  dragTabSource = tab ? { from: Number(tab.dataset.pane), idx: Number(tab.dataset.idx) } : null;
+}, true);
+document.addEventListener("dragend", () => { dragTabSource = null; clearDropMarker(); }, true);
+
+
+function clearDropMarker() {
+  if (dropMarker) dropMarker.remove();
+  dropMarker = null;
+}
+
+// Where a drop at (px, py) would land, as an index into the strip's tabs.
+//
+// Measured with the marker removed, always. It is an inline element with a
+// real width, so leaving it in shifts every tab to its right and the next
+// dragover computes a different index from the layout the previous one
+// caused — the marker oscillates between two positions and the user cannot
+// tell where the tab will go.
+//
+// Both axes, because .tabstrip wraps onto further rows (--tab-rows): with an
+// x-only comparison every row past the first lands at the end of the strip.
+function dropIndexIn(strip, px, py) {
+  clearDropMarker();
+  const tabs = [...strip.querySelectorAll(".tab")];
+  for (let i = 0; i < tabs.length; i++) {
+    const r = tabs[i].getBoundingClientRect();
+    if (py < r.top) return i;                       // on an earlier row
+    if (py <= r.bottom && px < r.left + r.width / 2) return i;
+  }
+  return tabs.length;
+}
+
+function showDropMarker(strip, at) {
+  const tabs = [...strip.querySelectorAll(".tab")];
+  dropMarker = document.createElement("span");
+  dropMarker.className = "tabdrop";
+  if (at >= tabs.length) strip.appendChild(dropMarker);
+  else strip.insertBefore(dropMarker, tabs[at]);
+}
+
+// Reordering inside one pane is allowed everywhere; moving *between* panes is
+// held to the pair the ⇄ button already offers. That restriction is a
+// deliberate one — the left column holds 260px tool windows, and a terminal
+// dropped into one is not a move anyone wants — and widening it is a separate
+// decision from adding the gesture.
+function mayDrop(from, to) {
+  return from === to || MOVE_BETWEEN[from] === to;
+}
+
+document.addEventListener("dragover", (e) => {
+  if (!dragHasTab(e.dataTransfer)) return;
+  const strip = e.target.closest && e.target.closest(".tabstrip");
+  if (!strip) return clearDropMarker();
+  const to = Number(strip.closest(".pane").dataset.pane);
+  if (!dragTabSource || !mayDrop(dragTabSource.from, to)) return clearDropMarker();
+  // Without preventDefault the browser refuses the drop outright, so this is
+  // what makes the strip a target at all.
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  showDropMarker(strip, dropIndexIn(strip, e.clientX, e.clientY));
+});
+
+document.addEventListener("dragleave", (e) => {
+  // dragleave also fires moving between a strip's own children, which would
+  // make the marker flicker off on every tab boundary crossed.
+  if (!dragHasTab(e.dataTransfer)) return;
+  const strip = e.target.closest && e.target.closest(".tabstrip");
+  if (strip && e.relatedTarget && strip.contains(e.relatedTarget)) return;
+  clearDropMarker();
+});
+
+document.addEventListener("drop", (e) => {
+  if (!dragHasTab(e.dataTransfer)) return;
+  const strip = e.target.closest && e.target.closest(".tabstrip");
+  const payload = e.dataTransfer.getData(TAB_MIME);
+  clearDropMarker();
+  if (!strip || !payload) return;
+  const [from, idx] = payload.split(":").map(Number);
+  const to = Number(strip.closest(".pane").dataset.pane);
+  if (!Number.isInteger(from) || !Number.isInteger(idx) || !mayDrop(from, to)) return;
+  e.preventDefault();
+  let at = dropIndexIn(strip, e.clientX, e.clientY);
+  // workspace.rs removes from the source *before* inserting, so within one
+  // pane `at` indexes the already-shortened list. Dropping a tab to the right
+  // of where it started would otherwise land it one place too far — and
+  // dropping it back exactly where it was would move it one to the right,
+  // which is the shape a reorder gets wrong most visibly.
+  if (from === to && at > idx) at -= 1;
+  if (from === to && at === idx) return; // a no-op move, not worth a broadcast
+  send({ t: "MoveTab", from, idx, to, at });
+}, true);
 
 // preventDefault on *every* file drag, not just ones over a valid target.
 // Without it the browser handles the drop itself and navigates to file:///,

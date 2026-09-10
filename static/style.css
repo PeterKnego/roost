@@ -998,3 +998,11 @@ dialog.roost.dlg-wide { width: min(760px, 96vw); }
    still reads as both. --row-on, not --tool: a highlight has to be mixed
    against the surface it is drawn on. */
 .content a.file.picked { background-color: var(--row-on); box-shadow: inset 2px 0 0 var(--accent); }
+/* The tab being dragged, and where it would land. A drop indicator is not
+   optional here: `at` is a position, and without a visible gap the user
+   cannot tell where the tab will go — a wrong guess means dragging again. */
+.tabstrip .tab.dragging { opacity: 0.4; }
+.tabstrip .tabdrop {
+  flex: 0 0 auto; align-self: center; width: 2px; height: 20px; border-radius: 1px;
+  background: var(--accent, var(--fg)); pointer-events: none;
+}
