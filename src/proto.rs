@@ -282,6 +282,11 @@ pub struct WorkspaceView {
     /// Session names currently running for this project. A Terminal tab whose
     /// name is absent renders its start placeholder instead of attaching.
     pub live_sessions: Vec<String>,
+    /// Terminal tabs the restored layout asked for whose shell is positively
+    /// gone — a reboot, or a reaped socket. The placeholder says so, instead
+    /// of rendering identically to a tab that never had a shell. Only ever
+    /// populated from positive evidence; see `hub::lost_terminal_sessions`.
+    pub lost_sessions: Vec<String>,
     /// Of those, the ones running a Claude — their tabs take the Claude mark
     /// in place of the terminal glyph. Derived in `hub::snapshot_event` from
     /// `claudes::cached_sessions`, never stored in the workspace: it is a

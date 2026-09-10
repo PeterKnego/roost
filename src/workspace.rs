@@ -88,6 +88,21 @@ pub struct Workspace {
     /// it is not the same as running it; the client uses this to decide
     /// whether that tab attaches immediately or shows its start placeholder.
     pub live_sessions: Vec<String>,
+    /// Session names that had a live shell when this workspace was last
+    /// written to disk. Restored by `wsstate::load` and never sent to a
+    /// client; it exists only so `hub::lost_terminal_sessions` can tell a tab
+    /// that lost its shell from one that never had one.
+    pub sessions_seen: Vec<String>,
+    /// Terminal tabs the restored layout asked for whose shell is *positively*
+    /// gone — the machine rebooted, or the socket was reaped — as opposed to
+    /// tabs that never had one.
+    ///
+    /// Without this the two are indistinguishable: both render the same
+    /// "Press Enter to start a terminal" placeholder, so a reboot that lost a
+    /// long-running Claude looks exactly like a tab nobody has used yet.
+    /// Computed once, when the hub loads the layout, and only from positive
+    /// evidence; never persisted, because it is a fact about this moment.
+    pub lost_sessions: Vec<String>,
     /// Whether the project root is a git repository, cached here so the
     /// hub doesn't re-stat the filesystem on every view.
     pub is_git: bool,
@@ -123,6 +138,8 @@ impl Workspace {
             buffers: HashMap::new(),
             watch_degraded: false,
             live_sessions: vec![],
+            sessions_seen: vec![],
+            lost_sessions: vec![],
             is_git: false,
             show_hidden: None,
         }
@@ -178,6 +195,7 @@ impl Workspace {
             buffers,
             watch_degraded: self.watch_degraded,
             live_sessions: self.live_sessions.clone(),
+            lost_sessions: self.lost_sessions.clone(),
             // Filled by `hub::snapshot_event`; `WsState` deliberately has no
             // such field (see the doc on `WorkspaceView::claude_sessions`).
             claude_sessions: vec![],

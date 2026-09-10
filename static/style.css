@@ -1064,3 +1064,9 @@ header button.proj:hover svg { opacity: 1; }
   padding-top: var(--padding-top, 16px) !important;
   min-height: auto;
 }
+
+/* A terminal tab whose shell is gone, as opposed to one that never had one.
+   Carries the config warning's colour because it is the same kind of news:
+   something you had is not there any more, and nothing else on the page says
+   so. */
+.termstart .termlost { color: #d29922; max-width: 46ch; margin: 0 0 10px; }

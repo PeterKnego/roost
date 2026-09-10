@@ -112,6 +112,48 @@ pub struct Hub {
 
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<Hub>>>>> = OnceLock::new();
 
+/// Terminal tabs the restored layout asks for whose shell is positively gone.
+///
+/// roost survives its own restart — dtach masters reparent to init, and
+/// `KillMode=process` keeps systemd from taking them — so after a restart
+/// these tabs simply reattach. A *reboot* is different: no process outlives a
+/// kernel, and the tabs come back pointing at nothing.
+///
+/// Both used to render the same "Press Enter to start a terminal"
+/// placeholder, so a reboot that lost a long-running Claude looked exactly
+/// like a tab nobody had used yet. Naming them is the difference.
+///
+/// Only positive evidence counts. `socket_names_checked` returning `None`
+/// means the socket directory could not be read, and telling a user their
+/// shell is gone on the strength of a failed `read_dir` would be a false
+/// claim about a shell that is still running — the same conflation
+/// CLAUDE.md's table is entirely about, here in its "says something untrue"
+/// form rather than its destructive one.
+fn lost_terminal_sessions(ws: &crate::workspace::Workspace, project: &str) -> Vec<String> {
+    let Some(on_disk) = crate::session::socket_names_checked(project) else {
+        return Vec::new(); // could not look: claim nothing
+    };
+    let mut out: Vec<String> = ws
+        .panes
+        .iter()
+        .flat_map(|p| p.tabs.iter())
+        .filter_map(|t| match t {
+            crate::proto::Tab::Terminal { session } => Some(session.clone()),
+            _ => None,
+        })
+        // Three conditions, and `sessions_seen` is the one that makes this a
+        // claim rather than a guess: roost watched a shell run in that session
+        // and wrote the fact down. The default layout ships an empty `term`
+        // tab, so without it every new project announced the loss of a shell
+        // it had never started.
+        .filter(|s| ws.sessions_seen.contains(s))
+        .filter(|s| !on_disk.contains(s) && !ws.live_sessions.contains(s))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 impl Hub {
     pub fn new(project: &str, dir: std::path::PathBuf) -> Hub {
         let (ws, warn) = crate::wsstate::load(project);
@@ -138,6 +180,11 @@ impl Hub {
         // died (or kept running under dtach) since the last save, and
         // `.git` may have appeared or vanished on disk in the meantime.
         hub.refresh_live_sessions();
+        // Once, here, and only here: this is the single moment the restored
+        // layout can be compared against what actually survived. A tab whose
+        // shell is gone is indistinguishable a second later, because by then
+        // the user may simply not have started it yet.
+        hub.ws.lost_sessions = lost_terminal_sessions(&hub.ws, project);
         hub.reconcile_buffers_with_disk();
         // The restored layout's terminal tabs are as much a request for those
         // sessions as a fresh click is — including `default_layout`'s own
@@ -1263,6 +1310,11 @@ impl Hub {
     /// every other project's connection setup, not just this one's.
     pub fn refresh_live_sessions(&mut self) {
         self.ws.live_sessions = crate::session::live_names(&self.project);
+        // A shell that is running again is no longer lost. Without this the
+        // note would survive the user starting a replacement in that very
+        // tab, which is the one moment it stops being true.
+        let live = &self.ws.live_sessions;
+        self.ws.lost_sessions.retain(|s| !live.contains(s));
         // Any enclosing work tree counts, not just this directory's own `.git`
         // — see `gitio::is_inside_work_tree`. A nested project has no `.git` of
         // its own, and offering `git init` there embeds a repository inside its
@@ -2333,6 +2385,142 @@ fn has_prefix_boundary(path: &str, prefix: &str) -> bool {
 /// classifier in `render`, so the conflict view looks like every other diff.
 #[cfg(test)]
 mod tests {
+    use super::lost_terminal_sessions;
+
+    fn ws_with_terminals(names: &[&str]) -> crate::workspace::Workspace {
+        let mut w = crate::workspace::Workspace::default_layout();
+        for p in w.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, crate::proto::Tab::Terminal { .. }));
+        }
+        w.panes[crate::proto::RIGHT as usize].tabs = names
+            .iter()
+            .map(|n| crate::proto::Tab::Terminal { session: (*n).to_string() })
+            .collect();
+        w
+    }
+
+    #[test]
+    fn a_terminal_tab_with_no_shell_left_is_named_as_lost() {
+        // The point of the whole field: after a reboot a restored Terminal tab
+        // rendered the same "Press Enter to start a terminal" placeholder as a
+        // tab nobody had ever used, so losing a long-running Claude was
+        // indistinguishable from never having started one.
+        crate::wsstate::set_state_dir_for_test();
+        let project = format!("lostsess{}", std::process::id());
+        let dir = crate::wsstate::state_dir()
+            .join("sock")
+            .join(crate::projects::storage_key(&project));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("alive"), b"").unwrap();
+
+        let mut w = ws_with_terminals(&["alive", "gone"]);
+        w.live_sessions = vec!["alive".into()];
+        w.sessions_seen = vec!["alive".into(), "gone".into()];
+        assert_eq!(
+            lost_terminal_sessions(&w, &project),
+            vec!["gone".to_string()],
+            "only the tab with no socket and no live session"
+        );
+    }
+
+    #[test]
+    fn a_tab_that_never_had_a_shell_is_not_called_lost() {
+        // The inverse of the mistake this codebase keeps making, and a bug
+        // this feature actually shipped in its first draft: instead of
+        // concluding "gone" from a failed check, it concluded "gone" from no
+        // check at all. `default_layout` puts an empty `term` tab in the right
+        // pane, so on a brand-new project — no socket directory, nothing ever
+        // started — every user was told their shell had not survived a reboot
+        // that never happened. Found by a browser test, not by review.
+        crate::wsstate::set_state_dir_for_test();
+        let project = format!("neverran{}", std::process::id());
+        let _ = std::fs::remove_dir_all(
+            crate::wsstate::state_dir().join("sock").join(crate::projects::storage_key(&project)),
+        );
+
+        let fresh = crate::workspace::Workspace::default_layout();
+        assert!(
+            fresh.panes[crate::proto::RIGHT as usize]
+                .tabs
+                .iter()
+                .any(|t| matches!(t, crate::proto::Tab::Terminal { .. })),
+            "setup: the default layout must actually carry a terminal tab, or \
+             this test passes by describing a layout that no longer exists"
+        );
+        assert_eq!(
+            lost_terminal_sessions(&fresh, &project),
+            Vec::<String>::new(),
+            "a tab whose shell was never started has lost nothing"
+        );
+
+        // And the same layout, once roost has recorded seeing a shell there,
+        // *is* a loss. Asserting both against one fixture is what stops the
+        // check above from being satisfied by a function that returns nothing.
+        let mut seen = fresh;
+        seen.sessions_seen = vec!["term".into()];
+        assert_eq!(
+            lost_terminal_sessions(&seen, &project),
+            vec!["term".to_string()],
+            "but the same tab, after roost saw a shell in it, is"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_socket_directory_claims_nothing() {
+        // The rule this codebase is built around, in its "says something
+        // untrue" form rather than its destructive one: a failed `read_dir`
+        // must not become "your shell is gone" about a shell that is still
+        // running. `socket_names_checked` answers `None` there, and `None`
+        // means claim nothing.
+        //
+        // Driven through a state dir that positively cannot be read, rather
+        // than by mocking: removing search permission is what an EACCES on a
+        // real deployment looks like. Skipped as root, which ignores the
+        // permission bits — this project has been bitten by that before.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if unsafe { libc_geteuid() } == 0 {
+                eprintln!("skipping: running as root ignores the permission bits");
+                return;
+            }
+            crate::wsstate::set_state_dir_for_test();
+            let project = format!("unreadable{}", std::process::id());
+            let dir = crate::wsstate::state_dir()
+                .join("sock")
+                .join(crate::projects::storage_key(&project));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("gone"), b"").unwrap();
+            // Asserts the state it later negates: readable, the tab *is* lost.
+            let mut w = ws_with_terminals(&["ghost"]);
+            w.live_sessions = vec![];
+            w.sessions_seen = vec!["ghost".into()];
+            assert_eq!(
+                lost_terminal_sessions(&w, &project),
+                vec!["ghost".to_string()],
+                "setup: while the directory is readable, the claim is made"
+            );
+
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let claimed = lost_terminal_sessions(&w, &project);
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                claimed.is_empty(),
+                "an unreadable directory must claim nothing, got {claimed:?}"
+            );
+        }
+    }
+
+    extern "C" {
+        #[link_name = "geteuid"]
+        fn libc_geteuid_raw() -> u32;
+    }
+    unsafe fn libc_geteuid() -> u32 {
+        libc_geteuid_raw()
+    }
+
     use super::*;
     use crate::proto::{self, Mode, Tab};
 

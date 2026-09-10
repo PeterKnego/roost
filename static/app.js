@@ -1447,9 +1447,20 @@ function terminalPlaceholder(session) {
   const box = document.createElement("div");
   box.className = "termstart";
   const isGit = state.is_git;
+  // A tab whose shell is *gone* must not read like one that never had a
+  // shell. roost survives its own restart — dtach masters reparent to init —
+  // so those tabs just reattach; a reboot outlives no process, and the tab
+  // comes back pointing at nothing. Both rendered this same placeholder, so
+  // losing a long-running Claude to a reboot looked exactly like a tab
+  // nobody had opened yet.
+  const lost = (state.lost_sessions || []).includes(session);
+  const gone = lost
+    ? `<p class="termlost">The shell in this tab did not survive — roost can outlive its
+        own restart, but not a reboot of the machine.</p>`
+    : "";
   box.innerHTML = isGit
-    ? `<p>Press <kbd>Enter</kbd> to start a terminal</p>`
-    : `<p>Not a git repository.</p>
+    ? `${gone}<p>Press <kbd>Enter</kbd> to start a terminal</p>`
+    : `${gone}<p>Not a git repository.</p>
        <p><button class="initgit">Initialize git repo</button></p>
        <p><a class="nogit" href="#">start without git</a></p>`;
   // A held or double-tapped Enter must not fire several StartTerminal
