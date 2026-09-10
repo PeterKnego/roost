@@ -308,6 +308,10 @@ export async function startRoost({ repoRoot, stateDir, roots, port, extraEnv = {
       // low turns a run into a soak test for the keepalive ping, so a browser
       // meets hundreds of them instead of two.
       ...(Deno.env.get("ROOST_PING_SECS") ? { ROOST_PING_SECS: Deno.env.get("ROOST_PING_SECS") } : {}),
+      // Same shape, same reason: cwds.rs re-walks /proc every 15s, and
+      // lostcwd.mjs has to see a `cd` reach the marker without either sleeping
+      // through it or replacing the real sampler with something faked.
+      ...(Deno.env.get("ROOST_CWD_POLL_SECS") ? { ROOST_CWD_POLL_SECS: Deno.env.get("ROOST_CWD_POLL_SECS") } : {}),
       // Every run gets its own Claude config dir, not just ide.mjs's.
       // `idelock.rs` writes a lock file per open project into
       // `$CLAUDE_CONFIG_DIR/ide/` (falling back to `~/.claude/ide/`), and a
