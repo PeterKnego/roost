@@ -320,16 +320,93 @@ const sentEdits = new Set();
 // project.
 const proposals = {};
 
+// --- the workspace connection -------------------------------------------
+//
+// Everything the user does to the workspace is an intent on this one socket:
+// opening a file, switching a tab, saving, renaming, moving a tab between
+// panes. Forty-six call sites go through `send`.
+//
+// It used to drop every one of them on the floor when the socket was down,
+// with no indicator anywhere on the page. Close a laptop, open it an hour
+// later, and roost looked completely fine — the tree, the tabs, the editor,
+// all painted from state loaded before it slept and connected to nothing —
+// and then quietly discarded everything you did to it.
+//
+// So: the connection has a visible state, and `send` stops lying.
+let ctrlTries = 0;
+let ctrlTimer = null;
+let ctrlWarned = false;
+
+/// Shown only when something is wrong. A permanent "connected" badge is
+/// clutter that stops being read, and the honest signal here is the absence
+/// of trouble rather than a constant reassurance — the same shape the config
+/// warning and the search panel's `.skipped` mark already use.
+function setConnState(state) {
+  const el = document.getElementById("connstate");
+  if (!el) return;
+  el.dataset.state = state;
+  el.hidden = state === "live";
+  el.textContent = state === "offline" ? "⚠ offline" : "⚠ reconnecting…";
+  el.title = state === "offline"
+    ? "not connected to roost — nothing you do here is being saved"
+    : "reconnecting to roost — changes are not being sent until this clears";
+}
+
+/// True when the intent went out. `false` means it did not happen, and the
+/// caller's effect will not arrive.
+///
+/// Reported once per outage rather than once per call: `EditBuffer` fires on
+/// a 200 ms debounce and `ShareSelection` on every selection change, so a
+/// banner per refusal would bury the page in identical messages within
+/// seconds of a laptop closing. The header state is the standing signal; this
+/// is the one-off that says an action you just took did not land.
 function send(intent) {
-  if (ctrl && ctrl.readyState === 1) ctrl.send(JSON.stringify(intent));
+  if (ctrl && ctrl.readyState === 1) {
+    ctrl.send(JSON.stringify(intent));
+    return true;
+  }
+  if (!ctrlWarned) {
+    ctrlWarned = true;
+    showError("not connected to roost — that did not happen. Retrying…");
+  }
+  return false;
 }
 
 function connectControl() {
   myOrigin = null; // a reconnect must not keep a stale id from the last socket
+  clearTimeout(ctrlTimer);
   ctrl = new WebSocket(wsUrl(`/ws/${PROJECT}/_workspace`));
+  ctrl.onopen = () => {
+    ctrlTries = 0;
+    ctrlWarned = false;
+    setConnState("live");
+  };
   ctrl.onmessage = (e) => onEvent(JSON.parse(e.data));
-  ctrl.onclose = () => setTimeout(connectControl, 1000);
+  ctrl.onclose = () => {
+    // Capped backoff, matching what `connectTerm` already does rather than
+    // the flat 1s this used to use: a roost that is genuinely down was being
+    // hit once a second, forever, by every open tab. Never gives up, for the
+    // same reason the terminal path never does — a laptop asleep for eight
+    // hours must still find its workspace when it wakes.
+    setConnState(ctrlTries > 2 ? "offline" : "reconnecting");
+    const wait = Math.min(500 * 2 ** ctrlTries++, 8000);
+    ctrlTimer = setTimeout(connectControl, wait);
+  };
 }
+
+/// A wake, a tab coming back to the foreground, or the OS reporting the
+/// network back. Each is a reason to try *now* rather than sit out the rest
+/// of a backoff that may have grown to eight seconds — which is the
+/// difference between a workspace that feels instant on wake and one that
+/// looks broken for a moment first.
+function probeControl() {
+  if (ctrl && (ctrl.readyState === 0 || ctrl.readyState === 1)) return;
+  ctrlTries = 0;
+  connectControl();
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) probeControl(); });
+addEventListener("online", probeControl);
+addEventListener("offline", () => setConnState("offline"));
 
 function onEvent(ev) {
   switch (ev.t) {

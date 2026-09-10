@@ -1757,6 +1757,7 @@ pub fn workspace_page(
   <a class="home" href="/" title="all projects">{SVG_HOME}</a><span class="proj">{proj_txt}</span>
   <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body, git from:body"></span><span id="wtlabel"></span></button>
   {warn}
+  <span id="connstate" hidden></span>
   {sharing_indicator}
   <label id="searchbox" for="searchinput" title="search this project (ctrl-shift-F or ⌘⇧F)">{SVG_SEARCH}<input id="searchinput" type="search" autocomplete="off" spellcheck="false" placeholder="Search files, contents, sessions" aria-label="Search files, contents, sessions"><kbd>⇧⌃F</kbd></label>
   <button id="projbtn" title="running projects">{SVG_DIAMOND}<span id="projcount"></span></button>
