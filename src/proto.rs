@@ -93,7 +93,19 @@ pub enum Intent {
     DeleteFile { rel: String },
     RenamePath { from: String, to: String },
     RequestState,
-    StartTerminal { session: String },
+    /// Start the shell for a terminal tab that has none. The placeholder's
+    /// two controls, in one message.
+    StartTerminal {
+        session: String,
+        /// Continue the Claude roost recorded for this terminal, instead of
+        /// giving it a bare shell (#18 step 2). The id is **not** here on
+        /// purpose: the client asks by session name and the server looks it
+        /// up, because the id lands on a command line and CLAUDE.md already
+        /// reserves that class of choice to the server. `#[serde(default)]`
+        /// so a client from before this field still parses.
+        #[serde(default)]
+        resume: bool,
+    },
     /// Ends one session outright — the shell and its dtach master, not just
     /// this browser's view of it. Deliberately *not* a flag on `CloseTab`:
     /// closing a tab rearranges layout and is reversible, while this destroys
@@ -118,6 +130,18 @@ pub enum Intent {
         /// was always one keystroke away.
         #[serde(default)]
         force: bool,
+        /// Continue this past conversation instead of starting a fresh one:
+        /// the id of a row in the ✻ menu (`claudehist`). Meaningful only with
+        /// `launch: Claude`.
+        ///
+        /// Unlike `StartTerminal`'s `resume`, this one *is* a value from the
+        /// client, because the menu is a list and the choice is which row. So
+        /// the server re-derives the authorisation at use — `claudehist::has`,
+        /// which validates the id and confirms this project actually has that
+        /// conversation. The row that offered the button is a hint, exactly as
+        /// `RemoveWorktree` says of its own.
+        #[serde(default)]
+        resume: Option<String>,
     },
     /// A span matched in terminal output, sent **verbatim** —
     /// `~/projects/roost/src/a.rs:42` and all. Deliberately not pre-parsed by
@@ -314,6 +338,16 @@ pub struct WorkspaceView {
     /// of rendering identically to a tab that never had a shell. Only ever
     /// populated from positive evidence; see `hub::lost_terminal_sessions`.
     pub lost_sessions: Vec<String>,
+    /// Of the lost ones, those with a recorded Claude session the placeholder
+    /// can offer to resume (#18 step 2). Names only: the id lands on a command
+    /// line, so it stays server-side and the browser asks for the resume by
+    /// session name (`Intent::StartTerminal`'s `resume`) rather than by value.
+    ///
+    /// Absence means *no record*, which is not *no Claude ran here* — hooks
+    /// are per-project and opt-in, so a hand-typed `claude` in a project with
+    /// the bell off records nothing. Nothing may render this as a claim that
+    /// the tab had no Claude; see `claudesess`'s module doc.
+    pub resumable_sessions: Vec<String>,
     /// Of those, the ones running a Claude — their tabs take the Claude mark
     /// in place of the terminal glyph. Derived in `hub::snapshot_event` from
     /// `claudes::cached_sessions`, never stored in the workspace: it is a
@@ -486,6 +520,38 @@ mod tests {
     fn diff_tab_none_is_the_full_diff_entry() {
         let i = decode(r#"{"t":"OpenTab","pane":2,"tab":{"k":"Diff","rel":null}}"#).unwrap();
         assert!(matches!(i, Intent::OpenTab { tab: Tab::Diff { rel: None }, .. }));
+    }
+
+    /// The field a client from before #18 step 2 does not send. Its default
+    /// has to be "plain shell", or an old browser's Enter on a placeholder
+    /// would start resuming conversations nobody asked for.
+    ///
+    /// Revert-checked: removing `#[serde(default)]` makes the first case fail
+    /// to decode at all — `Err("missing field `resume`")` — which is the
+    /// louder half of the same defect: every existing client's placeholder
+    /// stops working.
+    #[test]
+    fn start_terminal_resumes_only_when_asked_and_defaults_to_a_plain_shell() {
+        assert!(
+            matches!(
+                decode(r#"{"t":"StartTerminal","session":"shell"}"#).unwrap(),
+                Intent::StartTerminal { resume: false, .. }
+            ),
+            "a message with no `resume` must mean a plain shell"
+        );
+        assert!(matches!(
+            decode(r#"{"t":"StartTerminal","session":"shell","resume":true}"#).unwrap(),
+            Intent::StartTerminal { resume: true, session } if session == "shell"
+        ));
+        // No id on the wire, by design — so a message carrying one is not a
+        // way to smuggle it in. serde ignores unknown fields, which is the
+        // behaviour being pinned: the id is looked up server-side or not at
+        // all.
+        assert!(matches!(
+            decode(r#"{"t":"StartTerminal","session":"shell","resume":true,"session_id":"x; rm -rf ~"}"#)
+                .unwrap(),
+            Intent::StartTerminal { resume: true, .. }
+        ));
     }
 
     #[test]

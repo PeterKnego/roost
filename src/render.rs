@@ -1186,6 +1186,63 @@ pub fn overview_page(sel: &str, roots: &[String]) -> String {
 /// (`reachable == false`) renders as inert text, never as a link, since
 /// opening it is exactly what confinement forbids — but it still renders, so
 /// the user isn't left wondering where a worktree they know exists went.
+/// The ✻ menu: start fresh, or continue one of this project's past
+/// conversations.
+///
+/// Rows are `<button>`s carrying the id in a dataset attribute rather than
+/// anchors, because choosing one is an intent and not navigation. The id is
+/// escaped like everything else here — it comes from a filename in another
+/// program's directory, and `claudehist` has already refused anything that is
+/// not a plausible session id, but the escaping is the rule, not the backstop.
+///
+/// An **empty** list still renders, carrying `data-empty="1"`. The client asks
+/// for this fragment on every ✻ click and needs to tell "no history, so launch
+/// fresh straight away" from "the request failed", and a body that says which
+/// is cheaper than a second round trip. #18: absence is not a claim — the menu
+/// simply is not shown, and nothing anywhere says this project never ran a
+/// Claude.
+pub fn claude_history(rows: &[crate::claudehist::Conversation]) -> String {
+    let mut out = format!(
+        "<div class=\"chist\" data-empty=\"{}\">",
+        if rows.is_empty() { "1" } else { "0" }
+    );
+    out.push_str(
+        "<button class=\"chistrow chistnew\" data-resume=\"\">         <span class=\"chistlabel\">New conversation</span></button>",
+    );
+    for r in rows {
+        let label = if r.label.is_empty() { "(no first message)" } else { r.label.as_str() };
+        out.push_str(&format!(
+            "<button class=\"chistrow\" data-resume=\"{id}\" title=\"{title}\">             <span class=\"chistlabel\">{label}</span>             <span class=\"chistwhen\">{when}</span></button>",
+            id = esc(&r.session_id),
+            title = esc(&format!("{} — {}", r.session_id, r.label)),
+            label = esc(label),
+            when = esc(&ago(r.at, now_secs())),
+        ));
+    }
+    out.push_str("</div>");
+    out
+}
+
+/// "3m", "4h", "2d" — a menu row, not a timestamp. Deliberately coarse: which
+/// of two conversations is the recent one is the whole question, and a clock
+/// time would need the reader's timezone, which the server does not have.
+fn ago(at: u64, now: u64) -> String {
+    let d = now.saturating_sub(at);
+    match d {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m", d / 60),
+        3600..=86_399 => format!("{}h", d / 3600),
+        _ => format!("{}d", d / 86_400),
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectStatus]) -> String {
     let mut out = String::from("<span class=\"projstrip\">");
     // Only what is actually running. This panel answers "which projects have

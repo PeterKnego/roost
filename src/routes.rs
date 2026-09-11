@@ -488,6 +488,16 @@ fn serve_frag(
     // toggle, and asking must not create one (see `Hub::show_hidden`).
     let filter = settings.tree_filter_with(crate::hub::Hub::show_hidden(project));
     match what {
+        // The ✻ menu's rows. A fragment rather than a websocket event because
+        // it is asked for on a click and answered once — the same shape as the
+        // project strip, and it keeps the list out of every snapshot, which
+        // goes out on each debounced keystroke.
+        ["claudehist"] => {
+            http::html(
+                w,
+                &render::claude_history(&crate::claudehist::recent(&dir, crate::claudehist::MAX_ROWS)),
+            );
+        }
         ["tree"] => {
             let open = req.query.get("open").map(String::as_str).unwrap_or("");
             match req.query.get("dir") {

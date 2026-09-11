@@ -1210,7 +1210,9 @@ function buildPaneIcons(host, pi, pane, active, content) {
   // program to type in: the server allocates the name and types `claude`
   // into the shell it spawns.
   if (LAUNCHES.includes("claude")) {
-    icon(CLAUDE_MARK, "new terminal running Claude", () => newTerminal(pi, "claude"), "newclaude");
+    // The handler takes the button so the menu can anchor under it; `icon`
+    // returns the element it made.
+    const cb = icon(CLAUDE_MARK, "new terminal running Claude", () => claudeMenu(pi, cb), "newclaude");
   }
   // #52: the same gesture, pointed at this repository's open pull requests.
   // Deliberately its own button rather than a mode of the one above — it
@@ -1308,7 +1310,67 @@ function maximizedSizes(pi) {
 
 function pool() { return document.getElementById("termpool"); }
 
-function newTerminal(pane, launch) {
+/// The ✻ button's menu: start fresh, or continue one of this project's past
+/// conversations (#18).
+///
+/// The rows are fetched on the click rather than kept in `state`. The list is
+/// a directory of another program's files, and a snapshot goes out on every
+/// debounced keystroke — putting it there would mean a filesystem walk per
+/// keystroke for a menu almost nobody opens.
+///
+/// **No history means no menu.** That is not an error path: it is what ✻ did
+/// before this existed, and it is also what a failed fetch does, and what a
+/// Claude Code that has moved its transcripts somewhere else does. The button
+/// keeps working in every case, which is the whole error model — see
+/// `claudehist`'s module doc.
+async function claudeMenu(pane, btn) {
+  let list = null;
+  try {
+    const html = await (await fetch(`/frag/${PROJECT}/claudehist`)).text();
+    const wrap = document.createElement("div");
+    wrap.innerHTML = html;
+    list = wrap.querySelector(".chist");
+  } catch { /* fall through to a fresh launch */ }
+  if (!list || list.dataset.empty === "1") return newTerminal(pane, "claude");
+
+  closeClaudeMenu();
+  list.tabIndex = -1;
+  document.body.appendChild(list);
+  anchorPanel(list, btn);
+  // Anchored under the button, like the header popups. `anchorPanel` only sets
+  // the horizontal edge; the vertical one is this menu's own, since its
+  // trigger is in a pane header rather than the top bar.
+  const r = btn.getBoundingClientRect();
+  list.style.top = `${Math.round(r.bottom + 4)}px`;
+  openClaudeMenu = list;
+  list.onclick = (e) => {
+    const row = e.target.closest(".chistrow");
+    if (!row) return;
+    closeClaudeMenu();
+    // "" is the New row. An id goes on the wire, and the server re-derives
+    // whether this project actually has that conversation before it types
+    // anything — the row is a hint, not an authorisation.
+    newTerminal(pane, "claude", row.dataset.resume || undefined);
+  };
+  // Focused so Escape reaches it and so a keyboard user lands in the menu they
+  // just opened, not behind it.
+  list.focus();
+  list.onkeydown = (e) => { if (e.key === "Escape") { e.preventDefault(); closeClaudeMenu(); } };
+}
+
+let openClaudeMenu = null;
+function closeClaudeMenu() {
+  if (openClaudeMenu) openClaudeMenu.remove();
+  openClaudeMenu = null;
+}
+// Capture, so a click anywhere else closes it before that click does its own
+// work — a menu that outlived the click that dismissed it would sit over the
+// pane it was opened from.
+document.addEventListener("mousedown", (e) => {
+  if (openClaudeMenu && !openClaudeMenu.contains(e.target)) closeClaudeMenu();
+}, true);
+
+function newTerminal(pane, launch, resume) {
   // No prompt: the server allocates term/term1/term2… from `live_names`, which
   // sees detached sessions the client has no tabs for. A name picked here could
   // collide with one of those, and since attaching creates only when absent,
@@ -1317,7 +1379,12 @@ function newTerminal(pane, launch) {
   // `launch` names a program (one of LAUNCHES), never a command line: the
   // server owns what is typed, this only says which. Omitted, not null, for
   // the plain + so its message stays the one it has always sent.
-  send(launch ? { t: "NewTerminal", pane, launch } : { t: "NewTerminal", pane });
+  //
+  // `resume` names a conversation the ✻ menu offered. Omitted unless one was
+  // chosen, so the plain and fresh-Claude messages stay the ones they have
+  // always been.
+  if (!launch) return send({ t: "NewTerminal", pane });
+  send(resume ? { t: "NewTerminal", pane, launch, resume } : { t: "NewTerminal", pane, launch });
 }
 
 // The Edit/Preview switch lives in the filename stripe (`.path`), not on the
@@ -1529,8 +1596,21 @@ function terminalPlaceholder(session) {
     ? `<p class="termlost">The shell in this tab did not survive — roost can outlive its
         own restart, but not a reboot of the machine.</p>`
     : "";
+  // #18 step 2. The server says which tabs it recorded a Claude for; the id
+  // stays there, and this asks for it by session name. Gated on LAUNCHES too
+  // — the same startup probe the ✻ button uses — because offering a resume on
+  // a machine without `claude` on PATH buys a `command not found`.
+  //
+  // Absence offers nothing and *says* nothing. Hooks are per-project and
+  // opt-in, so "no record" means unknown, never "no Claude ran here"; the
+  // note above makes no claim about Claude and stays as it is.
+  const resumable = (state.resumable_sessions || []).includes(session)
+    && LAUNCHES.includes("claude");
+  const resume = resumable
+    ? `<p><button class="termresume">Resume the Claude that was here</button></p>`
+    : "";
   box.innerHTML = isGit
-    ? `${gone}<p>Press <kbd>Enter</kbd> to start a terminal</p>`
+    ? `${gone}${resume}<p>Press <kbd>Enter</kbd> to start a terminal</p>`
     : `${gone}<p>Not a git repository.</p>
        <p><button class="initgit">Initialize git repo</button></p>
        <p><a class="nogit" href="#">start without git</a></p>`;
@@ -1544,11 +1624,14 @@ function terminalPlaceholder(session) {
   // timeout a refused start would leave the placeholder permanently inert.
   // 2s is well past any held-Enter repeat rate, so the burst-suppression
   // this guard exists for is unaffected.
-  const start = () => {
+  const start = (resumeIt) => {
     if (box.dataset.sent) return;
     box.dataset.sent = "1";
     setTimeout(() => { delete box.dataset.sent; }, 2000);
-    send({ t: "StartTerminal", session });
+    // `resume` omitted rather than sent as false for a plain start: the field
+    // is `#[serde(default)]` server-side, so the message a plain Enter sends
+    // is byte-for-byte the one it has always sent.
+    send(resumeIt ? { t: "StartTerminal", session, resume: true } : { t: "StartTerminal", session });
   };
   if (isGit) {
     // Only this branch behaves like a control — tabIndex, the pointer
@@ -1557,8 +1640,35 @@ function terminalPlaceholder(session) {
     // handler wired to the box itself.
     box.classList.add("termstart-live");
     box.tabIndex = 0;
-    box.onclick = start;
-    box.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); start(); } };
+    // `() => start(false)`, not a bare `start`: as a bare handler the DOM passes the
+    // event as the first argument, and an Event object is truthy — so every
+    // plain click on the box would have asked for a resume.
+    box.onclick = () => start(false);
+    // `e.target === box` guards the resume button, which is a child: a
+    // <button> turns Enter into a click itself, but the keydown reaches this
+    // handler *first*, so without the check the plain start wins the
+    // `dataset.sent` race and a user who tabbed to Resume and pressed Enter
+    // gets a bare shell — silently, with the button gone. Load-bearing, not
+    // defensive: `tests/browser/resume.mjs` section C fails without it, with
+    // the intent it caught printed.
+    box.onkeydown = (e) => {
+      if (e.key === "Enter" && e.target === box) { e.preventDefault(); start(false); }
+    };
+    if (resumable) {
+      box.querySelector(".termresume").onclick = (e) => {
+        // Defensive rather than demonstrated: removing this does not fail
+        // `resume.mjs`, because the button's own handler runs before the
+        // bubbled one and `dataset.sent` swallows the second. It stays
+        // because that ordering is the only thing making it true, and the
+        // guard releases itself after 2s.
+        e.stopPropagation();
+        start(true);
+      };
+    }
+    // The box, not the button: the resume is offered, never automatic (#17 —
+    // it continues a conversation whose last turn may have been mid-edit), so
+    // the key that is already under the user's fingers must keep starting a
+    // plain shell.
     requestAnimationFrame(() => box.focus());
   } else {
     box.querySelector(".initgit").onclick = () => send({ t: "InitGit" });

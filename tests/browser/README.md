@@ -34,6 +34,8 @@ deno run -A tests/browser/buffer-lifecycle.mjs # navigating a file is not an edi
 deno run -A tests/browser/termlinks.mjs # a printed path or URL is a link only while the modifier is held
 deno run -A tests/browser/ide.mjs       # openDiff's proposal tab (Accept/Reject) and the Alt+K mention keybinding
 deno run -A tests/browser/claudeterm.mjs # the ✻ button: a terminal with claude typed in, hidden when claude is not installed
+deno run -A tests/browser/resume.mjs     # the offer to continue the Claude a reboot interrupted (#18 step 2): where the button renders, and what each way of activating the placeholder asks for
+deno run -A tests/browser/claudemenu.mjs # the ✻ menu: New plus this project's past conversations, and no menu at all when there are none (needs its own HOME — the history is Claude Code's directory, not roost's)
 deno run -A tests/browser/worktrees.mjs # the header's worktree switcher chip + panel
 deno run -A tests/browser/worktree-launch.mjs # the ✻ prompt, worktree creation into a second tab, switcher state and removal; needs a real CDP click for window.open
 deno run -A tests/browser/overview.mjs   # the front page (/): live session list, clicking one focuses it, ?at= reaches the picker, and selecting a project narrows/widens the session list
@@ -122,6 +124,25 @@ and one in `mdlinks.mjs` that passed while asserting nothing — and, in
 the tree ~3 times a second on its own. That last one was a real defect
 (`watch::is_access`), found only because the deleted-code check was actually
 performed.
+
+- In `claudemenu.mjs`: making `render::claude_history` always report
+  `data-empty="1"` fails 4 in section A — no menu, no rows. Removing the
+  `dataset.empty` check in `claudeMenu` so the menu always opens fails 3 in
+  section C, which is the requirement in its own words: with no history the ✻
+  button must launch a fresh Claude, not show a one-row menu.
+
+- In `resume.mjs`: making `resumable` in `terminalPlaceholder` always false
+  fails 1 (the button is never offered), and the negative controls stay green,
+  which is what says they are controls. Wiring the box back to
+  `box.onclick = start` fails 1 in section E with
+  `{"session":"clicked","resume":true}` — the DOM passes the event as the first
+  argument and an Event is truthy, so every plain click resumed. Dropping
+  `e.target === box` from the box's keydown fails 1 in section C with
+  `{"session":"ghost2"}` — keydown reaches the box before the button's own
+  click, so Enter on a focused Resume button started a bare shell instead.
+  Dropping the button's `stopPropagation` fails **nothing**, and its comment
+  says so: the button's handler runs first and `dataset.sent` swallows the
+  bubbled start.
 
 - Reverting the reconnect to its pre-fix behaviour (mark the entry stale, never
   retry) fails 7 assertions in `reconnect.mjs`.

@@ -11,6 +11,23 @@ These are load-bearing. Breaking one is a defect, not a style choice.
 
 - **Bind `127.0.0.1` only.** The websocket spawns a shell; the loopback bind is
   the security boundary.
+
+  **The container image substitutes that boundary rather than removing it**, and
+  the two rules are opposites because their deployments are — the same shape as
+  the `ide.rs` bullet below. Inside a namespace `127.0.0.1` is the container's
+  own loopback, which the host cannot reach, so `bind.rs` permits `0.0.0.0`
+  *only* on `ROOST_BIND_ALL=1`, and the network namespace becomes the boundary.
+  Three properties make that a substitution and not a hole: it is a boolean
+  named for its consequence rather than an address field, so it cannot be set by
+  someone typing a preference; an unrecognised value **exits**, because guessing
+  loopback would leave a container listening where nothing can reach it and say
+  nothing; and it is environment-only, never config, because the global config
+  lives on a volume the container's own user can write.
+
+  **Reconciling the two is the vulnerability, not the cleanup** — making the
+  host bind configurable "for symmetry", or dropping the gate because the
+  container needs `0.0.0.0` anyway, each removes a boundary. `ide.rs` keeps its
+  unconditional `127.0.0.1`: its client is a `claude` in the same container.
 - **HTTP is GET-only apart from `POST /upload` and `POST /paste`.** Every other
   state change is a websocket intent. Those two endpoints are the entire CSRF
   surface, and the only thing closing it is that they check `Origin` exactly as

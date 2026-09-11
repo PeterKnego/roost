@@ -1,7 +1,9 @@
 pub mod assets;
+pub mod bind;
 pub mod cli;
 pub mod claudehooks;
 pub mod claudes;
+pub mod claudehist;
 pub mod claudesess;
 pub mod cwds;
 pub mod config;

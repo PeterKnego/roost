@@ -58,11 +58,14 @@ pub struct Recorded {
 /// A session id roost is willing to hold.
 ///
 /// It ends up on a command line — `claude --resume <id>` is the whole point of
-/// recording it — and it arrives from another program's JSON. The shape Claude
+/// recording it — and it arrives from another program's JSON. `launch.rs`
+/// applies this same function again before typing it, so the rule that let an
+/// id in is the rule that lets it out; see `ClaudeSession::usable` for why it
+/// must not be the stricter UUID check used for ids roost mints itself. The shape Claude
 /// Code emits is a UUID; this accepts that and a little either side rather
 /// than pinning the format, but nothing that could be an option, a path or a
 /// second word. Same reasoning as `session::valid_name`, same conclusion.
-fn valid_session_id(s: &str) -> bool {
+pub fn valid_session_id(s: &str) -> bool {
     // The leading-dash refusal is not tidiness. `-` is in the character class
     // because a UUID is full of them, and with only the class to go on
     // `--dangerously-skip-permissions` is a perfectly good "session id" — one

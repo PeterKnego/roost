@@ -1,0 +1,110 @@
+# roost in a container. See docs/deploy.md for what this gives up compared with
+# the systemd unit — shells across a restart, above all.
+#
+# Before the first run, set these in a `.env` beside this file:
+#
+#   UID=1000              # id -u
+#   GID=1000              # id -g
+#   ROOST_PROJECTS=/home/you/projects
+#
+# ROOST_PROJECTS is mounted **at its own path** inside the container, not at
+# /projects, and that is load-bearing rather than tidy: git worktrees record
+# absolute paths in both directions, roost's `.origin` markers record the path a
+# project resolved to, and Claude Code keys its transcripts by an encoding of
+# the working directory. Remap the mount and worktrees vanish, resume finds no
+# history, and nothing says why.
+
+services:
+  roost:
+    build:
+      context: .
+      args:
+        APP_UID: ${UID:-1000}
+        APP_GID: ${GID:-1000}
+        VCS_REF: ${VCS_REF:-unknown}
+        APP_VERSION: ${APP_VERSION:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    image: roost:local
+    container_name: roost
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
+
+    # --- The boundary ----------------------------------------------------
+    # roost binds 127.0.0.1 everywhere else, and that bind IS the security
+    # boundary: the websocket spawns a shell. Inside a container that address
+    # is the container's own loopback and nothing on the host can reach it, so
+    # here the **network namespace** is the boundary instead, gated on this
+    # variable so no host build can reach 0.0.0.0 by accident.
+    #
+    # That substitution is only sound with the two lines below it:
+    #   * published to the host's loopback ONLY. `"8123:8123"` would be
+    #     0.0.0.0 and, on most daemons, through the host firewall too.
+    #   * one service on its own network. The Origin check refuses a client
+    #     that *sends* one; a curl from another container on this network sends
+    #     none, and gets a shell.
+    environment:
+      ROOST_BIND_ALL: "1"
+      ROOST_ROOTS: ${ROOST_PROJECTS:?set ROOST_PROJECTS to the directory holding your checkouts}
+      ROOST_STATE_DIR: /var/lib/roost
+    ports:
+      - "127.0.0.1:8123:8123"
+    networks: [roost]
+
+    # --- Least privilege, where it buys something ------------------------
+    cap_drop: [ALL]
+    # PID 1 that reaps: dtach masters reparent to it by design.
+    init: true
+
+    # NOT set, on purpose, and each is a decision rather than an omission:
+    #
+    #   read_only: true     the product installs toolchains and compiles. Note
+    #                       that a writable rootfs is not what makes an install
+    #                       survive — anything in /usr is gone at the next `up`
+    #                       after an image change. $HOME is the durable place.
+    #   no-new-privileges   incompatible with the sudo this image ships, and
+    #                       the image ships sudo because its purpose is letting
+    #                       the agent install things. In a container whose job
+    #                       is running the user's own agent, root *inside the
+    #                       namespace* is not the boundary anyone relies on.
+    #   tmpfs /tmp noexec   breaks language installers that unpack and execute
+    #                       there, and the thing it defends against is the
+    #                       user's own agent.
+
+    # --- Containment that does apply -------------------------------------
+    # A runaway build in an agent's terminal is the most likely way this
+    # container hurts its host, and it is not hypothetical.
+    pids_limit: 2048
+    mem_limit: 8g
+    cpus: 4.0
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+    volumes:
+      # The checkouts, at the host's own path. This is the blast radius: roost
+      # edits these files, because that is the product.
+      - ${ROOST_PROJECTS:?}:${ROOST_PROJECTS:?}
+      # Everything that must survive an image upgrade: the Claude login and
+      # transcripts (~/.claude), `claude` itself once installed
+      # (~/.local/bin), rustup, go, nvm, shell history.
+      #
+      # A *volume*, not the host's real home. Mounting that would share auth
+      # and history with everything in here; it is offered in docs/deploy.md as
+      # an opt-in, with the grant spelled out.
+      - roost-home:/home/roost
+      # Layouts, unsaved buffers, notifications — and the dtach sockets, which
+      # do NOT make shells survive a restart: a socket is worthless without the
+      # process holding it, and that process dies with the container.
+      #
+      # NEVER point this at a state directory a roost on the host is also
+      # using. This container's `ps` cannot see the host's dtach masters, so
+      # reconcile would read the host's live sockets as held by nothing and
+      # unlink them, leaving live shells alive and unreachable forever.
+      - roost-state:/var/lib/roost
+
+volumes:
+  roost-home:
+  roost-state:
+
+networks:
+  roost:
