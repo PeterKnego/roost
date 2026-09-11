@@ -2787,7 +2787,9 @@ mod tests {
             force: true,
             resume: Some(id.to_string()),
         });
-        let att = crate::session::reserve_and_attach(&project, "term", &dir).unwrap();
+        // `claude`, not `term`: develop gave the ✻ click its own name sequence,
+        // so the reservation this parks is on the name the click was allocated.
+        let att = crate::session::reserve_and_attach(&project, "claude", &dir).unwrap();
         let l = att.launch.as_ref().expect("the menu's pick must be parked");
         assert_eq!(
             l.session.as_ref(),
@@ -2839,7 +2841,9 @@ mod tests {
             force: true,
             resume: Some("aaaa1111-2222-3333-4444-555555555555".to_string()),
         });
-        let att = crate::session::reserve_and_attach(&project, "term", &dir).unwrap();
+        // `claude`, not `term`: develop gave the ✻ click its own name sequence,
+        // so the reservation this parks is on the name the click was allocated.
+        let att = crate::session::reserve_and_attach(&project, "claude", &dir).unwrap();
         let l = att.launch.as_ref().expect("a Claude was still asked for");
         assert!(
             matches!(l.session.as_ref(), Some(crate::launch::ClaudeSession::Fresh(_))),
