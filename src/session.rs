@@ -1082,12 +1082,36 @@ pub fn end_session(project: &str, name: &str) -> bool {
 /// spawns the PTY (see `term.rs`): until that lands the name is in no
 /// registry, so two quick clicks would otherwise both be handed `term`.
 pub fn next_free_name(project: &str, also_taken: &[String]) -> Option<String> {
+    next_free_name_with(project, also_taken, "term")
+}
+
+/// The first unused `<prefix>`, `<prefix>2`, `<prefix>3`, … for this project.
+///
+/// The prefix names what the terminal is *for*, so a Claude is `claude` rather
+/// than whichever `termN` happened to be free — a strip reading `term, term1,
+/// term2` says nothing about which one has an agent in it. Numbered from 2
+/// because the first has no number: `claude`, then `claude2`.
+///
+/// It stays inside `^[A-Za-z0-9_-]{1,32}$` and there is no room to relax that
+/// — the name lands in a dtach socket path and on a command line. So the
+/// pretty form ("Claude 2") is the client's business; this hands out a name.
+pub fn next_free_name_with(project: &str, also_taken: &[String], prefix: &str) -> Option<String> {
     let live = live_names(project);
     let taken = |n: &str| live.iter().any(|l| l == n) || also_taken.iter().any(|l| l == n);
     // One more candidate than the cap: with MAX names taken, every candidate
     // below is taken and the cap is what refuses — not an exhausted range.
+    //
+    // `term` keeps its historic numbering (`term`, `term1`, `term2`) because
+    // existing layouts on disk are full of those names and renumbering them
+    // would orphan a socket; a new prefix starts at 2, which is what reads
+    // correctly.
+    let bare_is_zero = prefix == "term";
     (0..=MAX_SESSIONS_PER_PROJECT)
-        .map(|i| if i == 0 { "term".to_string() } else { format!("term{i}") })
+        .map(|i| match (i, bare_is_zero) {
+            (0, _) => prefix.to_string(),
+            (i, true) => format!("{prefix}{i}"),
+            (i, false) => format!("{prefix}{}", i + 1),
+        })
         .find(|n| !taken(n))
         .filter(|_| live.len() < MAX_SESSIONS_PER_PROJECT)
 }

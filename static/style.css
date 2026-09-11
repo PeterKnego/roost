@@ -942,14 +942,50 @@ dialog.roost.dlg-wide { width: min(760px, 96vw); }
 .dlg-tabs { display: flex; gap: 2px; padding: 8px 14px 0; border-bottom: 1px solid var(--border); }
 .dlg-tab { font: inherit; padding: 5px 12px; border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; background: none; color: var(--muted); cursor: pointer; }
 .dlg-tab[aria-selected="true"] { color: var(--fg); border-color: var(--border); background: var(--bg); }
-.dlg-scope { display: flex; gap: 8px; align-items: center; padding: 10px 14px 2px; font-size: 12px; color: var(--muted); }
-.dlg-scope button { font: inherit; padding: 3px 10px; border: 1px solid var(--border); border-radius: 4px; background: none; color: var(--muted); cursor: pointer; }
-.dlg-scope button[aria-pressed="true"] { color: var(--fg); border-color: var(--accent); }
+/* The scope row: which file a change on this pane is written to.
+   A segmented pair rather than two outlined buttons with a gap. The accent
+   ring the selected one used to carry was the loudest thing in the dialog —
+   louder than the Save button — for a control that only says where writes go,
+   and it sat immediately under the tab strip, so the pane read as having two
+   competing rows of tabs. The selected segment is filled from `--row-on`, the
+   same token the tab strip and the menu use for "this one".
+   The file it writes is pushed to the far end and set in the mono face,
+   because it is a path. */
+.dlg-scope { display: flex; gap: 10px; align-items: center; padding: 10px 14px 2px;
+             font-size: 12px; color: var(--muted); }
+.dlg-scope .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
+.dlg-scope button { font: inherit; padding: 3px 12px; border: 0; border-right: 1px solid var(--border);
+                    background: none; color: var(--muted); cursor: pointer; }
+.dlg-scope button:last-child { border-right: 0; }
+.dlg-scope button[aria-pressed="true"] { color: var(--fg); background: var(--row-on); }
+.dlg-scope button:hover:not([aria-pressed="true"]) { color: var(--fg); }
+.dlg-scope .file { margin-left: auto; font-family: var(--mono); font-size: 11px; }
+
+/* ---- the About pane ---- */
+/* Same 14px gutter and the same row rhythm as `.dlg-rows`, so the pane lines
+   up with General instead of looking like a different dialog. Its first draft
+   reused `.ro-row`, which is the single-column shape meant for a long
+   read-only path — four short values came out full-bleed against the dialog
+   edge, each on two lines. */
+.dlg-about { padding: 4px 14px 8px; max-height: 60vh; overflow: auto; }
+.dlg-about .dlg-row:last-child { border-bottom: 0; }
+/* The right-hand column, matching `.dlg-row`'s 170px control slot. Mono
+   because every value here is an identifier, a hash or a timestamp. */
+.dlg-about .aboutval { justify-self: end; text-align: right; font-family: var(--mono);
+                       font-size: 12px; color: var(--fg); overflow-wrap: anywhere; }
+.dlg-about .aboutval.empty { color: var(--muted); font-family: inherit; font-style: italic; }
+/* Not the UA's blue-and-underlined: every other link in this app is the
+   accent, and a browser-default link inside a themed dialog is the one thing
+   that cannot be mistaken for part of it. */
+.dlg-about a { color: var(--accent); text-decoration: none; }
+.dlg-about a:hover { text-decoration: underline; }
 .dlg-rows { display: flex; flex-direction: column; max-height: 60vh; overflow: auto; padding: 4px 14px 8px; }
 /* An author `display` beats the UA's `[hidden] { display: none }`, so the
    pane toggle needs its own rule or the Settings rows stay visible under
-   the Theme tab. */
-.dlg-rows[hidden], .dlg-themes[hidden] { display: none; }
+   the Theme tab. `.dlg-scope` is here for the same reason and was missed
+   once: About has nothing to write anywhere, so it hides the scope row —
+   and the row went on showing, because the rule above it sets `display`. */
+.dlg-rows[hidden], .dlg-themes[hidden], .dlg-about[hidden], .dlg-scope[hidden] { display: none; }
 .dlg-warning { display: flex; gap: 6px; color: var(--warn, #d79921); font-size: 11px; padding: 8px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
 /* A setting is text on the left — label, key, source tag — with its one-line
    doc beneath, and the control in a fixed column on the right so every
@@ -1175,6 +1211,13 @@ header button.proj:hover svg { opacity: 1; }
        is the fallback for anything without dvh, and must stay first. */
     height: calc(100vh - var(--header-h, 36px) - var(--mobilebar-h, 56px));
     height: calc(100dvh - var(--header-h, 36px) - var(--mobilebar-h, 56px));
+    /* `--vvh` is `window.visualViewport.height`, written by app.js while a
+       soft keyboard is up. `dvh` does not shrink for the keyboard on iOS —
+       it is the viewport with the *browser* chrome retracted, which is a
+       different question — so without this the pane keeps its full height and
+       everything below the fold, the key bar included, sits under the
+       keyboard. Last, so it wins when it is set, and absent otherwise. */
+    height: calc(var(--vvh, 100dvh) - var(--header-h, 36px) - var(--mobilebar-h, 56px));
   }
   #grid > .pane { grid-column: 1; grid-row: 1; }
   /* `display:none`, not `visibility`/`hidden`: an xterm in a pane that still
@@ -1198,6 +1241,7 @@ header button.proj:hover svg { opacity: 1; }
   body[data-mpane="3"] #grid {
     height: calc(100vh - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
     height: calc(100dvh - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
+    height: calc(var(--vvh, 100dvh) - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
   }
 
   /* The header is a single row of a dozen controls at desktop width. Here it
@@ -1262,7 +1306,12 @@ header button.proj:hover svg { opacity: 1; }
   header button, #mobilebar button { min-height: 44px; min-width: 44px; }
   .paneicon { width: 32px; height: 32px; }
   .tab { padding: 10px 12px; }
-  .tab .x { width: 28px; height: 28px; margin-left: 4px; }
+  /* A bigger target for a finger. `.x` is an inline span holding a single
+     glyph, so width and height alone leave the × sitting wherever the line box
+     put it — off-centre in a 28px box, which is what it looked like. Made a
+     flex box so the glyph is centred in the target rather than near it. */
+  .tab .x { display: inline-flex; align-items: center; justify-content: center;
+            width: 28px; height: 28px; margin-left: 4px; line-height: 1; }
 
   /* A phone has no hover. Every affordance revealed by one needs a press
      state, or it is invisible until it is already activated. */

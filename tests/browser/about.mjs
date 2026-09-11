@@ -54,7 +54,7 @@ try {
   const rows = await evalIn(`(() => {
     const out = {};
     for (const r of document.querySelectorAll("#dlg-settings .dlg-about .dlg-row")) {
-      out[r.querySelector("label").textContent] = r.querySelector(".ro").textContent.trim();
+      out[r.querySelector("label").textContent] = r.querySelector(".aboutval").textContent.trim();
     }
     return out; })()`);
   ok(!!rows.Version && !!rows.Commit && !!rows.Built && !!rows.Repository,
@@ -67,6 +67,8 @@ try {
   ok(rows.Commit === server.commit && server.commit !== "unknown",
      `the commit is the server's own (${rows.Commit})`);
   ok(rows.Version === server.version, `and so is the version (${rows.Version})`);
+  ok((await evalIn(`document.querySelector("#dlg-settings .dlg-about a").href`)).startsWith(server.repository),
+     "and the repository link points at the server's own repository");
   // A tree with edits in it must say so. "Built from a1b2c3d" is false in the
   // common case of a local build, and this pane exists to be trusted.
   ok(/^[0-9a-f]{7,}(-dirty)?\??$/.test(server.commit),
@@ -74,13 +76,53 @@ try {
   ok(rows.Built !== "unknown" && !/1970/.test(rows.Built),
      `the build time is a real time, not the epoch: ${rows.Built}`);
 
-  console.log("C. the repository is a link");
+  console.log("C. it looks like the rest of the dialog");
+  // Reported: "prov nč v stilu ostalega dela appa". The first cut reused
+  // `.ro-row`, the single-column shape meant for one long read-only path, and
+  // gave the pane no gutter at all — four short values came out full-bleed
+  // against the dialog edge, each on two lines, under a scope switch that had
+  // nothing to switch.
+  //
+  // Asserted by *comparison* rather than against numbers: the claim is that
+  // this pane lines up with General, and a hard-coded 14px would keep passing
+  // if General moved.
+  const leftOf = async (sel) => await evalIn(
+    `Math.round(document.querySelector(${JSON.stringify(sel)}).getBoundingClientRect().left)`);
+  const aboutLeft = await leftOf("#dlg-settings .dlg-about .dlg-row label");
+  await evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="settings"]').click()`);
+  await sleep(200);
+  const generalLeft = await leftOf("#dlg-settings .dlg-rows .dlg-row label");
+  ok(Math.abs(aboutLeft - generalLeft) <= 1,
+     `its labels start where General's do (${aboutLeft} vs ${generalLeft})`);
+
+  // The scope switch chooses which file a change is written to, and Save
+  // writes it. Neither has anything to say about four read-only values.
+  ok(await evalIn(`!document.querySelector("#dlg-settings .dlg-scope").hidden`),
+     "General shows the scope switch");
+  await evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="about"]').click()`);
+  await sleep(200);
+  ok(!(await evalIn(`!!document.querySelector("#dlg-settings .dlg-scope").offsetParent`)),
+     "About hides it — and really hides it, not just sets the attribute");
+  ok(!(await evalIn(`!!document.querySelector("#dlg-settings .dlg-ok").offsetParent`)),
+     "and hides Save, which would invite the question of what it saves");
+  ok((await evalIn(`document.querySelector("#dlg-settings .dlg-cancel").textContent`)) === "Close",
+     "leaving one button, named for what it does");
+
+  console.log("D. the repository is a link");
   const link = await evalIn(`(() => {
     const a = document.querySelector("#dlg-settings .dlg-about a");
     return a ? { href: a.href, target: a.target, rel: a.rel } : null; })()`);
   ok(!!link && link.href.startsWith("https://"), `the repository is a link (${link && link.href})`);
   ok(link && link.target === "_blank" && link.rel.includes("noopener"),
      "opened in a new tab, with noopener — the workspace must not be navigated away from");
+  // Not the UA's blue-and-underlined. Every other link in this app is the
+  // accent, and a browser-default link inside a themed dialog is the one thing
+  // that cannot be mistaken for part of it.
+  const linkColor = await evalIn(`getComputedStyle(document.querySelector("#dlg-settings .dlg-about a")).color`);
+  const accent = await evalIn(`getComputedStyle(document.documentElement).getPropertyValue("--accent").trim()`);
+  ok(linkColor !== "rgb(0, 0, 238)" && linkColor !== "rgb(0, 0, 255)",
+     `it is not the browser's default link blue (${linkColor})`);
+  ok(!!accent, `and the theme defines the accent it uses (${accent})`);
 } finally {
   try { await page?.close(); } catch { /* already gone */ }
   browser.close();
