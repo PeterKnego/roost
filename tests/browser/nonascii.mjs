@@ -29,7 +29,16 @@ await Deno.writeTextFile(`${fx.roots}/proj/clean.md`, "# heading\n\nall ascii he
 await Deno.writeTextFile(`${fx.roots}/proj/main.rs`, "fn main() {}\n");
 // Past MAX_HIGHLIGHT_BYTES: the overlay is not worth repainting per keystroke
 // there, so the toggle has to say so rather than silently do nothing.
-await Deno.writeTextFile(`${fx.roots}/proj/big.txt`, "filler line — with a dash\n".repeat(5000));
+//
+// Sized against the cap, not at a number that looked large once. This fixture
+// was 130 KB, written when the cap was 100 KB, and stayed 130 KB when the cap
+// became 300 KB — so it quietly stopped being "past the cap". The assertions
+// above it went on passing and the two below it failed, blaming the toggle for
+// a fixture that no longer set up the case. Section D now reads the cap out of
+// the page, so the next time it moves this says so instead.
+const BIG_LINE = "filler line — with a dash\n";   // 26 chars; the dash is the point
+const BIG_REPEAT = 16_000;                        // 416k chars, past a 300 KB cap
+await Deno.writeTextFile(`${fx.roots}/proj/big.txt`, BIG_LINE.repeat(BIG_REPEAT));
 
 const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
 const browser = await startBrowser(profileDir(repoRoot));
@@ -119,7 +128,12 @@ try {
   ok(b && b.on && !b.has, "so the button is on but unaccented: the toggle and the indicator are independent");
   ok(await open("main.rs"), "main.rs opens");
   ok(!(await q(".nonasciibtn")), "a code file has no such button — hljs owns that overlay");
-  ok(await open("big.txt"), "a 130KB text file opens");
+  ok(await open("big.txt"), `a ${Math.round(BIG_LINE.length * BIG_REPEAT / 1000)}k-character text file opens`);
+  // The premise, asserted rather than assumed: everything below is about what
+  // happens *past* the cap, and none of it means anything if this file is not.
+  const cap = Number(await evalIn(`MAX_HIGHLIGHT_BYTES`));
+  ok(cap > 0 && BIG_LINE.length * BIG_REPEAT > cap,
+     `and it is genuinely over the ${Math.round(cap / 1000)}k-character highlight cap`);
   b = await btn();
   ok(b && b.has, "past the cap the indicator still counts");
   ok(b && b.disabled && /\d+ ?KB|large|big/i.test(b.title), `but the toggle is disabled and says why (${JSON.stringify(b && b.title)})`);
