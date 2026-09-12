@@ -9,11 +9,17 @@
 //! page dump its V8 precise-coverage report as it closes, then unions the
 //! covered byte ranges across all of them.
 //!
-//! **The union is the point.** Each test drives a narrow slice and they all
-//! share the same startup path, so averaging per-test percentages would count
-//! that path forty times and report a number far above the truth. Coverage is
-//! a property of the file, measured once, over the union of what every test
-//! reached.
+//! **The union is the point**, and it has to be a real union. Each test drives
+//! a narrow slice and they all share the same startup path, so averaging
+//! per-test percentages would count that path forty times and report a number
+//! far above the truth. Coverage is a property of the file, measured once, over
+//! the union of what every test reached.
+//!
+//! Which means combining entries with OR, never by writing each one in turn:
+//! every page loads every file, so a test that never touched a feature reports
+//! its functions with count 0, and a direct write lets that erase another
+//! test's coverage. See the comment at the merge below — the first version of
+//! this script did exactly that and under-reported dialog.js by 86 points.
 //!
 //! Byte ranges, not lines: V8 reports offsets, and converting to lines would
 //! mean calling a line covered because one expression on it ran. Bytes are
@@ -98,12 +104,28 @@ for (const line of (await Deno.readTextFile(covFile)).split("\n")) {
     files.set(url, { covered: bigger, length: end });
   }
   const cur = files.get(url);
+  // Per ENTRY first, then OR into the accumulator, and the distinction is the
+  // whole measurement. Within one entry a nested zero-count range must
+  // overwrite its parent — that is how V8 carves an `if` body that never ran
+  // out of a function that did. ACROSS entries it must not: every page loads
+  // every file, so a test that never opened a dialog still reports dialog.js's
+  // functions with count 0, and writing that straight into the accumulator
+  // erases what another test covered. Whichever test happened to be processed
+  // last then decided the file's number.
+  //
+  // This was not a rounding error. Measured on the same raw data: dialog.js
+  // read as 10.72% written directly and 97.13% as a union — and that 12.80%
+  // is the number #33 quotes to call it "the least covered file in the
+  // repository". A zero from one test is "this test did not run it", never
+  // "it does not run".
+  const mine = new Uint8Array(cur.length);
   for (const fn of entry.functions ?? []) {
     for (const r of fn.ranges ?? []) {
       const v = r.count > 0 ? 1 : 0;
-      for (let i = r.startOffset; i < r.endOffset && i < cur.length; i++) cur.covered[i] = v;
+      for (let i = r.startOffset; i < r.endOffset && i < mine.length; i++) mine[i] = v;
     }
   }
+  for (let i = 0; i < cur.length; i++) cur.covered[i] |= mine[i];
 }
 
 console.log("\n--- static/*.js, union of every test ---\n");
