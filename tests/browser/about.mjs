@@ -82,8 +82,56 @@ try {
      `the server describes its own install (channel=${server.channel} owner=${server.owner} replaceable=${server.replaceable})`);
   ok(rows.Installed === "built from a checkout",
      `and the row says how it got here (${JSON.stringify(rows.Installed)})`);
-  ok(rows.Upgrades === "roost can replace this copy",
+  // A checkout is yours to rebuild — #65 rules out roost touching a working
+  // tree, and the probe alone would say yes because `target/` is writable by
+  // definition. So the channel has to override the probe here.
+  ok(rows.Upgrades === "yours to rebuild",
      `and who may replace it (${JSON.stringify(rows.Upgrades)})`);
+  // And the row that only appears when there is something to type. This host
+  // is a checkout, so there must be nothing — asserted as an absence, which is
+  // the half a table of present cases cannot cover.
+  ok(rows.Upgrade === undefined,
+     `no command is offered for a checkout (${JSON.stringify(rows.Upgrade)})`);
+
+  // The row's *presence*, driven through the real renderer.
+  //
+  // Switching tabs re-renders from `state.settings` by reference; closing and
+  // reopening does not work, because the settings button sends `RequestState`
+  // and the server's own values overwrite anything set here. That cost four
+  // failing assertions to discover, so it is written down.
+  const asAbout = async (build) => {
+    await evalIn(`Object.assign(state.settings.build, ${JSON.stringify(build)}); 0`);
+    await evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="settings"]').click()`);
+    await evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="about"]').click()`);
+    return {
+      rows: await readRows(),
+      codes: await evalIn(`(() => {
+        const r = [...document.querySelectorAll("#dlg-settings .dlg-about .dlg-row")]
+          .find((x) => x.querySelector("label").textContent === "Upgrade");
+        return r ? [...r.querySelectorAll(".aboutval code")].map((c) => c.textContent) : null; })()`),
+    };
+  };
+  const original = await evalIn(`JSON.parse(JSON.stringify(state.settings.build))`);
+
+  const brew = await asAbout({ owner: "homebrew", channel: "release", replaceable: "yes" });
+  ok(brew.rows.Upgrade === "brew upgrade roost",
+     `a Homebrew install is given its command (${JSON.stringify(brew.rows.Upgrade)})`);
+  // As <code> elements, not a formatted string: the value is a command, and
+  // the row builds it the way every other value on this page is built.
+  ok(JSON.stringify(brew.codes) === JSON.stringify(["brew upgrade roost"]),
+     `rendered as one code element (${JSON.stringify(brew.codes)})`);
+
+  const deb = await asAbout({ owner: "system-package", channel: "release", replaceable: "no" });
+  ok(deb.codes && deb.codes.length === 2,
+     `a distro package gets both commands, since nothing here knows which host this is (${JSON.stringify(deb.codes)})`);
+  ok(deb.codes && !deb.codes.some((c) => c.includes("apt upgrade")),
+     "and never `apt upgrade`, which would find nothing: no package repository is published");
+
+  const tarball = await asAbout({ owner: "other", channel: "release", replaceable: "yes" });
+  ok(tarball.rows.Upgrade === undefined && tarball.codes === null,
+     `the row is absent where roost will offer the button instead (${JSON.stringify(tarball.rows.Upgrade)})`);
+
+  await asAbout(original); // leave the pane describing this binary again
 
   // The branches this host cannot be put into, tested on the functions the
   // renderer actually calls. `installLabel` and `upgradesLabel` are top-level
@@ -97,26 +145,31 @@ try {
   // package manager's copy must not become "roost may replace it" just
   // because the probe said yes, and this case asserts exactly that pairing.
   const label = async (build) => JSON.parse(await evalIn(
-    `JSON.stringify([installLabel(${JSON.stringify(build)}), upgradesLabel(${JSON.stringify(build)})])`));
+    `JSON.stringify([installLabel(${JSON.stringify(build)}), upgradesLabel(${JSON.stringify(build)}),
+                     upgradeCommand(${JSON.stringify(build)})])`));
 
   for (const [build, want, why] of [
     [{ owner: "homebrew", channel: "release", replaceable: "yes" },
-      ["Homebrew", "whatever installed it"],
+      ["Homebrew", "whatever installed it", ["brew upgrade roost"]],
       "a writable Cellar is still not roost's to replace"],
     [{ owner: "system-package", channel: "release", replaceable: "no" },
-      ["a system package", "whatever installed it"],
-      "a .deb in /usr/bin"],
+      ["a system package", "whatever installed it",
+        ["sudo apt install ./roost_*.deb", "sudo dnf install ./roost-*.rpm"]],
+      "a .deb in /usr/bin gets both commands and never `apt upgrade`, which finds nothing"],
     [{ owner: "cargo-bin", channel: "cargo", replaceable: "yes" },
-      ["cargo install", "roost can replace this copy"],
+      ["cargo install", "roost can replace this copy", ["cargo install roost --force"]],
       "cargo install and the shell installer share a directory, so the channel splits them"],
     [{ owner: "cargo-bin", channel: "release", replaceable: "yes" },
-      ["the shell installer", "roost can replace this copy"],
-      "...and here is the other half of that pair"],
+      ["the shell installer", "roost can replace this copy", null],
+      "...and the shell installer gets no command, because roost will offer the button"],
     [{ owner: "other", channel: "release", replaceable: "unknown" },
-      ["the release tarball", "unknown"],
-      "an unanswered probe says so rather than guessing"],
+      ["the release tarball", "unknown", null],
+      "an unanswered probe says so rather than guessing, and still offers no command"],
+    [{ owner: "other", channel: "checkout", replaceable: "yes" },
+      ["built from a checkout", "yours to rebuild", null],
+      "a writable checkout is still not roost's to update"],
     [{ owner: "unknown", channel: "unknown", replaceable: "unknown" },
-      ["unknown", "unknown"],
+      ["unknown", "unknown", null],
       "nothing known reads as nothing known"],
   ]) {
     const got = await label(build);
