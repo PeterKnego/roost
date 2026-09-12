@@ -71,6 +71,7 @@ const load = async (metrics, project = fx.project) => {
 const visiblePanes = `[...document.querySelectorAll('#grid > .pane')]
   .filter((p) => p.offsetParent !== null).map((p) => p.dataset.pane)`;
 const barVisible = `!!document.getElementById("mobilebar")?.offsetParent`;
+const termHost = `document.querySelector('.pane[data-pane="3"] .termhost')`;
 
 try {
   page = await load(PHONE);
@@ -432,7 +433,6 @@ try {
   ok((await evalIn(`${term}.buffer.active.length - ${term}.rows`)) <= 0,
      "which has no scrollback for a viewport drag to move — the reason a finger did nothing");
 
-  const termHost = `document.querySelector('.pane[data-pane="3"] .termhost')`;
   const at = await evalIn(`(() => { const r = ${termHost}.getBoundingClientRect();
     return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`);
   const dragOn = async (steps) => {
@@ -451,6 +451,40 @@ try {
   // desktop wheel produces, and now what a finger produces.
   ok(/\u001b\[<6[45];\d+;\d+M/.test(wire),
      `the drag reaches the program as wheel reports: ${JSON.stringify(wire.slice(0, 60))}`);
+
+  // Evenness, which is the difference between scrolling and stuttering.
+  // A terminal on the alternate screen can only move by whole rows — the
+  // program redraws, there is no sub-pixel anything — so the most it can do is
+  // put those steps where the finger asks for them.
+  //
+  // Handing xterm each touchmove's raw delta does not. Measured before the
+  // fix: a 120px drag in twenty even 6px steps produced eight row-steps on
+  // eight arbitrary frames and nothing on the other twelve, because each 6px
+  // delta was rounded on its own and 6/15 of a row rounds to nothing. The
+  // remainder is carried in app.js now, so the gaps between steps should be as
+  // regular as the row height allows.
+  // Matched on the plain substring, not a regex with an escape in it: an
+  // `\u001b` written inside this template literal is consumed here rather
+  // than reaching the page, and the first attempt at this recorded nothing
+  // for exactly that reason. "[<64;" and "[<65;" are the wheel-up and
+  // wheel-down SGR reports and appear in nothing else.
+  await evalIn(`window.__frame = 0; window.__at = [];
+    ${term}.onData((d) => { if (d.includes("[<64;") || d.includes("[<65;")) window.__at.push(window.__frame); });`);
+  await page.cmd("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: at.x, y: at.y - 60 }] });
+  for (let i = 1; i <= 20; i++) {
+    await evalIn(`window.__frame = ${i}`);
+    await page.cmd("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: at.x, y: at.y - 60 + i * 6 }] });
+    await sleep(16);
+  }
+  await page.cmd("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  const frames = await evalIn(`window.__at`);
+  const gaps = frames.slice(1).map((v, i) => v - frames[i]);
+  // 6px steps into a 15px row is one step every 2.5 frames, so alternating 2
+  // and 3 is exactly even. Anything wider than that is a stall the finger did
+  // not ask for — which is what was reported.
+  ok(gaps.length >= 4 && Math.max(...gaps) - Math.min(...gaps) <= 1,
+     `the row-steps are evenly spaced across the drag: gaps ${JSON.stringify(gaps)}`);
+  await sleep(400);
 
   // Momentum, which is most of what "really bad" meant. The browser supplies
   // inertia for a real scrollable div and for nothing else, so a translated
@@ -484,25 +518,75 @@ try {
   await evalIn(`${term}.write("\u001b[?1l\u001b[?1049l")`);
   await sleep(300);
 
-  console.log("E6. names, the close target, and the keyboard");
-  // A ✻ click is handed a name that says what the terminal is for, so the
-  // strip reports which tab has an agent in it rather than making you guess
-  // between term1 and term2.
-  await evalIn(`send({ t: "NewTerminal", pane: 3, launch: "claude" })`);
-  await until(async () => (await evalIn(`state.panes[3].tabs.some(t => t.session === "claude")`)), 10, "the claude tab");
-  // `force`, because a second ✻ with a Claude already running answers with the
-  // worktree prompt instead of opening — which is `worktree_prompt` doing its
-  // job, and a different feature from this one.
-  await evalIn(`send({ t: "NewTerminal", pane: 3, launch: "claude", force: true })`);
-  ok(await until(() => evalIn(`state.panes[3].tabs.some(t => t.session === "claude2")`), 10, "the second"),
-     "a second one is claude2, not the next free termN");
-  const labels = await evalIn(`[...document.querySelectorAll('.pane[data-pane="3"] .tabstrip .tab')]
-    .map((t) => t.textContent.replace("\u00d7", "").trim())`);
-  // The name has to stay inside ^[A-Za-z0-9_-]{1,32}$ — it lands in a dtach
-  // socket path and on a command line — so "Claude 2" is the strip's business.
-  ok(labels.includes("Claude") && labels.includes("Claude 2"),
-     `and reads as Claude / Claude 2 (${JSON.stringify(labels)})`);
+  console.log("E6b. the keys do not summon a keyboard; tapping the terminal does");
+  // Reported: pressing an arrow brought the keyboard up over the half of the
+  // screen you were reading. Focusing xterm's hidden textarea is what opens a
+  // soft keyboard, and the handler used to call `term.focus()` after every
+  // key — while the whole point of these keys is to drive a menu *without*
+  // typing.
+  //
+  // Asserted through `document.activeElement`, which is the thing a keyboard
+  // actually follows. There is no way to observe the keyboard itself from
+  // here, and saying so is better than a test that implies otherwise.
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="3"]').click()`);
+  await sleep(300);
+  const helper = `document.querySelector('.pane[data-pane="3"] textarea')`;
+  const focused = async () => await evalIn(`document.activeElement === ${helper}`);
+  await evalIn(`${helper}.blur(); document.body.focus();`);
+  ok(!(await focused()), "setup: nothing is focused, so no keyboard would be up");
 
+  const pressKey = async (k) => {
+    await evalIn(`(() => { const b = document.querySelector('#termkeys button[data-k="${k}"]');
+      b.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerType: "touch" })); })()`);
+    await sleep(150);
+  };
+  await pressKey("up");
+  await pressKey("down");
+  await pressKey("enter");
+  ok(!(await focused()),
+     "pressing the arrows and Enter leaves the terminal unfocused — no keyboard");
+
+  // The route that raises one, and now the only route: tapping the terminal.
+  // A dedicated ⌨ button was tried and removed — the terminal already does
+  // this, and it was one more control competing for a row six keys wide.
+  //
+  // This is the assertion that keeps the change above honest: "the keys do
+  // not focus" is only a good thing while *something* still does.
+  const termRect = await evalIn(`(() => { const r = ${termHost}.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`);
+  await page.cmd("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: termRect.x, y: termRect.y }] });
+  await page.cmd("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  await sleep(400);
+  ok(await focused(), "tapping the terminal focuses it, which is what raises the keyboard");
+  ok(!(await evalIn(`!!document.querySelector('#termkeys button[data-k="keyboard"]')`)),
+     "and there is no separate keyboard button competing for the row");
+
+  console.log("E6c. the frame follows the visible viewport");
+  // A keyboard cannot be raised in headless, so what is checked here is the
+  // wiring it depends on, and the test says as much rather than implying the
+  // keyboard itself was exercised. Two numbers matter: `height`, which is how
+  // much is visible, and `offsetTop` — iOS does not shrink the layout
+  // viewport, it *scrolls* it, so the visible window slides down the page.
+  // The first version of this fix used only `height`, which is why it left
+  // the header off the top of the screen.
+  const vvars = await evalIn(`(() => {
+    const cs = getComputedStyle(document.documentElement);
+    return { h: cs.getPropertyValue("--vvh").trim(), top: cs.getPropertyValue("--vvtop").trim(),
+             realH: Math.round(window.visualViewport.height),
+             realTop: Math.round(window.visualViewport.offsetTop),
+             bodyPos: getComputedStyle(document.body).position }; })()`);
+  ok(vvars.h === `${vvars.realH}px`, `--vvh tracks the visible height (${vvars.h})`);
+  ok(vvars.top === `${vvars.realTop}px`, `--vvtop tracks how far it scrolled (${vvars.top})`);
+  ok(vvars.bodyPos === "fixed",
+     "and the workspace is a fixed frame, so nothing scrolls the document under it");
+  // The standards-track half of the same fix, and the reason the JS above is
+  // still needed: `interactive-widget=resizes-content` tells the browser to
+  // shrink the *layout* viewport for a keyboard, which makes `dvh` correct on
+  // its own — on Chromium. Safari has not shipped it. Both, therefore.
+  ok((await evalIn(`document.querySelector('meta[name="viewport"]').content`)).includes("interactive-widget=resizes-content"),
+     "and the viewport meta asks the browser to resize the layout viewport too");
+
+  console.log("E6. the close target, and the keyboard");
   // Reported: the × was not centred. It is a span holding one glyph, so width
   // and height alone leave it wherever the line box put it.
   const x = await evalIn(`(() => {
@@ -512,8 +596,79 @@ try {
     return { w: Math.round(r.width), h: Math.round(r.height), d: cs.display,
              a: cs.alignItems, j: cs.justifyContent }; })()`);
   ok(x.w >= 24 && x.h >= 24, `the close target is finger-sized (${x.w}x${x.h})`);
+  // The assertion the last attempt was missing, and the reason it "passed"
+  // while a screenshot showed otherwise: a 28px control inside a 24px tab
+  // shares the tab's centre line while hanging two pixels out of it at each
+  // end. Centred and contained are different claims.
+  const fits = await evalIn(`(() => {
+    const tab = document.querySelector('.pane[data-pane="3"] .tab');
+    const el = tab.querySelector(".x");
+    const t = tab.getBoundingClientRect(), c = el.getBoundingClientRect();
+    return { tabH: Math.round(t.height), xH: Math.round(c.height),
+             over: Math.round(Math.max(0, t.top - c.top) + Math.max(0, c.bottom - t.bottom)) }; })()`);
+  ok(fits.over === 0,
+     `and it is inside the tab, not overflowing it (tab ${fits.tabH}px, × ${fits.xH}px, over ${fits.over}px)`);
+  ok(fits.tabH >= 44, `with the tab itself finger-sized too (${fits.tabH}px)`);
+
+  // Found by reading the measurements rather than the assertions: on the
+  // desktop the × is `opacity: 0` until the tab is hovered or active. A phone
+  // has no hover, so on every *inactive* tab the control was simply not there
+  // — and no test had ever asked whether it could be seen, only where it was.
+  //
+  // A second tab is opened for exactly that reason: with one tab it is always
+  // the active one, and the active tab was never the broken case.
+  await evalIn(`send({ t: "NewTerminal", pane: 3 })`);
+  ok(await until(async () => (await evalIn(
+       `document.querySelectorAll('.pane[data-pane="3"] .tabstrip .tab').length`)) >= 2, 15, "a second tab"),
+     "setup: a second tab, so one of them is inactive");
+  const seen = await evalIn(`[...document.querySelectorAll('.pane[data-pane="3"] .tabstrip .tab .x')]
+    .map((e) => Number(getComputedStyle(e).opacity))`);
+  ok(seen.length >= 2 && seen.every((o) => o > 0.5),
+     `every tab's × is legible without a hover (${JSON.stringify(seen)})`);
+
+  // And the cost of making the tabs finger-sized: two 44px tabs plus the pane
+  // icons stopped fitting across 390px and wrapped to a second row, which took
+  // 44 more pixels off a pane that has 16% of the screen already. Asserted as
+  // rows rather than pixels — the fix was to stop the × floating twenty pixels
+  // from its label, and the row count is what that bought.
+  const tabRows = await evalIn(`(() => {
+    const tops = [...document.querySelectorAll('.pane[data-pane="3"] .tabstrip .tab')]
+      .map((t) => Math.round(t.getBoundingClientRect().top));
+    return new Set(tops).size; })()`);
+  ok(tabRows === 1, `two tabs and the pane icons still share one row (${tabRows} rows)`);
   ok(x.d.includes("flex") && x.a === "center" && x.j === "center",
      `and the glyph is centred in it, not merely inside it (${JSON.stringify(x)})`);
+  // Reported twice, the second time with a screenshot: centring the glyph
+  // inside its own box was not enough, because the *box* was an inline element
+  // riding the text baseline — a 28px box on a 13px baseline sits high. The
+  // tab has to be a flex row for its label and its × to be centred against
+  // each other, so this compares the two centres rather than looking at
+  // either one's properties.
+  const centres = await evalIn(`(() => {
+    const tab = document.querySelector('.pane[data-pane="3"] .tab');
+    const el = tab.querySelector(".x");
+    const t = tab.getBoundingClientRect(), c = el.getBoundingClientRect();
+    return { tab: Math.round(t.top + t.height / 2), x: Math.round(c.top + c.height / 2) }; })()`);
+  ok(Math.abs(centres.tab - centres.x) <= 1,
+     `and it sits on the tab's own centre line (${JSON.stringify(centres)})`);
+
+  // The one the previous three attempts could not make. Every assertion so far
+  // measured the close control's *box*; the mark inside it was drawn with the
+  // character `×`, which sits on the font's math axis — so a flex box centred
+  // a line box around a glyph that is not in the middle of it, and the mark
+  // rode visibly high in a 28px target while every box measurement said
+  // "centred". It is an SVG now, and this compares the drawn thing to the box
+  // that holds it.
+  const glyph = await evalIn(`(() => {
+    const el = document.querySelector('.pane[data-pane="3"] .tab .x');
+    const g = el.querySelector("svg");
+    if (!g) return null;
+    const b = el.getBoundingClientRect(), r = g.getBoundingClientRect();
+    return { dy: Math.round((r.top + r.height / 2) - (b.top + b.height / 2)),
+             dx: Math.round((r.left + r.width / 2) - (b.left + b.width / 2)) }; })()`);
+  ok(glyph !== null, "the close mark is drawn, not a character with its own baseline opinion");
+  ok(glyph && Math.abs(glyph.dy) <= 1 && Math.abs(glyph.dx) <= 1,
+     `and it is centred in its box, not merely inside it (${JSON.stringify(glyph)})`);
 
   // The soft keyboard. `dvh` is the viewport with the browser's chrome
   // retracted, a different question, and on iOS it does not shrink for the

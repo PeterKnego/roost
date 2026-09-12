@@ -229,6 +229,12 @@ const PANE_ICONS = {
   restore: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 7H9V2.5M2.5 9H7v4.5M9 7l4.5-4.5M7 9l-4.5 4.5"/></svg>',
   // Two arrows meeting a check: a review that comes back round. Drawn at the
   // same 15px weight as `newterm` beside it.
+  // The tab's close control. Drawn, not typed: `×` (U+00D7) is placed on the
+  // font's math axis, so a flex box centres the *line box* around a glyph that
+  // is not in the middle of it — visibly high in a 28px target, which is how
+  // this was reported. Two crossing lines have no such opinion. Same geometry
+  // as the header's own close button (`SVG_X` in render.rs).
+  close: '<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>',
   prloop: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.6 6.4a5.6 5.6 0 0 1 9.3-2.2l1.5 1.4"/><path d="M13.4 9.6a5.6 5.6 0 0 1-9.3 2.2L2.6 10.4"/><path d="M13.6 2.4v3.2h-3.2M2.4 13.6v-3.2h3.2"/></svg>',
   newterm: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="10.5" height="9.5" rx="1.2"/><path d="M4 6.8l1.7 1.5L4 9.8M8 10.6h2.6"/><path d="M13.3 2.2v3.6M11.5 4h3.6"/></svg>',
 };
@@ -1031,7 +1037,10 @@ function render() {
       x.className = "x";
       x.title =
         t.k === "Terminal" ? "end session (alt-click to detach, leaving it running)" : "close";
-      x.textContent = "×";
+      // innerHTML from PANE_ICONS, which is constant markup in this file —
+      // the same rule the pane icons above follow. A tab label is
+      // attacker-influenced (a filename, a branch name); this is not.
+      x.innerHTML = PANE_ICONS.close;
       x.onclick = (e) => { e.stopPropagation(); closeTab(pi, ti, t, e.altKey); };
       // The tab is draggable and this sits inside it, so without this a
       // mousedown on × plus a few pixels of pointer drift starts a tab drag
@@ -2396,14 +2405,43 @@ function wireTouchScroll(node, term) {
     }
   };
 
+  /// A row's height in CSS pixels, measured from the rendered rows rather
+  /// than from `options.fontSize` — the theme's line height is not part of
+  /// that number, and this has to match what a row actually occupies.
+  const rowHeight = () => {
+    const el = term.element && term.element.querySelector(".xterm-rows > div");
+    const h = el && el.getBoundingClientRect().height;
+    return h && h > 1 ? h : 17;
+  };
+
   /// One notch of scrolling, `dy` pixels' worth. Positive is a finger moving
   /// down, which shows earlier output — the direction a wheel-up gives.
+  ///
+  /// The pixels are accumulated and spent a whole row at a time, and that is
+  /// the difference between this feeling like scrolling and feeling like
+  /// stuttering. A terminal on the alternate screen can only move by whole
+  /// rows — the program redraws, there is no sub-pixel anything — so the most
+  /// it can do is put those steps where the finger asks for them.
+  ///
+  /// Handing xterm each touchmove's raw delta does not: measured, a 120px drag
+  /// in twenty even 6px steps produced eight row-steps on eight arbitrary
+  /// frames and nothing on the other twelve, because each 6px delta was
+  /// rounded on its own and 6/15 of a row rounds to nothing. Carrying the
+  /// remainder here, and sending an exact multiple of the row height, makes
+  /// the same drag step once every two and a half frames — evenly, which is
+  /// what reads as smooth.
+  let carry = 0;
   const emit = (dy) => {
     const el = screen();
     if (!el) return;
+    carry += dy;
+    const h = rowHeight();
+    const rows = Math.trunc(carry / h);
+    if (!rows) return;
+    carry -= rows * h;
     const r = el.getBoundingClientRect();
     el.dispatchEvent(new WheelEvent("wheel", {
-      deltaY: -dy, deltaMode: 0, bubbles: true, cancelable: true,
+      deltaY: -rows * h, deltaMode: 0, bubbles: true, cancelable: true,
       clientX: Math.round(r.left + r.width / 2),
       clientY: Math.round(r.top + r.height / 2),
     }));
@@ -2411,6 +2449,7 @@ function wireTouchScroll(node, term) {
 
   node.addEventListener("touchstart", (e) => {
     glide = 0;
+    carry = 0;
     if (!translate() || e.touches.length !== 1) { last = null; return; }
     last = e.touches[0].clientY;
     at = e.timeStamp;
@@ -3548,12 +3587,26 @@ function initTermKeys() {
     // keyboard the user is about to type into. preventDefault keeps focus where
     // it is, which is the terminal.
     b.addEventListener("pointerdown", (e) => {
+      // `preventDefault` is what stops the press moving focus, which is the
+      // whole point: a click would focus the button first, and on iOS
+      // focusing a button dismisses the keyboard — so an arrow press would
+      // close the keyboard it is supposed to be independent of.
       e.preventDefault();
       const entry = targetTerm();
+      if (!entry) return;
       const make = TERM_KEYS[b.dataset.k];
-      if (!entry || !make) return;
+      if (!make) return;
       entry.term.input(make(entry.term));
-      entry.term.focus();
+      // Deliberately no `focus()`. Focusing xterm's hidden textarea is what
+      // opens the soft keyboard, so every arrow press used to summon one over
+      // the half of the screen you were trying to read — while the whole point
+      // of these keys is to drive a menu *without* typing.
+      //
+      // Nothing here replaces it, and nothing needs to: tapping the terminal
+      // focuses it and raises the keyboard, which is the gesture people
+      // already use. A dedicated ⌨ button was tried and removed — it was one
+      // more control competing for a row that is already six wide, for a job
+      // the terminal itself does.
     });
   }
 }
@@ -3593,12 +3646,23 @@ function initMobileBar() {
 function watchKeyboard() {
   const vv = window.visualViewport;
   if (!vv) return; // every current browser has it; an old one keeps `dvh`
+  const root = document.documentElement;
   const apply = () => {
-    document.documentElement.style.setProperty("--vvh", `${Math.round(vv.height)}px`);
-    // The workspace is a fixed frame, so the page itself should never be
-    // scrolled. If the browser scrolled it to reveal a field, put it back and
-    // let the shrunken frame do the revealing instead.
-    if (window.scrollY !== 0) window.scrollTo(0, 0);
+    // Two numbers, and the first version of this used only the first.
+    //
+    // `height` is how much is visible, and it is what shrinks when a keyboard
+    // opens — `dvh` does not follow it. `interactive-widget=resizes-content`
+    // in the viewport meta makes the *layout* viewport follow it too, which
+    // fixes this outright, but only on Chromium: Safari has not shipped it,
+    // and iOS is where this was reported.
+    //
+    // `offsetTop` is the half that was missing. iOS does not shrink the layout
+    // viewport at all; it scrolls it, so the visible window slides down the
+    // document. Sizing to `height` alone therefore left the frame the right
+    // size in the wrong place — header above the top of the screen, footer
+    // still under the keyboard.
+    root.style.setProperty("--vvh", `${Math.round(vv.height)}px`);
+    root.style.setProperty("--vvtop", `${Math.round(vv.offsetTop)}px`);
     fitTerminals();
   };
   vv.addEventListener("resize", apply);

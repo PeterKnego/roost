@@ -209,7 +209,14 @@ main { flex: 1; min-height: 0; }
    tail was the ✎ *and* the × together; the right fix was moving the ✎ to the
    filename stripe (.modebtn below), which it was, so a single reserved × is
    modest and the jumping is gone. */
-.tabstrip .tab .x { opacity: 0; margin-left: 2px; padding: 0 2px; border-radius: 3px; transition: opacity .1s; }
+/* An inline-flex box around the drawn × (PANE_ICONS.close in app.js), because
+   an inline SVG otherwise sits on the text baseline and rides low next to the
+   label. The glyph used to be the character `×`, which has the opposite
+   problem — U+00D7 is placed on the font's math axis, so centring its line box
+   leaves the mark visibly high. Two crossing lines have no such opinion. */
+.tabstrip .tab .x { display: inline-flex; align-items: center; justify-content: center;
+                    opacity: 0; margin-left: 2px; padding: 0 2px; border-radius: 3px;
+                    line-height: 0; transition: opacity .1s; }
 .tabstrip .tab:hover .x, .tabstrip .tab.active .x { opacity: .55; }
 .tabstrip .tab .x:hover { opacity: 1; background: var(--bg3, var(--bg2)); }
 /* The create pair lives with the pane controls now (see buildPaneIcons), so
@@ -1197,6 +1204,24 @@ header button.proj:hover svg { opacity: 1; }
    two things that can happen to it: the alternative, measured above, is a 2px
    pane and a sideways scrollbar. */
 @media (max-width: 900px) {
+  /* The whole workspace is a frame pinned to what is *visible*, not to the
+     page. On iOS the layout viewport does not shrink for the keyboard — it is
+     scrolled instead, so the visible window slides down the document — and a
+     frame sized to the page therefore has its header above the top of the
+     screen and its footer under the keyboard at the same time.
+     `--vvtop` is `visualViewport.offsetTop`, which is how far it slid;
+     `--vvh` is how much is left. Both are written by `watchKeyboard`.
+     `position: fixed` so nothing here scrolls the document underneath. */
+  html { overscroll-behavior: none; }
+  body {
+    position: fixed;
+    top: var(--vvtop, 0px);
+    left: 0;
+    right: 0;
+    height: var(--vvh, 100dvh);
+    overflow: hidden;
+  }
+
   /* One cell. Every pane is placed in it and all but the chosen one is
      removed from the layout, so nothing depends on --left-w/--right-w — which
      `render()` still writes on every State broadcast, harmlessly. */
@@ -1306,12 +1331,31 @@ header button.proj:hover svg { opacity: 1; }
   header button, #mobilebar button { min-height: 44px; min-width: 44px; }
   .paneicon { width: 32px; height: 32px; }
   .tab { padding: 10px 12px; }
-  /* A bigger target for a finger. `.x` is an inline span holding a single
-     glyph, so width and height alone leave the × sitting wherever the line box
-     put it — off-centre in a 28px box, which is what it looked like. Made a
-     flex box so the glyph is centred in the target rather than near it. */
-  .tab .x { display: inline-flex; align-items: center; justify-content: center;
-            width: 28px; height: 28px; margin-left: 4px; line-height: 1; }
+  /* A bigger target for a finger, inside a tab big enough to hold it.
+     Reported twice, and the second time was the useful one: the tab is
+     `height: 24px` from `.tabstrip .tab`, which is two selectors and beats a
+     bare `.tab` — so the padding written here never applied, and a 28px close
+     control was *taller than the tab containing it*. It overflowed by two
+     pixels top and bottom, which is what "still not aligned" looks like.
+     A browser test missed it because both boxes share a centre line while one
+     hangs out of the other; the screenshot did not.
+     Matching the original selector so the height can actually give way. */
+  .tabstrip .tab { height: auto; min-height: 44px; padding: 2px 4px 2px 8px; gap: 4px; }
+  /* The target is 28px because a finger needs one; the *glyph* has to stay
+     next to the label it closes. Centring a 13px × in a 28px box puts seven
+     pixels of nothing on each side, and with the tab's own gap and a margin on
+     top of that the × ended up some twenty pixels adrift — attached to
+     nothing, which is what it looked like. Negative margin pulls the box back
+     over that padding: the hit area keeps its size, the glyph moves in. */
+  .tabstrip .tab .x { display: inline-flex; align-items: center; justify-content: center;
+                      width: 28px; height: 28px; margin: 0 -6px 0 -4px; padding: 0;
+                      line-height: 0; flex: 0 0 auto;
+                      /* No hover on a phone, so a control that only appears
+                         under one never appears. `.active` carries a higher
+                         specificity than a bare `.tab .x`, so both are named
+                         or the open tab keeps the desktop's faded value. */
+                      opacity: .8; }
+  .tabstrip .tab.active .x, .tabstrip .tab:hover .x { opacity: .8; }
 
   /* A phone has no hover. Every affordance revealed by one needs a press
      state, or it is invisible until it is already activated. */
