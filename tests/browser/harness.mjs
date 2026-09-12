@@ -209,7 +209,36 @@ export async function attachTarget(webSocketDebuggerUrl) {
       pending.set(i, { res, timer });
       ws.send(JSON.stringify({ id: i, method, params }));
     });
+  /// Collects the page's counters *now* and appends them.
+  ///
+  /// `takePreciseCoverage` both collects and resets, so calling this mid-test
+  /// loses nothing: what follows accumulates afresh and is taken again at
+  /// close, and coverage.mjs unions the two.
+  const snapshotCoverage = async () => {
+    if (!COVERAGE) return;
+    const taken = cmd("Profiler.takePreciseCoverage")
+      .then((r) => appendCoverage(r.result?.result ?? []))
+      .catch(() => {});
+    pendingCoverage.push(taken);
+    await taken;
+  };
+
+  // Anything that navigates throws the counters away, and the loss is silent:
+  // V8 keeps coverage per script instance, a reload makes a new one, and the
+  // take at close then reports functions that demonstrably ran as never
+  // entered. `roots.mjs` drives the whole add-root flow and then reloads in
+  // its last section, so `addRootFlow`, `sendAddRoot` and `renderRoots` were
+  // all reported at count 0 — and overview.js read as 76.52% when the
+  // functions in question are exercised end to end, with revert-checks
+  // recorded in that file's own header.
+  //
+  // Snapshotted here rather than by asking each test to remember, for the same
+  // reason `Deno.exit` is wrapped below: a line every future author has to
+  // remember is not a fix. A false positive costs one extra snapshot, which
+  // the union absorbs.
+  const NAVIGATES = /location\s*\.\s*(reload|assign|replace)\s*\(|location\s*\.\s*href\s*=|location\s*=|history\s*\.\s*(go|back|forward)\s*\(/;
   const evalIn = async (expression) => {
+    if (COVERAGE && NAVIGATES.test(expression)) await snapshotCoverage();
     const r = await cmd("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
     if (r.result?.exceptionDetails) throw new Error(r.result.exceptionDetails.exception?.description || "eval failed");
     return r.result?.result?.value;
@@ -244,10 +273,7 @@ export async function attachTarget(webSocketDebuggerUrl) {
     // kill the process mid-round-trip and collect nothing — the first run of
     // this reported 0 bytes for exactly that reason. `Deno.exit` is wrapped
     // below to drain these first.
-    const taken = cmd("Profiler.takePreciseCoverage")
-      .then((r) => appendCoverage(r.result?.result ?? []))
-      .catch(() => {}) // a page that has already gone contributes nothing
-      .finally(finish);
+    const taken = snapshotCoverage().finally(finish);
     pendingCoverage.push(taken);
     return taken;
   };
@@ -277,7 +303,7 @@ export async function attachTarget(webSocketDebuggerUrl) {
       throw new Error("Page.bringToFront did not make the page visible — animation frames stay suspended");
     }
   };
-  return { cmd, evalIn, close, bringToFront };
+  return { cmd, evalIn, close, bringToFront, snapshotCoverage };
 }
 
 /// Set `ROOST_JS_COV=<file>` to append every page's V8 precise-coverage
