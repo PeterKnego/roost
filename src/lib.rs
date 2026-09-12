@@ -19,6 +19,7 @@ pub mod idecwd;
 pub mod idelock;
 pub mod ideport;
 pub mod idesess;
+pub mod install;
 pub mod launch;
 pub mod modes;
 pub mod notify;

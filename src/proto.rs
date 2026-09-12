@@ -322,6 +322,21 @@ pub struct BuildInfo {
     /// timezone; 0 means unknown.
     pub built_epoch: u64,
     pub repository: String,
+    /// How this binary was produced: `release`, `cargo`, `checkout` or
+    /// `unknown`. Baked at build time, and deliberately no finer — Homebrew,
+    /// the `.deb`, the `.rpm` and the tarball are the same bytes, so a
+    /// compiled-in value cannot separate them (see `install.rs`).
+    pub channel: String,
+    /// Whether this process could replace its own executable: `yes`, `no` or
+    /// `unknown`. Established by writing a probe file, not by reading
+    /// permission bits, and three-valued because "could not find out" is not
+    /// "no" — this is what decides whether an update button can work at all.
+    pub replaceable: String,
+    /// Best-effort guess at what manages this binary — `homebrew`,
+    /// `system-package`, `cargo-bin`, `other`, `unknown`. Cosmetic: it words a
+    /// suggested command and nothing acts on it, so a wrong guess costs a
+    /// wrong sentence rather than a wrong operation.
+    pub owner: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
