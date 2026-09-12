@@ -299,12 +299,47 @@ function installLabel(b) {
 /// So a package manager's copy reads as managed however the probe came out,
 /// and only an install roost owns reads as replaceable.
 function upgradesLabel(b) {
+  // A checkout is nobody's to update but yours. #65 is blunt about it — "an
+  // upgrade button that ran `git pull` in someone's working tree would be the
+  // worst thing in this repository" — and the probe alone would say yes, since
+  // a target/ directory is writable by definition.
+  if (b.channel === "checkout") return "yours to rebuild";
   if (b.owner === "homebrew" || b.owner === "system-package") {
     return "whatever installed it";
   }
   if (b.replaceable === "yes") return "roost can replace this copy";
   if (b.replaceable === "no") return "not writable by roost";
   return "unknown";
+}
+
+/// The command a user must run, or `null` when there is nothing for them to
+/// type.
+///
+/// Null is the interesting half: for the release tarball and the shell
+/// installer roost owns the file and will offer to replace it, so a shell line
+/// there would contradict the button rather than help. The row is rendered only
+/// when this returns something, which keeps it present exactly where the button
+/// will not be.
+///
+/// `apt upgrade` is deliberately absent. No package repository is published —
+/// the `.deb` and `.rpm` are files on a releases page — so it would find
+/// nothing. Both commands are shown because `.deb` and `.rpm` install to the
+/// same place and nothing here knows which host this is; telling a Fedora user
+/// to run `apt` is the one wrong-command case worth spending two lines to
+/// avoid.
+function upgradeCommand(b) {
+  switch (b.owner) {
+    case "homebrew":
+      return ["brew upgrade roost"];
+    case "system-package":
+      return ["sudo apt install ./roost_*.deb", "sudo dnf install ./roost-*.rpm"];
+    case "cargo-bin":
+      // Both live in ~/.cargo/bin; only the channel separates them, and only
+      // one of them is roost's to replace.
+      return b.channel === "cargo" ? ["cargo install roost --force"] : null;
+    default:
+      return null;
+  }
 }
 
 function openSettings(settings) {
@@ -547,17 +582,23 @@ function openSettings(settings) {
       "How this copy got here. Read from where the binary sits, because Homebrew, a system package and the release tarball are the same bytes."],
     ["Upgrades", "upgrades",
       "Whether roost could replace this copy itself, or whatever installed it owns that."],
+    ["Upgrade", "command",
+      "Run this to get a newer one. Shown only where the upgrade is yours to run \u2014 download the newer package first where one is named, since no package repository is published."],
   ];
 
   function renderAbout() {
     about.replaceChildren();
     const b = (view && view.build) || {};
     const value = (kind) =>
-      kind === "built" ? fmtBuilt(b.built_epoch)
+      kind === "command" ? (upgradeCommand(b) || []).join(" / ")
+      : kind === "built" ? fmtBuilt(b.built_epoch)
       : kind === "install" ? installLabel(b)
       : kind === "upgrades" ? upgradesLabel(b)
       : (b[kind] || "unknown");
     for (const [label, kind, doc] of ABOUT_ROWS) {
+      // The only row that is not always there: absent where roost will offer
+      // to do the upgrade itself, so it cannot contradict that button.
+      if (kind === "command" && !upgradeCommand(b)) continue;
       const r = document.createElement("div");
       r.className = "dlg-row";
       const text = document.createElement("div"); text.className = "text";
@@ -572,7 +613,20 @@ function openSettings(settings) {
       // `unknown` is a real answer here — a release tarball has no `.git` —
       // so it is set back like a placeholder rather than shown as a value.
       cell.className = "aboutval" + (v === "unknown" ? " empty" : "");
-      if (kind === "repository" && v !== "unknown") {
+      if (kind === "command") {
+        // <code> per line, built as elements: a command is data on this page
+        // like every other value here.
+        // `|| []` is not defensive habit: without it, removing the skip above
+        // throws mid-render, and because this is the last row the six before it
+        // are already in the DOM — so a crash looks exactly like the row being
+        // correctly absent. A revert check found that; the empty row this
+        // renders instead is visible, and asserted against.
+        for (const line of upgradeCommand(b) || []) {
+          const c = document.createElement("code");
+          c.textContent = line;
+          cell.appendChild(c);
+        }
+      } else if (kind === "repository" && v !== "unknown") {
         const a = document.createElement("a");
         a.href = v; a.textContent = "GitHub";
         a.target = "_blank"; a.rel = "noopener noreferrer";
