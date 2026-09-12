@@ -25,6 +25,14 @@ try {
   one = await openPage(browser.port, url);
   two = await openPage(browser.port, url);
   for (const p of [one, two]) await until(() => p.evalIn("ctrl && ctrl.readyState === 1 && !!state && !!state.settings"), 30, "app");
+  // Opening `two` put `one` behind it, and a hidden page is served no
+  // animation frames — see `bringToFront` in harness.mjs. Everything below
+  // but the two mirror checks drives `one`, and the terminal it holds paints
+  // through xterm's renderer, which runs on a frame. Nothing here asserts on
+  // paint *today*, so this guards the next assertion that does rather than
+  // fixing a failure; the two `two.evalIn` lines read `data-theme` off the
+  // document, which needs no frame.
+  await one.bringToFront();
 
   console.log("A. applyTheme switches the cascade in place, both directions");
   // A terminal that exists BEFORE the switch: xterm reads the variables at

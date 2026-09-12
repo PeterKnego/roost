@@ -681,7 +681,7 @@ try {
   // This is not a workaround for a test artifact: it is what the browser
   // does to any inactive tab, and a real user driving page one is looking at
   // it, so it is foreground for them by definition.
-  await page1.cmd("Page.bringToFront");
+  await page1.bringToFront();
   await freshSearch(evalIn, "farline_9f3");
   ok(
     await until(() => evalIn(`document.querySelectorAll("#searchresults .searchrow").length > 0`), 10, "farline row"),
@@ -697,7 +697,7 @@ try {
   );
 
   console.log("\nG. THE case: searching within a file already open AND focused in Edit");
-  await page1.cmd("Page.bringToFront"); // see F's comment; still page one throughout this section
+  await page1.bringToFront(); // see F's comment; still page one throughout this section
   await evalIn(`(() => {
     const c = [...document.querySelectorAll(".pane .content")].find((c) => {
       const n = c.querySelector(".editwrap .path .rel");
@@ -769,7 +769,7 @@ try {
   // also means the mirrored scroll genuinely depends on page two's *own*
   // rendering, not on whatever page one already computed, which is the
   // point of a mirroring test.
-  await page2.cmd("Page.bringToFront");
+  await page2.bringToFront();
   ok(
     await until(async () => {
       // Bound once and checked explicitly: boxScrollTop() returns null while
