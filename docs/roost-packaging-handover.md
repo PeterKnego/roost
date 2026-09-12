@@ -1,7 +1,7 @@
 # Roost — packaging and distribution handover
 
-Date of survey: 2026-09-06. Last updated: 2026-09-08 (6.1 decided; steps 1 and 2
-done bar one secret).
+Date of survey: 2026-09-06. Last updated: 2026-09-12 (steps 1 and 2 done and
+published; both macOS binaries executed on a Mac — see sections 4 and 6.3).
 Repository: https://github.com/PeterKnego/roost (public, branch `master`)
 Version at survey: 0.5.0
 
@@ -146,11 +146,25 @@ Build these four targets:
 - `aarch64-unknown-linux-musl`
 
 The two Linux targets are verified to build (see C3), and `aarch64` needs the
-explicit `rust-lld` linker setting. The two macOS targets are **unverified** —
-this survey had no macOS machine.
+explicit `rust-lld` linker setting. **Both macOS targets were executed on a Mac
+on 2026-09-12**, which ends the caveat this survey opened with:
 
-macOS has no binary today. The README says that macOS is in daily use. Mac
-users must therefore install a Rust toolchain first. Close this gap first.
+| Target | How it was run | Result |
+|---|---|---|
+| `aarch64-apple-darwin` | native, macOS 26.6.2 (build 25G83), Apple Silicon | `roost 0.5.2`; serves `HTTP 200`; browser terminal works (Step 2) |
+| `x86_64-apple-darwin` | **under Rosetta 2**, same Apple Silicon host | `roost 0.5.2`; serves `HTTP 200` |
+
+The x86_64 row is Rosetta, not a native Intel Mac. Rosetta translates
+instructions and nothing else — the Mach-O loads, the bytes are the release
+artifact's, and a native Intel Mac is not expected to differ — but it is a
+substitution, and the dev/prod substitution table in CLAUDE.md is the reason to
+write it down as one instead of as a native run.
+
+**This gap is closed.** macOS had no binary at the time of the survey, so Mac
+users had to install a Rust toolchain first even though the README says macOS is
+in daily use. As of `v0.5.2` there are two macOS binaries and a Homebrew tap,
+and `brew install peterknego/tap/roost` is the channel to point Mac users at —
+not the tarball, for the reason in 6.3.
 
 ## 5. Work to do, in order
 
@@ -191,10 +205,13 @@ Verified on 2026-09-08 under the `dist` profile, not `release`:
 | linker line commented out | fails with the exact `Relocations in generic ELF (EM: 183)` from C3, no binary produced |
 | `dist build --artifacts=local` | `roost-x86_64-unknown-linux-musl.tar.xz` + `.sha256`; holds the binary, `README.md`, `LICENSE-MIT`, `LICENSE-APACHE`; extracted binary prints `roost 0.5.0` |
 
-Still unverified, and unverifiable without pushing a tag: the two macOS targets
-and the `ubuntu-22.04-arm` runner. The first tag is the test.
+Still unverified at the time of writing, and unverifiable without pushing a tag:
+the two macOS targets and the `ubuntu-22.04-arm` runner. The first tag was the
+test, and it passed — `v0.5.2` on 2026-09-09 produced all four `.tar.xz`
+artifacts with sidecars, so the arm runner built. The macOS binaries were then
+run on a Mac on 2026-09-12; see section 4.
 
-### Step 2 — Publish a Homebrew tap — **done 2026-09-08, blocked on one secret**
+### Step 2 — Publish a Homebrew tap — **done; published 2026-09-09, installed and run on macOS 2026-09-12**
 
 `PeterKnego/homebrew-tap` exists, is public, and holds a seed `README.md` — a
 tap must not be an empty repository, because dist checks it out to push the
@@ -246,16 +263,44 @@ byte-identical `roost.rb` (`diff` clean). That is why the name is still free to
 change today and will not be after the first release: once a user has run
 `brew tap`, a rename leaves their clone on a GitHub redirect.
 
-**Outstanding — needs a browser, so it could not be done here.** That job
-authenticates with `secrets.HOMEBREW_TAP_TOKEN`, and
-`gh api repos/PeterKnego/roost/actions/secrets` returns `total_count: 0`. Until
-it is set, a tagged release will build and upload every artifact and *then* fail
-at the publish step. Mint a personal access token with `repo` scope on the tap,
-then:
+**The secret is set and the publish job ran — resolved 2026-09-09.**
+`gh api repos/PeterKnego/roost/actions/secrets` now returns `total_count: 1` for
+`HOMEBREW_TAP_TOKEN`, and `check-tap-token.yml` has four runs, all success, the
+last at `2026-09-09T12:17:19Z`. `PeterKnego/homebrew-tap` was pushed at
+`2026-09-09T09:05:07Z`, about one minute after `v0.5.2` published at
+`2026-09-09T09:03:58Z` — that push *is* the publish job succeeding, which is
+better evidence than the job's own green tick. The tap holds
+`Formula/roost.rb` with `version "0.5.2"`, all four targets,
+`license any_of: ["MIT", "Apache-2.0"]` and `depends_on "dtach"`; all four URLs
+answer 200 and all four `sha256` values match the release's own `.sha256`
+sidecars, which rules out the mismatch that would break `brew install` quietly.
+
+**Installed and run on a Mac on 2026-09-12** — the first execution of a macOS
+roost binary anywhere, since the runners cross-compile and never run it:
 
 ```sh
-gh secret set HOMEBREW_TAP_TOKEN -R PeterKnego/roost
+$ brew install peterknego/tap/roost
+🍺  /opt/homebrew/Cellar/roost/0.5.2: 7 files, 4MB, built in 2 seconds
+$ roost --version
+roost 0.5.2
+$ file /opt/homebrew/Cellar/roost/0.5.2/bin/roost
+/opt/homebrew/Cellar/roost/0.5.2/bin/roost: Mach-O 64-bit executable arm64
 ```
+
+It serves — `HTTP 200` on `http://127.0.0.1:8899/`, listening on `127.0.0.1`
+only — and the terminal works end to end. Clicking into a terminal in a real
+browser spawned `dtach -A <state>/sock/<project>/term -E -r winch -z /bin/bash
+-l`, which forked a master holding `/bin/bash -l` on its own tty; a typed
+`echo …; ls` was run by that shell and its output rendered back in the browser,
+and reloading the page replayed the session screen. The dtach socket directory
+was created, which is exactly the step `ROOST_CMD=cat` in the test suite cannot
+reach — the first row of the dev/prod substitution table in CLAUDE.md.
+
+**What this did not test: `depends_on "dtach"` actually pulling dtach.** That
+Mac already had `dtach` 0.9, installed on request on 2026-08-16, so Homebrew
+reported `Would install 1 formula: roost` and treated the dependency as
+satisfied. `brew deps roost` does answer `dtach`, so the declaration is present
+and resolves; a fresh machine is what would prove it installs.
 
 ### Step 3 — Publish an install script
 
@@ -379,12 +424,79 @@ crates.io shows and is already what the generated formula carries — verified:
 and any future deb/rpm must declare **both** explicitly rather than copying the
 GitHub field; that is the only place this can still go wrong.
 
-**6.3 — macOS Gatekeeper.**
-Binaries that a browser downloads are quarantined. Binaries that `curl` fetches
-and binaries that Homebrew installs mostly avoid this. The two primary channels
-therefore avoid the need for an Apple Developer account (approximately 100 EUR
-per year). If you later publish a download link on a web page, this becomes
-necessary.
+**6.3 — macOS Gatekeeper. Measured on 2026-09-12. The conclusion below held;
+"mostly avoid this" was too soft, and the tarball fails by *hanging*.**
+
+cargo-dist does not notarize, and nothing in the four artifacts carries a
+Developer ID. What ships is an *ad-hoc, linker-signed* Mach-O — not the same as
+unsigned, since arm64 refuses to execute an unsigned binary at all, but with no
+team identifier, so Gatekeeper assesses it as unidentified:
+
+```
+$ codesign -dv roost
+Identifier=roost-f429bd63c60b472a
+CodeDirectory v=20400 size=31128 flags=0x20002(adhoc,linker-signed) hashes=969+0
+Signature=adhoc
+TeamIdentifier=not set
+$ spctl -a -vv roost
+roost: rejected
+```
+
+**`spctl` rejects the Homebrew binary too, and that channel works fine.** The
+two are byte-identical — `sha256 a17bc4c9243f1c14a5b3f152dde9447c0bf13e4f41a53c289aa35f11e381f581`
+for both. So the signature is not what separates them. The quarantine
+attribute is, and only a browser sets it:
+
+| Provenance | `com.apple.quarantine` | `roost --version` |
+|---|---|---|
+| `brew install` | absent | `roost 0.5.2` |
+| `curl -O` the tarball | absent | `roost 0.5.2` |
+| Chromium download | `0081;6aa574ab;Chromium;` | **hangs indefinitely, no output** |
+
+Three things the earlier note did not capture:
+
+- **`tar xf` propagates the flag.** The attribute sits on the `.tar.xz`, and
+  macOS's bsdtar copies it onto the extracted binary. Extracting from a command
+  line does not launder a browser download.
+- **It hangs; it does not refuse.** A quarantined `roost --version` produced no
+  stdout, no stderr and no exit status, and was still blocked when killed after
+  two minutes. Gatekeeper raises a GUI prompt and the `exec` waits on the
+  answer — which nobody sees over ssh or inside a scripted install. Read from
+  `log show --predicate 'subsystem == "com.apple.syspolicy"'` and the kernel
+  log, not inferred from the stall:
+
+  ```
+  syspolicyd: GK evaluateScanResult: 1, PST: (team: (null)), (id: roost-f429bd63c60b472a), (bundle_id: NOT_A_BUNDLE)
+  syspolicyd: Prompt shown (6, 0), waiting for response: PST: ... (id: roost-f429bd63c60b472a)
+  kernel (AppleSystemPolicy): ASP: Security policy would not allow process: 44825, .../roost
+  kernel (AppleMobileFileIntegrity): AMFI: '.../roost' has no CMS blob?
+  kernel (AppleMobileFileIntegrity): AMFI: '.../roost': Unrecoverable CT signature issue, bailing out.
+  ```
+
+  A hang is worse than a rejection for the reason CLAUDE.md's "absence of
+  evidence" table is about: there is no error text to search for, and nothing
+  distinguishes it from a server that started correctly.
+- **Stripping the attribute after a blocked run does not rescue that path.**
+  Once a prompt is pending, `xattr -d com.apple.quarantine` and a re-run blocked
+  again. The workaround only works on a binary not yet executed while
+  quarantined — so the documented order matters:
+
+  ```sh
+  tar xf roost-aarch64-apple-darwin.tar.xz
+  xattr -d com.apple.quarantine roost-aarch64-apple-darwin/roost   # before the first run
+  ./roost-aarch64-apple-darwin/roost --version                     # roost 0.5.2
+  ```
+
+So Homebrew and `curl`-based installs do avoid the Apple Developer account
+(approximately 100 EUR per year), as the original note said. What changes is the
+tarball: it needs notarization, or that `xattr -d` line printed wherever the
+download is offered. See issue #65, which lists the released binary as one of
+its supported shapes.
+
+Minor, same session: each `.tar.xz.sha256` sidecar ends with a blank line, so
+`shasum -a 256 -c` prints `WARNING: 1 line is improperly formatted` directly
+beneath its `OK`. The verification succeeds and the exit status is 0; it only
+looks alarming next to a checksum a user was told to trust.
 
 **6.4 — Security note for package descriptions.**
 Roost binds to `127.0.0.1` and has no authentication of its own. Keep this
@@ -413,6 +525,26 @@ Re-verified on 2026-09-06 against live sources rather than from memory:
   `aur.archlinux.org/cgit`, which installs `/usr/bin/${_appname}` with
   `pkgname=${_appname}` and declares `provides=("roost")`.
 
-Still unverified: the two macOS targets, and the Amazon Linux 2023 row in C2
-(2.34 is below both loaders that were tested, so it follows by inspection, but
-it was not run).
+Added on 2026-09-12, on a Mac (macOS 26.6.2 build 25G83, Apple Silicon):
+`brew install peterknego/tap/roost` then `roost --version`, `which`, `file` and
+a served `curl` against `127.0.0.1`; the browser terminal driven in a real
+Chromium down to a typed command and its output; both release tarballs
+downloaded, `shasum -a 256 -c`'d, extracted and executed; `codesign -dv` and
+`spctl -a -vv` on each binary; and the quarantine path reproduced with an actual
+Chromium download, read back with `xattr -l`, with the Gatekeeper block
+confirmed in `log show` rather than deduced from the hang.
+
+One trap worth recording, because it nearly produced the opposite report: a
+headless browser is not a browser. xterm.js repaints inside
+`requestAnimationFrame`, which never fires in a tab macOS considers hidden, so
+the terminal's DOM stayed frozen at one prompt while the shell was in fact
+running every command — `document.hidden` was `true` and a test `rAF` callback
+never ran. The terminal only read as broken through the DOM; xterm's own buffer
+held the full session. Verified properly by focusing a headed instance until
+`document.visibilityState` became `visible`. Same shape as the table in
+section 5 of CLAUDE.md.
+
+Still unverified: the Amazon Linux 2023 row in C2 (2.34 is below both loaders
+that were tested, so it follows by inspection, but it was not run); a *native*
+Intel Mac, as against the Rosetta run recorded in section 4; and whether
+`depends_on "dtach"` installs dtach on a machine that lacks it.
