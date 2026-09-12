@@ -491,9 +491,20 @@ surfaces as a conflict at the *next* release.
 ## The development instance
 
 Because the deployed binary ignores the checkout, iterating on the UI needs a
-*second* roost whose assets come from a working tree — a transient unit with its
-own port, state dir and `ROOST_STATIC`. The exact invocation, ports and tailnet
-routes for this host are in `~/.config/roost/deploy-host.md`.
+*second* roost whose assets come from a working tree — its own port, state dir
+and `ROOST_STATIC`. `scripts/testroost.sh` is that, and is the way in: it takes
+a port, gives itself its own state directory, roots and global config, refuses
+to start on a state directory another running instance already holds, and on
+Ctrl-C stops the sessions it started. See CONTRIBUTING.md for the flags; this
+host's ports and tailnet routes are in `~/.config/roost/deploy-host.md`.
+
+That script is deliberately foreground, because the alternative failure is
+quiet: a scratch instance was once found still serving twelve days after its
+state directory had been deleted, and nothing about a listening port says which
+checkout it was built from.
+
+Run one as a *unit* instead — a transient `systemd-run`, say, to keep it across
+logouts — and one property becomes load-bearing.
 
 **`KillMode=process` is not optional** on that unit. `systemd-run` defaults to
 `control-group`, which SIGKILLs everything in the unit's cgroup on stop — the
@@ -513,14 +524,25 @@ a stale shell is recoverable, a killed one is not.
 
 **It needs its own `ROOST_STATE_DIR`.** Two instances sharing one show each
 other's projects in the header strip and each other's sessions in the socket
-directory, which is rarely what you want from a throwaway dev server.
+directory, which is rarely what you want from a throwaway dev server — and
+riskier than untidy when their roots differ, because a key that resolves under
+neither instance's roots is the exact input that once read as "the directory was
+deleted" (CLAUDE.md's absence-of-evidence table). `scripts/testroost.sh` sets
+its own, and refuses to start on one that another running instance already
+holds.
 
-**Its origin must be allowlisted separately, port included.** The `Origin`
-header a browser sends for a non-default port carries that port, which the
-unqualified entry does not cover, so `allowed_origins` must list both. Miss the
-second one and the failure is confusing rather than obvious: pages load over
-plain HTTP while every websocket 403s, so the workspace renders with no tabs
-and no terminals.
+**Its origin must be allowlisted separately, port included, and in its own
+config.** The `Origin` header a browser sends for a non-default port carries
+that port, which the unqualified entry does not cover. Miss it and the failure
+is confusing rather than obvious: pages load while every websocket 403s, so the
+workspace renders with no tabs and no terminals.
+
+Where that entry goes follows from `ROOST_CONFIG`, which is per instance: an
+instance reads only the global config its own `ROOST_CONFIG` names, so the dev
+origin belongs in the *dev* instance's file (`scripts/testroost.sh` puts it
+under that instance's state directory) and not in the deployed service's. Adding
+it there would widen what can open a shell on the instance that matters, and
+would not help the dev instance anyway, since it never reads that file.
 
 Adding a dev route widens what can open a websocket — and a websocket spawns a
 shell — by exactly one origin. Keep both tailnet-only; do not `tailscale
