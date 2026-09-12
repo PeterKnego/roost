@@ -3989,6 +3989,52 @@ mod tests {
         drop(rx_a);
     }
 
+    /// `do_fileop` is the shared tail of CreateFile, CreateDir and DeleteFile,
+    /// and its two halves go to different audiences: a success is a tree change
+    /// every client must see, a refusal is the asking client's own business.
+    ///
+    /// Two subscribers, deliberately: with one, `broadcast` and `send_to` are
+    /// indistinguishable, so a refusal broadcast to everyone — an error banner
+    /// on a tab whose user did nothing — would pass a single-client test.
+    #[test]
+    fn a_fileop_broadcasts_success_and_tells_only_the_asker_about_a_refusal() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let proj = d.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let mut h = Hub::new("fileop_audience", proj.clone());
+        let (_a, rx_a) = h.subscribe();
+        let (b, rx_b) = h.subscribe();
+        drain(&rx_a);
+        drain(&rx_b);
+
+        h.handle(&b, Intent::CreateFile { rel: "notes.txt".into() });
+        assert!(proj.join("notes.txt").is_file(), "the file itself was not created");
+        for (who, msgs) in [("the other client", drain(&rx_a)), ("the asking client", drain(&rx_b))] {
+            assert!(
+                msgs.iter().any(|m| m.contains("TreeChanged")),
+                "{who} must see the tree change; got {msgs:?}"
+            );
+        }
+
+        // The same path again, which `must_not_exist` refuses.
+        h.handle(&b, Intent::CreateFile { rel: "notes.txt".into() });
+        let (to_a, to_b) = (drain(&rx_a), drain(&rx_b));
+        // On the reason, not merely on "an error happened": a refusal that
+        // named the wrong path, or said nothing useful, is the failure this
+        // function exists to avoid.
+        assert!(
+            to_b.iter().any(|m| m.contains("already exists") && m.contains("notes.txt")),
+            "the asker must be told why; got {to_b:?}"
+        );
+        assert!(
+            to_a.is_empty(),
+            "a client that did nothing must hear nothing about someone else's refusal; got {to_a:?}"
+        );
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
     /// The + button no longer asks for a name, so the server must hand out an
     /// unused one. `term` then `term1`: without the `also_taken` check, the
     /// second click sees no *live* session yet (the PTY only spawns when the
