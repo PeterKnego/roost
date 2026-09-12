@@ -134,9 +134,35 @@ export async function startBrowser(profileDir) {
 /// expression in the page and returns its value; that is the whole interface
 /// the tests need, because everything they assert about lives in app.js's own
 /// state (`terms`, an entry's socket, the xterm buffer).
+/// A desktop viewport, because the default one is a phone.
+///
+/// Headless Chromium opens at 780x493 here (measured), and `static/style.css`
+/// has had a `@media (max-width: 900px)` rule since the phone work landed — so
+/// every page this opens was silently rendering the ONE-PANE mobile layout,
+/// with `#mobilebar` visible and panes 0, 1 and 2 at 0x0. A test that never
+/// mentions a viewport was not testing "the default window"; it was testing
+/// the phone.
+///
+/// That took two tests down in ways that pointed nowhere near the cause.
+/// `autosave.mjs` typed into an editor whose pane was 0x0: a zero-sized
+/// textarea cannot take focus, so `focus()` left it on a terminal placeholder
+/// and `Input.insertText` went there instead — reported as "typing never
+/// reached the editor". `copyselect.mjs` got a 94-column terminal in which the
+/// command line no longer wrapped, so the row it matched by marker text was
+/// the command line rather than the output line, and its drag selected 16
+/// characters of shell prompt.
+///
+/// Set here rather than in each test so the next one cannot forget it. A test
+/// that wants a different viewport still calls
+/// `Emulation.setDeviceMetricsOverride` itself and overrides this — which is
+/// what `mobile.mjs` does, deliberately, with `mobile: true`.
+const DESKTOP = { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false };
+
 export async function openPage(cdpPort, url) {
   const t = await (await fetch(`http://127.0.0.1:${cdpPort}/json/new?${url}`, { method: "PUT" })).json();
-  return attachTarget(t.webSocketDebuggerUrl);
+  const p = await attachTarget(t.webSocketDebuggerUrl);
+  await p.cmd("Emulation.setDeviceMetricsOverride", DESKTOP);
+  return p;
 }
 
 /// Attaches a CDP client to a target that already exists — a tab opened by
