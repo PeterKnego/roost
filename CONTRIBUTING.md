@@ -58,6 +58,34 @@ suite. They drive a real Chromium against a real roost with real `dtach`, and
 they skip silently rather than failing when no browser is found — a skip is
 not a pass.
 
+## Poking at it by hand: a second instance
+
+Never point a browser — and especially not browser automation — at the roost
+you are working in. roost sizes every session's PTY to the minimum over all
+attached clients, so one headless 1280x720 tab clamps every terminal in that
+project. It has happened, and the symptom ("Claude is using only half the
+terminal") gives no hint that a stray tab is the cause.
+
+Start a throwaway one instead:
+
+```sh
+scripts/testroost.sh            # :8445, or pass a port
+scripts/testroost.sh 9001 --no-build
+```
+
+It gets its own state directory, its own roots with a fixture project, and its
+own global config, so nothing it does can reach the instance you work in.
+`ROOST_STATIC` points at your checkout, so an edit to `static/app.js` or
+`static/style.css` needs only a browser reload — no rebuild. Ctrl-C stops it
+and the sessions it started.
+
+Override `ROOST_TEST_STATE` or `ROOST_TEST_ROOTS` if you want it somewhere
+else. Keep its roots away from the roots the live instance uses: the cwd
+sampler in `src/cwds.rs` finds shells by walking `/proc` for
+`ROOST_PROJECT`/`ROOST_SESSION`, which is instance-blind, so with overlapping
+project keys a new session in one instance can start in a cwd sampled from the
+other's shell.
+
 ## Read CLAUDE.md first
 
 [CLAUDE.md](CLAUDE.md) lists this project's hard constraints — the loopback
