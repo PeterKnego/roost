@@ -1389,6 +1389,31 @@ mod tests {
         assert!(process_age_secs(0).is_none() || process_age_secs(4_294_967_294).is_none());
     }
 
+    /// `ages_snapshot` is the overview's one-fork replacement for a
+    /// `process_age_secs` per session, and its failure direction is chosen: an
+    /// empty map so every age renders "unknown" rather than `0`. That makes
+    /// "returned nothing" indistinguishable from "nothing is running" unless a
+    /// test insists on a pid that must be there — so this one asserts on our
+    /// own, and cross-checks the age against the single-pid path that is
+    /// already covered. A snapshot that forked and parsed nothing, or parsed
+    /// the wrong column, fails here instead of reading as "no ages known".
+    #[test]
+    fn ages_snapshot_sees_our_own_process_and_agrees_with_the_single_pid_path() {
+        let me = std::process::id();
+        let ages = ages_snapshot();
+        assert!(
+            !ages.is_empty(),
+            "a live host always has processes: an empty map is the failure branch, not a reading"
+        );
+        let snap = *ages.get(&me).expect("our own pid must appear in a host-wide ps");
+        let single = process_age_secs(me).expect("our own process must be readable");
+        assert!(
+            snap.abs_diff(single) <= 2,
+            "the two paths disagree about our own age: snapshot {snap}, per-pid {single}"
+        );
+        assert!(snap < 60 * 60, "own process age looked wrong: {snap}");
+    }
+
     #[test]
     fn end_session_ends_one_and_leaves_its_siblings_alone() {
         let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
