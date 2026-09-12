@@ -170,6 +170,10 @@ try {
   ok(await longPage.evalIn(`!!document.getElementById("bell")?.offsetParent && !!document.getElementById("settings")?.offsetParent`),
      "while the ones with no other route stay");
   try { await longPage.close(); } catch { /* already gone */ }
+  // Closing the tab that was in front does not hand the front back: this page
+  // stays `hidden`, and a hidden page is served no animation frames. E4 below
+  // depends on one — see `bringToFront` in harness.mjs.
+  await page.bringToFront();
 
   console.log("B4. the front page, which is where you arrive");
   // Reported from a phone: tiny text, hard to open a project. Two causes, and
@@ -209,6 +213,7 @@ try {
   ok(fm.panes.length === 2 && fm.panes.every((w) => w > PHONE.width * 0.9),
      `both panes get the full width instead of 360px + a sliver (${JSON.stringify(fm.panes)})`);
   try { await front.close(); } catch { /* already gone */ }
+  await page.bringToFront();
 
   console.log("C. switching panes");
   await evalIn(`document.querySelector('#mobilebar button[data-mpane="0"]').click()`);
@@ -322,6 +327,11 @@ try {
   await evalIn(`[...terms.values()][0].term.input(${JSON.stringify("seq 1 300" + String.fromCharCode(13))})`);
   ok(await until(async () => (await evalIn(screenText)).includes("300"), 20, "output"),
      "a terminal with more output than fits");
+  // The precondition, asserted rather than assumed: xterm sizes the scroll
+  // area on an animation frame, so in a hidden page the next assertion fails
+  // for a reason that has nothing to do with the phone layout it is about.
+  ok(await evalIn(`document.visibilityState === "visible"`),
+     "the page is in front, so animation frames are being served");
   const vp = `document.querySelector('.pane[data-pane="3"] .xterm-viewport')`;
   ok(await until(async () => (await evalIn(`${vp} ? ${vp}.scrollHeight - ${vp}.clientHeight : 0`)) > 50, 10, "scrollback"),
      "and it has somewhere to scroll to");
