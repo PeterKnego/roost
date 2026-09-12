@@ -87,7 +87,7 @@ const NONASCII_KEY = "roost.nonascii";
 // instead. Only the highlight function differs, so everything hledit.mjs
 // established about the two layers agreeing holds for it unchanged.
 if (window.codeInput && window.hljs) {
-  codeInput.registerTemplate("hl", codeInput.templates.hljs(hljs, codePlugins()));
+  codeInput.registerTemplate("hl", numbered(codeInput.templates.hljs(hljs, codePlugins())));
   // preElementStyled=false, as templates.hljs defaults it: that puts the
   // padding on `pre code`, where style.css and hledit.mjs expect it. True
   // moves it to the <pre>, and the marks land 10px off the glyphs.
@@ -195,6 +195,120 @@ function nonAsciiCount(text) {
   let n = 0;
   for (const m of text.matchAll(NON_ASCII_RE)) n += [...m[0]].length;
   return n;
+}
+
+/// Adds the line-number gutter to a code template by wrapping the highlight
+/// function it already has, rather than replacing it: the hljs template's own
+/// highlight does more than call hljs — it clears `data-highlighted` first, or
+/// hljs refuses to touch an element it has already seen — and a second copy of
+/// the library's business here is a second thing to keep in step.
+function numbered(t) {
+  const base = t.highlight;
+  t.highlight = function (el, ...rest) {
+    base.call(this, el, ...rest);
+    gutterFor(el);
+  };
+  return t;
+}
+
+/// Numbers an already-highlighted <code>, and sizes the column the numbers
+/// sit in.
+///
+/// The width comes from the line count rather than a constant, because a
+/// four-digit gutter in front of a 30-line config wastes a tenth of a phone's
+/// width, and any constant is wrong the moment a file passes it — hub.rs is
+/// over 7000 lines.
+///
+/// The property goes on the <code-input> host, never the <pre>: the vendor
+/// stylesheet pushes `--padding-left` onto *both* layers with `!important`,
+/// so this is the one place that moves the textarea and the highlighted <pre>
+/// together. Moving them apart is how the colours walk off the caret.
+function gutterFor(el) {
+  // code-input appends one "\n" to the value before highlighting (the same
+  // one scrollEditorTo's sync guard counts on), and a preview's <pre> holds
+  // the file's text and nothing else. Left unsaid, that one character would
+  // make the two surfaces disagree about the last line of every file: six
+  // numbers in Edit, five in Preview, changing under you as you switch modes.
+  const host = el.closest("code-input");
+  const n = lineCount(el.textContent, !!host);
+  el.innerHTML = wrapLines(el.innerHTML, !!host);
+  const home = host || el.closest("pre");
+  if (home) home.style.setProperty("--ln-gutter", `calc(${Math.max(2, String(n).length)}ch + 14px)`);
+}
+
+/// How many lines the gutter will number, for `text` that carries one
+/// synthetic trailing newline or does not. Kept in step with wrapLines by
+/// construction: a file of N newlines has N+1 rows, the last of them empty
+/// where the file ends in one — which is a row the editor's textarea really
+/// does show and the caret really can sit on, so it gets a number.
+function lineCount(text, synthetic) {
+  const nl = (text.match(/\n/g) || []).length;
+  return nl - (synthetic ? 1 : 0) + 1;
+}
+
+/// Wraps each logical line of highlighted HTML in a `<span class="ln">`, which
+/// is all the stylesheet needs to number it (a counter and an
+/// absolutely-positioned `::before`).
+///
+/// Why the numbers are drawn and not measured: this editor soft-wraps
+/// (`white-space: pre-wrap`, static/style.css), so one logical line is not one
+/// visual row and a gutter of `1\n2\n3…` drifts at the first long line. An
+/// absolutely-positioned box with `top` left auto keeps its *static* position
+/// — where it would have sat in flow — which is the start of its span's
+/// **first** line box. A line wrapped over three rows therefore gets exactly
+/// one number, on its first row, and the layout engine does the wrap
+/// arithmetic. The alternative was a per-line measuring pass re-run on every
+/// keystroke, resize and pane drag. Probed in headless Chromium before this
+/// was written: five lines, two of them wrapped over several rows each, every
+/// number tracking its own line's first rect rather than a uniform multiple.
+///
+/// The newline stays *inside* its line's span, and that is the constraint that
+/// makes this safe to drop into the editor at all: `textContent` comes out
+/// byte-identical, so scrollEditorTo's `pre.textContent.length <
+/// ta.value.length` sync guard — which tells a fresh mount's unlanded
+/// highlight apart from a reveal at the very last character — goes on meaning
+/// what it meant. Nothing here can reach the textarea, so the bytes a save
+/// writes are untouched either way; the gutter lives entirely in the layer
+/// underneath.
+///
+/// hljs spans cross line boundaries — a block comment, a multi-line string —
+/// so open tags are closed at each newline and re-opened on the next line.
+/// Scanning for tags is enough: everything here is hljs's own markup plus text
+/// hljs already escaped, so a file's own `<` arrives as `&lt;` and no entity
+/// contains a newline.
+function wrapLines(html, synthetic) {
+  const open = [];   // hljs tags still open at this point in the walk
+  const lines = [];
+  let cur = "";
+  const endLine = () => {
+    lines.push(cur + "</span>".repeat(open.length));
+    cur = open.join("");
+  };
+  const addText = (s) => {
+    const parts = s.split("\n");
+    for (let i = 0; i < parts.length - 1; i++) {
+      cur += parts[i] + "\n"; // inside the span, so textContent is unchanged
+      endLine();
+    }
+    cur += parts[parts.length - 1];
+  };
+  const TAG = /<[^>]*>/g;
+  let pos = 0, m;
+  while ((m = TAG.exec(html))) {
+    addText(html.slice(pos, m.index));
+    if (m[0][1] === "/") open.pop();
+    else if (!m[0].endsWith("/>")) open.push(m[0]);
+    cur += m[0];
+    pos = m.index + m[0].length;
+  }
+  addText(html.slice(pos));
+  // Whatever follows the final newline is the last row, empty or not — that is
+  // the row a file ending in a newline leaves behind, and the editor's textarea
+  // paints it. The exception is the "\n" code-input appends for itself: that
+  // one is not part of the file, so the empty remainder after it is dropped
+  // rather than numbered, or every buffer would carry a phantom last number.
+  if (!synthetic || cur.replace(/<[^>]*>/g, "").length) lines.push(cur + "</span>".repeat(open.length));
+  return lines.map((l) => `<span class="ln">${l}</span>`).join("");
 }
 
 function nonAsciiOn() {
@@ -1456,7 +1570,15 @@ function mountTab(content, t) {
   fetch(url).then((r) => r.text()).then((html) => {
     if (content.dataset.url !== url) return; // this pane moved on before we got here
     content.innerHTML = html;
-    content.querySelectorAll("pre code").forEach((b) => window.hljs && hljs.highlightElement(b));
+    content.querySelectorAll("pre code").forEach((b) => {
+      if (!window.hljs) return;
+      hljs.highlightElement(b);
+      // Numbers on a code *file*'s preview only. A markdown preview's fenced
+      // blocks arrive through this same query, and there a gutter is noise:
+      // they are quotations inside prose, and their numbers would not be the
+      // numbers of any file.
+      if (b.parentElement && b.parentElement.classList.contains("codeview")) gutterFor(b);
+    });
     wireFragment(content);
     if (t.k === "File") {
       const mb = modeButton(t.rel, t.mode);

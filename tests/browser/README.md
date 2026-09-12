@@ -472,6 +472,29 @@ performed.
   instead of ever reaching that assertion. Restored, the file returns to a
   clean PASS.
 
+- In `gutter.mjs`: removing the `gutterFor` calls entirely — the whole feature —
+  fails 13. The one that matters is narrower: leaving the `.ln` spans in place
+  and adding `top: 0` to `.ln::before`, so the numbers no longer keep their
+  static position, fails 6 and nothing else. That is the difference between a
+  wrap-aware gutter and a naive one, and the offsets it prints say so
+  (`[-10,-30,-171,-191,-211,-232]` — the jump is the wrapped line). Reverting
+  just the `synthetic` argument, so code-input's appended newline is treated
+  like a file's own, fails exactly 1: the preview then numbers five lines where
+  the editor numbers six, and the last number changes as you switch modes.
+  That defect was found *by* this file, not guarded after the fact.
+
+  Two traps specific to it, both load-bearing. Geometry alone cannot see an
+  empty `content`: the ::before box would still be there, correctly placed, and
+  every placement assertion would pass — which is CLAUDE.md's strip-test
+  failure exactly. Hence the screenshot, decoded on a canvas in the page, and
+  hence the *widths* of the ink as well as its positions, since six `0`s paint
+  six bands in the six right places and only their width gives them away. And a
+  pseudo-element cannot be measured from the page at all —
+  `getComputedStyle(el, "::before").content` returns the literal `counter(ln)`,
+  the accessibility tree does not carry it (both checked, not assumed), and in
+  the editor `elementFromPoint` hits the textarea stacked over the gutter. CDP's
+  `DOM.getBoxModel` against the pseudo-element node is the only way in.
+
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
 

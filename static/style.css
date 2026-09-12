@@ -324,7 +324,14 @@ main { flex: 1; min-height: 0; }
                           measured, and both layers scroll together. */
                        white-space: pre-wrap;
                        --padding-top: 8px; --padding-bottom: 8px;
-                       --padding-left: 10px; --padding-right: 10px;
+                       /* --ln-gutter is set per file from its line count
+                          (gutterFor in static/app.js) and is 0 where there is no
+                          gutter, so this is the editor's old 10px unchanged for a
+                          plain file. It goes through --padding-left because the
+                          vendor stylesheet pushes that onto the textarea and the
+                          <pre> alike with !important — one property, both layers,
+                          no drift. */
+                       --padding-left: calc(10px + var(--ln-gutter, 0px)); --padding-right: 10px;
                        --code-input_default-caret-color: var(--fg); }
 /* The textarea inside carries .editor too, so the app's own selectors still
    find it — but .editor paints an opaque background, which over a highlighted
@@ -335,6 +342,12 @@ main { flex: 1; min-height: 0; }
    — measured at 4739px inside a 590px pane, taking the pane's layout with it —
    instead of wrapping at the pane's edge. */
 .editwrap code-input pre code { width: auto; max-width: 100%; }
+/* The containing block for this layer's line numbers, and where their counter
+   starts. Safe to position: the vendor stylesheet gives `code-input textarea`
+   z-index 1 and `code-input pre` z-index 0 outright, and z-index applies to a
+   grid item whether it is positioned or not — so this cannot lift the
+   highlighted layer over the textarea and hide the caret. */
+.editwrap code-input pre { position: relative; counter-reset: ln; }
 /* A highlight.js theme paints its own background, which would sit over this
    app's in a slightly different shade and stop where the text stops. The
    library's docs call this out: beat the theme on specificity and let the
@@ -448,11 +461,34 @@ details[open] > summary { background-image: var(--twisty-open); }
 .xy { display: inline-block; min-width: 2.2em; color: var(--muted); font-family: var(--mono); font-size: 11px; }
 .hint { color: var(--muted); padding: 16px; }
 .path { position: sticky; top: 0; background: var(--bg2); border-bottom: 1px solid var(--hairline, var(--border)); padding: 4px 10px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
-.codeview { padding: 10px; font: 13px/1.55 var(--mono); overflow-x: auto; background: var(--bg); }
+.codeview { padding: 10px 10px 10px calc(10px + var(--ln-gutter, 0px)); font: 13px/1.55 var(--mono);
+            overflow-x: auto; background: var(--bg); position: relative; counter-reset: ln; }
 /* font too, not just the background: the UA stylesheet sets `code { font-family:
    monospace }`, which beats inheritance from .codeview and rendered a preview
    in the browser's default mono while every editor and terminal used --mono. */
 .codeview code { background: none; font: inherit; }
+/* The line-number gutter, for both surfaces that have lines: a code file's
+   editor and a code file's preview. `.ln` spans come from wrapLines() in
+   static/app.js, one per logical line with its own newline inside it.
+
+   Generated content, never text, and that is the point twice over. It cannot
+   reach the textarea, whose value is what a save hashes and writes; and
+   `content` is not `textContent`, so copying a preview out yields the code
+   without a column of numbers welded to it (user-select belt and braces —
+   browsers have differed on whether generated content joins a selection).
+
+   `top` is deliberately absent. An absolutely positioned box with only `left`
+   set keeps its static position — where it would have sat in flow — which is
+   the start of its span's FIRST line box. That is what makes the gutter
+   wrap-aware for free: a line wrapped over three rows gets one number, on its
+   first row, with no measuring pass. The box is a block of one line-height, so
+   it sits half a leading above the inline text box and the glyphs line up. */
+.ln::before { counter-increment: ln; content: counter(ln);
+              position: absolute; left: 4px;
+              width: calc(var(--ln-gutter, 0px) - 14px); text-align: right;
+              color: var(--muted); opacity: .6;
+              user-select: none; -webkit-user-select: none; pointer-events: none; }
+
 .diffview { font: 12.5px/1.5 var(--mono); padding: 6px 0; }
 .dl { padding: 0 12px; white-space: pre-wrap; }
 .dl.add { background: var(--add-bg); color: var(--add-fg); }
