@@ -5,6 +5,10 @@
 //! edits an asset without running the generator.
 use std::{env, fs, path::{Path, PathBuf}};
 
+// Shared with the test suite so the channel logic is testable; see the
+// comments in that file for why it is not simply a fn in here.
+include!("src/channel.rs");
+
 fn main() {
     println!("cargo:rerun-if-changed=static");
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
@@ -54,6 +58,14 @@ fn emit_build_info() {
     }
 
     println!("cargo:rustc-env=ROOST_GIT_HASH={}", git_hash(&root));
+    let ref_type = env::var("GITHUB_REF_TYPE").ok();
+    println!(
+        "cargo:rustc-env=ROOST_CHANNEL={}",
+        channel_from(ref_type.as_deref(), &root)
+    );
+    // Or the channel goes stale: a tagged CI build and a local one differ only
+    // in the environment, which cargo does not watch by itself.
+    println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
     // Seconds since the epoch, formatted by the server rather than here: a
     // build script has no business picking a date format, and the raw number
     // survives being carried through an env var without a parser.

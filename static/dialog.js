@@ -274,6 +274,39 @@ function askMenu({ items, x, y }) {
 // config file on the next dialog's Enter.
 let settingsSession = null;
 
+/// How this copy was installed, in one phrase.
+///
+/// Two fields make it, and neither is enough alone: the baked channel cannot
+/// tell Homebrew from a .deb from the tarball (identical bytes), and the path
+/// cannot tell `cargo install` from the shell installer, because
+/// `install-path = "CARGO_HOME"` puts both in ~/.cargo/bin. See
+/// src/install.rs.
+function installLabel(b) {
+  switch (b.owner) {
+    case "homebrew": return "Homebrew";
+    case "system-package": return "a system package";
+    case "cargo-bin": return b.channel === "cargo" ? "cargo install" : "the shell installer";
+    case "other": return b.channel === "checkout" ? "built from a checkout" : "the release tarball";
+    default: return "unknown";
+  }
+}
+
+/// Who may replace this binary.
+///
+/// `replaceable` is a probe, not a guess — but a writable directory is not
+/// permission to write into it: Homebrew's Cellar is writable and
+/// overwriting it would leave `brew` describing a file that is not there.
+/// So a package manager's copy reads as managed however the probe came out,
+/// and only an install roost owns reads as replaceable.
+function upgradesLabel(b) {
+  if (b.owner === "homebrew" || b.owner === "system-package") {
+    return "whatever installed it";
+  }
+  if (b.replaceable === "yes") return "roost can replace this copy";
+  if (b.replaceable === "no") return "not writable by roost";
+  return "unknown";
+}
+
 function openSettings(settings) {
   const el = document.getElementById("dlg-settings");
   const session = {};
@@ -510,13 +543,20 @@ function openSettings(settings) {
     ["Commit", "commit", "Marked -dirty when the tree had uncommitted changes, and ? when git could not say."],
     ["Built", "built", "When this binary was compiled, in your timezone."],
     ["Repository", "repository", "Where the source is."],
+    ["Installed", "install",
+      "How this copy got here. Read from where the binary sits, because Homebrew, a system package and the release tarball are the same bytes."],
+    ["Upgrades", "upgrades",
+      "Whether roost could replace this copy itself, or whatever installed it owns that."],
   ];
 
   function renderAbout() {
     about.replaceChildren();
     const b = (view && view.build) || {};
     const value = (kind) =>
-      kind === "built" ? fmtBuilt(b.built_epoch) : (b[kind] || "unknown");
+      kind === "built" ? fmtBuilt(b.built_epoch)
+      : kind === "install" ? installLabel(b)
+      : kind === "upgrades" ? upgradesLabel(b)
+      : (b[kind] || "unknown");
     for (const [label, kind, doc] of ABOUT_ROWS) {
       const r = document.createElement("div");
       r.className = "dlg-row";

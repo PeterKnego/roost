@@ -616,6 +616,7 @@ pub fn raw_setting(path: &Path, key: &str) -> Option<SettingValue> {
 /// The repository URL comes from `Cargo.toml`'s `repository` field rather than
 /// a literal here, so there is one place it can be wrong.
 pub fn build_info() -> crate::proto::BuildInfo {
+    let install = crate::install::describe();
     crate::proto::BuildInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         commit: option_env!("ROOST_GIT_HASH").unwrap_or("unknown").to_string(),
@@ -623,6 +624,9 @@ pub fn build_info() -> crate::proto::BuildInfo {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
         repository: option_env!("CARGO_PKG_REPOSITORY").unwrap_or("").to_string(),
+        channel: install.channel.to_string(),
+        replaceable: install.replaceable.as_str().to_string(),
+        owner: install.owner.as_str().to_string(),
     }
 }
 

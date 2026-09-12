@@ -51,14 +51,16 @@ try {
      "and the scope switch is gone, since nothing on this pane is written anywhere");
 
   console.log("B. it reports this binary, not a placeholder");
-  const rows = await evalIn(`(() => {
+  const readRows = () => evalIn(`(() => {
     const out = {};
     for (const r of document.querySelectorAll("#dlg-settings .dlg-about .dlg-row")) {
       out[r.querySelector("label").textContent] = r.querySelector(".aboutval").textContent.trim();
     }
     return out; })()`);
-  ok(!!rows.Version && !!rows.Commit && !!rows.Built && !!rows.Repository,
-     `all four rows are present: ${JSON.stringify(Object.keys(rows))}`);
+  const rows = await readRows();
+  ok(!!rows.Version && !!rows.Commit && !!rows.Built && !!rows.Repository
+       && !!rows.Installed && !!rows.Upgrades,
+     `all six rows are present: ${JSON.stringify(Object.keys(rows))}`);
   // The assertion that makes this pane worth having: the commit shown is the
   // commit the checkout is on. Compared against `state.settings.build`, which
   // the Rust test has already tied to `build.rs` — so a rendering that
@@ -67,6 +69,59 @@ try {
   ok(rows.Commit === server.commit && server.commit !== "unknown",
      `the commit is the server's own (${rows.Commit})`);
   ok(rows.Version === server.version, `and so is the version (${rows.Version})`);
+  // Provenance (#65 step 1b). Asserted against the server's own fields, not
+  // against a hardcoded phrase, so a renderer that invented a value or read
+  // the wrong field fails — the same reason the commit assertion above
+  // compares with `state.settings.build`.
+  //
+  // The harness runs roost from `target/`, in a checkout, in a directory cargo
+  // just wrote. So the server must report exactly this, and the row must be
+  // the phrase that follows from it. A test asserting only "some phrase is
+  // shown" would pass with the two fields swapped.
+  ok(server.channel === "checkout" && server.owner === "other" && server.replaceable === "yes",
+     `the server describes its own install (channel=${server.channel} owner=${server.owner} replaceable=${server.replaceable})`);
+  ok(rows.Installed === "built from a checkout",
+     `and the row says how it got here (${JSON.stringify(rows.Installed)})`);
+  ok(rows.Upgrades === "roost can replace this copy",
+     `and who may replace it (${JSON.stringify(rows.Upgrades)})`);
+
+  // The branches this host cannot be put into, tested on the functions the
+  // renderer actually calls. `installLabel` and `upgradesLabel` are top-level
+  // in dialog.js precisely so this is possible: driving them through the UI is
+  // not, because opening the dialog sends `RequestState` and the server's own
+  // values overwrite anything the test sets.
+  //
+  // The Homebrew row is the one the design turns on. A Cellar directory IS
+  // writable — the probe answers `yes` — and overwriting it would still be
+  // wrong, because `brew` would then describe a file that is not there. So a
+  // package manager's copy must not become "roost may replace it" just
+  // because the probe said yes, and this case asserts exactly that pairing.
+  const label = async (build) => JSON.parse(await evalIn(
+    `JSON.stringify([installLabel(${JSON.stringify(build)}), upgradesLabel(${JSON.stringify(build)})])`));
+
+  for (const [build, want, why] of [
+    [{ owner: "homebrew", channel: "release", replaceable: "yes" },
+      ["Homebrew", "whatever installed it"],
+      "a writable Cellar is still not roost's to replace"],
+    [{ owner: "system-package", channel: "release", replaceable: "no" },
+      ["a system package", "whatever installed it"],
+      "a .deb in /usr/bin"],
+    [{ owner: "cargo-bin", channel: "cargo", replaceable: "yes" },
+      ["cargo install", "roost can replace this copy"],
+      "cargo install and the shell installer share a directory, so the channel splits them"],
+    [{ owner: "cargo-bin", channel: "release", replaceable: "yes" },
+      ["the shell installer", "roost can replace this copy"],
+      "...and here is the other half of that pair"],
+    [{ owner: "other", channel: "release", replaceable: "unknown" },
+      ["the release tarball", "unknown"],
+      "an unanswered probe says so rather than guessing"],
+    [{ owner: "unknown", channel: "unknown", replaceable: "unknown" },
+      ["unknown", "unknown"],
+      "nothing known reads as nothing known"],
+  ]) {
+    const got = await label(build);
+    ok(JSON.stringify(got) === JSON.stringify(want), `${why} (${JSON.stringify(got)})`);
+  }
   ok((await evalIn(`document.querySelector("#dlg-settings .dlg-about a").href`)).startsWith(server.repository),
      "and the repository link points at the server's own repository");
   // A tree with edits in it must say so. "Built from a1b2c3d" is false in the
