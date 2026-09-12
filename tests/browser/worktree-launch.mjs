@@ -222,6 +222,14 @@ try {
     ok(await until(async () => /FAKE-CLAUDE-STARTED argv=--session-id/.test(await page2.evalIn(`__txt(${JSON.stringify(s2)})`)), 60, "claude in the worktree"), "…with claude already typed into it");
   }
 
+  // The worktree tab above is in front now, which leaves this one hidden and
+  // therefore frameless (see `bringToFront` in harness.mjs). Sections D and E
+  // drive this page, and `app.js` mounts a terminal tab's fit/focus/resize
+  // inside a `requestAnimationFrame` — so a future assertion here about
+  // cols/rows or focus would fail for a reason that has nothing to do with
+  // worktrees. The session-count assertions below do not need a frame.
+  await page.bringToFront();
+
   console.log("\nD. start here anyway");
   await evalIn(`document.querySelector('.pane[data-pane="3"] .paneicons .newclaude').click()`);
   await until(() => evalIn(`document.getElementById("dlg-choice").open`), 10, "the prompt again");

@@ -225,7 +225,33 @@ export async function attachTarget(webSocketDebuggerUrl) {
     pendingCoverage.push(taken);
     return taken;
   };
-  return { cmd, evalIn, close };
+  /// Brings this page back to the foreground, and proves it arrived.
+  ///
+  /// Opening a second tab puts the first into `visibilityState: "hidden"`,
+  /// and closing the second does **not** bring the first back. A hidden page
+  /// is served no `requestAnimationFrame` callbacks, while its timers,
+  /// websockets and event handlers all keep running — so the page half works,
+  /// which is far harder to recognise than a page that is plainly asleep.
+  ///
+  /// Measured, in `mobile.mjs`: xterm sizes `.xterm-scroll-area` inside one of
+  /// those callbacks, so after two tabs had been opened and closed a terminal
+  /// held 307 lines of scrollback, rendered every one of them, and had a
+  /// viewport with **nothing to scroll** — `scrollHeight` 585 over a
+  /// `clientHeight` of 585. `_innerRefresh` ran exactly once, before the
+  /// output arrived, and never again. It reads as a roost bug in the phone
+  /// layout and it is not one; it is this.
+  ///
+  /// So: any test that opens another page and then carries on driving an
+  /// earlier one has to call this, and asserting `visibilityState` here
+  /// rather than trusting the CDP reply is the difference between a fix and
+  /// a fix-shaped no-op.
+  const bringToFront = async () => {
+    await cmd("Page.bringToFront");
+    if (!await until(() => evalIn(`document.visibilityState === "visible"`), 10, "the page to come forward")) {
+      throw new Error("Page.bringToFront did not make the page visible — animation frames stay suspended");
+    }
+  };
+  return { cmd, evalIn, close, bringToFront };
 }
 
 /// Set `ROOST_JS_COV=<file>` to append every page's V8 precise-coverage
