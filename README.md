@@ -74,6 +74,26 @@ build attestations. `cargo binstall roost` fetches them directly.
 
 macOS is used daily; Windows is untested.
 
+> **On macOS, a tarball downloaded in a browser hangs rather than failing.**
+> Safari and Chrome set `com.apple.quarantine` on the download, `tar` copies it
+> onto the extracted binary, and Gatekeeper then waits on a GUI prompt nobody
+> sees over ssh: no output, no error, no exit status, indistinguishable from a
+> server that started. Strip it **before the first run** — doing it afterwards
+> does not clear a prompt already pending:
+>
+> ```sh
+> tar xf roost-aarch64-apple-darwin.tar.xz
+> xattr -d com.apple.quarantine roost-aarch64-apple-darwin/roost
+> ./roost-aarch64-apple-darwin/roost --version     # roost 0.5.2
+> ```
+>
+> `brew install` and `curl` are both unaffected — Homebrew strips the attribute
+> and `curl` never sets it, and the binary is byte-identical in all three cases.
+> Measured on macOS 26.6.2 (Apple Silicon) on 2026-09-12: the release binaries
+> are ad-hoc/linker-signed and not notarized, so `spctl` reports `rejected` even
+> for the Homebrew copy that runs — the quarantine attribute is the gate, not
+> the signature.
+
 > **roost has no authentication of its own.** It only binds to `127.0.0.1`.
 > Put an auth layer in front of it — `tailscale serve` is what I use.
 > Read [Security model](#security-model) before exposing it.
