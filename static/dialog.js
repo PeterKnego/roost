@@ -285,7 +285,16 @@ function installLabel(b) {
   switch (b.owner) {
     case "homebrew": return "Homebrew";
     case "system-package": return "a system package";
-    case "cargo-bin": return b.channel === "cargo" ? "cargo install" : "the shell installer";
+    case "cargo-bin":
+      // Three things write here, and only the channel separates them. The
+      // checkout arm covers `cargo install --git`, which the README offers
+      // for building off `develop`: it clones first, so it bakes `checkout`,
+      // and reading it as the shell installer contradicted the Upgrades row
+      // beside it.
+      if (b.channel === "cargo") return "cargo install";
+      if (b.channel === "checkout") return "cargo install from git";
+      if (b.channel === "release") return "the shell installer";
+      return "unknown";
     case "other": return b.channel === "checkout" ? "built from a checkout" : "the release tarball";
     default: return "unknown";
   }
@@ -299,12 +308,70 @@ function installLabel(b) {
 /// So a package manager's copy reads as managed however the probe came out,
 /// and only an install roost owns reads as replaceable.
 function upgradesLabel(b) {
+  // A checkout is nobody's to update but yours. #65 is blunt about it — "an
+  // upgrade button that ran `git pull` in someone's working tree would be the
+  // worst thing in this repository" — and the probe alone would say yes, since
+  // a target/ directory is writable by definition.
+  if (b.channel === "checkout") return "yours to rebuild";
   if (b.owner === "homebrew" || b.owner === "system-package") {
     return "whatever installed it";
   }
   if (b.replaceable === "yes") return "roost can replace this copy";
   if (b.replaceable === "no") return "not writable by roost";
   return "unknown";
+}
+
+/// The command a user must run, or `null` when there is nothing for them to
+/// type.
+///
+/// The tarball and shell-installer lines are what roost will one day do by
+/// itself for a copy it may replace (#65 step 4). Until that button exists, a
+/// copy roost will replace *one day* is the user's to replace *today*, so the
+/// line is shown whatever the probe said — an earlier cut withheld it to avoid
+/// contradicting a button that had not shipped, and left those users with
+/// nothing to type. When the button lands, the `replaceable === "yes"` case
+/// is the one it takes over.
+///
+/// The tarball is fetched with `curl` on purpose, and named exactly: a browser
+/// download is quarantined on macOS and the binary then hangs rather than
+/// failing (README), and only a browser sets that attribute.
+///
+/// `apt upgrade` is deliberately absent. No package repository is published —
+/// the `.deb` and `.rpm` are files on a releases page — so it would find
+/// nothing. Both commands are shown because `.deb` and `.rpm` install to the
+/// same place and nothing here knows which host this is; telling a Fedora user
+/// to run `apt` is the one wrong-command case worth spending two lines to
+/// avoid.
+function upgradeCommand(b) {
+  const known = (v) => (v && v !== "unknown" ? v : null);
+  const repo = known(b.repository);
+  switch (b.owner) {
+    case "homebrew":
+      return ["brew upgrade roost"];
+    case "system-package":
+      return ["sudo apt install ./roost_*.deb", "sudo dnf install ./roost-*.rpm"];
+    case "cargo-bin":
+      // All three live in ~/.cargo/bin; only the channel separates them.
+      if (b.channel === "cargo") return ["cargo install roost --force"];
+      if (b.channel === "checkout") return repo ? [`cargo install --git ${repo}`] : null;
+      if (b.channel === "release") {
+        return repo
+          ? [`curl --proto '=https' --tlsv1.2 -LsSf ${repo}/releases/latest/download/roost-installer.sh | sh`]
+          : null;
+      }
+      return null;
+    case "other": {
+      // Only a *release* tarball has a newer one to fetch; a checkout is
+      // "yours to rebuild" and a source tarball of unknown provenance has no
+      // download that is known to match it.
+      const target = known(b.target);
+      return b.channel === "release" && repo && target
+        ? [`curl -LO ${repo}/releases/latest/download/roost-${target}.tar.xz`]
+        : null;
+    }
+    default:
+      return null;
+  }
 }
 
 function openSettings(settings) {
@@ -547,17 +614,24 @@ function openSettings(settings) {
       "How this copy got here. Read from where the binary sits, because Homebrew, a system package and the release tarball are the same bytes."],
     ["Upgrades", "upgrades",
       "Whether roost could replace this copy itself, or whatever installed it owns that."],
+    ["Upgrade", "command",
+      "Run this to get a newer one. Where a package is named, download it first: no package repository is published. A tarball is fetched with curl on purpose \u2014 a browser download is quarantined on macOS and the binary then hangs."],
   ];
 
   function renderAbout() {
     about.replaceChildren();
     const b = (view && view.build) || {};
     const value = (kind) =>
-      kind === "built" ? fmtBuilt(b.built_epoch)
+      kind === "command" ? (upgradeCommand(b) || []).join(" / ")
+      : kind === "built" ? fmtBuilt(b.built_epoch)
       : kind === "install" ? installLabel(b)
       : kind === "upgrades" ? upgradesLabel(b)
       : (b[kind] || "unknown");
     for (const [label, kind, doc] of ABOUT_ROWS) {
+      // The only row that is not always there: absent where there is nothing
+      // to type — a checkout, an unknown owner, or a tarball whose target or
+      // repository the build did not record.
+      if (kind === "command" && !upgradeCommand(b)) continue;
       const r = document.createElement("div");
       r.className = "dlg-row";
       const text = document.createElement("div"); text.className = "text";
@@ -572,7 +646,20 @@ function openSettings(settings) {
       // `unknown` is a real answer here — a release tarball has no `.git` —
       // so it is set back like a placeholder rather than shown as a value.
       cell.className = "aboutval" + (v === "unknown" ? " empty" : "");
-      if (kind === "repository" && v !== "unknown") {
+      if (kind === "command") {
+        // <code> per line, built as elements: a command is data on this page
+        // like every other value here.
+        // `|| []` is not defensive habit: without it, removing the skip above
+        // throws mid-render, and because this is the last row the six before it
+        // are already in the DOM — so a crash looks exactly like the row being
+        // correctly absent. A revert check found that; the empty row this
+        // renders instead is visible, and asserted against.
+        for (const line of upgradeCommand(b) || []) {
+          const c = document.createElement("code");
+          c.textContent = line;
+          cell.appendChild(c);
+        }
+      } else if (kind === "repository" && v !== "unknown") {
         const a = document.createElement("a");
         a.href = v; a.textContent = "GitHub";
         a.target = "_blank"; a.rel = "noopener noreferrer";

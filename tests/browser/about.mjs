@@ -82,8 +82,64 @@ try {
      `the server describes its own install (channel=${server.channel} owner=${server.owner} replaceable=${server.replaceable})`);
   ok(rows.Installed === "built from a checkout",
      `and the row says how it got here (${JSON.stringify(rows.Installed)})`);
-  ok(rows.Upgrades === "roost can replace this copy",
+  // A checkout is yours to rebuild — #65 rules out roost touching a working
+  // tree, and the probe alone would say yes because `target/` is writable by
+  // definition. So the channel has to override the probe here.
+  ok(rows.Upgrades === "yours to rebuild",
      `and who may replace it (${JSON.stringify(rows.Upgrades)})`);
+  // And the row that only appears when there is something to type. This host
+  // is a checkout, so there must be nothing — asserted as an absence, which is
+  // the half a table of present cases cannot cover.
+  ok(rows.Upgrade === undefined,
+     `no command is offered for a checkout (${JSON.stringify(rows.Upgrade)})`);
+
+  // The row's *presence*, driven through the real renderer.
+  //
+  // Switching tabs re-renders from `state.settings` by reference; closing and
+  // reopening does not work, because the settings button sends `RequestState`
+  // and the server's own values overwrite anything set here. That cost four
+  // failing assertions to discover, so it is written down.
+  const asAbout = async (build) => {
+    await evalIn(`Object.assign(state.settings.build, ${JSON.stringify(build)}); 0`);
+    await evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="settings"]').click()`);
+    await evalIn(`document.querySelector('#dlg-settings .dlg-tab[data-tab="about"]').click()`);
+    return {
+      rows: await readRows(),
+      codes: await evalIn(`(() => {
+        const r = [...document.querySelectorAll("#dlg-settings .dlg-about .dlg-row")]
+          .find((x) => x.querySelector("label").textContent === "Upgrade");
+        return r ? [...r.querySelectorAll(".aboutval code")].map((c) => c.textContent) : null; })()`),
+    };
+  };
+  const original = await evalIn(`JSON.parse(JSON.stringify(state.settings.build))`);
+
+  const brew = await asAbout({ owner: "homebrew", channel: "release", replaceable: "yes" });
+  ok(brew.rows.Upgrade === "brew upgrade roost",
+     `a Homebrew install is given its command (${JSON.stringify(brew.rows.Upgrade)})`);
+  // As <code> elements, not a formatted string: the value is a command, and
+  // the row builds it the way every other value on this page is built.
+  ok(JSON.stringify(brew.codes) === JSON.stringify(["brew upgrade roost"]),
+     `rendered as one code element (${JSON.stringify(brew.codes)})`);
+
+  const deb = await asAbout({ owner: "system-package", channel: "release", replaceable: "no" });
+  ok(deb.codes && deb.codes.length === 2,
+     `a distro package gets both commands, since nothing here knows which host this is (${JSON.stringify(deb.codes)})`);
+  ok(deb.codes && !deb.codes.some((c) => c.includes("apt upgrade")),
+     "and never `apt upgrade`, which would find nothing: no package repository is published");
+
+  // A tarball gets its exact download, named by the triple the build baked,
+  // fetched with curl: the README's macOS finding is that a browser download
+  // hangs, and this row is where a user would otherwise go looking for one.
+  // Shown whatever the probe said — a button that has not shipped yet is not a
+  // reason to show nothing today.
+  const tarball = await asAbout({ owner: "other", channel: "release", replaceable: "yes" });
+  ok(tarball.codes && tarball.codes.length === 1
+       && tarball.codes[0] === `curl -LO ${server.repository}/releases/latest/download/roost-${server.target}.tar.xz`,
+     `a release tarball is given its own download, by the baked target (${JSON.stringify(tarball.codes)})`);
+  ok(server.target && server.target !== "unknown" && /-(linux|darwin)/.test(server.target),
+     `and that target is a real triple (${server.target})`);
+
+  await asAbout(original); // leave the pane describing this binary again
 
   // The branches this host cannot be put into, tested on the functions the
   // renderer actually calls. `installLabel` and `upgradesLabel` are top-level
@@ -97,26 +153,49 @@ try {
   // package manager's copy must not become "roost may replace it" just
   // because the probe said yes, and this case asserts exactly that pairing.
   const label = async (build) => JSON.parse(await evalIn(
-    `JSON.stringify([installLabel(${JSON.stringify(build)}), upgradesLabel(${JSON.stringify(build)})])`));
+    `JSON.stringify([installLabel(${JSON.stringify(build)}), upgradesLabel(${JSON.stringify(build)}),
+                     upgradeCommand(${JSON.stringify(build)})])`));
 
+  // Every fixture carries the repository and a target so the arms that build
+  // a URL from them are reached; the two rows that withhold them assert the
+  // null those arms fall back to.
+  const R = "https://github.com/PeterKnego/roost";
+  const T = "x86_64-unknown-linux-musl";
   for (const [build, want, why] of [
-    [{ owner: "homebrew", channel: "release", replaceable: "yes" },
-      ["Homebrew", "whatever installed it"],
+    [{ owner: "homebrew", channel: "release", replaceable: "yes", repository: R, target: T },
+      ["Homebrew", "whatever installed it", ["brew upgrade roost"]],
       "a writable Cellar is still not roost's to replace"],
-    [{ owner: "system-package", channel: "release", replaceable: "no" },
-      ["a system package", "whatever installed it"],
-      "a .deb in /usr/bin"],
-    [{ owner: "cargo-bin", channel: "cargo", replaceable: "yes" },
-      ["cargo install", "roost can replace this copy"],
+    [{ owner: "system-package", channel: "release", replaceable: "no", repository: R, target: T },
+      ["a system package", "whatever installed it",
+        ["sudo apt install ./roost_*.deb", "sudo dnf install ./roost-*.rpm"]],
+      "a .deb in /usr/bin gets both commands and never `apt upgrade`, which finds nothing"],
+    [{ owner: "cargo-bin", channel: "cargo", replaceable: "yes", repository: R, target: T },
+      ["cargo install", "roost can replace this copy", ["cargo install roost --force"]],
       "cargo install and the shell installer share a directory, so the channel splits them"],
-    [{ owner: "cargo-bin", channel: "release", replaceable: "yes" },
-      ["the shell installer", "roost can replace this copy"],
-      "...and here is the other half of that pair"],
-    [{ owner: "other", channel: "release", replaceable: "unknown" },
-      ["the release tarball", "unknown"],
-      "an unanswered probe says so rather than guessing"],
-    [{ owner: "unknown", channel: "unknown", replaceable: "unknown" },
-      ["unknown", "unknown"],
+    [{ owner: "cargo-bin", channel: "release", replaceable: "yes", repository: R, target: T },
+      ["the shell installer", "roost can replace this copy",
+        [`curl --proto '=https' --tlsv1.2 -LsSf ${R}/releases/latest/download/roost-installer.sh | sh`]],
+      "...and the shell installer is re-run, since no button exists yet to contradict"],
+    // `cargo install --git`, which the README offers for building off develop:
+    // it clones, so it bakes `checkout`, and lands in ~/.cargo/bin. Before this
+    // row it read as "the shell installer" beside "yours to rebuild".
+    [{ owner: "cargo-bin", channel: "checkout", replaceable: "yes", repository: R, target: T },
+      ["cargo install from git", "yours to rebuild", [`cargo install --git ${R}`]],
+      "cargo install --git is named for what it is, and told how to do it again"],
+    [{ owner: "cargo-bin", channel: "checkout", replaceable: "yes", repository: "unknown", target: T },
+      ["cargo install from git", "yours to rebuild", null],
+      "...but not with a repository the build did not record"],
+    [{ owner: "other", channel: "release", replaceable: "unknown", repository: R, target: T },
+      ["the release tarball", "unknown", [`curl -LO ${R}/releases/latest/download/roost-${T}.tar.xz`]],
+      "an unanswered probe says so rather than guessing, and the download is still the user's to run"],
+    [{ owner: "other", channel: "release", replaceable: "no", repository: R, target: "unknown" },
+      ["the release tarball", "not writable by roost", null],
+      "a tarball with no baked target has no download that is known to match it"],
+    [{ owner: "other", channel: "checkout", replaceable: "yes", repository: R, target: T },
+      ["built from a checkout", "yours to rebuild", null],
+      "a writable checkout is still not roost's to update"],
+    [{ owner: "unknown", channel: "unknown", replaceable: "unknown", repository: R, target: T },
+      ["unknown", "unknown", null],
       "nothing known reads as nothing known"],
   ]) {
     const got = await label(build);
