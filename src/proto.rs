@@ -227,6 +227,32 @@ pub enum Intent {
     /// `accept: false` with a `text` is still a rejection — the text is only
     /// ever read on the accepting path.
     AnswerProposal { id: String, accept: bool, text: Option<String> },
+    /// Restore this project from an archive the browser has already uploaded
+    /// through `POST /upload` (#18 step 3).
+    ///
+    /// Deliberately **not** a third POST endpoint. CLAUDE.md caps the HTTP
+    /// surface at two and then says what the alternative is: "Every other
+    /// state change is a websocket intent." A restore is a state change; what
+    /// it needs is a *body delivered*, and roost already has exactly one
+    /// audited way to deliver one. Coming in here rather than over HTTP also
+    /// puts it behind the handshake's `Origin` check, which is a stronger gate
+    /// than a POST's — a `multipart/form-data` POST is a CORS simple request
+    /// any page can submit cross-origin with no preflight, while a handshake
+    /// from that page is refused before the first frame.
+    ///
+    /// `file` is project-relative and confined by `projects::safe_resolve`,
+    /// like every other `rel` on this enum. Nothing *inside* the archive names
+    /// a path at all — see `backup`'s module doc.
+    RestoreWorkspace {
+        file: String,
+        /// Describe the restore without performing it. The dialog always
+        /// sends this first: #18 calls restore the most destructive operation
+        /// roost would have, and the failure worth catching — a transcript
+        /// directory re-derived somewhere unexpected — is visible in a listing
+        /// and invisible in a success message.
+        #[serde(default)]
+        dry_run: bool,
+    },
     /// The editor's current selection, sent as ambient context on a debounce
     /// from `static/app.js` — not a deliberate gesture like `MentionPath`'s
     /// Alt+K. `rel` is resolved and confined server-side exactly like
@@ -465,6 +491,18 @@ pub enum Event {
     /// change (every debounced keystroke, via `EditBuffer`), and two whole
     /// file bodies have no business on that path.
     Proposal { id: String, rel: String, old_text: String, new_text: String },
+    /// What a restore would do, or has just done (#18 step 3).
+    ///
+    /// Sent with `send_to` and never broadcast: the archive was uploaded by
+    /// one person, on one connection, and a second browser on the project has
+    /// no context for a listing of paths it did not ask for. The workspace
+    /// change a real restore causes reaches everyone the way every other one
+    /// does — through the state snapshot.
+    ///
+    /// `refused` and an empty `lines` is a real combination and the renderer
+    /// must show it: it is the whole of what the user is told when an archive
+    /// is rejected before a single file is touched.
+    RestoreReport { dry_run: bool, lines: Vec<String>, refused: Option<String> },
     /// This project's notices — not the whole store — sent on connect and
     /// after any read-state change, so no two browsers on the same project
     /// disagree about the badge count.
