@@ -730,6 +730,204 @@ fn collect_memory(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Restore
+// ---------------------------------------------------------------------------
+
+/// One thing a restore would do, or would not.
+///
+/// A plan is built whole before anything is written, and `dry_run` renders
+/// exactly this list. That is not a convenience: #18 calls restore "the most
+/// destructive operation roost would have", and the failure worth catching —
+/// a transcript directory re-derived to somewhere the user did not expect — is
+/// visible in a listing and invisible in a success message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// Write this entry to this path. `replacing` is the existing file moved
+    /// aside first, which only the layout ever has.
+    Write { kind: Kind, id: String, to: std::path::PathBuf, replacing: Option<std::path::PathBuf> },
+    /// A transcript already at the destination. Never overwritten, no flag,
+    /// see `plan`.
+    Keep { id: String, at: std::path::PathBuf },
+}
+
+impl Step {
+    pub fn line(&self) -> String {
+        match self {
+            Step::Write { kind, id, to, replacing } => {
+                let what = match kind {
+                    Kind::Workspace => "layout".to_string(),
+                    Kind::Memory => format!("memory {id}"),
+                    Kind::Transcript => format!("conversation {}", short(id)),
+                    k => format!("{} {id}", k.wire()),
+                };
+                match replacing {
+                    Some(old) => format!(
+                        "{what} → {} (the current one is kept as {})",
+                        to.display(),
+                        old.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+                    ),
+                    None => format!("{what} → {}", to.display()),
+                }
+            }
+            Step::Keep { id, at } => format!(
+                "conversation {} is already here and is left alone ({})",
+                short(id),
+                at.display()
+            ),
+        }
+    }
+}
+
+/// Everything a restore would do, computed before it does any of it.
+pub fn plan(
+    state: &std::path::Path,
+    tdir: Option<&std::path::Path>,
+    project: &str,
+    archive: &Archive,
+    now: u64,
+) -> Result<Vec<Step>, String> {
+    let key = crate::projects::storage_key(project);
+    let mut steps = Vec::new();
+    for e in &archive.entries {
+        // Re-validated here even though `parse` already did it. The id becomes
+        // a path component on the next line, and this codebase puts the check
+        // next to the use — `claudehist::has` says the same thing about the
+        // same id: "the row that offered the button is a hint, not an
+        // authorisation".
+        if !e.kind.valid_id(&e.id) {
+            return Err(format!("entry {} carries an id this restore will not use", e.kind.wire()));
+        }
+        match e.kind {
+            Kind::Workspace => {
+                let to = state.join(format!("{key}.json"));
+                // Renamed aside, never deleted. A restore onto the wrong
+                // project is then one `mv` away from being undone, and
+                // `wsstate::load` reads one exact path so the extra file is
+                // invisible to it.
+                let replacing = to
+                    .exists()
+                    .then(|| state.join(format!("{key}.json.before-restore-{now}")));
+                steps.push(Step::Write { kind: e.kind, id: e.id.clone(), to, replacing });
+            }
+            Kind::Session => steps.push(Step::Write {
+                kind: e.kind,
+                id: e.id.clone(),
+                to: state.join("claude").join(&key).join(format!("{}.json", e.id)),
+                replacing: None,
+            }),
+            Kind::Cwd => steps.push(Step::Write {
+                kind: e.kind,
+                id: e.id.clone(),
+                to: state.join("cwd").join(&key).join(&e.id),
+                replacing: None,
+            }),
+            Kind::Launch => steps.push(Step::Write {
+                kind: e.kind,
+                id: e.id.clone(),
+                to: state.join("launch").join(&key).join(&e.id),
+                replacing: None,
+            }),
+            Kind::Transcript | Kind::Memory => {
+                // The re-derivation. `tdir` is computed from the project being
+                // restored *into*, never from `archive.header.source` — which
+                // is why an archive taken at one path restores correctly at
+                // another, and why `source` is documented as informational.
+                let Some(tdir) = tdir else {
+                    return Err(
+                        "this archive holds conversations, but this project has no \
+                         directory to put them in — is HOME set?"
+                            .to_string(),
+                    );
+                };
+                let to = if e.kind == Kind::Transcript {
+                    tdir.join(format!("{}.jsonl", e.id))
+                } else {
+                    tdir.join("memory").join(&e.id)
+                };
+                // Positive evidence, the CLAUDE.md way: `symlink_metadata`,
+                // not `exists()`. `exists()` follows symlinks and collapses
+                // "not there" into "cannot look", and both of those answers
+                // would be read here as "free to write", which for a
+                // transcript means overwriting a conversation that is not in
+                // this archive. `Err(NotFound)` is absent; anything else is
+                // *cannot tell*, and cannot-tell keeps the file.
+                match std::fs::symlink_metadata(&to) {
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        steps.push(Step::Write {
+                            kind: e.kind,
+                            id: e.id.clone(),
+                            to,
+                            replacing: None,
+                        })
+                    }
+                    _ => steps.push(Step::Keep { id: e.id.clone(), at: to }),
+                }
+            }
+        }
+    }
+    Ok(steps)
+}
+
+/// Carries out a plan. Returns the lines describing what it did.
+///
+/// Every refusal has already happened in `plan` and in the caller's checks, so
+/// this is deliberately dull: it creates parents, renames one file aside, and
+/// writes. A failure part-way leaves what it has already written, which is why
+/// the layout's old copy is renamed rather than deleted — the one irreversible
+/// thing in reach stays reversible.
+pub fn apply(archive: &Archive, steps: &[Step]) -> Result<Vec<String>, String> {
+    let mut done = Vec::new();
+    for step in steps {
+        let Step::Write { kind, id, to, replacing } = step else {
+            done.push(step.line());
+            continue;
+        };
+        let Some(entry) =
+            archive.entries.iter().find(|e| e.kind == *kind && e.id == *id)
+        else {
+            continue;
+        };
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        if let Some(aside) = replacing {
+            std::fs::rename(to, aside)
+                .map_err(|e| format!("cannot set {} aside: {e}", to.display()))?;
+        }
+        write_private(to, &entry.bytes)
+            .map_err(|e| format!("cannot write {}: {e}", to.display()))?;
+        done.push(step.line());
+    }
+    Ok(done)
+}
+
+/// Write-then-rename at 0600, the discipline `claudesess::record` sets.
+///
+/// 0600 on the temp file before the rename, not on the target after it: the
+/// window between the two is exactly when a restored transcript — every
+/// prompt, file and command output of a past conversation — would be
+/// world-readable.
+fn write_private(to: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = to.parent().unwrap_or(std::path::Path::new("."));
+    let stem = to.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let tmp = dir.join(format!(".{stem}.restore.{}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    match std::fs::rename(&tmp, to) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1175,6 +1373,205 @@ mod tests {
         for off in [None, Some(""), Some("0"), Some("true"), Some("yes"), Some("on"),
                     Some("11"), Some(" 1"), Some("1 "), Some("01"), Some("TRUE")] {
             assert!(!wants_conversations(off), "{off:?} was treated as the opt-in");
+        }
+    }
+
+    // ---- restore ----
+
+    /// **The test this feature exists to pass.**
+    ///
+    /// Back up project A, living at one path with its conversations under one
+    /// derived directory; restore it as project B at a *different* path with a
+    /// *different* derived directory, and assert the transcript landed under
+    /// B's.
+    ///
+    /// A same-name round trip — back up `proj`, restore `proj` — is the
+    /// obvious test and proves nothing at all: it stays green against an
+    /// implementation that records the source's absolute path and copies it
+    /// straight back, which is precisely #18's third difficulty and the thing
+    /// the whole no-paths format is for.
+    ///
+    /// Revert-checked by doing exactly that — deriving the destination from
+    /// `archive.header.source` instead of from the project being restored
+    /// into, which is the one-line "simplification" the `source` field invites.
+    /// Three tests go red and this one is the first: the transcript lands back
+    /// in the *source's* directory, so the destination never receives it.
+    #[test]
+    fn an_archive_restores_under_the_destinations_own_derived_directory() {
+        let src = Fixture::new("rederive-src");
+        let dst = Fixture::new("rederive-dst");
+        src.layout("alpha", r#"{"which":"alpha"}"#);
+        src.marker("claude", "alpha", "term.json", r#"{"session_id":"abc","event":"Stop"}"#);
+        src.transcript("864ee734-e3ab-434e-8278-745a850b16ad", "{\"turn\":1}\n");
+        let (report, raw) = src.run("alpha", true);
+        assert_eq!(report.conversations, 1, "setup: the source really had one");
+
+        let archive = parse(&raw).unwrap();
+        // Different project name, different state directory, different
+        // transcript directory. Nothing about the destination is shared with
+        // the source, which is what makes the assertion below mean something.
+        let steps = plan(&dst.state, Some(&dst.tdir), "beta", &archive, 1757750000).unwrap();
+        apply(&archive, &steps).unwrap();
+
+        let landed = dst.tdir.join("864ee734-e3ab-434e-8278-745a850b16ad.jsonl");
+        assert!(landed.is_file(), "the transcript is under the destination's directory");
+        assert_eq!(std::fs::read_to_string(&landed).unwrap(), "{\"turn\":1}\n");
+        // And nothing was written back where it came from.
+        assert!(
+            !src.tdir.join("beta.jsonl").exists()
+                && std::fs::read_dir(&src.tdir).unwrap().count() == 1,
+            "the source directory was touched"
+        );
+        // The layout landed under the *destination's* key, not alpha's.
+        assert_eq!(
+            std::fs::read_to_string(dst.state.join("beta.json")).unwrap(),
+            r#"{"which":"alpha"}"#
+        );
+        assert!(!dst.state.join("alpha.json").exists(), "the source key must not appear");
+        assert!(dst.state.join("claude/beta/term.json").is_file(), "and so did the marker");
+    }
+
+    /// #18's third security question — "Does restore ever overwrite an
+    /// existing transcript?" — answered in code. No. There is no flag.
+    ///
+    /// The assertion is on the existing file's **content**. Asserting that a
+    /// skip was *reported* is the version that passes against a restore that
+    /// reports the skip and then writes anyway through a second path.
+    ///
+    /// Revert-checked by deleting the exists-check and always pushing a
+    /// `Write`: this test alone goes red, on the content, with the machine's
+    /// two-turn conversation replaced by the archive's one-turn copy.
+    #[test]
+    fn a_restore_never_writes_over_a_conversation_that_is_already_here() {
+        let src = Fixture::new("nooverwrite-src");
+        let dst = Fixture::new("nooverwrite-dst");
+        let id = "864ee734-e3ab-434e-8278-745a850b16ad";
+        src.layout("alpha", "{}");
+        src.transcript(id, "{\"from\":\"the archive\"}\n");
+        let (_, raw) = src.run("alpha", true);
+        let archive = parse(&raw).unwrap();
+
+        // The live one. Longer than the archived copy, so a truncating write
+        // is caught as well as a replacing one.
+        let live = "{\"from\":\"the machine\"}\n{\"and\":\"a second turn\"}\n";
+        dst.transcript(id, live);
+
+        let steps = plan(&dst.state, Some(&dst.tdir), "alpha", &archive, 1757750000).unwrap();
+        assert!(
+            steps.iter().any(|s| matches!(s, Step::Keep { id: k, .. } if k == id)),
+            "the plan must say it is leaving it alone: {steps:?}"
+        );
+        apply(&archive, &steps).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dst.tdir.join(format!("{id}.jsonl"))).unwrap(),
+            live,
+            "the conversation on this machine was modified"
+        );
+    }
+
+    #[test]
+    fn a_transcript_entry_roost_cannot_read_as_absent_is_kept() {
+        // The last row of CLAUDE.md's table: "`Path::exists()` on a dangling
+        // symlink → the destination is free → the symlink's target". `exists()`
+        // collapses "not there" and "cannot look" into `false`, and here
+        // `false` means "write over it".
+        //
+        // The symlink must **dangle**, and the first version of this test is
+        // why that is spelled out: it pointed at a file that existed, so
+        // `exists()` and `symlink_metadata` agreed, and swapping one for the
+        // other left the test green. Revert-checked properly this time —
+        // replacing the match with `if to.exists()` makes this test, and only
+        // this test, fail.
+        #[cfg(unix)]
+        {
+            let src = Fixture::new("dangling-src");
+            let dst = Fixture::new("dangling-dst");
+            let id = "864ee734-e3ab-434e-8278-745a850b16ad";
+            src.layout("alpha", "{}");
+            src.transcript(id, "archived\n");
+            let (_, raw) = src.run("alpha", true);
+            let archive = parse(&raw).unwrap();
+
+            let link = dst.tdir.join(format!("{id}.jsonl"));
+            let target = dst.root.join("not-here-yet.jsonl");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(!link.exists(), "setup: exists() must report false for this");
+            assert!(std::fs::symlink_metadata(&link).is_ok(), "setup: but something IS there");
+
+            let steps = plan(&dst.state, Some(&dst.tdir), "alpha", &archive, 1).unwrap();
+            apply(&archive, &steps).unwrap();
+
+            // Something was at that name and roost could not read it as a
+            // transcript. The only safe reading is "leave it alone" — so the
+            // symlink is still a symlink, still pointing where it did, and the
+            // archived copy did not land on top of it.
+            let md = std::fs::symlink_metadata(&link).expect("the entry is still there");
+            assert!(md.file_type().is_symlink(), "the symlink was replaced by the restore");
+            assert_eq!(std::fs::read_link(&link).unwrap(), target, "it now points elsewhere");
+            assert!(!target.exists(), "the write followed the link out of the directory");
+        }
+    }
+
+    #[test]
+    fn the_layout_it_replaces_is_kept_beside_it() {
+        // The one thing a restore is *for* replacing. Renamed, not deleted:
+        // restoring onto the wrong project is then one `mv` from being undone.
+        let src = Fixture::new("aside-src");
+        let dst = Fixture::new("aside-dst");
+        src.layout("alpha", r#"{"which":"archived"}"#);
+        let (_, raw) = src.run("alpha", false);
+        let archive = parse(&raw).unwrap();
+        dst.layout("alpha", r#"{"which":"live"}"#);
+
+        let steps = plan(&dst.state, None, "alpha", &archive, 1757750000).unwrap();
+        apply(&archive, &steps).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dst.state.join("alpha.json")).unwrap(),
+            r#"{"which":"archived"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.state.join("alpha.json.before-restore-1757750000")).unwrap(),
+            r#"{"which":"live"}"#,
+            "the layout that was here is still recoverable"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_plan_describes_the_restore_without_performing_it() {
+        let src = Fixture::new("dryrun-src");
+        let dst = Fixture::new("dryrun-dst");
+        src.layout("alpha", "{}");
+        src.transcript("864ee734-e3ab-434e-8278-745a850b16ad", "x\n");
+        let (_, raw) = src.run("alpha", true);
+        let archive = parse(&raw).unwrap();
+
+        let steps = plan(&dst.state, Some(&dst.tdir), "beta", &archive, 1).unwrap();
+        let lines: Vec<String> = steps.iter().map(Step::line).collect();
+        assert!(lines.iter().any(|l| l.contains("layout →")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("conversation 864ee734… →")), "{lines:?}");
+        // The whole point: building the plan wrote nothing. A plan that
+        // created its destination directories would already have changed the
+        // machine before the user saw the listing.
+        assert!(!dst.state.join("beta.json").exists());
+        assert_eq!(std::fs::read_dir(&dst.tdir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_restored_transcript_is_not_world_readable() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let src = Fixture::new("perm-src");
+            let dst = Fixture::new("perm-dst");
+            let id = "864ee734-e3ab-434e-8278-745a850b16ad";
+            src.layout("alpha", "{}");
+            src.transcript(id, "every command it ran\n");
+            let (_, raw) = src.run("alpha", true);
+            let archive = parse(&raw).unwrap();
+            let steps = plan(&dst.state, Some(&dst.tdir), "alpha", &archive, 1).unwrap();
+            apply(&archive, &steps).unwrap();
+            let m = std::fs::metadata(dst.tdir.join(format!("{id}.jsonl"))).unwrap();
+            assert_eq!(m.permissions().mode() & 0o077, 0, "no group or other bits");
         }
     }
 }
