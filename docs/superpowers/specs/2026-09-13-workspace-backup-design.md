@@ -1,10 +1,13 @@
 # Backing up a workspace, conversations included
 
-*2026-09-13. Status: designed, not implemented. Issue
+*2026-09-13. Status: designed, reviewed 2026-09-13, not implemented. Issue
 [#18](https://github.com/PeterKnego/roost/issues/18), step 3. Steps 1 and 2 are
 merged into develop (`src/claudesess.rs`, `src/claudehist.rs`, #68). This design
 settles the three questions #18's own security section asks and nothing wider:
-step 4, remote destinations, stays out.*
+step 4, remote destinations, stays out. **The review replaced the surface** — a
+first draft made this a pair of CLI subcommands; it is a download and a
+websocket intent. See* Surface *below for what that changed and what it did
+not.*
 
 ## What and why
 
@@ -58,40 +61,81 @@ reported success would be quietly lossy, so this design has to say which of the
 two it takes and which it leaves, and say so *in its own output* rather than
 only here. See **What this deliberately does not capture**.
 
-## Surface: a subcommand, not a route
+## Surface: a download and an intent
 
-`roost backup` and `roost restore`, beside `roost notify` and
-`roost claude-hook` in `main.rs`.
-
-Four reasons, and the first is a hard constraint rather than a preference.
-
-**CLAUDE.md caps the HTTP surface at two POSTs.** "HTTP is GET-only apart from
-`POST /upload` and `POST /paste` … Keep the surface at two." A restore takes a
-body. Making it a route means a third POST, and that bullet's whole argument is
-that the two existing ones are the entire CSRF surface precisely because there
-are two of them to audit.
-
-**#18 says "to a file the user names."** That is an argv path. There is no
-file-picker in a browser that names a path on the server.
-
-**A transcript is the highest-value file on the machine** — #18's words, and
-the reason `claudesess::record` writes 0600. A route would put every prompt,
-every file read and every command output through the tunnel on its way to a
-browser's download directory. A subcommand writes it to a local file with no
-network hop at all, which is what "local backup" should mean.
-
-**Restore is the most destructive operation roost would have**, again #18's
-words. A subcommand cannot be reached by a forged websocket intent or a
-cross-origin form post. It requires someone already on the machine.
+**Backup is a `GET`. Restore is the existing `POST /upload` followed by a
+websocket intent.** No new HTTP endpoint of any kind.
 
 ```
-roost backup  <project> <file> [--conversations]
-roost restore <file> [--project <name>] [--dry-run]
+GET  /{project}/backup?conversations=1     -> the archive, as a download
+POST /upload/{project}                     -> existing, unchanged
+ws   RestoreWorkspace { file, dry_run }    -> restore from an uploaded archive
 ```
 
-Both print a summary to stdout and exit non-zero on failure — the `roost
-notify` contract, deliberately not the `roost claude-hook` one, which must
-always exit 0 because it runs inside every Claude session.
+The first draft of this design made both halves CLI subcommands, beside `roost
+notify` and `roost claude-hook`. The argument was CLAUDE.md's hard constraint —
+"HTTP is GET-only apart from `POST /upload` and `POST /paste` … Keep the
+surface at two" — and a restore takes a body, so a route meant a third POST.
+
+That argument was sound and the conclusion was wrong, because it skipped the
+next sentence of the same bullet: **"Every other state change is a websocket
+intent."** Restore is a state change. It does not need a POST of its own; it
+needs a body *delivered*, and roost already has exactly one sanctioned way to
+deliver a body — the upload endpoint that streams parts to disk with the
+`Origin` check, enforces its caps mid-body, and has been audited as one of the
+two. Uploading an archive into the project and then naming it in an intent uses
+both existing mechanisms for what they are already for, and adds no surface at
+all.
+
+So the constraint is not being traded away for phone access. Both are kept.
+
+### Why each half lands where it does
+
+**Backup is a GET because it is a read.** It changes nothing; it is a
+`Content-Disposition: attachment` over bytes roost already has. There was never
+a reason for it to be anything else.
+
+**Restore is an intent because it is destructive.** #18 calls it "the most
+destructive operation roost would have", and the whole reason CLAUDE.md routes
+state changes through the socket is that the socket's handshake checks `Origin`
+and refuses a handshake carrying none — which is a *stronger* gate than the one
+a third POST would have had, not a weaker one, because a `multipart/form-data`
+POST is a CORS simple request that any page can submit cross-origin with no
+preflight, and a websocket handshake from a hostile page is refused before the
+first frame.
+
+**The intent names an uploaded file, never a path.** `file` is a project-
+relative name resolved by `projects::safe_resolve`, the same confinement every
+other `rel` on the enum gets. The browser cannot name `/etc/shadow`, nor
+`../../other-project`, and nothing in the archive can either — see the section
+below, which is the other half of the same property.
+
+### What this costs, stated plainly
+
+**An archive to be restored must fit `config::max_upload_bytes`** — 100 MB by
+default, and already global-config-only (`READ_ONLY_KEYS`), for exactly the
+reason #18 wants a backup destination to be: "never per-project, or a cloned
+repo could raise its own disk ceiling."
+
+This host's largest project directory is 173 MB, so this is a real ceiling that
+a real project on this machine already exceeds. Three things make it the right
+one anyway:
+
+- The caps below cut a backup well under it in the normal case, and say so when
+  they do.
+- It is the *restore* side only. A backup of any size downloads fine; it is
+  reading it back through the browser that is bounded. A user with a 400 MB
+  archive can raise `max_upload_bytes` in the global config — a deliberate,
+  single-machine, non-project decision, which is the shape this should have.
+- Inventing a second ceiling for this one path is how a codebase ends up with
+  two disagreeing limits and a bug report about the wrong one. The upload cap
+  is the upload cap.
+
+**The uploaded archive lands in the project, visibly.** It is a file in the
+tree, in `git status`, until the user deletes it — and on the restore path it
+is read and then left exactly where it is. Deleting someone's file because we
+finished reading it is precisely the move the CLAUDE.md table is eleven rows
+of. The summary names the file and says it is still there.
 
 ## The archive format, and the one property that matters
 
@@ -180,16 +224,23 @@ for the same reason.
 | `MAX_TOTAL_BYTES` | 512 MB | The entire 24-project corpus is 407 MB, so this cannot be hit by one honest project today, and it bounds the file a user is asked to find room for. |
 | `MAX_MEMORY_BYTES` | 1 MB total | roost's is 20 KB. This is a text notebook, not a store. |
 
-**Every one of them names itself in the summary when it fires**, with the
-transcript it dropped:
+**Every one of them names itself when it fires**, with the transcript it
+dropped. The archive is a download, so there is no stdout to say it on: the
+counts and the skip reasons go in the **header line of the archive itself**,
+and the dialog renders them from the `RestoreWorkspace` dry run — which means
+the user reads them at the moment they matter, opening the file, rather than in
+a terminal they have closed. A backup nobody ever restores never needed the
+message; a backup being restored is exactly when "this one is missing and here
+is why" is worth having.
 
 ```
-backed up roost -> /tmp/roost.roostbak (18.2 MB)
+this archive: roost, 2026-09-13, 18.2 MB
   layout, 3 terminals, 2 conversations
-  skipped 1 conversation: 3f1c… is 41.0 MB (MAX_TRANSCRIPT_BYTES is 32 MB)
+  1 conversation was not captured:
+  3f1c… is 41.0 MB (MAX_TRANSCRIPT_BYTES is 32 MB)
 ```
 
-This is the CLAUDE.md rule about `Results`/`Outcome` applied to a CLI: "A
+This is the CLAUDE.md rule about `Results`/`Outcome` applied here: "A
 search that skipped something says so … All three used to render as an empty
 note, which is the same defect as the table below wearing a quieter coat: no
 crash, no lost shell, and no way for the user to tell." A backup that silently
@@ -217,9 +268,9 @@ already uses:
 - **skipped** — a decision: over a cap, an id that failed validation, a
   directory where a transcript was expected. Named, with which rule fired.
 - **unreadable** — *could not look*. Counted separately and, if the transcript
-  directory itself is the thing that could not be read while `--conversations`
-  was asked for, **the backup fails and writes nothing**, rather than
-  succeeding with a hole in it.
+  directory itself is the thing that could not be read while conversations
+  were asked for, **the backup fails and sends nothing**, rather than a 200
+  with a hole in it.
 
 That last clause is the one worth arguing about, so: a partial archive is
 usable and a refused one is not. The counter-argument is that a user who cannot
@@ -258,11 +309,13 @@ Three further refusals, all before anything is written:
   parses or nothing happens; an entry whose declared length runs past the end
   of the file fails the archive rather than truncating the entry.
 
-`--dry-run` prints the identical summary and writes nothing. It exists because
-this is the operation #18 flags as the most destructive roost would have, and
-because the interesting failure — a re-derived transcript directory that is not
-the one the user expected — is visible in a listing and invisible in a
-success message.
+`RestoreWorkspace { dry_run: true }` produces the identical summary and writes
+nothing. It is what the dialog sends first, always: the user sees what would
+land before anything does, and the second click is the one that acts. It exists
+because this is the operation #18 flags as the most destructive roost would
+have, and because the interesting failure — a re-derived transcript directory
+that is not the one the user expected — is visible in a listing and invisible
+in a success message.
 
 ## What this deliberately does not capture
 
@@ -291,17 +344,20 @@ table is eleven rows of.
 
 ## Security, against #18's three questions
 
-**"Is the transcript included by default?"** No. `roost backup` without
-`--conversations` writes layout only. #18: "it is a reason for it to be
-explicit, opt-in per project, and never a default". Per *invocation* is
-stronger than per project — there is no stored setting that can drift into
-being forgotten, and the flag is in the shell history of the person who typed
-it.
+**"Is the transcript included by default?"** No. `GET /{project}/backup` with
+no `conversations=1` writes layout only, and the checkbox in the dialog is
+unticked every time it opens — it is not remembered, because a remembered one
+is the "configured once and forgotten" shape #18 warns about. #18: "it is a
+reason for it to be explicit, opt-in per project, and never a default". Per
+*invocation* is stronger than per project: there is no stored setting to drift,
+and the person who ticked it was looking at the warning beside it when they
+did.
 
 **"Can a project-scoped config key set a remote destination?"** There is no
 config key and no remote destination. Step 4 is out of scope, so the question
 this design has to answer is only that it must not *create* the shape — and it
-does not: the destination is argv. When step 4 lands, `GLOBAL_ONLY_KEYS` is
+does not: the destination is the browser that asked, over the connection it
+already holds. When step 4 lands, `GLOBAL_ONLY_KEYS` is
 where it goes, for the reason #18 gives, which is sharper than the one that put
 `share_selection` there: "A cloned repo naming a backup host is strictly worse
 than a cloned repo raising a disk ceiling."
@@ -310,17 +366,28 @@ than a cloned repo raising a disk ceiling."
 
 Two more that #18 does not ask.
 
-**The archive is 0600 and created with it**, not chmodded after — the window
-between `create` and `set_permissions` is exactly when a 407 MB file of every
-credential the machine has seen is world-readable. `claudesess::record` writes
-0600 already and is cited as precedent, but it writes to a temp file in a 0700
-directory; this one is written wherever the user pointed it, which may be
-`/tmp`.
+**The archive is streamed, never staged on disk.** The GET writes it to the
+socket as it reads; roost does not put a file containing every credential the
+machine has seen into `/tmp` on the way out, and there is therefore no
+temp file to leak, to chmod, or to forget to delete when the connection drops
+halfway. This is the one clear win the download has over the CLI draft, which
+had to write the file somewhere and argue about its mode.
 
-**A backup is written to a temp name in the destination directory and renamed
-into place.** Same discipline as everywhere else in this codebase, and here it
-also means an interrupted backup never leaves something that looks like a
-complete archive.
+**The download inherits the tunnel, and that is a real exposure, stated.** #18
+is right that moving a transcript off the machine is the point of the feature
+and also its whole risk. Behind Access this is Dean's SSO session on Dean's
+device; on a roost reachable some other way it is whatever that is. roost
+cannot resolve this for the user, so it does not pretend to: the checkbox that
+includes conversations carries the sentence "every prompt, file and command
+output in them" beside it, unticked, every time.
+
+**A backup is a read, so it takes no lock across it.** The walk reads the state
+directory and up to 512 MB of another program's files; holding the hub lock
+across that would wedge every session in the project, which is the deadlock
+CLAUDE.md says this codebase has already shipped once. The GET runs on its own
+connection thread and touches the hub not at all; the restore intent is
+diverted before the hub lock exactly as `Search` is, and for the identical
+reason.
 
 ## Testing
 
@@ -341,14 +408,22 @@ reason", so, concretely:
   naming the right one is the whole user-facing contract.
 - **The unreadable-directory test must distinguish refusal from an empty
   archive.** Both leave the user without conversations; only one of them says
-  so. Assert the exit code and the message, not the absence of entries.
+  so. Assert the status and the message, not the absence of entries.
 - **A malformed archive test per refusal**, asserting on the message. A single
   `is_err()` over a truncated file passes when the parser rejects everything.
 - **Revert the fix and watch it fail** for the re-derivation test and the
   no-overwrite test, and record what the failure looked like in the test's own
   comment. Both are the kind that pass vacuously.
 
-`cargo test`, no browser test: there is no browser in this feature.
+**And a browser test, which the CLI draft would not have needed.** The dialog,
+the download, the upload and the two-step dry-run-then-commit all live in
+`static/app.js`, which no Rust test can reach — CLAUDE.md is explicit that
+"anything touching `static/app.js` should be checked there". `tests/browser/
+backup.mjs` drives a real round trip: download an archive, upload it into a
+second project, dry-run, commit, and assert the restored layout. Its trap to
+avoid is the first one `tests/browser/README.md` names — asserting on an
+element that exists before the action, so the test passes against a button that
+does nothing.
 
 ## Open, and deliberately not settled here
 
