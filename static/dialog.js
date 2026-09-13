@@ -759,17 +759,30 @@ function openSettings(settings) {
       const f = pick.files && pick.files[0];
       if (!f) return;
       restoreBusy = true; restoreLines = []; restoreRefused = null; render();
-      // Through the existing upload endpoint — the archive becomes a file in
-      // the project, and the intent below names it. No new HTTP surface; see
-      // Intent::RestoreWorkspace.
-      postFiles(`/upload/${PROJECT}`, [f], `upload ${f.name}`, (ok) => {
+      // Uploaded under a name of this moment, not the file's own.
+      //
+      // `POST /upload` refuses a name that is already in the project — it never
+      // overwrites, which is right and must stay. But the archive of a restore
+      // is exactly the file a person picks twice: once for the dry run they
+      // read and then thought better of, once for the real thing an hour later.
+      // Under its own name the second attempt fails with "already exists",
+      // which is a true sentence about a file they did not know roost had kept
+      // and no help at all.
+      //
+      // So the copy is stamped. It never collides, it never overwrites, and the
+      // report names it so it can be deleted — roost does not delete it,
+      // because removing a file because we finished reading it is the move
+      // CLAUDE.md's table is eleven rows of.
+      const stem = f.name.replace(/\.roostbak$/, "").replace(/[^A-Za-z0-9._-]/g, "-");
+      const name = `${stem}-${Date.now()}.roostbak`;
+      postFiles(`/upload/${PROJECT}`, [new File([f], name)], `upload ${name}`, (ok) => {
         restoreBusy = false;
-        if (!ok) { restoreRefused = `${f.name} did not upload`; return render(); }
-        restoreFile = f.name;
+        if (!ok) { restoreRefused = `${name} did not upload`; return render(); }
+        restoreFile = name;
         restoreBusy = true;
         // The dry run always comes first. The user never sends a restore they
         // have not seen a listing for.
-        send({ t: "RestoreWorkspace", file: f.name, dry_run: true });
+        send({ t: "RestoreWorkspace", file: name, dry_run: true });
         render();
       });
     };

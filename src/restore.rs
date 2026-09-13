@@ -112,6 +112,11 @@ fn plan_or_refusal(
         return Ok(lines);
     }
     lines.extend(crate::backup::apply(&archive, &steps)?);
+    // The archive is still sitting in the project, because roost does not
+    // delete a file because it finished reading it — that is the move
+    // CLAUDE.md's table is eleven rows of. Said out loud, so it is the user's
+    // to remove rather than litter they discover in `git status` later.
+    lines.push(format!("{file} is still in this project — delete it when you are done with it."));
     Ok(lines)
 }
 
@@ -283,6 +288,13 @@ mod tests {
             !lines.iter().any(|l| l == "Nothing has been written yet."),
             "a real restore claimed to have written nothing: {lines:?}"
         );
+        // The archive is left where it is, and the user is told so — roost
+        // does not delete a file because it finished reading it.
+        assert!(
+            lines.iter().any(|l| l.contains("a.roostbak is still in this project")),
+            "the report must say the archive is still there: {lines:?}"
+        );
+        assert!(proj.join("a.roostbak").exists(), "and it really is");
         assert_eq!(std::fs::read_to_string(&landed).unwrap(), r#"{"restored":true}"#);
         let _ = std::fs::remove_file(&landed);
     }
