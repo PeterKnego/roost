@@ -1,6 +1,7 @@
 # Making a project from the front page
 
-*2026-09-13. Status: designed, not implemented. Reported by Dean: "ko klikneš
+*2026-09-13. Status: **implemented 2026-09-13** (`src/roots.rs`,
+`static/overview.js`, `tests/browser/roots.mjs`). Reported by Dean: "ko klikneš
 add button v seznamu projektov, bi mogel sam sprejet ime pa kreirat folder, pa
 ga ne." Decisions from that conversation, including one that overrides the
 first option offered.*
@@ -141,3 +142,17 @@ The failure mode this repo names as dominant is a test that cannot fail, so:
   project landed under the *second* root, not the first.
 - **A browser test**, because the dialog's branch — one root versus several —
   is in `static/overview.js` and no Rust test reaches it.
+
+## What implementation added
+
+- **The refusal carries a `missing` flag.** The client has to know whether a
+  refusal is the one its confirmation can answer, and it must not learn that by
+  matching on the message — a refusal string is for a person to read, and a
+  client that branches on its wording breaks the day the wording improves.
+- **The front page had no `dlg-choice` shell.** `askChoice` finds its dialog by
+  id, so the "which root?" question would have found `null` and the flow would
+  have died with nothing on screen. Shipped now, with a Rust test that asserts
+  the front page carries every shell its own script calls.
+- **The project key is the path under its root, not the final segment.**
+  `file_name()` would key `a/b` as `b` and send the browser to a project that
+  does not exist.

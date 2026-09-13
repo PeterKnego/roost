@@ -1135,7 +1135,7 @@ pub fn overview_page(sel: &str, roots: &[String]) -> String {
            <span class=\"home\">{SVG_HOME}</span><span class=\"proj\">roost</span>\
            <span class=\"vsep\"></span>\
            <span class=\"roots\" title=\"{roots_title}\">{roots_html}</span>\
-           <button id=\"addroot\" type=\"button\" title=\"add a project root\">+</button>\
+           <button id=\"addroot\" type=\"button\" title=\"new project, or a new project root\">+</button>\
          </header>\
          <main id=\"overview\">\
            <section class=\"pane ovpane tool\">\
@@ -1163,6 +1163,17 @@ pub fn overview_page(sel: &str, roots: &[String]) -> String {
            <div class=\"dlg-buttons\">\
              <button type=\"button\" class=\"dlg-cancel\">Cancel</button>\
              <button type=\"button\" class=\"dlg-ok\"></button>\
+           </div>\
+         </dialog>\
+         <!-- Shipped because `askChoice` needs it: with several roots, the +\
+              asks which one a new project goes in. Without this shell that\
+              call finds no dialog and the flow dies silently. -->\
+         <dialog id=\"dlg-choice\" class=\"roost\">\
+           <h2 class=\"dlg-title\"></h2>\
+           <div class=\"dlg-body\"></div>\
+           <div class=\"dlg-detail\" hidden></div>\
+           <div class=\"dlg-buttons\">\
+             <button type=\"button\" class=\"dlg-cancel\">Cancel</button>\
            </div>\
          </dialog>\
          <script src=\"/static/dialog.js?v={dv}\"></script>\
@@ -3591,7 +3602,7 @@ mod tests {
             h.contains(r#"<span class="roots" title="/home/x/projects:/srv/&lt;code&gt;">"#),
             "the full list is the escaped tooltip: {h}"
         );
-        assert!(h.contains(r#"</span><button id="addroot" type="button" title="add a project root">+</button>"#), "{h}");
+        assert!(h.contains(r#"</span><button id="addroot" type="button" title="new project, or a new project root">+</button>"#), "{h}");
         assert!(h.contains(r#"<script src="/static/dialog.js?v="#), "{h}");
         for id in ["dlg-confirm", "dlg-text"] {
             assert!(h.contains(&format!(r#"id="{id}""#)), "no {id} shell on the front page");
@@ -4221,5 +4232,24 @@ mod tests {
             .expect("its end")
             .0;
         assert!(dlg.contains("dlg-backup"), "the pane is outside the settings dialog");
+    }
+
+    /// `askChoice` is how the `+` asks which root a new project goes in when
+    /// there is more than one, and it finds its dialog by id. The workspace
+    /// page has always shipped this shell; the front page had not, so the
+    /// call would have found `null` and the flow would have died with nothing
+    /// on screen — the failure mode a browser test catches and no Rust test
+    /// would have.
+    #[test]
+    fn the_front_page_ships_every_dialog_shell_its_own_script_asks_for() {
+        let h = overview_page("", &["/tmp/a".to_string()]);
+        for id in ["dlg-confirm", "dlg-text", "dlg-choice"] {
+            assert!(h.contains(&format!(r#"id="{id}""#)), "no {id} shell on the front page");
+        }
+        // A <dialog> is display:none without `open`; marking one `hidden`
+        // yields a dialog that can never be shown.
+        assert!(!h.contains(r#"<dialog id="dlg-choice" class="roost" hidden"#), "{h}");
+        // Filled from JS with textContent, so it must ship empty.
+        assert!(h.contains(r#"<div class="dlg-body"></div>"#), "the choice body must ship empty");
     }
 }

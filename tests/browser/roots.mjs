@@ -1,5 +1,6 @@
-//! Adding project roots from the front page: the empty state, Add path, the
-//! + beside the roots, and a refused path. Starts roost with ROOST_ROOTS
+//! The front page's `+`: making a project, adding a root, and creating a root
+//! that is not there yet. One field, and what you type decides — absolute is a
+//! root, anything else is a project under one. Starts roost with ROOST_ROOTS
 //! empty (which `roots_from` treats as unset) and the global config on an
 //! empty file, so there are no roots at all.
 //!
@@ -32,6 +33,21 @@
 //!       list no longer carries it anywhere, so it is the *markup* the
 //!       clickability assertion guards and the CSS the height one guards.
 //!       Neither assertion covers the other.
+//!
+//! Revert-checks for the `+`'s two new halves (all restored):
+//!   (f) making `makeProject` always take `roots[0]` and never ask -> D's
+//!       "with two roots it asks which one" and "both roots are offered"
+//!       fail. B2 stays green, which is what says it is the *other* branch:
+//!       with one root the two implementations are indistinguishable.
+//!   (g) deleting the `dlg-choice` shell from `render::overview_page` -> B2's
+//!       "the front page ships the choice dialog its own script calls" and
+//!       both of D's fail. Written as two assertions rather than one for a
+//!       reason: `.open` on a missing shell throws, and an uncaught
+//!       TypeError takes the run down without reporting a single section
+//!       after it.
+//!   (h) `add_root` creating whether or not `create` was set -> E's "Cancel
+//!       creates nothing" fails, which is the assertion that makes the
+//!       confirmation a confirmation rather than a delay.
 //!
 //! Section B's "kept its comment" assertion also caught a real bug one
 //! layer down: `config::write_setting` writing the *first* key into a file
@@ -70,12 +86,37 @@ try {
   console.log("\nB. Add path lists the fixture's projects and writes the file");
   await evalIn(`document.querySelector("#ovprojects .ovnoroots .addroot").click(); 0`);
   ok(await until(() => evalIn(`document.getElementById("dlg-text").open`), 5, "dialog"), "the text dialog opened");
-  ok(/project root/i.test(await evalIn(`document.querySelector("#dlg-text .dlg-title").textContent`)), "titled for a root");
+  // One field, two meanings — so the label has to say both, or someone types
+  // a name expecting a root (or a path expecting a project).
+  const label0 = await evalIn(`document.querySelector("#dlg-text .dlg-label").textContent`);
+  ok(/absolute path/i.test(label0) && /project/i.test(label0), `the label names both halves (got ${JSON.stringify(label0)})`);
   await evalIn(`(() => { const i = document.getElementById("dlg-input"); i.value = ${JSON.stringify(fx.roots)}; i.dispatchEvent(new Event("input")); })(); document.querySelector("#dlg-text .dlg-ok").click(); 0`);
   ok(await until(() => evalIn(`!!document.querySelector('#ovprojects .ovrow')`), 15, "projects"), "the projects list appeared");
   ok(await until(() => evalIn(`[...document.querySelectorAll("header .roots .root")].some((r) => r.textContent === ${JSON.stringify(fx.roots)})`), 5, "header"), "the header shows the root");
   ok(await until(async () => /roots = \[/.test(await Deno.readTextFile(globalToml)), 5, "file"), "the global file holds the list");
   ok(/^# global\n/.test(await Deno.readTextFile(globalToml)), "and kept its comment");
+
+  console.log("\nB2. with one root, a name makes a project and asks nothing");
+  // The other half of section D. With one root there is no choice to make, and
+  // a dialog that asked anyway would be a question with one answer. Tested
+  // here, while exactly one root is configured, because two lines later there
+  // are two and this branch becomes unreachable.
+  await evalIn(`document.getElementById("addroot").click(); 0`);
+  await until(() => evalIn(`document.getElementById("dlg-text").open`), 5, "dialog");
+  await evalIn(`(() => { const i = document.getElementById("dlg-input"); i.value = "solo"; i.dispatchEvent(new Event("input")); })(); document.querySelector("#dlg-text .dlg-ok").click(); 0`);
+  ok(await until(async () => {
+    try { return (await Deno.stat(`${fx.roots}/solo/.git`)).isDirectory; } catch { return false; }
+  }, 15, "the solo project"), "it lands in the only root, git initialised");
+  // Two assertions, not one. `.open` on a missing shell throws and takes the
+  // whole run down with an uncaught TypeError — legible enough to debug, but
+  // not a failing assertion, and a run that dies here reports nothing about
+  // the sections after it. Revert-checked by deleting the shell from
+  // `render::overview_page`: this now fails as a normal assertion, and the
+  // Rust test `the_front_page_ships_every_dialog_shell_its_own_script_asks_for`
+  // catches the same removal without a browser at all.
+  ok(await evalIn(`!!document.getElementById("dlg-choice")`),
+     "the front page ships the choice dialog its own script calls");
+  ok(!(await evalIn(`!!document.getElementById("dlg-choice")?.open`)), "and nothing was asked");
 
   console.log("\nC. + adds a second root");
   await evalIn(`document.getElementById("addroot").click(); 0`);
@@ -84,20 +125,78 @@ try {
   ok(await until(() => evalIn(`document.querySelectorAll("header .roots .root").length === 2`), 5, "two roots"), "the header shows two roots");
   ok(await until(() => evalIn(`[...document.querySelectorAll("#ovprojects .ovrow")].some((r) => /other/.test(r.textContent))`), 15, "other project"), "and the second root's project is listed");
 
-  console.log("\nD. a path that does not exist is refused and the text is kept");
+  console.log("\nD. a name makes a project, and with two roots it asks which");
+  // The report this change came from: "ko klikneš add button v seznamu
+  // projektov, bi mogel sam sprejet ime pa kreirat folder, pa ga ne."
   await evalIn(`document.getElementById("addroot").click(); 0`);
   await until(() => evalIn(`document.getElementById("dlg-text").open`), 5, "dialog");
-  await evalIn(`(() => { const i = document.getElementById("dlg-input"); i.value = "/nowhere/at/all"; i.dispatchEvent(new Event("input")); })(); document.querySelector("#dlg-text .dlg-ok").click(); 0`);
-  // The refusal is the reopened dialog's own label, not a banner: the modal
-  // covers a banner (verified by hand — the banner cannot even be clicked),
-  // so the reason was unreadable exactly when it was needed.
-  ok(await until(() => evalIn(`document.getElementById("dlg-text").open && /no such directory/.test(document.querySelector("#dlg-text .dlg-label").textContent)`), 5, "labelled"),
-     "the reopened dialog's label names the refusal");
-  ok(await until(() => evalIn(`document.getElementById("dlg-text").open && document.getElementById("dlg-input").value === "/nowhere/at/all"`), 5, "reopened"), "the dialog reopened with the text kept");
-  await evalIn(`document.querySelector("#dlg-text .dlg-cancel").click(); 0`);
-  ok((await evalIn(`document.querySelectorAll("header .roots .root").length`)) === 2, "and the root list is unchanged");
+  await evalIn(`(() => { const i = document.getElementById("dlg-input"); i.value = "mqtt-bridge"; i.dispatchEvent(new Event("input")); })(); document.querySelector("#dlg-text .dlg-ok").click(); 0`);
+  // Two roots are configured by now, so a silent choice about where a folder
+  // lands on disk is exactly what must not happen.
+  ok(await until(() => evalIn(`document.getElementById("dlg-choice").open`), 5, "the root choice"),
+     "with two roots it asks which one");
+  const choices = JSON.parse(await evalIn(
+    `JSON.stringify([...document.querySelectorAll("#dlg-choice .dlg-choice")].map((b) => b.dataset.choice))`));
+  ok(choices.length === 2 && choices.includes(fx.roots) && choices.includes(second),
+     `both roots are offered (got ${JSON.stringify(choices)})`);
+  // Picked deliberately: the *second* root. A client that ignored the choice
+  // and a server that always took roots[0] would both pass against the first.
+  await evalIn(`document.querySelector('#dlg-choice .dlg-choice[data-choice=${JSON.stringify(second)}]').click(); 0`);
+  ok(await until(async () => {
+    try { return (await Deno.stat(`${second}/mqtt-bridge/.git`)).isDirectory; } catch { return false; }
+  }, 15, "the new project"), "the folder is created in the chosen root, with a git repository in it");
+  let strayed = false;
+  try { await Deno.stat(`${fx.roots}/mqtt-bridge`); strayed = true; } catch { /* expected */ }
+  ok(!strayed, "and not in the root nobody chose");
+  ok(await until(() => evalIn(`[...document.querySelectorAll("#ovprojects .ovrow")].some((r) => /mqtt-bridge/.test(r.textContent))`), 15, "the row"),
+     "it appears in the projects list without a reload");
+  ok(await until(() => evalIn(`new URLSearchParams(location.search).get("sel") === "mqtt-bridge"`), 5, "selection"),
+     "and it is selected, so a reload comes back to it");
 
-  console.log("\nE. four long roots: the + stays in the header, and stays clickable");
+  console.log("\nE. a path that does not exist offers to create it");
+  await evalIn(`document.getElementById("addroot").click(); 0`);
+  await until(() => evalIn(`document.getElementById("dlg-text").open`), 5, "dialog");
+  const fresh = `${fx.base}/made-by-roost`;
+  await evalIn(`(() => { const i = document.getElementById("dlg-input"); i.value = ${JSON.stringify(fresh)}; i.dispatchEvent(new Event("input")); })(); document.querySelector("#dlg-text .dlg-ok").click(); 0`);
+  ok(await until(() => evalIn(`document.getElementById("dlg-confirm").open`), 5, "the confirm"),
+     "an absolute path that is not there asks before creating it");
+  // Cancel first, and assert nothing happened: a confirmation that creates
+  // whichever button you press is not a confirmation.
+  await evalIn(`document.querySelector("#dlg-confirm .dlg-cancel").click(); 0`);
+  await sleep(300);
+  let made = false;
+  try { await Deno.stat(fresh); made = true; } catch { /* expected */ }
+  ok(!made, "Cancel creates nothing");
+  ok((await evalIn(`document.querySelectorAll("header .roots .root").length`)) === 2, "and adds no root");
+
+  await evalIn(`document.getElementById("addroot").click(); 0`);
+  await until(() => evalIn(`document.getElementById("dlg-text").open`), 5, "dialog");
+  await evalIn(`(() => { const i = document.getElementById("dlg-input"); i.value = ${JSON.stringify(fresh)}; i.dispatchEvent(new Event("input")); })(); document.querySelector("#dlg-text .dlg-ok").click(); 0`);
+  await until(() => evalIn(`document.getElementById("dlg-confirm").open`), 5, "the confirm again");
+  await evalIn(`document.querySelector("#dlg-confirm .dlg-ok").click(); 0`);
+  ok(await until(async () => {
+    try { return (await Deno.stat(fresh)).isDirectory; } catch { return false; }
+  }, 15, "the created root"), "confirming creates the directory");
+  ok(await until(() => evalIn(`document.querySelectorAll("header .roots .root").length === 3`), 5, "three roots"),
+     "and adds it as a root");
+
+  console.log("\nF. a refusal that is not 'missing' still reopens with the reason");
+  // The other branch, and the one that says the `missing` flag is doing work:
+  // a path that exists but is a *file* cannot be created into, so it must come
+  // back as a refusal on the label — not as an offer to create it.
+  const afile = `${fx.base}/a-file`;
+  await Deno.writeTextFile(afile, "not a directory\n");
+  await evalIn(`document.getElementById("addroot").click(); 0`);
+  await until(() => evalIn(`document.getElementById("dlg-text").open`), 5, "dialog");
+  await evalIn(`(() => { const i = document.getElementById("dlg-input"); i.value = ${JSON.stringify(afile)}; i.dispatchEvent(new Event("input")); })(); document.querySelector("#dlg-text .dlg-ok").click(); 0`);
+  ok(await until(() => evalIn(`document.getElementById("dlg-text").open && /not a directory/.test(document.querySelector("#dlg-text .dlg-label").textContent)`), 5, "labelled"),
+     "the reopened dialog's label names the refusal");
+  ok(!(await evalIn(`document.getElementById("dlg-confirm").open`)), "and no offer to create it");
+  ok(await evalIn(`document.getElementById("dlg-input").value === ${JSON.stringify(afile)}`), "with the text kept");
+  await evalIn(`document.querySelector("#dlg-text .dlg-cancel").click(); 0`);
+  ok((await evalIn(`document.querySelectorAll("header .roots .root").length`)) === 3, "and the root list is unchanged");
+
+  console.log("\nG. four long roots: the + stays in the header, and stays clickable");
   // Four ~60-character roots overflow any header on any window, which is the
   // state the wrapping list broke in: the list grew a second line, the header
   // is a fixed 38px, and the + was pushed out of it — still in the DOM, still
