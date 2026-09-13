@@ -268,6 +268,38 @@ impl Hub {
         hub
     }
 
+    /// Re-reads the layout from disk, discarding what this hub holds.
+    ///
+    /// Exists for exactly one caller: a restore (#18 step 3) has just replaced
+    /// the state file underneath a hub that was built from the old one. Without
+    /// this the restore appears to work and then silently reverts — the hub
+    /// still holds the previous layout in memory, and the next intent that
+    /// touches it calls `wsstate::save` and writes that layout straight back
+    /// over the restored file. Nothing anywhere would say so.
+    ///
+    /// Deliberately narrow and deliberately not a general "reload" the UI can
+    /// reach: it drops in-memory buffers, which for a *dirty* buffer means
+    /// dropping unsaved text. That is safe here only because `restore::run`
+    /// refuses while any session of the project is live and the caller sends
+    /// the fresh snapshot immediately; it would not be safe as a button.
+    pub fn reload_from_disk(&mut self) {
+        let project = self.project.clone();
+        let (ws, warn) = crate::wsstate::load(&project);
+        if let Some(w) = warn {
+            eprintln!("roost: {w}");
+        }
+        self.ws = ws;
+        // The same three steps `new` runs for the same reason: a restored
+        // layout describes what was true on another machine, and reality here
+        // is whatever actually survived.
+        self.refresh_live_sessions();
+        self.ws.lost_sessions = lost_terminal_sessions(&self.ws, &project);
+        self.ws.resumable_sessions =
+            resumable_terminal_sessions(&self.ws.lost_sessions, &project);
+        self.reconcile_buffers_with_disk();
+        self.sync_reservations();
+    }
+
     /// Restored buffers describe what was true when roost last wrote the state
     /// file; the disk may have moved since, and nothing records that — the
     /// state file cannot, because staleness is a fact about the file, not
@@ -738,6 +770,14 @@ impl Hub {
             // stalling every browser on the project with nothing to say so.
             Intent::Search { .. } => {
                 unreachable!("Search is diverted in wsconn before this lock is taken")
+            }
+            // Same reasoning as `Search` above, and the same deliberate panic
+            // rather than a fall-through: a restore reads an archive the size
+            // of an upload and writes the state directory, so running it under
+            // this lock would stall every browser on the project. Named here
+            // so that adding a second dispatch site fails loudly.
+            Intent::RestoreWorkspace { .. } => {
+                unreachable!("RestoreWorkspace is diverted in wsconn before this lock is taken")
             }
             _ => {}
         }
@@ -6504,6 +6544,54 @@ mod tests {
             got.iter().any(|m| m.contains(r#""t":"Error""#) && !m.contains("outside")),
             "a missing-but-confined path must not be reported as outside the project, got {got:?}"
         );
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// A restore replaces the state file underneath a hub that was built from
+    /// the old one. Without `reload_from_disk` the restore appears to work and
+    /// then silently reverts: the hub still holds the previous layout, and the
+    /// next intent that touches it saves that layout back over the restored
+    /// file. Nothing anywhere says so — no error, no banner, and a state file
+    /// whose contents are correct right up until the next click.
+    ///
+    /// Found while wiring #18 step 3, not by a test — which is why this one
+    /// exists. Revert-checked by deleting the `reload_from_disk()` call from
+    /// the restore arm in `wsconn`: the second assertion fails with the hub
+    /// still reporting the pre-restore `show_hidden`, and the file on disk is
+    /// back to the pre-restore contents after the save.
+    #[test]
+    fn a_layout_replaced_on_disk_is_picked_up_rather_than_written_back_over() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let proj = d.path().join("reloadproj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // The hub as it was before the restore.
+        let mut h = Hub::new("reloadproj", proj.clone());
+        h.ws.show_hidden = Some(false);
+        crate::wsstate::save("reloadproj", &h.ws).unwrap();
+        assert_eq!(h.ws.show_hidden, Some(false), "setup");
+
+        // What a restore does: write a different layout to the same path,
+        // behind the hub's back.
+        let mut restored = h.ws.clone();
+        restored.show_hidden = Some(true);
+        crate::wsstate::save("reloadproj", &restored).unwrap();
+        assert_eq!(
+            h.ws.show_hidden,
+            Some(false),
+            "setup: the hub has not noticed, which is the whole problem"
+        );
+
+        h.reload_from_disk();
+        assert_eq!(h.ws.show_hidden, Some(true), "the hub must pick the restored layout up");
+
+        // And the restored value survives the next save — the moment the
+        // silent revert used to happen.
+        crate::wsstate::save("reloadproj", &h.ws).unwrap();
+        let (after, _) = crate::wsstate::load("reloadproj");
+        assert_eq!(after.show_hidden, Some(true), "the restored layout was written back over");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 }

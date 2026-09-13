@@ -471,7 +471,73 @@ fn serve_static(w: &mut impl Write, rel: &str) {
 /// for that — it's the one hazard this dispatch-by-kind approach carries
 /// that a fully generic parse wouldn't.
 const FRAGMENT_KINDS: &[&str] =
-    &["tree", "file", "raw", "changes", "status", "diff", "proposal", "theme.css"];
+    &["tree", "file", "raw", "changes", "status", "diff", "proposal", "theme.css", "backup"];
+
+/// The archive, as a download.
+///
+/// Chunked rather than `Content-Length`, for three reasons that point the same
+/// way. The length is not known until the walk has finished; the alternative is
+/// staging the whole archive somewhere to measure it, which for a file holding
+/// every credential the machine has seen means either `/tmp` or a second copy
+/// in memory; and an interrupted chunked response is an error in the browser
+/// rather than a file that looks complete. The per-entry declared lengths in
+/// `backup::parse` are the second line of defence at restore time.
+///
+/// The walk's own `Err` — an unreadable conversation directory — arrives
+/// *before* any body is written, which is what makes a 500 possible here at
+/// all. Once the first chunk is out the status is spent, and the only honest
+/// signal left is to drop the connection without the terminating chunk. That
+/// is why `collect` builds its entries before writing a byte.
+fn serve_backup(w: &mut impl Write, project: &str, dir: &Path, conversations: bool) {
+    let mut body = Vec::new();
+    if let Err(e) = crate::backup::collect(project, dir, conversations, &mut body) {
+        // The refusal reaches the user as text, because it is the one thing
+        // they can act on: it names the directory and says why nothing was
+        // written rather than handing back an archive with a hole in it.
+        return http::respond(w, 500, "Internal Server Error", "text/plain; charset=utf-8", e.as_bytes());
+    }
+    // The storage key, not the project name: it is already percent-encoded, so
+    // no quote, newline or `/` from a project name can reach this header raw.
+    // `storage_key` leaves `%` and every printable ASCII alone, hence the
+    // second pass — a filename is not a storage key, and the only characters
+    // that matter here are the ones that would end the quoted string.
+    let stem: String = crate::projects::storage_key(project)
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let day = crate::backup::today_utc();
+    let name = format!("{stem}-{day}.roostbak");
+    // `nosniff` because this body is attacker-influenced in the only sense
+    // that matters here: it contains a project's own files. Without it a
+    // browser is free to sniff an archive whose first transcript happens to
+    // begin with markup and render it as HTML in roost's own origin.
+    //
+    // No `Origin` check, deliberately, and the reasoning belongs here because
+    // every other write path in this file has one. A GET cannot require it: a
+    // download is a top-level navigation and browsers send no `Origin` on one,
+    // so requiring it would refuse the only request this endpoint exists to
+    // serve. What stands in its place is that a GET response is not *readable*
+    // cross-origin — roost sends no CORS headers, so a hostile page can cause
+    // this download and never see a byte of it — plus the DNS-rebinding gate
+    // `route()` applies to every request before this is reached. The residual
+    // is a page that can make a file land in someone's downloads folder, which
+    // is true of every URL on the internet.
+    let _ = write!(
+        w,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+         Content-Disposition: attachment; filename=\"{name}\"\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    );
+    // One chunk per 64 KB, so a large archive does not sit in a single write.
+    for part in body.chunks(64 * 1024) {
+        let _ = write!(w, "{:x}\r\n", part.len());
+        let _ = w.write_all(part);
+        let _ = w.write_all(b"\r\n");
+    }
+    let _ = w.write_all(b"0\r\n\r\n");
+    let _ = w.flush();
+}
 
 fn serve_frag(
     w: &mut impl Write,
@@ -497,6 +563,23 @@ fn serve_frag(
                 w,
                 &render::claude_history(&crate::claudehist::recent(&dir, crate::claudehist::MAX_ROWS)),
             );
+        }
+        // #18 step 3. A GET because a backup is a read: it changes nothing,
+        // and there was never a reason for it to be anything else. The
+        // *restore* half is the existing `POST /upload` plus a
+        // `RestoreWorkspace` intent, so the two-POST surface CLAUDE.md caps
+        // stays at two.
+        //
+        // `conversations=1` is the opt-in #18 asks for and the only thing that
+        // turns transcripts on. Anything else in the query — including
+        // `conversations=0`, `conversations=true`, or a repeat — leaves them
+        // off: this is the switch that decides whether every prompt, file and
+        // command output on the machine leaves it, so it matches one exact
+        // string rather than being parsed leniently.
+        ["backup"] => {
+            let conversations =
+                crate::backup::wants_conversations(req.query.get("conversations").map(String::as_str));
+            serve_backup(w, project, &dir, conversations)
         }
         ["tree"] => {
             let open = req.query.get("open").map(String::as_str).unwrap_or("");
@@ -1257,5 +1340,76 @@ mod tests {
                 "content_type and class_of disagree about {rel:?}"
             );
         }
+    }
+
+    /// #18 step 3. Goes through `route()` like every other fragment test —
+    /// the download has to be reachable by the *router*, not merely by a
+    /// direct call to `serve_backup`, which is the gap the harness comment
+    /// above describes.
+    #[test]
+    fn the_backup_download_is_an_archive_and_conversations_are_off_unless_asked() {
+        crate::wsstate::set_state_dir_for_test();
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("bkproj")).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+
+        let out = frag_route(&roots, "/frag/bkproj/backup");
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{}", &out[..out.len().min(80)]);
+        assert!(out.contains("Content-Disposition: attachment;"), "{out}");
+        assert!(out.contains(".roostbak\""), "the name must say what it is: {out}");
+        assert!(out.contains("Transfer-Encoding: chunked"), "{out}");
+        // An archive whose first transcript begins with markup must not be
+        // sniffable as HTML in roost's own origin.
+        assert!(out.contains("X-Content-Type-Options: nosniff"), "{out}");
+        // The body is chunked, so the magic is not at a fixed offset — but it
+        // must be in there, and this is the assertion that would catch a
+        // handler that sent headers and no body at all.
+        let body = out.split_once("\r\n\r\n").expect("headers end").1;
+        assert!(body.contains(crate::backup::MAGIC), "no archive in the body: {body:?}");
+        assert!(body.ends_with("0\r\n\r\n"), "the terminating chunk is missing: {body:?}");
+    }
+
+    /// The opt-in reaches the handler at all.
+    ///
+    /// Deliberately narrow: with no transcript directory the response is
+    /// byte-identical whichever way the flag goes, so this asserts only that
+    /// both forms route and neither 500s. The exactness of the match is where
+    /// it can actually be tested — `backup::wants_conversations`, a pure
+    /// function with its own exhaustive test. An assertion here that the
+    /// archive "holds no conversation" would pass against a handler that
+    /// ignored the query string completely, which is the trap this project
+    /// names as its dominant failure mode.
+    #[test]
+    fn both_forms_of_the_backup_request_route() {
+        crate::wsstate::set_state_dir_for_test();
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("bkoptin")).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        for q in ["", "?conversations=1", "?conversations=0", "?conversations=nonsense"] {
+            let out = frag_route(&roots, &format!("/frag/bkoptin/backup{q}"));
+            assert!(out.starts_with("HTTP/1.1 200 OK"), "{q}: {}", &out[..out.len().min(60)]);
+        }
+    }
+
+    /// A project name that would end the quoted filename, or start a second
+    /// header line. Neither reaches the response.
+    #[test]
+    fn a_project_name_cannot_write_its_own_download_header() {
+        crate::wsstate::set_state_dir_for_test();
+        let d = tempfile::tempdir().unwrap();
+        // resolve_project accepts a nested rel, so a `/` in the name is the
+        // realistic case (a worktree); the rest are what a hostile directory
+        // name on the roots would be called.
+        std::fs::create_dir_all(d.path().join("bk/sub")).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let out = frag_route(&roots, "/frag/bk/sub/backup");
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{}", &out[..out.len().min(80)]);
+        let disp = out
+            .lines()
+            .find(|l| l.starts_with("Content-Disposition"))
+            .expect("a disposition header");
+        assert_eq!(disp.matches('"').count(), 2, "the filename must stay one quoted token: {disp}");
+        assert!(!disp.contains('/'), "no separator survives into the name: {disp}");
+        assert!(disp.contains("bk-2Fsub") || disp.contains("bk-sub"), "{disp}");
     }
 }

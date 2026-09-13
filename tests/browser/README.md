@@ -57,6 +57,7 @@ deno run -A tests/browser/popups.mjs     # the header's popups: one open at a ti
 deno run -A tests/browser/treefollow.mjs # the tree expands to the active file and marks it, without collapsing what the user opened
 deno run -A tests/browser/treemention.mjs # ctrl/shift-click picks tree rows and Alt+K mentions them, in tree order and bounded
 deno run -A tests/browser/watchdog.mjs   # the workspace connection's visible state, and send() refusing instead of silently dropping
+deno run -A tests/browser/backup.mjs     # backing a workspace up and restoring it into a *different* project (#18 step 3) — needs its own HOME, like claudemenu.mjs
 ```
 
 Each scenario is its own file and its own roost, so they can be run in any
@@ -124,6 +125,22 @@ and one in `mdlinks.mjs` that passed while asserting nothing — and, in
 the tree ~3 times a second on its own. That last one was a real defect
 (`watch::is_access`), found only because the deleted-code check was actually
 performed.
+
+- In `backup.mjs`: deriving the restore destination from the archive's own
+  `header.source` instead of from the project being restored into — the
+  one-line "simplification" that field invites — fails 2 in sections D and E,
+  and it is the whole reason the test restores into a *second* project at a
+  different path. A round trip back into the source stays green against it,
+  which is #18's third difficulty exactly. Making the conversations checkbox
+  remember its state fails 2 in section B.
+
+  Section G exists because of a revert-check that **passed**. "A Restore button
+  appears only once a listing has come back" is true whether or not the guard
+  is there, so deleting the guard failed nothing; asserting the button is
+  absent *before* a listing arrives is a race. A refused archive is neither —
+  the upload succeeded, so the pane has a file, and without the guard it offers
+  Restore for an archive the server has just refused to read. With section G,
+  deleting the guard fails 1.
 
 - In `claudemenu.mjs`: making `render::claude_history` always report
   `data-empty="1"` fails 4 in section A — no menu, no rows. Removing the

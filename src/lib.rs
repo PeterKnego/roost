@@ -1,4 +1,5 @@
 pub mod assets;
+pub mod backup;
 pub mod bind;
 pub mod cli;
 pub mod claudehooks;
@@ -32,6 +33,7 @@ pub mod proto;
 pub mod registry;
 pub mod relaunch;
 pub mod render;
+pub mod restore;
 pub mod roots;
 pub mod routes;
 pub mod screen;
