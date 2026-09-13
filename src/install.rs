@@ -164,7 +164,17 @@ pub struct Install {
     pub owner: Owner,
 }
 
+/// Probed once per process. The answer is constant for the process's life
+/// (`BuildInfo` promises as much), and the probe is a write: called from
+/// `config::build_info`, an uncached version created and deleted a file in
+/// the binary's directory on every settings snapshot — every new connection,
+/// every dialog open. A read path should not leave marks.
 pub fn describe() -> Install {
+    static ONCE: std::sync::OnceLock<Install> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(probe)
+}
+
+fn probe() -> Install {
     let (replaceable, owner) = match exe() {
         Some(p) => (
             p.parent().map(dir_writable).unwrap_or(Replaceable::Unknown),

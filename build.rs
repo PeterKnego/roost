@@ -66,6 +66,14 @@ fn emit_build_info() {
     // Or the channel goes stale: a tagged CI build and a local one differ only
     // in the environment, which cargo does not watch by itself.
     println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
+    // The triple names the release tarball (`roost-<target>.tar.xz`), which is
+    // what lets About offer an exact download line instead of "see the
+    // releases page". Cargo always sets TARGET for a build script; the
+    // fallback is for the invariant, not for a case that occurs.
+    println!(
+        "cargo:rustc-env=ROOST_TARGET={}",
+        env::var("TARGET").unwrap_or_else(|_| "unknown".into())
+    );
     // Seconds since the epoch, formatted by the server rather than here: a
     // build script has no business picking a date format, and the raw number
     // survives being carried through an env var without a parser.

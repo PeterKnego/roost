@@ -337,6 +337,12 @@ pub struct BuildInfo {
     /// suggested command and nothing acts on it, so a wrong guess costs a
     /// wrong sentence rather than a wrong operation.
     pub owner: String,
+    /// The target triple this binary was built for, e.g.
+    /// `x86_64-unknown-linux-musl`. Names the release tarball, so the About
+    /// pane can offer the exact download rather than a page to browse — and
+    /// on macOS a `curl` line is the fix for the quarantine hang, since only a
+    /// browser sets the attribute.
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -285,7 +285,16 @@ function installLabel(b) {
   switch (b.owner) {
     case "homebrew": return "Homebrew";
     case "system-package": return "a system package";
-    case "cargo-bin": return b.channel === "cargo" ? "cargo install" : "the shell installer";
+    case "cargo-bin":
+      // Three things write here, and only the channel separates them. The
+      // checkout arm covers `cargo install --git`, which the README offers
+      // for building off `develop`: it clones first, so it bakes `checkout`,
+      // and reading it as the shell installer contradicted the Upgrades row
+      // beside it.
+      if (b.channel === "cargo") return "cargo install";
+      if (b.channel === "checkout") return "cargo install from git";
+      if (b.channel === "release") return "the shell installer";
+      return "unknown";
     case "other": return b.channel === "checkout" ? "built from a checkout" : "the release tarball";
     default: return "unknown";
   }
@@ -315,11 +324,17 @@ function upgradesLabel(b) {
 /// The command a user must run, or `null` when there is nothing for them to
 /// type.
 ///
-/// Null is the interesting half: for the release tarball and the shell
-/// installer roost owns the file and will offer to replace it, so a shell line
-/// there would contradict the button rather than help. The row is rendered only
-/// when this returns something, which keeps it present exactly where the button
-/// will not be.
+/// The tarball and shell-installer lines are what roost will one day do by
+/// itself for a copy it may replace (#65 step 4). Until that button exists, a
+/// copy roost will replace *one day* is the user's to replace *today*, so the
+/// line is shown whatever the probe said — an earlier cut withheld it to avoid
+/// contradicting a button that had not shipped, and left those users with
+/// nothing to type. When the button lands, the `replaceable === "yes"` case
+/// is the one it takes over.
+///
+/// The tarball is fetched with `curl` on purpose, and named exactly: a browser
+/// download is quarantined on macOS and the binary then hangs rather than
+/// failing (README), and only a browser sets that attribute.
 ///
 /// `apt upgrade` is deliberately absent. No package repository is published —
 /// the `.deb` and `.rpm` are files on a releases page — so it would find
@@ -328,15 +343,32 @@ function upgradesLabel(b) {
 /// to run `apt` is the one wrong-command case worth spending two lines to
 /// avoid.
 function upgradeCommand(b) {
+  const known = (v) => (v && v !== "unknown" ? v : null);
+  const repo = known(b.repository);
   switch (b.owner) {
     case "homebrew":
       return ["brew upgrade roost"];
     case "system-package":
       return ["sudo apt install ./roost_*.deb", "sudo dnf install ./roost-*.rpm"];
     case "cargo-bin":
-      // Both live in ~/.cargo/bin; only the channel separates them, and only
-      // one of them is roost's to replace.
-      return b.channel === "cargo" ? ["cargo install roost --force"] : null;
+      // All three live in ~/.cargo/bin; only the channel separates them.
+      if (b.channel === "cargo") return ["cargo install roost --force"];
+      if (b.channel === "checkout") return repo ? [`cargo install --git ${repo}`] : null;
+      if (b.channel === "release") {
+        return repo
+          ? [`curl --proto '=https' --tlsv1.2 -LsSf ${repo}/releases/latest/download/roost-installer.sh | sh`]
+          : null;
+      }
+      return null;
+    case "other": {
+      // Only a *release* tarball has a newer one to fetch; a checkout is
+      // "yours to rebuild" and a source tarball of unknown provenance has no
+      // download that is known to match it.
+      const target = known(b.target);
+      return b.channel === "release" && repo && target
+        ? [`curl -LO ${repo}/releases/latest/download/roost-${target}.tar.xz`]
+        : null;
+    }
     default:
       return null;
   }
@@ -583,7 +615,7 @@ function openSettings(settings) {
     ["Upgrades", "upgrades",
       "Whether roost could replace this copy itself, or whatever installed it owns that."],
     ["Upgrade", "command",
-      "Run this to get a newer one. Shown only where the upgrade is yours to run \u2014 download the newer package first where one is named, since no package repository is published."],
+      "Run this to get a newer one. Where a package is named, download it first: no package repository is published. A tarball is fetched with curl on purpose \u2014 a browser download is quarantined on macOS and the binary then hangs."],
   ];
 
   function renderAbout() {
@@ -596,8 +628,9 @@ function openSettings(settings) {
       : kind === "upgrades" ? upgradesLabel(b)
       : (b[kind] || "unknown");
     for (const [label, kind, doc] of ABOUT_ROWS) {
-      // The only row that is not always there: absent where roost will offer
-      // to do the upgrade itself, so it cannot contradict that button.
+      // The only row that is not always there: absent where there is nothing
+      // to type — a checkout, an unknown owner, or a tarball whose target or
+      // repository the build did not record.
       if (kind === "command" && !upgradeCommand(b)) continue;
       const r = document.createElement("div");
       r.className = "dlg-row";

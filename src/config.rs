@@ -627,6 +627,7 @@ pub fn build_info() -> crate::proto::BuildInfo {
         channel: install.channel.to_string(),
         replaceable: install.replaceable.as_str().to_string(),
         owner: install.owner.as_str().to_string(),
+        target: option_env!("ROOST_TARGET").unwrap_or("unknown").to_string(),
     }
 }
 
