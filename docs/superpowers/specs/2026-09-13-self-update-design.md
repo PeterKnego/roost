@@ -380,3 +380,35 @@ trusted — CLAUDE.md's *Testing* section says why.
    dependency, sha256-only verification, always writing to `~/.cargo/bin`,
    and piping a remote script into a shell from the process that holds the
    terminal sockets.
+
+## Handoff
+
+Written for whoever picks this up, since the person who designed it is not
+the person implementing it.
+
+- **Branch.** `self-update`, cut from `develop` at `7270fa6` (the merge of
+  #78). It carries the two documents and nothing else.
+- **Order of work.** The version check (step 2, its own spec) is designed but
+  **not implemented**, and this design consumes its stored fact, its
+  comparator, its `ureq` agent and its `SettingsView` route. Implement step 2
+  first, or in the same plan as the first tasks here. Then invoke the
+  `writing-plans` skill on this spec; the plan's first task is the
+  `wsstate::save` check named under *The restart*.
+- **Maintainer-only prerequisites**, outside the repository: the minisign
+  keypair and the two `release` environment secrets, recorded as open item
+  6.5 in `docs/roost-packaging-handover.md`. The code can be written and
+  tested against the committed test keypair before those exist; the real
+  key is needed only for the first release.
+- **Building in a worktree on the dev host.** `~/.cargo/config.toml` there
+  points every checkout at one shared target directory, and `build.rs` bakes
+  absolute asset paths, so a second checkout silently builds over the first
+  (CLAUDE.md, *Build from one checkout*). Redirect the worktree with an
+  uncommitted `[build] target-dir = "target"` in its `.cargo/config.toml`, or
+  check the branch out in the main directory instead. Run tests with
+  `cargo test -- --test-threads=1`; a bare `cargo test` has hung here.
+- **What was verified this session**: the baseline suite on this branch, 913
+  library tests and every integration binary green, single-threaded. What
+  was **not**: whether `wsstate::save` includes dirty buffer text, whether
+  `minisign-verify` accepts a signature produced by the `minisign` CLI
+  unchanged (Tauri's `.sig` files are minisign format, which is the
+  expectation), and anything about the exec under systemd.

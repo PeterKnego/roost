@@ -2,7 +2,8 @@
 
 *2026-09-12. Status: designed, reviewed 2026-09-13, not implemented. Issue
 [#65](https://github.com/PeterKnego/roost/issues/65), step 2. Steps 1a and 1b are
-merged into develop (#77); step 3 is open as #78. Decisions from conversation on 2026-09-12, one of
+merged into develop (#77); step 3 is merged (#78); step 4 is designed in
+`2026-09-13-self-update-design.md`. Decisions from conversation on 2026-09-12, one of
 which reverses a constraint the issue states — see* The reversal *below. The
 review on 2026-09-13 changed the state file's schema, named the path by which
 the answer reaches About, and settled the three questions that were open.*
