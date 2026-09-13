@@ -209,6 +209,34 @@ try {
   ok(!(await page.evalIn(`!!document.querySelector('#dlg-settings .bk-restore')`)),
      "with nothing to click: a refused archive must not be restorable");
   ok(!(await page.evalIn(`!!(${report})`)), "and no listing is shown for it");
+  console.log("H. the pane works on a phone");
+  // ~/projects/CLAUDE.md: every web project must work on desktop *and* mobile,
+  // no exceptions. A settings pane with a two-column row and a fixed-width
+  // button is exactly what that rule exists for.
+  await page.cmd("Emulation.setDeviceMetricsOverride",
+    { width: 390, height: 844, deviceScaleFactor: 3, mobile: true });
+  await page.evalIn(`document.querySelector('#dlg-settings .dlg-cancel').click(); 0`);
+  await openBackupPane(page);
+  const fits = await page.evalIn(`(() => {
+    const p = ${pane};
+    return { overflow: p.scrollWidth - p.clientWidth,
+             dl: document.querySelector('#dlg-settings .bk-download').getBoundingClientRect().height,
+             // Geometry, not width. A width threshold does not discriminate:
+             // measured, the two-column row still gives the sentence 298px at
+             // 390px wide, so any threshold loose enough to pass one-column
+             // passes two-column too. Whether the switch sits *below* the text
+             // or beside it is the property, and it has one answer.
+             stacked: ${box}.getBoundingClientRect().top
+                      >= document.querySelector('#dlg-settings .dlg-backup .doc').getBoundingClientRect().bottom };
+  })()`);
+  ok(fits.overflow <= 1, `the pane does not scroll sideways (overflow ${fits.overflow}px)`);
+  // 44px is the tap-target floor the same file sets.
+  ok(fits.dl >= 44, `the Download button is tappable (${fits.dl}px tall)`);
+  // The row collapses to one column below 640px, so the explanation sentence
+  // gets the full width instead of sharing it with the switch. Revert-checked:
+  // deleting the `grid-template-columns: 1fr` from the mobile block fails this
+  // and nothing else.
+  ok(fits.stacked, "the switch sits below its explanation, not beside it");
 } finally {
   try { await page?.close(); } catch { /* already gone */ }
   browser.close();

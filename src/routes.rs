@@ -507,10 +507,26 @@ fn serve_backup(w: &mut impl Write, project: &str, dir: &Path, conversations: bo
         .collect();
     let day = crate::backup::today_utc();
     let name = format!("{stem}-{day}.roostbak");
+    // `nosniff` because this body is attacker-influenced in the only sense
+    // that matters here: it contains a project's own files. Without it a
+    // browser is free to sniff an archive whose first transcript happens to
+    // begin with markup and render it as HTML in roost's own origin.
+    //
+    // No `Origin` check, deliberately, and the reasoning belongs here because
+    // every other write path in this file has one. A GET cannot require it: a
+    // download is a top-level navigation and browsers send no `Origin` on one,
+    // so requiring it would refuse the only request this endpoint exists to
+    // serve. What stands in its place is that a GET response is not *readable*
+    // cross-origin — roost sends no CORS headers, so a hostile page can cause
+    // this download and never see a byte of it — plus the DNS-rebinding gate
+    // `route()` applies to every request before this is reached. The residual
+    // is a page that can make a file land in someone's downloads folder, which
+    // is true of every URL on the internet.
     let _ = write!(
         w,
         "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
          Content-Disposition: attachment; filename=\"{name}\"\r\n\
+         X-Content-Type-Options: nosniff\r\n\
          Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
     );
     // One chunk per 64 KB, so a large archive does not sit in a single write.
@@ -1342,6 +1358,9 @@ mod tests {
         assert!(out.contains("Content-Disposition: attachment;"), "{out}");
         assert!(out.contains(".roostbak\""), "the name must say what it is: {out}");
         assert!(out.contains("Transfer-Encoding: chunked"), "{out}");
+        // An archive whose first transcript begins with markup must not be
+        // sniffable as HTML in roost's own origin.
+        assert!(out.contains("X-Content-Type-Options: nosniff"), "{out}");
         // The body is chunked, so the magic is not at a fixed offset — but it
         // must be in there, and this is the assertion that would catch a
         // handler that sent headers and no body at all.

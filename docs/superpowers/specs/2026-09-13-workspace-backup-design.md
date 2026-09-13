@@ -1,6 +1,9 @@
 # Backing up a workspace, conversations included
 
-*2026-09-13. Status: designed, reviewed 2026-09-13, not implemented. Issue
+*2026-09-13. Status: **implemented 2026-09-13** (`src/backup.rs`,
+`src/restore.rs`, `tests/browser/backup.mjs`); see
+`docs/superpowers/plans/2026-09-13-workspace-backup.md` for the task order and
+what implementation changed. Reviewed 2026-09-13. Issue
 [#18](https://github.com/PeterKnego/roost/issues/18), step 3. Steps 1 and 2 are
 merged into develop (`src/claudesess.rs`, `src/claudehist.rs`, #68). This design
 settles the three questions #18's own security section asks and nothing wider:
@@ -443,3 +446,26 @@ does nothing.
   refused by the destination check, which is correct but unhelpful.
 - Step 4, remote destinations. #18 is right that it should wait for this to
   work, and right about what it needs when it comes.
+
+## What implementation changed
+
+Recorded here rather than left for a reader to discover by diffing.
+
+- **`MAX_TOTAL_BYTES` is 128 MB, not 512.** An archive is restored by uploading
+  it, so one larger than `max_upload_bytes` is a backup roost cannot read back.
+  See the table above.
+- **The archive is built in memory, not streamed entry by entry.** The header
+  carries the report and the report is not known until the walk finishes.
+- **The uploaded copy is renamed before it is sent.** `POST /upload` refuses a
+  name already in the project — correct, and it stays — but the archive of a
+  restore is exactly the file someone picks twice. Stamped with the moment, it
+  never collides and never overwrites, and the report names it so the user can
+  delete it. roost does not.
+- **A hub that has had its state file replaced is reloaded.** Not in the design
+  at all, and a defect without it: the restore appeared to work and then
+  silently reverted, because the hub still held the old layout and the next
+  intent saved it back over the restored file.
+- **The download carries `nosniff` and no `Origin` check**, with the argument
+  for the second in `routes.rs`: a GET cannot require an `Origin` header
+  because a download is a top-level navigation and browsers send none, and what
+  stands in its place is that the response is not readable cross-origin.

@@ -1,6 +1,7 @@
 # Backing up a workspace, conversations included
 
-*2026-09-13. #18 step 3. Steps 1 and 2 shipped (`claudesess.rs`, `claudehist.rs`,
+*2026-09-13. Status: implemented 2026-09-13; every task's revert-check was*
+*performed and its observed failure recorded in the test's own comment. #18 step 3. Steps 1 and 2 shipped (`claudesess.rs`, `claudehist.rs`,
 #68). Spec: `docs/superpowers/specs/2026-09-13-workspace-backup-design.md`,
 reviewed 2026-09-13 — the review replaced the surface, so this plan implements
 the download-and-intent design, not the CLI one the spec's first draft had.*
