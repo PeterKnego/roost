@@ -304,6 +304,51 @@ fn take_line(buf: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
     }
 }
 
+/// Whether a `?conversations=` query value is the opt-in.
+///
+/// A function, and a pure one, because the route test cannot check this: with
+/// no transcript directory the response is byte-identical either way, so an
+/// assertion there passes against a handler that ignores the query entirely.
+/// This is the switch that decides whether every prompt, every file read and
+/// every command output on the machine leaves it, so it matches one exact
+/// string — `conversations=true`, `=yes` and `=on` are all *off*, deliberately,
+/// because a switch of this consequence should be hard to trip by accident and
+/// there is exactly one thing roost's own UI sends.
+pub fn wants_conversations(v: Option<&str>) -> bool {
+    v == Some("1")
+}
+
+/// Today, as `YYYY-MM-DD`, for the download's filename.
+///
+/// Civil-from-days rather than a date crate: this is the only date roost
+/// formats, and the algorithm is Howard Hinnant's, which is exact for every
+/// year this will ever see. A wrong day here misnames a file; it is not worth
+/// a dependency, and it is worth the eight lines rather than a guess.
+pub fn today_utc() -> String {
+    civil_from_unix(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    )
+}
+
+/// The pure half, split so its test needs no clock — and so the four dates
+/// that break a naive version can be asserted at all.
+fn civil_from_unix(secs: u64) -> String {
+    let z = (secs / 86400) as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// Conversations examined, newest first. `claudehist::MAX_SCANNED` is 30
 /// because it is filling ten menu rows; a backup should reach further than a
 /// menu, and 50 covers 21 of this host's 24 project directories whole.
@@ -1104,5 +1149,32 @@ mod tests {
         let a = parse(&raw).unwrap();
         let ws = a.entries.iter().find(|e| e.kind == Kind::Workspace).unwrap();
         assert_eq!(String::from_utf8_lossy(&ws.bytes), r#"{"which":"child"}"#);
+    }
+
+    #[test]
+    fn the_date_in_a_download_name_is_the_real_one() {
+        // Hand-rolled civil-from-days, so it is checked against dates computed
+        // elsewhere rather than against itself. These four are the ones that
+        // break a naive implementation: a leap day, the day after it, a
+        // century that is not a leap year, and one that is.
+        for (secs, want) in [
+            (0u64, "1970-01-01"),
+            (951782400, "2000-02-29"),
+            (951868800, "2000-03-01"),
+            (1709164800, "2024-02-29"),
+            (4107542400, "2100-03-01"),
+            (1757750400, "2025-09-13"),
+        ] {
+            assert_eq!(civil_from_unix(secs), want, "for {secs}");
+        }
+    }
+
+    #[test]
+    fn the_conversations_opt_in_is_one_exact_string() {
+        assert!(wants_conversations(Some("1")), "the one thing the UI sends");
+        for off in [None, Some(""), Some("0"), Some("true"), Some("yes"), Some("on"),
+                    Some("11"), Some(" 1"), Some("1 "), Some("01"), Some("TRUE")] {
+            assert!(!wants_conversations(off), "{off:?} was treated as the opt-in");
+        }
     }
 }
