@@ -1028,7 +1028,7 @@ dialog.roost.dlg-wide { width: min(760px, 96vw); }
    the Theme tab. `.dlg-scope` is here for the same reason and was missed
    once: About has nothing to write anywhere, so it hides the scope row —
    and the row went on showing, because the rule above it sets `display`. */
-.dlg-rows[hidden], .dlg-themes[hidden], .dlg-about[hidden], .dlg-scope[hidden] { display: none; }
+.dlg-rows[hidden], .dlg-themes[hidden], .dlg-about[hidden], .dlg-backup[hidden], .dlg-scope[hidden] { display: none; }
 .dlg-warning { display: flex; gap: 6px; color: var(--warn, #d79921); font-size: 11px; padding: 8px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
 /* A setting is text on the left — label, key, source tag — with its one-line
    doc beneath, and the control in a fixed column on the right so every
@@ -1059,6 +1059,34 @@ dialog.roost.dlg-wide { width: min(760px, 96vw); }
 .dlg-group { padding: 14px 0 6px; }
 .dlg-group .title { font-size: 13px; color: var(--fg); }
 .dlg-group .hint { font-size: 12px; color: var(--muted); line-height: 1.35; margin-top: 2px; padding: 0; }
+
+/* The Backup pane (#18 step 3). Two halves, deliberately not symmetrical: a
+   download is one button, a restore is a listing you read and then confirm. */
+.dlg-backup { padding: 4px 14px 12px; max-height: 60vh; overflow: auto; }
+.dlg-backup .dlg-row { display: grid; grid-template-columns: 1fr auto; gap: 12px;
+  align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.dlg-backup .dlg-row .doc { font-size: 11px; color: var(--muted); line-height: 1.4; margin-top: 2px; }
+.dlg-backup .bk-download, .dlg-backup .bk-restore {
+  font: inherit; font-size: 13px; margin-top: 10px; padding: 8px 14px; min-height: 44px;
+  border: 1px solid var(--border); border-radius: 6px; background: none; color: var(--fg); cursor: pointer; }
+.dlg-backup .bk-download:hover, .dlg-backup .bk-restore:hover { border-color: var(--accent); }
+/* Touch has no hover, so every control needs a pressed state of its own —
+   without one a tap on a phone gives no feedback at all. */
+.dlg-backup .bk-download:active, .dlg-backup .bk-restore:active,
+.dlg-backup .bk-file:active { transform: translateY(1px); border-color: var(--accent); }
+.dlg-backup .bk-restore { border-color: var(--del-fg); color: var(--del-fg); }
+.dlg-backup .bk-file { font: inherit; font-size: 13px; margin-top: 8px; width: 100%; }
+.dlg-backup .bk-busy { padding: 8px 0; }
+.dlg-backup .bk-report { margin-top: 10px; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+.dlg-backup .bk-line { font-family: var(--mono); font-size: 11px; line-height: 1.5;
+  color: var(--muted); overflow-wrap: anywhere; }
+.dlg-backup .bk-line:first-child { color: var(--fg); }
+@media (max-width: 640px) {
+  /* One column on a phone: the label and its switch side by side leaves the
+     doc sentence four words wide. */
+  .dlg-backup .dlg-row { grid-template-columns: 1fr; }
+  .dlg-backup .bk-download, .dlg-backup .bk-restore { width: 100%; }
+}
 .dlg-themes .theme-source { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); padding: 2px 0 8px; }
 .dlg-themes .clear, .dlg-row .clear { font: inherit; font-size: 11px; background: none; border: 1px solid var(--border); border-radius: 9px; color: var(--muted); cursor: pointer; padding: 0 8px; line-height: 16px; }
 .dlg-themes .clear:hover, .dlg-row .clear:hover { color: var(--fg); }

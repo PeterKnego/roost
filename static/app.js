@@ -912,6 +912,25 @@ function onEvent(ev) {
       // acted, so nothing here depends on the delay completing.
       setTimeout(() => { location.href = "/"; }, 1200);
       break;
+    // #18 step 3. Goes only to the dialog that asked: the listing describes a
+    // restore this browser initiated, and a second browser on the project has
+    // no context for a page of paths it did not ask for. The workspace change a
+    // real restore causes reaches everyone through the State snapshot, the way
+    // every other change does.
+    case "RestoreReport":
+      if (settingsOpen && typeof settingsOpen.onRestoreReport === "function") {
+        try {
+          settingsOpen.onRestoreReport(ev);
+        } catch (e) {
+          console.error("roost: the backup pane's onRestoreReport threw", e);
+          settingsOpen = null;
+        }
+      } else if (ev.refused) {
+        // The dialog was closed while the restore ran. A refusal still has to
+        // land somewhere — silence here is a restore that looks like it worked.
+        showError(ev.refused);
+      }
+      break;
     case "Notice": onNotice(ev.notice); break;
     case "Notices":
       notices = ev.list;
@@ -4540,7 +4559,11 @@ function setUploadProgress(label, fraction) {
   box.textContent = `${label} — ${Math.round(fraction * 100)}%`;
 }
 
-function postFiles(url, files, label) {
+// `done` is optional and only the backup pane passes one: it needs to know
+// *when* the archive has landed, because the intent that restores it names a
+// file that must already be there. The two older call sites fire and forget,
+// and are unchanged.
+function postFiles(url, files, label, done) {
   const form = new FormData();
   for (const f of files) form.append("file", f, f.name);
   const xhr = new XMLHttpRequest();
@@ -4552,12 +4575,22 @@ function postFiles(url, files, label) {
   };
   xhr.onload = () => {
     setUploadProgress(label, null);
-    if (xhr.status !== 200) return showError(`${label}: ${xhr.responseText || xhr.status}`);
+    if (xhr.status !== 200) {
+      showError(`${label}: ${xhr.responseText || xhr.status}`);
+      if (done) done(false);
+      return;
+    }
     let body = {};
-    try { body = JSON.parse(xhr.responseText); } catch { return; }
-    for (const r of body.results || []) if (!r.ok) showError(`${r.name}: ${r.error}`);
+    try { body = JSON.parse(xhr.responseText); } catch { if (done) done(false); return; }
+    let ok = true;
+    for (const r of body.results || []) if (!r.ok) { ok = false; showError(`${r.name}: ${r.error}`); }
+    if (done) done(ok);
   };
-  xhr.onerror = () => { setUploadProgress(label, null); showError(`${label}: upload failed`); };
+  xhr.onerror = () => {
+    setUploadProgress(label, null);
+    showError(`${label}: upload failed`);
+    if (done) done(false);
+  };
   xhr.send(form);
 }
 

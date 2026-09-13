@@ -395,6 +395,7 @@ function openSettings(settings) {
   const rows = el.querySelector(".dlg-rows");
   const themes = el.querySelector(".dlg-themes");
   const about = el.querySelector(".dlg-about");
+  const backup = el.querySelector(".dlg-backup");
   const okBtn = el.querySelector(".dlg-ok");
   const cancelBtn = el.querySelector(".dlg-cancel");
 
@@ -404,7 +405,7 @@ function openSettings(settings) {
 
   function renderTabs() {
     tabs.replaceChildren();
-    for (const [id, label] of [["settings", "General"], ["theme", "Theme"], ["about", "About"]]) {
+    for (const [id, label] of [["settings", "General"], ["theme", "Theme"], ["backup", "Backup"], ["about", "About"]]) {
       const b = document.createElement("button");
       b.type = "button"; b.className = "dlg-tab"; b.dataset.tab = id; b.textContent = label;
       b.setAttribute("role", "tab"); b.setAttribute("aria-selected", String(pane === id));
@@ -680,25 +681,177 @@ function openSettings(settings) {
     try { return new Date(epoch * 1000).toLocaleString(); } catch { return "unknown"; }
   }
 
+
+  // ------------------------------------------------------------- backup pane
+  //
+  // #18 step 3. Two halves with very different risk, so they look different:
+  // a download, and a restore that always shows what it would do first.
+  //
+  // `withConversations` is deliberately **not** remembered — not in
+  // localStorage, not in `session`, not across a tab switch within one opening
+  // of this dialog. #18: a backup that includes transcripts must be "explicit,
+  // opt-in per project, and never a default", and warns that the dangerous
+  // shape is one "configured once and forgotten". A checkbox that comes back
+  // ticked is that shape. It resets every time this pane is drawn, so the
+  // warning beside it is read by whoever ticks it.
+  let restoreFile = null;      // the uploaded archive's name, once it is there
+  let restoreLines = [];       // the last report from the server
+  let restoreRefused = null;
+  let restoreBusy = false;
+
+  function renderBackup() {
+    backup.replaceChildren();
+    const withConversations = { on: false };
+
+    const section = (title, doc) => {
+      const g = document.createElement("div"); g.className = "dlg-group";
+      const t = document.createElement("div"); t.className = "title"; t.textContent = title;
+      const h = document.createElement("div"); h.className = "hint"; h.textContent = doc;
+      g.append(t, h); backup.appendChild(g); return g;
+    };
+
+    section(
+      "Download a backup",
+      "The layout of this project — its panes, tabs and terminals — as one file you keep.",
+    );
+
+    const optRow = document.createElement("div"); optRow.className = "dlg-row";
+    const optText = document.createElement("div"); optText.className = "text";
+    const optLine = document.createElement("div"); optLine.className = "line";
+    const optLab = document.createElement("label");
+    optLab.textContent = "Include conversations";
+    optLine.appendChild(optLab);
+    optText.appendChild(optLine);
+    const optDoc = document.createElement("div"); optDoc.className = "doc";
+    // The sentence #18 asks for, next to the control rather than in a doc
+    // nobody opens: this is the switch that moves the highest-value file on
+    // the machine off it.
+    optDoc.textContent =
+      "Every prompt, every file Claude read, and every command it ran and its output. "
+      + "Off unless you tick it, every time.";
+    optText.appendChild(optDoc);
+    const optBox = document.createElement("input");
+    optBox.type = "checkbox"; optBox.className = "bk-conversations";
+    optBox.checked = false;
+    optBox.onchange = () => { withConversations.on = optBox.checked; };
+    optRow.append(optText, optBox);
+    backup.appendChild(optRow);
+
+    const dl = document.createElement("button");
+    dl.type = "button"; dl.className = "bk-download"; dl.textContent = "Download";
+    dl.onclick = () => {
+      // A plain navigation, so the browser's own download machinery handles a
+      // large file — no blob in memory, and the progress bar is the one the
+      // user already knows.
+      const q = withConversations.on ? "?conversations=1" : "";
+      window.location.href = `/frag/${PROJECT}/backup${q}`;
+    };
+    backup.appendChild(dl);
+
+    section(
+      "Restore from a backup",
+      "Choose an archive. roost shows exactly what it would do before it does any of it.",
+    );
+
+    const pick = document.createElement("input");
+    pick.type = "file"; pick.className = "bk-file"; pick.accept = ".roostbak";
+    pick.onchange = () => {
+      const f = pick.files && pick.files[0];
+      if (!f) return;
+      restoreBusy = true; restoreLines = []; restoreRefused = null; render();
+      // Through the existing upload endpoint — the archive becomes a file in
+      // the project, and the intent below names it. No new HTTP surface; see
+      // Intent::RestoreWorkspace.
+      postFiles(`/upload/${PROJECT}`, [f], `upload ${f.name}`, (ok) => {
+        restoreBusy = false;
+        if (!ok) { restoreRefused = `${f.name} did not upload`; return render(); }
+        restoreFile = f.name;
+        restoreBusy = true;
+        // The dry run always comes first. The user never sends a restore they
+        // have not seen a listing for.
+        send({ t: "RestoreWorkspace", file: f.name, dry_run: true });
+        render();
+      });
+    };
+    backup.appendChild(pick);
+
+    if (restoreBusy) {
+      const b = document.createElement("div"); b.className = "hint bk-busy";
+      b.textContent = "Working…";
+      backup.appendChild(b);
+    }
+
+    if (restoreRefused) {
+      const r = document.createElement("div");
+      r.className = "dlg-warning bk-refused";
+      r.textContent = restoreRefused;
+      backup.appendChild(r);
+    }
+
+    if (restoreLines.length) {
+      const list = document.createElement("div"); list.className = "bk-report";
+      for (const line of restoreLines) {
+        const p = document.createElement("div"); p.className = "bk-line";
+        // textContent: every one of these carries a path from the server.
+        p.textContent = line;
+        list.appendChild(p);
+      }
+      backup.appendChild(list);
+    }
+
+    // The second click, and only after a listing has come back. A restore
+    // button that is available before the dry run would let someone restore an
+    // archive they have not looked at, which is the whole thing the dry run is
+    // for.
+    if (restoreFile && restoreLines.length && !restoreRefused && !restoreBusy) {
+      const go = document.createElement("button");
+      go.type = "button"; go.className = "bk-restore danger";
+      go.textContent = "Restore now";
+      go.onclick = () => {
+        restoreBusy = true; render();
+        send({ t: "RestoreWorkspace", file: restoreFile, dry_run: false });
+      };
+      backup.appendChild(go);
+    }
+  }
+
   function render() {
     renderTabs(); renderScope();
     rows.hidden = pane !== "settings";
     themes.hidden = pane !== "theme";
     about.hidden = pane !== "about";
+    backup.hidden = pane !== "backup";
     // Nothing on this pane is editable, so the two controls that exist for
     // editing have nothing to say: the scope switch chooses which file a
     // change is written to, and Save writes it. Offering "Save" over four
     // read-only values invites the question of what it would save.
-    scopeBar.hidden = pane === "about";
-    cancelBtn.textContent = pane === "about" ? "Close" : "Cancel";
-    okBtn.hidden = pane === "about";
+    // Backup joins About here for the same reason: nothing on it is written
+    // by Save. Its two actions carry their own buttons, because a download and
+    // a restore are not the same gesture as "apply these fields".
+    const readOnlyPane = pane === "about" || pane === "backup";
+    scopeBar.hidden = readOnlyPane;
+    cancelBtn.textContent = readOnlyPane ? "Close" : "Cancel";
+    okBtn.hidden = readOnlyPane;
     if (pane === "settings") renderRows();
     else if (pane === "theme") renderThemes();
+    else if (pane === "backup") renderBackup();
     else renderAbout();
   }
 
   return runDialog(el, (finish) => {
     settingsOpen = {
+      onRestoreReport(ev) {
+        restoreBusy = false;
+        restoreRefused = ev.refused || null;
+        restoreLines = ev.lines || [];
+        // A real restore is finished: the archive it used should not be
+        // offerable a second time without a fresh listing, because the plan
+        // that listing described has already been carried out and the next one
+        // would be computed against a different machine state.
+        if (!ev.dry_run) restoreFile = null;
+        pane = "backup";
+        render();
+      },
       onSnapshot(s) {
         view = s;
         if (awaitingSave) {

@@ -1734,8 +1734,8 @@ dialog.roost, .dlg-title, .dlg-blocked { display: revert !important; visibility:
 /* The detail slot holds the diff a save conflict is about to overwrite; hiding
    it would hide what "Overwrite" destroys. Hidden by attribute when empty. */
 .dlg-detail:not([hidden]) { display: block !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
-.dlg-body, .dlg-buttons, .dlg-items, .dlg-tabs, .dlg-scope:not([hidden]), .dlg-rows:not([hidden]), .dlg-themes:not([hidden]), .dlg-about:not([hidden]), .dlg-warning:not([hidden]) { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
-.dlg-body, .dlg-items, .dlg-rows, .dlg-themes:not([hidden]), .dlg-about:not([hidden]) { flex-direction: column !important; }
+.dlg-body, .dlg-buttons, .dlg-items, .dlg-tabs, .dlg-scope:not([hidden]), .dlg-rows:not([hidden]), .dlg-themes:not([hidden]), .dlg-about:not([hidden]), .dlg-backup:not([hidden]), .dlg-warning:not([hidden]) { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
+.dlg-body, .dlg-items, .dlg-rows, .dlg-themes:not([hidden]), .dlg-about:not([hidden]), .dlg-backup:not([hidden]) { flex-direction: column !important; }
 .dlg-buttons { flex-direction: row !important; order: 0 !important; }
 .dlg-buttons button:not([hidden]), .dlg-item { transform: none !important; font-size: 13px !important; order: 0 !important; }
 /* The About pane has nothing to save, so its OK button is hidden by
@@ -1944,6 +1944,7 @@ pub fn workspace_page(
   <div class="dlg-rows" hidden></div>
   <div class="dlg-themes" hidden></div>
   <div class="dlg-about" hidden></div>
+  <div class="dlg-backup" hidden></div>
   <div class="dlg-buttons">
     <button type="button" class="dlg-cancel">Cancel</button>
     <button type="button" class="dlg-ok">Save</button>
@@ -3492,7 +3493,7 @@ mod tests {
         assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-detail:not([hidden])"),
             "the structural CSS does not lock .dlg-detail's visibility");
         for cls in [".dlg-tabs", ".dlg-scope", ".dlg-rows", ".dlg-row", ".dlg-themes", ".dlg-tile",
-                    ".dlg-tiles", ".dlg-tab", ".dlg-warning"] {
+                    ".dlg-tiles", ".dlg-tab", ".dlg-warning", ".dlg-backup"] {
             assert!(DIALOG_STRUCTURAL_CSS.contains(cls), "the structural CSS does not lock {cls}");
         }
         assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-row { display: grid !important"),
@@ -4194,5 +4195,31 @@ mod tests {
         // just the empty `<ul class="ovsessions"></ul>` with no message. Restored.
         let out = overview_sessions("", &[]);
         assert!(out.contains("no sessions") || out.contains("nothing running"), "{out}");
+    }
+
+    /// #18 step 3. The pane ships as an empty, hidden slot like the other
+    /// three: everything in it is built from JS with `textContent`, because
+    /// every line of a restore listing carries a path from the server.
+    ///
+    /// A `<div>` is not a `<dialog>`, so unlike the shells above it *is*
+    /// marked `hidden` — that is how `render()` switches panes. The assertion
+    /// that matters is that it ships empty.
+    #[test]
+    fn the_backup_pane_ships_as_an_empty_hidden_slot() {
+        let html = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
+        assert!(
+            html.contains(r#"<div class="dlg-backup" hidden></div>"#),
+            "the backup pane must ship empty and hidden"
+        );
+        // It has to be inside the settings dialog, not loose in the body:
+        // openSettings finds it with el.querySelector(".dlg-backup").
+        let dlg = html
+            .split_once(r#"<dialog id="dlg-settings""#)
+            .expect("the settings dialog")
+            .1
+            .split_once("</dialog>")
+            .expect("its end")
+            .0;
+        assert!(dlg.contains("dlg-backup"), "the pane is outside the settings dialog");
     }
 }
