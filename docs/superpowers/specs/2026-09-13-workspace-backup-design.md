@@ -221,7 +221,7 @@ for the same reason.
 |---|---|---|
 | `MAX_TRANSCRIPTS` | 50 | Newest first. `claudehist::MAX_SCANNED` is 30 for a menu; a backup should reach further than a menu, and 50 covers 21 of this host's 24 project directories whole. |
 | `MAX_TRANSCRIPT_BYTES` | 32 MB | The largest transcript measured is 25.7 MB. |
-| `MAX_TOTAL_BYTES` | 512 MB | The entire 24-project corpus is 407 MB, so this cannot be hit by one honest project today, and it bounds the file a user is asked to find room for. |
+| `MAX_TOTAL_BYTES` | 128 MB | **Revised during implementation, from 512 MB.** An archive is restored by uploading it, so one larger than `max_upload_bytes` is a backup roost cannot read back — 512 MB promised a file only a one-way trip could produce. 128 MB sits above the 100 MB default with headroom for a raised one, and it is also what bounds the walk's peak memory, below. |
 | `MAX_MEMORY_BYTES` | 1 MB total | roost's is 20 KB. This is a text notebook, not a store. |
 
 **Every one of them names itself when it fires**, with the transcript it
@@ -366,12 +366,19 @@ than a cloned repo raising a disk ceiling."
 
 Two more that #18 does not ask.
 
-**The archive is streamed, never staged on disk.** The GET writes it to the
-socket as it reads; roost does not put a file containing every credential the
-machine has seen into `/tmp` on the way out, and there is therefore no
+**The archive is never staged on disk.** roost does not put a file containing
+every credential the machine has seen into `/tmp` on the way out, so there is no
 temp file to leak, to chmod, or to forget to delete when the connection drops
-halfway. This is the one clear win the download has over the CLI draft, which
-had to write the file somewhere and argue about its mode.
+halfway. This is the clear win the download has over the CLI draft, which had to
+write the file somewhere and then argue about its mode.
+
+It is built in memory rather than streamed entry-by-entry, which the
+implementation settled and which is worth recording because the first draft
+said "streamed". The header carries the report, the report is not known until
+the walk has finished, and the header is the first line — so streaming would
+mean either a trailer nobody would look for or a second pass over files that
+may have changed underneath. `MAX_TOTAL_BYTES` is what makes buffering safe,
+and is the reason it was revised down.
 
 **The download inherits the tunnel, and that is a real exposure, stated.** #18
 is right that moving a transcript off the machine is the point of the feature

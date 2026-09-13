@@ -304,6 +304,387 @@ fn take_line(buf: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
     }
 }
 
+/// Conversations examined, newest first. `claudehist::MAX_SCANNED` is 30
+/// because it is filling ten menu rows; a backup should reach further than a
+/// menu, and 50 covers 21 of this host's 24 project directories whole.
+pub const MAX_TRANSCRIPTS: usize = 50;
+/// One conversation. The largest measured on this host is 25.7 MB.
+pub const MAX_TRANSCRIPT_BYTES: u64 = 32 * 1024 * 1024;
+/// The archive.
+///
+/// Not the 512 MB an earlier draft of the spec had, and the reason is worth
+/// keeping: an archive is restored by *uploading* it, so one larger than
+/// `config::max_upload_bytes` (100 MB by default) is a backup roost cannot
+/// read back. A ceiling above that default leaves headroom for a raised one
+/// without ever promising a file that only a one-way trip can produce. It also
+/// bounds peak memory — see `collect_in` on why the walk buffers.
+pub const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+/// The project's `memory/` directory, in total. roost's is 20 KB; this is a
+/// notebook, not a store.
+pub const MAX_MEMORY_BYTES: u64 = 1024 * 1024;
+
+/// Something the walk chose not to take, or could not.
+///
+/// Each variant carries **the cap it hit**, not just the fact that one did.
+/// A bare count renders as "1 skipped" whichever rule fired, which is a
+/// message that passes a test and answers no question the user has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Skip {
+    TooBig { id: String, bytes: u64, cap: u64 },
+    TooMany { cap: usize, dropped: usize },
+    TotalFull { cap: u64, dropped: usize },
+    /// *Could not look* at one file inside a directory that was itself
+    /// readable. Kept apart from the decisions above for the reason
+    /// `search::Results` keeps its three counters apart: "could not look" and
+    /// "chose not to" are different answers, and only one of them is a gap.
+    Unreadable { id: String },
+}
+
+impl Skip {
+    fn line(&self) -> String {
+        match self {
+            Skip::TooBig { id, bytes, cap } => format!(
+                "{} is {} (MAX_TRANSCRIPT_BYTES is {})",
+                short(id),
+                mb(*bytes),
+                mb(*cap)
+            ),
+            Skip::TooMany { cap, dropped } => {
+                format!("{dropped} older than the newest {cap} (MAX_TRANSCRIPTS is {cap})")
+            }
+            Skip::TotalFull { cap, dropped } => {
+                format!("{dropped} would not fit (MAX_TOTAL_BYTES is {})", mb(*cap))
+            }
+            Skip::Unreadable { id } => format!("{} could not be read", short(id)),
+        }
+    }
+}
+
+fn mb(n: u64) -> String {
+    format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+}
+
+/// An id, shortened the way the ✻ menu shortens one. Full ids are 36
+/// characters and four of them in a note is a wall.
+fn short(id: &str) -> String {
+    if id.chars().count() > 8 {
+        format!("{}…", id.chars().take(8).collect::<String>())
+    } else {
+        id.to_string()
+    }
+}
+
+/// What the walk took and what it left. Rendered into the archive's header so
+/// that whoever opens the file reads it at the moment it matters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Report {
+    pub layout: bool,
+    pub sessions: usize,
+    pub conversations: usize,
+    pub memories: usize,
+    pub skipped: Vec<Skip>,
+}
+
+fn plural(n: usize, one: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {one}s")
+    }
+}
+
+impl Report {
+    /// The lines that go in the header, and the whole of what a user is told.
+    ///
+    /// A skip is never folded into the count above it. CLAUDE.md, on the
+    /// search results this copies: "All three used to render as an empty note,
+    /// which is the same defect as the table below wearing a quieter coat: no
+    /// crash, no lost shell, and no way for the user to tell."
+    pub fn notes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut took: Vec<String> = Vec::new();
+        if self.layout {
+            took.push("layout".into());
+        }
+        if self.sessions > 0 {
+            took.push(plural(self.sessions, "terminal"));
+        }
+        if self.conversations > 0 {
+            took.push(plural(self.conversations, "conversation"));
+        }
+        if self.memories > 0 {
+            took.push(plural(self.memories, "memory file"));
+        }
+        out.push(if took.is_empty() {
+            // Not an empty string. A backup that captured nothing is a real
+            // outcome and has to read as one, or it renders as a blank line
+            // that looks like a rendering bug.
+            "nothing was captured".to_string()
+        } else {
+            took.join(", ")
+        });
+        if !self.skipped.is_empty() {
+            let n: usize = self
+                .skipped
+                .iter()
+                .map(|s| match s {
+                    Skip::TooMany { dropped, .. } | Skip::TotalFull { dropped, .. } => *dropped,
+                    _ => 1,
+                })
+                .sum();
+            out.push(format!("{} was not captured:", plural(n, "conversation")));
+            out.extend(self.skipped.iter().map(|s| s.line()));
+        }
+        out
+    }
+}
+
+/// Everything roost knows about `project`, written to `w` as one archive.
+///
+/// `conversations` is the opt-in #18 asks for and nothing else turns it on.
+pub fn collect(
+    project: &str,
+    dir: &std::path::Path,
+    conversations: bool,
+    w: &mut impl Write,
+) -> Result<Report, String> {
+    let tdir = if conversations { crate::claudehist::transcript_dir(dir) } else { None };
+    collect_in(&crate::wsstate::state_dir(), tdir.as_deref(), project, dir, w)
+}
+
+/// The walk, with both directories passed in.
+///
+/// Split for the reason `claudehist::transcript_dir_in` is split, and it is
+/// the same reason: `HOME` and `ROOST_STATE_DIR` are process-global, so a test
+/// that set them would race every other test in the binary for one variable —
+/// "a flake in whichever test loses", as CLAUDE.md puts it. Here the split
+/// buys something further: the restore-at-a-different-path property can be
+/// tested by handing this two unrelated directories, which is the only way to
+/// test it that a same-name round trip does not fake.
+///
+/// **Entries are built in memory before anything is written.** The header
+/// carries the report, the report is not known until the walk finishes, and
+/// the header is the first line — so the alternative is a trailer nobody would
+/// look for or a second pass over files that may have changed underneath.
+/// `MAX_TOTAL_BYTES` is what makes this safe, and is sized in its own comment.
+pub fn collect_in(
+    state: &std::path::Path,
+    tdir: Option<&std::path::Path>,
+    project: &str,
+    dir: &std::path::Path,
+    w: &mut impl Write,
+) -> Result<Report, String> {
+    let key = crate::projects::storage_key(project);
+    let mut report = Report::default();
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut total: u64 = 0;
+
+    if let Ok(bytes) = std::fs::read(state.join(format!("{key}.json"))) {
+        total += bytes.len() as u64;
+        report.layout = true;
+        entries.push(Entry { kind: Kind::Workspace, id: String::new(), at: 0, bytes });
+    }
+
+    // The three per-session markers. A session with a record in one and not
+    // the others is normal — `cwds` only writes once a shell has moved, and
+    // `relaunch` only for a terminal roost started something in.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (kind, sub, suffix) in [
+        (Kind::Session, "claude", ".json"),
+        (Kind::Cwd, "cwd", ""),
+        (Kind::Launch, "launch", ""),
+    ] {
+        let d = state.join(sub).join(&key);
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(session) = name.strip_suffix(suffix) else { continue };
+            // A temp file from an interrupted atomic write (`.term.tmp.123`)
+            // is not a record; `valid_name` refuses the leading dot, so this
+            // is already handled, but the filter is what makes that true.
+            if !crate::session::valid_name(session) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(e.path()) else {
+                report.skipped.push(Skip::Unreadable { id: session.to_string() });
+                continue;
+            };
+            total += bytes.len() as u64;
+            seen.insert(session.to_string());
+            entries.push(Entry { kind, id: session.to_string(), at: 0, bytes });
+        }
+    }
+    report.sessions = seen.len();
+
+    if let Some(tdir) = tdir {
+        collect_conversations(tdir, &mut entries, &mut report, &mut total)?;
+    }
+
+    let header = Header {
+        project: project.to_string(),
+        created: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        roost: env!("CARGO_PKG_VERSION").to_string(),
+        source: dir.to_string_lossy().to_string(),
+        notes: report.notes(),
+    };
+    write_header(w, &header).map_err(|e| e.to_string())?;
+    for e in &entries {
+        write_entry(w, e).map_err(|e| e.to_string())?;
+    }
+    Ok(report)
+}
+
+/// The conversations half, and the one place this module departs from
+/// `claudehist`'s error model on purpose.
+///
+/// `claudehist::recent_in` opens with `let Ok(entries) = read_dir(tdir) else {
+/// return Vec::new() }`, and defends it at length: every failure folds to "no
+/// history", because the decision it feeds is *offer a menu or don't* and no
+/// shell dies of it.
+///
+/// **That reasoning does not transfer.** The decision here is "write a file
+/// the user will rely on and tell them it worked". An unreadable directory
+/// folded to an empty list produces a valid archive holding zero
+/// conversations, a cheerful summary, and a user who finds out on the day they
+/// restore. So a directory that cannot be enumerated at all is an `Err` and no
+/// archive is written — while a single file that cannot be read inside a
+/// directory that *was* enumerated is a `Skip::Unreadable`, named, and the
+/// archive is still written. The difference is whether "zero" is
+/// distinguishable from "none", and only in the first case is it not.
+fn collect_conversations(
+    tdir: &std::path::Path,
+    entries: &mut Vec<Entry>,
+    report: &mut Report,
+    total: &mut u64,
+) -> Result<(), String> {
+    let rd = match std::fs::read_dir(tdir) {
+        Ok(rd) => rd,
+        // A directory that has never existed is not a failure: a project where
+        // Claude has never run has no conversations, and that is an answer.
+        // Anything else — a permission error, an I/O error — is "cannot look".
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "cannot read this project's conversations at {}: {e}. \
+                 Refusing rather than writing a backup with none in it.",
+                tdir.display()
+            ))
+        }
+    };
+    let mut found: Vec<(u64, String, std::path::PathBuf, u64)> = Vec::new();
+    for e in rd.flatten() {
+        let path = e.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let Some(id) = name.strip_suffix(".jsonl") else { continue };
+        if !crate::claudesess::valid_session_id(id) {
+            continue;
+        }
+        let Ok(md) = e.metadata() else {
+            report.skipped.push(Skip::Unreadable { id: id.to_string() });
+            continue;
+        };
+        if !md.is_file() {
+            continue;
+        }
+        let at = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        found.push((at, id.to_string(), path, md.len()));
+    }
+    // Newest first, and by id where two share a timestamp, so the set taken is
+    // the same set on a second run. `claudehist::recent_in` sorts identically.
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    if found.len() > MAX_TRANSCRIPTS {
+        report
+            .skipped
+            .push(Skip::TooMany { cap: MAX_TRANSCRIPTS, dropped: found.len() - MAX_TRANSCRIPTS });
+        found.truncate(MAX_TRANSCRIPTS);
+    }
+    let mut no_room = 0usize;
+    for (at, id, path, len) in found {
+        if len > MAX_TRANSCRIPT_BYTES {
+            report.skipped.push(Skip::TooBig { id, bytes: len, cap: MAX_TRANSCRIPT_BYTES });
+            continue;
+        }
+        if *total + len > MAX_TOTAL_BYTES {
+            no_room += 1;
+            continue;
+        }
+        // Read before the entry is written, so the declared length is the
+        // length actually captured: a transcript is appended to by a live
+        // Claude, and a header written from the `metadata` above would state a
+        // size the payload no longer has.
+        let Ok(bytes) = std::fs::read(&path) else {
+            report.skipped.push(Skip::Unreadable { id });
+            continue;
+        };
+        // And re-checked against the bytes in hand, for the same reason: the
+        // file may have grown past the cap between the stat and the read.
+        if bytes.len() as u64 > MAX_TRANSCRIPT_BYTES {
+            report.skipped.push(Skip::TooBig {
+                id,
+                bytes: bytes.len() as u64,
+                cap: MAX_TRANSCRIPT_BYTES,
+            });
+            continue;
+        }
+        *total += bytes.len() as u64;
+        report.conversations += 1;
+        entries.push(Entry { kind: Kind::Transcript, id, at, bytes });
+    }
+    if no_room > 0 {
+        report.skipped.push(Skip::TotalFull { cap: MAX_TOTAL_BYTES, dropped: no_room });
+    }
+    collect_memory(&tdir.join("memory"), entries, report, total);
+    Ok(())
+}
+
+/// The project's `memory/` directory, if it has one.
+///
+/// Included because a backup of "the conversations" that dropped it would be
+/// quietly lossy: this is where Claude Code keeps what it was told to remember
+/// about the project, it is small, and it is the part a user would most
+/// notice missing. Unlike the transcripts it is *not* a reason to refuse the
+/// archive when unreadable — a project with no memory directory is the common
+/// case, so "cannot look" and "nothing there" are not distinguishable here in
+/// a way that could mislead anyone.
+fn collect_memory(
+    mem: &std::path::Path,
+    entries: &mut Vec<Entry>,
+    report: &mut Report,
+    total: &mut u64,
+) {
+    let Ok(rd) = std::fs::read_dir(mem) else { return };
+    let mut used: u64 = 0;
+    let mut names: Vec<String> = rd
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            valid_memory_name(&n).then_some(n)
+        })
+        .collect();
+    // Alphabetical, so a memory directory over the cap keeps the same files
+    // each time rather than whatever the directory happened to yield first.
+    names.sort();
+    for name in names {
+        let Ok(bytes) = std::fs::read(mem.join(&name)) else { continue };
+        let len = bytes.len() as u64;
+        if used + len > MAX_MEMORY_BYTES || *total + len > MAX_TOTAL_BYTES {
+            continue;
+        }
+        used += len;
+        *total += len;
+        report.memories += 1;
+        entries.push(Entry { kind: Kind::Memory, id: name, at: 0, bytes });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +871,238 @@ mod tests {
         let got = parse(&archive_of(&[])).expect("a header with no entries is an archive");
         assert!(got.entries.is_empty());
         assert_eq!(got.header.notes, vec!["layout, 1 conversation".to_string()]);
+    }
+
+    // ---- the walk ----
+
+    /// A state directory and a transcript directory, neither of them the
+    /// process's real ones. Everything below uses this rather than
+    /// `set_state_dir_for_test`, because `collect_in` takes both as
+    /// arguments — which is the point of the split, and what lets these tests
+    /// run in parallel with the rest of the binary without racing `HOME`.
+    struct Fixture {
+        root: std::path::PathBuf,
+        state: std::path::PathBuf,
+        tdir: std::path::PathBuf,
+        dir: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Fixture {
+            let root = std::env::temp_dir().join(format!(
+                "roost-bk-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let f = Fixture {
+                state: root.join("state"),
+                tdir: root.join("transcripts"),
+                dir: root.join("project"),
+                root,
+            };
+            for d in [&f.state, &f.tdir, &f.dir] {
+                std::fs::create_dir_all(d).unwrap();
+            }
+            f
+        }
+        fn layout(&self, key: &str, body: &str) {
+            std::fs::write(self.state.join(format!("{key}.json")), body).unwrap();
+        }
+        fn marker(&self, sub: &str, key: &str, name: &str, body: &str) {
+            let d = self.state.join(sub).join(key);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(name), body).unwrap();
+        }
+        fn transcript(&self, id: &str, body: &str) {
+            std::fs::write(self.tdir.join(format!("{id}.jsonl")), body).unwrap();
+        }
+        fn run(&self, project: &str, conversations: bool) -> (Report, Vec<u8>) {
+            let mut out = Vec::new();
+            let t = conversations.then(|| self.tdir.clone());
+            let r = collect_in(&self.state, t.as_deref(), project, &self.dir, &mut out)
+                .expect("the walk succeeded");
+            (r, out)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_layout_only_backup_holds_no_conversation_even_when_there_are_some() {
+        // The default, and #18's first security question answered in code:
+        // "Is the transcript included by default, or is workspace layout only
+        // the default and conversations an explicit extra?"
+        let f = Fixture::new("layoutonly");
+        f.layout("proj", r#"{"sizes":[1]}"#);
+        f.transcript("864ee734-e3ab-434e-8278-745a850b16ad", "{}\n");
+        let (r, raw) = f.run("proj", false);
+        assert!(r.layout);
+        assert_eq!(r.conversations, 0);
+        let a = parse(&raw).unwrap();
+        assert_eq!(a.entries.len(), 1, "only the layout");
+        assert_eq!(a.entries[0].kind, Kind::Workspace);
+        // The transcript existed and was readable, so a zero here is a
+        // decision rather than a failure — and the same call with the flag on
+        // must find it, or this test proves nothing about the flag.
+        let (r2, _) = f.run("proj", true);
+        assert_eq!(r2.conversations, 1, "the fixture's transcript is reachable");
+    }
+
+    #[test]
+    fn conversations_come_with_the_flag_and_the_header_says_what_was_taken() {
+        let f = Fixture::new("withconv");
+        f.layout("proj", "{}");
+        f.marker("claude", "proj", "term.json", r#"{"session_id":"abc","event":"Stop"}"#);
+        f.marker("cwd", "proj", "term", "/home/claude/projects/proj");
+        f.transcript("864ee734-e3ab-434e-8278-745a850b16ad", "{\"a\":1}\n");
+        let (r, raw) = f.run("proj", true);
+        assert_eq!((r.layout, r.sessions, r.conversations), (true, 1, 1));
+        let a = parse(&raw).unwrap();
+        assert_eq!(a.header.notes[0], "layout, 1 terminal, 1 conversation");
+        // The same session appears under two kinds and is counted once: the
+        // number is terminals, not markers, and a reader told "2 terminals"
+        // for one terminal would go looking for the other.
+        assert_eq!(a.entries.iter().filter(|e| e.kind == Kind::Session).count(), 1);
+        assert_eq!(a.entries.iter().filter(|e| e.kind == Kind::Cwd).count(), 1);
+    }
+
+    #[test]
+    fn the_cap_that_fired_is_named_and_it_is_the_right_one() {
+        // A count of skips passes whichever cap fired. The message is the
+        // whole user-facing contract, so the message is what is asserted.
+        let f = Fixture::new("caps");
+        f.layout("proj", "{}");
+        f.transcript("aaaaaaaa-0000-0000-0000-000000000001", "small\n");
+        let big = "x".repeat(MAX_TRANSCRIPT_BYTES as usize + 1);
+        f.transcript("bbbbbbbb-0000-0000-0000-000000000002", &big);
+        let (r, raw) = f.run("proj", true);
+        assert_eq!(r.conversations, 1, "the small one was taken");
+        assert_eq!(r.skipped.len(), 1);
+        let notes = parse(&raw).unwrap().header.notes;
+        let joined = notes.join("\n");
+        assert!(joined.contains("1 conversation was not captured:"), "{joined}");
+        assert!(joined.contains("MAX_TRANSCRIPT_BYTES"), "the cap must name itself: {joined}");
+        assert!(joined.contains("bbbbbbbb…"), "and name what it dropped: {joined}");
+        // Not the other caps. A note that named every constant would satisfy
+        // the assertions above while telling the user nothing.
+        assert!(!joined.contains("MAX_TRANSCRIPTS is"), "{joined}");
+        assert!(!joined.contains("MAX_TOTAL_BYTES"), "{joined}");
+    }
+
+    #[test]
+    fn nothing_captured_reads_as_an_answer_rather_than_a_blank_line() {
+        let f = Fixture::new("empty");
+        let (_, raw) = f.run("proj", true);
+        assert_eq!(parse(&raw).unwrap().header.notes, vec!["nothing was captured".to_string()]);
+    }
+
+    #[test]
+    fn an_unreadable_conversation_directory_refuses_instead_of_backing_up_none() {
+        // The departure from claudehist's error model, and the reason this
+        // module has one of its own. Folding this to an empty list produces a
+        // valid archive with zero conversations and a summary that says so
+        // — indistinguishable from a project where Claude never ran.
+        //
+        // Revert-checked by giving the read_dir the same `Err(_) => return
+        // Ok(())` arm claudehist has. What came back was
+        // `Report { layout: true, conversations: 0, memories: 0, skipped: [] }`
+        // — not an error, not a skip, nothing anywhere to read as a warning.
+        // That report is the defect: a backup of a project with transcripts
+        // on disk, holding none of them, reporting complete success.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let f = Fixture::new("unreadable");
+            f.layout("proj", "{}");
+            f.transcript("aaaaaaaa-0000-0000-0000-000000000001", "x\n");
+            std::fs::set_permissions(&f.tdir, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let mut out = Vec::new();
+            let got = collect_in(&f.state, Some(&f.tdir), "proj", &f.dir, &mut out);
+            std::fs::set_permissions(&f.tdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Running as root defeats the fixture — the directory is readable
+            // whatever its mode — so the assertion is skipped rather than
+            // inverted. A test that silently passes as root is exactly the
+            // "passes for the wrong reason" class CLAUDE.md names.
+            if !nix_is_root() {
+                let e = got.expect_err("an unreadable directory must refuse");
+                assert!(e.contains("Refusing"), "{e}");
+                assert!(out.is_empty(), "and must not have written a partial archive");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn nix_is_root() -> bool {
+        // No libc dependency: root is the one user that can read a 0000
+        // directory it owns, so ask the filesystem instead of the uid.
+        let probe = std::env::temp_dir().join(format!("roost-rootprobe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&probe);
+        if std::fs::create_dir_all(&probe).is_err() {
+            return false;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000));
+        let readable = std::fs::read_dir(&probe).is_ok();
+        let _ = std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&probe);
+        readable
+    }
+
+    #[test]
+    fn a_missing_conversation_directory_is_an_answer_not_a_failure() {
+        // The other side of the test above, and the distinction the whole
+        // module turns on: "never existed" is *not there*, "cannot look" is a
+        // refusal, and collapsing the first into the second would refuse a
+        // backup of every project Claude has never been run in.
+        let f = Fixture::new("notranscripts");
+        f.layout("proj", "{}");
+        let mut out = Vec::new();
+        let r = collect_in(&f.state, Some(&f.root.join("nope")), "proj", &f.dir, &mut out)
+            .expect("a project where Claude never ran still backs up");
+        assert_eq!(r.conversations, 0);
+        assert!(r.layout);
+    }
+
+    #[test]
+    fn memory_files_travel_with_the_conversations() {
+        let f = Fixture::new("memory");
+        f.layout("proj", "{}");
+        std::fs::create_dir_all(f.tdir.join("memory")).unwrap();
+        std::fs::write(f.tdir.join("memory/MEMORY.md"), "- [a](a.md)\n").unwrap();
+        std::fs::write(f.tdir.join("memory/a.md"), "a fact\n").unwrap();
+        // Not a memory file: refused by name, not copied under a tidied one.
+        std::fs::write(f.tdir.join("memory/.hidden"), "no\n").unwrap();
+        let (r, raw) = f.run("proj", true);
+        assert_eq!(r.memories, 2);
+        let a = parse(&raw).unwrap();
+        let mut names: Vec<&str> =
+            a.entries.iter().filter(|e| e.kind == Kind::Memory).map(|e| e.id.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["MEMORY.md", "a.md"]);
+        // And they are off by default, with the conversations they belong to.
+        let (r2, _) = f.run("proj", false);
+        assert_eq!(r2.memories, 0);
+    }
+
+    #[test]
+    fn a_project_key_with_a_slash_reaches_its_own_state_and_no_one_elses() {
+        // A worktree is a project whose key is percent-encoded
+        // (`roost%2F.claude%2Fworktrees%2Fclaude-1`). The walk builds paths
+        // from `storage_key`, so a backup of the worktree must not pick up the
+        // parent's layout, and vice versa.
+        let f = Fixture::new("worktree");
+        f.layout("proj", r#"{"which":"parent"}"#);
+        f.layout("proj%2Fsub", r#"{"which":"child"}"#);
+        f.marker("claude", "proj%2Fsub", "term.json", "{}");
+        let (r, raw) = f.run("proj/sub", false);
+        assert_eq!((r.layout, r.sessions), (true, 1));
+        let a = parse(&raw).unwrap();
+        let ws = a.entries.iter().find(|e| e.kind == Kind::Workspace).unwrap();
+        assert_eq!(String::from_utf8_lossy(&ws.bytes), r#"{"which":"child"}"#);
     }
 }
