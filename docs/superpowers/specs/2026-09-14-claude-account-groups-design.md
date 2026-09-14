@@ -235,7 +235,11 @@ the prompt cache, which Claude Code rebuilds on the first message.
 
 - The account list: name, and the email, *not logged in*, or *unreadable*.
   `default` is always first and shows the email from `~/.claude.json` by the
-  same three-way read.
+  same three-way read. Each row is laid out with a usage column that this
+  step leaves empty: #92 fills it with the 5-hour, 7-day and per-model
+  windows, and the project header chip and ✻ menu rows below get the current
+  account's tightest window the same way. The row, the chip and the menu are
+  designed here so #92 adds numbers, not surfaces.
 - **Add account**: a name field, validated client-side by the same regex and
   again by the server. On success the server creates the profile and opens a
   terminal in the current project with `CLAUDE_CONFIG_DIR` set and `claude`
