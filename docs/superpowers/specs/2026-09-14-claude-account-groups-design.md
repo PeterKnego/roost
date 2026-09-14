@@ -2,7 +2,9 @@
 
 *2026-09-14. Status: designed, not implemented. Decisions from conversation on
 2026-09-14, after reading [claude-swap](https://github.com/realiti4/claude-swap)
-at commit 7187ce8. No issue yet.*
+at commit 7187ce8. Issue [#90](https://github.com/PeterKnego/roost/issues/90), step 1 of
+three, tracked as [#91](https://github.com/PeterKnego/roost/issues/91); quota
+is #92 and automatic switching #93.*
 
 ## What and why
 
