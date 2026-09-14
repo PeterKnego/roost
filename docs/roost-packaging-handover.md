@@ -504,6 +504,28 @@ statement in every package description and in the post-install message. A
 package manager install can make a user assume that the service is safe to
 expose.
 
+**6.5 — A release signing key, for self-update. Open; maintainer-only.**
+`docs/superpowers/specs/2026-09-13-self-update-design.md` has roost verify a
+downloaded tarball against a minisign public key compiled into the binary
+before it replaces itself. Three things in that design live outside the
+repository and can only be done by the account owner:
+
+- Generate the keypair once, offline: `minisign -G`. Commit the public key as
+  `keys/roost.pub`; **never** commit the secret key.
+- Add the secret key and its password to the `release` GitHub environment as
+  `ROOST_MINISIGN_KEY` and `ROOST_MINISIGN_PASSWORD`, the same environment
+  that gates the crates.io and Homebrew publish jobs (see the comments in
+  `.github/workflows/publish-crates-io.yml` for why an environment secret and
+  not a repository secret).
+- Keep the secret key somewhere that survives this machine. A lost key means
+  every installed roost refuses future updates and its users run the shell
+  installer once — the same failure Tauri documents for its updater.
+
+No signing job runs on a pull request and `publish_prereleases` is unset, so
+the first end-to-end exercise of the key is the first tagged release after the
+feature merges. Whoever cuts that release clicks `Update` on a shell-installer
+copy before announcing it.
+
 ## 7. How this was checked
 
 Re-verified on 2026-09-06 against live sources rather than from memory:
