@@ -15,6 +15,7 @@
 - `ureq` is promoted from `[dev-dependencies]` to `[dependencies]` as `ureq = { version = "2.12", features = ["proxy-from-env"] }`; it is removed from dev-dependencies (a normal dependency is already visible to `tests/*.rs`). Verified in `Cargo.lock:1179-1182` — the tree already holds 2.12.1.
 - **The trust store stays `webpki-roots`.** `ureq`'s `default = ["tls", "gzip"]` and `tls = ["dep:webpki-roots", "dep:rustls", "dep:rustls-pki-types"]` (read from the vendored `ureq-2.12.1/Cargo.toml`). Do **not** add `native-certs` or `native-tls`: it drags OpenSSL into a static musl build. Behind a TLS-intercepting proxy the check reads `Unknown`, and that is accepted and recorded.
 - **`proxy-from-env` is enabled.** It is off in ureq's default set (`ureq-2.12.1/src/agent.rs:267-270` makes `try_proxy_from_env` default to the feature flag), so a default build ignores `HTTPS_PROXY` entirely.
+- **Promoting `ureq` puts `rustls` and `ring` into the shipped binary, and `ring` compiles C.** The release runners are fine: `dist plan --output-format=json` lists `sudo apt-get install musl-tools` under `packages_install` for both musl targets (read on the dev host on 2026-09-14). Two places are not: the container job in `ci.yml:92-94` builds `x86_64-unknown-linux-musl` after only `rustup target add`, and a dev host without `musl-tools`. Tried on 2026-09-14 with this exact promotion: `cargo build --target x86_64-unknown-linux-musl` failed at `ring v0.17.14` with `failed to find tool "x86_64-linux-musl-gcc"`. Task 6 fixes the CI step and corrects the packaging handover, which currently says the release binary has no crypto dependency.
 - **An explicit 10 s `timeout()` on the agent.** `AgentBuilder::timeout` (`ureq-2.12.1/src/agent.rs:490`) is the overall bound. ureq's own defaults are a 30 s connect timeout and *no* read timeout, so a half-open connection would park the detached thread forever and nothing waits on that thread.
 - **Endpoint `https://index.crates.io/ro/os/roost`**, derived — never spelled — by the sparse-index prefix rule: one character `1/`, two `2/`, three `3/{first}/`, four or more `{first two}/{next two}/`, applied to `CARGO_PKG_NAME`. The endpoint is **not** configurable at all, by any scope.
 - **User-Agent `roost/<version> (+https://github.com/PeterKnego/roost)`**, built from `CARGO_PKG_VERSION` and `CARGO_PKG_REPOSITORY`.
@@ -998,7 +999,7 @@ git commit -m "Record what a stored verdict does to the upgrade-and-restart case
 ### Task 6: The fetch — ureq, one flight, a detached thread, no escaping panic
 
 **Files:**
-- Modify: `Cargo.toml:45-49` (the tail of `[dependencies]` and all of `[dev-dependencies]`), `src/version.rs`
+- Modify: `Cargo.toml:45-49` (the tail of `[dependencies]` and all of `[dev-dependencies]`), `src/version.rs`, `.github/workflows/ci.yml:92-94` (the musl toolchain `ring` needs), `docs/roost-packaging-handover.md` (sections 2.5 and C3, which say there is no crypto dependency)
 - Test: `src/version.rs` `mod tests`
 
 **Interfaces:**
@@ -1031,6 +1032,35 @@ ureq = { version = "2.12", features = ["proxy-from-env"] }
 [dev-dependencies]
 tempfile = "3"
 ```
+
+`ring` now builds for the musl targets, and it compiles C. In `.github/workflows/ci.yml`, replace the `Install the musl target` step (lines 92-94):
+
+```yaml
+      # Runners have docker and the musl target is a rustup add away — and,
+      # since the version check promoted ureq, ring needs a C compiler that
+      # targets musl (cc-rs looks for x86_64-linux-musl-gcc, then musl-gcc).
+      # dist installs the same package on the release runners.
+      - name: Install the musl target
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+```
+
+In `docs/roost-packaging-handover.md`, section 2.5 (`~50-66`) opens with "The release binary has no TLS or crypto dependency at all" and C3 (`~118-125`) says "nothing in the tree needs a C toolchain beyond libc bindings". Both were true through 0.5.2 and stop being true here. Replace 2.5's first paragraph with:
+
+```markdown
+The release binary carries `rustls` and `ring` since the version check
+(#65 step 2) promoted `ureq` to a runtime dependency; before that both were
+dev-only. `ring` compiles C, so the musl targets need `musl-tools` on the
+build host — dist installs it on the release runners (`dist plan` lists it
+under `packages_install`), `ci.yml`'s container job installs it explicitly,
+and a dev host needs `sudo apt-get install musl-tools` once. There is still
+no `openssl`, `openssl-sys` or `native-tls` anywhere in the lock file.
+```
+
+and add one sentence to C3 after "Both musl targets were built …": "Since step 2, `ring` needs `musl-tools` as well; see 2.5."
+
+On a dev host, before `cargo build --target x86_64-unknown-linux-musl`: `sudo apt-get install musl-tools`. Then confirm the fix with that exact command; expected: `Finished`, and `file target/x86_64-unknown-linux-musl/debug/roost` reports a static executable.
 
 Then add to `src/version.rs`'s `mod tests`. Deleting the `IN_FLIGHT.swap` guard fails the single-flight test; deleting the `catch_unwind` fails `a_panicking_fetch_does_not_leave_the_guard_taken`; making a failed fetch overwrite `latest` fails `a_failed_check_keeps_the_last_good_latest`.
 
@@ -1308,7 +1338,7 @@ Expected: PASS, 19 tests. Also run `cargo build` and confirm it links.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock src/version.rs
+git add Cargo.toml Cargo.lock src/version.rs .github/workflows/ci.yml docs/roost-packaging-handover.md
 git commit -m "One flight, ten seconds, and a thread nothing can escape"
 ```
 
