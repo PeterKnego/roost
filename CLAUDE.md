@@ -303,7 +303,15 @@ the four traps that make a browser test pass while asserting nothing.
 
 ## Process
 
-Design docs live in `docs/superpowers/specs/`, implementation plans in
-`docs/superpowers/plans/`. For anything beyond a small fix, write the spec
-first and get it reviewed, then the plan, then implement task-by-task with a
-review between tasks.
+For anything beyond a small fix, three steps, each at its own time:
+
+1. **Brainstorm the feature or change, and put the outcome into a new
+   issue.** The problem, the decisions made, the shape. A brainstorm ends
+   there — no spec file, no branch, no PR.
+2. **When the issue is being worked on, write the spec** into
+   `docs/superpowers/specs/`, on the work branch, and get it reviewed.
+3. **Then the implementation plan**, into `docs/superpowers/plans/`, the same
+   way, and implement task-by-task with a review between tasks.
+
+The spec and the plan are written by whoever picks the issue up, when they
+pick it up — not ahead of time, and not as PRs of their own.
