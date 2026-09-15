@@ -3,3 +3,8 @@
 /.superpowers/
 /.claude/worktrees/
 /tests/browser/tmp/
+
+# roost's claudehooks::set backs up .claude/settings.local.json beside it before
+# rewriting. The live file is covered by the global gitignore; the backup was
+# not, and it dirtied the tree in front of every release preflight.
+/.claude/settings.local.json.bak
