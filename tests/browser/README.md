@@ -57,6 +57,7 @@ deno run -A tests/browser/popups.mjs     # the header's popups: one open at a ti
 deno run -A tests/browser/treefollow.mjs # the tree expands to the active file and marks it, without collapsing what the user opened
 deno run -A tests/browser/treemention.mjs # ctrl/shift-click picks tree rows and Alt+K mentions them, in tree order and bounded
 deno run -A tests/browser/watchdog.mjs   # the workspace connection's visible state, and send() refusing instead of silently dropping
+deno run -A tests/browser/paste.mjs      # the terminal key bar's paste button (#97): bracketed vs bare at the pty, and the textarea fallback when the clipboard says no
 deno run -A tests/browser/backup.mjs     # backing a workspace up and restoring it into a *different* project (#18 step 3) — needs its own HOME, like claudemenu.mjs
 ```
 
@@ -125,6 +126,14 @@ and one in `mdlinks.mjs` that passed while asserting nothing — and, in
 the tree ~3 times a second on its own. That last one was a real defect
 (`watch::is_access`), found only because the deleted-code check was actually
 performed.
+
+- In `paste.mjs`: `term.input` instead of `term.paste` fails B and D — and C,
+  which the plan had predicted would stay green. That prediction was wrong in a
+  useful direction: `paste` normalises the pasted newline to CR and `input`
+  does not, so C reports `"alpha\nbeta"` and `input` turns out to be wrong in
+  two ways. Hard-coding the wrapper instead fails **only** C, which is the pair
+  working — B alone passes against a button that always brackets, putting
+  literal escapes into every plain shell.
 
 - In `backup.mjs`: deriving the restore destination from the archive's own
   `header.source` instead of from the project being restored into — the

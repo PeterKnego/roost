@@ -161,6 +161,43 @@ function askText({ title, label = "", value = "", confirm = "OK" }) {
   }, null);
 }
 
+// The paste fallback (#97), reached when the Clipboard API is missing or says
+// no — and it is the half that always works, not the polite one.
+//
+// A <textarea> rather than `askText`'s <input>, for the case that matters: the
+// text people paste into a Claude prompt is multi-line, and a single-line
+// input silently drops everything after the first newline in some engines and
+// flattens it in others.
+//
+// Enter deliberately does NOT confirm, unlike `askText`. Enter is a newline
+// here, because this box exists to hold newlines; Send is the only way out,
+// which is why it is a button and says what it does.
+function askPasteText() {
+  const el = document.getElementById("dlg-paste");
+  return runDialog(el, (finish) => {
+    el.querySelector(".dlg-title").textContent = "Paste";
+    const lab = el.querySelector(".dlg-label");
+    // A person arrives here because something was refused, which is the worst
+    // moment to be terse: the instruction is the whole content of the dialog.
+    lab.textContent = "Long-press the box, choose Paste, then Send.";
+    lab.hidden = false;
+    const input = el.querySelector(".dlg-input");
+    input.value = "";
+    const okBtn = el.querySelector(".dlg-ok");
+    okBtn.textContent = "Send";
+    okBtn.disabled = false;
+    okBtn.classList.remove("danger");
+    // Not `.trim()`, and not `|| null`: leading and trailing whitespace is
+    // content in a paste — indentation is the obvious case — and this is the
+    // one dialog whose value is bytes rather than a name.
+    okBtn.onclick = () => finish(input.value === "" ? null : input.value);
+    el.querySelector(".dlg-cancel").onclick = () => finish(null);
+    // Focused on open, because focus is what makes the long-press offer a
+    // callout at all — the thing the terminal itself cannot do.
+    return () => input.focus();
+  }, null);
+}
+
 // Several positive answers and a Cancel: "start in a new worktree / start
 // here anyway / dismiss". Not a menu, because a menu is positioned at a
 // pointer and has no title or body to say what is being asked; not a

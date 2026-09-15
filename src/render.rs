@@ -1908,6 +1908,13 @@ pub fn workspace_page(
   <button type="button" data-k="down" aria-label="down">&#8595;</button>
   <button type="button" data-k="enter" aria-label="enter">&#9166;</button>
   <button type="button" data-k="ctrlc">^C</button>
+  <!-- #97. Last, after ^C: it is the only one here that is not a key, and the
+       six before it are in the order a hand reaches for them. iOS raises no
+       Paste callout over a terminal — xterm's rows are `user-select: none` and
+       its editable textarea is parked under the cursor, not under the finger —
+       so on a phone this button is the only way clipboard text reaches a
+       terminal at all. -->
+  <button type="button" data-k="paste">paste</button>
 </div>
 <nav id="mobilebar" aria-label="pane">
   <button type="button" data-mpane="0" aria-pressed="false">{SVG_M_TREE}<span>Files</span></button>
@@ -1940,6 +1947,21 @@ pub fn workspace_page(
   </div>
 </dialog>
 <dialog id="dlg-menu" class="roost"><div class="dlg-items"></div></dialog>
+<!-- #97's fallback, and load-bearing rather than polite: `navigator.clipboard`
+     is `undefined` outside a secure context, the permission can be refused, and
+     whether the bar's `pointerdown` satisfies the activation rule differs by
+     engine. A real <textarea> is exactly the editable element iOS will offer
+     its callout for, so a long-press works inside this where it does not over
+     the terminal. -->
+<dialog id="dlg-paste" class="roost">
+  <h2 class="dlg-title"></h2>
+  <label class="dlg-label" for="dlg-paste-text"></label>
+  <textarea id="dlg-paste-text" class="dlg-input" rows="4" autocomplete="off" spellcheck="false"></textarea>
+  <div class="dlg-buttons">
+    <button type="button" class="dlg-cancel">Cancel</button>
+    <button type="button" class="dlg-ok">Send</button>
+  </div>
+</dialog>
 <dialog id="dlg-choice" class="roost">
   <h2 class="dlg-title"></h2>
   <div class="dlg-body"></div>
@@ -4251,5 +4273,46 @@ mod tests {
         assert!(!h.contains(r#"<dialog id="dlg-choice" class="roost" hidden"#), "{h}");
         // Filled from JS with textContent, so it must ship empty.
         assert!(h.contains(r#"<div class="dlg-body"></div>"#), "the choice body must ship empty");
+    }
+
+    /// #97. The paste button and the dialog it falls back to.
+    ///
+    /// iOS raises no Paste callout over a terminal, so on a phone this button
+    /// is the only route from the clipboard into a shell.
+    #[test]
+    fn the_terminal_key_bar_offers_paste_and_the_page_ships_its_fallback() {
+        let h = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
+        let bar = h
+            .split_once(r#"<div id="termkeys""#)
+            .expect("the terminal key bar")
+            .1
+            .split_once("</div>")
+            .expect("its end")
+            .0;
+        assert!(bar.contains(r#"data-k="paste""#), "no paste button in the bar: {bar}");
+        // Last, after ^C. The six before it are keys in the order a hand
+        // reaches for them; this one is not a key, and putting it among them
+        // would move every button someone has already learned the position of.
+        let keys: Vec<&str> = bar.match_indices("data-k=\"").map(|(i, _)| {
+            let rest = &bar[i + 8..];
+            &rest[..rest.find('"').expect("a closing quote")]
+        }).collect();
+        assert_eq!(keys, vec!["esc", "tab", "up", "down", "enter", "ctrlc", "paste"], "bar order changed");
+
+        // The fallback shell, shipped empty: `askPasteText` fills the title and
+        // label with textContent, and the box must start empty or a stale
+        // paste would be sent by the next person who taps Send.
+        assert!(h.contains(r#"<textarea id="dlg-paste-text" class="dlg-input" rows="4""#), "{h}");
+        assert!(
+            h.contains(r#"autocomplete="off" spellcheck="false"></textarea>"#),
+            "the paste box must ship empty"
+        );
+        // A <dialog> is display:none without `open`; marking one `hidden`
+        // yields a dialog that can never be shown.
+        assert!(!h.contains(r#"<dialog id="dlg-paste" class="roost" hidden"#), "{h}");
+        // It carries the class the mobile 16px rule keys on. Without it iOS
+        // zooms the page when the box takes focus — on the one dialog that
+        // only ever opens on a phone.
+        assert!(h.contains(r#"id="dlg-paste-text" class="dlg-input""#), "{h}");
     }
 }
