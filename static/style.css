@@ -961,6 +961,10 @@ dialog.roost::backdrop { background: rgba(0,0,0,.35); }
 .dlg-input { width: calc(100% - 28px); margin: 0 14px; padding: 5px 7px;
              background: var(--bg); color: var(--fg); font: inherit;
              border: 1px solid var(--border); border-radius: 4px; }
+/* The paste fallback's box (#97). Tall enough to show that it takes more than
+   one line, and resizable only downward — a textarea that can be dragged wider
+   than its dialog is a scrollbar waiting to happen. */
+#dlg-paste-text { min-height: 84px; resize: vertical; font-family: var(--mono); }
 .dlg-detail { margin: 0 14px; max-height: 40vh; overflow: auto; border: 1px solid var(--border); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .dlg-buttons { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 14px; }
 .dlg-buttons button { padding: 5px 12px; border-radius: 4px; font: inherit;
@@ -1514,7 +1518,11 @@ header button.proj:hover svg { opacity: 1; }
 @media (max-width: 640px) {
   dialog.roost { width: calc(100vw - 24px); max-width: none; }
   .dlg-row { grid-template-columns: minmax(0, 1fr); }
-  #searchbox input, #dlg-input, .dlg-row input, .dlg-row textarea,
+  /* `.dlg-input`, not `#dlg-input`: #97 added a second one (the paste box, a
+     <textarea> with its own id) and an id selector would have missed it —
+     leaving exactly the iOS focus-zoom this block exists to prevent, on the
+     one dialog that only ever opens on a phone. */
+  #searchbox input, .dlg-input, .dlg-row input, .dlg-row textarea,
   .content textarea, .codeinput textarea { font-size: 16px; }
 }
 

@@ -3719,6 +3719,47 @@ function targetTerm() {
   return byPane || terms.get(lastFocusedSession) || null;
 }
 
+/// Clipboard text into a terminal, for the phone. #97.
+///
+/// iOS raises no Paste callout over a terminal: xterm's rows are
+/// `user-select: none` (the same fact `onSelectionChange` above is built on)
+/// and its editable textarea is parked under the cursor, not under the finger,
+/// so a long-press finds nothing to offer a menu about. This button is the only
+/// way clipboard text reaches a terminal on a phone.
+///
+/// **`term.paste`, never `term.input`.** `paste` is what wraps the text in
+/// `ESC [ 200 ~` … `ESC [ 201 ~` when the program turned bracketed paste on,
+/// and Claude Code turns it on. Through `input`, a multi-line paste arrives as
+/// a run of carriage returns — every line submitted as its own turn, which is
+/// worse than the bug this fixes. The bracketing is xterm's decision and not
+/// roost's: `paste` consults the mode the program set, so a plain shell still
+/// receives the text bare.
+async function pasteInto(entry) {
+  let text = null;
+  try {
+    // `undefined` outside a secure context, so the guard is not defensive
+    // decoration: a roost reached over plain http on a LAN address has no
+    // Clipboard API at all.
+    if (navigator.clipboard && navigator.clipboard.readText) {
+      text = await navigator.clipboard.readText();
+    }
+  } catch {
+    // Refused, or no user activation. Which of the two does not change what
+    // happens next, which is the point of having a fallback at all — the
+    // activation rules differ by engine and the engine that matters here
+    // cannot be tested on this host.
+    text = null;
+  }
+  // `null` is "could not read", `""` is "read it, it was empty". Only the
+  // first opens the dialog. Folding them together would reopen a prompt over
+  // a clipboard the user had genuinely emptied — this codebase's own "absence
+  // of evidence is not evidence of absence", pointed at a UI.
+  if (text === null) text = await askPasteText();
+  // Same route for both paths, so the bracketing rule above holds however the
+  // text arrived. `null` from a cancelled dialog pastes nothing.
+  if (text) entry.term.paste(text);
+}
+
 function initTermKeys() {
   const bar = document.getElementById("termkeys");
   if (!bar) return;
@@ -3735,6 +3776,10 @@ function initTermKeys() {
       e.preventDefault();
       const entry = targetTerm();
       if (!entry) return;
+      // Branched before the table, because a paste is neither of the two
+      // things `TERM_KEYS` holds: its values are `() => string`, and this is
+      // asynchronous and must not go through `term.input`. See `pasteInto`.
+      if (b.dataset.k === "paste") { pasteInto(entry); return; }
       const make = TERM_KEYS[b.dataset.k];
       if (!make) return;
       entry.term.input(make(entry.term));
