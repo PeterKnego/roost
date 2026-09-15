@@ -463,6 +463,15 @@ a container is a fourth substitution nothing else in the suite can see.
 
 ## Cutting a release
 
+**Write the release's [`RELEASES.md`](../RELEASES.md) entry first.** `dist`
+reads that file when it builds the release and uses the section whose heading
+matches the tag's version as the GitHub release body — verified by reading
+`announcement_title` and `announcement_changelog` back out of `dist plan
+--output-format=json`. An entry added after the tag never reaches the release
+page, and nothing fails at the time: the release publishes with dist's
+generated install instructions and no word about what changed. Preflight does
+not check this.
+
 ```sh
 make release VERSION=0.5.2
 ```
