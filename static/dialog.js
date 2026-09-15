@@ -84,7 +84,13 @@ function runDialog(el, fill, dismissed) {
     // throw.
     try {
       const ready = fill(finish);
-      el.showModal();
+      // `showModal` on an already-open dialog throws InvalidStateError. That
+      // can happen even with the `openDlg` guard above, because `openDlg` is
+      // cleared by `finish` while the platform's `close` event is still only
+      // queued — so for one turn the element is open and `openDlg` says
+      // nothing is. Asking the element itself is the question that cannot be
+      // stale.
+      if (!el.open) el.showModal();
       if (ready) ready();
     } catch (err) {
       openDlg = null;
@@ -152,6 +158,43 @@ function askText({ title, label = "", value = "", confirm = "OK" }) {
       // selects the whole thing, which is what a new file wants.
       input.setSelectionRange(value.lastIndexOf("/") + 1, value.length);
     };
+  }, null);
+}
+
+// The paste fallback (#97), reached when the Clipboard API is missing or says
+// no — and it is the half that always works, not the polite one.
+//
+// A <textarea> rather than `askText`'s <input>, for the case that matters: the
+// text people paste into a Claude prompt is multi-line, and a single-line
+// input silently drops everything after the first newline in some engines and
+// flattens it in others.
+//
+// Enter deliberately does NOT confirm, unlike `askText`. Enter is a newline
+// here, because this box exists to hold newlines; Send is the only way out,
+// which is why it is a button and says what it does.
+function askPasteText() {
+  const el = document.getElementById("dlg-paste");
+  return runDialog(el, (finish) => {
+    el.querySelector(".dlg-title").textContent = "Paste";
+    const lab = el.querySelector(".dlg-label");
+    // A person arrives here because something was refused, which is the worst
+    // moment to be terse: the instruction is the whole content of the dialog.
+    lab.textContent = "Long-press the box, choose Paste, then Send.";
+    lab.hidden = false;
+    const input = el.querySelector(".dlg-input");
+    input.value = "";
+    const okBtn = el.querySelector(".dlg-ok");
+    okBtn.textContent = "Send";
+    okBtn.disabled = false;
+    okBtn.classList.remove("danger");
+    // Not `.trim()`, and not `|| null`: leading and trailing whitespace is
+    // content in a paste — indentation is the obvious case — and this is the
+    // one dialog whose value is bytes rather than a name.
+    okBtn.onclick = () => finish(input.value === "" ? null : input.value);
+    el.querySelector(".dlg-cancel").onclick = () => finish(null);
+    // Focused on open, because focus is what makes the long-press offer a
+    // callout at all — the thing the terminal itself cannot do.
+    return () => input.focus();
   }, null);
 }
 
@@ -268,6 +311,106 @@ function askMenu({ items, x, y }) {
 // config file on the next dialog's Enter.
 let settingsSession = null;
 
+/// How this copy was installed, in one phrase.
+///
+/// Two fields make it, and neither is enough alone: the baked channel cannot
+/// tell Homebrew from a .deb from the tarball (identical bytes), and the path
+/// cannot tell `cargo install` from the shell installer, because
+/// `install-path = "CARGO_HOME"` puts both in ~/.cargo/bin. See
+/// src/install.rs.
+function installLabel(b) {
+  switch (b.owner) {
+    case "homebrew": return "Homebrew";
+    case "system-package": return "a system package";
+    case "cargo-bin":
+      // Three things write here, and only the channel separates them. The
+      // checkout arm covers `cargo install --git`, which the README offers
+      // for building off `develop`: it clones first, so it bakes `checkout`,
+      // and reading it as the shell installer contradicted the Upgrades row
+      // beside it.
+      if (b.channel === "cargo") return "cargo install";
+      if (b.channel === "checkout") return "cargo install from git";
+      if (b.channel === "release") return "the shell installer";
+      return "unknown";
+    case "other": return b.channel === "checkout" ? "built from a checkout" : "the release tarball";
+    default: return "unknown";
+  }
+}
+
+/// Who may replace this binary.
+///
+/// `replaceable` is a probe, not a guess — but a writable directory is not
+/// permission to write into it: Homebrew's Cellar is writable and
+/// overwriting it would leave `brew` describing a file that is not there.
+/// So a package manager's copy reads as managed however the probe came out,
+/// and only an install roost owns reads as replaceable.
+function upgradesLabel(b) {
+  // A checkout is nobody's to update but yours. #65 is blunt about it — "an
+  // upgrade button that ran `git pull` in someone's working tree would be the
+  // worst thing in this repository" — and the probe alone would say yes, since
+  // a target/ directory is writable by definition.
+  if (b.channel === "checkout") return "yours to rebuild";
+  if (b.owner === "homebrew" || b.owner === "system-package") {
+    return "whatever installed it";
+  }
+  if (b.replaceable === "yes") return "roost can replace this copy";
+  if (b.replaceable === "no") return "not writable by roost";
+  return "unknown";
+}
+
+/// The command a user must run, or `null` when there is nothing for them to
+/// type.
+///
+/// The tarball and shell-installer lines are what roost will one day do by
+/// itself for a copy it may replace (#65 step 4). Until that button exists, a
+/// copy roost will replace *one day* is the user's to replace *today*, so the
+/// line is shown whatever the probe said — an earlier cut withheld it to avoid
+/// contradicting a button that had not shipped, and left those users with
+/// nothing to type. When the button lands, the `replaceable === "yes"` case
+/// is the one it takes over.
+///
+/// The tarball is fetched with `curl` on purpose, and named exactly: a browser
+/// download is quarantined on macOS and the binary then hangs rather than
+/// failing (README), and only a browser sets that attribute.
+///
+/// `apt upgrade` is deliberately absent. No package repository is published —
+/// the `.deb` and `.rpm` are files on a releases page — so it would find
+/// nothing. Both commands are shown because `.deb` and `.rpm` install to the
+/// same place and nothing here knows which host this is; telling a Fedora user
+/// to run `apt` is the one wrong-command case worth spending two lines to
+/// avoid.
+function upgradeCommand(b) {
+  const known = (v) => (v && v !== "unknown" ? v : null);
+  const repo = known(b.repository);
+  switch (b.owner) {
+    case "homebrew":
+      return ["brew upgrade roost"];
+    case "system-package":
+      return ["sudo apt install ./roost_*.deb", "sudo dnf install ./roost-*.rpm"];
+    case "cargo-bin":
+      // All three live in ~/.cargo/bin; only the channel separates them.
+      if (b.channel === "cargo") return ["cargo install roost --force"];
+      if (b.channel === "checkout") return repo ? [`cargo install --git ${repo}`] : null;
+      if (b.channel === "release") {
+        return repo
+          ? [`curl --proto '=https' --tlsv1.2 -LsSf ${repo}/releases/latest/download/roost-installer.sh | sh`]
+          : null;
+      }
+      return null;
+    case "other": {
+      // Only a *release* tarball has a newer one to fetch; a checkout is
+      // "yours to rebuild" and a source tarball of unknown provenance has no
+      // download that is known to match it.
+      const target = known(b.target);
+      return b.channel === "release" && repo && target
+        ? [`curl -LO ${repo}/releases/latest/download/roost-${target}.tar.xz`]
+        : null;
+    }
+    default:
+      return null;
+  }
+}
+
 function openSettings(settings) {
   const el = document.getElementById("dlg-settings");
   const session = {};
@@ -288,6 +431,8 @@ function openSettings(settings) {
   const scopeBar = el.querySelector(".dlg-scope");
   const rows = el.querySelector(".dlg-rows");
   const themes = el.querySelector(".dlg-themes");
+  const about = el.querySelector(".dlg-about");
+  const backup = el.querySelector(".dlg-backup");
   const okBtn = el.querySelector(".dlg-ok");
   const cancelBtn = el.querySelector(".dlg-cancel");
 
@@ -297,7 +442,7 @@ function openSettings(settings) {
 
   function renderTabs() {
     tabs.replaceChildren();
-    for (const [id, label] of [["settings", "General"], ["theme", "Theme"]]) {
+    for (const [id, label] of [["settings", "General"], ["theme", "Theme"], ["backup", "Backup"], ["about", "About"]]) {
       const b = document.createElement("button");
       b.type = "button"; b.className = "dlg-tab"; b.dataset.tab = id; b.textContent = label;
       b.setAttribute("role", "tab"); b.setAttribute("aria-selected", String(pane === id));
@@ -307,7 +452,10 @@ function openSettings(settings) {
   }
   function renderScope() {
     scopeBar.replaceChildren();
-    const lab = document.createElement("span"); lab.textContent = "Scope:"; scopeBar.appendChild(lab);
+    const lab = document.createElement("span"); lab.textContent = "Writing to"; scopeBar.appendChild(lab);
+    // One segmented control, not two buttons with a gap between them: they are
+    // two states of one choice, and the styling says so.
+    const seg = document.createElement("div"); seg.className = "seg"; scopeBar.appendChild(seg);
     for (const [id, label] of [["project", "Project"], ["global", "Global"]]) {
       const b = document.createElement("button");
       b.type = "button"; b.dataset.scope = id; b.textContent = label;
@@ -323,7 +471,7 @@ function openSettings(settings) {
         if (previewTheme) { applyTheme(themeBefore); previewTheme = null; }
         render();
       };
-      scopeBar.appendChild(b);
+      seg.appendChild(b);
     }
     const f = document.createElement("span"); f.className = "file"; f.textContent = fileName(); scopeBar.appendChild(f);
   }
@@ -358,8 +506,9 @@ function openSettings(settings) {
   // Human labels for the keys. The key itself stays visible beside the label
   // in the mono face: it is what you would type into the file.
   const LABELS = {
-    hide: "Hidden names", show_hidden: "Show dot-files", autosave: "Autosave",
+    hide: "Hidden names", show_hidden: "Show dot-files", autosave: "Autosave", follow_tree: "Tree follows the open file",
     share_selection: "Share selection with Claude", worktree_prompt: "Offer a worktree for a second Claude",
+    relaunch: "Restart agents when a project opens",
     allowed_origins: "Allowed origins", max_upload_bytes: "Upload limit", ide: "IDE connection", roots: "Project roots",
   };
   function rowFor(r) {
@@ -484,14 +633,275 @@ function openSettings(settings) {
       document.head.insertBefore(l, document.head.firstChild);
     }
   }
+  /// What this binary is. `#56`: roost is deployed by building it and copying
+  /// a binary about, and nothing in the UI could answer "is this the thing I
+  /// built?" — a question this project has already got wrong twice (CLAUDE.md,
+  /// "Verify, don't trust") and once more on 2026-09-10, when a phone was
+  /// reported as still broken after a fix it had never fetched.
+  /// The four rows are `.dlg-row`s like every other pane's, so the label
+  /// column, the doc line under it and the fixed right-hand column all line up
+  /// with General — a settings dialog with a pane that lays itself out
+  /// differently reads as a different dialog. The values are values, not
+  /// settings, so the right column carries text rather than a control.
+  const ABOUT_ROWS = [
+    ["Version", "version", "The release this binary was built from."],
+    ["Commit", "commit", "Marked -dirty when the tree had uncommitted changes, and ? when git could not say."],
+    ["Built", "built", "When this binary was compiled, in your timezone."],
+    ["Repository", "repository", "Where the source is."],
+    ["Installed", "install",
+      "How this copy got here. Read from where the binary sits, because Homebrew, a system package and the release tarball are the same bytes."],
+    ["Upgrades", "upgrades",
+      "Whether roost could replace this copy itself, or whatever installed it owns that."],
+    ["Upgrade", "command",
+      "Run this to get a newer one. Where a package is named, download it first: no package repository is published. A tarball is fetched with curl on purpose \u2014 a browser download is quarantined on macOS and the binary then hangs."],
+  ];
+
+  function renderAbout() {
+    about.replaceChildren();
+    const b = (view && view.build) || {};
+    const value = (kind) =>
+      kind === "command" ? (upgradeCommand(b) || []).join(" / ")
+      : kind === "built" ? fmtBuilt(b.built_epoch)
+      : kind === "install" ? installLabel(b)
+      : kind === "upgrades" ? upgradesLabel(b)
+      : (b[kind] || "unknown");
+    for (const [label, kind, doc] of ABOUT_ROWS) {
+      // The only row that is not always there: absent where there is nothing
+      // to type — a checkout, an unknown owner, or a tarball whose target or
+      // repository the build did not record.
+      if (kind === "command" && !upgradeCommand(b)) continue;
+      const r = document.createElement("div");
+      r.className = "dlg-row";
+      const text = document.createElement("div"); text.className = "text";
+      const line = document.createElement("div"); line.className = "line";
+      const l = document.createElement("label"); l.textContent = label; line.appendChild(l);
+      text.appendChild(line);
+      const d = document.createElement("div"); d.className = "doc"; d.textContent = doc;
+      text.appendChild(d);
+
+      const v = value(kind);
+      const cell = document.createElement("div");
+      // `unknown` is a real answer here — a release tarball has no `.git` —
+      // so it is set back like a placeholder rather than shown as a value.
+      cell.className = "aboutval" + (v === "unknown" ? " empty" : "");
+      if (kind === "command") {
+        // <code> per line, built as elements: a command is data on this page
+        // like every other value here.
+        // `|| []` is not defensive habit: without it, removing the skip above
+        // throws mid-render, and because this is the last row the six before it
+        // are already in the DOM — so a crash looks exactly like the row being
+        // correctly absent. A revert check found that; the empty row this
+        // renders instead is visible, and asserted against.
+        for (const line of upgradeCommand(b) || []) {
+          const c = document.createElement("code");
+          c.textContent = line;
+          cell.appendChild(c);
+        }
+      } else if (kind === "repository" && v !== "unknown") {
+        const a = document.createElement("a");
+        a.href = v; a.textContent = "GitHub";
+        a.target = "_blank"; a.rel = "noopener noreferrer";
+        a.title = v;
+        cell.appendChild(a);
+      } else {
+        cell.textContent = v;
+      }
+      r.append(text, cell);
+      about.appendChild(r);
+    }
+  }
+
+  /// A build time as the reader's own local time. `0` means the build script
+  /// could not tell, which is a real answer and must not render as 1970.
+  function fmtBuilt(epoch) {
+    if (!epoch) return "unknown";
+    try { return new Date(epoch * 1000).toLocaleString(); } catch { return "unknown"; }
+  }
+
+
+  // ------------------------------------------------------------- backup pane
+  //
+  // #18 step 3. Two halves with very different risk, so they look different:
+  // a download, and a restore that always shows what it would do first.
+  //
+  // `withConversations` is deliberately **not** remembered — not in
+  // localStorage, not in `session`, not across a tab switch within one opening
+  // of this dialog. #18: a backup that includes transcripts must be "explicit,
+  // opt-in per project, and never a default", and warns that the dangerous
+  // shape is one "configured once and forgotten". A checkbox that comes back
+  // ticked is that shape. It resets every time this pane is drawn, so the
+  // warning beside it is read by whoever ticks it.
+  let restoreFile = null;      // the uploaded archive's name, once it is there
+  let restoreLines = [];       // the last report from the server
+  let restoreRefused = null;
+  let restoreBusy = false;
+
+  function renderBackup() {
+    backup.replaceChildren();
+    const withConversations = { on: false };
+
+    const section = (title, doc) => {
+      const g = document.createElement("div"); g.className = "dlg-group";
+      const t = document.createElement("div"); t.className = "title"; t.textContent = title;
+      const h = document.createElement("div"); h.className = "hint"; h.textContent = doc;
+      g.append(t, h); backup.appendChild(g); return g;
+    };
+
+    section(
+      "Download a backup",
+      "The layout of this project — its panes, tabs and terminals — as one file you keep.",
+    );
+
+    const optRow = document.createElement("div"); optRow.className = "dlg-row";
+    const optText = document.createElement("div"); optText.className = "text";
+    const optLine = document.createElement("div"); optLine.className = "line";
+    const optLab = document.createElement("label");
+    optLab.textContent = "Include conversations";
+    optLine.appendChild(optLab);
+    optText.appendChild(optLine);
+    const optDoc = document.createElement("div"); optDoc.className = "doc";
+    // The sentence #18 asks for, next to the control rather than in a doc
+    // nobody opens: this is the switch that moves the highest-value file on
+    // the machine off it.
+    optDoc.textContent =
+      "Every prompt, every file Claude read, and every command it ran and its output. "
+      + "Off unless you tick it, every time.";
+    optText.appendChild(optDoc);
+    const optBox = document.createElement("input");
+    optBox.type = "checkbox"; optBox.className = "bk-conversations";
+    optBox.checked = false;
+    optBox.onchange = () => { withConversations.on = optBox.checked; };
+    optRow.append(optText, optBox);
+    backup.appendChild(optRow);
+
+    const dl = document.createElement("button");
+    dl.type = "button"; dl.className = "bk-download"; dl.textContent = "Download";
+    dl.onclick = () => {
+      // A plain navigation, so the browser's own download machinery handles a
+      // large file — no blob in memory, and the progress bar is the one the
+      // user already knows.
+      const q = withConversations.on ? "?conversations=1" : "";
+      window.location.href = `/frag/${PROJECT}/backup${q}`;
+    };
+    backup.appendChild(dl);
+
+    section(
+      "Restore from a backup",
+      "Choose an archive. roost shows exactly what it would do before it does any of it.",
+    );
+
+    const pick = document.createElement("input");
+    pick.type = "file"; pick.className = "bk-file"; pick.accept = ".roostbak";
+    pick.onchange = () => {
+      const f = pick.files && pick.files[0];
+      if (!f) return;
+      restoreBusy = true; restoreLines = []; restoreRefused = null; render();
+      // Uploaded under a name of this moment, not the file's own.
+      //
+      // `POST /upload` refuses a name that is already in the project — it never
+      // overwrites, which is right and must stay. But the archive of a restore
+      // is exactly the file a person picks twice: once for the dry run they
+      // read and then thought better of, once for the real thing an hour later.
+      // Under its own name the second attempt fails with "already exists",
+      // which is a true sentence about a file they did not know roost had kept
+      // and no help at all.
+      //
+      // So the copy is stamped. It never collides, it never overwrites, and the
+      // report names it so it can be deleted — roost does not delete it,
+      // because removing a file because we finished reading it is the move
+      // CLAUDE.md's table is eleven rows of.
+      const stem = f.name.replace(/\.roostbak$/, "").replace(/[^A-Za-z0-9._-]/g, "-");
+      const name = `${stem}-${Date.now()}.roostbak`;
+      postFiles(`/upload/${PROJECT}`, [new File([f], name)], `upload ${name}`, (ok) => {
+        restoreBusy = false;
+        if (!ok) { restoreRefused = `${name} did not upload`; return render(); }
+        restoreFile = name;
+        restoreBusy = true;
+        // The dry run always comes first. The user never sends a restore they
+        // have not seen a listing for.
+        send({ t: "RestoreWorkspace", file: name, dry_run: true });
+        render();
+      });
+    };
+    backup.appendChild(pick);
+
+    if (restoreBusy) {
+      const b = document.createElement("div"); b.className = "hint bk-busy";
+      b.textContent = "Working…";
+      backup.appendChild(b);
+    }
+
+    if (restoreRefused) {
+      const r = document.createElement("div");
+      r.className = "dlg-warning bk-refused";
+      r.textContent = restoreRefused;
+      backup.appendChild(r);
+    }
+
+    if (restoreLines.length) {
+      const list = document.createElement("div"); list.className = "bk-report";
+      for (const line of restoreLines) {
+        const p = document.createElement("div"); p.className = "bk-line";
+        // textContent: every one of these carries a path from the server.
+        p.textContent = line;
+        list.appendChild(p);
+      }
+      backup.appendChild(list);
+    }
+
+    // The second click, and only after a listing has come back. A restore
+    // button that is available before the dry run would let someone restore an
+    // archive they have not looked at, which is the whole thing the dry run is
+    // for.
+    if (restoreFile && restoreLines.length && !restoreRefused && !restoreBusy) {
+      const go = document.createElement("button");
+      go.type = "button"; go.className = "bk-restore danger";
+      go.textContent = "Restore now";
+      go.onclick = () => {
+        restoreBusy = true; render();
+        send({ t: "RestoreWorkspace", file: restoreFile, dry_run: false });
+      };
+      backup.appendChild(go);
+    }
+  }
+
   function render() {
     renderTabs(); renderScope();
-    rows.hidden = pane !== "settings"; themes.hidden = pane !== "theme";
-    if (pane === "settings") renderRows(); else renderThemes();
+    rows.hidden = pane !== "settings";
+    themes.hidden = pane !== "theme";
+    about.hidden = pane !== "about";
+    backup.hidden = pane !== "backup";
+    // Nothing on this pane is editable, so the two controls that exist for
+    // editing have nothing to say: the scope switch chooses which file a
+    // change is written to, and Save writes it. Offering "Save" over four
+    // read-only values invites the question of what it would save.
+    // Backup joins About here for the same reason: nothing on it is written
+    // by Save. Its two actions carry their own buttons, because a download and
+    // a restore are not the same gesture as "apply these fields".
+    const readOnlyPane = pane === "about" || pane === "backup";
+    scopeBar.hidden = readOnlyPane;
+    cancelBtn.textContent = readOnlyPane ? "Close" : "Cancel";
+    okBtn.hidden = readOnlyPane;
+    if (pane === "settings") renderRows();
+    else if (pane === "theme") renderThemes();
+    else if (pane === "backup") renderBackup();
+    else renderAbout();
   }
 
   return runDialog(el, (finish) => {
     settingsOpen = {
+      onRestoreReport(ev) {
+        restoreBusy = false;
+        restoreRefused = ev.refused || null;
+        restoreLines = ev.lines || [];
+        // A real restore is finished: the archive it used should not be
+        // offerable a second time without a fresh listing, because the plan
+        // that listing described has already been carried out and the next one
+        // would be computed against a different machine state.
+        if (!ev.dry_run) restoreFile = null;
+        pane = "backup";
+        render();
+      },
       onSnapshot(s) {
         view = s;
         if (awaitingSave) {
@@ -566,10 +976,36 @@ function openSettings(settings) {
     // Escape and the backdrop go through runDialog's own finish; hook the
     // revert onto the dialog's close so every exit restores the preview.
     el.addEventListener("close", function onClose() {
+      // The event may not be ours. A `close` queued by a *previous* session is
+      // delivered after this one has opened, and it dispatches to every
+      // listener attached by then — including this one, which is why guarding
+      // on the session token alone is not enough: this session's own handler
+      // answers "yes, mine" to the previous session's event.
+      //
+      // `el.open` is what separates them. If the dialog is open right now,
+      // this close is not about the session that is showing.
+      if (el.open) return;
       el.removeEventListener("close", onClose);
+      // `close` is delivered asynchronously — `el.close()` queues it rather
+      // than dispatching inline — so a close followed by a reopen inside the
+      // same turn runs THIS handler after the next session has already
+      // installed itself. Nulling `settingsOpen` there kills the live
+      // session: app.js gates both `onSnapshot` and `onError` on it, so the
+      // confirming snapshot never reaches the dialog and it sits open with
+      // Save disabled, for good.
+      //
+      // That is the mechanism behind #49. The symptom was a different
+      // assertion failing almost every run of settings.mjs, always in a later
+      // section, because the wedged dialog is only noticed by whatever the
+      // next section happens to do with it.
+      //
+      // `settingsSession` is the token that already exists for exactly this —
+      // `endSession` checks it — and it has to be read BEFORE `endSession`
+      // clears it.
+      const mine = settingsSession === session;
       endSession();
-      if (settingsOpen) { settingsOpen = null; if (previewTheme) applyTheme(themeBefore); }
-    });
+      if (mine && settingsOpen) { settingsOpen = null; if (previewTheme) applyTheme(themeBefore); }
+    }, { once: false });
     render();
     return () => tabs.querySelector(".dlg-tab").focus();
   }, false);

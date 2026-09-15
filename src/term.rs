@@ -152,7 +152,7 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // path as keystrokes from the browser — and before any browser input
     // can arrive on this socket, so it lands at the shell's first prompt.
     if let Some(l) = att.launch {
-        let typed = crate::launch::keystrokes(l.launch, l.session_id.as_deref());
+        let typed = crate::launch::keystrokes(l.launch, l.session.as_ref());
         if let Err(e) = session::write_input(&att.key, &typed) {
             eprintln!("roost: could not start {:?} in {project}/{name}: {e}", l.launch);
         }

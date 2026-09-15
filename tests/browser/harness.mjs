@@ -116,16 +116,53 @@ export async function startBrowser(profileDir) {
     try { return (await fetch(`http://127.0.0.1:${port}/json/version`)).ok; } catch { return false; }
   }, 30, "chromium's debug port");
   if (!up) { try { proc.kill("SIGKILL"); } catch {} throw new Error(`${bin} never opened its debug port`); }
-  return { bin, port, close: () => { try { proc.kill("SIGKILL"); } catch {} } };
+  const kill = () => { try { proc.kill("SIGKILL"); } catch { /* already gone */ } };
+  return {
+    bin,
+    port,
+    // Every test calls this immediately after `page.close()` and awaits
+    // neither, so under coverage the browser was being SIGKILLed while the
+    // `takePreciseCoverage` round-trip was still in flight — the take then
+    // timed out after 30s and collected nothing, which is what the first two
+    // runs of this reported. The kill is deferred into the same drain the
+    // exit wrapper runs.
+    close: () => (COVERAGE ? deferredKills.push(kill) : kill()),
+  };
 }
 
 /// Opens a tab and returns a thin CDP client for it. `evalIn` runs an
 /// expression in the page and returns its value; that is the whole interface
 /// the tests need, because everything they assert about lives in app.js's own
 /// state (`terms`, an entry's socket, the xterm buffer).
+/// A desktop viewport, because the default one is a phone.
+///
+/// Headless Chromium opens at 780x493 here (measured), and `static/style.css`
+/// has had a `@media (max-width: 900px)` rule since the phone work landed — so
+/// every page this opens was silently rendering the ONE-PANE mobile layout,
+/// with `#mobilebar` visible and panes 0, 1 and 2 at 0x0. A test that never
+/// mentions a viewport was not testing "the default window"; it was testing
+/// the phone.
+///
+/// That took two tests down in ways that pointed nowhere near the cause.
+/// `autosave.mjs` typed into an editor whose pane was 0x0: a zero-sized
+/// textarea cannot take focus, so `focus()` left it on a terminal placeholder
+/// and `Input.insertText` went there instead — reported as "typing never
+/// reached the editor". `copyselect.mjs` got a 94-column terminal in which the
+/// command line no longer wrapped, so the row it matched by marker text was
+/// the command line rather than the output line, and its drag selected 16
+/// characters of shell prompt.
+///
+/// Set here rather than in each test so the next one cannot forget it. A test
+/// that wants a different viewport still calls
+/// `Emulation.setDeviceMetricsOverride` itself and overrides this — which is
+/// what `mobile.mjs` does, deliberately, with `mobile: true`.
+const DESKTOP = { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false };
+
 export async function openPage(cdpPort, url) {
   const t = await (await fetch(`http://127.0.0.1:${cdpPort}/json/new?${url}`, { method: "PUT" })).json();
-  return attachTarget(t.webSocketDebuggerUrl);
+  const p = await attachTarget(t.webSocketDebuggerUrl);
+  await p.cmd("Emulation.setDeviceMetricsOverride", DESKTOP);
+  return p;
 }
 
 /// Attaches a CDP client to a target that already exists — a tab opened by
@@ -172,20 +209,149 @@ export async function attachTarget(webSocketDebuggerUrl) {
       pending.set(i, { res, timer });
       ws.send(JSON.stringify({ id: i, method, params }));
     });
+  /// Collects the page's counters *now* and appends them.
+  ///
+  /// `takePreciseCoverage` both collects and resets, so calling this mid-test
+  /// loses nothing: what follows accumulates afresh and is taken again at
+  /// close, and coverage.mjs unions the two.
+  const snapshotCoverage = async () => {
+    if (!COVERAGE) return;
+    const taken = cmd("Profiler.takePreciseCoverage")
+      .then((r) => appendCoverage(r.result?.result ?? []))
+      .catch(() => {});
+    pendingCoverage.push(taken);
+    await taken;
+  };
+
+  // Anything that navigates throws the counters away, and the loss is silent:
+  // V8 keeps coverage per script instance, a reload makes a new one, and the
+  // take at close then reports functions that demonstrably ran as never
+  // entered. `roots.mjs` drives the whole add-root flow and then reloads in
+  // its last section, so `addRootFlow`, `sendAddRoot` and `renderRoots` were
+  // all reported at count 0 — and overview.js read as 76.52% when the
+  // functions in question are exercised end to end, with revert-checks
+  // recorded in that file's own header.
+  //
+  // Snapshotted here rather than by asking each test to remember, for the same
+  // reason `Deno.exit` is wrapped below: a line every future author has to
+  // remember is not a fix. A false positive costs one extra snapshot, which
+  // the union absorbs.
+  const NAVIGATES = /location\s*\.\s*(reload|assign|replace)\s*\(|location\s*\.\s*href\s*=|location\s*=|history\s*\.\s*(go|back|forward)\s*\(/;
   const evalIn = async (expression) => {
+    if (COVERAGE && NAVIGATES.test(expression)) await snapshotCoverage();
     const r = await cmd("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
     if (r.result?.exceptionDetails) throw new Error(r.result.exceptionDetails.exception?.description || "eval failed");
     return r.result?.result?.value;
   };
   await cmd("Runtime.enable");
+  // Coverage, when asked for. Off by default and entirely absent from a
+  // normal run: instrumentation changes what V8 does with the code under
+  // test, and this suite's whole value is that it drives the real thing.
+  //
+  // It has to be armed here rather than around a whole run because the
+  // counters live in the *page*, and every test closes its own page — so a
+  // collector that waited until the end would find nothing to read.
+  if (COVERAGE) {
+    await cmd("Profiler.enable");
+    await cmd("Profiler.startPreciseCoverage", { callCount: false, detailed: true });
+  }
   // Outstanding timers are cleared on close, or a 30s timer left armed by an
   // in-flight command keeps the process alive well past the last assertion.
+  //
+  // Async only when collecting: `close()` is called from a `finally` in every
+  // test and most do not await it, so the take below is fired and the socket
+  // is closed after it resolves. Tests that do await get the same behaviour.
   const close = () => {
-    for (const p of pending.values()) clearTimeout(p.timer);
-    pending.clear();
-    try { ws.close(); } catch { /* already gone */ }
+    const finish = () => {
+      for (const p of pending.values()) clearTimeout(p.timer);
+      pending.clear();
+      try { ws.close(); } catch { /* already gone */ }
+    };
+    if (!COVERAGE) return finish();
+    // Registered as well as returned. Every test calls `close()` from a
+    // `finally` without awaiting it and then calls `Deno.exit`, which would
+    // kill the process mid-round-trip and collect nothing — the first run of
+    // this reported 0 bytes for exactly that reason. `Deno.exit` is wrapped
+    // below to drain these first.
+    const taken = snapshotCoverage().finally(finish);
+    pendingCoverage.push(taken);
+    return taken;
   };
-  return { cmd, evalIn, close };
+  /// Brings this page back to the foreground, and proves it arrived.
+  ///
+  /// Opening a second tab puts the first into `visibilityState: "hidden"`,
+  /// and closing the second does **not** bring the first back. A hidden page
+  /// is served no `requestAnimationFrame` callbacks, while its timers,
+  /// websockets and event handlers all keep running — so the page half works,
+  /// which is far harder to recognise than a page that is plainly asleep.
+  ///
+  /// Measured, in `mobile.mjs`: xterm sizes `.xterm-scroll-area` inside one of
+  /// those callbacks, so after two tabs had been opened and closed a terminal
+  /// held 307 lines of scrollback, rendered every one of them, and had a
+  /// viewport with **nothing to scroll** — `scrollHeight` 585 over a
+  /// `clientHeight` of 585. `_innerRefresh` ran exactly once, before the
+  /// output arrived, and never again. It reads as a roost bug in the phone
+  /// layout and it is not one; it is this.
+  ///
+  /// So: any test that opens another page and then carries on driving an
+  /// earlier one has to call this, and asserting `visibilityState` here
+  /// rather than trusting the CDP reply is the difference between a fix and
+  /// a fix-shaped no-op.
+  const bringToFront = async () => {
+    await cmd("Page.bringToFront");
+    if (!await until(() => evalIn(`document.visibilityState === "visible"`), 10, "the page to come forward")) {
+      throw new Error("Page.bringToFront did not make the page visible — animation frames stay suspended");
+    }
+  };
+  return { cmd, evalIn, close, bringToFront, snapshotCoverage };
+}
+
+/// Set `ROOST_JS_COV=<file>` to append every page's V8 precise-coverage
+/// report to that file, one JSON object per line. `tests/browser/coverage.mjs`
+/// runs the suite this way and unions the result.
+const COVERAGE = Deno.env.get("ROOST_JS_COV") ?? null;
+
+/// Coverage takes still in flight when a test decides it is done, and the
+/// browser kills that must wait for them.
+const pendingCoverage = [];
+const deferredKills = [];
+/// Every fixture this process created, so none can be forgotten.
+const fixtureCleanups = [];
+
+// `Deno.exit` is every test's last statement, and it is synchronous — so
+// anything not already done by then is simply lost. Wrapping it lets the event
+// loop drain first, and keeps all 45 test files unchanged.
+//
+// Unconditional now, not gated on coverage, because the fixture cleanup rides
+// on it. Five separate test files shipped without `await fx.cleanup()`, each
+// leaving a live `dtach` master and a `/tmp/roost-browser-*` tree behind —
+// 74 trees and 9 shells were found on this host in one day. The reason it kept
+// happening is that **nothing fails when you forget it**: the test passes, the
+// suite is green, and the only symptom is litter nobody is looking for. A line
+// every future author has to remember is not a fix; this is.
+//
+// It also closes the no-browser path, which no per-test line could: every test
+// calls `startRoost` *before* `startBrowser`, so on a host with no Chromium the
+// skip below called `Deno.exit(0)` with a roost already spawned and listening —
+// leaking a server per file, which `fixture.cleanup` from a later run can never
+// find because it matches only dtach cmdlines under its own state dir.
+const realExit = Deno.exit.bind(Deno);
+Deno.exit = (code) => {
+  Promise.allSettled(pendingCoverage)
+    .then(() => { for (const k of deferredKills) k(); })
+    .then(() => Promise.allSettled(fixtureCleanups.map((f) => f())))
+    .finally(() => realExit(code));
+};
+
+/// Appends the entries for this project's own scripts. Everything else — the
+/// vendored libraries, the CDP shim, `about:blank` — is dropped here rather
+/// than at report time so the file stays small across forty test processes.
+async function appendCoverage(entries) {
+  const ours = entries.filter((e) => /\/static\/[^/]+\.js(\?|$)/.test(e.url ?? "")
+    && !/\/static\/vendor\//.test(e.url));
+  if (!ours.length) return;
+  await Deno.writeTextFile(COVERAGE, ours.map((e) => JSON.stringify(e)).join("\n") + "\n",
+    { append: true });
 }
 
 // ------------------------------------------------------------------- roost
@@ -220,6 +386,10 @@ export async function startRoost({ repoRoot, stateDir, roots, port, extraEnv = {
       // low turns a run into a soak test for the keepalive ping, so a browser
       // meets hundreds of them instead of two.
       ...(Deno.env.get("ROOST_PING_SECS") ? { ROOST_PING_SECS: Deno.env.get("ROOST_PING_SECS") } : {}),
+      // Same shape, same reason: cwds.rs re-walks /proc every 15s, and
+      // lostcwd.mjs has to see a `cd` reach the marker without either sleeping
+      // through it or replacing the real sampler with something faked.
+      ...(Deno.env.get("ROOST_CWD_POLL_SECS") ? { ROOST_CWD_POLL_SECS: Deno.env.get("ROOST_CWD_POLL_SECS") } : {}),
       // Every run gets its own Claude config dir, not just ide.mjs's.
       // `idelock.rs` writes a lock file per open project into
       // `$CLAUDE_CONFIG_DIR/ide/` (falling back to `~/.claude/ide/`), and a
@@ -349,24 +519,36 @@ export async function fixture({ autosave = true } = {}) {
   if (!autosave) await disableAutosave(project);
   const stateDir = `${base}/state`;
   await Deno.mkdir(stateDir, { recursive: true });
-  return {
-    base, roots, project: "proj", dir: project, stateDir,
-    cleanup: async () => {
-      // The shells this run started are dtach masters holding sockets under
-      // our state dir; nothing else on the machine can match that path.
-      await killByCmdline(stateDir);
-      await sleep(300);
-      // Reported, not swallowed. A bare `catch {}` here is how two abandoned
-      // /tmp/roost-browser-* trees and a live shell went unnoticed: the removal
-      // failed every run and said nothing, so the only symptom was litter
-      // nobody was looking for. A cleanup that cannot clean up has to say so.
-      try {
-        await Deno.remove(base, { recursive: true });
-      } catch (e) {
-        console.log(`    (cleanup: ${base} not removed — ${e.message})`);
-      }
-    },
+  let cleaned = false;
+  const cleanup = async () => {
+    // Idempotent, because it is now called from two places: the test's own
+    // `finally` (the fast path, which tears the tree down while the process is
+    // still healthy) and the exit drain above (the backstop). Running the
+    // removal twice would report a spurious failure from the second.
+    if (cleaned) return;
+    cleaned = true;
+    return doCleanup();
   };
+  fixtureCleanups.push(cleanup);
+  return {
+    base, roots, project: "proj", dir: project, stateDir, cleanup,
+  };
+
+  async function doCleanup() {
+    // The shells this run started are dtach masters holding sockets under our
+    // state dir; nothing else on the machine can match that path.
+    await killByCmdline(stateDir);
+    await sleep(300);
+    // Reported, not swallowed. A bare `catch {}` here is how two abandoned
+    // /tmp/roost-browser-* trees and a live shell went unnoticed: the removal
+    // failed every run and said nothing, so the only symptom was litter nobody
+    // was looking for. A cleanup that cannot clean up has to say so.
+    try {
+      await Deno.remove(base, { recursive: true });
+    } catch (e) {
+      console.log(`    (cleanup: ${base} not removed — ${e.message})`);
+    }
+  }
 }
 
 /// Where the browser profile goes. Snap-packaged Chromium is confined to

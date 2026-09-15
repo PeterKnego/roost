@@ -1,0 +1,758 @@
+//! roost on a phone: one pane at a time, and every affordance reachable by
+//! touch.
+//!
+//! #15, piece 2. Before this there was no phone layout at all — not a cramped
+//! one. `static/style.css` had no width breakpoint anywhere in a thousand
+//! lines; the workspace grid asks for ~790px of fixed columns before the
+//! middle pane gets a single pixel, and the viewport meta tells the browser to
+//! lay that out at 390px and try. roost was reachable from a phone and
+//! unusable on arrival.
+//!
+//! CLAUDE.md: "`tests/browser/` is the only thing that can see any of this. A
+//! mobile layout needs a CDP run at a phone viewport, and a skip is not a
+//! pass." So this file emulates a real device — width, DPR, `mobile: true` and
+//! touch — rather than merely narrowing the window, because the two differ in
+//! ways that matter here: `mobile: true` is what makes the viewport meta take
+//! effect, and without touch emulation `matchMedia` and tap targets are being
+//! asked the wrong question.
+//!
+//! The trap this file is written against is the one in tests/browser/README:
+//! at 390px almost everything is offscreen or zero-sized, so an assertion that
+//! merely finds an element, or reads a size without comparing it to the
+//! viewport, passes for the wrong reason. Every assertion here compares
+//! against the viewport or against the *other* panes.
+//!
+//! Run: deno run -A tests/browser/mobile.mjs
+import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startRoost, until }
+  from "./harness.mjs";
+
+const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
+let fail = 0;
+const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) fail++; };
+
+// A representative small phone. Narrower than an iPhone 15 (393) on purpose:
+// if it works here it works on the common sizes, and 390 is what #15 names.
+const PHONE = { width: 390, height: 844, deviceScaleFactor: 3, mobile: true };
+
+const fx = await fixture();
+await Deno.writeTextFile(`${fx.dir}/notes.md`, "# notes\n\nsome text\n");
+
+// A second project with a *realistic* name, on a realistic branch. The header
+// section below opens this one rather than `proj` on `main`, and that is the
+// whole point of it existing: with the short fixture names the header measured
+// 82px over two rows and this file was green, while a phone showed 130px over
+// three — the project and branch chips came to 131px and 194px and filled the
+// first row by themselves. The fixture never entered the state that breaks,
+// which is the failure mode CLAUDE.md names by name.
+const LONG_PROJECT = "mitsubishi2mqtt";
+const LONG_BRANCH = "power-cycle-detection";
+const longDir = `${fx.roots}/${LONG_PROJECT}`;
+await Deno.mkdir(longDir, { recursive: true });
+await Deno.writeTextFile(`${longDir}/a.md`, "# a\n");
+for (const args of [["init", "-q"], ["checkout", "-q", "-b", LONG_BRANCH]]) {
+  await new Deno.Command("git", { args, cwd: longDir, stdout: "null", stderr: "null" }).output();
+}
+
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const browser = await startBrowser(profileDir(repoRoot));
+let page;
+
+const load = async (metrics, project = fx.project) => {
+  const p = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${project}`);
+  await p.cmd("Emulation.setDeviceMetricsOverride", { ...metrics, screenOrientation: undefined });
+  if (metrics.mobile) {
+    await p.cmd("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
+  }
+  await until(() => p.evalIn("typeof state !== 'undefined' && !!state && ctrl && ctrl.readyState === 1"),
+    30, "app.js");
+  return p;
+};
+
+const visiblePanes = `[...document.querySelectorAll('#grid > .pane')]
+  .filter((p) => p.offsetParent !== null).map((p) => p.dataset.pane)`;
+const barVisible = `!!document.getElementById("mobilebar")?.offsetParent`;
+const termHost = `document.querySelector('.pane[data-pane="3"] .termhost')`;
+
+try {
+  page = await load(PHONE);
+  const { evalIn } = page;
+
+  console.log("A. one pane at a time, and a way to switch");
+  ok(await evalIn(barVisible), "the pane switcher is on screen");
+  ok((await evalIn(`document.querySelectorAll("#mobilebar button").length`)) === 4,
+     "with one button per pane");
+  // The assertion the whole change exists for. Not "the grid is narrow" —
+  // exactly one pane is in the layout, which is what makes the one on screen
+  // usable at all.
+  const shown = await evalIn(visiblePanes);
+  ok(shown.length === 1, `exactly one pane is laid out, got ${JSON.stringify(shown)}`);
+  ok(shown[0] === "3", "and it opens on the terminal — #15's whole point is talking to Claude");
+  ok((await evalIn(`document.querySelector('#mobilebar button[data-mpane="3"]').getAttribute("aria-pressed")`)) === "true",
+     "the switcher says which one that is");
+
+  console.log("B. the pane that is showing actually fills the phone");
+  // The trap this guards: at 390px a pane can be 'visible' and 8px wide, or
+  // pushed off the right edge entirely, and a test that only asked
+  // `offsetParent !== null` would call that a pass.
+  const box = await evalIn(`(() => { const p = document.querySelector('#grid > .pane[data-pane="3"]');
+    const r = p.getBoundingClientRect();
+    return { w: Math.round(r.width), h: Math.round(r.height), left: Math.round(r.left), right: Math.round(r.right) }; })()`);
+  ok(box.w > PHONE.width * 0.9, `the pane is ${box.w}px of a ${PHONE.width}px viewport`);
+  ok(box.left >= 0 && box.right <= PHONE.width + 1, `and it is on screen (${box.left}..${box.right})`);
+  ok(box.h > 300, `with usable height, got ${box.h}px`);
+  // Nothing may scroll the page sideways — the one thing the project's own
+  // rules call out by name.
+  ok((await evalIn(`document.documentElement.scrollWidth`)) <= PHONE.width + 1,
+     "and the document does not scroll horizontally");
+
+  console.log("B2. the widths that were actually broken");
+  // Measured on `develop` before this change: at 768px (every tablet) the
+  // middle pane rendered 2px wide and `scrollWidth` was 804 against a 768
+  // viewport — the whole page scrolling sideways, which the workspace rules
+  // forbid by name. A landscape phone at 844px was the same. Both are well
+  // clear of any 640px breakpoint, which is why this file checks them.
+  for (const [label, m] of [
+    ["tablet portrait", { width: 768, height: 1024, deviceScaleFactor: 2, mobile: true }],
+    ["phone landscape", { width: 844, height: 390, deviceScaleFactor: 3, mobile: true }],
+    ["a desktop window dragged to 800", { width: 800, height: 900, deviceScaleFactor: 1, mobile: false }],
+  ]) {
+    await page.cmd("Emulation.setDeviceMetricsOverride", m);
+    await sleep(250);
+    const panes = await evalIn(visiblePanes);
+    const docW = await evalIn(`document.documentElement.scrollWidth`);
+    ok(panes.length === 1 && docW <= m.width + 1,
+       `${label} (${m.width}px): one pane (${JSON.stringify(panes)}), no sideways scroll (${docW})`);
+  }
+  await page.cmd("Emulation.setDeviceMetricsOverride", PHONE);
+  await sleep(250);
+
+  console.log("B3. the header with a real project and branch name");
+  // Measured on a phone against `mitsubishi2mqtt` on `power-cycle-detection`:
+  // 130px over three rows, 28% of the screen gone before the terminal. The
+  // same code with this file's old `proj` on `main` measured 82px and 16%,
+  // which is why it was green while the phone was not.
+  const longPage = await load(PHONE, LONG_PROJECT);
+  const hdr = await longPage.evalIn(`(() => {
+    const h = document.querySelector("header");
+    // Visual rows, by clustering tops rather than counting distinct ones:
+    // controls of different heights are centred differently inside the same
+    // line, so the home icon sits 14px below the project name while plainly
+    // beside it. The first attempt counted three rows over an 82px header.
+    // (No backticks in here: this comment lives inside a template literal.)
+    const tops = [...h.children].map((c) => c.getBoundingClientRect())
+      .filter((r) => r.height).map((r) => r.top).sort((a, b) => a - b);
+    let rows = 0, last = -1e9;
+    for (const t of tops) { if (t - last > 24) { rows++; last = t; } }
+    const bar = document.getElementById("mobilebar").getBoundingClientRect().height;
+    const keys = document.getElementById("termkeys").getBoundingClientRect().height;
+    const wb = document.getElementById("wtbtn").getBoundingClientRect();
+    const bullet = h.querySelector(".gbullet");
+    const br = bullet && bullet.getBoundingClientRect();
+    return { h: Math.round(h.getBoundingClientRect().height), rows,
+             pct: Math.round(((h.getBoundingClientRect().height + bar + keys) / window.innerHeight) * 100),
+             bullet: !!br && br.width > 0 && br.right <= wb.right + 1 }; })()`);
+  ok(hdr.rows <= 2, `the header stays within two rows, got ${hdr.rows} (${hdr.h}px)`);
+  ok(hdr.h <= 100, `and under 100px, got ${hdr.h}px`);
+  // A budget, not a pixel count, so a control added to the header cannot
+  // quietly spend the screen: the number moving is fine, nobody noticing is
+  // not.
+  ok(hdr.pct <= 24, `header plus switcher plus keys is ${hdr.pct}% of the screen`);
+  // The branch *name* is what gives way, never the status beside it: a
+  // truncated `power-cycle-detect…` still reads, a missing dirty bullet does
+  // not say "clean". This is the assertion that fails if the whole button is
+  // clipped instead, which is what the first attempt did.
+  ok(hdr.bullet, "and the git status bullet survives the truncation");
+  // The two controls the phone layout drops, and the reason each is safe to
+  // drop: this asserts the trim actually happened, because a rule that stopped
+  // matching would show up here and nowhere else.
+  ok((await longPage.evalIn(`["refresh", "projbtn"].filter((id) => !!document.getElementById(id)?.offsetParent)`)).length === 0,
+     "refresh and the projects strip are dropped — the browser reload and the home link are their routes");
+  ok(await longPage.evalIn(`!!document.getElementById("bell")?.offsetParent && !!document.getElementById("settings")?.offsetParent`),
+     "while the ones with no other route stay");
+  try { await longPage.close(); } catch { /* already gone */ }
+  // Closing the tab that was in front does not hand the front back: this page
+  // stays `hidden`, and a hidden page is served no animation frames. E4 below
+  // depends on one — see `bringToFront` in harness.mjs.
+  await page.bringToFront();
+
+  console.log("B4. the front page, which is where you arrive");
+  // Reported from a phone: tiny text, hard to open a project. Two causes, and
+  // the first one hid the second.
+  //
+  // The front page had no `<meta name="viewport">` at all — the workspace page
+  // has always had one. So a phone laid it out at its default 980px and scaled
+  // the result down: every width rule was skipped and the text arrived about a
+  // third of its intended size. Measured before the fix: window.innerWidth 980
+  // on a 390px device.
+  const front = await openPage(browser.port, `http://127.0.0.1:${roost.port}/`);
+  await front.cmd("Emulation.setDeviceMetricsOverride", PHONE);
+  await front.cmd("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
+  await until(() => front.evalIn(`!!document.querySelector("#ovprojects .ovrow")`), 20, "the project list");
+  const fm = await front.evalIn(`(() => {
+    const row = document.querySelector("#ovprojects .ovrow");
+    const go = row.querySelector(".ovgo");
+    const gr = go && go.getBoundingClientRect();
+    return { vw: window.innerWidth, docW: document.documentElement.scrollWidth,
+             rowH: Math.round(row.getBoundingClientRect().height),
+             font: parseInt(getComputedStyle(row).fontSize, 10),
+             goShown: !!gr && getComputedStyle(go).visibility === "visible",
+             goH: gr ? Math.round(gr.height) : 0,
+             panes: [...document.querySelectorAll("#overview > .ovpane")]
+               .map((e) => Math.round(e.getBoundingClientRect().width)) }; })()`);
+  ok(fm.vw === PHONE.width,
+     `the page lays out at device width, not the 980px default (got ${fm.vw})`);
+  ok(fm.docW <= PHONE.width, `and does not scroll sideways (${fm.docW})`);
+  ok(fm.font >= 15, `rows are readable, ${fm.font}px`);
+  ok(fm.rowH >= 44, `and tappable, ${fm.rowH}px tall`);
+  // The one that actually stopped you getting in: `.ovgo`, the link that opens
+  // a project, is `visibility: hidden` until `:hover` — and a phone has no
+  // hover, so on a touch screen the way in was invisible on every row but the
+  // selected one.
+  ok(fm.goShown && fm.goH >= 44,
+     `the open link is visible and tappable without a hover (shown ${fm.goShown}, ${fm.goH}px)`);
+  ok(fm.panes.length === 2 && fm.panes.every((w) => w > PHONE.width * 0.9),
+     `both panes get the full width instead of 360px + a sliver (${JSON.stringify(fm.panes)})`);
+  try { await front.close(); } catch { /* already gone */ }
+  await page.bringToFront();
+
+  console.log("C. switching panes");
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="0"]').click()`);
+  ok(await until(async () => JSON.stringify(await evalIn(visiblePanes)) === '["0"]', 5, "the tree"),
+     "tapping Files shows the tree pane and only the tree pane");
+  ok((await evalIn(`document.querySelector('#mobilebar button[data-mpane="3"]').getAttribute("aria-pressed")`)) === "false",
+     "and the switcher moves with it");
+
+  console.log("D. opening a file brings its pane forward");
+  // The gesture route. Without it a tap on a file in the tree opens the editor
+  // in a pane that is not on screen — the intent goes out, the tab appears,
+  // and nothing visible happens at all, which is the phone version of a
+  // silent no-op.
+  ok(await until(() => evalIn(`!!document.querySelector('.pane[data-pane="0"] .content a.file')`), 15, "the tree"),
+     "the tree lists the project's files");
+  await evalIn(`[...document.querySelectorAll('.pane[data-pane="0"] .content a.file')]
+    .find((a) => a.textContent.includes("notes.md")).click()`);
+  ok(await until(async () => JSON.stringify(await evalIn(visiblePanes)) === '["2"]', 10, "the editor"),
+     "tapping a file switches to the editor pane");
+  ok(await until(async () => (await evalIn(`document.querySelector('.pane[data-pane="2"] .content')?.textContent ?? ""`)).includes("notes"), 10, "content"),
+     "and the file is what is in it");
+
+  console.log("E. the terminal is usable at this width");
+  // #15's argument is that the phone job is talking to Claude, so a phone
+  // layout that renders a terminal it cannot type into has done nothing. The
+  // assertion is on the *fitted column count*: an xterm in a pane that was
+  // never re-fitted keeps the 80 columns it was built with and clips, and
+  // "there is a terminal element" would pass either way.
+  // Started while a DIFFERENT pane is on screen, which is the ordinary case
+  // and the one with the bug in it: the terminal pane is `display:none` at
+  // that moment, so the xterm mounts measuring zero. Only the switch re-fits
+  // it. Starting it in the pane already showing would fit it by accident and
+  // this section would pass with `showMobilePane`'s fit deleted.
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="0"]').click()`);
+  const sess = await evalIn(`state.panes[3].tabs.find((t) => t.k === "Terminal")?.session ?? null`);
+  ok(!!sess, "the terminal pane has a session to start");
+  await evalIn(`send({ t: "StartTerminal", session: ${JSON.stringify(sess)} })`);
+  ok(await until(() => evalIn("terms.size > 0"), 30, "a terminal"), "its shell starts while its pane is hidden");
+  await sleep(800);
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="3"]').click()`);
+  await sleep(1200);
+  const grid = await evalIn(`(() => { const t = [...terms.values()][0].term; return { cols: t.cols, rows: t.rows }; })()`);
+  ok(grid.cols > 20 && grid.cols < 70,
+     `switching to it fits it to the phone, not 80 columns or 0 (got ${grid.cols}x${grid.rows})`);
+  const host = await evalIn(`(() => { const r = document.querySelector('.pane[data-pane="3"] .termhost').getBoundingClientRect();
+    return { w: Math.round(r.width), right: Math.round(r.right) }; })()`);
+  ok(host.right <= PHONE.width + 1, `and it does not run off the screen (right edge ${host.right})`);
+  // term.input, never term.paste: bash turns on bracketed paste, under which
+  // a pasted line is not run.
+  // JSON.stringify, not an escape written straight into the template
+  // literal: that way the carriage return is interpolated into the source
+  // sent to the page as a real CR, which leaves the string literal it sits
+  // inside unterminated. The page reports only "Invalid or unexpected
+  // token", with no hint that the test wrote it.
+  await evalIn(`[...terms.values()][0].term.input(${JSON.stringify("echo PHONE_OK" + String.fromCharCode(13))})`);
+  const screenText = `(() => { const b = [...terms.values()][0].term.buffer.active; let s = "";
+      for (let i = 0; i < b.length; i++) s += b.getLine(i).translateToString(true) + String.fromCharCode(10);
+      return s; })()`;
+  ok(await until(async () => (await evalIn(screenText)).includes("PHONE_OK"), 20, "the echo"),
+     "and it answers what is typed into it");
+
+  console.log("E2. touch targets");
+  // 44px is the floor Apple and Android both publish. The desktop sizes here
+  // are 20px, which is a miss on every attempt.
+  const small = await evalIn(`(() => {
+    const out = [];
+    for (const b of document.querySelectorAll("#mobilebar button, header button")) {
+      if (!b.offsetParent) continue;
+      const r = b.getBoundingClientRect();
+      if (r.height < 44 || r.width < 44) out.push((b.id || b.dataset.mpane || b.textContent.trim() || "?") + ":" + Math.round(r.width) + "x" + Math.round(r.height));
+    }
+    return out; })()`);
+  ok(small.length === 0, `every visible header/switcher control is at least 44x44 (small: ${JSON.stringify(small)})`);
+  // iOS zooms the page when a focused input is under 16px and does not zoom
+  // back out on blur, which strands the user at 2x with no way back.
+  ok((await evalIn(`getComputedStyle(document.getElementById("searchinput")).fontSize`)) === "16px",
+     "the search field is 16px, so focusing it does not zoom the page");
+
+  console.log("E3. the header popups open where the finger is");
+  // #projpanel has two triggers (HEADER_POPUPS in app.js: `projbtn` and
+  // `projname`) and is anchored `right: 8px` for the first of them. The phone
+  // trim hides `projbtn`, so the only thing left to tap is the project name on
+  // the LEFT while the panel opened hard against the right edge — measured at
+  // 390px, the name at x 35-85 and the panel at x 151-382, with nothing
+  // connecting them. Reported from a phone.
+  //
+  // Asserted against the viewport rather than against the trigger: the fix is
+  // that these span the screen, so "aligned with the button" is the wrong
+  // question. All three are checked because they are anchored to *different*
+  // sides, and a rule that caught one would be equally wrong about the others.
+  for (const [panel, trigger] of [["projpanel", "projname"], ["noticepanel", "bell"], ["wtpanel", "wtbtn"]]) {
+    await evalIn(`(() => { const t = document.getElementById(${JSON.stringify(trigger)});
+      t.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); t.click(); })()`);
+    await sleep(300);
+    const r = await evalIn(`(() => { const e = document.getElementById(${JSON.stringify(panel)});
+      if (!e || !e.offsetParent) return null; const b = e.getBoundingClientRect();
+      return { l: Math.round(b.left), r: Math.round(b.right) }; })()`);
+    ok(r && r.l <= 8 && r.r >= PHONE.width - 8,
+       `#${panel} spans the screen instead of hanging off one edge (${JSON.stringify(r)})`);
+    await evalIn(`document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }))`);
+    await sleep(150);
+  }
+
+  console.log("E4. the terminal scrolls under a finger");
+  // Reported from a phone as "sticking". `.xterm-viewport` is a real
+  // scrollable div, so it scrolls — and then hands the leftover delta to the
+  // page the moment it hits an end, which stalls the gesture and starts the
+  // next drag somewhere else.
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="3"]').click()`);
+  await sleep(300);
+  await evalIn(`[...terms.values()][0].term.input(${JSON.stringify("seq 1 300" + String.fromCharCode(13))})`);
+  ok(await until(async () => (await evalIn(screenText)).includes("300"), 20, "output"),
+     "a terminal with more output than fits");
+  // The precondition, asserted rather than assumed: xterm sizes the scroll
+  // area on an animation frame, so in a hidden page the next assertion fails
+  // for a reason that has nothing to do with the phone layout it is about.
+  ok(await evalIn(`document.visibilityState === "visible"`),
+     "the page is in front, so animation frames are being served");
+  const vp = `document.querySelector('.pane[data-pane="3"] .xterm-viewport')`;
+  ok(await until(async () => (await evalIn(`${vp} ? ${vp}.scrollHeight - ${vp}.clientHeight : 0`)) > 50, 10, "scrollback"),
+     "and it has somewhere to scroll to");
+  await evalIn(`${vp}.scrollTop = ${vp}.scrollHeight`);
+  const atBottom = await evalIn(`${vp}.scrollTop`);
+  const mid = await evalIn(`(() => { const r = ${vp}.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`);
+  // Raw touch events, not `Input.synthesizeScrollGesture`. Its touch path is
+  // inert in chrome-headless-shell — measured: a 400px touch gesture moved the
+  // viewport 3900 -> 3900 while the same gesture as `mouse` moved it to 3770,
+  // and a hand-dispatched touch sequence to 3700. A test built on it would
+  // have reported "the terminal does not scroll" forever, about a terminal
+  // that scrolls.
+  const touch = (type, y) => page.cmd("Input.dispatchTouchEvent",
+    { type, touchPoints: type === "touchEnd" ? [] : [{ x: mid.x, y }] });
+  const drag = async (from, steps) => {
+    await touch("touchStart", from);
+    for (let i = 1; i <= steps; i++) { await touch("touchMove", from + i * 25); await sleep(16); }
+    await touch("touchEnd", 0);
+    await sleep(500);
+  };
+  await drag(mid.y - 150, 8);
+  const scrolled = await evalIn(`${vp}.scrollTop`);
+  ok(scrolled < atBottom, `a finger dragged down scrolls the terminal back (${atBottom} -> ${scrolled})`);
+
+  // The half that was reported as sticking. `.xterm-viewport` is a real
+  // scrollable div, so it always scrolled; what it also did was hand the
+  // leftover delta to the page on reaching an end, which stalls the gesture
+  // and starts the next drag from somewhere else.
+  //
+  // Asserted on the computed property as well as the behaviour, and the
+  // distinction is worth being plain about: the drag above is a real gesture,
+  // while `overscroll-behavior` is checked as a *style* because the page in
+  // this layout has nothing to scroll anyway — so a behavioural check of the
+  // chaining would pass with the property removed. It is a regression guard
+  // on the fix, not a demonstration of it.
+  ok((await evalIn(`getComputedStyle(${vp}).overscrollBehaviorY`)) === "contain",
+     "and the gesture is kept inside the terminal rather than chaining to the page");
+  ok((await evalIn(`getComputedStyle(${vp}).touchAction`)) === "pan-y",
+     "with the browser told up front that a vertical drag is a scroll");
+  await drag(mid.y - 200, 16);
+  ok((await evalIn(`window.scrollY`)) === 0, "dragging past the top leaves the page where it was");
+
+  console.log("E5. the terminal key bar");
+  // Claude's TUI is driven with arrows and Enter, and a phone soft keyboard has
+  // neither — so its menus ("1. yes / 2. no", a file picker, a permission
+  // prompt) were simply unreachable. Reported from a phone.
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="3"]').click()`);
+  await sleep(400);
+  ok(await evalIn(`!!document.getElementById("termkeys")?.offsetParent`),
+     "the key bar is on screen with the terminal in front");
+  ok(await evalIn(`document.querySelector('#mobilebar button[data-mpane="0"]').click(), true`)
+     && await until(async () => !(await evalIn(`!!document.getElementById("termkeys")?.offsetParent`)), 5, "hidden"),
+     "and not over the file tree, where those keys mean nothing");
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="3"]').click()`);
+  await sleep(400);
+
+  // What the buttons actually send. Recorded at `term.input`, because the
+  // bytes are the whole point: an arrow is not one byte string, and a TUI that
+  // has set DECCKM expects ESC O A where a shell expects ESC [ A. Sending the
+  // wrong one moves nothing and looks like a dead button.
+  await evalIn(`window.__sent = []; (() => { const e = ${JSON.stringify("x")} && null; })();
+    (function () { const t = [...terms.values()][0].term; const orig = t.input.bind(t);
+      t.input = (d) => { window.__sent.push(d); return orig(d); }; })()`);
+  const press = async (k) => {
+    await evalIn(`(() => { const b = document.querySelector('#termkeys button[data-k="${k}"]');
+      b.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true })); })()`);
+    await sleep(120);
+  };
+  await press("up"); await press("down"); await press("enter"); await press("esc");
+  const sent = await evalIn(`window.__sent`);
+  ok(JSON.stringify(sent) === JSON.stringify(["\u001b[A", "\u001b[B", "\r", "\u001b"]),
+     `a shell at a prompt gets the normal cursor sequences: ${JSON.stringify(sent)}`);
+
+  // The mode-aware half. Putting the terminal into application-cursor-keys
+  // mode is what Claude's menus do, and the same button must then send a
+  // different sequence — this is the assertion that fails if the bytes are
+  // hard-coded, which is how the buttons would be dead exactly where they are
+  // needed.
+  await evalIn(`window.__sent = []; [...terms.values()][0].term.write("\u001b[?1h")`);
+  await sleep(400);
+  await press("up"); await press("down");
+  const appSent = await evalIn(`window.__sent`);
+  ok(JSON.stringify(appSent) === JSON.stringify(["\u001bOA", "\u001bOB"]),
+     `and a TUI in DECCKM gets the application ones: ${JSON.stringify(appSent)}`);
+  await evalIn(`[...terms.values()][0].term.write("\u001b[?1l")`);
+
+  console.log("E7. scrolling a running TUI");
+  // Last of the terminal sections on purpose: it puts the terminal on the
+  // alternate screen, and the normal-buffer scroll checked above wants its
+  // scrollback intact.
+  // The reported one: dragging inside a running Claude did nothing. The
+  // viewport is a real scrollable div, so on the *normal* buffer a finger has
+  // always worked — but a full-screen TUI switches to the alternate screen,
+  // where xterm keeps no scrollback by design, so there is nothing for the
+  // viewport to move. A desktop mouse gets past this without anyone noticing:
+  // xterm turns a wheel event into whatever the program asked for. A finger
+  // produces no wheel event, so app.js makes one.
+  //
+  // Recorded at `onData`, which is what the terminal actually sends, so this
+  // asserts the bytes rather than that a handler ran.
+  const term = `[...terms.values()][0].term`;
+  await evalIn(`window.__wire = []; ${term}.onData((d) => window.__wire.push(d));`);
+  // The modes a full-screen TUI turns on: alternate screen, application
+  // cursor keys, and SGR mouse reporting. Claude sets all three.
+  await evalIn(`${term}.write("\u001b[?1049h\u001b[?1h\u001b[?1000h\u001b[?1006h")`);
+  await until(() => evalIn(`${term}.modes.mouseTrackingMode !== "none"`), 10, "mouse reporting");
+  ok(await evalIn(`${term}.buffer.active.type === "alternate"`), "the terminal is on the alternate screen");
+  ok((await evalIn(`${term}.buffer.active.length - ${term}.rows`)) <= 0,
+     "which has no scrollback for a viewport drag to move — the reason a finger did nothing");
+
+  const at = await evalIn(`(() => { const r = ${termHost}.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`);
+  const dragOn = async (steps) => {
+    await page.cmd("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: at.x, y: at.y - 120 }] });
+    for (let i = 1; i <= steps; i++) {
+      await page.cmd("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: at.x, y: at.y - 120 + i * 20 }] });
+      await sleep(16);
+    }
+    await page.cmd("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    await sleep(500);
+  };
+  await evalIn(`window.__wire = []`);
+  await dragOn(6);
+  const wire = await evalIn(`window.__wire.join("")`);
+  // SGR mouse reports: ESC [ < 64 ; col ; row M is a wheel-up. This is what a
+  // desktop wheel produces, and now what a finger produces.
+  ok(/\u001b\[<6[45];\d+;\d+M/.test(wire),
+     `the drag reaches the program as wheel reports: ${JSON.stringify(wire.slice(0, 60))}`);
+
+  // Evenness, which is the difference between scrolling and stuttering.
+  // A terminal on the alternate screen can only move by whole rows — the
+  // program redraws, there is no sub-pixel anything — so the most it can do is
+  // put those steps where the finger asks for them.
+  //
+  // Handing xterm each touchmove's raw delta does not. Measured before the
+  // fix: a 120px drag in twenty even 6px steps produced eight row-steps on
+  // eight arbitrary frames and nothing on the other twelve, because each 6px
+  // delta was rounded on its own and 6/15 of a row rounds to nothing. The
+  // remainder is carried in app.js now, so the gaps between steps should be as
+  // regular as the row height allows.
+  // Matched on the plain substring, not a regex with an escape in it: an
+  // `\u001b` written inside this template literal is consumed here rather
+  // than reaching the page, and the first attempt at this recorded nothing
+  // for exactly that reason. "[<64;" and "[<65;" are the wheel-up and
+  // wheel-down SGR reports and appear in nothing else.
+  await evalIn(`window.__frame = 0; window.__at = [];
+    ${term}.onData((d) => { if (d.includes("[<64;") || d.includes("[<65;")) window.__at.push(window.__frame); });`);
+  await page.cmd("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: at.x, y: at.y - 60 }] });
+  for (let i = 1; i <= 20; i++) {
+    await evalIn(`window.__frame = ${i}`);
+    await page.cmd("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: at.x, y: at.y - 60 + i * 6 }] });
+    await sleep(16);
+  }
+  await page.cmd("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  const frames = await evalIn(`window.__at`);
+  const gaps = frames.slice(1).map((v, i) => v - frames[i]);
+  // 6px steps into a 15px row is one step every 2.5 frames, so alternating 2
+  // and 3 is exactly even. Anything wider than that is a stall the finger did
+  // not ask for — which is what was reported.
+  ok(gaps.length >= 4 && Math.max(...gaps) - Math.min(...gaps) <= 1,
+     `the row-steps are evenly spaced across the drag: gaps ${JSON.stringify(gaps)}`);
+  await sleep(400);
+
+  // Momentum, which is most of what "really bad" meant. The browser supplies
+  // inertia for a real scrollable div and for nothing else, so a translated
+  // gesture stops dead at the fingertip unless it is continued — a flick that
+  // moves six lines and halts does not read as scrolling.
+  //
+  // Measured across `touchend`: the count at the moment the finger lifts,
+  // against the count a few frames later.
+  await evalIn(`window.__wire = []`);
+  await page.cmd("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: at.x, y: at.y - 150 }] });
+  for (let i = 1; i <= 8; i++) {
+    await page.cmd("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: at.x, y: at.y - 150 + i * 30 }] });
+    await sleep(8);
+  }
+  await page.cmd("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  const atLift = await evalIn(`window.__wire.length`);
+  await sleep(700);
+  const afterGlide = await evalIn(`window.__wire.length`);
+  ok(afterGlide > atLift,
+     `a flick keeps scrolling after the finger lifts (${atLift} -> ${afterGlide} reports)`);
+
+  // With mouse reporting off but still on the alternate screen, the standard
+  // emulation every terminal does is arrow keys — in whichever cursor mode is
+  // set, since the wrong one moves nothing.
+  await evalIn(`${term}.write("\u001b[?1006l\u001b[?1000l"); window.__wire = [];`);
+  await until(async () => (await evalIn(`${term}.modes.mouseTrackingMode`)) === "none", 10, "reporting off");
+  await dragOn(6);
+  const keys = await evalIn(`window.__wire.join("")`);
+  ok(keys.includes("\u001bOA"),
+     `without mouse reporting it sends application cursor keys: ${JSON.stringify(keys.slice(0, 40))}`);
+  await evalIn(`${term}.write("\u001b[?1l\u001b[?1049l")`);
+  await sleep(300);
+
+  console.log("E6b. the keys do not summon a keyboard; tapping the terminal does");
+  // Reported: pressing an arrow brought the keyboard up over the half of the
+  // screen you were reading. Focusing xterm's hidden textarea is what opens a
+  // soft keyboard, and the handler used to call `term.focus()` after every
+  // key — while the whole point of these keys is to drive a menu *without*
+  // typing.
+  //
+  // Asserted through `document.activeElement`, which is the thing a keyboard
+  // actually follows. There is no way to observe the keyboard itself from
+  // here, and saying so is better than a test that implies otherwise.
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="3"]').click()`);
+  await sleep(300);
+  const helper = `document.querySelector('.pane[data-pane="3"] textarea')`;
+  const focused = async () => await evalIn(`document.activeElement === ${helper}`);
+  await evalIn(`${helper}.blur(); document.body.focus();`);
+  ok(!(await focused()), "setup: nothing is focused, so no keyboard would be up");
+
+  const pressKey = async (k) => {
+    await evalIn(`(() => { const b = document.querySelector('#termkeys button[data-k="${k}"]');
+      b.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerType: "touch" })); })()`);
+    await sleep(150);
+  };
+  await pressKey("up");
+  await pressKey("down");
+  await pressKey("enter");
+  ok(!(await focused()),
+     "pressing the arrows and Enter leaves the terminal unfocused — no keyboard");
+
+  // The route that raises one, and now the only route: tapping the terminal.
+  // A dedicated ⌨ button was tried and removed — the terminal already does
+  // this, and it was one more control competing for a row six keys wide.
+  //
+  // This is the assertion that keeps the change above honest: "the keys do
+  // not focus" is only a good thing while *something* still does.
+  const termRect = await evalIn(`(() => { const r = ${termHost}.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`);
+  await page.cmd("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: termRect.x, y: termRect.y }] });
+  await page.cmd("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  await sleep(400);
+  ok(await focused(), "tapping the terminal focuses it, which is what raises the keyboard");
+  ok(!(await evalIn(`!!document.querySelector('#termkeys button[data-k="keyboard"]')`)),
+     "and there is no separate keyboard button competing for the row");
+
+  console.log("E6c. the frame follows the visible viewport");
+  // A keyboard cannot be raised in headless, so what is checked here is the
+  // wiring it depends on, and the test says as much rather than implying the
+  // keyboard itself was exercised. Two numbers matter: `height`, which is how
+  // much is visible, and `offsetTop` — iOS does not shrink the layout
+  // viewport, it *scrolls* it, so the visible window slides down the page.
+  // The first version of this fix used only `height`, which is why it left
+  // the header off the top of the screen.
+  const vvars = await evalIn(`(() => {
+    const cs = getComputedStyle(document.documentElement);
+    return { h: cs.getPropertyValue("--vvh").trim(), top: cs.getPropertyValue("--vvtop").trim(),
+             realH: Math.round(window.visualViewport.height),
+             realTop: Math.round(window.visualViewport.offsetTop),
+             bodyPos: getComputedStyle(document.body).position }; })()`);
+  ok(vvars.h === `${vvars.realH}px`, `--vvh tracks the visible height (${vvars.h})`);
+  ok(vvars.top === `${vvars.realTop}px`, `--vvtop tracks how far it scrolled (${vvars.top})`);
+  ok(vvars.bodyPos === "fixed",
+     "and the workspace is a fixed frame, so nothing scrolls the document under it");
+  // The standards-track half of the same fix, and the reason the JS above is
+  // still needed: `interactive-widget=resizes-content` tells the browser to
+  // shrink the *layout* viewport for a keyboard, which makes `dvh` correct on
+  // its own — on Chromium. Safari has not shipped it. Both, therefore.
+  ok((await evalIn(`document.querySelector('meta[name="viewport"]').content`)).includes("interactive-widget=resizes-content"),
+     "and the viewport meta asks the browser to resize the layout viewport too");
+
+  console.log("E6. the close target, and the keyboard");
+  // Reported: the × was not centred. It is a span holding one glyph, so width
+  // and height alone leave it wherever the line box put it.
+  const x = await evalIn(`(() => {
+    const el = document.querySelector('.pane[data-pane="3"] .tab .x');
+    const r = el.getBoundingClientRect();
+    const cs = getComputedStyle(el);
+    return { w: Math.round(r.width), h: Math.round(r.height), d: cs.display,
+             a: cs.alignItems, j: cs.justifyContent }; })()`);
+  ok(x.w >= 24 && x.h >= 24, `the close target is finger-sized (${x.w}x${x.h})`);
+  // The assertion the last attempt was missing, and the reason it "passed"
+  // while a screenshot showed otherwise: a 28px control inside a 24px tab
+  // shares the tab's centre line while hanging two pixels out of it at each
+  // end. Centred and contained are different claims.
+  const fits = await evalIn(`(() => {
+    const tab = document.querySelector('.pane[data-pane="3"] .tab');
+    const el = tab.querySelector(".x");
+    const t = tab.getBoundingClientRect(), c = el.getBoundingClientRect();
+    return { tabH: Math.round(t.height), xH: Math.round(c.height),
+             over: Math.round(Math.max(0, t.top - c.top) + Math.max(0, c.bottom - t.bottom)) }; })()`);
+  ok(fits.over === 0,
+     `and it is inside the tab, not overflowing it (tab ${fits.tabH}px, × ${fits.xH}px, over ${fits.over}px)`);
+  ok(fits.tabH >= 44, `with the tab itself finger-sized too (${fits.tabH}px)`);
+
+  // Found by reading the measurements rather than the assertions: on the
+  // desktop the × is `opacity: 0` until the tab is hovered or active. A phone
+  // has no hover, so on every *inactive* tab the control was simply not there
+  // — and no test had ever asked whether it could be seen, only where it was.
+  //
+  // A second tab is opened for exactly that reason: with one tab it is always
+  // the active one, and the active tab was never the broken case.
+  await evalIn(`send({ t: "NewTerminal", pane: 3 })`);
+  ok(await until(async () => (await evalIn(
+       `document.querySelectorAll('.pane[data-pane="3"] .tabstrip .tab').length`)) >= 2, 15, "a second tab"),
+     "setup: a second tab, so one of them is inactive");
+  const seen = await evalIn(`[...document.querySelectorAll('.pane[data-pane="3"] .tabstrip .tab .x')]
+    .map((e) => Number(getComputedStyle(e).opacity))`);
+  ok(seen.length >= 2 && seen.every((o) => o > 0.5),
+     `every tab's × is legible without a hover (${JSON.stringify(seen)})`);
+
+  // And the cost of making the tabs finger-sized: two 44px tabs plus the pane
+  // icons stopped fitting across 390px and wrapped to a second row, which took
+  // 44 more pixels off a pane that has 16% of the screen already. Asserted as
+  // rows rather than pixels — the fix was to stop the × floating twenty pixels
+  // from its label, and the row count is what that bought.
+  const tabRows = await evalIn(`(() => {
+    const tops = [...document.querySelectorAll('.pane[data-pane="3"] .tabstrip .tab')]
+      .map((t) => Math.round(t.getBoundingClientRect().top));
+    return new Set(tops).size; })()`);
+  ok(tabRows === 1, `two tabs and the pane icons still share one row (${tabRows} rows)`);
+  ok(x.d.includes("flex") && x.a === "center" && x.j === "center",
+     `and the glyph is centred in it, not merely inside it (${JSON.stringify(x)})`);
+  // Reported twice, the second time with a screenshot: centring the glyph
+  // inside its own box was not enough, because the *box* was an inline element
+  // riding the text baseline — a 28px box on a 13px baseline sits high. The
+  // tab has to be a flex row for its label and its × to be centred against
+  // each other, so this compares the two centres rather than looking at
+  // either one's properties.
+  const centres = await evalIn(`(() => {
+    const tab = document.querySelector('.pane[data-pane="3"] .tab');
+    const el = tab.querySelector(".x");
+    const t = tab.getBoundingClientRect(), c = el.getBoundingClientRect();
+    return { tab: Math.round(t.top + t.height / 2), x: Math.round(c.top + c.height / 2) }; })()`);
+  ok(Math.abs(centres.tab - centres.x) <= 1,
+     `and it sits on the tab's own centre line (${JSON.stringify(centres)})`);
+
+  // The one the previous three attempts could not make. Every assertion so far
+  // measured the close control's *box*; the mark inside it was drawn with the
+  // character `×`, which sits on the font's math axis — so a flex box centred
+  // a line box around a glyph that is not in the middle of it, and the mark
+  // rode visibly high in a 28px target while every box measurement said
+  // "centred". It is an SVG now, and this compares the drawn thing to the box
+  // that holds it.
+  const glyph = await evalIn(`(() => {
+    const el = document.querySelector('.pane[data-pane="3"] .tab .x');
+    const g = el.querySelector("svg");
+    if (!g) return null;
+    const b = el.getBoundingClientRect(), r = g.getBoundingClientRect();
+    return { dy: Math.round((r.top + r.height / 2) - (b.top + b.height / 2)),
+             dx: Math.round((r.left + r.width / 2) - (b.left + b.width / 2)) }; })()`);
+  ok(glyph !== null, "the close mark is drawn, not a character with its own baseline opinion");
+  ok(glyph && Math.abs(glyph.dy) <= 1 && Math.abs(glyph.dx) <= 1,
+     `and it is centred in its box, not merely inside it (${JSON.stringify(glyph)})`);
+
+  // The soft keyboard. `dvh` is the viewport with the browser's chrome
+  // retracted, a different question, and on iOS it does not shrink for the
+  // keyboard at all — so the pane kept its full height and the key bar sat
+  // underneath it. `visualViewport` is the API that knows.
+  ok((await evalIn(`getComputedStyle(document.documentElement).getPropertyValue("--vvh").trim()`))
+       === `${Math.round(await evalIn(`window.visualViewport.height`))}px`,
+     "the layout follows the visual viewport, which is what a keyboard changes");
+
+  console.log("F. a desktop is untouched");
+  // The negative control, and the reason any of the above means anything: all
+  // of it is scoped to a media query, and a rule that leaked would show here
+  // as a desktop with three of its four panes gone.
+  try { await page.close(); } catch { /* already gone */ }
+  page = await load({ width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
+  const desktop = await page.evalIn(visiblePanes);
+  ok(desktop.length === 4, `all four panes are laid out on a desktop, got ${JSON.stringify(desktop)}`);
+  ok(!(await page.evalIn(barVisible)), "and the switcher is not on screen");
+  ok((await page.evalIn(`getComputedStyle(document.querySelector('#grid > .divider')).display`)) !== "none",
+     "the dividers are back, so a desktop can still resize its panes");
+  // The scoping check for B3's trim, and it is here because B3 cannot make it:
+  // "hidden on a phone" is equally true of a rule that hides them everywhere.
+  // Revert-checked — moving `#refresh, #projbtn { display: none }` out of the
+  // media query passes the whole file without this line.
+  ok((await page.evalIn(`["refresh", "projbtn"].filter((id) => !!document.getElementById(id)?.offsetParent)`)).length === 2,
+     "and both controls the phone drops are back — the trim is scoped to the phone, not global");
+
+  // Reported from the desktop as well as the phone: the project dropdown
+  // opened across the header from the name you clicked. #projpanel has two
+  // triggers and was anchored in CSS to the right edge for one of them, so
+  // clicking the project name on the left opened a panel on the right.
+  for (const trigger of ["projname", "projbtn"]) {
+    await page.evalIn(`(() => { const p = document.getElementById("projpanel");
+      if (!p.hidden) { p.hidden = true; } })()`);
+    await page.evalIn(`document.getElementById(${JSON.stringify(trigger)}).click()`);
+    await sleep(250);
+    const g = await page.evalIn(`(() => {
+      const p = document.getElementById("projpanel"), t = document.getElementById(${JSON.stringify(trigger)});
+      if (!p || p.hidden) return null;
+      const pr = p.getBoundingClientRect(), tr = t.getBoundingClientRect();
+      return { dx: Math.round(pr.left - tr.left), below: Math.round(pr.top - tr.bottom) }; })()`);
+    ok(g && Math.abs(g.dx) <= 8 && g.below >= 0 && g.below < 40,
+       `opened from #${trigger} it sits under it (${JSON.stringify(g)})`);
+  }
+  await page.evalIn(`document.getElementById("projpanel").hidden = true`);
+
+  console.log("F2. the band just above the breakpoint");
+  // Not broken before, but the narrowest useful thing on a 1000px screen was
+  // the pane holding the file you are reading: 192px. Asserted as a floor
+  // rather than an exact number, because the number is a consequence of the
+  // side columns' clamps and not a promise.
+  await page.cmd("Emulation.setDeviceMetricsOverride", { width: 1000, height: 900, deviceScaleFactor: 1, mobile: false });
+  await sleep(250);
+  const midW = await page.evalIn(`Math.round(document.querySelector('#grid > .pane[data-pane="2"]').getBoundingClientRect().width)`);
+  ok(midW >= 300, `at 1000px the middle pane is ${midW}px, not the 192px the unclamped grid gives`);
+  ok((await page.evalIn(`document.documentElement.scrollWidth`)) <= 1000, "and nothing scrolls sideways");
+  await page.cmd("Emulation.setDeviceMetricsOverride", { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
+  await sleep(250);
+  ok((await page.evalIn(`Math.round(document.querySelector('#grid > .pane[data-pane="2"]').getBoundingClientRect().width)`)) > 550,
+     "while a real desktop keeps the width it always had — the clamp is scoped, not global");
+
+  console.log("G. a desktop window dragged narrow becomes a phone, with no reload");
+  // The case a media query gets right and a User-Agent check does not. It is
+  // also the one that catches an init that only ever runs on first paint.
+  await page.cmd("Emulation.setDeviceMetricsOverride", PHONE);
+  ok(await until(async () => (await page.evalIn(visiblePanes)).length === 1, 5, "one pane"),
+     "narrowing the window collapses to one pane");
+  ok(await page.evalIn(barVisible), "and the switcher appears without a reload");
+} finally {
+  try { await page?.close(); } catch { /* already gone */ }
+  browser.close();
+  await roost.close();
+  await fx.cleanup();
+}
+
+console.log(fail === 0 ? "\nPASS" : `\nFAIL (${fail})`);
+Deno.exit(fail === 0 ? 0 : 1);

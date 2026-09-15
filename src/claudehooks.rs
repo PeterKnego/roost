@@ -24,7 +24,11 @@ use std::path::Path;
 /// The command roost installs. Ownership is this exact string, nothing
 /// looser: a user who writes their own `roost notify` hook keeps it.
 pub const COMMAND: &str = "roost claude-hook";
-const EVENTS: [&str; 2] = ["Notification", "Stop"];
+/// `SessionStart` is not for notifying — it produces no message — but for the
+/// id it carries. `Stop` fires when a turn *ends*, so a session interrupted
+/// before its first turn completed would never announce itself, and that is
+/// the session worth recovering. See `claudesess`.
+const EVENTS: [&str; 3] = ["SessionStart", "Notification", "Stop"];
 const REL: &str = ".claude/settings.local.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,12 +329,12 @@ mod tests {
     /// ".claude/settings.local.json: cannot read: No such file or directory
     /// (os error 2)") right: Absent`.
     #[test]
-    fn a_missing_file_is_absent_and_enable_writes_exactly_the_two_entries() {
+    fn a_missing_file_is_absent_and_enable_writes_exactly_our_entries() {
         let d = proj();
         assert_eq!(state(d.path()), HookState::Absent);
         set(d.path(), true).unwrap();
         let expected: serde_json::Value = serde_json::from_str(&format!(
-            r#"{{"hooks":{{"Notification":[{{"hooks":[{OURS}]}}],"Stop":[{{"hooks":[{OURS}]}}]}}}}"#
+            r#"{{"hooks":{{"SessionStart":[{{"hooks":[{OURS}]}}],"Notification":[{{"hooks":[{OURS}]}}],"Stop":[{{"hooks":[{OURS}]}}]}}}}"#
         )).unwrap();
         let got: serde_json::Value = serde_json::from_str(&read(d.path())).unwrap();
         assert_eq!(got, expected);
@@ -378,7 +382,11 @@ mod tests {
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(keys, ["permissions", "hooks", "zeta"], "top-level order kept");
         let hooks: Vec<&str> = v["hooks"].as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(hooks, ["Stop", "PreToolUse", "Notification"], "event order kept, new one last");
+        assert_eq!(
+            hooks,
+            ["Stop", "PreToolUse", "SessionStart", "Notification"],
+            "existing event order kept; the two missing ones appended in EVENTS order"
+        );
         assert_eq!(state(d.path()), HookState::Present);
     }
 
@@ -395,7 +403,8 @@ mod tests {
         write(d.path(), &format!(r#"{{
   "hooks": {{
     "Stop": [ {{ "hooks": [ {{ "type": "command", "command": "say done" }}, {OURS} ] }} ],
-    "Notification": [ {{ "hooks": [ {OURS} ] }} ]
+    "Notification": [ {{ "hooks": [ {OURS} ] }} ],
+    "SessionStart": [ {{ "hooks": [ {OURS} ] }} ]
   }},
   "other": true
 }}
@@ -631,6 +640,38 @@ mod tests {
     /// check never got to run in that revert, since the panic in (a) stops
     /// the test; the early return is what both cases share, so (a) alone
     /// is enough to show the code path was reached.)
+    #[test]
+    fn an_existing_two_event_install_reads_as_absent_and_upgrades_in_place() {
+        // The user-visible effect of adding a third event. Every project that
+        // had the bell on before this release has only `Notification` and
+        // `Stop`, so its bell now reads off — which is honest (roost's hooks
+        // are not all installed) and is what makes turning it back on install
+        // the missing one. What must NOT happen is the rest of the file being
+        // rewritten around it, so this asserts the foreign entry survives.
+        let d = proj();
+        write(
+            d.path(),
+            &format!(
+                r#"{{"hooks":{{"Notification":[{{"hooks":[{OURS}]}}],"Stop":[{{"hooks":[{{"type":"command","command":"say done"}},{OURS}]}}]}}}}"#
+            ),
+        );
+        assert_eq!(
+            state(d.path()),
+            HookState::Absent,
+            "two of the three events is not all of them"
+        );
+        set(d.path(), true).unwrap();
+        assert_eq!(state(d.path()), HookState::Present, "and enabling adds the missing one");
+        let v: serde_json::Value = serde_json::from_str(&read(d.path())).unwrap();
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"].as_array().unwrap().len(),
+            2,
+            "the user's own Stop hook is still there"
+        );
+        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "say done");
+        assert_eq!(v["hooks"]["SessionStart"][0]["hooks"][0]["command"], COMMAND);
+    }
+
     #[test]
     fn a_no_op_set_touches_nothing() {
         // (a) Disabling a project roost has never touched creates nothing.

@@ -7,11 +7,25 @@ it.
 
 ## The boundary
 
-roost binds `127.0.0.1` only, and that bind is deliberately not configurable.
-It has **no authentication of its own**. You are expected to put something
-that authenticates in front of it, such as `tailscale serve`, and the
-security of a deployment is the security of that layer plus the loopback
-boundary.
+roost binds `127.0.0.1`, and on a host that bind is not configurable. It has
+**no authentication of its own**. You are expected to put something that
+authenticates in front of it, such as `tailscale serve`, and the security of a
+deployment is the security of that layer plus the loopback boundary.
+
+**In a container the boundary is substituted, not removed.** Inside a network
+namespace `127.0.0.1` is the container's own loopback, which nothing on the host
+can reach, so the official image binds `0.0.0.0` and the **namespace** becomes
+the boundary instead. That is permitted only by `ROOST_BIND_ALL=1` — a boolean
+named for its consequence rather than an address field, so it cannot be set by
+someone typing a preference, and an unrecognised value refuses to start rather
+than falling back. The substitution holds only if the port is published to the
+host's loopback (`127.0.0.1:8123:8123`, never `0.0.0.0`) and nothing else on the
+container's network can reach it: the `Origin` check refuses a client that
+*sends* one, and a non-browser client on that network sends none.
+
+Both statements are true of their own deployment, and reconciling them — making
+the host configurable, or dropping the gate because the container needs
+`0.0.0.0` anyway — removes a boundary rather than tidying one.
 
 Inside that boundary, roost defends against the one attacker that loopback
 does not stop: **a web page open in the same browser**. Concretely:

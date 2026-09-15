@@ -88,6 +88,36 @@ pub struct Workspace {
     /// it is not the same as running it; the client uses this to decide
     /// whether that tab attaches immediately or shows its start placeholder.
     pub live_sessions: Vec<String>,
+    /// Session names that had a live shell when this workspace was last
+    /// written to disk. Restored by `wsstate::load` and never sent to a
+    /// client; it exists only so `hub::lost_terminal_sessions` can tell a tab
+    /// that lost its shell from one that never had one.
+    pub sessions_seen: Vec<String>,
+    /// Terminal tabs the restored layout asked for whose shell is *positively*
+    /// gone — the machine rebooted, or the socket was reaped — as opposed to
+    /// tabs that never had one.
+    ///
+    /// Without this the two are indistinguishable: both render the same
+    /// "Press Enter to start a terminal" placeholder, so a reboot that lost a
+    /// long-running Claude looks exactly like a tab nobody has used yet.
+    /// Computed once, when the hub loads the layout, and only from positive
+    /// evidence; never persisted, because it is a fact about this moment.
+    pub lost_sessions: Vec<String>,
+    /// Of the lost ones, those roost recorded a Claude session id for, so the
+    /// placeholder can offer `claude --resume <id>` (#18 step 2). The id
+    /// itself never leaves the server — this is only *which tabs* have one.
+    ///
+    /// Computed beside `lost_sessions` and filtered by the same rule, for the
+    /// same reason and one more: it is a read per terminal off the state
+    /// directory, and `WorkspaceView::claude_sessions` and `show_hidden` both
+    /// record why a snapshot is the wrong place for that — a snapshot goes out
+    /// on every debounced keystroke.
+    ///
+    /// A subset of `lost_sessions` by construction, not by coincidence:
+    /// `session::end_session` calls `claudesess::forget`, so a record can only
+    /// outlive a session nobody ended — one lost to a reboot or a reaped
+    /// socket.
+    pub resumable_sessions: Vec<String>,
     /// Whether the project root is a git repository, cached here so the
     /// hub doesn't re-stat the filesystem on every view.
     pub is_git: bool,
@@ -123,6 +153,9 @@ impl Workspace {
             buffers: HashMap::new(),
             watch_degraded: false,
             live_sessions: vec![],
+            sessions_seen: vec![],
+            lost_sessions: vec![],
+            resumable_sessions: vec![],
             is_git: false,
             show_hidden: None,
         }
@@ -178,6 +211,8 @@ impl Workspace {
             buffers,
             watch_degraded: self.watch_degraded,
             live_sessions: self.live_sessions.clone(),
+            lost_sessions: self.lost_sessions.clone(),
+            resumable_sessions: self.resumable_sessions.clone(),
             // Filled by `hub::snapshot_event`; `WsState` deliberately has no
             // such field (see the doc on `WorkspaceView::claude_sessions`).
             claude_sessions: vec![],
@@ -329,12 +364,32 @@ pub fn apply_layout(w: &mut Workspace, intent: &Intent) -> Result<bool, String> 
             if *idx >= src.tabs.len() {
                 return Err(format!("no tab {idx}"));
             }
+            // Which tab the pane was *showing*, captured before the
+            // removal renumbers everything. Only for a move within one pane:
+            // see below.
+            let keep = (from == to).then(|| src.tabs.get(src.active).cloned()).flatten();
             let tab = src.tabs.remove(*idx);
             src.active = src.active.min(src.tabs.len().saturating_sub(1));
             let dst = pane_mut(w, *to)?;
             let at = (*at).min(dst.tabs.len());
             dst.tabs.insert(at, tab);
-            dst.active = at;
+            // Moving a tab *to another pane* activates it there, which is
+            // what the ⇄ button has always done and what someone sending a
+            // tab somewhere means.
+            //
+            // Reordering *within* a pane is a different gesture and was
+            // unreachable until tabs became draggable: the button only ever
+            // moves between panes. Activating there would mean nudging a
+            // background tab one slot along silently switched what the pane
+            // displays — unmounting an editor with unsaved edits and a
+            // cursor position, or replaying a terminal's screen — for a
+            // gesture that was about tidying the strip. So the pane goes on
+            // showing what it was showing, found again by identity because
+            // its index has just moved under it.
+            dst.active = match keep {
+                Some(t) => dst.tabs.iter().position(|x| *x == t).unwrap_or(at),
+                None => at,
+            };
             Ok(true)
         }
         Intent::Resize { sizes } => {
@@ -608,6 +663,50 @@ mod tests {
         .unwrap();
         assert!(w.panes[proto::MIDDLE as usize].tabs.is_empty());
         assert_eq!(w.panes[proto::RIGHT as usize].tabs[0], file("a.rs"));
+    }
+
+    #[test]
+    fn reordering_inside_a_pane_leaves_the_pane_showing_what_it_was_showing() {
+        // Reachable only since tabs became draggable: the ⇄ button always
+        // moves *between* panes. Nudging a background tab one slot along must
+        // not switch what the pane displays — that unmounts an editor with
+        // unsaved edits and a cursor position, or replays a terminal's
+        // screen, for a gesture that was about tidying the strip.
+        let mut w = Workspace::default_layout();
+        let p = proto::MIDDLE;
+        {
+            let pane = &mut w.panes[p as usize];
+            pane.tabs = vec![file("a.rs"), file("b.rs"), file("c.rs")];
+            pane.active = 2; // looking at c.rs
+        }
+        // Drag a.rs (index 0) to sit between b.rs and c.rs.
+        apply_layout(&mut w, &Intent::MoveTab { from: p, idx: 0, to: p, at: 1 }).unwrap();
+        let pane = &w.panes[p as usize];
+        assert_eq!(pane.tabs, vec![file("b.rs"), file("a.rs"), file("c.rs")], "the reorder happened");
+        assert_eq!(
+            pane.tabs[pane.active],
+            file("c.rs"),
+            "and the pane still shows c.rs, at whatever index it now has"
+        );
+    }
+
+    #[test]
+    fn moving_a_tab_to_another_pane_still_activates_it_there() {
+        // The other half, and the reason the rule above is conditional: the
+        // ⇄ button's meaning is "send this tab over there", and arriving
+        // without being shown would be the surprise in that direction.
+        let mut w = Workspace::default_layout();
+        w.panes[proto::MIDDLE as usize].tabs = vec![file("a.rs")];
+        w.panes[proto::MIDDLE as usize].active = 0;
+        w.panes[proto::RIGHT as usize].tabs = vec![file("x.rs"), file("y.rs")];
+        w.panes[proto::RIGHT as usize].active = 0;
+        apply_layout(
+            &mut w,
+            &Intent::MoveTab { from: proto::MIDDLE, idx: 0, to: proto::RIGHT, at: 1 },
+        )
+        .unwrap();
+        let dst = &w.panes[proto::RIGHT as usize];
+        assert_eq!(dst.tabs[dst.active], file("a.rs"), "the moved tab is shown in its new pane");
     }
 
     #[test]

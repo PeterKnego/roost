@@ -4,9 +4,9 @@
 
 # roost
 
-**Run your long-running coding sessions on server. Watch them through your browser.**
+**Run your long-running coding sessions on a server. Watch them through your browser.**
 
-This project started because I was scratching my itch: I wanted a simple remote termnal that survives any interruption, preferably runs through browser, and has a few must-haves: file tree, file upload, diff window, editor and preview. 
+This project started because I was scratching my itch: I wanted a simple remote terminal that survives any interruption, preferably runs through browser, and has a few must-haves: file tree, file upload, diff window, editor and preview.
 I managed to get by with mosh/tmux/md-tui, but that setup just did not understand projects and worktrees.
 So I created a lightweight Rust tool that gives any coding project its own browser tab and all needed info in one place. Backed by `dtach` shells that survive tab close, laptop sleep, network down and even restart of `roost` itself.
 
@@ -23,7 +23,7 @@ So I created a lightweight Rust tool that gives any coding project its own brows
 
 ## Why
 
-Because you want a simpler way to have remote access to your server box. Roost is a 4MB Rust binary that gives your every project or worktree a tab in a browser.
+Because you want a simpler way to have remote access to your server box. Roost is a 4MB Rust binary that gives every one of your projects or worktrees a tab in a browser.
 
 |                          | roost | ttyd / Wetty | code-server | tmux + ssh |
 | ------------------------ | :---: | :----------: | :---------: | :--------: |
@@ -74,33 +74,53 @@ build attestations. `cargo binstall roost` fetches them directly.
 
 macOS is used daily; Windows is untested.
 
-> **roost has no authentication of its own.** It only binds to `127.0.0.1`. 
-> Put auth layer in front of it - `tailscale serve` is what I use.
+> **On macOS, a tarball downloaded in a browser hangs rather than failing.**
+> Safari and Chrome set `com.apple.quarantine` on the download, `tar` copies it
+> onto the extracted binary, and Gatekeeper then waits on a GUI prompt nobody
+> sees over ssh: no output, no error, no exit status, indistinguishable from a
+> server that started. Strip it **before the first run** — doing it afterwards
+> does not clear a prompt already pending:
+>
+> ```sh
+> tar xf roost-aarch64-apple-darwin.tar.xz
+> xattr -d com.apple.quarantine roost-aarch64-apple-darwin/roost
+> ./roost-aarch64-apple-darwin/roost --version     # roost 0.5.2
+> ```
+>
+> `brew install` and `curl` are both unaffected — Homebrew strips the attribute
+> and `curl` never sets it, and the binary is byte-identical in all three cases.
+> Measured on macOS 26.6.2 (Apple Silicon) on 2026-09-12: the release binaries
+> are ad-hoc/linker-signed and not notarized, so `spctl` reports `rejected` even
+> for the Homebrew copy that runs — the quarantine attribute is the gate, not
+> the signature.
+
+> **roost has no authentication of its own.** It only binds to `127.0.0.1`.
+> Put an auth layer in front of it — `tailscale serve` is what I use.
 > Read [Security model](#security-model) before exposing it.
 
 ## Features
 
 ### A tab per project/worktree
-Every tab represents project/worktree, and has panes in familiar IDE-like arrangemet: file-tree, file-diffs, file priview/editor, terminal.
+Every tab represents a project or worktree, and has panes in familiar IDE-like arrangement: file-tree, file-diffs, file preview/editor, terminal.
 
 ### Terminals that survive reload/re-attach/restart
-Each terminal is a PTY owned by `roost` and wrapped in `dtach`, so sessions survive a tab reload, network disconnect, laptop sleep, and even a `roost` restart. 
+Each terminal is a PTY owned by `roost` and wrapped in `dtach`, so sessions survive a tab reload, network disconnect, laptop sleep, and even a `roost` restart.
 
 ### All state lives on the server and mirrors live
 Open a file in one browser and it opens in every connected browser. Layout and unsaved buffers persist across restarts, stored outside the repo — so pane drags never show up in `git status`.
 
-### Drag-n-drop files/images or paste images 
-Drag-n-drop files into file tree for instant upload to remote filesystem.
+### Drag-n-drop files/images or paste images
+Drag-n-drop files into the file tree for instant upload to remote filesystem.
 As for images, you can drag them or paste them into `claude` terminal and they will be uploaded and pasted directly into `claude` as image - this is a must-have feature when you just want to quickly paste a screenshot into claude for analysis.
 
 ### Claude Code integrates with the project
-A `claude` running in a terminal pane connects back to `roost` via IDE protocol, same as VS Code or Jetbrains IDEs. This gives it unique integration abilities: paste image, links to @file, "live" links in terminal that open when clicking on it and `claude` initiated file diff viewer (if in manual permission mode).
+A `claude` running in a terminal pane connects back to `roost` via the IDE protocol, the same as VS Code or JetBrains IDEs. This gives it unique integration abilities: paste image, links to @file, "live" links in the terminal that open when you click them and `claude` initiated file diff viewer (if in manual permission mode).
 
 <img src="docs/img/proposal.png" alt="A proposal tab showing the two lines Claude wants to delete, with Accept, Reject and Edit buttons, beside the terminal where Claude is asking for the same approval" width="900">
 
 ### Desktop notifications
-Roost supports sending desktop notifications from any terminal. Clicking notification will take you directly to that terminal.
-Also, Roost can install hooks into `claude` to enable notification every time `claude` needs attention. See [docs/notifications.md](docs/notifications.md).
+Roost supports sending desktop notifications from any terminal. Clicking a notification will take you directly to that terminal.
+Also, Roost can install hooks into `claude` to enable a notification every time `claude` needs attention. See [docs/notifications.md](docs/notifications.md).
 
 ## Security model
 

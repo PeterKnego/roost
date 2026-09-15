@@ -34,6 +34,8 @@ deno run -A tests/browser/buffer-lifecycle.mjs # navigating a file is not an edi
 deno run -A tests/browser/termlinks.mjs # a printed path or URL is a link only while the modifier is held
 deno run -A tests/browser/ide.mjs       # openDiff's proposal tab (Accept/Reject) and the Alt+K mention keybinding
 deno run -A tests/browser/claudeterm.mjs # the ✻ button: a terminal with claude typed in, hidden when claude is not installed
+deno run -A tests/browser/resume.mjs     # the offer to continue the Claude a reboot interrupted (#18 step 2): where the button renders, and what each way of activating the placeholder asks for
+deno run -A tests/browser/claudemenu.mjs # the ✻ menu: New plus this project's past conversations, and no menu at all when there are none (needs its own HOME — the history is Claude Code's directory, not roost's)
 deno run -A tests/browser/worktrees.mjs # the header's worktree switcher chip + panel
 deno run -A tests/browser/worktree-launch.mjs # the ✻ prompt, worktree creation into a second tab, switcher state and removal; needs a real CDP click for window.open
 deno run -A tests/browser/overview.mjs   # the front page (/): live session list, clicking one focuses it, ?at= reaches the picker, and selecting a project narrows/widens the session list
@@ -50,6 +52,13 @@ deno run -A tests/browser/nonascii.mjs   # the editor's non-ASCII indicator and 
 deno run -A tests/browser/notices.mjs    # the bell panel holds only this project's notices, and Clear empties only what it shows
 deno run -A tests/browser/dialogs.mjs    # the dialog primitive: askConfirm/askText/askMenu's exits, focus restoration, and a guard that no code path reaches a native confirm/prompt/alert
 deno run -A tests/browser/closetab.mjs   # closing a dirty file tab: the confirmation must not let the tab strip renumber underneath a stale index
+deno run -A tests/browser/tabdrag.mjs    # dragging a tab between panes and within one, the drop indicator, and coexistence with the file-upload drag
+deno run -A tests/browser/popups.mjs     # the header's popups: one open at a time, and the trigger toggles its own shut
+deno run -A tests/browser/treefollow.mjs # the tree expands to the active file and marks it, without collapsing what the user opened
+deno run -A tests/browser/treemention.mjs # ctrl/shift-click picks tree rows and Alt+K mentions them, in tree order and bounded
+deno run -A tests/browser/watchdog.mjs   # the workspace connection's visible state, and send() refusing instead of silently dropping
+deno run -A tests/browser/paste.mjs      # the terminal key bar's paste button (#97): bracketed vs bare at the pty, and the textarea fallback when the clipboard says no
+deno run -A tests/browser/backup.mjs     # backing a workspace up and restoring it into a *different* project (#18 step 3) — needs its own HOME, like claudemenu.mjs
 ```
 
 Each scenario is its own file and its own roost, so they can be run in any
@@ -117,6 +126,49 @@ and one in `mdlinks.mjs` that passed while asserting nothing — and, in
 the tree ~3 times a second on its own. That last one was a real defect
 (`watch::is_access`), found only because the deleted-code check was actually
 performed.
+
+- In `paste.mjs`: `term.input` instead of `term.paste` fails B and D — and C,
+  which the plan had predicted would stay green. That prediction was wrong in a
+  useful direction: `paste` normalises the pasted newline to CR and `input`
+  does not, so C reports `"alpha\nbeta"` and `input` turns out to be wrong in
+  two ways. Hard-coding the wrapper instead fails **only** C, which is the pair
+  working — B alone passes against a button that always brackets, putting
+  literal escapes into every plain shell.
+
+- In `backup.mjs`: deriving the restore destination from the archive's own
+  `header.source` instead of from the project being restored into — the
+  one-line "simplification" that field invites — fails 2 in sections D and E,
+  and it is the whole reason the test restores into a *second* project at a
+  different path. A round trip back into the source stays green against it,
+  which is #18's third difficulty exactly. Making the conversations checkbox
+  remember its state fails 2 in section B.
+
+  Section G exists because of a revert-check that **passed**. "A Restore button
+  appears only once a listing has come back" is true whether or not the guard
+  is there, so deleting the guard failed nothing; asserting the button is
+  absent *before* a listing arrives is a race. A refused archive is neither —
+  the upload succeeded, so the pane has a file, and without the guard it offers
+  Restore for an archive the server has just refused to read. With section G,
+  deleting the guard fails 1.
+
+- In `claudemenu.mjs`: making `render::claude_history` always report
+  `data-empty="1"` fails 4 in section A — no menu, no rows. Removing the
+  `dataset.empty` check in `claudeMenu` so the menu always opens fails 3 in
+  section C, which is the requirement in its own words: with no history the ✻
+  button must launch a fresh Claude, not show a one-row menu.
+
+- In `resume.mjs`: making `resumable` in `terminalPlaceholder` always false
+  fails 1 (the button is never offered), and the negative controls stay green,
+  which is what says they are controls. Wiring the box back to
+  `box.onclick = start` fails 1 in section E with
+  `{"session":"clicked","resume":true}` — the DOM passes the event as the first
+  argument and an Event is truthy, so every plain click resumed. Dropping
+  `e.target === box` from the box's keydown fails 1 in section C with
+  `{"session":"ghost2"}` — keydown reaches the box before the button's own
+  click, so Enter on a focused Resume button started a bare shell instead.
+  Dropping the button's `stopPropagation` fails **nothing**, and its comment
+  says so: the button's handler runs first and `dataset.sent` swallows the
+  bubbled start.
 
 - Reverting the reconnect to its pre-fix behaviour (mark the entry stale, never
   retry) fails 7 assertions in `reconnect.mjs`.
@@ -446,6 +498,29 @@ performed.
   instead of ever reaching that assertion. Restored, the file returns to a
   clean PASS.
 
+- In `gutter.mjs`: removing the `gutterFor` calls entirely — the whole feature —
+  fails 13. The one that matters is narrower: leaving the `.ln` spans in place
+  and adding `top: 0` to `.ln::before`, so the numbers no longer keep their
+  static position, fails 6 and nothing else. That is the difference between a
+  wrap-aware gutter and a naive one, and the offsets it prints say so
+  (`[-10,-30,-171,-191,-211,-232]` — the jump is the wrapped line). Reverting
+  just the `synthetic` argument, so code-input's appended newline is treated
+  like a file's own, fails exactly 1: the preview then numbers five lines where
+  the editor numbers six, and the last number changes as you switch modes.
+  That defect was found *by* this file, not guarded after the fact.
+
+  Two traps specific to it, both load-bearing. Geometry alone cannot see an
+  empty `content`: the ::before box would still be there, correctly placed, and
+  every placement assertion would pass — which is CLAUDE.md's strip-test
+  failure exactly. Hence the screenshot, decoded on a canvas in the page, and
+  hence the *widths* of the ink as well as its positions, since six `0`s paint
+  six bands in the six right places and only their width gives them away. And a
+  pseudo-element cannot be measured from the page at all —
+  `getComputedStyle(el, "::before").content` returns the literal `counter(ln)`,
+  the accessibility tree does not carry it (both checked, not assumed), and in
+  the editor `elementFromPoint` hits the textarea stacked over the gutter. CDP's
+  `DOM.getBoxModel` against the pseudo-element node is the only way in.
+
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
 
@@ -456,6 +531,34 @@ site; do not "simplify" them away:
 | Typing before the prompt | readline discards typeahead while initialising, so the first command silently vanishes. Wait for a prompt. |
 | Content that fits one screen | `dtach`'s redraw opens with `\e[H\e[J`, which hides duplicated output all by itself — the no-duplication assertion passes with the reset deleted. Scroll past one screen first. |
 | The default 800x600 headless window | Narrower than the default left (260px) and right (520px) panes together: the middle column collapses and the right pane hangs off the viewport. A layout assertion then measures *that*, and `elementFromPoint` returns null off-screen, so a reachability test fails (or passes) for the wrong reason. Override the metrics — see `tabwrap.mjs` and `save.mjs`, where a layout assertion measured 1px of overshoot instead of the real 26px until the viewport was widened. |
+
+## Measuring what they cover
+
+`cargo llvm-cov` measures `src/` and cannot see a line of `static/*.js` —
+which is a fifth of the shipped code. This does:
+
+```sh
+deno run -A tests/browser/coverage.mjs            # every test
+deno run -A tests/browser/coverage.mjs --only search,dotfiles
+```
+
+It runs each test with `ROOST_JS_COV` set, which makes the harness dump each
+page's V8 precise-coverage report as it closes, then **unions the covered byte
+ranges across every test**. The union is the point: each test drives a narrow
+slice and they all share the same startup path, so averaging per-test
+percentages would count that path forty times over.
+
+Two things to know before reading a number from it:
+
+- **Instrumentation is not free.** `altscreen.mjs` is throughput-bound — it
+  pushes 1 MB of output to turn the ring over — and times out under coverage
+  while passing in 8 seconds without it. A failure in a coverage run is not
+  automatically a regression, and the total is a slight under-estimate.
+- **Bytes, not lines.** V8 reports offsets. Converting to lines would call a
+  line covered because one expression on it ran.
+
+Coverage is off unless `ROOST_JS_COV` is set, so an ordinary run of any test
+is completely unaffected.
 
 ## What these cannot prove
 

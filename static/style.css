@@ -209,7 +209,14 @@ main { flex: 1; min-height: 0; }
    tail was the ✎ *and* the × together; the right fix was moving the ✎ to the
    filename stripe (.modebtn below), which it was, so a single reserved × is
    modest and the jumping is gone. */
-.tabstrip .tab .x { opacity: 0; margin-left: 2px; padding: 0 2px; border-radius: 3px; transition: opacity .1s; }
+/* An inline-flex box around the drawn × (PANE_ICONS.close in app.js), because
+   an inline SVG otherwise sits on the text baseline and rides low next to the
+   label. The glyph used to be the character `×`, which has the opposite
+   problem — U+00D7 is placed on the font's math axis, so centring its line box
+   leaves the mark visibly high. Two crossing lines have no such opinion. */
+.tabstrip .tab .x { display: inline-flex; align-items: center; justify-content: center;
+                    opacity: 0; margin-left: 2px; padding: 0 2px; border-radius: 3px;
+                    line-height: 0; transition: opacity .1s; }
 .tabstrip .tab:hover .x, .tabstrip .tab.active .x { opacity: .55; }
 .tabstrip .tab .x:hover { opacity: 1; background: var(--bg3, var(--bg2)); }
 /* The create pair lives with the pane controls now (see buildPaneIcons), so
@@ -317,7 +324,14 @@ main { flex: 1; min-height: 0; }
                           measured, and both layers scroll together. */
                        white-space: pre-wrap;
                        --padding-top: 8px; --padding-bottom: 8px;
-                       --padding-left: 10px; --padding-right: 10px;
+                       /* --ln-gutter is set per file from its line count
+                          (gutterFor in static/app.js) and is 0 where there is no
+                          gutter, so this is the editor's old 10px unchanged for a
+                          plain file. It goes through --padding-left because the
+                          vendor stylesheet pushes that onto the textarea and the
+                          <pre> alike with !important — one property, both layers,
+                          no drift. */
+                       --padding-left: calc(10px + var(--ln-gutter, 0px)); --padding-right: 10px;
                        --code-input_default-caret-color: var(--fg); }
 /* The textarea inside carries .editor too, so the app's own selectors still
    find it — but .editor paints an opaque background, which over a highlighted
@@ -328,6 +342,12 @@ main { flex: 1; min-height: 0; }
    — measured at 4739px inside a 590px pane, taking the pane's layout with it —
    instead of wrapping at the pane's edge. */
 .editwrap code-input pre code { width: auto; max-width: 100%; }
+/* The containing block for this layer's line numbers, and where their counter
+   starts. Safe to position: the vendor stylesheet gives `code-input textarea`
+   z-index 1 and `code-input pre` z-index 0 outright, and z-index applies to a
+   grid item whether it is positioned or not — so this cannot lift the
+   highlighted layer over the textarea and hide the caret. */
+.editwrap code-input pre { position: relative; counter-reset: ln; }
 /* A highlight.js theme paints its own background, which would sit over this
    app's in a slightly different shade and stop where the text stops. The
    library's docs call this out: beat the theme on specificity and let the
@@ -441,11 +461,34 @@ details[open] > summary { background-image: var(--twisty-open); }
 .xy { display: inline-block; min-width: 2.2em; color: var(--muted); font-family: var(--mono); font-size: 11px; }
 .hint { color: var(--muted); padding: 16px; }
 .path { position: sticky; top: 0; background: var(--bg2); border-bottom: 1px solid var(--hairline, var(--border)); padding: 4px 10px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
-.codeview { padding: 10px; font: 13px/1.55 var(--mono); overflow-x: auto; background: var(--bg); }
+.codeview { padding: 10px 10px 10px calc(10px + var(--ln-gutter, 0px)); font: 13px/1.55 var(--mono);
+            overflow-x: auto; background: var(--bg); position: relative; counter-reset: ln; }
 /* font too, not just the background: the UA stylesheet sets `code { font-family:
    monospace }`, which beats inheritance from .codeview and rendered a preview
    in the browser's default mono while every editor and terminal used --mono. */
 .codeview code { background: none; font: inherit; }
+/* The line-number gutter, for both surfaces that have lines: a code file's
+   editor and a code file's preview. `.ln` spans come from wrapLines() in
+   static/app.js, one per logical line with its own newline inside it.
+
+   Generated content, never text, and that is the point twice over. It cannot
+   reach the textarea, whose value is what a save hashes and writes; and
+   `content` is not `textContent`, so copying a preview out yields the code
+   without a column of numbers welded to it (user-select belt and braces —
+   browsers have differed on whether generated content joins a selection).
+
+   `top` is deliberately absent. An absolutely positioned box with only `left`
+   set keeps its static position — where it would have sat in flow — which is
+   the start of its span's FIRST line box. That is what makes the gutter
+   wrap-aware for free: a line wrapped over three rows gets one number, on its
+   first row, with no measuring pass. The box is a block of one line-height, so
+   it sits half a leading above the inline text box and the glyphs line up. */
+.ln::before { counter-increment: ln; content: counter(ln);
+              position: absolute; left: 4px;
+              width: calc(var(--ln-gutter, 0px) - 14px); text-align: right;
+              color: var(--muted); opacity: .6;
+              user-select: none; -webkit-user-select: none; pointer-events: none; }
+
 .diffview { font: 12.5px/1.5 var(--mono); padding: 6px 0; }
 .dl { padding: 0 12px; white-space: pre-wrap; }
 .dl.add { background: var(--add-bg); color: var(--add-fg); }
@@ -918,6 +961,10 @@ dialog.roost::backdrop { background: rgba(0,0,0,.35); }
 .dlg-input { width: calc(100% - 28px); margin: 0 14px; padding: 5px 7px;
              background: var(--bg); color: var(--fg); font: inherit;
              border: 1px solid var(--border); border-radius: 4px; }
+/* The paste fallback's box (#97). Tall enough to show that it takes more than
+   one line, and resizable only downward — a textarea that can be dragged wider
+   than its dialog is a scrollbar waiting to happen. */
+#dlg-paste-text { min-height: 84px; resize: vertical; font-family: var(--mono); }
 .dlg-detail { margin: 0 14px; max-height: 40vh; overflow: auto; border: 1px solid var(--border); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .dlg-buttons { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 14px; }
 .dlg-buttons button { padding: 5px 12px; border-radius: 4px; font: inherit;
@@ -942,14 +989,50 @@ dialog.roost.dlg-wide { width: min(760px, 96vw); }
 .dlg-tabs { display: flex; gap: 2px; padding: 8px 14px 0; border-bottom: 1px solid var(--border); }
 .dlg-tab { font: inherit; padding: 5px 12px; border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; background: none; color: var(--muted); cursor: pointer; }
 .dlg-tab[aria-selected="true"] { color: var(--fg); border-color: var(--border); background: var(--bg); }
-.dlg-scope { display: flex; gap: 8px; align-items: center; padding: 10px 14px 2px; font-size: 12px; color: var(--muted); }
-.dlg-scope button { font: inherit; padding: 3px 10px; border: 1px solid var(--border); border-radius: 4px; background: none; color: var(--muted); cursor: pointer; }
-.dlg-scope button[aria-pressed="true"] { color: var(--fg); border-color: var(--accent); }
+/* The scope row: which file a change on this pane is written to.
+   A segmented pair rather than two outlined buttons with a gap. The accent
+   ring the selected one used to carry was the loudest thing in the dialog —
+   louder than the Save button — for a control that only says where writes go,
+   and it sat immediately under the tab strip, so the pane read as having two
+   competing rows of tabs. The selected segment is filled from `--row-on`, the
+   same token the tab strip and the menu use for "this one".
+   The file it writes is pushed to the far end and set in the mono face,
+   because it is a path. */
+.dlg-scope { display: flex; gap: 10px; align-items: center; padding: 10px 14px 2px;
+             font-size: 12px; color: var(--muted); }
+.dlg-scope .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; }
+.dlg-scope button { font: inherit; padding: 3px 12px; border: 0; border-right: 1px solid var(--border);
+                    background: none; color: var(--muted); cursor: pointer; }
+.dlg-scope button:last-child { border-right: 0; }
+.dlg-scope button[aria-pressed="true"] { color: var(--fg); background: var(--row-on); }
+.dlg-scope button:hover:not([aria-pressed="true"]) { color: var(--fg); }
+.dlg-scope .file { margin-left: auto; font-family: var(--mono); font-size: 11px; }
+
+/* ---- the About pane ---- */
+/* Same 14px gutter and the same row rhythm as `.dlg-rows`, so the pane lines
+   up with General instead of looking like a different dialog. Its first draft
+   reused `.ro-row`, which is the single-column shape meant for a long
+   read-only path — four short values came out full-bleed against the dialog
+   edge, each on two lines. */
+.dlg-about { padding: 4px 14px 8px; max-height: 60vh; overflow: auto; }
+.dlg-about .dlg-row:last-child { border-bottom: 0; }
+/* The right-hand column, matching `.dlg-row`'s 170px control slot. Mono
+   because every value here is an identifier, a hash or a timestamp. */
+.dlg-about .aboutval { justify-self: end; text-align: right; font-family: var(--mono);
+                       font-size: 12px; color: var(--fg); overflow-wrap: anywhere; }
+.dlg-about .aboutval.empty { color: var(--muted); font-family: inherit; font-style: italic; }
+/* Not the UA's blue-and-underlined: every other link in this app is the
+   accent, and a browser-default link inside a themed dialog is the one thing
+   that cannot be mistaken for part of it. */
+.dlg-about a { color: var(--accent); text-decoration: none; }
+.dlg-about a:hover { text-decoration: underline; }
 .dlg-rows { display: flex; flex-direction: column; max-height: 60vh; overflow: auto; padding: 4px 14px 8px; }
 /* An author `display` beats the UA's `[hidden] { display: none }`, so the
    pane toggle needs its own rule or the Settings rows stay visible under
-   the Theme tab. */
-.dlg-rows[hidden], .dlg-themes[hidden] { display: none; }
+   the Theme tab. `.dlg-scope` is here for the same reason and was missed
+   once: About has nothing to write anywhere, so it hides the scope row —
+   and the row went on showing, because the rule above it sets `display`. */
+.dlg-rows[hidden], .dlg-themes[hidden], .dlg-about[hidden], .dlg-backup[hidden], .dlg-scope[hidden] { display: none; }
 .dlg-warning { display: flex; gap: 6px; color: var(--warn, #d79921); font-size: 11px; padding: 8px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
 /* A setting is text on the left — label, key, source tag — with its one-line
    doc beneath, and the control in a fixed column on the right so every
@@ -980,6 +1063,34 @@ dialog.roost.dlg-wide { width: min(760px, 96vw); }
 .dlg-group { padding: 14px 0 6px; }
 .dlg-group .title { font-size: 13px; color: var(--fg); }
 .dlg-group .hint { font-size: 12px; color: var(--muted); line-height: 1.35; margin-top: 2px; padding: 0; }
+
+/* The Backup pane (#18 step 3). Two halves, deliberately not symmetrical: a
+   download is one button, a restore is a listing you read and then confirm. */
+.dlg-backup { padding: 4px 14px 12px; max-height: 60vh; overflow: auto; }
+.dlg-backup .dlg-row { display: grid; grid-template-columns: 1fr auto; gap: 12px;
+  align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.dlg-backup .dlg-row .doc { font-size: 11px; color: var(--muted); line-height: 1.4; margin-top: 2px; }
+.dlg-backup .bk-download, .dlg-backup .bk-restore {
+  font: inherit; font-size: 13px; margin-top: 10px; padding: 8px 14px; min-height: 44px;
+  border: 1px solid var(--border); border-radius: 6px; background: none; color: var(--fg); cursor: pointer; }
+.dlg-backup .bk-download:hover, .dlg-backup .bk-restore:hover { border-color: var(--accent); }
+/* Touch has no hover, so every control needs a pressed state of its own —
+   without one a tap on a phone gives no feedback at all. */
+.dlg-backup .bk-download:active, .dlg-backup .bk-restore:active,
+.dlg-backup .bk-file:active { transform: translateY(1px); border-color: var(--accent); }
+.dlg-backup .bk-restore { border-color: var(--del-fg); color: var(--del-fg); }
+.dlg-backup .bk-file { font: inherit; font-size: 13px; margin-top: 8px; width: 100%; }
+.dlg-backup .bk-busy { padding: 8px 0; }
+.dlg-backup .bk-report { margin-top: 10px; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+.dlg-backup .bk-line { font-family: var(--mono); font-size: 11px; line-height: 1.5;
+  color: var(--muted); overflow-wrap: anywhere; }
+.dlg-backup .bk-line:first-child { color: var(--fg); }
+@media (max-width: 640px) {
+  /* One column on a phone: the label and its switch side by side leaves the
+     doc sentence four words wide. */
+  .dlg-backup .dlg-row { grid-template-columns: 1fr; }
+  .dlg-backup .bk-download, .dlg-backup .bk-restore { width: 100%; }
+}
 .dlg-themes .theme-source { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); padding: 2px 0 8px; }
 .dlg-themes .clear, .dlg-row .clear { font: inherit; font-size: 11px; background: none; border: 1px solid var(--border); border-radius: 9px; color: var(--muted); cursor: pointer; padding: 0 8px; line-height: 16px; }
 .dlg-themes .clear:hover, .dlg-row .clear:hover { color: var(--fg); }
@@ -991,3 +1102,444 @@ dialog.roost.dlg-wide { width: min(760px, 96vw); }
 .dlg-tile .swatch { display: block; width: 100%; height: 6px; border-radius: 3px; background: var(--tile-accent, var(--color-primary)); }
 .dlg-tile[aria-pressed="true"] { border-color: var(--accent); }
 .dlg-tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Rows picked to be mentioned. A different question from `.sel` — which file
+   you are looking at — so a different mark: an accent bar on the leading
+   edge, which composes with a filled row instead of replacing it.
+
+   The bar is on `.picked` alone; the background is only applied when the row
+   is *not* also `.sel` and not hovered. All three selectors have identical
+   specificity (0,3,1), so whichever came last simply won — and this one did,
+   which meant a picked row that was also the current file lost its
+   `--sel-bg` fill and a picked row gave no hover feedback at all, both
+   contradicting the design this comment describes.
+
+   Mixed against `--tool`, not `--row-on`. The tree pane's surface is
+   `--tool`, while `--row-on` is mixed against `--bg2` — which the theme
+   header warns is set *lighter* than `--bg` — so a picked row read
+   noticeably lighter than the tree around it in the dark themes. A highlight
+   has to be mixed against the surface it is actually drawn on.
+
+   `user-select: none` because shift-click is a range gesture here:
+   `preventDefault` on `click` does not undo the native text selection the
+   browser already made on `mousedown`, so extending a range painted the
+   blue selection across every row in between, over the pick highlight. */
+.content a.file, .content summary { user-select: none; }
+.content a.file.picked { box-shadow: inset 2px 0 0 var(--accent); }
+.content a.file.picked:not(.sel):not(:hover) {
+  background-color: color-mix(in oklab, var(--fg) 12%, var(--tool));
+}
+/* The tab being dragged, and where it would land. A drop indicator is not
+   optional here: `at` is a position, and without a visible gap the user
+   cannot tell where the tab will go — a wrong guess means dragging again. */
+.tabstrip .tab.dragging { opacity: 0.4; }
+.tabstrip .tabdrop {
+  flex: 0 0 auto; align-self: center; width: 2px; height: 20px; border-radius: 1px;
+  background: var(--accent, var(--fg)); pointer-events: none;
+}
+
+/* The connection state. Only ever visible when something is wrong — see
+   setConnState — so it costs no header width in the ordinary case, and it
+   borrows the config warning's colour because it is the same kind of news. */
+#connstate { color: #d29922; cursor: help; font-weight: 500; white-space: nowrap; }
+#connstate[data-state="offline"] { color: var(--del-fg, #cf222e); }
+/* The project name is the switcher's other trigger, so it has to look like a
+   control rather than a label — a click target that does not look like one is
+   the same problem in a quieter coat. It keeps the header's text colour and
+   weight; only the caret and a hover ground say it does something. */
+header button.proj {
+  display: flex; align-items: center; gap: 4px;
+  background: none; border: none; padding: 2px 6px; border-radius: 5px;
+  font: inherit; font-weight: 500; color: var(--fg); cursor: pointer;
+}
+header button.proj:hover { background: var(--tab-hover); }
+header button.proj svg { opacity: .55; }
+header button.proj:hover svg { opacity: 1; }
+
+/* code-input's keyboard-navigation banner, suppressed.
+   The Indent plugin calls setKeyboardNavInstructions on every focus, and the
+   library then paints a black 3em bar across the top of the editor and adds
+   `padding-top: calc(16px + 3em)` to both layers — unless the element is
+   focused by a mousedown on the code-input itself. roost focuses editors
+   programmatically (revealInEditor for a search hit or a file:line terminal
+   link, and remountEditor), so landing on a search result dropped a black bar
+   over the editor and shifted its text down ~48px until the user clicked in
+   it.
+   Hidden rather than switched off: `escTabToChangeFocus` stays on, so
+   Esc-then-Tab still moves focus out of the textarea and keyboard users keep
+   their escape hatch. Only the banner goes. The padding override needs
+   `!important` because the library's own rule carries one. */
+.editwrap code-input .code-input_keyboard-navigation-instructions { display: none; }
+.editwrap code-input textarea,
+.editwrap code-input pre code {
+  padding-top: var(--padding-top, 16px) !important;
+  min-height: auto;
+}
+
+/* A terminal tab whose shell is gone, as opposed to one that never had one.
+   Carries the config warning's colour because it is the same kind of news:
+   something you had is not there any more, and nothing else on the page says
+   so. */
+/* The ✻ menu (#18): start fresh, or continue a past conversation. Positioned
+   by app.js against the button that opened it, like the header popups. */
+.chist { position: fixed; z-index: 40; min-width: 260px; max-width: min(460px, 92vw);
+         max-height: 60vh; overflow-y: auto; background: var(--bg2);
+         border: 1px solid var(--border); border-radius: 4px; padding: 4px;
+         display: flex; flex-direction: column; gap: 1px; }
+.chist:focus { outline: none; }
+.chistrow { display: flex; align-items: baseline; gap: 8px; width: 100%;
+            /* 44px is the phone tap target the project rules ask for; a menu
+               row is exactly the control that gets mis-tapped. */
+            min-height: 44px; padding: 6px 8px; border: 0; border-radius: 3px;
+            background: none; color: var(--fg); font: inherit; text-align: left;
+            cursor: pointer; }
+.chistrow:hover { background: var(--tab-hover); }
+.chistrow:active { background: var(--tab-hover); }
+.chistnew { border-bottom: 1px solid var(--border); border-radius: 3px 3px 0 0; }
+/* The label is the only part allowed to grow; the age stays legible at any
+   width, which is what makes two rows comparable at a glance. */
+.chistlabel { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+              white-space: nowrap; }
+.chistwhen { flex: none; color: var(--muted); font-size: 11px; }
+.termstart .termlost { color: #d29922; max-width: 46ch; margin: 0 0 10px; }
+/* The resume offer (#18 step 2). Sized as a real tap target rather than
+   matching .initgit's padding: this one appears on the phone, where the tab
+   whose shell a reboot took is exactly the thing you come back to. */
+.termstart .termresume { font: inherit; min-height: 44px; padding: 6px 16px; border-radius: 6px;
+                         border: 1px solid var(--border); background: var(--bg2); color: var(--fg);
+                         cursor: pointer; }
+.termstart .termresume:hover { border-color: var(--accent); color: var(--accent); }
+.termstart .termresume:active { background: var(--tab-hover); }
+
+/* The switcher itself. Present in the DOM at every width — a desktop window
+   dragged narrow has to grow one without a reload — and shown only by the
+   block above. */
+#mobilebar { display: none; align-items: stretch; gap: 2px; padding: 4px;
+             background: var(--tool); border-top: 1px solid var(--border); }
+#mobilebar button { flex: 1; display: flex; flex-direction: column; align-items: center;
+                    justify-content: center; gap: 2px; padding: 4px 0; border: 0; border-radius: 8px;
+                    background: none; color: var(--muted); font: inherit; font-size: 11px;
+                    cursor: pointer; -webkit-tap-highlight-color: transparent; }
+#mobilebar button[aria-pressed="true"] { color: var(--fg); background: var(--tab-hover); }
+#mobilebar button:active { background: var(--tab-hover); }
+/* Kept legible when a pane has something waiting in it: the same dot the tab
+   strip uses, because "there is a change you have not looked at" is the one
+   thing a switcher has to say that a plain tab bar does not. */
+#mobilebar button .dot { position: absolute; margin: -14px 0 0 18px; width: 6px; height: 6px;
+                         border-radius: 50%; background: var(--accent, #d29922); }
+
+/* The terminal key bar. Present in the DOM at every width, shown only on a
+   phone with the terminal pane in front — see the phone block below. */
+#termkeys { display: none; align-items: stretch; gap: 4px; padding: 4px 4px 0;
+            background: var(--tool); }
+#termkeys button { flex: 1; min-width: 0; min-height: 44px; border: 1px solid var(--border);
+                   border-radius: 8px; background: var(--bg2); color: var(--fg);
+                   font: inherit; font-size: 13px; cursor: pointer;
+                   -webkit-tap-highlight-color: transparent; }
+#termkeys button:active { background: var(--tab-hover); }
+
+/* ============================ phone layout ============================ */
+/* Until this block existed there was no phone layout at all — not a cramped
+   one. The grid asks for ~790px of fixed columns before the middle pane gets a
+   single pixel, on a viewport that is 390px wide, and the viewport meta tells
+   the browser to lay out at device width and then try. So the workspace was
+   reachable from a phone (the tunnel works, the login works) and unusable on
+   arrival.
+
+   These are overrides on a desktop stylesheet rather than a mobile-first
+   rewrite, which is a deliberate trade: inverting 1000 lines of working CSS
+   blind, on a project whose every affordance is hover- or drag-driven, risks
+   far more than it buys.
+
+   The organising decision is #15's: a phone is not a small desktop, it is a
+   different job. Three panes side by side is not a layout that shrinks — it is
+   the wrong shape. One pane at a time, with a switcher, is the shape.
+
+   The number is a measurement rather than a convention. The fixed columns
+   cost 260 + 8 + 8 + 520 plus 12px of padding = 808px before the middle pane
+   gets one pixel, so the three-pane layout has nothing left to give well
+   before a phone width: measured on a real page, 768px (every tablet) put the
+   middle pane at **2px** and made the document scroll horizontally —
+   `scrollWidth` 804 against a 768 viewport — which the workspace rules forbid
+   by name. A landscape phone at 844px was the same.
+
+   `pointer: coarse` was tried here first, to catch a landscape phone without
+   claiming a narrow desktop window. It is not verifiable in this project's
+   own browser tests — chrome-headless-shell answers `coarse` at every size,
+   so a run cannot tell the two apart — and a layout rule nobody can test is
+   worth less than a blunter one that every run checks. A desktop window
+   dragged below 900px gets the phone layout, and that is the better of the
+   two things that can happen to it: the alternative, measured above, is a 2px
+   pane and a sideways scrollbar. */
+@media (max-width: 900px) {
+  /* The whole workspace is a frame pinned to what is *visible*, not to the
+     page. On iOS the layout viewport does not shrink for the keyboard — it is
+     scrolled instead, so the visible window slides down the document — and a
+     frame sized to the page therefore has its header above the top of the
+     screen and its footer under the keyboard at the same time.
+     `--vvtop` is `visualViewport.offsetTop`, which is how far it slid;
+     `--vvh` is how much is left. Both are written by `watchKeyboard`.
+     `position: fixed` so nothing here scrolls the document underneath. */
+  html { overscroll-behavior: none; }
+  body {
+    position: fixed;
+    top: var(--vvtop, 0px);
+    left: 0;
+    right: 0;
+    height: var(--vvh, 100dvh);
+    overflow: hidden;
+  }
+
+  /* One cell. Every pane is placed in it and all but the chosen one is
+     removed from the layout, so nothing depends on --left-w/--right-w — which
+     `render()` still writes on every State broadcast, harmlessly. */
+  #grid {
+    padding: 4px;
+    gap: 0;
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr;
+    /* dvh, not vh: a soft keyboard shrinks the visual viewport and `100vh`
+       does not notice, which puts the pane switcher under the keyboard —
+       exactly where the terminal's send affordance must not be. The vh line
+       is the fallback for anything without dvh, and must stay first. */
+    height: calc(100vh - var(--header-h, 36px) - var(--mobilebar-h, 56px));
+    height: calc(100dvh - var(--header-h, 36px) - var(--mobilebar-h, 56px));
+    /* `--vvh` is `window.visualViewport.height`, written by app.js while a
+       soft keyboard is up. `dvh` does not shrink for the keyboard on iOS —
+       it is the viewport with the *browser* chrome retracted, which is a
+       different question — so without this the pane keeps its full height and
+       everything below the fold, the key bar included, sits under the
+       keyboard. Last, so it wins when it is set, and absent otherwise. */
+    height: calc(var(--vvh, 100dvh) - var(--header-h, 36px) - var(--mobilebar-h, 56px));
+  }
+  #grid > .pane { grid-column: 1; grid-row: 1; }
+  /* `display:none`, not `visibility`/`hidden`: an xterm in a pane that still
+     occupies layout would keep being measured and fitted at the wrong size.
+     A hidden pane measures zero instead, which app.js's switch handler then
+     re-fits — see `showMobilePane`. */
+  body[data-mpane="0"] #grid > .pane:not([data-pane="0"]),
+  body[data-mpane="1"] #grid > .pane:not([data-pane="1"]),
+  body[data-mpane="2"] #grid > .pane:not([data-pane="2"]),
+  body[data-mpane="3"] #grid > .pane:not([data-pane="3"]) { display: none; }
+  /* No pointer to drag them with, and nothing to resize when one pane fills
+     the screen. */
+  #grid > .divider { display: none; }
+
+  #mobilebar { display: flex; }
+  /* Only with the terminal in front: these keys mean nothing over a file tree,
+     and the screen is the scarcest thing here. */
+  body[data-mpane="3"] #termkeys { display: flex; }
+  /* The keys sit inside the frame the grid measures, so the pane gives up
+     their height rather than the page growing past the viewport. */
+  body[data-mpane="3"] #grid {
+    height: calc(100vh - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
+    height: calc(100dvh - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
+    height: calc(var(--vvh, 100dvh) - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
+  }
+
+  /* The header is a single row of a dozen controls at desktop width. Here it
+     wraps, and the search field — which uses margin:auto to centre — takes the
+     full second row. Two rows is the budget; it took three.
+
+     Measured with a real project and branch (`mitsubishi2mqtt` on
+     `power-cycle-detection`) rather than the browser test's `proj` on `main`:
+     the two chips came to 131px and 194px, so they filled the first row by
+     themselves and pushed every icon onto a third. Header 130px, 28% of the
+     screen gone before the terminal. With the short fixture names the same
+     code measured 82px and 16%, which is why the test was green and the phone
+     was not — the fixture never entered the state that breaks. */
+  header { flex-wrap: wrap; height: auto; padding: 4px 6px; row-gap: 4px; }
+  /* Share what is left after the icons and truncate, rather than taking the
+     width the name happens to be. `flex: 1 1 0` with `min-width: 0` is what
+     lets a flex item shrink below its content — without the `min-width` the
+     default `auto` floors it at the text width and the wrap comes back. */
+  #projname { flex: 1 1 0; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  #wtbtn { flex: 0 1 auto; min-width: 0; white-space: nowrap; }
+  /* The branch button is an icon plus two spans, and inside `#gitinfo` the
+     branch name is followed by the dirty bullet and the ± counts. Clipping the
+     whole span therefore hides the *status* — the thing the button is there to
+     report — while keeping the part of the name that fits, which is backwards:
+     `power-cycle-detection` truncated still reads, a missing ● does not say
+     "clean". So the ellipsis goes on the name alone and the bullet keeps its
+     width. */
+  /* The branch button is an icon plus `#gitinfo` (the branch name, then the
+     dirty bullet and the counts) plus `#wtlabel`. Capping the *name* rather
+     than clipping the button is what keeps the status visible: a truncated
+     `power-cycle-detect…` still reads, while a missing ● does not say "clean".
+     So the button sizes to its content and only the name is bounded. */
+  #wtbtn { overflow: visible; }
+  #wtbtn #branch {
+    display: inline-block; max-width: 22vw; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom;
+  }
+  /* The icons keep their 44px and never shrink: a tap target that gave way
+     under pressure would be the wrong thing to trade. */
+  header > .home, #bell, #settings, #closeproj { flex: 0 0 auto; }
+  header .vsep { display: none; }
+  #searchbox { order: 99; flex: 1 0 100%; margin: 0; }
+  /* 16px is not a style choice: iOS zooms the whole page when a focused input
+     is smaller, and the zoom does not come back on blur. Applied in the
+     narrower block below, with the dialog rules, since it is a phone problem
+     rather than a narrow-window one. */
+  #searchbox kbd { display: none; }
+  /* Text, not a shortcut hint nobody can type. */
+  #closeproj span { display: none; }
+  /* Measured before trimming: the header wrapped to FOUR rows at 390px and
+     header plus switcher took 22% of the screen — before a soft keyboard takes
+     half of what is left. Two controls go, and both have another route on a
+     phone: `refresh` is what the browser's own reload does, and `projbtn`
+     opens the running-projects strip that the home link reaches anyway. The
+     rest stay, because nothing else here can be got to another way. */
+  #refresh, #projbtn { display: none; }
+
+  /* Tap targets. 44px is the floor Apple and Android both publish, and the
+     desktop sizes here are 20px. Widened rather than made taller where the
+     row height is load-bearing (the tab strip sets the pane's header height),
+     via padding, so the strip does not grow four rows deep. */
+  header button, #mobilebar button { min-height: 44px; min-width: 44px; }
+  .paneicon { width: 32px; height: 32px; }
+  .tab { padding: 10px 12px; }
+  /* A bigger target for a finger, inside a tab big enough to hold it.
+     Reported twice, and the second time was the useful one: the tab is
+     `height: 24px` from `.tabstrip .tab`, which is two selectors and beats a
+     bare `.tab` — so the padding written here never applied, and a 28px close
+     control was *taller than the tab containing it*. It overflowed by two
+     pixels top and bottom, which is what "still not aligned" looks like.
+     A browser test missed it because both boxes share a centre line while one
+     hangs out of the other; the screenshot did not.
+     Matching the original selector so the height can actually give way. */
+  .tabstrip .tab { height: auto; min-height: 44px; padding: 2px 4px 2px 8px; gap: 4px; }
+  /* The target is 28px because a finger needs one; the *glyph* has to stay
+     next to the label it closes. Centring a 13px × in a 28px box puts seven
+     pixels of nothing on each side, and with the tab's own gap and a margin on
+     top of that the × ended up some twenty pixels adrift — attached to
+     nothing, which is what it looked like. Negative margin pulls the box back
+     over that padding: the hit area keeps its size, the glyph moves in. */
+  .tabstrip .tab .x { display: inline-flex; align-items: center; justify-content: center;
+                      width: 28px; height: 28px; margin: 0 -6px 0 -4px; padding: 0;
+                      line-height: 0; flex: 0 0 auto;
+                      /* No hover on a phone, so a control that only appears
+                         under one never appears. `.active` carries a higher
+                         specificity than a bare `.tab .x`, so both are named
+                         or the open tab keeps the desktop's faded value. */
+                      opacity: .8; }
+  .tabstrip .tab.active .x, .tabstrip .tab:hover .x { opacity: .8; }
+
+  /* A phone has no hover. Every affordance revealed by one needs a press
+     state, or it is invisible until it is already activated. */
+  .paneicon:active, header button:active, .tab:active { background: var(--tab-hover); color: var(--fg); }
+
+  /* The three header popups are anchored to the control that opens them:
+     #projpanel and #noticepanel to the right, #wtpanel to the left. At this
+     width that anchoring is not merely tight, it is wrong — #projpanel has two
+     triggers (`projbtn` and `projname`, see HEADER_POPUPS in app.js) and the
+     phone trim above hides `projbtn`, so the only thing left to tap is the
+     project name on the *left* while the panel opens hard against the right
+     edge. Measured at 390px: the name occupies x 35-85, the panel x 151-382.
+     Nothing connects them.
+
+     Spanning the viewport removes the question rather than answering it
+     twice. It is also what these are: vertical lists, not menus that want to
+     hang off a corner. */
+  /* Full width, and both edges are !important because app.js's `anchorPanel`
+     writes an inline `left` for the desktop case. At this width there is no
+     room to sit under a trigger anyway: a 220px panel anchored to a 44px
+     button would still be mostly off one edge. */
+  #projpanel, #wtpanel, #noticepanel {
+    left: 4px !important; right: 4px !important; width: auto; max-width: none;
+  }
+  /* No hover to reveal a row under a finger. */
+  .projstrip .proj:active, .wtstrip .wt:active, .notice:active { background: var(--bg); }
+
+  /* ---- the project list (the front page) ---- */
+  /* Two fixed-ish columns, 360px of which is the project list, on a 390px
+     screen: the Sessions pane got about twenty pixels. Stacked instead, and
+     each pane gets its own scroll. */
+  #overview {
+    grid-template-columns: 1fr;
+    grid-auto-rows: minmax(0, 1fr);
+    padding: 4px;
+    height: calc(100vh - var(--header-h, 38px));
+    height: calc(100dvh - var(--header-h, 38px));
+  }
+  /* Rows are 3px of padding and 13px of text on a desktop, driven by a
+     pointer. Under a finger they are neither reachable nor readable. */
+  #overview .ovrow, #overview .ovsession a {
+    min-height: 44px; padding: 6px 10px; font-size: 15px;
+  }
+  #overview .ovbody { padding: 4px 2px; }
+  /* The one that actually stops you getting in. `.ovgo` — the link that opens
+     a project — is `visibility: hidden` until `:hover`, and a phone has no
+     hover: on a touch screen the way into a project was invisible on every row
+     but the selected one. Nothing here is a substitute for tapping it. */
+  #overview .ovgo { visibility: visible; font-size: 14px; padding: 0 8px; min-height: 44px;
+                    display: inline-flex; align-items: center; }
+  #overview .ovcaret { width: 1.6em; min-height: 44px; display: inline-flex;
+                       align-items: center; justify-content: center; }
+  #overview .ovkind { width: auto; min-width: 4.5em; }
+  #overview .ovrow:active, #overview .ovsession a:active { background: var(--tab-hover); }
+
+  /* The search results panel is anchored under the search field on desktop.
+     At this width there is nothing to anchor to — it fills the screen. */
+  #searchoverlay .searchpanel { left: 4px !important; right: 4px !important; width: auto !important; max-width: none; }
+  /* Terminal scrolling under a finger.
+     `.xterm-viewport` is a real scrollable div, so it scrolls — and then hands
+     the leftover delta to whatever is behind it the moment it reaches an end,
+     which here is the page. That hand-off is what reads as sticking: the
+     scroll stalls at the boundary, the page moves instead, and the next drag
+     starts from somewhere else. `overscroll-behavior: contain` keeps the
+     gesture inside the terminal; `touch-action: pan-y` stops the browser
+     waiting to see whether a vertical drag was meant as a pinch or a
+     horizontal pan before it scrolls anything, which is the delay felt at the
+     start of each drag. */
+  .xterm-viewport {
+    overscroll-behavior: contain;
+    touch-action: pan-y;
+    -webkit-overflow-scrolling: touch;
+  }
+  /* And nothing behind it to move: the workspace is a fixed frame, not a
+     document, so a rubber-band on the body is only ever an accident. */
+  body { overscroll-behavior: none; }
+
+}
+
+/* ---- dialogs, at genuinely small widths only ---- */
+/* Deliberately 640 and not the 900 above. The workspace breakpoint is a
+   measurement about the three-pane grid (808px of fixed columns); a dialog is
+   `min(760px, 96vw)` and has room for its two-column rows well below that. At
+   900 these rules reached an 800px desktop window and stacked every settings
+   row — caught by `tests/browser/settings.mjs`, which runs at the browser's
+   default 800px and asserts a boolean row is one compact line. It measured
+   81px.
+
+   The 16px input size is here for the same reason: it exists because iOS zooms
+   a focused field smaller than that and does not zoom back, which is a phone
+   problem, not an 800px-window problem. */
+@media (max-width: 640px) {
+  dialog.roost { width: calc(100vw - 24px); max-width: none; }
+  .dlg-row { grid-template-columns: minmax(0, 1fr); }
+  /* `.dlg-input`, not `#dlg-input`: #97 added a second one (the paste box, a
+     <textarea> with its own id) and an id selector would have missed it —
+     leaving exactly the iOS focus-zoom this block exists to prevent, on the
+     one dialog that only ever opens on a phone. */
+  #searchbox input, .dlg-input, .dlg-row input, .dlg-row textarea,
+  .content textarea, .codeinput textarea { font-size: 16px; }
+}
+
+/* ---- the band just above the phone breakpoint ---- */
+/* At 1000px the middle pane is 192px — not broken, but the narrowest useful
+   thing on the screen is the one holding the file you are reading. `min()`
+   against the var rather than a replacement for it, so above this band a
+   drag-resized width is used untouched and nothing here can cap how wide a
+   person may drag a pane on a real screen. Inside it, the side columns give
+   way before the middle pane does. */
+@media (min-width: 901px) and (max-width: 1100px) {
+  #grid {
+    grid-template-columns:
+      minmax(0, min(var(--left-w, 260px), 22vw))
+      var(--divider)
+      minmax(200px, 1fr)
+      var(--divider)
+      minmax(0, min(var(--right-w, 520px), 38vw));
+  }
+}

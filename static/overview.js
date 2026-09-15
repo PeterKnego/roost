@@ -154,38 +154,103 @@
     // exactly as the server renders it (render.rs's `roots_title`).
     span.title = list.join(":");
   }
-  function sendAddRoot(path) {
+  // One exchange per connection, whichever intent it carries.
+  function sendRoots(intent) {
     return new Promise((resolve) => {
       const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/_roots`);
       let done = false;
       const finish = (v) => { if (!done) { done = true; resolve(v); } try { ws.close(); } catch {} };
-      ws.onopen = () => ws.send(JSON.stringify({ t: "AddRoot", path }));
+      ws.onopen = () => ws.send(JSON.stringify(intent));
       ws.onmessage = (e) => { try { finish(JSON.parse(e.data)); } catch { finish({ t: "Error", msg: "unreadable reply" }); } };
       ws.onerror = () => finish({ t: "Error", msg: "could not reach roost" });
       ws.onclose = () => finish({ t: "Error", msg: "connection closed before a reply" });
     });
   }
+
+  // The roots roost is serving, read back out of the header this page already
+  // renders — the same list `renderRoots` writes, so there is no second copy
+  // to drift. Used only to decide whether to *ask* which root; the server
+  // re-validates whatever comes back, because the dialog that offered it is a
+  // hint and not an authorisation.
+  function currentRoots() {
+    return Array.from(document.querySelectorAll("header .roots .root")).map((s) => s.textContent);
+  }
+
+  // What the user typed decides what happens: absolute means a root, anything
+  // else means a project under one. A relative path has no reading as a root —
+  // a root is a place on disk roost scans, and there is nothing for it to be
+  // relative to — so the two cannot collide. `~` counts as absolute: the
+  // server expands it (`config::expand_home`) and a person typing `~/work`
+  // plainly means a place, not a project name.
+  const looksAbsolute = (s) => s.startsWith("/") || s.startsWith("~");
+
   // `reason` is the previous attempt's refusal. It goes in the reopened
   // dialog's own label rather than a banner: the dialog is modal and covers
   // the banner (it cannot even be clicked), so a banner said why exactly
   // where it could not be read.
   async function addRootFlow(prefill = "", reason = "") {
-    const label = reason ? `${reason} — try another path` : "Directory to scan for projects";
-    const path = await askText({ title: "Add a project root", label, value: prefill, confirm: "Add" });
-    if (!path) return;
-    const reply = await sendAddRoot(path);
+    const label = reason
+      ? `${reason} — try again`
+      : "A name makes a project here; an absolute path adds a place to look for them";
+    const text = await askText({ title: "New project", label, value: prefill, confirm: "Create" });
+    if (!text) return;
+    const input = text.trim();
+    if (!input) return addRootFlow(text, "enter a name or a path");
+    return looksAbsolute(input) ? addRoot(input) : makeProject(input);
+  }
+
+  async function addRoot(path, create = false) {
+    const reply = await sendRoots({ t: "AddRoot", path, create });
     if (reply.t === "Roots") {
       renderRoots(reply.roots);
       const sel = selNow();
       refresh("proj", sel);
       refresh("sess", sel);
-    } else {
-      // A typo is one edit away: reopen with the text kept, and with the
-      // reason on the label. Returned, so a caller awaiting this flow waits
-      // for the retry rather than resolving while the dialog is still up.
-      return addRootFlow(path, reply.msg);
+      return;
     }
+    // The refusal the confirmation can answer — and the only one. Everything
+    // else reopens the text dialog with the reason on its label, as before.
+    if (reply.missing) {
+      const yes = await askConfirm({
+        title: "Create it?",
+        lines: [`${path} does not exist.`, "Create the directory and add it as a project root?"],
+        confirm: "Create",
+      });
+      if (!yes) return;
+      return addRoot(path, true);
+    }
+    // A typo is one edit away: reopen with the text kept, and with the reason
+    // on the label.
+    return addRootFlow(path, reply.msg);
   }
+
+  async function makeProject(rel) {
+    const roots = currentRoots();
+    let root = roots.length === 1 ? roots[0] : null;
+    if (roots.length > 1) {
+      // Never a silent choice about where a folder lands on disk. The paths
+      // are the labels; there is nothing shorter that stays unambiguous.
+      root = await askChoice({
+        title: "Which project root?",
+        lines: [`Make ${rel} in:`],
+        choices: roots.map((r) => ({ id: r, label: r })),
+      });
+      if (!root) return;
+    }
+    const reply = await sendRoots({ t: "NewProject", rel, root });
+    if (reply.t !== "Project") return addRootFlow(rel, reply.msg);
+    // Refreshed and selected, not navigated to: creating a project and being
+    // thrown out of the page you created it from is a bigger move than was
+    // asked for, and the row is one click from opening.
+    //
+    // `select(key, true)` first, for the history entry and so a reload comes
+    // back to it — the same thing a click on a row does. The projects pane is
+    // then refetched with the new key as `sel`, because `select` only marks
+    // rows that are already on screen and this one is not yet among them.
+    select(reply.key, true);
+    refresh("proj", reply.key);
+  }
+
   document.addEventListener("click", (e) => {
     if (e.target.closest("#addroot, .addroot")) { e.preventDefault(); addRootFlow(); }
   });

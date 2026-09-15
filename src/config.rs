@@ -11,12 +11,14 @@ struct RawConfig {
     hide: Option<Vec<String>>,
     show_hidden: Option<bool>,
     autosave: Option<bool>,
+    follow_tree: Option<bool>,
     allowed_origins: Option<Vec<String>>,
     max_upload_bytes: Option<u64>,
     share_selection: Option<bool>,
     ide: Option<bool>,
     roots: Option<Vec<String>>,
     worktree_prompt: Option<bool>,
+    relaunch: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +32,25 @@ pub struct Settings {
     /// hostile checkout could set here widens a boundary: it only decides
     /// whether the person editing that project's own files has to press ⌘S.
     pub autosave: bool,
+    /// Whether the file tree expands to the active file and marks it.
+    ///
+    /// Project-scoped, and that is a decision rather than a copy of whichever
+    /// neighbour was nearest. `GLOBAL_ONLY_KEYS` exists for keys where a
+    /// checkout must not get a vote, and the test is what the key can do: a
+    /// hostile project setting this one moves a scrollbar and expands a
+    /// directory the user can already see. It grants nothing, reveals
+    /// nothing, and raises no ceiling — the same argument `autosave` and
+    /// `show_hidden` are project-scoped under. A project you always work in
+    /// one deep subtree of is exactly where the answer differs from your
+    /// other projects, which is what per-project is for.
+    ///
+    /// On by default. The case it exists for is a file *Claude* opened —
+    /// where "where am I?" is the question you most want answered and the
+    /// tree is the only thing that can answer it — and that case is invisible
+    /// unless it is on. The usual reason to default an auto-expanding tree
+    /// off is that it discards your navigation; following here never
+    /// collapses anything, so the cost of being wrong is a scroll.
+    pub follow_tree: bool,
     /// Off unless a project asks for it. This ships file contents to Claude
     /// with no explicit user action, and roost has no permission system to
     /// scope it the way Claude Code's own `Read` deny rules do. Unlike
@@ -67,6 +88,7 @@ impl Default for Settings {
             hide: vec![],
             show_hidden: false,
             autosave: true,
+            follow_tree: true,
             warning: None,
         }
     }
@@ -74,9 +96,13 @@ impl Default for Settings {
 
 /// Keys a project file may set — display-level, nothing a hostile checkout
 /// could widen a boundary with. In this order in the dialog.
-pub const PROJECT_KEYS: &[&str] = &["theme", "hide", "show_hidden", "autosave"];
+pub const PROJECT_KEYS: &[&str] = &["theme", "hide", "show_hidden", "autosave", "follow_tree"];
 /// Keys only the global file may set; see the readers below for why each.
-pub const GLOBAL_ONLY_KEYS: &[&str] = &["share_selection", "worktree_prompt"];
+/// `relaunch` is here for the sharpest reason any key has been: it decides
+/// whether opening a project *starts an agent*. A cloned repository that could
+/// set it would be arranging to run `claude` on a machine it has just arrived
+/// on.
+pub const GLOBAL_ONLY_KEYS: &[&str] = &["share_selection", "worktree_prompt", "relaunch"];
 /// Keys no page may write. Shown read-only; not in any allowlist, so a
 /// forged intent is refused too.
 pub const READ_ONLY_KEYS: &[&str] = &["allowed_origins", "max_upload_bytes", "ide", "roots"];
@@ -125,7 +151,11 @@ pub fn validate(scope: Scope, key: &str, value: Option<&SettingValue>) -> Result
             Ok(())
         }
         ("hide", _) => Err("hide takes a list of names".into()),
-        ("show_hidden" | "autosave" | "share_selection" | "worktree_prompt", SettingValue::Bool(_)) => Ok(()),
+        (
+            "show_hidden" | "autosave" | "follow_tree" | "share_selection" | "worktree_prompt"
+            | "relaunch",
+            SettingValue::Bool(_),
+        ) => Ok(()),
         (k, _) => Err(format!("{k} takes true or false")),
     }
 }
@@ -165,6 +195,9 @@ pub fn load(paths: &[&Path]) -> Settings {
                 }
                 if let Some(v) = raw.autosave {
                     s.autosave = v;
+                }
+                if let Some(v) = raw.follow_tree {
+                    s.follow_tree = v;
                 }
             }
             Err(e) => warnings.push(format!("{}: {}", path.display(), e.message())),
@@ -288,6 +321,25 @@ fn worktree_prompt_from(global: &Path) -> bool {
         .and_then(|s| toml::from_str::<RawConfig>(&s).ok())
         .and_then(|r| r.worktree_prompt)
         .unwrap_or(true)
+}
+
+/// Whether opening a project restarts the agents roost itself launched in it.
+///
+/// Global only (see `GLOBAL_ONLY_KEYS`) and **off** unless asked for. #17 is
+/// careful about this for good reason — a relaunch starts an agent in a
+/// checkout whose state it does not know — so absent, unreadable and
+/// unparseable all mean off, which is the one direction where being wrong
+/// costs nothing.
+pub fn relaunch() -> bool {
+    relaunch_from(&global_config_path())
+}
+
+fn relaunch_from(global: &Path) -> bool {
+    std::fs::read_to_string(global)
+        .ok()
+        .and_then(|s| toml::from_str::<RawConfig>(&s).ok())
+        .and_then(|r| r.relaunch)
+        .unwrap_or(false)
 }
 
 /// The directories scanned for projects, from the global config's `roots`.
@@ -559,6 +611,26 @@ pub fn raw_setting(path: &Path, key: &str) -> Option<SettingValue> {
 /// that field's doc comment), so the roughly twenty file reads here are paid
 /// once per invalidation, not once per snapshot — a snapshot goes out on
 /// every debounced keystroke.
+/// What the running binary is, from values `build.rs` baked in.
+///
+/// The repository URL comes from `Cargo.toml`'s `repository` field rather than
+/// a literal here, so there is one place it can be wrong.
+pub fn build_info() -> crate::proto::BuildInfo {
+    let install = crate::install::describe();
+    crate::proto::BuildInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        commit: option_env!("ROOST_GIT_HASH").unwrap_or("unknown").to_string(),
+        built_epoch: option_env!("ROOST_BUILD_EPOCH")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        repository: option_env!("CARGO_PKG_REPOSITORY").unwrap_or("").to_string(),
+        channel: install.channel.to_string(),
+        replaceable: install.replaceable.as_str().to_string(),
+        owner: install.owner.as_str().to_string(),
+        target: option_env!("ROOST_TARGET").unwrap_or("unknown").to_string(),
+    }
+}
+
 pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
     use crate::proto::{SettingRow, SettingsView, SettingValue as V};
     let global = global_config_path();
@@ -589,10 +661,14 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
         "Show dot-files and dot-directories in the file tree.");
     push("autosave", "bool", V::Bool(s.autosave), V::Bool(true), true,
         "Save an edited file a second after the last keystroke and on blur; off means ⌘S.");
+    push("follow_tree", "bool", V::Bool(s.follow_tree), V::Bool(true), true,
+        "Expand the file tree to the file you are looking at, and mark it.");
     push("share_selection", "bool", V::Bool(share_selection()), V::Bool(false), true,
         "Let a Claude connected to this project read the text you select in the editor.");
     push("worktree_prompt", "bool", V::Bool(worktree_prompt()), V::Bool(true), false,
         "When a Claude is already running here, ✻ offers to start the next one in a new worktree.");
+    push("relaunch", "bool", V::Bool(relaunch()), V::Bool(false), false,
+        "When you open a project, restart the agents roost had launched in it before a reboot. Never resumes a conversation \u{2014} it starts a fresh one.");
     push("allowed_origins", "list", V::List(allowed_origins()), V::List(vec![]), false,
         "Browser origins allowed to connect besides loopback, such as the tailnet address.");
     push("max_upload_bytes", "str", V::Str(max_upload_bytes().to_string()), V::Str(DEFAULT_MAX_UPLOAD.to_string()), false,
@@ -610,6 +686,7 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
          removing one is a hand edit of ~/.config/roost/config.toml.",
     );
     SettingsView {
+        build: build_info(),
         keys,
         themes: crate::themes::catalogue(),
         project_file: ".roost/config.toml".into(),
@@ -620,6 +697,72 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_build_info_never_reports_a_plausible_looking_unknown() {
+        // #56 exists because roost is deployed by building it and copying a
+        // binary about, and nothing in the UI could answer "is this the thing
+        // I built?". A panel that can be quietly wrong is worse than none, so
+        // every field either says something true or says `unknown` — never an
+        // empty string, which reads as a real value in a table.
+        let b = super::build_info();
+        assert_eq!(b.version, env!("CARGO_PKG_VERSION"));
+        assert!(!b.commit.is_empty(), "a blank commit reads as a real one");
+        // Built in this repo, from a checkout with git available, so the
+        // commit must be a real one — this is what fails if `build.rs` stops
+        // emitting it, which is the silent-degradation case: `unknown` is
+        // correct on a release tarball and wrong here.
+        assert_ne!(b.commit, "unknown", "built in a git checkout, so the hash is knowable");
+        let core = b.commit.trim_end_matches('?').trim_end_matches("-dirty");
+        assert!(
+            core.len() >= 7 && core.chars().all(|c| c.is_ascii_hexdigit()),
+            "not a commit hash: {}",
+            b.commit
+        );
+
+        // The `-dirty` suffix, checked against the tree it describes rather
+        // than allowed either way. "Built from a1b2c3d" is false in the common
+        // case of a local build with edits in the tree, and this panel exists
+        // to be trusted — so the assertion has to be able to see the suffix go
+        // missing. Written this way after a revert-check: dropping the whole
+        // `git status` branch from `build.rs` left an earlier version of this
+        // test green, because it accepted a bare hash as readily as a marked
+        // one.
+        //
+        // Skipped where the answer is not knowable — a release tarball, or a
+        // box with no `git` — because there the *right* answer is `unknown`
+        // and this assertion has nothing to say.
+        if b.commit != "unknown" && !b.commit.ends_with('?') {
+            let st = std::process::Command::new("git")
+                .args(["status", "--porcelain", "--untracked-files=no"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .output();
+            if let Ok(st) = st {
+                if st.status.success() {
+                    let tree_dirty = !st.stdout.is_empty();
+                    assert_eq!(
+                        b.commit.ends_with("-dirty"),
+                        tree_dirty,
+                        "the commit says dirty={} while the tree says dirty={}: {}",
+                        b.commit.ends_with("-dirty"),
+                        tree_dirty,
+                        b.commit
+                    );
+                }
+            }
+        }
+        assert!(b.built_epoch > 1_600_000_000, "a build time of {} is not a time", b.built_epoch);
+        assert!(b.repository.starts_with("https://"), "repository: {:?}", b.repository);
+    }
+
+    #[test]
+    fn the_settings_snapshot_carries_the_build_info() {
+        // The dialog reads this off the snapshot it already gets; without it
+        // the About pane renders four `unknown`s and nothing says why.
+        let d = tempfile::tempdir().unwrap();
+        let v = super::settings_view(d.path());
+        assert_eq!(v.build, super::build_info());
+    }
+
     use super::*;
     use crate::proto::{Scope, SettingValue as V};
     use std::fs;
@@ -1176,6 +1319,14 @@ mod tests {
         assert_eq!(m.effective, V::Str("7".into()));
         assert!(m.writable.is_empty());
         assert!(row("autosave").reload, "autosave is embedded at page load");
+        // Project-scoped on purpose, and asserted so the choice is a decision
+        // rather than whichever list a later edit happened to land in. A
+        // checkout setting this one moves a scrollbar; it grants nothing and
+        // raises no ceiling, which is the test `GLOBAL_ONLY_KEYS` exists for.
+        let f = row("follow_tree");
+        assert_eq!(f.writable, vec!["project", "global"], "follow_tree is not global-only");
+        assert_eq!(f.default, V::Bool(true), "it follows unless something turns it off");
+        assert!(f.reload, "it is embedded at page load, like autosave");
         // Every row explains itself: the dialog shows `doc` under the key.
         for r in &v.keys {
             assert!(!r.doc.is_empty() && r.doc.ends_with('.'), "{}: doc {:?}", r.key, r.doc);
@@ -1184,7 +1335,7 @@ mod tests {
         assert!(!row("theme").reload);
         // Order: project keys, global-only keys, read-only keys.
         let keys: Vec<&str> = v.keys.iter().map(|r| r.key.as_str()).collect();
-        assert_eq!(keys, ["theme", "hide", "show_hidden", "autosave", "share_selection", "worktree_prompt", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
+        assert_eq!(keys, ["theme", "hide", "show_hidden", "autosave", "follow_tree", "share_selection", "worktree_prompt", "relaunch", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
         assert_eq!(v.themes.len(), 5 + 35);
         assert!(v.global_file.ends_with("global.toml"));
         assert_eq!(v.project_file, ".roost/config.toml");

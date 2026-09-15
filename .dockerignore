@@ -1,0 +1,10 @@
+# The build context is sent to the daemon whole, so keep it to what the build
+# actually reads: Cargo metadata, src/, static/, build.rs.
+/target
+.git
+.github
+.claude
+docs/img
+tests/browser/tmp
+*.deb
+*.rpm

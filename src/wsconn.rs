@@ -340,6 +340,45 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
                     searcher.submit(q, seq);
                     continue;
                 }
+                // Diverted for the same reason Search is: it reads an archive
+                // the size of an upload and writes the state directory, and
+                // CLAUDE.md forbids holding this lock across blocking I/O —
+                // this project has already shipped one deadlock that way.
+                //
+                // Run inline on this connection's read thread rather than on a
+                // worker: unlike a search there is no newer request that
+                // supersedes it, and a restore that overlapped itself would be
+                // two plans built against the same directory and applied in an
+                // order nobody chose. One at a time, per connection, and the
+                // browser's buttons are disabled while it runs.
+                if let Ok(proto::Intent::RestoreWorkspace { file, dry_run }) = decoded {
+                    let ev = crate::restore::run(project, &dir, &file, dry_run);
+                    let applied = !dry_run
+                        && matches!(&ev, proto::Event::RestoreReport { refused: None, .. });
+                    {
+                        let mut h = Hub::lock(&hub);
+                        h.send_to(&id, &ev);
+                        // A restore that actually wrote replaced the state
+                        // file underneath a hub built from the old one. Without
+                        // this reload the restore appears to work and then
+                        // silently reverts: the next intent touching the layout
+                        // saves what is still in memory back over it.
+                        //
+                        // Broadcast, not `send_to`: a second browser on this
+                        // project is now looking at a layout that no longer
+                        // exists on disk, and it did not ask for the restore.
+                        if applied {
+                            h.reload_from_disk();
+                            // The settings cache is keyed to the hub, not to
+                            // the layout, but a restore may have replaced the
+                            // project's own config too — cheaper to drop it
+                            // than to reason about which half changed.
+                            let snapshot = h.snapshot_event(&id);
+                            h.broadcast(&snapshot);
+                        }
+                    }
+                    continue;
+                }
                 let dirty = {
                     let mut h = Hub::lock(&hub);
                     match decoded {

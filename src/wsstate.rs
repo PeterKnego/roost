@@ -70,6 +70,20 @@ struct Disk {
     /// at the test rather than silently rejecting every old file.
     #[serde(default)]
     show_hidden: Option<bool>,
+    /// The sessions roost saw a live shell for when this file was written.
+    ///
+    /// Positive evidence, and the whole reason it is persisted: a terminal tab
+    /// with no socket behind it is only *lost* if there was once something to
+    /// lose. The default layout ships an empty `term` tab, so without this
+    /// every brand-new project announced that a shell it had never started had
+    /// failed to survive — the same "concluded from a failed check" mistake as
+    /// the table in CLAUDE.md, pointed the other way.
+    ///
+    /// Absent from every file written before this existed. An empty set there
+    /// is the right reading: those files record nothing about shells, so they
+    /// support no claim that one is gone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sessions_seen: Vec<String>,
 }
 
 /// Honours `ROOST_STATE_DIR` for tests and operators who want state
@@ -124,6 +138,7 @@ pub fn save(project: &str, w: &Workspace) -> Result<(), String> {
     }
     let disk = Disk {
         show_hidden: w.show_hidden,
+        sessions_seen: w.live_sessions.clone(),
         sizes: w.sizes,
         panes: w
             .panes
@@ -176,6 +191,7 @@ pub fn load(project: &str) -> (Workspace, Option<String>) {
         Ok(d) => {
             w.sizes = d.sizes;
             w.show_hidden = d.show_hidden;
+            w.sessions_seen = d.sessions_seen;
             if d.panes.len() == w.panes.len() {
                 w.panes = d
                     .panes
@@ -497,6 +513,61 @@ mod tests {
     /// must still load — falling back to the old behaviour, which is right
     /// for a clean buffer (its text *is* the disk) and merely leaves a dirty
     /// one reporting a conflict it can be forced past, as it did before.
+    #[test]
+    fn the_shells_roost_saw_survive_a_save_and_load() {
+        with_state_dir(|| {
+            // This is the only durable evidence that a terminal tab ever had a
+            // shell — the socket does not outlive a reboot and neither does
+            // the process. If it stops round-tripping, `hub` sees an empty set
+            // and every genuinely lost shell goes back to being reported as a
+            // tab nobody opened, silently and with the suite still green.
+            let mut w = Workspace::default_layout();
+            w.live_sessions = vec!["term".into(), "claude".into()];
+            save("seen_probe", &w).unwrap();
+            let (got, warn) = load("seen_probe");
+            assert!(warn.is_none());
+            assert_eq!(
+                got.sessions_seen,
+                vec!["term".to_string(), "claude".to_string()],
+                "what was running at save time is what comes back"
+            );
+            assert!(
+                got.live_sessions.is_empty(),
+                "but not as live sessions: loading a file must not imply a \
+                 running shell, which is the claim that would make every \
+                 restored tab attach to nothing"
+            );
+        });
+    }
+
+    #[test]
+    fn a_state_file_from_before_this_existed_claims_no_shells() {
+        with_state_dir(|| {
+            // Every file on every existing install is this shape. An empty set
+            // is the right reading — those files record nothing about shells,
+            // so they support no claim that one is gone — and the alternative
+            // is worse than useless: defaulting to "all of them" would tell
+            // every user, once, that shells they never started had died.
+            std::fs::create_dir_all(state_dir()).unwrap();
+            let raw = serde_json::json!({
+                "sizes": {"left_w": 260, "right_w": 520, "left_split": 60},
+                "panes": [
+                    {"tabs": [], "active": 0}, {"tabs": [], "active": 0},
+                    {"tabs": [], "active": 0},
+                    {"tabs": [{"k": "Terminal", "session": "term"}], "active": 0}
+                ],
+                "buffers": {},
+            });
+            std::fs::write(state_dir().join("old_seen_probe.json"), raw.to_string()).unwrap();
+            let (got, warn) = load("old_seen_probe");
+            assert!(warn.is_none(), "an old file is not a corrupt one");
+            assert!(
+                got.sessions_seen.is_empty(),
+                "no record of a shell is not a record of every shell"
+            );
+        });
+    }
+
     #[test]
     fn a_state_file_written_before_base_hash_still_loads() {
         with_state_dir(|| {

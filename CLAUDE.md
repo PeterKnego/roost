@@ -11,6 +11,23 @@ These are load-bearing. Breaking one is a defect, not a style choice.
 
 - **Bind `127.0.0.1` only.** The websocket spawns a shell; the loopback bind is
   the security boundary.
+
+  **The container image substitutes that boundary rather than removing it**, and
+  the two rules are opposites because their deployments are — the same shape as
+  the `ide.rs` bullet below. Inside a namespace `127.0.0.1` is the container's
+  own loopback, which the host cannot reach, so `bind.rs` permits `0.0.0.0`
+  *only* on `ROOST_BIND_ALL=1`, and the network namespace becomes the boundary.
+  Three properties make that a substitution and not a hole: it is a boolean
+  named for its consequence rather than an address field, so it cannot be set by
+  someone typing a preference; an unrecognised value **exits**, because guessing
+  loopback would leave a container listening where nothing can reach it and say
+  nothing; and it is environment-only, never config, because the global config
+  lives on a volume the container's own user can write.
+
+  **Reconciling the two is the vulnerability, not the cleanup** — making the
+  host bind configurable "for symmetry", or dropping the gate because the
+  container needs `0.0.0.0` anyway, each removes a boundary. `ide.rs` keeps its
+  unconditional `127.0.0.1`: its client is a `claude` in the same container.
 - **HTTP is GET-only apart from `POST /upload` and `POST /paste`.** Every other
   state change is a websocket intent. Those two endpoints are the entire CSRF
   surface, and the only thing closing it is that they check `Origin` exactly as
@@ -83,14 +100,36 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   result list of `.git` internals and source triplicated across worktrees, and
   the 20 000-file cap firing before the real files were reached. Making the two
   "consistent" by dropping those refusals brings all of that back.
+
+  A third refusal, and the only one that *is* overridable: a directory git
+  ignores. `src/gitignore.rs` is a deliberately partial matcher, and its
+  failure direction is chosen — an unsupported construct contributes no rule,
+  and a file carrying any negation (`!`), or one that cannot be read at all,
+  makes its whole subtree **opaque**: nothing there is ignored, by it or by
+  any ancestor. Suppressing ancestors is the point, and it follows from git's
+  precedence — a deeper `.gitignore` outranks a shallower one, so a `!` here
+  can re-include what a parent excluded. Dropping the `!` and keeping the
+  parent's rule is the one mistake that hides a whole project, and it shipped
+  once: `parse` returned an empty list for both "no rules" and "no usable
+  rules", so a `!dist/` in `.gitignore` vanished while `.git/info/exclude`'s
+  `dist/` survived in the same merged scope. Descendants are deliberately
+  unaffected — they outrank the bailing file too. It tests directories only,
+  and `show_hidden` turns it off, which is what makes a partial matcher safe
+  to ship: a directory it skips wrongly is still reachable. `TreeFilter` runs
+  first, so `target`, `node_modules` and every dotfile never reach it — which
+  is what keeps the reported count rare enough to be worth reading.
 - **A search that skipped something says so.** `Results` carries an `Outcome`
-  and two counters (`unreadable`, `skipped_nested`) rather than being a bare
-  list, and the client renders every one of them. The distinction that matters
-  is three-way, not two: *could not look* (an unreadable directory — a gap),
-  *chose not to look* (a nested checkout, contents below three characters — a
-  decision), and *looked and found nothing*. All three used to render as an
-  empty note, which is the same defect as the table below wearing a quieter
-  coat: no crash, no lost shell, and no way for the user to tell.
+  and three counters (`unreadable`, `skipped_nested`, `skipped_ignored`) rather
+  than being a bare list, and the client renders every one of them. The
+  distinction that matters is three-way, not two: *could not look* (an
+  unreadable directory — a gap), *chose not to look* (a nested checkout, a
+  gitignored directory, contents below three characters — a decision), and
+  *looked and found nothing*. The two "chose not to" counters stay apart
+  because the answer to "where is my build output" is a different answer from
+  "where is my submodule", and only one of them names an override. All three
+  used to render as an empty note, which is the same defect as the table below
+  wearing a quieter coat: no crash, no lost shell, and no way for the user to
+  tell.
 - **Never hold a lock across blocking I/O.** This project has already shipped
   one deadlock that way (the global session registry held across a PTY write,
   which wedged every session in every project).
@@ -264,7 +303,15 @@ the four traps that make a browser test pass while asserting nothing.
 
 ## Process
 
-Design docs live in `docs/superpowers/specs/`, implementation plans in
-`docs/superpowers/plans/`. For anything beyond a small fix, write the spec
-first and get it reviewed, then the plan, then implement task-by-task with a
-review between tasks.
+For anything beyond a small fix, three steps, each at its own time:
+
+1. **Brainstorm the feature or change, and put the outcome into a new
+   issue.** The problem, the decisions made, the shape. A brainstorm ends
+   there — no spec file, no branch, no PR.
+2. **When the issue is being worked on, write the spec** into
+   `docs/superpowers/specs/`, on the work branch, and get it reviewed.
+3. **Then the implementation plan**, into `docs/superpowers/plans/`, the same
+   way, and implement task-by-task with a review between tasks.
+
+The spec and the plan are written by whoever picks the issue up, when they
+pick it up — not ahead of time, and not as PRs of their own.

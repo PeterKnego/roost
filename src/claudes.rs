@@ -186,6 +186,20 @@ pub fn cached_sessions(project: &str) -> Vec<String> {
     }
 }
 
+/// The watcher's most recent walk, cloned out.
+///
+/// For callers that need the whole `ClaudeProc` rather than just the session
+/// names `cached_sessions` returns — `ide::mention_to`, which wants the SSE
+/// port to explain *why* a mention could not be delivered.
+///
+/// Up to `POLL` stale, which is the right trade for an explanation: the
+/// alternative is a fresh `/proc` walk on a path that runs under the hub
+/// lock, and CLAUDE.md forbids blocking I/O there. `Search` was diverted to a
+/// worker thread for exactly that reason.
+pub fn cached_scan() -> Vec<ClaudeProc> {
+    scan_cell().lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Projects whose set of (terminal, Claude) pairs differs between two scans.
 ///
 /// Compares `(project, session)` only, never the port. `tick` broadcasts to

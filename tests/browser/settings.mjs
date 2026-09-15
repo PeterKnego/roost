@@ -25,6 +25,14 @@ try {
   one = await openPage(browser.port, url);
   two = await openPage(browser.port, url);
   for (const p of [one, two]) await until(() => p.evalIn("ctrl && ctrl.readyState === 1 && !!state && !!state.settings"), 30, "app");
+  // Opening `two` put `one` behind it, and a hidden page is served no
+  // animation frames — see `bringToFront` in harness.mjs. Everything below
+  // but the two mirror checks drives `one`, and the terminal it holds paints
+  // through xterm's renderer, which runs on a frame. Nothing here asserts on
+  // paint *today*, so this guards the next assertion that does rather than
+  // fixing a failure; the two `two.evalIn` lines read `data-theme` off the
+  // document, which needs no frame.
+  await one.bringToFront();
 
   console.log("A. applyTheme switches the cascade in place, both directions");
   // A terminal that exists BEFORE the switch: xterm reads the variables at
@@ -102,7 +110,7 @@ try {
   const labels = await one.evalIn(`[...document.querySelectorAll("#dlg-settings .dlg-row")].map((l) => l.dataset.key).join(",")`);
   // No theme row here: the theme is chosen on the Theme pane, which also
   // carries its source line and Clear.
-  ok(labels === "hide,show_hidden,autosave,share_selection,worktree_prompt,allowed_origins,max_upload_bytes,ide,roots", `rows in the spec's order, without theme (${labels})`);
+  ok(labels === "hide,show_hidden,autosave,follow_tree,share_selection,worktree_prompt,relaunch,allowed_origins,max_upload_bytes,ide,roots", `rows in the spec's order, without theme (${labels})`);
   ok(/keystroke/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="autosave"] .doc').textContent`)), "each row explains what the setting does");
   {
     const h = await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="autosave"]').getBoundingClientRect().height`);

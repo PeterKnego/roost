@@ -52,6 +52,10 @@ impl Default for Sizes {
 #[serde(rename_all = "lowercase")]
 pub enum Launch {
     Claude,
+    /// A Claude put on this repository's open pull requests, looping until
+    /// they are finished. See `launch::PR_LOOP_PROMPT` for what it is told,
+    /// including the bounds that stop it. #52.
+    PrLoop,
 }
 
 /// Which config file a `SetSetting` edits.
@@ -89,7 +93,19 @@ pub enum Intent {
     DeleteFile { rel: String },
     RenamePath { from: String, to: String },
     RequestState,
-    StartTerminal { session: String },
+    /// Start the shell for a terminal tab that has none. The placeholder's
+    /// two controls, in one message.
+    StartTerminal {
+        session: String,
+        /// Continue the Claude roost recorded for this terminal, instead of
+        /// giving it a bare shell (#18 step 2). The id is **not** here on
+        /// purpose: the client asks by session name and the server looks it
+        /// up, because the id lands on a command line and CLAUDE.md already
+        /// reserves that class of choice to the server. `#[serde(default)]`
+        /// so a client from before this field still parses.
+        #[serde(default)]
+        resume: bool,
+    },
     /// Ends one session outright — the shell and its dtach master, not just
     /// this browser's view of it. Deliberately *not* a flag on `CloseTab`:
     /// closing a tab rearranges layout and is reversible, while this destroys
@@ -114,6 +130,18 @@ pub enum Intent {
         /// was always one keystroke away.
         #[serde(default)]
         force: bool,
+        /// Continue this past conversation instead of starting a fresh one:
+        /// the id of a row in the ✻ menu (`claudehist`). Meaningful only with
+        /// `launch: Claude`.
+        ///
+        /// Unlike `StartTerminal`'s `resume`, this one *is* a value from the
+        /// client, because the menu is a list and the choice is which row. So
+        /// the server re-derives the authorisation at use — `claudehist::has`,
+        /// which validates the id and confirms this project actually has that
+        /// conversation. The row that offered the button is a hint, exactly as
+        /// `RemoveWorktree` says of its own.
+        #[serde(default)]
+        resume: Option<String>,
     },
     /// A span matched in terminal output, sent **verbatim** —
     /// `~/projects/roost/src/a.rs:42` and all. Deliberately not pre-parsed by
@@ -199,6 +227,32 @@ pub enum Intent {
     /// `accept: false` with a `text` is still a rejection — the text is only
     /// ever read on the accepting path.
     AnswerProposal { id: String, accept: bool, text: Option<String> },
+    /// Restore this project from an archive the browser has already uploaded
+    /// through `POST /upload` (#18 step 3).
+    ///
+    /// Deliberately **not** a third POST endpoint. CLAUDE.md caps the HTTP
+    /// surface at two and then says what the alternative is: "Every other
+    /// state change is a websocket intent." A restore is a state change; what
+    /// it needs is a *body delivered*, and roost already has exactly one
+    /// audited way to deliver one. Coming in here rather than over HTTP also
+    /// puts it behind the handshake's `Origin` check, which is a stronger gate
+    /// than a POST's — a `multipart/form-data` POST is a CORS simple request
+    /// any page can submit cross-origin with no preflight, while a handshake
+    /// from that page is refused before the first frame.
+    ///
+    /// `file` is project-relative and confined by `projects::safe_resolve`,
+    /// like every other `rel` on this enum. Nothing *inside* the archive names
+    /// a path at all — see `backup`'s module doc.
+    RestoreWorkspace {
+        file: String,
+        /// Describe the restore without performing it. The dialog always
+        /// sends this first: #18 calls restore the most destructive operation
+        /// roost would have, and the failure worth catching — a transcript
+        /// directory re-derived somewhere unexpected — is visible in a listing
+        /// and invisible in a success message.
+        #[serde(default)]
+        dry_run: bool,
+    },
     /// The editor's current selection, sent as ambient context on a debounce
     /// from `static/app.js` — not a deliberate gesture like `MentionPath`'s
     /// Alt+K. `rel` is resolved and confined server-side exactly like
@@ -271,6 +325,50 @@ pub struct SettingsView {
     pub global_file: String,
     /// `Settings::warning` — a config file that did not parse, named.
     pub warning: Option<String>,
+    /// What this binary is, for the About panel. Constant for the life of the
+    /// process, and carried here rather than fetched separately because it is
+    /// a server fact and this snapshot is already how server facts reach the
+    /// dialog.
+    pub build: BuildInfo,
+}
+
+/// The identity of the running binary.
+///
+/// Every field can be the string `unknown`, and that is a real answer rather
+/// than a gap to paper over: a release tarball has no `.git`, and a build box
+/// may have no `git`. See `build.rs::git_hash` — a display that can be quietly
+/// wrong is worse than one that says it does not know.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub struct BuildInfo {
+    pub version: String,
+    /// Short commit, with `-dirty` when the tree had uncommitted changes and a
+    /// trailing `?` when `git status` itself could not be trusted.
+    pub commit: String,
+    /// Unix seconds. Formatted by the client, which knows the reader's
+    /// timezone; 0 means unknown.
+    pub built_epoch: u64,
+    pub repository: String,
+    /// How this binary was produced: `release`, `cargo`, `checkout` or
+    /// `unknown`. Baked at build time, and deliberately no finer — Homebrew,
+    /// the `.deb`, the `.rpm` and the tarball are the same bytes, so a
+    /// compiled-in value cannot separate them (see `install.rs`).
+    pub channel: String,
+    /// Whether this process could replace its own executable: `yes`, `no` or
+    /// `unknown`. Established by writing a probe file, not by reading
+    /// permission bits, and three-valued because "could not find out" is not
+    /// "no" — this is what decides whether an update button can work at all.
+    pub replaceable: String,
+    /// Best-effort guess at what manages this binary — `homebrew`,
+    /// `system-package`, `cargo-bin`, `other`, `unknown`. Cosmetic: it words a
+    /// suggested command and nothing acts on it, so a wrong guess costs a
+    /// wrong sentence rather than a wrong operation.
+    pub owner: String,
+    /// The target triple this binary was built for, e.g.
+    /// `x86_64-unknown-linux-musl`. Names the release tarball, so the About
+    /// pane can offer the exact download rather than a page to browse — and
+    /// on macOS a `curl` line is the fix for the quarantine hang, since only a
+    /// browser sets the attribute.
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -282,6 +380,21 @@ pub struct WorkspaceView {
     /// Session names currently running for this project. A Terminal tab whose
     /// name is absent renders its start placeholder instead of attaching.
     pub live_sessions: Vec<String>,
+    /// Terminal tabs the restored layout asked for whose shell is positively
+    /// gone — a reboot, or a reaped socket. The placeholder says so, instead
+    /// of rendering identically to a tab that never had a shell. Only ever
+    /// populated from positive evidence; see `hub::lost_terminal_sessions`.
+    pub lost_sessions: Vec<String>,
+    /// Of the lost ones, those with a recorded Claude session the placeholder
+    /// can offer to resume (#18 step 2). Names only: the id lands on a command
+    /// line, so it stays server-side and the browser asks for the resume by
+    /// session name (`Intent::StartTerminal`'s `resume`) rather than by value.
+    ///
+    /// Absence means *no record*, which is not *no Claude ran here* — hooks
+    /// are per-project and opt-in, so a hand-typed `claude` in a project with
+    /// the bell off records nothing. Nothing may render this as a claim that
+    /// the tab had no Claude; see `claudesess`'s module doc.
+    pub resumable_sessions: Vec<String>,
     /// Of those, the ones running a Claude — their tabs take the Claude mark
     /// in place of the terminal glyph. Derived in `hub::snapshot_event` from
     /// `claudes::cached_sessions`, never stored in the workspace: it is a
@@ -378,6 +491,18 @@ pub enum Event {
     /// change (every debounced keystroke, via `EditBuffer`), and two whole
     /// file bodies have no business on that path.
     Proposal { id: String, rel: String, old_text: String, new_text: String },
+    /// What a restore would do, or has just done (#18 step 3).
+    ///
+    /// Sent with `send_to` and never broadcast: the archive was uploaded by
+    /// one person, on one connection, and a second browser on the project has
+    /// no context for a listing of paths it did not ask for. The workspace
+    /// change a real restore causes reaches everyone the way every other one
+    /// does — through the state snapshot.
+    ///
+    /// `refused` and an empty `lines` is a real combination and the renderer
+    /// must show it: it is the whole of what the user is told when an archive
+    /// is rejected before a single file is touched.
+    RestoreReport { dry_run: bool, lines: Vec<String>, refused: Option<String> },
     /// This project's notices — not the whole store — sent on connect and
     /// after any read-state change, so no two browsers on the same project
     /// disagree about the badge count.
@@ -454,6 +579,38 @@ mod tests {
     fn diff_tab_none_is_the_full_diff_entry() {
         let i = decode(r#"{"t":"OpenTab","pane":2,"tab":{"k":"Diff","rel":null}}"#).unwrap();
         assert!(matches!(i, Intent::OpenTab { tab: Tab::Diff { rel: None }, .. }));
+    }
+
+    /// The field a client from before #18 step 2 does not send. Its default
+    /// has to be "plain shell", or an old browser's Enter on a placeholder
+    /// would start resuming conversations nobody asked for.
+    ///
+    /// Revert-checked: removing `#[serde(default)]` makes the first case fail
+    /// to decode at all — `Err("missing field `resume`")` — which is the
+    /// louder half of the same defect: every existing client's placeholder
+    /// stops working.
+    #[test]
+    fn start_terminal_resumes_only_when_asked_and_defaults_to_a_plain_shell() {
+        assert!(
+            matches!(
+                decode(r#"{"t":"StartTerminal","session":"shell"}"#).unwrap(),
+                Intent::StartTerminal { resume: false, .. }
+            ),
+            "a message with no `resume` must mean a plain shell"
+        );
+        assert!(matches!(
+            decode(r#"{"t":"StartTerminal","session":"shell","resume":true}"#).unwrap(),
+            Intent::StartTerminal { resume: true, session } if session == "shell"
+        ));
+        // No id on the wire, by design — so a message carrying one is not a
+        // way to smuggle it in. serde ignores unknown fields, which is the
+        // behaviour being pinned: the id is looked up server-side or not at
+        // all.
+        assert!(matches!(
+            decode(r#"{"t":"StartTerminal","session":"shell","resume":true,"session_id":"x; rm -rf ~"}"#)
+                .unwrap(),
+            Intent::StartTerminal { resume: true, .. }
+        ));
     }
 
     #[test]

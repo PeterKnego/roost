@@ -85,15 +85,38 @@ const browser = await startBrowser(profileDir(repoRoot));
 let ws, after, roost;
 
 /// The dtach sockets on disk for the fixture project — the evidence that the
-/// shells themselves ended, kept separate from what the page shows. `.origin`
-/// is the registry's marker, not a session.
+/// shells themselves ended, kept separate from what the page shows.
+///
+/// Every dot entry is metadata beside a socket, never a session: a session
+/// name is `^[A-Za-z0-9_-]{1,32}$` and so can never contain one, which is why
+/// `src/modes.rs` gives its sidecar a leading dot in the first place. Named
+/// exclusions do not hold — this filtered exactly `.origin` and section C
+/// went red the day `.modes.<name>` arrived beside it, reporting
+/// `[".modes.term","term"]` against a `=== 1`.
 async function sockets() {
   const out = [];
   try {
     for await (const e of Deno.readDir(`${fx.stateDir}/sock/${fx.project}`)) {
-      if (e.name !== ".origin") out.push(e.name);
+      if (!e.name.startsWith(".")) out.push(e.name);
     }
   } catch { /* the whole directory may be gone; that is zero sessions */ }
+  return out.sort();
+}
+
+/// The sticky-modes sidecars beside those sockets.
+///
+/// Asserted separately rather than left to the filter above: `modes.rs` ties
+/// the file's life to the *socket's*, and a dot filter that quietly ignored a
+/// leaked one would turn a broken sweep into a green suite. Measured while
+/// diagnosing section C — after a close the directory holds `.origin` alone,
+/// so this is a real zero and not an untested wish.
+async function sidecars() {
+  const out = [];
+  try {
+    for await (const e of Deno.readDir(`${fx.stateDir}/sock/${fx.project}`)) {
+      if (e.name.startsWith(".modes.")) out.push(e.name);
+    }
+  } catch { /* the whole directory may be gone */ }
   return out.sort();
 }
 
@@ -127,6 +150,8 @@ try {
   await ws.evalIn(`document.querySelector("#dlg-confirm .dlg-ok").click(); 0`);
   ok(await until(async () => (await sockets()).length === 0, 30, "every socket unlinked"),
      `the shells themselves ended: ${JSON.stringify(await sockets())}`);
+  ok((await sidecars()).length === 0,
+     `and took their modes sidecars with them: ${JSON.stringify(await sidecars())}`);
   // The sockets go early in the close, but the close is not over: it sweeps a
   // second time after `CLOSE_SETTLE` (see Section D), and `closing` stays true
   // across both — so `term.rs` deliberately refuses a new terminal for that

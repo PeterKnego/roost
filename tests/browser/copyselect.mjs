@@ -41,10 +41,31 @@ try {
     window.__last = () => __txt().split("\\n").filter((l) => l.trim()).pop() || "";
     window.__mouse = () => __t().term.modes.mouseTrackingMode;
     window.__flash = () => __t().node.dataset.flash || "";
+    // The row the marker is the WHOLE of, not merely a row containing it.
+    // \`echo <marker>\` puts the marker on two rows: the command line, where it
+    // sits after the prompt, and the output line, where it starts at column 0.
+    // Only the second is draggable by "start at the left edge and go one
+    // marker's width" -- and a \`find\` on \`includes\` returns the first, which is
+    // the command line. That went unnoticed for as long as the terminal was
+    // narrow enough to wrap the command line, because then no single rendered
+    // row held the whole marker except the output one. Widen the terminal and
+    // the same test drags across 16 characters of shell prompt instead
+    // (measured: a 62-character prompt, so the drag never reaches the marker).
     window.__rowRect = (needle) => { const rows = [...document.querySelectorAll(".xterm-rows div")];
-      const r = rows.find((n) => n.textContent.includes(needle));
+      const r = rows.find((n) => n.textContent.trimStart().startsWith(needle));
       if (!r) return null; const b = r.getBoundingClientRect();
-      return { x: b.left + 4, y: b.top + b.height / 2, x2: b.left + 4 + 7 * needle.length }; };`);
+      // Measured, not assumed: this was 7px hardcoded while the real cell is
+      // 7.83px here, so a marker-width drag fell two columns short. The row
+      // div spans the whole terminal, so its width over the column count is
+      // the cell width without reaching into xterm's internals.
+      const cell = b.width / __t().term.cols;
+      // Half a cell past the last glyph so the final column is inside the
+      // drag, and 1px in rather than 4 so the first one is: at a 7.83px cell,
+      // +4 is past the midpoint of column 0 and xterm rounds the selection to
+      // column 1 -- which drops the marker's first character, the exact
+      // difference between this assertion passing and failing.
+      return { x: b.left + 1, y: b.top + b.height / 2,
+               x2: b.left + cell * (needle.length + 0.5) }; };`);
 
   const clip = () => evalIn(`navigator.clipboard.readText().then((t) => t, () => "<unreadable>")`);
   const seed = () => evalIn(`navigator.clipboard.writeText("STALE-CLIPBOARD").then(() => "ok")`);
@@ -86,7 +107,10 @@ try {
   await drag(false);
   ok(await evalIn(`__t().term.getSelection().length > 0`), "xterm registered the selection (guards the rest)");
   const one = await clip();
-  ok(one.includes("echo") || one.includes(MARKER.slice(0, 8)),
+  // The WHOLE marker, not a prefix. The loose form this replaced -- "contains
+  // echo, or the marker's first 8 characters" -- is satisfied by a drag that
+  // lands on the wrong row or starts a column late, and both have happened.
+  ok(one.includes(MARKER),
      `the selection reached the clipboard (${JSON.stringify(one.slice(0, 40))})`);
   ok(/copied/.test(await evalIn("__flash()")), `and the terminal said so (${await evalIn("__flash()")})`);
 
@@ -104,7 +128,7 @@ try {
   await drag(true); // shift, the way a real terminal bypasses an app's mouse
   ok(await evalIn(`__t().term.getSelection().length > 0`), "shift-drag still selects locally");
   const two = await clip();
-  ok(two.includes(MARKER.slice(0, 8)) || two.includes("echo"),
+  ok(two.includes(MARKER),
      `the selection reached the clipboard with the app holding the mouse (${JSON.stringify(two.slice(0, 40))})`);
   ok(/copied/.test(await evalIn("__flash()")), "and the terminal said so there too");
 

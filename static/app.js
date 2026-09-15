@@ -87,11 +87,89 @@ const NONASCII_KEY = "roost.nonascii";
 // instead. Only the highlight function differs, so everything hledit.mjs
 // established about the two layers agreeing holds for it unchanged.
 if (window.codeInput && window.hljs) {
-  codeInput.registerTemplate("hl", codeInput.templates.hljs(hljs, []));
+  codeInput.registerTemplate("hl", numbered(codeInput.templates.hljs(hljs, codePlugins())));
   // preElementStyled=false, as templates.hljs defaults it: that puts the
   // padding on `pre code`, where style.css and hledit.mjs expect it. True
   // moves it to the <pre>, and the marks land 10px off the glyphs.
   codeInput.registerTemplate("nonascii", new codeInput.Template(markNonAscii, false, false, false, []));
+}
+
+/// The plugins a *code* file's editor gets: Tab inserts an indent and Enter
+/// keeps it, and brackets and quotes close themselves.
+///
+/// Code files only. A prose file uses the "nonascii" template and keeps Tab
+/// as focus movement — auto-closing a quote in a paragraph of English is
+/// wrong far more often than it is right, and prose has no indentation to
+/// carry onto the next line.
+///
+/// Neither plugin touches the buffer except where the user typed. Both act
+/// only on `keydown`/`beforeinput`/`input` and insert through
+/// `execCommand("insertText")`, which fires the same `input` event ordinary
+/// typing does — so the 200 ms debounce, `EditBuffer`, autosave, ⌘S and the
+/// conflict patch all see these edits exactly as they see a keystroke. That
+/// is the property that matters here: save is guarded against a hash of what
+/// was read from disk, so anything that rewrote the text wholesale — a
+/// whitespace normaliser, a line-ending fixer — would make a buffer conflict
+/// with itself. Nothing here does.
+///
+/// Returns an empty list rather than failing if the plugin files did not
+/// load, so an editor without them is the old editor rather than no editor.
+function codePlugins() {
+  const p = [];
+  const P = window.codeInput && codeInput.plugins;
+  if (!P) return p;
+  // `in`, never a truthiness test. `codeInput.plugins` is a Proxy whose `get`
+  // trap *throws* `ReferenceError` for any name it does not know, so
+  // `if (P.Indent)` does not evaluate to false when the plugin file is
+  // missing — it throws. This function is called at app.js's top level, so
+  // that throw aborts evaluation of the entire file: no `send`, no `state`,
+  // no websocket, no editors, no terminals. A dead workspace, from one
+  // `<script>` that 404'd mid-deploy — or from a future `codePlugins()` entry
+  // added without its script tag. The doc below promised graceful
+  // degradation and delivered the opposite.
+  const has = (name) => name in P;
+  // A tab character, not spaces, and the asymmetry is the reason. Roost's
+  // editor has no per-language configuration and cannot know a file's
+  // convention, so it will sometimes be wrong either way — but the two
+  // wrongs are not equal. A tab landing in a spaces-indented file renders as
+  // a wide gap the moment it is typed, so it is seen and undone. Spaces
+  // landing in a Makefile — where the tab is load-bearing syntax — are
+  // invisible and break the build. Prefer the mistake that shows.
+  //
+  // `escTabToChangeFocus` (the plugin's own default) keeps Esc-then-Tab
+  // moving focus, so the keyboard is not trapped in the textarea.
+  if (has("Indent")) p.push(new P.Indent(false, 1, { "(": ")", "[": "]", "{": "}" }));
+  // `{` is deliberately absent from the auto-close pairs while `Indent`
+  // keeps it. The two plugins disagree about braces: AutoCloseBrackets
+  // inserts the `}`, `Indent.checkEnter` splits it onto its own line, and
+  // then `Indent.checkCloseBracket` dedents when the user types `}` while
+  // AutoCloseBrackets cannot step over a closer that is no longer the next
+  // character. Measured with real keystrokes:
+  //
+  //     `if (x) ` → `{` → `if (x) {}` → Enter → `if (x) {\n\t\n}`
+  //                → `}` → `if (x) {\n}\n}`
+  //
+  // Typing the closing brace by habit — which most people do — produced a
+  // syntax error in every code file. Dropping `{` here keeps `Indent`'s
+  // brace-aware Enter, which is the half the issue actually asked for, and
+  // leaves `(`, `[` and `"` closing themselves.
+  if (has("AutoCloseBrackets")) p.push(new P.AutoCloseBrackets({ "(": ")", "[": "]", '"': '"' }));
+  // Find within the buffer, and go to a line.
+  //
+  // `alwaysCtrl: false` is what keeps the two searches apart on both
+  // platforms: this takes ⌘F on a Mac and Ctrl+F elsewhere, while roost's
+  // project search is ⇧⌘F / ⇧⌃F and requires Shift (see the `KeyF` handler
+  // near the search overlay). They answer different questions — one searches
+  // files on disk, the other the buffer in front of you, *including unsaved
+  // changes the disk has never seen* — so they want different keys rather
+  // than one key that guesses.
+  //
+  // Both plugins bind on the code-input's own textarea, never on `document`,
+  // so neither can take a keystroke away from a terminal pane. That matters
+  // more than it looks: Ctrl+F and Ctrl+G are both readline bindings.
+  if (has("FindAndReplace")) p.push(new P.FindAndReplace(true, true, {}, false));
+  if (has("GoToLine")) p.push(new P.GoToLine());
+  return p;
 }
 
 /// code-input's highlight hook for the "nonascii" template. It arrives with
@@ -117,6 +195,120 @@ function nonAsciiCount(text) {
   let n = 0;
   for (const m of text.matchAll(NON_ASCII_RE)) n += [...m[0]].length;
   return n;
+}
+
+/// Adds the line-number gutter to a code template by wrapping the highlight
+/// function it already has, rather than replacing it: the hljs template's own
+/// highlight does more than call hljs — it clears `data-highlighted` first, or
+/// hljs refuses to touch an element it has already seen — and a second copy of
+/// the library's business here is a second thing to keep in step.
+function numbered(t) {
+  const base = t.highlight;
+  t.highlight = function (el, ...rest) {
+    base.call(this, el, ...rest);
+    gutterFor(el);
+  };
+  return t;
+}
+
+/// Numbers an already-highlighted <code>, and sizes the column the numbers
+/// sit in.
+///
+/// The width comes from the line count rather than a constant, because a
+/// four-digit gutter in front of a 30-line config wastes a tenth of a phone's
+/// width, and any constant is wrong the moment a file passes it — hub.rs is
+/// over 7000 lines.
+///
+/// The property goes on the <code-input> host, never the <pre>: the vendor
+/// stylesheet pushes `--padding-left` onto *both* layers with `!important`,
+/// so this is the one place that moves the textarea and the highlighted <pre>
+/// together. Moving them apart is how the colours walk off the caret.
+function gutterFor(el) {
+  // code-input appends one "\n" to the value before highlighting (the same
+  // one scrollEditorTo's sync guard counts on), and a preview's <pre> holds
+  // the file's text and nothing else. Left unsaid, that one character would
+  // make the two surfaces disagree about the last line of every file: six
+  // numbers in Edit, five in Preview, changing under you as you switch modes.
+  const host = el.closest("code-input");
+  const n = lineCount(el.textContent, !!host);
+  el.innerHTML = wrapLines(el.innerHTML, !!host);
+  const home = host || el.closest("pre");
+  if (home) home.style.setProperty("--ln-gutter", `calc(${Math.max(2, String(n).length)}ch + 14px)`);
+}
+
+/// How many lines the gutter will number, for `text` that carries one
+/// synthetic trailing newline or does not. Kept in step with wrapLines by
+/// construction: a file of N newlines has N+1 rows, the last of them empty
+/// where the file ends in one — which is a row the editor's textarea really
+/// does show and the caret really can sit on, so it gets a number.
+function lineCount(text, synthetic) {
+  const nl = (text.match(/\n/g) || []).length;
+  return nl - (synthetic ? 1 : 0) + 1;
+}
+
+/// Wraps each logical line of highlighted HTML in a `<span class="ln">`, which
+/// is all the stylesheet needs to number it (a counter and an
+/// absolutely-positioned `::before`).
+///
+/// Why the numbers are drawn and not measured: this editor soft-wraps
+/// (`white-space: pre-wrap`, static/style.css), so one logical line is not one
+/// visual row and a gutter of `1\n2\n3…` drifts at the first long line. An
+/// absolutely-positioned box with `top` left auto keeps its *static* position
+/// — where it would have sat in flow — which is the start of its span's
+/// **first** line box. A line wrapped over three rows therefore gets exactly
+/// one number, on its first row, and the layout engine does the wrap
+/// arithmetic. The alternative was a per-line measuring pass re-run on every
+/// keystroke, resize and pane drag. Probed in headless Chromium before this
+/// was written: five lines, two of them wrapped over several rows each, every
+/// number tracking its own line's first rect rather than a uniform multiple.
+///
+/// The newline stays *inside* its line's span, and that is the constraint that
+/// makes this safe to drop into the editor at all: `textContent` comes out
+/// byte-identical, so scrollEditorTo's `pre.textContent.length <
+/// ta.value.length` sync guard — which tells a fresh mount's unlanded
+/// highlight apart from a reveal at the very last character — goes on meaning
+/// what it meant. Nothing here can reach the textarea, so the bytes a save
+/// writes are untouched either way; the gutter lives entirely in the layer
+/// underneath.
+///
+/// hljs spans cross line boundaries — a block comment, a multi-line string —
+/// so open tags are closed at each newline and re-opened on the next line.
+/// Scanning for tags is enough: everything here is hljs's own markup plus text
+/// hljs already escaped, so a file's own `<` arrives as `&lt;` and no entity
+/// contains a newline.
+function wrapLines(html, synthetic) {
+  const open = [];   // hljs tags still open at this point in the walk
+  const lines = [];
+  let cur = "";
+  const endLine = () => {
+    lines.push(cur + "</span>".repeat(open.length));
+    cur = open.join("");
+  };
+  const addText = (s) => {
+    const parts = s.split("\n");
+    for (let i = 0; i < parts.length - 1; i++) {
+      cur += parts[i] + "\n"; // inside the span, so textContent is unchanged
+      endLine();
+    }
+    cur += parts[parts.length - 1];
+  };
+  const TAG = /<[^>]*>/g;
+  let pos = 0, m;
+  while ((m = TAG.exec(html))) {
+    addText(html.slice(pos, m.index));
+    if (m[0][1] === "/") open.pop();
+    else if (!m[0].endsWith("/>")) open.push(m[0]);
+    cur += m[0];
+    pos = m.index + m[0].length;
+  }
+  addText(html.slice(pos));
+  // Whatever follows the final newline is the last row, empty or not — that is
+  // the row a file ending in a newline leaves behind, and the editor's textarea
+  // paints it. The exception is the "\n" code-input appends for itself: that
+  // one is not part of the file, so the empty remainder after it is dropped
+  // rather than numbered, or every buffer would carry a phantom last number.
+  if (!synthetic || cur.replace(/<[^>]*>/g, "").length) lines.push(cur + "</span>".repeat(open.length));
+  return lines.map((l) => `<span class="ln">${l}</span>`).join("");
 }
 
 function nonAsciiOn() {
@@ -149,6 +341,15 @@ const PANE_ICONS = {
   // detached arrowhead.
   maximize: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2.5h4.5V7M7 13.5H2.5V9M13.5 2.5L9 7M2.5 13.5L7 9"/></svg>',
   restore: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 7H9V2.5M2.5 9H7v4.5M9 7l4.5-4.5M7 9l-4.5 4.5"/></svg>',
+  // Two arrows meeting a check: a review that comes back round. Drawn at the
+  // same 15px weight as `newterm` beside it.
+  // The tab's close control. Drawn, not typed: `×` (U+00D7) is placed on the
+  // font's math axis, so a flex box centres the *line box* around a glyph that
+  // is not in the middle of it — visibly high in a 28px target, which is how
+  // this was reported. Two crossing lines have no such opinion. Same geometry
+  // as the header's own close button (`SVG_X` in render.rs).
+  close: '<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>',
+  prloop: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.6 6.4a5.6 5.6 0 0 1 9.3-2.2l1.5 1.4"/><path d="M13.4 9.6a5.6 5.6 0 0 1-9.3 2.2L2.6 10.4"/><path d="M13.6 2.4v3.2h-3.2M2.4 13.6v-3.2h3.2"/></svg>',
   newterm: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="10.5" height="9.5" rx="1.2"/><path d="M4 6.8l1.7 1.5L4 9.8M8 10.6h2.6"/><path d="M13.3 2.2v3.6M11.5 4h3.6"/></svg>',
 };
 // The official Claude mark (lobehub packaging of Anthropic's starburst,
@@ -266,16 +467,161 @@ const sentEdits = new Set();
 // project.
 const proposals = {};
 
+// --- the workspace connection -------------------------------------------
+//
+// Everything the user does to the workspace is an intent on this one socket:
+// opening a file, switching a tab, saving, renaming, moving a tab between
+// panes. Forty-six call sites go through `send`.
+//
+// It used to drop every one of them on the floor when the socket was down,
+// with no indicator anywhere on the page. Close a laptop, open it an hour
+// later, and roost looked completely fine — the tree, the tabs, the editor,
+// all painted from state loaded before it slept and connected to nothing —
+// and then quietly discarded everything you did to it.
+//
+// So: the connection has a visible state, and `send` stops lying.
+let ctrlTries = 0;
+let ctrlTimer = null;
+let ctrlWarned = false;
+/// When the in-flight connect attempt started, so a socket wedged in
+/// CONNECTING can be told from one that is merely still trying.
+let ctrlAttemptAt = 0;
+/// Buffers whose `EditBuffer` was refused because the socket was down. The
+/// text itself is not held here — `texts` already has it, updated on the
+/// keystroke rather than on the debounce — only the fact that roost has not
+/// seen it.
+const unsentEdits = new Set();
+/// Past this, a socket still in CONNECTING is not "trying", it is wedged: a
+/// SYN into a network that went away leaves Chrome in state 0 for minutes.
+const STALE_CONNECT_MS = 4000;
+
+/// Shown only when something is wrong. A permanent "connected" badge is
+/// clutter that stops being read, and the honest signal here is the absence
+/// of trouble rather than a constant reassurance — the same shape the config
+/// warning and the search panel's `.skipped` mark already use.
+function setConnState(state) {
+  const el = document.getElementById("connstate");
+  if (!el) return;
+  el.dataset.state = state;
+  el.hidden = state === "live";
+  el.textContent = state === "offline" ? "⚠ offline" : "⚠ reconnecting…";
+  el.title = state === "offline"
+    ? "not connected to roost — nothing you do here is being saved"
+    : "reconnecting to roost — changes are not being sent until this clears";
+}
+
+/// True when the intent went out. `false` means it did not happen, and the
+/// caller's effect will not arrive.
+///
+/// Reported once per outage rather than once per call: `EditBuffer` fires on
+/// a 200 ms debounce and `ShareSelection` on every selection change, so a
+/// banner per refusal would bury the page in identical messages within
+/// seconds of a laptop closing. The header state is the standing signal; this
+/// is the one-off that says an action you just took did not land.
 function send(intent) {
-  if (ctrl && ctrl.readyState === 1) ctrl.send(JSON.stringify(intent));
+  if (ctrl && ctrl.readyState === 1) {
+    ctrl.send(JSON.stringify(intent));
+    return true;
+  }
+  if (!ctrlWarned) {
+    ctrlWarned = true;
+    showError("not connected to roost — that did not happen. Retrying…");
+  }
+  return false;
 }
 
 function connectControl() {
   myOrigin = null; // a reconnect must not keep a stale id from the last socket
-  ctrl = new WebSocket(wsUrl(`/ws/${PROJECT}/_workspace`));
-  ctrl.onmessage = (e) => onEvent(JSON.parse(e.data));
-  ctrl.onclose = () => setTimeout(connectControl, 1000);
+  clearTimeout(ctrlTimer);
+  ctrlAttemptAt = Date.now();
+  // Every handler is tied to the socket that installed it. Without this a
+  // superseded socket — one still in CLOSING while a fresh connect is already
+  // up, which is what a `systemctl restart roost` produces — fires its
+  // `onclose` against the new socket's world: it drags the state back to
+  // reconnecting over a live connection and schedules a second
+  // `connectControl`, leaving the intermediate socket open forever with its
+  // `onmessage` still attached, so every server event is applied twice.
+  // `connectTerm` avoids the same trap by reading `entry.sock`.
+  const sock = new WebSocket(wsUrl(`/ws/${PROJECT}/_workspace`));
+  ctrl = sock;
+  sock.onopen = () => {
+    if (ctrl !== sock) return;
+    ctrlTries = 0;
+    ctrlWarned = false;
+    setConnState("live");
+    flushUnsentEdits();
+  };
+  sock.onmessage = (e) => { if (ctrl === sock) onEvent(JSON.parse(e.data)); };
+  sock.onclose = () => {
+    if (ctrl !== sock) return;
+    // Capped backoff, matching what `connectTerm` already does rather than
+    // the flat 1s this used to use: a roost that is genuinely down was being
+    // hit once a second, forever, by every open tab. Never gives up, for the
+    // same reason the terminal path never does — a laptop asleep for eight
+    // hours must still find its workspace when it wakes.
+    setConnState(ctrlTries > 2 ? "offline" : "reconnecting");
+    const wait = Math.min(500 * 2 ** ctrlTries++, 8000);
+    ctrlTimer = setTimeout(connectControl, wait);
+  };
 }
+
+/// Re-sends what roost never received. `texts` holds the current text of every
+/// buffer, updated on the keystroke rather than on the debounce, so this can
+/// always reconstruct the edit.
+///
+/// Without it, typing during an outage is silently discarded: the refused
+/// `EditBuffer` never reaches roost, whose buffer stays `Clean` with an
+/// unchanged `base_hash`, so `resolve_replay` hands back the *disk* text on
+/// reconnect and the `BufferText` handler assigns it straight into the
+/// textarea. Making the outage visible (above) made that worse rather than
+/// better: the header clears to live at the same moment, saying it landed.
+///
+/// Re-sending a buffer that happens to match its base is harmless — the
+/// server treats an edit equal to the base as clean, which
+/// `an_edit_that_matches_the_base_leaves_the_buffer_clean` pins.
+function flushUnsentEdits() {
+  if (!unsentEdits.size) return;
+  for (const rel of [...unsentEdits]) {
+    const text = texts.get(rel);
+    if (text === undefined) { unsentEdits.delete(rel); continue; }
+    sentEdits.add(rel);
+    // Deliberately not cleared here. A successful `send` means the bytes left
+    // this browser, not that roost has applied them — and the reconnect's own
+    // replay can still be in flight behind it, carrying the disk text. The
+    // flag is cleared by confirmation: a State that reports the buffer dirty,
+    // or a BufferText that already matches what we hold.
+    send({ t: "EditBuffer", rel, text });
+  }
+}
+
+/// A wake, a tab coming back to the foreground, or the OS reporting the
+/// network back. Each is a reason to try *now* rather than sit out the rest
+/// of a backoff that may have grown to eight seconds — which is the
+/// difference between a workspace that feels instant on wake and one that
+/// looks broken for a moment first.
+function probeControl() {
+  // Already up. The state is re-asserted rather than assumed: nothing else
+  // clears a stale badge on this path, and a badge that says "nothing you do
+  // here is being saved" over a working connection is worse than none.
+  if (ctrl && ctrl.readyState === 1) return setConnState("live");
+  // Still connecting, and recently enough to be believed. Past that it is
+  // wedged — a SYN into a network that has gone away sits in CONNECTING for
+  // minutes, no `onclose` fires, and no retry is scheduled, so the wake this
+  // function exists for would otherwise do nothing at all.
+  if (ctrl && ctrl.readyState === 0 && Date.now() - ctrlAttemptAt < STALE_CONNECT_MS) return;
+  if (ctrl) { try { ctrl.close(); } catch { /* already gone */ } }
+  ctrlTries = 0;
+  connectControl();
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) probeControl(); });
+// `online` is a reason to *try*, never a verdict. Deliberately no `offline`
+// handler: roost binds 127.0.0.1, so `navigator.onLine` going false says
+// nothing about this socket — an ethernet unplug on the machine running roost
+// would paint "nothing you do here is being saved" over a connection that is
+// working perfectly, and nothing would clear it, because `online` finds the
+// socket already open and returns. The socket's own close is the only
+// evidence that the socket is down.
+addEventListener("online", probeControl);
 
 function onEvent(ev) {
   switch (ev.t) {
@@ -307,6 +653,11 @@ function onEvent(ev) {
         for (const rel of texts.keys()) if (!openRels.has(rel)) texts.delete(rel);
         for (const rel of editors.keys()) if (!openRels.has(rel)) editors.delete(rel);
         for (const rel of sentEdits) if (!openRels.has(rel)) sentEdits.delete(rel);
+        // roost calling a buffer dirty is positive evidence it received the
+        // edit — the only confirmation available, since an EditBuffer is
+        // echoed to other clients and never back to its author.
+        for (const b of state.buffers) if (b.dirty) unsentEdits.delete(b.rel);
+        for (const rel of [...unsentEdits]) if (!openRels.has(rel)) unsentEdits.delete(rel);
         // Autosave resumes as soon as the server says this buffer has nothing
         // outstanding — saved, discarded, or gone. SaveOk is the common route
         // and clears it sooner, but not the only one: the banner's "discard
@@ -374,6 +725,22 @@ function onEvent(ev) {
       // case, so a client-side dirty check here would be redundant at best
       // and would break the two legitimate cases above at worst.
       if (ev.origin && ev.origin === myOrigin) break;
+      // The one case the reasoning above does not cover, because it assumes
+      // the server *knows* this buffer is dirty. During an outage it does
+      // not: the `EditBuffer` never arrived, so roost's buffer is still
+      // `Clean` with an unchanged `base_hash`, and `resolve_replay` therefore
+      // answers the reconnect with the **disk** text. Applying that would
+      // discard everything typed while offline — measured, and the reason
+      // this arm exists.
+      //
+      // Equality is what clears it rather than the send: our own `EditBuffer`
+      // is broadcast to every *other* client and never echoed back here, so
+      // waiting for an echo would pin this flag forever and make a later
+      // external write invisible for that file.
+      if (!ev.origin && unsentEdits.has(ev.rel)) {
+        if (texts.get(ev.rel) === ev.text) unsentEdits.delete(ev.rel);
+        else break; // ours is newer than anything roost has seen
+      }
       // An empty origin is the server telling us what the file now says — a
       // discard, a reload, an external write. Whatever this client had
       // outstanding is superseded by it, and holding the flag past that would
@@ -545,6 +912,25 @@ function onEvent(ev) {
       // acted, so nothing here depends on the delay completing.
       setTimeout(() => { location.href = "/"; }, 1200);
       break;
+    // #18 step 3. Goes only to the dialog that asked: the listing describes a
+    // restore this browser initiated, and a second browser on the project has
+    // no context for a page of paths it did not ask for. The workspace change a
+    // real restore causes reaches everyone through the State snapshot, the way
+    // every other change does.
+    case "RestoreReport":
+      if (settingsOpen && typeof settingsOpen.onRestoreReport === "function") {
+        try {
+          settingsOpen.onRestoreReport(ev);
+        } catch (e) {
+          console.error("roost: the backup pane's onRestoreReport threw", e);
+          settingsOpen = null;
+        }
+      } else if (ev.refused) {
+        // The dialog was closed while the restore ran. A refusal still has to
+        // land somewhere — silence here is a restore that looks like it worked.
+        showError(ev.refused);
+      }
+      break;
     case "Notice": onNotice(ev.notice); break;
     case "Notices":
       notices = ev.list;
@@ -671,13 +1057,27 @@ function iconExt(rel) {
   return ext.toLowerCase();
 }
 
+/// How a session name reads in a tab.
+///
+/// The server hands out `claude`, `claude2`, `prloop` — names that have to
+/// stay inside `^[A-Za-z0-9_-]{1,32}$`, since they land in a dtach socket path
+/// and on a command line. "Claude 2" is the same name said out loud, and only
+/// the strip needs it; everything that addresses a session still uses the real
+/// one.
+function sessionLabel(session) {
+  const m = /^(claude|prloop)([0-9]*)$/.exec(session || "");
+  if (!m) return session;
+  const base = m[1] === "claude" ? "Claude" : "PR loop";
+  return m[2] ? `${base} ${m[2]}` : base;
+}
+
 function tabLabel(t) {
   switch (t.k) {
     case "Tree": return "Files";
     case "Changes": return "Changes";
     case "File": return t.rel.split("/").pop();
     case "Diff": return t.rel ? t.rel.split("/").pop() : "full diff";
-    case "Terminal": return t.session;
+    case "Terminal": return sessionLabel(t.session);
     case "Proposal": {
       const p = state && state.proposals && state.proposals[t.id];
       return p ? p.rel.split("/").pop() : "proposal";
@@ -689,6 +1089,14 @@ function render() {
   if (!state) return;
   const header = document.querySelector("header");
   if (header) document.documentElement.style.setProperty("--header-h", header.offsetHeight + "px");
+  // Measured for the same reason as the header: #grid subtracts both from the
+  // viewport, and the bar's height is a function of the font the theme picked.
+  // `offsetHeight` is 0 while it is display:none above the breakpoint, which
+  // is the right contribution there — nothing is taking up that space.
+  const mbar = document.getElementById("mobilebar");
+  if (mbar) document.documentElement.style.setProperty("--mobilebar-h", mbar.offsetHeight + "px");
+  const tkeys = document.getElementById("termkeys");
+  if (tkeys) document.documentElement.style.setProperty("--termkeys-h", tkeys.offsetHeight + "px");
   // htmx swaps into #gitinfo/#wtlabel and the #projcount/#bellcount writes
   // below all change the header's width while the panel is open, and
   // #searchbox uses margin:auto, so the field (and the panel anchored to it)
@@ -732,15 +1140,80 @@ function render() {
       // Terminal tabs route through focusSession, not a bare ActivateTab, so
       // the obvious gesture of clicking a dotted tab is what clears its dot
       // — see hasAttention/focusSession below.
-      b.onclick = () =>
+      const activate = () => {
+        revealPane(pi);
         t.k === "Terminal" ? focusSession(t.session) : send({ t: "ActivateTab", pane: pi, idx: ti });
+      };
+      b.onclick = activate;
+      // On a touch screen the first tap is routinely spent somewhere else.
+      // With a terminal focused the soft keyboard is up, and tapping outside
+      // it goes to dismissing the keyboard — the `click` never reaches the
+      // tab, so switching took two taps where a mouse takes one. Reported
+      // from a phone for file tabs and terminal tabs alike.
+      //
+      // `pointerdown` fires on the first touch whatever the focus does with
+      // it. `preventDefault` there suppresses the compatibility mouse events
+      // *and* the click that would follow, so this activates once rather than
+      // twice — and, as a bonus, keeps focus where it is, so the keyboard does
+      // not close underneath a tap that was only changing tabs.
+      //
+      // Touch only: a mouse keeps the click path, because `mousedown` on a
+      // tab is where the drag-between-panes gesture starts and preventing its
+      // default would break it. The × has its own handler and is skipped here
+      // for the same reason.
+      b.addEventListener("pointerdown", (e) => {
+        if (e.pointerType !== "touch" || e.target.closest(".x")) return;
+        e.preventDefault();
+        activate();
+      });
       const x = document.createElement("span");
       x.className = "x";
       x.title =
         t.k === "Terminal" ? "end session (alt-click to detach, leaving it running)" : "close";
-      x.textContent = "×";
+      // innerHTML from PANE_ICONS, which is constant markup in this file —
+      // the same rule the pane icons above follow. A tab label is
+      // attacker-influenced (a filename, a branch name); this is not.
+      x.innerHTML = PANE_ICONS.close;
       x.onclick = (e) => { e.stopPropagation(); closeTab(pi, ti, t, e.altKey); };
+      // The tab is draggable and this sits inside it, so without this a
+      // mousedown on × plus a few pixels of pointer drift starts a tab drag
+      // instead of firing the click — the tab does not close and the user
+      // has to aim again. `draggable=false` stops the ancestor walk that
+      // resolves a drag source.
+      x.draggable = false;
       b.appendChild(x);
+      // Drag is a second route to MoveTab, never a new operation: the same
+      // intent the ⇄ button sends, with `at` taken from where the pointer is
+      // instead of always being the destination's length. So reordering
+      // inside a pane and moving between two are one gesture, and the server
+      // needs no change at all.
+      b.draggable = true;
+      b.dataset.pane = String(pi);
+      b.dataset.idx = String(ti);
+      b.dataset.key = tabKey(t);
+      b.ondragstart = (e) => {
+        // A private type rather than text/plain: it is what keeps this drag
+        // and a file drag distinguishable. `dragHasFiles` already declines
+        // this one, and `dragHasTab` declines a file drag, so the two
+        // document-level handlers below can never swallow each other's drop.
+        // (`getData` is unreadable during dragover for security — only
+        // `types` is — which is exactly what the type is being used for.)
+        // The tab's *identity*, not its index. A drag is a human-scale
+        // interval and render() rebuilds this strip on every State
+        // broadcast — a terminal exiting, a proposal tab opening, another
+        // browser closing a tab — so an index captured here can address a
+        // different tab by the time the drop lands, silently and in range,
+        // where the server's `idx >= len` guard never fires. This is the
+        // stale-index defect `closeTab` was already fixed for; see its
+        // comment about re-resolving by rel and the `< 0` branch.
+        e.dataTransfer.setData(TAB_MIME, JSON.stringify({ from: pi, key: tabKey(t) }));
+        e.dataTransfer.effectAllowed = "move";
+        b.classList.add("dragging");
+      };
+      // Also clears the marker: render() rebuilds this strip's innerHTML on
+      // every State broadcast, so the node this fires on may already be gone
+      // and the marker is not in it anyway.
+      b.ondragend = () => { b.classList.remove("dragging"); clearDropMarker(); };
       strip.appendChild(b);
     });
 
@@ -809,7 +1282,50 @@ function render() {
     // so a pendingLink still pointing at it must not outlive it.
     if (pendingLink && pendingLink.entry === e) pendingLink = null;
   });
+
+  // Following runs on a *change* of active file, not on every State. A State
+  // snapshot arrives on every EditBuffer — including the debounce of the
+  // user's own typing — so following unconditionally here would fire a tree
+  // fetch a few times a second while someone edits, and re-scroll the pane
+  // under them each time.
+  const nowActive = activeFileRel();
+  if (nowActive !== lastFollowed) {
+    // Committed only when a follow actually issued. `followTreeTo` bails when
+    // no pane shows a Tree tab, or when its fragment is still in flight and
+    // `ul.tree` does not exist yet — which is precisely the fresh-load and
+    // reconnect case where Claude opens a file for you. Recording the file
+    // anyway meant the follow was dropped and never retried, so the tree
+    // never expanded to it: the exact case this feature exists for.
+    if (followTreeTo(nowActive) || !nowActive) lastFollowed = nowActive;
+    // No file open at all: the mark has to go, or the tree goes on claiming
+    // you are looking at a file that is no longer there.
+    if (!nowActive) {
+      document.querySelectorAll(".content").forEach((c) => {
+        c.querySelectorAll("a.file.sel").forEach((a) => a.classList.remove("sel"));
+      });
+    }
+  } else if (nowActive) {
+    // The tab did not change, but this render may have rebuilt the tree's
+    // pane (a Tree tab activated, a fragment re-fetched). Re-marking is local
+    // and costs no request; expanding is what we skip.
+    state.panes.forEach((pane, pi) => {
+      const a = pane.tabs[pane.active];
+      if (!a || a.k !== "Tree") return;
+      const content = document.querySelector(`.pane[data-pane="${pi}"] .content`);
+      // Marked, never scrolled. This branch runs on *every* State — including
+      // the debounce of the user's own typing — and `scrollIntoView` here
+      // snapped the tree back to the edited file about once a second while
+      // someone scrolled the pane to look somewhere else. `block: "nearest"`
+      // does not help: it is a no-op only while the row is already visible,
+      // which is exactly the state the user just left.
+      if (content && followTree()) markTreeRow(content, nowActive, false);
+    });
+  }
 }
+
+/// The file the tree was last expanded to, so following costs a request only
+/// when the answer actually changes.
+let lastFollowed = "";
 
 // Per-pane header controls. Everything here drives an existing intent, so the
 // result mirrors to other browsers and survives a restart exactly like a drag
@@ -836,7 +1352,31 @@ function buildPaneIcons(host, pi, pane, active, content) {
   // program to type in: the server allocates the name and types `claude`
   // into the shell it spawns.
   if (LAUNCHES.includes("claude")) {
-    icon(CLAUDE_MARK, "new terminal running Claude", () => newTerminal(pi, "claude"), "newclaude");
+    // The handler takes the button so the menu can anchor under it; `icon`
+    // returns the element it made.
+    const cb = icon(CLAUDE_MARK, "new terminal running Claude", () => claudeMenu(pi, cb), "newclaude");
+  }
+  // #52: the same gesture, pointed at this repository's open pull requests.
+  // Deliberately its own button rather than a mode of the one above — it
+  // starts something that commits and pushes, and that should never be one
+  // misread icon away from "a terminal running Claude".
+  //
+  // Confirmed first, and the confirmation names the bounds, because a control
+  // whose consequence is "an agent starts pushing to my branches" has to say
+  // so before it runs and not in a tooltip nobody opens.
+  if (LAUNCHES.includes("prloop")) {
+    icon(PANE_ICONS.prloop, "review the open pull requests, and keep at them", async () => {
+      const yes = await askConfirm({
+        title: "Put Claude on the open PRs",
+        lines: [
+          "It reviews each open pull request, comments, and answers what comes back — committing to their branches as it goes.",
+          "It stops after 5 pushes to any one PR, after 2 hours, when a finding comes back twice, or when every thread is dealt with and CI is green.",
+          "It never touches the default branch. Interrupt it like any other terminal.",
+        ],
+        confirm: "Start",
+      });
+      if (yes) newTerminal(pi, "prloop");
+    }, "newprloop");
   }
   if (active && active.k === "Tree") {
     const hidden = showHidden();
@@ -912,7 +1452,67 @@ function maximizedSizes(pi) {
 
 function pool() { return document.getElementById("termpool"); }
 
-function newTerminal(pane, launch) {
+/// The ✻ button's menu: start fresh, or continue one of this project's past
+/// conversations (#18).
+///
+/// The rows are fetched on the click rather than kept in `state`. The list is
+/// a directory of another program's files, and a snapshot goes out on every
+/// debounced keystroke — putting it there would mean a filesystem walk per
+/// keystroke for a menu almost nobody opens.
+///
+/// **No history means no menu.** That is not an error path: it is what ✻ did
+/// before this existed, and it is also what a failed fetch does, and what a
+/// Claude Code that has moved its transcripts somewhere else does. The button
+/// keeps working in every case, which is the whole error model — see
+/// `claudehist`'s module doc.
+async function claudeMenu(pane, btn) {
+  let list = null;
+  try {
+    const html = await (await fetch(`/frag/${PROJECT}/claudehist`)).text();
+    const wrap = document.createElement("div");
+    wrap.innerHTML = html;
+    list = wrap.querySelector(".chist");
+  } catch { /* fall through to a fresh launch */ }
+  if (!list || list.dataset.empty === "1") return newTerminal(pane, "claude");
+
+  closeClaudeMenu();
+  list.tabIndex = -1;
+  document.body.appendChild(list);
+  anchorPanel(list, btn);
+  // Anchored under the button, like the header popups. `anchorPanel` only sets
+  // the horizontal edge; the vertical one is this menu's own, since its
+  // trigger is in a pane header rather than the top bar.
+  const r = btn.getBoundingClientRect();
+  list.style.top = `${Math.round(r.bottom + 4)}px`;
+  openClaudeMenu = list;
+  list.onclick = (e) => {
+    const row = e.target.closest(".chistrow");
+    if (!row) return;
+    closeClaudeMenu();
+    // "" is the New row. An id goes on the wire, and the server re-derives
+    // whether this project actually has that conversation before it types
+    // anything — the row is a hint, not an authorisation.
+    newTerminal(pane, "claude", row.dataset.resume || undefined);
+  };
+  // Focused so Escape reaches it and so a keyboard user lands in the menu they
+  // just opened, not behind it.
+  list.focus();
+  list.onkeydown = (e) => { if (e.key === "Escape") { e.preventDefault(); closeClaudeMenu(); } };
+}
+
+let openClaudeMenu = null;
+function closeClaudeMenu() {
+  if (openClaudeMenu) openClaudeMenu.remove();
+  openClaudeMenu = null;
+}
+// Capture, so a click anywhere else closes it before that click does its own
+// work — a menu that outlived the click that dismissed it would sit over the
+// pane it was opened from.
+document.addEventListener("mousedown", (e) => {
+  if (openClaudeMenu && !openClaudeMenu.contains(e.target)) closeClaudeMenu();
+}, true);
+
+function newTerminal(pane, launch, resume) {
   // No prompt: the server allocates term/term1/term2… from `live_names`, which
   // sees detached sessions the client has no tabs for. A name picked here could
   // collide with one of those, and since attaching creates only when absent,
@@ -921,7 +1521,12 @@ function newTerminal(pane, launch) {
   // `launch` names a program (one of LAUNCHES), never a command line: the
   // server owns what is typed, this only says which. Omitted, not null, for
   // the plain + so its message stays the one it has always sent.
-  send(launch ? { t: "NewTerminal", pane, launch } : { t: "NewTerminal", pane });
+  //
+  // `resume` names a conversation the ✻ menu offered. Omitted unless one was
+  // chosen, so the plain and fresh-Claude messages stay the ones they have
+  // always been.
+  if (!launch) return send({ t: "NewTerminal", pane });
+  send(resume ? { t: "NewTerminal", pane, launch, resume } : { t: "NewTerminal", pane, launch });
 }
 
 // The Edit/Preview switch lives in the filename stripe (`.path`), not on the
@@ -976,7 +1581,7 @@ function mountTab(content, t) {
   if (t.k === "File" && t.mode === "Edit") { mountEditor(content, t.rel); return; }
   if (t.k === "Proposal") { renderProposal(content, t); return; }
   const url =
-    t.k === "Tree" ? `/frag/${PROJECT}/tree`
+    t.k === "Tree" ? `/frag/${PROJECT}/tree${followTree() && activeFileRel() ? `?open=${encodeURIComponent(activeFileRel())}` : ""}`
     : t.k === "Changes" ? `/frag/${PROJECT}/changes`
     : t.k === "File" ? `/frag/${PROJECT}/file?path=${encodeURIComponent(t.rel)}`
     : `/frag/${PROJECT}/diff${t.rel ? "?path=" + encodeURIComponent(t.rel) : ""}`;
@@ -984,7 +1589,15 @@ function mountTab(content, t) {
   fetch(url).then((r) => r.text()).then((html) => {
     if (content.dataset.url !== url) return; // this pane moved on before we got here
     content.innerHTML = html;
-    content.querySelectorAll("pre code").forEach((b) => window.hljs && hljs.highlightElement(b));
+    content.querySelectorAll("pre code").forEach((b) => {
+      if (!window.hljs) return;
+      hljs.highlightElement(b);
+      // Numbers on a code *file*'s preview only. A markdown preview's fenced
+      // blocks arrive through this same query, and there a gutter is noise:
+      // they are quotations inside prose, and their numbers would not be the
+      // numbers of any file.
+      if (b.parentElement && b.parentElement.classList.contains("codeview")) gutterFor(b);
+    });
     wireFragment(content);
     if (t.k === "File") {
       const mb = modeButton(t.rel, t.mode);
@@ -1122,9 +1735,33 @@ function terminalPlaceholder(session) {
   const box = document.createElement("div");
   box.className = "termstart";
   const isGit = state.is_git;
+  // A tab whose shell is *gone* must not read like one that never had a
+  // shell. roost survives its own restart — dtach masters reparent to init —
+  // so those tabs just reattach; a reboot outlives no process, and the tab
+  // comes back pointing at nothing. Both rendered this same placeholder, so
+  // losing a long-running Claude to a reboot looked exactly like a tab
+  // nobody had opened yet.
+  const lost = (state.lost_sessions || []).includes(session);
+  const gone = lost
+    ? `<p class="termlost">The shell in this tab did not survive — roost can outlive its
+        own restart, but not a reboot of the machine.</p>`
+    : "";
+  // #18 step 2. The server says which tabs it recorded a Claude for; the id
+  // stays there, and this asks for it by session name. Gated on LAUNCHES too
+  // — the same startup probe the ✻ button uses — because offering a resume on
+  // a machine without `claude` on PATH buys a `command not found`.
+  //
+  // Absence offers nothing and *says* nothing. Hooks are per-project and
+  // opt-in, so "no record" means unknown, never "no Claude ran here"; the
+  // note above makes no claim about Claude and stays as it is.
+  const resumable = (state.resumable_sessions || []).includes(session)
+    && LAUNCHES.includes("claude");
+  const resume = resumable
+    ? `<p><button class="termresume">Resume the Claude that was here</button></p>`
+    : "";
   box.innerHTML = isGit
-    ? `<p>Press <kbd>Enter</kbd> to start a terminal</p>`
-    : `<p>Not a git repository.</p>
+    ? `${gone}${resume}<p>Press <kbd>Enter</kbd> to start a terminal</p>`
+    : `${gone}<p>Not a git repository.</p>
        <p><button class="initgit">Initialize git repo</button></p>
        <p><a class="nogit" href="#">start without git</a></p>`;
   // A held or double-tapped Enter must not fire several StartTerminal
@@ -1137,11 +1774,14 @@ function terminalPlaceholder(session) {
   // timeout a refused start would leave the placeholder permanently inert.
   // 2s is well past any held-Enter repeat rate, so the burst-suppression
   // this guard exists for is unaffected.
-  const start = () => {
+  const start = (resumeIt) => {
     if (box.dataset.sent) return;
     box.dataset.sent = "1";
     setTimeout(() => { delete box.dataset.sent; }, 2000);
-    send({ t: "StartTerminal", session });
+    // `resume` omitted rather than sent as false for a plain start: the field
+    // is `#[serde(default)]` server-side, so the message a plain Enter sends
+    // is byte-for-byte the one it has always sent.
+    send(resumeIt ? { t: "StartTerminal", session, resume: true } : { t: "StartTerminal", session });
   };
   if (isGit) {
     // Only this branch behaves like a control — tabIndex, the pointer
@@ -1150,8 +1790,35 @@ function terminalPlaceholder(session) {
     // handler wired to the box itself.
     box.classList.add("termstart-live");
     box.tabIndex = 0;
-    box.onclick = start;
-    box.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); start(); } };
+    // `() => start(false)`, not a bare `start`: as a bare handler the DOM passes the
+    // event as the first argument, and an Event object is truthy — so every
+    // plain click on the box would have asked for a resume.
+    box.onclick = () => start(false);
+    // `e.target === box` guards the resume button, which is a child: a
+    // <button> turns Enter into a click itself, but the keydown reaches this
+    // handler *first*, so without the check the plain start wins the
+    // `dataset.sent` race and a user who tabbed to Resume and pressed Enter
+    // gets a bare shell — silently, with the button gone. Load-bearing, not
+    // defensive: `tests/browser/resume.mjs` section C fails without it, with
+    // the intent it caught printed.
+    box.onkeydown = (e) => {
+      if (e.key === "Enter" && e.target === box) { e.preventDefault(); start(false); }
+    };
+    if (resumable) {
+      box.querySelector(".termresume").onclick = (e) => {
+        // Defensive rather than demonstrated: removing this does not fail
+        // `resume.mjs`, because the button's own handler runs before the
+        // bubbled one and `dataset.sent` swallows the second. It stays
+        // because that ordering is the only thing making it true, and the
+        // guard releases itself after 2s.
+        e.stopPropagation();
+        start(true);
+      };
+    }
+    // The box, not the button: the resume is offered, never automatic (#17 —
+    // it continues a conversation whose last turn may have been mid-edit), so
+    // the key that is already under the user's fingers must keep starting a
+    // plain shell.
     requestAnimationFrame(() => box.focus());
   } else {
     box.querySelector(".initgit").onclick = () => send({ t: "InitGit" });
@@ -1206,6 +1873,157 @@ function reconcileList(ul, html) {
   ordered.forEach((li) => ul.appendChild(li));
   wireFileLinks(ul); // see wireFileLinks: no container oncontextmenu here
   window.htmx && htmx.process(ul);
+}
+
+/// Whether the tree follows the file you are looking at. Project-scoped; see
+/// `Settings::follow_tree` for why that is safe and why it defaults on.
+function followTree() {
+  return document.body.dataset.followTree !== "0";
+}
+
+/// The file the user is looking at, or "" — the active `File` tab of the
+/// middle or right pane, middle first. Deliberately the same shape of
+/// question `mentionTarget()` asks, and deliberately *not* the focused
+/// editor: the tree should follow a file opened by a Claude link too, and
+/// that lands in a tab without taking focus.
+function activeFileRel() {
+  for (const pi of [MIDDLE, RIGHT]) {
+    const p = state && state.panes[pi];
+    const t = p && p.tabs[p.active];
+    if (t && t.k === "File" && t.rel) return t.rel;
+  }
+  return "";
+}
+
+/// Expands the tree to `rel` and marks its row, without collapsing anything.
+///
+/// One request, not one per level. `tree_level` already expands every
+/// ancestor of `?open=` inline and recursively — "so the file is visible on
+/// load with no extra round trip" — so the whole path arrives together and
+/// the four sequential fetches a naive `data-rel` walk would cost never
+/// happen.
+///
+/// The merge is where the care is. A wholesale replace would land the path
+/// and collapse everything else the user had opened, which is the thing that
+/// makes an auto-expanding tree hostile. `mergeTreePath` keeps every existing
+/// node instead, and only *descends* into the ones that are open — with one
+/// exception that is safe precisely because it is empty: a **closed**
+/// `<details>` has never been fetched (`hx-trigger="toggle once"`), so its
+/// `<ul>` holds nothing, and swapping it for the server's expanded copy
+/// cannot lose a single expanded descendant.
+function followTreeTo(rel) {
+  if (!followTree() || !rel || !state) return false;
+  const gen = ++followGen;
+  let issued = false;
+  state.panes.forEach((pane, pi) => {
+    const active = pane.tabs[pane.active];
+    if (!active || active.k !== "Tree") return;
+    const content = document.querySelector(`.pane[data-pane="${pi}"] .content`);
+    const root = content && content.querySelector(":scope > ul.tree");
+    if (!root) return;
+    issued = true;
+    fetch(`/frag/${PROJECT}/tree?dir=&open=${encodeURIComponent(rel)}`)
+      .then((r) => {
+        // `r.text()` alone accepts a 404's `no such project` and a 500's
+        // hint fragment as a tree listing. Neither yields any `<li>`, so the
+        // merge below would empty `ul.tree` — the whole pane, and every
+        // expansion in it — and call that a follow. "I could not look"
+        // rendered as "there is nothing there".
+        if (!r.ok) throw new Error(`tree fragment: ${r.status}`);
+        return r.text();
+      })
+      .then((html) => {
+        // A superseded response must not land. Two quick tab switches issue
+        // two overlapping fetches with no ordering; if the first resolves
+        // last it marks and scrolls to the file you already left, and on an
+        // idle workspace nothing ever corrects it.
+        if (gen !== followGen) return;
+        mergeTreePath(root, html, rel);
+        markTreeRow(content, rel);
+      })
+      .catch(() => {}); // a failed follow is a tree that did not move
+  });
+  return issued;
+}
+
+/// Bumped per follow, so a response that arrives after a newer one has been
+/// issued can be dropped rather than applied.
+let followGen = 0;
+
+/// Ancestors of `rel` plus `rel` itself: "a/b/c.rs" -> a, a/b, a/b/c.rs.
+function relChain(rel) {
+  const parts = rel.split("/");
+  return parts.map((_, i) => parts.slice(0, i + 1).join("/"));
+}
+
+/// Merges one level, preferring existing nodes everywhere except along the
+/// path to `rel`, where a closed (and therefore empty) node is replaced by
+/// the server's expanded one and an open one is recursed into.
+function mergeTreePath(ul, html, rel) {
+  const onPath = new Set(relChain(rel));
+  const fresh = document.createElement("ul");
+  fresh.innerHTML = html;
+  const existing = new Map();
+  Array.from(ul.children).forEach((li) => {
+    const id = treeItemId(li);
+    if (id) existing.set(id, li);
+  });
+  const ordered = Array.from(fresh.children).map((li) => {
+    const id = treeItemId(li);
+    const old = id && existing.get(id);
+    if (!old) return li;
+    const oldDetails = old.querySelector(":scope > details[data-rel]");
+    const newDetails = li.querySelector(":scope > details[data-rel]");
+    if (oldDetails && newDetails && onPath.has(oldDetails.dataset.rel)) {
+      const oldUlPeek = oldDetails.querySelector(":scope > ul");
+      // Emptiness, not closedness. "A closed <details> has never been
+      // fetched" is false: `hx-trigger="toggle once"` fetches on first
+      // expand, and collapsing afterwards leaves the children in place —
+      // nested expansions and all. Swapping such a node for the server's
+      // copy silently discarded them, which is exactly the "never collapses
+      // anything" invariant this function claims.
+      if (!oldUlPeek || !oldUlPeek.children.length) {
+        // Genuinely never fetched, so nothing to lose.
+        return li;
+      }
+      // Loaded, whether or not it is open. Expand it (it is on the path) and
+      // recurse, so its own descendants survive.
+      oldDetails.open = true;
+      // Already open and possibly holding the user's own expansions further
+      // down. Keep it and recurse, so this level's descent continues without
+      // touching anything off the path.
+      const oldUl = oldDetails.querySelector(":scope > ul");
+      const newUl = newDetails.querySelector(":scope > ul");
+      if (oldUl && newUl) mergeTreePath(oldUl, newUl.innerHTML, rel);
+      return old;
+    }
+    return old;
+  });
+  ul.innerHTML = "";
+  ordered.forEach((li) => ul.appendChild(li));
+  wireFileLinks(ul);
+  window.htmx && htmx.process(ul);
+}
+
+/// Marks `rel`'s row as the current one and scrolls it into view.
+///
+/// `block: "nearest"` never scrolls a row that is already visible, which is
+/// what keeps following from yanking the pane on every tab switch within one
+/// directory. The class is the same `.sel` the server already puts on the
+/// `?open=` row, so there is one appearance for "this is the current file"
+/// rather than two that can drift.
+function markTreeRow(content, rel, scroll = true) {
+  content.querySelectorAll("a.file.sel").forEach((a) => a.classList.remove("sel"));
+  const row = content.querySelector(`a.file[data-rel="${cssEscape(rel)}"]`);
+  if (!row) return;
+  row.classList.add("sel");
+  if (scroll) row.scrollIntoView({ block: "nearest" });
+}
+
+/// A filename can contain a quote, a bracket, anything — it comes off the
+/// filesystem, not from us — so it cannot go into a selector raw.
+function cssEscape(s) {
+  return window.CSS && CSS.escape ? CSS.escape(s) : s.replace(/["\\]/g, "\\$&");
 }
 
 // TreeChanged fires on every filesystem write — including every file Claude
@@ -1266,6 +2084,18 @@ function wireFileLinks(root) {
       // or htmx's own delegated listener would also fire and log a swap
       // error trying to target it.
       e.stopPropagation();
+      // A modified click picks rows to mention instead of opening one. Plain
+      // click still opens, untouched: opening a file is the tree's primary
+      // job and making it worse to gain a secondary one is a bad trade.
+      // Tree rows only. `class="file"` is emitted by `changes_fragment` as
+      // well as by the tree, so keying on it alone made every row in the
+      // Changes pane pickable — and its first row carries `data-rel=""`, so
+      // a modified click on "full diff" entered `pickTreeRow`, hit the empty
+      // -rel guard, and did nothing at all: no diff opened, nothing picked,
+      // no feedback.
+      if (a.closest("ul.tree") && (e.ctrlKey || e.metaKey || e.shiftKey)) {
+        return pickTreeRow(a, e.shiftKey && !e.ctrlKey && !e.metaKey);
+      }
       const rel = a.dataset.rel;
       const isDiff = a.getAttribute("hx-get")?.includes("/diff");
       send({
@@ -1273,6 +2103,9 @@ function wireFileLinks(root) {
         pane: 2,
         tab: isDiff ? { k: "Diff", rel: rel || null } : { k: "File", rel, mode: defaultMode(rel) },
       });
+      // Tapping a file in the tree is the clearest "show me this" there is,
+      // and on a phone the tree and the editor are never on screen together.
+      revealPane(2);
       // `[run](deploy.md#running)` names a heading as well as a file
       // (render.rs's link_open emits it as data-hash). Armed after the intent,
       // never before: the tab's fragment is only fetched once the State
@@ -1282,6 +2115,105 @@ function wireFileLinks(root) {
     };
     a.oncontextmenu = (e) => { e.preventDefault(); fileMenu(e, a.dataset.rel); };
   });
+  paintTreePicked(root);
+}
+
+// --- picking files in the tree, to mention several at once ----------------
+//
+// A separate state from the tree's `.sel` row, and deliberately so. `.sel` is
+// the server's answer to "which file are you looking at" (`?open=`); this is
+// the user's answer to "which files do I want to hand to Claude next". They
+// are different questions with different lifetimes — one follows your tabs,
+// the other is a gesture you make and then spend — and collapsing them would
+// mean opening a file silently changed what Alt+K is about to send.
+//
+// Client-local, and not mirrored. roost mirrors workspace state across
+// browsers because it is shared *document* state; a pick is one viewer's
+// intent about what to do in the next second. Mirroring it would mean a
+// second browser's Alt+K sending files this one had chosen, which is the
+// "silently mentioning the wrong file" failure the binding is already
+// careful about.
+//
+// Held as rels rather than as DOM classes because the tree is re-rendered
+// under it — every TreeChanged reconciles the listing — so a class alone
+// would be dropped by the next filesystem write Claude makes.
+const treePicked = new Set();
+let lastPickedRel = null;
+
+/// At most this many paths from one Alt+K. A shift-range over a large
+/// directory is one gesture away, and each pick becomes a line typed into a
+/// terminal — an unbounded mention is a self-inflicted flood, not a feature.
+/// Sixteen, matching this codebase's other per-request bounds, and it names
+/// itself when it fires.
+const MAX_MENTIONS = 16;
+
+function pickTreeRow(a, range) {
+  const rel = a.dataset.rel;
+  const box = a.closest(".content");
+  if (!rel || !box) return;
+  // Scoped to the tree itself, matching what the gesture is allowed on, so a
+  // Changes row in the same pane can never join a range.
+  const rows = [...box.querySelectorAll("ul.tree a.file[data-rel]")];
+  if (range && lastPickedRel) {
+    const from = rows.findIndex((r) => r.dataset.rel === lastPickedRel);
+    const to = rows.indexOf(a);
+    if (from >= 0 && to >= 0) {
+      for (let i = Math.min(from, to); i <= Math.max(from, to); i++) {
+        treePicked.add(rows[i].dataset.rel);
+      }
+      lastPickedRel = rel;
+      return paintTreePicked(a.closest(".content"));
+    }
+  }
+  if (treePicked.has(rel)) {
+    treePicked.delete(rel);
+    // Not left as the anchor: ctrl-click to pick, ctrl-click again to
+    // un-pick, then shift-click elsewhere would run the range from the row
+    // just removed and silently bring it back.
+    lastPickedRel = null;
+  } else {
+    treePicked.add(rel);
+    lastPickedRel = rel;
+  }
+  paintTreePicked(box);
+}
+
+/// Repaints the picked rows. Called after every tree render as well as on
+/// every pick, because the set outlives the DOM nodes it marks.
+function paintTreePicked(root) {
+  if (!root) return;
+  root.querySelectorAll("ul.tree a.file[data-rel]").forEach((a) => {
+    a.classList.toggle("picked", treePicked.has(a.dataset.rel));
+  });
+}
+
+function clearTreePicked() {
+  if (!treePicked.size) return;
+  treePicked.clear();
+  lastPickedRel = null;
+  document.querySelectorAll(".content").forEach(paintTreePicked);
+}
+
+/// The picked paths in tree order, so what arrives at Claude reads in the
+/// order the user sees rather than in the order they happened to click.
+function pickedInTreeOrder() {
+  if (!treePicked.size) return [];
+  // A `Set` alongside the list, because `MAX_MENTIONS` bounds only the send:
+  // `treePicked` itself is unbounded, and one shift-range over an expanded
+  // `node_modules` can put thousands in it. With `seen.includes` this ran
+  // quadratically on every Alt+K.
+  const seen = [];
+  const have = new Set();
+  document.querySelectorAll("ul.tree a.file[data-rel]").forEach((a) => {
+    const rel = a.dataset.rel;
+    if (treePicked.has(rel) && !have.has(rel)) { have.add(rel); seen.push(rel); }
+  });
+  // A pick whose row has since disappeared (a directory collapsed, a file
+  // renamed under us) is still a path the user chose. Kept, at the end,
+  // rather than silently dropped — dropping it would turn "mention these
+  // four" into "mention these three" with nothing saying so.
+  treePicked.forEach((rel) => { if (!have.has(rel)) { have.add(rel); seen.push(rel); } });
+  return seen;
 }
 
 function wireFragment(content) {
@@ -1565,6 +2497,144 @@ addEventListener("keydown", (e) => { if (linkModifier(e)) setArmed(true); });
 addEventListener("keyup", (e) => { if (!linkModifier(e)) setArmed(false); });
 addEventListener("blur", () => setArmed(false));
 
+/// Touch scrolling that behaves the way a desktop wheel already does.
+///
+/// The problem, from a phone: dragging inside a running Claude did nothing.
+/// `.xterm-viewport` is a real scrollable div, so on the *normal* buffer a
+/// finger has always worked — but a full-screen TUI switches to the alternate
+/// screen, where xterm keeps no scrollback by design, so there is nothing for
+/// the viewport to move. A desktop mouse gets past this without anyone
+/// noticing: xterm translates a wheel event into whatever the program asked
+/// for, and a finger produces no wheel event.
+///
+/// So this makes one. Confirmed against the vendored xterm rather than
+/// assumed — with a TUI running, `term.modes.mouseTrackingMode` reads
+/// `"vt200"`, and a synthetic `WheelEvent` on `.xterm-screen` comes back out
+/// of `onData` as `ESC [ < 64 ; 24 ; 21 M`, a correctly encoded SGR mouse
+/// report. xterm does the encoding; this only has to supply the event.
+///
+/// Three cases, and only the last two are ours:
+///
+///   * mouse reporting on — the program scrolls itself, and wants wheel
+///     reports. This is Claude.
+///   * alternate screen, no mouse reporting — the standard emulation every
+///     terminal does: send the arrow keys, in whichever cursor mode is set.
+///   * normal buffer — hands off. The browser's own scrolling has momentum
+///     that nothing written here would match.
+function wireTouchScroll(node, term) {
+  const screen = () => node.querySelector(".xterm-screen");
+  let last = null, at = 0, velocity = 0, glide = 0;
+
+  /// Whether this terminal wants us to translate.
+  ///
+  /// Only two answers, and the second draft of this had three. The first
+  /// distinguished "mouse reporting on, send wheel" from "alternate screen,
+  /// send arrow keys", and hand-rolled the arrow keys — DECCKM and all. A
+  /// revert-check showed the distinction made no difference: xterm *already*
+  /// turns a wheel into cursor keys on the alternate screen when the program
+  /// is not asking for mouse reports. That is precisely what a desktop wheel
+  /// does, so supplying the wheel and letting xterm decide is both smaller and
+  /// more faithful than deciding here.
+  const translate = () => {
+    try {
+      if (term.modes.mouseTrackingMode !== "none") return true;
+      // The alternate screen keeps no scrollback, so the viewport has nothing
+      // to move and a finger does nothing at all without this.
+      return term.buffer.active.type === "alternate";
+    } catch {
+      return false; // an xterm without `modes` translates nothing
+    }
+  };
+
+  /// A row's height in CSS pixels, measured from the rendered rows rather
+  /// than from `options.fontSize` — the theme's line height is not part of
+  /// that number, and this has to match what a row actually occupies.
+  const rowHeight = () => {
+    const el = term.element && term.element.querySelector(".xterm-rows > div");
+    const h = el && el.getBoundingClientRect().height;
+    return h && h > 1 ? h : 17;
+  };
+
+  /// One notch of scrolling, `dy` pixels' worth. Positive is a finger moving
+  /// down, which shows earlier output — the direction a wheel-up gives.
+  ///
+  /// The pixels are accumulated and spent a whole row at a time, and that is
+  /// the difference between this feeling like scrolling and feeling like
+  /// stuttering. A terminal on the alternate screen can only move by whole
+  /// rows — the program redraws, there is no sub-pixel anything — so the most
+  /// it can do is put those steps where the finger asks for them.
+  ///
+  /// Handing xterm each touchmove's raw delta does not: measured, a 120px drag
+  /// in twenty even 6px steps produced eight row-steps on eight arbitrary
+  /// frames and nothing on the other twelve, because each 6px delta was
+  /// rounded on its own and 6/15 of a row rounds to nothing. Carrying the
+  /// remainder here, and sending an exact multiple of the row height, makes
+  /// the same drag step once every two and a half frames — evenly, which is
+  /// what reads as smooth.
+  let carry = 0;
+  const emit = (dy) => {
+    const el = screen();
+    if (!el) return;
+    carry += dy;
+    const h = rowHeight();
+    const rows = Math.trunc(carry / h);
+    if (!rows) return;
+    carry -= rows * h;
+    const r = el.getBoundingClientRect();
+    el.dispatchEvent(new WheelEvent("wheel", {
+      deltaY: -rows * h, deltaMode: 0, bubbles: true, cancelable: true,
+      clientX: Math.round(r.left + r.width / 2),
+      clientY: Math.round(r.top + r.height / 2),
+    }));
+  };
+
+  node.addEventListener("touchstart", (e) => {
+    glide = 0;
+    carry = 0;
+    if (!translate() || e.touches.length !== 1) { last = null; return; }
+    last = e.touches[0].clientY;
+    at = e.timeStamp;
+    velocity = 0;
+  }, { passive: true });
+
+  node.addEventListener("touchmove", (e) => {
+    if (last === null || e.touches.length !== 1) return;
+    if (!translate()) { last = null; return; }
+    const y = e.touches[0].clientY;
+    const dy = y - last;
+    const dt = Math.max(1, e.timeStamp - at);
+    // Weighted so a flick is read from its end rather than its whole length.
+    velocity = velocity * 0.6 + (dy / dt) * 0.4;
+    last = y; at = e.timeStamp;
+    emit(dy);
+    // Only once we are actually translating: an unconditional preventDefault
+    // would also stop the page scrolling in the cases we hand back.
+    if (e.cancelable) e.preventDefault();
+  }, { passive: false });
+
+  node.addEventListener("touchend", () => {
+    if (last === null) return;
+    last = null;
+    if (!translate()) return;
+    // Momentum. The browser supplies it for a real scrollable div and for
+    // nothing else, so a translated gesture stops dead at the fingertip
+    // unless it is continued here — which is most of what "really bad" meant.
+    // Decayed per frame rather than per pixel so it lasts the same time at
+    // any refresh rate.
+    let v = velocity * 16;
+    if (Math.abs(v) < 1.5) return;
+    const token = ++glide;
+    const step = () => {
+      if (token !== glide) return;
+      v *= 0.94;
+      if (Math.abs(v) < 0.6) return;
+      emit(v);
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }, { passive: true });
+}
+
 function ensureTerm(session) {
   // No "the socket died, rebuild it" branch any more: an entry now heals its
   // own socket (see connectTerm), so a caller cannot find a dead one here.
@@ -1710,6 +2780,11 @@ function ensureTerm(session) {
     const s = entry.sock;
     if (s && s.readyState === 1) s.send(new TextEncoder().encode(d));
   });
+  // After the terminal exists, not beside the focus listener above: `term` is
+  // a `const` declared further down this function, so wiring it up there threw
+  // `Cannot access 'term' before initialization` — inside `onEvent`, which
+  // swallowed it into a terminal that simply never mounted.
+  wireTouchScroll(node, term);
   terms.set(session, entry);
   connectTerm(entry, session);
   return entry;
@@ -2032,7 +3107,10 @@ function pushEdit(rel) {
   const ta = editors.get(rel);
   if (ta) {
     sentEdits.add(rel);
-    send({ t: "EditBuffer", rel, text: ta.value });
+    // Remembered when it does not go out, and re-sent on reconnect. Ignoring
+    // this answer is how text typed during an outage was discarded.
+    if (send({ t: "EditBuffer", rel, text: ta.value })) unsentEdits.delete(rel);
+    else unsentEdits.add(rel);
   }
 }
 
@@ -2192,6 +3270,45 @@ function mentionSelection(rel) {
 // character literal.
 document.addEventListener("keydown", (e) => {
   if (!e.altKey || (e.code !== "KeyK" && e.key.toLowerCase() !== "k" && e.key !== "˚")) return;
+  // A tree pick outranks the active tab, and the reason is visibility. The
+  // active tab is ambient — it is whatever you last opened — while a pick is
+  // a gesture you just made and can see highlighted, so it is the one you
+  // are more likely to have meant. The ambiguity the issue warns about is
+  // resolved by that plus two things below: the picks are painted, so what
+  // will be sent is on screen, and they are cleared once spent, so a
+  // forgotten selection cannot hijack a later Alt+K.
+  const picked = pickedInTreeOrder();
+  if (picked.length) {
+    e.preventDefault();
+    const session = activeTerminalSession();
+    // One `MentionPath` per path rather than a batched intent. The protocol
+    // already carries exactly this, the socket delivers in order, and a
+    // second wire shape for "the same thing, plural" is a cost with no
+    // matching gain — the receiving end sees a list either way.
+    const send_n = picked.slice(0, MAX_MENTIONS);
+    for (const rel of send_n) {
+      send({ t: "MentionPath", rel, line_start: null, line_end: null, session });
+    }
+    // Only what actually went out is spent. Clearing the whole set discarded
+    // the remainder too, so the banner's "the first 16 of 24" read as an
+    // invitation to press Alt+K again — and the second press found nothing
+    // picked, fell through to `mentionTarget()`, and mentioned whatever was
+    // in the active tab instead. That is the silent wrong-file mention this
+    // binding is supposed to be careful about.
+    for (const rel of send_n) treePicked.delete(rel);
+    lastPickedRel = null;
+    document.querySelectorAll(".content").forEach(paintTreePicked);
+    // The cap names itself, like every other bound in this codebase. Silence
+    // here would mean sixteen of twenty-five files arriving with nothing to
+    // say the rest were dropped.
+    if (picked.length > MAX_MENTIONS) {
+      showError(
+        `mentioned the first ${MAX_MENTIONS} of ${picked.length} selected files — ` +
+        `the rest are still selected, press Alt+K again`,
+      );
+    }
+    return;
+  }
   const target = mentionTarget();
   if (target === null) {
     // Alt+K is Meta-k in readline, so a keystroke aimed at a shell must not
@@ -2200,7 +3317,7 @@ document.addEventListener("keydown", (e) => {
     if (e.target && e.target.closest && e.target.closest(".xterm")) return;
     // Silence here is indistinguishable from a broken binding, which is how
     // this was reported in the first place.
-    showError("Alt+K mentions the file in the active tab — open a file first.");
+    showError("Alt+K mentions the file in the active tab, or the files picked in the tree — open a file, or ctrl/⌘-click some.");
     return;
   }
   e.preventDefault();
@@ -2323,8 +3440,23 @@ async function showClaudeHere(pane, terminals) {
 // that are reporting a failure prepend "Error: " themselves (see showError);
 // a success notice like ProjectClosed's session count should not look like one.
 function showBanner(text) {
+  // One banner per distinct message, with a count. Alt+K on a tree selection
+  // sends up to sixteen separate `MentionPath` intents, and every one that
+  // cannot be delivered answers with its own `Event::Error` — so a single
+  // keystroke with no Claude attached stacked sixteen identical banners down
+  // the page, each with its own dismiss button and its own 8s timer. The
+  // information in the sixteenth is the same as in the first.
+  const existing = [...document.querySelectorAll(".error-banner")]
+    .find((el) => el.dataset.text === text);
+  if (existing) {
+    const n = Number(existing.dataset.count || "1") + 1;
+    existing.dataset.count = String(n);
+    existing.querySelector("b").textContent = `${text} (${n}×)`;
+    return;
+  }
   const box = document.createElement("div");
   box.className = "conflict error-banner";
+  box.dataset.text = text;
   const b = document.createElement("b");
   b.textContent = text;
   const dismiss = document.createElement("button");
@@ -2478,7 +3610,261 @@ window.onmousemove = (e) => {
   render();
 };
 
-window.addEventListener("resize", () => terms.forEach((e) => { try { e.fit.fit(); sendResize(e); } catch {} }));
+const fitTerminals = () => terms.forEach((e) => { try { e.fit.fit(); sendResize(e); } catch {} });
+window.addEventListener("resize", fitTerminals);
+
+// ------------------------------------------------------ phone layout
+// #15: three panes side by side is not a layout that shrinks, it is the wrong
+// shape. One pane at a time with a switcher is the shape, and which pane is
+// showing is the only state this needs — the panes themselves are the same
+// panes, rendered by the same code, with the other three taken out of the
+// layout by CSS.
+//
+// The breakpoint lives in the stylesheet AND here, which is a duplication
+// worth its keep: CSS decides what is drawn, and this decides whether a tap on
+// a file should also change which pane is on screen. `matchMedia` with the
+// same query is what keeps the two from drifting silently — a stylesheet-only
+// answer cannot be read from JS, and a JS-only answer cannot lay out.
+// Kept in step with the stylesheet's own breakpoint — see the comment on that
+// block for why the number is 900 and why it is a measurement, not a
+// convention.
+const PHONE_QUERY = "(max-width: 900px)";
+const phone = window.matchMedia(PHONE_QUERY);
+const MPANE_KEY = "roost.mpane";
+
+/// Which pane the switcher opens on. Terminal, deliberately: #15's whole
+/// argument is that the phone job is talking to Claude, not driving an IDE.
+const DEFAULT_MPANE = "3";
+
+function mobileBar() { return document.getElementById("mobilebar"); }
+
+/// Shows one pane and re-fits the terminals in it.
+///
+/// The fit has to happen *after* the attribute change, and it is the reason
+/// the CSS hides panes with `display:none` rather than `visibility`: a pane
+/// that still occupies layout would keep an xterm measured at the old size,
+/// and one that occupies none measures zero — so every switch re-fits, and
+/// a terminal mounted while its pane was hidden gets its real size here.
+function showMobilePane(pi) {
+  const n = String(pi);
+  if (!["0", "1", "2", "3"].includes(n)) return;
+  document.body.dataset.mpane = n;
+  const bar = mobileBar();
+  if (bar) {
+    for (const b of bar.querySelectorAll("button")) {
+      b.setAttribute("aria-pressed", String(b.dataset.mpane === n));
+    }
+  }
+  // Stored, not derived from the layout: reopening the project on the phone
+  // should land where you left it, and the workspace's own `active` tab
+  // indices say nothing about which *pane* was in front.
+  try { localStorage.setItem(MPANE_KEY, n); } catch { /* private mode */ }
+  // The key bar only has a height once the terminal pane is in front, and
+  // #grid subtracts that height. Measured here rather than in `render()`
+  // alone, because switching panes does not go through a State broadcast —
+  // without this the grid keeps the previous pane's arithmetic and the
+  // terminal is fitted to a frame the wrong size by exactly the bar.
+  const tk = document.getElementById("termkeys");
+  if (tk) document.documentElement.style.setProperty("--termkeys-h", tk.offsetHeight + "px");
+  fitTerminals();
+}
+
+/// The gesture route: a tap that means "show me this" has to also bring the
+/// pane it lives in to the front, or on a phone it does nothing visible at all
+/// — the tab activates in a pane that is not on screen.
+///
+/// A no-op above the breakpoint, where all four panes are already visible and
+/// yanking the layout around would be the bug rather than the fix.
+function revealPane(pi) {
+  if (!phone.matches) return;
+  showMobilePane(pi);
+}
+
+// ---- the terminal key bar -------------------------------------------
+// Claude's TUI is driven with arrows and Enter, and a phone soft keyboard has
+// neither: the menus it puts up — "1. yes  2. no", a file picker, a permission
+// prompt — are simply unreachable from a phone. That makes the terminal
+// readable there and not usable, which is the opposite of what #15 wants from
+// it.
+//
+// The sequences are asked of xterm rather than hard-coded, because an arrow is
+// not one byte string. A TUI that has set DECCKM (application cursor keys)
+// expects `ESC O A` where a shell at a prompt expects `ESC [ A`, and Claude
+// sets it — sending the wrong one moves nothing and looks like a dead button.
+const TERM_KEYS = {
+  esc: () => "\x1b",
+  tab: () => "\t",
+  enter: () => "\r",
+  ctrlc: () => "\x03",
+  up: (t) => (appCursor(t) ? "\x1bOA" : "\x1b[A"),
+  down: (t) => (appCursor(t) ? "\x1bOB" : "\x1b[B"),
+};
+
+/// Whether this terminal is in application-cursor-keys mode.
+///
+/// `term.modes` is xterm's own view of the modes the *program* set, so this
+/// follows Claude in and out of its menus without roost tracking anything.
+/// Guarded: a vendored xterm without `modes` degrades to the normal sequences,
+/// which is what a plain shell wants — never to a thrown error inside a click
+/// handler.
+function appCursor(t) {
+  try { return !!t.modes.applicationCursorKeysMode; } catch { return false; }
+}
+
+/// The terminal a key press should go to: the one showing in the pane the
+/// switcher has in front, falling back to the last focused session.
+function targetTerm() {
+  const host = document.querySelector('.pane[data-pane="3"] .termhost[data-session]');
+  const byPane = host && terms.get(host.dataset.session);
+  return byPane || terms.get(lastFocusedSession) || null;
+}
+
+/// Clipboard text into a terminal, for the phone. #97.
+///
+/// iOS raises no Paste callout over a terminal: xterm's rows are
+/// `user-select: none` (the same fact `onSelectionChange` above is built on)
+/// and its editable textarea is parked under the cursor, not under the finger,
+/// so a long-press finds nothing to offer a menu about. This button is the only
+/// way clipboard text reaches a terminal on a phone.
+///
+/// **`term.paste`, never `term.input`.** `paste` is what wraps the text in
+/// `ESC [ 200 ~` … `ESC [ 201 ~` when the program turned bracketed paste on,
+/// and Claude Code turns it on. Through `input`, a multi-line paste arrives as
+/// a run of carriage returns — every line submitted as its own turn, which is
+/// worse than the bug this fixes. The bracketing is xterm's decision and not
+/// roost's: `paste` consults the mode the program set, so a plain shell still
+/// receives the text bare.
+async function pasteInto(entry) {
+  let text = null;
+  try {
+    // `undefined` outside a secure context, so the guard is not defensive
+    // decoration: a roost reached over plain http on a LAN address has no
+    // Clipboard API at all.
+    if (navigator.clipboard && navigator.clipboard.readText) {
+      text = await navigator.clipboard.readText();
+    }
+  } catch {
+    // Refused, or no user activation. Which of the two does not change what
+    // happens next, which is the point of having a fallback at all — the
+    // activation rules differ by engine and the engine that matters here
+    // cannot be tested on this host.
+    text = null;
+  }
+  // `null` is "could not read", `""` is "read it, it was empty". Only the
+  // first opens the dialog. Folding them together would reopen a prompt over
+  // a clipboard the user had genuinely emptied — this codebase's own "absence
+  // of evidence is not evidence of absence", pointed at a UI.
+  if (text === null) text = await askPasteText();
+  // Same route for both paths, so the bracketing rule above holds however the
+  // text arrived. `null` from a cancelled dialog pastes nothing.
+  if (text) entry.term.paste(text);
+}
+
+function initTermKeys() {
+  const bar = document.getElementById("termkeys");
+  if (!bar) return;
+  for (const b of bar.querySelectorAll("button")) {
+    // pointerdown, not click: a click first moves focus, and on iOS focusing a
+    // button dismisses the soft keyboard — so every arrow press would close the
+    // keyboard the user is about to type into. preventDefault keeps focus where
+    // it is, which is the terminal.
+    b.addEventListener("pointerdown", (e) => {
+      // `preventDefault` is what stops the press moving focus, which is the
+      // whole point: a click would focus the button first, and on iOS
+      // focusing a button dismisses the keyboard — so an arrow press would
+      // close the keyboard it is supposed to be independent of.
+      e.preventDefault();
+      const entry = targetTerm();
+      if (!entry) return;
+      // Branched before the table, because a paste is neither of the two
+      // things `TERM_KEYS` holds: its values are `() => string`, and this is
+      // asynchronous and must not go through `term.input`. See `pasteInto`.
+      if (b.dataset.k === "paste") { pasteInto(entry); return; }
+      const make = TERM_KEYS[b.dataset.k];
+      if (!make) return;
+      entry.term.input(make(entry.term));
+      // Deliberately no `focus()`. Focusing xterm's hidden textarea is what
+      // opens the soft keyboard, so every arrow press used to summon one over
+      // the half of the screen you were trying to read — while the whole point
+      // of these keys is to drive a menu *without* typing.
+      //
+      // Nothing here replaces it, and nothing needs to: tapping the terminal
+      // focuses it and raises the keyboard, which is the gesture people
+      // already use. A dedicated ⌨ button was tried and removed — it was one
+      // more control competing for a row that is already six wide, for a job
+      // the terminal itself does.
+    });
+  }
+}
+
+function initMobileBar() {
+  const bar = mobileBar();
+  if (!bar) return;
+  for (const b of bar.querySelectorAll("button")) {
+    // `pointerdown`, for the reason the tab strip's handler explains at
+    // length: with a terminal focused the soft keyboard is up, and the first
+    // tap outside it is spent closing the keyboard rather than reaching the
+    // control. Switching panes is the gesture that must never cost two taps.
+    b.addEventListener("pointerdown", (e) => {
+      if (e.pointerType !== "touch") return;
+      e.preventDefault();
+      showMobilePane(b.dataset.mpane);
+    });
+    b.onclick = () => showMobilePane(b.dataset.mpane);
+  }
+  let start = DEFAULT_MPANE;
+  try { start = localStorage.getItem(MPANE_KEY) || DEFAULT_MPANE; } catch { /* private mode */ }
+  showMobilePane(start);
+}
+
+// ---- the soft keyboard ------------------------------------------------
+// A phone keyboard covers the bottom of the screen without the layout
+// viewport noticing: `100dvh` is the viewport with the *browser's* chrome
+// retracted, which is a different question, and on iOS it does not shrink for
+// the keyboard at all. So the pane kept its full height, and everything at the
+// bottom — the key bar, and whatever you were typing into — sat underneath it.
+//
+// `window.visualViewport` is the API that does know. Its height is what is
+// actually visible, and it changes as the keyboard opens and closes.
+// `offsetTop` matters too: iOS scrolls the layout viewport up to keep a
+// focused field visible, and without accounting for it the header ends up
+// above the top of the screen.
+function watchKeyboard() {
+  const vv = window.visualViewport;
+  if (!vv) return; // every current browser has it; an old one keeps `dvh`
+  const root = document.documentElement;
+  const apply = () => {
+    // Two numbers, and the first version of this used only the first.
+    //
+    // `height` is how much is visible, and it is what shrinks when a keyboard
+    // opens — `dvh` does not follow it. `interactive-widget=resizes-content`
+    // in the viewport meta makes the *layout* viewport follow it too, which
+    // fixes this outright, but only on Chromium: Safari has not shipped it,
+    // and iOS is where this was reported.
+    //
+    // `offsetTop` is the half that was missing. iOS does not shrink the layout
+    // viewport at all; it scrolls it, so the visible window slides down the
+    // document. Sizing to `height` alone therefore left the frame the right
+    // size in the wrong place — header above the top of the screen, footer
+    // still under the keyboard.
+    root.style.setProperty("--vvh", `${Math.round(vv.height)}px`);
+    root.style.setProperty("--vvtop", `${Math.round(vv.offsetTop)}px`);
+    fitTerminals();
+  };
+  vv.addEventListener("resize", apply);
+  vv.addEventListener("scroll", apply);
+  apply();
+}
+
+// Crossing the breakpoint in either direction. A desktop window dragged narrow
+// has to grow a switcher without a reload, and one dragged wide has to stop
+// hiding three panes — the attribute is harmless above the breakpoint (no rule
+// reads it), but the terminals still need re-fitting because their pane just
+// changed width by several hundred pixels.
+phone.addEventListener("change", () => {
+  if (phone.matches) showMobilePane(document.body.dataset.mpane || DEFAULT_MPANE);
+  fitTerminals();
+});
 
 // A directory's first expand is driven by real htmx (hx-get + hx-trigger
 // "toggle once" on the <details>, see render::tree_level) rather than the
@@ -2528,12 +3914,48 @@ if (closeBtn) closeBtn.onclick = async () => {
 // answered by the front page. The bell covers the one thing you do want
 // mid-task — what needs attention — so this became on-demand.
 const projBtn = document.getElementById("projbtn");
+/// Puts a header popup directly under the control that opened it.
+///
+/// These were anchored in CSS to a fixed edge — #projpanel and #noticepanel to
+/// the right, #wtpanel to the left — which is only ever correct for one
+/// trigger. #projpanel has two (`projbtn` on the right, `projname` on the
+/// left), so on a desktop it opened across the header from the project name,
+/// and on a phone, where the trim hides `projbtn`, it opened against the right
+/// edge with nothing there at all.
+///
+/// Left-aligned to the trigger and clamped to the viewport, which is what the
+/// branch switcher already does by being anchored to the only control that
+/// opens it. Written to `style.left` with `right` cleared, so it overrides
+/// whichever edge the stylesheet picked.
+function anchorPanel(panel, trigger) {
+  if (!panel || !trigger || !trigger.getBoundingClientRect) return;
+  const t = trigger.getBoundingClientRect();
+  if (!t.width && !t.height) return; // a hidden trigger anchors nothing
+  panel.style.right = "auto";
+  // Measured after clearing `right`, or the width read is the one the old
+  // anchoring produced.
+  const w = panel.getBoundingClientRect().width;
+  const max = Math.max(4, window.innerWidth - w - 4);
+  panel.style.left = `${Math.round(Math.min(Math.max(4, t.left), max))}px`;
+}
+
 const projPanel = document.getElementById("projpanel");
 if (projBtn && projPanel) {
-  projBtn.onclick = () => {
+  // Two triggers, one panel. The header names the project you are in and the
+  // control that changes it was somewhere else entirely, so the thing you
+  // look at was the thing that did nothing. The ◆ stays: it is a reasonable
+  // muscle-memory target, and removing it is a separate decision from adding
+  // the obvious one.
+  const toggleProjects = (trigger) => {
     projPanel.hidden = !projPanel.hidden;
-    if (!projPanel.hidden && window.htmx) htmx.trigger(document.body, "refresh");
+    if (!projPanel.hidden) {
+      anchorPanel(projPanel, trigger);
+      if (window.htmx) htmx.trigger(document.body, "refresh");
+    }
   };
+  projBtn.onclick = () => toggleProjects(projBtn);
+  const projName = document.getElementById("projname");
+  if (projName) projName.onclick = () => toggleProjects(projName);
   // Clicking through to a project should not leave the panel hanging open
   // behind the tab switch.
   projPanel.onclick = (e) => { if (e.target.closest("a")) projPanel.hidden = true; };
@@ -2557,6 +3979,7 @@ const wtPanel = document.getElementById("wtpanel");
 if (wtBtn && wtPanel) {
   wtBtn.onclick = () => {
     wtPanel.hidden = !wtPanel.hidden;
+    if (!wtPanel.hidden) anchorPanel(wtPanel, wtBtn);
     if (!wtPanel.hidden && window.htmx) {
       // State costs two git calls per worktree; ask only while looking.
       // `document.body.dataset.key` is already the server's `percent_encode(key)`
@@ -2597,6 +4020,7 @@ if (bell) {
   bell.onclick = () => {
     const p = document.getElementById("noticepanel");
     p.hidden = !p.hidden;
+    if (!p.hidden) anchorPanel(p, bell);
     renderNotices();
   };
 }
@@ -2622,7 +4046,7 @@ if (settingsBtn) {
 // fires, and Tab-to-focus is untouched, so keyboard users are not locked out.
 // (The pane-header icons are <span>s, which are not focusable, so they never
 // had this problem — only these real buttons do.)
-for (const id of ["projbtn", "wtbtn", "bell", "settings", "refresh", "closeproj"]) {
+for (const id of ["projbtn", "projname", "wtbtn", "bell", "settings", "refresh", "closeproj"]) {
   const b = document.getElementById(id);
   if (b) b.addEventListener("mousedown", (e) => e.preventDefault());
 }
@@ -2632,24 +4056,32 @@ for (const id of ["projbtn", "wtbtn", "bell", "settings", "refresh", "closeproj"
 // can stopPropagation the event, and it runs before the trigger's own click
 // toggles the panel — so a click on the trigger is seen as "inside the
 // trigger" and left alone, and opening a popup never immediately re-closes it.
+//
+// A panel may have more than one trigger — the projects panel is opened by
+// the ◆ button and by the project name — and every one of them has to count
+// as "inside". With a single trigger per entry, a click on the second one is
+// outside the first: mousedown closes the panel and the click reopens it, so
+// the panel could be opened but never closed from that trigger.
 const HEADER_POPUPS = [
-  ["projbtn", "projpanel"],
-  ["wtbtn", "wtpanel"],
-  ["bell", "noticepanel"],
+  ["projpanel", ["projbtn", "projname"]],
+  ["wtpanel", ["wtbtn"]],
+  ["noticepanel", ["bell"]],
 ];
 document.addEventListener(
   "mousedown",
   (e) => {
-    for (const [btnId, panelId] of HEADER_POPUPS) {
+    for (const [panelId, btnIds] of HEADER_POPUPS) {
       const panel = document.getElementById(panelId);
-      const btn = document.getElementById(btnId);
       // A click inside a modal dialog is outside the panel in DOM terms but
       // not in the user's: the hook row's confirmation opens one, and closing
       // the panel under it would take away the row the answer changes.
       if (e.target.closest && e.target.closest("dialog.roost")) continue;
-      if (panel && !panel.hidden && !panel.contains(e.target) && btn && !btn.contains(e.target)) {
-        panel.hidden = true;
-      }
+      if (!panel || panel.hidden || panel.contains(e.target)) continue;
+      const onTrigger = btnIds.some((id) => {
+        const b = document.getElementById(id);
+        return b && b.contains(e.target);
+      });
+      if (!onTrigger) panel.hidden = true;
     }
   },
   true,
@@ -2670,6 +4102,15 @@ if (location.hash.startsWith("#session=")) {
   };
   tryFocus();
 }
+
+// Before `connectControl`, so the first State broadcast renders into a layout
+// that has already decided which pane is in front. After it, the first
+// `render()` would measure the switcher and fit terminals against a body with
+// no `data-mpane` at all — which on a phone is all four panes stacked in one
+// grid cell, for as long as the socket takes to answer.
+initMobileBar();
+initTermKeys();
+watchKeyboard();
 
 connectControl();
 
@@ -3057,10 +4498,12 @@ function focusSession(session) {
     const ti = state.panes[pi].tabs.findIndex((t) => t.k === "Terminal" && t.session === session);
     if (ti >= 0) {
       send({ t: "ActivateTab", pane: pi, idx: ti });
+      revealPane(pi);
       return;
     }
   }
   send({ t: "OpenTab", pane: 3, tab: { k: "Terminal", session } });
+  revealPane(3);
 }
 
 // The tab-strip dot for a session in THIS project: derived from `notices`
@@ -3161,7 +4604,11 @@ function setUploadProgress(label, fraction) {
   box.textContent = `${label} — ${Math.round(fraction * 100)}%`;
 }
 
-function postFiles(url, files, label) {
+// `done` is optional and only the backup pane passes one: it needs to know
+// *when* the archive has landed, because the intent that restores it names a
+// file that must already be there. The two older call sites fire and forget,
+// and are unchanged.
+function postFiles(url, files, label, done) {
   const form = new FormData();
   for (const f of files) form.append("file", f, f.name);
   const xhr = new XMLHttpRequest();
@@ -3173,12 +4620,22 @@ function postFiles(url, files, label) {
   };
   xhr.onload = () => {
     setUploadProgress(label, null);
-    if (xhr.status !== 200) return showError(`${label}: ${xhr.responseText || xhr.status}`);
+    if (xhr.status !== 200) {
+      showError(`${label}: ${xhr.responseText || xhr.status}`);
+      if (done) done(false);
+      return;
+    }
     let body = {};
-    try { body = JSON.parse(xhr.responseText); } catch { return; }
-    for (const r of body.results || []) if (!r.ok) showError(`${r.name}: ${r.error}`);
+    try { body = JSON.parse(xhr.responseText); } catch { if (done) done(false); return; }
+    let ok = true;
+    for (const r of body.results || []) if (!r.ok) { ok = false; showError(`${r.name}: ${r.error}`); }
+    if (done) done(ok);
   };
-  xhr.onerror = () => { setUploadProgress(label, null); showError(`${label}: upload failed`); };
+  xhr.onerror = () => {
+    setUploadProgress(label, null);
+    showError(`${label}: upload failed`);
+    if (done) done(false);
+  };
   xhr.send(form);
 }
 
@@ -3211,6 +4668,131 @@ function droppedDirectories(dt) {
   }
   return dirs;
 }
+
+// ---------------------------------------------------------------- tab drag
+//
+// Moving a tab is already `Intent::MoveTab { from, idx, to, at }`, and `at` is
+// already a position — the ⇄ button simply always passes the destination's
+// length. So a drop at a position needs no protocol change and no server
+// change, and reordering within a pane falls out of the same intent.
+//
+// roost already uses drag-and-drop for file upload (the two document-level
+// handlers below). The two coexist because each declines the other's drag by
+// type, and the direction that matters is this one: a tab handler that did not
+// check would swallow a *file* drop and uploads would silently stop working.
+const TAB_MIME = "application/x-roost-tab";
+
+function dragHasTab(dt) {
+  return !!dt && Array.prototype.includes.call(dt.types || [], TAB_MIME);
+}
+
+let dropMarker = null;
+
+// The source of the drag in flight, for `dragover` — which can read
+// `dataTransfer.types` but never `getData`, so the pane a tab came from is
+// not available there. `drop` reads the real payload and does not trust this.
+let dragTabSource = null;
+document.addEventListener("dragstart", (e) => {
+  const tab = e.target.closest && e.target.closest(".tab");
+  dragTabSource = tab ? { from: Number(tab.dataset.pane), idx: Number(tab.dataset.idx) } : null;
+}, true);
+document.addEventListener("dragend", () => { dragTabSource = null; clearDropMarker(); }, true);
+
+
+function clearDropMarker() {
+  if (dropMarker) dropMarker.remove();
+  dropMarker = null;
+}
+
+// Where a drop at (px, py) would land, as an index into the strip's tabs.
+//
+// Measured with the marker removed, always. It is an inline element with a
+// real width, so leaving it in shifts every tab to its right and the next
+// dragover computes a different index from the layout the previous one
+// caused — the marker oscillates between two positions and the user cannot
+// tell where the tab will go.
+//
+// Both axes, because .tabstrip wraps onto further rows (--tab-rows): with an
+// x-only comparison every row past the first lands at the end of the strip.
+function dropIndexIn(strip, px, py) {
+  clearDropMarker();
+  const tabs = [...strip.querySelectorAll(".tab")];
+  for (let i = 0; i < tabs.length; i++) {
+    const r = tabs[i].getBoundingClientRect();
+    if (py < r.top) return i;                       // on an earlier row
+    if (py <= r.bottom && px < r.left + r.width / 2) return i;
+  }
+  return tabs.length;
+}
+
+function showDropMarker(strip, at) {
+  const tabs = [...strip.querySelectorAll(".tab")];
+  dropMarker = document.createElement("span");
+  dropMarker.className = "tabdrop";
+  if (at >= tabs.length) strip.appendChild(dropMarker);
+  else strip.insertBefore(dropMarker, tabs[at]);
+}
+
+// Reordering inside one pane is allowed everywhere; moving *between* panes is
+// held to the pair the ⇄ button already offers. That restriction is a
+// deliberate one — the left column holds 260px tool windows, and a terminal
+// dropped into one is not a move anyone wants — and widening it is a separate
+// decision from adding the gesture.
+function mayDrop(from, to) {
+  return from === to || MOVE_BETWEEN[from] === to;
+}
+
+document.addEventListener("dragover", (e) => {
+  if (!dragHasTab(e.dataTransfer)) return;
+  const strip = e.target.closest && e.target.closest(".tabstrip");
+  if (!strip) return clearDropMarker();
+  const to = Number(strip.closest(".pane").dataset.pane);
+  if (!dragTabSource || !mayDrop(dragTabSource.from, to)) return clearDropMarker();
+  // Without preventDefault the browser refuses the drop outright, so this is
+  // what makes the strip a target at all.
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  showDropMarker(strip, dropIndexIn(strip, e.clientX, e.clientY));
+});
+
+document.addEventListener("dragleave", (e) => {
+  // dragleave also fires moving between a strip's own children, which would
+  // make the marker flicker off on every tab boundary crossed.
+  if (!dragHasTab(e.dataTransfer)) return;
+  const strip = e.target.closest && e.target.closest(".tabstrip");
+  if (strip && e.relatedTarget && strip.contains(e.relatedTarget)) return;
+  clearDropMarker();
+});
+
+document.addEventListener("drop", (e) => {
+  if (!dragHasTab(e.dataTransfer)) return;
+  const strip = e.target.closest && e.target.closest(".tabstrip");
+  const payload = e.dataTransfer.getData(TAB_MIME);
+  clearDropMarker();
+  if (!strip || !payload) return;
+  let from, key;
+  try { ({ from, key } = JSON.parse(payload)); } catch { return; }
+  const to = Number(strip.closest(".pane").dataset.pane);
+  if (!Number.isInteger(from) || typeof key !== "string" || !mayDrop(from, to)) return;
+  // Re-resolved against the strip as it is *now*, not as it was when the
+  // drag began. A tab that has gone in the meantime is refused out loud
+  // rather than moving whichever tab has inherited its index.
+  const pane = state && state.panes[from];
+  const idx = pane ? pane.tabs.findIndex((t) => tabKey(t) === key) : -1;
+  e.preventDefault();
+  if (idx < 0) {
+    return showError("that tab moved or closed while you were dragging it — nothing was moved");
+  }
+  let at = dropIndexIn(strip, e.clientX, e.clientY);
+  // workspace.rs removes from the source *before* inserting, so within one
+  // pane `at` indexes the already-shortened list. Dropping a tab to the right
+  // of where it started would otherwise land it one place too far — and
+  // dropping it back exactly where it was would move it one to the right,
+  // which is the shape a reorder gets wrong most visibly.
+  if (from === to && at > idx) at -= 1;
+  if (from === to && at === idx) return; // a no-op move, not worth a broadcast
+  send({ t: "MoveTab", from, idx, to, at });
+}, true);
 
 // preventDefault on *every* file drag, not just ones over a valid target.
 // Without it the browser handles the drop itself and navigates to file:///,
@@ -3725,6 +5307,21 @@ function renderSearch(results) {
     const n = results.skipped_nested;
     parts.push(`${n} nested ${n === 1 ? "checkout" : "checkouts"} not searched`);
   }
+  // The third decision, kept apart from the two above because the answer to
+  // "where is my build output" is a different answer from "where is my
+  // submodule" — and because this one has an override the others do not.
+  // Naming it is what makes the override findable: a directory the ignore
+  // matcher skipped wrongly is invisible otherwise, and this module's ignore
+  // support is deliberately partial.
+  if (results.skipped_ignored) {
+    const n = results.skipped_ignored;
+    // Named as the control is actually labelled. The clause exists so the
+    // override is *findable*, and the only control is the tree pane's icon,
+    // whose title is "show dotfiles" — a user hunting for "show hidden
+    // files" has no string to look for, which defeats the whole point of
+    // saying it.
+    parts.push(`${n} gitignored ${n === 1 ? "directory" : "directories"} not searched — turn on "show dotfiles" to include them`);
+  }
   if (!parts.length && !searchRows.length) parts.push("no matches");
   // The other half of the honesty line, and the one the server cannot supply:
   // below three characters wsconn.rs sets `Query::contents = false`, so the
@@ -3769,6 +5366,7 @@ function activateSearchRow(i) {
     // parameter.
     focusNextReveal = true;
     send({ t: "OpenAtLine", pane: 2, rel: r.rel, line: r.line });
+    revealPane(2);
   } else {
     // Same rule the file tree uses (defaultMode, line 145): a rendered form
     // opens in Preview, everything else opens in Edit. Hardcoding Preview
@@ -3776,6 +5374,7 @@ function activateSearchRow(i) {
     // user clicked it from, and the server does not correct it — coerce_tab
     // only ever demotes Edit to Preview, never promotes back.
     send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: r.rel, mode: defaultMode(r.rel) } });
+    revealPane(2);
   }
 }
 

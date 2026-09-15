@@ -61,7 +61,11 @@ try {
   // ---------------------------------------------------------- claude present
   console.log("A. claude is on the login shell's PATH");
   roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shellPresent } });
-  ok(await until(async () => (await pageHtml(roost.port)).includes('data-launches="claude"'), 15, "page to offer claude"),
+  // A membership test, not an equality one. The attribute is the list of every
+  // launch on offer — `claude` and, since #52, `prloop` — and both are gated
+  // on the same probe for the same executable, so pinning the whole string
+  // made adding a second launch look like the first one had gone missing.
+  ok(await until(async () => /data-launches="[^"]*\bclaude\b/.test(await pageHtml(roost.port)), 15, "page to offer claude"),
      "the page offers the claude launch");
   page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   const { evalIn } = page;
@@ -106,6 +110,9 @@ try {
   // ----------------------------------------------------------- claude absent
   console.log("\nC. claude is not on the login shell's PATH");
   roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shellAbsent } });
+  // Empty, and it must stay an equality test here: with `claude` absent
+  // *nothing* may be offered, and `prloop` runs the same executable — a
+  // membership test would pass over a page still offering the other one.
   ok(await until(async () => (await pageHtml(roost.port)).includes('data-launches=""'), 15, "the check to finish"),
      "the startup check reaches the page: no launches offered");
   page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);

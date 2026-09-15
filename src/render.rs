@@ -1052,20 +1052,49 @@ pub fn status_fragment(st: &Status) -> String {
 /// changed URL is the only thing that makes it look again. The hash changes
 /// exactly when the icon bytes do, so the URL is stable across restarts and
 /// releases that do not touch the icon.
+/// A content hash of `rels`, for use as a `?v=` cache key.
+///
+/// FNV-1a over the bytes in the order given; eight hex digits is plenty for
+/// "did it change", which is all a cache key needs. Not cached in a `OnceLock`
+/// per caller — `assets::get` is already a lookup into a table built at
+/// startup, and this runs once per page render.
+fn asset_hash(rels: &[&str]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for rel in rels {
+        for b in crate::assets::get(rel).unwrap_or(&[]) {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{:016x}", h)[..8].to_string()
+}
+
+/// The `?v=` for one asset, memoised per name.
+///
+/// Every stylesheet and script roost ships carries one. Without it a browser
+/// applies its own heuristic — roost sends no `Cache-Control` at all — and a
+/// phone goes on running the previous release's `app.js` and `style.css` for
+/// as long as that heuristic says. It is not a theoretical staleness: a
+/// deployed CSS fix for terminal scrolling was reported as "still broken" from
+/// a phone that had never fetched it. The favicons had this from 2026-09-03;
+/// the files that actually change every release did not.
+fn av(rel: &str) -> String {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = g.get(rel) {
+        return v.clone();
+    }
+    let v = asset_hash(&[rel]);
+    g.insert(rel.to_string(), v.clone());
+    v
+}
+
 fn icon_links() -> String {
     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let v = VERSION.get_or_init(|| {
-        // FNV-1a over the four files in link order; eight hex digits is
-        // plenty for "did it change", which is all a cache key needs.
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for rel in ["favicon.ico", "favicon-32.png", "logo.svg", "apple-touch-icon.png"] {
-            for b in crate::assets::get(rel).unwrap_or(&[]) {
-                h ^= u64::from(*b);
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        }
-        format!("{:016x}", h)[..8].to_string()
-    });
+    let v = VERSION
+        .get_or_init(|| asset_hash(&["favicon.ico", "favicon-32.png", "logo.svg", "apple-touch-icon.png"]));
     format!(
         "<link rel=\"icon\" href=\"/static/favicon.ico?v={v}\" sizes=\"32x32\">\n\
          <link rel=\"icon\" type=\"image/png\" href=\"/static/favicon-32.png?v={v}\" sizes=\"32x32\">\n\
@@ -1085,11 +1114,20 @@ pub fn overview_page(sel: &str, roots: &[String]) -> String {
     // so the whole of it has to be readable somewhere: the tooltip, joined
     // the way `ROOST_ROOTS` spells a list.
     let roots_title = esc(&roots.join(":"));
+    let (sv, dv, ov) = (av("style.css"), av("dialog.js"), av("overview.js"));
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>roost</title>\
+        // The viewport meta the workspace page has always had and this one
+        // never did. Without it a phone lays the front page out at its default
+        // 980px and scales the result down: every width rule below the
+        // breakpoint is skipped, and the text arrives about a third of its
+        // intended size. Measured before adding it — `window.innerWidth` 980
+        // on a 390px device.
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1,interactive-widget=resizes-content\">\
+         <title>roost</title>\
          {icons}\
          <link rel=\"stylesheet\" href=\"/static/themes/darcula.css\">\
-         <link rel=\"stylesheet\" href=\"/static/style.css\">\
+         <link rel=\"stylesheet\" href=\"/static/style.css?v={sv}\">\
          {DIALOG_STRUCTURAL_CSS}\
          <script src=\"/static/vendor/htmx.min.js\"></script>\
          </head><body class=\"overview-body\">\
@@ -1097,7 +1135,7 @@ pub fn overview_page(sel: &str, roots: &[String]) -> String {
            <span class=\"home\">{SVG_HOME}</span><span class=\"proj\">roost</span>\
            <span class=\"vsep\"></span>\
            <span class=\"roots\" title=\"{roots_title}\">{roots_html}</span>\
-           <button id=\"addroot\" type=\"button\" title=\"add a project root\">+</button>\
+           <button id=\"addroot\" type=\"button\" title=\"new project, or a new project root\">+</button>\
          </header>\
          <main id=\"overview\">\
            <section class=\"pane ovpane tool\">\
@@ -1127,8 +1165,19 @@ pub fn overview_page(sel: &str, roots: &[String]) -> String {
              <button type=\"button\" class=\"dlg-ok\"></button>\
            </div>\
          </dialog>\
-         <script src=\"/static/dialog.js\"></script>\
-         <script src=\"/static/overview.js\"></script>\
+         <!-- Shipped because `askChoice` needs it: with several roots, the +\
+              asks which one a new project goes in. Without this shell that\
+              call finds no dialog and the flow dies silently. -->\
+         <dialog id=\"dlg-choice\" class=\"roost\">\
+           <h2 class=\"dlg-title\"></h2>\
+           <div class=\"dlg-body\"></div>\
+           <div class=\"dlg-detail\" hidden></div>\
+           <div class=\"dlg-buttons\">\
+             <button type=\"button\" class=\"dlg-cancel\">Cancel</button>\
+           </div>\
+         </dialog>\
+         <script src=\"/static/dialog.js?v={dv}\"></script>\
+         <script src=\"/static/overview.js?v={ov}\"></script>\
          </body></html>",
         SVG_HOME = SVG_HOME,
         icons = icon_links(),
@@ -1148,6 +1197,63 @@ pub fn overview_page(sel: &str, roots: &[String]) -> String {
 /// (`reachable == false`) renders as inert text, never as a link, since
 /// opening it is exactly what confinement forbids — but it still renders, so
 /// the user isn't left wondering where a worktree they know exists went.
+/// The ✻ menu: start fresh, or continue one of this project's past
+/// conversations.
+///
+/// Rows are `<button>`s carrying the id in a dataset attribute rather than
+/// anchors, because choosing one is an intent and not navigation. The id is
+/// escaped like everything else here — it comes from a filename in another
+/// program's directory, and `claudehist` has already refused anything that is
+/// not a plausible session id, but the escaping is the rule, not the backstop.
+///
+/// An **empty** list still renders, carrying `data-empty="1"`. The client asks
+/// for this fragment on every ✻ click and needs to tell "no history, so launch
+/// fresh straight away" from "the request failed", and a body that says which
+/// is cheaper than a second round trip. #18: absence is not a claim — the menu
+/// simply is not shown, and nothing anywhere says this project never ran a
+/// Claude.
+pub fn claude_history(rows: &[crate::claudehist::Conversation]) -> String {
+    let mut out = format!(
+        "<div class=\"chist\" data-empty=\"{}\">",
+        if rows.is_empty() { "1" } else { "0" }
+    );
+    out.push_str(
+        "<button class=\"chistrow chistnew\" data-resume=\"\">         <span class=\"chistlabel\">New conversation</span></button>",
+    );
+    for r in rows {
+        let label = if r.label.is_empty() { "(no first message)" } else { r.label.as_str() };
+        out.push_str(&format!(
+            "<button class=\"chistrow\" data-resume=\"{id}\" title=\"{title}\">             <span class=\"chistlabel\">{label}</span>             <span class=\"chistwhen\">{when}</span></button>",
+            id = esc(&r.session_id),
+            title = esc(&format!("{} — {}", r.session_id, r.label)),
+            label = esc(label),
+            when = esc(&ago(r.at, now_secs())),
+        ));
+    }
+    out.push_str("</div>");
+    out
+}
+
+/// "3m", "4h", "2d" — a menu row, not a timestamp. Deliberately coarse: which
+/// of two conversations is the recent one is the whole question, and a clock
+/// time would need the reader's timezone, which the server does not have.
+fn ago(at: u64, now: u64) -> String {
+    let d = now.saturating_sub(at);
+    match d {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m", d / 60),
+        3600..=86_399 => format!("{}h", d / 3600),
+        _ => format!("{}d", d / 86_400),
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub fn projects_strip(current_key: &str, projects: &[crate::registry::ProjectStatus]) -> String {
     let mut out = String::from("<span class=\"projstrip\">");
     // Only what is actually running. This panel answers "which projects have
@@ -1589,6 +1695,18 @@ const SVG_SEARCH: &str = r#"<svg width="14" height="14" viewBox="0 0 16 16" fill
 const SVG_BELL: &str = r#"<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true"><path d="M4 11V7.5a4 4 0 0 1 8 0V11l1 1.5H3z"/><path d="M6.5 13.5a1.5 1.5 0 0 0 3 0"/></svg>"#;
 const SVG_GEAR: &str = r#"<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>"#;
 const SVG_REFRESH: &str = r#"<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.5-3.6"/><path d="M13 2.5v3h-3"/></svg>"#;
+/// The disclosure caret on the project name. Drawn rather than a character
+/// so it inherits `currentColor` and the header's stroke weight like every
+/// other glyph up there.
+const SVG_CARET: &str = r#"<svg width="9" height="9" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>"#;
+/// The four icons in the mobile pane switcher. Line art at 20px rather than
+/// the header's 12-16px: this is a tap target, read at arm's length, and the
+/// header's icons disappear at that size on a phone screen.
+const SVG_M_TREE: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h6l1.5 2H20v12H4z"/></svg>"#;
+const SVG_M_CHANGES: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h10M4 7l3-3M4 7l3 3"/><path d="M20 17H10m10 0l-3-3m3 3l-3 3"/></svg>"#;
+const SVG_M_EDIT: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 4h9l5 5v11H5z"/><path d="M14 4v5h5"/><path d="M9 13h6M9 16.5h4"/></svg>"#;
+const SVG_M_TERM: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9.5l3 2.5-3 2.5M13 15h4"/></svg>"#;
+
 const SVG_X: &str = r#"<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>"#;
 
 /// A destructive `askConfirm` used to be a native `confirm()` — browser
@@ -1627,10 +1745,13 @@ dialog.roost, .dlg-title, .dlg-blocked { display: revert !important; visibility:
 /* The detail slot holds the diff a save conflict is about to overwrite; hiding
    it would hide what "Overwrite" destroys. Hidden by attribute when empty. */
 .dlg-detail:not([hidden]) { display: block !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
-.dlg-body, .dlg-buttons, .dlg-items, .dlg-tabs, .dlg-scope, .dlg-rows:not([hidden]), .dlg-themes:not([hidden]), .dlg-warning:not([hidden]) { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
-.dlg-body, .dlg-items, .dlg-rows, .dlg-themes:not([hidden]) { flex-direction: column !important; }
+.dlg-body, .dlg-buttons, .dlg-items, .dlg-tabs, .dlg-scope:not([hidden]), .dlg-rows:not([hidden]), .dlg-themes:not([hidden]), .dlg-about:not([hidden]), .dlg-backup:not([hidden]), .dlg-warning:not([hidden]) { display: flex !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
+.dlg-body, .dlg-items, .dlg-rows, .dlg-themes:not([hidden]), .dlg-about:not([hidden]), .dlg-backup:not([hidden]) { flex-direction: column !important; }
 .dlg-buttons { flex-direction: row !important; order: 0 !important; }
-.dlg-buttons button, .dlg-item { transform: none !important; font-size: 13px !important; order: 0 !important; }
+.dlg-buttons button:not([hidden]), .dlg-item { transform: none !important; font-size: 13px !important; order: 0 !important; }
+/* The About pane has nothing to save, so its OK button is hidden by
+   attribute. Without this the lock above would keep showing it. */
+.dlg-buttons button[hidden] { display: none !important; }
 .dlg-row { display: grid !important; visibility: visible !important; opacity: 1 !important; position: static !important; }
 .dlg-tile { display: flex !important; flex-direction: column !important; visibility: visible !important; opacity: 1 !important; }
 /* The grid each pane of tiles lives in. Locking .dlg-themes alone is not
@@ -1708,6 +1829,7 @@ pub fn workspace_page(
     // override against it: `ws.show_hidden ?? SHOW_HIDDEN_DEFAULT`.
     let sh = if s.show_hidden { "1" } else { "0" };
     let autosave = if s.autosave { "1" } else { "0" };
+    let follow_tree = if s.follow_tree { "1" } else { "0" };
     let share_selection = if sharing_on { "1" } else { "0" };
     // The launch buttons the tab strip may show, space-separated so a second
     // program is one more word, not one more attribute. Names are the wire
@@ -1728,16 +1850,19 @@ pub fn workspace_page(
         Some(rel) => format!("<link rel=\"stylesheet\" href=\"/frag/{proj_url}/{rel}\">"),
         None => String::new(),
     };
+    let (sv, dv, av_js) = (av("style.css"), av("dialog.js"), av("app.js"));
     format!(
         r#"<!doctype html>
-{html_open}<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+{html_open}<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
 <title>{proj_txt}</title>
 {icons}<link rel="stylesheet" href="/static/vendor/xterm.css">
 <link rel="stylesheet" href="/static/vendor/hljs-github-dark.min.css">
 <link rel="stylesheet" href="/static/vendor/github-markdown.min.css">
 <link rel="stylesheet" href="/static/vendor/code-input.min.css">
+<link rel="stylesheet" href="/static/vendor/code-input-find-and-replace.min.css">
+<link rel="stylesheet" href="/static/vendor/code-input-go-to-line.min.css">
 {theme_links}
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v={sv}">
 {theme_css}
 {DIALOG_STRUCTURAL_CSS}
 <script src="/static/vendor/htmx.min.js"></script>
@@ -1745,11 +1870,16 @@ pub fn workspace_page(
 <script src="/static/vendor/xterm-addon-fit.js"></script>
 <script src="/static/vendor/highlight.min.js"></script>
 <script src="/static/vendor/code-input.min.js"></script>
-</head><body data-project="{proj_txt}" data-key="{qkey}" data-show-hidden="{sh}" data-autosave="{autosave}" data-share-selection="{share_selection}" data-launches="{launches}">
+<script src="/static/vendor/code-input-indent.min.js"></script>
+<script src="/static/vendor/code-input-auto-close-brackets.min.js"></script>
+<script src="/static/vendor/code-input-find-and-replace.min.js"></script>
+<script src="/static/vendor/code-input-go-to-line.min.js"></script>
+</head><body data-project="{proj_txt}" data-key="{qkey}" data-show-hidden="{sh}" data-autosave="{autosave}" data-follow-tree="{follow_tree}" data-share-selection="{share_selection}" data-launches="{launches}">
 <header>
-  <a class="home" href="/" title="all projects">{SVG_HOME}</a><span class="proj">{proj_txt}</span>
+  <a class="home" href="/" title="all projects">{SVG_HOME}</a><button id="projname" class="proj" title="switch project">{proj_txt}{SVG_CARET}</button>
   <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body, git from:body"></span><span id="wtlabel"></span></button>
   {warn}
+  <span id="connstate" hidden></span>
   {sharing_indicator}
   <label id="searchbox" for="searchinput" title="search this project (ctrl-shift-F or ⌘⇧F)">{SVG_SEARCH}<input id="searchinput" type="search" autocomplete="off" spellcheck="false" placeholder="Search files, contents, sessions" aria-label="Search files, contents, sessions"><kbd>⇧⌃F</kbd></label>
   <button id="projbtn" title="running projects">{SVG_DIAMOND}<span id="projcount"></span></button>
@@ -1771,6 +1901,27 @@ pub fn workspace_page(
   <div class="divider" data-div="right-w"></div>
   <section class="pane" data-pane="3"><div class="panehead"><div class="tabstrip"></div><div class="paneicons"></div></div><div class="content"></div></section>
 </main>
+<div id="termkeys" aria-label="terminal keys">
+  <button type="button" data-k="esc">esc</button>
+  <button type="button" data-k="tab">tab</button>
+  <button type="button" data-k="up" aria-label="up">&#8593;</button>
+  <button type="button" data-k="down" aria-label="down">&#8595;</button>
+  <button type="button" data-k="enter" aria-label="enter">&#9166;</button>
+  <button type="button" data-k="ctrlc">^C</button>
+  <!-- #97. Last, after ^C: it is the only one here that is not a key, and the
+       six before it are in the order a hand reaches for them. iOS raises no
+       Paste callout over a terminal — xterm's rows are `user-select: none` and
+       its editable textarea is parked under the cursor, not under the finger —
+       so on a phone this button is the only way clipboard text reaches a
+       terminal at all. -->
+  <button type="button" data-k="paste">paste</button>
+</div>
+<nav id="mobilebar" aria-label="pane">
+  <button type="button" data-mpane="0" aria-pressed="false">{SVG_M_TREE}<span>Files</span></button>
+  <button type="button" data-mpane="1" aria-pressed="false">{SVG_M_CHANGES}<span>Changes</span></button>
+  <button type="button" data-mpane="2" aria-pressed="false">{SVG_M_EDIT}<span>Editor</span></button>
+  <button type="button" data-mpane="3" aria-pressed="false">{SVG_M_TERM}<span>Terminal</span></button>
+</nav>
 <div id="searchoverlay" hidden>
   <div class="searchpanel">
     <div id="searchresults"></div>
@@ -1796,6 +1947,21 @@ pub fn workspace_page(
   </div>
 </dialog>
 <dialog id="dlg-menu" class="roost"><div class="dlg-items"></div></dialog>
+<!-- #97's fallback, and load-bearing rather than polite: `navigator.clipboard`
+     is `undefined` outside a secure context, the permission can be refused, and
+     whether the bar's `pointerdown` satisfies the activation rule differs by
+     engine. A real <textarea> is exactly the editable element iOS will offer
+     its callout for, so a long-press works inside this where it does not over
+     the terminal. -->
+<dialog id="dlg-paste" class="roost">
+  <h2 class="dlg-title"></h2>
+  <label class="dlg-label" for="dlg-paste-text"></label>
+  <textarea id="dlg-paste-text" class="dlg-input" rows="4" autocomplete="off" spellcheck="false"></textarea>
+  <div class="dlg-buttons">
+    <button type="button" class="dlg-cancel">Cancel</button>
+    <button type="button" class="dlg-ok">Send</button>
+  </div>
+</dialog>
 <dialog id="dlg-choice" class="roost">
   <h2 class="dlg-title"></h2>
   <div class="dlg-body"></div>
@@ -1810,6 +1976,8 @@ pub fn workspace_page(
   <div class="dlg-scope"></div>
   <div class="dlg-rows" hidden></div>
   <div class="dlg-themes" hidden></div>
+  <div class="dlg-about" hidden></div>
+  <div class="dlg-backup" hidden></div>
   <div class="dlg-buttons">
     <button type="button" class="dlg-cancel">Cancel</button>
     <button type="button" class="dlg-ok">Save</button>
@@ -1822,8 +1990,8 @@ pub fn workspace_page(
      put inside the strip would be wiped on the next state broadcast. -->
 <footer id="statusbar" class="hidden"><span class="left"></span><span class="right"></span></footer>
 <div id="termpool" hidden></div>
-<script src="/static/dialog.js"></script>
-<script src="/static/app.js"></script>
+<script src="/static/dialog.js?v={dv}"></script>
+<script src="/static/app.js?v={av_js}"></script>
 </body></html>"#,
         SVG_HOME = SVG_HOME,
         icons = icon_links(),
@@ -3014,6 +3182,28 @@ mod tests {
     }
 
     #[test]
+    fn the_project_name_is_a_control_not_a_label() {
+        // The header named the project you were in, and the control that
+        // changed it was the ◆ button somewhere to the right — so the thing
+        // you look at was the thing that did nothing. The name is now the
+        // switcher's other trigger, which app.js keys off this id.
+        let s = Settings::default();
+        let h = workspace_page("proj", "proj", &s, None, false, &[]);
+        assert!(
+            h.contains(r#"<button id="projname" class="proj""#),
+            "the name is a button carrying the id app.js wires: {}",
+            &h[..400.min(h.len())]
+        );
+        // And it says so: a click target that does not look like one is the
+        // same defect wearing a quieter coat.
+        let name = h.split(r#"<button id="projname""#).nth(1).expect("the button");
+        let name = name.split("</button>").next().expect("its end");
+        assert!(name.contains("<svg"), "it carries a disclosure caret: {name}");
+        // The ◆ stays — a second trigger, not a replacement.
+        assert!(h.contains(r#"id="projbtn""#), "the diamond button is still there");
+    }
+
+    #[test]
     fn workspace_page_wires_everything() {
         let s = Settings { theme: "gruvbox".into(), ..Settings::default() };
         let h = workspace_page("proj", "proj", &s, Some("theme.css"), false, &[]);
@@ -3224,6 +3414,45 @@ mod tests {
     }
 
     #[test]
+    fn every_stylesheet_and_script_carries_a_cache_key_that_tracks_its_bytes() {
+        // roost sends no `Cache-Control` at all, so a browser falls back to its
+        // own heuristic and a phone goes on running the previous release's
+        // `app.js` and `style.css` for as long as that heuristic says. Not
+        // theoretical: a deployed CSS fix for terminal scrolling was reported
+        // as "still broken" from a phone that had never fetched it. The
+        // favicons have had a content hash since 2026-09-03; the two files
+        // that change every release did not.
+        let ws = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
+        let front = overview_page("", &["/home/x".into()]);
+        for (page, name, asset) in [
+            (&ws, "workspace", "style.css"),
+            (&ws, "workspace", "app.js"),
+            (&ws, "workspace", "dialog.js"),
+            (&front, "front", "style.css"),
+            (&front, "front", "dialog.js"),
+            (&front, "front", "overview.js"),
+        ] {
+            let want = format!("/static/{asset}?v=");
+            assert!(page.contains(&want), "{name} page loads {asset} with no cache key");
+            // Not merely *a* key: the one this asset's bytes produce. A
+            // hard-coded or shared constant would satisfy the line above and
+            // still never change when the file did.
+            let got = page.split(&want).nth(1).unwrap()[..8].to_string();
+            assert_eq!(got, av(asset), "{name}: {asset}'s key is not its content hash");
+        }
+
+        // And the property the whole thing rests on: different bytes, different
+        // key. Asserted across two real assets rather than by mutating one,
+        // since the table is built at startup — same technique, and it fails
+        // just as loudly if `av` ever returns a constant.
+        assert_ne!(
+            av("style.css"),
+            av("app.js"),
+            "two different files must not share a cache key"
+        );
+    }
+
+    #[test]
     fn the_workspace_page_ships_empty_dialog_shells() {
         let s = crate::config::Settings::default();
         let html = workspace_page("proj", "proj", &s, None, false, &[]);
@@ -3251,7 +3480,13 @@ mod tests {
             assert!(!html.contains(frag), "a dialog must not carry `hidden`: {frag}");
         }
         assert!(html.contains(r#"<button id="settings" title="settings">"#), "the gear is no longer 'not implemented'");
-        assert!(html.contains(r#"<script src="/static/dialog.js"></script>"#), "dialog.js not loaded");
+        // The `?v=` is a content hash, so the assertion is on the path plus the
+        // fact that it carries one — pinning the digits would make every edit to
+        // dialog.js fail this test for no reason.
+        assert!(
+            html.contains(r#"<script src="/static/dialog.js?v="#),
+            "dialog.js not loaded, or loaded without a cache key: {html}"
+        );
     }
 
     // Finding 2 (branch review, in-page dialogs): a project's own
@@ -3291,7 +3526,7 @@ mod tests {
         assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-detail:not([hidden])"),
             "the structural CSS does not lock .dlg-detail's visibility");
         for cls in [".dlg-tabs", ".dlg-scope", ".dlg-rows", ".dlg-row", ".dlg-themes", ".dlg-tile",
-                    ".dlg-tiles", ".dlg-tab", ".dlg-warning"] {
+                    ".dlg-tiles", ".dlg-tab", ".dlg-warning", ".dlg-backup"] {
             assert!(DIALOG_STRUCTURAL_CSS.contains(cls), "the structural CSS does not lock {cls}");
         }
         assert!(DIALOG_STRUCTURAL_CSS.contains(".dlg-row { display: grid !important"),
@@ -3389,8 +3624,8 @@ mod tests {
             h.contains(r#"<span class="roots" title="/home/x/projects:/srv/&lt;code&gt;">"#),
             "the full list is the escaped tooltip: {h}"
         );
-        assert!(h.contains(r#"</span><button id="addroot" type="button" title="add a project root">+</button>"#), "{h}");
-        assert!(h.contains(r#"<script src="/static/dialog.js"></script>"#), "{h}");
+        assert!(h.contains(r#"</span><button id="addroot" type="button" title="new project, or a new project root">+</button>"#), "{h}");
+        assert!(h.contains(r#"<script src="/static/dialog.js?v="#), "{h}");
         for id in ["dlg-confirm", "dlg-text"] {
             assert!(h.contains(&format!(r#"id="{id}""#)), "no {id} shell on the front page");
         }
@@ -3993,5 +4228,91 @@ mod tests {
         // just the empty `<ul class="ovsessions"></ul>` with no message. Restored.
         let out = overview_sessions("", &[]);
         assert!(out.contains("no sessions") || out.contains("nothing running"), "{out}");
+    }
+
+    /// #18 step 3. The pane ships as an empty, hidden slot like the other
+    /// three: everything in it is built from JS with `textContent`, because
+    /// every line of a restore listing carries a path from the server.
+    ///
+    /// A `<div>` is not a `<dialog>`, so unlike the shells above it *is*
+    /// marked `hidden` — that is how `render()` switches panes. The assertion
+    /// that matters is that it ships empty.
+    #[test]
+    fn the_backup_pane_ships_as_an_empty_hidden_slot() {
+        let html = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
+        assert!(
+            html.contains(r#"<div class="dlg-backup" hidden></div>"#),
+            "the backup pane must ship empty and hidden"
+        );
+        // It has to be inside the settings dialog, not loose in the body:
+        // openSettings finds it with el.querySelector(".dlg-backup").
+        let dlg = html
+            .split_once(r#"<dialog id="dlg-settings""#)
+            .expect("the settings dialog")
+            .1
+            .split_once("</dialog>")
+            .expect("its end")
+            .0;
+        assert!(dlg.contains("dlg-backup"), "the pane is outside the settings dialog");
+    }
+
+    /// `askChoice` is how the `+` asks which root a new project goes in when
+    /// there is more than one, and it finds its dialog by id. The workspace
+    /// page has always shipped this shell; the front page had not, so the
+    /// call would have found `null` and the flow would have died with nothing
+    /// on screen — the failure mode a browser test catches and no Rust test
+    /// would have.
+    #[test]
+    fn the_front_page_ships_every_dialog_shell_its_own_script_asks_for() {
+        let h = overview_page("", &["/tmp/a".to_string()]);
+        for id in ["dlg-confirm", "dlg-text", "dlg-choice"] {
+            assert!(h.contains(&format!(r#"id="{id}""#)), "no {id} shell on the front page");
+        }
+        // A <dialog> is display:none without `open`; marking one `hidden`
+        // yields a dialog that can never be shown.
+        assert!(!h.contains(r#"<dialog id="dlg-choice" class="roost" hidden"#), "{h}");
+        // Filled from JS with textContent, so it must ship empty.
+        assert!(h.contains(r#"<div class="dlg-body"></div>"#), "the choice body must ship empty");
+    }
+
+    /// #97. The paste button and the dialog it falls back to.
+    ///
+    /// iOS raises no Paste callout over a terminal, so on a phone this button
+    /// is the only route from the clipboard into a shell.
+    #[test]
+    fn the_terminal_key_bar_offers_paste_and_the_page_ships_its_fallback() {
+        let h = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
+        let bar = h
+            .split_once(r#"<div id="termkeys""#)
+            .expect("the terminal key bar")
+            .1
+            .split_once("</div>")
+            .expect("its end")
+            .0;
+        assert!(bar.contains(r#"data-k="paste""#), "no paste button in the bar: {bar}");
+        // Last, after ^C. The six before it are keys in the order a hand
+        // reaches for them; this one is not a key, and putting it among them
+        // would move every button someone has already learned the position of.
+        let keys: Vec<&str> = bar.match_indices("data-k=\"").map(|(i, _)| {
+            let rest = &bar[i + 8..];
+            &rest[..rest.find('"').expect("a closing quote")]
+        }).collect();
+        assert_eq!(keys, vec!["esc", "tab", "up", "down", "enter", "ctrlc", "paste"], "bar order changed");
+
+        // The fallback shell, shipped empty: `askPasteText` fills the title and
+        // label with textContent, and the box must start empty or a stale
+        // paste would be sent by the next person who taps Send.
+        assert!(h.contains(r#"<textarea id="dlg-paste-text" class="dlg-input" rows="4""#), "{h}");
+        assert!(
+            h.contains(r#"autocomplete="off" spellcheck="false"></textarea>"#),
+            "the paste box must ship empty"
+        );
+        // A <dialog> is display:none without `open`; marking one `hidden`
+        // yields a dialog that can never be shown.
+        assert!(!h.contains(r#"<dialog id="dlg-paste" class="roost" hidden"#), "{h}");
+        // It carries the class the mobile 16px rule keys on. Without it iOS
+        // zooms the page when the box takes focus — on the one dialog that
+        // only ever opens on a phone.
+        assert!(h.contains(r#"id="dlg-paste-text" class="dlg-input""#), "{h}");
     }
 }

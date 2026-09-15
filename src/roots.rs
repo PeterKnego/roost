@@ -1,11 +1,37 @@
-//! Adding a project root from the front page.
+//! Adding a project root, and making a project, from the front page.
 //!
-//! A root is a directory roost scans for projects; today they come only from
-//! `ROOST_ROOTS` or the global config's `roots`. This is the one place a
+//! A root is a directory roost scans for projects; they otherwise come only
+//! from `ROOST_ROOTS` or the global config's `roots`. This is the one place a
 //! browser may extend that list, behind the same Origin check every
-//! shell-spawning socket has. Validation reads metadata and canonicalises;
-//! it never creates, lists or follows into anything — the scan that follows
-//! is the existing one.
+//! shell-spawning socket has.
+//!
+//! ## One field, two meanings, and why they cannot collide
+//!
+//! The front page's `+` takes one string. **Absolute means a root; relative
+//! means a project.** A relative path has no reading as a root — a root is a
+//! place on disk roost scans, and there is nothing for it to be relative to —
+//! so the split is a fact about the input rather than a mode the user has to
+//! remember.
+//!
+//! ## This module used to create nothing, and now it does
+//!
+//! Its doc ended "it never creates, lists or follows into anything", and that
+//! was worth writing down: a browser can reach this socket, and the thing at
+//! the end of it is now a `mkdir`. Both creating paths are therefore explicit
+//! about what stands between the two.
+//!
+//! **A project (relative) is confined** by `projects::safe_resolve_parent`,
+//! the primitive CLAUDE.md names for creation destinations "because the target
+//! does not exist yet". Reused rather than reimplemented, which carries its
+//! restriction along: the parent must already exist, so `a/b` works when `a`
+//! does. One level at a time, by a check this codebase already trusts.
+//!
+//! **A root (absolute) is confined by nothing, because there is nothing to
+//! confine it to.** A root is by definition an arbitrary directory, and
+//! someone typing an absolute path into a field labelled *directory to scan
+//! for projects* has named it deliberately. What stands in place of a
+//! confinement is a confirmation: the client asks before this is called, so
+//! the old refusal became a question rather than an action.
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +47,23 @@ use crate::proto::SettingValue;
 /// `current` is the root list in effect (so a duplicate is caught against
 /// what the server actually serves), `env_roots` is `ROOST_ROOTS` if set.
 pub fn add_root(path: &str, current: &[PathBuf], env_roots: Option<&str>, global: &Path) -> Result<Vec<PathBuf>, String> {
+    add_root_maybe_creating(path, current, env_roots, global, false)
+}
+
+/// `add_root`, with the option to create the directory first.
+///
+/// `create` is set only by the client's second click — the confirmation that
+/// replaced the old flat refusal. It is a parameter rather than a behaviour
+/// because "add this root" and "make this directory and add it" are different
+/// requests, and a caller that has not asked the user must not be able to make
+/// the second one by accident.
+pub fn add_root_maybe_creating(
+    path: &str,
+    current: &[PathBuf],
+    env_roots: Option<&str>,
+    global: &Path,
+    create: bool,
+) -> Result<Vec<PathBuf>, String> {
     let raw = path.trim();
     if raw.is_empty() {
         return Err("enter a directory path".into());
@@ -32,7 +75,17 @@ pub fn add_root(path: &str, current: &[PathBuf], env_roots: Option<&str>, global
     // Three outcomes, not two: absent, present, and *could not look*. The
     // last is never folded into the first — see CLAUDE.md.
     match std::fs::symlink_metadata(&expanded) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(format!("{}: no such directory", expanded.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Absent — the one outcome the confirmation can act on. "Could not
+            // look" deliberately stays a refusal below: creating over
+            // something roost cannot stat is how a directory that *is* there
+            // gets written into.
+            if !create {
+                return Err(format!("{}: no such directory", expanded.display()));
+            }
+            std::fs::create_dir_all(&expanded)
+                .map_err(|e| format!("cannot create {}: {e}", expanded.display()))?;
+        }
         Err(e) => return Err(format!("cannot read {}: {e}", expanded.display())),
         Ok(_) => {}
     }
@@ -71,6 +124,96 @@ pub fn add_root(path: &str, current: &[PathBuf], env_roots: Option<&str>, global
     let mut out = current.to_vec();
     out.push(canon);
     Ok(out)
+}
+
+/// Creates `rel` as a project under one of `roots`, and `git init`s it.
+///
+/// Returns the created directory and the project key that names it — which is
+/// the path *relative to its root*, not the final segment: a project made as
+/// `a/b` is reached at `/a/b` and keyed `a/b`, and `file_name()` would call it
+/// `b` and send the browser to a project that does not exist.
+///
+/// `root` is the root the browser chose, and it
+/// is **re-validated against the list roost actually serves** rather than
+/// trusted: the dialog that offered it is a hint, not an authorisation — the
+/// same rule `RemoveWorktree` and `claudehist::has` state about their own.
+/// `None` means "there was only one to choose from", which is checked here
+/// rather than assumed.
+pub fn new_project(
+    rel: &str,
+    root: Option<&str>,
+    roots: &[PathBuf],
+) -> Result<(PathBuf, String), String> {
+    let name = rel.trim();
+    if name.is_empty() {
+        return Err("enter a name for the project".into());
+    }
+    if roots.is_empty() {
+        // The one refusal that is really a redirection: there is nothing for a
+        // relative path to be relative *to*, and the fix is the other half of
+        // this same field.
+        return Err(
+            "roost has no project roots yet, so there is nowhere to make this. \
+             Enter an absolute path first and roost will add it as a root."
+                .into(),
+        );
+    }
+    let base = match root {
+        Some(r) => {
+            let want = crate::config::expand_home(r);
+            roots
+                .iter()
+                .find(|k| *k == &want)
+                .ok_or_else(|| format!("{} is not one of this roost's project roots", want.display()))?
+                .clone()
+        }
+        // Absent is only an answer when there is one root. With several it is
+        // a missing choice, and guessing at it is how a folder lands somewhere
+        // nobody picked.
+        None if roots.len() == 1 => roots[0].clone(),
+        None => return Err("choose which project root to make it in".into()),
+    };
+    // The confinement. `rel` came from a browser and is about to become a
+    // directory: `safe_resolve_parent` canonicalises the parent and validates
+    // the final component, which is what CLAUDE.md prescribes for a target
+    // that does not exist yet.
+    let dest = crate::projects::safe_resolve_parent(&base, name)?;
+    // Positive evidence before creating, the CLAUDE.md way: `symlink_metadata`
+    // rather than `exists()`, because `exists()` follows symlinks and folds
+    // "cannot look" into "not there" — and here "not there" means "make a
+    // repository in it".
+    match std::fs::symlink_metadata(&dest) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot read {}: {e}", dest.display())),
+        Ok(_) => {
+            // Named, and left alone. "It is already there" is a different
+            // sentence from "I made it", and running `git init` over a
+            // directory someone already has is a change to a repository this
+            // was not asked to touch.
+            return Err(format!("{} already exists", dest.display()));
+        }
+    }
+    std::fs::create_dir(&dest).map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
+    // `git init`, always: roost's project list *is* the set of git
+    // repositories under the roots, so a folder without one would not appear
+    // in the list it was created from — the feature would look broken in the
+    // most confusing way available.
+    //
+    // A failure here is reported as what it is and the directory **stays**.
+    // Undoing a create by removing a directory is the move CLAUDE.md's table
+    // is eleven rows of, and a `git` that would not run says nothing about
+    // what is now in that directory.
+    crate::gitio::init(&dest).map_err(|e| {
+        format!("created {}, but `git init` failed: {e}", dest.display())
+    })?;
+    // Derived from the canonical parent `safe_resolve_parent` returned, not
+    // from the string the browser sent: `./a`, `a/` and `a` are one directory
+    // and must be one key.
+    let key = dest
+        .strip_prefix(base.canonicalize().as_deref().unwrap_or(&base))
+        .map(|k| k.to_string_lossy().to_string())
+        .unwrap_or_else(|_| name.to_string());
+    Ok((dest, key))
 }
 
 /// The `roots` list as the file actually spells it.
@@ -121,7 +264,21 @@ fn not_a_list(global: &Path, found: &str) -> String {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "t")]
 enum RootsIntent {
-    AddRoot { path: String },
+    AddRoot {
+        path: String,
+        /// Set by the client's second click: the confirmation that replaced
+        /// the old flat "no such directory". Defaulted so a client from
+        /// before this existed still parses, and still cannot create.
+        #[serde(default)]
+        create: bool,
+    },
+    /// Make a project under a root. `root` is which one; `None` is only an
+    /// answer when there is exactly one, and is checked, not assumed.
+    NewProject {
+        rel: String,
+        #[serde(default)]
+        root: Option<String>,
+    },
 }
 
 /// `/ws/_roots`: the front page's one write. One exchange per connection.
@@ -149,11 +306,41 @@ pub fn handle_ws(stream: TcpStream) {
     let Ok(mut ws) = accepted else { return };
     let reply = match ws.read() {
         Ok(Message::Text(t)) => match serde_json::from_str::<RootsIntent>(&t) {
-            Ok(RootsIntent::AddRoot { path }) => {
+            Ok(RootsIntent::AddRoot { path, create }) => {
                 let current = crate::projects::roots();
                 let env = std::env::var("ROOST_ROOTS").ok();
-                match add_root(&path, &current, env.as_deref(), &crate::config::global_config_path()) {
+                match add_root_maybe_creating(&path, &current, env.as_deref(), &crate::config::global_config_path(), create) {
                     Ok(list) => serde_json::json!({ "t": "Roots", "roots": list.iter().map(|p| p.display().to_string()).collect::<Vec<_>>() }),
+                    // `missing` tells the client whether this refusal is the
+                    // one its confirmation can answer. A flag rather than the
+                    // client matching on the message: a refusal string is for
+                    // a person to read, and a client that branches on its
+                    // wording breaks the day the wording improves.
+                    //
+                    // One extra `symlink_metadata` on a path that has already
+                    // failed, and only on the refusal path. Deliberately
+                    // re-derived rather than threaded out of `add_root`: it
+                    // decides whether to *offer* a question, and the answer to
+                    // that question re-checks everything from scratch.
+                    Err(msg) => {
+                        let missing = !create
+                            && matches!(
+                                std::fs::symlink_metadata(crate::config::expand_home(path.trim())),
+                                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+                            );
+                        serde_json::json!({ "t": "Error", "msg": msg, "missing": missing })
+                    }
+                }
+            }
+            Ok(RootsIntent::NewProject { rel, root }) => {
+                let roots = crate::projects::roots();
+                match new_project(&rel, root.as_deref(), &roots) {
+                    // The key is what the URL and every storage path use, and
+                    // it is derived here rather than by the client: the client
+                    // typed the name, and a name is not a key.
+                    Ok((dir, key)) => {
+                        serde_json::json!({ "t": "Project", "key": key, "path": dir.display().to_string() })
+                    }
                     Err(msg) => serde_json::json!({ "t": "Error", "msg": msg }),
                 }
             }
@@ -344,5 +531,214 @@ mod tests {
     #[cfg(unix)]
     fn nix_is_root() -> bool {
         std::fs::metadata("/proc/self").map(|m| { use std::os::unix::fs::MetadataExt; m.uid() == 0 }).unwrap_or(false)
+    }
+
+    // ---- making a project ----
+
+    fn is_repo(d: &Path) -> bool {
+        d.join(".git").exists()
+    }
+
+    #[test]
+    fn a_name_becomes_a_directory_with_a_repository_in_it() {
+        // The report, in one test: type a name, get a folder. And `git init`,
+        // because roost's project list *is* the git repositories under the
+        // roots — a folder without one would not appear in the list it was
+        // made from.
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("projects");
+        fs::create_dir_all(&root).unwrap();
+        let (dir, key) = new_project("mqtt-bridge", None, &[root.clone()]).unwrap();
+        assert_eq!(dir, root.canonicalize().unwrap().join("mqtt-bridge"));
+        assert_eq!(key, "mqtt-bridge", "the key is what the URL will use");
+        assert!(dir.is_dir(), "the directory was not created");
+        assert!(is_repo(&dir), "a project roost cannot list is not a project");
+    }
+
+    #[test]
+    fn a_nested_name_is_keyed_by_its_path_under_the_root_not_its_last_segment() {
+        // `file_name()` would call this `sub`, and the browser would then be
+        // sent to a project that does not exist. Caught by writing the key
+        // derivation twice and asking which one the URL uses.
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("projects");
+        fs::create_dir_all(root.join("group")).unwrap();
+        let (dir, key) = new_project("group/sub", None, &[root.clone()]).unwrap();
+        assert_eq!(key, "group/sub");
+        assert!(is_repo(&dir));
+    }
+
+    #[test]
+    fn the_parent_must_already_exist_and_says_so() {
+        // The restriction `safe_resolve_parent` carries, kept deliberately
+        // rather than worked around: it canonicalises the parent, which is
+        // what makes the confinement below possible at all.
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("projects");
+        fs::create_dir_all(&root).unwrap();
+        let e = new_project("nope/sub", None, &[root.clone()]).unwrap_err();
+        assert!(e.contains("no such directory"), "{e}");
+        assert!(!root.join("nope").exists(), "nothing was created on the way to refusing");
+    }
+
+    /// **The confinement test, written so that it reaches the confinement.**
+    ///
+    /// CLAUDE.md records why this matters in its own words: path-confinement
+    /// tests "that failed with `ENOENT` before ever reaching the confinement
+    /// check — which is why a symlink escape survived review". So the escape
+    /// here is *possible*: `escape` really exists outside the root, and the
+    /// parent of `../escape/evil` really canonicalises. Only the
+    /// `starts_with` check stands between the input and a `mkdir` out there.
+    ///
+    /// Revert-checked by deleting that check from `safe_resolve_parent`: this
+    /// test fails at its `unwrap_err`, because the call *succeeded* — a
+    /// directory was created at `<tmp>/escape/evil`, outside every root, from
+    /// a string a browser sent. Both halves fail, the plain `..` and the
+    /// symlinked parent.
+    #[test]
+    fn a_relative_path_cannot_escape_its_root() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("projects");
+        let outside = d.path().join("escape");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        // The fixture is only a fixture if the escape would otherwise land:
+        // the parent exists, so nothing before the confinement can refuse it.
+        assert!(root.join("../escape").canonicalize().unwrap() == outside.canonicalize().unwrap(),
+                "setup: the escape target must really be reachable");
+
+        let e = new_project("../escape/evil", None, &[root.clone()]).unwrap_err();
+        assert!(e.contains("outside project"), "refused for the wrong reason: {e}");
+        assert!(!outside.join("evil").exists(), "a directory was created outside the root");
+
+        // A symlinked parent resolves to where it really points and is checked
+        // from there — the same escape wearing a different coat.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+            let e = new_project("link/evil", None, &[root.clone()]).unwrap_err();
+            assert!(e.contains("outside project"), "a symlinked parent escaped: {e}");
+            assert!(!outside.join("evil").exists(), "a directory was created through the symlink");
+        }
+    }
+
+    #[test]
+    fn a_directory_that_is_already_there_is_named_and_left_alone() {
+        // "It is already there" is a different sentence from "I made it", and
+        // a `git init` over someone's existing directory is a change to a
+        // repository this feature was not asked to touch. So the assertion is
+        // on the directory's *contents*, not merely on the refusal.
+        //
+        // Revert-checked by running `git init` before returning the refusal:
+        // the refusal is still returned, still says "already exists", and this
+        // test still goes red — on `.git` appearing in a directory that was
+        // supposed to be left alone. An assertion on the error string alone
+        // would have stayed green.
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("projects");
+        let mine = root.join("mine");
+        fs::create_dir_all(&mine).unwrap();
+        fs::write(mine.join("notes.txt"), "already here\n").unwrap();
+
+        let e = new_project("mine", None, &[root.clone()]).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        assert!(!is_repo(&mine), "an existing directory was git initialised");
+        assert_eq!(fs::read_to_string(mine.join("notes.txt")).unwrap(), "already here\n");
+    }
+
+    #[test]
+    fn with_several_roots_the_chosen_one_is_used_and_an_unchosen_one_is_refused() {
+        // With one root a server that ignored `root` entirely would pass every
+        // other test in this file. This is the test that makes the field mean
+        // something, so it asserts the project landed under the **second**
+        // root — the one a version that always took `roots[0]` would miss.
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        let b = d.path().join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let roots = vec![a.clone(), b.clone()];
+
+        let (dir, _) = new_project("here", Some(b.to_str().unwrap()), &roots).unwrap();
+        assert!(dir.starts_with(b.canonicalize().unwrap()), "landed in {dir:?}, not under {b:?}");
+        assert!(!a.join("here").exists(), "it was also made under the root nobody chose");
+
+        // A root the browser invented is refused, not adopted. The dialog that
+        // offered it is a hint, not an authorisation.
+        let e = new_project("x", Some(d.path().join("elsewhere").to_str().unwrap()), &roots).unwrap_err();
+        assert!(e.contains("not one of this roost's project roots"), "{e}");
+
+        // And with several roots, naming none is a missing answer rather than
+        // a licence to pick.
+        let e = new_project("x", None, &roots).unwrap_err();
+        assert!(e.contains("choose which"), "{e}");
+        assert!(!a.join("x").exists() && !b.join("x").exists(), "one was picked anyway");
+    }
+
+    #[test]
+    fn with_no_roots_at_all_the_refusal_points_at_the_other_half_of_the_field() {
+        // There is nothing for a relative path to be relative to, and the fix
+        // is the same `+`: type an absolute path and it becomes a root.
+        let e = new_project("anything", None, &[]).unwrap_err();
+        assert!(e.contains("no project roots yet"), "{e}");
+        assert!(e.contains("absolute path"), "the refusal must say what to do instead: {e}");
+    }
+
+    #[test]
+    fn an_empty_name_is_refused_before_anything_is_touched() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("projects");
+        fs::create_dir_all(&root).unwrap();
+        for bad in ["", "   ", "/", "."] {
+            assert!(new_project(bad, None, &[root.clone()]).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    // ---- creating a root ----
+
+    #[test]
+    fn a_missing_root_is_refused_without_the_confirmation_and_created_with_it() {
+        // The confirmation is the whole of what stands where a confinement
+        // cannot: a root is by definition an arbitrary directory, so the old
+        // flat refusal became a question rather than an action. Both halves
+        // are asserted, because only the pair shows the flag does anything.
+        let d = tempfile::tempdir().unwrap();
+        let want = d.path().join("brand/new");
+
+        let e = add_root(want.to_str().unwrap(), &[], None, &global(&d)).unwrap_err();
+        assert!(e.contains("no such directory"), "{e}");
+        assert!(!want.exists(), "the unconfirmed call created it anyway");
+
+        let list = add_root_maybe_creating(want.to_str().unwrap(), &[], None, &global(&d), true).unwrap();
+        assert!(want.is_dir(), "the confirmed call did not create it");
+        assert_eq!(list.len(), 1);
+        assert!(fs::read_to_string(global(&d)).unwrap().contains("brand/new"), "and it was written to the config");
+    }
+
+    #[test]
+    fn a_path_roost_cannot_stat_is_not_created_over_even_with_the_confirmation() {
+        // `create` acts on *absent* only. "Cannot look" stays a refusal: a
+        // create over something roost could not stat is how a directory that
+        // really is there gets written into — the distinction CLAUDE.md's
+        // whole table is about.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let d = tempfile::tempdir().unwrap();
+            let locked = d.path().join("locked");
+            fs::create_dir_all(&locked).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let target = locked.join("inside");
+            let got = add_root_maybe_creating(target.to_str().unwrap(), &[], None, &global(&d), true);
+            let readable = fs::read_dir(&locked).is_ok();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            // Skipped rather than inverted when running as root, which can
+            // stat through a 0000 directory: a test that quietly passes as
+            // root is the "passes for the wrong reason" class by another name.
+            if !readable {
+                let e = got.unwrap_err();
+                assert!(e.contains("cannot read") || e.contains("cannot create"), "{e}");
+            }
+        }
     }
 }

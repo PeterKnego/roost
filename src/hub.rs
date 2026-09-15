@@ -112,6 +112,120 @@ pub struct Hub {
 
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<Hub>>>>> = OnceLock::new();
 
+/// Terminal tabs the restored layout asks for whose shell is positively gone.
+///
+/// roost survives its own restart — dtach masters reparent to init, and
+/// `KillMode=process` keeps systemd from taking them — so after a restart
+/// these tabs simply reattach. A *reboot* is different: no process outlives a
+/// kernel, and the tabs come back pointing at nothing.
+///
+/// Both used to render the same "Press Enter to start a terminal"
+/// placeholder, so a reboot that lost a long-running Claude looked exactly
+/// like a tab nobody had used yet. Naming them is the difference.
+///
+/// Only positive evidence counts. `socket_names_checked` returning `None`
+/// means the socket directory could not be read, and telling a user their
+/// shell is gone on the strength of a failed `read_dir` would be a false
+/// claim about a shell that is still running — the same conflation
+/// CLAUDE.md's table is entirely about, here in its "says something untrue"
+/// form rather than its destructive one.
+/// Parks a launch on every lost terminal roost had itself launched an agent
+/// in, so the shell that replaces it comes back running the same thing.
+///
+/// Step 3 of #17, and everything careful about it is in `relaunch`'s module
+/// doc: off unless asked for, global-only, the launch kind and never a resume.
+/// One more restraint lives here rather than there — this runs when a project
+/// is *opened*, not at boot. #17 asks for boot and this deliberately does
+/// less: a boot-time relaunch is the version with nobody in front of it, and
+/// doing it here keeps a person at the screen while an agent starts.
+///
+/// It arms rather than spawns. A `reserve` is permission for the next attach,
+/// which happens when the browser mounts the tab and asks — so nothing starts
+/// in a project nobody opened, and a tab the user closes first never fires.
+fn rearm_launches(lost: &[String], project: &str) {
+    rearm_launches_with(lost, project, crate::config::relaunch())
+}
+
+/// The reserving half, with the setting passed in.
+///
+/// Split out for the same reason `launches_to_rearm` was — a test that had to
+/// write the global config would race every other test for one environment
+/// variable — but for a different property: `launches_to_rearm` decides *which*
+/// terminals rearm, and this decides *what they are handed*. Since #18 step 2
+/// there is a second thing they could be handed, and #17 says they must not be;
+/// that is only assertable if the reserving can be driven directly.
+fn rearm_launches_with(lost: &[String], project: &str, enabled: bool) {
+    for (name, launch) in launches_to_rearm(lost, project, enabled) {
+        // `session: None` on purpose. #17: resuming would continue a
+        // conversation whose last turn may have been mid-edit, which it calls
+        // worse rather than better. A fresh one, in the same terminal.
+        crate::session::reserve(
+            project,
+            &name,
+            Some(crate::session::LaunchRequest { launch, session: None }),
+        );
+    }
+}
+
+/// The decision, separated from the reserving so it can be tested without the
+/// process-global config path.
+///
+/// `enabled` is passed in rather than read here for the same reason: a test
+/// that had to write `~/.config/roost/config.toml` to check "off means
+/// nothing happens" would be racing every other test in the binary for one
+/// environment variable — and "off means nothing happens" is the property this
+/// whole feature's safety rests on.
+fn launches_to_rearm(
+    lost: &[String],
+    project: &str,
+    enabled: bool,
+) -> Vec<(String, crate::proto::Launch)> {
+    if !enabled {
+        return Vec::new();
+    }
+    lost.iter()
+        .filter_map(|n| crate::relaunch::recorded(project, n).map(|l| (n.clone(), l)))
+        .collect()
+}
+
+fn lost_terminal_sessions(ws: &crate::workspace::Workspace, project: &str) -> Vec<String> {
+    let Some(on_disk) = crate::session::socket_names_checked(project) else {
+        return Vec::new(); // could not look: claim nothing
+    };
+    let mut out: Vec<String> = ws
+        .panes
+        .iter()
+        .flat_map(|p| p.tabs.iter())
+        .filter_map(|t| match t {
+            crate::proto::Tab::Terminal { session } => Some(session.clone()),
+            _ => None,
+        })
+        // Three conditions, and `sessions_seen` is the one that makes this a
+        // claim rather than a guess: roost watched a shell run in that session
+        // and wrote the fact down. The default layout ships an empty `term`
+        // tab, so without it every new project announced the loss of a shell
+        // it had never started.
+        .filter(|s| ws.sessions_seen.contains(s))
+        .filter(|s| !on_disk.contains(s) && !ws.live_sessions.contains(s))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Which of the lost sessions roost recorded a Claude for.
+///
+/// Absence is *no record*, never a claim that no Claude ran there — the whole
+/// reason `claudesess::recorded` returns an `Option` (see its module doc).
+/// Nothing destructive keys on this, so an unreadable record costs an offer
+/// that is not made, which is the safe direction.
+fn resumable_terminal_sessions(lost: &[String], project: &str) -> Vec<String> {
+    lost.iter()
+        .filter(|s| crate::claudesess::recorded(project, s).is_some())
+        .cloned()
+        .collect()
+}
+
 impl Hub {
     pub fn new(project: &str, dir: std::path::PathBuf) -> Hub {
         let (ws, warn) = crate::wsstate::load(project);
@@ -138,6 +252,13 @@ impl Hub {
         // died (or kept running under dtach) since the last save, and
         // `.git` may have appeared or vanished on disk in the meantime.
         hub.refresh_live_sessions();
+        // Once, here, and only here: this is the single moment the restored
+        // layout can be compared against what actually survived. A tab whose
+        // shell is gone is indistinguishable a second later, because by then
+        // the user may simply not have started it yet.
+        hub.ws.lost_sessions = lost_terminal_sessions(&hub.ws, project);
+        hub.ws.resumable_sessions = resumable_terminal_sessions(&hub.ws.lost_sessions, project);
+        rearm_launches(&hub.ws.lost_sessions, project);
         hub.reconcile_buffers_with_disk();
         // The restored layout's terminal tabs are as much a request for those
         // sessions as a fresh click is — including `default_layout`'s own
@@ -145,6 +266,38 @@ impl Hub {
         // intent at all.
         hub.sync_reservations();
         hub
+    }
+
+    /// Re-reads the layout from disk, discarding what this hub holds.
+    ///
+    /// Exists for exactly one caller: a restore (#18 step 3) has just replaced
+    /// the state file underneath a hub that was built from the old one. Without
+    /// this the restore appears to work and then silently reverts — the hub
+    /// still holds the previous layout in memory, and the next intent that
+    /// touches it calls `wsstate::save` and writes that layout straight back
+    /// over the restored file. Nothing anywhere would say so.
+    ///
+    /// Deliberately narrow and deliberately not a general "reload" the UI can
+    /// reach: it drops in-memory buffers, which for a *dirty* buffer means
+    /// dropping unsaved text. That is safe here only because `restore::run`
+    /// refuses while any session of the project is live and the caller sends
+    /// the fresh snapshot immediately; it would not be safe as a button.
+    pub fn reload_from_disk(&mut self) {
+        let project = self.project.clone();
+        let (ws, warn) = crate::wsstate::load(&project);
+        if let Some(w) = warn {
+            eprintln!("roost: {w}");
+        }
+        self.ws = ws;
+        // The same three steps `new` runs for the same reason: a restored
+        // layout describes what was true on another machine, and reality here
+        // is whatever actually survived.
+        self.refresh_live_sessions();
+        self.ws.lost_sessions = lost_terminal_sessions(&self.ws, &project);
+        self.ws.resumable_sessions =
+            resumable_terminal_sessions(&self.ws.lost_sessions, &project);
+        self.reconcile_buffers_with_disk();
+        self.sync_reservations();
     }
 
     /// Restored buffers describe what was true when roost last wrote the state
@@ -571,14 +724,16 @@ impl Hub {
                 let r = crate::fileops::rename(&dir, f, to);
                 return self.do_rename(from, r, &old, &new);
             }
-            Intent::StartTerminal { session } => return self.do_start_terminal(from, session.clone()),
+            Intent::StartTerminal { session, resume } => {
+                return self.do_start_terminal(from, session.clone(), *resume)
+            }
             Intent::InitGit => return self.do_init_git(from),
             Intent::CloseProject => return self.do_close_project(from),
             Intent::EndSession { session } => return self.do_end_session(from, session.clone()),
             Intent::NewWorktree { launch } => return self.do_new_worktree(from, *launch),
             Intent::RemoveWorktree { key } => return self.do_remove_worktree(from, key.clone()),
-            Intent::NewTerminal { pane, launch, force } => {
-                return self.do_new_terminal(from, *pane, *launch, *force)
+            Intent::NewTerminal { pane, launch, force, resume } => {
+                return self.do_new_terminal(from, *pane, *launch, *force, resume.clone())
             }
             Intent::OpenPath { text } => return self.do_open_path(from, text.clone()),
             Intent::OpenAtLine { pane, rel, line } => {
@@ -616,6 +771,14 @@ impl Hub {
             Intent::Search { .. } => {
                 unreachable!("Search is diverted in wsconn before this lock is taken")
             }
+            // Same reasoning as `Search` above, and the same deliberate panic
+            // rather than a fall-through: a restore reads an archive the size
+            // of an upload and writes the state directory, so running it under
+            // this lock would stall every browser on the project. Named here
+            // so that adding a second dispatch site fails loudly.
+            Intent::RestoreWorkspace { .. } => {
+                unreachable!("RestoreWorkspace is diverted in wsconn before this lock is taken")
+            }
             _ => {}
         }
         // CloseTab removes the tab from `self.ws` inside `apply_layout`
@@ -629,6 +792,29 @@ impl Hub {
                 .and_then(|p| p.tabs.get(*idx))
                 .and_then(|t| match t {
                     Tab::File { rel, .. } => Some(rel.clone()),
+                    _ => None,
+                }),
+            _ => None,
+        };
+        // A terminal tab closed before any browser attached leaves a
+        // reservation behind — permission for the *next* attach on that name
+        // to spawn, carrying whichever launch the click asked for. It used to
+        // be cleaned up by accident: the next allocation reserved over it, and
+        // names were handed out in one sequence, so `term2` came back round.
+        // Now that ✻ is given `claude`/`claude2` and + is given `term`/`term1`
+        // they no longer collide, and nothing overwrote it.
+        //
+        // Released explicitly instead, which is what `session::release` is
+        // for. Read before `apply_layout`, which has removed the tab by the
+        // time the answer is sent.
+        let closing_session: Option<String> = match &intent {
+            Intent::CloseTab { pane, idx } => self
+                .ws
+                .panes
+                .get(*pane as usize)
+                .and_then(|p| p.tabs.get(*idx))
+                .and_then(|t| match t {
+                    Tab::Terminal { session } => Some(session.clone()),
                     _ => None,
                 }),
             _ => None,
@@ -648,6 +834,9 @@ impl Hub {
                 }),
             _ => None,
         };
+        if let Some(name) = closing_session.as_deref() {
+            crate::session::release(&self.project, name);
+        }
         match workspace::apply_layout(&mut self.ws, &intent) {
             Ok(true) => {
                 // A layout change can add a terminal tab (OpenTab, MoveTab
@@ -1263,6 +1452,18 @@ impl Hub {
     /// every other project's connection setup, not just this one's.
     pub fn refresh_live_sessions(&mut self) {
         self.ws.live_sessions = crate::session::live_names(&self.project);
+        // A shell that is running again is no longer lost. Without this the
+        // note would survive the user starting a replacement in that very
+        // tab, which is the one moment it stops being true.
+        let live = &self.ws.live_sessions;
+        self.ws.lost_sessions.retain(|s| !live.contains(s));
+        // And with it the offer to resume: a tab with a shell in it again is
+        // not a tab waiting to be restored. Kept a subset of `lost_sessions`
+        // rather than filtered on `live` independently, so the two can never
+        // drift into a placeholder that offers a resume it no longer shows a
+        // loss for.
+        let lost = self.ws.lost_sessions.clone();
+        self.ws.resumable_sessions.retain(|s| lost.contains(s));
         // Any enclosing work tree counts, not just this directory's own `.git`
         // — see `gitio::is_inside_work_tree`. A nested project has no `.git` of
         // its own, and offering `git init` there embeds a repository inside its
@@ -1275,7 +1476,7 @@ impl Hub {
     /// validates the name, enforces the per-project cap, and tells every
     /// mirrored client the tab is now live. Spawning here too would double-
     /// spawn.
-    fn do_start_terminal(&mut self, from: &ConnId, session: String) {
+    fn do_start_terminal(&mut self, from: &ConnId, session: String, resume: bool) {
         if !crate::session::valid_name(&session) {
             let ev = Event::Error { msg: format!("invalid session name: {session}") };
             return self.send_to(from, &ev);
@@ -1301,6 +1502,31 @@ impl Hub {
         {
             let ev = Event::Error { msg: "too many terminal sessions".into() };
             return self.send_to(from, &ev);
+        }
+        // After every refusal above, so nothing is parked for a start that
+        // was not allowed to happen — otherwise a refused resume would sit
+        // there and be typed into whatever the user started next in this tab.
+        //
+        // `reserve`, not `reserve_if_absent`: this intent *is* the decision
+        // about what the next shell runs, which is the case that function's
+        // doc reserves it for.
+        //
+        // A `resume` with no record still starts a plain terminal rather than
+        // failing. The button is only offered where a record exists, so this
+        // is a stale client or a record removed in between — and "I have
+        // nothing recorded" is not "no Claude ran here" (`claudesess`), so the
+        // honest answer is a shell, not an error about a session.
+        if resume {
+            if let Some(rec) = crate::claudesess::recorded(&self.project, &session) {
+                crate::session::reserve(
+                    &self.project,
+                    &session,
+                    Some(crate::session::LaunchRequest {
+                        launch: crate::proto::Launch::Claude,
+                        session: Some(crate::launch::ClaudeSession::Resume(rec.session_id)),
+                    }),
+                );
+            }
         }
         self.ws.version += 1;
         self.broadcast(&Event::TerminalStarted { session });
@@ -1663,6 +1889,7 @@ impl Hub {
         pane: crate::proto::PaneId,
         launch: Option<crate::proto::Launch>,
         force: bool,
+        resume: Option<String>,
     ) {
         if self.closing {
             let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
@@ -1691,7 +1918,17 @@ impl Hub {
                 _ => None,
             })
             .collect();
-        let Some(name) = crate::session::next_free_name(&self.project, &on_tabs) else {
+        // The prefix says what the terminal is for. A ✻ click gets `claude`,
+        // `claude2`, … so the strip says which tab has an agent in it; a plain
+        // + keeps `term`. #52's `prloop` gets its own for the same reason —
+        // that one is pushing commits, and "which tab is that" should not need
+        // a guess.
+        let prefix = match launch.as_ref().copied() {
+            Some(crate::proto::Launch::Claude) => "claude",
+            Some(crate::proto::Launch::PrLoop) => "prloop",
+            None => "term",
+        };
+        let Some(name) = crate::session::next_free_name_with(&self.project, &on_tabs, prefix) else {
             let ev = Event::Error { msg: "too many terminal sessions".into() };
             return self.send_to(from, &ev);
         };
@@ -1703,7 +1940,23 @@ impl Hub {
         crate::session::reserve(
             &self.project,
             &name,
-            launch.map(|l| crate::session::LaunchRequest { launch: l, session_id: crate::launch::new_session_id() }),
+            launch.map(|l| crate::session::LaunchRequest {
+                launch: l,
+                // A chosen row wins over a fresh mint, but only after the
+                // server has confirmed this project really has that
+                // conversation — the menu is a hint. A `resume` that does not
+                // survive that check falls through to a fresh launch rather
+                // than failing: the user asked for a Claude, and the worst
+                // case is they get a new one instead of an old one.
+                session: resume
+                    .filter(|id| {
+                        l == crate::proto::Launch::Claude && crate::claudehist::has(&self.dir, id)
+                    })
+                    .map(crate::launch::ClaudeSession::Resume)
+                    .or_else(|| {
+                        crate::launch::new_session_id().map(crate::launch::ClaudeSession::Fresh)
+                    }),
+            }),
         );
         let intent = Intent::OpenTab { pane, tab: Tab::Terminal { session: name.clone() } };
         match workspace::apply_layout(&mut self.ws, &intent) {
@@ -2333,6 +2586,512 @@ fn has_prefix_boundary(path: &str, prefix: &str) -> bool {
 /// classifier in `render`, so the conflict view looks like every other diff.
 #[cfg(test)]
 mod tests {
+    use super::launches_to_rearm;
+
+    #[test]
+    fn nothing_relaunches_unless_the_setting_asks_for_it() {
+        // The property this whole feature's safety rests on, and the reason
+        // the decision is a separate function: #17 is careful about relaunch
+        // because it starts an agent in a checkout whose state it does not
+        // know, so an install that never opted in must see no difference at
+        // all — even with a launch recorded and the tab lost, which is exactly
+        // the state that would otherwise fire.
+        crate::wsstate::set_state_dir_for_test();
+        let project = format!("rearm{}", std::process::id());
+        crate::relaunch::record(project.as_str(), "term", crate::proto::Launch::Claude);
+        let lost = vec!["term".to_string()];
+
+        // Asserts the state it then negates: with the setting on this *is* a
+        // relaunch, so the empty result below is the setting talking and not a
+        // missing marker.
+        assert_eq!(
+            launches_to_rearm(&lost, &project, true),
+            vec![("term".to_string(), crate::proto::Launch::Claude)],
+            "setup: opted in, a recorded launch comes back"
+        );
+        assert!(
+            launches_to_rearm(&lost, &project, false).is_empty(),
+            "opted out, nothing is armed"
+        );
+    }
+
+    /// #18 step 2: the offer is made only where there is something to
+    /// resume, and never for a tab that merely has no shell.
+    ///
+    /// Revert-checked: dropping the `recorded(..).is_some()` filter makes the
+    /// second assertion fail with `["ghost", "plain"]` — every lost terminal
+    /// offering to resume a conversation that does not exist.
+    #[test]
+    fn only_a_lost_terminal_with_a_recorded_claude_is_offered_as_resumable() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::wsstate::set_state_dir_for_test();
+        let project = format!("resumable{}", std::process::id());
+        crate::claudesess::record(
+            &project,
+            "ghost",
+            &crate::claudesess::Recorded {
+                session_id: "864ee734-e3ab-434e-8278-745a850b16ad".into(),
+                transcript_path: None,
+                event: "SessionStart".into(),
+            },
+        );
+        let lost = vec!["ghost".to_string(), "plain".to_string()];
+        // Asserts the setup it then narrows: without this, an empty result
+        // below would be just as true of a state directory nothing was ever
+        // written to, which is how a filter test passes vacuously.
+        assert!(
+            crate::claudesess::recorded(&project, "ghost").is_some(),
+            "setup: `ghost` has a record"
+        );
+        assert_eq!(
+            resumable_terminal_sessions(&lost, &project),
+            vec!["ghost".to_string()],
+            "`plain` lost its shell too, but there is nothing recorded to resume"
+        );
+        crate::claudesess::forget(&project, "ghost");
+    }
+
+    /// The record outlives only a session nobody ended, which is what makes
+    /// "resumable" a subset of "lost" rather than a second, independent list.
+    ///
+    /// This is the assertion the subset property actually needs: the function
+    /// above takes `lost` as its input, so it cannot *not* be a subset there —
+    /// a test at that level would prove nothing. The place it can drift is
+    /// `refresh_live_sessions`, where a shell coming back has to take the
+    /// offer with it.
+    ///
+    /// Revert-checked: removing the `resumable_sessions.retain` leaves
+    /// `["ghost"]` after the session goes live — a placeholder offering to
+    /// resume in a tab that is no longer showing a placeholder at all.
+    #[test]
+    fn a_terminal_that_has_a_shell_again_stops_offering_a_resume() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let project = format!("resumelive{}", std::process::id());
+        let mut h = Hub::new(&project, d.path().to_path_buf());
+        h.ws.lost_sessions = vec!["ghost".into()];
+        h.ws.resumable_sessions = vec!["ghost".into()];
+
+        h.refresh_live_sessions();
+        assert_eq!(
+            h.ws.resumable_sessions,
+            vec!["ghost".to_string()],
+            "setup: with no shell running, the offer stands"
+        );
+
+        // A real session under that name, which is what the client sees when
+        // the user starts the terminal.
+        crate::session::reserve_and_attach(&project, "ghost", d.path()).unwrap();
+        h.refresh_live_sessions();
+        assert!(h.ws.lost_sessions.is_empty(), "setup: it is no longer lost");
+        assert!(
+            h.ws.resumable_sessions.is_empty(),
+            "and the resume offer goes with it: {:?}",
+            h.ws.resumable_sessions
+        );
+        crate::session::kill_project(&project);
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// The whole point of the feature, asserted where it lands: the shell the
+    /// next attach spawns is handed `--resume <the recorded id>`.
+    ///
+    /// Revert-checked: with the `if resume` block deleted from
+    /// `do_start_terminal`, `att.launch` is `None` and this fails on
+    /// "the resume must be parked for the next attach".
+    #[test]
+    fn starting_a_terminal_with_resume_parks_the_recorded_conversation() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let project = format!("resumestart{}", std::process::id());
+        let id = "864ee734-e3ab-434e-8278-745a850b16ad";
+        crate::claudesess::record(
+            &project,
+            "term",
+            &crate::claudesess::Recorded {
+                session_id: id.into(),
+                transcript_path: None,
+                event: "Stop".into(),
+            },
+        );
+        let mut h = Hub::new(&project, d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(&c, Intent::StartTerminal { session: "term".into(), resume: true });
+        let att = crate::session::reserve_and_attach(&project, "term", d.path()).unwrap();
+        let l = att.launch.as_ref().expect("the resume must be parked for the next attach");
+        assert_eq!(l.launch, proto::Launch::Claude);
+        assert_eq!(
+            l.session.as_ref(),
+            Some(&crate::launch::ClaudeSession::Resume(id.to_string())),
+            "the id must be the recorded one, and it must be a Resume, not a Fresh"
+        );
+        // The end of the road: what actually reaches the shell. Asserted here
+        // as well as in `launch`'s own tests because this is the only place
+        // the recorded id and the typing meet — a `Fresh` here would type
+        // `--session-id`, start an empty conversation, and look identical
+        // until the user noticed the history was gone.
+        assert_eq!(
+            crate::launch::keystrokes(l.launch, l.session.as_ref()),
+            format!("claude --resume {id}\r").into_bytes()
+        );
+        crate::session::kill_project(&project);
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// The two ways a resume must *not* happen, in the shape a stale client
+    /// or a plain Enter produces.
+    ///
+    /// Revert-checked: moving the `if resume` block above the refusal checks —
+    /// or dropping the `resume` guard so any start resumes — fails the second
+    /// case with a parked `Resume`, which is a terminal that silently
+    /// continues an old conversation when the user asked for a shell.
+    #[test]
+    fn a_plain_start_and_a_resume_with_nothing_recorded_both_give_a_bare_shell() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let project = format!("resumenone{}", std::process::id());
+        let mut h = Hub::new(&project, d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        // Asked to resume, nothing recorded: still a terminal, never an error
+        // about a session — "nothing recorded" is not "no Claude ran here".
+        h.handle(&c, Intent::StartTerminal { session: "term".into(), resume: true });
+        let att = crate::session::reserve_and_attach(&project, "term", d.path()).unwrap();
+        assert_eq!(att.launch, None, "no record, so nothing to type");
+        crate::session::kill_project(&project);
+
+        // Recorded, but the user pressed Enter rather than clicking Resume.
+        crate::claudesess::record(
+            &project,
+            "term2",
+            &crate::claudesess::Recorded {
+                session_id: "864ee734-e3ab-434e-8278-745a850b16ad".into(),
+                transcript_path: None,
+                event: "Stop".into(),
+            },
+        );
+        h.handle(&c, Intent::StartTerminal { session: "term2".into(), resume: false });
+        let att = crate::session::reserve_and_attach(&project, "term2", d.path()).unwrap();
+        assert_eq!(att.launch, None, "Enter starts a shell, even where a resume was available");
+        crate::session::kill_project(&project);
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// The ✻ menu's chosen row, end to end: the intent carries an id, the
+    /// server confirms this project has that conversation, and the shell that
+    /// spawns is handed `--resume <it>`.
+    ///
+    /// Revert-checked: dropping the `claudehist::has` filter still passes this
+    /// one — the id *is* valid here — which is why the refusal has its own test
+    /// below rather than being an extra assertion on this one.
+    #[test]
+    fn a_chosen_conversation_from_the_menu_is_what_the_new_terminal_resumes() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let home = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let project = format!("menupick{}", std::process::id());
+        let dir = d.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "864ee734-e3ab-434e-8278-745a850b16ad";
+        let tdir = crate::claudehist::transcript_dir(&dir).unwrap();
+        std::fs::create_dir_all(&tdir).unwrap();
+        std::fs::write(tdir.join(format!("{id}.jsonl")), "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}").unwrap();
+
+        let mut h = Hub::new(&project, dir.clone());
+        let (c, rx) = h.subscribe();
+        for p in h.ws.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+            p.active = 0;
+        }
+        drain(&rx);
+        h.handle(&c, Intent::NewTerminal {
+            pane: proto::RIGHT,
+            launch: Some(proto::Launch::Claude),
+            force: true,
+            resume: Some(id.to_string()),
+        });
+        // `claude`, not `term`: develop gave the ✻ click its own name sequence,
+        // so the reservation this parks is on the name the click was allocated.
+        let att = crate::session::reserve_and_attach(&project, "claude", &dir).unwrap();
+        let l = att.launch.as_ref().expect("the menu's pick must be parked");
+        assert_eq!(
+            l.session.as_ref(),
+            Some(&crate::launch::ClaudeSession::Resume(id.to_string()))
+        );
+        assert_eq!(
+            crate::launch::keystrokes(l.launch, l.session.as_ref()),
+            format!("claude --resume {id}\r").into_bytes()
+        );
+        crate::session::kill_project(&project);
+        std::env::remove_var("ROOST_CMD");
+        match prev_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
+    }
+
+    /// A row the project does not have. The menu is a hint, not an
+    /// authorisation — the same rule `RemoveWorktree` states about its own —
+    /// so a stale, forged or cross-project id must not become a `--resume`.
+    ///
+    /// It falls through to a *fresh* Claude rather than failing: the user asked
+    /// for one, and the worst outcome should be a new conversation instead of
+    /// an old one, not a button that does nothing.
+    ///
+    /// Revert-checked: removing the `claudehist::has` filter fails this with
+    /// `Some(Resume("aaaa1111-…"))` against the expected `Fresh`.
+    #[test]
+    fn an_id_this_project_does_not_have_falls_through_to_a_fresh_claude() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let home = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+        let project = format!("menuforged{}", std::process::id());
+        let dir = d.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut h = Hub::new(&project, dir.clone());
+        let (c, rx) = h.subscribe();
+        for p in h.ws.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+            p.active = 0;
+        }
+        drain(&rx);
+        h.handle(&c, Intent::NewTerminal {
+            pane: proto::RIGHT,
+            launch: Some(proto::Launch::Claude),
+            force: true,
+            resume: Some("aaaa1111-2222-3333-4444-555555555555".to_string()),
+        });
+        // `claude`, not `term`: develop gave the ✻ click its own name sequence,
+        // so the reservation this parks is on the name the click was allocated.
+        let att = crate::session::reserve_and_attach(&project, "claude", &dir).unwrap();
+        let l = att.launch.as_ref().expect("a Claude was still asked for");
+        assert!(
+            matches!(l.session.as_ref(), Some(crate::launch::ClaudeSession::Fresh(_))),
+            "an unauthorised id must not resume, and must not stop the launch: {:?}",
+            l.session
+        );
+        crate::session::kill_project(&project);
+        std::env::remove_var("ROOST_CMD");
+        match prev_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
+    }
+
+    /// #17's rule, now that there is something for it to rule out.
+    ///
+    /// `relaunch` restarts the agent roost launched; it must hand it a *fresh*
+    /// conversation, because resuming would continue one whose last turn may
+    /// have been mid-edit. Before #18 step 2 that was true because roost had
+    /// no recorded id to pass; it is now true only because this code does not
+    /// pass it, which is exactly the kind of property that rots silently.
+    ///
+    /// Revert-checked: changing `rearm_launches_with` to look the record up
+    /// and park a `Resume` fails here with
+    /// `Some(Resume("864ee734-…"))` against the expected `None`.
+    #[test]
+    fn a_relaunched_agent_starts_a_fresh_conversation_even_with_one_recorded() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let project = format!("rearmfresh{}", std::process::id());
+        crate::relaunch::record(&project, "term", proto::Launch::Claude);
+        crate::claudesess::record(
+            &project,
+            "term",
+            &crate::claudesess::Recorded {
+                session_id: "864ee734-e3ab-434e-8278-745a850b16ad".into(),
+                transcript_path: None,
+                event: "Stop".into(),
+            },
+        );
+        // Both records present, and the setting on — so anything the code
+        // *could* pass through is available to it.
+        assert!(crate::claudesess::recorded(&project, "term").is_some(), "setup: a conversation exists");
+
+        rearm_launches_with(&[String::from("term")], &project, true);
+        let att = crate::session::reserve_and_attach(&project, "term", d.path()).unwrap();
+        let l = att.launch.as_ref().expect("setup: the relaunch was armed");
+        assert_eq!(l.launch, proto::Launch::Claude);
+        assert_eq!(l.session, None, "#17: the launch kind only, never a resume");
+        assert_eq!(
+            crate::launch::keystrokes(l.launch, l.session.as_ref()),
+            b"claude\r".to_vec(),
+            "a bare claude reaches the shell"
+        );
+        crate::session::kill_project(&project);
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    #[test]
+    fn a_lost_tab_roost_never_launched_anything_in_is_left_alone() {
+        // Most terminals are plain shells. Relaunching one would be starting
+        // something the user never asked roost to start — and `default_layout`
+        // ships a `term` tab in every project, so this is the common case
+        // rather than an edge.
+        crate::wsstate::set_state_dir_for_test();
+        let project = format!("rearmplain{}", std::process::id());
+        assert!(
+            launches_to_rearm(&[String::from("term")], &project, true).is_empty(),
+            "no recorded launch, nothing to relaunch"
+        );
+    }
+
+    use super::lost_terminal_sessions;
+
+    fn ws_with_terminals(names: &[&str]) -> crate::workspace::Workspace {
+        let mut w = crate::workspace::Workspace::default_layout();
+        for p in w.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, crate::proto::Tab::Terminal { .. }));
+        }
+        w.panes[crate::proto::RIGHT as usize].tabs = names
+            .iter()
+            .map(|n| crate::proto::Tab::Terminal { session: (*n).to_string() })
+            .collect();
+        w
+    }
+
+    #[test]
+    fn a_terminal_tab_with_no_shell_left_is_named_as_lost() {
+        // The point of the whole field: after a reboot a restored Terminal tab
+        // rendered the same "Press Enter to start a terminal" placeholder as a
+        // tab nobody had ever used, so losing a long-running Claude was
+        // indistinguishable from never having started one.
+        crate::wsstate::set_state_dir_for_test();
+        let project = format!("lostsess{}", std::process::id());
+        let dir = crate::wsstate::state_dir()
+            .join("sock")
+            .join(crate::projects::storage_key(&project));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("alive"), b"").unwrap();
+
+        let mut w = ws_with_terminals(&["alive", "gone"]);
+        w.live_sessions = vec!["alive".into()];
+        w.sessions_seen = vec!["alive".into(), "gone".into()];
+        assert_eq!(
+            lost_terminal_sessions(&w, &project),
+            vec!["gone".to_string()],
+            "only the tab with no socket and no live session"
+        );
+    }
+
+    #[test]
+    fn a_tab_that_never_had_a_shell_is_not_called_lost() {
+        // The inverse of the mistake this codebase keeps making, and a bug
+        // this feature actually shipped in its first draft: instead of
+        // concluding "gone" from a failed check, it concluded "gone" from no
+        // check at all. `default_layout` puts an empty `term` tab in the right
+        // pane, so on a brand-new project — no socket directory, nothing ever
+        // started — every user was told their shell had not survived a reboot
+        // that never happened. Found by a browser test, not by review.
+        crate::wsstate::set_state_dir_for_test();
+        let project = format!("neverran{}", std::process::id());
+        let _ = std::fs::remove_dir_all(
+            crate::wsstate::state_dir().join("sock").join(crate::projects::storage_key(&project)),
+        );
+
+        let fresh = crate::workspace::Workspace::default_layout();
+        assert!(
+            fresh.panes[crate::proto::RIGHT as usize]
+                .tabs
+                .iter()
+                .any(|t| matches!(t, crate::proto::Tab::Terminal { .. })),
+            "setup: the default layout must actually carry a terminal tab, or \
+             this test passes by describing a layout that no longer exists"
+        );
+        assert_eq!(
+            lost_terminal_sessions(&fresh, &project),
+            Vec::<String>::new(),
+            "a tab whose shell was never started has lost nothing"
+        );
+
+        // And the same layout, once roost has recorded seeing a shell there,
+        // *is* a loss. Asserting both against one fixture is what stops the
+        // check above from being satisfied by a function that returns nothing.
+        let mut seen = fresh;
+        seen.sessions_seen = vec!["term".into()];
+        assert_eq!(
+            lost_terminal_sessions(&seen, &project),
+            vec!["term".to_string()],
+            "but the same tab, after roost saw a shell in it, is"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_socket_directory_claims_nothing() {
+        // The rule this codebase is built around, in its "says something
+        // untrue" form rather than its destructive one: a failed `read_dir`
+        // must not become "your shell is gone" about a shell that is still
+        // running. `socket_names_checked` answers `None` there, and `None`
+        // means claim nothing.
+        //
+        // Driven through a state dir that positively cannot be read, rather
+        // than by mocking: removing search permission is what an EACCES on a
+        // real deployment looks like. Skipped as root, which ignores the
+        // permission bits — this project has been bitten by that before.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if unsafe { libc_geteuid() } == 0 {
+                eprintln!("skipping: running as root ignores the permission bits");
+                return;
+            }
+            crate::wsstate::set_state_dir_for_test();
+            let project = format!("unreadable{}", std::process::id());
+            let dir = crate::wsstate::state_dir()
+                .join("sock")
+                .join(crate::projects::storage_key(&project));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("gone"), b"").unwrap();
+            // Asserts the state it later negates: readable, the tab *is* lost.
+            let mut w = ws_with_terminals(&["ghost"]);
+            w.live_sessions = vec![];
+            w.sessions_seen = vec!["ghost".into()];
+            assert_eq!(
+                lost_terminal_sessions(&w, &project),
+                vec!["ghost".to_string()],
+                "setup: while the directory is readable, the claim is made"
+            );
+
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let claimed = lost_terminal_sessions(&w, &project);
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                claimed.is_empty(),
+                "an unreadable directory must claim nothing, got {claimed:?}"
+            );
+        }
+    }
+
+    extern "C" {
+        #[link_name = "geteuid"]
+        fn libc_geteuid_raw() -> u32;
+    }
+    unsafe fn libc_geteuid() -> u32 {
+        libc_geteuid_raw()
+    }
+
     use super::*;
     use crate::proto::{self, Mode, Tab};
 
@@ -3270,6 +4029,52 @@ mod tests {
         drop(rx_a);
     }
 
+    /// `do_fileop` is the shared tail of CreateFile, CreateDir and DeleteFile,
+    /// and its two halves go to different audiences: a success is a tree change
+    /// every client must see, a refusal is the asking client's own business.
+    ///
+    /// Two subscribers, deliberately: with one, `broadcast` and `send_to` are
+    /// indistinguishable, so a refusal broadcast to everyone — an error banner
+    /// on a tab whose user did nothing — would pass a single-client test.
+    #[test]
+    fn a_fileop_broadcasts_success_and_tells_only_the_asker_about_a_refusal() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let proj = d.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let mut h = Hub::new("fileop_audience", proj.clone());
+        let (_a, rx_a) = h.subscribe();
+        let (b, rx_b) = h.subscribe();
+        drain(&rx_a);
+        drain(&rx_b);
+
+        h.handle(&b, Intent::CreateFile { rel: "notes.txt".into() });
+        assert!(proj.join("notes.txt").is_file(), "the file itself was not created");
+        for (who, msgs) in [("the other client", drain(&rx_a)), ("the asking client", drain(&rx_b))] {
+            assert!(
+                msgs.iter().any(|m| m.contains("TreeChanged")),
+                "{who} must see the tree change; got {msgs:?}"
+            );
+        }
+
+        // The same path again, which `must_not_exist` refuses.
+        h.handle(&b, Intent::CreateFile { rel: "notes.txt".into() });
+        let (to_a, to_b) = (drain(&rx_a), drain(&rx_b));
+        // On the reason, not merely on "an error happened": a refusal that
+        // named the wrong path, or said nothing useful, is the failure this
+        // function exists to avoid.
+        assert!(
+            to_b.iter().any(|m| m.contains("already exists") && m.contains("notes.txt")),
+            "the asker must be told why; got {to_b:?}"
+        );
+        assert!(
+            to_a.is_empty(),
+            "a client that did nothing must hear nothing about someone else's refusal; got {to_a:?}"
+        );
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
     /// The + button no longer asks for a name, so the server must hand out an
     /// unused one. `term` then `term1`: without the `also_taken` check, the
     /// second click sees no *live* session yet (the PTY only spawns when the
@@ -3451,8 +4256,8 @@ mod tests {
         }
         drain(&rx);
 
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
         drain(&rx);
 
         let names: Vec<String> = h.ws.panes[proto::RIGHT as usize]
@@ -3486,36 +4291,45 @@ mod tests {
         }
         drain(&rx);
 
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
         drain(&rx);
-        let first = crate::session::reserve_and_attach("newterm_launch", "term", d.path()).unwrap();
+        // ✻ is allocated `claude`, not whichever `termN` was free: a strip
+        // reading `term, term1, term2` says nothing about which tab has an
+        // agent in it. The plain + that followed keeps `term`.
+        let first = crate::session::reserve_and_attach("newterm_launch", "claude", d.path()).unwrap();
         assert_eq!(
             first.launch.as_ref().map(|l| l.launch),
             Some(proto::Launch::Claude),
-            "✻ got `term`, so `term` starts claude"
+            "✻ got `claude`, so `claude` starts claude"
         );
         assert!(
-            first.launch.as_ref().and_then(|l| l.session_id.as_deref()).is_some_and(crate::launch::valid_session_id),
+            first.launch.as_ref().and_then(|l| l.session.as_ref()).is_some_and(|s| {
+                matches!(s, crate::launch::ClaudeSession::Fresh(id) if crate::launch::valid_session_id(id))
+            }),
             "the hub minted an id"
         );
-        let second = crate::session::reserve_and_attach("newterm_launch", "term1", d.path()).unwrap();
-        assert_eq!(second.launch, None, "+ got `term1`, which stays a plain shell");
+        let second = crate::session::reserve_and_attach("newterm_launch", "term", d.path()).unwrap();
+        assert_eq!(second.launch, None, "+ got `term`, which stays a plain shell");
         crate::session::kill_project("newterm_launch");
 
-        // The stale case: ✻ allocates `term2`, its tab is closed before any
-        // browser attaches, and + is then handed `term2` back. The click that
-        // made it a claude shell is gone, so the shell must be plain.
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        // The stale case: ✻ allocates `claude2` (the first `claude` is taken),
+        // its tab is closed before any browser attaches, and a later ✻ is
+        // handed `claude2` back. The click that made it a claude shell is
+        // gone, so its own reservation must not survive the close.
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
         let idx = h.ws.panes[proto::RIGHT as usize]
             .tabs
             .iter()
-            .position(|t| matches!(t, Tab::Terminal { session } if session == "term2"))
-            .expect("✻ was handed term2");
+            .position(|t| matches!(t, Tab::Terminal { session } if session == "claude2"))
+            .expect("✻ was handed claude2");
         h.handle(&c, Intent::CloseTab { pane: proto::RIGHT, idx });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
         drain(&rx);
-        let reused = crate::session::reserve_and_attach("newterm_launch", "term2", d.path()).unwrap();
+        // The plain + that followed took `term1`; `claude2` is free again, and
+        // attaching it directly is what a browser that never saw the close
+        // would do.
+        let reused = crate::session::reserve_and_attach("newterm_launch", "claude2", d.path()).unwrap();
         assert_eq!(reused.launch, None, "a reallocated name must not inherit the old click");
         crate::session::kill_project("newterm_launch");
         std::env::remove_var("ROOST_CMD");
@@ -3536,22 +4350,24 @@ mod tests {
         let (a, rxa) = h.subscribe();
         let (_b, rxb) = h.subscribe();
         for p in h.ws.panes.iter_mut() { p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. })); p.active = 0; }
-        // First ✻: allocates `term`; spawn it the way a browser would, so the
-        // launch is consumed and recorded on the session.
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
-        let _att = crate::session::reserve_and_attach("prompt_second", "term", d.path()).unwrap();
+        // First ✻: allocates `claude`; spawn it the way a browser would, so
+        // the launch is consumed and recorded on the session.
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
+        let _att = crate::session::reserve_and_attach("prompt_second", "claude", d.path()).unwrap();
         assert_eq!(crate::session::launched_names("prompt_second").len(), 1, "fixture: a launched terminal exists");
         drain(&rxa); drain(&rxb);
         let version = h.ws.version;
 
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
         let got = rxa.try_recv().expect("the clicker hears back");
-        assert!(got.contains(r#""t":"ClaudeHere""#) && got.contains(r#""terminals":["term"]"#), "{got}");
+        // `claude`, not `term`: a ✻ click is allocated a name that says what
+        // the terminal is for.
+        assert!(got.contains(r#""t":"ClaudeHere""#) && got.contains(r#""terminals":["claude"]"#), "{got}");
         assert!(rxb.try_recv().is_err(), "nobody else hears anything");
         assert_eq!(h.ws.version, version, "no layout change");
         assert_eq!(crate::session::live_names("prompt_second").len(), 1, "no session allocated");
 
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: true });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: true, resume: None });
         assert!(h.ws.version > version, "force opens a terminal");
         assert!(rxb.try_recv().is_ok_and(|m| m.contains(r#""t":"State""#)), "…which everyone sees");
         crate::session::kill_project("prompt_second");
@@ -3570,11 +4386,11 @@ mod tests {
         let mut h = Hub::new("prompt_plus", d.path().to_path_buf());
         let (a, rxa) = h.subscribe();
         for p in h.ws.panes.iter_mut() { p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. })); p.active = 0; }
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
         let _att = crate::session::reserve_and_attach("prompt_plus", "term", d.path()).unwrap();
         drain(&rxa);
         let version = h.ws.version;
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
         assert!(h.ws.version > version, "a plain shell opens beside a Claude");
         crate::session::kill_project("prompt_plus");
     }
@@ -3950,7 +4766,7 @@ mod tests {
         //
         // What remains here is the *intent* half, which is the hub's own job
         // and is not timing-dependent.
-        Hub::lock(&hub).handle(&c, Intent::StartTerminal { session: "fresh".into() });
+        Hub::lock(&hub).handle(&c, Intent::StartTerminal { session: "fresh".into(), resume: false });
 
         let msgs: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
@@ -3976,7 +4792,7 @@ mod tests {
         let (_other, rx_other) = h.subscribe();
         while rx.try_recv().is_ok() {}
         while rx_other.try_recv().is_ok() {}
-        h.handle(&c, Intent::StartTerminal { session: "bad name;rm".into() });
+        h.handle(&c, Intent::StartTerminal { session: "bad name;rm".into(), resume: false });
         let msgs: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         let msgs_other: Vec<String> = std::iter::from_fn(|| rx_other.try_recv().ok()).collect();
         assert!(msgs.iter().any(|m| m.contains(r#""t":"Error""#)));
@@ -5369,7 +6185,7 @@ mod tests {
         std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
         let (mut h, url, dir) = repo_with_worktree(root.path());
         let (a, rx) = h.subscribe(); drain(&rx);
-        crate::session::reserve(&url, "term", Some(crate::session::LaunchRequest { launch: proto::Launch::Claude, session_id: None }));
+        crate::session::reserve(&url, "term", Some(crate::session::LaunchRequest { launch: proto::Launch::Claude, session: None }));
         let _att = crate::session::reserve_and_attach(&url, "term", &dir).unwrap();
         let got = refusal_of(&mut h, &a, &rx);
         // Names the more specific reason even though "live terminal" is also true.
@@ -5728,6 +6544,54 @@ mod tests {
             got.iter().any(|m| m.contains(r#""t":"Error""#) && !m.contains("outside")),
             "a missing-but-confined path must not be reported as outside the project, got {got:?}"
         );
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// A restore replaces the state file underneath a hub that was built from
+    /// the old one. Without `reload_from_disk` the restore appears to work and
+    /// then silently reverts: the hub still holds the previous layout, and the
+    /// next intent that touches it saves that layout back over the restored
+    /// file. Nothing anywhere says so — no error, no banner, and a state file
+    /// whose contents are correct right up until the next click.
+    ///
+    /// Found while wiring #18 step 3, not by a test — which is why this one
+    /// exists. Revert-checked by deleting the `reload_from_disk()` call from
+    /// the restore arm in `wsconn`: the second assertion fails with the hub
+    /// still reporting the pre-restore `show_hidden`, and the file on disk is
+    /// back to the pre-restore contents after the save.
+    #[test]
+    fn a_layout_replaced_on_disk_is_picked_up_rather_than_written_back_over() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let proj = d.path().join("reloadproj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // The hub as it was before the restore.
+        let mut h = Hub::new("reloadproj", proj.clone());
+        h.ws.show_hidden = Some(false);
+        crate::wsstate::save("reloadproj", &h.ws).unwrap();
+        assert_eq!(h.ws.show_hidden, Some(false), "setup");
+
+        // What a restore does: write a different layout to the same path,
+        // behind the hub's back.
+        let mut restored = h.ws.clone();
+        restored.show_hidden = Some(true);
+        crate::wsstate::save("reloadproj", &restored).unwrap();
+        assert_eq!(
+            h.ws.show_hidden,
+            Some(false),
+            "setup: the hub has not noticed, which is the whole problem"
+        );
+
+        h.reload_from_disk();
+        assert_eq!(h.ws.show_hidden, Some(true), "the hub must pick the restored layout up");
+
+        // And the restored value survives the next save — the moment the
+        // silent revert used to happen.
+        crate::wsstate::save("reloadproj", &h.ws).unwrap();
+        let (after, _) = crate::wsstate::load("reloadproj");
+        assert_eq!(after.show_hidden, Some(true), "the restored layout was written back over");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 }

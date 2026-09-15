@@ -101,6 +101,16 @@ await Deno.writeTextFile(
   `${fx.roots}/${fx.project}/docs/long.md`,
   `# Long\n\n[jump to running](#running)\n\n${FILLER}\n\n` +
     "## Running\n\nthe running section\n\n## Files & folders\n\nx\n\n" +
+    // Filler AFTER the heading too, and it is load-bearing. `scrollIntoView`
+    // puts the heading at the top of the scrollport only if there is a
+    // screenful below it to scroll up into; otherwise the scroll clamps at the
+    // bottom and the heading stops wherever the remaining content leaves it.
+    // Measured with the trailing content this file used to have: an 815px pane
+    // scrolled to its maximum (4558 of 5373) and left the heading 406px down,
+    // so the "near the top" assertion below could not pass. It did pass for as
+    // long as the pane had no height to speak of, which is the worst way for
+    // an assertion to be satisfied.
+    `${FILLER}\n\n` +
     "## Notes\n\na\n\n## Notes\n\nb\n",
 );
 

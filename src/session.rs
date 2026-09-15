@@ -41,7 +41,7 @@ pub fn valid_name(name: &str) -> bool {
 /// by `resolve_project`, before this project had a `dir` to reach here with.
 /// Without this, no worktree's terminal can ever start: `attach` rejects
 /// the project string before it gets anywhere near a shell.
-fn valid_project(project: &str) -> bool {
+pub(crate) fn valid_project(project: &str) -> bool {
     if project.is_empty() {
         return false;
     }
@@ -154,7 +154,9 @@ pub struct Attachment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchRequest {
     pub launch: crate::proto::Launch,
-    pub session_id: Option<String>,
+    /// Which conversation, and therefore which flag — see
+    /// `launch::ClaudeSession`. `None` is a plain `claude`.
+    pub session: Option<crate::launch::ClaudeSession>,
 }
 
 /// Permission for the *next* attach on this key to spawn a shell, placed by
@@ -436,6 +438,11 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
         guard.decide(&skey, &key)
     };
+    // Only a `Probe` is a session that outlived a previous roost: it requires
+    // a socket that still exists *and* is held. A `Spawn` is a brand-new
+    // session, and replaying a mode table into one is replaying a dead app's
+    // contract at a fresh shell — see the restore below.
+    let rejoining = matches!(decision, Decision::Probe);
     let reservation = match decision {
         Decision::Join => None,
         Decision::Spawn(r) => Some(r),
@@ -514,7 +521,15 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
             .map_err(|e| e.to_string())?;
         let mut cb = CommandBuilder::new(&cmd[0]);
         cb.args(&cmd[1..]);
-        cb.cwd(dir);
+        // The dtach *client's* cwd, which matters only when there is no socket
+        // to attach to: in that case dtach forks a master and the shell
+        // inherits this. So this is where a reboot gets undone — a session
+        // being created starts where its shell was last seen, a session being
+        // rejoined already has a cwd of its own and `dir` is inert.
+        //
+        // Gated on `rejoining` anyway. It costs nothing and it keeps the two
+        // cases legible: only a *new* shell is being placed anywhere.
+        cb.cwd(if rejoining { dir.to_path_buf() } else { crate::cwds::restore_dir(project, name, dir) });
         for (k, v) in session_env(project, name, crate::ide::port_for(project)) {
             cb.env(k, v);
         }
@@ -533,13 +548,44 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                 master: pair.master,
                 child,
                 child_pid,
-                screens: crate::screen::Screens::new(),
+                screens: {
+                    // Seeded from disk only when *rejoining*: the app behind
+                    // a surviving session declared its mode contract once, to
+                    // a process that is gone, and will never declare it
+                    // again. Only the modes — never the alternate-screen bit,
+                    // which has no safe stale value. See `crate::modes`.
+                    //
+                    // Gated on `Decision::Probe`, and that gate is the whole
+                    // correctness of this. `spawned` is true for a genuinely
+                    // new session too, and a sidecar routinely outlives its
+                    // session: when the user types `exit`, **dtach unlinks
+                    // its own socket**, so neither `kill_and_unlink` nor
+                    // `reconcile`'s dead-socket arm ever runs and the file is
+                    // orphaned. `next_free_name` then hands `term` back out,
+                    // and without this gate the fresh `bash` was replayed the
+                    // dead Claude's table — mouse reporting asserted at a
+                    // shell prompt, so every click types `\x1b[<0;12;5M` junk
+                    // and the wheel stops scrolling. A `Probe` cannot see an
+                    // orphan: it requires the socket to exist and be held.
+                    let mut sc = crate::screen::Screens::new();
+                    if rejoining {
+                        sc.restore(&crate::modes::load(project, name));
+                    }
+                    sc
+                },
                 subs: HashMap::new(),
                 sizes: HashMap::new(),
                 next_id: 0,
                 launched: launch.clone(),
             },
         );
+        // Written down as well as held in memory: the in-memory record dies
+        // with the process, and #17 step 3 is entirely about the case where
+        // the process is gone. Recorded at the spawn, not at the request, so
+        // it says what actually started rather than what was asked for.
+        if let Some(req) = launch.as_ref() {
+            crate::relaunch::record(project, name, req.launch);
+        }
         let pump_key = key.clone();
         let pump_project = project.to_string();
         let pump_session = name.to_string();
@@ -563,6 +609,9 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                         // deadlock this project has already shipped once.
                         let notices = osc.feed(&buf[..n]);
                         let switches = screen.feed(&buf[..n]);
+                        // Carries the mode table out of the critical section
+                        // below, so the write happens with the lock released.
+                        let mut modes_to_write: Option<Vec<(u16, bool)>> = None;
                         {
                             let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
                             let map = &mut guard.map;
@@ -575,6 +624,16 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                             // full (frozen tab, dead socket) is dropped rather
                             // than backing up the whole fan-out (I4).
                             s.subs.retain(|_, tx| tx.try_send(chunk.clone()).is_ok());
+                            // Read under the lock, written outside it, for
+                            // the same reason `publish` is: this project has
+                            // already shipped one deadlock from blocking I/O
+                            // held under the session registry.
+                            if s.screens.take_persist_dirty() {
+                                modes_to_write = Some(s.screens.persisted());
+                            }
+                        }
+                        if let Some(m) = modes_to_write {
+                            crate::modes::save(&pump_project, &pump_session, &m);
                         }
                         for p in notices {
                             crate::hub::publish(&pump_project, &pump_session, p);
@@ -881,6 +940,32 @@ pub fn launched_names(project: &str) -> Vec<(String, LaunchRequest)> {
 
 /// Session names with a socket on disk for this project. Dotfiles are skipped:
 /// `.origin` is metadata about the project key, not a session.
+/// `socket_names`, but able to say "I could not look".
+///
+/// Three answers, not two. `Some(names)` is what the directory holds; an
+/// absent directory is `Some(empty)` — it is created on a project's first
+/// attach, so its absence positively means no session has ever run here; and
+/// any other error is `None`.
+///
+/// The distinction exists because one caller does more than render a list.
+/// `hub` uses this to tell a user that the shell a restored tab held is
+/// **gone**, and an unreadable directory folded into "no sessions" would say
+/// that about shells that are still running. `socket_names` may keep folding
+/// it — it feeds listings, where the cost is a missing row for one refresh.
+pub fn socket_names_checked(project: &str) -> Option<Vec<String>> {
+    let dir = crate::wsstate::state_dir().join("sock").join(crate::projects::storage_key(project));
+    match std::fs::read_dir(&dir) {
+        Ok(rd) => Some(
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| !n.starts_with('.'))
+                .collect(),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+        Err(_) => None,
+    }
+}
+
 fn socket_names(project: &str) -> Vec<String> {
     let dir = crate::wsstate::state_dir().join("sock").join(crate::projects::storage_key(project));
     // An unreadable socket dir reads as "no sessions" here. Display-only:
@@ -968,6 +1053,17 @@ pub fn end_session(project: &str, name: &str) -> bool {
             let _ = s.child.wait();
         }
     } // lock released before any blocking socket work — see `attach`
+    // Both per-session records roost keeps, dropped for the same reason:
+    // `next_free_name` hands `term` straight back out after a close, so
+    // anything left behind here is attributed to whatever opens next under
+    // that name — a brand-new terminal starting in the closed session's
+    // directory, or reported as running the closed session's Claude.
+    //
+    // Best-effort, both of them: a marker that will not unlink must not cost
+    // the user their close, and each is re-validated where it is read.
+    crate::cwds::forget(project, name);
+    crate::claudesess::forget(project, name);
+    crate::relaunch::forget(project, name);
     end_socket(project, name, "End session")
 }
 
@@ -986,12 +1082,36 @@ pub fn end_session(project: &str, name: &str) -> bool {
 /// spawns the PTY (see `term.rs`): until that lands the name is in no
 /// registry, so two quick clicks would otherwise both be handed `term`.
 pub fn next_free_name(project: &str, also_taken: &[String]) -> Option<String> {
+    next_free_name_with(project, also_taken, "term")
+}
+
+/// The first unused `<prefix>`, `<prefix>2`, `<prefix>3`, … for this project.
+///
+/// The prefix names what the terminal is *for*, so a Claude is `claude` rather
+/// than whichever `termN` happened to be free — a strip reading `term, term1,
+/// term2` says nothing about which one has an agent in it. Numbered from 2
+/// because the first has no number: `claude`, then `claude2`.
+///
+/// It stays inside `^[A-Za-z0-9_-]{1,32}$` and there is no room to relax that
+/// — the name lands in a dtach socket path and on a command line. So the
+/// pretty form ("Claude 2") is the client's business; this hands out a name.
+pub fn next_free_name_with(project: &str, also_taken: &[String], prefix: &str) -> Option<String> {
     let live = live_names(project);
     let taken = |n: &str| live.iter().any(|l| l == n) || also_taken.iter().any(|l| l == n);
     // One more candidate than the cap: with MAX names taken, every candidate
     // below is taken and the cap is what refuses — not an exhausted range.
+    //
+    // `term` keeps its historic numbering (`term`, `term1`, `term2`) because
+    // existing layouts on disk are full of those names and renumbering them
+    // would orphan a socket; a new prefix starts at 2, which is what reads
+    // correctly.
+    let bare_is_zero = prefix == "term";
     (0..=MAX_SESSIONS_PER_PROJECT)
-        .map(|i| if i == 0 { "term".to_string() } else { format!("term{i}") })
+        .map(|i| match (i, bare_is_zero) {
+            (0, _) => prefix.to_string(),
+            (i, true) => format!("{prefix}{i}"),
+            (i, false) => format!("{prefix}{}", i + 1),
+        })
         .find(|n| !taken(n))
         .filter(|_| live.len() < MAX_SESSIONS_PER_PROJECT)
 }
@@ -1083,6 +1203,64 @@ pub static SESSION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
+    /// Ending a session drops *every* per-session record roost keeps.
+    ///
+    /// There are two now — `cwds` (where the shell was working) and
+    /// `claudesess` (which Claude was in it) — written by different features,
+    /// landing in the same three lines of `end_session`, and they met there as
+    /// a merge conflict. Each module tests its own `forget` directly, so
+    /// resolving that conflict by keeping one call and losing the other would
+    /// have left both suites green. This is the test that would not be.
+    ///
+    /// It matters because the name is reused: `next_free_name` hands `term`
+    /// straight back out after a close, so a record left behind is not stale
+    /// data sitting harmlessly on disk — it is attributed to whatever opens
+    /// next under that name.
+    #[test]
+    fn ending_a_session_drops_every_record_kept_about_it() {
+        crate::wsstate::set_state_dir_for_test();
+        let project = format!("endrecords{}", std::process::id());
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        crate::cwds::record(&project, "term", &sub);
+        crate::claudesess::record(
+            &project,
+            "term",
+            &crate::claudesess::Recorded {
+                session_id: "aaaa1111-2222-3333-4444-555555555555".into(),
+                transcript_path: Some("/tmp/t.jsonl".into()),
+                event: "Stop".into(),
+            },
+        );
+        // Asserts the state it then negates. Without this the two assertions
+        // below hold just as well over a pair of records that were never
+        // written — which is how a test for a deletion passes vacuously.
+        assert_eq!(
+            crate::cwds::restore_dir(&project, "term", dir.path()),
+            sub.canonicalize().unwrap(),
+            "setup: the cwd is recorded"
+        );
+        assert!(
+            crate::claudesess::recorded(&project, "term").is_some(),
+            "setup: the Claude session is recorded"
+        );
+
+        end_session(&project, "term");
+
+        assert_eq!(
+            crate::cwds::restore_dir(&project, "term", dir.path()),
+            dir.path(),
+            "the recorded cwd is gone, so the next `term` starts where a new terminal starts"
+        );
+        assert_eq!(
+            crate::claudesess::recorded(&project, "term"),
+            None,
+            "and the next `term` is not reported as running the closed session's Claude"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1209,6 +1387,31 @@ mod tests {
         assert!(age < 60 * 60, "own process age looked wrong: {age}");
         // A pid that cannot exist yields None rather than panicking.
         assert!(process_age_secs(0).is_none() || process_age_secs(4_294_967_294).is_none());
+    }
+
+    /// `ages_snapshot` is the overview's one-fork replacement for a
+    /// `process_age_secs` per session, and its failure direction is chosen: an
+    /// empty map so every age renders "unknown" rather than `0`. That makes
+    /// "returned nothing" indistinguishable from "nothing is running" unless a
+    /// test insists on a pid that must be there — so this one asserts on our
+    /// own, and cross-checks the age against the single-pid path that is
+    /// already covered. A snapshot that forked and parsed nothing, or parsed
+    /// the wrong column, fails here instead of reading as "no ages known".
+    #[test]
+    fn ages_snapshot_sees_our_own_process_and_agrees_with_the_single_pid_path() {
+        let me = std::process::id();
+        let ages = ages_snapshot();
+        assert!(
+            !ages.is_empty(),
+            "a live host always has processes: an empty map is the failure branch, not a reading"
+        );
+        let snap = *ages.get(&me).expect("our own pid must appear in a host-wide ps");
+        let single = process_age_secs(me).expect("our own process must be readable");
+        assert!(
+            snap.abs_diff(single) <= 2,
+            "the two paths disagree about our own age: snapshot {snap}, per-pid {single}"
+        );
+        assert!(snap < 60 * 60, "own process age looked wrong: {snap}");
     }
 
     #[test]
@@ -1408,13 +1611,13 @@ mod tests {
         reserve(
             "launchproj",
             "term",
-            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session_id: None }),
+            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session: None }),
         );
 
         let first = reserve_and_attach("launchproj", "term", d.path()).unwrap();
         assert_eq!(
             first.launch,
-            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session_id: None }),
+            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session: None }),
             "the attach that spawns carries it"
         );
         let mirror = reserve_and_attach("launchproj", "term", d.path()).unwrap();
@@ -1438,7 +1641,7 @@ mod tests {
         reserve(
             "launchproj2",
             "term",
-            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session_id: None }),
+            Some(LaunchRequest { launch: crate::proto::Launch::Claude, session: None }),
         );
         // The plain + click that got the same name back.
         reserve("launchproj2", "term", None);
@@ -1455,7 +1658,10 @@ mod tests {
         let _s = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ROOST_CMD", "cat");
         let d = tempfile::tempdir().unwrap();
-        let req = LaunchRequest { launch: crate::proto::Launch::Claude, session_id: Some("0123abcd-0123-4abc-8abc-0123456789ab".into()) };
+        let req = LaunchRequest {
+            launch: crate::proto::Launch::Claude,
+            session: Some(crate::launch::ClaudeSession::Fresh("0123abcd-0123-4abc-8abc-0123456789ab".into())),
+        };
         reserve("launched", "term", Some(req.clone()));
         let a = reserve_and_attach("launched", "term", d.path()).unwrap();
         assert_eq!(a.launch, Some(req.clone()), "the spawning attach carries it");

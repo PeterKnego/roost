@@ -22,6 +22,8 @@ only thing that exercises any of it.
 | `highlight.min.js`, `hljs-github-dark.min.css` | `highlight.js` | 11.9.0 | BSD-3-Clause |
 | `github-markdown.min.css` | `github-markdown-css` | 5.3.3 | MIT |
 | `code-input.min.js`, `code-input.min.css` | `@webcoder49/code-input` | 2.8.3 | MIT |
+| `code-input-indent.min.js`, `code-input-auto-close-brackets.min.js` | `@webcoder49/code-input` (`plugins/`) | 2.8.3 | MIT |
+| `code-input-find-and-replace.min.{js,css}`, `code-input-go-to-line.min.{js,css}` | `@webcoder49/code-input` (`plugins/`) | 2.8.3 | MIT |
 | file-type/folder icons (data URIs in `static/style.css`) | `material-extensions/vscode-material-icon-theme` | 5.38.0 | MIT |
 
 ## The file-type icons
@@ -67,5 +69,54 @@ commented at their sites:
   falls back to assigning `innerHTML`, which parses a source file's own angle
   brackets as markup.
 
-Its optional plugins (indentation, bracket closing, find-and-replace) are
-separate files; none are vendored.
+Its optional plugins are separate files under `plugins/` in the same package,
+and are vendored one at a time as they are used. Two are, both prefixed
+`code-input-` so the directory still sorts by package:
+
+- `indent.min.js` — Tab inserts an indent and Enter carries it onto the next
+  line. *Not* "Backspace deletes a whole indent": that branch is guarded on
+  `indentationNumChars != 1`, and the tab-character configuration leaves it at
+  1, so Backspace is plain Backspace here.
+- `auto-close-brackets.min.js` — brackets and quotes close themselves.
+  Constructed **without** `{`: the two plugins disagree about braces, and
+  leaving both to handle them made `{` Enter `}` produce `{\n}\n}` — a
+  syntax error from the most ordinary typing there is. `Indent` keeps its
+  brace-aware Enter; only the auto-inserted `}` is gone.
+
+Two upstream behaviours are known and deliberately not patched, because a
+vendored dist file has to stay byte-identical to the published one for
+"fetch the new dist over the old file" to remain the update procedure:
+
+- Typing a quote or bracket over a *selection* that begins with that same
+  character discards the keystroke instead of replacing the selection —
+  `checkClosingBracket` tests `data == value[selectionStart]` without
+  requiring a collapsed selection.
+- One `Indent` instance is shared by every code editor, because the plugin
+  array lives on the single registered `hl` template. Its `escJustPressed`
+  flag therefore carries across panes: Esc in one editor, then Tab in
+  another, moves focus instead of indenting.
+- `find-and-replace.min.js` — ⌘F / Ctrl+F finds within the buffer, Ctrl+H
+  replaces. Constructed with `alwaysCtrl: false`, which is what keeps it off
+  roost's own ⇧⌘F / ⇧⌃F project search: that one requires Shift, this one
+  must not.
+- `go-to-line.min.js` — Ctrl+G asks for a line number.
+
+The last two ship stylesheets as well, which is why the head gained two more
+`<link>`s. Both bind on the code-input's own textarea rather than on
+`document`, so neither can take Ctrl+F or Ctrl+G away from a terminal pane —
+both are readline bindings.
+
+They are passed to the **`hl` template only**, so they apply to code files and
+not to prose. Both act only on `keydown`/`beforeinput`/`input` and insert
+through `execCommand("insertText")`, which fires the same `input` event
+ordinary typing does — so the edit debounce, `EditBuffer`, autosave, ⌘S and
+the conflict patch see these edits exactly as they see a keystroke. That
+matters more here than anywhere else in this directory: save is guarded
+against a hash of what was read from disk, so a plugin that rewrote the text
+wholesale would make a buffer conflict with itself.
+
+No line-number gutter: this editor soft-wraps (`white-space: pre-wrap` on
+`.editwrap code-input`), so a logical line can occupy several visual rows and
+a gutter has to measure each one on every edit and every pane resize. That is
+a design question rather than a file to vendor, and code-input has no plugin
+for it.
