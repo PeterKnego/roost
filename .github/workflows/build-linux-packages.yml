@@ -28,9 +28,22 @@ jobs:
           merge-multiple: true
 
       - name: Build packages from the released binaries
+        # The plan is handed over as an environment variable, never expanded
+        # into the script. `${{ inputs.plan }}` inside a `run:` is substituted
+        # before bash parses the line, so the JSON's own bytes become shell
+        # syntax — and the plan carries the whole changelog. On v0.6.0-rc.1
+        # (run 34993476520) the apostrophe in "Claude's menus" closed the
+        # single-quoted string, and every backticked term after it ran as a
+        # command substitution: `nosniff: command not found`, and
+        # `cargo install --git` invoked with no URL. It had never fired before
+        # only because there was no RELEASES.md, so the plan had no prose in
+        # it. An environment variable is opaque to the parser whatever the
+        # notes contain; release.yml's own publish job passes PLAN the same way.
+        env:
+          PLAN: ${{ inputs.plan }}
         run: |
           set -euo pipefail
-          VERSION=$(echo '${{ inputs.plan }}' | jq -r '.releases[0].app_version')
+          VERSION=$(jq -r '.releases[0].app_version' <<<"$PLAN")
 
           for pair in "x86_64-unknown-linux-musl amd64 x86_64" \
                       "aarch64-unknown-linux-musl arm64 aarch64"; do
