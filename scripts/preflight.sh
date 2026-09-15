@@ -177,11 +177,25 @@ ok "tests pass"
 
 # A credential used only by CI can only be tested by CI.
 #
-# This whole block is unreachable from a branch other than master:
-# workflow_dispatch 404s unless the workflow is on the repository's default
-# branch. It cannot be exercised until this branch merges.
+# `--ref master` is load-bearing, and its absence fails in a way that reads as
+# something else. check-tap-token.yml carries `environment: release`, and that
+# environment allows only master, v* and *.*.* — deliberately, since develop
+# permits a self-merged PR at zero approvals and so is not a trusted ref for a
+# token. A bare `gh workflow run` targets the repository's *default* branch,
+# which is develop, so the run is refused at the environment gate before a
+# single step executes. It then produces no logs at all — `gh run view --log`
+# returns nothing — and the only evidence is a run annotation reading "Branch
+# develop is not allowed to deploy to release". Measured on this repo: run
+# 34977527251 (no --ref) came back headBranch=develop, refused; run
+# 34977766127 (--ref master) came back headBranch=master and actually ran.
+#
+# The comment this replaces claimed the block was "unreachable from a branch
+# other than master: workflow_dispatch 404s unless the workflow is on the
+# repository's default branch". That was true while master *was* the default.
+# The two-branch flow made develop the default and inverted the failure: the
+# dispatch now succeeds and runs on the wrong ref instead of 404ing.
 DISPATCHED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-gh workflow run check-tap-token.yml >/dev/null
+gh workflow run check-tap-token.yml --ref master >/dev/null
 say "dispatched tap token check…"
 sleep 20
 
@@ -192,18 +206,36 @@ sleep 20
 # to the run this invocation actually triggered.
 list_dispatched_run() {
   gh run list --workflow=check-tap-token.yml --limit 10 \
-    --json databaseId,conclusion,status,createdAt \
+    --json databaseId,conclusion,status,createdAt,url \
     --jq "[.[] | select(.createdAt >= \"$DISPATCHED_AT\")] | sort_by(.createdAt) | last"
 }
 RUN=$(list_dispatched_run)
 if [ -z "$RUN" ] || [ "$RUN" = null ]; then die "could not find the dispatched tap token check run"; fi
 
 # Bounded: an unattended release (Task 10) must not hang forever if the run
-# never completes. 60 tries at 5s apart is 5 minutes.
+# never completes. 180 tries at 5s apart is 15 minutes.
+#
+# It was 5, which was right for a run that starts executing the moment it is
+# dispatched. The `release` environment now requires a review, so the run sits
+# in `waiting` until a human approves it, and the bound became a race against
+# the operator's attention rather than a guard against a hung job. Fifteen
+# minutes is still a bound — this must not wait forever — but it is long
+# enough that approving is not a sprint.
+#
+# A `waiting` run is announced once, with its URL, because the failure it
+# otherwise produces is indistinguishable from a broken token: preflight would
+# die saying the check "did not complete" while the run was merely unapproved,
+# and the operator would go looking at the tap credential.
 TRIES=0
+ANNOUNCED_WAIT=false
 while [ "$(echo "$RUN" | jq -r .status)" != completed ]; do
+  if [ "$(echo "$RUN" | jq -r .status)" = waiting ] && [ "$ANNOUNCED_WAIT" = false ]; then
+    ANNOUNCED_WAIT=true
+    say "  the release environment needs your approval before this can run:"
+    say "  $(echo "$RUN" | jq -r .url)"
+  fi
   TRIES=$((TRIES + 1))
-  [ "$TRIES" -le 60 ] || die "tap token check did not complete within 5 minutes — see run $(echo "$RUN" | jq -r .databaseId)"
+  [ "$TRIES" -le 180 ] || die "tap token check did not complete within 15 minutes — see run $(echo "$RUN" | jq -r .databaseId)"
   sleep 5
   RUN=$(list_dispatched_run)
   if [ -z "$RUN" ] || [ "$RUN" = null ]; then die "could not find the dispatched tap token check run"; fi
