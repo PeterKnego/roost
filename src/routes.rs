@@ -332,6 +332,15 @@ pub fn content_type(rel: &str) -> &'static str {
         "woff2" => "font/woff2",
         "ttf" => "font/ttf",
         "otf" => "font/otf",
+        // The one extension that gets a real type without being theme-
+        // replaceable (#112). Everything above is in `assets::THEME_EXT`, and
+        // the invariant the test below documents — a real type implies
+        // `Class::Theme` — holds for all of them. A manifest must not: it
+        // names the installed app, its icons, its scope and its start_url, so
+        // a project theme that could replace it could rename roost on a home
+        // screen and re-point where launching it lands. `Class::Code`, and
+        // replaceable only by the operator through `$ROOST_STATIC`.
+        "webmanifest" => "application/manifest+json",
         _ => "application/octet-stream",
     }
 }
@@ -1340,6 +1349,16 @@ mod tests {
                 "content_type and class_of disagree about {rel:?}"
             );
         }
+        // The one deliberate exception (#112), asserted rather than left for
+        // someone to discover and "fix" by adding `webmanifest` to
+        // `THEME_EXT` — which would let a project theme rename roost on a home
+        // screen and re-point its start_url.
+        assert_eq!(content_type("manifest.webmanifest"), "application/manifest+json");
+        assert_eq!(
+            crate::assets::class_of("manifest.webmanifest"),
+            crate::assets::Class::Code,
+            "a theme must never be able to replace the manifest"
+        );
     }
 
     /// #18 step 3. Goes through `route()` like every other fragment test —
