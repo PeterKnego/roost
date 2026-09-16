@@ -57,6 +57,7 @@ deno run -A tests/browser/popups.mjs     # the header's popups: one open at a ti
 deno run -A tests/browser/treefollow.mjs # the tree expands to the active file and marks it, without collapsing what the user opened
 deno run -A tests/browser/treemention.mjs # ctrl/shift-click picks tree rows and Alt+K mentions them, in tree order and bounded
 deno run -A tests/browser/watchdog.mjs   # the workspace connection's visible state, and send() refusing instead of silently dropping
+deno run -A tests/browser/touchfiles.mjs # the file menu on a folder, Upload files… without a drag, and terminal select mode (#110)
 deno run -A tests/browser/paste.mjs      # the terminal key bar's paste button (#97): bracketed vs bare at the pty, and the textarea fallback when the clipboard says no
 deno run -A tests/browser/backup.mjs     # backing a workspace up and restoring it into a *different* project (#18 step 3) — needs its own HOME, like claudemenu.mjs
 ```
@@ -126,6 +127,18 @@ and one in `mdlinks.mjs` that passed while asserting nothing — and, in
 the tree ~3 times a second on its own. That last one was a real defect
 (`watch::is_access`), found only because the deleted-code check was actually
 performed.
+
+- In `touchfiles.mjs`: dropping the `isDir` branch in `fileMenu` reproduces the
+  reported bug exactly — a nested folder offers `a/untitled.txt` and a
+  top-level one `untitled.txt`, the project root — while the file and
+  blank-space controls stay green.
+
+  Binding the folder menu to `details` instead of `details > summary`
+  **passed**, and the fix was to the test, not the code. Every assertion was
+  about folders and blank space; a file row lives *inside* its folder's
+  element and the `<a>` handler does not stop propagation, so that swap opens
+  two menus on every file in an expanded folder. `file.menus === 1` now
+  catches it.
 
 - In `paste.mjs`: `term.input` instead of `term.paste` fails B and D — and C,
   which the plan had predicted would stay green. That prediction was wrong in a

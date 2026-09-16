@@ -90,9 +90,12 @@ try {
   })()`);
   const b = JSON.parse(bar);
   ok(b.found, "there is a paste button");
-  ok(b.n === 7, `the bar has seven buttons (got ${b.n})`);
+  ok(b.n === 8, `the bar has eight buttons (got ${b.n})`);
   // ~/projects/CLAUDE.md's tap-target floor, and the reason the button count
-  // matters: a seventh at 390px is the width this has to survive.
+  // matters. Measured at 390px: seven buttons gave 51px each, eight give
+  // exactly 44 — the floor itself. **The row is full.** A ninth button fails
+  // this assertion rather than quietly shipping a control too small to hit,
+  // which is what it is here to do.
   ok(b.h >= 44, `it is tall enough to tap (${Math.round(b.h)}px)`);
   ok(b.w >= 44, `and wide enough (${Math.round(b.w)}px)`);
   ok(b.overflow <= 1, `the bar does not scroll sideways (overflow ${b.overflow}px)`);
