@@ -124,6 +124,42 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
             let sel = req.query.get("sel").map(String::as_str).unwrap_or("");
             http::html(w, &render::overview_sessions(sel, &build_overview_sessions(roots, sel)));
         }
+        // #116. A JSON rendering of data the HTML fragments already serve, for
+        // a native client that must not parse htmx output.
+        //
+        // Not a new exposure: the same rows already leave the machine through
+        // `/frag/_overview_*`, behind the same DNS-rebinding host check
+        // `route()` applies above and the same tunnel and Access in front of
+        // it. And these are reads, so they are GETs — nothing here touches
+        // CLAUDE.md's "keep the surface at two" POST cap.
+        //
+        // Unversioned on purpose. There is exactly one client and it ships
+        // with roost; a `/v1/` that never sees a `/v2/` is a promise nobody
+        // asked for. Said here rather than left to be inferred from its
+        // absence.
+        ["api", "projects"] => {
+            // `project_rows`, not `known_projects`: the latter lists only
+            // projects that have been *opened*, which is right for the header
+            // strip and wrong here — a phone listing projects should see the
+            // same set the front page does, which is every project under the
+            // roots. Caught by the test, which created a project and then
+            // could not find it.
+            //
+            // Worktrees are not expanded. `build_overview_projects` takes an
+            // `open` list because the front page pays the git cost only for
+            // rows the user expanded; a client that wants a project's
+            // worktrees can ask for them, and one that does not should not pay
+            // a `git worktree list` per project to get a list of names.
+            let rows = registry::project_rows(roots);
+            let json: Vec<ApiProject> = rows.iter().map(ApiProject::from).collect();
+            http::json(w, &json)
+        }
+        ["api", "sessions"] => {
+            let sel = req.query.get("project").map(String::as_str).unwrap_or("");
+            let rows = build_overview_sessions(roots, sel);
+            let json: Vec<ApiSession> = rows.iter().map(ApiSession::from).collect();
+            http::json(w, &json)
+        }
         // Root scope, not /static/sw.js: a service worker may only control
         // URLs under its own path, and this one has to focus and navigate
         // workspace tabs at /{project}.
@@ -317,6 +353,82 @@ pub static ASSET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 // Must classify the same way `assets::class_of` does — see `ext_of`'s doc
 // comment for why: the two functions disagreeing about one string is the
 // defect, not any individual choice either makes.
+
+/// The wire shape of a project (#116).
+///
+/// A struct of its own rather than `Serialize` on `registry::ProjectStatus`:
+/// that type is roost's internal answer and carries `wt`, a whole
+/// `WorktreeStatus` with git evidence in it. Deriving on it would make every
+/// future field of an internal struct part of a client contract by default,
+/// which is how an API grows things nobody meant to promise.
+#[derive(serde::Serialize)]
+struct ApiProject {
+    /// Storage key, percent-encoded (`karpie%2Fsrc`).
+    key: String,
+    /// URL form, readable slashes (`karpie/src`).
+    url: String,
+    live: usize,
+    /// `null`, never `0`, when the age is genuinely unknown — the normal case
+    /// right after a restart, when this process's session map is empty. The
+    /// field's own comment in `registry.rs` records why `0` was wrong: it
+    /// claimed every project's oldest shell had just started, at exactly the
+    /// moment "what did I leave running for days?" is the question being
+    /// asked.
+    oldest_age_secs: Option<u64>,
+    has_layout: bool,
+    branch: String,
+    parent: Option<String>,
+    /// False for a worktree git vouches for that does not canonicalise under
+    /// any root. **Kept, not omitted** — the web UI renders it dimmed and
+    /// unclickable rather than dropping it, and a client that silently listed
+    /// fewer projects than the web UI would be the harder bug to find.
+    reachable: bool,
+    is_worktree: bool,
+}
+
+impl From<&registry::ProjectStatus> for ApiProject {
+    fn from(p: &registry::ProjectStatus) -> Self {
+        ApiProject {
+            key: p.key.clone(),
+            url: p.url.clone(),
+            live: p.live,
+            oldest_age_secs: p.oldest_age_secs,
+            has_layout: p.has_layout,
+            branch: p.branch.clone(),
+            parent: p.parent.clone(),
+            reachable: p.reachable,
+            is_worktree: p.wt.is_some(),
+        }
+    }
+}
+
+/// The wire shape of a live session (#116).
+#[derive(serde::Serialize)]
+struct ApiSession {
+    project_url: String,
+    name: String,
+    /// True only on *positive* evidence that a Claude is in this terminal —
+    /// `claudes.rs` has a third answer, `Unknown`, and it is reported here as
+    /// `false` for the same reason the web UI renders it as a plain shell: no
+    /// mark is the honest rendering of "nobody looked successfully".
+    is_claude: bool,
+    /// `null` for unknown, for the same reason as `oldest_age_secs` above.
+    age_secs: Option<u64>,
+    attached: usize,
+}
+
+impl From<&render::OvSession> for ApiSession {
+    fn from(s: &render::OvSession) -> Self {
+        ApiSession {
+            project_url: s.project_url.clone(),
+            name: s.name.clone(),
+            is_claude: s.is_claude,
+            age_secs: s.age_secs,
+            attached: s.attached,
+        }
+    }
+}
+
 pub fn content_type(rel: &str) -> &'static str {
     match crate::assets::ext_of(rel).as_str() {
         "css" => "text/css; charset=utf-8",
@@ -1430,5 +1542,59 @@ mod tests {
         assert_eq!(disp.matches('"').count(), 2, "the filename must stay one quoted token: {disp}");
         assert!(!disp.contains('/'), "no separator survives into the name: {disp}");
         assert!(disp.contains("bk-2Fsub") || disp.contains("bk-sub"), "{disp}");
+    }
+
+    /// #116. The JSON the native client lists from — asserted through
+    /// `route()`, like every other endpoint test here, so the *router* has to
+    /// reach it and not merely the handler.
+    #[test]
+    fn the_api_lists_projects_as_json() {
+        crate::wsstate::set_state_dir_for_test();
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("apiproj")).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let out = frag_route(&roots, "/api/projects");
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{}", &out[..out.len().min(80)]);
+        assert!(out.contains("Content-Type: application/json"), "{out}");
+        // The body carries project names and branch names, which come off the
+        // filesystem; a browser free to sniff it as HTML would render them in
+        // roost's own origin.
+        assert!(out.contains("X-Content-Type-Options: nosniff"), "{out}");
+        let body = out.split_once("\r\n\r\n").expect("headers end").1;
+        let v: serde_json::Value = serde_json::from_str(body).expect("a JSON array");
+        assert!(v.is_array(), "got {v}");
+        let row = v.as_array().unwrap().iter().find(|r| r["url"] == "apiproj").expect("the project");
+        // The distinction this endpoint has to preserve, and the one most
+        // easily lost in a hand-written serializer: unknown is `null`, never
+        // `0`. `registry.rs` records why — `0` claimed every project's oldest
+        // shell had just started, at the moment "what did I leave running for
+        // days?" is the question.
+        assert!(row["oldest_age_secs"].is_null() || row["oldest_age_secs"].is_u64());
+        assert!(row["reachable"].is_boolean(), "reachable must be carried, not omitted: {row}");
+        // The internal `wt` is a whole WorktreeStatus with git evidence in it.
+        // It is not part of the contract; only whether this *is* a worktree.
+        assert!(row.get("wt").is_none(), "internal state leaked into the wire shape: {row}");
+        assert!(row["is_worktree"].is_boolean(), "{row}");
+    }
+
+    /// The sessions list, and that `?project=` narrows it rather than being
+    /// ignored — an endpoint that returned everything regardless would pass a
+    /// shape check and show a phone every session on the machine.
+    #[test]
+    fn the_api_lists_sessions_and_the_project_filter_is_honoured() {
+        crate::wsstate::set_state_dir_for_test();
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("apisess")).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let all = frag_route(&roots, "/api/sessions");
+        assert!(all.starts_with("HTTP/1.1 200 OK"), "{}", &all[..all.len().min(80)]);
+        let body = all.split_once("\r\n\r\n").expect("headers end").1;
+        assert!(serde_json::from_str::<serde_json::Value>(body).unwrap().is_array());
+        // A key that matches nothing must produce an empty list, not the
+        // unfiltered one.
+        let none = frag_route(&roots, "/api/sessions?project=nosuchproject");
+        let nbody = none.split_once("\r\n\r\n").expect("headers end").1;
+        let v: serde_json::Value = serde_json::from_str(nbody).unwrap();
+        assert_eq!(v.as_array().map(|a| a.len()), Some(0), "the filter was ignored: {v}");
     }
 }
