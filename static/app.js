@@ -2059,7 +2059,8 @@ function refreshTree() {
   });
 }
 
-// Wires the file <a> elements only — no container-level oncontextmenu.
+// Wires the file <a> elements and each folder's <summary> — but never a
+// container-level oncontextmenu.
 // reconcileList calls this (not wireFragment) on the <ul> it just merged:
 // a `ul`/`details` oncontextmenu handler doesn't stop propagation, so
 // assigning one at every reconciled nesting level would make a blank-space
@@ -2114,6 +2115,28 @@ function wireFileLinks(root) {
       if (a.dataset.hash && !isDiff) revealAnchor(rel, a.dataset.hash);
     };
     a.oncontextmenu = (e) => { e.preventDefault(); fileMenu(e, a.dataset.rel); };
+  });
+  // Folders (#110). A directory is `<details data-rel><summary>`, not an `<a>`,
+  // so before this a right-click on one fell through to the container handler
+  // above — which is written for blank space and passes `rel: ""`. The menu
+  // opened, and offered to create in the *project root* whatever folder you
+  // had clicked.
+  //
+  // Bound to the `<summary>` rather than to the `<details>`: the details
+  // element contains the whole subtree, so a handler there would also fire for
+  // every descendant row and shadow their own. The summary is the row itself.
+  //
+  // `stopPropagation` is not tidiness. The container handler at the pane's
+  // `.content` mount only skips `a[data-rel]`, so without this a folder opens
+  // this menu and then that one as well — two dialogs, the second targeting
+  // the root. See that handler's comment for why it is a single container
+  // listener in the first place.
+  root.querySelectorAll("details[data-rel] > summary").forEach((s) => {
+    s.oncontextmenu = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      fileMenu(e, s.parentElement.dataset.rel, true);
+    };
   });
   paintTreePicked(root);
 }
@@ -2229,11 +2252,27 @@ function wireFragment(content) {
 // A real menu now, rather than a numbered prompt(). The prompt was never a
 // menu by choice — it was the only way prompt() could offer four options —
 // and it cost a second dialog for every action.
-async function fileMenu(e, rel) {
-  const dir = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "";
+async function fileMenu(e, rel, isDir = false) {
+  // A parameter, not a guess from the string. `rel` has no shape that
+  // separates `docs` the folder from `docs` the extensionless file, and
+  // re-deriving it from the DOM at use time is how the two get confused again
+  // later. The caller knows which element it bound to; it says so.
+  //
+  // For a file the target is its *parent* — right-clicking `src/main.rs` and
+  // asking for a new file means one beside it. For a folder the target is the
+  // folder itself. Stripping the last segment for both is the bug #110
+  // reported: it offered the project root for a top-level folder, and the
+  // folder's parent for a nested one.
+  const dir = isDir ? rel : (rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "");
   const items = [
     { id: "new", label: "New file…" },
     { id: "newdir", label: "New folder…" },
+    // #110. Upload was drag-and-drop only, and a phone has no drag — so there
+    // was no way to get a file into a project at all. Nothing about the
+    // upload path needed fixing; it needed a way in that is not a mouse.
+    // Better on desktop too, which is why it is a menu item rather than a
+    // phone-only control.
+    { id: "upload", label: "Upload files…" },
   ];
   // Rename and Delete need a target. The prompt version offered them at the
   // project root and then silently did nothing, because its guards were
@@ -2248,6 +2287,8 @@ async function fileMenu(e, rel) {
     const name = await askText({ title: "New folder", label: "Path",
       value: dir ? `${dir}/newdir` : "newdir", confirm: "Create" });
     if (name) send({ t: "CreateDir", rel: name });
+  } else if (choice === "upload") {
+    pickAndUpload(dir);
   } else if (choice === "rename") {
     const to = await askText({ title: "Rename", label: "New path", value: rel, confirm: "Rename" });
     if (to && to !== rel) send({ t: "RenamePath", from: rel, to });
@@ -2257,6 +2298,35 @@ async function fileMenu(e, rel) {
       confirm: "Delete", danger: true });
     if (yes) send({ t: "DeleteFile", rel });
   }
+}
+
+/// The file picker behind the menu's "Upload files…" (#110).
+///
+/// Created per invocation and discarded, rather than living in the page: a
+/// persistent input keeps its last selection, so picking the *same* file twice
+/// fires no `change` at all and the second upload silently never happens.
+///
+/// `uploadFiles` is the call the drop handler makes, with the directory the
+/// menu was opened on — so this is a second way in, not a second
+/// implementation.
+function pickAndUpload(dir) {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.multiple = true;
+  // Off-screen rather than `hidden`: a `display:none` input cannot be opened
+  // by `click()` in every engine, and this has to work on the one that has no
+  // other way to upload.
+  input.style.position = "fixed";
+  input.style.left = "-9999px";
+  input.onchange = () => {
+    if (input.files && input.files.length) uploadFiles(input.files, dir);
+    input.remove();
+  };
+  // A cancelled picker fires no `change`, so the element would otherwise be
+  // left in the document for the life of the page, once per cancelled upload.
+  input.oncancel = () => input.remove();
+  document.body.appendChild(input);
+  input.click();
 }
 
 function refreshKind(kind) {
@@ -2521,7 +2591,13 @@ addEventListener("blur", () => setArmed(false));
 ///     terminal does: send the arrow keys, in whichever cursor mode is set.
 ///   * normal buffer — hands off. The browser's own scrolling has momentum
 ///     that nothing written here would match.
-function wireTouchScroll(node, term) {
+/// `entry` is passed so select mode (#110) can stand this down. The gate is in
+/// front of `translate()` rather than folded into it: `translate()` answers
+/// "does this terminal want the wheel translated", which is a fact about the
+/// program, and select mode is a fact about what the user is doing. Keeping
+/// them apart means nothing about the scrolling that shipped changes when the
+/// mode is off.
+function wireTouchScroll(node, term, entry) {
   const screen = () => node.querySelector(".xterm-screen");
   let last = null, at = 0, velocity = 0, glide = 0;
 
@@ -2591,6 +2667,11 @@ function wireTouchScroll(node, term) {
   node.addEventListener("touchstart", (e) => {
     glide = 0;
     carry = 0;
+    // Select mode: hand the touch to xterm as a mouse press instead of
+    // scrolling with it. Returning *before* the translate() gate matters —
+    // on a plain shell translate() is false and this listener would otherwise
+    // fall through to native scrolling, which is the thing being suspended.
+    if (entry && entry.selectMode) { last = null; return forwardAsMouse(e, "mousedown"); }
     if (!translate() || e.touches.length !== 1) { last = null; return; }
     last = e.touches[0].clientY;
     at = e.timeStamp;
@@ -2598,6 +2679,7 @@ function wireTouchScroll(node, term) {
   }, { passive: true });
 
   node.addEventListener("touchmove", (e) => {
+    if (entry && entry.selectMode) return forwardAsMouse(e, "mousemove");
     if (last === null || e.touches.length !== 1) return;
     if (!translate()) { last = null; return; }
     const y = e.touches[0].clientY;
@@ -2612,7 +2694,8 @@ function wireTouchScroll(node, term) {
     if (e.cancelable) e.preventDefault();
   }, { passive: false });
 
-  node.addEventListener("touchend", () => {
+  node.addEventListener("touchend", (e) => {
+    if (entry && entry.selectMode) return forwardAsMouse(e, "mouseup");
     if (last === null) return;
     last = null;
     if (!translate()) return;
@@ -2710,7 +2793,13 @@ function ensureTerm(session) {
   // only where it settles is worth writing to the clipboard.
   term.onSelectionChange(() => {
     clearTimeout(entry.selTimer);
-    entry.selTimer = setTimeout(() => copySelection(entry), 200);
+    entry.selTimer = setTimeout(() => {
+      copySelection(entry);
+      // The mode's job is done the moment a selection exists and has been
+      // copied. Leaving it armed would cost the next scroll, and the user
+      // would have to know to press the button again to get scrolling back.
+      if (entry.selectMode && entry.term.getSelection()) setSelectMode(entry, false);
+    }, 200);
   });
   // OSC 52 is how an application copies on the user's behalf, and it is the
   // half of copying that a selection handler cannot reach: when a full-screen
@@ -2784,7 +2873,7 @@ function ensureTerm(session) {
   // a `const` declared further down this function, so wiring it up there threw
   // `Cannot access 'term' before initialization` — inside `onEvent`, which
   // swallowed it into a terminal that simply never mounted.
-  wireTouchScroll(node, term);
+  wireTouchScroll(node, term, entry);
   terms.set(session, entry);
   connectTerm(entry, session);
   return entry;
@@ -2844,6 +2933,43 @@ function connectTerm(entry, session) {
 // attacker-influenced bytes. 100 KB of base64 is far more than any copy a
 // person makes and far less than a payload worth worrying about.
 const MAX_OSC52_B64 = 100_000;
+
+/// Turns one touch into the mouse event xterm's selection is built on (#110).
+///
+/// xterm listens for `mousedown` on its screen element and then tracks
+/// `mousemove`/`mouseup` on the document, so the press is dispatched at the
+/// touch point and the rest go to the document — matching where a real mouse
+/// drag would deliver them, rather than where the finger happens to be.
+///
+/// `touchend` carries no `touches`, so the last known point is used: a
+/// `mouseup` at 0,0 would collapse the selection that had just been made.
+function forwardAsMouse(e, type) {
+    const t = e.touches && e.touches.length ? e.touches[0] : (e.changedTouches && e.changedTouches[0]);
+    if (!t) return;
+    if (e.cancelable) e.preventDefault();
+    const target = type === "mousedown" ? document.elementFromPoint(t.clientX, t.clientY) : document;
+    if (!target) return;
+    target.dispatchEvent(new MouseEvent(type, {
+      bubbles: true, cancelable: true, view: window,
+      clientX: t.clientX, clientY: t.clientY, button: 0, buttons: type === "mouseup" ? 0 : 1,
+    }));
+}
+
+/// Select mode: a terminal whose touch drags select instead of scroll (#110).
+///
+/// It turns itself off, and that is not a nicety: a terminal left in this mode
+/// no longer scrolls, with nothing on screen to say why — the same class of
+/// silent dead end the codebase keeps finding. Off on a settled selection
+/// (where copy-on-select has just run, so the job is done), and off when the
+/// button is pressed again.
+function setSelectMode(entry, on) {
+  entry.selectMode = !!on;
+  entry.node.classList.toggle("selecting", entry.selectMode);
+  for (const b of document.querySelectorAll('#termkeys button[data-k="select"]')) {
+    b.setAttribute("aria-pressed", String(entry.selectMode));
+  }
+  if (entry.selectMode) termFlash(entry, "drag to select");
+}
 
 function copySelection(entry) {
   const text = entry.term.getSelection();
@@ -3780,6 +3906,7 @@ function initTermKeys() {
       // things `TERM_KEYS` holds: its values are `() => string`, and this is
       // asynchronous and must not go through `term.input`. See `pasteInto`.
       if (b.dataset.k === "paste") { pasteInto(entry); return; }
+      if (b.dataset.k === "select") { setSelectMode(entry, !entry.selectMode); return; }
       const make = TERM_KEYS[b.dataset.k];
       if (!make) return;
       entry.term.input(make(entry.term));

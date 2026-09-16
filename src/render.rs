@@ -1915,6 +1915,18 @@ pub fn workspace_page(
        so on a phone this button is the only way clipboard text reaches a
        terminal at all. -->
   <button type="button" data-k="paste">paste</button>
+  <!-- #110. xterm draws its own selection layer and drives it from *mouse*
+       events, and on touch a drag is consumed by scrolling and never becomes
+       one — so a phone could not select terminal text at all, which is why
+       copy-on-select and the OSC 52 handler could never fire there. This
+       suspends the scroll translation so a drag selects instead. -->
+  <button type="button" data-k="select" aria-pressed="false">select</button>
+  <!-- The row is full. Measured at 390px, eight buttons are 44px wide each —
+       exactly the tap-target floor ~/projects/CLAUDE.md sets. A ninth needs
+       something else: a second row, an overflow, or a control that earns its
+       place by displacing one of these. `tests/browser/paste.mjs` asserts the
+       count and the width, so adding one fails there rather than shipping a
+       button too small to hit. -->
 </div>
 <nav id="mobilebar" aria-label="pane">
   <button type="button" data-mpane="0" aria-pressed="false">{SVG_M_TREE}<span>Files</span></button>
@@ -4275,7 +4287,7 @@ mod tests {
         assert!(h.contains(r#"<div class="dlg-body"></div>"#), "the choice body must ship empty");
     }
 
-    /// #97. The paste button and the dialog it falls back to.
+    /// #97's paste button and its fallback dialog, and #110's select toggle.
     ///
     /// iOS raises no Paste callout over a terminal, so on a phone this button
     /// is the only route from the clipboard into a shell.
@@ -4297,7 +4309,15 @@ mod tests {
             let rest = &bar[i + 8..];
             &rest[..rest.find('"').expect("a closing quote")]
         }).collect();
-        assert_eq!(keys, vec!["esc", "tab", "up", "down", "enter", "ctrlc", "paste"], "bar order changed");
+        // #110 appended `select` after `paste`. Both are appended rather than
+        // slotted among the six keys, for the reason the markup comment gives:
+        // the keys are in the order a hand reaches for them, and inserting
+        // among them moves buttons people have already learned the place of.
+        assert_eq!(
+            keys,
+            vec!["esc", "tab", "up", "down", "enter", "ctrlc", "paste", "select"],
+            "bar order changed"
+        );
 
         // The fallback shell, shipped empty: `askPasteText` fills the title and
         // label with textContent, and the box must start empty or a stale
@@ -4314,5 +4334,16 @@ mod tests {
         // zooms the page when the box takes focus — on the one dialog that
         // only ever opens on a phone.
         assert!(h.contains(r#"id="dlg-paste-text" class="dlg-input""#), "{h}");
+    }
+
+    /// #110. Select mode is a *state*, so the button has to say which state it
+    /// is in to something that is not looking at a colour.
+    #[test]
+    fn the_select_toggle_ships_unpressed_and_announces_its_state() {
+        let h = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
+        assert!(
+            h.contains(r#"<button type="button" data-k="select" aria-pressed="false">select</button>"#),
+            "the select button must ship with an explicit unpressed state: {h}"
+        );
     }
 }
