@@ -1,97 +1,127 @@
-# The iOS companion — handover
+# The native iOS app — handover
 
 For a Claude running on the macOS machine, or for whoever picks up
 [#114](https://github.com/PeterKnego/roost/issues/114).
 
-Everything below that can be established without a Mac has been. What remains
-needs one, and this document exists because **the development host cannot do
-any of it**: `which xcodebuild swift swiftc` finds nothing, `uname` says Linux.
-An iOS app cannot be built, signed, run or tested there, so nothing in this
-file has been compiled by the person who wrote it. Treat every code shape as a
-proposal, not as something that has run.
+**Nothing in this document has been compiled by the person who wrote it.** The
+development host is a headless Linux VM — `which xcodebuild swift swiftc` finds
+nothing, `uname` says Linux — so an iOS app cannot be built, signed, run or
+tested there. Treat every code shape here as a proposal, not as something that
+has run. Same precedent, and the same reason, as
+`docs/macos-artifact-verification-handover.md`.
 
-Same precedent as `docs/macos-artifact-verification-handover.md`, and for the
-same reason.
+## 1. What this is
 
-## 1. What the app is
+**A native app. Not a webview.** An earlier draft of this document proposed a
+`WKWebView` shell; that was rejected — the point is an iOS app experience.
 
-**A webview around the page roost already serves, plus push registration and a
-share sheet.** Home Assistant's own app is largely this; its native parts are
-push, location, sensors and a barcode scanner, and roost wants one of them.
+The shape follows #15's finding that the phone job is *talking to Claude*,
+not driving a three-pane IDE:
 
-Deliberately not: a native terminal, a native file tree, or a second UI to keep
-in step with the web one. roost's web UI already works on a phone as of v0.6.0
-— one pane at a time, terminal keys, a paste button (#97), and the touch
-affordances in #110.
+- a **real terminal** (`SwiftTerm`)
+- native lists of projects and sessions
+- a notification that opens the session it came from
+- the **share sheet** — text or a URL into a Claude prompt
 
-## 2. What is already true, so you do not re-derive it
+## 2. The biggest win, and why it justifies native on its own
 
-- **roost is reached over HTTPS through a Cloudflare Tunnel**, gated by
-  Cloudflare Access (email SSO, 24-hour session). The dev instance is
-  `https://roost.black.si`. A webview must survive that login flow; it is a
-  normal browser redirect, so `WKWebView` with a persistent
-  `WKWebsiteDataStore` should carry the cookie, but **this is unverified.**
-- **roost binds `127.0.0.1` only.** The tunnel is the boundary. The app never
-  talks to a LAN address.
-- **Every browser-facing websocket checks `Origin`** and refuses a handshake
-  carrying none. A `WKWebView` sends one, so the app lands on the *browser*
-  side of that rule and its origin must be allowlisted — `allowed_origins`,
-  global config only. See CLAUDE.md on why `src/ide.rs` inverts the same rule
-  and why the two must not be reconciled.
-- **The notification content already exists server-side.** `notify.rs` holds a
-  bounded, persisted, machine-wide ring of `{id, project, session, title, body,
-  at, read}`. The app does not need to invent a payload.
+roost's web UI has needed a bespoke workaround for every basic text gesture,
+because xterm.js draws its own selection layer and is driven by mouse events:
 
-## 3. The transport fork, which is the real decision
+- **#97** — a paste button, because iOS raises no Paste callout over a terminal
+- **#110** — a select-mode toggle, because a touch drag scrolls instead of
+  selecting
 
-**Web Push does not work in a webview.** iOS grants Web Push to a web app added
-to the Home Screen, not to a `WKWebView` inside a third-party app. So:
+`SwiftTerm` is a real `UIView`. Selection, the loupe, and the system copy/paste
+menu come from iOS, not from us. **Both of those issues stop existing** in a
+native client.
 
-| | Home Screen web app (#112 + #113) | Native app (#114) |
-|---|---|---|
-| transport | Web Push, VAPID | APNs |
-| who sends | roost itself | a relay holding APNs credentials |
-| needs | nothing external | Apple Developer account, a hosted relay |
-| roost can do it alone | yes | no — it binds loopback and has never met the device |
+## 3. What roost already gives you, and the one gap
 
-That relay is what Home Assistant solved with Nabu Casa, and it is a product
-decision: every notification title passes through it.
+**The terminal is a clean fit.** `/ws/{project}/term/{name}` streams **raw PTY
+bytes** — exactly what `SwiftTerm` consumes. No translation layer, no
+re-encoding. Send keystrokes back as binary frames; send `resize:{cols}x{rows}`
+as a text frame (see `src/term.rs`).
 
-**So the order matters.** #113 lands Web Push on Linux and Dean checks whether
-an installed web app raises the notification on his own iPhone. If it does, the
-app's remaining value is onboarding, durable auth and the share sheet — real,
-but far smaller than "roost on a phone", and buildable with no relay at all.
+**The workspace is already JSON.** `/ws/{project}/_workspace` carries
+`Intent`/`Event` (`src/proto.rs`): the layout snapshot, notices, terminal
+lifecycle, everything the web client uses.
 
-**Start with the parts that need no push.** A stored URL and a surviving login
-are most of what makes a phone app feel like an app, and neither depends on
-#113.
+**The gap: the lists are HTML.** `/frag/_overview_projects` and its siblings
+render htmx fragments. A native client must not parse those. The data exists in
+`registry::known_projects`; only its rendering is HTML-only, so a small JSON
+surface is a rendering addition, not a redesign. These are reads — GETs — so
+they cost nothing against CLAUDE.md's two-POST cap. **That work belongs on the
+Linux side; ask for it rather than screen-scraping.**
 
-## 4. Suggested first milestone
+## 4. Push: no relay is needed
 
-Nothing here is on the critical path of #113, which is the point.
+An earlier draft of this document said APNs requires a relay holding the push
+credentials. **That was wrong and it mattered**, because it was the main
+argument against going native.
 
-1. A single-screen app: a text field for the roost URL, stored in the keychain,
-   and a `WKWebView` on it.
-2. Verify the Access login completes **and survives a cold launch** — that is
-   the first thing that would make the app worse than Safari if it failed.
-3. Pull-to-refresh, and a way back to the URL field when the stored one is
-   wrong. A companion app that cannot be re-pointed is a reinstall.
-4. The share extension: text or a URL shared to roost, landing in a Claude
-   prompt. **This is the one genuinely native-only interaction** and may be the
-   best reason for the whole app; it is worth building early so it can be
-   judged.
+APNs is an *outbound* HTTP/2 call to `api.push.apple.com`, authenticated by a
+JWT signed with an APNs auth key (`.p8`). A self-hosted server with internet
+access can push directly, and roost has internet access.
 
-## 5. Distribution, uncosted
+Home Assistant's relay exists because HA is **multi-tenant** — thousands of
+users without developer accounts, instances often unreachable. Neither applies
+to one owner with one always-on instance.
 
-App Store review on every release, permanently, for a single-maintainer
-project. TestFlight for one user is far lighter and may be the honest answer
-for a long time. Worth settling before the first build rather than after.
+The real cost is narrower: **APNs requires HTTP/2**, so roost needs an HTTP/2
+client, which is heavier than the HTTP/1.1 client #85 and #113 want. A
+dependency argument, not an architectural one.
 
-## 6. What to send back
+## 5. Security — do not improvise this
 
-- Whether the Access login survives a cold launch in `WKWebView`, and what it
-  took.
-- Whether an installed **Home Screen** web app on the same device raises a
-  notification once #113 lands — the question that sizes this whole issue.
-- Anything roost's web UI does badly inside a webview that it does not do badly
-  in Safari. That is a roost bug, not an app bug, and it comes back here.
+roost has **two opposite rules**, both deliberate, and CLAUDE.md says plainly
+that *"reconciling the two is the vulnerability, not the cleanup"*, naming
+CVE-2025-52882 (Claude Code's own extension shipped a socket Origin-blind and
+unauthenticated through 1.0.23):
+
+- every **browser-facing** socket refuses a handshake carrying **no** `Origin`
+- `src/ide.rs` refuses any handshake that **carries** one, and authenticates by
+  constant-time comparison against a lock-file token
+
+**A native app is a third case.** It is not local, so the lock-file token does
+not reach it. It is not a browser, so an `Origin` allowlist is theatre — the
+app can send any string it likes.
+
+Proposed, to be argued in the spec before code:
+
+- a **Cloudflare Access service token** (`CF-Access-Client-Id` /
+  `CF-Access-Client-Secret`) carries the app through the tunnel, so the
+  transport is authenticated before roost sees the request
+- roost gains a **third rule**, named as one, for a remote non-browser client
+  with its own token — never by loosening either existing rule
+
+## 6. What gates everything: an Apple Developer account
+
+Nothing in this repo carries a team identifier, and `cargo-dist` does not
+notarize, so there is no account in the picture yet.
+
+- without one: a free Apple ID sideload **expires every 7 days**
+- with one: the `.p8` for APNs, and TestFlight for a single user — far lighter
+  than App Store review on every release, and probably the honest answer for a
+  long time
+
+Settle this first. It gates push *and* any install that lasts more than a week.
+
+## 7. Suggested first milestone
+
+Deliberately nothing that needs push, so it is not blocked on #113:
+
+1. Connect: a roost URL and an Access service token, stored in the keychain.
+2. List the sessions of one project over `/ws/{project}/_workspace`.
+3. Open one in `SwiftTerm` over `/ws/{project}/term/{name}`, keystrokes back,
+   `resize:` on rotation.
+4. Confirm selection and copy work with a finger, with nothing bespoke — that
+   is the thesis of the whole app, and if it is awkward, say so early.
+
+## 8. What to send back
+
+- Whether #97 and #110's workarounds really do become unnecessary. That is the
+  claim this app rests on.
+- Anything the protocol makes awkward for a native client. That is a roost bug
+  and it comes back here.
+- Whether the JSON surface in §3 is the right shape, before it is built.
