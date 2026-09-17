@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod assets;
 pub mod backup;
 pub mod bind;

@@ -5,6 +5,11 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("notify") => std::process::exit(roost::cli::run_notify(&args[1..])),
         Some("claude-hook") => std::process::exit(roost::cli::run_claude_hook()),
+        // #118. Read-only, and local: a process in a roost terminal already
+        // has ROOST_PROJECT/ROOST_SESSION, so these need no endpoint, no
+        // socket and no token.
+        Some("sessions") => std::process::exit(roost::cli::run_sessions(&args[1..])),
+        Some("wait") => std::process::exit(roost::cli::run_wait(&args[1..])),
         Some("--version" | "-V") => {
             println!("roost {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
@@ -57,6 +62,8 @@ fn main() {
                 "roost: `{p}` is not a port number\n\
                  usage: roost [PORT]        (default 8444)\n\
                         roost notify <title> [body]\n\
+                        roost sessions [--project NAME] [--json]\n\
+                        roost wait <session> [--for idle|blocked] [--timeout N]\n\
                         roost claude-hook\n\
                         roost --version"
             );
