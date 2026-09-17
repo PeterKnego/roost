@@ -1093,13 +1093,31 @@ fn av(rel: &str) -> String {
 
 fn icon_links() -> String {
     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let v = VERSION
-        .get_or_init(|| asset_hash(&["favicon.ico", "favicon-32.png", "logo.svg", "apple-touch-icon.png"]));
+    let v = VERSION.get_or_init(|| {
+        asset_hash(&[
+            "favicon.ico",
+            "favicon-32.png",
+            "logo.svg",
+            "apple-touch-icon.png",
+            "manifest.webmanifest",
+            "icon-192.png",
+            "icon-512.png",
+        ])
+    });
+    // `crossorigin="use-credentials"`, and it is not boilerplate (#112). A
+    // manifest is fetched as a *no-credentials* request by default. roost is
+    // normally reached through Cloudflare Access, which answers an
+    // unauthenticated request with a redirect to a login page — so the default
+    // fetch retrieves an HTML login page instead of the manifest, the parse
+    // fails, and the only symptom is that Add to Home Screen quietly produces
+    // a bookmark rather than an app. With credentials the session cookie rides
+    // along and the real file comes back.
     format!(
         "<link rel=\"icon\" href=\"/static/favicon.ico?v={v}\" sizes=\"32x32\">\n\
          <link rel=\"icon\" type=\"image/png\" href=\"/static/favicon-32.png?v={v}\" sizes=\"32x32\">\n\
          <link rel=\"icon\" type=\"image/svg+xml\" href=\"/static/logo.svg?v={v}\">\n\
-         <link rel=\"apple-touch-icon\" href=\"/static/apple-touch-icon.png?v={v}\">\n"
+         <link rel=\"apple-touch-icon\" href=\"/static/apple-touch-icon.png?v={v}\">\n\
+         <link rel=\"manifest\" href=\"/static/manifest.webmanifest?v={v}\" crossorigin=\"use-credentials\">\n"
     )
 }
 
@@ -4345,5 +4363,53 @@ mod tests {
             h.contains(r#"<button type="button" data-k="select" aria-pressed="false">select</button>"#),
             "the select button must ship with an explicit unpressed state: {h}"
         );
+    }
+
+    /// #112. Without a manifest, Add to Home Screen gives a bookmark rather
+    /// than an app — and on iOS there is then no route to Web Push at all,
+    /// which is what #113 needs.
+    #[test]
+    fn both_pages_link_an_installable_manifest_with_credentials() {
+        let work = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
+        let front = overview_page("", &["/tmp/a".to_string()]);
+        for (name, html) in [("workspace", &work), ("front page", &front)] {
+            assert!(
+                html.contains(r#"<link rel="manifest" href="/static/manifest.webmanifest?v="#),
+                "the {name} does not link the manifest"
+            );
+            // The detail that decides whether this works at all behind
+            // Cloudflare Access: a manifest is fetched without credentials by
+            // default, and Access answers that with a login page. The parse
+            // then fails and the only symptom is a bookmark instead of an app.
+            assert!(
+                html.contains(r#"manifest.webmanifest?v="#) && html.contains(r#"crossorigin="use-credentials""#),
+                "the {name}'s manifest link must carry credentials"
+            );
+        }
+    }
+
+    /// The manifest is real JSON, declares the fields that make an install an
+    /// install, and names icons that exist.
+    #[test]
+    fn the_manifest_is_installable_and_its_icons_are_on_disk() {
+        let raw = crate::assets::get("manifest.webmanifest").expect("manifest must be embedded");
+        let v: serde_json::Value = serde_json::from_slice(&raw).expect("manifest must be valid JSON");
+        assert_eq!(v["display"], "standalone", "a bookmark is not an install");
+        // The project list, not a project: roost serves many, and an installed
+        // app pinned to one is wrong for the tool.
+        assert_eq!(v["start_url"], "/");
+        // Must cover /ws/ and /frag/, or the app leaves its own scope on the
+        // first fragment fetch and the browser hands it back to Safari.
+        assert_eq!(v["scope"], "/");
+        let icons = v["icons"].as_array().expect("icons must be a list");
+        assert!(!icons.is_empty(), "a manifest with no icons installs without one");
+        for icon in icons {
+            let src = icon["src"].as_str().expect("each icon needs a src");
+            let rel = src.strip_prefix("/static/").expect("icons are served from /static/");
+            assert!(
+                crate::assets::get(rel).is_some(),
+                "{src} is named by the manifest but is not embedded"
+            );
+        }
     }
 }
