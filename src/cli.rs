@@ -280,6 +280,178 @@ pub fn run_claude_hook() -> i32 {
     0
 }
 
+/// `roost sessions` — what is running in this project, and what each agent is
+/// doing (#118).
+///
+/// Prints a table, or JSON with `--json`. `--project` is a fallback: a process
+/// inside a roost terminal already has `ROOST_PROJECT`, which is how
+/// `claudesess::terminal_from_env` identifies the same thing.
+pub fn run_sessions(args: &[String]) -> i32 {
+    let mut project: Option<String> = None;
+    let mut json = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--json" => json = true,
+            "--project" => match it.next() {
+                Some(p) => project = Some(p.clone()),
+                None => {
+                    eprintln!("roost sessions: --project needs a value");
+                    return 2;
+                }
+            },
+            other => {
+                eprintln!("roost sessions: unknown argument `{other}`");
+                return 2;
+            }
+        }
+    }
+    let project = match project.or_else(|| std::env::var("ROOST_PROJECT").ok()) {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "roost sessions: no project. Run this inside a roost terminal, \
+                 or pass --project <name>."
+            );
+            return 2;
+        }
+    };
+    let rows = match crate::agents::sessions(&project) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("roost sessions: {e}");
+            return 1;
+        }
+    };
+    if json {
+        let v: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "session": r.session,
+                    "live": r.live,
+                    "state": r.state.wire(),
+                    "session_id": r.session_id,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&v).unwrap_or_else(|_| "[]".into()));
+        return 0;
+    }
+    if rows.is_empty() {
+        println!("no terminals in {project}");
+        return 0;
+    }
+    for r in &rows {
+        println!(
+            "{:<16} {:<8} {}",
+            r.session,
+            if r.live { "live" } else { "gone" },
+            r.state.wire()
+        );
+    }
+    // Said once, under the table, and only when it applies: a reader seeing a
+    // column of `unknown` should be told the likely cause rather than left to
+    // guess that every agent is mysteriously silent.
+    if rows.iter().all(|r| r.state == crate::agents::State::Unknown) {
+        println!();
+        println!(
+            "roost has no record for any of these. Claude hooks are per-project \
+             and opt-in — turn them on with the bell in {project} and roost will \
+             know what each one is doing."
+        );
+    }
+    0
+}
+
+/// `roost wait <session> [--for idle|blocked|working] [--timeout N]` (#118).
+///
+/// Exit 0 only when the state was actually reached. A timeout is exit 1,
+/// deliberately: a script writing `roost wait other --for idle && do_thing`
+/// must stop when the wait did not happen.
+pub fn run_wait(args: &[String]) -> i32 {
+    let Some(session) = args.first().filter(|a| !a.starts_with("--")) else {
+        eprintln!("usage: roost wait <session> [--for idle|blocked|working] [--timeout SECONDS]");
+        return 2;
+    };
+    let mut want = crate::agents::State::Idle;
+    let mut timeout = std::time::Duration::from_secs(300);
+    let mut project: Option<String> = None;
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--for" => match it.next().map(|s| crate::agents::State::from_wanted(s)) {
+                Some(Some(w)) => want = w,
+                _ => {
+                    // `unknown` lands here too, and that is the point: it is an
+                    // answer roost gives, never a condition to wait for.
+                    eprintln!("roost wait: --for takes idle, blocked or working");
+                    return 2;
+                }
+            },
+            "--timeout" => match it.next().and_then(|s| s.parse::<u64>().ok()) {
+                Some(n) => timeout = std::time::Duration::from_secs(n),
+                None => {
+                    eprintln!("roost wait: --timeout takes a number of seconds");
+                    return 2;
+                }
+            },
+            "--project" => match it.next() {
+                Some(p) => project = Some(p.clone()),
+                None => {
+                    eprintln!("roost wait: --project needs a value");
+                    return 2;
+                }
+            },
+            other => {
+                eprintln!("roost wait: unknown argument `{other}`");
+                return 2;
+            }
+        }
+    }
+    let Some(project) = project.or_else(|| std::env::var("ROOST_PROJECT").ok()) else {
+        eprintln!("roost wait: no project. Run this inside a roost terminal, or pass --project <name>.");
+        return 2;
+    };
+    if !crate::session::valid_name(session) {
+        eprintln!("roost wait: {session:?} is not a terminal name");
+        return 2;
+    }
+    match crate::agents::wait(
+        &project,
+        session,
+        want,
+        timeout,
+        std::time::Duration::from_millis(500),
+        &|d| std::thread::sleep(d),
+        &std::time::Instant::now,
+    ) {
+        crate::agents::Outcome::Reached => 0,
+        // The two failures are worded apart on purpose. One is "it did not
+        // happen"; the other is "roost was never able to tell", which is a
+        // different problem with a different fix, and a shared message would
+        // send the reader looking in the wrong place.
+        crate::agents::Outcome::TimedOut { last } => {
+            eprintln!(
+                "roost wait: {session} never reached {} within {}s — last seen {}",
+                want.wire(),
+                timeout.as_secs(),
+                last.wire()
+            );
+            1
+        }
+        crate::agents::Outcome::NeverKnew => {
+            eprintln!(
+                "roost wait: roost has no record of {session}, so it cannot tell what it is \
+                 doing — Claude hooks are per-project and opt-in, and are off for {project}. \
+                 Waited {}s and refused to guess.",
+                timeout.as_secs()
+            );
+            1
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
