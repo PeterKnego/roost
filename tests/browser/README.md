@@ -57,6 +57,7 @@ deno run -A tests/browser/popups.mjs     # the header's popups: one open at a ti
 deno run -A tests/browser/treefollow.mjs # the tree expands to the active file and marks it, without collapsing what the user opened
 deno run -A tests/browser/treemention.mjs # ctrl/shift-click picks tree rows and Alt+K mentions them, in tree order and bounded
 deno run -A tests/browser/watchdog.mjs   # the workspace connection's visible state, and send() refusing instead of silently dropping
+deno run -A tests/browser/download.mjs   # right-click → Download: a real navigation, a real file on disk, and the label that says which version (#120)
 deno run -A tests/browser/touchfiles.mjs # the file menu on a folder, Upload files… without a drag, and terminal select mode (#110)
 deno run -A tests/browser/paste.mjs      # the terminal key bar's paste button (#97): bracketed vs bare at the pty, and the textarea fallback when the clipboard says no
 deno run -A tests/browser/backup.mjs     # backing a workspace up and restoring it into a *different* project (#18 step 3) — needs its own HOME, like claudemenu.mjs
@@ -127,6 +128,13 @@ and one in `mdlinks.mjs` that passed while asserting nothing — and, in
 the tree ~3 times a second on its own. That last one was a real defect
 (`watch::is_access`), found only because the deleted-code check was actually
 performed.
+
+- In `download.mjs`: making the Download item unconditional fails section C —
+  it appears on a folder. Dropping the `dirty` branch in the label fails D.
+  Both drive a **real navigation** and a real file on disk rather than a
+  `fetch`: the menu item is a top-level navigation, which is exactly why the
+  route needs no `Origin` check, and a `fetch` would exercise a path no user
+  takes and pass against a menu item that navigates nowhere.
 
 - In `touchfiles.mjs`: dropping the `isDir` branch in `fileMenu` reproduces the
   reported bug exactly — a nested folder offers `a/untitled.txt` and a

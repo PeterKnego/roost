@@ -2274,6 +2274,17 @@ async function fileMenu(e, rel, isDir = false) {
     // phone-only control.
     { id: "upload", label: "Upload files…" },
   ];
+  // #120. Only on a file: a folder has nothing to download, and offering it
+  // there would be the "offered and then silently did nothing" shape the menu
+  // was built to get rid of — see the comment on rename/delete below.
+  //
+  // The label says *which* version when it matters. A tab with unsaved edits
+  // holds text the server has never seen, and a download that silently handed
+  // back the on-disk file would be the quiet kind of wrong.
+  if (rel && !isDir) {
+    const dirty = state && state.buffers && state.buffers.some((b) => b.rel === rel && b.dirty);
+    items.push({ id: "download", label: dirty ? "Download (saved version)" : "Download" });
+  }
   // Rename and Delete need a target. The prompt version offered them at the
   // project root and then silently did nothing, because its guards were
   // `choice === "3" && rel`. A menu can simply not offer them.
@@ -2287,6 +2298,12 @@ async function fileMenu(e, rel, isDir = false) {
     const name = await askText({ title: "New folder", label: "Path",
       value: dir ? `${dir}/newdir` : "newdir", confirm: "Create" });
     if (name) send({ t: "CreateDir", rel: name });
+  } else if (choice === "download") {
+    // A plain navigation, so the browser's own download machinery handles it:
+    // no blob in memory, a progress indicator the user already knows, and a
+    // file of any size. No intent and no XHR — this is a GET.
+    window.location.href =
+      `/frag/${PROJECT}/download?path=${rel.split("/").map(encodeURIComponent).join("/")}`;
   } else if (choice === "upload") {
     pickAndUpload(dir);
   } else if (choice === "rename") {

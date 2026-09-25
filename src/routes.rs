@@ -12,7 +12,7 @@
 //!                        into the project's `.roost/theme/` directory
 //! Fragment errors render as 200 + hint (htmx ignores 4xx bodies).
 use crate::{config, gitio, http, launch, projects, registry, render};
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -592,7 +592,128 @@ fn serve_static(w: &mut impl Write, rel: &str) {
 /// for that — it's the one hazard this dispatch-by-kind approach carries
 /// that a fully generic parse wouldn't.
 const FRAGMENT_KINDS: &[&str] =
-    &["tree", "file", "raw", "changes", "status", "diff", "proposal", "theme.css", "backup"];
+    &["tree", "file", "raw", "changes", "status", "diff", "proposal", "theme.css", "backup", "download"];
+
+
+/// One file from the tree, as a download (#120).
+///
+/// The second streaming download in this file, and it follows `serve_backup`
+/// rather than reinventing: **chunked**, because once the first byte is out the
+/// status is spent and a browser must report a failed transfer rather than save
+/// a truncated file that looks complete; **no `Origin` check**, for the reason
+/// spelled out on `serve_backup` — a download is a top-level navigation and
+/// browsers send none, the response is not readable cross-origin, and the
+/// DNS-rebinding host gate in `route()` applies before either is reached.
+///
+/// It carries `SANDBOX` as well as `NOSNIFF`, which `serve_backup` does not
+/// need: this serves arbitrary repository content, so a `.html` or `.svg` must
+/// be unable to render in roost's origin by two independent rules.
+///
+/// **No size cap, and that is not an oversight.** `projects::MAX_FILE_BYTES`
+/// bounds the other read paths because they `fs::read` the whole file into
+/// memory; this one reads `DOWNLOAD_CHUNK` at a time and writes each chunk as
+/// it goes, so peak memory is one chunk whatever the file size. The cap would
+/// be guarding a cost this path does not pay, and build output and logs — the
+/// reason to download anything — are routinely past 2 MB. What it *does* cost
+/// is one connection thread for the length of the transfer.
+fn serve_download(w: &mut impl Write, dir: &Path, rel: &str) {
+    let Some(rel) = crate::assets::normalize(rel) else {
+        return http::not_found(w, "no such file");
+    };
+    // The same pipeline `serve_raw` uses, in the same order: normalise, then
+    // canonicalise-and-confine. `safe_resolve` resolves symlinks, so what is
+    // checked below is the target, which is what actually gets read.
+    let Ok(path) = projects::safe_resolve(dir, rel) else {
+        return http::not_found(w, "no such file");
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return http::not_found(w, "no such file");
+    };
+    if meta.is_dir() {
+        // Upload's own wording, because it is the same answer to the same
+        // question asked from the other direction.
+        return http::not_found(w, "folders are not downloaded — use git or scp for a directory");
+    }
+    // Matched on the type, not inferred from "not a directory". A FIFO or a
+    // device node in a cloned repository would block this connection thread on
+    // `read` forever — no error, no timeout, one thread gone per attempt.
+    if !meta.file_type().is_file() {
+        return http::not_found(w, "not a regular file");
+    }
+    let Ok(mut f) = std::fs::File::open(&path) else {
+        return http::not_found(w, "no such file");
+    };
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let (fallback, encoded) = disposition_name(&name);
+    let _ = write!(
+        w,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+         Content-Disposition: attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}\r\n\
+         {}: {}\r\n{}: {}\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        NOSNIFF.0, NOSNIFF.1, SANDBOX.0, SANDBOX.1
+    );
+    let mut buf = vec![0u8; DOWNLOAD_CHUNK];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if write!(w, "{n:x}\r\n").is_err()
+                    || w.write_all(&buf[..n]).is_err()
+                    || w.write_all(b"\r\n").is_err()
+                {
+                    return; // the peer went away; nothing useful left to say
+                }
+            }
+            // A read error after the first chunk cannot change the status any
+            // more, so the connection is dropped *without* the terminating
+            // chunk. That is what makes the browser report a failed download
+            // instead of saving what arrived as if it were the whole file.
+            Err(_) => return,
+        }
+    }
+    let _ = w.write_all(b"0\r\n\r\n");
+    let _ = w.flush();
+}
+
+/// 64 KB. Large enough that a big file is not a syscall storm, small enough
+/// that peak memory per transfer is uninteresting.
+const DOWNLOAD_CHUNK: usize = 64 * 1024;
+
+/// The two forms of a filename in `Content-Disposition`, per RFC 6266.
+///
+/// The name comes out of the repository, so it is **attacker-controlled header
+/// content**: a file called `a"b.txt`, or one with a newline in its name, would
+/// otherwise end the quoted string or inject a header outright. So the quoted
+/// fallback keeps only printable ASCII minus the two characters that can end
+/// it, and the RFC 5987 form carries the real name percent-encoded for anything
+/// that understands it.
+///
+/// An empty result would emit `filename=""`, which some browsers save as a
+/// literal empty name, so it falls back to a word.
+fn disposition_name(name: &str) -> (String, String) {
+    let fallback: String = name
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' => '-',
+            c if (c as u32) < 0x20 || (c as u32) == 0x7f => '-',
+            c if !c.is_ascii() => '-',
+            c => c,
+        })
+        .collect();
+    let fallback = if fallback.trim().is_empty() { "download".to_string() } else { fallback };
+    let encoded: String = name
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'~') {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    (fallback, encoded)
+}
 
 /// The archive, as a download.
 ///
@@ -770,6 +891,12 @@ fn serve_frag(
         ["raw"] => match req.query.get("path") {
             None => http::not_found(w, "missing path"),
             Some(rel) => serve_raw(w, &dir, rel),
+        },
+        // #120. The other half of upload: roost could put a file on the server
+        // and had no way to hand one back.
+        ["download"] => match req.query.get("path") {
+            None => http::not_found(w, "missing path"),
+            Some(rel) => serve_download(w, &dir, rel),
         },
         ["changes"] => match gitio::status(&dir) {
             Ok(st) => http::html(w, &render::changes_fragment(project, &st)),
@@ -1136,11 +1263,23 @@ mod tests {
     /// while the router itself could never reach it; this is the fix for
     /// that class of gap, short of opening a real socket.
     fn frag_route(roots: &[PathBuf], path: &str) -> String {
+        String::from_utf8_lossy(&frag_route_bytes(roots, path)).into_owned()
+    }
+
+    /// The same call without the lossy UTF-8 conversion.
+    ///
+    /// Every other fragment is text, so `frag_route` returning a `String` has
+    /// always been right. A download is not: `from_utf8_lossy` replaces every
+    /// invalid sequence with U+FFFD, which silently rewrites a binary body —
+    /// the 160 KB test first failed at exactly 65536 bytes and looked like a
+    /// chunking bug in `serve_download`, when it was the harness mangling the
+    /// bytes on the way out.
+    fn frag_route_bytes(roots: &[PathBuf], path: &str) -> Vec<u8> {
         let raw = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
         let req = http::parse(&mut std::io::Cursor::new(raw.as_bytes())).unwrap();
         let mut buf: Vec<u8> = Vec::new();
         route(&mut buf, &req, roots);
-        String::from_utf8_lossy(&buf).into_owned()
+        buf
     }
 
     /// The tree lists every file, so a .png can be clicked. Before this, the file
@@ -1596,5 +1735,188 @@ mod tests {
         let nbody = none.split_once("\r\n\r\n").expect("headers end").1;
         let v: serde_json::Value = serde_json::from_str(nbody).unwrap();
         assert_eq!(v.as_array().map(|a| a.len()), Some(0), "the filter was ignored: {v}");
+    }
+
+    // ---- downloading a file (#120) ----
+
+    fn dl(roots: &[PathBuf], q: &str) -> String {
+        frag_route(roots, &format!("/frag/p/download?path={q}"))
+    }
+
+    #[test]
+    fn a_download_serves_the_exact_bytes_with_the_headers_that_stop_it_rendering() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("build.log"), b"line one\nline two\n").unwrap();
+        let roots = vec![d.path().to_path_buf()];
+
+        let out = dl(&roots, "build.log");
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{}", &out[..out.len().min(80)]);
+        assert!(out.contains("Content-Disposition: attachment;"), "{out}");
+        assert!(out.contains(r#"filename="build.log""#), "{out}");
+        // Two independent rules, because this serves arbitrary repository
+        // content: a downloaded .html or .svg must not render in roost's origin.
+        assert!(out.contains("X-Content-Type-Options: nosniff"), "{out}");
+        assert!(out.contains("Content-Security-Policy: sandbox"), "{out}");
+        assert!(out.contains("Transfer-Encoding: chunked"), "{out}");
+        let body = out.split_once("\r\n\r\n").expect("headers end").1;
+        assert_eq!(dechunk(body), b"line one\nline two\n", "wrong bytes: {body:?}");
+    }
+
+    /// More than one chunk. A single-chunk fixture passes against a writer that
+    /// ignores its loop and sends only the first read.
+    #[test]
+    fn a_file_larger_than_one_chunk_arrives_whole() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        // 160 KB: three chunks at 64 KB, with the last one short.
+        let want: Vec<u8> = (0..160_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(p.join("big.bin"), &want).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+
+        let raw = frag_route_bytes(&roots, "/frag/p/download?path=big.bin");
+        let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("headers end") + 4;
+        let got = dechunk_bytes(&raw[sep..]);
+        assert_eq!(got.len(), want.len(), "truncated at {} bytes", got.len());
+        assert_eq!(got, want, "the bytes changed somewhere in the chunking");
+    }
+
+    #[test]
+    fn a_directory_is_refused_with_the_words_upload_uses() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("p");
+        std::fs::create_dir_all(p.join("src")).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let out = dl(&roots, "src");
+        assert!(out.starts_with("HTTP/1.1 404"), "{out}");
+        assert!(out.contains("folders are not downloaded"), "{out}");
+    }
+
+    /// A FIFO would block the connection thread on `read` forever — no error,
+    /// no timeout, one thread gone per attempt. **Bounded by its own timeout**,
+    /// because a regression here hangs the run rather than failing it, and
+    /// CLAUDE.md is explicit that a hang proves nothing about a green suite.
+    #[test]
+    fn a_fifo_is_refused_promptly_rather_than_blocking_the_thread() {
+        #[cfg(unix)]
+        {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("p");
+            std::fs::create_dir_all(&p).unwrap();
+            let fifo = p.join("pipe");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !made {
+                return; // no mkfifo on this host; skipped rather than faked
+            }
+            let roots = vec![d.path().to_path_buf()];
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(dl(&roots, "pipe"));
+            });
+            let out = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("serve_download blocked on a FIFO instead of refusing it");
+            assert!(out.starts_with("HTTP/1.1 404"), "{out}");
+            assert!(out.contains("not a regular file"), "{out}");
+        }
+    }
+
+    /// The confinement, written so it *reaches* the confinement.
+    ///
+    /// The symlink's target must exist, or the call fails with `ENOENT` before
+    /// `safe_resolve` compares anything — which is exactly how a symlink escape
+    /// survived review here once already (CLAUDE.md, *Testing*).
+    #[test]
+    fn a_path_leaving_the_project_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(d.path().join("secret.txt"), b"not yours\n").unwrap();
+        let roots = vec![d.path().to_path_buf()];
+
+        for q in ["../secret.txt", "..%2Fsecret.txt", "/etc/passwd"] {
+            let out = dl(&roots, q);
+            assert!(out.starts_with("HTTP/1.1 404"), "{q} was served: {out}");
+            assert!(!out.contains("not yours"), "{q} leaked the file: {out}");
+        }
+        #[cfg(unix)]
+        {
+            // The escape is genuinely reachable: the target exists and the
+            // symlink resolves. Only `safe_resolve`'s prefix check refuses it.
+            std::os::unix::fs::symlink(d.path().join("secret.txt"), p.join("link.txt")).unwrap();
+            assert!(p.join("link.txt").canonicalize().is_ok(), "setup: the link must resolve");
+            let out = dl(&roots, "link.txt");
+            assert!(out.starts_with("HTTP/1.1 404"), "a symlink out of the project was served");
+            assert!(!out.contains("not yours"), "the symlink leaked its target: {out}");
+        }
+    }
+
+    /// The filename is attacker-controlled header content: it comes out of the
+    /// repository. The fixture really contains a quote, a newline and non-ASCII
+    /// — an escaping test whose fixture has nothing to escape is one of the
+    /// vacuous ones CLAUDE.md lists by name.
+    #[test]
+    fn a_hostile_filename_cannot_end_the_header_or_start_another() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let nasty = "a\"b\nSet-Cookie: x=1\u{2028}č.txt";
+        if std::fs::write(p.join(nasty), b"ok\n").is_err() {
+            return; // a filesystem that refuses the name; nothing to assert
+        }
+        let roots = vec![d.path().to_path_buf()];
+        let out = dl(&roots, &crate::http::percent_encode(nasty));
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{}", &out[..out.len().min(120)]);
+        let head = out.split_once("\r\n\r\n").expect("headers end").0;
+        let disp = head
+            .lines()
+            .find(|l| l.starts_with("Content-Disposition"))
+            .expect("a disposition header");
+        // Exactly two quotes: the ones roost wrote. A third means the name
+        // closed the string early.
+        assert_eq!(disp.matches('"').count(), 2, "the filename escaped its quotes: {disp}");
+        // Injection means a *newline*, not the literal word. The fallback
+        // neutered the newline to `-`, so "Set-Cookie" survives as ordinary
+        // text inside a quoted value — harmless, and asserting on the word
+        // instead of the CR/LF was this test failing for the wrong reason.
+        assert!(
+            !head.contains("\nSet-Cookie") && !head.contains("\rSet-Cookie"),
+            "a header was injected: {head:?}"
+        );
+        assert!(!disp.contains('\n') && !disp.contains('\r'), "{disp:?}");
+        // And the real name survives, percent-encoded, in the RFC 5987 form.
+        assert!(disp.contains("filename*=UTF-8''"), "{disp}");
+        assert!(disp.contains("%C4%8D"), "the real name was lost, not encoded: {disp}");
+    }
+
+    /// Reassembles a chunked body. Asserting on the raw chunked text would pass
+    /// against a writer that emitted the right bytes with the wrong framing.
+    fn dechunk(body: &str) -> Vec<u8> {
+        dechunk_bytes(body.as_bytes())
+    }
+
+    fn dechunk_bytes(b: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let Some(nl) = b[i..].windows(2).position(|w| w == b"\r\n") else { break };
+            let size = std::str::from_utf8(&b[i..i + nl])
+                .ok()
+                .and_then(|s| usize::from_str_radix(s.trim(), 16).ok())
+                .unwrap_or(0);
+            i += nl + 2;
+            if size == 0 {
+                break;
+            }
+            out.extend_from_slice(&b[i..(i + size).min(b.len())]);
+            i += size + 2;
+        }
+        out
     }
 }
