@@ -42,10 +42,15 @@ pub(crate) fn run_git(repo: &Path, args: &[&str], allow_exit_1: bool) -> Result<
     let mut stderr_pipe = child.stderr.take();
     let stdout_thread = std::thread::spawn(move || {
         let mut buf = String::new();
-        if let Some(s) = stdout_pipe.as_mut() {
-            let _ = s.read_to_string(&mut buf);
-        }
-        buf
+        // The error is kept, not dropped: on invalid UTF-8 `read_to_string`
+        // leaves `buf` empty, and an empty stdout from a successful git reads
+        // as "nothing to report", a clean tree, when the truth is "could not
+        // read the answer".
+        let ok = match stdout_pipe.as_mut() {
+            Some(s) => s.read_to_string(&mut buf).is_ok(),
+            None => true,
+        };
+        (buf, ok)
     });
     let stderr_thread = std::thread::spawn(move || {
         let mut buf = String::new();
@@ -66,12 +71,15 @@ pub(crate) fn run_git(repo: &Path, args: &[&str], allow_exit_1: bool) -> Result<
             None => std::thread::sleep(std::time::Duration::from_millis(25)),
         }
     };
-    let stdout = stdout_thread.join().unwrap_or_default();
+    let (stdout, stdout_ok) = stdout_thread.join().unwrap_or_default();
     let stderr = stderr_thread.join().unwrap_or_default();
     let code = status.code().unwrap_or(-1);
     if code != 0 && !(allow_exit_1 && code == 1) {
         // git diff exits 1 when differences exist (only allowed if allow_exit_1 is true)
         return Err(stderr.trim().to_string());
+    }
+    if !stdout_ok {
+        return Err(format!("git {} output was not valid UTF-8", args.first().unwrap_or(&"")));
     }
     Ok(stdout)
 }
@@ -116,6 +124,49 @@ pub fn parse_status(porcelain: &str) -> Status {
         }
     }
     Status { branch, changes, ahead, behind, upstream }
+}
+
+/// One `git status --porcelain=v2 -z` entry, for the one caller that acts on
+/// status rather than displaying it: `revert`. Separate from `parse_status`
+/// because `-z` changes the framing (NUL-terminated, names unquoted, a
+/// rename's two paths as two fields) and because the display parser drops
+/// unmerged entries, which a destructive caller must see in order to refuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Entry {
+    Ordinary { xy: String, path: String },
+    Renamed { xy: String, path: String, orig: String },
+    Unmerged { xy: String, path: String },
+    Untracked { path: String },
+}
+
+pub fn parse_status_z(out: &str) -> Vec<Entry> {
+    let mut fields = out.split('\0');
+    let mut entries = Vec::new();
+    while let Some(f) = fields.next() {
+        if let Some(rest) = f.strip_prefix("1 ") {
+            // XY sub mH mI mW hH hI path
+            let p: Vec<&str> = rest.splitn(8, ' ').collect();
+            if p.len() == 8 {
+                entries.push(Entry::Ordinary { xy: p[0].into(), path: p[7].into() });
+            }
+        } else if let Some(rest) = f.strip_prefix("2 ") {
+            // XY sub mH mI mW hH hI Xscore path, then origPath as its own field
+            let p: Vec<&str> = rest.splitn(9, ' ').collect();
+            let orig = fields.next().unwrap_or("");
+            if p.len() == 9 {
+                entries.push(Entry::Renamed { xy: p[0].into(), path: p[8].into(), orig: orig.into() });
+            }
+        } else if let Some(rest) = f.strip_prefix("u ") {
+            // XY sub m1 m2 m3 mW h1 h2 h3 path
+            let p: Vec<&str> = rest.splitn(10, ' ').collect();
+            if p.len() == 10 {
+                entries.push(Entry::Unmerged { xy: p[0].into(), path: p[9].into() });
+            }
+        } else if let Some(rest) = f.strip_prefix("? ") {
+            entries.push(Entry::Untracked { path: rest.into() });
+        }
+    }
+    entries
 }
 
 /// Gated on being inside *any* work tree, matching `is_inside_work_tree` and
@@ -372,6 +423,45 @@ mod tests {
             !is_inside_work_tree(&deep),
             "with no repo in any ancestor this must be false, or `git init` is never offered \
              and the escape hatch for a plain directory is unreachable"
+        );
+    }
+
+    /// Review Focus 3. `-z` output carries a filename's raw bytes, and the
+    /// stdout thread used to drop `read_to_string`'s error, leaving an empty
+    /// String: a run that succeeded with no output, which a status reader
+    /// takes for a clean tree. "Could not read" must not become "nothing".
+    ///
+    /// Revert-checked: Commented out the stdout_ok check after joining the thread,
+    /// which made the function return Ok("") for undecodable output. The test
+    /// correctly failed with "undecodable output must not read as success: """,
+    /// confirming the test detects the bug. Restored from backup and test passes.
+    #[test]
+    fn undecodable_output_is_an_error_not_empty() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = tempfile::tempdir().unwrap();
+        run_git(d.path(), &["init", "-q"], false).unwrap();
+        std::fs::write(d.path().join(std::ffi::OsStr::from_bytes(b"bad\xff")), "x").unwrap();
+        let got = run_git(d.path(), &["status", "--porcelain=v2", "-z"], false);
+        let err = got.expect_err("undecodable output must not read as success");
+        assert!(err.contains("not valid UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn parse_status_z_reads_every_entry_kind_and_keeps_awkward_names() {
+        // One of each kind; the ordinary name has a space and non-ASCII, and a
+        // rename's two paths are separate NUL fields under -z (a tab without it).
+        let out = "1 .M N... 100644 100644 100644 abc abc a b\u{e9}.rs\0\
+                   2 R. N... 100644 100644 100644 abc abc R100 new.rs\0old.rs\0\
+                   u UU N... 100644 100644 100644 100644 abc abc abc c.rs\0\
+                   ? new dir/x.txt\0";
+        assert_eq!(
+            parse_status_z(out),
+            vec![
+                Entry::Ordinary { xy: ".M".into(), path: "a b\u{e9}.rs".into() },
+                Entry::Renamed { xy: "R.".into(), path: "new.rs".into(), orig: "old.rs".into() },
+                Entry::Unmerged { xy: "UU".into(), path: "c.rs".into() },
+                Entry::Untracked { path: "new dir/x.txt".into() },
+            ]
         );
     }
 }
