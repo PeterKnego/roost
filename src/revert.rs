@@ -175,9 +175,11 @@ pub fn execute(_dir: &Path, plan: &Plan, run: GitRunner) -> Result<String, Strin
     let n = plan.paths.len();
     let label = format!("roost revert: {n} file{}", if n == 1 { "" } else { "s" });
 
-    // Get the stash hash BEFORE the push to detect if a new entry was created.
-    let before_stash = run(&plan.toplevel, &["stash", "list", "-1", "--format=%H"])
-        .unwrap_or_default();
+    // Read before the push, and a failure refuses: without a trustworthy
+    // "before" there is no way to tell afterwards whether a failed push left
+    // an entry, and guessing "" would name the user's older stash as ours.
+    let before = run(&plan.toplevel, &["stash", "list", "-1", "--format=%H"])
+        .map_err(|e| format!("Could not read the stash list: {e}. {NOTHING}"))?;
 
     // Build root-relative paths for stash push (prefix + project-relative path).
     let mut root_paths = Vec::new();
@@ -189,24 +191,18 @@ pub fn execute(_dir: &Path, plan: &Plan, run: GitRunner) -> Result<String, Strin
     let mut args = vec!["--literal-pathspecs", "stash", "push", "-m", label.as_str(), "--"];
     args.extend(root_paths.iter().map(|p| p.as_str()));
     let out = run(&plan.toplevel, &args).map_err(|e| {
-        let first = e.lines().next().unwrap_or("").trim();
-        // Check if a new stash entry was created by comparing before/after hashes.
-        let after_stash = run(&plan.toplevel, &["stash", "list", "-1", "--format=%H"])
-            .unwrap_or_default();
-        let stash_msg = if after_stash == before_stash {
-            // No new stash entry was created.
-            "".to_string()
-        } else if after_stash.is_empty() {
-            // Could not read the stash after the error.
-            "Nothing was reverted; whether a stash entry was left could not be checked; see `git stash list`.".to_string()
-        } else {
-            // A new stash entry was created.
-            format!("Nothing was reverted, but a stash entry \"{label}\" was created; `git stash drop` removes it.")
-        };
-        if stash_msg.is_empty() {
-            format!("git refused: {first}. {NOTHING}")
-        } else {
-            format!("git refused: {first}. {stash_msg}")
+        let first = e.lines().next().unwrap_or("").trim().to_string();
+        // Three outcomes, never two: the after-check can fail, and "could not
+        // look" is not "no entry" (CLAUDE.md).
+        match run(&plan.toplevel, &["stash", "list", "-1", "--format=%H"]) {
+            Ok(after) if after.trim().is_empty() => format!("git refused: {first}. {NOTHING}"),
+            Ok(after) if after == before => format!("git refused: {first}. {NOTHING}"),
+            Ok(_) => format!(
+                "git refused: {first}. Nothing was reverted, but a stash entry \"{label}\" was created; `git stash drop` removes it."
+            ),
+            Err(_) => format!(
+                "git refused: {first}. Nothing was reverted; whether a stash entry was left could not be checked; see `git stash list`."
+            ),
         }
     })?;
     // Exit 0 is not the evidence: with nothing left to save, git says "No
@@ -311,6 +307,69 @@ mod tests {
         assert_eq!(std::fs::read_to_string(d.path().join("ab")).unwrap(), "2\n", "ab was not selected");
     }
 
+    /// Finding 1: The pre-check must not fold "could not read" into "empty".
+    /// If the pre-check fails, we cannot trustworthy compare afterwards, so refuse before pushing.
+    /// Runner fails on all "list" commands (simulating read failure); real git otherwise.
+    /// Assert error starts with "Could not read the stash list:", ends with "Nothing was reverted.",
+    /// file unchanged, and no stash was created.
+    ///
+    /// Revert-checked: restore .unwrap_or_default() on pre-check fails this test.
+    #[test]
+    fn a_failed_stash_precheck_refuses_before_pushing() {
+        let d = repo(&[("a.txt", "a\n")]);
+        std::fs::write(d.path().join("a.txt"), "a2\n").unwrap();
+        let p = build_plan(d.path(), None, &real).unwrap();
+        let list_fails = |dir: &Path, a: &[&str]| {
+            if a.contains(&"list") {
+                Err("fatal: could not open stash file".to_string())
+            } else {
+                real(dir, a)
+            }
+        };
+        let err = execute(d.path(), &p, &list_fails).unwrap_err();
+        assert!(err.starts_with("Could not read the stash list:"), "{err}");
+        assert!(err.ends_with("Nothing was reverted."), "{err}");
+        // File should be unchanged because push never ran
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "a2\n");
+        // No stash created because push never ran
+        assert_eq!(git(d.path(), &["stash", "list"]), "");
+    }
+
+    /// Finding 1: The post-check must distinguish "could not read" from "no entry".
+    /// Repo has a change and NO prior stash. Push fails (simulated), but post-check
+    /// cannot read stash list (also fails). The error must say "could not be checked",
+    /// not "Nothing was reverted." alone.
+    ///
+    /// Revert-checked: return NOTHING in Err(_) arm instead of "could not be checked" fails this.
+    #[test]
+    fn a_failed_stash_postcheck_says_it_could_not_tell() {
+        let d = repo(&[("a.txt", "a\n")]);
+        std::fs::write(d.path().join("a.txt"), "a2\n").unwrap();
+        let p = build_plan(d.path(), None, &real).unwrap();
+        // Pre-check succeeds (no stash), but post-check fails
+        let list_count = std::cell::Cell::new(0u32);
+        let pre_ok_post_fails = |dir: &Path, a: &[&str]| {
+            if a.contains(&"list") {
+                let count = list_count.get();
+                list_count.set(count + 1);
+                if count == 0 {
+                    // First call (pre-check) succeeds
+                    real(dir, a)
+                } else {
+                    // Second call (post-check) fails
+                    Err("fatal: could not open stash file".to_string())
+                }
+            } else if a.contains(&"push") {
+                Err("fatal: simulated".to_string())
+            } else {
+                real(dir, a)
+            }
+        };
+        let err = execute(d.path(), &p, &pre_ok_post_fails).unwrap_err();
+        assert!(err.contains("could not be checked"), "{err}");
+        assert!(err.contains("Nothing was reverted"), "{err}");
+    }
+
     /// Revert-checked: dropping the `--` + paths from stash push (stashes everything
     /// instead of just selected files) fails this test (b.txt assertion fails).
     #[test]
@@ -364,7 +423,7 @@ mod tests {
     /// Important (controller addition): stash entry detection must not blame an older stash.
     /// The repo has a pre-existing stash with subject "roost revert: 1 file".
     /// When stash push fails WITHOUT actually running (no new entry), the error message
-    /// must NOT mention "created" and must NOT list an entry count.
+    /// must NOT mention "created".
     ///
     /// Revert-checked: using label matching (after.trim().ends_with(&label)) instead of hash
     /// comparison fails this test. Output: panicked at "error must end cleanly" assertion, got:
@@ -498,6 +557,7 @@ mod tests {
         };
         let err = execute(d.path(), &p, &no_ident).unwrap_err();
         assert!(err.starts_with("git refused: "), "{err}");
+        assert!(err.ends_with("Nothing was reverted."), "{err}");
         assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "a2\n");
     }
 
