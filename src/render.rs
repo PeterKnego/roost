@@ -35,6 +35,15 @@ pub fn diff_html(diff: &str) -> String {
         .collect()
 }
 
+/// The "Revert all" confirmation's detail: which paths, with their XY codes.
+/// Escaped like every other interpolation; `askChoice` sets it as innerHTML.
+pub fn revert_list_html(paths: &[crate::revert::PlanPath]) -> String {
+    paths
+        .iter()
+        .map(|p| format!("<div class=\"dl ctx\">{} {}</div>", esc(&p.xy), esc(&p.path)))
+        .collect()
+}
+
 /// The hunk view for an `openDiff` proposal Claude is still waiting on an
 /// answer for. Same shape as the `diff` fragment's own output (a `.path`
 /// breadcrumb over a `.diffview` of `diff_html`-classified lines) — reusing
@@ -4411,5 +4420,12 @@ mod tests {
                 "{src} is named by the manifest but is not embedded"
             );
         }
+    }
+
+    #[test]
+    fn revert_list_html_escapes_paths() {
+        let h = revert_list_html(&[crate::revert::PlanPath { path: "<b>.rs".into(), xy: ".M".into() }]);
+        assert!(h.contains("&lt;b&gt;.rs") && !h.contains("<b>"), "{h}");
+        assert!(h.contains(".M"), "{h}");
     }
 }
