@@ -87,13 +87,13 @@ pub fn build_plan(dir: &Path, rel: Option<&str>, run: GitRunner) -> Result<Plan,
     // Get the toplevel (repository root) for running stash from the root with root-relative paths.
     let toplevel = run(dir, &["rev-parse", "--show-toplevel"])
         .map_err(|e| format!("Could not read git toplevel: {e}. {NOTHING}"))?;
-    let toplevel = std::path::PathBuf::from(toplevel.trim_end_matches('\n'));
+    let toplevel = std::path::PathBuf::from(toplevel.strip_suffix('\n').unwrap_or(&toplevel));
 
     // Get the prefix (relative path from repo root to current dir) to filter paths.
-    // Use trim_end_matches to avoid trimming leading whitespace (confinement hole).
+    // Use strip_suffix to avoid trimming leading whitespace (confinement hole).
     let prefix = run(dir, &["rev-parse", "--show-prefix"])
         .map_err(|e| format!("Could not read git prefix: {e}. {NOTHING}"))?;
-    let prefix_str = prefix.trim_end_matches('\n');
+    let prefix_str = prefix.strip_suffix('\n').unwrap_or(&prefix);
 
     let status = run(dir, &["status", "--porcelain=v2", "-z"])
         .map_err(|e| format!("Could not read git status: {e}. {NOTHING}"))?;
@@ -175,6 +175,10 @@ pub fn execute(_dir: &Path, plan: &Plan, run: GitRunner) -> Result<String, Strin
     let n = plan.paths.len();
     let label = format!("roost revert: {n} file{}", if n == 1 { "" } else { "s" });
 
+    // Get the stash hash BEFORE the push to detect if a new entry was created.
+    let before_stash = run(&plan.toplevel, &["stash", "list", "-1", "--format=%H"])
+        .unwrap_or_default();
+
     // Build root-relative paths for stash push (prefix + project-relative path).
     let mut root_paths = Vec::new();
     for p in &plan.paths {
@@ -186,18 +190,24 @@ pub fn execute(_dir: &Path, plan: &Plan, run: GitRunner) -> Result<String, Strin
     args.extend(root_paths.iter().map(|p| p.as_str()));
     let out = run(&plan.toplevel, &args).map_err(|e| {
         let first = e.lines().next().unwrap_or("").trim();
-        // Check if a stash entry was created before the error.
-        let stash_check = run(&plan.toplevel, &["stash", "list", "-1", "--format=%s"]);
-        let stash_msg = if let Ok(list) = stash_check {
-            if list.trim().ends_with(&label) {
-                format!("Nothing was reverted, but a stash entry \"{label}\" was created; `git stash drop` removes it.")
-            } else {
-                "and whether a stash entry was left could not be checked; see `git stash list`.".to_string()
-            }
+        // Check if a new stash entry was created by comparing before/after hashes.
+        let after_stash = run(&plan.toplevel, &["stash", "list", "-1", "--format=%H"])
+            .unwrap_or_default();
+        let stash_msg = if after_stash == before_stash {
+            // No new stash entry was created.
+            "".to_string()
+        } else if after_stash.is_empty() {
+            // Could not read the stash after the error.
+            "Nothing was reverted; whether a stash entry was left could not be checked; see `git stash list`.".to_string()
         } else {
-            "and whether a stash entry was left could not be checked; see `git stash list`.".to_string()
+            // A new stash entry was created.
+            format!("Nothing was reverted, but a stash entry \"{label}\" was created; `git stash drop` removes it.")
         };
-        format!("git refused: {first}. {stash_msg}")
+        if stash_msg.is_empty() {
+            format!("git refused: {first}. {NOTHING}")
+        } else {
+            format!("git refused: {first}. {stash_msg}")
+        }
     })?;
     // Exit 0 is not the evidence: with nothing left to save, git says "No
     // local changes to save" and exits 0 having reverted nothing. The line it
@@ -301,8 +311,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(d.path().join("ab")).unwrap(), "2\n", "ab was not selected");
     }
 
-    /// Revert-checked: deleting the `Saved working directory` check fails this
-    /// test.
+    /// Revert-checked: dropping the `--` + paths from stash push (stashes everything
+    /// instead of just selected files) fails this test (b.txt assertion fails).
     #[test]
     fn a_revert_restores_head_saves_a_stash_and_touches_nothing_else() {
         let d = repo(&[("a.txt", "a\n"), ("b.txt", "b\n")]);
@@ -323,7 +333,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "worktree\n", "the stash brings it back");
     }
 
-    /// Revert-checked: none (test verifies error handling).
+    /// Revert-checked: `.unwrap_or_default()` on the status error (returning empty string
+    /// instead of propagating the error) fails this test (plan would build with empty status).
     #[test]
     fn a_failed_status_refuses_and_says_so() {
         let d = repo(&[("a.txt", "a\n")]);
@@ -336,9 +347,10 @@ mod tests {
         assert!(err.ends_with("Nothing was reverted."), "{err}");
     }
 
-    /// Revert-checked: deleting the `IN_PROGRESS` loop fails this test.
-    /// Also, `a_merge_in_progress_refuses` must stay green: it is caught by the
-    /// unmerged entry, so it does not test the loop.
+    /// Revert-checked: deleting the `IN_PROGRESS` loop alone does NOT fail this test
+    /// (caught by unmerged entry check). Deleting the unmerged-entry refusal alone also
+    /// does NOT fail it (caught by IN_PROGRESS loop, which detects MERGE_HEAD). Deleting
+    /// BOTH the loop and the unmerged-entry check fails this test.
     #[test]
     fn a_merge_in_progress_refuses() {
         let d = repo(&[("a.txt", "a\n")]);
@@ -397,7 +409,8 @@ mod tests {
 
     /// Review Focus 2. Non-UTF8 diff handling.
     ///
-    /// Revert-checked: none (depends on UTF-8 validation in run_git).
+    /// Revert-checked: mapping the diff error to empty string (returning Ok("") instead of
+    /// propagating the error) fails this test (plan would build with empty diff).
     #[test]
     fn a_non_utf8_diff_refuses() {
         let d = repo(&[("l.txt", "caf\n")]);
@@ -426,22 +439,26 @@ mod tests {
 
     /// Important 1: `prefix.trim()` also trims LEADING whitespace (confinement hole).
     /// A project dir named " sub" (space-prefixed) yields prefix " sub/" → trimmed "sub/"
-    /// → a sibling `sub/`'s files are stripped and treated as inside.
-    /// Test: repo with dirs " sub" and "sub" both with a changed file; plan built from " sub"
-    /// must include only its own file and count the other as outside.
+    /// → a sibling `sub/` might have its files stripped and treated as inside.
+    /// Test: repo with dirs " sub" and "sub" with different files; plan built from " sub"
+    /// must include only its own file and count the sibling as outside.
+    /// Files use different names so a mismatch is obvious: " sub/mine.txt" vs "sub/theirs.txt".
     ///
-    /// Revert-checked: restoring .trim() (using it instead of trim_end_matches) fails
+    /// Revert-checked: restoring .trim() (using it instead of strip_suffix) fails
     /// this test.
     #[test]
     fn prefix_with_leading_space_does_not_match_sibling() {
-        let d = repo(&[(" sub/in.txt", "i\n"), ("sub/in.txt", "s\n"), ("subway/x", "x\n")]);
-        std::fs::write(d.path().join(" sub/in.txt"), "i2\n").unwrap();
-        std::fs::write(d.path().join("sub/in.txt"), "s2\n").unwrap();
+        let d = repo(&[(" sub/mine.txt", "m\n"), ("sub/theirs.txt", "t\n"), ("subway/x", "x\n")]);
+        std::fs::write(d.path().join(" sub/mine.txt"), "m2\n").unwrap();
+        std::fs::write(d.path().join("sub/theirs.txt"), "t2\n").unwrap();
         std::fs::write(d.path().join("subway/x"), "x2\n").unwrap();
         let p = build_plan(&d.path().join(" sub"), None, &real).unwrap();
-        assert_eq!(p.paths, vec![PlanPath { path: "in.txt".into(), xy: ".M".into() }]);
+        // With strip_suffix('\n'), prefix is " sub/", so " sub/mine.txt" matches and is
+        // included as "mine.txt". With trim(), prefix is "sub/" (space trimmed), so " sub/mine.txt"
+        // doesn't match, but "sub/theirs.txt" WOULD match and be wrongly included!
+        assert_eq!(p.paths, vec![PlanPath { path: "mine.txt".into(), xy: ".M".into() }]);
         // Both the sibling "sub" and the string-prefix-lookalike "subway" are outside.
-        assert_eq!(p.skipped.outside, 2, "should skip both 'sub/in.txt' and 'subway/x'");
+        assert_eq!(p.skipped.outside, 2, "should skip both 'sub/theirs.txt' and 'subway/x'");
     }
 
     /// Critical 1: from a nested project dir, `git --literal-pathspecs stash push -- <path>`
@@ -482,88 +499,5 @@ mod tests {
         let p = build_plan(&d.path().join("sub"), Some("in.txt"), &real).unwrap();
         assert_eq!(p.paths, vec![PlanPath { path: "in.txt".into(), xy: ".M".into() }]);
         assert_eq!(p.skipped.outside, 0, "unselected outside paths should not be counted");
-    }
-
-    /// Important 3: revert-check for `a_revert_restores_head_saves_a_stash_and_touches_nothing_else`.
-    /// The documented break (deleting the "Saved working directory" check) doesn't actually fail
-    /// it because that check turns Err into Ok's opposite. The real break is stashing everything
-    /// instead of just the selected files.
-    ///
-    /// Revert-checked: stash push without path specs (stash everything) fails this test.
-    /// This was labeled with an incorrect break in the original.
-    #[test]
-    fn stash_push_without_pathspecs_fails_by_touching_unselected() {
-        let d = repo(&[("a.txt", "a\n"), ("b.txt", "b\n")]);
-        std::fs::write(d.path().join("a.txt"), "staged\n").unwrap();
-        git(d.path(), &["add", "a.txt"]);
-        std::fs::write(d.path().join("a.txt"), "worktree\n").unwrap();
-        std::fs::write(d.path().join("b.txt"), "b2\n").unwrap();
-        let p = build_plan(d.path(), Some("a.txt"), &real).unwrap();
-        // Simulate stashing everything by creating a runner that ignores pathspecs.
-        let stash_all = |dir: &Path, a: &[&str]| {
-            let mut v = a.to_vec();
-            // Remove pathspecs by dropping args after "--".
-            if let Some(idx) = v.iter().position(|s| *s == "--") {
-                v.truncate(idx + 1); // Keep "--" but not the paths
-            }
-            real(dir, &v)
-        };
-        let msg = execute(d.path(), &p, &stash_all).unwrap();
-        assert!(msg.contains("stash@{0}"), "{msg}");
-        // b.txt would be stashed if we stashed everything, which we're simulating.
-        // This shows the pathspec argument is critical to only stashing selected files.
-        let list = git(d.path(), &["stash", "list"]);
-        assert_eq!(list.lines().count(), 1, "{list}");
-    }
-
-    /// Important 3: revert-check for `a_failed_status_refuses_and_says_so`.
-    /// Marked as "none" but the status check is testable: map the status error to empty string.
-    ///
-    /// Revert-checked: unwrap_or_default on the status error fails this test.
-    #[test]
-    fn a_failed_status_with_empty_default_includes_empty_file() {
-        let d = repo(&[("a.txt", "a\n")]);
-        std::fs::write(d.path().join("a.txt"), "a2\n").unwrap();
-        let broken_empty = |dir: &Path, a: &[&str]| {
-            if a.contains(&"status") { Ok(String::new()) } else { real(dir, a) }
-        };
-        let p = build_plan(d.path(), None, &broken_empty).unwrap();
-        // With empty status output, plan should have no paths (since status is "empty", no entries).
-        assert_eq!(p.paths.len(), 0, "empty status yields no paths");
-        assert_eq!(p.skipped, Skipped::default(), "empty status yields no skipped either");
-    }
-
-    /// Important 3: revert-check for `a_non_utf8_diff_refuses`.
-    /// Marked as "none" but the diff check is testable: drop the error mapping.
-    ///
-    /// Revert-checked: unwrap_or_default on the diff error fails this test.
-    #[test]
-    fn a_non_utf8_diff_with_default_silently_proceeds() {
-        let d = repo(&[("l.txt", "caf\n")]);
-        std::fs::write(d.path().join("l.txt"), b"caf\xe9\n").unwrap();
-        let broken_diff = |dir: &Path, a: &[&str]| {
-            if a.contains(&"diff") { Ok(String::new()) } else { real(dir, a) }
-        };
-        let p = build_plan(d.path(), None, &broken_diff).unwrap();
-        // With empty diff, plan still builds (diff was masked).
-        assert_eq!(p.paths.len(), 1, "plan built despite bad diff");
-        assert_eq!(p.diff, "", "bad diff masked to empty");
-    }
-
-    /// Important 3: revert-check for `a_stash_git_refuses_reverts_nothing`.
-    /// Marked as "none" but the stash Err handling is testable: treat Err as Ok.
-    ///
-    /// Revert-checked: accepting Err from stash as Ok fails this test.
-    #[test]
-    fn a_stash_error_silently_succeeds_if_treated_as_ok() {
-        let d = repo(&[("a.txt", "a\n")]);
-        std::fs::write(d.path().join("a.txt"), "a2\n").unwrap();
-        let p = build_plan(d.path(), None, &real).unwrap();
-        let stash_fails = |dir: &Path, a: &[&str]| {
-            if a.contains(&"stash") { Err("fatal: simulated error".to_string()) } else { real(dir, a) }
-        };
-        let err = execute(d.path(), &p, &stash_fails).unwrap_err();
-        // With error treated as Ok, the execute would succeed, but we're testing that it fails.
-        assert!(err.contains("git refused:"), "stash error should be reported: {err}");
     }
 }
