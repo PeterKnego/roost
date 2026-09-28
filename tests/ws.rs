@@ -401,3 +401,137 @@ fn workspace_socket_malformed_json_is_reported_not_fatal() {
     let _ = ws.close(None);
     std::env::remove_var("ROOST_STATE_DIR");
 }
+
+/// Reads until the Close frame and hands it back, so a test can assert on
+/// *why* the socket closed rather than only that it did. A bare EOF or a read
+/// error is a failure here, not a close: `assert_ws_closes` accepts those, and
+/// that leniency is exactly what let a reasonless refusal pass as "closed".
+fn read_close_frame(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+) -> Option<tungstenite::protocol::CloseFrame<'static>> {
+    let mut saw = Vec::new();
+    for _ in 0..50 {
+        match ws.read() {
+            Ok(tungstenite::Message::Close(f)) => return f,
+            Ok(m) => saw.push(format!("{m:?}")),
+            Err(e) => panic!("expected a Close frame, read ended with {e:?}; frames first: {saw:?}"),
+        }
+    }
+    panic!("no Close frame within the read budget; frames seen: {saw:?}");
+}
+
+/// #123: a terminal whose command is not installed says so, instead of
+/// closing with nothing and reading as "session ended" — the same words the
+/// tab shows after a deliberate `exit`, so nothing hinted that anything was
+/// wrong, let alone what to install.
+///
+/// Asserts on the reason text and the code, not on the close: the refusal
+/// already closed cleanly before this fix, so a close-only test was green
+/// against the bug.
+///
+/// Revert-checked: restoring `close(None)` in `term.rs` fails this with
+/// "the refusal must carry a Close frame with a reason".
+#[test]
+fn a_missing_command_names_itself_in_the_close_frame() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
+    std::env::set_var("ROOST_CMD", "roost-no-such-command-123");
+    let (_d, port) = fixture_named("missingcmd");
+    let mut ws = ws_connect_term(port, "/ws/missingcmd/term/nocmd").unwrap();
+    let frame = read_close_frame(&mut ws);
+    std::env::remove_var("ROOST_CMD");
+    std::env::remove_var("ROOST_STATE_DIR");
+
+    let frame = frame.expect("the refusal must carry a Close frame with a reason, not an empty close");
+    assert_eq!(
+        frame.code,
+        tungstenite::protocol::frame::coding::CloseCode::Error,
+        "a failed spawn is a server-side error (1011), not a normal close: {frame:?}"
+    );
+    assert!(
+        frame.reason.contains("roost-no-such-command-123") && frame.reason.contains("not installed"),
+        "the reason must name the missing command and say it is not installed: {:?}",
+        frame.reason
+    );
+    assert!(
+        !roost::session::live_names("missingcmd").iter().any(|n| n == "nocmd"),
+        "a spawn that never happened must leave no session behind"
+    );
+}
+
+/// A bare command name is looked up on `PATH`, and only there.
+///
+/// portable-pty's own lookup tries `cwd/<name>` *before* `PATH`, and a
+/// terminal's cwd is inside the project — so a checkout carrying an
+/// executable named `dtach` at its root had it run in place of the real one
+/// the moment a terminal opened. That is repository code executing on a
+/// click that promises a shell.
+///
+/// Watched failing before the fix: "the project's own roost-cwd-probe ran".
+/// It covers only a name *absent* from PATH, where the lookup refuses before
+/// any spawn — so it stays green if the spawn is handed the bare name again.
+/// The test below is the one that sees that.
+#[test]
+fn a_command_is_not_run_from_the_project_directory() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
+    let (d, port) = fixture_named("cwdcmd");
+    let marker = d.path().join("ran");
+    let probe = d.path().join("cwdcmd/roost-cwd-probe");
+    std::fs::write(&probe, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::env::set_var("ROOST_CMD", "roost-cwd-probe");
+    let mut ws = ws_connect_term(port, "/ws/cwdcmd/term/probe").unwrap();
+    let frame = read_close_frame(&mut ws);
+    std::env::remove_var("ROOST_CMD");
+    std::env::remove_var("ROOST_STATE_DIR");
+
+    assert!(
+        std::fs::symlink_metadata(&marker).is_err(),
+        "the project's own roost-cwd-probe ran: a bare command must resolve on PATH only"
+    );
+    // And it was refused as missing, rather than failing some other way that
+    // would also have left no marker.
+    let reason = frame.map(|f| f.reason.to_string()).unwrap_or_default();
+    assert!(reason.contains("not installed"), "expected a not-installed refusal, got {reason:?}");
+}
+
+/// The case the one above cannot reach, and the real one: a command that *is*
+/// installed, shadowed by a same-named executable in the project — a checkout
+/// carrying its own `dtach`. There the lookup succeeds, so what protects the
+/// user is that the spawn is handed the resolved absolute path; handed the
+/// bare name, portable-pty tries `cwd/<name>` first and runs the project's.
+///
+/// `true` stands in for `dtach` because it is on every PATH this suite runs
+/// under and exits at once, so the socket closes without a shell to tend.
+///
+/// Revert-checked: `CommandBuilder::new(&cmd[0])` in place of the resolved
+/// path fails this, and only this, of the three tests here.
+#[test]
+fn an_installed_command_is_not_shadowed_by_one_in_the_project() {
+    let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let sd = tempfile::tempdir().unwrap();
+    std::env::set_var("ROOST_STATE_DIR", sd.path());
+    let (d, port) = fixture_named("shadowcmd");
+    let marker = d.path().join("ran");
+    let shadow = d.path().join("shadowcmd/true");
+    std::fs::write(&shadow, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::env::set_var("ROOST_CMD", "true");
+    let mut ws = ws_connect_term(port, "/ws/shadowcmd/term/shadow").unwrap();
+    assert_ws_closes(&mut ws, "an_installed_command_is_not_shadowed_by_one_in_the_project");
+    std::env::remove_var("ROOST_CMD");
+    std::env::remove_var("ROOST_STATE_DIR");
+    assert!(
+        std::fs::symlink_metadata(&marker).is_err(),
+        "the project's own `true` ran in place of the one on PATH"
+    );
+}

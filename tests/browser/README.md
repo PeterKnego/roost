@@ -60,6 +60,7 @@ deno run -A tests/browser/watchdog.mjs   # the workspace connection's visible st
 deno run -A tests/browser/download.mjs   # right-click → Download: a real navigation, a real file on disk, and the label that says which version (#120)
 deno run -A tests/browser/touchfiles.mjs # the file menu on a folder, Upload files… without a drag, and terminal select mode (#110)
 deno run -A tests/browser/paste.mjs      # the terminal key bar's paste button (#97): bracketed vs bare at the pty, and the textarea fallback when the clipboard says no
+deno run -A tests/browser/nodtach.mjs    # a host without dtach says so on the terminal, and does not reconnect into the refusal (#123)
 deno run -A tests/browser/backup.mjs     # backing a workspace up and restoring it into a *different* project (#18 step 3) — needs its own HOME, like claudemenu.mjs
 ```
 
@@ -147,6 +148,14 @@ performed.
   element and the `<a>` handler does not stop propagation, so that swap opens
   two menus on every file in an expanded folder. `file.menus === 1` now
   catches it.
+
+- In `nodtach.mjs`: making `onclose` say "session ended" regardless of the
+  close reason fails 3 in section A. Dropping the badge's `max-width` fails 1.
+  A `white-space: normal` beside it failed nothing when removed alone — the
+  badge already inherits it — so it was deleted rather than kept as
+  unexplained insurance. roost's own `PATH` is a symlink farm minus `dtach`,
+  not `ROOST_CMD`: the failure under test is the real default command, which
+  only a real lookup reaches.
 
 - In `paste.mjs`: `term.input` instead of `term.paste` fails B and D — and C,
   which the plan had predicted would stay green. That prediction was wrong in a
