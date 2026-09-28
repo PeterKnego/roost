@@ -936,8 +936,9 @@ pub fn changes_fragment(project: &str, st: &Status) -> String {
     );
     for c in &st.changes {
         out.push_str(&format!(
-            "<li><a class=\"file\" data-rel=\"{}\" data-ext=\"{}\" hx-get=\"/frag/{}/diff?path={}\" hx-target=\"#content\"><span class=\"xy\">{}</span>{}</a></li>",
+            "<li><a class=\"file\" data-rel=\"{}\" data-xy=\"{}\" data-ext=\"{}\" hx-get=\"/frag/{}/diff?path={}\" hx-target=\"#content\"><span class=\"xy\">{}</span>{}</a></li>",
             esc(&c.path),
+            esc(&c.xy),
             icon_ext(c.path.rsplit('/').next().unwrap_or(&c.path)),
             project_url,
             crate::http::percent_encode(&c.path),
@@ -3099,6 +3100,17 @@ mod tests {
         assert!(!s.contains("⎇"), "{s}");
         let clean = changes_fragment("proj", &Status { branch: "main".into(), changes: vec![], ..Default::default() });
         assert!(clean.contains("working tree clean"));
+    }
+
+    /// The client decides the menu's disabled state from this; a row without
+    /// it would offer Revert on an untracked file and let the server say no.
+    /// `"` in the fixture because `esc` is what stands between an XY code and
+    /// the attribute (XY never holds one, but the rule is "escape everything").
+    #[test]
+    fn change_rows_carry_their_xy() {
+        let st = Status { changes: vec![crate::gitio::Change { xy: "??".into(), path: "n.txt".into() }], ..Default::default() };
+        let h = changes_fragment("p", &st);
+        assert!(h.contains(r#"data-rel="n.txt""#) && h.contains(r#"data-xy="??""#), "{h}");
     }
 
     #[test]

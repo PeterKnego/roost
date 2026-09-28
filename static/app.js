@@ -847,6 +847,16 @@ function onEvent(ev) {
       // so that State's render() swaps the "not a git repo" offer for the
       // normal start hint on its own — nothing else needed here.
       break;
+    case "RevertPlan":
+      confirmRevert(ev);
+      break;
+    case "Reverted":
+      if (ev.ok) { showBanner(ev.msg); break; }
+      showError(ev.msg);
+      // The dialog was built on something that no longer holds; show the
+      // user what is true now instead of leaving them to right-click again.
+      if (ev.stale) send({ t: "RevertPreview", rel: ev.rel ?? null });
+      break;
     case "CloseRefused":
       // Backstop only: the Close button's own handler already checks
       // dirty buffers before ever sending CloseProject. This covers a
@@ -1561,6 +1571,15 @@ function mountTab(content, t) {
   // response landing after the pane has moved on (e.g. to a Terminal tab)
   // must not clobber whatever is here now — see the dataset.url check below.
   delete content.dataset.url;
+  // What wireFragment keys its context menu on: a tree gets the file menu,
+  // Changes and Diff the git menu (#125). On the element, not passed along,
+  // because htmx:afterSwap also calls wireFragment with only the element.
+  // Set here, before any early return below, because `.content` is reused
+  // across tabs — a Terminal, Edit-mode File or Proposal tab returns before
+  // reaching the generic fetch branch, and would otherwise keep a stale
+  // dataset.kind from whatever tab was mounted here last.
+  content.dataset.kind = t.k;
+  content.dataset.rel = t.k === "Diff" ? (t.rel || "") : "";
   if (t.k === "Terminal") {
     const liveNow = state.live_sessions.includes(t.session);
     // Only attach when a session already exists (state.live_sessions, or a
@@ -2069,7 +2088,7 @@ function refreshTree() {
 // project root, with create/rename/delete armed. The single container
 // handler wireFragment sets once, at the pane's outer `.content` mount,
 // already catches blank clicks anywhere inside via bubbling.
-function wireFileLinks(root) {
+function wireFileLinks(root, menu = fileMenu) {
   // Any anchor carrying data-rel, not just tree rows: markdown previews emit
   // <a class="mdlink" data-rel> for links to project files, and they want the
   // identical open-as-tab and context-menu behaviour. A no-op for existing
@@ -2114,7 +2133,7 @@ function wireFileLinks(root) {
       // Diff has no headings, so it never arms.
       if (a.dataset.hash && !isDiff) revealAnchor(rel, a.dataset.hash);
     };
-    a.oncontextmenu = (e) => { e.preventDefault(); fileMenu(e, a.dataset.rel); };
+    a.oncontextmenu = (e) => { e.preventDefault(); menu(e, a.dataset.rel, a.dataset.xy); };
   });
   // Folders (#110). A directory is `<details data-rel><summary>`, not an `<a>`,
   // so before this a right-click on one fell through to the container handler
@@ -2240,6 +2259,18 @@ function pickedInTreeOrder() {
 }
 
 function wireFragment(content) {
+  // Changes and Diff show changes, not places: New file, Rename and Delete
+  // mean nothing there, and Delete on a change row read as "drop this
+  // change" while deleting the file (#125).
+  if (content.dataset.kind === "Changes" || content.dataset.kind === "Diff") {
+    wireFileLinks(content, gitMenu);
+    content.oncontextmenu = (e) => {
+      if (e.target.closest("a[data-rel]")) return;
+      e.preventDefault();
+      gitMenu(e, content.dataset.rel || "", undefined);
+    };
+    return;
+  }
   wireFileLinks(content);
   // right-clicking blank space in a tree targets the project root
   content.oncontextmenu = (e) => {
@@ -2314,6 +2345,63 @@ async function fileMenu(e, rel, isDir = false) {
     const yes = await askConfirm({ title: "Delete", lines: [`Delete ${rel}?`],
       confirm: "Delete", danger: true });
     if (yes) send({ t: "DeleteFile", rel });
+  }
+}
+
+/// Why a change row cannot be reverted, or "" if it can. A hint for the menu
+/// only: the server decides again from its own status (revert.rs), so an
+/// unknown XY (a Diff tab has none) is offered and the server answers.
+function revertBlock(rel, xy) {
+  if (rel.startsWith("../")) return "outside this project";
+  if (!xy) return "";
+  if (xy === "??") return "untracked, no committed version";
+  if (xy[0] === "A") return "added, no committed version";
+  if (xy[0] === "R" || xy[0] === "C") return "renamed";
+  return "";
+}
+
+let revertRel = null;
+
+async function gitMenu(e, rel, xy) {
+  const all = !rel;
+  const why = all ? "" : revertBlock(rel, xy);
+  const choice = await askMenu({
+    items: [{ id: "revert", label: all ? "Revert all…" : "Revert…", disabled: !!why, hint: why }],
+    x: e.clientX, y: e.clientY,
+  });
+  if (choice !== "revert") return;
+  revertRel = all ? null : rel;
+  send({ t: "RevertPreview", rel: revertRel });
+}
+
+function skippedText(s) {
+  const parts = [];
+  if (s.untracked) parts.push(`${s.untracked} untracked`);
+  if (s.added) parts.push(`${s.added} added`);
+  if (s.renamed) parts.push(`${s.renamed} renamed`);
+  if (s.outside) parts.push(`${s.outside} outside this project`);
+  return parts.join(", ");
+}
+
+async function confirmRevert(ev) {
+  const skip = skippedText(ev.skipped);
+  if (!ev.paths.length) { showBanner(skip ? `Nothing to revert: ${skip}.` : "Nothing to revert."); return; }
+  const n = ev.paths.length;
+  const what = ev.rel || `${n} file${n === 1 ? "" : "s"}`;
+  const lines = ["They are saved to git stash first; `git stash apply` brings them back."];
+  if (ev.staged) lines.push("This includes staged changes.");
+  if (skip) {
+    const k = ev.skipped.untracked + ev.skipped.added + ev.skipped.renamed + ev.skipped.outside;
+    lines.push(`${k} file${k === 1 ? " is" : "s are"} not included: ${skip}.`);
+  }
+  for (const d of ev.dirty) lines.push(`${d} has unsaved edits in roost; they are discarded too.`);
+  // Cancel holds focus: Enter must never be the thing that discards work.
+  const choice = await askChoice({
+    title: `Discard changes to ${what}?`, lines, detailHtml: ev.detail_html, focus: "cancel",
+    choices: [{ id: "discard", label: `Discard changes to ${what}` }],
+  });
+  if (choice === "discard") {
+    send({ t: "Revert", rel: ev.rel ?? null, token: ev.token, discard_buffers: ev.dirty });
   }
 }
 

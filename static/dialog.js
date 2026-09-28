@@ -256,6 +256,15 @@ function askMenu({ items, x, y }) {
       b.type = "button";
       b.className = "dlg-item";
       b.textContent = it.label;
+      // A disabled item still says why: a menu that silently lacks the
+      // command does not answer "why can't I do this here".
+      if (it.disabled) b.disabled = true;
+      if (it.hint) {
+        const s = document.createElement("small");
+        s.className = "dlg-hint";
+        s.textContent = it.hint;
+        b.append(s);
+      }
       b.onclick = () => finish(it.id);
       list.appendChild(b);
     }
@@ -265,7 +274,8 @@ function askMenu({ items, x, y }) {
     el.onkeydown = (e) => {
       if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
       e.preventDefault();
-      const btns = [...list.querySelectorAll(".dlg-item")];
+      const btns = [...list.querySelectorAll(".dlg-item:not(:disabled)")];
+      if (!btns.length) return;
       const i = btns.indexOf(document.activeElement);
       const n = (e.key === "ArrowDown" ? i + 1 : i - 1 + btns.length) % btns.length;
       btns[n].focus();
@@ -286,7 +296,7 @@ function askMenu({ items, x, y }) {
       const r = el.getBoundingClientRect();
       if (r.right > innerWidth - 8) el.style.left = `${Math.max(8, innerWidth - r.width - 8)}px`;
       if (r.bottom > innerHeight - 8) el.style.top = `${Math.max(8, innerHeight - r.height - 8)}px`;
-      const first = list.querySelector(".dlg-item");
+      const first = list.querySelector(".dlg-item:not(:disabled)") || el;
       if (first) first.focus();
     };
   }, null);
