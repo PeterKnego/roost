@@ -141,7 +141,15 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
             // rather than demonstrated: removing the flush does not fail
             // `an_unreserved_terminal_connect_creates_nothing_and_closes_cleanly`,
             // so treat it as cheap insurance, not as a tested property.
-            let _ = ws_read.close(None);
+            //
+            // The reason travels in the frame because this stderr line reaches
+            // only the journal, and the person at the browser is often on
+            // another machine (#123). A close with a code is still a clean
+            // close, so `app.js` still does not reconnect into this refusal.
+            let _ = ws_read.close(Some(tungstenite::protocol::CloseFrame {
+                code: tungstenite::protocol::frame::coding::CloseCode::Error,
+                reason: close_reason(&e).into(),
+            }));
             let _ = ws_read.flush();
             return;
         }
@@ -282,4 +290,48 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     }
     session::detach(&att.key, att.id); // detach only; the session survives
     let _ = out.join();
+}
+
+/// An attach error cut to fit a websocket Close reason, which RFC 6455 caps at
+/// 123 bytes. Cut at a character boundary: tungstenite refuses a reason that
+/// is not valid UTF-8, and a refused frame is a close with no reason at all,
+/// which is the silence this exists to end.
+fn close_reason(err: &str) -> String {
+    const MAX: usize = 123;
+    if err.len() <= MAX {
+        return err.to_string();
+    }
+    let mut end = MAX - '…'.len_utf8();
+    while !err.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &err[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_reason_is_sent_whole() {
+        assert_eq!(close_reason("that session has ended"), "that session has ended");
+    }
+
+    /// The fixture puts the cut inside a character on purpose: an ASCII string
+    /// cannot tell a byte cut from a character cut, and neither can bare `é`s,
+    /// whose two-byte boundaries include the cut point (the first version of
+    /// this test used those and passed against a byte cut). The leading `x`
+    /// shifts every boundary by one.
+    ///
+    /// Revert-checked: cutting bytes and repairing with `from_utf8_lossy`
+    /// fails the last assertion with a U+FFFD where an `é` was split.
+    #[test]
+    fn a_long_reason_is_cut_to_fit_at_a_character_boundary() {
+        let long = format!("x{}", "é".repeat(100));
+        let r = close_reason(&long);
+        assert!(r.len() <= 123, "{} bytes", r.len());
+        assert!(r.ends_with('…'), "a cut reason must say it was cut: {r:?}");
+        let body = r.strip_prefix('x').unwrap().trim_end_matches('…');
+        assert!(body.chars().all(|c| c == 'é'), "cut mid-character: {r:?}");
+    }
 }
