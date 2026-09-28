@@ -779,6 +779,11 @@ impl Hub {
             Intent::RestoreWorkspace { .. } => {
                 unreachable!("RestoreWorkspace is diverted in wsconn before this lock is taken")
             }
+            // Diverted in wsconn for the same reason as the two above: git
+            // under this lock would stall every browser on the project.
+            Intent::RevertPreview { .. } | Intent::Revert { .. } => {
+                unreachable!("revert intents are diverted in wsconn before this lock is taken")
+            }
             _ => {}
         }
         // CloseTab removes the tab from `self.ws` inside `apply_layout`

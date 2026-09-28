@@ -379,6 +379,29 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
                     }
                     continue;
                 }
+                // Diverted like a restore, and for the same reason: a revert
+                // plan is several git calls with a 15 s deadline each, and
+                // this lock is what every other socket on the project waits
+                // on. Inline, one at a time per connection. Wrapped because a
+                // panic here would escape a socket thread (CLAUDE.md).
+                if let Ok(proto::Intent::RevertPreview { rel }) = decoded {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::revert::run_preview(&hub, &id, rel, &crate::worktree::real_git)
+                    }));
+                    if r.is_err() {
+                        Hub::lock(&hub).send_to(&id, &proto::Event::Error { msg: "revert preview failed".into() });
+                    }
+                    continue;
+                }
+                if let Ok(proto::Intent::Revert { rel, token, discard_buffers }) = decoded {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::revert::run_revert(&hub, &id, rel, token, discard_buffers, &crate::worktree::real_git)
+                    }));
+                    if r.is_err() {
+                        Hub::lock(&hub).send_to(&id, &proto::Event::Error { msg: "revert failed; check git stash list".into() });
+                    }
+                    continue;
+                }
                 let dirty = {
                     let mut h = Hub::lock(&hub);
                     match decoded {

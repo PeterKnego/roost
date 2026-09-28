@@ -217,6 +217,76 @@ pub fn execute(_dir: &Path, plan: &Plan, run: GitRunner) -> Result<String, Strin
     ))
 }
 
+use crate::hub::{ConnId, Hub};
+use crate::proto::Event;
+use std::sync::{Arc, Mutex};
+
+/// The paths among `paths` with an unsaved roost buffer. Buffer keys are
+/// project-relative, the same space as porcelain paths run in the project.
+fn dirty_among(hub: &Arc<Mutex<Hub>>, paths: &[PlanPath]) -> Vec<String> {
+    let h = Hub::lock(hub);
+    paths.iter().filter(|p| h.ws.buffers.get(&p.path).is_some_and(|b| b.dirty())).map(|p| p.path.clone()).collect()
+}
+
+fn project_dir(hub: &Arc<Mutex<Hub>>) -> std::path::PathBuf {
+    Hub::lock(hub).dir.clone()
+}
+
+pub fn run_preview(hub: &Arc<Mutex<Hub>>, id: &ConnId, rel: Option<String>, run: GitRunner) {
+    let dir = project_dir(hub); // lock released at the end of this statement
+    let ev = match build_plan(&dir, rel.as_deref(), run) {
+        Err(msg) => Event::Reverted { rel, ok: false, msg, stale: false },
+        Ok(plan) => {
+            let dirty = dirty_among(hub, &plan.paths);
+            let detail_html = if rel.is_some() {
+                crate::render::diff_html(&plan.diff)
+            } else {
+                crate::render::revert_list_html(&plan.paths)
+            };
+            Event::RevertPlan {
+                rel, paths: plan.paths, staged: plan.staged, skipped: plan.skipped,
+                dirty, detail_html, token: plan.token,
+            }
+        }
+    };
+    Hub::lock(hub).send_to(id, &ev);
+}
+
+pub fn run_revert(
+    hub: &Arc<Mutex<Hub>>, id: &ConnId, rel: Option<String>, token: String,
+    discard: Vec<String>, run: GitRunner,
+) {
+    let refuse = |msg: String, stale: bool| {
+        Hub::lock(hub).send_to(id, &Event::Reverted { rel: rel.clone(), ok: false, msg, stale });
+    };
+    let dir = project_dir(hub);
+    let plan = match build_plan(&dir, rel.as_deref(), run) {
+        Ok(p) => p,
+        Err(msg) => return refuse(msg, false),
+    };
+    if plan.token != token || plan.paths.is_empty() {
+        return refuse("These changes changed since you looked; review them again.".into(), true);
+    }
+    if let Some(p) = dirty_among(hub, &plan.paths).into_iter().find(|p| !discard.contains(p)) {
+        return refuse(format!("{p} gained unsaved edits; review again."), true);
+    }
+    match execute(&dir, &plan, run) {
+        Err(msg) => refuse(msg, false),
+        Ok(msg) => {
+            let mut h = Hub::lock(hub);
+            // Only buffers the dialog named, and only for paths reverted. One
+            // that went dirty after the check was never named, so it is left
+            // alone: its file changed under it, the existing conflict path.
+            for rel in discard.iter().filter(|r| plan.paths.iter().any(|p| &p.path == *r)) {
+                h.handle(id, crate::proto::Intent::CloseBuffer { rel: rel.clone() });
+            }
+            h.send_to(id, &Event::Reverted { rel: rel.clone(), ok: true, msg, stale: false });
+            let snap = h.snapshot_event(id);
+            h.broadcast(&snap);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,5 +693,182 @@ mod tests {
         let p = build_plan(&d.path().join("sub"), Some("in.txt"), &real).unwrap();
         assert_eq!(p.paths, vec![PlanPath { path: "in.txt".into(), xy: ".M".into() }]);
         assert_eq!(p.skipped.outside, 0, "unselected outside paths should not be counted");
+    }
+
+    use crate::hub::Hub;
+    use std::sync::{Arc, Mutex};
+
+    fn hub_on(d: &Path) -> Arc<Mutex<Hub>> {
+        Arc::new(Mutex::new(Hub::new("revertproj", d.to_path_buf())))
+    }
+    fn drain(rx: &std::sync::mpsc::Receiver<String>) -> Vec<String> {
+        let mut v = vec![];
+        while let Ok(m) = rx.try_recv() { v.push(m); }
+        v
+    }
+    fn token_of(msgs: &[String]) -> String {
+        let m = msgs.iter().find(|m| m.contains(r#""t":"RevertPlan""#)).expect("a RevertPlan");
+        let v: serde_json::Value = serde_json::from_str(m).unwrap();
+        v["token"].as_str().expect("the token is a JSON string").to_string()
+    }
+
+    /// Two subscribers, or `send_to` and `broadcast` look the same.
+    #[test]
+    fn plan_and_result_reach_only_the_requester() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let d = repo(&[("a.txt", "a\n")]);
+        std::fs::write(d.path().join("a.txt"), "a2\n").unwrap();
+        let hub = hub_on(d.path());
+        let (me, rx_me) = Hub::lock(&hub).subscribe();
+        let (_other, rx_other) = Hub::lock(&hub).subscribe();
+        drain(&rx_me); drain(&rx_other);
+
+        run_preview(&hub, &me, None, &real);
+        let token = token_of(&drain(&rx_me));
+        run_revert(&hub, &me, None, token, vec![], &real);
+        let mine = drain(&rx_me);
+        let theirs = drain(&rx_other);
+        std::env::remove_var("ROOST_STATE_DIR");
+
+        assert!(mine.iter().any(|m| m.contains(r#""t":"Reverted""#) && m.contains(r#""ok":true"#)), "{mine:?}");
+        assert!(!theirs.iter().any(|m| m.contains("RevertPlan") || m.contains(r#""t":"Reverted""#)), "{theirs:?}");
+    }
+
+    /// Review Focus 5.
+    #[test]
+    fn the_token_travels_as_a_string() {
+        let ev = crate::proto::Event::RevertPlan {
+            rel: None, paths: vec![], staged: false, skipped: Skipped::default(),
+            dirty: vec![], detail_html: String::new(), token: format!("{:016x}", u64::MAX),
+        };
+        let s = crate::proto::encode(&ev);
+        assert!(s.contains(r#""token":"ffffffffffffffff""#), "{s}");
+    }
+
+    #[test]
+    fn a_change_made_after_the_preview_is_not_reverted() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let d = repo(&[("a.txt", "a\n")]);
+        std::fs::write(d.path().join("a.txt"), "seen\n").unwrap();
+        let hub = hub_on(d.path());
+        let (me, rx) = Hub::lock(&hub).subscribe();
+        drain(&rx);
+        run_preview(&hub, &me, None, &real);
+        let token = token_of(&drain(&rx));
+        std::fs::write(d.path().join("a.txt"), "unseen\n").unwrap();
+        run_revert(&hub, &me, None, token, vec![], &real);
+        let msgs = drain(&rx);
+        std::env::remove_var("ROOST_STATE_DIR");
+        assert!(msgs.iter().any(|m| m.contains("changed since you looked") && m.contains(r#""stale":true"#)), "{msgs:?}");
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "unseen\n");
+    }
+
+    /// The tree went clean between preview and revert: refused as changed,
+    /// never reported as a success.
+    #[test]
+    fn a_tree_cleaned_after_the_preview_is_refused_not_reported_reverted() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let d = repo(&[("a.txt", "a\n")]);
+        std::fs::write(d.path().join("a.txt"), "a2\n").unwrap();
+        let hub = hub_on(d.path());
+        let (me, rx) = Hub::lock(&hub).subscribe();
+        drain(&rx);
+        run_preview(&hub, &me, None, &real);
+        let token = token_of(&drain(&rx));
+        std::fs::write(d.path().join("a.txt"), "a\n").unwrap();
+        run_revert(&hub, &me, None, token, vec![], &real);
+        let msgs = drain(&rx);
+        std::env::remove_var("ROOST_STATE_DIR");
+        assert!(msgs.iter().any(|m| m.contains(r#""t":"Reverted""#) && m.contains(r#""ok":false"#)), "{msgs:?}");
+    }
+
+    #[test]
+    fn an_unnamed_dirty_buffer_refuses_and_a_named_one_is_discarded() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let d = repo(&[("a.txt", "a\n")]);
+        std::fs::write(d.path().join("a.txt"), "a2\n").unwrap();
+        let hub = hub_on(d.path());
+        let (me, rx) = Hub::lock(&hub).subscribe();
+        {
+            let mut h = Hub::lock(&hub);
+            h.handle(&me, crate::proto::Intent::OpenTab {
+                pane: crate::proto::MIDDLE,
+                tab: crate::proto::Tab::File { rel: "a.txt".into(), mode: crate::proto::Mode::Edit },
+            });
+            h.handle(&me, crate::proto::Intent::EditBuffer { rel: "a.txt".into(), text: "typed\n".into() });
+        }
+        drain(&rx);
+        run_preview(&hub, &me, None, &real);
+        let plan = drain(&rx);
+        assert!(plan.iter().any(|m| m.contains(r#""dirty":["a.txt"]"#)), "{plan:?}");
+        let token = token_of(&plan);
+
+        run_revert(&hub, &me, None, token.clone(), vec![], &real);
+        let refused = drain(&rx);
+        assert!(refused.iter().any(|m| m.contains("unsaved edits")), "{refused:?}");
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "a2\n");
+        assert!(Hub::lock(&hub).ws.buffers["a.txt"].dirty(), "an unnamed buffer is not discarded");
+
+        run_revert(&hub, &me, None, token, vec!["a.txt".into()], &real);
+        let done = drain(&rx);
+        std::env::remove_var("ROOST_STATE_DIR");
+        assert!(done.iter().any(|m| m.contains(r#""ok":true"#)), "{done:?}");
+        assert!(!Hub::lock(&hub).ws.buffers["a.txt"].dirty(), "a named buffer is discarded to the file");
+        assert!(done.iter().any(|m| m.contains(r#""t":"BufferText""#) && m.contains("a\\n")), "{done:?}");
+    }
+
+    /// No hub lock while git runs. The runner parks inside `stash push` until
+    /// told to go; while it is parked the lock must be takeable. A lock-held
+    /// implementation scores 0 here. Timed rather than counted on failure,
+    /// because a deadlock hangs.
+    ///
+    /// Parks on `push` specifically, not on every arg list containing
+    /// `stash`: `execute` also runs a `stash list` pre-check before the push,
+    /// so parking on every stash-bearing call would need two releases from
+    /// one `go.send`, and deadlock instead of failing when the lock really is
+    /// held.
+    #[test]
+    fn the_hub_lock_is_free_while_git_runs() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let d = repo(&[("a.txt", "a\n")]);
+        std::fs::write(d.path().join("a.txt"), "a2\n").unwrap();
+        let hub = hub_on(d.path());
+        let (me, rx) = Hub::lock(&hub).subscribe();
+        drain(&rx);
+        run_preview(&hub, &me, None, &real);
+        let token = token_of(&drain(&rx));
+
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (h2, me2) = (hub.clone(), me.clone());
+        let worker = std::thread::spawn(move || {
+            let wait = Mutex::new(wait);
+            let slow = move |p: &Path, a: &[&str]| {
+                if a.contains(&"push") { let _ = wait.lock().unwrap().recv(); }
+                real(p, a)
+            };
+            run_revert(&h2, &me2, None, token, vec![], &slow);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200)); // let it reach the parked stash
+        let mut free = 0;
+        for _ in 0..50 {
+            if hub.try_lock().is_ok() { free += 1; }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        go.send(()).unwrap();
+        let started = std::time::Instant::now();
+        worker.join().unwrap();
+        std::env::remove_var("ROOST_STATE_DIR");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "the revert hung after release");
+        assert!(free > 40, "the hub lock was free only {free}/50 times while git was running");
     }
 }
