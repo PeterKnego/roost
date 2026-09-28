@@ -380,10 +380,12 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
                     continue;
                 }
                 // Diverted like a restore, and for the same reason: a revert
-                // plan is several git calls with a 15 s deadline each, and
-                // this lock is what every other socket on the project waits
-                // on. Inline, one at a time per connection. Wrapped because a
-                // panic here would escape a socket thread (CLAUDE.md).
+                // is several git calls, the push among them with no deadline
+                // at all (killing it partway is the half-state it must not
+                // leave), and this lock is what every other socket on the
+                // project waits on. Inline, one at a time per connection.
+                // Wrapped because a panic here would escape a socket thread
+                // (CLAUDE.md).
                 if let Ok(proto::Intent::RevertPreview { rel }) = decoded {
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         crate::revert::run_preview(&hub, &id, rel, &crate::worktree::real_git)
@@ -395,7 +397,10 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
                 }
                 if let Ok(proto::Intent::Revert { rel, token, discard_buffers }) = decoded {
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::revert::run_revert(&hub, &id, rel, token, discard_buffers, &crate::worktree::real_git)
+                        crate::revert::run_revert(
+                            &hub, &id, rel, token, discard_buffers,
+                            &crate::worktree::real_git, &crate::worktree::real_git_unbounded,
+                        )
                     }));
                     if r.is_err() {
                         Hub::lock(&hub).send_to(&id, &proto::Event::Error { msg: "revert failed; check git stash list".into() });

@@ -26,9 +26,9 @@ await git(fx.dir, "config", "user.name", "t");
 await Deno.writeFile(`${fx.dir}/a.txt`, enc.encode("base\n"));
 await Deno.writeFile(`${fx.dir}/b.txt`, enc.encode("base\n"));
 // A third committed file, reverted only in section C, so that section's
-// "changed nothing" claim cannot be masked by D also using a.txt (fix
-// round 1, Important 2): if C ever really discarded a.txt, D's own assertions
-// would keep passing off C's leftovers with nothing to tell the two apart.
+// "changed nothing" claim cannot be masked by D also using a.txt: if C ever
+// really discarded a.txt, D's own assertions would keep passing off C's
+// leftovers with nothing to tell the two apart.
 await Deno.writeFile(`${fx.dir}/c.txt`, enc.encode("base\n"));
 await git(fx.dir, "add", "-A");
 await git(fx.dir, "commit", "-qm", "base");
@@ -110,8 +110,7 @@ try {
   console.log("\nC. cancel, and Enter, change nothing");
   // Its own file, c.txt, never touched by any other section — so a break
   // that made this section *actually* discard the file cannot be masked by
-  // D re-reverting the same path and reporting success anyway (fix round 1,
-  // Important 2).
+  // D re-reverting the same path and reporting success anyway.
   ok(await openConfirm("c.txt"), "Revert… opens a confirmation");
   ok(await evalIn(`document.activeElement === document.querySelector("#dlg-choice .dlg-cancel")`), "focus is on Cancel");
   ok(await evalIn(`document.querySelector("#dlg-choice .dlg-detail").textContent.includes("changed")`), "it shows the diff");
@@ -120,8 +119,8 @@ try {
   // applies its native "Enter activates the focused button" behaviour to a
   // TRUSTED event — a synthetic one is silently ignored. The untrusted form
   // proved nothing about Enter; the `.click()` that used to follow it was
-  // the only thing actually exercised (fix round 1, Important 1). Escape
-  // uses the same trusted mechanism in `closeMenu` above.
+  // the only thing actually exercised. Escape uses the same trusted
+  // mechanism in `closeMenu` above.
   await cmd("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" });
   await cmd("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
   ok(await until(() => evalIn(`!document.querySelector("#dlg-choice[open]")`), 5, "dialog closed"),
@@ -131,7 +130,7 @@ try {
   // dialog, and `Revert` is then a websocket round trip the server answers
   // asynchronously. Reading the file immediately after "closed" races that
   // round trip and can read "changed\n" out of sheer luck before the write
-  // lands — seen live during this fix's own revert-check, where this
+  // lands — seen live during a revert-check, where this
   // assertion passed under the break while the very next section proved the
   // file really had been discarded. Settling past the round trip first is
   // what makes the read mean something.
@@ -151,7 +150,7 @@ try {
   console.log("\nD. confirm reverts on disk and names the stash");
   // Counted rather than string-matched, and independent of C: C now reverts
   // nothing (it uses c.txt, never a.txt), so this count is not D reading a
-  // stash C already made (fix round 1, Important 2) — it is proof that THIS
+  // stash C already made — it is proof that THIS
   // confirmation is what created exactly one new entry.
   const stashLines = async () => (await git(fx.dir, "stash", "list")).split("\n").filter((l) => l.length > 0);
   const stashBefore = (await stashLines()).length;

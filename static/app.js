@@ -2360,8 +2360,6 @@ function revertBlock(rel, xy) {
   return "";
 }
 
-let revertRel = null;
-
 async function gitMenu(e, rel, xy) {
   const all = !rel;
   const why = all ? "" : revertBlock(rel, xy);
@@ -2370,8 +2368,7 @@ async function gitMenu(e, rel, xy) {
     x: e.clientX, y: e.clientY,
   });
   if (choice !== "revert") return;
-  revertRel = all ? null : rel;
-  send({ t: "RevertPreview", rel: revertRel });
+  send({ t: "RevertPreview", rel: all ? null : rel });
 }
 
 function skippedText(s) {

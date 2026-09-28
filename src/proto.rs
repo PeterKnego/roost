@@ -227,22 +227,6 @@ pub enum Intent {
     /// `accept: false` with a `text` is still a rejection — the text is only
     /// ever read on the accepting path.
     AnswerProposal { id: String, accept: bool, text: Option<String> },
-    /// Restore this project from an archive the browser has already uploaded
-    /// through `POST /upload` (#18 step 3).
-    ///
-    /// Deliberately **not** a third POST endpoint. CLAUDE.md caps the HTTP
-    /// surface at two and then says what the alternative is: "Every other
-    /// state change is a websocket intent." A restore is a state change; what
-    /// it needs is a *body delivered*, and roost already has exactly one
-    /// audited way to deliver one. Coming in here rather than over HTTP also
-    /// puts it behind the handshake's `Origin` check, which is a stronger gate
-    /// than a POST's — a `multipart/form-data` POST is a CORS simple request
-    /// any page can submit cross-origin with no preflight, while a handshake
-    /// from that page is refused before the first frame.
-    ///
-    /// `file` is project-relative and confined by `projects::safe_resolve`,
-    /// like every other `rel` on this enum. Nothing *inside* the archive names
-    /// a path at all — see `backup`'s module doc.
     /// What a revert would do (#125). Answered to the requester only, with a
     /// token over exactly what the dialog will show. `None` is "all".
     /// Diverted in wsconn: a plan is several git calls.
@@ -261,6 +245,22 @@ pub enum Intent {
         #[serde(default)]
         discard_buffers: Vec<String>,
     },
+    /// Restore this project from an archive the browser has already uploaded
+    /// through `POST /upload` (#18 step 3).
+    ///
+    /// Deliberately **not** a third POST endpoint. CLAUDE.md caps the HTTP
+    /// surface at two and then says what the alternative is: "Every other
+    /// state change is a websocket intent." A restore is a state change; what
+    /// it needs is a *body delivered*, and roost already has exactly one
+    /// audited way to deliver one. Coming in here rather than over HTTP also
+    /// puts it behind the handshake's `Origin` check, which is a stronger gate
+    /// than a POST's — a `multipart/form-data` POST is a CORS simple request
+    /// any page can submit cross-origin with no preflight, while a handshake
+    /// from that page is refused before the first frame.
+    ///
+    /// `file` is project-relative and confined by `projects::safe_resolve`,
+    /// like every other `rel` on this enum. Nothing *inside* the archive names
+    /// a path at all — see `backup`'s module doc.
     RestoreWorkspace {
         file: String,
         /// Describe the restore without performing it. The dialog always

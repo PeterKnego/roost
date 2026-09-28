@@ -24,6 +24,21 @@ pub struct Status {
 }
 
 pub(crate) fn run_git(repo: &Path, args: &[&str], allow_exit_1: bool) -> Result<String, String> {
+    run_git_within(repo, args, allow_exit_1, Some(std::time::Duration::from_secs(15)))
+}
+
+/// `run_git` with no kill deadline, for a git command that mutates the work
+/// tree in steps. Killing `stash push` between saving the entry and resetting
+/// the last path leaves exactly the half-state a deadline exists to avoid, so
+/// such a command is waited out: a slow git is recoverable, a git SIGKILLed
+/// mid-write is not.
+pub(crate) fn run_git_unbounded(repo: &Path, args: &[&str]) -> Result<String, String> {
+    run_git_within(repo, args, false, None)
+}
+
+fn run_git_within(
+    repo: &Path, args: &[&str], allow_exit_1: bool, limit: Option<std::time::Duration>,
+) -> Result<String, String> {
     use std::io::Read;
     use std::process::Stdio;
     let mut child = Command::new("git")
@@ -59,14 +74,15 @@ pub(crate) fn run_git(repo: &Path, args: &[&str], allow_exit_1: bool) -> Result<
         }
         buf
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = limit.map(|l| (std::time::Instant::now() + l, l));
     let status = loop {
         match child.try_wait().map_err(|e| e.to_string())? {
             Some(st) => break st,
-            None if std::time::Instant::now() > deadline => {
+            None if deadline.is_some_and(|(at, _)| std::time::Instant::now() > at) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("git {} timed out after 15s", args.first().unwrap_or(&"")));
+                let secs = deadline.map_or(0, |(_, l)| l.as_secs());
+                return Err(format!("git {} timed out after {secs}s", args.first().unwrap_or(&"")));
             }
             None => std::thread::sleep(std::time::Duration::from_millis(25)),
         }
@@ -188,7 +204,10 @@ pub fn status(repo: &Path) -> Result<Status, String> {
     if !is_inside_work_tree(repo) {
         return Err("not a git repository".into());
     }
-    run_git(repo, &["status", "--porcelain=v2", "-b"], false).map(|s| parse_status(&s))
+    // Raw non-ASCII names: these paths travel back as a revert's `rel`,
+    // which is matched against `-z` output. Git still quotes `"`, `\` and
+    // control characters.
+    run_git(repo, &["-c", "core.quotePath=false", "status", "--porcelain=v2", "-b"], false).map(|s| parse_status(&s))
 }
 
 /// Whether `dir` sits inside *any* git work tree — its own, or an ancestor's.
@@ -341,6 +360,24 @@ mod tests {
         assert!(diff(d.path(), Some("../../etc/passwd")).is_err());
     }
 
+    /// The Changes list's paths are sent back as `rel` to the revert, which
+    /// matches them against `-z` output where names are raw. A quoted
+    /// `"caf\303\251.txt"` never matches, and the revert says there is
+    /// nothing to do. `core.quotePath` is set here explicitly, so a host
+    /// whose global config already turns it off cannot make this pass.
+    ///
+    /// Revert-checked: dropping `-c core.quotePath=false` from `status` fails
+    /// this with `left: ["\"caf\\303\\251.txt\""]`.
+    #[test]
+    fn status_names_a_non_ascii_path_raw() {
+        let d = repo_fixture();
+        run_git(d.path(), &["config", "core.quotePath", "true"], false).unwrap();
+        fs::write(d.path().join("café.txt"), "c\n").unwrap();
+        let st = status(d.path()).unwrap();
+        let paths: Vec<&str> = st.changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["café.txt"]);
+    }
+
     #[test]
     fn status_errors_outside_a_repo() {
         let d = tempfile::tempdir().unwrap();
@@ -426,7 +463,7 @@ mod tests {
         );
     }
 
-    /// Review Focus 3. `-z` output carries a filename's raw bytes, and the
+    /// `-z` output carries a filename's raw bytes, and the
     /// stdout thread used to drop `read_to_string`'s error, leaving an empty
     /// String: a run that succeeded with no output, which a status reader
     /// takes for a clean tree. "Could not read" must not become "nothing".
