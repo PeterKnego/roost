@@ -1,0 +1,219 @@
+# Reverting a change from the Changes pane and the Diff tab
+
+*2026-09-28. Status: designed, not implemented. Issue
+[#125](https://github.com/PeterKnego/roost/issues/125). The issue listed four
+open questions; the answers below were settled in review, and three facts that
+change the design were found by probing a scratch repository, not assumed.*
+
+## What is wrong today
+
+Right-clicking in the Changes pane or a Diff tab opens the **file tree's**
+menu. `mountTab` calls `wireFragment` on every fetched fragment, Diff
+included, so blank space offers *New file… / New folder…* at the project
+root. Each change row is an `a.file[data-rel]`, so `wireFileLinks` gives it
+the full file menu, **Delete** included. In a list of changes, "Delete" reads
+as "drop this change" and deletes the file.
+
+And there is no way to throw a change away without a terminal.
+
+## Decisions
+
+1. **The file menu stays on the tree.** `fileMenu` is bound to tree rows,
+   markdown `mdlink`s and blank tree space only. The Changes pane and Diff
+   tabs get `gitMenu` instead, split by the same `closest("ul.tree")` test the
+   click handler already uses.
+2. **`gitMenu` has one command: Revert.** *Revert…* on a change row or inside
+   a single-file Diff tab; *Revert all…* on the "full diff" row, the full Diff
+   tab and blank space in Changes.
+3. **A revert never deletes a file.** It touches only paths with a version in
+   `HEAD` to return to. Untracked (`??`), added (`A`) and a rename's new path
+   are excluded; a deleted file (`D`) is included, since restoring it creates
+   and loses nothing.
+4. **Only paths inside the project.** In a nested project, git lists files
+   outside it as `../x`. Those are excluded, and every path is confined with
+   `projects::safe_resolve` as everywhere else.
+5. **Every revert is saved to `git stash` first**, in the same git command
+   that reverts (see *Mechanism*), and the result names the stash entry.
+6. **Always confirmed**, with the dialog showing exactly what is lost and
+   focus on Cancel.
+
+## Three facts found by probing (git 2.53)
+
+- **Porcelain paths are relative to git's cwd, not the repository root.**
+  `git -C sub status --porcelain=v2` lists a root file as `../ab`. This is
+  why decision 4 is needed at all: without it a nested project's Changes list
+  offers reverts outside the project.
+- **A pathspec after `--` is a pattern.** Reverting a file literally named
+  `a*` also matches `ab`. `git --literal-pathspecs` fixes it; with it, the
+  probe reverted `a*` and left `ab` changed.
+- **`git stash push -- <paths>` reverts exactly those paths** (index and
+  worktree, back to `HEAD`) and records them as one stash entry. It also
+  records the rest of the *index* in that entry, so `git stash apply --index`
+  can conflict. Plain `git stash apply` restored the reverted content exactly
+  in the probe; it does not restore the staged/unstaged split. That is
+  the stated recovery, and its limit is written down here rather than
+  discovered by a user.
+
+## UI
+
+### The menu
+
+| Right-click on | Item |
+|---|---|
+| An eligible change row, or inside a single-file Diff tab | **Revert…** |
+| "full diff", the full Diff tab, blank space in Changes | **Revert all…** |
+| An ineligible row | **Revert…** disabled, with the reason on a second line: *untracked, no committed version* / *added, no committed version* / *renamed* / *outside this project* |
+
+Disabled rather than absent: a menu silently lacking the item does not answer
+"why can't I revert this", which is CLAUDE.md's rule that a check which
+skipped something says so. `askMenu` items gain `disabled` and `hint`; a
+disabled item is not clickable and arrow keys skip it.
+
+`render::changes_fragment` adds `data-xy` to each row so the client can decide
+the display. That decision is a hint only; the server decides again.
+
+### The confirmation
+
+`askChoice` with `focus: "cancel"`, so Enter destroys nothing.
+
+- **Title:** *Discard changes to `src/a.rs`?* or *Discard changes to 3 files?*
+- **Lines:** *They are saved to git stash first; `git stash apply` brings them
+  back.* Then, when they apply: *This includes staged changes.* /
+  *2 files are not included: 1 untracked, 1 outside this project.* /
+  *`a.rs` has unsaved edits in roost; they are discarded too.*
+- **Detail:** one file: its diff; all: the path and XY list. Both are
+  server-rendered and escaped, the only thing `detailHtml` accepts.
+- **One button:** *Discard changes to 3 files*, beside Cancel.
+
+After a revert a banner says the outcome (see *Results*).
+
+## Protocol
+
+Two intents, both websocket (the HTTP surface stays GET plus the two upload
+POSTs).
+
+**`RevertPreview { rel: Option<String> }`**, `None` for all. The server
+answers the requester only (`send_to`):
+
+```
+Event::RevertPlan {
+  rel,
+  paths: [{ path, xy }],
+  staged: bool,                       // any path has an index-side change
+  skipped: { untracked, added, renamed, outside },
+  dirty: [path],                      // paths with an unsaved roost buffer
+  detail_html,
+  token,                              // hash of sorted (path, xy) + their diff text
+}
+```
+
+An empty `paths` shows the banner *Nothing to revert: …* with the skipped
+counts, and no dialog.
+
+**`Revert { rel, token, discard_buffers: Vec<String> }`**, sent only by the
+dialog's button. The server rebuilds the plan and proceeds only if the token
+matches, every path in `plan.dirty` is in `discard_buffers`, and `paths` is
+not empty.
+
+The token is the hash `base_hash` already uses (the plan confirms which).
+It is what makes "revert only what the user saw" enforceable: Claude editing
+the file between the look and the click changes the diff, and so the token.
+
+## Building a plan
+
+One function, used by both intents. Every failure is its own refusal.
+
+1. `git status --porcelain=v2 -z` in the project directory, parsed by a `-z`
+   variant of `parse_status` (the display parser splits lines and would
+   misread a quoted or newline-bearing name). A spawn failure, a non-zero exit
+   or a timeout: refuse. Exit 0 with no output is a clean tree, a real answer;
+   in a `Revert` it yields an empty plan, whose token cannot match the one the
+   dialog was built from, so it is refused there without a special case.
+   Any unmerged (`u`) entry: refuse.
+2. A merge, rebase, cherry-pick or revert in progress: refuse. Checked from
+   the git dir with `symlink_metadata`: `NotFound` is absent, any other error
+   is *cannot tell*, which also refuses.
+3. Per path: `safe_resolve` against the project (a failure goes to
+   `outside`); `??`, `A`, and a rename's new path to their buckets.
+4. `git diff HEAD -- <paths>` under `--literal-pathspecs`, for the token and
+   (one file) the detail.
+
+## Mechanism
+
+Both intents are routed by `wsconn` away from the hub lock, like `Search` and
+`CloseProject`: a plan is several git calls with a deadline of up to 15 s
+each, and CLAUDE.md forbids blocking I/O under a lock every socket on the
+project needs.
+
+1. Under the hub lock, briefly: read which buffers are dirty (memory only).
+2. Unlocked: build the plan, check it, then
+   `git --literal-pathspecs stash push -m "roost revert: N files" -- <paths>`.
+3. Re-lock: reset each buffer named in `discard_buffers` to its file on disk,
+   send `Event::Reverted { ok, msg, stash }` to the requester, broadcast a
+   snapshot. The watcher refreshes Changes.
+
+A buffer that turns dirty between steps 1 and 3 was never named, so it is not
+touched; its file changed on disk under it, which is the existing conflict
+path for every outside write. Nothing is discarded without having been shown.
+
+The revert is one git command. If `stash push` fails, git reverted nothing;
+if it succeeds, the stash entry exists. There is no half-state to reason about,
+which is why this was chosen over `stash create` + `store` + `restore`
+(three steps, and a snapshot of the *whole* worktree, so applying it would
+bring back changes the user never reverted) and over roost copying file
+contents into its own state directory (no git-native recovery).
+
+## Results
+
+| Situation | Message | Git touched |
+|---|---|---|
+| Status failed to run, exited non-zero, or timed out | *Could not read git status: <reason>. Nothing was reverted.* | no |
+| Merge/rebase/cherry-pick/revert in progress, or an unmerged entry | *A merge is in progress; finish or abort it first. Nothing was reverted.* | no |
+| Could not tell whether one is in progress | *Could not check for a merge in progress: <reason>. Nothing was reverted.* | no |
+| Token mismatch | *These changes changed since you looked; review them again.* (client reopens the preview) | no |
+| A dirty buffer not named | *`a.rs` gained unsaved edits; review again.* | no |
+| Nothing eligible | *Nothing to revert: 2 untracked, 1 outside this project.* | no |
+| `stash push` failed | *git refused: <first stderr line>. Nothing was reverted.* | no |
+| Success | *Reverted 3 files; saved as stash@{0} ("roost revert: 3 files"). `git stash apply` brings them back.* | yes |
+
+Refusals reach only the requester; stderr is also logged.
+
+## Testing
+
+Each test must fail with the code it covers reverted. The plan names the
+revert check for each.
+
+**Rust**, in `gitio` and `hub`, against real scratch repositories:
+
+- Plan: `??`, `A`, a rename's new path each land in their own bucket; `../x`
+  in a real nested project lands in `outside`; `a*` beside `ab` reverts only
+  `a*`; a name with a space and a non-ASCII character survives the `-z`
+  parser.
+- Refusals, each asserting the message **and** the file unchanged on disk:
+  status failure (not "nothing to revert"); a tree cleaned between preview
+  and revert (refused as changed, not reported as success); a real `MERGE_HEAD`; a stale token
+  (file edited between preview and revert); an unnamed dirty buffer.
+- Success: the file matches `HEAD` in index and worktree; `git stash list`
+  has exactly one `roost revert: 1 file`; `git stash apply` brings the content
+  back; an **unselected** changed file is byte-identical. That last one is what
+  tells "reverted this" from "reverted everything".
+- Privacy: `RevertPlan` and `Reverted` reach only the requester, with **two**
+  subscribers (one cannot tell `send_to` from `broadcast`).
+- Lock: while a revert is held inside a slow git (a runner blocked on a
+  channel), another connection's `RequestState` is answered. Timed, since a
+  deadlock hangs rather than fails.
+
+**Browser**, new `tests/browser/revert.mjs`, real dtach and a real repository:
+
+- A change row's menu has *Revert…* and no *Delete*; a tree row's file menu
+  is unchanged.
+- An untracked row shows *Revert…* disabled with its reason.
+- Cancel leaves the file on disk untouched; confirm reverts it on disk, the
+  banner names the stash, the row leaves Changes.
+- Enter in the dialog does not discard.
+- Right-click inside a Diff tab gives the git menu, not *New file…*.
+
+## Out of scope
+
+Hunk- or line-level revert. Stage, unstage, commit. Reverting untracked or
+added files (decision 3). Paths outside the project (decision 4).
