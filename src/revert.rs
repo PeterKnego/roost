@@ -333,6 +333,70 @@ mod tests {
         assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "worktree\n", "the stash brings it back");
     }
 
+    /// Important (controller addition): stash entry detection via before/after hash comparison.
+    /// Runner executes the real stash push, then returns an error to simulate failure AFTER saving.
+    /// The message must report that an entry was created and be discoverable via stash drop.
+    ///
+    /// Revert-checked: making the after-check report equal hashes (after_stash == before_stash)
+    /// fails this test. Output: panicked at assertion expecting "was created" in message, but got:
+    /// "git refused: fatal: simulated error after stash. Nothing was reverted."
+    #[test]
+    fn a_push_that_saved_then_failed_names_the_stash_entry() {
+        let d = repo(&[("a.txt", "a\n")]);
+        std::fs::write(d.path().join("a.txt"), "a2\n").unwrap();
+        let p = build_plan(d.path(), None, &real).unwrap();
+        let stash_then_fail = |dir: &Path, a: &[&str]| {
+            if a.contains(&"push") {
+                // Run the real stash push first (which succeeds and saves)
+                let _ = real(dir, a);
+                // Then return an error to simulate a failure after save
+                Err("fatal: simulated error after stash".to_string())
+            } else {
+                real(dir, a)
+            }
+        };
+        let msg = execute(d.path(), &p, &stash_then_fail).unwrap_err();
+        assert!(msg.contains("was created"), "message must report stash entry created: {msg}");
+        let list = git(d.path(), &["stash", "list"]);
+        assert_eq!(list.lines().count(), 1, "exactly one stash entry should exist: {list}");
+    }
+
+    /// Important (controller addition): stash entry detection must not blame an older stash.
+    /// The repo has a pre-existing stash with subject "roost revert: 1 file".
+    /// When stash push fails WITHOUT actually running (no new entry), the error message
+    /// must NOT mention "created" and must NOT list an entry count.
+    ///
+    /// Revert-checked: using label matching (after.trim().ends_with(&label)) instead of hash
+    /// comparison fails this test. Output: panicked at "error must end cleanly" assertion, got:
+    /// "git refused: fatal: simulated error before stash. Nothing was reverted, but a stash entry
+    /// \"roost revert: 1 file\" was created; `git stash drop` removes it."
+    #[test]
+    fn a_push_that_failed_without_saving_does_not_blame_an_older_stash() {
+        let d = repo(&[("a.txt", "a\n")]);
+        // Create a pre-existing stash with the same label format
+        std::fs::write(d.path().join("a.txt"), "old\n").unwrap();
+        git(d.path(), &["stash", "push", "-q", "-m", "roost revert: 1 file"]);
+        // Make a new change for the plan
+        std::fs::write(d.path().join("a.txt"), "new\n").unwrap();
+        let p = build_plan(d.path(), None, &real).unwrap();
+        let fail_without_running = |dir: &Path, a: &[&str]| {
+            if a.contains(&"push") {
+                // Return error WITHOUT running stash push (no new entry created)
+                Err("fatal: simulated error before stash".to_string())
+            } else {
+                real(dir, a)
+            }
+        };
+        let msg = execute(d.path(), &p, &fail_without_running).unwrap_err();
+        // Must end with "Nothing was reverted." (no extra message about a stash)
+        assert!(msg.ends_with("Nothing was reverted."), "error must end cleanly: {msg}");
+        // Must NOT mention "created" (don't blame the old stash)
+        assert!(!msg.contains("created"), "message must not mention stash creation: {msg}");
+        // The stash list should still have exactly 1 entry (the old one, not a new one)
+        let list = git(d.path(), &["stash", "list"]);
+        assert_eq!(list.lines().count(), 1, "only the pre-existing stash should exist: {list}");
+    }
+
     /// Revert-checked: `.unwrap_or_default()` on the status error (returning empty string
     /// instead of propagating the error) fails this test (plan would build with empty status).
     #[test]
