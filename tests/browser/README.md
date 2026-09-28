@@ -60,6 +60,7 @@ deno run -A tests/browser/watchdog.mjs   # the workspace connection's visible st
 deno run -A tests/browser/download.mjs   # right-click → Download: a real navigation, a real file on disk, and the label that says which version (#120)
 deno run -A tests/browser/touchfiles.mjs # the file menu on a folder, Upload files… without a drag, and terminal select mode (#110)
 deno run -A tests/browser/paste.mjs      # the terminal key bar's paste button (#97): bracketed vs bare at the pty, and the textarea fallback when the clipboard says no
+deno run -A tests/browser/revert.mjs     # revert from the Changes pane and a Diff tab: the git menu, the disabled hints, cancel vs confirm, and the stash on disk (#125)
 deno run -A tests/browser/backup.mjs     # backing a workspace up and restoring it into a *different* project (#18 step 3) — needs its own HOME, like claudemenu.mjs
 ```
 
@@ -541,6 +542,46 @@ performed.
   the accessibility tree does not carry it (both checked, not assumed), and in
   the editor `elementFromPoint` hits the textarea stacked over the gutter. CDP's
   `DOM.getBoxModel` against the pseudo-element node is the only way in.
+
+- In `revert.mjs`: dropping the Changes/Diff branch in `wireFragment` (so
+  every pane wires up the tree's own `fileMenu`) fails 11 — both A assertions
+  (the file menu's New file/Rename/Delete appear where Revert… should), B, all
+  3 in C (the confirmation never opens), all 4 in D (nothing was ever reverted,
+  cascading from C), and E (the Diff tab offers the tree menu too). Only F,
+  the tree's own control, is untouched — `FAIL (11)`. Setting
+  `confirmRevert`'s `askChoice` call to `focus: "first"` instead of `"cancel"`
+  fails 2 in C directly — focus lands on Discard, and Enter on the "change
+  nothing" path reverts the file for real — plus 1 more in D (the banner
+  assertion, cascading: a.txt was already reverted during C, so D's own
+  right-click finds no row and its menu times out) — `FAIL (3)`. The label
+  and detail assertions in C keep passing throughout, which is what says C is
+  testing *which* control has focus and not whether a dialog opened at all.
+  Making `revertBlock` always return `""` fails B alone (`FAIL (1)`): the
+  untracked row's Revert… item is offered and enabled with no hint, and every
+  other section is unaffected because the server still refuses the revert
+  itself — this is the client-side hint the function exists for, not the
+  enforcement. Dropping the `send({t:"Revert"…` call from `confirmRevert`'s
+  discard branch fails all 4 disk/stash/banner/row assertions in D and nothing
+  outside it (`FAIL (4)`) — the confirmation still opens and closes, it just
+  never asks the server to do anything.
+
+  Two things about the test itself, found while running these checks rather
+  than assumed: `closeMenu()` cannot be `el.close()`. `dialog.js`'s `runDialog`
+  only clears its one-dialog-at-a-time gate from inside `finish`, which a
+  `cancel` event, a backdrop click or an item click reaches — a bare
+  `.close()` bypasses all three and leaves the next `askMenu`/`askChoice`
+  call silently resolving dismissed with no dialog shown at all. Confirmed
+  live: with `.close()` here, section B's own contextmenu produced `items:
+  []`. The fix is a real CDP Escape keypress, the same mechanism
+  `dialogs.mjs` already uses to dismiss a menu. And `rightClick`/`openConfirm`
+  had to be made to fail an assertion rather than throw when the element they
+  target is missing — under the `focus: "first"` break above, C's own
+  "cancel" actually discards the file for real, so D's right-click on the now
+  vanished `a.txt` row hit a null `getBoundingClientRect()` and crashed the
+  run before E or F could report anything. Guarding those two call sites
+  (`?.click()`, and an `if (!el) return false` before the click) turns a
+  cascading break into the same kind of legible, section-scoped FAIL every
+  other file here produces, without changing what any assertion checks.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
