@@ -544,44 +544,80 @@ performed.
   `DOM.getBoxModel` against the pseudo-element node is the only way in.
 
 - In `revert.mjs`: dropping the Changes/Diff branch in `wireFragment` (so
-  every pane wires up the tree's own `fileMenu`) fails 11 — both A assertions
-  (the file menu's New file/Rename/Delete appear where Revert… should), B, all
-  3 in C (the confirmation never opens), all 4 in D (nothing was ever reverted,
-  cascading from C), and E (the Diff tab offers the tree menu too). Only F,
-  the tree's own control, is untouched — `FAIL (11)`. Setting
-  `confirmRevert`'s `askChoice` call to `focus: "first"` instead of `"cancel"`
-  fails 2 in C directly — focus lands on Discard, and Enter on the "change
-  nothing" path reverts the file for real — plus 1 more in D (the banner
-  assertion, cascading: a.txt was already reverted during C, so D's own
-  right-click finds no row and its menu times out) — `FAIL (3)`. The label
-  and detail assertions in C keep passing throughout, which is what says C is
-  testing *which* control has focus and not whether a dialog opened at all.
-  Making `revertBlock` always return `""` fails B alone (`FAIL (1)`): the
-  untracked row's Revert… item is offered and enabled with no hint, and every
-  other section is unaffected because the server still refuses the revert
-  itself — this is the client-side hint the function exists for, not the
-  enforcement. Dropping the `send({t:"Revert"…` call from `confirmRevert`'s
-  discard branch fails all 4 disk/stash/banner/row assertions in D and nothing
-  outside it (`FAIL (4)`) — the confirmation still opens and closes, it just
-  never asks the server to do anything.
+  every pane wires up the tree's own `fileMenu`) fails 13 — both A assertions
+  (the file menu's New file/Rename/Delete appear where Revert… should), B, 4
+  of C's 8 (both `openConfirm` calls report no confirmation ever opened, and
+  the focus/diff checks that depend on one having opened; the four that read
+  the *outcome* of a keypress stay green because with no confirmation open
+  there is nothing for Enter or Cancel to do, so the file genuinely stays
+  untouched — a true report about a menu that never worked, not a gap in the
+  check), 5 of D's 6 (nothing was ever reverted, cascading from C — a.txt on
+  disk, the stash-count delta, the new entry's text, the banner, the row;
+  only "b.txt is untouched" stays green, since nothing ever touched it
+  either way), and E (the Diff tab offers the tree menu too). Only F, the
+  tree's own control, is untouched — `FAIL (13)`. Setting
+  `confirmRevert`'s `askChoice` call to `focus: "first"` instead of
+  `"cancel"` fails 4 in C alone (`FAIL (4)`) and, since fix round 1 gave C
+  its own file and D an independent before/after stash count (see below), D
+  passes cleanly on its own merit rather than off C's leftovers: focus lands
+  on Discard, so "focus is on Cancel" fails directly; the trusted Enter then
+  really discards c.txt, so the settled read fails "Enter … left the file
+  untouched"; the second `openConfirm` times out because c.txt's row is
+  already gone from Changes, failing "opens a confirmation again"; and the
+  settled read after clicking Cancel fails too, because there is nothing
+  left to cancel. The dialog-closed and diff-shown assertions keep passing
+  throughout — Discard closes the dialog exactly like Cancel does, and the
+  diff is still rendered before Enter is pressed — which is what says C is
+  testing which button Enter actually hit and what happened on disk, not
+  merely whether a dialog appeared and disappeared. Making `revertBlock`
+  always return `""` still fails B alone (`FAIL (1)`): the untracked row's
+  Revert… item is offered and enabled with no hint, and every other section
+  is unaffected because the server still refuses the revert itself — this is
+  the client-side hint the function exists for, not the enforcement.
+  Dropping the `send({t:"Revert"…` call from `confirmRevert`'s discard branch
+  now fails all 5 of D's disk/stash-count/entry-text/banner/row assertions
+  and nothing outside it (`FAIL (5)`) — the confirmation still opens and
+  closes, it just never asks the server to do anything.
 
-  Two things about the test itself, found while running these checks rather
-  than assumed: `closeMenu()` cannot be `el.close()`. `dialog.js`'s `runDialog`
-  only clears its one-dialog-at-a-time gate from inside `finish`, which a
-  `cancel` event, a backdrop click or an item click reaches — a bare
-  `.close()` bypasses all three and leaves the next `askMenu`/`askChoice`
-  call silently resolving dismissed with no dialog shown at all. Confirmed
-  live: with `.close()` here, section B's own contextmenu produced `items:
-  []`. The fix is a real CDP Escape keypress, the same mechanism
-  `dialogs.mjs` already uses to dismiss a menu. And `rightClick`/`openConfirm`
-  had to be made to fail an assertion rather than throw when the element they
-  target is missing — under the `focus: "first"` break above, C's own
-  "cancel" actually discards the file for real, so D's right-click on the now
-  vanished `a.txt` row hit a null `getBoundingClientRect()` and crashed the
-  run before E or F could report anything. Guarding those two call sites
-  (`?.click()`, and an `if (!el) return false` before the click) turns a
-  cascading break into the same kind of legible, section-scoped FAIL every
-  other file here produces, without changing what any assertion checks.
+  Three things about the test itself, found while running these checks
+  rather than assumed — the first two during the initial pass, the third
+  during fix round 1's re-check of the same break. `closeMenu()` cannot be
+  `el.close()`. `dialog.js`'s `runDialog` only clears its one-dialog-at-a-time
+  gate from inside `finish`, which a `cancel` event, a backdrop click or an
+  item click reaches — a bare `.close()` bypasses all three and leaves the
+  next `askMenu`/`askChoice` call silently resolving dismissed with no dialog
+  shown at all. Confirmed live: with `.close()` here, section B's own
+  contextmenu produced `items: []`. The fix is a real CDP Escape keypress,
+  the same mechanism `dialogs.mjs` already uses to dismiss a menu.
+  `rightClick`/`openConfirm` had to be made to fail an assertion rather than
+  throw when the element they target is missing — under the `focus: "first"`
+  break, a section's own "cancel" can discard its file for real, so a later
+  right-click on the now-vanished row hit a null `getBoundingClientRect()`
+  and crashed the run before later sections could report anything. Guarding
+  those call sites (`?.click()`, and an `if (!el) return false` before the
+  click) turns a cascading break into the same kind of legible,
+  section-scoped FAIL every other file here produces, without changing what
+  any assertion checks. And section C's Enter originally used
+  `dispatchEvent(new KeyboardEvent("keydown", {key:"Enter"}))`, an untrusted
+  event: `askChoice` installs no keydown handler, so only a browser's native
+  "Enter activates the focused button" behaviour — which fires for trusted
+  events only — could make Enter do anything, and the `.click()` written
+  right after it was silently the only thing being exercised. Fixed with a
+  trusted CDP `Input.dispatchKeyEvent` pair, same as Escape. That in turn
+  exposed a second, subtler vacuous pass: reading the file immediately after
+  the dialog reported closed raced the server's async handling of the
+  (wrongly-triggered, under the break) `Revert` intent, and passed on sheer
+  timing luck the first time this was run. A settle wait before the disk
+  read — the same "wait past the window" shape CLAUDE.md's autosave section
+  already documents — turns that race into a real, reliably-failing
+  assertion, confirmed by watching it go from `ok` to `FAIL` under the
+  `focus: "first"` break once the wait was added. Separately (fix round 1,
+  Important 2), C and D originally shared `a.txt`, so a broken C that
+  actually discarded the file let D's own assertions read as passing off
+  C's leftovers rather than off anything D did. C now uses its own file,
+  `c.txt`, untouched by any other section, and D asserts `git stash list`
+  grew by exactly one entry between a before/after count rather than
+  string-matching for a label that could already be there.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:

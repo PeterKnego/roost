@@ -25,10 +25,16 @@ await git(fx.dir, "config", "user.email", "t@example.com");
 await git(fx.dir, "config", "user.name", "t");
 await Deno.writeFile(`${fx.dir}/a.txt`, enc.encode("base\n"));
 await Deno.writeFile(`${fx.dir}/b.txt`, enc.encode("base\n"));
+// A third committed file, reverted only in section C, so that section's
+// "changed nothing" claim cannot be masked by D also using a.txt (fix
+// round 1, Important 2): if C ever really discarded a.txt, D's own assertions
+// would keep passing off C's leftovers with nothing to tell the two apart.
+await Deno.writeFile(`${fx.dir}/c.txt`, enc.encode("base\n"));
 await git(fx.dir, "add", "-A");
 await git(fx.dir, "commit", "-qm", "base");
 await Deno.writeFile(`${fx.dir}/a.txt`, enc.encode("changed\n"));
 await Deno.writeFile(`${fx.dir}/b.txt`, enc.encode("changed\n"));
+await Deno.writeFile(`${fx.dir}/c.txt`, enc.encode("changed\n"));
 await Deno.writeFile(`${fx.dir}/new.txt`, enc.encode("untracked\n"));
 
 const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
@@ -47,7 +53,8 @@ try {
   // writing this, not assumed.
   await evalIn(`send({ t: "OpenTab", pane: 0, tab: { k: "Changes" } })`);
   const row = (rel) => `document.querySelector('.content[data-kind="Changes"] a[data-rel=${JSON.stringify(rel)}]')`;
-  ok(await until(() => evalIn(`!!${row("a.txt")} && !!${row("new.txt")}`), 20, "change rows"), "Changes lists the three files");
+  ok(await until(() => evalIn(`!!${row("a.txt")} && !!${row("c.txt")} && !!${row("new.txt")}`), 20, "change rows"),
+     "Changes lists the four files");
 
   // `el` can legitimately be null here: a revert-check that makes an earlier
   // section discard a file for real (e.g. C's cancel silently confirming)
@@ -101,19 +108,63 @@ try {
   };
 
   console.log("\nC. cancel, and Enter, change nothing");
-  ok(await openConfirm("a.txt"), "Revert… opens a confirmation");
+  // Its own file, c.txt, never touched by any other section — so a break
+  // that made this section *actually* discard the file cannot be masked by
+  // D re-reverting the same path and reporting success anyway (fix round 1,
+  // Important 2).
+  ok(await openConfirm("c.txt"), "Revert… opens a confirmation");
   ok(await evalIn(`document.activeElement === document.querySelector("#dlg-choice .dlg-cancel")`), "focus is on Cancel");
   ok(await evalIn(`document.querySelector("#dlg-choice .dlg-detail").textContent.includes("changed")`), "it shows the diff");
-  await evalIn(`document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); document.activeElement.click();`);
+  // A trusted CDP key event, not `dispatchEvent(new KeyboardEvent(...))`:
+  // askChoice installs no keydown handler of its own, and a browser only
+  // applies its native "Enter activates the focused button" behaviour to a
+  // TRUSTED event — a synthetic one is silently ignored. The untrusted form
+  // proved nothing about Enter; the `.click()` that used to follow it was
+  // the only thing actually exercised (fix round 1, Important 1). Escape
+  // uses the same trusted mechanism in `closeMenu` above.
+  await cmd("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" });
+  await cmd("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  ok(await until(() => evalIn(`!document.querySelector("#dlg-choice[open]")`), 5, "dialog closed"),
+     "Enter (focused on Cancel) closed the confirmation");
+  // The dialog closing proves nothing about which button Enter actually hit
+  // — under `focus: "first"` it lands on Discard, which *also* closes the
+  // dialog, and `Revert` is then a websocket round trip the server answers
+  // asynchronously. Reading the file immediately after "closed" races that
+  // round trip and can read "changed\n" out of sheer luck before the write
+  // lands — seen live during this fix's own revert-check, where this
+  // assertion passed under the break while the very next section proved the
+  // file really had been discarded. Settling past the round trip first is
+  // what makes the read mean something.
   await sleep(800);
-  ok((await read(`${fx.dir}/a.txt`)) === "changed\n", "Enter/Cancel left the file on disk untouched");
+  ok((await read(`${fx.dir}/c.txt`)) === "changed\n", "Enter on the confirmation left the file untouched");
+
+  // A separate, separately named check that an explicit Cancel click is
+  // equally inert — distinct from the Enter path above, which exercises
+  // focus rather than the button itself.
+  ok(await openConfirm("c.txt"), "Revert… opens a confirmation again");
+  await evalIn(`document.querySelector("#dlg-choice .dlg-cancel").click()`);
+  ok(await until(() => evalIn(`!document.querySelector("#dlg-choice[open]")`), 5, "dialog closed"),
+     "clicking Cancel closed the confirmation");
+  await sleep(800);
+  ok((await read(`${fx.dir}/c.txt`)) === "changed\n", "clicking Cancel left the file on disk untouched");
 
   console.log("\nD. confirm reverts on disk and names the stash");
+  // Counted rather than string-matched, and independent of C: C now reverts
+  // nothing (it uses c.txt, never a.txt), so this count is not D reading a
+  // stash C already made (fix round 1, Important 2) — it is proof that THIS
+  // confirmation is what created exactly one new entry.
+  const stashLines = async () => (await git(fx.dir, "stash", "list")).split("\n").filter((l) => l.length > 0);
+  const stashBefore = (await stashLines()).length;
   await openConfirm("a.txt");
   await evalIn(`document.querySelector('#dlg-choice .dlg-choice[data-choice="discard"]')?.click()`);
   ok(await until(async () => (await read(`${fx.dir}/a.txt`)) === "base\n", 15, "reverted"), "a.txt is back at HEAD on disk");
   ok((await read(`${fx.dir}/b.txt`)) === "changed\n", "b.txt, not selected, is untouched");
-  ok((await git(fx.dir, "stash", "list")).includes("roost revert: 1 file"), "the change is in git stash");
+  await until(async () => (await stashLines()).length === stashBefore + 1, 15, "a new stash entry");
+  const stashAfter = await stashLines();
+  ok(stashAfter.length === stashBefore + 1,
+     `the stash grew by exactly one entry (before ${stashBefore}, after ${stashAfter.length})`);
+  ok(!!stashAfter[0] && stashAfter[0].includes("roost revert: 1 file"),
+     `the new top stash entry names the revert (${JSON.stringify(stashAfter[0])})`);
   ok(await until(() => evalIn(`[...document.querySelectorAll(".error-banner")].some((b) => b.textContent.includes("stash@{0}"))`), 10, "banner"),
      "the banner names the stash");
   ok(await until(() => evalIn(`!${row("a.txt")}`), 15, "row gone"), "a.txt left the Changes list");
