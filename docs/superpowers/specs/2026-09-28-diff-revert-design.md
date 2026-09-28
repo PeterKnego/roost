@@ -1,8 +1,8 @@
 # Reverting a change from the Changes pane and the Diff tab
 
-*2026-09-28. Status: designed, not implemented. Issue
+*2026-09-28. Status: implemented on `diff-revert`. Issue
 [#125](https://github.com/PeterKnego/roost/issues/125). The issue listed four
-open questions; the answers below were settled in review, and three facts that
+open questions; the answers below were settled in review, and the facts that
 change the design were found by probing a scratch repository, not assumed.*
 
 ## What is wrong today
@@ -30,24 +30,39 @@ And there is no way to throw a change away without a terminal.
    are excluded; a deleted file (`D`) is included, since restoring it creates
    and loses nothing.
 4. **Only paths inside the project.** In a nested project, git lists files
-   outside it as `../x`. Those are excluded, and every path is confined with
-   `projects::safe_resolve` as everywhere else.
-5. **Every revert is saved to `git stash` first**, in the same git command
+   outside it too. Those are excluded, confined by stripping the project's
+   prefix (see *Deviation* below).
+5. **Every revert is saved to `git stash` first**, by the same git command
    that reverts (see *Mechanism*), and the result names the stash entry.
 6. **Always confirmed**, with the dialog showing exactly what is lost and
    focus on Cancel.
 
-## Three facts found by probing (git 2.53)
+## Facts found by probing (git 2.53)
 
-- **Porcelain paths are relative to git's cwd, not the repository root.**
-  `git -C sub status --porcelain=v2` lists a root file as `../ab`. This is
-  why decision 4 is needed at all: without it a nested project's Changes list
-  offers reverts outside the project.
+- **Porcelain paths depend on `-z`.** Without it they are relative to git's
+  cwd: `git -C sub status --porcelain=v2` lists a root file as `../top.txt`
+  (the Changes list uses this form). With `-z` they are relative to the
+  **repository root**: the same call lists `top.txt` and `sub/in.txt`. The
+  plan uses `-z`, so a nested project strips its own prefix
+  (`git rev-parse --show-prefix`) and counts a path without it as outside.
+  This is why decision 4 is needed at all: without it a nested project's
+  revert takes the parent's changes.
+- **`stash push` must run from the toplevel.** `git -C sub
+  --literal-pathspecs stash push -- in.txt` prints "Saved working
+  directory…", then fails `pathspec 'in.txt' did not match any files`,
+  exit 1, with nothing reverted and an entry left behind. The push therefore
+  runs in the toplevel with prefix + path.
 - **A pathspec after `--` is a pattern.** Reverting a file literally named
   `a*` also matches `ab`. `git --literal-pathspecs` fixes it; with it, the
   probe reverted `a*` and left `ab` changed.
 - **`git stash push -- <paths>` reverts exactly those paths** (index and
-  worktree, back to `HEAD`) and records them as one stash entry. It also
+  worktree, back to `HEAD`) and records them as one stash entry, **but not
+  atomically**: it saves the entry first and resets the paths afterwards, and
+  can fail in between. With a read-only `d/`, pushing `a.txt d/b.txt z.txt`
+  printed "Saved working directory…", then `error: unable to write file
+  'd/b.txt'`, exit 1, with `a.txt` deleted from the worktree, `z.txt`
+  reverted and `d/b.txt` unchanged: the entry held the only copy. A tracked
+  file replaced by a directory ("Directory not empty") does the same. It also
   records the rest of the *index* in that entry, so `git stash apply --index`
   can conflict. Plain `git stash apply` restored the reverted content exactly
   in the probe; it does not restore the staged/unstaged split. That is
@@ -133,8 +148,20 @@ One function, used by both intents. Every failure is its own refusal.
 2. A merge, rebase, cherry-pick or revert in progress: refuse. Checked from
    the git dir with `symlink_metadata`: `NotFound` is absent, any other error
    is *cannot tell*, which also refuses.
-3. Per path: `safe_resolve` against the project (a failure goes to
-   `outside`); `??`, `A`, and a rename's new path to their buckets.
+3. Per path: strip the project's prefix (a path without it goes to
+   `outside`); `??`, `A`, and a rename's new path to their buckets. A
+   single-file preview whose `rel` matches no status entry at all refuses:
+   *<rel> is not in git status; refresh the Changes list.* "Matched nothing"
+   is not "nothing to revert". The Changes list's `gitio::status` runs with
+   `core.quotePath=false` so that a non-ASCII name it shows is the raw name
+   the `-z` plan matches.
+
+**Deviation: confinement is by prefix strip, not `safe_resolve`.** Paths
+come from git's tree entries, root-relative under `-z`: git refuses a path
+beyond a symlink (it tracks the link itself), so there is no link to
+resolve, and a deleted file, or a whole deleted directory, has no parent for
+`safe_resolve_parent` to canonicalise. The lexical strip is exact for this
+input; `safe_resolve` would refuse legitimate deletions.
 4. `git diff HEAD -- <paths>` under `--literal-pathspecs`, for the token and
    (one file) the detail.
 
@@ -142,23 +169,34 @@ One function, used by both intents. Every failure is its own refusal.
 
 Both intents are routed by `wsconn` away from the hub lock, like `Search` and
 `CloseProject`: a plan is several git calls with a deadline of up to 15 s
-each, and CLAUDE.md forbids blocking I/O under a lock every socket on the
-project needs.
+each, the push has none (below), and CLAUDE.md forbids blocking I/O under a
+lock every socket on the project needs.
 
 1. Under the hub lock, briefly: read which buffers are dirty (memory only).
-2. Unlocked: build the plan, check it, then
-   `git --literal-pathspecs stash push -m "roost revert: N files" -- <paths>`.
-3. Re-lock: reset each buffer named in `discard_buffers` to its file on disk,
-   send `Event::Reverted { ok, msg, stash }` to the requester, broadcast a
+2. Unlocked: build the plan, check it, read the top stash entry
+   (`git stash list -1 --format=%H%x09%s`; a failure refuses), then, in the
+   toplevel, `git --literal-pathspecs stash push -m "roost revert: N files"
+   -- <prefix+paths>`, then read the top entry again.
+3. Re-lock: reset each buffer that was dirty at the check and named in
+   `discard_buffers` to its file on disk, send
+   `Event::Reverted { rel, ok, msg, stale }` to the requester, broadcast a
    snapshot. The watcher refreshes Changes.
 
 A buffer that turns dirty between steps 1 and 3 was never named, so it is not
 touched; its file changed on disk under it, which is the existing conflict
 path for every outside write. Nothing is discarded without having been shown.
 
-The revert is one git command. If `stash push` fails, git reverted nothing;
-if it succeeds, the stash entry exists. There is no half-state to reason about,
-which is why this was chosen over `stash create` + `store` + `restore`
+The revert is one git command, but not an atomic one: `stash push` can stop
+partway after saving (see *Facts*). So the push has **no kill deadline**
+(killing it mid-way would make that half-state), and what happened is read
+from the stash list, never from git's wording (translated) or exit status
+(silent on how far it got). The entry is **ours** when the top hash changed
+**and** its subject ends with the exact label: a new hash alone could be a
+concurrent stash, the label alone an older roost revert. A push that stopped
+partway is reported as such and points at `git stash apply`; nothing ever
+suggests `git stash drop`, which there deletes the only copy.
+
+One command was still chosen over `stash create` + `store` + `restore`
 (three steps, and a snapshot of the *whole* worktree, so applying it would
 bring back changes the user never reverted) and over roost copying file
 contents into its own state directory (no git-native recovery).
@@ -173,10 +211,18 @@ contents into its own state directory (no git-native recovery).
 | Token mismatch | *These changes changed since you looked; review them again.* (client reopens the preview) | no |
 | A dirty buffer not named | *`a.rs` gained unsaved edits; review again.* | no |
 | Nothing eligible | *Nothing to revert: 2 untracked, 1 outside this project.* | no |
-| `stash push` failed | *git refused: <first stderr line>. Nothing was reverted.* | no |
-| Success | *Reverted 3 files; saved as stash@{0} ("roost revert: 3 files"). `git stash apply` brings them back.* | yes |
+| `rel` matches no status entry | *<rel> is not in git status; refresh the Changes list. Nothing was reverted.* | no |
+| Could not read the stash list before pushing | *Could not read the stash list: <reason>. Nothing was reverted.* | no |
+| Push failed, no new entry | *git refused: <first stderr line>. Nothing was reverted.* | no |
+| Push failed, a new entry that is ours | *git stopped partway after saving the changes as stash@{0} ("roost revert: 3 files"): some files may already be reverted — check `git status`. `git stash apply` brings them back.* | partly |
+| Push failed, a new entry that is not ours | *git refused: <first stderr line>. The stash changed while this ran, so whether this revert saved anything could not be told — see `git stash list` before dropping anything.* | unknown |
+| Push failed, stash list unreadable after | *git refused: <first stderr line>. Whether a stash entry was left could not be checked — see `git stash list` before dropping anything.* | unknown |
+| Push succeeded, no new entry | *These changes were already gone. Nothing was reverted.* | no |
+| Push succeeded, a new entry that is not ours | *git did not report an error. The stash changed while this ran, …* | unknown |
+| Success (a new entry that is ours) | *Reverted 3 files; saved as stash@{0} ("roost revert: 3 files"). `git stash apply` brings them back.* | yes |
 
-Refusals reach only the requester; stderr is also logged.
+Refusals reach only the requester; every one but a stale refusal is also
+logged to stderr as `roost: revert in <dir>: <msg>`.
 
 ## Testing
 
@@ -185,8 +231,8 @@ revert check for each.
 
 **Rust**, in `gitio` and `hub`, against real scratch repositories:
 
-- Plan: `??`, `A`, a rename's new path each land in their own bucket; `../x`
-  in a real nested project lands in `outside`; `a*` beside `ab` reverts only
+- Plan: `??`, `A`, a rename's new path each land in their own bucket; a
+  parent's change in a real nested project lands in `outside`; `a*` beside `ab` reverts only
   `a*`; a name with a space and a non-ASCII character survives the `-z`
   parser.
 - Refusals, each asserting the message **and** the file unchanged on disk:
