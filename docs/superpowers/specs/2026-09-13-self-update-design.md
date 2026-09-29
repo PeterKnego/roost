@@ -153,7 +153,10 @@ version.
    `BuildInfo` and the version from the check — **not configurable**, for the
    version-check spec's reason: a setting that let a repo name the host roost
    fetches a binary from would be the hole that spec exists to avoid. The
-   same `ureq` agent as the check, ten-second timeout per request, and a size
+   same User-Agent and proxy handling as the check but its own `ureq` agent —
+   ten seconds to connect and two minutes overall, body included, because the
+   check's ten-second overall bound cannot carry the tarball over a link below
+   ~150 KB/s — and a size
    cap of 64 MB checked against `Content-Length` before the body is buffered:
    the tarball is a few megabytes, and a server that answers with gigabytes
    is one to walk away from.
@@ -199,9 +202,15 @@ After the swap the thread does three things in order, then execs.
 3. **Exec.** `std::os::unix::process::CommandExt::exec` on the captured path
    with this process's `args_os()`. The environment is inherited, which
    carries `ROOST_ROOTS`, `ROOST_STATE_DIR`, `ROOST_BIND_ALL` and the port
-   argument unchanged. `exec` keeps the PID: systemd sees nothing,
-   `KillMode=process` is irrelevant, and the dtach masters remain children of
-   the same process. A hand-run roost keeps its terminal. If `exec` returns —
+   argument unchanged. `exec` keeps the PID: systemd sees nothing and
+   `KillMode=process` is irrelevant. The dtach masters were never roost's
+   children — `dtach -A` forks them off, so they are grandchildren already
+   reparented to init or the subreaper, and the exec does not reach them.
+   Roost's children are the `dtach -A` attach clients, one per attached
+   terminal: their PTYs close on exec, they exit, and the new image, which
+   did not spawn them, never reaps them — one zombie per attached terminal
+   per update (see *Under systemd* below). A hand-run roost keeps its
+   terminal. If `exec` returns —
    which it does only on failure — the thread records it through `errlog`,
    clears the in-flight guard, and the process keeps serving on the old
    binary with the new file already in place. About then reads `restart
@@ -249,8 +258,9 @@ inside roost.
 **Client side.** `minisign-verify`, zero dependencies, is the crate Tauri's
 updater itself uses. The signature covers the tarball bytes, so verification
 runs on the buffered download before decompression touches it. A signature
-that does not verify is reported as exactly that — *signature did not verify*
-— distinct from a download that failed or a `.minisig` that was missing,
+that does not verify is reported as exactly that — *signature did not
+verify*, followed by minisign's own cause (another key, or a failed check) —
+distinct from a download that failed or a `.minisig` that was missing,
 because the first is the one someone should hear about.
 
 **Two things this does not replace.** The sha256 files and the SLSA
@@ -463,6 +473,15 @@ it, the `other`-signed tarball served, `Update` clicked:
 `pgrep -c dtach` unchanged) needs a release carrying the real key and a real
 signature. It belongs to the first release that ships the real
 `keys/roost.pub`, whoever cuts it, before it is announced.
+
+**A known gap for that run to check: zombie attach clients.** Each attached
+terminal's `dtach -A` client is a child of roost; the exec closes its PTY,
+it exits, and the new image never reaps it, so every update leaves one
+zombie per attached terminal until roost itself exits. The masters and
+shells are unaffected (they are not roost's children, and the manual run
+above saw both survive). The systemd run should count them — `ps -o
+pid,ppid,stat,cmd --ppid <MainPID>` before and after, looking for `Z` — and
+decide whether reaping unknown children after an exec is worth adding.
 
 **The suite afterwards,** on the same host after a normal `cargo build`
 (no key, `roost 0.6.0`): `cargo test --lib -- --test-threads=1` 1098 passed

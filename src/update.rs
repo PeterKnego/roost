@@ -20,6 +20,13 @@ pub const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 pub const PROBE_SECS: u64 = 5;
 /// How long `Later` keeps the dialog from opening by itself. The mark stays.
 pub const DEFER_SECS: u64 = 24 * 60 * 60;
+/// The longest `latest` accepted as a version. Real ones are a dozen
+/// characters; the bound is on what reaches a URL, not on semver.
+pub const MAX_VERSION_LEN: usize = 64;
+/// The download's overall bound, body included. The version check's ten
+/// seconds cannot carry the 1.4 MB tarball over a link below ~150 KB/s;
+/// this carries it down to ~12 KB/s.
+pub const DOWNLOAD_SECS: u64 = 120;
 
 /// The public key `build.rs` baked from `keys/roost.pub`, or `None` for a
 /// build made without one — which offers nothing, rather than trusting
@@ -65,14 +72,16 @@ pub fn asset_urls(base: &str, target: &str) -> (String, String) {
 /// nothing unsigned is parsed. `allow_legacy` is false — the release signs
 /// with a current minisign, and the legacy format is one more thing to
 /// accept for no reason. The three messages are distinct on purpose: a
-/// signature that does not verify is the one someone should hear about.
+/// signature that does not verify is the one someone should hear about, and
+/// it carries minisign's cause after the prefix, because "tampered" and
+/// "signed by another key" are different conversations with the maintainer.
 pub fn verify(tarball: &[u8], minisig: &str, pubkey_b64: &str) -> Result<(), String> {
     let pk = minisign_verify::PublicKey::from_base64(pubkey_b64)
         .map_err(|e| format!("the compiled-in key could not be read: {e}"))?;
     let sig = minisign_verify::Signature::decode(minisig)
         .map_err(|e| format!("the signature file could not be read: {e}"))?;
     pk.verify(tarball, &sig, false)
-        .map_err(|_| "signature did not verify".to_string())
+        .map_err(|e| format!("signature did not verify: {e}"))
 }
 
 /// Bounds the *cumulative* decompressed output `xz_decompress` writes across
@@ -428,8 +437,7 @@ pub fn read_capped(r: impl std::io::Read, cap: u64) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// The real fetch: the version check's agent (ten-second bound, the
-/// User-Agent crates.io asks for, `HTTPS_PROXY` honoured), redirects
+/// The real fetch: its own agent (see `download_agent`), redirects
 /// followed — `releases/download/` answers 302 to a CDN — and the cap checked
 /// against `Content-Length` before a byte of body is buffered. A non-2xx is
 /// an error in `ureq` 2 (`Error::Status`), whose message carries the code.
@@ -437,10 +445,24 @@ pub fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
     http_get_capped(url, MAX_ARCHIVE_BYTES)
 }
 
+/// The version check's User-Agent and proxy handling, but not its timeout:
+/// that one's ten seconds bound the whole request, body included, and a
+/// release cannot cross a link below ~150 KB/s inside it. Connecting keeps
+/// the check's ten seconds — a host that does not answer is no slower to
+/// give up on here — and the body gets `DOWNLOAD_SECS`.
+fn download_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(crate::version::TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(DOWNLOAD_SECS))
+        .user_agent(&crate::version::user_agent())
+        .try_proxy_from_env(true)
+        .build()
+}
+
 /// `http_get_bytes` with the cap as a parameter, so a test can reach both
 /// checks over a real socket without sending 64 MB.
 fn http_get_capped(url: &str, cap: u64) -> Result<Vec<u8>, String> {
-    let resp = crate::version::agent().get(url).call().map_err(|e| e.to_string())?;
+    let resp = download_agent().get(url).call().map_err(|e| e.to_string())?;
     if let Some(len) = resp.header("Content-Length").and_then(|v| v.parse::<u64>().ok()) {
         if len > cap {
             return Err(format!("the server announced {len} bytes, above the {cap} byte cap"));
@@ -646,8 +668,14 @@ pub type ExecFn = fn(&Path) -> String;
 /// Replace this process with the file at `exe`, same PID, same arguments,
 /// same environment: `ROOST_ROOTS`, `ROOST_STATE_DIR`, `ROOST_BIND_ALL` and
 /// the port argument ride along unchanged. systemd sees nothing;
-/// `KillMode=process` is irrelevant; the dtach masters stay children of the
-/// same PID; a hand-run roost keeps its terminal. The listening socket needs
+/// `KillMode=process` is irrelevant; a hand-run roost keeps its terminal.
+/// The dtach masters are not our children at all — `dtach -A` forks them
+/// off, so they are grandchildren reparented to init (or the subreaper) and
+/// the exec does not touch them. What *is* our child is each `dtach -A`
+/// attach client, one per attached terminal; its PTY closes on exec, it
+/// exits, and the new image, which never spawned it, does not reap it — a
+/// zombie per attached terminal per update, a known gap the owed systemd
+/// run is to measure. The listening socket needs
 /// no hand-off: Rust opens sockets close-on-exec, and the new process binds
 /// the same port a few milliseconds later. Returns only on failure.
 pub fn exec(exe: &Path) -> String {
@@ -655,6 +683,27 @@ pub fn exec(exe: &Path) -> String {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let err = std::process::Command::new(exe).args(args).exec();
     err.to_string()
+}
+
+/// `latest` came from the network and is about to become part of two URLs
+/// and the probe's expected output, so only the characters a version uses
+/// get through: a `/` or `..` would walk the download somewhere else, which
+/// the signature would catch, but a URL built from it is still a URL nobody
+/// meant to fetch. The oversized case does not echo the string back.
+fn plain_version(v: &str) -> Result<(), String> {
+    if v.is_empty() {
+        return Err("the last check named an empty version".into());
+    }
+    if v.len() > MAX_VERSION_LEN {
+        return Err(format!(
+            "the last check named a version of {} characters, above the {MAX_VERSION_LEN} allowed",
+            v.len()
+        ));
+    }
+    if !v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-')) {
+        return Err(format!("the last check named {v:?}, which is not a plain version"));
+    }
+    Ok(())
 }
 
 /// The three checks, in the order a user would want to hear about them:
@@ -668,6 +717,7 @@ pub fn eligible() -> Result<String, String> {
     }
     let s = crate::version::current().ok_or("no version check has run yet")?;
     let latest = s.latest.ok_or("the last check did not name a version")?;
+    plain_version(&latest)?;
     match crate::version::verdict(env!("CARGO_PKG_VERSION"), Some(&latest)) {
         crate::version::Latest::Newer(v) => Ok(v),
         _ => Err(format!("{latest} is not newer than {}", env!("CARGO_PKG_VERSION"))),
@@ -1031,12 +1081,17 @@ mod tests {
         let sig = sign_bytes(&sk, &data);
         assert_eq!(verify(&data, &sig, &pk), Ok(()));
 
+        // The prefix is what the dialog and About lead with; the cause after
+        // it is what tells a tampered file from a release signed by another
+        // key, which are different conversations with the maintainer.
         let mut flipped = data.clone();
         flipped[7] ^= 0x01;
-        assert_eq!(verify(&flipped, &sig, &pk).unwrap_err(), "signature did not verify");
+        let e = verify(&flipped, &sig, &pk).unwrap_err();
+        assert!(e.starts_with("signature did not verify: ") && e.contains("verification failed"), "{e}");
 
         let (other_pk, _) = test_key();
-        assert_eq!(verify(&data, &sig, &other_pk).unwrap_err(), "signature did not verify");
+        let e = verify(&data, &sig, &other_pk).unwrap_err();
+        assert!(e.starts_with("signature did not verify: ") && e.contains("different key"), "{e}");
 
         let e = verify(&data, "this is not a minisig file", &pk).unwrap_err();
         assert!(e.starts_with("the signature file could not be read"), "{e}");
@@ -1068,7 +1123,8 @@ mod tests {
         assert!(lines[2].starts_with("trusted comment: "), "line 2 was: {}", lines[2]);
         lines[2].push_str("-tampered");
         let tampered = lines.join("\n");
-        assert_eq!(verify(&data, &tampered, &pk).unwrap_err(), "signature did not verify");
+        let e = verify(&data, &tampered, &pk).unwrap_err();
+        assert!(e.starts_with("signature did not verify: "), "{e}");
     }
 
     enum Member<'a> {
@@ -1273,7 +1329,8 @@ mod tests {
         let (_, other_sk) = test_key();
         serve(a.clone(), sign_bytes(&other_sk, &a));
         let (phase, msg) = run_pipeline(&plan, fetch_served, &mut |_| {}).unwrap_err();
-        assert_eq!((phase, msg.as_str()), (Phase::Verify, "signature did not verify"));
+        assert_eq!(phase, Phase::Verify);
+        assert!(msg.starts_with("signature did not verify"), "{msg}");
         check("signature");
 
         let empty = tar_xz(&[Member::File(&format!("{T}/README.md"), b"x")]);
@@ -1370,7 +1427,8 @@ mod tests {
         let before = std::fs::read(&plan.exe).unwrap();
         let mut phases = Vec::new();
         let err = run_pipeline(&plan, fetch_served, &mut |p| phases.push(p)).unwrap_err();
-        assert_eq!(err, (Phase::Verify, "signature did not verify".to_string()));
+        assert_eq!(err.0, Phase::Verify);
+        assert!(err.1.starts_with("signature did not verify"), "{}", err.1);
         assert_eq!(phases, [Phase::Download, Phase::Verify], "unpack must not start");
         assert_eq!(std::fs::read(&plan.exe).unwrap(), before);
         assert_eq!(leftovers(d.path()), Vec::<String>::new());
@@ -1943,6 +2001,7 @@ mod tests {
     /// is released 50 ms in and the retry waits 100 ms; if the first spawn
     /// were scheduled after the release this run would pass without
     /// exercising the retry, which is why the release is not immediate.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_probe_that_meets_text_file_busy_retries_once() {
         let d = tempfile::tempdir().unwrap();
@@ -1958,6 +2017,10 @@ mod tests {
     }
 
     /// Only once: a file that stays busy is a probe failure, named.
+    ///
+    /// Both ETXTBSY tests are Linux-only: they rely on Linux refusing to exec
+    /// a file that is open for writing, which other Unixes need not do.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_probe_that_stays_busy_fails_with_the_reason() {
         let d = tempfile::tempdir().unwrap();
@@ -1965,5 +2028,56 @@ mod tests {
         let _writer = std::fs::OpenOptions::new().write(true).open(&exe).unwrap();
         let e = probe(&exe, "9.9.9", std::time::Duration::from_secs(2)).unwrap_err();
         assert!(e.starts_with("the new binary could not be started:") && e.to_lowercase().contains("busy"), "{e}");
+    }
+
+    /// The check's answer is a string from the network that becomes part of
+    /// two URLs and a probe's expected output, so anything but a plain
+    /// version is refused before either is built. Revert-checked: with
+    /// `plain_version` returning `Ok(())` for everything, every refusal row
+    /// here fails with `called Result::unwrap_err() on an Ok value`.
+    #[test]
+    fn a_latest_that_is_not_a_plain_version_is_refused_by_name() {
+        assert_eq!(plain_version("1.2.3"), Ok(()));
+        assert_eq!(plain_version("1.2.3-rc.1+build.5"), Ok(()));
+        let e = plain_version("9.9.9+/../../x").unwrap_err();
+        assert_eq!(e, "the last check named \"9.9.9+/../../x\", which is not a plain version");
+        let e = plain_version("https://evil.example/roost?v=1").unwrap_err();
+        assert!(e.ends_with("which is not a plain version"), "{e}");
+        let e = plain_version("").unwrap_err();
+        assert_eq!(e, "the last check named an empty version");
+        let long = "1".repeat(MAX_VERSION_LEN + 1);
+        let e = plain_version(&long).unwrap_err();
+        assert_eq!(e, format!("the last check named a version of {} characters, above the {MAX_VERSION_LEN} allowed", MAX_VERSION_LEN + 1));
+        assert_eq!(plain_version(&"1".repeat(MAX_VERSION_LEN)), Ok(()));
+    }
+
+    /// The download has its own agent, not the version check's: that one's
+    /// ten seconds bound the *whole* request, body included, which a slow
+    /// link cannot fit a release into. This server sends its twelve bytes
+    /// one per second, past the check's bound and well inside the
+    /// download's. Revert-checked: with `http_get_capped` back on
+    /// `version::agent()`, this fails after ten seconds with `Err("the
+    /// download stopped: timed out reading response")`.
+    #[test]
+    fn a_download_slower_than_the_check_s_timeout_still_completes() {
+        use std::io::Write;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut req = [0u8; 4096];
+                let _ = s.read(&mut req);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n");
+                for _ in 0..12 {
+                    let _ = s.write_all(b"x");
+                    let _ = s.flush();
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+        });
+        let started = std::time::Instant::now();
+        let r = http_get_bytes(&format!("http://{addr}/roost.tar.xz"));
+        assert_eq!(r, Ok(vec![b'x'; 12]), "after {:?}", started.elapsed());
+        assert!(started.elapsed() > std::time::Duration::from_secs(crate::version::TIMEOUT_SECS));
     }
 }
