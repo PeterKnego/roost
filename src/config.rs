@@ -726,7 +726,7 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
     push("relaunch", "bool", V::Bool(relaunch()), V::Bool(false), false,
         "When you open a project, restart the agents roost had launched in it before a reboot. Never resumes a conversation \u{2014} it starts a fresh one.");
     push("version_check", "bool", V::Bool(version_check()), V::Bool(true), false,
-        "Ask crates.io once a day whether a newer roost has been published, and say so in About. Nothing is downloaded.");
+        "Ask crates.io once a day (once an hour after a failed check) whether a newer roost has been published, and say so in About. Nothing is downloaded.");
     push("allowed_origins", "list", V::List(allowed_origins()), V::List(vec![]), false,
         "Browser origins allowed to connect besides loopback, such as the tailnet address.");
     push("max_upload_bytes", "str", V::Str(max_upload_bytes().to_string()), V::Str(DEFAULT_MAX_UPLOAD.to_string()), false,

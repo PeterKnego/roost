@@ -680,7 +680,7 @@ function openSettings(settings) {
   const ABOUT_ROWS = [
     ["Version", "version", "The release this binary was built from."],
     ["Latest", "latest",
-      "The newest version published to crates.io, checked once a day when you open roost. Nothing is downloaded."],
+      "The newest version published to crates.io, checked once a day (once an hour after a failed check) when you open roost. Nothing is downloaded."],
     ["Commit", "commit", "Marked -dirty when the tree had uncommitted changes, and ? when git could not say."],
     ["Built", "built", "When this binary was compiled, in your timezone."],
     ["Repository", "repository", "Where the source is."],
