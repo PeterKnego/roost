@@ -369,6 +369,15 @@ export async function startRoost({ repoRoot, stateDir, roots, port, extraEnv = {
   if (!build.success) throw new Error("cargo build failed");
   const bin = `${meta.target_directory}/debug/roost`;
 
+  // The browser suite runs the real binary with the developer's real HOME, so
+  // without this every test that opens a project would fire a real request at
+  // crates.io on connect. Written into the state dir, which is this run's own
+  // and is removed with it. Placed *before* `...extraEnv` below, so a test
+  // that names its own config (settings.mjs, roots.mjs, ide.mjs) still wins —
+  // each of those writes the key into its own file instead.
+  const offConfig = `${stateDir}/version-check-off.toml`;
+  await Deno.writeTextFile(offConfig, "version_check = false\n");
+
   const spawn = () => new Deno.Command(bin, {
     args: [String(port)],
     // clearEnv so nothing from the developer's shell — ROOST_CMD above all —
@@ -406,6 +415,7 @@ export async function startRoost({ repoRoot, stateDir, roots, port, extraEnv = {
       // Before `...extraEnv`, so a test that wants a specific directory —
       // ide.mjs reads the lock file it writes — can still say so.
       CLAUDE_CONFIG_DIR: `${stateDir}/claude`,
+      ROOST_CONFIG: offConfig,
       ...extraEnv,
     },
     stdout: "null", stderr: "null",

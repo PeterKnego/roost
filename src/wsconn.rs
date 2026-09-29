@@ -158,6 +158,15 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     );
     let Ok(mut ws_read) = accepted else { return };
 
+    // Lazily, when a browser connects, and only if the stored answer is stale
+    // — a roost left running for a month makes no request until someone looks
+    // at it. Here rather than in `serve`: after the Origin check, so a refused
+    // handshake fires nothing, and before the hub lock below, so nothing is
+    // held across it. It returns at once; the connection never waits for the
+    // request, which runs on a detached thread. Single-flight for the whole
+    // process, so ten tabs are one request.
+    crate::version::maybe_check();
+
     // Obtained *before* any hub lock is taken, and the registry lock inside
     // for_project is released before this call returns: a socket thread must
     // never hold a hub lock while acquiring the registry lock, or two threads

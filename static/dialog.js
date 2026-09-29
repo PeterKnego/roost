@@ -421,6 +421,29 @@ function upgradeCommand(b) {
   }
 }
 
+/// What About says about newer versions, from `state.settings.update`.
+///
+/// Five renderings, three of which come from the comparator and two from the
+/// state file itself: its absence ("not checked yet", the few seconds after a
+/// fresh install) and the setting ("version checks are off", the answer to
+/// "why does this never say anything"). Both are shown rather than left blank
+/// — an empty row is the same defect in a quieter coat, and neither was
+/// assertable while they were silent.
+///
+/// An unknown status renders as "could not check" rather than throwing or
+/// going blank: About does not say *why* a check failed, and a status this
+/// does not recognise is one more way of not knowing.
+function latestLabel(u) {
+  const v = u || {};
+  switch (v.status) {
+    case "newer": return `${v.latest} available`;
+    case "up-to-date": return "up to date";
+    case "never": return "not checked yet";
+    case "off": return "version checks are off";
+    default: return "could not check";
+  }
+}
+
 function openSettings(settings) {
   const el = document.getElementById("dlg-settings");
   const session = {};
@@ -519,6 +542,7 @@ function openSettings(settings) {
     hide: "Hidden names", show_hidden: "Show dot-files", autosave: "Autosave", follow_tree: "Tree follows the open file", read_when_watching: "Read notices you are watching",
     share_selection: "Share selection with Claude", worktree_prompt: "Offer a worktree for a second Claude",
     relaunch: "Restart agents when a project opens",
+    version_check: "Check for a newer roost",
     allowed_origins: "Allowed origins", max_upload_bytes: "Upload limit", ide: "IDE connection", roots: "Project roots",
   };
   function rowFor(r) {
@@ -655,6 +679,8 @@ function openSettings(settings) {
   /// settings, so the right column carries text rather than a control.
   const ABOUT_ROWS = [
     ["Version", "version", "The release this binary was built from."],
+    ["Latest", "latest",
+      "The newest version published to crates.io, checked once a day (once an hour after a failed check) when you open roost. Nothing is downloaded."],
     ["Commit", "commit", "Marked -dirty when the tree had uncommitted changes, and ? when git could not say."],
     ["Built", "built", "When this binary was compiled, in your timezone."],
     ["Repository", "repository", "Where the source is."],
@@ -669,11 +695,13 @@ function openSettings(settings) {
   function renderAbout() {
     about.replaceChildren();
     const b = (view && view.build) || {};
+    const u = (view && view.update) || {};
     const value = (kind) =>
       kind === "command" ? (upgradeCommand(b) || []).join(" / ")
       : kind === "built" ? fmtBuilt(b.built_epoch)
       : kind === "install" ? installLabel(b)
       : kind === "upgrades" ? upgradesLabel(b)
+      : kind === "latest" ? latestLabel(u)
       : (b[kind] || "unknown");
     for (const [label, kind, doc] of ABOUT_ROWS) {
       // The only row that is not always there: absent where there is nothing

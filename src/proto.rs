@@ -335,6 +335,27 @@ pub struct ThemeEntry {
     pub accent: String,
 }
 
+/// What roost knows about newer versions of itself.
+///
+/// A **sibling** of `SettingsView::build`, not a field of `BuildInfo`: that
+/// struct's doc comment promises it is constant for the life of the process,
+/// and this is the one server fact on the About panel that is not.
+///
+/// `status` is one of `off`, `never`, `unknown`, `up-to-date`, `newer`. Five
+/// values where `version::Latest` has three, because two of them — no state
+/// file at all, and the setting turned off — are facts the *state file* knows
+/// rather than outcomes the comparator produces. About is exactly where
+/// someone goes to wonder about either, and both are assertable in the browser
+/// test, which the silent alternatives were not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub struct UpdateView {
+    pub status: String,
+    /// The newest unyanked version the last successful check saw, or empty.
+    /// Carried whole rather than folded into `status` because #65's step 4
+    /// names it in a dialog title and in a skipped-version record.
+    pub latest: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Default)]
 pub struct SettingsView {
     pub keys: Vec<SettingRow>,
@@ -348,6 +369,8 @@ pub struct SettingsView {
     /// a server fact and this snapshot is already how server facts reach the
     /// dialog.
     pub build: BuildInfo,
+    /// See `UpdateView`. Beside `build`, never inside it.
+    pub update: UpdateView,
 }
 
 /// The identity of the running binary.

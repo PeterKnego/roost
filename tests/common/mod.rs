@@ -33,6 +33,29 @@ pub fn isolate_ide_dir_for_tests() {
     roost::ideport::set_ports_dir_for_test(p);
 }
 
+/// Every integration binary's server reads the *developer's* real
+/// `~/.config/roost/config.toml` unless something says otherwise, and nine of
+/// these files open workspace websockets — which is what fires the version
+/// check. A green suite that makes real requests to crates.io turns a rate
+/// limit or an offline runner into a flake in whichever test lost, so the
+/// suite says so out loud instead.
+///
+/// Only when the caller has not already named a config (`tests/roots.rs`
+/// has), and held for the process's life so the path stays valid: a `TempDir`
+/// dropped here would take the file with it.
+fn disable_version_check() {
+    static FIXTURE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    if std::env::var_os("ROOST_CONFIG").is_some() {
+        return;
+    }
+    let d = FIXTURE.get_or_init(|| {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("config.toml"), "version_check = false\n").unwrap();
+        d
+    });
+    std::env::set_var("ROOST_CONFIG", d.path().join("config.toml"));
+}
+
 /// `serve`'s accept loop now re-reads `projects::roots()` on every connection
 /// instead of using its `startup_roots` argument after boot (so a root added
 /// from the front page is visible to the very next request, not just after a
@@ -48,6 +71,7 @@ pub fn isolate_ide_dir_for_tests() {
 /// through to the config file — setting it to empty would be indistinguishable
 /// from that, not from "no roots".
 pub fn start(roots: Vec<PathBuf>) -> u16 {
+    disable_version_check();
     isolate_ide_dir_for_tests();
     if roots.is_empty() {
         std::env::remove_var("ROOST_ROOTS");

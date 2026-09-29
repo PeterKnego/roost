@@ -66,7 +66,7 @@ const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) 
 
 const fx = await fixture();
 const globalToml = `${fx.base}/global.toml`;
-await Deno.writeTextFile(globalToml, "# global\n");
+await Deno.writeTextFile(globalToml, "# global\nversion_check = false\n");
 const second = `${fx.base}/more`;
 await Deno.mkdir(`${second}/other`, { recursive: true });
 await new Deno.Command("git", { args: ["init", "-q"], cwd: `${second}/other`, stdout: "null", stderr: "null" }).output();
@@ -208,7 +208,7 @@ try {
     await Deno.mkdir(dir, { recursive: true });
     long.push(dir);
   }
-  await Deno.writeTextFile(globalToml, `# global\nroots = [${long.map((p) => JSON.stringify(p)).join(", ")}]\n`);
+  await Deno.writeTextFile(globalToml, `# global\nversion_check = false\nroots = [${long.map((p) => JSON.stringify(p)).join(", ")}]\n`);
   await evalIn(`location.reload()`);
   ok(await until(() => evalIn(`document.querySelectorAll("header .roots .root").length === 4`), 20, "four roots"),
      "the header lists all four");
