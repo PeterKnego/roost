@@ -119,6 +119,11 @@ const wire = (page, project) => {
     // file would then assert on an empty store in both pages — passing for
     // the worst possible reason.
     await until(async () => (await evalIn("__last()")).trimEnd().endsWith("$"), 30, "shell prompt");
+    // Mounting the tab focused the terminal (mountTab), and a page typing
+    // in the terminal a notice comes from reads it on arrival (#129). This
+    // file is about which project a notice belongs to, not about who is
+    // watching, so nobody is: the sequence is typed with focus elsewhere.
+    await evalIn(`document.activeElement && document.activeElement.blur()`);
     const cmd = `printf '\\033]777;notify;${title};${body}\\007'`;
     await evalIn(`__t().term.input(${JSON.stringify(cmd + "\r")})`);
     return loc.session;

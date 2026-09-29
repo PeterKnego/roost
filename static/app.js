@@ -42,6 +42,20 @@ let SHOW_HIDDEN_DEFAULT = document.body.dataset.showHidden === "1";
 // like SHOW_HIDDEN_DEFAULT: it changes only when someone edits a config file,
 // which already needs a reload to take effect.
 let AUTOSAVE = document.body.dataset.autosave === "1";
+// Whether a notice for the terminal you are looking at is read on sight.
+// Not embedded like AUTOSAVE: followSettings() re-reads it from every
+// snapshot, and "watching" needs a laid-out snapshot anyway, so there is no
+// moment before the first State when the value is wanted.
+let READ_WHEN_WATCHING = true;
+// The terminal mountTab last focused by itself, until a hand lands in it.
+// mountTab focuses whatever terminal a snapshot mounts — including one
+// another client activated — so on an idle second device with roost in
+// front, keyboard focus alone would have it reading your notices for you.
+let autoFocused = null;
+// The session a gesture on this page just asked focusSession for — a tab
+// click, a notice, a desktop notification. The mountTab that follows is
+// that gesture's doing, so its focus is a hand's, not autoFocused.
+let handFocus = null;
 // Whether the editor's current selection is sent to Claude as ambient
 // context, embedded once per page load like AUTOSAVE and SHOW_HIDDEN_DEFAULT.
 // Off unless the project's config opted in (Settings::share_selection); the
@@ -1593,7 +1607,13 @@ function mountTab(content, t) {
     const e = ensureTerm(t.session);
     content.appendChild(e.node);   // MOVE, not rebuild — the socket survives
     requestAnimationFrame(() => {
-      try { e.fit.fit(); e.term.focus(); sendResize(e); } catch {}
+      try {
+        e.fit.fit();
+        autoFocused = handFocus === t.session ? null : t.session;
+        handFocus = null;
+        e.term.focus();
+        sendResize(e);
+      } catch {}
     });
     return;
   }
@@ -2847,7 +2867,12 @@ function ensureTerm(session) {
   // vendored build's public Terminal facade (the "d" class the UMD bundle
   // exports) wraps an internal core that has its own onFocus/onBlur, but
   // does not forward either one; calling `term.onFocus` throws.
-  node.addEventListener("focusin", () => { lastFocusedSession = session; });
+  node.addEventListener("focusin", () => { lastFocusedSession = session; readWatched(); });
+  // A click or a keystroke in this terminal is the hand autoFocused waits
+  // for. Capture phase, because xterm handles both and may stop them.
+  const byHand = () => { if (autoFocused === session) autoFocused = null; readWatched(); };
+  node.addEventListener("pointerdown", byHand, true);
+  node.addEventListener("keydown", byHand, true);
   // xterm's own defaults are black-on-white-ish and take no part in the theme
   // cascade, so the active theme's variables are read off :root and handed to
   // it — otherwise the terminal is a black rectangle inside a #1e1f22 pane.
@@ -4506,6 +4531,8 @@ function followSettings() {
   }
   const auto = row("autosave");
   if (auto) AUTOSAVE = auto.effective === true;
+  const rw = row("read_when_watching");
+  if (rw) READ_WHEN_WATCHING = rw.effective === true;
   // The tree re-fetches itself when showHidden() changes (see the State
   // handler), so this one assignment is the whole of the visible effect.
   const sh = row("show_hidden");
@@ -4721,6 +4748,39 @@ function markSessionNoticesRead(session) {
   }
 }
 
+// The session whose notices are being read right now, or null. Keyboard
+// focus, deliberately not lastFocusedSession: that one means "the terminal a
+// mention is aimed at" and outlives focus moving to the editor, and a Claude
+// working in one pane while you type in another is precisely the terminal
+// whose notices you have NOT read. getClientRects covers both ways a host is
+// off-screen — pooled behind another tab, or in a collapsed phone pane —
+// reading from the DOM what the user actually sees.
+function watchedSession() {
+  if (!READ_WHEN_WATCHING) return null;
+  if (document.visibilityState !== "visible" || !document.hasFocus()) return null;
+  const host = document.activeElement && document.activeElement.closest(".termhost");
+  if (!host || !host.getClientRects().length) return null;
+  const s = host.dataset.session;
+  if (s === autoFocused) return null;
+  return s && terms.has(s) && terms.get(s).node === host ? s : null;
+}
+
+function readWatched() {
+  const s = watchedSession();
+  if (s) markSessionNoticesRead(s);
+}
+
+// Coming back to the page. The terminal's own focusin (ensureTerm) re-fires
+// when the window regains focus, and reads the notice itself when it lands
+// after the page is visible — but Chromium does not promise that order: it
+// has been seen delivering focus and focusin while visibilityState was still
+// "hidden", then visibilitychange last, and in that order only the listener
+// below can read it. Window focus covers switching OS windows with the page
+// left visible. markSessionNoticesRead sends nothing when nothing is unread,
+// so whichever of the three fires second is free.
+document.addEventListener("visibilitychange", () => { if (!document.hidden) readWatched(); });
+window.addEventListener("focus", readWatched);
+
 // Activate the terminal tab for `session`, opening it if it is not on screen.
 // Both paths are ordinary intents, so every connected client follows.
 function focusSession(session) {
@@ -4730,11 +4790,16 @@ function focusSession(session) {
   for (let pi = 0; pi < state.panes.length; pi++) {
     const ti = state.panes[pi].tabs.findIndex((t) => t.k === "Terminal" && t.session === session);
     if (ti >= 0) {
+      // Only when this activation will mount it: an already-active tab gets
+      // no mountTab, and a handFocus left waiting would later bless a
+      // mount some other client caused.
+      if (state.panes[pi].active !== ti) handFocus = session;
       send({ t: "ActivateTab", pane: pi, idx: ti });
       revealPane(pi);
       return;
     }
   }
+  handFocus = session;
   send({ t: "OpenTab", pane: 3, tab: { k: "Terminal", session } });
   revealPane(3);
 }
@@ -4754,7 +4819,15 @@ function hasAttention(session) {
 
 function onNotice(n) {
   notices.push(n);
-  if (canNotify() && Notification.permission === "granted") {
+  // Read on arrival when it comes from the terminal being typed in: the
+  // server is told, and the local row is marked too, so the dot does not
+  // flash before the rebroadcast. No OS banner for it: a banner for the
+  // terminal under your cursor is noise. Other windows still banner — they
+  // received the same Notice and are not watching.
+  if (n.project === PROJECT && n.session === watchedSession()) {
+    n.read = true;
+    send({ t: "MarkNoticeRead", id: n.id });
+  } else if (canNotify() && Notification.permission === "granted") {
     if (swReg) swReg.active && swReg.active.postMessage({ kind: "notify", notice: n });
     // Fallback when there's no service worker: same attribution rule as
     // sw.js — project/session (server truth) in the title, payload text in

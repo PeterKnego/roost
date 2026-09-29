@@ -12,6 +12,7 @@ struct RawConfig {
     show_hidden: Option<bool>,
     autosave: Option<bool>,
     follow_tree: Option<bool>,
+    read_when_watching: Option<bool>,
     allowed_origins: Option<Vec<String>>,
     max_upload_bytes: Option<u64>,
     share_selection: Option<bool>,
@@ -51,6 +52,13 @@ pub struct Settings {
     /// off is that it discards your navigation; following here never
     /// collapses anything, so the cost of being wrong is a scroll.
     pub follow_tree: bool,
+    /// Whether a notice for the terminal you are looking at is read on sight
+    /// (on return to the page, on clicking in, and on arrival, which then
+    /// raises no OS banner). Project-scoped: a checkout setting it only
+    /// decides what you see as unread, which grants nothing and raises no
+    /// ceiling — `autosave`'s argument. On by default because off is the
+    /// behaviour #129 reported as a bug.
+    pub read_when_watching: bool,
     /// Off unless a project asks for it. This ships file contents to Claude
     /// with no explicit user action, and roost has no permission system to
     /// scope it the way Claude Code's own `Read` deny rules do. Unlike
@@ -89,6 +97,7 @@ impl Default for Settings {
             show_hidden: false,
             autosave: true,
             follow_tree: true,
+            read_when_watching: true,
             warning: None,
         }
     }
@@ -96,7 +105,7 @@ impl Default for Settings {
 
 /// Keys a project file may set — display-level, nothing a hostile checkout
 /// could widen a boundary with. In this order in the dialog.
-pub const PROJECT_KEYS: &[&str] = &["theme", "hide", "show_hidden", "autosave", "follow_tree"];
+pub const PROJECT_KEYS: &[&str] = &["theme", "hide", "show_hidden", "autosave", "follow_tree", "read_when_watching"];
 /// Keys only the global file may set; see the readers below for why each.
 /// `relaunch` is here for the sharpest reason any key has been: it decides
 /// whether opening a project *starts an agent*. A cloned repository that could
@@ -152,8 +161,8 @@ pub fn validate(scope: Scope, key: &str, value: Option<&SettingValue>) -> Result
         }
         ("hide", _) => Err("hide takes a list of names".into()),
         (
-            "show_hidden" | "autosave" | "follow_tree" | "share_selection" | "worktree_prompt"
-            | "relaunch",
+            "show_hidden" | "autosave" | "follow_tree" | "read_when_watching" | "share_selection"
+            | "worktree_prompt" | "relaunch",
             SettingValue::Bool(_),
         ) => Ok(()),
         (k, _) => Err(format!("{k} takes true or false")),
@@ -198,6 +207,9 @@ pub fn load(paths: &[&Path]) -> Settings {
                 }
                 if let Some(v) = raw.follow_tree {
                     s.follow_tree = v;
+                }
+                if let Some(v) = raw.read_when_watching {
+                    s.read_when_watching = v;
                 }
             }
             Err(e) => warnings.push(format!("{}: {}", path.display(), e.message())),
@@ -663,6 +675,8 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
         "Save an edited file a second after the last keystroke and on blur; off means ⌘S.");
     push("follow_tree", "bool", V::Bool(s.follow_tree), V::Bool(true), true,
         "Expand the file tree to the file you are looking at, and mark it.");
+    push("read_when_watching", "bool", V::Bool(s.read_when_watching), V::Bool(true), false,
+        "Mark a terminal's notices read while you are typing in it, with no desktop banner for them.");
     push("share_selection", "bool", V::Bool(share_selection()), V::Bool(false), true,
         "Let a Claude connected to this project read the text you select in the editor.");
     push("worktree_prompt", "bool", V::Bool(worktree_prompt()), V::Bool(true), false,
@@ -840,6 +854,28 @@ mod tests {
         assert!(!load(&[&g]).autosave);
         fs::write(&p, "autosave = true").unwrap();
         assert!(load(&[&g, &p]).autosave, "a project can turn it back on");
+        assert!(load(&[&g, &p]).warning.is_none());
+    }
+
+    // Same shape as autosave's test and for the same reason: asserting only
+    // the default passes with the cascade never reading the key at all.
+    #[test]
+    fn read_when_watching_defaults_on_and_either_layer_can_turn_it_off() {
+        let d = tempfile::tempdir().unwrap();
+        let g = d.path().join("global.toml");
+        let p = d.path().join("project.toml");
+        fs::write(&g, "hide = [\"dist\"]").unwrap();
+        assert!(load(&[&g]).read_when_watching, "on unless something says otherwise");
+
+        fs::write(&p, "read_when_watching = false").unwrap();
+        let s = load(&[&g, &p]);
+        assert!(!s.read_when_watching, "a project can turn it off for itself");
+        assert_eq!(s.hide, vec!["dist"], "and the global key still survives");
+
+        fs::write(&g, "read_when_watching = false").unwrap();
+        assert!(!load(&[&g]).read_when_watching);
+        fs::write(&p, "read_when_watching = true").unwrap();
+        assert!(load(&[&g, &p]).read_when_watching, "a project can turn it back on");
         assert!(load(&[&g, &p]).warning.is_none());
     }
 
@@ -1117,6 +1153,10 @@ mod tests {
     fn values_must_match_the_key_and_a_theme_must_exist() {
         let e = validate(Scope::Project, "autosave", Some(&V::Str("yes".into()))).unwrap_err();
         assert!(e.contains("autosave") && e.contains("true or false"), "{e}");
+        let e = validate(Scope::Project, "read_when_watching", Some(&V::Str("yes".into()))).unwrap_err();
+        assert!(e.contains("read_when_watching") && e.contains("true or false"), "{e}");
+        assert!(validate(Scope::Project, "read_when_watching", Some(&V::Bool(false))).is_ok(),
+            "a project may set it: it grants nothing and raises no ceiling");
         let e = validate(Scope::Project, "theme", Some(&V::Str("not-a-theme".into()))).unwrap_err();
         assert!(e.contains("not-a-theme"), "{e}");
         let e = validate(Scope::Project, "hide", Some(&V::List(vec!["a/b".into()]))).unwrap_err();
@@ -1327,6 +1367,13 @@ mod tests {
         assert_eq!(f.writable, vec!["project", "global"], "follow_tree is not global-only");
         assert_eq!(f.default, V::Bool(true), "it follows unless something turns it off");
         assert!(f.reload, "it is embedded at page load, like autosave");
+        // Project-scoped for the spec's reason: a checkout setting it decides
+        // only whether a notice from a terminal you are typing in is shown
+        // unread. Live, not embedded — app.js re-reads it from every snapshot.
+        let r = row("read_when_watching");
+        assert_eq!(r.writable, vec!["project", "global"], "read_when_watching is not global-only");
+        assert_eq!(r.default, V::Bool(true));
+        assert!(!r.reload, "followed live from State, not embedded at page load");
         // Every row explains itself: the dialog shows `doc` under the key.
         for r in &v.keys {
             assert!(!r.doc.is_empty() && r.doc.ends_with('.'), "{}: doc {:?}", r.key, r.doc);
@@ -1335,7 +1382,7 @@ mod tests {
         assert!(!row("theme").reload);
         // Order: project keys, global-only keys, read-only keys.
         let keys: Vec<&str> = v.keys.iter().map(|r| r.key.as_str()).collect();
-        assert_eq!(keys, ["theme", "hide", "show_hidden", "autosave", "follow_tree", "share_selection", "worktree_prompt", "relaunch", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
+        assert_eq!(keys, ["theme", "hide", "show_hidden", "autosave", "follow_tree", "read_when_watching", "share_selection", "worktree_prompt", "relaunch", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
         assert_eq!(v.themes.len(), 5 + 35);
         assert!(v.global_file.ends_with("global.toml"));
         assert_eq!(v.project_file, ".roost/config.toml");

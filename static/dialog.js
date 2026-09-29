@@ -516,7 +516,7 @@ function openSettings(settings) {
   // Human labels for the keys. The key itself stays visible beside the label
   // in the mono face: it is what you would type into the file.
   const LABELS = {
-    hide: "Hidden names", show_hidden: "Show dot-files", autosave: "Autosave", follow_tree: "Tree follows the open file",
+    hide: "Hidden names", show_hidden: "Show dot-files", autosave: "Autosave", follow_tree: "Tree follows the open file", read_when_watching: "Read notices you are watching",
     share_selection: "Share selection with Claude", worktree_prompt: "Offer a worktree for a second Claude",
     relaunch: "Restart agents when a project opens",
     allowed_origins: "Allowed origins", max_upload_bytes: "Upload limit", ide: "IDE connection", roots: "Project roots",
