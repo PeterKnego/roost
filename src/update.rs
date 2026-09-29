@@ -5,7 +5,11 @@ include!("pubkey.rs");
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use crate::hub::{ConnId, Hub};
+use crate::proto::Event;
 
 /// The download cap. The musl tarball is 1.4 MB; a server answering with
 /// gigabytes is one to walk away from, and the check happens twice — against
@@ -177,13 +181,29 @@ pub fn extract_binary(tar_xz: &[u8]) -> Result<Vec<u8>, String> {
 /// within the bound is a refusal, not a success taken on faith.
 pub fn probe(exe: &Path, want: &str, timeout: std::time::Duration) -> Result<(), String> {
     use std::io::Read;
-    let mut child = std::process::Command::new(exe)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("the new binary could not be started: {e}"))?;
+    let spawn = || {
+        std::process::Command::new(exe)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    // `stage` closes its write handle before this runs, but a thread that
+    // forked while that handle was open leaves a child holding an inherited
+    // copy until it execs — and while it does, exec of the staged file is
+    // ETXTBSY. The window is microseconds, and failing is safe, but it would
+    // cost the user a whole re-download for nothing, so one retry after the
+    // child has certainly exec'd. Exactly one: a file still busy after that
+    // is someone else's writer, and a probe failure is the right answer.
+    let mut child = match spawn() {
+        Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            spawn()
+        }
+        r => r,
+    }
+    .map_err(|e| format!("the new binary could not be started: {e}"))?;
     let mut stdout = child.stdout.take().expect("stdout was piped");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -580,8 +600,214 @@ pub fn view() -> crate::proto::UpdateView {
     v
 }
 
+/// One update for the whole process. Taken on the calling thread before the
+/// pipeline thread starts, so two clicks in the same instant fetch once.
+/// Cleared on every path except a successful exec, where the process is
+/// about to be replaced — by `Flight`'s `Drop`, so a panic clears it too.
+static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Owns the taken `IN_FLIGHT`. Moved into the pipeline thread, so the flag
+/// is released when that thread finishes by any route — a return, a panic
+/// past both `catch_unwind`s, or the thread never starting (the closure
+/// that owns it is dropped by the failed `spawn`). The one route that never
+/// drops it is the exec that worked, and there nothing is left to release.
+struct Flight;
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The exec seam: a plain `fn`, like `FetchBytes`, so a test can drive the
+/// whole flight without replacing the test runner.
+pub type ExecFn = fn(&Path) -> String;
+
+/// Replace this process with the file at `exe`, same PID, same arguments,
+/// same environment: `ROOST_ROOTS`, `ROOST_STATE_DIR`, `ROOST_BIND_ALL` and
+/// the port argument ride along unchanged. systemd sees nothing;
+/// `KillMode=process` is irrelevant; the dtach masters stay children of the
+/// same PID; a hand-run roost keeps its terminal. The listening socket needs
+/// no hand-off: Rust opens sockets close-on-exec, and the new process binds
+/// the same port a few milliseconds later. Returns only on failure.
+pub fn exec(exe: &Path) -> String {
+    use std::os::unix::process::CommandExt;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let err = std::process::Command::new(exe).args(args).exec();
+    err.to_string()
+}
+
+/// The three checks, in the order a user would want to hear about them:
+/// is this copy roost's to replace, does this build carry a key, and is the
+/// last check's version actually newer than this one. `Ok` carries the
+/// version to install.
+pub fn eligible() -> Result<String, String> {
+    replaceable_here()?;
+    if public_key().is_none() {
+        return Err("this build carries no release key".into());
+    }
+    let s = crate::version::current().ok_or("no version check has run yet")?;
+    let latest = s.latest.ok_or("the last check did not name a version")?;
+    match crate::version::verdict(env!("CARGO_PKG_VERSION"), Some(&latest)) {
+        crate::version::Latest::Newer(v) => Ok(v),
+        _ => Err(format!("{latest} is not newer than {}", env!("CARGO_PKG_VERSION"))),
+    }
+}
+
+fn progress(phase: &str, detail: &str) -> Event {
+    Event::UpdateProgress { phase: phase.to_string(), detail: detail.to_string() }
+}
+
+/// Never under a hub lock: it appends to a file.
+fn log(text: &str) {
+    crate::errlog::record(&format!("update: {text}"), crate::errlog::now_secs());
+}
+
+/// One message to the requester alone. The lock lives for this statement.
+fn tell(hub: &Arc<Mutex<Hub>>, to: &ConnId, phase: &str, detail: &str) {
+    Hub::lock(hub).send_to(to, &progress(phase, detail));
+}
+
+/// This executable, as the path the rename must replace: absolute and with
+/// every symlink resolved. A symlink (`~/bin/roost -> ~/.cargo/bin/roost`)
+/// would make the rename replace the *link* and leave the real file old;
+/// a relative path (macOS `current_exe` can return one) would stage in the
+/// cwd, possibly another filesystem, where the rename is not atomic or
+/// refused. On Linux this is `/proc/self/exe`, which after an earlier swap
+/// in this process names the deleted inode with " (deleted)" — canonicalize
+/// then fails, which refuses a second update over a swapped file that is
+/// waiting for a restart, rather than guessing at a path.
+fn this_exe() -> Result<PathBuf, String> {
+    let p = std::env::current_exe().map_err(|e| format!("this executable's path could not be read: {e}"))?;
+    std::fs::canonicalize(&p).map_err(|e| format!("{} could not be resolved: {e}", p.display()))
+}
+
+/// The `Update` intent. Decides, then hands off to `drive` with the real
+/// exec. Nothing here holds the hub lock for longer than one `send_to`.
+pub fn start(hub: Arc<Mutex<Hub>>, from: ConnId, fetch: FetchBytes) {
+    let plan = eligible().and_then(|latest| {
+        let exe = this_exe()?;
+        let b = crate::config::build_info();
+        let (tarball_url, sig_url) = asset_urls(&download_base(&b.repository, &latest), &b.target);
+        Ok(Plan {
+            exe,
+            tarball_url,
+            sig_url,
+            pubkey: public_key().unwrap_or_default().to_string(),
+            want: latest,
+            probe_timeout: std::time::Duration::from_secs(PROBE_SECS),
+        })
+    });
+    match plan {
+        Ok(plan) => drive(hub, from, plan, fetch, exec),
+        Err(why) => {
+            log(&format!("refused: {why}"));
+            tell(&hub, &from, "refused", &why);
+        }
+    }
+}
+
+/// A failure message that names what it was working on: the tarball URL
+/// for the network phases, the executable for the rest — unless the
+/// message already carries it, as an HTTP error carries its URL (and the
+/// signature's URL begins with the tarball's).
+fn located(plan: &Plan, phase: Phase, msg: &str) -> String {
+    let subject = match phase {
+        Phase::Download | Phase::Verify => plan.tarball_url.clone(),
+        _ => plan.exe.display().to_string(),
+    };
+    if msg.contains(&subject) {
+        msg.to_string()
+    } else {
+        format!("{msg} ({subject})")
+    }
+}
+
+/// The pipeline on a detached thread, reporting each phase to `from` alone.
+/// Split from `start` so a test can drive it with a `Plan` pointing at a
+/// tempdir and an exec that does not replace the test runner.
+pub fn drive(hub: Arc<Mutex<Hub>>, from: ConnId, plan: Plan, fetch: FetchBytes, exec_fn: ExecFn) {
+    // Before the thread, deliberately: a guard taken inside it would let
+    // two clicks in the same instant both start.
+    if IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        log("refused: already updating");
+        tell(&hub, &from, "refused", "already updating");
+        return;
+    }
+    let flight = Flight;
+    *LAST_FAILURE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    log(&format!("starting: {} -> {}", plan.tarball_url, plan.exe.display()));
+    let want = plan.want.clone();
+    let (hub2, from2) = (hub.clone(), from.clone());
+    let spawned = std::thread::Builder::new().name("roost-update".into()).spawn(move || {
+        let _flight = flight;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_pipeline(&plan, fetch, &mut |p: Phase| {
+                log(p.as_str());
+                tell(&hub2, &from2, p.as_str(), "");
+            })
+        }));
+        // A second net for the reporting itself: nothing may unwind out of
+        // this thread, and `_flight` releases the guard either way.
+        let settled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            settle(&hub2, &from2, &plan, outcome, exec_fn)
+        }));
+        if settled.is_err() {
+            eprintln!("roost: update: reporting the outcome panicked");
+        }
+    });
+    if let Err(e) = spawned {
+        // The closure, `flight` with it, was dropped by the failed spawn.
+        let msg = format!("the update thread could not start: {e}");
+        log(&format!("failed at internal: {msg}"));
+        record_failure(&want, Phase::Internal, &msg);
+        tell(&hub, &from, "failed", &format!("internal: {msg}"));
+        crate::hub::broadcast_settings_all();
+    }
+}
+
+/// What the pipeline's outcome means, told to the requester, logged, and
+/// kept for About — then pushed to every hub, since About's row changed.
+/// Called with no hub lock held, which `broadcast_settings_all` needs.
+fn settle(
+    hub: &Arc<Mutex<Hub>>,
+    from: &ConnId,
+    plan: &Plan,
+    outcome: std::thread::Result<Result<(), (Phase, String)>>,
+    exec_fn: ExecFn,
+) {
+    let (phase, msg) = match outcome {
+        Ok(Ok(())) => {
+            log(&format!("swapped {} for {}; exec", plan.exe.display(), plan.want));
+            tell(hub, from, "restarting", &plan.want);
+            // A moment for the frame to leave the socket before the
+            // process that holds it is replaced.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let err = exec_fn(&plan.exe);
+            // Only reached when exec returned, which it does only on
+            // failure: the new file is in place, this process is not it.
+            // That is `installed`, not a failure: the file is right, and
+            // About says "restart roost" rather than "update failed".
+            let msg = located(plan, Phase::Exec, &err);
+            log(&format!("failed at exec: {msg}"));
+            record_installed(&plan.want);
+            tell(hub, from, "failed", &format!("exec: {msg}"));
+            crate::hub::broadcast_settings_all();
+            return;
+        }
+        Ok(Err((phase, msg))) => (phase, msg),
+        Err(_) => (Phase::Internal, "the updater panicked".to_string()),
+    };
+    let msg = located(plan, phase, &msg);
+    log(&format!("failed at {}: {msg}", phase.as_str()));
+    record_failure(&plan.want, phase, &msg);
+    tell(hub, from, "failed", &format!("{}: {msg}", phase.as_str()));
+    crate::hub::broadcast_settings_all();
+}
+
 #[cfg(test)]
 pub fn reset_for_test() {
+    IN_FLIGHT.store(false, Ordering::SeqCst);
     *LAST_FAILURE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
@@ -1479,5 +1705,188 @@ mod tests {
 
         record_installed("999.1.0");
         assert_eq!(view().installed, "999.1.0");
+    }
+
+    use std::sync::atomic::{AtomicBool as TestFlag, AtomicUsize, Ordering::SeqCst};
+    static FETCHES: AtomicUsize = AtomicUsize::new(0);
+    static RELEASE: TestFlag = TestFlag::new(false);
+
+    fn blocking_404(url: &str) -> Result<Vec<u8>, String> {
+        FETCHES.fetch_add(1, SeqCst);
+        while !RELEASE.load(SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Err(format!("{url}: status code 404"))
+    }
+
+    fn panicking_fetch(_url: &str) -> Result<Vec<u8>, String> {
+        panic!("the socket thread must not carry this");
+    }
+
+    fn no_exec(_exe: &Path) -> String {
+        "test: exec not attempted".to_string()
+    }
+
+    fn events(rx: &std::sync::mpsc::Receiver<String>) -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn wait_until(mut f: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if f() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("condition not reached in 4s");
+    }
+
+    /// Two subscribers, because with one `send_to` and `broadcast` are
+    /// indistinguishable. This test binary is a checkout, so `start` refuses
+    /// — and the refusal is the requester's alone. Replacing the `send_to`
+    /// with a `broadcast` fails the second subscriber's assertion; deleting
+    /// it fails `got.len() == 1`.
+    #[test]
+    fn a_refusal_reaches_the_requester_and_nobody_else() {
+        let _env = env_fixture();
+        let d = tempfile::tempdir().unwrap();
+        let mut h = crate::hub::Hub::new("upd_refuse", d.path().to_path_buf());
+        let (a, rx_a) = h.subscribe();
+        let (_b, rx_b) = h.subscribe();
+        let hub = std::sync::Arc::new(std::sync::Mutex::new(h));
+        start(hub, a, fetch_404);
+        let got = events(&rx_a);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].contains(r#""t":"UpdateProgress""#) && got[0].contains(r#""phase":"refused""#), "{}", got[0]);
+        assert!(got[0].contains("channel checkout"), "the reason is named: {}", got[0]);
+        assert!(events(&rx_b).is_empty(), "one connection's refusal is not everyone's");
+        assert!(!IN_FLIGHT.load(SeqCst), "a refusal before `drive` never takes the guard");
+    }
+
+    /// A second click anywhere while one runs is answered *already updating*
+    /// rather than starting a second download.
+    #[test]
+    fn two_intents_during_one_run_fetch_once_and_refuse_the_second() {
+        let _env = env_fixture();
+        let d = tempfile::tempdir().unwrap();
+        // A check naming the version being installed, so `view()` keeps the
+        // failure: it drops one that is for another version.
+        crate::version::write_state_to(&crate::version::state_path(), &checked("9.9.9")).unwrap();
+        crate::version::reset_for_test();
+        FETCHES.store(0, SeqCst);
+        RELEASE.store(false, SeqCst);
+        let (pk, _) = test_key();
+        let mut h = crate::hub::Hub::new("upd_flight", d.path().to_path_buf());
+        let (a, rx_a) = h.subscribe();
+        let (b, rx_b) = h.subscribe();
+        let hub = std::sync::Arc::new(std::sync::Mutex::new(h));
+        drive(hub.clone(), a, plan_in(d.path(), &pk, "9.9.9"), blocking_404, no_exec);
+        wait_until(|| FETCHES.load(SeqCst) >= 1);
+        drive(hub.clone(), b, plan_in(d.path(), &pk, "9.9.9"), blocking_404, no_exec);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(FETCHES.load(SeqCst), 1, "the guard is taken before the thread starts");
+        let got = events(&rx_b);
+        assert!(got.iter().any(|e| e.contains(r#""phase":"refused""#) && e.contains("already updating")), "{got:?}");
+        RELEASE.store(true, SeqCst);
+        wait_until(|| !IN_FLIGHT.load(SeqCst));
+        let got = events(&rx_a);
+        assert!(got.iter().any(|e| e.contains(r#""phase":"download""#)), "{got:?}");
+        assert!(got.iter().any(|e| e.contains(r#""phase":"failed""#) && e.contains("404")), "{got:?}");
+        assert_eq!(view().failure.split(':').next(), Some("download"), "the failure is kept for About");
+        RELEASE.store(false, SeqCst);
+    }
+
+    /// CLAUDE.md: no panic may escape a socket or watcher thread — and this
+    /// one would also leave the guard taken forever. Deleting the
+    /// `catch_unwind` around the pipeline leaves no `failed` event (the
+    /// thread dies with the panic); deleting the `Flight` guard as well
+    /// leaves `IN_FLIGHT` set and `wait_until` panics after 4s.
+    #[test]
+    fn a_panicking_fetch_clears_the_guard_and_is_reported_as_a_failure() {
+        let _env = env_fixture();
+        let d = tempfile::tempdir().unwrap();
+        let (pk, _) = test_key();
+        let mut h = crate::hub::Hub::new("upd_panic", d.path().to_path_buf());
+        let (a, rx_a) = h.subscribe();
+        let hub = std::sync::Arc::new(std::sync::Mutex::new(h));
+        drive(hub, a, plan_in(d.path(), &pk, "9.9.9"), panicking_fetch, no_exec);
+        wait_until(|| !IN_FLIGHT.load(SeqCst));
+        let got = events(&rx_a);
+        assert!(got.iter().any(|e| e.contains(r#""phase":"failed""#) && e.contains("internal")), "{got:?}");
+    }
+
+    /// The swap succeeded and the exec did not: the file is the new version,
+    /// the process is the old one, and About must say so rather than hide it.
+    /// Deleting `record_installed` fails `installed == "9.9.9"`; routing the
+    /// exec failure through `record_failure` instead fails `failure == ""`.
+    #[test]
+    fn a_swapped_file_whose_exec_fails_is_reported_as_installed() {
+        let _env = env_fixture();
+        let d = tempfile::tempdir().unwrap();
+        let (pk, sk) = test_key();
+        let (a, sig) = release(&sk, "9.9.9");
+        serve(a, sig);
+        let mut h = crate::hub::Hub::new("upd_exec", d.path().to_path_buf());
+        let (id, rx) = h.subscribe();
+        let hub = std::sync::Arc::new(std::sync::Mutex::new(h));
+        let plan = plan_in(d.path(), &pk, "9.9.9");
+        let exe = plan.exe.clone();
+        drive(hub, id, plan, fetch_served, no_exec);
+        wait_until(|| !IN_FLIGHT.load(SeqCst));
+        assert!(String::from_utf8_lossy(&std::fs::read(&exe).unwrap()).contains("roost 9.9.9"), "the file was swapped");
+        let got = events(&rx);
+        assert!(got.iter().any(|e| e.contains(r#""phase":"restarting""#)), "{got:?}");
+        assert!(got.iter().any(|e| e.contains(r#""phase":"failed""#) && e.contains("exec: test: exec not attempted")), "{got:?}");
+        assert_eq!(view().installed, "9.9.9");
+        assert_eq!(view().failure, "", "an exec failure is `installed`, not `failure`: the file is right");
+    }
+
+    /// A recorded failure names what it was working on — the URL for the
+    /// network phases, the executable for the rest — without doubling a URL
+    /// the HTTP error already carries. Deleting the append in `located`
+    /// fails the verify and probe rows; dropping the `contains` check fails
+    /// the download row with the URL twice.
+    #[test]
+    fn a_failure_names_the_url_or_path_it_was_working_on() {
+        let d = tempfile::tempdir().unwrap();
+        let (pk, _) = test_key();
+        let plan = plan_in(d.path(), &pk, "9.9.9");
+        let url = plan.tarball_url.clone();
+        let exe = plan.exe.display().to_string();
+        let dl = located(&plan, Phase::Download, &format!("{}: status code 404", plan.sig_url));
+        assert_eq!(dl, format!("{}: status code 404", plan.sig_url), "the sig URL already names the tarball URL");
+        let dl = located(&plan, Phase::Download, "the download exceeded the 9 byte cap");
+        assert_eq!(dl, format!("the download exceeded the 9 byte cap ({url})"));
+        assert_eq!(located(&plan, Phase::Verify, "signature did not verify"), format!("signature did not verify ({url})"));
+        assert_eq!(located(&plan, Phase::Probe, "the new binary exited 1"), format!("the new binary exited 1 ({exe})"));
+    }
+
+    /// Revert-checked: without the one retry, this fails with
+    /// "the new binary could not be started: Text file busy". The writer
+    /// is released 50 ms in and the retry waits 100 ms; if the first spawn
+    /// were scheduled after the release this run would pass without
+    /// exercising the retry, which is why the release is not immediate.
+    #[test]
+    fn a_probe_that_meets_text_file_busy_retries_once() {
+        let d = tempfile::tempdir().unwrap();
+        let exe = fake_exe(d.path(), "busy", "echo 'roost 9.9.9'");
+        let writer = std::fs::OpenOptions::new().write(true).open(&exe).unwrap();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(writer);
+        });
+        let r = probe(&exe, "9.9.9", std::time::Duration::from_secs(2));
+        t.join().unwrap();
+        assert_eq!(r, Ok(()));
+    }
+
+    /// Only once: a file that stays busy is a probe failure, named.
+    #[test]
+    fn a_probe_that_stays_busy_fails_with_the_reason() {
+        let d = tempfile::tempdir().unwrap();
+        let exe = fake_exe(d.path(), "busy", "echo 'roost 9.9.9'");
+        let _writer = std::fs::OpenOptions::new().write(true).open(&exe).unwrap();
+        let e = probe(&exe, "9.9.9", std::time::Duration::from_secs(2)).unwrap_err();
+        assert!(e.starts_with("the new binary could not be started:") && e.to_lowercase().contains("busy"), "{e}");
     }
 }
