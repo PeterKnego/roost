@@ -215,6 +215,12 @@ try {
   ok((await page2.evalIn(`texts.get(${JSON.stringify(REL)})`)) === ORIGINAL,
      "the second page's connect-time replay shows the file's own original text, not the marker");
 
+  // Opening page2 put page1 in the background (visibilityState: "hidden"),
+  // where timers and websockets keep running but rAF-driven work does not —
+  // harness.mjs's own warning. This section goes on driving page1 (the
+  // dialog, the click), so it has to come forward again first.
+  await page.bringToFront();
+
   await evalIn(`Object.assign(state.settings.update, { status: "newer", latest: "999.1.0", offer: true, skipped: null, failure: null, deferred_until: 0 }); 0`);
   await evalIn(`openUpdate(state.settings); 0`);
   ok(await until(() => evalIn(`document.getElementById("dlg-update").open && !document.querySelector("#dlg-update .dlg-ok").hidden`), 5, "a fresh Update dialog"),
@@ -256,7 +262,7 @@ try {
   // flush sent it, not the timer.
   const echoedFast = await until(
     () => page2.evalIn(`texts.get(${JSON.stringify(REL)}) === ${JSON.stringify(MARKER)}`),
-    0.15, null);
+    0.15, "the edit echoed to page2 inside the debounce window");
   ok(echoedFast,
      `a second, already-connected client saw the new text within ~150ms of the click (texts on page2: ${JSON.stringify(await page2.evalIn(`texts.get(${JSON.stringify(REL)})`))})`);
 
