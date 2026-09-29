@@ -67,6 +67,79 @@ pub fn verify(tarball: &[u8], minisig: &str, pubkey_b64: &str) -> Result<(), Str
         .map_err(|_| "signature did not verify".to_string())
 }
 
+/// Caps what `xz_decompress` is allowed to write, so a small, already-signed
+/// tarball that unpacks to gigabytes (a decompression bomb) is refused as it
+/// grows rather than after it is fully materialized. `lzma_rs`'s XZ entry
+/// point takes no size limit of its own — that only exists on the raw LZMA
+/// API's `Options::memlimit`, which the XZ container format doesn't expose —
+/// so the bound has to be enforced from the write side instead.
+struct Capped<'a> {
+    buf: &'a mut Vec<u8>,
+    cap: u64,
+}
+
+impl std::io::Write for Capped<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() as u64 + data.len() as u64 > self.cap {
+            return Err(std::io::Error::other("decompressed archive exceeds the size cap"));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The one binary out of a release tarball. dist writes `<target>/roost`
+/// beside a README and two licences, so the rule is *exactly one regular
+/// member whose file name is `roost`*, at any depth. A symlink there would
+/// be followed by nothing here but is refused anyway: the file that gets
+/// probed and swapped has to be the bytes that were signed. Nothing here
+/// ever touches disk — the result is bytes in memory, staged and swapped by
+/// a later step — so there is no path to confine and no traversal to guard
+/// against; the only hostile shapes that matter at this stage are ones that
+/// would make this function allocate or return the wrong bytes.
+pub fn extract_binary(tar_xz: &[u8]) -> Result<Vec<u8>, String> {
+    let mut tar = Vec::new();
+    lzma_rs::xz_decompress(&mut &tar_xz[..], &mut Capped { buf: &mut tar, cap: MAX_ARCHIVE_BYTES })
+        .map_err(|e| format!("the archive could not be decompressed: {e:?}"))?;
+    let mut archive = tar::Archive::new(&tar[..]);
+    let entries = archive.entries().map_err(|e| format!("the archive could not be read: {e}"))?;
+    let mut found: Option<Vec<u8>> = None;
+    let mut count = 0usize;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("the archive could not be read: {e}"))?;
+        let is_roost = entry
+            .path()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n == "roost"))
+            .unwrap_or(false);
+        if !is_roost {
+            continue;
+        }
+        count += 1;
+        match entry.header().entry_type() {
+            tar::EntryType::Regular | tar::EntryType::Continuous => {}
+            tar::EntryType::Directory => return Err("the roost member is a directory".into()),
+            tar::EntryType::Symlink | tar::EntryType::Link => return Err("the roost member is a symlink".into()),
+            other => return Err(format!("the roost member is not a regular file ({other:?})")),
+        }
+        if entry.size() > MAX_ARCHIVE_BYTES {
+            return Err("the roost member is larger than the download cap".into());
+        }
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        std::io::Read::read_to_end(&mut entry, &mut bytes)
+            .map_err(|e| format!("the roost member could not be read: {e}"))?;
+        found = Some(bytes);
+    }
+    match (count, found) {
+        (0, _) => Err("the archive has no roost member".into()),
+        (1, Some(b)) => Ok(b),
+        (n, _) => Err(format!("the archive has {n} roost members")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +258,97 @@ mod tests {
         lines[2].push_str("-tampered");
         let tampered = lines.join("\n");
         assert_eq!(verify(&data, &tampered, &pk).unwrap_err(), "signature did not verify");
+    }
+
+    enum Member<'a> {
+        File(&'a str, &'a [u8]),
+        Dir(&'a str),
+        Link(&'a str, &'a str),
+    }
+
+    /// An archive the way dist writes one, built in memory: a top directory
+    /// named for the target, files under it. `xz_compress` produces a
+    /// stream `xz_decompress` reads; the release's is `xz -9`, same format.
+    fn tar_xz(members: &[Member]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        for m in members {
+            let mut h = tar::Header::new_gnu();
+            match m {
+                Member::File(path, data) => {
+                    h.set_mode(0o755);
+                    h.set_size(data.len() as u64);
+                    b.append_data(&mut h, path, *data).unwrap();
+                }
+                Member::Dir(path) => {
+                    h.set_entry_type(tar::EntryType::Directory);
+                    h.set_mode(0o755);
+                    h.set_size(0);
+                    b.append_data(&mut h, path, &b""[..]).unwrap();
+                }
+                Member::Link(path, target) => {
+                    h.set_entry_type(tar::EntryType::Symlink);
+                    h.set_size(0);
+                    b.append_link(&mut h, path, target).unwrap();
+                }
+            }
+        }
+        let tar = b.into_inner().unwrap();
+        let mut out = Vec::new();
+        lzma_rs::xz_compress(&mut &tar[..], &mut out).unwrap();
+        out
+    }
+
+    const T: &str = "roost-x86_64-unknown-linux-musl";
+
+    /// The layout `tar -tJf` printed for v0.5.2 on 2026-09-14: a directory
+    /// named for the target, and under it README.md, roost, and two
+    /// licences. The member is `<dir>/roost`, not `roost`.
+    #[test]
+    fn the_release_layout_yields_the_one_binary() {
+        let a = tar_xz(&[
+            Member::Dir(&format!("{T}/")),
+            Member::File(&format!("{T}/README.md"), b"# roost"),
+            Member::File(&format!("{T}/roost"), b"\x7fELF fake"),
+            Member::File(&format!("{T}/LICENSE-MIT"), b"MIT"),
+            Member::File(&format!("{T}/LICENSE-APACHE"), b"Apache"),
+        ]);
+        assert_eq!(extract_binary(&a).unwrap(), b"\x7fELF fake");
+    }
+
+    #[test]
+    fn every_other_shape_is_refused_by_name() {
+        let none = tar_xz(&[Member::File(&format!("{T}/README.md"), b"x")]);
+        assert_eq!(extract_binary(&none).unwrap_err(), "the archive has no roost member");
+
+        let two = tar_xz(&[Member::File(&format!("{T}/roost"), b"a"), Member::File("other/roost", b"b")]);
+        assert_eq!(extract_binary(&two).unwrap_err(), "the archive has 2 roost members");
+
+        let link = tar_xz(&[Member::Link(&format!("{T}/roost"), "/bin/sh")]);
+        assert_eq!(extract_binary(&link).unwrap_err(), "the roost member is a symlink");
+
+        let dir = tar_xz(&[Member::Dir(&format!("{T}/roost/"))]);
+        assert_eq!(extract_binary(&dir).unwrap_err(), "the roost member is a directory");
+
+        let e = extract_binary(b"definitely not xz").unwrap_err();
+        assert!(e.starts_with("the archive could not be decompressed"), "{e}");
+    }
+
+    /// `extract_binary` decompresses into an in-memory `Vec`, so nothing
+    /// bounds the output size unless something does — a small compressed
+    /// input that expands past the cap must be refused while it is still
+    /// growing, not after gigabytes were already allocated. Exercised
+    /// directly against `Capped` rather than through a real xz bomb: nothing
+    /// else in this file can generate one small enough for a unit test.
+    /// Revert-checked: deleting the cap check turns `write` into a plain
+    /// append and the second `unwrap_err()` below fails with
+    /// `Ok(4)` instead of a size-cap error.
+    #[test]
+    fn capped_write_refuses_output_past_the_cap() {
+        let mut buf = Vec::new();
+        let mut w = Capped { buf: &mut buf, cap: 4 };
+        assert_eq!(std::io::Write::write(&mut w, b"ab").unwrap(), 2);
+        let e = std::io::Write::write(&mut w, b"cdef").unwrap_err();
+        assert_eq!(e.to_string(), "decompressed archive exceeds the size cap");
+        assert_eq!(buf, b"ab", "the over-cap write must not be partially applied");
     }
 }
