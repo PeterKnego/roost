@@ -344,18 +344,51 @@ pub fn run_pipeline(plan: &Plan, fetch: FetchBytes, report: &mut dyn FnMut(Phase
         .exe
         .parent()
         .ok_or((Phase::Unpack, "the executable has no parent directory".to_string()))?;
-    let staged = stage(dir, &bytes).map_err(|e| (Phase::Unpack, e))?;
+    let staged = Staged(Some(stage(dir, &bytes).map_err(|e| (Phase::Unpack, e))?));
 
     report(Phase::Probe);
-    if let Err(e) = probe(&staged, &plan.want, plan.probe_timeout) {
-        return Err((Phase::Probe, unstage(&staged, e)));
+    if let Err(e) = probe(staged.path(), &plan.want, plan.probe_timeout) {
+        return Err((Phase::Probe, staged.fail(e)));
     }
 
     report(Phase::Swap);
-    if let Err(e) = swap(&staged, &plan.exe) {
-        return Err((Phase::Swap, unstage(&staged, e)));
+    if let Err(e) = swap(staged.path(), &plan.exe) {
+        return Err((Phase::Swap, staged.fail(e)));
     }
+    staged.disarm();
     Ok(())
+}
+
+/// Owns the staged path from `stage` until the rename. A failure returns
+/// through `fail`, which folds a failed removal into the message; a panic
+/// between the two (in `probe`, or in a `report` that takes the hub lock)
+/// unwinds through `Drop`, which removes it too. Without this one leak
+/// blocks every later update in the process: the name is pid-fixed and
+/// `stage` refuses a path that exists. Disarmed only once `swap` returns
+/// `Ok`, when the path names the executable and is no longer ours to remove.
+struct Staged(Option<PathBuf>);
+
+impl Staged {
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("a Staged is armed until it is consumed")
+    }
+    fn fail(mut self, why: String) -> String {
+        match self.0.take() {
+            Some(p) => unstage(&p, why),
+            None => why,
+        }
+    }
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = unstage(&p, String::new());
+        }
+    }
 }
 
 /// Read at most `cap` bytes, and say so if there were more: the header check
@@ -727,6 +760,8 @@ mod tests {
 
     use std::io::Read as _;
     use std::sync::Mutex as StdMutex;
+    /// Shared by every pipeline test, so they are correct only one at a
+    /// time: this module relies on `--test-threads=1`, as the suite does.
     static SERVED: StdMutex<Option<(Vec<u8>, String)>> = StdMutex::new(None);
 
     fn serve(tarball: Vec<u8>, sig: String) {
@@ -862,6 +897,57 @@ mod tests {
     /// Revert-checked: moving unpack ahead of verify fails here with
     /// `left: (Unpack, "the archive could not be decompressed: XzError(...)")`.
     ///
+    /// A panic between staging and the rename — here in `report`, which in
+    /// the server takes the hub lock — still removes the staged file, or the
+    /// pid-fixed name would refuse every later update in the process.
+    /// Revert-checked: a `Drop` that disarms without removing fails here at
+    /// "a panic left the staged file behind" with
+    /// `left: [".roost-update.<pid>"], right: []`.
+    #[test]
+    fn a_panic_after_staging_still_removes_the_staged_file() {
+        let d = tempfile::tempdir().unwrap();
+        let (pk, sk) = test_key();
+        let (a, sig) = release(&sk, "9.9.9");
+        serve(a, sig);
+        let plan = plan_in(d.path(), &pk, "9.9.9");
+        let before = std::fs::read(&plan.exe).unwrap();
+        let mut staged_seen = false;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_pipeline(&plan, fetch_served, &mut |p| {
+                if p == Phase::Probe {
+                    staged_seen = !leftovers(d.path()).is_empty();
+                    panic!("report panicked on probe");
+                }
+            })
+        }));
+        assert!(r.is_err(), "the panic propagated");
+        assert!(staged_seen, "the file was staged before the panic, so its absence below means removal");
+        assert_eq!(leftovers(d.path()), Vec::<String>::new(), "a panic left the staged file behind");
+        assert_eq!(std::fs::read(&plan.exe).unwrap(), before);
+    }
+
+    /// The rename itself failing — the executable's path is a non-empty
+    /// directory, which `rename` refuses — reports `Swap` and still removes
+    /// the staged file. Revert-checked: disarming the guard on that branch
+    /// and returning the bare error fails the leftovers assertion with
+    /// `left: [".roost-update.<pid>"], right: []`.
+    #[test]
+    fn a_refused_rename_reports_swap_and_removes_the_staged_file() {
+        let d = tempfile::tempdir().unwrap();
+        let (pk, sk) = test_key();
+        let (a, sig) = release(&sk, "9.9.9");
+        serve(a, sig);
+        let mut plan = plan_in(d.path(), &pk, "9.9.9");
+        plan.exe = d.path().join("in-the-way");
+        std::fs::create_dir(&plan.exe).unwrap();
+        std::fs::write(plan.exe.join("keep"), b"k").unwrap();
+        let (phase, msg) = run_pipeline(&plan, fetch_served, &mut |_| {}).unwrap_err();
+        assert_eq!(phase, Phase::Swap, "{msg}");
+        assert!(msg.starts_with("rename refused"), "{msg}");
+        assert_eq!(leftovers(d.path()), Vec::<String>::new());
+        assert_eq!(std::fs::read(plan.exe.join("keep")).unwrap(), b"k");
+    }
+
     /// Order: the signature is checked over the raw downloaded bytes, and a
     /// tarball that fails it never reaches the decompressor. The fixture is
     /// bytes `extract_binary` refuses loudly ("could not be decompressed"),
