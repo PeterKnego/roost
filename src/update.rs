@@ -3,7 +3,7 @@
 
 include!("pubkey.rs");
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The download cap. The musl tarball is 1.4 MB; a server answering with
 /// gigabytes is one to walk away from, and the check happens twice — against
@@ -217,10 +217,186 @@ pub fn probe(exe: &Path, want: &str, timeout: std::time::Duration) -> Result<(),
     Ok(())
 }
 
+/// Where the pipeline was when it stopped. The dialog names it, About names
+/// it, and `errlog` records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Download,
+    Verify,
+    Unpack,
+    Probe,
+    Swap,
+    Exec,
+    /// The thread panicked. Reported like any other failure, and it clears
+    /// the guard like any other failure.
+    Internal,
+}
+
+impl Phase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Phase::Download => "download",
+            Phase::Verify => "verify",
+            Phase::Unpack => "unpack",
+            Phase::Probe => "probe",
+            Phase::Swap => "swap",
+            Phase::Exec => "exec",
+            Phase::Internal => "internal",
+        }
+    }
+}
+
+/// The injection seam, like `version::FetchFn`: a plain `fn` so it crosses
+/// into the detached thread without a lifetime.
+pub type FetchBytes = fn(&str) -> Result<Vec<u8>, String>;
+
+/// Everything the pipeline needs, decided before the thread starts. `exe`
+/// is captured first of all: on Linux `current_exe` reads `/proc/self/exe`,
+/// which after the rename names the deleted inode with ` (deleted)`.
+pub struct Plan {
+    pub exe: PathBuf,
+    pub tarball_url: String,
+    pub sig_url: String,
+    pub pubkey: String,
+    pub want: String,
+    pub probe_timeout: std::time::Duration,
+}
+
+/// The new bytes, as `.roost-update.<pid>` in the executable's own directory
+/// — the same directory because the swap is a rename, and a rename is atomic
+/// only within one filesystem.
+///
+/// `create_new` (`O_EXCL`) because anything already at that name is not
+/// ours: it may be a symlink `fs::write` would follow and write through, and
+/// it is not ours to delete either — the error leaves it where it is. The
+/// file is created 0600 and marked 0755 only once every byte is written, so
+/// nothing can execute a half-written file. A failure *after* the create
+/// removes the one path this call created, and nothing else.
+pub fn stage(dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let p = dir.join(format!(".roost-update.{}", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&p).map_err(|e| format!("could not create {}: {e}", p.display()))?;
+    let written = f
+        .write_all(bytes)
+        .and_then(|()| f.sync_all())
+        .map_err(|e| format!("could not write {}: {e}", p.display()))
+        .and_then(|()| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(std::fs::Permissions::from_mode(0o755))
+                    .map_err(|e| format!("could not mark {} executable: {e}", p.display()))?;
+            }
+            Ok(())
+        });
+    // Closed before anything can exec it: an open write handle is ETXTBSY.
+    drop(f);
+    if let Err(e) = written {
+        return Err(unstage(&p, e));
+    }
+    Ok(p)
+}
+
+/// Remove the file `stage` created, by its exact path, and fold a failure to
+/// do so into the error rather than dropping it: a staged file left behind
+/// is worth a sentence in the dialog.
+fn unstage(staged: &Path, why: String) -> String {
+    match std::fs::remove_file(staged) {
+        Ok(()) => why,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => why,
+        Err(e) => format!("{why} (and {} could not be removed: {e})", staged.display()),
+    }
+}
+
+/// The one irreversible step, and a single syscall. The running process
+/// keeps its old inode until it execs.
+pub fn swap(staged: &Path, exe: &Path) -> Result<(), String> {
+    std::fs::rename(staged, exe).map_err(|e| format!("rename refused: {e}"))
+}
+
+/// Fetch, verify, unpack, probe, swap. Every step before the rename fails
+/// safe by construction: the executable is untouched and the staged file is
+/// removed. `report` is called as each phase *starts*, so the dialog reads
+/// what is happening rather than what just did.
+///
+/// Verify runs on the downloaded bytes before `extract_binary` sees them.
+/// That order is what makes `extract_binary`'s unbounded single XZ block
+/// acceptable (see `Capped`), so it is not an order to rearrange.
+pub fn run_pipeline(plan: &Plan, fetch: FetchBytes, report: &mut dyn FnMut(Phase)) -> Result<(), (Phase, String)> {
+    report(Phase::Download);
+    let tarball = fetch(&plan.tarball_url).map_err(|e| (Phase::Download, e))?;
+    let sig = fetch(&plan.sig_url).map_err(|e| (Phase::Download, e))?;
+    let sig = String::from_utf8(sig).map_err(|_| (Phase::Download, "the signature file is not text".to_string()))?;
+
+    report(Phase::Verify);
+    verify(&tarball, &sig, &plan.pubkey).map_err(|e| (Phase::Verify, e))?;
+
+    report(Phase::Unpack);
+    let bytes = extract_binary(&tarball).map_err(|e| (Phase::Unpack, e))?;
+    let dir = plan
+        .exe
+        .parent()
+        .ok_or((Phase::Unpack, "the executable has no parent directory".to_string()))?;
+    let staged = stage(dir, &bytes).map_err(|e| (Phase::Unpack, e))?;
+
+    report(Phase::Probe);
+    if let Err(e) = probe(&staged, &plan.want, plan.probe_timeout) {
+        return Err((Phase::Probe, unstage(&staged, e)));
+    }
+
+    report(Phase::Swap);
+    if let Err(e) = swap(&staged, &plan.exe) {
+        return Err((Phase::Swap, unstage(&staged, e)));
+    }
+    Ok(())
+}
+
+/// Read at most `cap` bytes, and say so if there were more: the header check
+/// in `http_get_bytes` is what a well-behaved server passes, and this is what
+/// a lying one hits.
+pub fn read_capped(r: impl std::io::Read, cap: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    r.take(cap + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("the download stopped: {e}"))?;
+    if buf.len() as u64 > cap {
+        return Err(format!("the download exceeded the {cap} byte cap"));
+    }
+    Ok(buf)
+}
+
+/// The real fetch: the version check's agent (ten-second bound, the
+/// User-Agent crates.io asks for, `HTTPS_PROXY` honoured), redirects
+/// followed — `releases/download/` answers 302 to a CDN — and the cap checked
+/// against `Content-Length` before a byte of body is buffered. A non-2xx is
+/// an error in `ureq` 2 (`Error::Status`), whose message carries the code.
+pub fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
+    http_get_capped(url, MAX_ARCHIVE_BYTES)
+}
+
+/// `http_get_bytes` with the cap as a parameter, so a test can reach both
+/// checks over a real socket without sending 64 MB.
+fn http_get_capped(url: &str, cap: u64) -> Result<Vec<u8>, String> {
+    let resp = crate::version::agent().get(url).call().map_err(|e| e.to_string())?;
+    if let Some(len) = resp.header("Content-Length").and_then(|v| v.parse::<u64>().ok()) {
+        if len > cap {
+            return Err(format!("the server announced {len} bytes, above the {cap} byte cap"));
+        }
+    }
+    read_capped(resp.into_reader(), cap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     /// A real executable — a fake `roost`, standing in for a staged binary
     /// under test. Has to be a real, runnable file rather than a mock: the
@@ -547,5 +723,281 @@ mod tests {
         let e = std::io::Write::write(&mut w, b"cdef").unwrap_err();
         assert_eq!(e.to_string(), "decompressed archive exceeds the size cap");
         assert_eq!(buf, b"ab", "the over-cap write must not be partially applied");
+    }
+
+    use std::io::Read as _;
+    use std::sync::Mutex as StdMutex;
+    static SERVED: StdMutex<Option<(Vec<u8>, String)>> = StdMutex::new(None);
+
+    fn serve(tarball: Vec<u8>, sig: String) {
+        *SERVED.lock().unwrap_or_else(|e| e.into_inner()) = Some((tarball, sig));
+    }
+
+    /// Answers the two URLs the plan names from `SERVED`, anything else 404.
+    fn fetch_served(url: &str) -> Result<Vec<u8>, String> {
+        let g = SERVED.lock().unwrap_or_else(|e| e.into_inner());
+        let (t, s) = g.as_ref().ok_or("nothing served")?;
+        if url.ends_with(".tar.xz") {
+            Ok(t.clone())
+        } else if url.ends_with(".minisig") {
+            Ok(s.clone().into_bytes())
+        } else {
+            Err(format!("{url}: status code 404"))
+        }
+    }
+
+    fn fetch_404(url: &str) -> Result<Vec<u8>, String> {
+        Err(format!("{url}: status code 404"))
+    }
+
+    /// A "release": a fake roost that answers `--version` with `want`,
+    /// packed the way dist packs one, signed with `sk`.
+    fn release(sk: &minisign::SecretKey, want: &str) -> (Vec<u8>, String) {
+        let script = format!("#!/bin/sh\necho 'roost {want}'\n");
+        let a = tar_xz(&[Member::Dir(&format!("{T}/")), Member::File(&format!("{T}/roost"), script.as_bytes())]);
+        let sig = sign_bytes(sk, &a);
+        (a, sig)
+    }
+
+    fn plan_in(d: &Path, pk: &str, want: &str) -> Plan {
+        let exe = fake_exe(d, "roost", "echo 'roost 0.0.1'");
+        Plan {
+            exe,
+            tarball_url: format!("http://test/roost-{T}.tar.xz"),
+            sig_url: format!("http://test/roost-{T}.tar.xz.minisig"),
+            pubkey: pk.to_string(),
+            want: want.to_string(),
+            probe_timeout: std::time::Duration::from_secs(2),
+        }
+    }
+
+    fn leftovers(d: &Path) -> Vec<String> {
+        std::fs::read_dir(d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".roost-update."))
+            .collect()
+    }
+
+    /// The whole pipeline, start to swapped file, with every phase reported
+    /// in order and the old file gone. Deleting the `swap` call leaves the
+    /// old bytes in place and fails `assert_ne!`; deleting any `report`
+    /// call fails the phase list.
+    #[test]
+    fn a_signed_release_replaces_the_executable_in_place() {
+        let d = tempfile::tempdir().unwrap();
+        let (pk, sk) = test_key();
+        let (a, sig) = release(&sk, "9.9.9");
+        serve(a, sig);
+        let plan = plan_in(d.path(), &pk, "9.9.9");
+        let before = std::fs::read(&plan.exe).unwrap();
+        let mut phases = Vec::new();
+        run_pipeline(&plan, fetch_served, &mut |p| phases.push(p)).unwrap();
+        assert_eq!(phases, [Phase::Download, Phase::Verify, Phase::Unpack, Phase::Probe, Phase::Swap]);
+        let after = std::fs::read(&plan.exe).unwrap();
+        assert_ne!(after, before);
+        assert!(String::from_utf8_lossy(&after).contains("roost 9.9.9"), "the swapped file is the new one");
+        assert_eq!(leftovers(d.path()), Vec::<String>::new(), "no staged file remains");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&plan.exe).unwrap().permissions().mode() & 0o777, 0o755);
+        }
+    }
+
+    /// Every failure before the rename leaves the executable byte-identical
+    /// and the staged file gone. Each row names the phase it fails in, which
+    /// is what the dialog shows.
+    #[test]
+    fn every_failure_leaves_the_executable_untouched_and_nothing_staged() {
+        let d = tempfile::tempdir().unwrap();
+        let (pk, sk) = test_key();
+        let plan = plan_in(d.path(), &pk, "9.9.9");
+        let before = std::fs::read(&plan.exe).unwrap();
+        let check = |why: &str| {
+            assert_eq!(std::fs::read(&plan.exe).unwrap(), before, "{why}: the executable changed");
+            assert_eq!(leftovers(d.path()), Vec::<String>::new(), "{why}: a staged file remains");
+        };
+
+        let (phase, msg) = run_pipeline(&plan, fetch_404, &mut |_| {}).unwrap_err();
+        assert_eq!(phase, Phase::Download);
+        assert!(msg.contains("404"), "{msg}");
+        check("download failed");
+
+        let (a, _) = release(&sk, "9.9.9");
+        let (_, other_sk) = test_key();
+        serve(a.clone(), sign_bytes(&other_sk, &a));
+        let (phase, msg) = run_pipeline(&plan, fetch_served, &mut |_| {}).unwrap_err();
+        assert_eq!((phase, msg.as_str()), (Phase::Verify, "signature did not verify"));
+        check("signature");
+
+        let empty = tar_xz(&[Member::File(&format!("{T}/README.md"), b"x")]);
+        serve(empty.clone(), sign_bytes(&sk, &empty));
+        let (phase, msg) = run_pipeline(&plan, fetch_served, &mut |_| {}).unwrap_err();
+        assert_eq!((phase, msg.as_str()), (Phase::Unpack, "the archive has no roost member"));
+        check("no member");
+
+        let (a, sig) = release(&sk, "9.9.8");
+        serve(a, sig);
+        let (phase, msg) = run_pipeline(&plan, fetch_served, &mut |_| {}).unwrap_err();
+        assert_eq!(phase, Phase::Probe);
+        assert!(msg.contains("9.9.8"), "{msg}");
+        check("wrong version");
+
+        // `exec` so the probe's kill lands on the sleeper itself rather than
+        // on a shell that would leave a `sleep 30` orphaned behind the test.
+        let hang_script = "#!/bin/sh\nexec sleep 30\n";
+        let a = tar_xz(&[Member::File(&format!("{T}/roost"), hang_script.as_bytes())]);
+        serve(a.clone(), sign_bytes(&sk, &a));
+        let (phase, _) = run_pipeline(&plan, fetch_served, &mut |_| {}).unwrap_err();
+        assert_eq!(phase, Phase::Probe);
+        check("hang");
+    }
+
+    /// Order: the signature is checked over the raw downloaded bytes, and a
+    /// tarball that fails it never reaches the decompressor. The fixture is
+    /// bytes `extract_binary` refuses loudly ("could not be decompressed"),
+    /// signed by the wrong key — so the pipeline running unpack first would
+    /// report `Unpack`, and running it at all would show in `phases`.
+    #[test]
+    fn a_bad_signature_is_refused_before_decompression_sees_the_bytes() {
+        let d = tempfile::tempdir().unwrap();
+        let (pk, _) = test_key();
+        let (_, other_sk) = test_key();
+        let garbage = b"definitely not xz".to_vec();
+        assert!(extract_binary(&garbage).unwrap_err().starts_with("the archive could not be decompressed"));
+        serve(garbage.clone(), sign_bytes(&other_sk, &garbage));
+        let plan = plan_in(d.path(), &pk, "9.9.9");
+        let before = std::fs::read(&plan.exe).unwrap();
+        let mut phases = Vec::new();
+        let err = run_pipeline(&plan, fetch_served, &mut |p| phases.push(p)).unwrap_err();
+        assert_eq!(err, (Phase::Verify, "signature did not verify".to_string()));
+        assert_eq!(phases, [Phase::Download, Phase::Verify], "unpack must not start");
+        assert_eq!(std::fs::read(&plan.exe).unwrap(), before);
+        assert_eq!(leftovers(d.path()), Vec::<String>::new());
+    }
+
+    /// The staged file lands in the directory it is given — the pipeline
+    /// gives it the executable's, which is what keeps the rename on one
+    /// filesystem — under the pid-unique name, executable, holding exactly
+    /// the bytes. `stage` creates it 0600 and marks it 0755 only once it is
+    /// written, so dropping the `set_permissions` fails the mode assertion
+    /// with 0o600 whatever the umask is.
+    #[test]
+    fn the_staged_file_is_beside_the_executable_pid_named_and_executable() {
+        let d = tempfile::tempdir().unwrap();
+        let p = stage(d.path(), b"new bytes").unwrap();
+        assert_eq!(p, d.path().join(format!(".roost-update.{}", std::process::id())));
+        assert_eq!(std::fs::read(&p).unwrap(), b"new bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o755);
+        }
+    }
+
+    /// Something already at the staged name is not ours, so it is neither
+    /// written through nor removed. A symlink planted there pointing at
+    /// another file is the case that matters: `fs::write` would follow it
+    /// and overwrite the target. Replacing `create_new` with a plain
+    /// `fs::write` fails the victim assertion; adding a cleanup that removes
+    /// the path on any error fails the "still there" assertion.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_already_at_the_staged_name_is_neither_followed_nor_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let victim = d.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let name = d.path().join(format!(".roost-update.{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &name).unwrap();
+        let e = stage(d.path(), b"new bytes").unwrap_err();
+        assert!(e.contains("could not create"), "{e}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        assert!(std::fs::symlink_metadata(&name).unwrap().file_type().is_symlink(), "not ours, so still there");
+    }
+
+    /// `swap` is a rename: the executable's path names a new inode, and a
+    /// handle open on the old one — the running process, in production —
+    /// still reads the old bytes. A copy-over-the-top would rewrite the
+    /// same inode in place, so the open handle would read the new bytes.
+    #[test]
+    fn swap_replaces_the_executable_by_rename_not_by_rewriting_it() {
+        let d = tempfile::tempdir().unwrap();
+        let exe = d.path().join("roost");
+        std::fs::write(&exe, b"old binary").unwrap();
+        let mut running = std::fs::File::open(&exe).unwrap();
+        let staged = stage(d.path(), b"new binary!").unwrap();
+        swap(&staged, &exe).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new binary!");
+        let mut old = Vec::new();
+        running.read_to_end(&mut old).unwrap();
+        assert_eq!(old, b"old binary", "the old inode was rewritten, not replaced");
+        assert!(matches!(std::fs::symlink_metadata(&staged), Err(e) if e.kind() == std::io::ErrorKind::NotFound));
+
+        // A rename that cannot happen leaves the target alone.
+        let e = swap(&d.path().join(".roost-update.missing"), &exe).unwrap_err();
+        assert!(e.starts_with("rename refused"), "{e}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new binary!");
+    }
+
+    /// The cap, enforced on the body as well as the header — a server that
+    /// lies about `Content-Length` is a server that sends more than it said.
+    #[test]
+    fn a_download_past_the_cap_is_refused_while_reading() {
+        let big = std::io::repeat(b'x').take(100);
+        assert_eq!(read_capped(big, 99).unwrap_err(), "the download exceeded the 99 byte cap");
+        let ok = std::io::repeat(b'x').take(99);
+        assert_eq!(read_capped(ok, 99).unwrap().len(), 99);
+    }
+
+    /// A one-shot HTTP server on loopback answering every request with
+    /// `head` then `body`, then closing.
+    fn one_shot(head: String, body: Vec<u8>) -> String {
+        use std::io::Write;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut req = [0u8; 4096];
+                let _ = s.read(&mut req);
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(&body);
+            }
+        });
+        format!("http://{addr}/roost.tar.xz")
+    }
+
+    /// Through a real socket and the real agent: an announced length above
+    /// the cap is refused from the header, before any body is read — the
+    /// body here is short and the connection closes, so without the header
+    /// check the read would succeed; and a server that announces nothing
+    /// and sends too much is stopped by the read-side cap. Deleting the
+    /// header check fails the first assertion with `Ok`; replacing
+    /// `read_capped` with a plain `read_to_end` fails the second with `Ok`.
+    #[test]
+    fn the_cap_is_checked_against_content_length_and_again_while_reading() {
+        let url = one_shot("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n".into(), b"tiny".to_vec());
+        assert_eq!(
+            http_get_capped(&url, 100).unwrap_err(),
+            "the server announced 1000 bytes, above the 100 byte cap"
+        );
+
+        let url = one_shot("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".into(), vec![b'x'; 1000]);
+        assert_eq!(http_get_capped(&url, 100).unwrap_err(), "the download exceeded the 100 byte cap");
+
+        let url = one_shot("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n".into(), b"tiny".to_vec());
+        assert_eq!(http_get_capped(&url, 100).unwrap(), b"tiny");
+
+        let url = one_shot("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(), vec![]);
+        let e = http_get_capped(&url, 100).unwrap_err();
+        assert!(e.contains("404"), "{e}");
+    }
+
+    #[test]
+    fn every_phase_has_the_name_the_wire_uses() {
+        let all = [Phase::Download, Phase::Verify, Phase::Unpack, Phase::Probe, Phase::Swap, Phase::Exec, Phase::Internal];
+        let names: Vec<&str> = all.iter().map(|p| p.as_str()).collect();
+        assert_eq!(names, ["download", "verify", "unpack", "probe", "swap", "exec", "internal"]);
     }
 }
