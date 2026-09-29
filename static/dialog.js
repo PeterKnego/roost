@@ -431,14 +431,20 @@ function upgradeCommand(b) {
 /// knowing.
 function latestLabel(u) {
   const v = u || {};
-  if (v.installed) return `restart roost to run ${v.installed}`;
+  // The failure suffix is appended once, after the base text is chosen —
+  // including after "restart roost to run": an exec failure is exactly when
+  // the user needs the reason, so `installed` does not short-circuit it.
   let text;
-  switch (v.status) {
-    case "newer": text = v.skipped === v.latest ? `${v.latest} skipped` : `${v.latest} available`; break;
-    case "up-to-date": text = "up to date"; break;
-    case "never": text = "not checked yet"; break;
-    case "off": text = "version checks are off"; break;
-    default: text = "could not check";
+  if (v.installed) {
+    text = `restart roost to run ${v.installed}`;
+  } else {
+    switch (v.status) {
+      case "newer": text = v.skipped === v.latest ? `${v.latest} skipped` : `${v.latest} available`; break;
+      case "up-to-date": text = "up to date"; break;
+      case "never": text = "not checked yet"; break;
+      case "off": text = "version checks are off"; break;
+      default: text = "could not check";
+    }
   }
   if (v.failure) text += ` (update failed: ${v.failure})`;
   return text;
@@ -1076,6 +1082,13 @@ function openSettings(settings) {
 /// mark stays, and the row shows the outcome. After "restarting" the page
 /// reloads on the next control reconnect (app.js), so this dialog is the
 /// last thing the old process paints.
+///
+/// Unlike `settingsOpen`, there is no `onSnapshot` hook: a `State` while
+/// this is open cannot change `u.offer`/`u.latest` mid-flight (this client
+/// is the only one running an update, and the fields it read are already
+/// pinned into `u`/`b` above), so the title and body can go stale only in
+/// ways `onProgress` already covers — nothing here depends on a fresher
+/// settings snapshot to stay correct.
 function openUpdate(settings) {
   const el = document.getElementById("dlg-update");
   const u = (settings && settings.update) || {};
@@ -1126,6 +1139,14 @@ function openUpdate(settings) {
     skip.onclick = () => { send({ t: "SkipUpdate", version: u.latest }); finish("skip"); };
     updateOpen = {
       onProgress(ev) {
+        // Typing does not stop once Update is clicked. Re-flush on every
+        // phase so an edit made during download/verify/unpack/probe/swap
+        // is not still sitting in the debounce when `restarting` reloads
+        // the page — the only window left after this is between the last
+        // progress frame and the exec itself, and the reload that follows
+        // restores buffer text from what the server actually persisted,
+        // not from what was left in an unsent debounce.
+        for (const rel of Array.from(pendingEdits.keys())) pushEdit(rel);
         progress.hidden = false;
         if (ev.phase === "failed") {
           progress.textContent = `update failed: ${ev.detail}`;
