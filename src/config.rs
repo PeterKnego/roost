@@ -20,6 +20,7 @@ struct RawConfig {
     roots: Option<Vec<String>>,
     worktree_prompt: Option<bool>,
     relaunch: Option<bool>,
+    version_check: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,7 +112,8 @@ pub const PROJECT_KEYS: &[&str] = &["theme", "hide", "show_hidden", "autosave", 
 /// whether opening a project *starts an agent*. A cloned repository that could
 /// set it would be arranging to run `claude` on a machine it has just arrived
 /// on.
-pub const GLOBAL_ONLY_KEYS: &[&str] = &["share_selection", "worktree_prompt", "relaunch"];
+pub const GLOBAL_ONLY_KEYS: &[&str] =
+    &["share_selection", "worktree_prompt", "relaunch", "version_check"];
 /// Keys no page may write. Shown read-only; not in any allowlist, so a
 /// forged intent is refused too.
 pub const READ_ONLY_KEYS: &[&str] = &["allowed_origins", "max_upload_bytes", "ide", "roots"];
@@ -162,7 +164,7 @@ pub fn validate(scope: Scope, key: &str, value: Option<&SettingValue>) -> Result
         ("hide", _) => Err("hide takes a list of names".into()),
         (
             "show_hidden" | "autosave" | "follow_tree" | "read_when_watching" | "share_selection"
-            | "worktree_prompt" | "relaunch",
+            | "worktree_prompt" | "relaunch" | "version_check",
             SettingValue::Bool(_),
         ) => Ok(()),
         (k, _) => Err(format!("{k} takes true or false")),
@@ -352,6 +354,46 @@ fn relaunch_from(global: &Path) -> bool {
         .and_then(|s| toml::from_str::<RawConfig>(&s).ok())
         .and_then(|r| r.relaunch)
         .unwrap_or(false)
+}
+
+/// Whether roost asks crates.io what the newest published version is.
+///
+/// Global only (see `GLOBAL_ONLY_KEYS`): roost's own code names the
+/// destination, and a setting a cloned repository could write would let it
+/// enable, disable, or — if the endpoint were ever configurable — redirect a
+/// request this process makes. The endpoint is deliberately not a setting at
+/// all.
+///
+/// **Deliberately not `relaunch_from`'s shape.** That reader folds absent,
+/// unreadable and unparseable into one default, which is right where the
+/// default is "do nothing" and wrong here, where the default is a request. An
+/// operator who wrote `version_check = false` and later broke the same file
+/// with a typo elsewhere would otherwise get back the request they turned off,
+/// with nothing in About to say why. So: absent means on; unreadable or
+/// unparseable means off. `Settings::warning` already names the broken file in
+/// the dialog, so the silence has an explanation beside it.
+pub fn version_check() -> bool {
+    version_check_from(&global_config_path())
+}
+
+fn version_check_from(global: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(global) else {
+        // `read_to_string` cannot distinguish "nothing at all there" from
+        // "something is there but not a readable file" (a directory, a
+        // dangling symlink, a permissions error), so ask `symlink_metadata`
+        // — CLAUDE.md's rule for a decision that must not conflate the two.
+        // Only a genuine `NotFound` (no dirent at all, symlink or otherwise)
+        // is absent; anything else present-but-unreadable is treated the
+        // same as an unparseable file below: off, not on.
+        return matches!(
+            global.symlink_metadata(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        );
+    };
+    match toml::from_str::<RawConfig>(&text) {
+        Ok(raw) => raw.version_check.unwrap_or(true),
+        Err(_) => false,
+    }
 }
 
 /// The directories scanned for projects, from the global config's `roots`.
@@ -683,6 +725,8 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
         "When a Claude is already running here, ✻ offers to start the next one in a new worktree.");
     push("relaunch", "bool", V::Bool(relaunch()), V::Bool(false), false,
         "When you open a project, restart the agents roost had launched in it before a reboot. Never resumes a conversation \u{2014} it starts a fresh one.");
+    push("version_check", "bool", V::Bool(version_check()), V::Bool(true), false,
+        "Ask crates.io once a day whether a newer roost has been published, and say so in About. Nothing is downloaded.");
     push("allowed_origins", "list", V::List(allowed_origins()), V::List(vec![]), false,
         "Browser origins allowed to connect besides loopback, such as the tailnet address.");
     push("max_upload_bytes", "str", V::Str(max_upload_bytes().to_string()), V::Str(DEFAULT_MAX_UPLOAD.to_string()), false,
@@ -967,6 +1011,57 @@ mod tests {
         assert!(worktree_prompt_from(&g), "unparseable: on, a typo must not change a button");
     }
 
+    /// The three-way rule the spec insists on, and the reason it is not a copy
+    /// of `relaunch_from`: an operator who wrote `version_check = false` and
+    /// later broke the same file with a typo elsewhere must not silently get
+    /// back the network request they turned off.
+    #[test]
+    fn an_unreadable_global_file_means_the_check_is_off_but_an_absent_one_does_not() {
+        let d = tempfile::tempdir().unwrap();
+
+        let missing = d.path().join("nope.toml");
+        assert!(version_check_from(&missing), "absent means on: the check is the default");
+
+        let empty = d.path().join("empty.toml");
+        fs::write(&empty, "theme = \"dark\"\n").unwrap();
+        assert!(version_check_from(&empty), "a file that says nothing about it means on");
+
+        let off = d.path().join("off.toml");
+        fs::write(&off, "version_check = false\n").unwrap();
+        assert!(!version_check_from(&off), "false means off");
+
+        let on = d.path().join("on.toml");
+        fs::write(&on, "version_check = true\n").unwrap();
+        assert!(version_check_from(&on), "true means on");
+
+        // The arm that separates this reader from `relaunch_from`.
+        let broken = d.path().join("broken.toml");
+        fs::write(&broken, "version_check = false\nthis is not = = toml\n").unwrap();
+        assert!(
+            !version_check_from(&broken),
+            "a file that did not parse means off — `Settings::warning` names it in the dialog"
+        );
+
+        let unreadable = d.path().join("adir.toml");
+        fs::create_dir(&unreadable).unwrap();
+        assert!(!version_check_from(&unreadable), "a file that cannot be read means off");
+    }
+
+    /// A cloned repository must not be able to turn this on, off, or anywhere.
+    #[test]
+    fn version_check_is_global_only_and_takes_a_bool() {
+        assert_eq!(writable_in("version_check"), ["global"]);
+        assert_eq!(
+            validate(Scope::Project, "version_check", Some(&V::Bool(false))).unwrap_err(),
+            "version_check is a global setting; switch the scope to global"
+        );
+        assert!(validate(Scope::Global, "version_check", Some(&V::Bool(false))).is_ok());
+        assert_eq!(
+            validate(Scope::Global, "version_check", Some(&V::Str("yes".into()))).unwrap_err(),
+            "version_check takes true or false"
+        );
+    }
+
     // The reverse direction: a global `true` is what a per-project `false`
     // has to be able to override, or the setting is one-way.
     #[test]
@@ -1023,9 +1118,16 @@ mod tests {
         std::env::remove_var("ROOST_PING_SECS");
     }
 
-    /// `ROOST_MAX_UPLOAD` is process-global and these tests write it, so they
-    /// serialise. Without this they interleave and each sees another's value.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// `ROOST_MAX_UPLOAD` and `ROOST_CONFIG` are process-global and these tests
+    /// write them, so they serialise. Without this they interleave and each
+    /// sees another's value.
+    ///
+    /// `pub(crate)` because `version.rs`'s tests point `ROOST_CONFIG` at their
+    /// own fixture too. A test needing both this and
+    /// `wsstate::STATE_ENV_LOCK` takes **`STATE_ENV_LOCK` first**; the order
+    /// has to be total, and no test today takes them the other way round (an
+    /// inversion deadlocks, and a deadlock hangs rather than fails).
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The test that fails the moment someone "helpfully" moves this key into
     /// `Settings`. A project's `.roost/config.toml` ships inside the repository,
@@ -1382,7 +1484,7 @@ mod tests {
         assert!(!row("theme").reload);
         // Order: project keys, global-only keys, read-only keys.
         let keys: Vec<&str> = v.keys.iter().map(|r| r.key.as_str()).collect();
-        assert_eq!(keys, ["theme", "hide", "show_hidden", "autosave", "follow_tree", "read_when_watching", "share_selection", "worktree_prompt", "relaunch", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
+        assert_eq!(keys, ["theme", "hide", "show_hidden", "autosave", "follow_tree", "read_when_watching", "share_selection", "worktree_prompt", "relaunch", "version_check", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
         assert_eq!(v.themes.len(), 5 + 35);
         assert!(v.global_file.ends_with("global.toml"));
         assert_eq!(v.project_file, ".roost/config.toml");
