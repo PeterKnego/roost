@@ -98,6 +98,57 @@ pub fn default_command(project: &str, name: &str) -> Vec<String> {
     ]
 }
 
+/// The executable a terminal's command names, found on `PATH` and only there.
+///
+/// Resolved here rather than left to portable-pty for two reasons. Its lookup
+/// tries `cwd/<name>` *before* `PATH`, and a terminal's cwd is inside the
+/// project, so a checkout with an executable named `dtach` at its root ran in
+/// place of the real one: repository code executing on a click that promises
+/// a shell. And it reports a miss as a formatted `anyhow` string, with no
+/// error kind left to tell "not installed" from any other spawn failure, so
+/// the one failure worth install advice (#123) could only be recognised by
+/// string-matching someone else's prose.
+///
+/// A name containing `/` is taken as written: that is an operator's explicit
+/// path in `ROOST_CMD`, not a lookup. `PATH` entries that are empty or
+/// relative are skipped, since POSIX reads both as "the current directory",
+/// which is the hole this closes.
+fn resolve_command(name: &str) -> Result<PathBuf, String> {
+    resolve_on(name, &std::env::var_os("PATH").unwrap_or_default())
+}
+
+/// `resolve_command` with `PATH` passed in, so tests need not mutate the
+/// process-global one under every other test's spawn.
+fn resolve_on(name: &str, path: &std::ffi::OsStr) -> Result<PathBuf, String> {
+    if name.contains('/') {
+        return Ok(PathBuf::from(name));
+    }
+    // A stat that fails with anything but NotFound is a directory we could not
+    // look in, not one without the command. The spawn is refused either way,
+    // but the message must not claim "not installed" when it could not tell.
+    let mut unreadable = false;
+    for dir in std::env::split_paths(path).filter(|d| d.is_absolute()) {
+        let candidate = dir.join(name);
+        match std::fs::metadata(&candidate) {
+            Ok(m) => {
+                use std::os::unix::fs::PermissionsExt;
+                if m.is_file() && m.permissions().mode() & 0o111 != 0 {
+                    return Ok(candidate);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => unreadable = true,
+        }
+    }
+    Err(if unreadable {
+        format!("{name} was not found on PATH, and part of PATH could not be read")
+    } else if name == "dtach" {
+        "dtach is not installed on this host: install it (apt or brew install dtach), then reopen the terminal".into()
+    } else {
+        format!("{name} is not installed on this host (not found on PATH)")
+    })
+}
+
 pub fn min_geometry(sizes: &HashMap<u64, (u16, u16)>) -> Option<(u16, u16)> {
     let cols = sizes.values().map(|(c, _)| *c).min()?;
     let rows = sizes.values().map(|(_, r)| *r).min()?;
@@ -461,6 +512,12 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         }
     };
 
+    // Resolved before the lock, not at the spawn: the lookup stats every PATH
+    // entry, and filesystem I/O under the global session lock stalls every
+    // session's output. Consulted only if this attach turns out to spawn.
+    let cmd = default_command(project, name);
+    let resolved = cmd.first().map(|c| resolve_command(c));
+
     let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
     // Re-checked after the probe released the lock: a close may have started
     // in between, and it outranks an authorisation taken a moment ago.
@@ -476,10 +533,10 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
     let spawned = !map.contains_key(&key);
     let mut launch = None;
     if spawned {
-        let cmd = default_command(project, name);
-        if cmd.is_empty() {
-            return Err("empty command".into());
-        }
+        let program = match resolved {
+            None => return Err("empty command".into()),
+            Some(r) => r?,
+        };
         // The reservation was consumed by `decide` above, before the spawn can
         // fail, rather than after: a spawn that fails leaves no session, and
         // the browser's retry would otherwise find the entry still there and
@@ -519,7 +576,7 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         let pair = pty
             .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| e.to_string())?;
-        let mut cb = CommandBuilder::new(&cmd[0]);
+        let mut cb = CommandBuilder::new(&program);
         cb.args(&cmd[1..]);
         // The dtach *client's* cwd, which matters only when there is no socket
         // to attach to: in that case dtach forks a master and the shell
@@ -2104,5 +2161,85 @@ mod tests {
             !seen.contains(concat!("RESH", "_")),
             "a terminal still exports the old prefix, so hooks would see both: {seen:?}"
         );
+    }
+
+    fn exe(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_command_resolves_to_the_first_executable_on_path() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let want = exe(b.path(), "tool", 0o755);
+        let path = std::env::join_paths([a.path(), b.path()]).unwrap();
+        assert_eq!(resolve_on("tool", &path).unwrap(), want);
+    }
+
+    /// POSIX reads an empty or relative PATH entry as the current directory,
+    /// and the current directory is the project: the hole this lookup closes,
+    /// reopened through PATH instead of through portable-pty. The fixture is
+    /// a real executable reachable *only* through those entries, so a lookup
+    /// that honoured them would find it.
+    #[test]
+    fn empty_and_relative_path_entries_are_not_searched() {
+        let d = tempfile::tempdir().unwrap();
+        exe(d.path(), "tool", 0o755);
+        let cwd = std::env::current_dir().unwrap();
+        let rel = pathdiff_rel(&cwd, d.path());
+        for path in [format!(":{rel}"), rel.clone(), format!("{rel}:")] {
+            let got = resolve_on("tool", std::ffi::OsStr::new(&path));
+            assert!(got.is_err(), "PATH={path:?} found {got:?} through a relative entry");
+        }
+    }
+
+    /// A relative spelling of `d` from `cwd`, so the fixture is reachable
+    /// through a relative PATH entry from wherever the test runs.
+    fn pathdiff_rel(cwd: &Path, d: &Path) -> String {
+        let up = cwd.components().count() - 1;
+        format!("{}{}", "../".repeat(up), d.strip_prefix("/").unwrap().display())
+    }
+
+    #[test]
+    fn a_file_that_is_not_executable_is_not_the_command() {
+        let d = tempfile::tempdir().unwrap();
+        exe(d.path(), "tool", 0o644);
+        let err = resolve_on("tool", d.path().as_os_str()).unwrap_err();
+        assert!(err.contains("tool is not installed"), "{err}");
+    }
+
+    /// The only message with advice in it, and the longest: it must survive
+    /// `term::close_reason`'s 123-byte cut whole, or the advice is what gets
+    /// cut off.
+    #[test]
+    fn a_missing_dtach_says_how_to_install_it_within_a_close_reason() {
+        let d = tempfile::tempdir().unwrap();
+        let err = resolve_on("dtach", d.path().as_os_str()).unwrap_err();
+        assert!(err.contains("install dtach"), "{err}");
+        assert!(err.len() <= 123, "{} bytes would be cut: {err}", err.len());
+    }
+
+    /// "Not installed" is a claim about the host, so it is only made when
+    /// every PATH entry was actually looked in. A directory that cannot be
+    /// searched is a gap, and the message says so instead.
+    #[test]
+    fn an_unsearchable_path_entry_is_not_reported_as_not_installed() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let locked = d.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root can search a 0o000 directory, and then there is no gap to see.
+        let searchable = std::fs::metadata(locked.join("tool")).map(|_| true).unwrap_or_else(|e| e.kind() == std::io::ErrorKind::NotFound);
+        let err = resolve_on("tool", locked.as_os_str()).unwrap_err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if searchable {
+            eprintln!("skipped: this user can search a 0o000 directory");
+            return;
+        }
+        assert!(err.contains("could not be read") && !err.contains("not installed"), "{err}");
     }
 }

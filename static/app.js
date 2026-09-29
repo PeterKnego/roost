@@ -3021,7 +3021,11 @@ function connectTerm(entry, session) {
     // delivers a real Close frame, not a bare EOF. integration.rs's
     // child_exit_delivers_a_close_frame_not_a_bare_eof pins that, because if
     // it ever regressed this handler would start respawning killed shells.
-    if (ev.wasClean) { termStatus(entry, "session ended"); return; }
+    // A clean close with a reason is a refusal the server explained (#123):
+    // the shell never started, and "session ended" — what the tab also says
+    // after `exit` — would hide why. Still no reconnect: the refusal would
+    // simply repeat.
+    if (ev.wasClean) { termStatus(entry, ev.reason || "session ended"); return; }
     termStatus(entry, "reconnecting…");
     // Capped backoff, and deliberately never gives up: a laptop asleep for
     // eight hours must still find its terminal alive on wake.

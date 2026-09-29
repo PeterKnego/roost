@@ -248,6 +248,9 @@ main { flex: 1; min-height: 0; }
   padding: 2px 7px; border-radius: 3px; pointer-events: none;
   font: 11px/1.6 var(--mono); color: var(--bg);
   background: var(--warn, #d79921);
+  /* A refusal's reason (#123) runs to a sentence; wrapped inside the pane
+     rather than spilling past its left edge, where it could not be read. */
+  max-width: calc(100% - 16px);
 }
 /* Copy-on-select has to announce itself. The clipboard is invisible, and a
    copy that silently does nothing is precisely the failure this replaced — so
