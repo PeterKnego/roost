@@ -67,7 +67,7 @@ publish-jobs = ["homebrew", "./publish-crates-io"]
 # generator — without this, `dist plan` fails every CI run with "has out of date
 # contents".
 #
-# The single edit is `environment: release` on `publish-homebrew-formula`.
+# The first edit is `environment: release` on `publish-homebrew-formula`.
 # HOMEBREW_TAP_TOKEN is an environment secret rather than a repo secret,
 # because a repo secret is readable by any workflow file on any ref and a
 # pull_request run from a same-repo branch supplies its own copies — so the
@@ -83,6 +83,13 @@ publish-jobs = ["homebrew", "./publish-crates-io"]
 # will not reach the workflow and nothing will say so. On a dist upgrade:
 # remove this key, run `dist init`, re-add `environment: release` to
 # publish-homebrew-formula, then restore this key.
+#
+# The second edit is the `if: publishing == 'true'` gate on
+# `custom-sign-release-artifacts`. dist generates that job (and its clause in
+# `host`) from `global-artifacts-jobs` below, the way it generated
+# `custom-build-linux-packages`, but ungated — so on a pull request it would
+# hit the `release` environment and show as a failed check. Re-add the gate
+# after a `dist init` too.
 allow-dirty = ["ci"]
 
 # dist's default grant for a custom publish job is `{id-token, packages}`, and
@@ -98,7 +105,8 @@ github-custom-job-permissions = { "publish-crates-io" = { "id-token" = "write", 
 # Runs in the global phase, not the local one: the local phase is a matrix, so
 # a job there sees one target's output. The global phase is the first point at
 # which all four binaries exist and can be downloaded.
-global-artifacts-jobs = ["./build-linux-packages"]
+# Listed for the record; release.yml is hand-edited (allow-dirty), so the job block there is what runs.
+global-artifacts-jobs = ["./build-linux-packages", "./sign-release-artifacts"]
 
 # dtach is a *runtime* prerequisite, not a build one — roost spawns it, it is
 # not linked against. `stage = ["run"]` is what turns this into a `depends_on`

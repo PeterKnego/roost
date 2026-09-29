@@ -745,7 +745,7 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
     );
     SettingsView {
         build: build_info(),
-        update: crate::version::view(),
+        update: crate::update::view(),
         keys,
         themes: crate::themes::catalogue(),
         project_file: ".roost/config.toml".into(),
@@ -1512,6 +1512,8 @@ mod tests {
         let v = settings_view(d.path());
         assert_eq!(v.update.status, "off", "the reader is consulted, not defaulted");
         let json = serde_json::to_value(&v).unwrap();
+        assert!(!v.update.offer, "a checkout is never offered the button; the field rides beside status");
+        assert!(json["update"].get("offer").is_some(), "the client reads state.settings.update.offer");
         assert!(json.get("update").is_some(), "the client reads state.settings.update");
         assert!(json["update"]["latest"].is_string(),
             "the JS and the #86 self-update plan both read state.settings.update.latest by name");

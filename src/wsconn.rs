@@ -416,6 +416,30 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
                     }
                     continue;
                 }
+                // Diverted like Search and RestoreWorkspace: an update is a
+                // download and two probes, a choice is a file write that
+                // every hub then hears about, and the reply must reach only
+                // this connection. `update::start` takes the hub lock itself,
+                // briefly, once per phase; nothing here holds it.
+                match &decoded {
+                    Ok(proto::Intent::Update) => {
+                        crate::update::start(hub.clone(), id.clone(), crate::update::http_get_bytes);
+                        continue;
+                    }
+                    Ok(proto::Intent::DeferUpdate) => {
+                        if let Err(msg) = crate::update::apply_defer(crate::errlog::now_secs()) {
+                            Hub::lock(&hub).send_to(&id, &proto::Event::Error { msg });
+                        }
+                        continue;
+                    }
+                    Ok(proto::Intent::SkipUpdate { version }) => {
+                        if let Err(msg) = crate::update::apply_skip(version) {
+                            Hub::lock(&hub).send_to(&id, &proto::Event::Error { msg });
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
                 let dirty = {
                     let mut h = Hub::lock(&hub);
                     match decoded {

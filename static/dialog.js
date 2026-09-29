@@ -423,25 +423,31 @@ function upgradeCommand(b) {
 
 /// What About says about newer versions, from `state.settings.update`.
 ///
-/// Five renderings, three of which come from the comparator and two from the
-/// state file itself: its absence ("not checked yet", the few seconds after a
-/// fresh install) and the setting ("version checks are off", the answer to
-/// "why does this never say anything"). Both are shown rather than left blank
-/// — an empty row is the same defect in a quieter coat, and neither was
-/// assertable while they were silent.
-///
-/// An unknown status renders as "could not check" rather than throwing or
-/// going blank: About does not say *why* a check failed, and a status this
-/// does not recognise is one more way of not knowing.
+/// Step 2's five renderings, and three more from step 4 in order of
+/// precedence: a swapped file whose exec failed ("restart roost to run"),
+/// a skipped version, and a failed attempt appended to whatever the row
+/// would otherwise say. An unknown status still renders as "could not
+/// check": a status this build does not recognise is one more way of not
+/// knowing.
 function latestLabel(u) {
   const v = u || {};
-  switch (v.status) {
-    case "newer": return `${v.latest} available`;
-    case "up-to-date": return "up to date";
-    case "never": return "not checked yet";
-    case "off": return "version checks are off";
-    default: return "could not check";
+  // The failure suffix is appended once, after the base text is chosen —
+  // including after "restart roost to run": an exec failure is exactly when
+  // the user needs the reason, so `installed` does not short-circuit it.
+  let text;
+  if (v.installed) {
+    text = `restart roost to run ${v.installed}`;
+  } else {
+    switch (v.status) {
+      case "newer": text = v.skipped === v.latest ? `${v.latest} skipped` : `${v.latest} available`; break;
+      case "up-to-date": text = "up to date"; break;
+      case "never": text = "not checked yet"; break;
+      case "off": text = "version checks are off"; break;
+      default: text = "could not check";
+    }
   }
+  if (v.failure) text += ` (update failed: ${v.failure})`;
+  return text;
 }
 
 function openSettings(settings) {
@@ -741,6 +747,23 @@ function openSettings(settings) {
         a.target = "_blank"; a.rel = "noopener noreferrer";
         a.title = v;
         cell.appendChild(a);
+      } else if (kind === "latest") {
+        cell.textContent = v;
+        // The action lives where the wondering happens. One dialog at a time,
+        // so the settings dialog closes first, through the hook the open
+        // dialog exposes; `finish` is not in scope here.
+        if (u.offer && u.status === "newer" && u.skipped !== u.latest && !u.installed) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "dlg-upd";
+          btn.textContent = u.failure ? "Retry" : "Update";
+          btn.onclick = () => {
+            const so = settingsOpen;
+            if (so && so.close) so.close();
+            openUpdate(view);
+          };
+          cell.appendChild(btn);
+        }
       } else {
         cell.textContent = v;
       }
@@ -963,6 +986,7 @@ function openSettings(settings) {
         awaitingSave = false;
         okBtn.disabled = false;
       },
+      close() { finish(false); },
     };
     okBtn.textContent = "Save"; okBtn.disabled = false; okBtn.classList.remove("danger");
     const save = () => {
@@ -1047,4 +1071,111 @@ function openSettings(settings) {
     render();
     return () => tabs.querySelector(".dlg-tab").focus();
   }, false);
+}
+
+/// The update dialog: `roost 0.5.3 is available — you are running 0.5.2`.
+/// Update / Later / Skip for a copy roost may replace; the command About
+/// already shows, as copyable text, plus Later / Skip for every other
+/// shape. A checkout never gets here (`updateWanted` in app.js).
+///
+/// Escape closes it and nothing else: a running pipeline continues, the
+/// mark stays, and the row shows the outcome. After "restarting" the page
+/// reloads on the next control reconnect (app.js), so this dialog is the
+/// last thing the old process paints.
+///
+/// Unlike `settingsOpen`, there is no `onSnapshot` hook: a `State` while
+/// this is open cannot change `u.offer`/`u.latest` mid-flight (this client
+/// is the only one running an update, and the fields it read are already
+/// pinned into `u`/`b` above), so the title and body can go stale only in
+/// ways `onProgress` already covers — nothing here depends on a fresher
+/// settings snapshot to stay correct.
+function openUpdate(settings, opts) {
+  const el = document.getElementById("dlg-update");
+  // Opened by itself (`renderUpdateMark`), the dialog lands while the user
+  // may be typing in a terminal; with focus on Update, the next Enter or
+  // Space would start download→swap→exec. So a self-opened dialog focuses
+  // Later, and only one the user asked for — the mark, About's button —
+  // focuses Update.
+  const selfOpened = !!(opts && opts.selfOpened);
+  const u = (settings && settings.update) || {};
+  const b = (settings && settings.build) || {};
+  return runDialog(el, (finish) => {
+    el.querySelector(".dlg-title").textContent = `roost ${u.latest} is available — you are running ${b.version}`;
+    const body = el.querySelector(".dlg-body");
+    body.replaceChildren();
+    const cmd = el.querySelector(".dlg-cmd");
+    const progress = el.querySelector(".dlg-progress");
+    progress.hidden = true;
+    progress.textContent = "";
+    const ok = el.querySelector(".dlg-ok");
+    const later = el.querySelector(".dlg-later");
+    const skip = el.querySelector(".dlg-skip");
+    skip.textContent = `Skip ${u.latest}`;
+    ok.disabled = false; later.disabled = false; skip.disabled = false;
+    const p = document.createElement("p");
+    if (u.installed) {
+      // The new file is already in place and only the exec failed: a second
+      // Update would download the same release again. About's row says the
+      // same thing; the failure, if any, stays visible below it.
+      cmd.hidden = true;
+      ok.hidden = true;
+      p.textContent = `restart roost to run ${u.installed}`;
+      if (u.failure) { progress.hidden = false; progress.textContent = `update failed: ${u.failure}`; }
+    } else if (u.offer) {
+      cmd.hidden = true;
+      ok.hidden = false;
+      ok.textContent = u.failure ? "Retry" : "Update";
+      p.textContent = "roost downloads the release, verifies its signature, checks that it runs, swaps the file and restarts itself. Terminals survive; this page reloads.";
+      if (u.failure) { progress.hidden = false; progress.textContent = `update failed: ${u.failure}`; }
+    } else {
+      ok.hidden = true;
+      const lines = upgradeCommand(b) || [];
+      cmd.hidden = lines.length === 0;
+      cmd.textContent = lines.join("\n");
+      p.textContent = lines.length
+        ? "This copy is upgraded by whatever installed it. Run:"
+        : "This copy is upgraded by whatever installed it.";
+    }
+    body.appendChild(p);
+    ok.onclick = () => {
+      ok.disabled = true; later.disabled = true; skip.disabled = true;
+      progress.hidden = false;
+      progress.textContent = "starting…";
+      // The server execs over this process once the swap succeeds, so any
+      // edit still sitting in the debounce would never reach disk. Frames on
+      // one socket are read in order by the server, so flushing every
+      // pending edit before the Update intent is enough to guarantee they
+      // land first — no need to wait for a reply.
+      for (const rel of Array.from(pendingEdits.keys())) pushEdit(rel);
+      send({ t: "Update" });
+    };
+    later.onclick = () => { send({ t: "DeferUpdate" }); finish("later"); };
+    skip.onclick = () => { send({ t: "SkipUpdate", version: u.latest }); finish("skip"); };
+    updateOpen = {
+      onProgress(ev) {
+        // Typing does not stop once Update is clicked. Re-flush on every
+        // phase so an edit made during download/verify/unpack/probe/swap
+        // is not still sitting in the debounce when `restarting` reloads
+        // the page — the only window left after this is between the last
+        // progress frame and the exec itself, and the reload that follows
+        // restores buffer text from what the server actually persisted,
+        // not from what was left in an unsent debounce.
+        for (const rel of Array.from(pendingEdits.keys())) pushEdit(rel);
+        progress.hidden = false;
+        if (ev.phase === "failed") {
+          progress.textContent = `update failed: ${ev.detail}`;
+          ok.disabled = false; ok.textContent = "Retry";
+          later.disabled = false; skip.disabled = false;
+        } else if (ev.phase === "refused") {
+          progress.textContent = ev.detail === "already updating" ? "already updating" : `not updated: ${ev.detail}`;
+          later.disabled = false; skip.disabled = false;
+        } else if (ev.phase === "restarting") {
+          progress.textContent = "restarting roost…";
+        } else {
+          progress.textContent = `${ev.phase}…`;
+        }
+      },
+    };
+    return () => (ok.hidden || selfOpened ? later : ok).focus();
+  }, "dismissed").then((v) => { updateOpen = null; return v; });
 }

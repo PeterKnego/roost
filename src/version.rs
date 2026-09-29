@@ -437,7 +437,9 @@ pub fn maybe_check_with(fetch: FetchFn) {
 /// whatever the process knows at that moment. No push, no broadcast when a
 /// check completes: the pane is the only consumer, and it asks.
 fn mk_view(status: &str, latest: &str) -> crate::proto::UpdateView {
-    crate::proto::UpdateView { status: status.to_string(), latest: latest.to_string() }
+    // The five fields #86 adds are not this module's facts; `update::view`
+    // fills them over this one.
+    crate::proto::UpdateView { status: status.to_string(), latest: latest.to_string(), ..Default::default() }
 }
 
 /// The view decision, taking `now` as a parameter so a stale-success-then-

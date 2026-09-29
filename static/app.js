@@ -560,6 +560,11 @@ function connectControl() {
   ctrl = sock;
   sock.onopen = () => {
     if (ctrl !== sock) return;
+    // The server said it was restarting and this is the first socket the
+    // new process accepted. Reload, so the page learns the new version the
+    // way every client does — the dialog reads "restarting roost…" until
+    // then, not "reconnecting".
+    if (reloadOnReconnect) { location.reload(); return; }
     ctrlTries = 0;
     ctrlWarned = false;
     setConnState("live");
@@ -953,6 +958,13 @@ function onEvent(ev) {
         // The dialog was closed while the restore ran. A refusal still has to
         // land somewhere — silence here is a restore that looks like it worked.
         showError(ev.refused);
+      }
+      break;
+    case "UpdateProgress":
+      if (ev.phase === "restarting") reloadOnReconnect = true;
+      if (ev.phase === "failed") reloadOnReconnect = false;
+      if (updateOpen) {
+        try { updateOpen.onProgress(ev); } catch (e) { console.error("roost: the update dialog's onProgress threw", e); updateOpen = null; }
       }
       break;
     case "Notice": onNotice(ev.notice); break;
@@ -4295,6 +4307,12 @@ if (settingsBtn) {
     if (typeof openSettings === "function") openSettings(state.settings);
   };
 }
+const updmark = document.getElementById("updmark");
+if (updmark) {
+  updmark.onclick = () => {
+    if (state && state.settings && typeof openUpdate === "function") openUpdate(state.settings);
+  };
+}
 
 // Header control buttons must not steal keyboard focus from the terminal or
 // the editor. Glancing at notifications, or opening the worktree switcher,
@@ -4437,6 +4455,43 @@ let appliedTheme = null;
 // While open, a theme in the snapshot is not applied over the preview.
 let settingsOpen = null;
 
+// ---- the update mark and dialog (#65 step 4) ----
+// dialog.js assigns `updateOpen` while its dialog is open, the way it
+// assigns `settingsOpen`; app.js calls its hook when UpdateProgress lands.
+let updateOpen = null;
+// The dialog opens by itself once per page load, when the mark first
+// appears and the choice is not deferred. Later clicks of the mark reopen it.
+let updateOffered = false;
+// Set when the server said "restarting": the next successful control
+// reconnect is the new process, and the page reloads to learn its version.
+let reloadOnReconnect = false;
+
+// The mark's rule. A checkout never gets one: About already says "yours to
+// rebuild", and a developer on a branch is behind a release by design.
+function updateWanted(s) {
+  const u = (s && s.update) || {};
+  const b = (s && s.build) || {};
+  return u.status === "newer" && !!u.latest && u.skipped !== u.latest && b.channel !== "checkout";
+}
+
+function renderUpdateMark() {
+  const el = document.getElementById("updmark");
+  if (!el || !state || !state.settings) return;
+  const s = state.settings;
+  const u = s.update || {};
+  const show = updateWanted(s);
+  el.hidden = !show;
+  if (show) {
+    el.textContent = `↑ ${u.latest}`;
+    el.title = `roost ${u.latest} is available — you are running ${(s.build || {}).version}`;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (show && !updateOffered && !(u.deferred_until > now) && typeof openUpdate === "function") {
+    updateOffered = true;
+    openUpdate(s, { selfOpened: true });
+  }
+}
+
 // Which of the two mechanisms `render::theme_head` would have used for
 // `name`, expressed in the client so a preview matches a reload: a roost
 // file is one <link>; a daisyUI name is data-theme on <html> plus the
@@ -4524,6 +4579,7 @@ function followSettings() {
       settingsOpen = null;
     }
   }
+  renderUpdateMark();
   const theme = row("theme");
   if (theme) {
     if (appliedTheme === null) appliedTheme = theme.effective; // first snapshot: the page is already painted with it
