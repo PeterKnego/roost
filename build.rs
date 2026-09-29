@@ -78,8 +78,15 @@ fn emit_build_info() {
     // The release signing key, if the maintainer has committed it (#87).
     // Absent bakes an empty string: that build carries no key, offers no
     // [Update] button, and refuses the intent. It never means "trust anything".
-    let pub_path = root.join("keys").join("roost.pub");
-    println!("cargo:rerun-if-changed={}", pub_path.display());
+    //
+    // The directory is watched, not the file: cargo treats a missing
+    // `rerun-if-changed` path as changed on every build, and a fresh
+    // `ROOST_BUILD_EPOCH` below would then rebuild the crate and every test
+    // binary each time. Cargo scans a watched directory's whole contents, so
+    // adding, removing or editing `roost.pub` still reruns this.
+    let keys_dir = root.join("keys");
+    let pub_path = keys_dir.join("roost.pub");
+    println!("cargo:rerun-if-changed={}", keys_dir.display());
     let key = fs::read_to_string(&pub_path).ok().and_then(|t| pubkey_line(&t)).unwrap_or_default();
     println!("cargo:rustc-env=ROOST_UPDATE_PUBKEY={key}");
     // Seconds since the epoch, formatted by the server rather than here: a
