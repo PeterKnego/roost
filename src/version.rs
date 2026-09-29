@@ -102,9 +102,73 @@ pub fn newest_unyanked(body: &str) -> Option<String> {
     best.map(|(_, s)| s)
 }
 
-/// Placeholder ordering, replaced by the real comparator in the next task.
+/// What roost tells the user about its own version.
+///
+/// The same discipline as `install::Replaceable`, and for the same reason:
+/// "could not reach crates.io" is not "you are up to date". Two of the three
+/// are cheerful and the third is the one that matters, which is what makes it
+/// the variant a refactor loses. **Computed at display time, never stored** —
+/// see `State`'s doc comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Latest {
+    UpToDate,
+    Newer(String),
+    Unknown,
+}
+
 fn cmp_parsed(a: &Parsed, b: &Parsed) -> std::cmp::Ordering {
-    a.nums.cmp(&b.nums)
+    use std::cmp::Ordering::*;
+    match a.nums.cmp(&b.nums) {
+        Equal => match (&a.pre, &b.pre) {
+            (None, None) => Equal,
+            // A prerelease orders below the same version without one, as
+            // semver does: 0.5.2-rc.2 is told that 0.5.2 is available.
+            (Some(_), None) => Less,
+            (None, Some(_)) => Greater,
+            (Some(x), Some(y)) => cmp_pre(x, y),
+        },
+        other => other,
+    }
+}
+
+/// semver's dotted-identifier rule: numeric identifiers compare numerically
+/// and rank below alphanumeric ones, and a shorter run of identifiers is
+/// lower when every shared one is equal.
+fn cmp_pre(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    let (mut ai, mut bi) = (a.split('.'), b.split('.'));
+    loop {
+        let o = match (ai.next(), bi.next()) {
+            (None, None) => return Equal,
+            (None, Some(_)) => return Less,
+            (Some(_), None) => return Greater,
+            (Some(x), Some(y)) => match (x.parse::<u64>(), y.parse::<u64>()) {
+                (Ok(p), Ok(q)) => p.cmp(&q),
+                (Ok(_), Err(_)) => Less,
+                (Err(_), Ok(_)) => Greater,
+                (Err(_), Err(_)) => x.cmp(y),
+            },
+        };
+        if o != Equal {
+            return o;
+        }
+    }
+}
+
+/// `None` when either side is a version string this cannot read — which
+/// reaches the user as `Unknown`.
+pub fn compare(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    Some(cmp_parsed(&parse(a)?, &parse(b)?))
+}
+
+/// The whole display decision, in one place, from two strings.
+pub fn verdict(running: &str, latest: Option<&str>) -> Latest {
+    let Some(l) = latest else { return Latest::Unknown };
+    match compare(running, l) {
+        None => Latest::Unknown,
+        Some(std::cmp::Ordering::Less) => Latest::Newer(l.to_string()),
+        Some(_) => Latest::UpToDate,
+    }
 }
 
 #[cfg(test)]
@@ -198,5 +262,39 @@ not json at all
 {\"name\":\"roost\"}
 ";
         assert_eq!(newest_unyanked(body).as_deref(), Some("0.5.1"));
+    }
+
+    /// Every branch of the comparison, as a table.
+    ///
+    /// Two of the three outcomes are cheerful and the third is the one that
+    /// matters, so the unreadable rows are here in force: "could not tell" is
+    /// never "you are up to date".
+    #[test]
+    fn the_comparator_orders_running_against_the_index() {
+        use Latest::*;
+        for (running, index, want, why) in [
+            ("0.5.2", Some("0.5.2"), UpToDate, "the same version"),
+            ("0.5.2", Some("0.5.1"), UpToDate, "an index behind the running binary is not an upgrade"),
+            ("0.5.2", Some("0.5.3"), Newer("0.5.3".into()), "a patch release"),
+            ("0.5.2", Some("0.6.0"), Newer("0.6.0".into()), "a minor release"),
+            ("0.5.2", Some("1.0.0"), Newer("1.0.0".into()), "a major release"),
+            ("0.9.0", Some("0.10.0"), Newer("0.10.0".into()), "components are numbers, not strings"),
+            // The case the spec measured: git has v0.5.2-rc.2, the index has
+            // none, so a checkout built at an rc tag must be told 0.5.2 exists.
+            ("0.5.2-rc.2", Some("0.5.2"), Newer("0.5.2".into()), "a prerelease is below its own release"),
+            ("0.5.2", Some("0.5.2-rc.1"), UpToDate, "and the release is above the prerelease"),
+            ("0.5.2-rc.1", Some("0.5.2-rc.2"), Newer("0.5.2-rc.2".into()), "rc.2 is above rc.1"),
+            ("0.5.2-rc.2", Some("0.5.2-rc.1"), UpToDate, "and rc.1 is not above rc.2"),
+            ("0.5.2+build.7", Some("0.5.2"), UpToDate, "build metadata is ignored on the running side"),
+            ("0.5.2", Some("0.5.2+build.7"), UpToDate, "and on the index side"),
+            ("0.5.2", None, Unknown, "nothing to compare against"),
+            ("0.5.2", Some("banana"), Unknown, "an unreadable index version"),
+            ("banana", Some("0.5.3"), Unknown, "an unreadable running version"),
+            ("0.5", Some("0.5.3"), Unknown, "two components is not a version this reads"),
+            ("0.5.2.1", Some("0.5.3"), Unknown, "and neither is four"),
+            ("", Some("0.5.3"), Unknown, "nor an empty string"),
+        ] {
+            assert_eq!(verdict(running, index), want, "{why}: {running} vs {index:?}");
+        }
     }
 }
