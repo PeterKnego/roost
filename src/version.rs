@@ -384,12 +384,23 @@ pub fn maybe_check_with(fetch: FetchFn) {
         return;
     }
     // Detached: nothing joins this, and nothing may escape it.
-    std::thread::spawn(move || {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            check_once_with(fetch);
-        }));
+    // `Builder::spawn`, not `thread::spawn`: the latter panics when the OS
+    // refuses a thread (EAGAIN), which would escape into the websocket connect
+    // thread that called us *and* leave the guard taken for the life of the
+    // process. No test can make the OS refuse a thread, so this arm is
+    // untested by design rather than covered by a test that could not fail.
+    let spawned = std::thread::Builder::new()
+        .name("roost-version-check".into())
+        .spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                check_once_with(fetch);
+            }));
+            IN_FLIGHT.store(false, Ordering::SeqCst);
+        });
+    if let Err(e) = spawned {
+        eprintln!("roost: version check: could not start a thread: {e}");
         IN_FLIGHT.store(false, Ordering::SeqCst);
-    });
+    }
 }
 
 #[cfg(test)]
@@ -720,10 +731,15 @@ not json at all
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert_eq!(CALLS.load(SeqCst), 1, "the in-flight guard is taken before the staleness test");
         RELEASE.store(true, SeqCst);
+        // On the guard, not on `current()`: the thread stores its answer
+        // before it releases the guard and finishes, so waiting on the answer
+        // alone could return with the thread still running into a later
+        // test's ROOST_STATE_DIR.
         for _ in 0..200 {
-            if current().is_some() { break }
+            if !IN_FLIGHT.load(SeqCst) { break }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        assert!(!IN_FLIGHT.load(SeqCst), "the check thread finished");
         assert_eq!(CALLS.load(SeqCst), 1, "and still once after it finished");
         assert_eq!(current().unwrap().latest.as_deref(), Some("9.9.9"));
         RELEASE.store(false, SeqCst);
