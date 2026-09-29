@@ -619,12 +619,30 @@ happened, autosave stops for that buffer instead of re-raising the conflict
 banner every second. An explicit ⌘S is what resolves it, and a save that
 actually lands is what starts autosave again.
 
+### Read when watching
+
+A notice from the terminal you are typing in is marked read, and raises no
+desktop banner; returning to the page, or clicking into a terminal, reads the
+ones already waiting for it. "Typing in" means the page is visible, its window
+has focus, and the keyboard focus is in that terminal — a terminal merely
+visible in another pane keeps its dot. To keep every notice unread until you
+click it:
+
+```toml
+read_when_watching = false
+```
+
+Globally or per project, and live: an open page follows a change on the next
+snapshot, no reload. Per-project for `autosave`'s reason — a checkout setting
+it changes only what you see as unread.
+
 ### The settings dialog
 
 The header's gear opens it. Two panes, **Settings** and **Theme**, and a
 scope switch, **Project** (`{project}/.roost/config.toml`) or **Global**
 (`~/.config/roost/config.toml`, or `$ROOST_CONFIG`). It writes the display
-keys only — `theme`, `hide`, `show_hidden`, `autosave`, and in Global scope
+keys only — `theme`, `hide`, `show_hidden`, `autosave`, `follow_tree`,
+`read_when_watching`, and in Global scope
 also `share_selection` and `worktree_prompt`. `allowed_origins`,
 `max_upload_bytes`, `ide` and `roots` are shown read-only and have no write
 path from a page at all: the hub refuses them by name. Writes go through
