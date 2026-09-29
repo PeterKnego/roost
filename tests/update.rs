@@ -64,17 +64,19 @@ fn later_reaches_every_page_and_a_stale_skip_is_refused_to_its_sender() {
     std::env::remove_var("ROOST_STATE_DIR");
 }
 
-// `Update` itself, diverted the same way. This test binary is a checkout
-// with no compiled-in key (`update::public_key()` is `None` — `keys/roost.pub`
-// does not exist in this tree), so `update::eligible()` refuses before any
-// network call or exec is attempted, and the refusal must reach the
-// requester as an `UpdateProgress{phase:"refused"}`. That message is
-// distinct from `Hub::handle`'s defensive-arm `Error` ("update intents are
-// handled before the hub") — asserting its *absence* is what proves this
-// frame came from the real divert into `update::start`, not from a second
-// dispatch site that fell through to the arm meant only as a backstop.
+// `Update` itself, diverted the same way. From this test binary, a checkout,
+// `update::eligible()` refuses at its first clause — the channel ("channel
+// checkout") — before any network call or exec is attempted, and the refusal
+// must reach the requester as an `UpdateProgress{phase:"refused"}`. It does
+// not reach the key clause, and with one socket it cannot tell "to the
+// sender" from "to everyone"; the unit tests in `src/update.rs` own both.
+// The refusal is distinct from `Hub::handle`'s defensive-arm `Error`
+// ("update intents are handled before the hub") — asserting its *absence*
+// is what proves this frame came from the real divert into `update::start`,
+// not from a second dispatch site that fell through to the arm meant only as
+// a backstop.
 #[test]
-fn update_with_no_compiled_in_key_is_refused_to_its_sender_alone() {
+fn update_from_a_checkout_is_refused_through_the_divert() {
     let _g = WS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let sd = tempfile::tempdir().unwrap();
     std::env::set_var("ROOST_STATE_DIR", sd.path());
