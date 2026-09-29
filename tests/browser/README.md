@@ -49,6 +49,7 @@ deno run -A tests/browser/themes.mjs     # a daisyUI theme name reaches paint th
 deno run -A tests/browser/settings.mjs   # the settings dialog: live theme preview, Save/Cancel, both scopes, read-only keys refused
 deno run -A tests/browser/roots.mjs      # no roots: the front page explains and Add path works; + adds another; a bad path is refused
 deno run -A tests/browser/version.mjs    # the About Latest row: five renderings, and the harness's off switch
+deno run -A tests/browser/update.mjs     # the update mark, dialog, Later/Skip, and the About row's button (#65 step 4); plants a fresh check.json so no request fires
 deno run -A tests/browser/nonascii.mjs   # the editor's non-ASCII indicator and highlight toggle: count, accent, marks under the glyphs, cap, persistence
 deno run -A tests/browser/notices.mjs    # the bell panel holds only this project's notices, and Clear empties only what it shows
 deno run -A tests/browser/dialogs.mjs    # the dialog primitive: askConfirm/askText/askMenu's exits, focus restoration, and a guard that no code path reaches a native confirm/prompt/alert
@@ -589,6 +590,30 @@ performed.
   section B's row text — the fixture-that-silently-does-nothing trap this
   section exists to catch, and here it would also mean the suite was hitting
   crates.io on every connect.
+
+- In `update.mjs`: dropping the `b.channel !== "checkout"` clause from
+  `updateWanted` (`static/app.js`) fails 3, not 1 — "no mark for a checkout"
+  as expected, plus "and no dialog" and "the command is shown instead",
+  because the mark now shows and the dialog auto-opens on the very first
+  render, before section B gets to assert either was still absent; the
+  cascade is real, and the fix is still one clause. Sending `DeferUpdate`
+  instead of `SkipUpdate` from the Skip button fails 4 from section D on
+  (the snapshot never carries the skip, the mark never disappears, the row
+  never reads "skipped", and the un-skip after restart has nothing to
+  restore). Planting a *stale* `checked_at` (25 hours old) instead of a fresh
+  one fails section A's byte-identical assertion as the header predicts, but
+  on a host with real internet access — this one — the cascade goes further
+  than a single fixture-author's environment without it: the real check
+  succeeds, overwrites `check.json` with this crate's actual published
+  version, and every hardcoded `"999.x"` assertion downstream disagrees with
+  it, ending in an uncaught `TypeError` on a `null` `.click()` in section E
+  once the row it expected is simply not there. That is still the same
+  underlying failure — a real request went out — just louder than "FAIL 1"
+  when the request does not fail closed. Section F's own revert (the
+  controller-required proof; see the file's own header for what it isolates
+  and why) fails exactly 1 — the "saw it almost immediately" assertion —
+  with every other assertion in the section, including the refusal text,
+  staying green.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
