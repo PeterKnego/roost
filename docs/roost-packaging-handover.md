@@ -53,7 +53,7 @@ The release binary carries `rustls` and `ring` since the version check
 (#65 step 2) promoted `ureq` to a runtime dependency; before that both were
 dev-only. `ring` compiles C, so the musl targets need `musl-tools` on the
 build host — dist installs it on the release runners (`dist plan` lists it
-under `packages_install`), `ci.yml`'s container job installs it explicitly,
+under `packages_install`), `ci.yml`'s `scripts` job installs it explicitly,
 and a dev host needs `sudo apt-get install musl-tools` once. There is still
 no `openssl`, `openssl-sys` or `native-tls` anywhere in the lock file: the
 trust store is `webpki-roots` (ureq's default `tls` feature, the bundled
