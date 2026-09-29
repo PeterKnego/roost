@@ -816,6 +816,30 @@ not json at all
         RELEASE.store(false, SeqCst);
     }
 
+    /// The connect is lazy *and* throttled: a browser reconnecting every few
+    /// seconds must not fire a request every few seconds.
+    #[test]
+    fn a_fresh_state_fires_nothing_on_connect() {
+        let (_g1, _g2, _d) = env_fixture(true);
+        write_state_to(&state_path(), &st(Some("9.9.9"), Some(now()), None)).unwrap();
+        for _ in 0..5 {
+            maybe_check_with(failing_fetch);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(CALLS.load(SeqCst), 0, "a check 0 seconds ago is fresh; nothing is fetched");
+
+        // ...and a stale one does fire, which is what says the assertion above
+        // is about staleness and not about the guard or the config.
+        reset_for_test();
+        write_state_to(&state_path(), &st(Some("9.9.9"), Some(now() - 25 * 3600), None)).unwrap();
+        maybe_check_with(failing_fetch);
+        for _ in 0..200 {
+            if CALLS.load(SeqCst) >= 1 { break }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(CALLS.load(SeqCst), 1, "a check 25 hours ago is stale");
+    }
+
     /// A body that parsed but named no usable version is "could not determine",
     /// which earns the one-hour retry rather than a day of silence.
     #[test]
