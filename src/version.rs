@@ -407,22 +407,45 @@ pub fn maybe_check_with(fetch: FetchFn) {
 /// cache miss, which `RequestState` forces — so opening the dialog shows
 /// whatever the process knows at that moment. No push, no broadcast when a
 /// check completes: the pane is the only consumer, and it asks.
-pub fn view() -> crate::proto::UpdateView {
-    let mk = |status: &str, latest: &str| crate::proto::UpdateView {
-        status: status.to_string(),
-        latest: latest.to_string(),
-    };
-    if !crate::config::version_check() {
-        return mk("off", "");
-    }
+fn mk_view(status: &str, latest: &str) -> crate::proto::UpdateView {
+    crate::proto::UpdateView { status: status.to_string(), latest: latest.to_string() }
+}
+
+/// The view decision, taking `now` as a parameter so a stale-success-then-
+/// failure scenario can be tested without waiting on a clock. `view()` below
+/// is the only real caller.
+///
+/// `UpToDate` is the one verdict that goes stale on its own: a success from
+/// months ago, invalidated by every retry since failing, must not read as
+/// "up to date" forever just because it was true once — that is the
+/// TLS-intercepting-proxy case the spec calls out. `Newer` does not get this
+/// treatment: keeping the last good answer is right there, because an upgrade
+/// that was real does not stop being owed just because the retries since have
+/// failed.
+fn view_at(s: Option<State>, now: u64) -> crate::proto::UpdateView {
     // No state file at all is "not checked yet" — the few seconds after a
     // fresh install — and is not the same answer as a check that failed.
-    let Some(s) = current() else { return mk("never", "") };
+    let Some(s) = s else { return mk_view("never", "") };
     match verdict(env!("CARGO_PKG_VERSION"), s.latest.as_deref()) {
-        Latest::Newer(v) => mk("newer", &v),
-        Latest::UpToDate => mk("up-to-date", s.latest.as_deref().unwrap_or("")),
-        Latest::Unknown => mk("unknown", s.latest.as_deref().unwrap_or("")),
+        Latest::Newer(v) => mk_view("newer", &v),
+        Latest::UpToDate => {
+            let failed_after_success = matches!((s.checked_at, s.failed_at), (Some(c), Some(f)) if f > c);
+            let success_is_old = s.checked_at.is_some_and(|c| now.saturating_sub(c) >= 2 * FRESH_SECS);
+            if failed_after_success && success_is_old {
+                mk_view("unknown", s.latest.as_deref().unwrap_or(""))
+            } else {
+                mk_view("up-to-date", s.latest.as_deref().unwrap_or(""))
+            }
+        }
+        Latest::Unknown => mk_view("unknown", s.latest.as_deref().unwrap_or("")),
     }
+}
+
+pub fn view() -> crate::proto::UpdateView {
+    if !crate::config::version_check() {
+        return mk_view("off", "");
+    }
+    view_at(current(), now())
 }
 
 #[cfg(test)]
@@ -935,5 +958,54 @@ not json at all
         let v = view();
         assert_eq!(v.status, "newer");
         assert_eq!(v.latest, "999.0.0", "step 4 reads this string, so it is carried whole");
+    }
+
+    /// A success that is old, and has a failure after it, cannot be trusted to
+    /// still be true: the TLS-intercepting-proxy case the spec names reads as
+    /// `Unknown`, not as a permanent "up to date" from whatever the last
+    /// success happened to say.
+    ///
+    /// Keeping the last good answer is still right for `Newer` (row b): a
+    /// user who is owed an upgrade does not stop being owed one because the
+    /// retries since then all failed. It is only `UpToDate` that goes stale,
+    /// because "nothing to do" is the answer most likely to be silently wrong.
+    ///
+    /// RED, before `view_at` existed: this test called `view()` directly with
+    /// `write_state_to` + `reset_for_test()` the same way the five-state test
+    /// above does, using timestamps relative to `now()`; row (a) failed with
+    /// `left: "up-to-date", right: "unknown"` — `view()` had no notion of
+    /// staleness at all, only `verdict()`. Restored to the fixed version below
+    /// after confirming the failure.
+    #[test]
+    fn a_stale_success_with_a_later_failure_is_unknown_but_a_recent_one_is_not() {
+        let fixed_now = 10_000_000u64;
+        let running = env!("CARGO_PKG_VERSION");
+
+        // (a) Old success, later failure, running == latest: the success is
+        // more than two fresh-intervals old and nothing has confirmed it
+        // since, so this reads as `Unknown`, not `UpToDate`.
+        let checked = fixed_now - 2 * FRESH_SECS - 10;
+        let failed = checked + 10;
+        let a = st(Some(running), Some(checked), Some(failed));
+        let v = view_at(Some(a), fixed_now);
+        assert_eq!(v.status, "unknown", "an old success invalidated by a later failure is unknown");
+        assert_eq!(v.latest, running, "the fact survives even though the verdict does not");
+
+        // (b) Same age and failure shape, but the stored `latest` is still
+        // ahead of the running binary: `Newer` is decided before the
+        // staleness check ever runs, so the upgrade is still reported.
+        let b = st(Some("999.0.0"), Some(checked), Some(failed));
+        let v = view_at(Some(b), fixed_now);
+        assert_eq!(v.status, "newer", "a real upgrade does not expire because retries since have failed");
+        assert_eq!(v.latest, "999.0.0");
+
+        // (c) A recent success with a later failure, both well within the
+        // 2*FRESH_SECS bound: still trustworthy, still up to date.
+        let checked_recent = fixed_now - 10;
+        let failed_recent = checked_recent + 5;
+        let c = st(Some(running), Some(checked_recent), Some(failed_recent));
+        let v = view_at(Some(c), fixed_now);
+        assert_eq!(v.status, "up-to-date", "a recent success outranks a failure that came right after it");
+        assert_eq!(v.latest, running);
     }
 }
