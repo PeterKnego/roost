@@ -1908,6 +1908,7 @@ pub fn workspace_page(
   <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body, git from:body"></span><span id="wtlabel"></span></button>
   {warn}
   <span id="connstate" hidden></span>
+  <button id="updmark" title="" hidden></button>
   {sharing_indicator}
   <label id="searchbox" for="searchinput" title="search this project (ctrl-shift-F or ⌘⇧F)">{SVG_SEARCH}<input id="searchinput" type="search" autocomplete="off" spellcheck="false" placeholder="Search files, contents, sessions" aria-label="Search files, contents, sessions"><kbd>⇧⌃F</kbd></label>
   <button id="projbtn" title="running projects">{SVG_DIAMOND}<span id="projcount"></span></button>
@@ -2008,6 +2009,17 @@ pub fn workspace_page(
   <div class="dlg-detail" hidden></div>
   <div class="dlg-buttons">
     <button type="button" class="dlg-cancel">Cancel</button>
+  </div>
+</dialog>
+<dialog id="dlg-update" class="roost">
+  <h2 class="dlg-title"></h2>
+  <div class="dlg-body"></div>
+  <pre class="dlg-cmd" hidden></pre>
+  <p class="dlg-progress" hidden></p>
+  <div class="dlg-buttons">
+    <button type="button" class="dlg-skip"></button>
+    <button type="button" class="dlg-later">Later</button>
+    <button type="button" class="dlg-ok"></button>
   </div>
 </dialog>
 <dialog id="dlg-settings" class="roost dlg-wide">
@@ -3507,9 +3519,10 @@ mod tests {
     fn the_workspace_page_ships_empty_dialog_shells() {
         let s = crate::config::Settings::default();
         let html = workspace_page("proj", "proj", &s, None, false, &[]);
-        for id in ["dlg-confirm", "dlg-text", "dlg-menu", "dlg-choice", "dlg-settings"] {
+        for id in ["dlg-confirm", "dlg-text", "dlg-menu", "dlg-choice", "dlg-settings", "dlg-update"] {
             assert!(html.contains(&format!(r#"id="{id}""#)), "no {id} shell");
         }
+        assert!(html.contains(r#"<button id="updmark" title="" hidden></button>"#), "the mark ships hidden and empty");
         // Filled from JS with textContent, so they must ship empty — the same
         // rule the notification centre follows above. A shell carrying text
         // would mean a path was interpolated into HTML somewhere.
