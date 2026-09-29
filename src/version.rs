@@ -424,6 +424,12 @@ not json at all
         // `registry::known_projects_inner` globs *.json at the top of the
         // state dir into project rows — a file named there would show as a
         // phantom project, exactly as `notify.rs` records.
+        //
+        // `state_path()` reads the process-global `ROOST_STATE_DIR` (via
+        // `wsstate::state_dir()`) even though this test never sets it itself
+        // — a concurrently-running test's `set_var` is still a data race on
+        // that read without the lock, per `STATE_ENV_LOCK`'s doc comment.
+        let _envg = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(state_path().parent().unwrap().file_name().unwrap(), "update");
         assert_eq!(state_path().file_name().unwrap(), "check.json");
     }
