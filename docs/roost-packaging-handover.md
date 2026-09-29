@@ -549,10 +549,10 @@ it does is decided by the tagged tree and the secret together, because
 - **`keys/roost.pub` committed, secret missing or empty** — the job fails and
   `host` does not run. Those binaries accept only a signed update, so
   shipping them without signatures would break their own next update.
-- **Secret set, `keys/roost.pub` absent at the tag** — also a failure: half
-  the setup is done, and the release would ship binaries that can never
-  self-update. Commit the key, or remove the secret to ship unsigned on
-  purpose.
+- **Secret set, `keys/roost.pub` absent at the tag** — the half-way state
+  while the steps above are done, secret first. Also unsigned with a
+  `::warning::`: the binaries carry no key, so there is nothing to protect
+  and nothing that could read a signature.
 - **Both present** — every `roost-*.tar.xz` is signed, and each `.minisig` is
   verified against `keys/roost.pub` with `minisign -V -H` in the same job
   before it is uploaded as `artifacts-signatures`. A secret that does not

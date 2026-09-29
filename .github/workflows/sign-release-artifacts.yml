@@ -5,8 +5,8 @@
 #
 # Whether a release is signed follows from the tagged tree, not from this file:
 # build.rs bakes keys/roost.pub into the binary when it is committed, so the
-# binaries of this very release trust that key or trust none. Four cases, and
-# only one of them may ship unsigned:
+# binaries of this very release trust that key or trust none. Four cases; the
+# only one that fails is a committed key with nothing to sign for it:
 #
 #   keys/roost.pub  ROOST_MINISIGN_KEY
 #   absent          unset               ship unsigned, with a warning: the
@@ -19,9 +19,11 @@
 #   present         set                 sign every tarball, then verify each
 #                                       signature against keys/roost.pub
 #                                       before it is uploaded
-#   absent          set                 FAIL: half of #87 is done, and this
-#                                       release would ship binaries that can
-#                                       never self-update
+#   absent          set                 ship unsigned, with a warning: the
+#                                       half-way state while #87 is done (the
+#                                       secret added before the key is
+#                                       committed); the binaries carry no key,
+#                                       so there is nothing to protect
 name: Sign release artifacts
 
 on:
@@ -75,8 +77,8 @@ jobs:
               echo "::error title=Signing key missing::keys/roost.pub is committed, so these binaries will only accept a signed update, but ROOST_MINISIGN_KEY is not set in the release environment. Shipping them unsigned would break their own next update."
               exit 1 ;;
             false/true)
-              echo "::error title=Public key missing::ROOST_MINISIGN_KEY is set but keys/roost.pub is not committed at this tag, so these binaries would carry no key and could never self-update. Commit the public key, or remove the secret to ship unsigned on purpose."
-              exit 1 ;;
+              echo "::warning title=Release is unsigned::secret set but keys/roost.pub not committed: binaries carry no key; not signing"
+              echo "sign=false" >> "$GITHUB_OUTPUT" ;;
             *)
               echo "::error::could not tell whether this release should be signed ($has_pub/$HAS_SECRET)"
               exit 1 ;;
