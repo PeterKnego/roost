@@ -516,23 +516,67 @@ expose.
 `docs/superpowers/specs/2026-09-13-self-update-design.md` has roost verify a
 downloaded tarball against a minisign public key compiled into the binary
 before it replaces itself. Three things in that design live outside the
-repository and can only be done by the account owner:
+repository and can only be done by the account owner, and one check follows
+them:
 
-- Generate the keypair once, offline: `minisign -G`. Commit the public key as
-  `keys/roost.pub`; **never** commit the secret key.
-- Add the secret key and its password to the `release` GitHub environment as
-  `ROOST_MINISIGN_KEY` and `ROOST_MINISIGN_PASSWORD`, the same environment
-  that gates the crates.io and Homebrew publish jobs (see the comments in
-  `.github/workflows/publish-crates-io.yml` for why an environment secret and
-  not a repository secret).
-- Keep the secret key somewhere that survives this machine. A lost key means
+- Generate the keypair once, offline and **unencrypted**: `minisign -G -W -p
+  roost.pub -s roost.key`. The C `minisign` CLI has no non-interactive
+  password option, so the release job could not use an encrypted key, and a
+  password stored beside the key in the same environment protects nothing.
+  Commit the public key as `keys/roost.pub`; **never** commit `roost.key`.
+- Add the secret key's file contents to the `release` GitHub environment as
+  `ROOST_MINISIGN_KEY` — the one secret; there is no password secret. The
+  same environment gates the Homebrew publish (see the comments on
+  `publish-homebrew-formula` in `release.yml` for why an environment secret
+  and not a repository secret).
+- Keep `roost.key` somewhere that survives this machine. A lost key means
   every installed roost refuses future updates and its users run the shell
   installer once — the same failure Tauri documents for its updater.
+- Check a release by hand once: `minisign -V -p keys/roost.pub -m
+  roost-<target>.tar.xz` against the downloaded tarball and its `.minisig`.
 
-No signing job runs on a pull request and `publish_prereleases` is unset, so
-the first end-to-end exercise of the key is the first tagged release after the
-feature merges. Whoever cuts that release clicks `Update` on a shell-installer
-copy before announcing it.
+The job that uses them is `.github/workflows/sign-release-artifacts.yml`,
+called from the hand-added `custom-sign-release-artifacts` job in
+`release.yml` (hand-edited under `allow-dirty`; the `global-artifacts-jobs`
+entry in `dist-workspace.toml` is only a record). It runs in the `release`
+environment, so it is one more job whose approval a release waits on. What
+it does is decided by the tagged tree and the secret together, because
+`build.rs` bakes `keys/roost.pub` into the very binaries being released:
+
+- **Neither present** — the state until the steps above are done. The
+  release ships unsigned with a `::warning::` on the run: its binaries carry
+  no key and offer no `Update` button, so a signature would have no reader.
+- **`keys/roost.pub` committed, secret missing or empty** — the job fails and
+  `host` does not run. Those binaries accept only a signed update, so
+  shipping them without signatures would break their own next update.
+- **Secret set, `keys/roost.pub` absent at the tag** — also a failure: half
+  the setup is done, and the release would ship binaries that can never
+  self-update. Commit the key, or remove the secret to ship unsigned on
+  purpose.
+- **Both present** — every `roost-*.tar.xz` is signed, and each `.minisig` is
+  verified against `keys/roost.pub` with `minisign -V -H` in the same job
+  before it is uploaded as `artifacts-signatures`. A secret that does not
+  match the committed public key, or a legacy (non-prehashed) signature that
+  `src/update.rs` would refuse, fails the release instead of shipping.
+  `host` attaches the signatures with everything else under `artifacts-*`;
+  in the unsigned case there is simply no such bundle.
+
+The plan and the key reach the script only through environment variables,
+never through a `${{ }}` expression inside `run:` (the plan carries the
+release notes; see the v0.6.0-rc.1 note in `build-linux-packages.yml`). The
+key is written to a file under `$RUNNER_TEMP` with `umask 077`, never echoed
+or put on a command line, and removed by the script's own `trap` and again by
+an `always()` step. `minisign` comes from Ubuntu's archive at an exact
+version (`minisign=0.11-1`, noble universe), so apt verifies it against the
+signed index; the job runs on `ubuntu-24.04` because jammy has no `minisign`
+package and this job builds nothing that the 22.04 glibc floor concerns.
+
+No signing job runs on a pull request, so the first end-to-end exercise of
+the key is a tag. The signing job is gated on `publishing` alone, not on
+`publish_prereleases` as the publish jobs are, so an `-rc` tag is signed too
+and its signatures can be checked by hand (the last bullet above) before a
+real release. Whoever cuts the first real release after the key lands clicks
+`Update` on a shell-installer copy before announcing it.
 
 ## 7. How this was checked
 

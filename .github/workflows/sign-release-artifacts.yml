@@ -1,0 +1,163 @@
+# Signs every release tarball with the maintainer's minisign key, so a running
+# roost can verify a download offline before it replaces itself (#65 step 4,
+# src/update.rs). In the global phase beside build-linux-packages: the first
+# point at which all four tarballs exist.
+#
+# Whether a release is signed follows from the tagged tree, not from this file:
+# build.rs bakes keys/roost.pub into the binary when it is committed, so the
+# binaries of this very release trust that key or trust none. Four cases, and
+# only one of them may ship unsigned:
+#
+#   keys/roost.pub  ROOST_MINISIGN_KEY
+#   absent          unset               ship unsigned, with a warning: the
+#                                       binaries carry no key and offer no
+#                                       Update button, so a signature would
+#                                       have no reader (#87 not done yet)
+#   present         unset               FAIL: binaries that trust a key but
+#                                       ship no signatures break their own
+#                                       next update
+#   present         set                 sign every tarball, then verify each
+#                                       signature against keys/roost.pub
+#                                       before it is uploaded
+#   absent          set                 FAIL: half of #87 is done, and this
+#                                       release would ship binaries that can
+#                                       never self-update
+name: Sign release artifacts
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  sign-release-artifacts:
+    # 24.04, not the 22.04 every other job here uses: jammy has no minisign
+    # package (it first appears in noble, 0.11-1, universe), and this job builds
+    # nothing, so the glibc floor that pins the others to 22.04 does not apply.
+    runs-on: ubuntu-24.04
+    # ROOST_MINISIGN_KEY is an *environment* secret, for the reason release.yml
+    # gives on publish-homebrew-formula: a repo secret is readable by any
+    # workflow file on any ref, and a pull request supplies its own copies.
+    # The environment allows only tags v*/*.*.* and master, so refs/pull/N/merge
+    # is refused before the job starts — and the caller gates on publishing so a
+    # PR run skips this job instead of showing it refused.
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      # For keys/roost.pub as the tag has it: the key these binaries were built
+      # to trust is the only one worth signing for.
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Decide whether this release is signed
+        id: mode
+        # Only whether the secret is set reaches this step, as the string
+        # 'true' or 'false'; the key itself is given to the signing step alone.
+        env:
+          HAS_SECRET: ${{ secrets.ROOST_MINISIGN_KEY != '' }}
+        run: |
+          set -euo pipefail
+          # -L as well as -e: a dangling symlink is still something committed
+          # under that name, and build.rs reading nothing from it is a fault to
+          # surface, not an absence to skip over.
+          if [ -e keys/roost.pub ] || [ -L keys/roost.pub ]; then has_pub=true; else has_pub=false; fi
+          case "$has_pub/$HAS_SECRET" in
+            true/true)
+              echo "sign=true" >> "$GITHUB_OUTPUT" ;;
+            false/false)
+              echo "::warning title=Release is unsigned::keys/roost.pub is not committed and ROOST_MINISIGN_KEY is not set, so these binaries carry no release key and offer no Update button. See item 6.5 in docs/roost-packaging-handover.md."
+              echo "sign=false" >> "$GITHUB_OUTPUT" ;;
+            true/false)
+              echo "::error title=Signing key missing::keys/roost.pub is committed, so these binaries will only accept a signed update, but ROOST_MINISIGN_KEY is not set in the release environment. Shipping them unsigned would break their own next update."
+              exit 1 ;;
+            false/true)
+              echo "::error title=Public key missing::ROOST_MINISIGN_KEY is set but keys/roost.pub is not committed at this tag, so these binaries would carry no key and could never self-update. Commit the public key, or remove the secret to ship unsigned on purpose."
+              exit 1 ;;
+            *)
+              echo "::error::could not tell whether this release should be signed ($has_pub/$HAS_SECRET)"
+              exit 1 ;;
+          esac
+
+      - if: steps.mode.outputs.sign == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: dist-in/
+          merge-multiple: true
+
+      # From noble's archive, so apt checks it against Ubuntu's signed index,
+      # and at an exact version: the release pocket never changes, so
+      # 0.11-1 installs the same bytes on every run. 0.11 signs prehashed by
+      # default (src/update.rs refuses legacy signatures) and reads an
+      # unencrypted key without prompting.
+      - name: Install minisign
+        if: steps.mode.outputs.sign == 'true'
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends minisign=0.11-1
+
+      # The key is unencrypted (generated with `minisign -G -W`): the C CLI
+      # has no non-interactive password option, and a password stored beside
+      # the key in the same environment would protect nothing.
+      - name: Sign and verify every tarball
+        if: steps.mode.outputs.sign == 'true'
+        # The plan goes in through the environment, never `${{ }}` inside the
+        # script: it carries the release notes, and an apostrophe in them once
+        # turned the rest into shell syntax (see build-linux-packages.yml).
+        # The key goes the same way, to a file only this user can read, and
+        # never onto a command line or into the log.
+        env:
+          PLAN: ${{ inputs.plan }}
+          ROOST_MINISIGN_KEY: ${{ secrets.ROOST_MINISIGN_KEY }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/minisign.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$ROOST_MINISIGN_KEY" > "$key")
+          VERSION=$(jq -r '.releases[0].app_version' <<<"$PLAN")
+          if [ -z "$VERSION" ] || [ "$VERSION" = null ]; then
+            echo "::error::the plan names no app_version"
+            exit 1
+          fi
+
+          shopt -s nullglob
+          tarballs=(dist-in/roost-*.tar.xz)
+          if [ ${#tarballs[@]} -eq 0 ]; then
+            echo "::error::no roost-*.tar.xz among the downloaded artifacts"
+            ls -la dist-in/ || true
+            exit 1
+          fi
+
+          mkdir -p out
+          for f in "${tarballs[@]}"; do
+            name=$(basename "$f")
+            # </dev/null: were the key ever encrypted, minisign would wait for
+            # a password; this makes it fail instead of hanging the release.
+            minisign -S -s "$key" -m "$f" -x "out/$name.minisig" \
+              -t "roost v$VERSION $name" </dev/null
+            # Checked here against the committed public key, with -H so a
+            # legacy signature fails the way src/update.rs would fail it. A
+            # secret that does not match keys/roost.pub fails the release
+            # rather than shipping signatures no installed roost accepts.
+            minisign -V -H -q -p keys/roost.pub -m "$f" -x "out/$name.minisig"
+          done
+          ls -la out
+
+      # Same version as release.yml's own uploads — see the note in
+      # build-linux-packages.yml: v4 and v8 do not interoperate. Not run on an
+      # unsigned release, so there is no artifacts-signatures at all; host
+      # downloads artifacts-* by pattern, which the other bundles still match.
+      - if: steps.mode.outputs.sign == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-signatures
+          path: out/*.minisig
+          if-no-files-found: error
+
+      # The script's trap covers every way the script itself ends; this covers
+      # a runner that stops it before the trap can run.
+      - name: Remove the key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/minisign.key"
