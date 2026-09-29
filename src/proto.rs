@@ -271,6 +271,17 @@ pub enum Intent {
         #[serde(default)]
         dry_run: bool,
     },
+    /// Download, verify, probe, swap and re-exec the newer release the
+    /// version check found. Diverted in `wsconn` before the hub lock, like
+    /// `Search`; refused for every shape but the two roost may replace.
+    Update,
+    /// `Later`: the dialog stops opening by itself for a day. The mark stays.
+    DeferUpdate,
+    /// `Skip <version>`: neither mark nor dialog for that version again. It
+    /// carries the version so a click from a stale page cannot skip one it
+    /// never saw. Both are global, not per project — a version is not about
+    /// any project — and both push a fresh settings snapshot to every hub.
+    SkipUpdate { version: String },
     /// The editor's current selection, sent as ambient context on a debounce
     /// from `static/app.js` — not a deliberate gesture like `MentionPath`'s
     /// Alt+K. `rel` is resolved and confined server-side exactly like
@@ -354,6 +365,21 @@ pub struct UpdateView {
     /// Carried whole rather than folded into `status` because #65's step 4
     /// names it in a dialog title and in a skipped-version record.
     pub latest: String,
+    /// Whether this copy gets the `[Update]` button: channel `release`,
+    /// owner neither Homebrew nor a system package, write probe yes, **and**
+    /// a public key compiled in. Decided here so the client never
+    /// re-derives it.
+    pub offer: bool,
+    /// The version the user skipped, or empty. A newer `latest` un-skips.
+    pub skipped: String,
+    /// When `Later` expires, or 0 when not deferred. The mark stays either way.
+    pub deferred_until: u64,
+    /// `"<phase>: <message>"` from the last attempt at *this* `latest`, or
+    /// empty. Not persisted: an exec is the success case.
+    pub failure: String,
+    /// The version whose file is in place but whose exec failed, or empty —
+    /// the one state where the file and the display disagree, reported.
+    pub installed: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Default)]
@@ -544,6 +570,11 @@ pub enum Event {
     /// must show it: it is the whole of what the user is told when an archive
     /// is rejected before a single file is touched.
     RestoreReport { dry_run: bool, lines: Vec<String>, refused: Option<String> },
+    /// The update pipeline's progress, to the connection that asked and
+    /// nobody else. `phase` is `download`, `verify`, `unpack`, `probe`,
+    /// `swap`, `restarting`, `failed` or `refused`; `detail` carries the
+    /// message for the last two and the version for `restarting`.
+    UpdateProgress { phase: String, detail: String },
     /// This project's notices — not the whole store — sent on connect and
     /// after any read-state change, so no two browsers on the same project
     /// disagree about the badge count.

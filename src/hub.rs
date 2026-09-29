@@ -784,6 +784,13 @@ impl Hub {
             Intent::RevertPreview { .. } | Intent::Revert { .. } => {
                 unreachable!("revert intents are diverted in wsconn before this lock is taken")
             }
+            // Diverted in wsconn like the ones above: a download must not run
+            // under this lock, and a choice is a file write that every hub
+            // then hears about. Named here so a second dispatch site fails
+            // loudly.
+            Intent::Update | Intent::DeferUpdate | Intent::SkipUpdate { .. } => {
+                unreachable!("update intents are diverted in wsconn before this lock is taken")
+            }
             _ => {}
         }
         // CloseTab removes the tab from `self.ws` inside `apply_layout`
@@ -2531,6 +2538,40 @@ pub fn broadcast_all(ev: &Event) {
     };
     for h in hubs {
         Hub::lock(&h).broadcast(ev);
+    }
+}
+
+/// Push a fresh settings snapshot to every project's clients after a
+/// process-wide fact changed — an update choice, which is not about any
+/// project, so every open page must drop or keep its mark at once. Same
+/// lock order as `broadcast_all`: registry, then hub, never both.
+///
+/// **The caller must hold no hub lock** — this locks every hub in turn, the
+/// caller's own included, and a `Mutex` is not reentrant. Call it where
+/// `wsconn` calls `broadcast_to_project`: after the block that held the lock.
+///
+/// The settings view is built *between* the two short hub locks, not under
+/// either: it reads both config files and the choices file, and a hub lock
+/// held across that would stall every browser on the project for a choice
+/// made on another one. It is used for this one event and not left in the
+/// cache, because it was computed outside the lock — a `SetSetting` landing
+/// in that window would otherwise be hidden by a stale cached view until the
+/// next invalidation. The next snapshot recomputes, exactly as after any
+/// other invalidation.
+pub fn broadcast_settings_all() {
+    let Some(reg) = REGISTRY.get() else { return };
+    let hubs: Vec<Arc<Mutex<Hub>>> = {
+        let map = reg.lock().unwrap_or_else(|e| e.into_inner());
+        map.values().cloned().collect()
+    };
+    for h in hubs {
+        let dir = Hub::lock(&h).dir.clone();
+        let fresh = crate::config::settings_view(&dir);
+        let mut g = Hub::lock(&h);
+        g.settings = Some(fresh);
+        let ev = g.snapshot_event(&String::new());
+        g.settings = None;
+        g.broadcast(&ev);
     }
 }
 
@@ -4678,6 +4719,71 @@ mod tests {
             }
         }
 
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    // An update choice is process-wide, so every project's open page has to
+    // hear it at once — and through the settings *cache*, which is the trap:
+    // each hub below is primed with a snapshot taken before the choice, so a
+    // broadcast that merely re-sent `snapshot_event` would re-send the old
+    // cached view and every assertion here would time out.
+    //
+    // Run on its own thread and waited on with a timeout, because the
+    // failure this function is most exposed to is a lock-order deadlock,
+    // and a deadlock hangs rather than fails.
+    //
+    // Watched fail with `g.settings = Some(fresh)` removed (the cache primed
+    // before the choice is re-sent): A's receiver timed out on "skipped".
+    #[test]
+    fn an_update_choice_reaches_every_projects_clients_past_the_settings_cache() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let cfg = d.path().join("config.toml");
+        std::fs::write(&cfg, "version_check = false\n").unwrap();
+        std::env::set_var("ROOST_CONFIG", &cfg);
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+
+        let hub_a = Hub::for_project("update-choice-a", dir_a.path().to_path_buf());
+        let hub_b = Hub::for_project("update-choice-b", dir_b.path().to_path_buf());
+        let (_ca, rxa) = Hub::lock(&hub_a).subscribe();
+        let (_cb, rxb) = Hub::lock(&hub_b).subscribe();
+        for h in [&hub_a, &hub_b] {
+            let mut g = Hub::lock(h);
+            let _ = g.snapshot_event(&String::new());
+            assert!(g.settings.as_ref().is_some_and(|v| v.update.skipped.is_empty()), "primed before the choice");
+        }
+        while rxa.try_recv().is_ok() {}
+        while rxb.try_recv().is_ok() {}
+
+        let choice = crate::update::Choices { skipped: Some("7.7.7".into()), deferred_until: None };
+        crate::update::write_choices_to(&crate::update::choices_path(), &choice).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            broadcast_settings_all();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("broadcast_settings_all must return, not deadlock");
+
+        // Filtered by content, because `broadcast_settings_all` reaches every
+        // hub in the registry, including concurrently running tests' hubs,
+        // whose snapshots would otherwise satisfy a bare "got a State".
+        for (name, rx) in [("A", &rxa), ("B", &rxb)] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                let m = rx.recv_timeout(left).unwrap_or_else(|_| panic!("{name}'s clients must hear the skip"));
+                if m.contains(r#""t":"State""#) && m.contains(r#""skipped":"7.7.7""#) {
+                    break;
+                }
+            }
+        }
+        std::env::remove_var("ROOST_CONFIG");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 

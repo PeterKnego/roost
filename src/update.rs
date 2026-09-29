@@ -5,6 +5,7 @@ include!("pubkey.rs");
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// The download cap. The musl tarball is 1.4 MB; a server answering with
 /// gigabytes is one to walk away from, and the check happens twice — against
@@ -510,6 +511,72 @@ pub fn skip_in(path: &Path, latest: Option<&str>, version: &str) -> Result<(), S
     c.skipped = Some(version.to_string());
     c.deferred_until = None;
     write_choices_to(path, &c)
+}
+
+/// The last attempt's failure, for the version it was for. Not persisted:
+/// an exec is the success case, and a crash is a different problem.
+static LAST_FAILURE: Mutex<Option<(String, Phase, String)>> = Mutex::new(None);
+/// The version swapped in when the exec afterwards failed. The one state
+/// where the file and the display disagree, so About says "restart roost".
+static INSTALLED: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn record_failure(latest: &str, phase: Phase, msg: &str) {
+    *LAST_FAILURE.lock().unwrap_or_else(|e| e.into_inner()) = Some((latest.to_string(), phase, msg.to_string()));
+}
+
+pub fn record_installed(version: &str) {
+    *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(version.to_string());
+}
+
+/// The button's condition, from the same four strings `upgradesLabel` in
+/// `dialog.js` reads for "roost can replace this copy" — so the server and
+/// the label cannot disagree. Each refusal names why, for the log.
+pub fn replaceable_by(b: &crate::proto::BuildInfo) -> Result<(), String> {
+    if b.channel != "release" {
+        return Err(format!("channel {}", b.channel));
+    }
+    if b.owner == "homebrew" || b.owner == "system-package" {
+        return Err(format!("owned by {}", b.owner));
+    }
+    if b.replaceable != "yes" {
+        return Err("not writable by roost".into());
+    }
+    Ok(())
+}
+
+pub fn replaceable_here() -> Result<(), String> {
+    replaceable_by(&crate::config::build_info())
+}
+
+/// What the dialog and the About row render from: step 2's two fields, plus
+/// the choices and this process's last outcome. Read by
+/// `config::settings_view`, so on every settings-cache miss — which
+/// `RequestState`, a connecting client, `SetSetting` and every choice's
+/// `hub::broadcast_settings_all` each cause.
+///
+/// Its I/O is one small read of `choices.json` per call. `check.json` is
+/// read once per process by `version::current` and cached after, and
+/// `build_info`'s write probe is a `OnceLock`. The two statics are leaf
+/// locks held for a clone, never across I/O.
+pub fn view() -> crate::proto::UpdateView {
+    let mut v = crate::version::view();
+    v.offer = replaceable_here().is_ok() && public_key().is_some();
+    let now = crate::errlog::now_secs();
+    let c = read_choices_from(&choices_path());
+    v.skipped = c.skipped.clone().unwrap_or_default();
+    v.deferred_until = if deferred(&c, now) { c.deferred_until.unwrap_or(0) } else { 0 };
+    v.installed = INSTALLED.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+    v.failure = match &*LAST_FAILURE.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some((for_version, phase, msg)) if *for_version == v.latest => format!("{}: {msg}", phase.as_str()),
+        _ => String::new(),
+    };
+    v
+}
+
+#[cfg(test)]
+pub fn reset_for_test() {
+    *LAST_FAILURE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *INSTALLED.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 #[cfg(test)]
@@ -1279,5 +1346,98 @@ mod tests {
 
         skip_in(&p, Some("0.5.3"), "0.5.3").unwrap();
         assert_eq!(read_choices_from(&p), ch(Some("0.5.3"), None), "a skip clears the deferral");
+    }
+
+    /// Points both process-global env vars at this test's own fixture.
+    /// `STATE_ENV_LOCK` first, then `config::ENV_LOCK`, the order documented
+    /// on both; an inversion deadlocks rather than fails.
+    fn env_fixture() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+        tempfile::TempDir,
+    ) {
+        let g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let g2 = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path());
+        let cfg = d.path().join("config.toml");
+        std::fs::write(&cfg, "version_check = true\n").unwrap();
+        std::env::set_var("ROOST_CONFIG", &cfg);
+        crate::version::reset_for_test();
+        reset_for_test();
+        (g1, g2, d)
+    }
+
+    fn checked(latest: &str) -> crate::version::State {
+        crate::version::State {
+            latest: Some(latest.to_string()),
+            checked_at: Some(crate::errlog::now_secs()),
+            failed_at: None,
+        }
+    }
+
+    /// The button's condition, from the same four strings `upgradesLabel`
+    /// reads, so the server and the label cannot disagree.
+    ///
+    /// Deleting any one of `replaceable_by`'s three refusals turns the
+    /// matching `unwrap_err` rows into a panic on `Ok(())`; the two `Ok` rows
+    /// fail if the owner check is widened to refuse `cargo-bin` or `other`.
+    #[test]
+    fn replaceable_means_release_not_package_managed_and_writable() {
+        let b = |channel: &str, owner: &str, replaceable: &str| crate::proto::BuildInfo {
+            channel: channel.into(), owner: owner.into(), replaceable: replaceable.into(),
+            ..Default::default()
+        };
+        assert_eq!(replaceable_by(&b("release", "cargo-bin", "yes")), Ok(()), "the shell installer");
+        assert_eq!(replaceable_by(&b("release", "other", "yes")), Ok(()), "the tarball");
+        assert_eq!(replaceable_by(&b("release", "homebrew", "yes")).unwrap_err(), "owned by homebrew");
+        assert_eq!(replaceable_by(&b("release", "system-package", "yes")).unwrap_err(), "owned by system-package");
+        assert_eq!(replaceable_by(&b("release", "other", "no")).unwrap_err(), "not writable by roost");
+        assert_eq!(replaceable_by(&b("release", "other", "unknown")).unwrap_err(), "not writable by roost");
+        assert_eq!(replaceable_by(&b("checkout", "other", "yes")).unwrap_err(), "channel checkout");
+        assert_eq!(replaceable_by(&b("cargo", "cargo-bin", "yes")).unwrap_err(), "channel cargo");
+    }
+
+    /// The five fields beside step 2's two, each from the place it lives:
+    /// `offer` from the build and the key, `skipped`/`deferred_until` from
+    /// the choices file, `failure`/`installed` from this process.
+    ///
+    /// Deleting the `public_key().is_some()` clause from `view()` cannot fail
+    /// here — this checkout has no key *and* is not channel `release` — which
+    /// is why `replaceable_by` has its own test above. Each of the other four
+    /// assignments in `view()`, deleted, leaves its field at the default and
+    /// fails its assertion; dropping the `for_version == latest` guard fails
+    /// the "dropped when latest changes" assertion; dropping the `deferred()`
+    /// gate fails "an expired deferral is not carried".
+    #[test]
+    fn the_view_carries_the_choices_and_the_last_outcome() {
+        let (_g1, _g2, _d) = env_fixture();
+        crate::version::write_state_to(&crate::version::state_path(), &checked("999.0.0")).unwrap();
+        crate::version::reset_for_test();
+        let v = view();
+        assert_eq!((v.status.as_str(), v.latest.as_str()), ("newer", "999.0.0"), "step 2's fields are untouched");
+        assert!(!v.offer, "this test binary is a checkout without a key: no button");
+        assert_eq!((v.skipped.as_str(), v.deferred_until, v.failure.as_str(), v.installed.as_str()), ("", 0, "", ""));
+
+        write_choices_to(&choices_path(), &Choices { skipped: Some("999.0.0".into()), deferred_until: None }).unwrap();
+        assert_eq!(view().skipped, "999.0.0");
+
+        let soon = crate::errlog::now_secs() + 100;
+        write_choices_to(&choices_path(), &Choices { skipped: None, deferred_until: Some(soon) }).unwrap();
+        assert_eq!(view().deferred_until, soon);
+        write_choices_to(&choices_path(), &Choices { skipped: None, deferred_until: Some(1) }).unwrap();
+        assert_eq!(view().deferred_until, 0, "an expired deferral is not carried");
+
+        record_failure("999.0.0", Phase::Verify, "signature did not verify");
+        assert_eq!(view().failure, "verify: signature did not verify");
+        // A failure belongs to the version it was for. A new check that names
+        // another version drops it: the row must not say "update failed" about
+        // a release nobody has tried to install.
+        crate::version::write_state_to(&crate::version::state_path(), &checked("999.1.0")).unwrap();
+        crate::version::reset_for_test();
+        assert_eq!(view().failure, "");
+
+        record_installed("999.1.0");
+        assert_eq!(view().installed, "999.1.0");
     }
 }
