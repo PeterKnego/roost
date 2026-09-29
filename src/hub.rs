@@ -784,12 +784,19 @@ impl Hub {
             Intent::RevertPreview { .. } | Intent::Revert { .. } => {
                 unreachable!("revert intents are diverted in wsconn before this lock is taken")
             }
-            // Diverted in wsconn like the ones above: a download must not run
-            // under this lock, and a choice is a file write that every hub
-            // then hears about. Named here so a second dispatch site fails
-            // loudly.
+            // Meant to be diverted in wsconn like the ones above: a download
+            // must not run under this lock, and a choice is a file write that
+            // every hub then hears about. But unlike those arms this one is
+            // reachable — the intents exist before their divert does, and any
+            // page `Origin` admits can forge one — so it refuses rather than
+            // panics: a panic here kills the socket thread holding this lock.
+            // Kept after the divert lands, as the answer to a second dispatch
+            // site. Logged to stderr only, not `errlog::record`: that appends
+            // a file under this lock, once per forged frame, with no bound.
             Intent::Update | Intent::DeferUpdate | Intent::SkipUpdate { .. } => {
-                unreachable!("update intents are diverted in wsconn before this lock is taken")
+                eprintln!("roost: {}: update intent reached the hub; refused", self.project);
+                self.send_to(from, &Event::Error { msg: "update intents are handled before the hub".into() });
+                return;
             }
             _ => {}
         }
@@ -4719,6 +4726,38 @@ mod tests {
             }
         }
 
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    // The update intents exist before their wsconn divert does, and any page
+    // `Origin` admits can send one, so reaching `handle` must be a refusal to
+    // the sender, not a panic that kills the socket thread. Two connections,
+    // so a `broadcast` of the refusal would show up on the bystander.
+    //
+    // Watched fail with the arm put back to `unreachable!`: the test panicked
+    // with "update intents are diverted in wsconn before this lock is taken".
+    #[test]
+    fn an_update_intent_reaching_the_hub_is_refused_to_its_sender_only() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::for_project("update-intent-refused", dir.path().to_path_buf());
+        let (asker, rx) = Hub::lock(&hub).subscribe();
+        let (_other, rx_other) = Hub::lock(&hub).subscribe();
+        while rx.try_recv().is_ok() {}
+        while rx_other.try_recv().is_ok() {}
+
+        for intent in [Intent::Update, Intent::DeferUpdate, Intent::SkipUpdate { version: "9.9.9".into() }] {
+            let label = format!("{intent:?}");
+            Hub::lock(&hub).handle(&asker, intent);
+            let m = rx.try_recv().unwrap_or_else(|_| panic!("{label}: the sender must be told"));
+            assert!(m.contains(r#""t":"Error""#), "{label}: got {m}");
+            assert!(m.contains("update intents are handled before the hub"), "{label}: got {m}");
+            assert!(rx.try_recv().is_err(), "{label}: exactly one reply, no state push");
+            assert!(rx_other.try_recv().is_err(), "{label}: the bystander hears nothing");
+        }
         std::env::remove_var("ROOST_STATE_DIR");
     }
 

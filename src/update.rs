@@ -558,9 +558,16 @@ pub fn replaceable_here() -> Result<(), String> {
 /// read once per process by `version::current` and cached after, and
 /// `build_info`'s write probe is a `OnceLock`. The two statics are leaf
 /// locks held for a clone, never across I/O.
+/// The `[Update]` button's whole condition: a copy roost may replace *and* a
+/// key to verify with. Pure, so the key clause is testable in a checkout
+/// that has none.
+pub fn offer_for(build: &crate::proto::BuildInfo, key: Option<&str>) -> bool {
+    replaceable_by(build).is_ok() && key.is_some()
+}
+
 pub fn view() -> crate::proto::UpdateView {
     let mut v = crate::version::view();
-    v.offer = replaceable_here().is_ok() && public_key().is_some();
+    v.offer = offer_for(&crate::config::build_info(), public_key());
     let now = crate::errlog::now_secs();
     let c = read_choices_from(&choices_path());
     v.skipped = c.skipped.clone().unwrap_or_default();
@@ -1351,11 +1358,11 @@ mod tests {
     /// Points both process-global env vars at this test's own fixture.
     /// `STATE_ENV_LOCK` first, then `config::ENV_LOCK`, the order documented
     /// on both; an inversion deadlocks rather than fails.
-    fn env_fixture() -> (
-        std::sync::MutexGuard<'static, ()>,
-        std::sync::MutexGuard<'static, ()>,
-        tempfile::TempDir,
-    ) {
+    ///
+    /// The returned `EnvFixture` unsets both vars on drop, before its locks
+    /// are released — the fields drop in declaration order after `drop` —
+    /// so no later test inherits a path into a deleted tempdir.
+    fn env_fixture() -> EnvFixture {
         let g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let g2 = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = tempfile::tempdir().unwrap();
@@ -1365,7 +1372,22 @@ mod tests {
         std::env::set_var("ROOST_CONFIG", &cfg);
         crate::version::reset_for_test();
         reset_for_test();
-        (g1, g2, d)
+        EnvFixture { _dir: d, _g2: g2, _g1: g1 }
+    }
+
+    struct EnvFixture {
+        _dir: tempfile::TempDir,
+        _g2: std::sync::MutexGuard<'static, ()>,
+        _g1: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for EnvFixture {
+        fn drop(&mut self) {
+            std::env::remove_var("ROOST_STATE_DIR");
+            std::env::remove_var("ROOST_CONFIG");
+            crate::version::reset_for_test();
+            reset_for_test();
+        }
     }
 
     fn checked(latest: &str) -> crate::version::State {
@@ -1398,20 +1420,38 @@ mod tests {
         assert_eq!(replaceable_by(&b("cargo", "cargo-bin", "yes")).unwrap_err(), "channel cargo");
     }
 
+    /// The key clause, which `view()` cannot exercise in a checkout (no key,
+    /// and not channel `release` either). Deleting `&& key.is_some()` fails
+    /// the "no key, no button" row.
+    #[test]
+    fn the_button_needs_a_replaceable_copy_and_a_key() {
+        let b = |owner: &str, replaceable: &str| crate::proto::BuildInfo {
+            channel: "release".into(), owner: owner.into(), replaceable: replaceable.into(),
+            ..Default::default()
+        };
+        assert!(!offer_for(&b("cargo-bin", "yes"), None), "no key, no button");
+        assert!(offer_for(&b("cargo-bin", "yes"), Some("RWQkey")), "a replaceable release with a key");
+        assert!(offer_for(&b("other", "yes"), Some("RWQkey")), "the tarball too");
+        assert!(!offer_for(&b("homebrew", "yes"), Some("RWQkey")), "homebrew owns its copy");
+        assert!(!offer_for(&b("system-package", "yes"), Some("RWQkey")), "so does the package manager");
+        assert!(!offer_for(&b("other", "no"), Some("RWQkey")), "not writable");
+        assert!(!offer_for(&b("other", "unknown"), Some("RWQkey")), "could not tell is not yes");
+    }
+
     /// The five fields beside step 2's two, each from the place it lives:
     /// `offer` from the build and the key, `skipped`/`deferred_until` from
     /// the choices file, `failure`/`installed` from this process.
     ///
-    /// Deleting the `public_key().is_some()` clause from `view()` cannot fail
-    /// here — this checkout has no key *and* is not channel `release` — which
-    /// is why `replaceable_by` has its own test above. Each of the other four
+    /// Deleting the key clause cannot fail here — this checkout has no key
+    /// *and* is not channel `release` — which is why `replaceable_by` and
+    /// `offer_for` have their own tests above. Each of the other four
     /// assignments in `view()`, deleted, leaves its field at the default and
     /// fails its assertion; dropping the `for_version == latest` guard fails
     /// the "dropped when latest changes" assertion; dropping the `deferred()`
     /// gate fails "an expired deferral is not carried".
     #[test]
     fn the_view_carries_the_choices_and_the_last_outcome() {
-        let (_g1, _g2, _d) = env_fixture();
+        let _env = env_fixture();
         crate::version::write_state_to(&crate::version::state_path(), &checked("999.0.0")).unwrap();
         crate::version::reset_for_test();
         let v = view();
