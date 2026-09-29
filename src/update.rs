@@ -3,6 +3,7 @@
 
 include!("pubkey.rs");
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// The download cap. The musl tarball is 1.4 MB; a server answering with
@@ -425,6 +426,90 @@ fn http_get_capped(url: &str, cap: u64) -> Result<Vec<u8>, String> {
         }
     }
     read_capped(resp.into_reader(), cap)
+}
+
+/// What the user said to the dialog. Two choices, two lifetimes: `Later`
+/// defers the self-opening for `DEFER_SECS` and keeps the mark; `Skip` is
+/// per version, and a later version un-skips by itself because the stored
+/// value is the version string, not a flag.
+///
+/// **A separate file from the version check's**, on purpose: that one is
+/// written by the check thread when a fetch completes, this one by the intent
+/// handler when a user clicks. One file with two writers is a rename race in
+/// which a completed check silently discards a click.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Choices {
+    pub skipped: Option<String>,
+    pub deferred_until: Option<u64>,
+}
+
+pub fn choices_path() -> PathBuf {
+    crate::version::state_dir_for_update().join("choices.json")
+}
+
+/// Missing, truncated or unreadable is **no choice was made** — which errs
+/// toward showing the dialog, the recoverable direction. This is the one
+/// reader in the feature where folding "could not look" into the default is
+/// right, because the default is the safe one.
+pub fn read_choices_from(path: &Path) -> Choices {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Pid-unique temp file, then `rename`, like every piece of persistent
+/// evidence here — and like `version::write_state_to`, a failed rename must
+/// not leave the tmp file behind.
+pub fn write_choices_to(path: &Path, c: &Choices) -> Result<(), String> {
+    let dir = path.parent().ok_or_else(|| "no parent directory".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string(c).map_err(|e| e.to_string())?;
+    let tmp = dir.join(format!(".choices.{}.json.tmp", std::process::id()));
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    Ok(())
+}
+
+/// Deferred until a moment still ahead — and not further ahead than `Later`
+/// can write, so a stepped clock or a copied file cannot silence the dialog
+/// for a year.
+pub fn deferred(c: &Choices, now: u64) -> bool {
+    c.deferred_until.is_some_and(|t| t > now && t - now <= DEFER_SECS)
+}
+
+pub fn skipped(c: &Choices, latest: &str) -> bool {
+    c.skipped.as_deref() == Some(latest)
+}
+
+/// `Later`: the deferral moves, the skip stays.
+pub fn defer_in(path: &Path, now: u64) -> Result<(), String> {
+    let mut c = read_choices_from(path);
+    c.deferred_until = Some(now + DEFER_SECS);
+    write_choices_to(path, &c)
+}
+
+/// `Skip <version>`: only the version the last check actually saw, so a
+/// click from a stale page cannot skip a version it never showed. A skip
+/// clears the deferral — there is nothing left to defer.
+pub fn skip_in(path: &Path, latest: Option<&str>, version: &str) -> Result<(), String> {
+    match latest {
+        Some(l) if l == version => {}
+        Some(l) => return Err(format!("{version} is not the version the last check saw ({l})")),
+        None => return Err(format!("{version} is not the version the last check saw (no check yet)")),
+    }
+    let mut c = read_choices_from(path);
+    c.skipped = Some(version.to_string());
+    c.deferred_until = None;
+    write_choices_to(path, &c)
 }
 
 #[cfg(test)]
@@ -1100,5 +1185,99 @@ mod tests {
         let all = [Phase::Download, Phase::Verify, Phase::Unpack, Phase::Probe, Phase::Swap, Phase::Exec, Phase::Internal];
         let names: Vec<&str> = all.iter().map(|p| p.as_str()).collect();
         assert_eq!(names, ["download", "verify", "unpack", "probe", "swap", "exec", "internal"]);
+    }
+
+    fn ch(skipped: Option<&str>, deferred_until: Option<u64>) -> Choices {
+        Choices { skipped: skipped.map(str::to_string), deferred_until }
+    }
+
+    #[test]
+    fn the_choices_file_round_trips_beside_the_check_file_not_in_it() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("update").join("choices.json");
+        let c = ch(Some("0.5.3"), Some(1_789_320_967));
+        write_choices_to(&p, &c).unwrap();
+        assert_eq!(read_choices_from(&p), c);
+        let text = std::fs::read_to_string(&p).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let keys: Vec<&str> = json.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["skipped", "deferred_until"], "{text}");
+        // Its own file: the check thread writes check.json, the intent
+        // handler writes this, and one file with two writers is a rename
+        // race in which a completed check silently discards a click.
+        //
+        // `choices_path()` reads the process-global `ROOST_STATE_DIR` (via
+        // `version::state_dir_for_update`) even though this test never sets
+        // it itself — a concurrently-running test's `set_var` is still a
+        // data race on that read without the lock, per `STATE_ENV_LOCK`'s
+        // doc comment.
+        let _envg = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(choices_path().file_name().unwrap(), "choices.json");
+        assert_eq!(choices_path().parent().unwrap().file_name().unwrap(), "update");
+    }
+
+    /// Missing, truncated or the wrong shape is *no choice*, deliberately —
+    /// that errs toward showing the dialog, the recoverable direction.
+    #[test]
+    fn an_unreadable_choices_file_is_no_choice() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("choices.json");
+        assert_eq!(read_choices_from(&p), Choices::default());
+        std::fs::write(&p, "{\"skipped\":\"0.5").unwrap();
+        assert_eq!(read_choices_from(&p), Choices::default());
+        std::fs::write(&p, "[]").unwrap();
+        assert_eq!(read_choices_from(&p), Choices::default());
+    }
+
+    #[test]
+    fn a_skip_is_per_version_and_a_newer_one_unskips_by_itself() {
+        let c = ch(Some("0.5.3"), None);
+        assert!(skipped(&c, "0.5.3"));
+        assert!(!skipped(&c, "0.5.4"), "the stored value is the version, not a flag");
+        assert!(!skipped(&Choices::default(), "0.5.3"));
+    }
+
+    #[test]
+    fn a_deferral_expires_at_its_timestamp() {
+        let now = 1_000_000u64;
+        assert!(deferred(&ch(None, Some(now + 3600)), now), "an hour left");
+        assert!(!deferred(&ch(None, Some(now)), now), "expired exactly now");
+        assert!(!deferred(&ch(None, Some(now - 1)), now));
+        assert!(!deferred(&Choices::default(), now));
+    }
+
+    /// A stepped clock, or a file from another host: a deferral further
+    /// ahead than `Later` can ever write reads as expired, not as a mark that
+    /// stays silent for a year.
+    #[test]
+    fn a_deferral_too_far_ahead_reads_as_expired() {
+        let now = 1_000_000u64;
+        assert!(deferred(&ch(None, Some(now + DEFER_SECS)), now), "exactly what Later writes");
+        assert!(!deferred(&ch(None, Some(now + DEFER_SECS + 1)), now), "more than Later can write");
+    }
+
+    #[test]
+    fn later_writes_now_plus_a_day_and_keeps_the_skip() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("choices.json");
+        write_choices_to(&p, &ch(Some("0.5.2"), None)).unwrap();
+        defer_in(&p, 1_000_000).unwrap();
+        assert_eq!(read_choices_from(&p), ch(Some("0.5.2"), Some(1_000_000 + DEFER_SECS)));
+    }
+
+    /// `SkipUpdate` carries the version so a click from a stale page cannot
+    /// skip a version it never saw.
+    #[test]
+    fn a_skip_from_a_stale_page_is_ignored() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("choices.json");
+        write_choices_to(&p, &ch(None, Some(5))).unwrap();
+        let e = skip_in(&p, Some("0.5.4"), "0.5.3").unwrap_err();
+        assert_eq!(e, "0.5.3 is not the version the last check saw (0.5.4)");
+        assert_eq!(read_choices_from(&p), ch(None, Some(5)), "nothing written");
+        assert!(skip_in(&p, None, "0.5.3").is_err(), "no check yet, nothing to skip");
+
+        skip_in(&p, Some("0.5.3"), "0.5.3").unwrap();
+        assert_eq!(read_choices_from(&p), ch(Some("0.5.3"), None), "a skip clears the deferral");
     }
 }
