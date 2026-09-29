@@ -2,6 +2,8 @@
 //! `docs/superpowers/specs/2026-09-12-version-check-design.md`.
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// The sparse index. Not a setting, at any scope: a key that let a repository
 /// name the host roost fetches from would be the hole global-only config
@@ -262,6 +264,141 @@ pub fn stale(s: Option<&State>, now: u64) -> bool {
     !(fresh || cooling)
 }
 
+/// The request's overall bound. ureq's own defaults are a 30 s connect timeout
+/// and *no* read timeout, so a half-open connection would park the detached
+/// thread indefinitely. Nothing waits on that thread, so the cost would be
+/// invisible — which is the reason to bound it, not a reason not to.
+pub const TIMEOUT_SECS: u64 = 10;
+
+/// The injection seam, the same shape `registry::reconcile_with(roots,
+/// snapshot_fn)` uses for its process snapshot: every branch below is testable
+/// with no network. A plain `fn` pointer rather than a boxed closure so it
+/// crosses into the detached thread without a lifetime.
+pub type FetchFn = fn(&str) -> Result<String, String>;
+
+/// The configured agent. Three settings, each decided rather than defaulted;
+/// see the module's spec. Step 4's downloader reuses this.
+pub fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+        .user_agent(&user_agent())
+        .build()
+}
+
+/// Every failure is one string: About says "could not check" and does not say
+/// why — the reason is here, in the server log, for anyone who needs it.
+pub fn http_get(url: &str) -> Result<String, String> {
+    agent()
+        .get(url)
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_string()
+        .map_err(|e| e.to_string())
+}
+
+/// One check for the whole process, taken **before** the staleness test.
+static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// The answer this process knows, seeded from disk on first read and kept up
+/// to date by the check thread. `config::settings_view` reads it; nothing
+/// pushes or broadcasts when a check completes, because the About pane is the
+/// only consumer and it asks (`RequestState` invalidates the hub's settings
+/// cache).
+static CELL: OnceLock<Mutex<Option<State>>> = OnceLock::new();
+static LOADED: AtomicBool = AtomicBool::new(false);
+
+fn cell() -> &'static Mutex<Option<State>> {
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+/// Never holds the lock across the disk read: CLAUDE.md's rule, and this one
+/// is called from `settings_view`, which runs under the hub lock.
+pub fn current() -> Option<State> {
+    if !LOADED.load(Ordering::Acquire) {
+        let disk = read_state_from(&state_path());
+        let mut g = cell().lock().unwrap_or_else(|e| e.into_inner());
+        // A check that finished first already stored a fresher answer and set
+        // the flag; the swap tells us so, and we leave it alone.
+        if !LOADED.swap(true, Ordering::AcqRel) {
+            *g = disk;
+        }
+        return g.clone();
+    }
+    cell().lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn store(s: State) {
+    let mut g = cell().lock().unwrap_or_else(|e| e.into_inner());
+    *g = Some(s);
+    LOADED.store(true, Ordering::Release);
+}
+
+/// One check, start to finish, synchronously. Returns the state it wrote, so a
+/// test can assert on it without waiting on a thread.
+///
+/// A fetch that panics is a failure like any other: this runs on a thread
+/// nothing joins, so an escaping panic would be invisible *and* would leave
+/// the in-flight guard taken forever.
+pub fn check_once_with(fetch: FetchFn) -> State {
+    let previous = current().unwrap_or_default();
+    let fetched = index_url(env!("CARGO_PKG_NAME")).and_then(|url| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fetch(&url)))
+            .unwrap_or_else(|_| Err("the fetch panicked".into()))
+            .map_err(|e| {
+                eprintln!("roost: version check: {e}");
+                e
+            })
+            .ok()
+    });
+    // A body that parsed but named no usable version is "could not determine",
+    // not "nothing is newer" — so it takes the one-hour retry, not the day.
+    let next = match fetched.as_deref().and_then(newest_unyanked) {
+        Some(latest) => State { latest: Some(latest), checked_at: Some(now()), failed_at: None },
+        None => State { failed_at: Some(now()), ..previous },
+    };
+    if let Err(e) = write_state_to(&state_path(), &next) {
+        eprintln!("roost: version state write: {e}");
+    }
+    store(next.clone());
+    next
+}
+
+/// Fired from a workspace websocket connect. Returns immediately; the
+/// connection never waits for the request.
+pub fn maybe_check() {
+    maybe_check_with(http_get);
+}
+
+pub fn maybe_check_with(fetch: FetchFn) {
+    if !crate::config::version_check() {
+        return;
+    }
+    // Before the staleness test, deliberately: ten tabs connecting at once
+    // must fire one request, not ten, and a guard taken after the test would
+    // let all ten through the window between.
+    if IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if !stale(current().as_ref(), now()) {
+        IN_FLIGHT.store(false, Ordering::SeqCst);
+        return;
+    }
+    // Detached: nothing joins this, and nothing may escape it.
+    std::thread::spawn(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check_once_with(fetch);
+        }));
+        IN_FLIGHT.store(false, Ordering::SeqCst);
+    });
+}
+
+#[cfg(test)]
+pub fn reset_for_test() {
+    IN_FLIGHT.store(false, Ordering::SeqCst);
+    LOADED.store(false, Ordering::SeqCst);
+    *cell().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,5 +644,120 @@ not json at all
     fn a_failure_keeps_the_last_good_answer() {
         let after_failure = st(Some("0.5.3"), Some(1_000_000), Some(1_002_000));
         assert_eq!(verdict("0.5.2", after_failure.latest.as_deref()), Latest::Newer("0.5.3".into()));
+    }
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RELEASE: AtomicBool = AtomicBool::new(false);
+
+    /// Blocks until the test lets it go, so the guard is still held while the
+    /// other nine callers arrive.
+    fn blocking_fetch(_url: &str) -> Result<String, String> {
+        CALLS.fetch_add(1, SeqCst);
+        while !RELEASE.load(SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Ok("{\"name\":\"roost\",\"vers\":\"9.9.9\",\"yanked\":false}\n".to_string())
+    }
+
+    fn failing_fetch(_url: &str) -> Result<String, String> {
+        CALLS.fetch_add(1, SeqCst);
+        Err("dns: no such host".into())
+    }
+
+    fn panicking_fetch(_url: &str) -> Result<String, String> {
+        CALLS.fetch_add(1, SeqCst);
+        panic!("the socket thread must not carry this");
+    }
+
+    /// Points both process-global env vars at this test's own fixture.
+    /// `STATE_ENV_LOCK` **first**, then `config::ENV_LOCK` — the order is
+    /// documented on both, and an inversion deadlocks rather than fails.
+    fn env_fixture(on: bool) -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+        tempfile::TempDir,
+    ) {
+        let g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let g2 = crate::config::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path());
+        let cfg = d.path().join("config.toml");
+        std::fs::write(&cfg, if on { "version_check = true\n" } else { "version_check = false\n" }).unwrap();
+        std::env::set_var("ROOST_CONFIG", &cfg);
+        CALLS.store(0, SeqCst);
+        RELEASE.store(false, SeqCst);
+        reset_for_test();
+        (g1, g2, d)
+    }
+
+    /// Ten tabs connecting at once — or one browser test opening ten projects
+    /// — fire one request, not ten.
+    #[test]
+    fn ten_connects_with_a_blocking_fetch_fire_it_once() {
+        let (_g1, _g2, _d) = env_fixture(true);
+        for _ in 0..10 {
+            maybe_check_with(blocking_fetch);
+        }
+        // Wait for the one thread to actually be inside the fetch.
+        for _ in 0..200 {
+            if CALLS.load(SeqCst) >= 1 { break }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(CALLS.load(SeqCst), 1, "the in-flight guard is taken before the staleness test");
+        RELEASE.store(true, SeqCst);
+        for _ in 0..200 {
+            if current().is_some() { break }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(CALLS.load(SeqCst), 1, "and still once after it finished");
+        assert_eq!(current().unwrap().latest.as_deref(), Some("9.9.9"));
+        RELEASE.store(false, SeqCst);
+    }
+
+    /// CLAUDE.md: no panic may escape a socket or watcher thread — and this
+    /// one would also leave the guard taken forever, silencing every later
+    /// check in the process.
+    #[test]
+    fn a_panicking_fetch_does_not_leave_the_guard_taken() {
+        let (_g1, _g2, _d) = env_fixture(true);
+        let s = std::panic::catch_unwind(|| check_once_with(panicking_fetch));
+        assert!(s.is_ok(), "the panic is caught inside, not by the caller");
+        let s = s.unwrap();
+        assert!(s.failed_at.is_some(), "a panicking fetch is a failure, not a success");
+        assert_eq!(s.latest, None);
+    }
+
+    /// The whole point of two timestamps: a thirty-minute outage must not turn
+    /// "9.9.9 available" into "could not check".
+    #[test]
+    fn a_failed_check_keeps_the_last_good_latest() {
+        let (_g1, _g2, _d) = env_fixture(true);
+        RELEASE.store(true, SeqCst);
+        let good = check_once_with(blocking_fetch);
+        assert_eq!(good.latest.as_deref(), Some("9.9.9"));
+        assert!(good.checked_at.is_some() && good.failed_at.is_none());
+
+        let bad = check_once_with(failing_fetch);
+        assert_eq!(bad.latest.as_deref(), Some("9.9.9"), "the last good answer survives");
+        assert_eq!(bad.checked_at, good.checked_at, "the success timestamp is untouched");
+        assert!(bad.failed_at.is_some(), "and the failure is recorded for the one-hour retry");
+        RELEASE.store(false, SeqCst);
+    }
+
+    /// A body that parsed but named no usable version is "could not determine",
+    /// which earns the one-hour retry rather than a day of silence.
+    #[test]
+    fn an_index_with_nothing_usable_is_a_failure_not_a_success() {
+        let (_g1, _g2, _d) = env_fixture(true);
+        fn all_yanked(_url: &str) -> Result<String, String> {
+            Ok("{\"name\":\"roost\",\"vers\":\"0.5.2\",\"yanked\":true}\n".to_string())
+        }
+        let s = check_once_with(all_yanked);
+        assert_eq!(s.latest, None);
+        assert!(s.failed_at.is_some(), "the retry is the hour, not the day");
+        assert!(s.checked_at.is_none());
     }
 }

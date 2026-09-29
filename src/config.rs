@@ -753,6 +753,12 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
     }
 }
 
+/// `ENV_LOCK` lives with the tests that introduced it; re-exported so
+/// `version.rs`'s tests can name it as `crate::config::ENV_LOCK` — a private
+/// `mod tests` is otherwise invisible to a sibling module.
+#[cfg(test)]
+pub(crate) use tests::ENV_LOCK;
+
 #[cfg(test)]
 mod tests {
     #[test]

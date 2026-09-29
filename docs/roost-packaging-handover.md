@@ -49,9 +49,13 @@ Roost needs `dtach` and `git` on the `PATH` at run time.
 
 ### 2.5 Dependencies relevant to packaging
 
-The release binary has no TLS or crypto dependency at all. `Cargo.lock` does
-contain `rustls` and `ring`, but both are **dev-dependencies**, reached only
-through `ureq` in the test suite:
+The release binary carries `rustls` and `ring` since the version check
+(#65 step 2) promoted `ureq` to a runtime dependency; before that both were
+dev-only. `ring` compiles C, so the musl targets need `musl-tools` on the
+build host — dist installs it on the release runners (`dist plan` lists it
+under `packages_install`), `ci.yml`'s container job installs it explicitly,
+and a dev host needs `sudo apt-get install musl-tools` once. There is still
+no `openssl`, `openssl-sys` or `native-tls` anywhere in the lock file.
 
 ```
 rustls v0.23.43
@@ -125,6 +129,8 @@ nothing installed but the rustup targets themselves:
 |---|---|
 | `x86_64-unknown-linux-musl` | clean; `static-pie linked`, no NEEDED entries; `roost --version` runs |
 | `aarch64-unknown-linux-musl` | clean **only with `-C linker=rust-lld`**; `statically linked`, no NEEDED entries |
+
+Since step 2, `ring` needs `musl-tools` as well; see 2.5.
 
 The aarch64 caveat is not optional. Cargo defaults to the host `cc` as the
 linker driver, and `x86_64-linux-gnu-ld.bfd` then rejects the aarch64 objects:

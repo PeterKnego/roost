@@ -89,9 +89,14 @@ jobs:
       - name: Verify the crate packages
         run: cargo publish --locked --dry-run
 
-      # Runners have docker and the musl target is a rustup add away.
+      # Runners have docker and the musl target is a rustup add away — and,
+      # since the version check promoted ureq, ring needs a C compiler that
+      # targets musl (cc-rs looks for x86_64-linux-musl-gcc, then musl-gcc).
+      # dist installs the same package on the release runners.
       - name: Install the musl target
-        run: rustup target add x86_64-unknown-linux-musl
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update -q && sudo apt-get install -y -q musl-tools
 
       - name: Package install tests
         run: scripts/test/install.sh

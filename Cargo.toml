@@ -43,9 +43,16 @@ multer = "3.1"
 futures-executor = "0.3"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false }
+# Promoted from a dev-dependency: the version check is the one thing roost does
+# that reaches the network. `proxy-from-env` is off in ureq's default feature
+# set, so a default build ignores HTTPS_PROXY entirely — and an office behind
+# one NAT, where a proxy is mandatory, is exactly where this check was designed
+# to work. The TLS backend is left alone: the default `tls` feature is
+# webpki-roots (the bundled Mozilla set), and `native-tls` would drag OpenSSL
+# into a static musl build.
+ureq = { version = "2.12", features = ["proxy-from-env"] }
 
 [dev-dependencies]
-ureq = "2"
 tempfile = "3"
 
 [profile.release]
