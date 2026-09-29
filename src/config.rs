@@ -1513,6 +1513,8 @@ mod tests {
         assert_eq!(v.update.status, "off", "the reader is consulted, not defaulted");
         let json = serde_json::to_value(&v).unwrap();
         assert!(json.get("update").is_some(), "the client reads state.settings.update");
+        assert!(json["update"]["latest"].is_string(),
+            "the JS and the #86 self-update plan both read state.settings.update.latest by name");
         assert!(json["build"].get("status").is_none(), "and not state.settings.build.status");
         std::env::remove_var("ROOST_CONFIG");
     }
