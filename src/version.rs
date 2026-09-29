@@ -1,4 +1,21 @@
-//! Is there a newer roost? See
+//! Is there a newer roost than the one running? This module answers that one
+//! question, three ways: up to date, a newer version exists, or the answer
+//! could not be determined. It exists because a user who never looks for
+//! release notes should still find out an upgrade exists, and because a user
+//! who cannot reach crates.io — a TLS-intercepting proxy, an offline box —
+//! must be told exactly that, not a cheerful guess in either direction.
+//!
+//! The check fires from a websocket connect (`maybe_check`), not from a
+//! timer: roost is a single long-lived binary a user restarts rarely, so a
+//! background scheduler would tick away in a process nobody is looking at,
+//! while a check tied to "a browser just showed up to read About" answers the
+//! only question that matters — is the answer fresh when someone asks — for
+//! free. `stale()` throttles it to once a day on success and once an hour
+//! after a failure, so ten tabs connecting at once still cost one request.
+//!
+//! The three-valued answer is why `State` stores a fact (`latest`, from the
+//! last successful fetch) rather than a verdict: see `State`'s doc comment
+//! for why the verdict is computed at display time instead. Full design:
 //! `docs/superpowers/specs/2026-09-12-version-check-design.md`.
 
 use serde::{Deserialize, Serialize};
