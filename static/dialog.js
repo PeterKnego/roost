@@ -1089,8 +1089,14 @@ function openSettings(settings) {
 /// pinned into `u`/`b` above), so the title and body can go stale only in
 /// ways `onProgress` already covers — nothing here depends on a fresher
 /// settings snapshot to stay correct.
-function openUpdate(settings) {
+function openUpdate(settings, opts) {
   const el = document.getElementById("dlg-update");
+  // Opened by itself (`renderUpdateMark`), the dialog lands while the user
+  // may be typing in a terminal; with focus on Update, the next Enter or
+  // Space would start download→swap→exec. So a self-opened dialog focuses
+  // Later, and only one the user asked for — the mark, About's button —
+  // focuses Update.
+  const selfOpened = !!(opts && opts.selfOpened);
   const u = (settings && settings.update) || {};
   const b = (settings && settings.build) || {};
   return runDialog(el, (finish) => {
@@ -1107,7 +1113,15 @@ function openUpdate(settings) {
     skip.textContent = `Skip ${u.latest}`;
     ok.disabled = false; later.disabled = false; skip.disabled = false;
     const p = document.createElement("p");
-    if (u.offer) {
+    if (u.installed) {
+      // The new file is already in place and only the exec failed: a second
+      // Update would download the same release again. About's row says the
+      // same thing; the failure, if any, stays visible below it.
+      cmd.hidden = true;
+      ok.hidden = true;
+      p.textContent = `restart roost to run ${u.installed}`;
+      if (u.failure) { progress.hidden = false; progress.textContent = `update failed: ${u.failure}`; }
+    } else if (u.offer) {
       cmd.hidden = true;
       ok.hidden = false;
       ok.textContent = u.failure ? "Retry" : "Update";
@@ -1162,6 +1176,6 @@ function openUpdate(settings) {
         }
       },
     };
-    return () => (u.offer ? ok : later).focus();
+    return () => (ok.hidden || selfOpened ? later : ok).focus();
   }, "dismissed").then((v) => { updateOpen = null; return v; });
 }

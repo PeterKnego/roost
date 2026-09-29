@@ -64,6 +64,15 @@
 //! one property and not to Update or to editing in general. Restored and
 //! rebuilt, the file returns to a clean PASS, 40/40.
 //!
+//! Section B's focus assertion — a dialog that opened by itself focuses
+//! Later, never Update, so a keystroke meant for a terminal cannot start an
+//! update — was revert-checked by dropping `{ selfOpened: true }` from
+//! `renderUpdateMark`'s call in `static/app.js` (backed up with `cp`),
+//! `cargo build`, and running this file: it failed with `a self-opened dialog
+//! focuses Later, not Update ("dlg-ok")`, the only failure. Section G (an
+//! installed file offers no second Update) failed on the pre-fix dialog.js
+//! with the Update button visible and the offer's paragraph as the body.
+//!
 //! Run: deno run -A tests/browser/update.mjs
 import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startRoost, until }
   from "./harness.mjs";
@@ -116,6 +125,20 @@ try {
   console.log("B. a checkout gets no mark; a replaceable copy does, and the dialog opens itself once");
   ok(await evalIn(`document.getElementById("updmark").hidden`), "no mark for a checkout");
   ok(!(await evalIn(`document.getElementById("dlg-update").open`)), "and no dialog");
+  // A dialog that opens by itself lands while the user may be typing in a
+  // terminal, so Enter or Space must not start download→swap→exec: its focus
+  // goes to Later even when the Update button is offered. `offer` is set by
+  // hand for this one open, then put back for the checkout flow below.
+  await evalIn(`Object.assign(state.settings.build, { channel: "release", owner: "cargo-bin", replaceable: "yes" }); state.settings.update.offer = true; updateOffered = false; renderUpdateMark(); 0`);
+  ok(await until(() => evalIn(`document.getElementById("dlg-update").open`), 5, "auto-open with offer"),
+     "the dialog opened by itself with an Update button offered");
+  ok(!(await evalIn(`document.querySelector("#dlg-update .dlg-ok").hidden`)), "the Update button is there");
+  const focused = await evalIn(`(() => { const a = document.activeElement; return a ? (a.className || a.tagName) : null; })()`);
+  ok(focused === "dlg-later", `a self-opened dialog focuses Later, not Update (${JSON.stringify(focused)})`);
+  await evalIn(`document.getElementById("dlg-update").dispatchEvent(new Event("cancel", { cancelable: true })); 0`);
+  await until(() => evalIn(`!document.getElementById("dlg-update").open`), 5, "close");
+  await evalIn(`state.settings.update.offer = false; 0`);
+
   // The real renderer, on a build mutated in place — the about.mjs technique.
   await evalIn(`Object.assign(state.settings.build, { channel: "release", owner: "cargo-bin", replaceable: "yes" }); updateOffered = false; renderUpdateMark(); 0`);
   ok(!(await evalIn(`document.getElementById("updmark").hidden`)), "the mark shows for a replaceable copy");
@@ -187,6 +210,9 @@ try {
   ok(await until(() => evalIn(`!document.getElementById("dlg-settings").open && document.getElementById("dlg-update").open`), 5, "swap"),
      "the button closes settings and opens the update dialog");
   ok(!(await evalIn(`document.querySelector("#dlg-update .dlg-ok").hidden`)), "which now has an Update button");
+  // Asked for, not self-opened: here the Update button keeps the focus.
+  ok((await evalIn(`document.activeElement && document.activeElement.className`)) === "dlg-ok",
+     "an update dialog the user asked for focuses Update");
 
   // The real intent, from a checkout: refused, and the refusal reaches this
   // dialog as a progress line rather than a silent nothing.
@@ -272,6 +298,17 @@ try {
   ok(await until(() => evalIn(`document.querySelector("#dlg-update .dlg-progress").textContent.startsWith("not updated: channel checkout")`), 5, "refused"),
      `and Update was still handled, refused by name (${await evalIn(`document.querySelector("#dlg-update .dlg-progress").textContent`)})`);
   await evalIn(`document.getElementById("dlg-update").dispatchEvent(new Event("cancel", { cancelable: true })); 0`);
+
+  console.log("G. a swapped file waiting for a restart offers no second Update");
+  await evalIn(`Object.assign(state.settings.update, { status: "newer", latest: "999.1.0", offer: true, skipped: null, failure: null, deferred_until: 0, installed: "999.1.0" }); 0`);
+  await evalIn(`openUpdate(state.settings); 0`);
+  ok(await until(() => evalIn(`document.getElementById("dlg-update").open`), 5, "installed dialog"), "the dialog opens");
+  ok(await evalIn(`document.querySelector("#dlg-update .dlg-ok").hidden`), "no Update button once a newer file is installed");
+  ok(await evalIn(`document.querySelector("#dlg-update .dlg-cmd").hidden`), "and no upgrade command either");
+  const body = await evalIn(`document.querySelector("#dlg-update .dlg-body").textContent`);
+  ok(body === "restart roost to run 999.1.0", `the body says what About says (${JSON.stringify(body)})`);
+  await evalIn(`document.getElementById("dlg-update").dispatchEvent(new Event("cancel", { cancelable: true })); 0`);
+  await evalIn(`state.settings.update.installed = ""; 0`);
 
   const label = async (x) => await evalIn(`latestLabel(${JSON.stringify(x)})`);
   ok((await label({ status: "newer", latest: "1.0.0", skipped: "1.0.0" })) === "1.0.0 skipped", "skipped");

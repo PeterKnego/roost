@@ -52,7 +52,10 @@ skipped, three surfaces light up:
 - **The update dialog**, an in-page `<dialog>` on the `dialog.js` primitive.
   Its title names both versions: *roost 0.5.3 is available — you are running
   0.5.2*. It opens by itself once per browser page load when the mark first
-  appears, and on any later click of the mark.
+  appears, and on any later click of the mark. Opened by itself it focuses
+  `Later`, never `Update`: it can land while the user is typing in a
+  terminal, and Enter or Space must not start an update. Opened by a click,
+  it focuses `Update`.
 - **The About row.** `0.5.3 available` gains an `[Update]` button for
   replaceable copies. About is where a user goes to wonder, so the action
   lives there too, not only in the dialog.
@@ -288,7 +291,9 @@ updating*, or simply closes.
 
 **The in-flight guard clears on every path except `Restarting`**, where the
 process is about to be replaced. If exec fails after the swap, the guard
-clears and the row says `restart roost to run 0.5.3`.
+clears and the row says `restart roost to run 0.5.3`. The dialog says the
+same and offers no `Update`: the file is already in place, and a second run
+would only download it again.
 
 **Deliberately absent:** retry with backoff, resumed partial downloads,
 rollback after exec. A failed exec leaves a newer file and a running older

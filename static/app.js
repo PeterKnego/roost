@@ -4488,7 +4488,7 @@ function renderUpdateMark() {
   const now = Math.floor(Date.now() / 1000);
   if (show && !updateOffered && !(u.deferred_until > now) && typeof openUpdate === "function") {
     updateOffered = true;
-    openUpdate(s);
+    openUpdate(s, { selfOpened: true });
   }
 }
 
