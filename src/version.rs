@@ -477,6 +477,10 @@ not json at all
     /// verdict computed by the old binary would make the new one announce
     /// "0.5.3 available" while running 0.5.3 — the lying version display #65
     /// and #56 both exist to prevent.
+    ///
+    /// Revert-checked: a `verdict` that returns `Newer` whenever the file
+    /// holds a version — the shape a stored `"outcome"` would produce — fails
+    /// here with `left: Newer("0.5.3"), right: UpToDate`.
     #[test]
     fn the_verdict_is_not_stored() {
         let d = tempfile::tempdir().unwrap();
