@@ -403,6 +403,28 @@ pub fn maybe_check_with(fetch: FetchFn) {
     }
 }
 
+/// What the About pane renders from. Read by `config::settings_view` on every
+/// cache miss, which `RequestState` forces — so opening the dialog shows
+/// whatever the process knows at that moment. No push, no broadcast when a
+/// check completes: the pane is the only consumer, and it asks.
+pub fn view() -> crate::proto::UpdateView {
+    let mk = |status: &str, latest: &str| crate::proto::UpdateView {
+        status: status.to_string(),
+        latest: latest.to_string(),
+    };
+    if !crate::config::version_check() {
+        return mk("off", "");
+    }
+    // No state file at all is "not checked yet" — the few seconds after a
+    // fresh install — and is not the same answer as a check that failed.
+    let Some(s) = current() else { return mk("never", "") };
+    match verdict(env!("CARGO_PKG_VERSION"), s.latest.as_deref()) {
+        Latest::Newer(v) => mk("newer", &v),
+        Latest::UpToDate => mk("up-to-date", s.latest.as_deref().unwrap_or("")),
+        Latest::Unknown => mk("unknown", s.latest.as_deref().unwrap_or("")),
+    }
+}
+
 #[cfg(test)]
 pub fn reset_for_test() {
     IN_FLIGHT.store(false, Ordering::SeqCst);
@@ -852,5 +874,50 @@ not json at all
         assert_eq!(s.latest, None);
         assert!(s.failed_at.is_some(), "the retry is the hour, not the day");
         assert!(s.checked_at.is_none());
+    }
+
+    /// The five renderings the About row has, decided on the server so the
+    /// enum can stay three-valued.
+    ///
+    /// Revert-checked: deleting the `version_check()` gate makes `off` render
+    /// as `never`; deleting the `current().is_none()` arm makes `never`
+    /// render as `unknown`; folding `Unknown` into `UpToDate` fails the
+    /// `unknown` row — which is the one the whole feature exists to keep.
+    #[test]
+    fn the_view_reports_five_states_and_never_calls_unknown_up_to_date() {
+        // Off.
+        let (_g1, _g2, d) = env_fixture(false);
+        let v = view();
+        assert_eq!(v.status, "off");
+        assert_eq!(v.latest, "");
+        drop((_g1, _g2, d));
+
+        // Never checked: the check is on, and there is no state file.
+        let (_g1, _g2, _d) = env_fixture(true);
+        assert_eq!(view().status, "never");
+
+        // Could not check: a state file that records only a failure.
+        write_state_to(&state_path(), &st(None, None, Some(now() - 60))).unwrap();
+        reset_for_test();
+        assert_eq!(view().status, "unknown", "a failure is `could not check`, never `up to date`");
+
+        // Could not check, second way in: a `latest` the comparator cannot read.
+        write_state_to(&state_path(), &st(Some("banana"), Some(now()), None)).unwrap();
+        reset_for_test();
+        assert_eq!(view().status, "unknown");
+
+        // Up to date.
+        write_state_to(&state_path(), &st(Some(env!("CARGO_PKG_VERSION")), Some(now()), None)).unwrap();
+        reset_for_test();
+        let v = view();
+        assert_eq!(v.status, "up-to-date");
+        assert_eq!(v.latest, env!("CARGO_PKG_VERSION"));
+
+        // Newer.
+        write_state_to(&state_path(), &st(Some("999.0.0"), Some(now()), None)).unwrap();
+        reset_for_test();
+        let v = view();
+        assert_eq!(v.status, "newer");
+        assert_eq!(v.latest, "999.0.0", "step 4 reads this string, so it is carried whole");
     }
 }

@@ -745,6 +745,7 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
     );
     SettingsView {
         build: build_info(),
+        update: crate::version::view(),
         keys,
         themes: crate::themes::catalogue(),
         project_file: ".roost/config.toml".into(),
@@ -1495,6 +1496,24 @@ mod tests {
         assert!(v.global_file.ends_with("global.toml"));
         assert_eq!(v.project_file, ".roost/config.toml");
         assert!(v.warning.is_none());
+        std::env::remove_var("ROOST_CONFIG");
+    }
+
+    /// The one server fact on the About panel that is *not* constant for the
+    /// life of the process, so it is a sibling of `build`, not a field of
+    /// it — `BuildInfo`'s own doc comment promises constancy.
+    #[test]
+    fn the_settings_view_carries_the_update_answer_beside_build_not_inside_it() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        let global = d.path().join("global.toml");
+        fs::write(&global, "version_check = false\n").unwrap();
+        std::env::set_var("ROOST_CONFIG", &global);
+        let v = settings_view(d.path());
+        assert_eq!(v.update.status, "off", "the reader is consulted, not defaulted");
+        let json = serde_json::to_value(&v).unwrap();
+        assert!(json.get("update").is_some(), "the client reads state.settings.update");
+        assert!(json["build"].get("status").is_none(), "and not state.settings.build.status");
         std::env::remove_var("ROOST_CONFIG");
     }
 }
