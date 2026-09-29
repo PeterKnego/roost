@@ -67,12 +67,25 @@ pub fn verify(tarball: &[u8], minisig: &str, pubkey_b64: &str) -> Result<(), Str
         .map_err(|_| "signature did not verify".to_string())
 }
 
-/// Caps what `xz_decompress` is allowed to write, so a small, already-signed
-/// tarball that unpacks to gigabytes (a decompression bomb) is refused as it
-/// grows rather than after it is fully materialized. `lzma_rs`'s XZ entry
-/// point takes no size limit of its own — that only exists on the raw LZMA
-/// API's `Options::memlimit`, which the XZ container format doesn't expose —
-/// so the bound has to be enforced from the write side instead.
+/// Bounds the *cumulative* decompressed output `xz_decompress` writes across
+/// the XZ blocks that make up one stream — `lzma_rs`'s XZ entry point takes no
+/// size limit of its own (that only exists on the raw LZMA API's
+/// `Options::memlimit`, which the XZ container format doesn't expose), so
+/// this is the only bound between block N+1 and the running total.
+///
+/// It does **not** bound a single block: `lzma_rs` 0.3.0's `read_block`
+/// (`src/decode/xz.rs:196-284`) decodes one whole block into a local,
+/// unbounded `tmpbuf` and only calls `output.write_all(tmpbuf)` once that
+/// block is fully decoded (`xz.rs:282`) — so a one-block bomb is fully
+/// materialized in memory before `Capped::write` ever runs, no matter how
+/// small `cap` is. That gap is accepted here rather than worked around: this
+/// function only ever runs on bytes that already passed `verify` against the
+/// compiled-in key (the pipeline enforces that order), so producing a
+/// tarball that exploits it requires the release signing key. The bounds
+/// that do apply regardless of the key are the 64 MB download cap enforced
+/// while the tarball is fetched (`MAX_ARCHIVE_BYTES`, checked against
+/// `Content-Length` and again while reading the body) and, below, the
+/// per-member `entry.size()` check against the same constant.
 struct Capped<'a> {
     buf: &'a mut Vec<u8>,
     cap: u64,
@@ -333,17 +346,17 @@ mod tests {
         assert!(e.starts_with("the archive could not be decompressed"), "{e}");
     }
 
-    /// `extract_binary` decompresses into an in-memory `Vec`, so nothing
-    /// bounds the output size unless something does — a small compressed
-    /// input that expands past the cap must be refused while it is still
-    /// growing, not after gigabytes were already allocated. Exercised
-    /// directly against `Capped` rather than through a real xz bomb: nothing
-    /// else in this file can generate one small enough for a unit test.
+    /// Tests `Capped`'s running counter in isolation, calling `write`
+    /// directly rather than through `xz_decompress` — it does not, and
+    /// cannot, exercise the single-block gap `Capped`'s doc comment
+    /// describes: `lzma_rs` 0.3.0 hands a whole decoded block to `write` in
+    /// one call, so this test's two separate `write` calls model
+    /// cross-block accumulation only, never a single oversized write.
     /// Revert-checked: deleting the cap check turns `write` into a plain
     /// append and the second `unwrap_err()` below fails with
     /// `Ok(4)` instead of a size-cap error.
     #[test]
-    fn capped_write_refuses_output_past_the_cap() {
+    fn the_capped_writer_counts_across_writes() {
         let mut buf = Vec::new();
         let mut w = Capped { buf: &mut buf, cap: 4 };
         assert_eq!(std::io::Write::write(&mut w, b"ab").unwrap(), 2);
