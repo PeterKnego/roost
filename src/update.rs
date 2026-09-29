@@ -533,6 +533,26 @@ pub fn skip_in(path: &Path, latest: Option<&str>, version: &str) -> Result<(), S
     write_choices_to(path, &c)
 }
 
+/// `Later`, then every hub hears it: the mark is on every project page.
+pub fn apply_defer(now: u64) -> Result<(), String> {
+    defer_in(&choices_path(), now)?;
+    crate::hub::broadcast_settings_all();
+    Ok(())
+}
+
+/// `Skip <version>`, checked against the last check's fact. A mismatch is
+/// an error to the sender and a line in the log, and nothing is broadcast:
+/// no page's mark changed.
+pub fn apply_skip(version: &str) -> Result<(), String> {
+    let latest = crate::version::current().and_then(|s| s.latest);
+    if let Err(e) = skip_in(&choices_path(), latest.as_deref(), version) {
+        log(&format!("skip refused: {e}"));
+        return Err(e);
+    }
+    crate::hub::broadcast_settings_all();
+    Ok(())
+}
+
 /// The last attempt's failure, for the version it was for. Not persisted:
 /// an exec is the success case, and a crash is a different problem.
 static LAST_FAILURE: Mutex<Option<(String, Phase, String)>> = Mutex::new(None);
@@ -1705,6 +1725,43 @@ mod tests {
 
         record_installed("999.1.0");
         assert_eq!(view().installed, "999.1.0");
+    }
+
+    /// `apply_defer` writes through `defer_in` at `choices_path()`. The
+    /// broadcast that follows is exercised for real over a running hub by
+    /// hub.rs's `an_update_choice_reaches_every_projects_clients_past_the_settings_cache`;
+    /// this test only needs `broadcast_settings_all` to return rather than
+    /// deadlock with no `REGISTRY` set up, which `env_fixture`'s isolation
+    /// (a fresh state dir, no hub started) exercises incidentally.
+    #[test]
+    fn apply_defer_writes_the_choice_at_the_shared_path() {
+        let _env = env_fixture();
+        let now = 1_000_000u64;
+        assert_eq!(apply_defer(now), Ok(()));
+        let c = read_choices_from(&choices_path());
+        assert_eq!(c.deferred_until, Some(now + DEFER_SECS));
+    }
+
+    /// `apply_skip` checks the version against `version::current()`'s fact
+    /// before writing, and refuses (without writing) a version no check has
+    /// named — the wsconn divert's whole point, since a forged frame could
+    /// otherwise skip an update the user was never actually offered.
+    ///
+    /// Revert-checked: replacing the `skip_in` call with an unconditional
+    /// `write_choices_to` fails the first assertion here (`Ok(())` where an
+    /// `Err` is expected) and would let the stale-skip row of
+    /// `tests/update.rs`'s websocket test silently write to disk.
+    #[test]
+    fn apply_skip_refuses_a_stale_version_and_accepts_the_checked_one() {
+        let _env = env_fixture();
+        let e = apply_skip("1.2.3").unwrap_err();
+        assert_eq!(e, "1.2.3 is not the version the last check saw (no check yet)");
+        assert_eq!(read_choices_from(&choices_path()), Choices::default(), "nothing written on refusal");
+
+        crate::version::write_state_to(&crate::version::state_path(), &checked("1.2.3")).unwrap();
+        crate::version::reset_for_test();
+        assert_eq!(apply_skip("1.2.3"), Ok(()));
+        assert_eq!(read_choices_from(&choices_path()).skipped, Some("1.2.3".into()));
     }
 
     use std::sync::atomic::{AtomicBool as TestFlag, AtomicUsize, Ordering::SeqCst};
