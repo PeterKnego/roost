@@ -269,6 +269,15 @@ not json at all
     /// Two of the three outcomes are cheerful and the third is the one that
     /// matters, so the unreadable rows are here in force: "could not tell" is
     /// never "you are up to date".
+    ///
+    /// Revert-checked: swapping the operands in `verdict`'s `compare` call
+    /// (`compare(l, running)` instead of `compare(running, l)`) fails at
+    /// "an index behind the running binary is not an upgrade: 0.5.2 vs
+    /// Some(\"0.5.1\")" with `left: Newer("0.5.1")`, `right: UpToDate` — the
+    /// `for` loop's `assert_eq!` stops at the *first* row that disagrees
+    /// under the swap, which is this one (row 2), not the "a patch release"
+    /// row further down. The row right after the equal case is what makes
+    /// the swap visible.
     #[test]
     fn the_comparator_orders_running_against_the_index() {
         use Latest::*;
