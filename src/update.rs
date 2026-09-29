@@ -1765,6 +1765,15 @@ mod tests {
 
     /// A second click anywhere while one runs is answered *already updating*
     /// rather than starting a second download.
+    ///
+    /// Revert-checked twice, 5 runs each. Removing the guard fails with
+    /// "the second intent is refused before `drive` returns: []" (and, with
+    /// that assertion gone, at "the guard is taken before the thread
+    /// starts", `left: 2, right: 1`). Moving the swap inside the spawned
+    /// closure fails identically at the first assertion — which is why the
+    /// guard is taken on the calling thread. The plan's version of this test
+    /// waited for the first fetch before the second intent and passed with
+    /// the swap moved inside: by then the first thread had set the flag.
     #[test]
     fn two_intents_during_one_run_fetch_once_and_refuse_the_second() {
         let _env = env_fixture();
@@ -1780,8 +1789,19 @@ mod tests {
         let (a, rx_a) = h.subscribe();
         let (b, rx_b) = h.subscribe();
         let hub = std::sync::Arc::new(std::sync::Mutex::new(h));
+        // Back to back, and the second requester's answer read the moment
+        // `drive` returns: only a guard taken on this thread has refused by
+        // then. One taken inside the spawned thread answers later, from that
+        // thread — if it is the second thread that loses the race at all.
         drive(hub.clone(), a, plan_in(d.path(), &pk, "9.9.9"), blocking_404, no_exec);
+        drive(hub.clone(), b.clone(), plan_in(d.path(), &pk, "9.9.9"), blocking_404, no_exec);
+        let got = events(&rx_b);
+        assert!(
+            got.iter().any(|e| e.contains(r#""phase":"refused""#) && e.contains("already updating")),
+            "the second intent is refused before `drive` returns: {got:?}"
+        );
         wait_until(|| FETCHES.load(SeqCst) >= 1);
+        // A third, while the first is visibly mid-download.
         drive(hub.clone(), b, plan_in(d.path(), &pk, "9.9.9"), blocking_404, no_exec);
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(FETCHES.load(SeqCst), 1, "the guard is taken before the thread starts");
