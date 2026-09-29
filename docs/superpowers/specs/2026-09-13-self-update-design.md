@@ -367,6 +367,258 @@ trusted — CLAUDE.md's *Testing* section says why.
   doing once, checking `systemctl status` still reports the same main PID
   afterwards.
 
+### The manual run, 2026-09-29
+
+Run on the Linux deploy host, against a **scratch** roost only — the live
+instance, `~/.cargo/bin/roost` and the systemd unit were not touched. `$S`
+below abbreviates a per-session scratch directory on that host.
+
+**Setup.**
+
+- minisign: the official static `minisign-0.11-linux.tar.gz` release (the
+  version the release workflow pins), `minisign -v` → `minisign 0.11`. Two
+  keypairs, `test` (key id `EE6981AB76E996AA`) and `other`
+  (`3BDF52AC0BDF7362`), both `-G -W`.
+- The old binary: this branch at `f2ca33b` with `test.pub` copied to
+  `keys/roost.pub`, `GITHUB_REF_TYPE=tag cargo build` → `roost 0.6.0`,
+  channel `release`, copied to `$S/bin/roost`. Its About read
+  `target x86_64-unknown-linux-gnu`, owner `other`, *Upgrades* "roost can
+  replace this copy".
+- The new binary: `Cargo.toml` version set to `9.9.9`, plain `cargo build`,
+  packed the way dist packs it (`roost-x86_64-unknown-linux-gnu/roost` in
+  `roost-x86_64-unknown-linux-gnu.tar.xz`) and signed with
+  `minisign -S -s test.key` (the CLI verified its own signature with
+  `-Vm … -p test.pub` before serving). The same tarball bytes were signed a
+  second time with `other.key` for the failure path.
+- `Cargo.toml`/`Cargo.lock` restored from `cp` backups and `keys/roost.pub`
+  deleted afterwards; the tree was clean again before the run started.
+- The scratch instance: `ROOST_STATE_DIR=$S/state ROOST_ROOTS=$S/roots
+  ROOST_CONFIG=$S/config.toml` (`version_check = true`)
+  `ROOST_UPDATE_BASE=http://127.0.0.1:8999 $S/bin/roost 8446`, with a fresh
+  `check.json` naming `9.9.9` planted first, and
+  `python3 -m http.server 8999 --bind 127.0.0.1` serving the tarball.
+- The browser: headless Chromium through `tests/browser/harness.mjs`
+  (`startBrowser`/`openPage`/`evalIn`), from a scratch Deno script. The
+  terminal was opened with `NewTerminal`/`StartTerminal` as `notices.mjs`
+  does and `echo alive-$$` typed into it; the dialog was dismissed once so
+  About could be read, reopened by clicking the mark, and **`Update` was
+  clicked in the DOM** (`.dlg-ok.click()`). Every `UpdateProgress` frame the
+  dialog received was appended to `sessionStorage` by a wrapper around the
+  dialog's own `onProgress`, so the list survives the reload. The About
+  values below are each row's `textContent`, which includes the row's button
+  label — hence `9.9.9 availableUpdate` and `…)Retry`.
+
+**Success path.** Every expectation held:
+
+- The mark read `↑ 9.9.9` and the dialog opened itself with an `Update`
+  button.
+- The page saw, in order, `download…`, `verify…`, `unpack…`, `probe…`,
+  `swap…`, `restarting roost…`, then reloaded by itself ~3 s after the click
+  and reported `version 9.9.9`; the mark and the dialog were gone.
+- The roost PID was the same before and after (`1900561`, same start time,
+  `/proc/<pid>/exe` now the swapped file), `$S/bin` held one `roost` and no
+  `.roost-update.*`, its sha256 equals the packed 9.9.9 binary's, and
+  `$S/bin/roost --version` printed `roost 9.9.9`.
+- The dtach master (`1901356`) and its shell (`1901358`) were the same
+  processes before and after, and after the reload the terminal re-attached
+  by itself and the shell answered `echo still-$$` with `still-1901358`.
+- `error.log` holds the whole timeline, ending in `swapped … for 9.9.9; exec`.
+
+Three observations, none a defect:
+
+- **The pre-exec scrollback is not replayed.** The `alive-1901358` line was
+  not on screen after the reload; the shell was, and answered. The replay
+  ring lives in the process's memory, so an exec loses it exactly as any
+  roost restart does (`screen.rs`: "after a restart the ring is empty"). The
+  plan's wording ("the terminal tab still shows `alive-<pid>`") promised
+  more than this spec does; the spec's claim — the shell *still alive* —
+  holds.
+- The new version reported channel `checkout` and commit `f2ca33bda-dirty`,
+  because the 9.9.9 binary was built without `GITHUB_REF_TYPE` from a tree
+  with an edited `Cargo.toml`, as the plan's recipe does. A real release is
+  channel `release`.
+- The swapped file is mode `0755`; the file it replaced was `0775`. The
+  swap sets its own mode rather than copying the old one.
+
+**Failure path.** The old binary copied back, the scratch roost restarted on
+it, the `other`-signed tarball served, `Update` clicked:
+
+- Frames `download…`, `verify…`, then `update failed: verify: signature did
+  not verify (http://127.0.0.1:8999/roost-x86_64-unknown-linux-gnu.tar.xz)`
+  — the plan's expected text plus the URL suffix that `update::located`
+  appends by design — and the button became `Retry`.
+- About's *Latest* row read `9.9.9 available (update failed: verify:
+  signature did not verify (<url>))` with a `Retry` button; the version
+  stayed `0.6.0`.
+- The binary was untouched: sha256 `9b55a3a1…1d109` and size before and
+  after, `roost 0.6.0`. The shell survived this too (`still-1901358`).
+
+**Under systemd: not done here, and owed.** The exec under the unit
+(`systemctl --user show roost -p MainPID --value` the same before and after,
+`pgrep -c dtach` unchanged) needs a release carrying the real key and a real
+signature. It belongs to the first release that ships the real
+`keys/roost.pub`, whoever cuts it, before it is announced.
+
+**The suite afterwards,** on the same host after a normal `cargo build`
+(no key, `roost 0.6.0`): `cargo test --lib -- --test-threads=1` 1098 passed
+in 47.8 s wall; `cargo test --test '*' -- --test-threads=1` 82 passed across
+11 binaries in 30.0 s wall; `update.mjs`, `version.mjs`, `about.mjs` and
+`settings.mjs` all PASS.
+
+Transcript, success path:
+
+```text
+== before
+2026-09-29T13:27:57+00:00
+    PID                  STARTED CMD
+1900561 Tue Sep 29 13:26:37 2026 $S/bin/roost 8446
+total 41572
+drwxrwxr-x 2 claude claude     4096 Sep 29 13:25 .
+drwxrwxr-x 9 claude claude     4096 Sep 29 13:27 ..
+-rwxrwxr-x 1 claude claude 42804440 Sep 29 13:25 roost
+9b55a3a1fee3b1a174621ebec936821370857bc35bff3c67ae769746f31d1109  $S/bin/roost
+roost 0.6.0
+ls: cannot access '$S/state/error.log': No such file or directory
+[13:28:02.587] chromium /snap/bin/chromium cdp 35053
+[13:28:02.845] page ready: true
+[13:28:02.847] BuildInfo: {"version":"0.6.0","target":"x86_64-unknown-linux-gnu","channel":"release","owner":"other","replaceable":"yes"}
+[13:28:02.847] update view: {"status":"newer","latest":"9.9.9","offer":true,"skipped":"","deferred_until":0,"failure":"","installed":""}
+[13:28:02.847] mark: "↑ 9.9.9"
+[13:28:02.847] dialog opened itself: true
+[13:28:02.847] dialog title: "roost 9.9.9 is available — you are running 0.6.0"
+[13:28:02.848] dialog button: "Update"
+[13:28:03.590] About before: {"Version":"0.6.0","Latest":"9.9.9 availableUpdate","Commit":"f2ca33bda","Built":"9/29/2026, 1:25:46 PM","Repository":"GitHub","Installed":"the release tarball","Upgrades":"roost can replace this copy","Upgrade":"curl -LO https://github.com/PeterKnego/roost/releases/latest/download/roost-x86_64-unknown-linux-gnu.tar.xz"}
+[13:28:04.096] terminal socket: true
+[13:28:04.200] prompt: true
+[13:28:04.308] terminal session term printed: alive-1901358
+[13:28:04.344] ps before:
+    PID    PPID CMD
+1901358 1901356 /bin/bash -l
+    PID CMD
+1901356 /usr/bin/dtach -A $S/state/sock/scratch/term -E -r winch -z /bin/bash -l
+
+[13:28:04.352] reopened via mark: true
+[13:28:04.352] dialog button: "Update"
+[13:28:04.352] clicking Update
+[13:28:07.443] page reloaded: true
+[13:28:07.444]   progress frame: {"t":1790688484354,"phase":"download","detail":"","shown":"download…"}
+[13:28:07.444]   progress frame: {"t":1790688484365,"phase":"verify","detail":"","shown":"verify…"}
+[13:28:07.444]   progress frame: {"t":1790688484490,"phase":"unpack","detail":"","shown":"unpack…"}
+[13:28:07.444]   progress frame: {"t":1790688486501,"phase":"probe","detail":"","shown":"probe…"}
+[13:28:07.444]   progress frame: {"t":1790688486528,"phase":"swap","detail":"","shown":"swap…"}
+[13:28:07.444]   progress frame: {"t":1790688486528,"phase":"restarting","detail":"9.9.9","shown":"restarting roost…"}
+[13:28:07.444] BuildInfo after: {"version":"9.9.9","target":"x86_64-unknown-linux-gnu","channel":"checkout"}
+[13:28:07.444] update view after: {"status":"up-to-date","latest":"9.9.9","offer":false,"skipped":"","deferred_until":0,"failure":"","installed":""}
+[13:28:07.444] mark after: "(hidden)"
+[13:28:07.444] update dialog open after: false
+[13:28:08.162] About after: {"Version":"9.9.9","Latest":"up to date","Commit":"f2ca33bda-dirty","Built":"9/29/2026, 1:25:54 PM","Repository":"GitHub","Installed":"built from a checkout","Upgrades":"yours to rebuild"}
+[13:28:08.163] terminal re-attached without StartTerminal: true
+    (timed out waiting for alive in replay)
+[13:28:18.492] replay still shows alive line: false
+[13:28:18.597] shell answered: still-1901358 (same pid as alive: true)
+[13:28:18.627] ps after:
+    PID    PPID CMD
+1901358 1901356 /bin/bash -l
+    PID CMD
+1901356 /usr/bin/dtach -A $S/state/sock/scratch/term -E -r winch -z /bin/bash -l
+
+== after
+2026-09-29T13:28:48+00:00
+    PID                  STARTED CMD
+1900561 Tue Sep 29 13:26:37 2026 $S/bin/roost 8446
+$S/bin/roost
+total 41812
+drwxrwxr-x  2 claude claude     4096 Sep 29 13:28 .
+drwxrwxr-x 10 claude claude     4096 Sep 29 13:28 ..
+-rwxr-xr-x  1 claude claude 42803224 Sep 29 13:28 roost
+5594f8968c5d2aeb4cd3ae641d946ab5e1281018da1c0e95b69e8b96ce1cc11b  $S/bin/roost
+5594f8968c5d2aeb4cd3ae641d946ab5e1281018da1c0e95b69e8b96ce1cc11b  $S/roost-new
+roost 9.9.9
+-- error.log
+1790688484 update: starting: http://127.0.0.1:8999/roost-x86_64-unknown-linux-gnu.tar.xz -> $S/bin/roost
+1790688484 update: download
+1790688484 update: verify
+1790688484 update: unpack
+1790688486 update: probe
+1790688486 update: swap
+1790688486 update: swapped $S/bin/roost for 9.9.9; exec
+-- roost stdout/stderr
+roost listening on http://127.0.0.1:8446
+roost: startup reap — 1 stale ide lock file(s) from a previous run
+roost listening on http://127.0.0.1:8446
+-- http.log
+127.0.0.1 - - [29/Sep/2026 13:28:04] "GET /roost-x86_64-unknown-linux-gnu.tar.xz HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2026 13:28:04] "GET /roost-x86_64-unknown-linux-gnu.tar.xz.minisig HTTP/1.1" 200 -
+LISTEN 0      128                      127.0.0.1:8446       0.0.0.0:*    users:(("roost",pid=1900561,fd=3))          
+```
+
+Transcript, failure path:
+
+```text
+== before failure run
+total 41572
+drwxrwxr-x  2 claude claude     4096 Sep 29 13:28 .
+drwxrwxr-x 10 claude claude     4096 Sep 29 13:29 ..
+-rwxrwxr-x  1 claude claude 42804440 Sep 29 13:29 roost
+9b55a3a1fee3b1a174621ebec936821370857bc35bff3c67ae769746f31d1109  $S/bin/roost
+roost 0.6.0
+b0729de758335231b43c7e321364b11a5515fe6484a14e19c77d7cbcc2e80e43  $S/serve-bad/roost-x86_64-unknown-linux-gnu.tar.xz
+b0729de758335231b43c7e321364b11a5515fe6484a14e19c77d7cbcc2e80e43  $S/serve/roost-x86_64-unknown-linux-gnu.tar.xz
+untrusted comment: signature from minisign secret key
+RURic98LrFLfO2B1H6B6VTHfaIiEbpuC+5xD7//wACxh98ERxsg9UrH/z0LgFEPvu/YwseB6qwG9kZeIyFkRxiBDOjMPmFqtAwQ=
+[13:29:13.340] chromium /snap/bin/chromium cdp 37569
+[13:29:13.516] page ready: true
+[13:29:13.531] BuildInfo: {"version":"0.6.0","target":"x86_64-unknown-linux-gnu","channel":"release","owner":"other","replaceable":"yes"}
+[13:29:13.531] update view: {"status":"newer","latest":"9.9.9","offer":true,"skipped":"","deferred_until":0,"failure":"","installed":""}
+[13:29:13.533] mark: "↑ 9.9.9"
+[13:29:13.533] dialog opened itself: true
+[13:29:13.533] dialog title: "roost 9.9.9 is available — you are running 0.6.0"
+[13:29:13.533] dialog button: "Update"
+[13:29:14.279] About before: {"Version":"0.6.0","Latest":"9.9.9 availableUpdate","Commit":"f2ca33bda","Built":"9/29/2026, 1:25:46 PM","Repository":"GitHub","Installed":"the release tarball","Upgrades":"roost can replace this copy","Upgrade":"curl -LO https://github.com/PeterKnego/roost/releases/latest/download/roost-x86_64-unknown-linux-gnu.tar.xz"}
+[13:29:14.685] terminal socket: true
+[13:29:14.692] prompt: true
+[13:29:14.797] terminal session term printed: alive-1901358
+[13:29:14.830] ps before:
+    PID    PPID CMD
+1901358 1901356 /bin/bash -l
+    PID CMD
+1901356 /usr/bin/dtach -A $S/state/sock/scratch/term -E -r winch -z /bin/bash -l
+
+[13:29:14.836] reopened via mark: true
+[13:29:14.837] dialog button: "Update"
+[13:29:14.838] clicking Update
+[13:29:14.942]   progress frame: {"t":1790688554840,"phase":"download","detail":"","shown":"download…"}
+[13:29:14.943]   progress frame: {"t":1790688554847,"phase":"verify","detail":"","shown":"verify…"}
+[13:29:14.943]   progress frame: {"t":1790688554847,"phase":"failed","detail":"verify: signature did not verify (http://127.0.0.1:8999/roost-x86_64-unknown-linux-gnu.tar.xz)","shown":"update failed: verify: signature did not verify (http://127.0.0.1:8999/roost-x86_64-unknown-linux-gnu.tar.xz)"}
+[13:29:14.943] dialog progress line: "update failed: verify: signature did not verify (http://127.0.0.1:8999/roost-x86_64-unknown-linux-gnu.tar.xz)"
+[13:29:14.943] dialog button: "Retry"
+[13:29:14.944] update view: {"status":"newer","latest":"9.9.9","offer":true,"skipped":"","deferred_until":0,"failure":"verify: signature did not verify (http://127.0.0.1:8999/roost-x86_64-unknown-linux-gnu.tar.xz)","installed":""}
+[13:29:15.667] About after failure: {"Version":"0.6.0","Latest":"9.9.9 available (update failed: verify: signature did not verify (http://127.0.0.1:8999/roost-x86_64-unknown-linux-gnu.tar.xz))Retry","Commit":"f2ca33bda","Built":"9/29/2026, 1:25:46 PM","Repository":"GitHub","Installed":"the release tarball","Upgrades":"roost can replace this copy","Upgrade":"curl -LO https://github.com/PeterKnego/roost/releases/latest/download/roost-x86_64-unknown-linux-gnu.tar.xz"}
+[13:29:15.669] version after: 0.6.0
+[13:29:15.669] shell still answers:
+[13:29:15.774]    true
+== after failure run
+2026-09-29T13:29:15+00:00
+    PID                  STARTED CMD
+1901837 Tue Sep 29 13:29:04 2026 $S/bin/roost 8446
+total 41572
+drwxrwxr-x  2 claude claude     4096 Sep 29 13:29 .
+drwxrwxr-x 11 claude claude     4096 Sep 29 13:29 ..
+-rwxrwxr-x  1 claude claude 42804440 Sep 29 13:29 roost
+9b55a3a1fee3b1a174621ebec936821370857bc35bff3c67ae769746f31d1109  $S/bin/roost
+roost 0.6.0
+-- error.log (tail)
+1790688486 update: swap
+1790688486 update: swapped $S/bin/roost for 9.9.9; exec
+1790688554 update: starting: http://127.0.0.1:8999/roost-x86_64-unknown-linux-gnu.tar.xz -> $S/bin/roost
+1790688554 update: download
+1790688554 update: verify
+1790688554 update: failed at verify: signature did not verify (http://127.0.0.1:8999/roost-x86_64-unknown-linux-gnu.tar.xz)
+-- http-bad.log
+127.0.0.1 - - [29/Sep/2026 13:29:14] "GET /roost-x86_64-unknown-linux-gnu.tar.xz HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2026 13:29:14] "GET /roost-x86_64-unknown-linux-gnu.tar.xz.minisig HTTP/1.1" 200 -
+```
+
 ## Decided in conversation (2026-09-13)
 
 1. Button in About, not a `roost upgrade` subcommand — the subcommand remains
