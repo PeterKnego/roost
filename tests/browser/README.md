@@ -48,6 +48,7 @@ deno run -A tests/browser/search.mjs     # the search overlay (⇧⌃F), its res
 deno run -A tests/browser/themes.mjs     # a daisyUI theme name reaches paint through data-theme and the bridge; a roost theme is untouched
 deno run -A tests/browser/settings.mjs   # the settings dialog: live theme preview, Save/Cancel, both scopes, read-only keys refused
 deno run -A tests/browser/roots.mjs      # no roots: the front page explains and Add path works; + adds another; a bad path is refused
+deno run -A tests/browser/version.mjs    # the About Latest row: five renderings, and the harness's off switch
 deno run -A tests/browser/nonascii.mjs   # the editor's non-ASCII indicator and highlight toggle: count, accent, marks under the glyphs, cap, persistence
 deno run -A tests/browser/notices.mjs    # the bell panel holds only this project's notices, and Clear empties only what it shows
 deno run -A tests/browser/dialogs.mjs    # the dialog primitive: askConfirm/askText/askMenu's exits, focus restoration, and a guard that no code path reaches a native confirm/prompt/alert
@@ -575,6 +576,19 @@ performed.
   A missing row makes `rightClick`/`openConfirm` fail an assertion rather
   than throw, so a break that discards a file early still reports every
   later section instead of crashing the run.
+
+- In `version.mjs`: making `latestLabel` fall through to "up to date" instead
+  of "could not check" fails 5 — the two `unknown` rows, the unrecognised-
+  status row, and both `label(null)`/`label({})` rows: the whole point of a
+  three-valued answer is the one variant that is not cheerful. Dropping its
+  `off` case fails 2 — section B's row assertion and the last row of section
+  C, since a status of `off` now falls through to the same default as no
+  status at all. Removing `ROOST_CONFIG` from `startRoost` fails 2, not 1: with
+  no config file the state file is also absent, so the server reports `never`
+  rather than `off`, failing both section A's `status === "off"` assertion and
+  section B's row text — the fixture-that-silently-does-nothing trap this
+  section exists to catch, and here it would also mean the suite was hitting
+  crates.io on every connect.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:
