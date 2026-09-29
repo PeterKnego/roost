@@ -3,6 +3,8 @@
 
 include!("pubkey.rs");
 
+use std::path::Path;
+
 /// The download cap. The musl tarball is 1.4 MB; a server answering with
 /// gigabytes is one to walk away from, and the check happens twice — against
 /// `Content-Length` before the body is buffered, and while reading it.
@@ -153,9 +155,191 @@ pub fn extract_binary(tar_xz: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Run the staged file with `--version` and require stdout to be exactly
+/// `roost <want>` — what `main.rs` prints — with exit 0, inside `timeout`.
+/// The outer shape is `gitio::run_git`'s: stdout drained on its own thread so
+/// a full pipe cannot wedge the poll, `try_wait` against a deadline, then
+/// `kill` + `wait` so a hung child is reaped rather than leaked.
+///
+/// The wait for output is *itself* bounded by the same deadline the wait for
+/// exit is, via an `mpsc` channel instead of a bare `.join()` on the reader
+/// thread (the shape `launch::probe` and `gitio::run_git_within` both use).
+/// That matters here specifically: a child can fork a grandchild and then
+/// exit on time, leaving the pipe's write end open in a process this
+/// function never sees and so never kills. `read_to_string` only returns on
+/// EOF, so an unconditional `.join()` would block on that lingering
+/// descendant — the process exited, `try_wait` reports success, and the
+/// probe still hangs. Bounding the join with `recv_timeout` means that case
+/// instead comes back as "did not answer in time", which is the correct
+/// failure direction for a check gating a binary swap: no positive evidence
+/// within the bound is a refusal, not a success taken on faith.
+pub fn probe(exe: &Path, want: &str, timeout: std::time::Duration) -> Result<(), String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(exe)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("the new binary could not be started: {e}"))?;
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s);
+        let _ = tx.send(s);
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|e| format!("could not wait for the new binary: {e}"))? {
+            Some(st) => break st,
+            None if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("the new binary did not answer --version within {}s", timeout.as_secs()));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    };
+    // Bounded by whatever is left of `timeout`, not `timeout` again: the
+    // exit wait above may already have used most of it.
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let out = rx
+        .recv_timeout(remaining)
+        .map_err(|_| format!("the new binary did not answer --version within {}s", timeout.as_secs()))?;
+    if !status.success() {
+        return Err(format!("the new binary exited {status} on --version"));
+    }
+    let got = out.trim();
+    if got != format!("roost {want}") {
+        return Err(format!("the new binary reports {got:?}, not \"roost {want}\""));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// A real executable — a fake `roost`, standing in for a staged binary
+    /// under test. Has to be a real, runnable file rather than a mock: the
+    /// thing `probe` exercises is `Command::spawn` against an actual path,
+    /// the same reason `launch.rs`'s `fake_shell` and `claudes.rs`'s
+    /// `fake_proc` build real scripts instead of stubbing the process layer.
+    fn fake_exe(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        p
+    }
+
+    /// Positive evidence that the file is a working roost of the version
+    /// claimed: stdout exactly `roost <latest>`, exit 0, inside the bound.
+    #[test]
+    fn the_probe_wants_the_exact_version_line_within_the_timeout() {
+        let d = tempfile::tempdir().unwrap();
+        let t = std::time::Duration::from_secs(1);
+        let good = fake_exe(d.path(), "good", "echo 'roost 9.9.9'");
+        assert_eq!(probe(&good, "9.9.9", t), Ok(()));
+
+        let wrong = fake_exe(d.path(), "wrong", "echo 'roost 9.9.8'");
+        assert_eq!(
+            probe(&wrong, "9.9.9", t).unwrap_err(),
+            "the new binary reports \"roost 9.9.8\", not \"roost 9.9.9\""
+        );
+
+        let noisy = fake_exe(d.path(), "noisy", "echo 'roost 9.9.9'; echo extra");
+        assert!(probe(&noisy, "9.9.9", t).is_err(), "a second line is not the exact answer");
+
+        let failing = fake_exe(d.path(), "failing", "exit 3");
+        assert!(probe(&failing, "9.9.9", t).unwrap_err().contains("exited"), "a non-zero exit is reported as such");
+
+        // The macOS case: a binary that hangs. Timed, because a hang would
+        // otherwise pass by never returning.
+        let hang = fake_exe(d.path(), "hang", "sleep 30");
+        let started = std::time::Instant::now();
+        let e = probe(&hang, "9.9.9", t).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(4), "the probe returned in {:?}", started.elapsed());
+        assert_eq!(e, "the new binary did not answer --version within 1s");
+
+        let missing = d.path().join("missing");
+        assert!(probe(&missing, "9.9.9", t).unwrap_err().starts_with("the new binary could not be started"));
+    }
+
+    /// Positive evidence for the timeout branch's "reaped, not leaked" claim:
+    /// the process itself — not just `probe`'s return value — is gone from
+    /// `/proc` immediately after `probe` returns, i.e. `kill` was followed by
+    /// a `wait` that actually collected it rather than leaving a zombie.
+    ///
+    /// Revert-checked: with the `child.wait()` call after `child.kill()`
+    /// commented out, this test fails — `/proc/<pid>` (now a zombie entry)
+    /// still exists — while `the_probe_wants_the_exact_version_line_within_the_timeout`'s
+    /// hang row keeps passing regardless, since it only ever checks `probe`'s
+    /// return value and timing, not the process table. That is the gap this
+    /// test closes.
+    #[test]
+    fn a_timed_out_child_is_actually_reaped_not_left_as_a_zombie() {
+        let d = tempfile::tempdir().unwrap();
+        let pidfile = d.path().join("hang.pid");
+        let hang = fake_exe(d.path(), "hang", &format!("echo $$ > '{}'\nsleep 30\n", pidfile.display()));
+        let t = std::time::Duration::from_millis(300);
+
+        let started = std::time::Instant::now();
+        let e = probe(&hang, "9.9.9", t).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(4), "the probe returned in {:?}", started.elapsed());
+        assert_eq!(e, "the new binary did not answer --version within 0s");
+
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the fake exe writes its own pid before sleeping")
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "pid {pid} must be gone from /proc once probe returns: kill without a \
+             successful wait leaves a zombie behind, which /proc still lists"
+        );
+    }
+
+    /// A child can print the right line and exit on time while leaving a
+    /// *descendant* holding the stdout pipe open — this fakes that by
+    /// backgrounding a long sleep that inherits the same stdout fd before the
+    /// fake exe itself exits. `read_to_string` only returns on EOF, so that
+    /// descendant, which `probe` never sees and so never kills, would keep
+    /// the pipe open for the full 30s. The assertion is purely about time:
+    /// `probe` must come back within its own bound regardless, which is what
+    /// distinguishes a bounded `recv_timeout` from a bare `.join()` on the
+    /// reader thread — the latter would hang here for ~30s despite the
+    /// child having exited successfully with the right output already
+    /// flushed to the pipe.
+    ///
+    /// Revert-checked: replacing the `mpsc`/`recv_timeout` read with a plain
+    /// `thread::spawn(...).join()` (the shape this function's own doc comment
+    /// says *not* to use) makes this test hang for ~30s instead of returning
+    /// within the bound — confirmed by running it with that change in place
+    /// and a 35s wall-clock timeout, then reverting from the `/tmp` backup.
+    #[test]
+    fn a_grandchild_holding_stdout_open_does_not_hang_the_probe() {
+        let d = tempfile::tempdir().unwrap();
+        let leaky = fake_exe(d.path(), "leaky", "echo 'roost 9.9.9'\nsleep 30 &\n");
+        let t = std::time::Duration::from_secs(1);
+
+        let started = std::time::Instant::now();
+        let result = probe(&leaky, "9.9.9", t);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "the probe returned in {:?}, must not wait out the lingering grandchild",
+            started.elapsed()
+        );
+        // No positive evidence arrived within the bound (the pipe never saw
+        // EOF), so this must fail closed rather than guess at success.
+        assert!(result.is_err(), "{result:?}");
+    }
 
     /// The two URLs, from the three facts the binary already carries. The
     /// tag is `v<version>`, as `gh release list` shows for every release.
