@@ -806,6 +806,10 @@ mod tests {
         }
     }
 
+    /// Revert-checked: dropping the `unstage` after a failed probe fails
+    /// here at "wrong version: a staged file remains" with
+    /// `left: [".roost-update.<pid>"], right: []`.
+    ///
     /// Every failure before the rename leaves the executable byte-identical
     /// and the staged file gone. Each row names the phase it fails in, which
     /// is what the dialog shows.
@@ -855,6 +859,9 @@ mod tests {
         check("hang");
     }
 
+    /// Revert-checked: moving unpack ahead of verify fails here with
+    /// `left: (Unpack, "the archive could not be decompressed: XzError(...)")`.
+    ///
     /// Order: the signature is checked over the raw downloaded bytes, and a
     /// tarball that fails it never reaches the decompressor. The fixture is
     /// bytes `extract_binary` refuses loudly ("could not be decompressed"),
@@ -883,7 +890,8 @@ mod tests {
     /// filesystem — under the pid-unique name, executable, holding exactly
     /// the bytes. `stage` creates it 0600 and marks it 0755 only once it is
     /// written, so dropping the `set_permissions` fails the mode assertion
-    /// with 0o600 whatever the umask is.
+    /// whatever the umask is. Revert-checked: leaving the file at its
+    /// creation mode fails here with `left: 384` (0o600).
     #[test]
     fn the_staged_file_is_beside_the_executable_pid_named_and_executable() {
         let d = tempfile::tempdir().unwrap();
@@ -900,8 +908,9 @@ mod tests {
     /// Something already at the staged name is not ours, so it is neither
     /// written through nor removed. A symlink planted there pointing at
     /// another file is the case that matters: `fs::write` would follow it
-    /// and overwrite the target. Replacing `create_new` with a plain
-    /// `fs::write` fails the victim assertion; adding a cleanup that removes
+    /// and overwrite the target. Revert-checked: `create(true).truncate(true)`
+    /// in place of `create_new` writes through the link, `stage` returns `Ok`
+    /// and the `unwrap_err()` panics; adding a cleanup that removes
     /// the path on any error fails the "still there" assertion.
     #[cfg(unix)]
     #[test]
@@ -921,6 +930,9 @@ mod tests {
     /// handle open on the old one — the running process, in production —
     /// still reads the old bytes. A copy-over-the-top would rewrite the
     /// same inode in place, so the open handle would read the new bytes.
+    /// Revert-checked: `fs::copy` + `remove_file` in place of the rename
+    /// fails at "the old inode was rewritten, not replaced", the handle
+    /// reading `b"new binary!"`.
     #[test]
     fn swap_replaces_the_executable_by_rename_not_by_rewriting_it() {
         let d = tempfile::tempdir().unwrap();
@@ -972,9 +984,12 @@ mod tests {
     /// the cap is refused from the header, before any body is read — the
     /// body here is short and the connection closes, so without the header
     /// check the read would succeed; and a server that announces nothing
-    /// and sends too much is stopped by the read-side cap. Deleting the
-    /// header check fails the first assertion with `Ok`; replacing
-    /// `read_capped` with a plain `read_to_end` fails the second with `Ok`.
+    /// and sends too much is stopped by the read-side cap. Revert-checked:
+    /// disabling the header check fails the first assertion with "the
+    /// download stopped: response body closed before all bytes were read"
+    /// — the body was read, which is what the header check exists to
+    /// prevent. Replacing `read_capped` with a plain `read_to_end` fails
+    /// the second assertion with `Ok`.
     #[test]
     fn the_cap_is_checked_against_content_length_and_again_while_reading() {
         let url = one_shot("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n".into(), b"tiny".to_vec());
