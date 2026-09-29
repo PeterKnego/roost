@@ -45,6 +45,7 @@ pub mod term;
 pub mod textdiff;
 pub mod themes;
 pub mod upload;
+pub mod update;
 pub mod version;
 pub mod watch;
 pub mod workspace;

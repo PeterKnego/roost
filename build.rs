@@ -8,6 +8,7 @@ use std::{env, fs, path::{Path, PathBuf}};
 // Shared with the test suite so the channel logic is testable; see the
 // comments in that file for why it is not simply a fn in here.
 include!("src/channel.rs");
+include!("src/pubkey.rs");
 
 fn main() {
     println!("cargo:rerun-if-changed=static");
@@ -74,6 +75,13 @@ fn emit_build_info() {
         "cargo:rustc-env=ROOST_TARGET={}",
         env::var("TARGET").unwrap_or_else(|_| "unknown".into())
     );
+    // The release signing key, if the maintainer has committed it (#87).
+    // Absent bakes an empty string: that build carries no key, offers no
+    // [Update] button, and refuses the intent. It never means "trust anything".
+    let pub_path = root.join("keys").join("roost.pub");
+    println!("cargo:rerun-if-changed={}", pub_path.display());
+    let key = fs::read_to_string(&pub_path).ok().and_then(|t| pubkey_line(&t)).unwrap_or_default();
+    println!("cargo:rustc-env=ROOST_UPDATE_PUBKEY={key}");
     // Seconds since the epoch, formatted by the server rather than here: a
     // build script has no business picking a date format, and the raw number
     // survives being carried through an env var without a parser.
