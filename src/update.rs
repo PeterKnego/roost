@@ -53,6 +53,20 @@ pub fn asset_urls(base: &str, target: &str) -> (String, String) {
     (tarball, sig)
 }
 
+/// Verified over the tarball bytes, **before** decompression touches them:
+/// nothing unsigned is parsed. `allow_legacy` is false — the release signs
+/// with a current minisign, and the legacy format is one more thing to
+/// accept for no reason. The three messages are distinct on purpose: a
+/// signature that does not verify is the one someone should hear about.
+pub fn verify(tarball: &[u8], minisig: &str, pubkey_b64: &str) -> Result<(), String> {
+    let pk = minisign_verify::PublicKey::from_base64(pubkey_b64)
+        .map_err(|e| format!("the compiled-in key could not be read: {e}"))?;
+    let sig = minisign_verify::Signature::decode(minisig)
+        .map_err(|e| format!("the signature file could not be read: {e}"))?;
+    pk.verify(tarball, &sig, false)
+        .map_err(|_| "signature did not verify".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +121,69 @@ mod tests {
                 minisign_verify::PublicKey::from_base64(k).expect("keys/roost.pub holds a minisign key");
             }
         }
+    }
+
+    fn test_key() -> (String, minisign::SecretKey) {
+        let kp = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        (kp.pk.to_base64(), kp.sk)
+    }
+
+    fn sign_bytes(sk: &minisign::SecretKey, data: &[u8]) -> String {
+        minisign::sign(None, sk, data, Some("roost test signature"), None).unwrap().into_string()
+    }
+
+    /// Revert-checked: a `verify` that decodes both inputs and returns `Ok`
+    /// without calling `pk.verify` fails here at the flipped-byte row with
+    /// `called Result::unwrap_err() on an Ok value`.
+    ///
+    /// A valid signature passes; a flipped byte, another key, and garbage
+    /// each fail with their own message — "signature did not verify" is the
+    /// one someone should hear about, and it must not be confused with a
+    /// signature file that could not be read.
+    #[test]
+    fn the_signature_is_checked_over_the_tarball_bytes() {
+        let (pk, sk) = test_key();
+        let data = b"not really a tarball, but the bytes are what is signed".to_vec();
+        let sig = sign_bytes(&sk, &data);
+        assert_eq!(verify(&data, &sig, &pk), Ok(()));
+
+        let mut flipped = data.clone();
+        flipped[7] ^= 0x01;
+        assert_eq!(verify(&flipped, &sig, &pk).unwrap_err(), "signature did not verify");
+
+        let (other_pk, _) = test_key();
+        assert_eq!(verify(&data, &sig, &other_pk).unwrap_err(), "signature did not verify");
+
+        let e = verify(&data, "this is not a minisig file", &pk).unwrap_err();
+        assert!(e.starts_with("the signature file could not be read"), "{e}");
+
+        let e = verify(&data, &sig, "not a key").unwrap_err();
+        assert!(e.starts_with("the compiled-in key could not be read"), "{e}");
+    }
+
+    /// Three more refusals the row above doesn't exercise: an empty key (not
+    /// merely a wrong one), a `.minisig` truncated mid-file rather than pure
+    /// garbage, and a trusted-comment tamper. The last matters because
+    /// minisign's global signature covers `signature || trusted_comment`
+    /// specifically so the comment can't be forged independently of the
+    /// payload signature it describes — flip a byte there with the data and
+    /// data-signature untouched, and `verify` must still refuse it.
+    #[test]
+    fn empty_key_truncated_signature_and_a_tampered_trusted_comment_are_all_refused() {
+        let (pk, sk) = test_key();
+        let data = b"not really a tarball, but the bytes are what is signed".to_vec();
+        let sig = sign_bytes(&sk, &data);
+
+        let e = verify(&data, &sig, "").unwrap_err();
+        assert!(e.starts_with("the compiled-in key could not be read"), "{e}");
+
+        let e = verify(&data, &sig[..sig.len() / 2], &pk).unwrap_err();
+        assert!(e.starts_with("the signature file could not be read"), "{e}");
+
+        let mut lines: Vec<String> = sig.lines().map(str::to_string).collect();
+        assert!(lines[2].starts_with("trusted comment: "), "line 2 was: {}", lines[2]);
+        lines[2].push_str("-tampered");
+        let tampered = lines.join("\n");
+        assert_eq!(verify(&data, &tampered, &pk).unwrap_err(), "signature did not verify");
     }
 }
