@@ -268,7 +268,14 @@ pub fn write_state_to(path: &std::path::Path, s: &State) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // A failed rename must not leave the tmp file behind: a new one would
+        // otherwise accumulate on every process start that hits this path
+        // (e.g. a directory sitting where `check.json` belongs).
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    Ok(())
 }
 
 /// Whether a check is due. A timestamp in the future is stale, not fresh until
@@ -642,6 +649,31 @@ not json at all
         let _envg = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(state_path().parent().unwrap().file_name().unwrap(), "update");
         assert_eq!(state_path().file_name().unwrap(), "check.json");
+    }
+
+    /// A directory sitting where `check.json` belongs (or any other rename
+    /// failure) must not leave the pid-unique tmp file behind — a fresh one
+    /// would otherwise accumulate on every process start that hits this path.
+    ///
+    /// RED: with the `remove_file` cleanup deleted from `write_state_to`'s
+    /// error path (reverted to `std::fs::rename(&tmp, path).map_err(|e|
+    /// e.to_string())`), this failed with `left: 1, right: 0` — one `.tmp`
+    /// file left in the directory. Restored after confirming.
+    #[test]
+    fn a_failing_rename_leaves_no_temp_file_behind() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("check.json");
+        // A directory, not a file, at the destination: renaming a regular
+        // tmp file onto it fails (EISDIR), which is the failure this guards.
+        std::fs::create_dir(&p).unwrap();
+        let s = st(Some("0.5.3"), Some(1789234567), None);
+        assert!(write_state_to(&p, &s).is_err(), "renaming a file onto a directory must fail");
+        let leftover: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert_eq!(leftover.len(), 0, "no .tmp file should survive a failed rename: {leftover:?}");
     }
 
     #[test]
