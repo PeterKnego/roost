@@ -35,6 +35,7 @@ pub mod registry;
 pub mod relaunch;
 pub mod render;
 pub mod restore;
+pub mod revert;
 pub mod roots;
 pub mod routes;
 pub mod screen;

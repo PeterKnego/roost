@@ -994,6 +994,9 @@ dialog#dlg-menu { position: fixed; margin: 0; width: max-content;
    the surface it is drawn on, so it lifts in a dark theme and darkens in a
    light one. See its rationale at the top of this file. */
 .dlg-item:hover, .dlg-item:focus { background: var(--row-on); outline: none; }
+/* A command that cannot run here still names itself and why (#125). */
+.dlg-item:disabled { opacity: .55; cursor: default; }
+.dlg-item .dlg-hint { display: block; font-size: 11px; color: var(--muted); }
 /* ---- settings dialog ---- */
 dialog.roost.dlg-wide { width: min(760px, 96vw); }
 .dlg-tabs { display: flex; gap: 2px; padding: 8px 14px 0; border-bottom: 1px solid var(--border); }

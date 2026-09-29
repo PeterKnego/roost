@@ -35,6 +35,15 @@ pub fn diff_html(diff: &str) -> String {
         .collect()
 }
 
+/// The "Revert all" confirmation's detail: which paths, with their XY codes.
+/// Escaped like every other interpolation; `askChoice` sets it as innerHTML.
+pub fn revert_list_html(paths: &[crate::revert::PlanPath]) -> String {
+    paths
+        .iter()
+        .map(|p| format!("<div class=\"dl ctx\">{} {}</div>", esc(&p.xy), esc(&p.path)))
+        .collect()
+}
+
 /// The hunk view for an `openDiff` proposal Claude is still waiting on an
 /// answer for. Same shape as the `diff` fragment's own output (a `.path`
 /// breadcrumb over a `.diffview` of `diff_html`-classified lines) — reusing
@@ -927,8 +936,9 @@ pub fn changes_fragment(project: &str, st: &Status) -> String {
     );
     for c in &st.changes {
         out.push_str(&format!(
-            "<li><a class=\"file\" data-rel=\"{}\" data-ext=\"{}\" hx-get=\"/frag/{}/diff?path={}\" hx-target=\"#content\"><span class=\"xy\">{}</span>{}</a></li>",
+            "<li><a class=\"file\" data-rel=\"{}\" data-xy=\"{}\" data-ext=\"{}\" hx-get=\"/frag/{}/diff?path={}\" hx-target=\"#content\"><span class=\"xy\">{}</span>{}</a></li>",
             esc(&c.path),
+            esc(&c.xy),
             icon_ext(c.path.rsplit('/').next().unwrap_or(&c.path)),
             project_url,
             crate::http::percent_encode(&c.path),
@@ -3092,6 +3102,17 @@ mod tests {
         assert!(clean.contains("working tree clean"));
     }
 
+    /// The client decides the menu's disabled state from this; a row without
+    /// it would offer Revert on an untracked file and let the server say no.
+    /// `"` in the fixture because `esc` is what stands between an XY code and
+    /// the attribute (XY never holds one, but the rule is "escape everything").
+    #[test]
+    fn change_rows_carry_their_xy() {
+        let st = Status { changes: vec![crate::gitio::Change { xy: "??".into(), path: "n.txt".into() }], ..Default::default() };
+        let h = changes_fragment("p", &st);
+        assert!(h.contains(r#"data-rel="n.txt""#) && h.contains(r#"data-xy="??""#), "{h}");
+    }
+
     #[test]
     fn status_fragment_reports_the_git_state_like_a_shell_prompt() {
         use crate::gitio::{Change, Status};
@@ -4411,5 +4432,12 @@ mod tests {
                 "{src} is named by the manifest but is not embedded"
             );
         }
+    }
+
+    #[test]
+    fn revert_list_html_escapes_paths() {
+        let h = revert_list_html(&[crate::revert::PlanPath { path: "<b>.rs".into(), xy: ".M".into() }]);
+        assert!(h.contains("&lt;b&gt;.rs") && !h.contains("<b>"), "{h}");
+        assert!(h.contains(".M"), "{h}");
     }
 }

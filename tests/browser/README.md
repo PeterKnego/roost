@@ -61,6 +61,7 @@ deno run -A tests/browser/download.mjs   # right-click → Download: a real navi
 deno run -A tests/browser/touchfiles.mjs # the file menu on a folder, Upload files… without a drag, and terminal select mode (#110)
 deno run -A tests/browser/paste.mjs      # the terminal key bar's paste button (#97): bracketed vs bare at the pty, and the textarea fallback when the clipboard says no
 deno run -A tests/browser/nodtach.mjs    # a host without dtach says so on the terminal, and does not reconnect into the refusal (#123)
+deno run -A tests/browser/revert.mjs     # revert from the Changes pane and a Diff tab: the git menu, the disabled hints, cancel vs confirm, and the stash on disk (#125)
 deno run -A tests/browser/backup.mjs     # backing a workspace up and restoring it into a *different* project (#18 step 3) — needs its own HOME, like claudemenu.mjs
 ```
 
@@ -550,6 +551,30 @@ performed.
   the accessibility tree does not carry it (both checked, not assumed), and in
   the editor `elementFromPoint` hits the textarea stacked over the gutter. CDP's
   `DOM.getBoxModel` against the pseudo-element node is the only way in.
+
+- In `revert.mjs`: each section is revert-checked against a break in
+  `static/app.js` (the Changes/Diff menu wiring, `confirmRevert`'s focus and
+  its `Revert` send, `revertBlock`'s hints). Four traps found doing it, each
+  commented at its site:
+
+  - `closeMenu()` cannot be `el.close()`. `dialog.js`'s `runDialog` clears
+    its one-dialog-at-a-time gate only inside `finish`, which a bare
+    `.close()` bypasses, so the next `askMenu`/`askChoice` silently resolves
+    dismissed with no dialog shown. Dismiss with a real CDP Escape keypress.
+  - Enter must be a trusted CDP `Input.dispatchKeyEvent`. `askChoice` has no
+    keydown handler; only the browser's native "Enter activates the focused
+    button" can act, and it ignores a synthetic `KeyboardEvent`. With the
+    untrusted form, the `.click()` that followed was the only thing tested.
+  - Settle before reading the file after the dialog closes. Discard closes
+    the dialog exactly like Cancel, and the revert is an async round trip;
+    an immediate read passed under the `focus: "first"` break on timing luck.
+  - One file per section, and a before/after stash count. When C and D
+    shared `a.txt`, a C that really discarded it let D pass off C's
+    leftovers; C now uses `c.txt` alone and D asserts exactly one new entry.
+
+  A missing row makes `rightClick`/`openConfirm` fail an assertion rather
+  than throw, so a break that discards a file early still reports every
+  later section instead of crashing the run.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:

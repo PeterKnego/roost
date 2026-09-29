@@ -227,6 +227,24 @@ pub enum Intent {
     /// `accept: false` with a `text` is still a rejection — the text is only
     /// ever read on the accepting path.
     AnswerProposal { id: String, accept: bool, text: Option<String> },
+    /// What a revert would do (#125). Answered to the requester only, with a
+    /// token over exactly what the dialog will show. `None` is "all".
+    /// Diverted in wsconn: a plan is several git calls.
+    RevertPreview {
+        #[serde(default)]
+        rel: Option<String>,
+    },
+    /// Do it, if nothing changed since the preview: the server rebuilds the
+    /// plan and refuses on a different token. `discard_buffers` names the
+    /// unsaved roost buffers the dialog said would be discarded; a dirty one
+    /// it did not name refuses.
+    Revert {
+        #[serde(default)]
+        rel: Option<String>,
+        token: String,
+        #[serde(default)]
+        discard_buffers: Vec<String>,
+    },
     /// Restore this project from an archive the browser has already uploaded
     /// through `POST /upload` (#18 step 3).
     ///
@@ -507,6 +525,19 @@ pub enum Event {
     /// after any read-state change, so no two browsers on the same project
     /// disagree about the badge count.
     Notices { list: Vec<crate::notify::Notice> },
+    RevertPlan {
+        rel: Option<String>,
+        paths: Vec<crate::revert::PlanPath>,
+        staged: bool,
+        skipped: crate::revert::Skipped,
+        dirty: Vec<String>,
+        /// Server-rendered and escaped: a diff (one file) or a path list.
+        detail_html: String,
+        token: String,
+    },
+    /// `stale`: refused because what the user saw no longer holds; the client
+    /// re-asks for a preview rather than leaving them with a dead dialog.
+    Reverted { rel: Option<String>, ok: bool, msg: String, stale: bool },
 }
 
 pub fn decode(s: &str) -> Result<Intent, String> {

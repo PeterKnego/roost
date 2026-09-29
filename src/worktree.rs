@@ -86,6 +86,12 @@ pub fn real_git(repo: &Path, args: &[&str]) -> Result<String, String> {
     crate::gitio::run_git(repo, args, false)
 }
 
+/// The runner for a git command that must never be killed partway: no
+/// deadline. See `gitio::run_git_unbounded`.
+pub fn real_git_unbounded(repo: &Path, args: &[&str]) -> Result<String, String> {
+    crate::gitio::run_git_unbounded(repo, args)
+}
+
 pub const MAX_WORKTREES: u32 = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
