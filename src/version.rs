@@ -363,6 +363,11 @@ fn store(s: State) {
 /// A fetch that panics is a failure like any other: this runs on a thread
 /// nothing joins, so an escaping panic would be invisible *and* would leave
 /// the in-flight guard taken forever.
+///
+/// `pub` only so tests can call it directly; it bypasses `maybe_check_with`'s
+/// single-flight guard entirely, and two concurrent callers would race on the
+/// same pid-unique tmp name. Production code must only reach this through
+/// `maybe_check_with` (or `maybe_check`).
 pub fn check_once_with(fetch: FetchFn) -> State {
     let previous = current().unwrap_or_default();
     let fetched = index_url(env!("CARGO_PKG_NAME")).and_then(|url| {
