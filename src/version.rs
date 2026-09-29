@@ -694,6 +694,18 @@ not json at all
 
     /// Ten tabs connecting at once — or one browser test opening ten projects
     /// — fire one request, not ten.
+    ///
+    /// Revert-checked. Removing the guard fails with `left: 10, right: 1`.
+    /// Moving it *inside* the spawned closure (the staleness test left on the
+    /// calling thread) does **not** fail this test — five runs, all green: the
+    /// swap is atomic, so exactly one of the ten threads wins it while the
+    /// fetch blocks. What that placement gets wrong is the window after the
+    /// winner releases the guard: a thread that passed the staleness test
+    /// before the check finished, but was scheduled only after, swaps a free
+    /// guard and fetches again against an answer that is now fresh. That race
+    /// has no seam to force it, so this test cannot see it; the guard is taken
+    /// on the calling thread, before the staleness test, so the window does
+    /// not exist rather than being rare.
     #[test]
     fn ten_connects_with_a_blocking_fetch_fire_it_once() {
         let (_g1, _g2, _d) = env_fixture(true);
