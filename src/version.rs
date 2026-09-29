@@ -35,6 +35,78 @@ pub fn user_agent() -> String {
     format!("roost/{} (+{})", env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_REPOSITORY"))
 }
 
+/// A version as the comparator understands it: three numeric components, an
+/// optional prerelease, and build metadata discarded. Anything else is
+/// `None` — which reaches the user as `Unknown`, never as `UpToDate`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Parsed {
+    nums: [u64; 3],
+    pre: Option<String>,
+}
+
+fn parse(v: &str) -> Option<Parsed> {
+    // Build metadata is ignored for ordering, per semver.
+    let v = v.trim().split('+').next()?;
+    let (core, pre) = match v.split_once('-') {
+        Some((c, p)) if !p.is_empty() => (c, Some(p.to_string())),
+        Some(_) => return None, // a trailing `-` with nothing after it
+        None => (v, None),
+    };
+    let mut it = core.split('.');
+    let mut nums = [0u64; 3];
+    for slot in nums.iter_mut() {
+        let part = it.next()?;
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *slot = part.parse().ok()?;
+    }
+    if it.next().is_some() {
+        return None; // four components is not a version this reads
+    }
+    Some(Parsed { nums, pre })
+}
+
+/// The newest unyanked version in a sparse-index body.
+///
+/// `None` for an empty entry, for one where every release is yanked, and for
+/// one whose every `vers` is unreadable — all of which are `Unknown`, never
+/// `UpToDate`. One malformed line costs that line and nothing else: a registry
+/// that adds a field must not make the check go dark.
+pub fn newest_unyanked(body: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        vers: String,
+        #[serde(default)]
+        yanked: bool,
+    }
+    let mut best: Option<(Parsed, String)> = None;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(e) = serde_json::from_str::<Entry>(line) else { continue };
+        if e.yanked {
+            continue;
+        }
+        let Some(p) = parse(&e.vers) else { continue };
+        let better = match &best {
+            None => true,
+            Some((b, _)) => cmp_parsed(&p, b) == std::cmp::Ordering::Greater,
+        };
+        if better {
+            best = Some((p, e.vers));
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+/// Placeholder ordering, replaced by the real comparator in the next task.
+fn cmp_parsed(a: &Parsed, b: &Parsed) -> std::cmp::Ordering {
+    a.nums.cmp(&b.nums)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +145,58 @@ mod tests {
     fn the_request_identifies_itself() {
         let ua = user_agent();
         assert_eq!(ua, format!("roost/{} (+https://github.com/PeterKnego/roost)", env!("CARGO_PKG_VERSION")));
+    }
+
+    /// The index is JSON lines, newest last today — but "last" is a property
+    /// of how crates.io happens to write the file, not a guarantee, so the
+    /// answer is the maximum.
+    #[test]
+    fn the_newest_is_by_version_not_by_file_order() {
+        let body = "\
+{\"name\":\"roost\",\"vers\":\"0.4.0\",\"yanked\":false}
+{\"name\":\"roost\",\"vers\":\"0.5.2\",\"yanked\":false}
+{\"name\":\"roost\",\"vers\":\"0.5.0\",\"yanked\":false}
+{\"name\":\"roost\",\"vers\":\"0.5.1\",\"yanked\":false}
+";
+        assert_eq!(newest_unyanked(body).as_deref(), Some("0.5.2"));
+    }
+
+    /// A yanked release is not something to tell a user to upgrade to.
+    #[test]
+    fn the_newest_entry_being_yanked_is_skipped() {
+        let body = "\
+{\"name\":\"roost\",\"vers\":\"0.5.1\",\"yanked\":false}
+{\"name\":\"roost\",\"vers\":\"0.5.2\",\"yanked\":true}
+";
+        assert_eq!(newest_unyanked(body).as_deref(), Some("0.5.1"));
+    }
+
+    #[test]
+    fn every_entry_yanked_is_not_an_answer() {
+        let body = "\
+{\"name\":\"roost\",\"vers\":\"0.5.1\",\"yanked\":true}
+{\"name\":\"roost\",\"vers\":\"0.5.2\",\"yanked\":true}
+";
+        assert_eq!(newest_unyanked(body), None, "no unyanked release is `Unknown`, not `UpToDate`");
+    }
+
+    #[test]
+    fn an_empty_index_entry_is_not_an_answer() {
+        assert_eq!(newest_unyanked(""), None);
+        assert_eq!(newest_unyanked("\n\n  \n"), None);
+    }
+
+    /// One unreadable line must not cost the whole file, and an unreadable
+    /// *version* must not become the answer — a `vers` the comparator cannot
+    /// read would otherwise be stored and render as "could not check" forever.
+    #[test]
+    fn a_malformed_line_does_not_discard_the_file() {
+        let body = "\
+not json at all
+{\"name\":\"roost\",\"vers\":\"0.5.1\",\"yanked\":false}
+{\"name\":\"roost\",\"vers\":\"banana\",\"yanked\":false}
+{\"name\":\"roost\"}
+";
+        assert_eq!(newest_unyanked(body).as_deref(), Some("0.5.1"));
     }
 }
