@@ -1,6 +1,8 @@
 //! Is there a newer roost? See
 //! `docs/superpowers/specs/2026-09-12-version-check-design.md`.
 
+use serde::{Deserialize, Serialize};
+
 /// The sparse index. Not a setting, at any scope: a key that let a repository
 /// name the host roost fetches from would be the hole global-only config
 /// exists to avoid.
@@ -171,6 +173,95 @@ pub fn verdict(running: &str, latest: Option<&str>) -> Latest {
     }
 }
 
+/// 24 hours after a success. #65 asks for days rather than minutes.
+pub const FRESH_SECS: u64 = 24 * 60 * 60;
+/// 1 hour after a failure. A single interval cannot serve both cases:
+/// punishing a transient failure with a day of silence is wrong, and retrying
+/// from an offline box on every connect is worse.
+pub const RETRY_SECS: u64 = 60 * 60;
+
+/// What the network returned, not what it meant.
+///
+/// **No `outcome` field, deliberately.** Storing the verdict fails the first
+/// time it matters: upgrade to 0.5.3, restart inside the 24-hour window, and a
+/// verdict computed by the old binary makes the new one announce "0.5.3
+/// available" while running 0.5.3. `latest` is a fact; `Latest` is computed
+/// against `CARGO_PKG_VERSION` at display time.
+///
+/// Two timestamps because one cannot express "last success 20 hours ago, last
+/// failure 30 minutes ago", which is the state the two intervals exist for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct State {
+    /// The newest unyanked version the index reported, from the last
+    /// **successful** check. It survives a later failure.
+    pub latest: Option<String>,
+    /// When that success happened. Drives `FRESH_SECS`.
+    pub checked_at: Option<u64>,
+    /// When the most recent failure happened. Drives `RETRY_SECS`, and is
+    /// cleared by the next success.
+    pub failed_at: Option<u64>,
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A subdirectory, **not** a bare `.json` at the top of the state dir: that
+/// top level is the project-workspace namespace, and
+/// `registry::known_projects_inner` globs `*.json` there into project rows —
+/// a file named `version.json` would list as a phantom project called
+/// "version". `notify.rs` already shipped exactly that bug once.
+pub fn state_dir_for_update() -> std::path::PathBuf {
+    crate::wsstate::state_dir().join("update")
+}
+
+pub fn state_path() -> std::path::PathBuf {
+    state_dir_for_update().join("check.json")
+}
+
+/// Missing, truncated, or otherwise unreadable is **never checked**, never an
+/// answer. Nothing here folds "could not look" into "there is nothing".
+pub fn read_state_from(path: &std::path::Path) -> Option<State> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<State>(&text).ok()
+}
+
+/// Temp file with a pid-unique name, then `rename`, per CLAUDE.md: a reader
+/// must never see this half-written and act on the gap. Two roost processes
+/// sharing a state directory each do their own check and the later writer
+/// wins, which is harmless because both wrote a fact.
+pub fn write_state_to(path: &std::path::Path, s: &State) -> Result<(), String> {
+    let dir = path.parent().ok_or_else(|| "no parent directory".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let json = serde_json::to_string(s).map_err(|e| e.to_string())?;
+    let tmp = dir.join(format!(".check.{}.json.tmp", std::process::id()));
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+/// Whether a check is due. A timestamp in the future is stale, not fresh until
+/// that future arrives: a clock stepped backwards or a state file copied from
+/// another host must not silence the check for a day.
+pub fn stale(s: Option<&State>, now: u64) -> bool {
+    let Some(s) = s else { return true };
+    let fresh = s.checked_at.is_some_and(|t| t <= now && now - t < FRESH_SECS);
+    let cooling = s.failed_at.is_some_and(|t| t <= now && now - t < RETRY_SECS);
+    !(fresh || cooling)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +396,106 @@ not json at all
         ] {
             assert_eq!(verdict(running, index), want, "{why}: {running} vs {index:?}");
         }
+    }
+
+    fn st(latest: Option<&str>, checked: Option<u64>, failed: Option<u64>) -> State {
+        State {
+            latest: latest.map(str::to_string),
+            checked_at: checked,
+            failed_at: failed,
+        }
+    }
+
+    #[test]
+    fn the_state_file_round_trips_and_lives_out_of_the_project_namespace() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("update").join("check.json");
+        let s = st(Some("0.5.3"), Some(1789234567), None);
+        write_state_to(&p, &s).unwrap();
+        assert_eq!(read_state_from(&p), Some(s));
+
+        // The schema is exactly the three keys the spec names. An `outcome`
+        // field is the thing this file must never grow.
+        let text = std::fs::read_to_string(&p).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let keys: Vec<&str> = json.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys, ["latest", "checked_at", "failed_at"], "{text}");
+
+        // `registry::known_projects_inner` globs *.json at the top of the
+        // state dir into project rows — a file named there would show as a
+        // phantom project, exactly as `notify.rs` records.
+        assert_eq!(state_path().parent().unwrap().file_name().unwrap(), "update");
+        assert_eq!(state_path().file_name().unwrap(), "check.json");
+    }
+
+    #[test]
+    fn a_truncated_file_is_never_checked_not_an_answer() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("check.json");
+        assert_eq!(read_state_from(&p), None, "missing is never checked");
+        std::fs::write(&p, "{\"latest\":\"0.5.").unwrap();
+        assert_eq!(read_state_from(&p), None, "truncated is never checked, not an empty answer");
+        std::fs::write(&p, "").unwrap();
+        assert_eq!(read_state_from(&p), None, "empty is never checked");
+        std::fs::write(&p, "[]").unwrap();
+        assert_eq!(read_state_from(&p), None, "the wrong shape is never checked");
+    }
+
+    #[test]
+    fn the_two_intervals_are_not_one() {
+        let now = 1_000_000u64;
+        assert!(stale(None, now), "never checked is stale");
+        assert!(!stale(Some(&st(Some("0.5.3"), Some(now - 20 * 3600), None)), now),
+            "a success 20 hours ago is fresh");
+        assert!(stale(Some(&st(Some("0.5.3"), Some(now - 25 * 3600), None)), now),
+            "a success 25 hours ago is stale");
+        assert!(!stale(Some(&st(None, None, Some(now - 30 * 60))), now),
+            "a failure 30 minutes ago is not retried yet");
+        assert!(stale(Some(&st(None, None, Some(now - 90 * 60))), now),
+            "a failure 90 minutes ago is retried");
+        // The state the two intervals were designed for, and the one a single
+        // interval cannot express.
+        assert!(!stale(Some(&st(Some("0.5.3"), Some(now - 25 * 3600), Some(now - 30 * 60))), now),
+            "stale success, recent failure: wait out the hour, not the day");
+        assert!(stale(Some(&st(Some("0.5.3"), Some(now - 25 * 3600), Some(now - 90 * 60))), now),
+            "stale success, hour elapsed: retry");
+    }
+
+    /// A clock stepped backwards, or a state file copied from another host.
+    #[test]
+    fn a_future_timestamp_reads_as_stale() {
+        let now = 1_000_000u64;
+        assert!(stale(Some(&st(Some("0.5.3"), Some(now + 3600), None)), now),
+            "a success in the future is stale, not fresh until that future arrives");
+        assert!(stale(Some(&st(None, None, Some(now + 3600))), now),
+            "and so is a failure in the future");
+    }
+
+    /// The schema has no `outcome` field, and this is why.
+    ///
+    /// Upgrade to 0.5.3, restart inside the 24-hour window, and a stored
+    /// verdict computed by the old binary would make the new one announce
+    /// "0.5.3 available" while running 0.5.3 — the lying version display #65
+    /// and #56 both exist to prevent.
+    #[test]
+    fn the_verdict_is_not_stored() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("check.json");
+        // Written by a check that ran while this binary was 0.5.2.
+        write_state_to(&p, &st(Some("0.5.3"), Some(1789234567), None)).unwrap();
+        let s = read_state_from(&p).unwrap();
+        assert_eq!(verdict("0.5.2", s.latest.as_deref()), Latest::Newer("0.5.3".into()),
+            "as 0.5.2, the same file says an upgrade exists");
+        // Read back by the 0.5.3 binary the user just installed.
+        assert_eq!(verdict("0.5.3", s.latest.as_deref()), Latest::UpToDate,
+            "as 0.5.3, the same file must say up to date — the fact is stored, the verdict is not");
+    }
+
+    /// A thirty-minute outage must not turn "0.5.3 available" into "could not
+    /// check".
+    #[test]
+    fn a_failure_keeps_the_last_good_answer() {
+        let after_failure = st(Some("0.5.3"), Some(1_000_000), Some(1_002_000));
+        assert_eq!(verdict("0.5.2", after_failure.latest.as_deref()), Latest::Newer("0.5.3".into()));
     }
 }
