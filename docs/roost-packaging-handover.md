@@ -55,18 +55,19 @@ dev-only. `ring` compiles C, so the musl targets need `musl-tools` on the
 build host — dist installs it on the release runners (`dist plan` lists it
 under `packages_install`), `ci.yml`'s container job installs it explicitly,
 and a dev host needs `sudo apt-get install musl-tools` once. There is still
-no `openssl`, `openssl-sys` or `native-tls` anywhere in the lock file.
+no `openssl`, `openssl-sys` or `native-tls` anywhere in the lock file: the
+trust store is `webpki-roots` (ureq's default `tls` feature, the bundled
+Mozilla set), not the system's.
 
 ```
-rustls v0.23.43
-└── ureq v2.12.1
-    [dev-dependencies]
-    └── roost v0.5.0
+ring v0.17.14
+└── rustls v0.23.43
+    └── ureq v2.12.1
+        └── roost
 ```
 
-There is no `openssl`, `openssl-sys` or `native-tls` anywhere in the lock file.
-The shipped v0.5.0 binary declares exactly three NEEDED libraries: `libc.so.6`,
-`ld-linux-x86-64.so.2` and `libgcc_s.so.1`.
+The shipped v0.5.0 binary, built before that change, declares exactly three
+NEEDED libraries: `libc.so.6`, `ld-linux-x86-64.so.2` and `libgcc_s.so.1`.
 
 ## 3. Constraints
 
@@ -121,9 +122,10 @@ This is the most probable bug report after launch.
 
 **C3 — musl is available. Both targets verified building.**
 Because of the fact in section 2.5 a static musl build has no blocker: there is
-no `openssl-sys`, and nothing in the tree needs a C toolchain beyond libc
-bindings. Both musl targets were built from this checkout on 2026-09-06 with
-nothing installed but the rustup targets themselves:
+no `openssl-sys`. When this was written nothing in the tree needed a C
+toolchain beyond libc bindings; that changed with step 2 (below). Both musl
+targets were built from this checkout on 2026-09-06 with nothing installed but
+the rustup targets themselves:
 
 | Target | Result |
 |---|---|

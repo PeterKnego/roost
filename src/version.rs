@@ -729,17 +729,58 @@ not json at all
         RELEASE.store(false, SeqCst);
     }
 
-    /// CLAUDE.md: no panic may escape a socket or watcher thread — and this
-    /// one would also leave the guard taken forever, silencing every later
-    /// check in the process.
+    /// CLAUDE.md: no panic may escape a socket or watcher thread. A fetch that
+    /// panics is caught inside `check_once_with` and recorded as a failure,
+    /// so it earns the one-hour retry like any other. Deleting the inner
+    /// `catch_unwind` fails this on "the panic is caught inside".
     #[test]
-    fn a_panicking_fetch_does_not_leave_the_guard_taken() {
+    fn a_panicking_fetch_is_caught_and_recorded_as_a_failure() {
         let (_g1, _g2, _d) = env_fixture(true);
         let s = std::panic::catch_unwind(|| check_once_with(panicking_fetch));
         assert!(s.is_ok(), "the panic is caught inside, not by the caller");
         let s = s.unwrap();
         assert!(s.failed_at.is_some(), "a panicking fetch is a failure, not a success");
         assert_eq!(s.latest, None);
+    }
+
+    /// The real spawn path: a check thread whose fetch panics must still
+    /// release the in-flight guard, or every later check in the process is
+    /// silently skipped. Bounded polls throughout, so a stuck guard fails
+    /// rather than hangs.
+    ///
+    /// Revert-checked. Removing the guard release after the thread's
+    /// `catch_unwind` fails on "the guard is released after a panicking
+    /// check". Two catches stand between the panic and the guard, and each
+    /// alone suffices: removing only the inner one (in `check_once_with`) or
+    /// only the outer one (around it in the thread) passes; removing both
+    /// fails the same way — the thread dies with the guard taken.
+    #[test]
+    fn a_panicking_check_thread_releases_the_guard() {
+        let (_g1, _g2, _d) = env_fixture(true);
+        fn counting_fetch(_url: &str) -> Result<String, String> {
+            CALLS.fetch_add(1, SeqCst);
+            Ok("{\"name\":\"roost\",\"vers\":\"9.9.9\",\"yanked\":false}\n".to_string())
+        }
+        maybe_check_with(panicking_fetch);
+        let wait = |done: &dyn Fn() -> bool| {
+            for _ in 0..200 {
+                if done() { return }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        wait(&|| CALLS.load(SeqCst) >= 1);
+        assert_eq!(CALLS.load(SeqCst), 1, "the panicking fetch ran");
+        wait(&|| !IN_FLIGHT.load(SeqCst));
+        assert!(!IN_FLIGHT.load(SeqCst), "the guard is released after a panicking check");
+
+        // The failure just recorded is cooling for an hour; make the state
+        // stale again so only the guard can stop the next check.
+        store(State::default());
+        maybe_check_with(counting_fetch);
+        wait(&|| CALLS.load(SeqCst) >= 2);
+        wait(&|| !IN_FLIGHT.load(SeqCst));
+        assert_eq!(CALLS.load(SeqCst), 2, "the next check ran, exactly once");
+        assert_eq!(current().unwrap().latest.as_deref(), Some("9.9.9"));
     }
 
     /// The whole point of two timestamps: a thirty-minute outage must not turn
