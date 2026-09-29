@@ -11,7 +11,7 @@ const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) 
 
 const fx = await fixture();
 const globalToml = `${fx.base}/global.toml`;
-await Deno.writeTextFile(globalToml, "# global\ntheme = \"dark\"\n");
+await Deno.writeTextFile(globalToml, "# global\ntheme = \"dark\"\nversion_check = false\n");
 const projToml = `${fx.dir}/.roost/config.toml`;
 const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { ROOST_CONFIG: globalToml } });
 const browser = await startBrowser(profileDir(repoRoot));

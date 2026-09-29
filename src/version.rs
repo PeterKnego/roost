@@ -838,6 +838,22 @@ not json at all
         RELEASE.store(false, SeqCst);
     }
 
+    /// With the setting off, the injected fetch is never called — not
+    /// "usually", not "when the state happens to be fresh". Deleting the
+    /// config gate from `maybe_check_with` fails this with `left: 1, right: 0`.
+    #[test]
+    fn with_the_check_off_the_fetch_is_never_called() {
+        let (_g1, _g2, _d) = env_fixture(false);
+        // No state file at all, so staleness cannot be what stops it.
+        assert_eq!(read_state_from(&state_path()), None);
+        for _ in 0..5 {
+            maybe_check_with(failing_fetch);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(CALLS.load(SeqCst), 0, "the setting is off; nothing may reach the network");
+        assert_eq!(read_state_from(&state_path()), None, "and nothing was written either");
+    }
+
     /// The connect is lazy *and* throttled: a browser reconnecting every few
     /// seconds must not fire a request every few seconds.
     #[test]

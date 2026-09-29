@@ -19,6 +19,7 @@ fn roots_socket_adds_a_root_and_refuses_a_handshake_without_origin() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let d = tempfile::tempdir().unwrap();
     let global = d.path().join("config.toml");
+    std::fs::write(&global, "version_check = false\n").unwrap();
     std::env::set_var("ROOST_CONFIG", &global);
     std::env::remove_var("ROOST_ROOTS");
     let dir = d.path().join("projects");
