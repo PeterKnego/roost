@@ -40,6 +40,10 @@
 //!      window left A `visible/true`, not blurred. A known gap.
 //!   5. Disabling the arrival branch in onNotice: failed 4 in C — read state
 //!      and both banner counts.
+//!   6. Section G was written red, before `autoFocused` existed: failed 2 —
+//!      O read auto1 on arrival, having been focused only by mountTab.
+//!   7. With `autoFocused` but before `handFocus`: G passed and H failed 1 —
+//!      a tab clicked on this page stopped counting as watching.
 import { attachTarget, fixture, freePort, openPage, profileDir, startBrowser, startRoost, sleep, until }
   from "./harness.mjs";
 
@@ -88,7 +92,10 @@ const wire = (page) => {
   };
   const readState = (title) => evalIn(`(() => { const n = notices.find((x) => x.title === ${q(title)});
     return n ? (n.read ? "read" : "unread") : "absent"; })()`);
-  const focusTerm = (s) => evalIn(`(terms.get(${q(s)}).term.focus(),
+  // A click's shape: pointerdown on the terminal, then focus. The pointerdown
+  // is what makes it a hand rather than mountTab's own focus() (section G).
+  const focusTerm = (s) => evalIn(`(terms.get(${q(s)}).node.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })),
+    terms.get(${q(s)}).term.focus(),
     (document.activeElement && document.activeElement.closest(".termhost") || {dataset: {}}).dataset.session || null)`);
   const termFocus = () => evalIn(`(document.activeElement && document.activeElement.closest(".termhost") || {dataset: {}}).dataset.session || null`);
   const blurAll = () => evalIn(`(document.activeElement && document.activeElement.blur(), document.activeElement === document.body)`);
@@ -214,10 +221,43 @@ try {
   await A.evalIn(`send({ t: "SetSetting", scope: "project", key: "read_when_watching", value: null })`);
   ok(await until(async () => (await A.setting()) === true, 10, "setting back"), "A: cleared, back to the default on");
 
+  // ---- G. Focus nobody gave ----------------------------------------------
+  // Found in review. mountTab focuses whatever terminal a snapshot mounts, so
+  // a second device left idle with roost in front — O here — ends up with
+  // keyboard focus in a terminal because another client activated it, and
+  // would read that terminal's notices for you: your laptop's dot clears and
+  // nobody touched the desktop. Focus given by code is not watching until a
+  // hand lands in that terminal.
+  const w = await A.openTerm(0);
+  ok(!!w && w !== t, `terminal w (${w}) now active in pane 0, over t`);
+  await oFront();
+  ok(await O.termFocus() === null, "precondition: O holds no terminal focus");
+  const ti = await A.evalIn(`state.panes[0].tabs.findIndex((x) => x.k === "Terminal" && x.session === ${JSON.stringify(t)})`);
+  await A.evalIn(`send({ t: "ActivateTab", pane: 0, idx: ${ti} })`);
+  ok(await until(async () => (await O.termFocus()) === t, 10, "O auto-focused t"),
+    "precondition: A's activation mounted t on O, and mountTab focused it there");
+  await A.raise(t, "auto1");
+  ok(await seen("auto1", "unread"), "G: auto1 arrives unread");
+  await sleep(1500);
+  ok(await O.readState("auto1") === "unread", "G: a terminal focused by a layout change elsewhere is not watching");
+  await O.focusTerm(t);
+  ok(await seen("auto1", "read"), "G: a hand landing in it on that device is, and reads it");
+  await A.bringToFront();
+
+  // ---- H. A tab click is a hand ----------------------------------------
+  // The other side of G: a tab clicked on THIS device goes through
+  // focusSession, and the terminal it mounts is focused by mountTab too —
+  // but that focus came from the click, so it is watching.
+  ok(await A.termFocus() !== w, "precondition: A's keyboard is not in w");
+  await A.evalIn(`focusSession(${JSON.stringify(w)})`);
+  ok(await until(async () => (await A.termFocus()) === w, 10, "A focused w"), "H: clicking w's tab focuses it");
+  await A.raise(w, "hand1");
+  ok(await seen("hand1", "read"), "H: a notice from the terminal just clicked into is read on arrival");
+
   // ---- F. Visible but unfocused (best effort) ---------------------------
   // A tab switch hides the page, so it cannot tell the hasFocus() guard from
   // the visibility guard. A second window might leave A visible and blurred.
-  ok(await A.focusTerm(t) === t, "A: typing in t");
+  ok(await A.focusTerm(w) === w, "A: typing in w (active in pane 0 since H)");
   const ver = await (await fetch(`http://127.0.0.1:${browser.port}/json/version`)).json();
   const b = await attachTarget(ver.webSocketDebuggerUrl);
   try {
@@ -230,7 +270,7 @@ try {
   const v = await A.vis();
   note(`F: with a second window open, A reports ${v}`);
   if (v === "visible/false") {
-    await A.raise(t, "unf1");
+    await A.raise(w, "unf1");
     ok(await seen("unf1", "unread"), "A: visible but unfocused is not watching");
     await sleep(1500);
     ok(await O.readState("unf1") === "unread", "and stays unread");

@@ -47,6 +47,15 @@ let AUTOSAVE = document.body.dataset.autosave === "1";
 // snapshot, and "watching" needs a laid-out snapshot anyway, so there is no
 // moment before the first State when the value is wanted.
 let READ_WHEN_WATCHING = true;
+// The terminal mountTab last focused by itself, until a hand lands in it.
+// mountTab focuses whatever terminal a snapshot mounts — including one
+// another client activated — so on an idle second device with roost in
+// front, keyboard focus alone would have it reading your notices for you.
+let autoFocused = null;
+// The session a gesture on this page just asked focusSession for — a tab
+// click, a notice, a desktop notification. The mountTab that follows is
+// that gesture's doing, so its focus is a hand's, not autoFocused.
+let handFocus = null;
 // Whether the editor's current selection is sent to Claude as ambient
 // context, embedded once per page load like AUTOSAVE and SHOW_HIDDEN_DEFAULT.
 // Off unless the project's config opted in (Settings::share_selection); the
@@ -1598,7 +1607,13 @@ function mountTab(content, t) {
     const e = ensureTerm(t.session);
     content.appendChild(e.node);   // MOVE, not rebuild — the socket survives
     requestAnimationFrame(() => {
-      try { e.fit.fit(); e.term.focus(); sendResize(e); } catch {}
+      try {
+        e.fit.fit();
+        autoFocused = handFocus === t.session ? null : t.session;
+        handFocus = null;
+        e.term.focus();
+        sendResize(e);
+      } catch {}
     });
     return;
   }
@@ -2853,6 +2868,11 @@ function ensureTerm(session) {
   // exports) wraps an internal core that has its own onFocus/onBlur, but
   // does not forward either one; calling `term.onFocus` throws.
   node.addEventListener("focusin", () => { lastFocusedSession = session; readWatched(); });
+  // A click or a keystroke in this terminal is the hand autoFocused waits
+  // for. Capture phase, because xterm handles both and may stop them.
+  const byHand = () => { if (autoFocused === session) autoFocused = null; readWatched(); };
+  node.addEventListener("pointerdown", byHand, true);
+  node.addEventListener("keydown", byHand, true);
   // xterm's own defaults are black-on-white-ish and take no part in the theme
   // cascade, so the active theme's variables are read off :root and handed to
   // it — otherwise the terminal is a black rectangle inside a #1e1f22 pane.
@@ -4741,6 +4761,7 @@ function watchedSession() {
   const host = document.activeElement && document.activeElement.closest(".termhost");
   if (!host || !host.getClientRects().length) return null;
   const s = host.dataset.session;
+  if (s === autoFocused) return null;
   return s && terms.has(s) && terms.get(s).node === host ? s : null;
 }
 
@@ -4769,11 +4790,16 @@ function focusSession(session) {
   for (let pi = 0; pi < state.panes.length; pi++) {
     const ti = state.panes[pi].tabs.findIndex((t) => t.k === "Terminal" && t.session === session);
     if (ti >= 0) {
+      // Only when this activation will mount it: an already-active tab gets
+      // no mountTab, and a handFocus left waiting would later bless a
+      // mount some other client caused.
+      if (state.panes[pi].active !== ti) handFocus = session;
       send({ t: "ActivateTab", pane: pi, idx: ti });
       revealPane(pi);
       return;
     }
   }
+  handFocus = session;
   send({ t: "OpenTab", pane: 3, tab: { k: "Terminal", session } });
   revealPane(3);
 }

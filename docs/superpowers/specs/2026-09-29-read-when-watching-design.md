@@ -106,6 +106,19 @@ Server side this is the ordinary new-key checklist: `RawConfig`, `Settings`,
 `load`, `PROJECT_KEYS`, the bool arm in `validate`, a `push` row in
 `settings_view` (and the key-order assertion that pins the row list).
 
+### Focus nobody gave (found in review)
+
+`mountTab` focuses every terminal it mounts, including one mounted because
+*another client* activated it. An idle second device with roost in front
+would then hold keyboard focus in that terminal and read its notices for you —
+your laptop's dot clears, and nobody touched the desktop. So focus roost gave
+by itself (`autoFocused`) is not watching until a hand lands in that terminal
+(`pointerdown` or `keydown` inside it). A mount that follows this page's own
+`focusSession` — a tab click, a notice, a desktop-notification click — is a
+hand (`handFocus`). The alternative, `mountTab` focusing only on local
+activation, would also stop a remote layout change stealing the editor's
+focus; it changes more than this feature, and is left for its own issue.
+
 ## What it does not do
 
 - **Other windows still banner.** Suppression is per client. The window you
