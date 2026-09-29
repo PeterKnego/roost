@@ -141,9 +141,16 @@ One function, used by both intents. Every failure is its own refusal.
 1. `git status --porcelain=v2 -z` in the project directory, parsed by a `-z`
    variant of `parse_status` (the display parser splits lines and would
    misread a quoted or newline-bearing name). A spawn failure, a non-zero exit
-   or a timeout: refuse. Exit 0 with no output is a clean tree, a real answer;
-   in a `Revert` it yields an empty plan, whose token cannot match the one the
-   dialog was built from, so it is refused there without a special case.
+   or a timeout: refuse. Exit 0 with no output is a clean tree, a real answer,
+   and it yields an empty plan. **An empty plan is refused by its own guard,
+   `plan.paths.is_empty()` in `run_revert`, and the token does not cover it.**
+   A tree that went clean after a non-empty preview is refused by the token;
+   but when the preview was empty too (a nested project whose only change is
+   in its parent, say) both tokens hash the same empty basis and match. The
+   guard is then all that stops `stash push --` with no paths, which stashes
+   the whole repository, the parent's files included. It looks redundant next
+   to the token check and is not: `an_empty_plan_is_never_pushed` fails
+   without it.
    Any unmerged (`u`) entry: refuse.
 2. A merge, rebase, cherry-pick or revert in progress: refuse. Checked from
    the git dir with `symlink_metadata`: `NotFound` is absent, any other error
