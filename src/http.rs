@@ -127,6 +127,32 @@ pub fn respond_with(
     let _ = w.flush();
 }
 
+/// Every JSON response (#116).
+///
+/// `nosniff` for the same reason the static branch sends it: the body contains
+/// project names and branch names, which come from the filesystem, and a
+/// browser free to sniff a JSON document as HTML would be rendering them in
+/// roost's own origin.
+pub fn json(w: &mut impl Write, v: &impl serde::Serialize) {
+    match serde_json::to_vec(v) {
+        Ok(body) => respond_with(
+            w,
+            200,
+            "OK",
+            "application/json",
+            &[("X-Content-Type-Options", "nosniff")],
+            &body,
+        ),
+        // A serialization failure is roost's bug, not the caller's, and it
+        // must not answer 200 with an empty body — a client would read that as
+        // "no projects".
+        Err(e) => {
+            eprintln!("roost: json encode failed: {e}");
+            respond(w, 500, "Internal Server Error", "text/plain; charset=utf-8", b"encode failed")
+        }
+    }
+}
+
 /// Every HTML response, page or fragment.
 ///
 /// The `img-src` policy is a backstop, not the mechanism: `render::markdown_html`

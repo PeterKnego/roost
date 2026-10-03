@@ -248,6 +248,9 @@ main { flex: 1; min-height: 0; }
   padding: 2px 7px; border-radius: 3px; pointer-events: none;
   font: 11px/1.6 var(--mono); color: var(--bg);
   background: var(--warn, #d79921);
+  /* A refusal's reason (#123) runs to a sentence; wrapped inside the pane
+     rather than spilling past its left edge, where it could not be read. */
+  max-width: calc(100% - 16px);
 }
 /* Copy-on-select has to announce itself. The clipboard is invisible, and a
    copy that silently does nothing is precisely the failure this replaced — so
@@ -961,6 +964,13 @@ dialog.roost::backdrop { background: rgba(0,0,0,.35); }
 .dlg-input { width: calc(100% - 28px); margin: 0 14px; padding: 5px 7px;
              background: var(--bg); color: var(--fg); font: inherit;
              border: 1px solid var(--border); border-radius: 4px; }
+/* Select mode (#110): the terminal's touch drags select instead of scrolling.
+   Marked with an outline rather than only a colour, because the state changes
+   what a drag *does* and has to be legible at a glance — and because a colour
+   alone is the one cue a themed roost can quietly drop. */
+.termhost.selecting { outline: 2px solid var(--accent); outline-offset: -2px; }
+#termkeys button[aria-pressed="true"] { background: var(--accent); color: var(--bg); }
+
 /* The paste fallback's box (#97). Tall enough to show that it takes more than
    one line, and resizable only downward — a textarea that can be dragged wider
    than its dialog is a scrollbar waiting to happen. */
@@ -984,6 +994,9 @@ dialog#dlg-menu { position: fixed; margin: 0; width: max-content;
    the surface it is drawn on, so it lifts in a dark theme and darkens in a
    light one. See its rationale at the top of this file. */
 .dlg-item:hover, .dlg-item:focus { background: var(--row-on); outline: none; }
+/* A command that cannot run here still names itself and why (#125). */
+.dlg-item:disabled { opacity: .55; cursor: default; }
+.dlg-item .dlg-hint { display: block; font-size: 11px; color: var(--muted); }
 /* ---- settings dialog ---- */
 dialog.roost.dlg-wide { width: min(760px, 96vw); }
 .dlg-tabs { display: flex; gap: 2px; padding: 8px 14px 0; border-bottom: 1px solid var(--border); }
@@ -1143,6 +1156,14 @@ dialog.roost.dlg-wide { width: min(760px, 96vw); }
    borrows the config warning's colour because it is the same kind of news. */
 #connstate { color: #d29922; cursor: help; font-weight: 500; white-space: nowrap; }
 #connstate[data-state="offline"] { color: var(--del-fg, #cf222e); }
+/* The update mark: quiet, beside the chips, on every project page and not
+   on the overview. Clicking it opens the update dialog. */
+#updmark { height: 24px; padding: 0 8px; border-radius: 6px; border: 1px solid var(--accent);
+           background: none; color: var(--accent); cursor: pointer; font: inherit; white-space: nowrap; }
+#updmark:hover { background: var(--tool); }
+.dlg-cmd { font-family: var(--mono); font-size: 12px; background: var(--tool); padding: 8px; border-radius: 6px;
+           white-space: pre-wrap; user-select: all; }
+.dlg-progress { color: var(--muted); }
 /* The project name is the switcher's other trigger, so it has to look like a
    control rather than a label — a click target that does not look like one is
    the same problem in a quieter coat. It keeps the header's text colour and

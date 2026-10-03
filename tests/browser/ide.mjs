@@ -214,7 +214,7 @@ await Deno.mkdir(`${projectDir}/.roost`, { recursive: true });
 // longer reach it — which is the point of the move. `ROOST_CONFIG` is how a
 // test points roost at a global file it owns.
 const globalConfig = `${fx.base}/roost-global.toml`;
-await Deno.writeTextFile(globalConfig, "share_selection = true\n");
+await Deno.writeTextFile(globalConfig, "share_selection = true\nversion_check = false\n");
 
 // `let`, not `const`: section J restarts roost on a new port partway
 // through the run and reassigns this to the new instance, so the `finally`

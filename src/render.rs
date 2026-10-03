@@ -35,6 +35,15 @@ pub fn diff_html(diff: &str) -> String {
         .collect()
 }
 
+/// The "Revert all" confirmation's detail: which paths, with their XY codes.
+/// Escaped like every other interpolation; `askChoice` sets it as innerHTML.
+pub fn revert_list_html(paths: &[crate::revert::PlanPath]) -> String {
+    paths
+        .iter()
+        .map(|p| format!("<div class=\"dl ctx\">{} {}</div>", esc(&p.xy), esc(&p.path)))
+        .collect()
+}
+
 /// The hunk view for an `openDiff` proposal Claude is still waiting on an
 /// answer for. Same shape as the `diff` fragment's own output (a `.path`
 /// breadcrumb over a `.diffview` of `diff_html`-classified lines) — reusing
@@ -927,8 +936,9 @@ pub fn changes_fragment(project: &str, st: &Status) -> String {
     );
     for c in &st.changes {
         out.push_str(&format!(
-            "<li><a class=\"file\" data-rel=\"{}\" data-ext=\"{}\" hx-get=\"/frag/{}/diff?path={}\" hx-target=\"#content\"><span class=\"xy\">{}</span>{}</a></li>",
+            "<li><a class=\"file\" data-rel=\"{}\" data-xy=\"{}\" data-ext=\"{}\" hx-get=\"/frag/{}/diff?path={}\" hx-target=\"#content\"><span class=\"xy\">{}</span>{}</a></li>",
             esc(&c.path),
+            esc(&c.xy),
             icon_ext(c.path.rsplit('/').next().unwrap_or(&c.path)),
             project_url,
             crate::http::percent_encode(&c.path),
@@ -1093,13 +1103,31 @@ fn av(rel: &str) -> String {
 
 fn icon_links() -> String {
     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let v = VERSION
-        .get_or_init(|| asset_hash(&["favicon.ico", "favicon-32.png", "logo.svg", "apple-touch-icon.png"]));
+    let v = VERSION.get_or_init(|| {
+        asset_hash(&[
+            "favicon.ico",
+            "favicon-32.png",
+            "logo.svg",
+            "apple-touch-icon.png",
+            "manifest.webmanifest",
+            "icon-192.png",
+            "icon-512.png",
+        ])
+    });
+    // `crossorigin="use-credentials"`, and it is not boilerplate (#112). A
+    // manifest is fetched as a *no-credentials* request by default. roost is
+    // normally reached through Cloudflare Access, which answers an
+    // unauthenticated request with a redirect to a login page — so the default
+    // fetch retrieves an HTML login page instead of the manifest, the parse
+    // fails, and the only symptom is that Add to Home Screen quietly produces
+    // a bookmark rather than an app. With credentials the session cookie rides
+    // along and the real file comes back.
     format!(
         "<link rel=\"icon\" href=\"/static/favicon.ico?v={v}\" sizes=\"32x32\">\n\
          <link rel=\"icon\" type=\"image/png\" href=\"/static/favicon-32.png?v={v}\" sizes=\"32x32\">\n\
          <link rel=\"icon\" type=\"image/svg+xml\" href=\"/static/logo.svg?v={v}\">\n\
-         <link rel=\"apple-touch-icon\" href=\"/static/apple-touch-icon.png?v={v}\">\n"
+         <link rel=\"apple-touch-icon\" href=\"/static/apple-touch-icon.png?v={v}\">\n\
+         <link rel=\"manifest\" href=\"/static/manifest.webmanifest?v={v}\" crossorigin=\"use-credentials\">\n"
     )
 }
 
@@ -1880,6 +1908,7 @@ pub fn workspace_page(
   <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body, git from:body"></span><span id="wtlabel"></span></button>
   {warn}
   <span id="connstate" hidden></span>
+  <button id="updmark" title="" hidden></button>
   {sharing_indicator}
   <label id="searchbox" for="searchinput" title="search this project (ctrl-shift-F or ⌘⇧F)">{SVG_SEARCH}<input id="searchinput" type="search" autocomplete="off" spellcheck="false" placeholder="Search files, contents, sessions" aria-label="Search files, contents, sessions"><kbd>⇧⌃F</kbd></label>
   <button id="projbtn" title="running projects">{SVG_DIAMOND}<span id="projcount"></span></button>
@@ -1915,6 +1944,18 @@ pub fn workspace_page(
        so on a phone this button is the only way clipboard text reaches a
        terminal at all. -->
   <button type="button" data-k="paste">paste</button>
+  <!-- #110. xterm draws its own selection layer and drives it from *mouse*
+       events, and on touch a drag is consumed by scrolling and never becomes
+       one — so a phone could not select terminal text at all, which is why
+       copy-on-select and the OSC 52 handler could never fire there. This
+       suspends the scroll translation so a drag selects instead. -->
+  <button type="button" data-k="select" aria-pressed="false">select</button>
+  <!-- The row is full. Measured at 390px, eight buttons are 44px wide each —
+       exactly the tap-target floor ~/projects/CLAUDE.md sets. A ninth needs
+       something else: a second row, an overflow, or a control that earns its
+       place by displacing one of these. `tests/browser/paste.mjs` asserts the
+       count and the width, so adding one fails there rather than shipping a
+       button too small to hit. -->
 </div>
 <nav id="mobilebar" aria-label="pane">
   <button type="button" data-mpane="0" aria-pressed="false">{SVG_M_TREE}<span>Files</span></button>
@@ -1968,6 +2009,17 @@ pub fn workspace_page(
   <div class="dlg-detail" hidden></div>
   <div class="dlg-buttons">
     <button type="button" class="dlg-cancel">Cancel</button>
+  </div>
+</dialog>
+<dialog id="dlg-update" class="roost">
+  <h2 class="dlg-title"></h2>
+  <div class="dlg-body"></div>
+  <pre class="dlg-cmd" hidden></pre>
+  <p class="dlg-progress" hidden></p>
+  <div class="dlg-buttons">
+    <button type="button" class="dlg-skip"></button>
+    <button type="button" class="dlg-later">Later</button>
+    <button type="button" class="dlg-ok"></button>
   </div>
 </dialog>
 <dialog id="dlg-settings" class="roost dlg-wide">
@@ -3062,6 +3114,17 @@ mod tests {
         assert!(clean.contains("working tree clean"));
     }
 
+    /// The client decides the menu's disabled state from this; a row without
+    /// it would offer Revert on an untracked file and let the server say no.
+    /// `"` in the fixture because `esc` is what stands between an XY code and
+    /// the attribute (XY never holds one, but the rule is "escape everything").
+    #[test]
+    fn change_rows_carry_their_xy() {
+        let st = Status { changes: vec![crate::gitio::Change { xy: "??".into(), path: "n.txt".into() }], ..Default::default() };
+        let h = changes_fragment("p", &st);
+        assert!(h.contains(r#"data-rel="n.txt""#) && h.contains(r#"data-xy="??""#), "{h}");
+    }
+
     #[test]
     fn status_fragment_reports_the_git_state_like_a_shell_prompt() {
         use crate::gitio::{Change, Status};
@@ -3456,9 +3519,10 @@ mod tests {
     fn the_workspace_page_ships_empty_dialog_shells() {
         let s = crate::config::Settings::default();
         let html = workspace_page("proj", "proj", &s, None, false, &[]);
-        for id in ["dlg-confirm", "dlg-text", "dlg-menu", "dlg-choice", "dlg-settings"] {
+        for id in ["dlg-confirm", "dlg-text", "dlg-menu", "dlg-choice", "dlg-settings", "dlg-update"] {
             assert!(html.contains(&format!(r#"id="{id}""#)), "no {id} shell");
         }
+        assert!(html.contains(r#"<button id="updmark" title="" hidden></button>"#), "the mark ships hidden and empty");
         // Filled from JS with textContent, so they must ship empty — the same
         // rule the notification centre follows above. A shell carrying text
         // would mean a path was interpolated into HTML somewhere.
@@ -4275,7 +4339,7 @@ mod tests {
         assert!(h.contains(r#"<div class="dlg-body"></div>"#), "the choice body must ship empty");
     }
 
-    /// #97. The paste button and the dialog it falls back to.
+    /// #97's paste button and its fallback dialog, and #110's select toggle.
     ///
     /// iOS raises no Paste callout over a terminal, so on a phone this button
     /// is the only route from the clipboard into a shell.
@@ -4297,7 +4361,15 @@ mod tests {
             let rest = &bar[i + 8..];
             &rest[..rest.find('"').expect("a closing quote")]
         }).collect();
-        assert_eq!(keys, vec!["esc", "tab", "up", "down", "enter", "ctrlc", "paste"], "bar order changed");
+        // #110 appended `select` after `paste`. Both are appended rather than
+        // slotted among the six keys, for the reason the markup comment gives:
+        // the keys are in the order a hand reaches for them, and inserting
+        // among them moves buttons people have already learned the place of.
+        assert_eq!(
+            keys,
+            vec!["esc", "tab", "up", "down", "enter", "ctrlc", "paste", "select"],
+            "bar order changed"
+        );
 
         // The fallback shell, shipped empty: `askPasteText` fills the title and
         // label with textContent, and the box must start empty or a stale
@@ -4314,5 +4386,71 @@ mod tests {
         // zooms the page when the box takes focus — on the one dialog that
         // only ever opens on a phone.
         assert!(h.contains(r#"id="dlg-paste-text" class="dlg-input""#), "{h}");
+    }
+
+    /// #110. Select mode is a *state*, so the button has to say which state it
+    /// is in to something that is not looking at a colour.
+    #[test]
+    fn the_select_toggle_ships_unpressed_and_announces_its_state() {
+        let h = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
+        assert!(
+            h.contains(r#"<button type="button" data-k="select" aria-pressed="false">select</button>"#),
+            "the select button must ship with an explicit unpressed state: {h}"
+        );
+    }
+
+    /// #112. Without a manifest, Add to Home Screen gives a bookmark rather
+    /// than an app — and on iOS there is then no route to Web Push at all,
+    /// which is what #113 needs.
+    #[test]
+    fn both_pages_link_an_installable_manifest_with_credentials() {
+        let work = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
+        let front = overview_page("", &["/tmp/a".to_string()]);
+        for (name, html) in [("workspace", &work), ("front page", &front)] {
+            assert!(
+                html.contains(r#"<link rel="manifest" href="/static/manifest.webmanifest?v="#),
+                "the {name} does not link the manifest"
+            );
+            // The detail that decides whether this works at all behind
+            // Cloudflare Access: a manifest is fetched without credentials by
+            // default, and Access answers that with a login page. The parse
+            // then fails and the only symptom is a bookmark instead of an app.
+            assert!(
+                html.contains(r#"manifest.webmanifest?v="#) && html.contains(r#"crossorigin="use-credentials""#),
+                "the {name}'s manifest link must carry credentials"
+            );
+        }
+    }
+
+    /// The manifest is real JSON, declares the fields that make an install an
+    /// install, and names icons that exist.
+    #[test]
+    fn the_manifest_is_installable_and_its_icons_are_on_disk() {
+        let raw = crate::assets::get("manifest.webmanifest").expect("manifest must be embedded");
+        let v: serde_json::Value = serde_json::from_slice(&raw).expect("manifest must be valid JSON");
+        assert_eq!(v["display"], "standalone", "a bookmark is not an install");
+        // The project list, not a project: roost serves many, and an installed
+        // app pinned to one is wrong for the tool.
+        assert_eq!(v["start_url"], "/");
+        // Must cover /ws/ and /frag/, or the app leaves its own scope on the
+        // first fragment fetch and the browser hands it back to Safari.
+        assert_eq!(v["scope"], "/");
+        let icons = v["icons"].as_array().expect("icons must be a list");
+        assert!(!icons.is_empty(), "a manifest with no icons installs without one");
+        for icon in icons {
+            let src = icon["src"].as_str().expect("each icon needs a src");
+            let rel = src.strip_prefix("/static/").expect("icons are served from /static/");
+            assert!(
+                crate::assets::get(rel).is_some(),
+                "{src} is named by the manifest but is not embedded"
+            );
+        }
+    }
+
+    #[test]
+    fn revert_list_html_escapes_paths() {
+        let h = revert_list_html(&[crate::revert::PlanPath { path: "<b>.rs".into(), xy: ".M".into() }]);
+        assert!(h.contains("&lt;b&gt;.rs") && !h.contains("<b>"), "{h}");
+        assert!(h.contains(".M"), "{h}");
     }
 }

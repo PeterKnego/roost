@@ -158,6 +158,15 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     );
     let Ok(mut ws_read) = accepted else { return };
 
+    // Lazily, when a browser connects, and only if the stored answer is stale
+    // — a roost left running for a month makes no request until someone looks
+    // at it. Here rather than in `serve`: after the Origin check, so a refused
+    // handshake fires nothing, and before the hub lock below, so nothing is
+    // held across it. It returns at once; the connection never waits for the
+    // request, which runs on a detached thread. Single-flight for the whole
+    // process, so ten tabs are one request.
+    crate::version::maybe_check();
+
     // Obtained *before* any hub lock is taken, and the registry lock inside
     // for_project is released before this call returns: a socket thread must
     // never hold a hub lock while acquiring the registry lock, or two threads
@@ -378,6 +387,58 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
                         }
                     }
                     continue;
+                }
+                // Diverted like a restore, and for the same reason: a revert
+                // is several git calls, the push among them with no deadline
+                // at all (killing it partway is the half-state it must not
+                // leave), and this lock is what every other socket on the
+                // project waits on. Inline, one at a time per connection.
+                // Wrapped because a panic here would escape a socket thread
+                // (CLAUDE.md).
+                if let Ok(proto::Intent::RevertPreview { rel }) = decoded {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::revert::run_preview(&hub, &id, rel, &crate::worktree::real_git)
+                    }));
+                    if r.is_err() {
+                        Hub::lock(&hub).send_to(&id, &proto::Event::Error { msg: "revert preview failed".into() });
+                    }
+                    continue;
+                }
+                if let Ok(proto::Intent::Revert { rel, token, discard_buffers }) = decoded {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::revert::run_revert(
+                            &hub, &id, rel, token, discard_buffers,
+                            &crate::worktree::real_git, &crate::worktree::real_git_unbounded,
+                        )
+                    }));
+                    if r.is_err() {
+                        Hub::lock(&hub).send_to(&id, &proto::Event::Error { msg: "revert failed; check git stash list".into() });
+                    }
+                    continue;
+                }
+                // Diverted like Search and RestoreWorkspace: an update is a
+                // download and two probes, a choice is a file write that
+                // every hub then hears about, and the reply must reach only
+                // this connection. `update::start` takes the hub lock itself,
+                // briefly, once per phase; nothing here holds it.
+                match &decoded {
+                    Ok(proto::Intent::Update) => {
+                        crate::update::start(hub.clone(), id.clone(), crate::update::http_get_bytes);
+                        continue;
+                    }
+                    Ok(proto::Intent::DeferUpdate) => {
+                        if let Err(msg) = crate::update::apply_defer(crate::errlog::now_secs()) {
+                            Hub::lock(&hub).send_to(&id, &proto::Event::Error { msg });
+                        }
+                        continue;
+                    }
+                    Ok(proto::Intent::SkipUpdate { version }) => {
+                        if let Err(msg) = crate::update::apply_skip(version) {
+                            Hub::lock(&hub).send_to(&id, &proto::Event::Error { msg });
+                        }
+                        continue;
+                    }
+                    _ => {}
                 }
                 let dirty = {
                     let mut h = Hub::lock(&hub);

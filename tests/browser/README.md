@@ -48,6 +48,8 @@ deno run -A tests/browser/search.mjs     # the search overlay (⇧⌃F), its res
 deno run -A tests/browser/themes.mjs     # a daisyUI theme name reaches paint through data-theme and the bridge; a roost theme is untouched
 deno run -A tests/browser/settings.mjs   # the settings dialog: live theme preview, Save/Cancel, both scopes, read-only keys refused
 deno run -A tests/browser/roots.mjs      # no roots: the front page explains and Add path works; + adds another; a bad path is refused
+deno run -A tests/browser/version.mjs    # the About Latest row: five renderings, and the harness's off switch
+deno run -A tests/browser/update.mjs     # the update mark, dialog, Later/Skip, and the About row's button (#65 step 4); plants a fresh check.json so no request fires
 deno run -A tests/browser/nonascii.mjs   # the editor's non-ASCII indicator and highlight toggle: count, accent, marks under the glyphs, cap, persistence
 deno run -A tests/browser/notices.mjs    # the bell panel holds only this project's notices, and Clear empties only what it shows
 deno run -A tests/browser/dialogs.mjs    # the dialog primitive: askConfirm/askText/askMenu's exits, focus restoration, and a guard that no code path reaches a native confirm/prompt/alert
@@ -57,7 +59,11 @@ deno run -A tests/browser/popups.mjs     # the header's popups: one open at a ti
 deno run -A tests/browser/treefollow.mjs # the tree expands to the active file and marks it, without collapsing what the user opened
 deno run -A tests/browser/treemention.mjs # ctrl/shift-click picks tree rows and Alt+K mentions them, in tree order and bounded
 deno run -A tests/browser/watchdog.mjs   # the workspace connection's visible state, and send() refusing instead of silently dropping
+deno run -A tests/browser/download.mjs   # right-click → Download: a real navigation, a real file on disk, and the label that says which version (#120)
+deno run -A tests/browser/touchfiles.mjs # the file menu on a folder, Upload files… without a drag, and terminal select mode (#110)
 deno run -A tests/browser/paste.mjs      # the terminal key bar's paste button (#97): bracketed vs bare at the pty, and the textarea fallback when the clipboard says no
+deno run -A tests/browser/nodtach.mjs    # a host without dtach says so on the terminal, and does not reconnect into the refusal (#123)
+deno run -A tests/browser/revert.mjs     # revert from the Changes pane and a Diff tab: the git menu, the disabled hints, cancel vs confirm, and the stash on disk (#125)
 deno run -A tests/browser/backup.mjs     # backing a workspace up and restoring it into a *different* project (#18 step 3) — needs its own HOME, like claudemenu.mjs
 ```
 
@@ -126,6 +132,33 @@ and one in `mdlinks.mjs` that passed while asserting nothing — and, in
 the tree ~3 times a second on its own. That last one was a real defect
 (`watch::is_access`), found only because the deleted-code check was actually
 performed.
+
+- In `download.mjs`: making the Download item unconditional fails section C —
+  it appears on a folder. Dropping the `dirty` branch in the label fails D.
+  Both drive a **real navigation** and a real file on disk rather than a
+  `fetch`: the menu item is a top-level navigation, which is exactly why the
+  route needs no `Origin` check, and a `fetch` would exercise a path no user
+  takes and pass against a menu item that navigates nowhere.
+
+- In `touchfiles.mjs`: dropping the `isDir` branch in `fileMenu` reproduces the
+  reported bug exactly — a nested folder offers `a/untitled.txt` and a
+  top-level one `untitled.txt`, the project root — while the file and
+  blank-space controls stay green.
+
+  Binding the folder menu to `details` instead of `details > summary`
+  **passed**, and the fix was to the test, not the code. Every assertion was
+  about folders and blank space; a file row lives *inside* its folder's
+  element and the `<a>` handler does not stop propagation, so that swap opens
+  two menus on every file in an expanded folder. `file.menus === 1` now
+  catches it.
+
+- In `nodtach.mjs`: making `onclose` say "session ended" regardless of the
+  close reason fails 3 in section A. Dropping the badge's `max-width` fails 1.
+  A `white-space: normal` beside it failed nothing when removed alone — the
+  badge already inherits it — so it was deleted rather than kept as
+  unexplained insurance. roost's own `PATH` is a symlink farm minus `dtach`,
+  not `ROOST_CMD`: the failure under test is the real default command, which
+  only a real lookup reaches.
 
 - In `paste.mjs`: `term.input` instead of `term.paste` fails B and D — and C,
   which the plan had predicted would stay green. That prediction was wrong in a
@@ -520,6 +553,67 @@ performed.
   the accessibility tree does not carry it (both checked, not assumed), and in
   the editor `elementFromPoint` hits the textarea stacked over the gutter. CDP's
   `DOM.getBoxModel` against the pseudo-element node is the only way in.
+
+- In `revert.mjs`: each section is revert-checked against a break in
+  `static/app.js` (the Changes/Diff menu wiring, `confirmRevert`'s focus and
+  its `Revert` send, `revertBlock`'s hints). Four traps found doing it, each
+  commented at its site:
+
+  - `closeMenu()` cannot be `el.close()`. `dialog.js`'s `runDialog` clears
+    its one-dialog-at-a-time gate only inside `finish`, which a bare
+    `.close()` bypasses, so the next `askMenu`/`askChoice` silently resolves
+    dismissed with no dialog shown. Dismiss with a real CDP Escape keypress.
+  - Enter must be a trusted CDP `Input.dispatchKeyEvent`. `askChoice` has no
+    keydown handler; only the browser's native "Enter activates the focused
+    button" can act, and it ignores a synthetic `KeyboardEvent`. With the
+    untrusted form, the `.click()` that followed was the only thing tested.
+  - Settle before reading the file after the dialog closes. Discard closes
+    the dialog exactly like Cancel, and the revert is an async round trip;
+    an immediate read passed under the `focus: "first"` break on timing luck.
+  - One file per section, and a before/after stash count. When C and D
+    shared `a.txt`, a C that really discarded it let D pass off C's
+    leftovers; C now uses `c.txt` alone and D asserts exactly one new entry.
+
+  A missing row makes `rightClick`/`openConfirm` fail an assertion rather
+  than throw, so a break that discards a file early still reports every
+  later section instead of crashing the run.
+
+- In `version.mjs`: making `latestLabel` fall through to "up to date" instead
+  of "could not check" fails 5 — the two `unknown` rows, the unrecognised-
+  status row, and both `label(null)`/`label({})` rows: the whole point of a
+  three-valued answer is the one variant that is not cheerful. Dropping its
+  `off` case fails 2 — section B's row assertion and the last row of section
+  C, since a status of `off` now falls through to the same default as no
+  status at all. Removing `ROOST_CONFIG` from `startRoost` fails 2, not 1: with
+  no config file the state file is also absent, so the server reports `never`
+  rather than `off`, failing both section A's `status === "off"` assertion and
+  section B's row text — the fixture-that-silently-does-nothing trap this
+  section exists to catch, and here it would also mean the suite was hitting
+  crates.io on every connect.
+
+- In `update.mjs`: dropping the `b.channel !== "checkout"` clause from
+  `updateWanted` (`static/app.js`) fails 3, not 1 — "no mark for a checkout"
+  as expected, plus "and no dialog" and "the command is shown instead",
+  because the mark now shows and the dialog auto-opens on the very first
+  render, before section B gets to assert either was still absent; the
+  cascade is real, and the fix is still one clause. Sending `DeferUpdate`
+  instead of `SkipUpdate` from the Skip button fails 4 from section D on
+  (the snapshot never carries the skip, the mark never disappears, the row
+  never reads "skipped", and the un-skip after restart has nothing to
+  restore). Planting a *stale* `checked_at` (25 hours old) instead of a fresh
+  one fails section A's byte-identical assertion as the header predicts, but
+  on a host with real internet access — this one — the cascade goes further
+  than a single fixture-author's environment without it: the real check
+  succeeds, overwrites `check.json` with this crate's actual published
+  version, and every hardcoded `"999.x"` assertion downstream disagrees with
+  it, ending in an uncaught `TypeError` on a `null` `.click()` in section E
+  once the row it expected is simply not there. That is still the same
+  underlying failure — a real request went out — just louder than "FAIL 1"
+  when the request does not fail closed. Section F's own revert (the
+  controller-required proof; see the file's own header for what it isolates
+  and why) fails exactly 1 — the "saw it almost immediately" assertion —
+  with every other assertion in the section, including the refusal text,
+  staying green.
 
 Five things will make a browser test lie to you here. Each is commented at its
 site; do not "simplify" them away:

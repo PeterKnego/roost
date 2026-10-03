@@ -11,7 +11,7 @@ const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) 
 
 const fx = await fixture();
 const globalToml = `${fx.base}/global.toml`;
-await Deno.writeTextFile(globalToml, "# global\ntheme = \"dark\"\n");
+await Deno.writeTextFile(globalToml, "# global\ntheme = \"dark\"\nversion_check = false\n");
 const projToml = `${fx.dir}/.roost/config.toml`;
 const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { ROOST_CONFIG: globalToml } });
 const browser = await startBrowser(profileDir(repoRoot));
@@ -110,7 +110,7 @@ try {
   const labels = await one.evalIn(`[...document.querySelectorAll("#dlg-settings .dlg-row")].map((l) => l.dataset.key).join(",")`);
   // No theme row here: the theme is chosen on the Theme pane, which also
   // carries its source line and Clear.
-  ok(labels === "hide,show_hidden,autosave,follow_tree,share_selection,worktree_prompt,relaunch,allowed_origins,max_upload_bytes,ide,roots", `rows in the spec's order, without theme (${labels})`);
+  ok(labels === "hide,show_hidden,autosave,follow_tree,read_when_watching,share_selection,worktree_prompt,relaunch,version_check,allowed_origins,max_upload_bytes,ide,roots", `rows in the spec's order, without theme (${labels})`);
   ok(/keystroke/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="autosave"] .doc').textContent`)), "each row explains what the setting does");
   {
     const h = await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="autosave"]').getBoundingClientRect().height`);

@@ -10,6 +10,49 @@ added later never reaches the release page.
 Keep the newest section at the top, and say what a change means for someone
 running roost rather than what the diff did.
 
+## v0.7.0 — 2026-09-30 — roost tells you when there is a newer roost
+
+roost now knows what the newest published version is, and says so. The
+machinery to replace itself from a button is in this release too, but it stays
+switched off until the release signing key exists (#87): a release built
+without that key offers no button to anyone.
+
+- **A Latest row in About.** roost reads the newest published version from the
+  crates.io index and says one of: *0.x.y available*, *up to date*, *could not
+  check*, *not checked yet*, or *version checks are off*. It asks when a browser
+  opens a project — never on a timer, so a roost nobody is looking at makes no
+  requests — at most once a day after a success, hourly after a failure, and it
+  honours `HTTPS_PROXY`. `version_check = false` in the global config turns it
+  off. "Could not check" is never folded into "up to date", including after a
+  long run of failures.
+- **An ↑ mark when a newer version is out.** Once a version newer than this one
+  is published, the header shows `↑ 0.x.y` and a dialog offers *Later* (a day)
+  or *Skip 0.x.y*, with the upgrade command for how this copy was installed.
+  When the dialog opens by itself it focuses *Later*, so a keystroke meant for
+  a terminal cannot start anything. A checkout build shows no mark.
+- **The self-update, dormant.** For a release install that may replace itself,
+  a future signed release adds an *Update* button: roost downloads the tarball
+  and its signature, verifies the signature before opening anything, checks
+  the new binary answers `--version`, swaps it in, and restarts in place so
+  your terminals survive. It needs a key compiled in; this release has none.
+- **A terminal you are looking at has nothing unread.** A notice from the
+  terminal you are typing in is read on arrival and raises no desktop banner,
+  and returning to the page or clicking into a terminal reads the ones waiting
+  for it. `read_when_watching = false` keeps them unread until clicked.
+- **Revert from the Changes pane and the Diff tab**, instead of the file-tree
+  menu that appeared there.
+- **Download a file from the tree** — the other half of upload.
+- **Agents can ask what other agents are doing.** `roost sessions` lists them
+  and `roost wait` blocks until one finishes.
+- **Install roost to a phone's home screen**, and a JSON surface a native app
+  can read instead of scraping HTML.
+- **The Files pane and the terminal work by touch.**
+- **A missing `dtach` says so** on the terminal, instead of "session ended".
+
+Under the hood: roost now makes HTTPS requests itself, so the release binary
+carries rustls and ring (pure webpki roots, no OpenSSL), and building it for
+musl needs `musl-tools`.
+
 ## v0.6.0 — 2026-09-15 — roost on a phone, and a workspace you can carry
 
 The largest release so far: 108 commits. Three themes dominate — roost became

@@ -42,6 +42,20 @@ let SHOW_HIDDEN_DEFAULT = document.body.dataset.showHidden === "1";
 // like SHOW_HIDDEN_DEFAULT: it changes only when someone edits a config file,
 // which already needs a reload to take effect.
 let AUTOSAVE = document.body.dataset.autosave === "1";
+// Whether a notice for the terminal you are looking at is read on sight.
+// Not embedded like AUTOSAVE: followSettings() re-reads it from every
+// snapshot, and "watching" needs a laid-out snapshot anyway, so there is no
+// moment before the first State when the value is wanted.
+let READ_WHEN_WATCHING = true;
+// The terminal mountTab last focused by itself, until a hand lands in it.
+// mountTab focuses whatever terminal a snapshot mounts — including one
+// another client activated — so on an idle second device with roost in
+// front, keyboard focus alone would have it reading your notices for you.
+let autoFocused = null;
+// The session a gesture on this page just asked focusSession for — a tab
+// click, a notice, a desktop notification. The mountTab that follows is
+// that gesture's doing, so its focus is a hand's, not autoFocused.
+let handFocus = null;
 // Whether the editor's current selection is sent to Claude as ambient
 // context, embedded once per page load like AUTOSAVE and SHOW_HIDDEN_DEFAULT.
 // Off unless the project's config opted in (Settings::share_selection); the
@@ -546,6 +560,11 @@ function connectControl() {
   ctrl = sock;
   sock.onopen = () => {
     if (ctrl !== sock) return;
+    // The server said it was restarting and this is the first socket the
+    // new process accepted. Reload, so the page learns the new version the
+    // way every client does — the dialog reads "restarting roost…" until
+    // then, not "reconnecting".
+    if (reloadOnReconnect) { location.reload(); return; }
     ctrlTries = 0;
     ctrlWarned = false;
     setConnState("live");
@@ -847,6 +866,16 @@ function onEvent(ev) {
       // so that State's render() swaps the "not a git repo" offer for the
       // normal start hint on its own — nothing else needed here.
       break;
+    case "RevertPlan":
+      confirmRevert(ev);
+      break;
+    case "Reverted":
+      if (ev.ok) { showBanner(ev.msg); break; }
+      showError(ev.msg);
+      // The dialog was built on something that no longer holds; show the
+      // user what is true now instead of leaving them to right-click again.
+      if (ev.stale) send({ t: "RevertPreview", rel: ev.rel ?? null });
+      break;
     case "CloseRefused":
       // Backstop only: the Close button's own handler already checks
       // dirty buffers before ever sending CloseProject. This covers a
@@ -929,6 +958,13 @@ function onEvent(ev) {
         // The dialog was closed while the restore ran. A refusal still has to
         // land somewhere — silence here is a restore that looks like it worked.
         showError(ev.refused);
+      }
+      break;
+    case "UpdateProgress":
+      if (ev.phase === "restarting") reloadOnReconnect = true;
+      if (ev.phase === "failed") reloadOnReconnect = false;
+      if (updateOpen) {
+        try { updateOpen.onProgress(ev); } catch (e) { console.error("roost: the update dialog's onProgress threw", e); updateOpen = null; }
       }
       break;
     case "Notice": onNotice(ev.notice); break;
@@ -1561,6 +1597,15 @@ function mountTab(content, t) {
   // response landing after the pane has moved on (e.g. to a Terminal tab)
   // must not clobber whatever is here now — see the dataset.url check below.
   delete content.dataset.url;
+  // What wireFragment keys its context menu on: a tree gets the file menu,
+  // Changes and Diff the git menu (#125). On the element, not passed along,
+  // because htmx:afterSwap also calls wireFragment with only the element.
+  // Set here, before any early return below, because `.content` is reused
+  // across tabs — a Terminal, Edit-mode File or Proposal tab returns before
+  // reaching the generic fetch branch, and would otherwise keep a stale
+  // dataset.kind from whatever tab was mounted here last.
+  content.dataset.kind = t.k;
+  content.dataset.rel = t.k === "Diff" ? (t.rel || "") : "";
   if (t.k === "Terminal") {
     const liveNow = state.live_sessions.includes(t.session);
     // Only attach when a session already exists (state.live_sessions, or a
@@ -1574,7 +1619,13 @@ function mountTab(content, t) {
     const e = ensureTerm(t.session);
     content.appendChild(e.node);   // MOVE, not rebuild — the socket survives
     requestAnimationFrame(() => {
-      try { e.fit.fit(); e.term.focus(); sendResize(e); } catch {}
+      try {
+        e.fit.fit();
+        autoFocused = handFocus === t.session ? null : t.session;
+        handFocus = null;
+        e.term.focus();
+        sendResize(e);
+      } catch {}
     });
     return;
   }
@@ -2059,7 +2110,8 @@ function refreshTree() {
   });
 }
 
-// Wires the file <a> elements only — no container-level oncontextmenu.
+// Wires the file <a> elements and each folder's <summary> — but never a
+// container-level oncontextmenu.
 // reconcileList calls this (not wireFragment) on the <ul> it just merged:
 // a `ul`/`details` oncontextmenu handler doesn't stop propagation, so
 // assigning one at every reconciled nesting level would make a blank-space
@@ -2068,7 +2120,7 @@ function refreshTree() {
 // project root, with create/rename/delete armed. The single container
 // handler wireFragment sets once, at the pane's outer `.content` mount,
 // already catches blank clicks anywhere inside via bubbling.
-function wireFileLinks(root) {
+function wireFileLinks(root, menu = fileMenu) {
   // Any anchor carrying data-rel, not just tree rows: markdown previews emit
   // <a class="mdlink" data-rel> for links to project files, and they want the
   // identical open-as-tab and context-menu behaviour. A no-op for existing
@@ -2113,7 +2165,29 @@ function wireFileLinks(root) {
       // Diff has no headings, so it never arms.
       if (a.dataset.hash && !isDiff) revealAnchor(rel, a.dataset.hash);
     };
-    a.oncontextmenu = (e) => { e.preventDefault(); fileMenu(e, a.dataset.rel); };
+    a.oncontextmenu = (e) => { e.preventDefault(); menu(e, a.dataset.rel, a.dataset.xy); };
+  });
+  // Folders (#110). A directory is `<details data-rel><summary>`, not an `<a>`,
+  // so before this a right-click on one fell through to the container handler
+  // above — which is written for blank space and passes `rel: ""`. The menu
+  // opened, and offered to create in the *project root* whatever folder you
+  // had clicked.
+  //
+  // Bound to the `<summary>` rather than to the `<details>`: the details
+  // element contains the whole subtree, so a handler there would also fire for
+  // every descendant row and shadow their own. The summary is the row itself.
+  //
+  // `stopPropagation` is not tidiness. The container handler at the pane's
+  // `.content` mount only skips `a[data-rel]`, so without this a folder opens
+  // this menu and then that one as well — two dialogs, the second targeting
+  // the root. See that handler's comment for why it is a single container
+  // listener in the first place.
+  root.querySelectorAll("details[data-rel] > summary").forEach((s) => {
+    s.oncontextmenu = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      fileMenu(e, s.parentElement.dataset.rel, true);
+    };
   });
   paintTreePicked(root);
 }
@@ -2217,6 +2291,18 @@ function pickedInTreeOrder() {
 }
 
 function wireFragment(content) {
+  // Changes and Diff show changes, not places: New file, Rename and Delete
+  // mean nothing there, and Delete on a change row read as "drop this
+  // change" while deleting the file (#125).
+  if (content.dataset.kind === "Changes" || content.dataset.kind === "Diff") {
+    wireFileLinks(content, gitMenu);
+    content.oncontextmenu = (e) => {
+      if (e.target.closest("a[data-rel]")) return;
+      e.preventDefault();
+      gitMenu(e, content.dataset.rel || "", undefined);
+    };
+    return;
+  }
   wireFileLinks(content);
   // right-clicking blank space in a tree targets the project root
   content.oncontextmenu = (e) => {
@@ -2229,12 +2315,39 @@ function wireFragment(content) {
 // A real menu now, rather than a numbered prompt(). The prompt was never a
 // menu by choice — it was the only way prompt() could offer four options —
 // and it cost a second dialog for every action.
-async function fileMenu(e, rel) {
-  const dir = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "";
+async function fileMenu(e, rel, isDir = false) {
+  // A parameter, not a guess from the string. `rel` has no shape that
+  // separates `docs` the folder from `docs` the extensionless file, and
+  // re-deriving it from the DOM at use time is how the two get confused again
+  // later. The caller knows which element it bound to; it says so.
+  //
+  // For a file the target is its *parent* — right-clicking `src/main.rs` and
+  // asking for a new file means one beside it. For a folder the target is the
+  // folder itself. Stripping the last segment for both is the bug #110
+  // reported: it offered the project root for a top-level folder, and the
+  // folder's parent for a nested one.
+  const dir = isDir ? rel : (rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "");
   const items = [
     { id: "new", label: "New file…" },
     { id: "newdir", label: "New folder…" },
+    // #110. Upload was drag-and-drop only, and a phone has no drag — so there
+    // was no way to get a file into a project at all. Nothing about the
+    // upload path needed fixing; it needed a way in that is not a mouse.
+    // Better on desktop too, which is why it is a menu item rather than a
+    // phone-only control.
+    { id: "upload", label: "Upload files…" },
   ];
+  // #120. Only on a file: a folder has nothing to download, and offering it
+  // there would be the "offered and then silently did nothing" shape the menu
+  // was built to get rid of — see the comment on rename/delete below.
+  //
+  // The label says *which* version when it matters. A tab with unsaved edits
+  // holds text the server has never seen, and a download that silently handed
+  // back the on-disk file would be the quiet kind of wrong.
+  if (rel && !isDir) {
+    const dirty = state && state.buffers && state.buffers.some((b) => b.rel === rel && b.dirty);
+    items.push({ id: "download", label: dirty ? "Download (saved version)" : "Download" });
+  }
   // Rename and Delete need a target. The prompt version offered them at the
   // project root and then silently did nothing, because its guards were
   // `choice === "3" && rel`. A menu can simply not offer them.
@@ -2248,6 +2361,14 @@ async function fileMenu(e, rel) {
     const name = await askText({ title: "New folder", label: "Path",
       value: dir ? `${dir}/newdir` : "newdir", confirm: "Create" });
     if (name) send({ t: "CreateDir", rel: name });
+  } else if (choice === "download") {
+    // A plain navigation, so the browser's own download machinery handles it:
+    // no blob in memory, a progress indicator the user already knows, and a
+    // file of any size. No intent and no XHR — this is a GET.
+    window.location.href =
+      `/frag/${PROJECT}/download?path=${rel.split("/").map(encodeURIComponent).join("/")}`;
+  } else if (choice === "upload") {
+    pickAndUpload(dir);
   } else if (choice === "rename") {
     const to = await askText({ title: "Rename", label: "New path", value: rel, confirm: "Rename" });
     if (to && to !== rel) send({ t: "RenamePath", from: rel, to });
@@ -2257,6 +2378,89 @@ async function fileMenu(e, rel) {
       confirm: "Delete", danger: true });
     if (yes) send({ t: "DeleteFile", rel });
   }
+}
+
+/// Why a change row cannot be reverted, or "" if it can. A hint for the menu
+/// only: the server decides again from its own status (revert.rs), so an
+/// unknown XY (a Diff tab has none) is offered and the server answers.
+function revertBlock(rel, xy) {
+  if (rel.startsWith("../")) return "outside this project";
+  if (!xy) return "";
+  if (xy === "??") return "untracked, no committed version";
+  if (xy[0] === "A") return "added, no committed version";
+  if (xy[0] === "R" || xy[0] === "C") return "renamed";
+  return "";
+}
+
+async function gitMenu(e, rel, xy) {
+  const all = !rel;
+  const why = all ? "" : revertBlock(rel, xy);
+  const choice = await askMenu({
+    items: [{ id: "revert", label: all ? "Revert all…" : "Revert…", disabled: !!why, hint: why }],
+    x: e.clientX, y: e.clientY,
+  });
+  if (choice !== "revert") return;
+  send({ t: "RevertPreview", rel: all ? null : rel });
+}
+
+function skippedText(s) {
+  const parts = [];
+  if (s.untracked) parts.push(`${s.untracked} untracked`);
+  if (s.added) parts.push(`${s.added} added`);
+  if (s.renamed) parts.push(`${s.renamed} renamed`);
+  if (s.outside) parts.push(`${s.outside} outside this project`);
+  return parts.join(", ");
+}
+
+async function confirmRevert(ev) {
+  const skip = skippedText(ev.skipped);
+  if (!ev.paths.length) { showBanner(skip ? `Nothing to revert: ${skip}.` : "Nothing to revert."); return; }
+  const n = ev.paths.length;
+  const what = ev.rel || `${n} file${n === 1 ? "" : "s"}`;
+  const lines = ["They are saved to git stash first; `git stash apply` brings them back."];
+  if (ev.staged) lines.push("This includes staged changes.");
+  if (skip) {
+    const k = ev.skipped.untracked + ev.skipped.added + ev.skipped.renamed + ev.skipped.outside;
+    lines.push(`${k} file${k === 1 ? " is" : "s are"} not included: ${skip}.`);
+  }
+  for (const d of ev.dirty) lines.push(`${d} has unsaved edits in roost; they are discarded too.`);
+  // Cancel holds focus: Enter must never be the thing that discards work.
+  const choice = await askChoice({
+    title: `Discard changes to ${what}?`, lines, detailHtml: ev.detail_html, focus: "cancel",
+    choices: [{ id: "discard", label: `Discard changes to ${what}` }],
+  });
+  if (choice === "discard") {
+    send({ t: "Revert", rel: ev.rel ?? null, token: ev.token, discard_buffers: ev.dirty });
+  }
+}
+
+/// The file picker behind the menu's "Upload files…" (#110).
+///
+/// Created per invocation and discarded, rather than living in the page: a
+/// persistent input keeps its last selection, so picking the *same* file twice
+/// fires no `change` at all and the second upload silently never happens.
+///
+/// `uploadFiles` is the call the drop handler makes, with the directory the
+/// menu was opened on — so this is a second way in, not a second
+/// implementation.
+function pickAndUpload(dir) {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.multiple = true;
+  // Off-screen rather than `hidden`: a `display:none` input cannot be opened
+  // by `click()` in every engine, and this has to work on the one that has no
+  // other way to upload.
+  input.style.position = "fixed";
+  input.style.left = "-9999px";
+  input.onchange = () => {
+    if (input.files && input.files.length) uploadFiles(input.files, dir);
+    input.remove();
+  };
+  // A cancelled picker fires no `change`, so the element would otherwise be
+  // left in the document for the life of the page, once per cancelled upload.
+  input.oncancel = () => input.remove();
+  document.body.appendChild(input);
+  input.click();
 }
 
 function refreshKind(kind) {
@@ -2521,7 +2725,13 @@ addEventListener("blur", () => setArmed(false));
 ///     terminal does: send the arrow keys, in whichever cursor mode is set.
 ///   * normal buffer — hands off. The browser's own scrolling has momentum
 ///     that nothing written here would match.
-function wireTouchScroll(node, term) {
+/// `entry` is passed so select mode (#110) can stand this down. The gate is in
+/// front of `translate()` rather than folded into it: `translate()` answers
+/// "does this terminal want the wheel translated", which is a fact about the
+/// program, and select mode is a fact about what the user is doing. Keeping
+/// them apart means nothing about the scrolling that shipped changes when the
+/// mode is off.
+function wireTouchScroll(node, term, entry) {
   const screen = () => node.querySelector(".xterm-screen");
   let last = null, at = 0, velocity = 0, glide = 0;
 
@@ -2591,6 +2801,11 @@ function wireTouchScroll(node, term) {
   node.addEventListener("touchstart", (e) => {
     glide = 0;
     carry = 0;
+    // Select mode: hand the touch to xterm as a mouse press instead of
+    // scrolling with it. Returning *before* the translate() gate matters —
+    // on a plain shell translate() is false and this listener would otherwise
+    // fall through to native scrolling, which is the thing being suspended.
+    if (entry && entry.selectMode) { last = null; return forwardAsMouse(e, "mousedown"); }
     if (!translate() || e.touches.length !== 1) { last = null; return; }
     last = e.touches[0].clientY;
     at = e.timeStamp;
@@ -2598,6 +2813,7 @@ function wireTouchScroll(node, term) {
   }, { passive: true });
 
   node.addEventListener("touchmove", (e) => {
+    if (entry && entry.selectMode) return forwardAsMouse(e, "mousemove");
     if (last === null || e.touches.length !== 1) return;
     if (!translate()) { last = null; return; }
     const y = e.touches[0].clientY;
@@ -2612,7 +2828,8 @@ function wireTouchScroll(node, term) {
     if (e.cancelable) e.preventDefault();
   }, { passive: false });
 
-  node.addEventListener("touchend", () => {
+  node.addEventListener("touchend", (e) => {
+    if (entry && entry.selectMode) return forwardAsMouse(e, "mouseup");
     if (last === null) return;
     last = null;
     if (!translate()) return;
@@ -2662,7 +2879,12 @@ function ensureTerm(session) {
   // vendored build's public Terminal facade (the "d" class the UMD bundle
   // exports) wraps an internal core that has its own onFocus/onBlur, but
   // does not forward either one; calling `term.onFocus` throws.
-  node.addEventListener("focusin", () => { lastFocusedSession = session; });
+  node.addEventListener("focusin", () => { lastFocusedSession = session; readWatched(); });
+  // A click or a keystroke in this terminal is the hand autoFocused waits
+  // for. Capture phase, because xterm handles both and may stop them.
+  const byHand = () => { if (autoFocused === session) autoFocused = null; readWatched(); };
+  node.addEventListener("pointerdown", byHand, true);
+  node.addEventListener("keydown", byHand, true);
   // xterm's own defaults are black-on-white-ish and take no part in the theme
   // cascade, so the active theme's variables are read off :root and handed to
   // it — otherwise the terminal is a black rectangle inside a #1e1f22 pane.
@@ -2710,7 +2932,13 @@ function ensureTerm(session) {
   // only where it settles is worth writing to the clipboard.
   term.onSelectionChange(() => {
     clearTimeout(entry.selTimer);
-    entry.selTimer = setTimeout(() => copySelection(entry), 200);
+    entry.selTimer = setTimeout(() => {
+      copySelection(entry);
+      // The mode's job is done the moment a selection exists and has been
+      // copied. Leaving it armed would cost the next scroll, and the user
+      // would have to know to press the button again to get scrolling back.
+      if (entry.selectMode && entry.term.getSelection()) setSelectMode(entry, false);
+    }, 200);
   });
   // OSC 52 is how an application copies on the user's behalf, and it is the
   // half of copying that a selection handler cannot reach: when a full-screen
@@ -2784,7 +3012,7 @@ function ensureTerm(session) {
   // a `const` declared further down this function, so wiring it up there threw
   // `Cannot access 'term' before initialization` — inside `onEvent`, which
   // swallowed it into a terminal that simply never mounted.
-  wireTouchScroll(node, term);
+  wireTouchScroll(node, term, entry);
   terms.set(session, entry);
   connectTerm(entry, session);
   return entry;
@@ -2830,7 +3058,11 @@ function connectTerm(entry, session) {
     // delivers a real Close frame, not a bare EOF. integration.rs's
     // child_exit_delivers_a_close_frame_not_a_bare_eof pins that, because if
     // it ever regressed this handler would start respawning killed shells.
-    if (ev.wasClean) { termStatus(entry, "session ended"); return; }
+    // A clean close with a reason is a refusal the server explained (#123):
+    // the shell never started, and "session ended" — what the tab also says
+    // after `exit` — would hide why. Still no reconnect: the refusal would
+    // simply repeat.
+    if (ev.wasClean) { termStatus(entry, ev.reason || "session ended"); return; }
     termStatus(entry, "reconnecting…");
     // Capped backoff, and deliberately never gives up: a laptop asleep for
     // eight hours must still find its terminal alive on wake.
@@ -2844,6 +3076,43 @@ function connectTerm(entry, session) {
 // attacker-influenced bytes. 100 KB of base64 is far more than any copy a
 // person makes and far less than a payload worth worrying about.
 const MAX_OSC52_B64 = 100_000;
+
+/// Turns one touch into the mouse event xterm's selection is built on (#110).
+///
+/// xterm listens for `mousedown` on its screen element and then tracks
+/// `mousemove`/`mouseup` on the document, so the press is dispatched at the
+/// touch point and the rest go to the document — matching where a real mouse
+/// drag would deliver them, rather than where the finger happens to be.
+///
+/// `touchend` carries no `touches`, so the last known point is used: a
+/// `mouseup` at 0,0 would collapse the selection that had just been made.
+function forwardAsMouse(e, type) {
+    const t = e.touches && e.touches.length ? e.touches[0] : (e.changedTouches && e.changedTouches[0]);
+    if (!t) return;
+    if (e.cancelable) e.preventDefault();
+    const target = type === "mousedown" ? document.elementFromPoint(t.clientX, t.clientY) : document;
+    if (!target) return;
+    target.dispatchEvent(new MouseEvent(type, {
+      bubbles: true, cancelable: true, view: window,
+      clientX: t.clientX, clientY: t.clientY, button: 0, buttons: type === "mouseup" ? 0 : 1,
+    }));
+}
+
+/// Select mode: a terminal whose touch drags select instead of scroll (#110).
+///
+/// It turns itself off, and that is not a nicety: a terminal left in this mode
+/// no longer scrolls, with nothing on screen to say why — the same class of
+/// silent dead end the codebase keeps finding. Off on a settled selection
+/// (where copy-on-select has just run, so the job is done), and off when the
+/// button is pressed again.
+function setSelectMode(entry, on) {
+  entry.selectMode = !!on;
+  entry.node.classList.toggle("selecting", entry.selectMode);
+  for (const b of document.querySelectorAll('#termkeys button[data-k="select"]')) {
+    b.setAttribute("aria-pressed", String(entry.selectMode));
+  }
+  if (entry.selectMode) termFlash(entry, "drag to select");
+}
 
 function copySelection(entry) {
   const text = entry.term.getSelection();
@@ -3780,6 +4049,7 @@ function initTermKeys() {
       // things `TERM_KEYS` holds: its values are `() => string`, and this is
       // asynchronous and must not go through `term.input`. See `pasteInto`.
       if (b.dataset.k === "paste") { pasteInto(entry); return; }
+      if (b.dataset.k === "select") { setSelectMode(entry, !entry.selectMode); return; }
       const make = TERM_KEYS[b.dataset.k];
       if (!make) return;
       entry.term.input(make(entry.term));
@@ -4037,6 +4307,12 @@ if (settingsBtn) {
     if (typeof openSettings === "function") openSettings(state.settings);
   };
 }
+const updmark = document.getElementById("updmark");
+if (updmark) {
+  updmark.onclick = () => {
+    if (state && state.settings && typeof openUpdate === "function") openUpdate(state.settings);
+  };
+}
 
 // Header control buttons must not steal keyboard focus from the terminal or
 // the editor. Glancing at notifications, or opening the worktree switcher,
@@ -4179,6 +4455,43 @@ let appliedTheme = null;
 // While open, a theme in the snapshot is not applied over the preview.
 let settingsOpen = null;
 
+// ---- the update mark and dialog (#65 step 4) ----
+// dialog.js assigns `updateOpen` while its dialog is open, the way it
+// assigns `settingsOpen`; app.js calls its hook when UpdateProgress lands.
+let updateOpen = null;
+// The dialog opens by itself once per page load, when the mark first
+// appears and the choice is not deferred. Later clicks of the mark reopen it.
+let updateOffered = false;
+// Set when the server said "restarting": the next successful control
+// reconnect is the new process, and the page reloads to learn its version.
+let reloadOnReconnect = false;
+
+// The mark's rule. A checkout never gets one: About already says "yours to
+// rebuild", and a developer on a branch is behind a release by design.
+function updateWanted(s) {
+  const u = (s && s.update) || {};
+  const b = (s && s.build) || {};
+  return u.status === "newer" && !!u.latest && u.skipped !== u.latest && b.channel !== "checkout";
+}
+
+function renderUpdateMark() {
+  const el = document.getElementById("updmark");
+  if (!el || !state || !state.settings) return;
+  const s = state.settings;
+  const u = s.update || {};
+  const show = updateWanted(s);
+  el.hidden = !show;
+  if (show) {
+    el.textContent = `↑ ${u.latest}`;
+    el.title = `roost ${u.latest} is available — you are running ${(s.build || {}).version}`;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (show && !updateOffered && !(u.deferred_until > now) && typeof openUpdate === "function") {
+    updateOffered = true;
+    openUpdate(s, { selfOpened: true });
+  }
+}
+
 // Which of the two mechanisms `render::theme_head` would have used for
 // `name`, expressed in the client so a preview matches a reload: a roost
 // file is one <link>; a daisyUI name is data-theme on <html> plus the
@@ -4266,6 +4579,7 @@ function followSettings() {
       settingsOpen = null;
     }
   }
+  renderUpdateMark();
   const theme = row("theme");
   if (theme) {
     if (appliedTheme === null) appliedTheme = theme.effective; // first snapshot: the page is already painted with it
@@ -4273,6 +4587,8 @@ function followSettings() {
   }
   const auto = row("autosave");
   if (auto) AUTOSAVE = auto.effective === true;
+  const rw = row("read_when_watching");
+  if (rw) READ_WHEN_WATCHING = rw.effective === true;
   // The tree re-fetches itself when showHidden() changes (see the State
   // handler), so this one assignment is the whole of the visible effect.
   const sh = row("show_hidden");
@@ -4488,6 +4804,39 @@ function markSessionNoticesRead(session) {
   }
 }
 
+// The session whose notices are being read right now, or null. Keyboard
+// focus, deliberately not lastFocusedSession: that one means "the terminal a
+// mention is aimed at" and outlives focus moving to the editor, and a Claude
+// working in one pane while you type in another is precisely the terminal
+// whose notices you have NOT read. getClientRects covers both ways a host is
+// off-screen — pooled behind another tab, or in a collapsed phone pane —
+// reading from the DOM what the user actually sees.
+function watchedSession() {
+  if (!READ_WHEN_WATCHING) return null;
+  if (document.visibilityState !== "visible" || !document.hasFocus()) return null;
+  const host = document.activeElement && document.activeElement.closest(".termhost");
+  if (!host || !host.getClientRects().length) return null;
+  const s = host.dataset.session;
+  if (s === autoFocused) return null;
+  return s && terms.has(s) && terms.get(s).node === host ? s : null;
+}
+
+function readWatched() {
+  const s = watchedSession();
+  if (s) markSessionNoticesRead(s);
+}
+
+// Coming back to the page. The terminal's own focusin (ensureTerm) re-fires
+// when the window regains focus, and reads the notice itself when it lands
+// after the page is visible — but Chromium does not promise that order: it
+// has been seen delivering focus and focusin while visibilityState was still
+// "hidden", then visibilitychange last, and in that order only the listener
+// below can read it. Window focus covers switching OS windows with the page
+// left visible. markSessionNoticesRead sends nothing when nothing is unread,
+// so whichever of the three fires second is free.
+document.addEventListener("visibilitychange", () => { if (!document.hidden) readWatched(); });
+window.addEventListener("focus", readWatched);
+
 // Activate the terminal tab for `session`, opening it if it is not on screen.
 // Both paths are ordinary intents, so every connected client follows.
 function focusSession(session) {
@@ -4497,11 +4846,16 @@ function focusSession(session) {
   for (let pi = 0; pi < state.panes.length; pi++) {
     const ti = state.panes[pi].tabs.findIndex((t) => t.k === "Terminal" && t.session === session);
     if (ti >= 0) {
+      // Only when this activation will mount it: an already-active tab gets
+      // no mountTab, and a handFocus left waiting would later bless a
+      // mount some other client caused.
+      if (state.panes[pi].active !== ti) handFocus = session;
       send({ t: "ActivateTab", pane: pi, idx: ti });
       revealPane(pi);
       return;
     }
   }
+  handFocus = session;
   send({ t: "OpenTab", pane: 3, tab: { k: "Terminal", session } });
   revealPane(3);
 }
@@ -4521,7 +4875,15 @@ function hasAttention(session) {
 
 function onNotice(n) {
   notices.push(n);
-  if (canNotify() && Notification.permission === "granted") {
+  // Read on arrival when it comes from the terminal being typed in: the
+  // server is told, and the local row is marked too, so the dot does not
+  // flash before the rebroadcast. No OS banner for it: a banner for the
+  // terminal under your cursor is noise. Other windows still banner — they
+  // received the same Notice and are not watching.
+  if (n.project === PROJECT && n.session === watchedSession()) {
+    n.read = true;
+    send({ t: "MarkNoticeRead", id: n.id });
+  } else if (canNotify() && Notification.permission === "granted") {
     if (swReg) swReg.active && swReg.active.postMessage({ kind: "notify", notice: n });
     // Fallback when there's no service worker: same attribution rule as
     // sw.js — project/session (server truth) in the title, payload text in

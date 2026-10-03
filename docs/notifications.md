@@ -157,6 +157,16 @@ from a background tab; the favicon gets a small red-dot badge (not the count
 itself) when there is anything unread. Notices persist across a roost restart,
 so one raised overnight is still there in the morning.
 
+A notice from the terminal you are typing in is read on arrival and raises no
+OS banner, and coming back to the page — or clicking into a terminal — reads
+the ones already waiting for it. "Typing in" is keyboard focus in a visible,
+focused window, not merely a terminal on screen: one in another pane keeps its
+dot. Focus roost gave by itself does not count either — when another device
+switches a pane to a terminal, this one focuses it too, but it is not watching
+until you click or type in it; clicking the tab here is enough. Other windows on the same project still banner, having received the same
+notice without watching it. `read_when_watching = false` turns this off (see
+[deploy.md](deploy.md)); clicking a tab or a notice clears it either way.
+
 The panel, the badge and the two buttons under it are all about that one
 project. A worktree counts as its own project here — `roost` and
 `roost/.claude/worktrees/claude-1` are separate workspaces with separate

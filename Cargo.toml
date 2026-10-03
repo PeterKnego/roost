@@ -43,10 +43,27 @@ multer = "3.1"
 futures-executor = "0.3"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false }
+# Promoted from a dev-dependency: the version check is the one thing roost does
+# that reaches the network. `proxy-from-env` is off in ureq's default feature
+# set, so a default build ignores HTTPS_PROXY entirely — and an office behind
+# one NAT, where a proxy is mandatory, is exactly where this check was designed
+# to work. The TLS backend is left alone: the default `tls` feature is
+# webpki-roots (the bundled Mozilla set), and `native-tls` would drag OpenSSL
+# into a static musl build.
+ureq = { version = "2.12", features = ["proxy-from-env"] }
+# Step 4 of #65: verify a release tarball's minisign signature offline, then
+# open it. All three are pure Rust — the musl targets need no C toolchain for
+# them (ring, which ureq brings, is the one that does, and dist installs
+# musl-tools on the release runners for it).
+minisign-verify = "0.2"
+lzma-rs = "0.3"
+tar = "0.4"
 
 [dev-dependencies]
-ureq = "2"
 tempfile = "3"
+# Generates a keypair and signs inside the tests, so no secret key is ever
+# committed. Same author and format as the C minisign the release uses.
+minisign = "0.9"
 
 [profile.release]
 strip = true

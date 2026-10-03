@@ -12,6 +12,7 @@ struct RawConfig {
     show_hidden: Option<bool>,
     autosave: Option<bool>,
     follow_tree: Option<bool>,
+    read_when_watching: Option<bool>,
     allowed_origins: Option<Vec<String>>,
     max_upload_bytes: Option<u64>,
     share_selection: Option<bool>,
@@ -19,6 +20,7 @@ struct RawConfig {
     roots: Option<Vec<String>>,
     worktree_prompt: Option<bool>,
     relaunch: Option<bool>,
+    version_check: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +53,13 @@ pub struct Settings {
     /// off is that it discards your navigation; following here never
     /// collapses anything, so the cost of being wrong is a scroll.
     pub follow_tree: bool,
+    /// Whether a notice for the terminal you are looking at is read on sight
+    /// (on return to the page, on clicking in, and on arrival, which then
+    /// raises no OS banner). Project-scoped: a checkout setting it only
+    /// decides what you see as unread, which grants nothing and raises no
+    /// ceiling — `autosave`'s argument. On by default because off is the
+    /// behaviour #129 reported as a bug.
+    pub read_when_watching: bool,
     /// Off unless a project asks for it. This ships file contents to Claude
     /// with no explicit user action, and roost has no permission system to
     /// scope it the way Claude Code's own `Read` deny rules do. Unlike
@@ -89,6 +98,7 @@ impl Default for Settings {
             show_hidden: false,
             autosave: true,
             follow_tree: true,
+            read_when_watching: true,
             warning: None,
         }
     }
@@ -96,13 +106,14 @@ impl Default for Settings {
 
 /// Keys a project file may set — display-level, nothing a hostile checkout
 /// could widen a boundary with. In this order in the dialog.
-pub const PROJECT_KEYS: &[&str] = &["theme", "hide", "show_hidden", "autosave", "follow_tree"];
+pub const PROJECT_KEYS: &[&str] = &["theme", "hide", "show_hidden", "autosave", "follow_tree", "read_when_watching"];
 /// Keys only the global file may set; see the readers below for why each.
 /// `relaunch` is here for the sharpest reason any key has been: it decides
 /// whether opening a project *starts an agent*. A cloned repository that could
 /// set it would be arranging to run `claude` on a machine it has just arrived
 /// on.
-pub const GLOBAL_ONLY_KEYS: &[&str] = &["share_selection", "worktree_prompt", "relaunch"];
+pub const GLOBAL_ONLY_KEYS: &[&str] =
+    &["share_selection", "worktree_prompt", "relaunch", "version_check"];
 /// Keys no page may write. Shown read-only; not in any allowlist, so a
 /// forged intent is refused too.
 pub const READ_ONLY_KEYS: &[&str] = &["allowed_origins", "max_upload_bytes", "ide", "roots"];
@@ -152,8 +163,8 @@ pub fn validate(scope: Scope, key: &str, value: Option<&SettingValue>) -> Result
         }
         ("hide", _) => Err("hide takes a list of names".into()),
         (
-            "show_hidden" | "autosave" | "follow_tree" | "share_selection" | "worktree_prompt"
-            | "relaunch",
+            "show_hidden" | "autosave" | "follow_tree" | "read_when_watching" | "share_selection"
+            | "worktree_prompt" | "relaunch" | "version_check",
             SettingValue::Bool(_),
         ) => Ok(()),
         (k, _) => Err(format!("{k} takes true or false")),
@@ -198,6 +209,9 @@ pub fn load(paths: &[&Path]) -> Settings {
                 }
                 if let Some(v) = raw.follow_tree {
                     s.follow_tree = v;
+                }
+                if let Some(v) = raw.read_when_watching {
+                    s.read_when_watching = v;
                 }
             }
             Err(e) => warnings.push(format!("{}: {}", path.display(), e.message())),
@@ -340,6 +354,46 @@ fn relaunch_from(global: &Path) -> bool {
         .and_then(|s| toml::from_str::<RawConfig>(&s).ok())
         .and_then(|r| r.relaunch)
         .unwrap_or(false)
+}
+
+/// Whether roost asks crates.io what the newest published version is.
+///
+/// Global only (see `GLOBAL_ONLY_KEYS`): roost's own code names the
+/// destination, and a setting a cloned repository could write would let it
+/// enable, disable, or — if the endpoint were ever configurable — redirect a
+/// request this process makes. The endpoint is deliberately not a setting at
+/// all.
+///
+/// **Deliberately not `relaunch_from`'s shape.** That reader folds absent,
+/// unreadable and unparseable into one default, which is right where the
+/// default is "do nothing" and wrong here, where the default is a request. An
+/// operator who wrote `version_check = false` and later broke the same file
+/// with a typo elsewhere would otherwise get back the request they turned off,
+/// with nothing in About to say why. So: absent means on; unreadable or
+/// unparseable means off. `Settings::warning` already names the broken file in
+/// the dialog, so the silence has an explanation beside it.
+pub fn version_check() -> bool {
+    version_check_from(&global_config_path())
+}
+
+fn version_check_from(global: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(global) else {
+        // `read_to_string` cannot distinguish "nothing at all there" from
+        // "something is there but not a readable file" (a directory, a
+        // dangling symlink, a permissions error), so ask `symlink_metadata`
+        // — CLAUDE.md's rule for a decision that must not conflate the two.
+        // Only a genuine `NotFound` (no dirent at all, symlink or otherwise)
+        // is absent; anything else present-but-unreadable is treated the
+        // same as an unparseable file below: off, not on.
+        return matches!(
+            global.symlink_metadata(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        );
+    };
+    match toml::from_str::<RawConfig>(&text) {
+        Ok(raw) => raw.version_check.unwrap_or(true),
+        Err(_) => false,
+    }
 }
 
 /// The directories scanned for projects, from the global config's `roots`.
@@ -663,12 +717,16 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
         "Save an edited file a second after the last keystroke and on blur; off means ⌘S.");
     push("follow_tree", "bool", V::Bool(s.follow_tree), V::Bool(true), true,
         "Expand the file tree to the file you are looking at, and mark it.");
+    push("read_when_watching", "bool", V::Bool(s.read_when_watching), V::Bool(true), false,
+        "Mark a terminal's notices read while you are typing in it, with no desktop banner for them.");
     push("share_selection", "bool", V::Bool(share_selection()), V::Bool(false), true,
         "Let a Claude connected to this project read the text you select in the editor.");
     push("worktree_prompt", "bool", V::Bool(worktree_prompt()), V::Bool(true), false,
         "When a Claude is already running here, ✻ offers to start the next one in a new worktree.");
     push("relaunch", "bool", V::Bool(relaunch()), V::Bool(false), false,
         "When you open a project, restart the agents roost had launched in it before a reboot. Never resumes a conversation \u{2014} it starts a fresh one.");
+    push("version_check", "bool", V::Bool(version_check()), V::Bool(true), false,
+        "Ask crates.io once a day (once an hour after a failed check) whether a newer roost has been published, and say so in About. Nothing is downloaded.");
     push("allowed_origins", "list", V::List(allowed_origins()), V::List(vec![]), false,
         "Browser origins allowed to connect besides loopback, such as the tailnet address.");
     push("max_upload_bytes", "str", V::Str(max_upload_bytes().to_string()), V::Str(DEFAULT_MAX_UPLOAD.to_string()), false,
@@ -687,6 +745,7 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
     );
     SettingsView {
         build: build_info(),
+        update: crate::update::view(),
         keys,
         themes: crate::themes::catalogue(),
         project_file: ".roost/config.toml".into(),
@@ -694,6 +753,12 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
         warning: s.warning,
     }
 }
+
+/// `ENV_LOCK` lives with the tests that introduced it; re-exported so
+/// `version.rs`'s tests can name it as `crate::config::ENV_LOCK` — a private
+/// `mod tests` is otherwise invisible to a sibling module.
+#[cfg(test)]
+pub(crate) use tests::ENV_LOCK;
 
 #[cfg(test)]
 mod tests {
@@ -843,6 +908,28 @@ mod tests {
         assert!(load(&[&g, &p]).warning.is_none());
     }
 
+    // Same shape as autosave's test and for the same reason: asserting only
+    // the default passes with the cascade never reading the key at all.
+    #[test]
+    fn read_when_watching_defaults_on_and_either_layer_can_turn_it_off() {
+        let d = tempfile::tempdir().unwrap();
+        let g = d.path().join("global.toml");
+        let p = d.path().join("project.toml");
+        fs::write(&g, "hide = [\"dist\"]").unwrap();
+        assert!(load(&[&g]).read_when_watching, "on unless something says otherwise");
+
+        fs::write(&p, "read_when_watching = false").unwrap();
+        let s = load(&[&g, &p]);
+        assert!(!s.read_when_watching, "a project can turn it off for itself");
+        assert_eq!(s.hide, vec!["dist"], "and the global key still survives");
+
+        fs::write(&g, "read_when_watching = false").unwrap();
+        assert!(!load(&[&g]).read_when_watching);
+        fs::write(&p, "read_when_watching = true").unwrap();
+        assert!(load(&[&g, &p]).read_when_watching, "a project can turn it back on");
+        assert!(load(&[&g, &p]).warning.is_none());
+    }
+
     // Off unless a file turns it on — the opposite default from autosave,
     // because this key ships file contents to Claude with no explicit user
     // action. Both layers can still move it in both directions, same as
@@ -931,6 +1018,57 @@ mod tests {
         assert!(worktree_prompt_from(&g), "unparseable: on, a typo must not change a button");
     }
 
+    /// The three-way rule the spec insists on, and the reason it is not a copy
+    /// of `relaunch_from`: an operator who wrote `version_check = false` and
+    /// later broke the same file with a typo elsewhere must not silently get
+    /// back the network request they turned off.
+    #[test]
+    fn an_unreadable_global_file_means_the_check_is_off_but_an_absent_one_does_not() {
+        let d = tempfile::tempdir().unwrap();
+
+        let missing = d.path().join("nope.toml");
+        assert!(version_check_from(&missing), "absent means on: the check is the default");
+
+        let empty = d.path().join("empty.toml");
+        fs::write(&empty, "theme = \"dark\"\n").unwrap();
+        assert!(version_check_from(&empty), "a file that says nothing about it means on");
+
+        let off = d.path().join("off.toml");
+        fs::write(&off, "version_check = false\n").unwrap();
+        assert!(!version_check_from(&off), "false means off");
+
+        let on = d.path().join("on.toml");
+        fs::write(&on, "version_check = true\n").unwrap();
+        assert!(version_check_from(&on), "true means on");
+
+        // The arm that separates this reader from `relaunch_from`.
+        let broken = d.path().join("broken.toml");
+        fs::write(&broken, "version_check = false\nthis is not = = toml\n").unwrap();
+        assert!(
+            !version_check_from(&broken),
+            "a file that did not parse means off — `Settings::warning` names it in the dialog"
+        );
+
+        let unreadable = d.path().join("adir.toml");
+        fs::create_dir(&unreadable).unwrap();
+        assert!(!version_check_from(&unreadable), "a file that cannot be read means off");
+    }
+
+    /// A cloned repository must not be able to turn this on, off, or anywhere.
+    #[test]
+    fn version_check_is_global_only_and_takes_a_bool() {
+        assert_eq!(writable_in("version_check"), ["global"]);
+        assert_eq!(
+            validate(Scope::Project, "version_check", Some(&V::Bool(false))).unwrap_err(),
+            "version_check is a global setting; switch the scope to global"
+        );
+        assert!(validate(Scope::Global, "version_check", Some(&V::Bool(false))).is_ok());
+        assert_eq!(
+            validate(Scope::Global, "version_check", Some(&V::Str("yes".into()))).unwrap_err(),
+            "version_check takes true or false"
+        );
+    }
+
     // The reverse direction: a global `true` is what a per-project `false`
     // has to be able to override, or the setting is one-way.
     #[test]
@@ -987,9 +1125,16 @@ mod tests {
         std::env::remove_var("ROOST_PING_SECS");
     }
 
-    /// `ROOST_MAX_UPLOAD` is process-global and these tests write it, so they
-    /// serialise. Without this they interleave and each sees another's value.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// `ROOST_MAX_UPLOAD` and `ROOST_CONFIG` are process-global and these tests
+    /// write them, so they serialise. Without this they interleave and each
+    /// sees another's value.
+    ///
+    /// `pub(crate)` because `version.rs`'s tests point `ROOST_CONFIG` at their
+    /// own fixture too. A test needing both this and
+    /// `wsstate::STATE_ENV_LOCK` takes **`STATE_ENV_LOCK` first**; the order
+    /// has to be total, and no test today takes them the other way round (an
+    /// inversion deadlocks, and a deadlock hangs rather than fails).
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The test that fails the moment someone "helpfully" moves this key into
     /// `Settings`. A project's `.roost/config.toml` ships inside the repository,
@@ -1117,6 +1262,10 @@ mod tests {
     fn values_must_match_the_key_and_a_theme_must_exist() {
         let e = validate(Scope::Project, "autosave", Some(&V::Str("yes".into()))).unwrap_err();
         assert!(e.contains("autosave") && e.contains("true or false"), "{e}");
+        let e = validate(Scope::Project, "read_when_watching", Some(&V::Str("yes".into()))).unwrap_err();
+        assert!(e.contains("read_when_watching") && e.contains("true or false"), "{e}");
+        assert!(validate(Scope::Project, "read_when_watching", Some(&V::Bool(false))).is_ok(),
+            "a project may set it: it grants nothing and raises no ceiling");
         let e = validate(Scope::Project, "theme", Some(&V::Str("not-a-theme".into()))).unwrap_err();
         assert!(e.contains("not-a-theme"), "{e}");
         let e = validate(Scope::Project, "hide", Some(&V::List(vec!["a/b".into()]))).unwrap_err();
@@ -1327,6 +1476,13 @@ mod tests {
         assert_eq!(f.writable, vec!["project", "global"], "follow_tree is not global-only");
         assert_eq!(f.default, V::Bool(true), "it follows unless something turns it off");
         assert!(f.reload, "it is embedded at page load, like autosave");
+        // Project-scoped for the spec's reason: a checkout setting it decides
+        // only whether a notice from a terminal you are typing in is shown
+        // unread. Live, not embedded — app.js re-reads it from every snapshot.
+        let r = row("read_when_watching");
+        assert_eq!(r.writable, vec!["project", "global"], "read_when_watching is not global-only");
+        assert_eq!(r.default, V::Bool(true));
+        assert!(!r.reload, "followed live from State, not embedded at page load");
         // Every row explains itself: the dialog shows `doc` under the key.
         for r in &v.keys {
             assert!(!r.doc.is_empty() && r.doc.ends_with('.'), "{}: doc {:?}", r.key, r.doc);
@@ -1335,11 +1491,33 @@ mod tests {
         assert!(!row("theme").reload);
         // Order: project keys, global-only keys, read-only keys.
         let keys: Vec<&str> = v.keys.iter().map(|r| r.key.as_str()).collect();
-        assert_eq!(keys, ["theme", "hide", "show_hidden", "autosave", "follow_tree", "share_selection", "worktree_prompt", "relaunch", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
+        assert_eq!(keys, ["theme", "hide", "show_hidden", "autosave", "follow_tree", "read_when_watching", "share_selection", "worktree_prompt", "relaunch", "version_check", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
         assert_eq!(v.themes.len(), 5 + 35);
         assert!(v.global_file.ends_with("global.toml"));
         assert_eq!(v.project_file, ".roost/config.toml");
         assert!(v.warning.is_none());
+        std::env::remove_var("ROOST_CONFIG");
+    }
+
+    /// The one server fact on the About panel that is *not* constant for the
+    /// life of the process, so it is a sibling of `build`, not a field of
+    /// it — `BuildInfo`'s own doc comment promises constancy.
+    #[test]
+    fn the_settings_view_carries_the_update_answer_beside_build_not_inside_it() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        let global = d.path().join("global.toml");
+        fs::write(&global, "version_check = false\n").unwrap();
+        std::env::set_var("ROOST_CONFIG", &global);
+        let v = settings_view(d.path());
+        assert_eq!(v.update.status, "off", "the reader is consulted, not defaulted");
+        let json = serde_json::to_value(&v).unwrap();
+        assert!(!v.update.offer, "a checkout is never offered the button; the field rides beside status");
+        assert!(json["update"].get("offer").is_some(), "the client reads state.settings.update.offer");
+        assert!(json.get("update").is_some(), "the client reads state.settings.update");
+        assert!(json["update"]["latest"].is_string(),
+            "the JS and the #86 self-update plan both read state.settings.update.latest by name");
+        assert!(json["build"].get("status").is_none(), "and not state.settings.build.status");
         std::env::remove_var("ROOST_CONFIG");
     }
 }
