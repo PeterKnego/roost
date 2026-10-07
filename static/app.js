@@ -400,14 +400,15 @@ const extOf = (rel) => {
 };
 const refusesTextEdit = (rel) => NO_TEXT_EDIT_EXT.includes(extOf(rel));
 /// Files this app can *draw* rather than only spell out: markdown renders, and
-/// so does every image. Mirrors routes.rs's IMAGE_EXT plus the two markdown
-/// extensions render.rs's file_fragment branches on.
+/// so does every image, and a PDF through the browser's own viewer (#121).
+/// Mirrors routes.rs's IMAGE_EXT and PDF_EXT plus the two markdown extensions
+/// render.rs's file_fragment branches on.
 ///
 /// Deliberately wider than NO_TEXT_EDIT_EXT, and the gap is the point — svg is
 /// here *and* editable, because it draws as a picture and is text. CLAUDE.md
 /// records the release where gating Edit on "is it an image" silently took
 /// that away.
-const RENDERED_EXT = ["md", "markdown", "png", "jpg", "jpeg", "gif", "webp", "svg", "ico"];
+const RENDERED_EXT = ["md", "markdown", "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf"];
 const hasRenderedForm = (rel) => RENDERED_EXT.includes(extOf(rel));
 /// How a file opens when the user just clicks it.
 ///

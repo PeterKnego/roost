@@ -803,6 +803,32 @@ pub fn image_fragment(project: &str, rel: &str, mtime_secs: u64) -> String {
     )
 }
 
+/// A PDF opened as a tab (#121): the browser's own viewer in an `<iframe>`,
+/// on the raw route, with `v` as the same cache key `image_fragment` uses.
+///
+/// The link beside the path is the phone's way in. A phone's browser draws no
+/// PDF inside a frame — Chrome on Android shows nothing, iOS Safari only the
+/// first page — but every one of them opens a PDF it navigates to, so the
+/// tab offers that rather than a blank pane. Useful on a desktop too, for a
+/// document worth a whole window.
+pub fn pdf_fragment(project: &str, rel: &str, mtime_secs: u64) -> String {
+    let src = format!(
+        "/frag/{}/raw?path={}&v={}",
+        crate::http::percent_encode(project),
+        crate::http::percent_encode(rel),
+        mtime_secs
+    );
+    format!(
+        "<div class=\"path\">{}</div>\
+         <a class=\"pdfopen\" href=\"{}\" target=\"_blank\" rel=\"noopener\">open in a new tab ↗</a>\
+         <iframe class=\"pdfview\" src=\"{}\" title=\"{}\"></iframe>",
+        esc(rel),
+        esc(&src),
+        esc(&src),
+        esc(rel)
+    )
+}
+
 // Whole-tree eager rendering (the old design) is what made this slow: a
 // 41k-entry project produced 895 KB of HTML and still hit the 4,000-entry
 // budget with ~90% of the tree missing. Instead we render one level at a

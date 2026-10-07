@@ -486,6 +486,15 @@ pub const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "ic
 /// mismatch loses data, because `workspace.rs` is the actual guard.
 pub const NO_TEXT_EDIT_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf"];
 
+/// Extensions served as a document for the browser's own viewer (#121) — not
+/// on `IMAGE_EXT`, because that list also decides what a markdown `<img>` may
+/// embed, and a PDF is not a picture. Deny-by-default like the list above.
+pub const PDF_EXT: &[&str] = &["pdf"];
+
+pub fn is_pdf(rel: &str) -> bool {
+    PDF_EXT.contains(&crate::assets::ext_of(rel).as_str())
+}
+
 pub fn is_image(rel: &str) -> bool {
     IMAGE_EXT.contains(&crate::assets::ext_of(rel).as_str())
 }
@@ -504,6 +513,9 @@ fn serve_raw(w: &mut impl Write, dir: &Path, rel: &str) {
     let Some(rel) = crate::assets::normalize(rel) else {
         return http::not_found(w, "no such asset");
     };
+    if is_pdf(rel) {
+        return serve_pdf(w, dir, rel);
+    }
     if !is_image(rel) {
         return http::not_found(w, "not an image");
     }
@@ -595,6 +607,84 @@ const FRAGMENT_KINDS: &[&str] =
     &["tree", "file", "raw", "changes", "status", "diff", "proposal", "theme.css", "backup", "download"];
 
 
+/// A PDF for the browser's own viewer (#121), in a tab's `<iframe>` or opened
+/// on its own.
+///
+/// **Still `SANDBOX`.** #121 expected the built-in viewers to refuse a
+/// sandboxed document and planned a narrower policy for this route; the probe
+/// in its spec found both Chromium's and Firefox's viewer render under plain
+/// `sandbox`, so the route keeps exactly what every other project byte gets.
+/// The type comes from the extension and `nosniff` holds it there: an HTML
+/// file named `x.pdf` is offered to the PDF viewer, never rendered as a page.
+///
+/// Streamed, with no size cap, for the reason on `serve_download`: the cap
+/// bounds a whole-file read this path never makes. `MAX_FILE_BYTES` is not
+/// raised — images on the route above keep it.
+fn serve_pdf(w: &mut impl Write, dir: &Path, rel: &str) {
+    let (f, _) = match open_regular(dir, rel) {
+        Ok(opened) => opened,
+        Err(msg) => return http::not_found(w, msg),
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\n{}: {}\r\n{}: {}\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        NOSNIFF.0, NOSNIFF.1, SANDBOX.0, SANDBOX.1
+    );
+    stream_chunked(w, f, &head);
+}
+
+/// The file at `rel`, confined and open, if it is a regular file, with the
+/// path it resolved to. The
+/// pipeline both streaming routes share, in the order `serve_raw` uses:
+/// normalise, then canonicalise-and-confine. `safe_resolve` resolves
+/// symlinks, so what is checked here is the target, which is what gets read.
+fn open_regular(dir: &Path, rel: &str) -> Result<(std::fs::File, PathBuf), &'static str> {
+    let rel = crate::assets::normalize(rel).ok_or("no such file")?;
+    let path = projects::safe_resolve(dir, rel).map_err(|_| "no such file")?;
+    let meta = std::fs::metadata(&path).map_err(|_| "no such file")?;
+    if meta.is_dir() {
+        // Upload's own wording, because it is the same answer to the same
+        // question asked from the other direction.
+        return Err("folders are not downloaded — use git or scp for a directory");
+    }
+    // Matched on the type, not inferred from "not a directory". A FIFO or a
+    // device node in a cloned repository would block this connection thread on
+    // `read` forever — no error, no timeout, one thread gone per attempt.
+    if !meta.file_type().is_file() {
+        return Err("not a regular file");
+    }
+    let f = std::fs::File::open(&path).map_err(|_| "no such file")?;
+    Ok((f, path))
+}
+
+/// Writes `head`, then `f` as a chunked body, `DOWNLOAD_CHUNK` at a time.
+fn stream_chunked(w: &mut impl Write, mut f: std::fs::File, head: &str) {
+    if w.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let mut buf = vec![0u8; DOWNLOAD_CHUNK];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if write!(w, "{n:x}\r\n").is_err()
+                    || w.write_all(&buf[..n]).is_err()
+                    || w.write_all(b"\r\n").is_err()
+                {
+                    return; // the peer went away; nothing useful left to say
+                }
+            }
+            // A read error after the first chunk cannot change the status any
+            // more, so the connection is dropped *without* the terminating
+            // chunk. That is what makes the browser report a failed transfer
+            // instead of keeping what arrived as if it were the whole file.
+            Err(_) => return,
+        }
+    }
+    let _ = w.write_all(b"0\r\n\r\n");
+    let _ = w.flush();
+}
+
 /// One file from the tree, as a download (#120).
 ///
 /// The second streaming download in this file, and it follows `serve_backup`
@@ -617,63 +707,20 @@ const FRAGMENT_KINDS: &[&str] =
 /// reason to download anything — are routinely past 2 MB. What it *does* cost
 /// is one connection thread for the length of the transfer.
 fn serve_download(w: &mut impl Write, dir: &Path, rel: &str) {
-    let Some(rel) = crate::assets::normalize(rel) else {
-        return http::not_found(w, "no such file");
-    };
-    // The same pipeline `serve_raw` uses, in the same order: normalise, then
-    // canonicalise-and-confine. `safe_resolve` resolves symlinks, so what is
-    // checked below is the target, which is what actually gets read.
-    let Ok(path) = projects::safe_resolve(dir, rel) else {
-        return http::not_found(w, "no such file");
-    };
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return http::not_found(w, "no such file");
-    };
-    if meta.is_dir() {
-        // Upload's own wording, because it is the same answer to the same
-        // question asked from the other direction.
-        return http::not_found(w, "folders are not downloaded — use git or scp for a directory");
-    }
-    // Matched on the type, not inferred from "not a directory". A FIFO or a
-    // device node in a cloned repository would block this connection thread on
-    // `read` forever — no error, no timeout, one thread gone per attempt.
-    if !meta.file_type().is_file() {
-        return http::not_found(w, "not a regular file");
-    }
-    let Ok(mut f) = std::fs::File::open(&path) else {
-        return http::not_found(w, "no such file");
+    let (f, path) = match open_regular(dir, rel) {
+        Ok(opened) => opened,
+        Err(msg) => return http::not_found(w, msg),
     };
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let (fallback, encoded) = disposition_name(&name);
-    let _ = write!(
-        w,
+    let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
          Content-Disposition: attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}\r\n\
          {}: {}\r\n{}: {}\r\n\
          Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
         NOSNIFF.0, NOSNIFF.1, SANDBOX.0, SANDBOX.1
     );
-    let mut buf = vec![0u8; DOWNLOAD_CHUNK];
-    loop {
-        match f.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if write!(w, "{n:x}\r\n").is_err()
-                    || w.write_all(&buf[..n]).is_err()
-                    || w.write_all(b"\r\n").is_err()
-                {
-                    return; // the peer went away; nothing useful left to say
-                }
-            }
-            // A read error after the first chunk cannot change the status any
-            // more, so the connection is dropped *without* the terminating
-            // chunk. That is what makes the browser report a failed download
-            // instead of saving what arrived as if it were the whole file.
-            Err(_) => return,
-        }
-    }
-    let _ = w.write_all(b"0\r\n\r\n");
-    let _ = w.flush();
+    stream_chunked(w, f, &head);
 }
 
 /// 64 KB. Large enough that a big file is not a syscall storm, small enough
@@ -864,7 +911,10 @@ fn serve_frag(
             // it rejects `..` outright — so without this, `docs/../shot.png`
             // renders a fragment whose picture then 404s, which reads to the
             // user as a corrupt file rather than a bad path.
-            Some(rel) if is_image(rel) => match crate::assets::normalize(rel) {
+            //
+            // A PDF takes the same arm: it has no text either, and its tab is
+            // nothing but an <iframe> on the same raw route (#121).
+            Some(rel) if is_image(rel) || is_pdf(rel) => match crate::assets::normalize(rel) {
                 None => http::html(w, &render::file_error_fragment(rel, "path outside project")),
                 Some(rel) => match projects::safe_resolve(&dir, rel) {
                     Ok(path) => {
@@ -876,7 +926,11 @@ fn serve_frag(
                             // Not a failure worth refusing the page for: an unreadable mtime only
                             // costs the cache key, and 0 is a legitimate "I could not tell".
                             .unwrap_or(0);
-                        http::html(w, &render::image_fragment(project, rel, mtime_secs))
+                        if is_pdf(rel) {
+                            http::html(w, &render::pdf_fragment(project, rel, mtime_secs))
+                        } else {
+                            http::html(w, &render::image_fragment(project, rel, mtime_secs))
+                        }
                     },
                     Err(e) => http::html(w, &render::file_error_fragment(rel, &e)),
                 },
@@ -1893,6 +1947,131 @@ mod tests {
         // And the real name survives, percent-encoded, in the RFC 5987 form.
         assert!(disp.contains("filename*=UTF-8''"), "{disp}");
         assert!(disp.contains("%C4%8D"), "the real name was lost, not encoded: {disp}");
+    }
+
+    // ---- PDF (#121) ---------------------------------------------------------
+
+    fn pdf_fixture() -> (tempfile::TempDir, Vec<PathBuf>) {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("p/docs")).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        (d, roots)
+    }
+
+    /// Past the 2 MB cap, and more than one chunk: this is the test that fails
+    /// if the PDF goes through the image path's `MAX_FILE_BYTES` check (it did,
+    /// as "asset too large", before #121), and a single-chunk fixture would pass
+    /// a writer that sent only its first read. That images keep the cap is
+    /// `raw_refuses_an_oversize_image_and_a_symlink_out`, unchanged.
+    ///
+    /// Revert-checked: without the `is_pdf` branch in `serve_raw` this fails
+    /// with a 404 "not an image".
+    #[test]
+    fn a_pdf_past_the_cap_is_served_whole_with_the_headers_that_stop_it_rendering() {
+        let (d, roots) = pdf_fixture();
+        let mut want = b"%PDF-1.4\n".to_vec();
+        want.extend((0..(crate::projects::MAX_FILE_BYTES as u32 + 300_000)).map(|i| (i % 251) as u8));
+        std::fs::write(d.path().join("p/docs/paper.pdf"), &want).unwrap();
+
+        let raw = frag_route_bytes(&roots, "/frag/p/raw?path=docs/paper.pdf");
+        let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("headers end") + 4;
+        let head = String::from_utf8_lossy(&raw[..sep]);
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(head.contains("Content-Type: application/pdf"), "{head}");
+        assert!(head.contains("X-Content-Type-Options: nosniff"), "{head}");
+        // The probe in the spec found both browsers' viewers render under plain
+        // `sandbox`, so the PDF gets no exception from it.
+        assert!(head.contains("Content-Security-Policy: sandbox\r\n"), "{head}");
+        assert!(!head.contains("Content-Disposition"), "a viewer, not a download: {head}");
+        let got = dechunk_bytes(&raw[sep..]);
+        assert_eq!(got.len(), want.len(), "truncated at {} bytes", got.len());
+        assert_eq!(got, want, "the bytes changed somewhere in the chunking");
+    }
+
+    /// The type comes from the extension and is pinned by `nosniff`. The
+    /// fixture really is HTML with a script in it — one with nothing to
+    /// mis-sniff would pass against a route that sniffed.
+    #[test]
+    fn html_named_pdf_is_still_a_pdf() {
+        let (d, roots) = pdf_fixture();
+        std::fs::write(d.path().join("p/x.pdf"), "<!doctype html><script>alert(1)</script>").unwrap();
+        let out = frag_route(&roots, "/frag/p/raw?path=x.pdf");
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+        assert!(out.contains("Content-Type: application/pdf"), "{out}");
+        assert!(!out.contains("text/html"), "{out}");
+        assert!(out.contains("X-Content-Type-Options: nosniff"), "{out}");
+        assert!(out.contains("Content-Security-Policy: sandbox"), "{out}");
+    }
+
+    /// Bounded by its own timeout, like the download's FIFO test: a regression
+    /// hangs rather than fails. Revert-checked: without the regular-file check
+    /// in `open_regular` this fails at the 5 s `recv_timeout`.
+    #[test]
+    fn a_fifo_named_pdf_is_refused_promptly() {
+        #[cfg(unix)]
+        {
+            let (d, roots) = pdf_fixture();
+            let made = std::process::Command::new("mkfifo")
+                .arg(d.path().join("p/pipe.pdf"))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !made {
+                return; // no mkfifo on this host; skipped rather than faked
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(frag_route(&roots, "/frag/p/raw?path=pipe.pdf"));
+            });
+            let out = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("serve_pdf blocked on a FIFO instead of refusing it");
+            assert!(out.starts_with("HTTP/1.1 404"), "{out}");
+            assert!(out.contains("not a regular file"), "{out}");
+        }
+    }
+
+    /// The symlink's target exists, so only `safe_resolve`'s prefix check can
+    /// refuse it (CLAUDE.md, *Testing*).
+    #[test]
+    fn a_pdf_outside_the_project_is_refused() {
+        let (d, roots) = pdf_fixture();
+        std::fs::write(d.path().join("secret.pdf"), b"%PDF not yours").unwrap();
+        for q in ["../secret.pdf", "..%2Fsecret.pdf", "/etc/x.pdf"] {
+            let out = frag_route(&roots, &format!("/frag/p/raw?path={q}"));
+            assert!(out.starts_with("HTTP/1.1 404"), "{q} was served: {out}");
+            assert!(!out.contains("not yours"), "{q} leaked the file: {out}");
+        }
+        #[cfg(unix)]
+        {
+            let link = d.path().join("p/link.pdf");
+            std::os::unix::fs::symlink(d.path().join("secret.pdf"), &link).unwrap();
+            assert!(link.canonicalize().is_ok(), "setup: the link must resolve");
+            let out = frag_route(&roots, "/frag/p/raw?path=link.pdf");
+            assert!(out.starts_with("HTTP/1.1 404"), "a symlink out of the project was served: {out}");
+            assert!(!out.contains("not yours"), "{out}");
+        }
+    }
+
+    /// The `file` fragment for a PDF is the viewer, not the text path's
+    /// "binary file" error — which is what it was before #121. The name has
+    /// an `&` and a quote in it, so the escaping has something to escape.
+    /// Revert-checked: without `|| is_pdf(rel)` on the arm, the first
+    /// assertion fails and the fragment is the text path's error.
+    #[test]
+    fn the_file_fragment_for_a_pdf_is_a_frame_on_the_raw_route() {
+        let (d, roots) = pdf_fixture();
+        std::fs::write(d.path().join("p/docs/a&b\"c.pdf"), b"%PDF-1.4\n\0\0binary").unwrap();
+        let q = crate::http::percent_encode("docs/a&b\"c.pdf");
+        let out = frag_route(&roots, &format!("/frag/p/file?path={q}"));
+        assert!(out.contains("<iframe class=\"pdfview\""), "{out}");
+        assert!(!out.contains("binary"), "fell through to the text path: {out}");
+        // `&` in the query separator is escaped as an attribute value must be,
+        // and the name's own `&` and `"` are percent-encoded into the URL.
+        assert!(out.contains(&format!("src=\"/frag/p/raw?path={}&amp;v=", q.replace('&', "&amp;"))), "{out}");
+        assert!(out.contains("a&amp;b&quot;c.pdf"), "the path stripe must be escaped: {out}");
+        assert!(!out.contains("a&b\"c"), "an unescaped name reached the HTML: {out}");
+        assert!(out.contains("class=\"pdfopen\""), "the phone's way in: {out}");
     }
 
     /// Reassembles a chunked body. Asserting on the raw chunked text would pass
