@@ -834,6 +834,7 @@ function onEvent(ev) {
       if (state && state.panes.some((p) => p.tabs.some((t) => t.k === "Terminal" && t.session === ev.session))) {
         ensureTerm(ev.session);
       }
+      if (pendingClaudeSend) claimClaudeSend(ev.session);
       render();
       // live_sessions itself arrives moments later in the State broadcast
       // that follows this event, but the header strip (a separate htmx
@@ -2348,6 +2349,11 @@ async function fileMenu(e, rel, isDir = false) {
   if (rel && !isDir) {
     const dirty = state && state.buffers && state.buffers.some((b) => b.rel === rel && b.dirty);
     items.push({ id: "download", label: dirty ? "Download (saved version)" : "Download" });
+    // #146. Offered when there is a Claude to send to or one can be started;
+    // otherwise it would be an item that can only ever fail.
+    if (LAUNCHES.includes("claude") || (state && (state.claude_sessions || []).length)) {
+      items.push({ id: "claude", label: "Send to Claude" });
+    }
   }
   // Rename and Delete need a target. The prompt version offered them at the
   // project root and then silently did nothing, because its guards were
@@ -2368,6 +2374,8 @@ async function fileMenu(e, rel, isDir = false) {
     // file of any size. No intent and no XHR — this is a GET.
     window.location.href =
       `/frag/${PROJECT}/download?path=${rel.split("/").map(encodeURIComponent).join("/")}`;
+  } else if (choice === "claude") {
+    sendToClaude(rel);
   } else if (choice === "upload") {
     pickAndUpload(dir);
   } else if (choice === "rename") {
@@ -3029,7 +3037,12 @@ function connectTerm(entry, session) {
   const sock = new WebSocket(wsUrl(`/ws/${PROJECT}/term/${session}`));
   sock.binaryType = "arraybuffer";
   entry.sock = sock;
-  sock.onmessage = (e) => entry.term.write(new Uint8Array(e.data));
+  sock.onmessage = (e) => {
+    const bytes = new Uint8Array(e.data);
+    entry.term.write(bytes);
+    // A Send to Claude waiting for this terminal's Claude to come up (#146).
+    if (entry.watch) entry.watch(bytes);
+  };
   sock.onopen = () => {
     entry.tries = 0;
     // Every attachment gets the session's whole scrollback replayed
@@ -3604,6 +3617,146 @@ document.addEventListener("keydown", (e) => {
     session: activeTerminalSession(),
   });
 });
+
+// --- Send to Claude (#146) -------------------------------------------------
+//
+// The tree's menu puts `@path ` into a Claude's prompt and leaves it there:
+// nothing is submitted, so the user goes on writing the message around it.
+// Not Alt+K's route. That one goes through the IDE socket as `at_mentioned`
+// and needs the integration on and connected; this works on any Claude roost
+// can see, which is what makes it the one a phone can use.
+//
+// Pasted, never typed. Claude Code answers a permission prompt on a bare
+// digit, so a typed `@src/v2.rs` could pick option 2 of whatever dialog is
+// up; a bracketed paste only ever reaches the input. `term.paste` wraps it
+// when the app has asked for bracketed paste and goes through onData, so it
+// takes the same dead-socket guard as a keystroke.
+
+// How long a freshly launched Claude's output must stay quiet after it has
+// enabled bracketed paste. Measured: `?2004h` arrives ~0.35 s after
+// `claude\r` and input sent then is lost; 0.5 s later it lands.
+const CLAUDE_READY_QUIET_MS = 500;
+// Past this, nothing is typed. The terminal might be sitting in a shell (no
+// claude after all) or a trust dialog; text pasted into either is worse than
+// a banner saying it was not sent.
+const CLAUDE_READY_DEADLINE_MS = 30000;
+
+// Waiting for a NewTerminal this browser asked for. Claimed by the next
+// TerminalStarted; an unclaimed one (the worktree prompt sent the user
+// elsewhere, say) simply expires.
+let pendingClaudeSend = null;
+
+function claudeMention(rel) {
+  return /\s/.test(rel) ? `@"${rel}" ` : `@${rel} `;
+}
+
+/// The Claude a send goes to, or null when none is running. In order: the
+/// terminal last focused, one that is an active tab, any tab, then a live
+/// session with no tab at all. "Runs a Claude" is the server's evidence
+/// (`claude_sessions`), never the session name — "claude" is a legal name for
+/// a plain shell.
+function claudeTarget() {
+  if (!state) return null;
+  const claudes = new Set(state.claude_sessions || []);
+  if (!claudes.size) return null;
+  const tabbed = [];
+  const active = [];
+  for (const pane of state.panes) {
+    pane.tabs.forEach((t, ti) => {
+      if (t.k !== "Terminal" || !claudes.has(t.session)) return;
+      tabbed.push(t.session);
+      if (ti === pane.active) active.push(t.session);
+    });
+  }
+  if (tabbed.includes(lastFocusedSession)) return lastFocusedSession;
+  if (active.length) return active[0];
+  if (tabbed.length) return tabbed[0];
+  return [...claudes].find((s) => (state.live_sessions || []).includes(s)) || null;
+}
+
+function sendToClaude(rel) {
+  const text = claudeMention(rel);
+  const target = claudeTarget();
+  if (target) {
+    focusSession(target);
+    // Activating a tab mounts its terminal only after the State round trip,
+    // so the socket may not exist yet.
+    const t0 = Date.now();
+    const tryPaste = () => {
+      const e = terms.get(target);
+      if (e && e.sock && e.sock.readyState === 1) return e.term.paste(text);
+      if (Date.now() - t0 > 5000) return showError(`${target} did not connect; ${text.trim()} was not sent`);
+      setTimeout(tryPaste, 50);
+    };
+    tryPaste();
+    return;
+  }
+  if (!LAUNCHES.includes("claude")) {
+    showError("no Claude is running here, and claude is not on this host's PATH");
+    return;
+  }
+  pendingClaudeSend = { text, until: Date.now() + CLAUDE_READY_DEADLINE_MS };
+  // The pane terminals already live in; a fresh layout has them on the right.
+  const pi = state.panes.findIndex((p) => p.tabs.some((t) => t.k === "Terminal"));
+  newTerminal(pi >= 0 ? pi : RIGHT, "claude");
+}
+
+/// Claims a pending send for the terminal the server just started.
+function claimClaudeSend(session) {
+  const p = pendingClaudeSend;
+  pendingClaudeSend = null;
+  if (!p || Date.now() > p.until) return;
+  const e = terms.get(session);
+  if (!e) return; // not a terminal this browser shows, so not the one it asked for
+  whenClaudeReady(e, (ready) => {
+    // The launch record puts the session in claude_sessions from the start,
+    // so this is not proof of a Claude; it is a refusal to paste into a
+    // terminal the server does not even think is one.
+    if (ready && (state.claude_sessions || []).includes(session)) {
+      e.term.paste(p.text);
+      focusSession(session);
+    } else {
+      showError(`Claude did not become ready in ${session}; ${p.text.trim()} was not sent`);
+    }
+  });
+}
+
+/// Calls `done(true)` once the program the shell started has enabled
+/// bracketed paste and then gone quiet, `done(false)` at the deadline.
+///
+/// Observed rather than timed, because start-up time is anything from half a
+/// second to a self-update. The `?2004h` has to follow a `?2004l`: bash and
+/// zsh enable bracketed paste at every prompt and disable it when a line is
+/// accepted, so the shell's own prompt — which comes first — is not the
+/// signal; and Claude Code itself disables and re-enables it as it mounts,
+/// so a shell that never touches the mode still produces the pair.
+function whenClaudeReady(entry, done) {
+  let tail = "", off = false, armed = false, quiet = null;
+  const finish = (ready) => {
+    clearTimeout(quiet);
+    clearTimeout(deadline);
+    entry.watch = null;
+    done(ready);
+  };
+  const deadline = setTimeout(() => finish(false), CLAUDE_READY_DEADLINE_MS);
+  entry.watch = (bytes) => {
+    // Latin-1 is enough to find an ASCII escape sequence, and the seven
+    // carried-over characters catch one split across two chunks without being
+    // able to hold (and so re-count) a whole eight-character one.
+    let chunk = "";
+    for (const b of bytes) chunk += String.fromCharCode(b);
+    const s = tail + chunk;
+    tail = s.slice(-7);
+    for (const m of s.matchAll(/\x1b\[\?2004([hl])/g)) {
+      if (m[1] === "l") off = true;
+      else if (off) armed = true;
+    }
+    if (armed) {
+      clearTimeout(quiet);
+      quiet = setTimeout(() => finish(true), CLAUDE_READY_QUIET_MS);
+    }
+  };
+}
 
 // --- selection sharing (opt-in, off by default — see SHARE_SELECTION) ------
 //
