@@ -224,6 +224,19 @@ main { flex: 1; min-height: 0; }
    it apart. */
 .paneicons .newclaude svg { display: block; }
 .content { flex: 1 1 auto; overflow: auto; position: relative; }
+/* A PDF tab (#121): the viewer fills what is left under the path and scrolls
+   itself, so the pane must not scroll around it. */
+.content:has(> .pdfview) { display: flex; flex-direction: column; overflow: hidden; }
+.content > .pdfview { flex: 1 1 auto; min-height: 0; width: 100%; border: 0; background: var(--bg); }
+.content > .pdfopen { align-self: flex-end; padding: 6px 10px; font-size: 13px; color: var(--accent, #548af7);
+  text-decoration: none; min-height: 32px; box-sizing: border-box; }
+.content > .pdfopen:hover, .content > .pdfopen:active { text-decoration: underline; }
+/* A phone's browser draws no PDF in a frame (Android Chrome shows nothing,
+   iOS Safari one page), so there the link is the way in and the frame goes. */
+@media (max-width: 640px) {
+  .content > .pdfview { display: none; }
+  .content > .pdfopen { align-self: stretch; padding: 14px 16px; min-height: 44px; font-size: 16px; }
+}
 /* Inset from the card edge rather than bleeding into it: the fit addon sizes
    the grid from the host's *inner* box, so padding costs a column, not a
    clipped one. Left is roomier than right because the right edge is where the
