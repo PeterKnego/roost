@@ -2903,6 +2903,15 @@ function ensureTerm(session) {
     convertEol: false,
     fontSize: 13,
     fontFamily: v("--mono", "ui-monospace, Menlo, monospace"),
+    // xterm's default of 1.0 packs rows edge to edge, beside an editor at
+    // 1.55. Kept well short of that because every step costs rows on a short
+    // screen. rowHeight() below measures rendered rows, so it follows this.
+    lineHeight: 1.15,
+    // The colours a running program picks are outside the theme — Claude
+    // Code's dim status and hint lines were near-invisible on dark themes.
+    // xterm lifts any cell below WCAG AA contrast against its own background,
+    // per cell, so a program's colours survive wherever they already read.
+    minimumContrastRatio: 4.5,
     theme: termTheme(),
     // xterm already registers an OscLinkProvider, so OSC 8 sequences are
     // parsed and their ranges tracked; this option is the only thing missing,
