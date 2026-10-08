@@ -229,6 +229,12 @@ main { flex: 1; min-height: 0; }
    clipped one. Left is roomier than right because the right edge is where the
    viewport's scrollbar sits. */
 .content .termhost { position: absolute; inset: 0; padding: 4px 2px 2px 7px; }
+/* The body's `antialiased` is right for UI chrome, but it is macOS's greyscale
+   smoothing, which visibly thins light-on-dark text — the cost lands on the
+   panes people read for hours. `auto` gives them back the platform's normal
+   weight; it changes rasterisation only, never metrics, so code-input's two
+   overlaid layers cannot drift apart over it. Elsewhere it is a no-op. */
+.termhost, .editor, .editwrap code-input, .codeview { -webkit-font-smoothing: auto; }
 /* xterm ships an unstyled viewport, so the browser's default scrollbar lands
    directly on the card's border — a bright bar against every dark theme. */
 .termhost .xterm-viewport { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
