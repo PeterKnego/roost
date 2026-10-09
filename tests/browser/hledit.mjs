@@ -123,30 +123,51 @@ try {
   const visible = await evalIn(
     `getComputedStyle(document.querySelector('.pane[data-pane="2"] textarea.editor')).color`);
   ok(!/rgba\(0, 0, 0, 0\)|transparent/.test(visible), `and its text is visible (${visible})`);
-  console.log("\nE. long lines wrap, and both layers wrap identically");
+  console.log("\nE. long lines do not wrap, and both layers lay out identically");
   ok(await open("wide.rs"), "a file with lines wider than the pane opens");
   await until(() => q("code-input pre .hljs-keyword"), 10, "highlighting");
   const wrap = JSON.parse(await evalIn(`JSON.stringify((() => {
     const el = document.querySelector('.pane[data-pane="2"] code-input');
     const ta = el.querySelector("textarea"), code = el.querySelector("pre code");
-    const line = [...code.childNodes].map((n) => n.textContent).join("");
-    return { taW: ta.scrollWidth, codeW: code.scrollWidth, clientW: ta.clientWidth,
+    const pane = el.closest(".pane");
+    const ln = el.querySelector("pre .ln");
+    // Where this layer's first glyph actually lands, against where the
+    // textarea's text starts. Widths cannot show this: the textarea stretches
+    // to whatever the <pre> needs, so a shifted layer still matches in size.
+    const tw = document.createTreeWalker(ln, NodeFilter.SHOW_TEXT);
+    const t = tw.nextNode(), r = document.createRange();
+    r.setStart(t, 0); r.setEnd(t, 1);
+    const glyphX = r.getBoundingClientRect().left;
+    const taTextX = ta.getBoundingClientRect().left + parseFloat(getComputedStyle(ta).paddingLeft);
+    return { taW: ta.scrollWidth, codeW: code.scrollWidth,
              taH: ta.scrollHeight, codeH: code.scrollHeight,
+             hostScrollW: el.scrollWidth, hostW: el.clientWidth,
+             hostRight: el.getBoundingClientRect().right, paneRight: pane.getBoundingClientRect().right,
              ws: getComputedStyle(ta).whiteSpace,
-             bg: getComputedStyle(code).backgroundColor, hostBg: getComputedStyle(el).backgroundColor,
-             chars: line.length };
+             lnPos: ln ? getComputedStyle(ln, "::before").position : null, glyphX, taTextX,
+             bg: getComputedStyle(code).backgroundColor, hostBg: getComputedStyle(el).backgroundColor };
   })())`));
-  ok(wrap.ws === "pre-wrap", `the editor wraps (white-space: ${wrap.ws})`);
+  // Wrapped code broke at every hyphen and continued at column 0, reading as
+  // a new statement; a hanging indent is impossible over a single textarea.
+  // So a code file scrolls instead. Fails on the pre-wrap this replaced.
+  ok(wrap.ws === "pre", `the editor does not wrap (white-space: ${wrap.ws})`);
   // The property everything else rests on: one `white-space` on the element
-  // reaches both layers, because each takes it by inherit. If only the
-  // textarea wrapped, its wrapped height would tower over the pre's and the
-  // colours would sit lines away from the text.
+  // reaches both layers, because each takes it by inherit. If only one layer
+  // wrapped, the colours would sit lines away from the text. Equal sizes
+  // say nothing about the sticky line numbers, though: see the glyph check.
   ok(wrap.taH === wrap.codeH && wrap.taW === wrap.codeW,
      `both layers lay out identically (${wrap.taW}x${wrap.taH} vs ${wrap.codeW}x${wrap.codeH})`);
-  // The unbroken token is why this is not simply "nothing overflows": the
-  // library pins word-wrap:normal on both layers, so a 420-character token
-  // scrolls rather than breaking — together, which is what matters.
-  ok(wrap.taW > wrap.clientW, `an unbreakable token still scrolls (${wrap.taW}px in a ${wrap.clientW}px pane)`);
+  // The host is code-input's only scroller, so it is the thing that must
+  // overflow — not the pane, which a max-content layer once pushed to 4739px.
+  ok(wrap.hostScrollW > wrap.hostW, `the editor scrolls sideways (${wrap.hostScrollW}px in a ${wrap.hostW}px editor)`);
+  ok(wrap.hostRight <= wrap.paneRight + 1,
+     `and stays inside its pane (editor right ${Math.round(wrap.hostRight)} vs pane right ${Math.round(wrap.paneRight)})`);
+  ok(wrap.lnPos === "sticky", `line numbers stay in view while scrolled (::before position: ${wrap.lnPos})`);
+  // The sticky number sits in the <pre>'s flow, so its margins must net its
+  // inline advance to zero. Watched failing with margin-right raised by 36px:
+  // every size check above stayed green, the text sat 36px right of the caret.
+  ok(Math.abs(wrap.glyphX - wrap.taTextX) < 0.5,
+     `and take no room from the text (first glyph at ${wrap.glyphX.toFixed(1)}, textarea text at ${wrap.taTextX.toFixed(1)})`);
   // A highlight.js theme brings its own background; over this app's it reads
   // as a second, slightly different shade that stops where the text stops.
   ok(/rgba\(0, 0, 0, 0\)|transparent/.test(wrap.bg),
