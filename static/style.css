@@ -306,8 +306,13 @@ main { flex: 1; min-height: 0; }
              gap: 10px; height: 22px; padding: 0 10px; flex: none;
              background: var(--window); color: var(--muted); font-size: 11px; }
 #statusbar .right { margin-left: auto; }
-:root { --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
-.editor { width: 100%; height: 100%; border: 0; font: 13px/1.55 var(--mono); resize: none; padding: 8px 10px; background: var(--bg); color: var(--fg); outline: none; }
+:root { --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+        /* One size for every surface people read code in — terminal, editor,
+           code preview, proposal edit — so they cannot drift apart. The
+           terminal reads it off :root at construction, like --mono. 14 not
+           13: 13 read small beside a terminal running Claude for hours. */
+        --code-size: 14px; }
+.editor { width: 100%; height: 100%; border: 0; font: var(--code-size)/1.55 var(--mono); resize: none; padding: 8px 10px; background: var(--bg); color: var(--fg); outline: none; }
 /* Edit mode carries the same .path breadcrumb a preview does. The wrapper is
    what makes room for it: .editor is height:100%, so without a flex column
    above it the textarea would push its own last lines out of the pane. */
@@ -333,7 +338,7 @@ main { flex: 1; min-height: 0; }
    code-input inherits both to its pre, so setting them here is enough. */
 .editwrap code-input { flex: 1 1 auto; min-height: 0; height: auto; margin: 0;
                        background-color: var(--bg); color: var(--fg);
-                       font: 13px/1.55 var(--mono); tab-size: 4;
+                       font: var(--code-size)/1.55 var(--mono); tab-size: 4;
                        /* Wrapping, as the plain textarea did, for prose —
                           a code file opts out below. Set
                           on the element and nowhere else on purpose: both
@@ -492,7 +497,7 @@ details[open] > summary { background-image: var(--twisty-open); }
 .xy { display: inline-block; min-width: 2.2em; color: var(--muted); font-family: var(--mono); font-size: 11px; }
 .hint { color: var(--muted); padding: 16px; }
 .path { position: sticky; top: 0; background: var(--bg2); border-bottom: 1px solid var(--hairline, var(--border)); padding: 4px 10px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
-.codeview { padding: 10px 10px 10px calc(10px + var(--ln-gutter, 0px)); font: 13px/1.55 var(--mono);
+.codeview { padding: 10px 10px 10px calc(10px + var(--ln-gutter, 0px)); font: var(--code-size)/1.55 var(--mono);
             overflow-x: auto; background: var(--bg); position: relative; counter-reset: ln; }
 /* font too, not just the background: the UA stylesheet sets `code { font-family:
    monospace }`, which beats inheritance from .codeview and rendered a preview
@@ -810,7 +815,7 @@ ul.picker li .git:hover { text-decoration: underline; }
   height: 40%;
   min-height: 6em;
   margin: 0;
-  font: 13px/1.55 var(--mono);
+  font: var(--code-size)/1.55 var(--mono);
   background: var(--bg);
   color: var(--fg);
   border: 0;
