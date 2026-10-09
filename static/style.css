@@ -540,8 +540,19 @@ details[open] > summary { background-image: var(--twisty-open); }
   background: var(--bg); opacity: 1;
   color: color-mix(in oklab, var(--muted) 60%, var(--bg)); }
 
-.diffview { font: 12.5px/1.5 var(--mono); padding: 6px 0; }
+/* A diff scrolls sideways rather than wrapping, for the reason a code file's
+   editor does: wrapped code broke at every hyphen and went on at column 0, so
+   the continuation read as a line of its own — worse here, where it has no
+   +/- of its own either. The view is its own horizontal scroller, like
+   .codeview. One grid column at least as wide as the view and as wide as the
+   longest line, so every row shares one width and a short added line's
+   colour still reaches the right edge after scrolling over. .dl outside a
+   .diffview (the revert and save-conflict dialogs' detail) keeps wrapping:
+   those are small boxes with no room to scroll in. */
+.diffview { font: 12.5px/1.5 var(--mono); padding: 6px 0;
+            display: grid; grid-template-columns: minmax(max-content, 1fr); overflow-x: auto; }
 .dl { padding: 0 12px; white-space: pre-wrap; }
+.diffview .dl { white-space: pre; }
 .dl.add { background: var(--add-bg); color: var(--add-fg); }
 .dl.del { background: var(--del-bg); color: var(--del-fg); }
 .dl.hunk { color: var(--hunk); padding-top: 6px; }
