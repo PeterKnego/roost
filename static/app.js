@@ -2901,7 +2901,7 @@ function ensureTerm(session) {
   const v = (name, fallback) => css.getPropertyValue(name).trim() || fallback;
   const term = new Terminal({
     convertEol: false,
-    fontSize: 13,
+    fontSize: parseFloat(v("--code-size", "14px")) || 14,
     fontFamily: v("--mono", "ui-monospace, Menlo, monospace"),
     // xterm's default of 1.0 packs rows edge to edge, beside an editor at
     // 1.55. Kept well short of that because every step costs rows on a short
