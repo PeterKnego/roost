@@ -28,6 +28,7 @@ deno run -A tests/browser/autosave.mjs   # the editor writes itself out, and sto
 deno run -A tests/browser/tabwrap.mjs    # the tab strip wraps, and re-fits the terminal under it
 deno run -A tests/browser/shiftenter.mjs # shift+enter sends LF, so Claude inserts a newline
 deno run -A tests/browser/hledit.mjs     # a code file stays highlighted while you edit it
+deno run -A tests/browser/diffwrap.mjs   # a diff scrolls sideways, and every row's colour spans it
 deno run -A tests/browser/edit-by-default.mjs # clicking a text file opens an editor, not a preview
 deno run -A tests/browser/preview-follows.mjs # a previewed file follows the file on disk
 deno run -A tests/browser/buffer-lifecycle.mjs # navigating a file is not an edit; undoing one comes back clean
