@@ -334,8 +334,8 @@ main { flex: 1; min-height: 0; }
 .editwrap code-input { flex: 1 1 auto; min-height: 0; height: auto; margin: 0;
                        background-color: var(--bg); color: var(--fg);
                        font: 13px/1.55 var(--mono); tab-size: 4;
-                       /* Wrapping, as the plain textarea did — long lines are
-                          not worth a horizontal scroll in a 600px pane. Set
+                       /* Wrapping, as the plain textarea did, for prose —
+                          a code file opts out below. Set
                           on the element and nowhere else on purpose: both
                           layers take `white-space: inherit` from here, so
                           this is the one place that can change it without
@@ -355,6 +355,14 @@ main { flex: 1; min-height: 0; }
                           no drift. */
                        --padding-left: calc(10px + var(--ln-gutter, 0px)); --padding-right: 10px;
                        --code-input_default-caret-color: var(--fg); }
+/* A code file does not wrap. Wrapped code read badly in a 600px pane: rows
+   broke at every hyphen (`line-` / `height`) and the continuation started at
+   column 0, indistinguishable from a new statement. A hanging indent is not
+   available — the textarea is one text flow with no per-line box, and the two
+   layers must wrap identically or the colours walk off the caret — so the
+   choice was wrap badly or scroll, and scrolling is the library's own default.
+   Still set on the element, for the same both-layers reason as above. */
+.editwrap code-input[template="hl"] { white-space: pre; }
 /* The textarea inside carries .editor too, so the app's own selectors still
    find it — but .editor paints an opaque background, which over a highlighted
    layer would hide exactly what this is for. */
@@ -362,8 +370,9 @@ main { flex: 1; min-height: 0; }
    which is right when nothing wraps and wrong the moment something does: the
    longest line then sets the element's width and the whole editor grows to it
    — measured at 4739px inside a 590px pane, taking the pane's layout with it —
-   instead of wrapping at the pane's edge. */
-.editwrap code-input pre code { width: auto; max-width: 100%; }
+   instead of wrapping at the pane's edge. Not for a code file, which does not
+   wrap: there max-content is the width the host has to scroll across. */
+.editwrap code-input:not([template="hl"]) pre code { width: auto; max-width: 100%; }
 /* The containing block for this layer's line numbers, and where their counter
    starts. Safe to position: the vendor stylesheet gives `code-input textarea`
    z-index 1 and `code-input pre` z-index 0 outright, and z-index applies to a
@@ -510,6 +519,21 @@ details[open] > summary { background-image: var(--twisty-open); }
               width: calc(var(--ln-gutter, 0px) - 14px); text-align: right;
               color: var(--muted); opacity: .6;
               user-select: none; -webkit-user-select: none; pointer-events: none; }
+/* In a code file's editor, which scrolls sideways (it does not wrap), an
+   absolute number would scroll out of view with the text. Sticky keeps it at
+   the host's left edge instead, and the host is the right ancestor: it is the
+   only thing in code-input that scrolls. Sticky needs the box in flow, so its
+   margins net its inline advance to zero — the textarea has no such box, and a
+   number that took up width would push this layer's text off the caret. It
+   spans the whole gutter and paints the background so text scrolled under it
+   is hidden; the padding keeps the digits where the absolute rule puts them.
+   Normal position: x 0 to G+6 of the code box, the text starting at G+10. */
+.editwrap code-input[template="hl"] .ln::before {
+  position: sticky; left: 0; display: inline-block; box-sizing: border-box;
+  width: calc(var(--ln-gutter, 0px) + 6px); padding-right: 16px;
+  margin-left: calc(-1 * var(--ln-gutter, 0px) - 10px); margin-right: 4px;
+  background: var(--bg); opacity: 1;
+  color: color-mix(in oklab, var(--muted) 60%, var(--bg)); }
 
 .diffview { font: 12.5px/1.5 var(--mono); padding: 6px 0; }
 .dl { padding: 0 12px; white-space: pre-wrap; }
