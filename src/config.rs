@@ -13,6 +13,7 @@ struct RawConfig {
     autosave: Option<bool>,
     follow_tree: Option<bool>,
     read_when_watching: Option<bool>,
+    code_font_size: Option<i64>,
     allowed_origins: Option<Vec<String>>,
     max_upload_bytes: Option<u64>,
     share_selection: Option<bool>,
@@ -60,6 +61,14 @@ pub struct Settings {
     /// ceiling — `autosave`'s argument. On by default because off is the
     /// behaviour #129 reported as a bug.
     pub read_when_watching: bool,
+    /// Pixel size of every surface code is read in — terminal, editor, code
+    /// preview, proposal edit — as `--code-size`. `None` means unset, and that
+    /// is kept distinct from "set to the default" on purpose: unset emits
+    /// nothing, so a project's own `.roost/theme.css` can still choose the
+    /// size, while a value someone picked in Settings is put on `<html>`
+    /// where no stylesheet can override it. Project-scoped under `autosave`'s
+    /// argument: a checkout setting it changes how big its own text looks.
+    pub code_font_size: Option<u32>,
     /// Off unless a project asks for it. This ships file contents to Claude
     /// with no explicit user action, and roost has no permission system to
     /// scope it the way Claude Code's own `Read` deny rules do. Unlike
@@ -99,6 +108,7 @@ impl Default for Settings {
             autosave: true,
             follow_tree: true,
             read_when_watching: true,
+            code_font_size: None,
             warning: None,
         }
     }
@@ -106,7 +116,14 @@ impl Default for Settings {
 
 /// Keys a project file may set — display-level, nothing a hostile checkout
 /// could widen a boundary with. In this order in the dialog.
-pub const PROJECT_KEYS: &[&str] = &["theme", "hide", "show_hidden", "autosave", "follow_tree", "read_when_watching"];
+pub const PROJECT_KEYS: &[&str] =
+    &["theme", "code_font_size", "hide", "show_hidden", "autosave", "follow_tree", "read_when_watching"];
+/// What `--code-size` is when `code_font_size` is unset — `static/style.css`
+/// carries the same 14px, and the dialog shows this as the default.
+pub const DEFAULT_CODE_FONT_SIZE: u32 = 14;
+/// The range `code_font_size` accepts. Below 10 the terminal's cells stop
+/// being legible; above 24 a pane holds too few columns to run Claude in.
+pub const CODE_FONT_SIZES: std::ops::RangeInclusive<i64> = 10..=24;
 /// Keys only the global file may set; see the readers below for why each.
 /// `relaunch` is here for the sharpest reason any key has been: it decides
 /// whether opening a project *starts an agent*. A cloned repository that could
@@ -162,6 +179,13 @@ pub fn validate(scope: Scope, key: &str, value: Option<&SettingValue>) -> Result
             Ok(())
         }
         ("hide", _) => Err("hide takes a list of names".into()),
+        ("code_font_size", SettingValue::Int(n)) if CODE_FONT_SIZES.contains(n) => Ok(()),
+        ("code_font_size", SettingValue::Int(n)) => Err(format!(
+            "code_font_size: {n} is outside {}–{} pixels",
+            CODE_FONT_SIZES.start(),
+            CODE_FONT_SIZES.end()
+        )),
+        ("code_font_size", _) => Err("code_font_size takes a whole number of pixels".into()),
         (
             "show_hidden" | "autosave" | "follow_tree" | "read_when_watching" | "share_selection"
             | "worktree_prompt" | "relaunch" | "version_check",
@@ -212,6 +236,12 @@ pub fn load(paths: &[&Path]) -> Settings {
                 }
                 if let Some(v) = raw.read_when_watching {
                     s.read_when_watching = v;
+                }
+                // Out of range in a hand-edited file is ignored rather than
+                // clamped: clamping would show a size nobody wrote, and the
+                // dialog still shows the raw value beside the effective one.
+                if let Some(v) = raw.code_font_size.filter(|v| CODE_FONT_SIZES.contains(v)) {
+                    s.code_font_size = Some(v as u32);
                 }
             }
             Err(e) => warnings.push(format!("{}: {}", path.display(), e.message())),
@@ -560,6 +590,7 @@ pub fn write_setting(path: &Path, key: &str, value: Option<&SettingValue>) -> Re
         Some(v) => {
             let new_value = match v {
                 SettingValue::Bool(b) => toml_edit::Value::from(*b),
+                SettingValue::Int(i) => toml_edit::Value::from(*i),
                 SettingValue::Str(s) => toml_edit::Value::from(s.as_str()),
                 SettingValue::List(l) => {
                     let mut a = toml_edit::Array::new();
@@ -635,8 +666,7 @@ pub fn write_setting(path: &Path, key: &str, value: Option<&SettingValue>) -> Re
 }
 
 /// The raw value of one key in one file, no cascade, no defaults: what the
-/// dialog shows as "project: …" and "global: …". Integers come back as
-/// their decimal text (only read-only keys carry them). A file that does
+/// dialog shows as "project: …" and "global: …". A file that does
 /// not parse reads as absent; `Settings::warning` reports the parse error
 /// separately.
 pub fn raw_setting(path: &Path, key: &str) -> Option<SettingValue> {
@@ -651,7 +681,7 @@ pub fn raw_setting(path: &Path, key: &str) -> Option<SettingValue> {
         return Some(SettingValue::Str(s.to_string()));
     }
     if let Some(i) = v.as_integer() {
-        return Some(SettingValue::Str(i.to_string()));
+        return Some(SettingValue::Int(i));
     }
     if let Some(a) = v.as_array() {
         return Some(SettingValue::List(a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()));
@@ -709,6 +739,9 @@ pub fn settings_view(project_dir: &Path) -> crate::proto::SettingsView {
     };
     push("theme", "str", V::Str(s.theme.clone()), V::Str(defaults.theme.clone()), false,
         "Colour theme for this project's pages; pick it on the Theme tab.");
+    push("code_font_size", "int",
+        V::Int(s.code_font_size.unwrap_or(DEFAULT_CODE_FONT_SIZE).into()), V::Int(DEFAULT_CODE_FONT_SIZE.into()), false,
+        "Text size in pixels for the terminal, the editor and code previews, 10–24.");
     push("hide", "list", V::List(s.hide.clone()), V::List(vec![]), false,
         "Names left out of the file tree and of search, one per line (dist, node_modules).");
     push("show_hidden", "bool", V::Bool(s.show_hidden), V::Bool(false), false,
@@ -1437,7 +1470,7 @@ mod tests {
         assert_eq!(raw_setting(&p, "theme"), Some(V::Str("nord".into())));
         assert_eq!(raw_setting(&p, "autosave"), Some(V::Bool(false)));
         assert_eq!(raw_setting(&p, "hide"), Some(V::List(vec!["x".into()])));
-        assert_eq!(raw_setting(&p, "max_upload_bytes"), Some(V::Str("5".into())));
+        assert_eq!(raw_setting(&p, "max_upload_bytes"), Some(V::Int(5)));
         assert_eq!(raw_setting(&p, "show_hidden"), None);
         assert_eq!(raw_setting(&d.path().join("none.toml"), "theme"), None);
     }
@@ -1483,6 +1516,13 @@ mod tests {
         assert_eq!(r.writable, vec!["project", "global"], "read_when_watching is not global-only");
         assert_eq!(r.default, V::Bool(true));
         assert!(!r.reload, "followed live from State, not embedded at page load");
+        // Project-scoped under autosave's argument: a checkout setting it only
+        // changes how big its own text looks. Live, like the theme — app.js
+        // applies it from every snapshot, terminals included.
+        let c = row("code_font_size");
+        assert_eq!(c.writable, vec!["project", "global"], "code_font_size is not global-only");
+        assert_eq!((c.kind, &c.default, &c.effective), ("int", &V::Int(14), &V::Int(14)));
+        assert!(!c.reload, "followed live from State, not embedded at page load");
         // Every row explains itself: the dialog shows `doc` under the key.
         for r in &v.keys {
             assert!(!r.doc.is_empty() && r.doc.ends_with('.'), "{}: doc {:?}", r.key, r.doc);
@@ -1491,7 +1531,7 @@ mod tests {
         assert!(!row("theme").reload);
         // Order: project keys, global-only keys, read-only keys.
         let keys: Vec<&str> = v.keys.iter().map(|r| r.key.as_str()).collect();
-        assert_eq!(keys, ["theme", "hide", "show_hidden", "autosave", "follow_tree", "read_when_watching", "share_selection", "worktree_prompt", "relaunch", "version_check", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
+        assert_eq!(keys, ["theme", "code_font_size", "hide", "show_hidden", "autosave", "follow_tree", "read_when_watching", "share_selection", "worktree_prompt", "relaunch", "version_check", "allowed_origins", "max_upload_bytes", "ide", "roots"]);
         assert_eq!(v.themes.len(), 5 + 35);
         assert!(v.global_file.ends_with("global.toml"));
         assert_eq!(v.project_file, ".roost/config.toml");
@@ -1519,5 +1559,59 @@ mod tests {
             "the JS and the #86 self-update plan both read state.settings.update.latest by name");
         assert!(json["build"].get("status").is_none(), "and not state.settings.build.status");
         std::env::remove_var("ROOST_CONFIG");
+    }
+
+    /// Every refusal names why, because it lands in a banner; and the
+    /// in-range case is accepted at both scopes, since this key is meant for
+    /// a project as much as for everyone.
+    #[test]
+    fn code_font_size_takes_whole_pixels_in_range() {
+        for scope in [Scope::Project, Scope::Global] {
+            assert!(validate(scope, "code_font_size", Some(&V::Int(15))).is_ok());
+        }
+        assert!(validate(Scope::Project, "code_font_size", Some(&V::Int(10))).is_ok(), "10 is in range");
+        assert!(validate(Scope::Project, "code_font_size", Some(&V::Int(24))).is_ok(), "24 is in range");
+        for n in [9, 25, 0, -14] {
+            let e = validate(Scope::Project, "code_font_size", Some(&V::Int(n))).unwrap_err();
+            assert!(e.contains("outside 10–24"), "{n} must be refused by range: {e}");
+        }
+        let e = validate(Scope::Project, "code_font_size", Some(&V::Str("15".into()))).unwrap_err();
+        assert!(e.contains("whole number"), "a quoted number is refused, not written as a string: {e}");
+        assert!(validate(Scope::Project, "code_font_size", None).is_ok(), "and clearing it is always allowed");
+    }
+
+    /// The cascade, plus the two ways a hand-edited file can be wrong. An
+    /// out-of-range project value must not mask the global one: it is
+    /// ignored, so the global 12 stands — not clamped to 24, and not None.
+    #[test]
+    fn code_font_size_cascades_and_ignores_a_bad_value() {
+        let d = tempfile::tempdir().unwrap();
+        let g = d.path().join("global.toml");
+        let p = d.path().join("project.toml");
+        assert_eq!(load(&[&g, &p]).code_font_size, None, "unset is None, not the default");
+        fs::write(&g, "code_font_size = 12\n").unwrap();
+        assert_eq!(load(&[&g, &p]).code_font_size, Some(12));
+        fs::write(&p, "code_font_size = 16\n").unwrap();
+        assert_eq!(load(&[&g, &p]).code_font_size, Some(16), "project wins");
+        fs::write(&p, "code_font_size = 30\n").unwrap();
+        assert_eq!(load(&[&g, &p]).code_font_size, Some(12), "out of range is ignored, the global stands");
+        fs::write(&p, "code_font_size = \"16\"\n").unwrap();
+        let s = load(&[&g, &p]);
+        assert!(s.warning.is_some(), "a string where a number belongs is a parse error, reported");
+    }
+
+    /// The write path: an Int lands as a TOML integer, which the loader then
+    /// reads back. A Str arm reused for it would write "15" and the round
+    /// trip below would fail at load, with a config warning.
+    #[test]
+    fn code_font_size_round_trips_as_an_integer() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("config.toml");
+        write_setting(&p, "code_font_size", Some(&V::Int(15))).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains("code_font_size = 15") && !text.contains("\"15\""), "unquoted: {text}");
+        assert_eq!(raw_setting(&p, "code_font_size"), Some(V::Int(15)));
+        let s = load(&[&p]);
+        assert_eq!((s.code_font_size, s.warning), (Some(15), None));
     }
 }

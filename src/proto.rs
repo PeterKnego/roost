@@ -66,12 +66,16 @@ pub enum Scope {
     Project,
 }
 
-/// A config value as the dialog carries it. Untagged: `true`, `"nord"` and
-/// `["dist"]` are unambiguous on the wire and in TOML.
+/// A config value as the dialog carries it. Untagged: `true`, `15`, `"nord"`
+/// and `["dist"]` are unambiguous on the wire and in TOML. `Int` sits before
+/// `Str` only for readability — a JSON number never matches a string — and a
+/// quoted `"15"` stays a `Str`, which `config::validate` refuses for an
+/// integer key rather than writing `code_font_size = "15"` into the file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SettingValue {
     Bool(bool),
+    Int(i64),
     Str(String),
     List(Vec<String>),
 }
@@ -923,6 +927,13 @@ mod tests {
 
     #[test]
     fn set_setting_decodes_each_value_shape_and_a_clear() {
+        // A JSON number is an Int, and a quoted one stays a Str — which is
+        // what lets config::validate refuse "15" for an integer key instead
+        // of writing a TOML string the loader cannot read as a size.
+        let n: Intent = serde_json::from_str(r#"{"t":"SetSetting","scope":"project","key":"code_font_size","value":15}"#).unwrap();
+        assert_eq!(n, Intent::SetSetting { scope: Scope::Project, key: "code_font_size".into(), value: Some(SettingValue::Int(15)) });
+        let q: Intent = serde_json::from_str(r#"{"t":"SetSetting","scope":"project","key":"code_font_size","value":"15"}"#).unwrap();
+        assert_eq!(q, Intent::SetSetting { scope: Scope::Project, key: "code_font_size".into(), value: Some(SettingValue::Str("15".into())) });
         let b: Intent = serde_json::from_str(r#"{"t":"SetSetting","scope":"project","key":"autosave","value":false}"#).unwrap();
         assert_eq!(b, Intent::SetSetting { scope: Scope::Project, key: "autosave".into(), value: Some(SettingValue::Bool(false)) });
         let s: Intent = serde_json::from_str(r#"{"t":"SetSetting","scope":"global","key":"theme","value":"nord"}"#).unwrap();

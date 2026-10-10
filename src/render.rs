@@ -1834,17 +1834,24 @@ dialog.roost, .dlg-title, .dlg-blocked { display: revert !important; visibility:
 /// shadowed — rename it; this is checked against the embedded set only, so
 /// rendering never touches the filesystem.) The daisyUI links go in the
 /// cascade order the bridge needs: variables, then bridge, then style.css.
-fn theme_head(theme: &str) -> (String, String) {
+///
+/// `code_size` is `Settings::code_font_size`, and goes on the same tag as an
+/// inline `--code-size`: inline on `<html>` outranks every `:root` rule, a
+/// project's `.roost/theme.css` included, which is the point — a size picked
+/// in Settings is the most specific answer there is. Unset, nothing is
+/// emitted and the stylesheets decide. A `u32`, so there is nothing to escape.
+fn theme_head(theme: &str, code_size: Option<u32>) -> (String, String) {
+    let style = code_size.map(|px| format!(" style=\"--code-size: {px}px\"")).unwrap_or_default();
     match crate::themes::kind(theme) {
         Some(crate::themes::ThemeKind::Daisy) => (
-            format!("<html data-theme=\"{theme}\">"),
+            format!("<html data-theme=\"{theme}\"{style}>"),
             "<link rel=\"stylesheet\" href=\"/static/vendor/daisyui-themes.css\">\n\
              <link rel=\"stylesheet\" href=\"/static/daisy-bridge.css\">"
                 .into(),
         ),
         // A roost file, or an unknown name linked as a file: that is how a
         // theme in the user directory is reached.
-        _ => ("<html>".into(), format!("<link rel=\"stylesheet\" href=\"/static/themes/{}.css\">", esc(theme))),
+        _ => (format!("<html{style}>"), format!("<link rel=\"stylesheet\" href=\"/static/themes/{}.css\">", esc(theme))),
     }
 }
 
@@ -1860,7 +1867,7 @@ pub fn workspace_page(
     sharing_on: bool,
     launches: &[&str],
 ) -> String {
-    let (html_open, theme_links) = theme_head(&s.theme);
+    let (html_open, theme_links) = theme_head(&s.theme, s.code_font_size);
     let warn = s
         .warning
         .as_deref()
@@ -3226,6 +3233,24 @@ mod tests {
         let off = Settings { autosave: false, ..Settings::default() };
         let h = workspace_page("proj", "proj", &off, None, false, &[]);
         assert!(h.contains(r#"data-autosave="0""#), "and a configured false reaches the page");
+    }
+
+    // Both directions: a constant style attribute would pass the first and
+    // pin every page to one size, overriding a project's own theme.css even
+    // where nobody set code_font_size; an emission gated wrongly would pass
+    // the second and leave the setting doing nothing.
+    #[test]
+    fn the_page_carries_the_code_font_size_only_when_set() {
+        let unset = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
+        assert!(unset.contains("<html><head>"), "unset leaves <html> bare, so the stylesheets decide");
+        assert!(!unset.contains("--code-size: "), "and puts no size anywhere inline");
+        let set = Settings { code_font_size: Some(17), ..Settings::default() };
+        let h = workspace_page("proj", "proj", &set, None, false, &[]);
+        assert!(h.contains(r#"<html style="--code-size: 17px"><head>"#), "a set size lands on <html>: {}", &h[..80]);
+        let daisy = Settings { theme: "nord".into(), code_font_size: Some(12), ..Settings::default() };
+        let h = workspace_page("proj", "proj", &daisy, None, false, &[]);
+        assert!(h.contains(r#"<html data-theme="nord" style="--code-size: 12px">"#),
+            "and survives a daisyUI theme, which builds its own <html> tag: {}", &h[..80]);
     }
 
     // "Off unless a project asks for it, and visible whenever it is on" is

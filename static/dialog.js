@@ -533,6 +533,20 @@ function openSettings(settings) {
       c.onchange = () => { edits.set(r.key, { value: c.checked, clear: false }); };
       return c;
     }
+    if (r.kind === "int") {
+      // A number, not its text: the server refuses a quoted "15" for an
+      // integer key rather than write a string into the file. A field that
+      // does not hold a whole number yet records no edit, so Save sends the
+      // last good value or nothing — never NaN.
+      const i = document.createElement("input"); i.type = "number"; i.step = "1"; i.value = String(cur ?? "");
+      if (r.key === "code_font_size") { i.min = "10"; i.max = "24"; }
+      i.oninput = () => {
+        const n = Number(i.value);
+        if (i.value.trim() !== "" && Number.isInteger(n)) edits.set(r.key, { value: n, clear: false });
+        else edits.delete(r.key);
+      };
+      return i;
+    }
     if (r.kind === "list") {
       const t = document.createElement("textarea"); t.value = (Array.isArray(cur) ? cur : []).join("\n");
       t.oninput = () => { edits.set(r.key, { value: t.value.split("\n").map((s) => s.trim()).filter(Boolean), clear: false }); };
@@ -545,6 +559,7 @@ function openSettings(settings) {
   // Human labels for the keys. The key itself stays visible beside the label
   // in the mono face: it is what you would type into the file.
   const LABELS = {
+    code_font_size: "Code font size",
     hide: "Hidden names", show_hidden: "Show dot-files", autosave: "Autosave", follow_tree: "Tree follows the open file", read_when_watching: "Read notices you are watching",
     share_selection: "Share selection with Claude", worktree_prompt: "Offer a worktree for a second Claude",
     relaunch: "Restart agents when a project opens",

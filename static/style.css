@@ -1118,8 +1118,9 @@ dialog.roost.dlg-wide { width: min(760px, 96vw); }
 .dlg-row .doc { color: var(--muted); font-size: 12px; line-height: 1.35; margin-top: 2px; }
 .dlg-row[data-kind="list"] { grid-template-columns: minmax(0, 1fr); }
 .dlg-row[data-kind="list"] textarea { grid-column: 1 / -1; }
-.dlg-row input[type="text"], .dlg-row textarea { width: 100%; font: inherit; font-size: 12px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 4px 7px; justify-self: end; }
+.dlg-row input[type="text"], .dlg-row input[type="number"], .dlg-row textarea { width: 100%; font: inherit; font-size: 12px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 4px 7px; justify-self: end; }
 .dlg-row textarea { min-height: 3.2em; resize: vertical; font-family: var(--mono); }
+.dlg-row input[type="number"] { width: 6em; }
 .dlg-row.ro-row { grid-template-columns: minmax(0, 1fr); }
 .dlg-row .ro { color: var(--fg); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; }
 .dlg-row .ro.empty { color: var(--muted); font-family: inherit; }

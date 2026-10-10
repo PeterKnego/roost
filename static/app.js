@@ -4661,6 +4661,26 @@ function renderUpdateMark() {
 // vendored variables and the bridge. The vendored file goes FIRST in
 // <head>: its `:root` block defines --border as a width, and only a roost
 // theme file linked after it wins that back (the bridge does for daisyUI).
+/// `code_font_size` from a settings snapshot, onto this page. The server puts
+/// the same `--code-size` on <html> at render time (render::theme_head), so
+/// the first snapshot normally changes nothing; this is what carries a save
+/// — from this page's dialog or another browser's — to a page already open.
+/// Unset removes the inline value, handing the size back to the stylesheets
+/// (style.css's 14px, or a project's own theme.css). A terminal reads its
+/// size once at construction, so open ones are resized here and refitted,
+/// which re-sends their PTY geometry; without that a running Claude would
+/// keep drawing for the old column count.
+function applyCodeSize(r) {
+  const set = (r.project !== null && r.writable.includes("project")) || r.global !== null;
+  const root = document.documentElement.style;
+  const want = set ? `${r.effective}px` : "";
+  if (root.getPropertyValue("--code-size").trim() === want) return;
+  if (want) root.setProperty("--code-size", want); else root.removeProperty("--code-size");
+  const px = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--code-size")) || 14;
+  terms.forEach((e) => { try { e.term.options.fontSize = px; } catch {} });
+  fitTerminals();
+}
+
 function applyTheme(name) {
   const head = document.head;
   const styleLink = head.querySelector('link[href="/static/style.css"]');
@@ -4748,6 +4768,8 @@ function followSettings() {
     if (appliedTheme === null) appliedTheme = theme.effective; // first snapshot: the page is already painted with it
     else if (!settingsOpen && theme.effective !== appliedTheme) applyTheme(theme.effective);
   }
+  const size = row("code_font_size");
+  if (size) applyCodeSize(size);
   const auto = row("autosave");
   if (auto) AUTOSAVE = auto.effective === true;
   const rw = row("read_when_watching");
