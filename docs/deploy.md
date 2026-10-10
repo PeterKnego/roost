@@ -324,6 +324,14 @@ highlighter, which is a fixed stylesheet. A project theme goes in
 the user directory nor a project may supply JavaScript or HTML — only
 `$ROOST_STATIC` can, and only whoever starts the process can set it.
 
+Caching follows the layers. Every response says `Cache-Control: no-cache`, so
+a browser may keep a copy but asks before using it, and a normal reload after a
+deploy picks up the new build. The one exception is an embedded asset requested
+with the `?v=` hash of its current bytes, which is sent `immutable` for a year:
+a new build changes the hash and therefore the URL. The `$ROOST_STATIC` and
+user-directory layers never get that, even with the current `?v=`, because they
+change without the build changing; an edit there shows on the next reload.
+
 ## Running it in a container
 
 **A container sits beside the systemd unit; it does not replace it.** The one
