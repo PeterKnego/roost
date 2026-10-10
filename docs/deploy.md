@@ -636,13 +636,31 @@ Globally or per project, and live: an open page follows a change on the next
 snapshot, no reload. Per-project for `autosave`'s reason — a checkout setting
 it changes only what you see as unread.
 
+### Code font size
+
+One size for every surface code is read in — terminals, the editor, code
+previews and the proposal editor — in whole pixels, 10–24:
+
+```toml
+code_font_size = 16
+```
+
+Globally or per project, and live: a save resizes every open page's text and
+its running terminals on the next snapshot, and refits them, so a running
+program redraws for the new column count. Unset, the size is the
+stylesheets' — 14px, or whatever a project's own `.roost/theme.css` sets as
+`--code-size`; once set, it wins over any theme CSS. A value outside the range
+in a hand-edited file is ignored rather than clamped, and a quoted `"16"` is a
+parse error reported by the ⚠ config marker. Per-project for `autosave`'s
+reason — a checkout setting it changes only how big its own text looks.
+
 ### The settings dialog
 
 The header's gear opens it. Two panes, **Settings** and **Theme**, and a
 scope switch, **Project** (`{project}/.roost/config.toml`) or **Global**
 (`~/.config/roost/config.toml`, or `$ROOST_CONFIG`). It writes the display
-keys only — `theme`, `hide`, `show_hidden`, `autosave`, `follow_tree`,
-`read_when_watching`, and in Global scope
+keys only — `theme`, `code_font_size`, `hide`, `show_hidden`, `autosave`,
+`follow_tree`, `read_when_watching`, and in Global scope
 also `share_selection` and `worktree_prompt`. `allowed_origins`,
 `max_upload_bytes`, `ide` and `roots` are shown read-only and have no write
 path from a page at all: the hub refuses them by name. Writes go through
