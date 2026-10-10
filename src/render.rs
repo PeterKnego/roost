@@ -1108,13 +1108,17 @@ fn asset_hash(rels: &[&str]) -> String {
 /// The `?v=` for one asset, memoised per name.
 ///
 /// Every stylesheet and script roost ships carries one. Without it a browser
-/// applies its own heuristic — roost sends no `Cache-Control` at all — and a
+/// applied its own heuristic — roost sent no `Cache-Control` then — and a
 /// phone goes on running the previous release's `app.js` and `style.css` for
 /// as long as that heuristic says. It is not a theoretical staleness: a
 /// deployed CSS fix for terminal scrolling was reported as "still broken" from
 /// a phone that had never fetched it. The favicons had this from 2026-09-03;
 /// the files that actually change every release did not.
-fn av(rel: &str) -> String {
+///
+/// `routes::serve_static` compares a request's `?v=` against this to decide
+/// whether a response may be cached for good, so it must stay a hash of the
+/// *embedded* bytes — the only layer a version can vouch for.
+pub(crate) fn av(rel: &str) -> String {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
         std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));

@@ -60,7 +60,7 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
     let segs: Vec<&str> = req.path.split('/').filter(|s| !s.is_empty()).collect();
     match segs.as_slice() {
         [] => serve_index(w, req, roots),
-        ["static", rest @ ..] => serve_static(w, &rest.join("/")),
+        ["static", rest @ ..] => serve_static(w, &rest.join("/"), req.query.get("v").map(String::as_str)),
         // Cross-project data (the header strip) has no single project to
         // hang off — `serve_frag` below always resolves a project first, so
         // this cannot be folded into it. Must come before the general frag
@@ -163,7 +163,7 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
         // Root scope, not /static/sw.js: a service worker may only control
         // URLs under its own path, and this one has to focus and navigate
         // workspace tabs at /{project}.
-        ["sw.js"] => serve_static(w, "sw.js"),
+        ["sw.js"] => serve_static(w, "sw.js", None),
         // The fragment *kind* (tree/file/…) is normally exactly the last
         // segment (every other fragment endpoint takes no path segments of
         // its own — `dir=`/`path=` arrive as query params, see serve_frag
@@ -568,7 +568,14 @@ fn read_confined(base: &Path, rel: &str) -> Option<Vec<u8>> {
 ///
 /// The class restriction on layer 2 is the enforcement mechanism, not a
 /// check that could be forgotten: a code-class path never consults it.
-fn serve_static(w: &mut impl Write, rel: &str) {
+///
+/// `v` is the request's `?v=`. Only the embedded layer may answer with a
+/// forever-cache, and only when `v` is the hash of the bytes being sent: the
+/// other two layers change without the build changing, so their `?v=` (a hash
+/// of the *embedded* copy) vouches for nothing; and a stale page asking with
+/// an old `v` must not have today's bytes stored under yesterday's URL. Every
+/// other answer falls to `respond_with`'s `no-cache`.
+fn serve_static(w: &mut impl Write, rel: &str, v: Option<&str>) {
     // Before any layer, so a traversal attempt cannot reveal which layers exist.
     let Some(rel) = crate::assets::normalize(rel) else {
         return http::not_found(w, "no such asset");
@@ -588,10 +595,17 @@ fn serve_static(w: &mut impl Write, rel: &str) {
     }
 
     match crate::assets::get(rel) {
+        Some(body) if v.is_some_and(|v| v == crate::render::av(rel)) => {
+            http::respond_with(w, 200, "OK", ctype, &[NOSNIFF, IMMUTABLE], body)
+        }
         Some(body) => http::respond_with(w, 200, "OK", ctype, &[NOSNIFF], body),
         None => http::not_found(w, "no such asset"),
     }
 }
+
+/// A year is the conventional "forever"; `immutable` stops a reload from even
+/// revalidating. Safe only because the URL changes whenever the bytes do.
+const IMMUTABLE: (&str, &str) = ("Cache-Control", "public, max-age=31536000, immutable");
 
 /// Every fragment kind `serve_frag` matches on — the closed set `route()`
 /// consults to tell an ordinary fragment request from a `.roost/theme/{rel}`
@@ -1113,8 +1127,12 @@ mod tests {
     }
 
     fn serve(rel: &str) -> String {
+        serve_v(rel, None)
+    }
+
+    fn serve_v(rel: &str, v: Option<&str>) -> String {
         let mut buf: Vec<u8> = Vec::new();
-        serve_static(&mut buf, rel);
+        serve_static(&mut buf, rel, v);
         String::from_utf8_lossy(&buf).into_owned()
     }
 
@@ -1128,6 +1146,49 @@ mod tests {
         assert!(out.starts_with("HTTP/1.1 200 OK"));
         assert!(out.contains("X-Content-Type-Options: nosniff"));
         assert!(!out.contains("Content-Security-Policy"), "embedded assets are not untrusted");
+    }
+
+    /// The forever-cache needs both halves: the embedded layer, and a `v` that
+    /// is the hash of what is being sent. The old `v` case is the deploy this
+    /// exists for — a page from before it asks with yesterday's hash, and
+    /// must not get today's bytes cached for a year under that URL.
+    #[test]
+    fn only_the_current_version_of_an_embedded_asset_is_cached_for_good() {
+        let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_STATIC");
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let cur = crate::render::av("app.js");
+        let out = serve_v("app.js", Some(&cur));
+        assert!(out.contains("Cache-Control: public, max-age=31536000, immutable\r\n"), "current v: {}", &out[..200]);
+        assert_eq!(out.matches("Cache-Control:").count(), 1);
+        for v in [Some("00000000"), None] {
+            let out = serve_v("app.js", v);
+            assert!(out.contains("Cache-Control: no-cache\r\n") && !out.contains("immutable"), "v = {v:?}: {}", &out[..200]);
+        }
+    }
+
+    /// Both overlays change without the build changing, and their `?v=` is
+    /// the embedded copy's hash — so even the *current* `v` vouches for
+    /// nothing there. Fixtures carry a marker, so this cannot pass by the
+    /// overlay being skipped and the embedded file served instead.
+    #[test]
+    fn an_overlay_is_never_cached_for_good() {
+        let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = crate::render::av("style.css");
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("style.css"), "/*DEV*/").unwrap();
+        std::env::set_var("ROOST_STATIC", d.path());
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let out = serve_v("style.css", Some(&cur));
+        std::env::remove_var("ROOST_STATIC");
+        assert!(out.contains("/*DEV*/") && out.contains("Cache-Control: no-cache\r\n") && !out.contains("immutable"), "ROOST_STATIC: {out}");
+        let user = home.path().join(".config/roost/static");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("style.css"), "/*USER*/").unwrap();
+        let out = serve_v("style.css", Some(&cur));
+        assert!(out.contains("/*USER*/") && out.contains("Cache-Control: no-cache\r\n") && !out.contains("immutable"), "user dir: {out}");
     }
 
     #[test]
