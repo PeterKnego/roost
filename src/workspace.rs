@@ -225,6 +225,8 @@ impl Workspace {
             // `claude_sessions` above: it is a fact about the filesystem,
             // not the workspace layout.
             claude_hooks: None,
+            // Same reasoning and same filler, for `Kind::Worktree`.
+            worktree_hooks: None,
             settings: proto::SettingsView::default(),
         }
     }

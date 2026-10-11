@@ -1,41 +1,87 @@
-//! The two hook entries roost owns in a project's `.claude/settings.local.json`.
+//! The commands roost owns in a project's `.claude/settings.local.json`.
 //!
-//! Claude Code raises no notification of its own; a hook has to run
-//! `roost claude-hook`. This module is the only code that reads or writes
-//! that file, and it touches exactly the entries whose command is that
-//! string — a user's other hooks, other keys and their order survive every
-//! write. It writes the *local* settings file, the one Claude Code keeps
-//! personal and gitignored, never the committed one and never the global
-//! one: a clone of the repo must not inherit a hook that runs roost.
+//! Two of them. `roost claude-hook` (`Kind::Notify`) answers `SessionStart`,
+//! `Notification` and `Stop` because Claude Code raises no notification of
+//! its own. `roost worktree-hook` (`Kind::Worktree`) answers `WorktreeCreate`
+//! alone, with a much longer timeout, because it waits on a human in a
+//! browser rather than writing a line to a terminal. This module is the only
+//! code that reads or writes that file, and for either kind it touches
+//! exactly the entries whose command is that kind's exact string — a user's
+//! other hooks, other keys and their order survive every write. It writes
+//! the *local* settings file, the one Claude Code keeps personal and
+//! gitignored, never the committed one and never the global one: a clone of
+//! the repo must not inherit a hook that runs roost.
 //!
 //! Reading has three outcomes, not two. A file that exists but cannot be
 //! parsed is `Unknown`, and `Unknown` refuses to write: rewriting a file we
 //! could not read is how a hand-edited settings file gets destroyed.
 //!
-//! The symlink checks in `load` and `set` are advisory, not the enforcement:
-//! a same-user race can swap a symlink in between the `symlink_metadata`
-//! check and the later open. What actually stops a write from landing
-//! outside the project is `OpenOptions::create_new` on the backup (and now
-//! the temp-file) path, which refuses to open through an existing symlink
-//! at all rather than trusting a stat taken moments earlier.
+//! The symlink checks in `load` and `set_kind` are advisory, not the
+//! enforcement: a same-user race can swap a symlink in between the
+//! `symlink_metadata` check and the later open. What actually stops a write
+//! from landing outside the project is `OpenOptions::create_new` on the
+//! backup (and now the temp-file) path, which refuses to open through an
+//! existing symlink at all rather than trusting a stat taken moments
+//! earlier.
 
 use std::path::Path;
 
-/// The command roost installs. Ownership is this exact string, nothing
-/// looser: a user who writes their own `roost notify` hook keeps it.
+/// The command `Kind::Notify` installs. Ownership is this exact string,
+/// nothing looser: a user who writes their own `roost notify` hook keeps it.
 pub const COMMAND: &str = "roost claude-hook";
+/// The command `Kind::Worktree` installs.
+pub const WORKTREE_COMMAND: &str = "roost worktree-hook";
 /// `SessionStart` is not for notifying — it produces no message — but for the
 /// id it carries. `Stop` fires when a turn *ends*, so a session interrupted
 /// before its first turn completed would never announce itself, and that is
 /// the session worth recovering. See `claudesess`.
 const EVENTS: [&str; 3] = ["SessionStart", "Notification", "Stop"];
+/// `WorktreeCreate` is the only event `Kind::Worktree` ever installs under;
+/// see `merge`'s doc comment for why *disabling* still looks further.
+const WORKTREE_EVENTS: [&str; 1] = ["WorktreeCreate"];
 const REL: &str = ".claude/settings.local.json";
+
+/// The two owned commands. Each is a distinct file-shape (its own events,
+/// command string and timeout) sharing one reader/writer so both get the
+/// same atomic-write, symlink-refusal and backup behaviour for free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Notify,
+    Worktree,
+}
+
+impl Kind {
+    fn command(self) -> &'static str {
+        match self {
+            Kind::Notify => COMMAND,
+            Kind::Worktree => WORKTREE_COMMAND,
+        }
+    }
+    /// The events this kind installs itself under. Not the only events its
+    /// command may ever be *found* under — see `merge`'s disable path.
+    fn events(self) -> &'static [&'static str] {
+        match self {
+            Kind::Notify => &EVENTS,
+            Kind::Worktree => &WORKTREE_EVENTS,
+        }
+    }
+    /// Notify's hook writes one line to a terminal and returns; Worktree's
+    /// waits on a human clicking a dialog in a browser, bounded by
+    /// `hub::ASK_TIMEOUT` (60s) plus margin for the round trip, so 5s would
+    /// make Claude Code kill it before roost ever answers.
+    fn timeout(self) -> u64 {
+        match self {
+            Kind::Notify => 5,
+            Kind::Worktree => 120,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookState {
-    /// Both events carry a roost entry.
+    /// Every one of the kind's own events carries that kind's entry.
     Present,
-    /// No file, or fewer than both events carry one.
+    /// No file, or fewer than all of the kind's own events carry one.
     Absent,
     /// The file exists but could not be read or is not the shape this
     /// module knows how to rewrite. The string says why, for the UI.
@@ -87,10 +133,14 @@ fn load(project_dir: &Path) -> Result<Option<serde_json::Value>, String> {
         // An event key whose value isn't an array is refused, not skipped:
         // `event_has_ours`/`merge` treat "absent" and "not an array" alike,
         // so silently accepting this made enable a no-op `Ok` that
-        // installed nothing under that event.
+        // installed nothing under that event. Checked for both kinds' events
+        // here, in one shared `load`, because a single document can be read
+        // by either kind — a malformed `WorktreeCreate` must not read as
+        // `Absent` to `state_of(.., Kind::Worktree)` any more than a
+        // malformed `Notification` does to `Kind::Notify`.
         let hobj = h.as_object().expect("checked is_object above");
-        for event in EVENTS {
-            if let Some(ev) = hobj.get(event) {
+        for event in EVENTS.iter().chain(WORKTREE_EVENTS.iter()) {
+            if let Some(ev) = hobj.get(*event) {
                 if !ev.is_array() {
                     return Err(format!("{REL}: hooks.{event} is not an array"));
                 }
@@ -100,16 +150,17 @@ fn load(project_dir: &Path) -> Result<Option<serde_json::Value>, String> {
     Ok(Some(v))
 }
 
-fn is_ours(entry: &serde_json::Value) -> bool {
-    entry.get("command").and_then(|c| c.as_str()) == Some(COMMAND)
+fn is_ours(entry: &serde_json::Value, command: &str) -> bool {
+    entry.get("command").and_then(|c| c.as_str()) == Some(command)
 }
 
-fn our_entry() -> serde_json::Value {
-    serde_json::json!({ "type": "command", "command": COMMAND, "timeout": 5 })
+fn our_entry(kind: Kind) -> serde_json::Value {
+    serde_json::json!({ "type": "command", "command": kind.command(), "timeout": kind.timeout() })
 }
 
-/// Whether `event`'s array in `hooks` holds a roost entry in any group.
-fn event_has_ours(hooks: &serde_json::Value, event: &str) -> bool {
+/// Whether `event`'s array in `hooks` holds an entry matching `command` in
+/// any group.
+fn event_has_ours(hooks: &serde_json::Value, event: &str, command: &str) -> bool {
     hooks
         .get(event)
         .and_then(|a| a.as_array())
@@ -117,18 +168,25 @@ fn event_has_ours(hooks: &serde_json::Value, event: &str) -> bool {
             groups.iter().any(|g| {
                 g.get("hooks")
                     .and_then(|h| h.as_array())
-                    .map_or(false, |entries| entries.iter().any(is_ours))
+                    .map_or(false, |entries| entries.iter().any(|e| is_ours(e, command)))
             })
         })
 }
 
+/// `state(dir)` / `set(dir, on)` are `Kind::Notify`'s half of `state_of` /
+/// `set_kind` — kept as the original names and signatures so every call site
+/// and every pre-existing test from before `Kind` existed is untouched.
 pub fn state(project_dir: &Path) -> HookState {
+    state_of(project_dir, Kind::Notify)
+}
+
+pub fn state_of(project_dir: &Path, kind: Kind) -> HookState {
     match load(project_dir) {
         Err(why) => HookState::Unknown(why),
         Ok(None) => HookState::Absent,
         Ok(Some(v)) => {
             let hooks = v.get("hooks").cloned().unwrap_or(serde_json::Value::Null);
-            if EVENTS.iter().all(|e| event_has_ours(&hooks, e)) {
+            if kind.events().iter().all(|e| event_has_ours(&hooks, e, kind.command())) {
                 HookState::Present
             } else {
                 HookState::Absent
@@ -137,44 +195,54 @@ pub fn state(project_dir: &Path) -> HookState {
     }
 }
 
-/// Adds or removes roost's entries in `doc`, touching nothing else.
-fn merge(doc: &mut serde_json::Value, on: bool) {
+/// Adds or removes `kind`'s entries in `doc`, touching nothing else.
+///
+/// Enable only ever writes under `kind.events()` — `Kind::Worktree` installs
+/// under `WorktreeCreate` alone, never anywhere else, by construction.
+/// Disable is asymmetric on purpose: it scans *every* event key already
+/// present in `hooks`, not just `kind.events()`, so a stray entry carrying
+/// the kind's command under the wrong event (a hand edit, or a future bug)
+/// is still something disable can clean up. "Never installed elsewhere"
+/// is a promise about install; disable's job is removal of whatever matches,
+/// wherever it is.
+fn merge(doc: &mut serde_json::Value, kind: Kind, on: bool) {
     let obj = doc.as_object_mut().expect("load guarantees an object");
     if on {
         let hooks = obj
             .entry("hooks")
             .or_insert_with(|| serde_json::Value::Object(Default::default()));
-        for event in EVENTS {
-            if event_has_ours(hooks, event) {
+        for event in kind.events() {
+            if event_has_ours(hooks, event, kind.command()) {
                 continue;
             }
             let groups = hooks
                 .as_object_mut()
                 .expect("load guarantees an object")
-                .entry(event)
+                .entry(*event)
                 .or_insert_with(|| serde_json::Value::Array(Vec::new()));
             if let Some(arr) = groups.as_array_mut() {
                 // A group of our own, never an entry inside a foreign group:
                 // disabling then removes it without deciding what to do with
                 // a group we share.
-                arr.push(serde_json::json!({ "hooks": [our_entry()] }));
+                arr.push(serde_json::json!({ "hooks": [our_entry(kind)] }));
             }
         }
         return;
     }
     let Some(hooks) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) else { return };
-    for event in EVENTS {
-        let Some(groups) = hooks.get_mut(event).and_then(|a| a.as_array_mut()) else { continue };
+    let events: Vec<String> = hooks.keys().cloned().collect();
+    for event in events {
+        let Some(groups) = hooks.get_mut(&event).and_then(|a| a.as_array_mut()) else { continue };
         for g in groups.iter_mut() {
             if let Some(entries) = g.get_mut("hooks").and_then(|h| h.as_array_mut()) {
-                entries.retain(|e| !is_ours(e));
+                entries.retain(|e| !is_ours(e, kind.command()));
             }
         }
         groups.retain(|g| {
             g.get("hooks").and_then(|h| h.as_array()).map_or(true, |e| !e.is_empty())
         });
         if groups.is_empty() {
-            hooks.remove(event);
+            hooks.remove(&event);
         }
     }
     if hooks.is_empty() {
@@ -202,11 +270,17 @@ static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// never again, so the backup stays the state before roost touched
 /// anything, and never through a symlink planted at the backup's own path.
 pub fn set(project_dir: &Path, on: bool) -> Result<(), String> {
+    set_kind(project_dir, Kind::Notify, on)
+}
+
+/// `set`'s generalisation: see its doc comment for the write path, which is
+/// the same for either `kind`.
+pub fn set_kind(project_dir: &Path, kind: Kind, on: bool) -> Result<(), String> {
     let original = load(project_dir)?;
     let mut doc = original
         .clone()
         .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-    merge(&mut doc, on);
+    merge(&mut doc, kind, on);
 
     // Nothing to write: either the file already carries what `on` asks
     // for, or there was no file and `on` is `false`, which has nothing to
@@ -320,6 +394,9 @@ mod tests {
     fn write(p: &Path, s: &str) {
         std::fs::create_dir_all(p.join(".claude")).unwrap();
         std::fs::write(p.join(".claude/settings.local.json"), s).unwrap();
+    }
+    fn read_json(p: &Path) -> serde_json::Value {
+        serde_json::from_str(&read(p)).unwrap()
     }
 
     const OURS: &str = r#"{ "type": "command", "command": "roost claude-hook", "timeout": 5 }"#;
@@ -670,6 +747,66 @@ mod tests {
         );
         assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "say done");
         assert_eq!(v["hooks"]["SessionStart"][0]["hooks"][0]["command"], COMMAND);
+    }
+
+    #[test]
+    fn worktree_kind_installs_only_on_worktree_create_with_a_long_timeout() {
+        let d = tempfile::tempdir().unwrap();
+        set_kind(d.path(), Kind::Worktree, true).unwrap();
+        let v = read_json(d.path());
+        let hooks = v["hooks"].as_object().unwrap();
+        assert_eq!(hooks.keys().collect::<Vec<_>>(), vec!["WorktreeCreate"]);
+        assert_eq!(v["hooks"]["WorktreeCreate"][0]["hooks"][0]["command"], "roost worktree-hook");
+        assert_eq!(v["hooks"]["WorktreeCreate"][0]["hooks"][0]["timeout"], 120);
+    }
+
+    #[test]
+    fn kinds_are_independent() {
+        let d = tempfile::tempdir().unwrap();
+        set_kind(d.path(), Kind::Notify, true).unwrap();
+        set_kind(d.path(), Kind::Worktree, true).unwrap();
+        set_kind(d.path(), Kind::Notify, false).unwrap();
+        assert_eq!(state_of(d.path(), Kind::Worktree), HookState::Present);
+        assert_eq!(state_of(d.path(), Kind::Notify), HookState::Absent);
+    }
+
+    #[test]
+    fn a_non_array_worktree_create_is_unknown_and_refuses_to_write() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), r#"{"hooks": {"WorktreeCreate": 5}}"#);
+        assert!(matches!(state_of(d.path(), Kind::Worktree), HookState::Unknown(_)));
+        assert!(set_kind(d.path(), Kind::Worktree, true).is_err());
+        assert_eq!(read(d.path()), r#"{"hooks": {"WorktreeCreate": 5}}"#);
+    }
+
+    /// Spec: "A Worktree entry found under any event other than
+    /// WorktreeCreate is left alone on enable and removed on disable (never
+    /// installed elsewhere)." Plants a stray Worktree entry under `Stop`
+    /// (where it has no business being), then exercises the toggle: enable
+    /// must not touch it (it isn't under WorktreeCreate, so `event_has_ours`
+    /// never looks there), and disable must still find and remove it, since
+    /// disable's job is cleanup of whatever carries the command, not just
+    /// the kind's own events.
+    ///
+    /// Verified this can fail: see the revert check in the module doc above
+    /// `merge` — restricting disable's scan to `kind.events()` instead of
+    /// every key in `hooks` leaves the stray in place after disable, failing
+    /// the `"stray"` assertion below.
+    #[test]
+    fn a_stray_worktree_entry_elsewhere_survives_enable_and_dies_on_disable() {
+        let d = proj();
+        write(d.path(), r#"{"hooks": {"Stop": [{"hooks": [
+            {"type":"command","command":"roost worktree-hook","timeout":120}
+        ]}]}}"#);
+        set_kind(d.path(), Kind::Worktree, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&read(d.path())).unwrap();
+        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], "roost worktree-hook", "stray left alone on enable");
+        assert_eq!(v["hooks"]["WorktreeCreate"][0]["hooks"][0]["command"], "roost worktree-hook", "and installed under its own event");
+
+        set_kind(d.path(), Kind::Worktree, false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&read(d.path())).unwrap();
+        assert!(v["hooks"].get("Stop").is_none(), "stray removed on disable: {v}");
+        assert!(v["hooks"].get("WorktreeCreate").is_none());
     }
 
     #[test]

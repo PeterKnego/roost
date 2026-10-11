@@ -204,6 +204,7 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
         // very first message this is, not stuck showing whatever some
         // earlier connection's cache happened to hold.
         h.claude_hooks = None;
+        h.worktree_hooks = None;
         h.settings = None;
         let ev = h.snapshot_event(&id);
         h.send_to(&id, &ev);

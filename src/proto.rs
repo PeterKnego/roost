@@ -206,6 +206,12 @@ pub enum Intent {
     /// `.claude/settings.local.json`. Applies to the project, not the
     /// connection: every browser on it sees the new state.
     SetClaudeHooks { on: bool },
+    /// Enable or disable `claudehooks::Kind::Worktree` (`roost
+    /// worktree-hook`, on `WorktreeCreate` only) in this project's
+    /// `.claude/settings.local.json`. A sibling of `SetClaudeHooks`, kept
+    /// as its own intent rather than a second field on that one because the
+    /// two toggle independently — see `Hub::worktree_hooks`.
+    SetWorktreeHooks { on: bool },
     /// Write one key into one config file, or clear it (`value: None`) so
     /// inheritance resumes. Validated in `config::validate` before any
     /// file is touched; see the settings-dialog spec.
@@ -522,6 +528,11 @@ pub struct WorkspaceView {
     /// same reason. The file is still the truth; a hand edit shows at the
     /// next invalidation, not necessarily the next snapshot.
     pub claude_hooks: Option<bool>,
+    /// Same shape and reasoning as `claude_hooks` immediately above, for
+    /// `claudehooks::Kind::Worktree` instead: `Some(true)` present,
+    /// `Some(false)` absent, `None` unreadable/unparseable. Derived from
+    /// `Hub::worktree_hooks`, invalidated at the same three sites.
+    pub worktree_hooks: Option<bool>,
     /// Filled by `hub::snapshot_event` from a fresh `config::settings_view`;
     /// never persisted (it is a read of the files, not workspace state).
     #[serde(default)]

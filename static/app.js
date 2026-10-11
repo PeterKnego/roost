@@ -4936,6 +4936,45 @@ function hookRow() {
   return row;
 }
 
+// Same three-valued state as hookState() above, for
+// `claudehooks::Kind::Worktree` instead of `Kind::Notify`.
+function worktreeHookState() {
+  if (!state || state.worktree_hooks === undefined) return "unknown";
+  return state.worktree_hooks === null ? "unknown" : (state.worktree_hooks ? "on" : "off");
+}
+// A sibling of hookRow() immediately above: same confirm/escape pattern,
+// writing roost's other owned command (`roost worktree-hook`, installed
+// only on `WorktreeCreate`) into the same settings file.
+function worktreeHookRow() {
+  const row = document.createElement("div");
+  row.className = "hookrow";
+  const s = worktreeHookState();
+  const label = document.createElement("span");
+  if (s === "unknown") {
+    label.textContent = "Let roost create Claude's worktrees: cannot tell — .claude/settings.local.json could not be read or parsed";
+    row.appendChild(label);
+    return row;
+  }
+  label.textContent = `Let roost create Claude's worktrees: ${s}`;
+  row.appendChild(label);
+  const b = document.createElement("button");
+  b.textContent = s === "on" ? "Disable" : "Enable";
+  b.onclick = async (e) => {
+    e.stopPropagation();
+    const on = s !== "on";
+    const yes = await askConfirm({
+      title: "Let roost create Claude's worktrees",
+      lines: [on ? "Write a WorktreeCreate hook to .claude/settings.local.json?"
+                 : "Remove roost's worktree hook from .claude/settings.local.json?"],
+      confirm: on ? "Enable" : "Disable",
+      danger: !on,
+    });
+    if (yes) send({ t: "SetWorktreeHooks", on });
+  };
+  row.appendChild(b);
+  return row;
+}
+
 function renderNotices() {
   const n = unread();
   const count = document.getElementById("bellcount");
@@ -4948,6 +4987,7 @@ function renderNotices() {
   if (!panel || panel.hidden) return;
   panel.replaceChildren();
   panel.appendChild(hookRow());
+  panel.appendChild(worktreeHookRow());
   if (!notices.length) {
     const empty = document.createElement("div");
     empty.className = "notice-empty";

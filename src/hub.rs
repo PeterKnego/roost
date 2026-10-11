@@ -98,6 +98,12 @@ pub struct Hub {
     /// up at the next refresh or reconnect, not sooner, exactly as the spec's
     /// "Live following is deliberately not added" says.
     pub claude_hooks: Option<Option<bool>>,
+    /// Same cache, same three invalidation sites, for
+    /// `claudehooks::Kind::Worktree` instead of `Kind::Notify`. Kept as a
+    /// separate field rather than keying one cache by `Kind` because the two
+    /// are read and invalidated together everywhere that touches either —
+    /// a map would buy nothing and cost a lookup at both sites.
+    pub worktree_hooks: Option<Option<bool>>,
     /// Cached result of `config::settings_view(&self.dir)`, same shape and
     /// same reason as `claude_hooks` above: that call is a `load` of both
     /// config files plus a `raw_setting` read per key per file — on the
@@ -315,6 +321,7 @@ impl Hub {
             notices_dirty: false,
             proposals: HashMap::new(),
             claude_hooks: None,
+            worktree_hooks: None,
             settings: None,
             asks: Vec::new(),
         };
@@ -614,6 +621,15 @@ impl Hub {
             }
         });
         ws.claude_hooks = cached;
+        // Same cache, same reason, for `Kind::Worktree`.
+        let worktree_cached = *self.worktree_hooks.get_or_insert_with(|| {
+            match crate::claudehooks::state_of(&self.dir, crate::claudehooks::Kind::Worktree) {
+                crate::claudehooks::HookState::Present => Some(true),
+                crate::claudehooks::HookState::Absent => Some(false),
+                crate::claudehooks::HookState::Unknown(_) => None,
+            }
+        });
+        ws.worktree_hooks = worktree_cached;
         // See the doc comment on `settings` for why this is cached rather
         // than read on every call.
         ws.settings = self.settings.get_or_insert_with(|| crate::config::settings_view(&self.dir)).clone();
@@ -678,6 +694,7 @@ impl Hub {
                 // snapshot must show up here even though it does not show
                 // up on every keystroke.
                 self.claude_hooks = None;
+                self.worktree_hooks = None;
                 self.settings = None;
                 let ev = self.snapshot_event(from);
                 self.send_to(from, &ev);
@@ -727,6 +744,23 @@ impl Hub {
                 // comment — this is one of its three invalidation sites,
                 // matched here by `settings` for the same reason).
                 self.claude_hooks = None;
+                self.settings = None;
+                let snap = self.snapshot_event(from);
+                self.broadcast(&snap);
+                return;
+            }
+            Intent::SetWorktreeHooks { on } => {
+                // Sibling of SetClaudeHooks immediately above, same shape,
+                // for `Kind::Worktree` instead of `Kind::Notify`.
+                if let Err(e) = crate::claudehooks::set_kind(&self.dir, crate::claudehooks::Kind::Worktree, *on) {
+                    self.send_to(from, &Event::Error { msg: e });
+                    return;
+                }
+                self.ws.version += 1;
+                // Same invalidation as SetClaudeHooks, for the same reason:
+                // the write just made must not be shadowed by a cached read
+                // taken before it.
+                self.worktree_hooks = None;
                 self.settings = None;
                 let snap = self.snapshot_event(from);
                 self.broadcast(&snap);
@@ -3020,9 +3054,28 @@ fn approve_ask(project: String, dir: std::path::PathBuf, clicker: ConnId, ask: P
         crate::home::record(&project, &session, &owner).map_err(|e| {
             format!("{} was created, but roost could not record that {session} moved there: {e}", c.name)
         })?;
-        // Task 10: install the worktree hook into the new worktree's own
-        // `.claude/settings.local.json` here (spec §8), before replying.
+        // Install the worktree hook into the new worktree's own
+        // `.claude/settings.local.json`, mirroring whatever the main
+        // checkout has: a worktree Claude never ran `roost worktree-hook`
+        // from `dir` to enable it, so it inherits the setting instead of
+        // starting cold every time. Off the hub lock — `dir` and `c.path`
+        // are plain paths, and `claudehooks::set_kind` does its own file
+        // I/O with no lock involved.
         //
+        // Errors are logged and swallowed, not propagated: the worktree and
+        // its `home::record` already exist by this point, so failing the
+        // whole approve now would report a worktree creation failure for a
+        // worktree that in fact exists — the one thing CLAUDE.md's
+        // destruction table is about, in its "says something untrue" form.
+        // A fresh Claude started there without the hook just starts cold,
+        // same as any project that never had it installed.
+        if crate::claudehooks::state_of(&dir, crate::claudehooks::Kind::Worktree)
+            == crate::claudehooks::HookState::Present
+        {
+            if let Err(e) = crate::claudehooks::set_kind(&c.path, crate::claudehooks::Kind::Worktree, true) {
+                eprintln!("roost: could not install the worktree hook into {}: {e}", c.path.display());
+            }
+        }
         // Both hubs learn about the move before Claude does, so a
         // `StartTerminal`/`NewTerminal` racing the reply already sees the
         // resident. One lock at a time; never two.
@@ -8328,6 +8381,71 @@ mod tests {
         assert!(
             got_b.iter().any(|m| m.contains(r#""t":"WorktreeAskClosed""#) && m.contains(&id)),
             "the other browser's dialog is closed: {got_b:?}"
+        );
+        ask_env_clear(&[p, &owner]);
+    }
+
+    /// Task 10: when the main checkout has `Kind::Worktree` installed, a
+    /// freshly approved worktree inherits it — its own
+    /// `.claude/settings.local.json` gets the `WorktreeCreate` entry, not
+    /// the main checkout's file, which must stay untouched.
+    ///
+    /// Verified this can fail: commenting out the install call in
+    /// `approve_ask` (the Task 10 marker) fails the first assertion with
+    /// `No such file or directory (os error 2)` reading the new worktree's
+    /// settings file — nothing is installed there at all. Restored.
+    #[test]
+    fn approve_installs_the_worktree_hook_when_the_main_checkout_has_it() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-hook-on";
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        crate::claudehooks::set_kind(&repo, crate::claudehooks::Kind::Worktree, true).unwrap();
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: true });
+        let r = t.join().unwrap();
+        let AskReply::Path { path } = r else { panic!("expected Path, got {r:?}") };
+        let owner = format!("{p}/.claude/worktrees/worktree-fox");
+        let wt_settings = std::path::Path::new(&path).join(".claude/settings.local.json");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&wt_settings).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"]["WorktreeCreate"][0]["hooks"][0]["command"], "roost worktree-hook",
+            "the new worktree's own settings file carries the hook: {v}"
+        );
+        assert_eq!(
+            crate::claudehooks::state_of(&repo, crate::claudehooks::Kind::Worktree),
+            crate::claudehooks::HookState::Present,
+            "installing into the worktree must not disturb the main checkout's own file"
+        );
+        ask_env_clear(&[p, &owner]);
+    }
+
+    /// The other half: a main checkout that never enabled `Kind::Worktree`
+    /// leaves the new worktree with no settings file at all — approve must
+    /// not conjure one into existence just by running.
+    #[test]
+    fn approve_installs_nothing_when_the_main_checkout_lacks_the_hook() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-hook-off";
+        let (hub, _repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: true });
+        let r = t.join().unwrap();
+        let AskReply::Path { path } = r else { panic!("expected Path, got {r:?}") };
+        let owner = format!("{p}/.claude/worktrees/worktree-fox");
+        assert!(
+            !std::path::Path::new(&path).join(".claude/settings.local.json").exists(),
+            "no settings file at all when the main checkout never had the hook"
         );
         ask_env_clear(&[p, &owner]);
     }
