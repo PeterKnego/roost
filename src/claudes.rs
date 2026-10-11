@@ -63,14 +63,27 @@ pub fn claudes_in_proc(proc_root: &std::path::Path, project: &str) -> Vec<String
 }
 
 /// One terminal a running `claude` sits in: which project and session
-/// (`ROOST_PROJECT`/`ROOST_SESSION`), plus `CLAUDE_CODE_SSE_PORT` read from
-/// the same `environ`. Ordered on the full tuple so a scan sorts and dedups
-/// deterministically; `changed_projects` deliberately projects the port back
-/// out before comparing — see its doc comment.
+/// (`ROOST_PROJECT`/`ROOST_SESSION`), the project it actually counts under
+/// (`owner`), plus `CLAUDE_CODE_SSE_PORT` read from the same `environ`.
+/// Ordered on the full tuple so a scan sorts and dedups deterministically;
+/// `changed_projects` deliberately projects the port back out before
+/// comparing — see its doc comment.
+///
+/// `owner` is `home::effective_owner(project, session)`, resolved *here*,
+/// during the scan — a watcher-thread or HTTP-thread walk, never under a
+/// hub lock. `names_for` and everything built on it (`claude_evidence_with_scan`,
+/// `cached_sessions`, which `Hub::snapshot_event` calls on every debounced
+/// keystroke) then does a plain field comparison and no I/O at all. Moving
+/// the lookup here instead of leaving it in `names_for` is the fix for a
+/// real violation: `effective_owner` reads a re-home record and stats a
+/// worktree directory, and `Hub::snapshot_event` → `cached_sessions` →
+/// `claude_evidence_with_scan` → `names_for` used to run that under the
+/// hub lock on every snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ClaudeProc {
     pub project: String,
     pub session: String,
+    pub owner: String,
     pub sse_port: Option<u16>,
 }
 
@@ -114,7 +127,10 @@ pub fn try_claude_terminals(proc_root: &std::path::Path) -> Option<Vec<ClaudePro
         }
         if let (Some(p), Some(s)) = (proj, sess) {
             if crate::session::valid_name(&s) {
-                out.push(ClaudeProc { project: p, session: s, sse_port: port });
+                // Off any lock, here on the scanning thread: see the
+                // struct's doc comment.
+                let owner = crate::home::effective_owner(&p, &s);
+                out.push(ClaudeProc { project: p, session: s, owner, sse_port: port });
             }
         }
     }
@@ -123,25 +139,16 @@ pub fn try_claude_terminals(proc_root: &std::path::Path) -> Option<Vec<ClaudePro
     Some(out)
 }
 
+/// A Claude's terminal counts for its *effective owner* (`c.owner`), not the
+/// raw `ROOST_PROJECT` its environment carries (`c.project`) — so a
+/// re-homed Claude shows up (and the removal gate sees it) under the
+/// worktree it was moved into rather than the main checkout it started in.
+///
+/// Pure field comparison, deliberately: `c.owner` was already resolved
+/// during the scan (see `ClaudeProc`'s doc comment), so this does no I/O at
+/// all and is safe to call under a hub lock.
 fn names_for(project: &str, scan: &[ClaudeProc]) -> Vec<String> {
-    names_for_owned(&crate::wsstate::state_dir(), project, scan, &crate::home::resolves)
-}
-
-/// [`names_for`] mapped through re-homing: a Claude's terminal counts for
-/// its *effective owner*, not the raw `ROOST_PROJECT` its environment
-/// carries, so a re-homed Claude shows up (and the removal gate below sees
-/// it) under the worktree it was moved into rather than the main checkout
-/// it started in.
-fn names_for_owned(
-    state: &std::path::Path,
-    project: &str,
-    scan: &[ClaudeProc],
-    resolves: &dyn Fn(&str, &str) -> bool,
-) -> Vec<String> {
-    scan.iter()
-        .filter(|c| crate::home::effective_owner_with(state, resolves, &c.project, &c.session) == project)
-        .map(|c| c.session.clone())
-        .collect()
+    scan.iter().filter(|c| c.owner == project).map(|c| c.session.clone()).collect()
 }
 
 /// This terminal's Claude's `CLAUDE_CODE_SSE_PORT`, if there is a Claude
@@ -217,19 +224,29 @@ pub fn cached_scan() -> Vec<ClaudeProc> {
     scan_cell().lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Projects whose set of (terminal, Claude) pairs differs between two scans.
+/// Projects to wake: every `owner` whose `(project, session, owner)` tuple
+/// differs between the two scans. Never the port, for the reason below; but
+/// `owner` IS in the key, on purpose — it is re-resolved fresh on every walk
+/// (see `ClaudeProc`'s doc comment), so a re-home with no accompanying
+/// process change (the Claude just `cd`s, nothing exits or restarts) still
+/// changes this tuple on the very next poll, even though `project` and
+/// `session` are identical. Reporting the *owner* of each differing tuple
+/// — not the raw `project` — is what wakes both pages in one tick: the old
+/// tuple's owner is the home (losing the session), the new tuple's owner is
+/// the worktree (gaining it).
 ///
-/// Compares `(project, session)` only, never the port. `tick` broadcasts to
-/// every project this names, and a roost restart changes the port of every
-/// surviving Claude relative to the new listener — so including it here would
-/// wake every open workspace on the first tick after every restart, for a
-/// change no client renders. The port is carried on `ClaudeProc` for
-/// `ide::notify_selected` to read on an Alt+K, not for this.
+/// Compares `(project, session, owner)`, never the port. `tick` broadcasts
+/// to every project this names, and a roost restart changes the port of
+/// every surviving Claude relative to the new listener — so including it
+/// here would wake every open workspace on the first tick after every
+/// restart, for a change no client renders. The port is carried on
+/// `ClaudeProc` for `ide::notify_selected` to read on an Alt+K, not for
+/// this.
 fn changed_projects(old: &[ClaudeProc], new: &[ClaudeProc]) -> Vec<String> {
-    let key = |c: &ClaudeProc| (c.project.clone(), c.session.clone());
-    let a: HashSet<(String, String)> = old.iter().map(key).collect();
-    let b: HashSet<(String, String)> = new.iter().map(key).collect();
-    let mut out: Vec<String> = a.symmetric_difference(&b).map(|(p, _)| p.clone()).collect();
+    let key = |c: &ClaudeProc| (c.project.clone(), c.session.clone(), c.owner.clone());
+    let a: HashSet<(String, String, String)> = old.iter().map(key).collect();
+    let b: HashSet<(String, String, String)> = new.iter().map(key).collect();
+    let mut out: Vec<String> = a.symmetric_difference(&b).map(|(_, _, owner)| owner.clone()).collect();
     out.sort();
     out.dedup();
     out
@@ -404,10 +421,19 @@ mod tests {
     /// remembers launching nothing (it just restarted). Built on a fake
     /// `/proc`: pid 100 is a claude in term3 of this project, pid 200 a
     /// claude in another project, pid 300 a bash in this project.
+    ///
+    /// `ROOST_STATE_DIR` is set to an empty tempdir (rather than left at
+    /// whatever `state_dir()` defaults to) so the `owner` field this scan
+    /// now resolves is deterministic: no re-home record exists for either
+    /// terminal, so `owner` must equal `project` for both.
+    ///
     /// Revert-checked: with the scan's result replaced by `Vec::new()` the
     /// first assertion failed with `left: [] right: ["term3"]`.
     #[test]
     fn a_running_claude_process_names_its_terminal() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
         let d = tempfile::tempdir().unwrap();
         let mk = |pid: u32, comm: &str, env: &str| {
             let p = d.path().join(pid.to_string());
@@ -425,29 +451,36 @@ mod tests {
         assert_eq!(
             claude_terminals(d.path()),
             vec![
-                ClaudeProc { project: "karpie".into(), session: "term3".into(), sse_port: None },
-                ClaudeProc { project: "other".into(), session: "term".into(), sse_port: None },
+                ClaudeProc { project: "karpie".into(), session: "term3".into(), owner: "karpie".into(), sse_port: None },
+                ClaudeProc { project: "other".into(), session: "term".into(), owner: "other".into(), sse_port: None },
             ]
         );
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// A Claude whose terminal was re-homed into a worktree must count for
     /// that worktree, not for the main checkout its `ROOST_PROJECT`
-    /// environment still names — this is what lets the removal gate
-    /// (`hub::do_remove_worktree`) see it and what makes `tick` wake both
-    /// projects on a re-home.
+    /// environment still names. Unlike the pre-fix design, the mapping now
+    /// happens *during the scan* (`try_claude_terminals`, called here with
+    /// no hub lock held) rather than inside `names_for` — this proves the
+    /// owner really is resolved there: a real `.claude/worktrees/worktree-x`
+    /// directory under a real `ROOST_ROOTS` root is what lets the
+    /// production, fork-free `home::resolves` confirm it.
     ///
-    /// Revert-checked: dropping the `effective_owner_with` mapping (i.e.
-    /// filtering on `c.project == project` directly, `names_for`'s old
-    /// body) fails the first assertion — observed:
-    /// `assertion 'left == right' failed: left: [], right: ["term3"]` —
-    /// and the second assertion (now vacuously true since nothing maps to
-    /// the home either) would no longer discriminate on its own.
+    /// Revert-checked: dropping the `effective_owner` call in
+    /// `try_claude_terminals` (pushing `owner: p.clone()` unconditionally)
+    /// fails the first assertion — observed: `assertion 'left == right'
+    /// failed: left: [], right: ["term3"]`.
     #[test]
     fn a_rehomed_claude_counts_for_its_owner_not_its_home() {
-        let st = tempfile::tempdir().unwrap();
-        crate::home::record_in(st.path(), "karpie", "term3", "karpie/.claude/worktrees/worktree-x")
-            .unwrap();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let home_dir = root.path().join("karpie");
+        std::fs::create_dir_all(home_dir.join(".claude/worktrees/worktree-x")).unwrap();
+        crate::home::record("karpie", "term3", "karpie/.claude/worktrees/worktree-x").unwrap();
+
         let d = tempfile::tempdir().unwrap();
         let mk = |pid: u32, comm: &str, env: &str| {
             let p = d.path().join(pid.to_string());
@@ -457,13 +490,124 @@ mod tests {
         };
         mk(100, "claude", "ROOST_PROJECT=karpie\nROOST_SESSION=term3\n");
         let procs = claude_terminals(d.path());
-        // Always-true: the fake state dir has no project roots for a real
-        // `resolves` to find `karpie` under, so the real `home::resolves`
-        // would be fork-free but still can't look anything up here.
-        let yes = |_: &str, _: &str| true;
-        let owned = names_for_owned(st.path(), "karpie/.claude/worktrees/worktree-x", &procs, &yes);
-        assert_eq!(owned, vec!["term3".to_string()]);
-        assert!(names_for_owned(st.path(), "karpie", &procs, &yes).is_empty());
+        assert_eq!(names_for("karpie/.claude/worktrees/worktree-x", &procs), vec!["term3".to_string()]);
+        assert!(names_for("karpie", &procs).is_empty());
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// `names_for` must do no I/O of its own — the owner it compares against
+    /// was already resolved when the scan was taken (see `ClaudeProc`'s doc
+    /// comment) — which is what makes it safe to call from
+    /// `cached_sessions`, under the hub lock, on every debounced keystroke.
+    ///
+    /// Proven by construction rather than by inspection: `owner` is set to
+    /// a value that does *not* match `project` and that no real lookup
+    /// against `ROOST_STATE_DIR` (pointed at an empty, otherwise-untouched
+    /// tempdir) could ever produce — there is no re-home record anywhere
+    /// under it. If `names_for` still called `effective_owner` itself, it
+    /// would find `Owner::Here` and fall back to `project`, not the scan's
+    /// `owner` field.
+    ///
+    /// Revert-checked: reverting `names_for` to filter on `c.project ==
+    /// project` (ignoring the precomputed `owner`) fails the first
+    /// assertion — observed: `assertion 'left == right' failed: left: [],
+    /// right: ["term3"]` — because nothing in the fake scan has
+    /// `project == "owner-that-cannot-be-derived"`.
+    #[test]
+    fn names_for_does_no_io_of_its_own() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap(); // empty: no re-home record anywhere under it
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let scan = vec![ClaudeProc {
+            project: "karpie".into(),
+            session: "term3".into(),
+            owner: "owner-that-cannot-be-derived".into(),
+            sse_port: None,
+        }];
+        assert_eq!(names_for("owner-that-cannot-be-derived", &scan), vec!["term3".to_string()]);
+        assert!(names_for("karpie", &scan).is_empty(), "the raw ROOST_PROJECT must not win over the scanned owner");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// `changed_projects`'s whole point for re-homing: a Claude that just
+    /// `cd`s into a worktree starts, exits and restarts no process at all,
+    /// so the *only* thing that differs between two scans is the `owner`
+    /// field — re-resolved fresh on every walk. Reporting the owner of each
+    /// differing tuple (not the raw `project`) is what wakes both the home
+    /// (losing the session) and the worktree (gaining it) from one tick.
+    ///
+    /// Revert-checked: reverting the key back to `(project, session)` (the
+    /// pre-fix body) fails the assertion — observed: `assertion 'left ==
+    /// right' failed\n  left: []\n right: ["karpie",
+    /// "karpie/.claude/worktrees/worktree-x"]` — because an owner-only
+    /// change is invisible to that key, which is exactly finding
+    /// 1's bug: a re-home with no process change wakes nobody.
+    #[test]
+    fn an_owner_only_change_wakes_both_the_home_and_the_new_owner() {
+        let before = vec![ClaudeProc {
+            project: "karpie".into(),
+            session: "term3".into(),
+            owner: "karpie".into(),
+            sse_port: None,
+        }];
+        let after = vec![ClaudeProc {
+            project: "karpie".into(),
+            session: "term3".into(),
+            owner: "karpie/.claude/worktrees/worktree-x".into(),
+            sse_port: None,
+        }];
+        let mut changed = changed_projects(&before, &after);
+        changed.sort();
+        assert_eq!(changed, vec!["karpie".to_string(), "karpie/.claude/worktrees/worktree-x".to_string()]);
+    }
+
+    /// End to end through `tick`: the same `claude` process survives
+    /// between two polls (same pid, same environment — nothing exits or
+    /// restarts), and only a re-home record written in between changes
+    /// anything. `tick` must still notice on its very next poll and wake
+    /// both projects, because `try_claude_terminals` re-resolves `owner`
+    /// on every walk.
+    ///
+    /// Revert-checked: reverting `try_claude_terminals` to push
+    /// `owner: p.clone()` unconditionally (so it never calls
+    /// `effective_owner` at all) fails the second `tick` assertion —
+    /// observed: `assertion 'left == right' failed: left: [], right:
+    /// ["rehome-tick-fixture", "rehome-tick-fixture/.claude/worktrees/worktree-x"]`
+    /// — i.e. the re-home is silently invisible to the watcher.
+    #[test]
+    fn tick_wakes_both_projects_on_a_rehome_with_no_process_change() {
+        let _lock = SCAN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let home = "rehome-tick-fixture";
+        let owner = format!("{home}/.claude/worktrees/worktree-x");
+        std::fs::create_dir_all(root.path().join(home).join(".claude/worktrees/worktree-x")).unwrap();
+
+        let proc_root = tempfile::tempdir().unwrap();
+        fake_proc(proc_root.path(), &[(100, home, "term3")]);
+
+        assert_eq!(tick(proc_root.path()), vec![home.to_string()], "first sighting wakes the home");
+        assert_eq!(cached_sessions(home), vec!["term3".to_string()]);
+
+        // Nothing about the process changes — same pid, same environ —
+        // only the re-home record appears in between the two polls.
+        crate::home::record(home, "term3", &owner).unwrap();
+        let mut changed = tick(proc_root.path());
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec![home.to_string(), owner.clone()],
+            "a re-home with no process change must still wake both pages on the very next poll"
+        );
+        assert_eq!(cached_sessions(&owner), vec!["term3".to_string()]);
+        assert!(cached_sessions(home).is_empty(), "the home no longer shows it");
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// `sse_port_in`'s outer `Option` answers "is a Claude here at all";
@@ -502,8 +646,8 @@ mod tests {
     /// here with `assertion failed: changed_projects(&before, &after).is_empty()`.
     #[test]
     fn a_port_change_alone_does_not_wake_a_project() {
-        let before = vec![ClaudeProc { project: "karpie".into(), session: "term".into(), sse_port: Some(1111) }];
-        let after = vec![ClaudeProc { project: "karpie".into(), session: "term".into(), sse_port: Some(2222) }];
+        let before = vec![ClaudeProc { project: "karpie".into(), session: "term".into(), owner: "karpie".into(), sse_port: Some(1111) }];
+        let after = vec![ClaudeProc { project: "karpie".into(), session: "term".into(), owner: "karpie".into(), sse_port: Some(2222) }];
         assert!(changed_projects(&before, &after).is_empty());
         // …but a terminal appearing or leaving still does.
         let gone: Vec<ClaudeProc> = vec![];

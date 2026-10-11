@@ -433,27 +433,59 @@ fn reclaim_pending_for(conn_id: u64) {
     }
 }
 
-/// The project whose browsers should see this connection's `openDiff`
-/// traffic: the owner of the terminal this Claude sits in, when the terminal
-/// is known and its owner still resolves (`home::effective_owner`) — else
-/// this connection's own project, its home, exactly as before re-homing
-/// existed. A re-homed Claude's tab lives in the owner's workspace now
-/// (home.rs's module doc), so a proposal delivered to the home would open a
-/// tab in a panel nobody re-homed into is looking at.
+/// Where an `openDiff` for this connection actually lands:
+/// `(target_project, target_rel)`. The home — `home_project`, with
+/// `home_rel` unchanged — exactly as before re-homing existed, *unless all
+/// three* hold: the Claude's terminal resolves to a different owner; the
+/// file genuinely lies inside that owner's directory, on a real canonical-
+/// path comparison; and that owner actually has an open hub to receive it.
+///
+/// The canonical compare matters and a string prefix on `home_rel` would
+/// not do: confinement (`confined_target`) already resolved any symlinks on
+/// the way to `home_rel`, so its *text* no longer necessarily looks like a
+/// path under `.claude/worktrees/<dir>` even when the real file is there
+/// (or the reverse — text that looks right but resolves somewhere else
+/// entirely). Comparing the real, canonicalised locations is what a symlink
+/// cannot fool either way.
+///
+/// Any one of the three failing falls all the way back to the home, with
+/// `home_rel` unchanged: parking a proposal where nothing will ever answer
+/// it (no open hub for the owner) is worse than showing it in the "wrong"
+/// — but definitely open and definitely correct-file — tab. This is also
+/// why `has_dirty_buffer`/`open_proposal`/the `MAX_PENDING` cap all take
+/// this function's *chosen* target, never the raw session owner: the
+/// re-relativised `rel` they get only means the right file in the hub they
+/// actually land in.
 ///
 /// Looked up fresh on every call rather than cached on `Conn`: the session a
 /// connection sits in is itself only known once `ide_connected` arrives
 /// (`set_session`), and a `cwd`/session can in principle change over a
 /// connection's life the same way `cwd` already does.
-fn delivery_project(project: &str, conn_id: u64) -> String {
+fn delivery_target(home_project: &str, conn_id: u64, workspace: &Path, home_rel: &str) -> (String, String) {
+    let home = || (home_project.to_string(), home_rel.to_string());
     let sess = {
         let map = conns().lock().unwrap_or_else(|e| e.into_inner());
-        map.get(project).and_then(|v| v.iter().find(|t| t.id == conn_id)).map(|t| t.session.clone())
+        map.get(home_project).and_then(|v| v.iter().find(|t| t.id == conn_id)).map(|t| t.session.clone())
     };
-    match sess {
-        Some(crate::idesess::Sess::In(s)) => crate::home::effective_owner(project, &s),
-        _ => project.to_string(),
+    let Some(crate::idesess::Sess::In(s)) = sess else { return home() };
+    let owner = crate::home::effective_owner(home_project, &s);
+    if owner == home_project {
+        return home();
     }
+    // `effective_owner` already confirmed `owner` resolves; `owner_dir` is
+    // the same check, with the directory kept instead of discarded.
+    let Some(owner_dir) = crate::home::owner_dir(home_project, &owner) else { return home() };
+    let Ok(owner_canon) = owner_dir.canonicalize() else { return home() };
+    // Re-derives the canonical absolute path from `home_rel` rather than
+    // trusting its text — the same canonicalising confinement
+    // `confined_target` already ran, so this works whether or not the file
+    // exists yet (a brand new file's *parent* still canonicalises).
+    let Ok(home_abs) = crate::projects::safe_resolve_parent(workspace, home_rel) else { return home() };
+    let Ok(owner_rel) = home_abs.strip_prefix(&owner_canon) else { return home() };
+    if !crate::hub::is_open(&owner) {
+        return home();
+    }
+    (owner, owner_rel.to_string_lossy().into_owned())
 }
 
 /// Sends `msg` — a complete JSON-RPC notification, never a request — to every
@@ -888,6 +920,24 @@ pub(crate) fn park_for_test(
     id
 }
 
+/// Registers a fake Claude connection — no real socket behind it — in
+/// `session`'s terminal of `project`. For `hub.rs`'s own tests of
+/// mention/selection routing, which need a connection `notify_selected`/
+/// `notify_all` can actually find, but have no business reaching into
+/// `conns()`/`Target` directly (both private to this module).
+#[cfg(test)]
+pub(crate) fn register_fake_conn_for_test(
+    project: &str,
+    session: &str,
+) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+    conns().lock().unwrap_or_else(|e| e.into_inner()).entry(project.to_string()).or_default().push(
+        Target { id, reply: tx, session: crate::idesess::Sess::In(session.to_string()) },
+    );
+    rx
+}
+
 /// The pending id for a project's tab name, for tests that need to answer a
 /// proposal they parked over a real socket.
 #[cfg(test)]
@@ -1009,19 +1059,22 @@ fn open_diff(
         },
     };
 
-    // Where this lands: the owner, for a Claude whose terminal was re-homed
-    // into a worktree, since that is the workspace its tab actually shows in
-    // now. Computed once and used for every browser-facing decision below —
-    // the dirty-buffer guard, the cap, and the parked row's own `project` —
-    // so `answer`/`close_tab`/`reclaim_pending_for` all agree on which hub
-    // this proposal belongs to.
-    let target = delivery_project(&conn.project, conn.id);
+    // Where this lands, and under what name: the owner, re-relativised, for
+    // a Claude whose terminal was re-homed into a worktree that this very
+    // file actually lies inside and that has an open hub — the home
+    // otherwise. Computed once and used for every browser-facing decision
+    // below — the dirty-buffer guard, the cap, and the parked row's own
+    // `project` — so `has_dirty_buffer`/`open_proposal` and later
+    // `answer`/`reclaim_pending_for` all agree on which hub and which file
+    // this proposal belongs to. See `delivery_target`'s own doc comment for
+    // why a canonical compare, not `rel`'s text, decides "inside".
+    let (target, target_rel) = delivery_target(&conn.project, conn.id, &conn.workspace, &rel);
 
     // roost may be holding unsaved edits to this very file. Accepting would
     // discard them silently, which is the one thing the whole conflict-guard
     // exists to prevent.
-    if crate::hub::has_dirty_buffer(&target, &rel) {
-        return Some(err(id, -32002, format!("{rel} has unsaved changes in roost")));
+    if crate::hub::has_dirty_buffer(&target, &target_rel) {
+        return Some(err(id, -32002, format!("{target_rel} has unsaved changes in roost")));
     }
 
     let pid = new_pending_id(&conn.project);
@@ -1049,7 +1102,7 @@ fn open_diff(
     // a pending proposal's lock is held for minutes if it is held at all.
     // Taking the hub lock only *after* releasing the pending one is also what
     // keeps the lock order total — see `Hub::do_answer_proposal`.
-    crate::hub::open_proposal(&target, &pid, &rel, &old_text, &new_text);
+    crate::hub::open_proposal(&target, &pid, &target_rel, &old_text, &new_text);
 
     // No reply yet, and crucially the read loop is not blocked: Claude must
     // still be able to send `close_tab`, and a user who walked away must not
@@ -1069,25 +1122,27 @@ fn close_tab(
     conn: &Conn,
 ) -> Option<serde_json::Value> {
     let name = args["tab_name"].as_str().unwrap_or("");
-    // The same mapping `open_diff` used to park it — a withdrawal has to
-    // find the row under the project it was actually opened in, the owner
-    // for a re-homed Claude.
-    let target = delivery_project(&conn.project, conn.id);
-    let withdrawn: Vec<String> = {
+    // Filtered on `conn_id` alone, not a freshly re-derived target: which
+    // project a given tab actually parked under (`open_diff`'s
+    // `delivery_target`) depends on *that file's* containment, which
+    // `close_tab` has no path to recompute — only a `tab_name`. Each row's
+    // own stored `project` is what `open_diff` already decided and is
+    // therefore the only thing worth trusting here.
+    let withdrawn: Vec<(String, String)> = {
         let mut map = pending().lock().unwrap_or_else(|e| e.into_inner());
-        let ids: Vec<String> = map
+        let rows: Vec<(String, String)> = map
             .iter()
-            .filter(|(_, p)| p.project == target && p.tab_name == name)
-            .map(|(k, _)| k.clone())
+            .filter(|(_, p)| p.conn_id == conn.id && p.tab_name == name)
+            .map(|(k, p)| (k.clone(), p.project.clone()))
             .collect();
-        for k in &ids {
+        for (k, _) in &rows {
             map.remove(k);
         }
-        ids
+        rows
     };
     // Outside the lock, for the same reason `open_diff` is.
-    for k in &withdrawn {
-        crate::hub::close_proposal(&target, k);
+    for (k, project) in &withdrawn {
+        crate::hub::close_proposal(project, k);
     }
     Some(ok(id, text_result("TAB_CLOSED")))
 }
@@ -2455,45 +2510,18 @@ mod tests {
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
-    /// A re-homed Claude's `openDiff` must land in the *owner*'s hub, not
-    /// the home's: the terminal's tab lives in the owner's workspace now
-    /// (home.rs's module doc), so a proposal delivered to the home would
-    /// open a tab in a panel nobody re-homed into is looking at.
-    ///
-    /// Built without a real socket — a `Target`/`ConnGuard` constructed
-    /// directly and `dispatch` called in-process, the same shape
-    /// `a_connection_records_the_session_it_was_told_about` uses — because
-    /// the thing under test is `open_diff`'s routing, not the handshake.
-    ///
-    /// `ROOST_ROOTS` and a real `.claude/worktrees/w1` directory under the
-    /// home are what let the production, fork-free `home::resolves` (not an
-    /// injected stub) confirm the owner before `open_diff` routes to it;
-    /// without them the record would be real but unresolved and the
-    /// proposal would fall back to home, proving nothing about the routing.
-    ///
-    /// Revert-checked: reverting `delivery_project` to always return its
-    /// `project` argument (ignoring the looked-up session) fails the first
-    /// assertion — observed: `panicked ... the proposal must land in the
-    /// owner's hub` — and the proposal is found in the home's hub instead
-    /// (confirmed separately).
-    #[test]
-    fn an_open_diff_from_a_rehomed_claude_lands_in_the_owners_hub_not_the_home() {
-        idelock::isolate_ide_dir_for_test();
-        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let d = tempfile::tempdir().unwrap();
-        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
-        std::env::set_var("ROOST_ROOTS", d.path());
-
-        let home = "diff-rehome-home";
+    /// Shared rig for the `delivery_target` tests below: a home project
+    /// directory, a re-home record pointing "term3" at an owner worktree
+    /// directory under it, and an IDE connection for "term3" registered
+    /// under the home. Deliberately does *not* create either project's
+    /// hub — some of these tests need the owner's hub absent, so each test
+    /// calls `Hub::for_project` itself for whichever hubs it needs.
+    fn rehomed_conn(d: &Path, home: &str) -> (String, PathBuf, PathBuf, Conn) {
         let owner = format!("{home}/.claude/worktrees/w1");
-        let home_dir = d.path().join(home);
+        let home_dir = d.join(home);
         std::fs::create_dir_all(&home_dir).unwrap();
         let owner_dir = home_dir.join(".claude/worktrees/w1");
         std::fs::create_dir_all(&owner_dir).unwrap();
-
-        let hub_home = crate::hub::Hub::for_project(home, home_dir.clone());
-        let hub_owner = crate::hub::Hub::for_project(&owner, owner_dir.clone());
-
         crate::home::record(home, "term3", &owner).unwrap();
 
         let (tx, _rx) = std::sync::mpsc::channel::<String>();
@@ -2506,12 +2534,109 @@ mod tests {
                 session: crate::idesess::Sess::Unknown,
             });
         }
-        let _guard = ConnGuard { project: home.to_string(), id };
+        // No `ConnGuard` here, deliberately: one would deregister this very
+        // registration the moment this function returns (its `Drop` runs at
+        // end of scope), and `delivery_target`'s session lookup — which
+        // every one of these tests exercises through `dispatch`, called
+        // after this returns — would then always find nothing. These tests
+        // never exercise disconnect, so the registration is simply left for
+        // the process to clean up, same as every other process-global test
+        // fixture here (unique project names per test, not per-test teardown).
         set_session(home, id, crate::idesess::Sess::In("term3".into()));
+        let conn = Conn::new(home, home_dir.clone(), tx, id);
+        (owner, home_dir, owner_dir, conn)
+    }
 
-        let f = home_dir.join("a.rs");
+    /// The positive case: a file that genuinely lies inside the worktree
+    /// lands in the owner's hub, under the owner's *own* relative path
+    /// (`a.rs`), not the home-relative one
+    /// (`.claude/worktrees/w1/a.rs`) — the bug findings 4+5 of fix round 1
+    /// caught: the previous version of this test proposed a file that was
+    /// NOT inside the worktree and still asserted it landed at the owner,
+    /// which is the wrong-file case, not this one.
+    ///
+    /// Revert-checked: reverting `delivery_target` to always return
+    /// `(home_project, home_rel)` (ignoring the owner entirely) fails the
+    /// first assertion — observed: `panicked ... the proposal must land in
+    /// the owner's hub: assertion \`left == right\` failed\n  left: 0\n
+    /// right: 1`.
+    #[test]
+    fn an_open_diff_for_a_worktree_file_lands_in_the_owners_hub_as_its_own_relative_path() {
+        idelock::isolate_ide_dir_for_test();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", d.path());
+
+        let home = "diff-rehome-wt-home";
+        let (owner, home_dir, owner_dir, mut conn) = rehomed_conn(d.path(), home);
+        let hub_home = crate::hub::Hub::for_project(home, home_dir.clone());
+        let hub_owner = crate::hub::Hub::for_project(&owner, owner_dir.clone());
+
+        let f = owner_dir.join("a.rs"); // genuinely inside the worktree
         std::fs::write(&f, "on disk").unwrap();
-        let mut conn = Conn::new(home, home_dir.clone(), tx, id);
+        let msg = rpc(
+            1,
+            "tools/call",
+            serde_json::json!({
+                "name": "openDiff",
+                "arguments": {
+                    "old_file_path": f.to_str().unwrap(),
+                    "new_file_path": f.to_str().unwrap(),
+                    "new_file_contents": "proposed",
+                    "tab_name": "p1",
+                }
+            }),
+        );
+        assert!(dispatch(&msg, &mut conn).is_none(), "openDiff parks rather than answering immediately");
+
+        let owner_sides: Vec<_> = crate::hub::Hub::lock(&hub_owner).proposals.values().cloned().collect();
+        assert_eq!(owner_sides.len(), 1, "the proposal must land in the owner's hub");
+        assert_eq!(owner_sides[0].rel, "a.rs", "under the owner's own relative path");
+        assert!(crate::hub::Hub::lock(&hub_home).proposals.is_empty(), "and not in the home's");
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Finding 4: before re-relativising, `has_dirty_buffer` was asked about
+    /// the *home*-relative path in the *owner*'s hub — a key that buffer map
+    /// can never hold, since the owner's own buffers are keyed relative to
+    /// its own root. A worktree file the owner already has unsaved edits to
+    /// must still be refused, exactly as it would be for a native (never
+    /// re-homed) proposal.
+    ///
+    /// Revert-checked: reverting `has_dirty_buffer`'s call in `open_diff` to
+    /// ask about `rel` (the home-relative path) instead of `target_rel`
+    /// fails the assertion — observed: `panicked ... a dirty owner buffer
+    /// must refuse the proposal: None`. (The proposal is parked instead of
+    /// refused, because the home-relative key `.claude/worktrees/w1/a.rs`
+    /// matches no buffer in the owner's hub.)
+    #[test]
+    fn a_worktree_file_with_a_dirty_owner_buffer_is_refused() {
+        idelock::isolate_ide_dir_for_test();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", d.path());
+
+        let home = "diff-rehome-dirty-home";
+        let (owner, home_dir, owner_dir, mut conn) = rehomed_conn(d.path(), home);
+        let _hub_home = crate::hub::Hub::for_project(home, home_dir.clone());
+        let hub_owner = crate::hub::Hub::for_project(&owner, owner_dir.clone());
+        {
+            let mut h = crate::hub::Hub::lock(&hub_owner);
+            h.ws.buffers.insert(
+                "a.rs".into(),
+                crate::workspace::Buffer {
+                    content: crate::workspace::Content::Edited("typed in the owner's tab".into()),
+                    ..crate::workspace::Buffer::default()
+                },
+            );
+        }
+
+        let f = owner_dir.join("a.rs");
+        std::fs::write(&f, "on disk").unwrap();
         let msg = rpc(
             1,
             "tools/call",
@@ -2526,16 +2651,173 @@ mod tests {
             }),
         );
         let reply = dispatch(&msg, &mut conn);
-        assert!(reply.is_none(), "openDiff parks rather than answering immediately");
+        let msg_text = reply.as_ref().and_then(|r| r["error"]["message"].as_str().map(str::to_string));
+        assert!(msg_text.as_deref().is_some_and(|m| m.contains("unsaved changes")), "a dirty owner buffer must refuse the proposal: {msg_text:?}");
+        assert!(crate::hub::Hub::lock(&hub_owner).proposals.is_empty(), "refused, never parked");
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Finding 4's other half: a file outside the worktree — the home's own
+    /// file, not the worktree's — must stay at home even though the
+    /// terminal is re-homed. `rel`'s *text* could in principle still look
+    /// unrelated to `.claude/worktrees/w1`, but the point of the canonical
+    /// compare is that this holds regardless of what the text looks like.
+    ///
+    /// Revert-checked: reverting `delivery_target`'s `home_abs.strip_prefix
+    /// (&owner_canon)` check to always succeed (treating every file as
+    /// "inside" once an owner resolves) fails the assertion — observed:
+    /// `panicked ... a file outside the worktree must stay at home:
+    /// assertion \`left == right\` failed\n  left: 0\n right: 1`.
+    #[test]
+    fn an_open_diff_for_a_file_outside_the_worktree_stays_at_home() {
+        idelock::isolate_ide_dir_for_test();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", d.path());
+
+        let home = "diff-rehome-outside-home";
+        let (owner, home_dir, owner_dir, mut conn) = rehomed_conn(d.path(), home);
+        let hub_home = crate::hub::Hub::for_project(home, home_dir.clone());
+        let hub_owner = crate::hub::Hub::for_project(&owner, owner_dir.clone());
+
+        let f = home_dir.join("a.rs"); // sibling of .claude, not inside the worktree
+        std::fs::write(&f, "on disk").unwrap();
+        let msg = rpc(
+            1,
+            "tools/call",
+            serde_json::json!({
+                "name": "openDiff",
+                "arguments": {
+                    "old_file_path": f.to_str().unwrap(),
+                    "new_file_path": f.to_str().unwrap(),
+                    "new_file_contents": "proposed",
+                    "tab_name": "p1",
+                }
+            }),
+        );
+        assert!(dispatch(&msg, &mut conn).is_none());
+
+        assert_eq!(
+            crate::hub::Hub::lock(&hub_home).proposals.len(),
+            1,
+            "a file outside the worktree must stay at home"
+        );
+        assert!(crate::hub::Hub::lock(&hub_owner).proposals.is_empty());
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Finding 5: an owner with no open hub at all. `hub::open_proposal`
+    /// silently does nothing for a project with no hub (see its own doc
+    /// comment), so delivering there would park the row and leave Claude
+    /// waiting forever on a `MAX_PENDING` slot nobody will ever free.
+    ///
+    /// Revert-checked: dropping the `hub::is_open(&owner)` check from
+    /// `delivery_target` fails the assertion — observed: `panicked ... a
+    /// proposal must still land somewhere when nobody has the owner open:
+    /// assertion \`left == right\` failed\n  left: 0\n right: 1`.
+    #[test]
+    fn an_open_diff_with_no_open_hub_for_the_owner_stays_at_home() {
+        idelock::isolate_ide_dir_for_test();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", d.path());
+
+        let home = "diff-rehome-noowner-home";
+        let (_owner, home_dir, owner_dir, mut conn) = rehomed_conn(d.path(), home);
+        let hub_home = crate::hub::Hub::for_project(home, home_dir.clone());
+        // Deliberately no `Hub::for_project` for the owner: nobody has that
+        // worktree's tab open.
+
+        let f = owner_dir.join("a.rs");
+        std::fs::write(&f, "on disk").unwrap();
+        let msg = rpc(
+            1,
+            "tools/call",
+            serde_json::json!({
+                "name": "openDiff",
+                "arguments": {
+                    "old_file_path": f.to_str().unwrap(),
+                    "new_file_path": f.to_str().unwrap(),
+                    "new_file_contents": "proposed",
+                    "tab_name": "p1",
+                }
+            }),
+        );
+        assert!(dispatch(&msg, &mut conn).is_none());
+
+        assert_eq!(
+            crate::hub::Hub::lock(&hub_home).proposals.len(),
+            1,
+            "a proposal must still land somewhere when nobody has the owner open"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// `close_tab` cannot recompute `delivery_target` the way `open_diff`
+    /// did — it has only a `tab_name`, never the file path containment
+    /// depends on — so it must find the row by `conn_id` and trust that
+    /// row's own stored `project`, not a freshly (and differently) derived
+    /// target. A worktree-file proposal, parked under the owner, must still
+    /// close there when the same connection sends `close_tab`.
+    ///
+    /// Revert-checked: reverting the filter to `p.project == conn.project
+    /// && p.tab_name == name` (the pre-fix-round body — always the home,
+    /// never any recomputed or stored target) fails — observed: `panicked
+    /// ... the owner's proposal must actually close`. The row is filed
+    /// under the owner, `conn.project` is the home, so the old filter finds
+    /// nothing and the proposal is silently left parked.
+    #[test]
+    fn close_tab_withdraws_a_worktree_proposal_from_the_owner() {
+        idelock::isolate_ide_dir_for_test();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", d.path());
+
+        let home = "diff-rehome-close-home";
+        let (owner, home_dir, owner_dir, mut conn) = rehomed_conn(d.path(), home);
+        let hub_home = crate::hub::Hub::for_project(home, home_dir.clone());
+        let hub_owner = crate::hub::Hub::for_project(&owner, owner_dir.clone());
+
+        let f = owner_dir.join("a.rs");
+        std::fs::write(&f, "on disk").unwrap();
+        let open_msg = rpc(
+            1,
+            "tools/call",
+            serde_json::json!({
+                "name": "openDiff",
+                "arguments": {
+                    "old_file_path": f.to_str().unwrap(),
+                    "new_file_path": f.to_str().unwrap(),
+                    "new_file_contents": "proposed",
+                    "tab_name": "p1",
+                }
+            }),
+        );
+        assert!(dispatch(&open_msg, &mut conn).is_none());
+        assert_eq!(crate::hub::Hub::lock(&hub_owner).proposals.len(), 1, "setup: parked at the owner");
+
+        let close_msg = rpc(
+            2,
+            "tools/call",
+            serde_json::json!({"name": "close_tab", "arguments": {"tab_name": "p1"}}),
+        );
+        let reply = dispatch(&close_msg, &mut conn);
+        assert!(reply.is_some(), "close_tab answers immediately");
 
         assert!(
-            !crate::hub::Hub::lock(&hub_owner).proposals.is_empty(),
-            "the proposal must land in the owner's hub"
+            crate::hub::Hub::lock(&hub_owner).proposals.is_empty(),
+            "the owner's proposal must actually close"
         );
-        assert!(
-            crate::hub::Hub::lock(&hub_home).proposals.is_empty(),
-            "and not in the home's"
-        );
+        assert!(crate::hub::Hub::lock(&hub_home).proposals.is_empty());
 
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");

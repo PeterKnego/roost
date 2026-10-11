@@ -2185,7 +2185,16 @@ impl Hub {
                 return self.send_to(from, &ev);
             }
         };
-        if let Err(e) = crate::ide::mention_to(&self.project, session.as_deref(), &abs, lines) {
+        // The named terminal's Claude is registered wherever its socket
+        // actually is — its home, for a resident, never this project
+        // (`self.project` may itself be the *owner* here, which has no
+        // conns() entry at all for a session that lives elsewhere). `abs`
+        // is already a real absolute path, not project-relative, so
+        // sending it unchanged to the home's connection needs no
+        // re-relativising the way `ide.rs`'s proposal delivery does.
+        let target_project =
+            session.as_ref().and_then(|s| self.session_homes.get(s)).cloned().unwrap_or_else(|| self.project.clone());
+        if let Err(e) = crate::ide::mention_to(&target_project, session.as_deref(), &abs, lines) {
             let ev = Event::Error { msg: e };
             self.send_to(from, &ev);
         }
@@ -2223,6 +2232,15 @@ impl Hub {
             }
         };
         let _ = crate::ide::selection_changed(&self.project, &abs, &text, start, end);
+        // Unaimed, unlike `do_mention_path`: every connected Claude gets
+        // this, so every one of this project's *residents* must also be
+        // reached at their own home — their connection has no entry under
+        // `self.project` at all. Deduplicated by home, since several
+        // residents can share one.
+        let homes: std::collections::HashSet<&String> = self.session_homes.values().collect();
+        for home in homes {
+            let _ = crate::ide::selection_changed(home, &abs, &text, start, end);
+        }
     }
 
     /// The human's Accept/Reject, which **is** the permission answer Claude
@@ -2498,6 +2516,15 @@ fn open_hub(project: &str) -> Option<Arc<Mutex<Hub>>> {
     map.get(project).cloned()
 }
 
+/// Whether `project` has a hub at all — `ide.rs`'s `open_diff` needs this
+/// before deciding to deliver a proposal to an owner: parking it there with
+/// no hub to receive it would make `open_proposal` silently do nothing
+/// (see its own doc comment) while Claude waits forever and the row still
+/// holds one of that project's `MAX_PENDING` slots.
+pub fn is_open(project: &str) -> bool {
+    open_hub(project).is_some()
+}
+
 /// Whether roost is holding unsaved edits to `rel`.
 ///
 /// `openDiff` asks this before parking a proposal: accepting one would let
@@ -2652,7 +2679,12 @@ pub fn broadcast_to_project(project: &str, ev: &Event) {
 /// is a handful of small file reads/stats, never git).
 pub fn publish(project: &str, session: &str, p: crate::osc::Parsed) {
     let target = crate::home::effective_owner(project, session);
-    if let Some(notice) = crate::notify::record(project, session, p) {
+    // Recorded under `target`, not `project`: `Notice.project` is what
+    // `notify::list_for` filters a reload or a mark-all-read/clear against,
+    // and a re-homed session's tab is the owner's now — filing it under the
+    // home would make it invisible to everything but a browser that stayed
+    // subscribed across this very call.
+    if let Some(notice) = crate::notify::record(&target, session, p) {
         broadcast_to_project(&target, &Event::Notice { notice });
     }
 }
@@ -4158,6 +4190,49 @@ mod tests {
             leaked.is_err(),
             "a re-homed session's notice must not also land at home, got {leaked:?}"
         );
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// The sibling test above proves *live* delivery; this proves the
+    /// *persisted* store agrees. `notify::record` still stored
+    /// `Notice.project` as the raw `project` argument until this fix —
+    /// `list_for`, which every reload and the mark-all-read/clear buttons
+    /// go through, filters on that field. So a browser that reloads the
+    /// owner's tab (rather than staying subscribed across the `publish`
+    /// call) would see no notice at all, and the home's mark-all-read could
+    /// never reach it either.
+    ///
+    /// Revert-checked: reverting `publish` to call
+    /// `notify::record(project, …)` (the home, not `target`) fails the
+    /// first assertion — observed: `panicked ... []` — the notice is
+    /// filed under the home instead, invisible to `list_for(&owner)`.
+    #[test]
+    fn a_rehomed_sessions_notice_persists_under_its_owner_not_its_home() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", d.path());
+        crate::notify::reset_for_test();
+
+        let home = "notice-persist-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = d.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        std::fs::create_dir_all(home_dir.join(".claude/worktrees/w1")).unwrap();
+
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        publish(home, "term3", crate::osc::Parsed { title: None, body: "persisted for owner".into() });
+
+        let owner_notices = crate::notify::list_for(&owner);
+        assert!(
+            owner_notices.iter().any(|n| n.body.contains("persisted for owner")),
+            "the notice must be filed under the owner: {owner_notices:?}"
+        );
+        let home_notices = crate::notify::list_for(home);
+        assert!(home_notices.is_empty(), "and not under the home: {home_notices:?}");
 
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
@@ -5700,6 +5775,142 @@ mod tests {
         assert!(got.iter().any(|m| m.contains("no Claude")), "the asking client got no refusal: {got:?}");
         let others: Vec<String> = rx_other.try_iter().collect();
         assert!(others.is_empty(), "a refusal must leave the other subscriber's inbox empty, got: {others:?}");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Finding 6: an Alt+K aimed at a re-homed terminal, sent from the
+    /// *owner*'s hub (where that terminal's tab actually lives now). The
+    /// Claude it should reach is registered under the terminal's *home* —
+    /// `self.project` here is the owner, which has no `conns()` entry for
+    /// it at all — so `do_mention_path` must look the session up in
+    /// `self.session_homes` and route there instead.
+    ///
+    /// `register_fake_conn_for_test` stands in for a real IDE connection;
+    /// `term9` is an unrelated session under the same home, registered to
+    /// prove this is a *routed* mention (one session picked out), not a
+    /// broadcast that happens to work.
+    ///
+    /// Revert-checked: reverting `target_project` to always be
+    /// `self.project.clone()` (the pre-fix-round body) fails — observed:
+    /// `panicked ... the resident's own Claude must receive the mention:
+    /// Timeout`. (The mention is sent to `conns()[owner]`, which has no
+    /// entry at all, so `ide::mention_to` returns "no Claude is connected
+    /// to this project" and the refusal reaches `rx_asker` instead.)
+    #[test]
+    fn mention_from_a_rehomed_terminal_reaches_its_claude_at_home() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "mention-rehome-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+        std::fs::write(owner_dir.join("a.rs"), "fn main() {}").unwrap();
+
+        // `session_homes` only lists a resident whose terminal is actually
+        // live (`owned_live_names`) — a real dtach session at the home, not
+        // just the re-home record, the same discipline
+        // `remove_refuses_a_worktree_with_a_live_resident` follows.
+        crate::session::reserve_and_attach(home, "term3", &home_dir).unwrap();
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        // The resident's Claude is registered at its home, never the owner.
+        let rx_home = crate::ide::register_fake_conn_for_test(home, "term3");
+        // An unrelated session under the same home: proof this is routed,
+        // not broadcast.
+        let rx_other = crate::ide::register_fake_conn_for_test(home, "term9");
+
+        let mut h = Hub::new(&owner, owner_dir.clone());
+        assert_eq!(
+            h.session_homes.get("term3"),
+            Some(&home.to_string()),
+            "setup: the owner hub must see term3 as a resident"
+        );
+        let (asker, rx_asker) = h.subscribe();
+
+        h.handle(&asker, Intent::MentionPath {
+            rel: "a.rs".into(),
+            line_start: None,
+            line_end: None,
+            session: Some("term3".into()),
+        });
+
+        let got = rx_home
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the resident's own Claude must receive the mention");
+        assert!(got.contains("at_mentioned"), "{got}");
+        assert!(rx_other.try_recv().is_err(), "an unrelated session's Claude must not receive it");
+        assert!(
+            rx_asker.try_iter().collect::<Vec<_>>().is_empty(),
+            "no refusal, since the mention actually reached someone"
+        );
+
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Finding 6's other half: a shared selection is unaimed — every
+    /// connected Claude gets it — so from the owner's hub it must reach not
+    /// only any native connection under the owner itself but every
+    /// *resident's* connection too, each at its own home.
+    ///
+    /// Revert-checked: removing the `self.session_homes.values()` loop from
+    /// `do_share_selection` (the pre-fix-round body, which only ever calls
+    /// `ide::selection_changed(&self.project, ...)`) fails — observed:
+    /// `panicked ... the resident's Claude must receive the shared
+    /// selection: Timeout`.
+    #[test]
+    fn a_shared_selection_from_the_owner_also_reaches_its_residents_claude() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let cfg = root.path().join("global.toml");
+        std::fs::write(&cfg, "share_selection = true\n").unwrap();
+        std::env::set_var("ROOST_CONFIG", &cfg);
+
+        let home = "shareselection-rehome-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+        std::fs::write(owner_dir.join("a.rs"), "fn main() {}").unwrap();
+
+        crate::session::reserve_and_attach(home, "term3", &home_dir).unwrap();
+        crate::home::record(home, "term3", &owner).unwrap();
+        let rx_home = crate::ide::register_fake_conn_for_test(home, "term3");
+
+        let mut h = Hub::new(&owner, owner_dir.clone());
+        assert_eq!(h.session_homes.get("term3"), Some(&home.to_string()), "setup");
+        let (asker, _rx_asker) = h.subscribe();
+
+        h.handle(&asker, Intent::ShareSelection {
+            rel: "a.rs".into(),
+            text: "fn main".into(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 7,
+        });
+
+        let got = rx_home
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the resident's Claude must receive the shared selection");
+        assert!(got.contains("selection_changed"), "{got}");
+
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_CONFIG");
+        std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 

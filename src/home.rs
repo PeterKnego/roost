@@ -114,38 +114,53 @@ pub fn sweep(sock_state: &dyn Fn(&str, &str) -> Option<bool>) { sweep_in(&crate:
 /// A `false` here destroys nothing: the session is shown in its home, and
 /// the record is kept (see the module doc and `session::owned_live_names`).
 pub fn resolves_in(roots: &[PathBuf], home: &str, owner: &str) -> bool {
-    let Some(dir) = owner.strip_prefix(home).and_then(|r| r.strip_prefix("/.claude/worktrees/")) else {
-        return false;
-    };
+    owner_dir_in(roots, home, owner).is_some()
+}
+
+pub fn resolves(home: &str, owner: &str) -> bool {
+    resolves_in(&crate::projects::roots(), home, owner)
+}
+
+/// The owner's real directory when it `resolves`, rather than just a bool —
+/// what `ide.rs`'s `open_diff` needs to re-relativise a confined path
+/// against before delivering a proposal to the owner's hub instead of the
+/// home's. `resolves_in` is this with the directory discarded; see it for
+/// why this is fork-free and for the "cannot tell" direction (display-only,
+/// so it leans toward keeping the session at the owner here exactly as
+/// `resolves_in` leans toward keeping it shown there).
+pub fn owner_dir_in(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
+    let dir = owner.strip_prefix(home).and_then(|r| r.strip_prefix("/.claude/worktrees/"))?;
     // roost's own `worktree-<name>` and the older `claude-N` both fit the
     // session-name alphabet, except a `worktree-` name longer than 23. No
     // shape admits `/`, `.` or `..`, which is what keeps `dir` one segment.
     let shaped = crate::session::valid_name(dir)
         || dir.strip_prefix("worktree-").is_some_and(crate::wtname::valid);
     if !shaped {
-        return false;
+        return None;
     }
     // A home with a dot segment would send `resolve_project` to git. Every
     // home is a main checkout, which has none; refusing one keeps this
     // fork-free by construction rather than by that assumption.
     if home.split('/').any(|s| s.starts_with('.')) {
-        return false;
+        return None;
     }
-    let Some(home_dir) = crate::projects::resolve_project(roots, home) else { return false };
-    match std::fs::symlink_metadata(home_dir.join(".claude/worktrees").join(dir)) {
-        Ok(m) => m.is_dir(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+    let home_dir = crate::projects::resolve_project(roots, home)?;
+    let wt_dir = home_dir.join(".claude/worktrees").join(dir);
+    match std::fs::symlink_metadata(&wt_dir) {
+        Ok(m) if m.is_dir() => Some(wt_dir),
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         // Cannot tell: keep showing the session where its record says. This
         // is display-only and destroys nothing either way, so it does not
         // need positive evidence — but a worktree we merely could not stat
         // is not one that was removed, and moving the tab back to the home
         // on an EACCES would be the same misreading in a milder form.
-        Err(_) => true,
+        Err(_) => Some(wt_dir),
     }
 }
 
-pub fn resolves(home: &str, owner: &str) -> bool {
-    resolves_in(&crate::projects::roots(), home, owner)
+pub fn owner_dir(home: &str, owner: &str) -> Option<PathBuf> {
+    owner_dir_in(&crate::projects::roots(), home, owner)
 }
 
 /// The project a session actually shows in: `home` itself, unless the
@@ -212,6 +227,31 @@ mod tests {
 
         std::fs::remove_dir_all(wts.join("worktree-x")).unwrap();
         assert!(!resolves_in(&roots, "proj", "proj/.claude/worktrees/worktree-x"), "a removed worktree no longer resolves");
+    }
+
+    /// `owner_dir_in` is `resolves_in` with the directory kept rather than
+    /// discarded — `ide.rs`'s `open_diff` needs the real path to
+    /// re-relativise a confined file against, not just a yes/no.
+    ///
+    /// Revert-checked: changing the `Ok(m) if m.is_dir()` arm to return
+    /// `home_dir` instead of `wt_dir` (still `Some`, so `resolves_in` — and
+    /// every one of its own boolean-only tests — would not notice at all)
+    /// fails here — observed: `assertion 'left == right' failed\n  left:
+    /// ".../proj"\n right: ".../proj/.claude/worktrees/worktree-x"`. This is
+    /// the test `resolves_in`'s suite structurally cannot write, since it
+    /// only ever asserts true/false.
+    #[test]
+    fn owner_dir_in_returns_the_real_path_resolves_in_only_reports_as_true() {
+        let root = tempfile::tempdir().unwrap();
+        let wts = root.path().join("proj/.claude/worktrees");
+        std::fs::create_dir_all(wts.join("worktree-x")).unwrap();
+        let roots = vec![root.path().to_path_buf()];
+
+        let dir = owner_dir_in(&roots, "proj", "proj/.claude/worktrees/worktree-x")
+            .expect("an existing worktree resolves");
+        assert_eq!(dir, wts.join("worktree-x"));
+
+        assert!(owner_dir_in(&roots, "proj", "proj/.claude/worktrees/worktree-gone").is_none());
     }
 
     /// Display-only, so "cannot tell" keeps the session where its record
