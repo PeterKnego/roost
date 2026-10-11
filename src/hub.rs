@@ -202,7 +202,7 @@ fn lost_terminal_sessions(ws: &crate::workspace::Workspace, project: &str) -> Ve
         .iter()
         .flat_map(|p| p.tabs.iter())
         .filter_map(|t| match t {
-            crate::proto::Tab::Terminal { session } => Some(session.clone()),
+            crate::proto::Tab::Terminal { session, .. } => Some(session.clone()),
             _ => None,
         })
         // Three conditions, and `sessions_seen` is the one that makes this a
@@ -534,6 +534,11 @@ impl Hub {
         // running host, not of the saved layout. Reading it back from disk
         // would mark tabs from a previous boot.
         ws.claude_sessions = crate::claudes::cached_sessions(&self.project);
+        // Same reasoning: a fact about which sockets are actually live right
+        // now, not about the saved layout, so it is never persisted and is
+        // filled fresh on every snapshot from the in-memory `session_homes`
+        // `refresh_live_sessions` just rebuilt.
+        ws.session_homes = self.session_homes.clone();
         // See the doc comment on `claude_hooks` for why this is cached
         // rather than read on every call.
         let cached = *self.claude_hooks.get_or_insert_with(|| {
@@ -567,10 +572,16 @@ impl Hub {
     /// for a name (`✻` reserves before the tab exists). Nothing here removes
     /// reservations — `do_close_project` drops the whole project's in one
     /// go, which is the case that matters.
+    ///
+    /// `home: None` tabs only: a resident's reservation belongs under its
+    /// *home*, not here — that is where the browser's own follow-up connect
+    /// actually lands (it dials `tab.home`), and reserving the name under
+    /// this project too would park a second, never-consumed reservation at
+    /// an address nothing ever spawns through.
     fn sync_reservations(&self) {
         for p in &self.ws.panes {
             for t in &p.tabs {
-                if let Tab::Terminal { session } = t {
+                if let Tab::Terminal { session, home: None } = t {
                     crate::session::reserve_if_absent(&self.project, session);
                 }
             }
@@ -839,7 +850,7 @@ impl Hub {
                 .get(*pane as usize)
                 .and_then(|p| p.tabs.get(*idx))
                 .and_then(|t| match t {
-                    Tab::Terminal { session } => Some(session.clone()),
+                    Tab::Terminal { session, .. } => Some(session.clone()),
                     _ => None,
                 }),
             _ => None,
@@ -1495,6 +1506,76 @@ impl Hub {
         // loss for.
         let lost = self.ws.lost_sessions.clone();
         self.ws.resumable_sessions.retain(|s| lost.contains(s));
+
+        // A resident with no tab of its own yet. Nothing that opens a
+        // terminal tab (`OpenTab`, `StartTerminal`, a restored layout) ever
+        // names a session this project never spawned, so this refresh — the
+        // moment `session_homes` above just learned about it — is the only
+        // place that can give a freshly re-homed terminal a tab on its
+        // *owner*'s page. Guarded on whether a tab already exists: calling
+        // `apply_layout`'s `OpenTab` unconditionally would, via `find_tab`,
+        // re-focus that pane on *every* refresh — i.e. on every unrelated
+        // intent — stealing attention from whatever tab the user actually
+        // has open.
+        let already_tabbed: std::collections::HashSet<String> = self
+            .ws
+            .panes
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .filter_map(|t| match t {
+                Tab::Terminal { session, .. } => Some(session.clone()),
+                _ => None,
+            })
+            .collect();
+        for (name, home) in self.session_homes.clone() {
+            if already_tabbed.contains(&name) {
+                continue;
+            }
+            let intent = Intent::OpenTab {
+                pane: crate::proto::LEFT_TOP,
+                tab: Tab::Terminal { session: name, home: Some(home) },
+            };
+            if let Ok(true) = workspace::apply_layout(&mut self.ws, &intent) {
+                self.ws.version += 1;
+            }
+        }
+
+        // The mirror image, found on the *home*'s own refresh: a native tab
+        // (`home: None`) whose session is still truly alive here
+        // (`live_names`, the raw sockets — not `owned`, which the re-home
+        // filter above has already adjusted) but absent from
+        // `self.ws.live_sessions` just moved, rather than ended — that
+        // absence is exactly what `owned_live_names`'s own `Elsewhere`-and-
+        // resolves filter means. The owner's own refresh (above) is what
+        // gives it a tab there instead, so this page no longer has any
+        // business showing one.
+        let raw_live = crate::session::live_names(&self.project);
+        let project = self.project.clone();
+        let mut rehomed: Vec<(String, String)> = Vec::new();
+        for pane in &self.ws.panes {
+            for t in &pane.tabs {
+                if let Tab::Terminal { session, home: None } = t {
+                    if rehomed.iter().any(|(s, _)| s == session) {
+                        continue;
+                    }
+                    if raw_live.contains(session) && !self.ws.live_sessions.contains(session) {
+                        rehomed
+                            .push((session.clone(), crate::home::effective_owner(&project, session)));
+                    }
+                }
+            }
+        }
+        for (session, owner) in rehomed {
+            let ended = workspace::apply_layout(
+                &mut self.ws,
+                &Intent::EndSession { session: session.clone() },
+            );
+            if let Ok(true) = ended {
+                self.ws.version += 1;
+            }
+            self.broadcast(&Event::Rehomed { session, owner });
+        }
+
         // Any enclosing work tree counts, not just this directory's own `.git`
         // — see `gitio::is_inside_work_tree`. A nested project has no `.git` of
         // its own, and offering `git init` there embeds a repository inside its
@@ -1510,6 +1591,20 @@ impl Hub {
     fn do_start_terminal(&mut self, from: &ConnId, session: String, resume: bool) {
         if !crate::session::valid_name(&session) {
             let ev = Event::Error { msg: format!("invalid session name: {session}") };
+            return self.send_to(from, &ev);
+        }
+        // A lost tab's "press Enter" placeholder retries its old name, which
+        // is the other way (besides a fresh `+`/`✻` click, already guarded
+        // by `do_new_terminal`'s `also_taken`) a browser can ask for a name
+        // already in play on this page. `self.session_homes` is exactly
+        // that: a resident's name, taken here though this project's own
+        // `sock/` has no such socket. Spawning anyway would land the
+        // browser in a brand-new, unrelated shell under the name a Claude
+        // at the resident's home is still running in.
+        if let Some(home) = self.session_homes.get(&session) {
+            let ev = Event::Error {
+                msg: format!("terminal {session} is in use by a terminal moved here from {home}"),
+            };
             return self.send_to(from, &ev);
         }
         // I4: a close in flight is killing every one of this project's
@@ -1655,20 +1750,28 @@ impl Hub {
             self.ws.version += 1;
         }
         let project = self.project.clone();
+        // A resident's dtach master lives at its *home*, never here
+        // (`home.rs`'s module doc): ending it must kill the real session
+        // there, or this would report success while leaving the shell —
+        // and any Claude in it — running untouched. `self.session_homes` is
+        // exactly `do_new_terminal`'s `also_taken` source: a name in it is
+        // a resident's, not a native tab's.
+        let kill_target = self.session_homes.get(&session).cloned().unwrap_or_else(|| project.clone());
         match self.self_ref.upgrade() {
             Some(hub_arc) => {
                 let thread_project = project.clone();
+                let thread_kill_target = kill_target.clone();
                 let thread_session = session.clone();
                 let spawned =
                     std::thread::Builder::new().name("end-session".into()).spawn(move || {
                         // No panic may escape a socket thread; one here must not
                         // strand the hub lock and leave every later intent stuck.
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            crate::session::end_session(&thread_project, &thread_session)
+                            crate::session::end_session(&thread_kill_target, &thread_session)
                         }))
                         .unwrap_or_else(|_| {
                             eprintln!(
-                                "roost: end_session panicked ending {thread_project}/{thread_session}"
+                                "roost: end_session panicked ending {thread_kill_target}/{thread_session}"
                             );
                             false
                         });
@@ -1678,6 +1781,20 @@ impl Hub {
                             let snap = h.snapshot_event(&String::new());
                             h.broadcast(&snap);
                         }
+                        // The kill just happened at `thread_kill_target`, not
+                        // `thread_project`, for a resident — so that other
+                        // project's own browsers, if any are open, must hear
+                        // about it too. `open_hub`, not `for_project`: a
+                        // home with nobody connected has no hub to refresh
+                        // and nothing waiting to be told.
+                        if thread_kill_target != thread_project {
+                            if let Some(home_hub) = open_hub(&thread_kill_target) {
+                                let mut hh = Hub::lock(&home_hub);
+                                hh.refresh_live_sessions();
+                                let snap = hh.snapshot_event(&String::new());
+                                hh.broadcast(&snap);
+                            }
+                        }
                         // Ending a project's last session empties its row in
                         // every other project's ◆ panel; same placement
                         // rules as `do_close_project`'s nudge.
@@ -1685,12 +1802,12 @@ impl Hub {
                     });
                 if let Err(e) = spawned {
                     eprintln!("roost: could not spawn end-session thread for {project}: {e}");
-                    crate::session::end_session(&project, &session);
+                    crate::session::end_session(&kill_target, &session);
                     self.refresh_live_sessions();
                 }
             }
             None => {
-                crate::session::end_session(&project, &session);
+                crate::session::end_session(&kill_target, &session);
                 self.refresh_live_sessions();
             }
         }
@@ -1953,7 +2070,7 @@ impl Hub {
             .iter()
             .flat_map(|p| p.tabs.iter())
             .filter_map(|t| match t {
-                Tab::Terminal { session } => Some(session.clone()),
+                Tab::Terminal { session, .. } => Some(session.clone()),
                 _ => None,
             })
             .chain(self.session_homes.keys().cloned())
@@ -1998,7 +2115,7 @@ impl Hub {
                     }),
             }),
         );
-        let intent = Intent::OpenTab { pane, tab: Tab::Terminal { session: name.clone() } };
+        let intent = Intent::OpenTab { pane, tab: Tab::Terminal { session: name.clone(), home: None } };
         match workspace::apply_layout(&mut self.ws, &intent) {
             Ok(true) => {
                 // A layout change can add a terminal tab (OpenTab, MoveTab
@@ -3097,7 +3214,7 @@ mod tests {
         }
         w.panes[crate::proto::RIGHT as usize].tabs = names
             .iter()
-            .map(|n| crate::proto::Tab::Terminal { session: (*n).to_string() })
+            .map(|n| crate::proto::Tab::Terminal { session: (*n).to_string(), home: None })
             .collect();
         w
     }
@@ -3244,6 +3361,116 @@ mod tests {
             out.push(m);
         }
         out
+    }
+
+    /// Whether any pane carries a terminal tab for `session`, regardless of
+    /// whether it is native or a resident's.
+    fn has_terminal_tab(h: &Hub, session: &str) -> bool {
+        h.ws.panes.iter().flat_map(|p| p.tabs.iter()).any(
+            |t| matches!(t, Tab::Terminal { session: s, .. } if s == session),
+        )
+    }
+
+    /// The `home` carried by `session`'s terminal tab, if any pane has one —
+    /// `None` both when there is no such tab and when the tab is native, a
+    /// distinction this test module never needs to tell apart on its own
+    /// (every caller already knows which it is asking about).
+    fn terminal_tab_home(h: &Hub, session: &str) -> Option<String> {
+        for p in &h.ws.panes {
+            for t in &p.tabs {
+                if let Tab::Terminal { session: s, home } = t {
+                    if s == session {
+                        return home.clone();
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Two hubs sharing one live session: `home` is where its dtach socket
+    /// actually lives, `owner` is a worktree under it recorded as where the
+    /// tab now shows. Plain `Hub::new`, not `for_project` — this is about
+    /// `refresh_live_sessions`'s own bookkeeping, which needs neither a
+    /// watcher thread nor an IDE lock file, and both hubs are handed back as
+    /// `Arc<Mutex<Hub>>` only so the test can `Hub::lock` either one the way
+    /// a real connection would.
+    ///
+    /// The home's own tab for `session` is added by hand
+    /// (`Workspace::default_layout`'s own seeded `term` tab is a different
+    /// name on purpose, so it cannot be mistaken for this fixture's subject)
+    /// — nothing that opens a tab runs here, because what is under test is
+    /// what happens to a tab that is already there once re-homing is
+    /// recorded, not how the tab got there.
+    fn two_hubs_with_session(
+        root: &std::path::Path,
+        session: &str,
+    ) -> (Arc<Mutex<Hub>>, Arc<Mutex<Hub>>, String, String) {
+        let home = format!("rehome-{session}-home");
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.join(&home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+        crate::session::reserve_and_attach(&home, session, &home_dir).unwrap();
+        let mut home_hub = Hub::new(&home, home_dir);
+        home_hub.ws.panes[proto::RIGHT as usize]
+            .tabs
+            .push(Tab::Terminal { session: session.to_string(), home: None });
+        let owner_hub = Hub::new(&owner, owner_dir);
+        (Arc::new(Mutex::new(home_hub)), Arc::new(Mutex::new(owner_hub)), home, owner)
+    }
+
+    /// Two hubs and two connections, so a broadcast to the wrong project is
+    /// visible — a single-subscriber fixture cannot tell `send_to` from
+    /// `broadcast`, and cannot tell "sent to the right hub" from "sent to
+    /// whichever hub happened to be open".
+    ///
+    /// Revert-checked (Step 5): removing the tab-drop half of
+    /// `refresh_live_sessions` (the loop that calls `EndSession` on a native
+    /// tab whose session just resolved elsewhere) fails at the first
+    /// assertion — observed: `assertion failed: !has_terminal_tab(&Hub::lock(&home_hub), "term3")`.
+    #[test]
+    fn rehoming_moves_the_tab_and_tells_the_home() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let (home_hub, owner_hub, home, owner) = two_hubs_with_session(root.path(), "term3");
+        crate::home::record(&home, "term3", &owner).unwrap();
+
+        let (_ah, rx_ah) = Hub::lock(&home_hub).subscribe();
+        let (_ao, rx_ao) = Hub::lock(&owner_hub).subscribe();
+        drain(&rx_ah);
+        drain(&rx_ao);
+
+        Hub::lock(&home_hub).refresh_live_sessions();
+        Hub::lock(&owner_hub).refresh_live_sessions();
+
+        assert!(!has_terminal_tab(&Hub::lock(&home_hub), "term3"), "the home must drop its own tab for a session that moved away");
+        assert_eq!(
+            terminal_tab_home(&Hub::lock(&owner_hub), "term3"),
+            Some(home.clone()),
+            "the owner must gain a tab naming the resident's real home"
+        );
+
+        let home_msgs = drain(&rx_ah);
+        assert!(
+            home_msgs.iter().any(|m| m.contains(r#""t":"Rehomed""#) && m.contains("term3") && m.contains(&owner)),
+            "the home's own browser must be told where its tab went: {home_msgs:?}"
+        );
+        let owner_msgs = drain(&rx_ao);
+        assert!(
+            !owner_msgs.iter().any(|m| m.contains(r#""t":"Rehomed""#)),
+            "the owner did not lose a tab, so it must not hear Rehomed: {owner_msgs:?}"
+        );
+
+        crate::session::kill_project(&home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     #[test]
@@ -4505,7 +4732,7 @@ mod tests {
             .tabs
             .iter()
             .filter_map(|t| match t {
-                Tab::Terminal { session } => Some(session.clone()),
+                Tab::Terminal { session, .. } => Some(session.clone()),
                 _ => None,
             })
             .collect();
@@ -4541,7 +4768,7 @@ mod tests {
             .tabs
             .iter()
             .filter_map(|t| match t {
-                Tab::Terminal { session } => Some(session.clone()),
+                Tab::Terminal { session, .. } => Some(session.clone()),
                 _ => None,
             })
             .collect();
@@ -4598,7 +4825,7 @@ mod tests {
         let idx = h.ws.panes[proto::RIGHT as usize]
             .tabs
             .iter()
-            .position(|t| matches!(t, Tab::Terminal { session } if session == "claude2"))
+            .position(|t| matches!(t, Tab::Terminal { session, .. } if session == "claude2"))
             .expect("✻ was handed claude2");
         h.handle(&c, Intent::CloseTab { pane: proto::RIGHT, idx });
         h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
@@ -4688,11 +4915,11 @@ mod tests {
         }
         h.handle(
             &c,
-            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::Terminal { session: "term".into() } },
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::Terminal { session: "term".into(), home: None } },
         );
         h.handle(
             &c,
-            Intent::OpenTab { pane: proto::RIGHT, tab: Tab::Terminal { session: "term".into() } },
+            Intent::OpenTab { pane: proto::RIGHT, tab: Tab::Terminal { session: "term".into(), home: None } },
         );
         drain(&rx);
         drain(&rx_other);
@@ -4701,7 +4928,7 @@ mod tests {
 
         let remaining: Vec<&Tab> = h.ws.panes.iter().flat_map(|p| p.tabs.iter()).collect();
         assert!(
-            !remaining.iter().any(|t| matches!(t, Tab::Terminal { session } if session == "term")),
+            !remaining.iter().any(|t| matches!(t, Tab::Terminal { session, .. } if session == "term")),
             "the ended session must not keep a tab in any pane"
         );
         let msgs_other: Vec<String> = std::iter::from_fn(|| rx_other.try_recv().ok()).collect();
@@ -4709,6 +4936,110 @@ mod tests {
             msgs_other.iter().any(|m| m.contains(r#""t":"State""#)),
             "a second browser must be told its terminal tab is gone"
         );
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Minimal, test-only "is anything holding this path" check via `ps` —
+    /// the same shape as `session.rs`'s own private helper of the same
+    /// name, duplicated rather than exposed: both exist only to prove a real
+    /// process is or isn't there for one test's own known, plain tempdir
+    /// path, and a shared `pub(crate)` version would widen a process-table
+    /// scrape into the crate's real interface for no caller that needs it.
+    fn any_process_holds(path: &std::path::Path) -> bool {
+        let target = path.to_string_lossy();
+        let out = std::process::Command::new("ps")
+            .args(["-Ao", "args="])
+            .output()
+            .expect("ps must be runnable for this check to mean anything");
+        assert!(
+            out.status.success() && !out.stdout.is_empty(),
+            "ps failed or returned nothing; this test cannot trust its own assertions right now"
+        );
+        String::from_utf8_lossy(&out.stdout).lines().any(|l| l.contains(target.as_ref()))
+    }
+
+    /// Carried from Task 4: before this, `do_end_session` always ended
+    /// `self.project`/`session` — for a resident that kills nothing at all
+    /// (the owner's own `sock/` has no socket by that name) while still
+    /// reporting success, leaving the real shell at `home`, and any Claude
+    /// in it, running untouched forever.
+    ///
+    /// Real dtach, not `ROOST_CMD=cat`: a `cat` client has no detached
+    /// master to leave behind, so the exact bug this guards against —
+    /// ending the client without ending the master — cannot reproduce under
+    /// the substitute at all (see `session::
+    /// kill_project_ends_the_detached_dtach_master_and_shell_not_just_the_client`,
+    /// which exists for the identical reason). `/usr/bin/dtach` is a runtime
+    /// prerequisite elsewhere in this project, so a failure to attach here
+    /// is a real environment defect worth failing loudly on, not a reason
+    /// to skip.
+    ///
+    /// `Hub::for_project`, not a bare `Hub::new()`: `do_end_session`'s
+    /// thread-spawning path only runs once `self_ref` resolves (see its own
+    /// doc comment), and that threaded path — kill off the hub lock, then
+    /// re-lock to broadcast — is the one this test exists to exercise.
+    #[test]
+    fn end_session_on_a_resident_ends_the_real_session_at_its_home() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "endresident_home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let att = crate::session::reserve_and_attach(home, "term3", &home_dir)
+            .expect("/usr/bin/dtach is a runtime prerequisite elsewhere in this project");
+        let sock = crate::session::socket_path(home, "term3");
+        // dtach's own fork-and-detach takes an unpredictable, usually-small
+        // amount of wall time to complete — the same poll
+        // `kill_project_ends_the_detached_dtach_master_...` uses, for the
+        // same reason.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up before this test can mean anything");
+        drop(att);
+
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        let owner_hub = Hub::for_project(&owner, owner_dir.clone());
+        assert_eq!(
+            Hub::lock(&owner_hub).session_homes.get("term3"),
+            Some(&home.to_string()),
+            "setup: the owner hub must see term3 as a resident"
+        );
+        let (c, _rx) = Hub::lock(&owner_hub).subscribe();
+
+        Hub::lock(&owner_hub).handle(&c, Intent::EndSession { session: "term3".into() });
+
+        // The kill runs on its own thread, off the hub lock (see
+        // `do_end_session`'s doc comment) — give it a moment to actually
+        // finish before checking what it did.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(
+            !any_process_holds(&sock),
+            "ending a resident from the owner's page must kill the real session at its home"
+        );
+        assert!(
+            matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here),
+            "the re-home record must be forgotten once the session actually ends"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
@@ -4731,7 +5062,7 @@ mod tests {
         let (c, _rx) = h.subscribe();
         h.handle(
             &c,
-            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::Terminal { session: "term1".into() } },
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::Terminal { session: "term1".into(), home: None } },
         );
         h.handle(
             &c,
@@ -5175,6 +5506,44 @@ mod tests {
             !msgs_other.iter().any(|m| m.contains(r#""t":"Error""#)),
             "an invalid session name is the requester's business, not every mirrored browser's"
         );
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Ruling 5 (carried from Task 4): `StartTerminal` restarts a lost tab
+    /// under its old name, which is the *other* way a browser can ask for a
+    /// name already in play — `do_new_terminal`'s `also_taken` only guards
+    /// the fresh-click path. Without this guard a name a resident holds on
+    /// this page would pass straight to `session::reserve`, and the
+    /// browser's own follow-up connect to `/ws/{project}/term/{session}`
+    /// would create a brand-new, unrelated shell under the name a Claude at
+    /// the resident's home is still running in.
+    ///
+    /// `session_homes` is set directly, the same as
+    /// `new_terminal_in_an_owner_skips_a_residents_name` above: resolving a
+    /// real re-home record reads the configured project roots, which this
+    /// test does not need to set up just to exercise the guard.
+    ///
+    /// Revert-checked: deleting the guard lets this reach `TerminalStarted`
+    /// instead — observed: `assertion failed:
+    /// msgs.iter().any(|m| m.contains("\"t\":\"Error\"") && m.contains("moved here from"))`.
+    #[test]
+    fn start_terminal_refuses_a_name_held_by_a_resident() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("startrefuse_owner", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+        h.session_homes.insert("term3".into(), "startrefuse_home".into());
+
+        h.handle(&c, Intent::StartTerminal { session: "term3".into(), resume: false });
+
+        let msgs = drain(&rx);
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("moved here from")),
+            "{msgs:?}"
+        );
+        assert!(!msgs.iter().any(|m| m.contains(r#""t":"TerminalStarted""#)));
         std::env::remove_var("ROOST_STATE_DIR");
     }
 

@@ -831,8 +831,13 @@ function onEvent(ev) {
       // just the one that asked — only attach if this client actually has
       // a Terminal tab on that session, or every mirroring tab would open
       // and immediately close a PTY socket for a session it never showed.
-      if (state && state.panes.some((p) => p.tabs.some((t) => t.k === "Terminal" && t.session === ev.session))) {
-        ensureTerm(ev.session);
+      if (state) {
+        let home;
+        const hasTab = state.panes.some((p) => p.tabs.some((t) => {
+          if (t.k === "Terminal" && t.session === ev.session) { home = t.home; return true; }
+          return false;
+        }));
+        if (hasTab) ensureTerm(ev.session, home);
       }
       if (pendingClaudeSend) claimClaudeSend(ev.session);
       render();
@@ -859,6 +864,19 @@ function onEvent(ev) {
       }
       pendingTab = null;
       document.body.dispatchEvent(new Event("projects"));
+      break;
+    }
+    case "Rehomed": {
+      // This browser's own tab for `ev.session` was just dropped — see
+      // `hub::refresh_live_sessions` — because the session moved to
+      // `ev.owner`'s page. There is no tab left here to update, so the
+      // same transient-banner-plus-link fallback `WorktreeReady` uses when
+      // its popup is blocked is the whole of what this can do: say where it
+      // went, and offer a way there.
+      showBanner(`${ev.session} moved to ${ev.owner.split("/").pop()} → `);
+      const a = document.createElement("a");
+      a.href = "/" + projectPath(ev.owner); a.target = "_blank"; a.textContent = "open it there";
+      document.querySelector(".error-banner:last-of-type b")?.append(a);
       break;
     }
     case "GitInit":
@@ -1618,7 +1636,7 @@ function mountTab(content, t) {
       content.appendChild(terminalPlaceholder(t.session));
       return;
     }
-    const e = ensureTerm(t.session);
+    const e = ensureTerm(t.session, t.home);
     content.appendChild(e.node);   // MOVE, not rebuild — the socket survives
     requestAnimationFrame(() => {
       try {
@@ -2861,7 +2879,7 @@ function wireTouchScroll(node, term, entry) {
   }, { passive: true });
 }
 
-function ensureTerm(session) {
+function ensureTerm(session, home) {
   // No "the socket died, rebuild it" branch any more: an entry now heals its
   // own socket (see connectTerm), so a caller cannot find a dead one here.
   // Rebuilding on the way past was also what made recovery depend on the
@@ -2932,8 +2950,13 @@ function ensureTerm(session) {
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(node);
+  // `home` names the project this session's dtach socket (and paste route)
+  // actually lives under, when a tab shows a terminal re-homed from
+  // elsewhere (`home.rs`); `undefined`/falsy for the overwhelming common
+  // case, a native terminal, which dials this page's own PROJECT exactly as
+  // before this field existed.
   const entry = { node, term, fit, sock: null, tries: 0, timer: null, attached: false, gone: false,
-                  selTimer: null, flashTimer: null, linkProviders: null };
+                  selTimer: null, flashTimer: null, linkProviders: null, home };
   registerTermLinks(term, entry);
   // Copy on select. xterm's rows are `user-select: none`, so a browser
   // selection over terminal text is impossible and xterm's own selection is
@@ -3043,7 +3066,11 @@ function ensureTerm(session) {
 // and no visible difference from a live idle shell — until the user happened
 // to switch tabs and back, which is what rebuilt the socket.
 function connectTerm(entry, session) {
-  const sock = new WebSocket(wsUrl(`/ws/${PROJECT}/term/${session}`));
+  // A resident's socket lives at its home, never at this page's own
+  // project (`home.rs`) — `entry.home`, set once in `ensureTerm` from the
+  // tab's own `home` field, names it; `|| PROJECT` is the native case,
+  // unchanged from before re-homing existed.
+  const sock = new WebSocket(wsUrl(`/ws/${entry.home || PROJECT}/term/${session}`));
   sock.binaryType = "arraybuffer";
   entry.sock = sock;
   sock.onmessage = (e) => {
@@ -5130,6 +5157,14 @@ function sessionUnder(target) {
   return host ? host.dataset.session : null;
 }
 
+// The project a paste to `session` must reach: its home when the tab is a
+// resident (`terms` carries the same `home` the socket itself dials — see
+// `ensureTerm`/`connectTerm`), this page's own `PROJECT` otherwise, exactly
+// as before re-homing existed.
+function termHomeOrProject(session) {
+  return terms.get(session)?.home || PROJECT;
+}
+
 function firstImage(files) {
   return [...files].find((f) => f.type.startsWith("image/")) || null;
 }
@@ -5362,7 +5397,7 @@ document.addEventListener("drop", (e) => {
   if (session) {
     const img = e.dataTransfer.files.length ? firstImage(e.dataTransfer.files) : null;
     if (img) {
-      postFiles(`/paste/${PROJECT}/${session}`, [img], "paste");
+      postFiles(`/paste/${termHomeOrProject(session)}/${session}`, [img], "paste");
       return;
     }
     return showError("only images can be dropped on a terminal — drop other files on the Files pane");
@@ -5394,7 +5429,7 @@ document.addEventListener("paste", (e) => {
     if (!img) return; // not an image: xterm's text paste, untouched
     e.preventDefault();
     e.stopPropagation(); // xterm must not also act on this one
-    postFiles(`/paste/${PROJECT}/${session}`, [img], "paste");
+    postFiles(`/paste/${termHomeOrProject(session)}/${session}`, [img], "paste");
     return;
   }
   const dir = uploadTargetDir(document.activeElement) ?? uploadTargetDir(e.target);

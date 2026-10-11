@@ -22,7 +22,20 @@ pub enum Tab {
     Changes,
     File { rel: String, mode: Mode },
     Diff { rel: Option<String> },
-    Terminal { session: String },
+    Terminal {
+        session: String,
+        /// The project this terminal's dtach socket actually lives under,
+        /// when it differs from the page showing the tab (`home.rs`). Absent
+        /// for the overwhelming common case — a native terminal, same as
+        /// before this field existed — so an old saved layout, and every
+        /// native tab a fresh one writes, round-trips byte-identical to the
+        /// pre-re-homing wire shape; see
+        /// `a_saved_layout_without_home_still_loads`. Never set by a client:
+        /// only `hub::refresh_live_sessions` writes `Some`, the moment it
+        /// finds a live resident with no tab yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home: Option<String>,
+    },
     /// A change Claude has proposed and nobody has answered yet. Deliberately
     /// not `Tab::Diff`, which is a git diff of a tracked path: a proposal
     /// compares disk against content that has never been written, and it is
@@ -471,6 +484,18 @@ pub struct WorkspaceView {
     /// `claudes::cached_sessions`, never stored in the workspace: it is a
     /// fact about the host's processes, not about the layout.
     pub claude_sessions: Vec<String>,
+    /// Resident name → its home, for every terminal re-homed into this
+    /// project (`home.rs`). Filled in `hub::snapshot_event` from
+    /// `Hub.session_homes`, the same way `claude_sessions` is derived there —
+    /// never kept in `WsState`, since it is rebuilt from the live records and
+    /// sockets on every refresh and a saved copy could only ever be stale.
+    /// Each resident's own `Tab::Terminal.home` already carries the same
+    /// fact for the client's own use (dialing the terminal and paste sockets
+    /// at the session's real home); this is the same information keyed for
+    /// a consumer that has a session name but no tab to read it off, such as
+    /// a future "ending a resident" confirmation.
+    #[serde(default)]
+    pub session_homes: std::collections::BTreeMap<String, String>,
     /// Whether the project directory is a git repository — drives the
     /// initialise-git offer on the placeholder.
     pub is_git: bool,
@@ -596,6 +621,16 @@ pub enum Event {
     /// `stale`: refused because what the user saw no longer holds; the client
     /// re-asks for a preview rather than leaving them with a dead dialog.
     Reverted { rel: Option<String>, ok: bool, msg: String, stale: bool },
+    /// A terminal this browser held a native tab for has just been re-homed
+    /// into `owner` — `hub::refresh_live_sessions` found the tab here no
+    /// longer resolving to this project and dropped it. Sent only to this
+    /// (the home's) browsers, never to the owner's: the owner's own refresh
+    /// is what gives the tab a home there, carried in the ordinary `State`
+    /// snapshot, and a second "it arrived" announcement on top of that would
+    /// be the same fact said twice from two different events. Client-side
+    /// this is a transient banner and a link to `owner`, not workspace
+    /// state — nothing here is persisted.
+    Rehomed { session: String, owner: String },
 }
 
 pub fn decode(s: &str) -> Result<Intent, String> {
@@ -645,6 +680,25 @@ mod tests {
         assert!(matches!(i, Intent::MoveTab { from: 2, idx: 0, to: 3, at: 1 }));
         let i = decode(r#"{"t":"OpenTab","pane":3,"tab":{"k":"Terminal","session":"shell"}}"#).unwrap();
         assert!(matches!(i, Intent::OpenTab { tab: Tab::Terminal { .. }, .. }));
+    }
+
+    /// `home` is new; every saved layout on disk and every client that has
+    /// not been told about re-homing yet sends and expects the old shape —
+    /// no `home` key at all. `#[serde(default)]` is what keeps the read side
+    /// working, and `skip_serializing_if` is what keeps the write side from
+    /// drifting away from it the moment a native tab round-trips through the
+    /// server once: without it, a fresh `State` broadcast for a tab nobody
+    /// ever re-homed would start carrying `"home":null`, which is still
+    /// parseable but is no longer the byte-identical wire shape this pins.
+    #[test]
+    fn a_saved_layout_without_home_still_loads() {
+        let t: Tab = serde_json::from_str(r#"{"k":"Terminal","session":"term"}"#).unwrap();
+        assert_eq!(t, Tab::Terminal { session: "term".into(), home: None });
+        assert_eq!(
+            serde_json::to_string(&t).unwrap(),
+            r#"{"k":"Terminal","session":"term"}"#,
+            "byte-identical when native"
+        );
     }
 
     #[test]
