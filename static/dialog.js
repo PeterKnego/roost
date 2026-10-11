@@ -208,11 +208,16 @@ function askPasteText() {
 // something (the save conflict: overwrite discards the disk's changes,
 // discard-mine discards yours), so Enter destroys nothing.
 //
+// `bindDismiss`, optional, is handed a function that closes this dialog as if
+// Cancel were pressed — for a question the server can withdraw (a worktree ask
+// another browser answered first). Called only once the dialog is really
+// showing, so a caller that never receives it never had a dialog to close.
+//
 // `detailHtml` is the one exception to "nothing here builds an HTML string":
 // it is set as innerHTML, and the only caller passes the diff render.rs
 // produced, which escapes every line before wrapping it. Never pass anything
 // that came from the DOM or from a path here.
-function askChoice({ title, lines = [], choices, detailHtml = "", focus = "first" }) {
+function askChoice({ title, lines = [], choices, detailHtml = "", focus = "first", bindDismiss = null }) {
   const el = document.getElementById("dlg-choice");
   return runDialog(el, (finish) => {
     el.querySelector(".dlg-title").textContent = title;
@@ -242,6 +247,7 @@ function askChoice({ title, lines = [], choices, detailHtml = "", focus = "first
       buttons.appendChild(b);
       first = first || b;
     }
+    if (bindDismiss) bindDismiss(() => finish(null));
     return () => (focus === "cancel" ? cancelBtn : first || cancelBtn).focus();
   }, null);
 }

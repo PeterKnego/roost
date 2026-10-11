@@ -30,6 +30,11 @@ let pendingFocusDone = false;
 // when WorktreeReady arrives. Opened on the click because a window.open after
 // a websocket round trip is not reliably inside the user gesture.
 let pendingTab = null;
+// Worktree asks from a Claude's hook (hub::ask_worktree_blocking): id → the
+// function that closes this browser's dialog for it. Present only while that
+// dialog is really showing, so WorktreeAskClosed for any other id — answered
+// elsewhere before this browser ever showed it — is a no-op.
+const worktreeAsks = new Map();
 // The config file's `show_hidden`, embedded by render.rs at page load and
 // kept live from the snapshot afterwards (followSettings), like AUTOSAVE. The
 // workspace's own toggle (state.show_hidden) overrides it when set; null
@@ -850,6 +855,16 @@ function onEvent(ev) {
     case "ClaudeHere":
       showClaudeHere(ev.pane, ev.terminals);
       break;
+    case "WorktreeAsk":
+      showWorktreeAsk(ev.id, ev.session, ev.name);
+      break;
+    case "WorktreeAskClosed": {
+      // Answered in another browser, or the server's 60 s ran out: either
+      // way an answer from here would be ignored, so the question goes.
+      const dismiss = worktreeAsks.get(ev.id);
+      if (dismiss) dismiss();
+      break;
+    }
     case "WorktreeReady": {
       const url = "/" + projectPath(ev.url) + (ev.launch ? `?launch=${encodeURIComponent(ev.launch)}` : "");
       if (pendingTab && !pendingTab.closed) {
@@ -3890,6 +3905,36 @@ async function showClaudeHere(pane, terminals) {
     send({ t: "NewWorktree", launch: "claude" });
   } else if (pick === "here") {
     send({ t: "NewTerminal", pane, launch: "claude", force: true });
+  }
+}
+
+// A Claude asked, through roost's worktree hook, for a worktree, and is
+// blocked until some browser of this project answers (spec §3). The first
+// answer from any browser wins; the server closes everyone else's dialog.
+// Cancel and Escape answer nothing — another browser still may, and the
+// server refuses on its own at 60 s. Every string goes through askChoice's
+// textContent; `session` and `name` were validated server-side, but that is
+// not what keeps them out of markup.
+async function showWorktreeAsk(id, session, name) {
+  const pick = await askChoice({
+    title: `Claude in ${session} wants a worktree`,
+    lines: [`worktree-${name}`],
+    choices: [
+      { id: "create", label: "Create and open in new tab" },
+      { id: "refuse", label: "Refuse" },
+    ],
+    // A withdrawn dialog resolves null like Cancel, so it sends nothing.
+    bindDismiss: (dismiss) => worktreeAsks.set(id, dismiss),
+  });
+  worktreeAsks.delete(id);
+  if (pick === "create") {
+    // Opened right after the click's promise resolves, as showClaudeHere
+    // does — still inside the click's user activation, so the popup blocker
+    // allows it. WorktreeReady navigates it once the worktree exists.
+    pendingTab = window.open("about:blank");
+    send({ t: "WorktreeAnswer", id, approve: true });
+  } else if (pick === "refuse") {
+    send({ t: "WorktreeAnswer", id, approve: false });
   }
 }
 

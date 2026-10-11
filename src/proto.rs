@@ -244,6 +244,10 @@ pub enum Intent {
     /// `accept: false` with a `text` is still a rejection — the text is only
     /// ever read on the accepting path.
     AnswerProposal { id: String, accept: bool, text: Option<String> },
+    /// A browser's answer to a `WorktreeAsk` Claude's hook is blocked on.
+    /// The first answer from any browser wins; an `id` that is no longer
+    /// pending (someone else answered, or it timed out) is ignored.
+    WorktreeAnswer { id: String, approve: bool },
     /// What a revert would do (#125). Answered to the requester only, with a
     /// token over exactly what the dialog will show. `None` is "all".
     /// Diverted in wsconn: a plan is several git calls.
@@ -564,6 +568,14 @@ pub enum Event {
     /// The worktree exists and is registered. Sent to the clicker only —
     /// it is the one holding the tab to navigate.
     WorktreeReady { url: String, launch: Option<Launch> },
+    /// Claude in `session` asked for worktree `worktree-<name>` through the
+    /// hook and is blocked until a browser answers with `WorktreeAnswer`.
+    /// Broadcast to every browser of the project; `id` is a server counter,
+    /// never derived from the request.
+    WorktreeAsk { id: String, session: String, name: String },
+    /// The ask `id` is settled — answered by some browser, or timed out —
+    /// so every other browser's dialog for it closes.
+    WorktreeAskClosed { id: String },
     /// The set of projects with live sessions changed — `project` started
     /// its first shell, ended its last, or was closed. Machine-wide, sent to
     /// every project's clients via `hub::broadcast_all` — unlike `Notice`,

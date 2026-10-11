@@ -113,6 +113,39 @@ pub struct Hub {
     /// not reflected sooner, same as `claude_hooks`; the settings dialog
     /// opening will ask for a fresh `RequestState` itself (a later task).
     pub settings: Option<crate::proto::SettingsView>,
+    /// Worktree asks from Claude's hook that no browser has answered yet
+    /// (`ask_worktree_blocking`). Whoever *removes* an entry owns its
+    /// `reply` sender and is the only one who may answer it — the answer
+    /// handler, or the asker's own timeout — so exactly one reply is ever
+    /// sent, by construction rather than by a flag. Never persisted: the
+    /// hook connection it answers does not survive a restart either.
+    asks: Vec<PendingAsk>,
+}
+
+/// How long Claude's worktree ask waits for a browser before it is refused.
+/// Inside the hook client's own `cli::REPLY_TIMEOUT` (90 s), so the server
+/// always answers before the client gives up — a reply the client never
+/// reads would leave a worktree Claude was never told about.
+pub const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// At most this many unanswered asks per project (R22). Each one holds a
+/// hook connection thread (bounded process-wide by `hooksock`) and a dialog
+/// in every browser; per project, like `ide::MAX_PENDING`, so one Claude in
+/// a loop cannot starve the others.
+pub const MAX_PENDING_ASKS: usize = 4;
+
+/// Process-wide, so an id never repeats across projects or hub rebuilds, and
+/// never derived from the request: the id travels to every browser and back,
+/// and nothing Claude sent should be able to choose it.
+static NEXT_ASK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+const NO_TAB: &str = "no roost tab is open on this project to approve it";
+
+struct PendingAsk {
+    id: String,
+    session: String,
+    name: String,
+    reply: Sender<crate::hooksock::AskReply>,
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<Hub>>>>> = OnceLock::new();
@@ -283,6 +316,7 @@ impl Hub {
             proposals: HashMap::new(),
             claude_hooks: None,
             settings: None,
+            asks: Vec::new(),
         };
         // A freshly loaded hub must report reality, not whatever the
         // persisted layout happened to say last time: sessions may have
@@ -807,6 +841,9 @@ impl Hub {
             }
             Intent::AnswerProposal { id, accept, text } => {
                 return self.do_answer_proposal(from, id.clone(), *accept, text.clone())
+            }
+            Intent::WorktreeAnswer { id, approve } => {
+                return self.do_worktree_answer(from, id.clone(), *approve)
             }
             // A search performs an unbounded filesystem walk, so `wsconn.rs`
             // diverts it to a worker thread *before* this lock is taken —
@@ -2056,6 +2093,38 @@ impl Hub {
         }
     }
 
+    /// A browser's answer to a parked worktree ask. Runs under the hub lock,
+    /// so it only settles the ask: removes it (taking ownership of its reply
+    /// sender), closes every browser's dialog, and either refuses or hands
+    /// the git work to a thread — the `do_new_worktree` shape. An `id` that
+    /// is no longer pending was answered by someone else or timed out; the
+    /// first answer won, and this one is dropped without a word.
+    fn do_worktree_answer(&mut self, from: &ConnId, id: String, approve: bool) {
+        let Some(i) = self.asks.iter().position(|a| a.id == id) else { return };
+        let ask = self.asks.remove(i);
+        self.broadcast(&Event::WorktreeAskClosed { id });
+        if !approve {
+            let _ = ask.reply.send(ask_refuse("refused in roost"));
+            return;
+        }
+        if self.closing {
+            let _ = ask.reply.send(ask_refuse("project is closing"));
+            return;
+        }
+        let (project, dir, clicker) = (self.project.clone(), self.dir.clone(), from.clone());
+        // The closure owns `ask`, so a failed spawn drops its sender unsent;
+        // this clone is how that one failure still answers.
+        let fallback = ask.reply.clone();
+        let spawned = std::thread::Builder::new()
+            .name("worktree-ask".into())
+            .spawn(move || approve_ask(project, dir, clicker, ask));
+        if spawned.is_err() {
+            let msg = "could not start worktree creation";
+            let _ = fallback.send(ask_refuse(msg));
+            self.send_to(from, &Event::Error { msg: msg.into() });
+        }
+    }
+
     /// `git worktree remove` (no `--force`), then `git branch -d` (no
     /// `-D`) off the hub lock, the `do_new_worktree` shape. Four independent
     /// gates are re-derived here — Claude evidence, a live terminal, dirty,
@@ -2819,11 +2888,177 @@ fn open_hub(project: &str) -> Option<Arc<Mutex<Hub>>> {
     map.get(project).cloned()
 }
 
-/// Filled in by Task 9. Blocks the calling (socket) thread, never a hub
-/// lock: `hooksock.rs`'s accept loop spawns one thread per connection
+fn ask_refuse(msg: impl Into<String>) -> crate::hooksock::AskReply {
+    crate::hooksock::AskReply::Refuse { refuse: msg.into() }
+}
+
+/// Claude's worktree hook asking the browsers of its project (spec §3).
+/// Blocks the calling (socket) thread for up to [`ASK_TIMEOUT`], never a
+/// hub lock: `hooksock.rs`'s accept loop spawns one thread per connection
 /// precisely so this can block without stalling any other hook request.
-pub fn ask_worktree_blocking(_req: crate::hooksock::AskRequest) -> crate::hooksock::AskReply {
-    crate::hooksock::AskReply::Refuse { refuse: "not implemented".into() }
+pub fn ask_worktree_blocking(req: crate::hooksock::AskRequest) -> crate::hooksock::AskReply {
+    ask_worktree_blocking_with(req, ASK_TIMEOUT)
+}
+
+/// [`ask_worktree_blocking`] with the wait injected, so a test can watch a
+/// timeout in milliseconds. A panic anywhere in here becomes a refusal: the
+/// hook must always get an answer, and the default answer is no.
+pub fn ask_worktree_blocking_with(
+    req: crate::hooksock::AskRequest,
+    timeout: std::time::Duration,
+) -> crate::hooksock::AskReply {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ask_inner(req, timeout)))
+        .unwrap_or_else(|_| ask_refuse("roost failed while asking; nothing was created"))
+}
+
+fn ask_inner(req: crate::hooksock::AskRequest, timeout: std::time::Duration) -> crate::hooksock::AskReply {
+    use std::sync::mpsc::RecvTimeoutError;
+    // Both land in a path and a git argument later, so they are checked
+    // before anything else is looked at, let alone shown to a person.
+    if !crate::session::valid_name(&req.session) {
+        return ask_refuse(format!("invalid terminal name {:?}", req.session));
+    }
+    if let Err(e) = crate::wtname::check(&req.name) {
+        return ask_refuse(e);
+    }
+    // Off every lock: a dot-segment URL makes this ask git.
+    if crate::projects::resolve_project(&crate::projects::roots(), &req.project).is_none() {
+        return ask_refuse(format!("{} is not a project roost serves", req.project));
+    }
+    // Looked up, never created: a project nobody has open has no browser to
+    // ask, and building a hub would start a watcher for nobody.
+    let Some(arc) = open_hub(&req.project) else { return ask_refuse(NO_TAB) };
+    let id = NEXT_ASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_string();
+    let (tx, rx) = channel();
+    {
+        let mut h = Hub::lock(&arc);
+        if h.subs.is_empty() {
+            return ask_refuse(NO_TAB);
+        }
+        if h.asks.iter().any(|a| a.session == req.session) {
+            return ask_refuse("an earlier request from this terminal is still waiting");
+        }
+        if h.asks.len() >= MAX_PENDING_ASKS {
+            return ask_refuse(format!("too many worktree requests waiting in {}", req.project));
+        }
+        h.asks.push(PendingAsk { id: id.clone(), session: req.session.clone(), name: req.name.clone(), reply: tx });
+        h.broadcast(&Event::WorktreeAsk { id: id.clone(), session: req.session, name: req.name });
+        // `broadcast` is what prunes closed sockets, so a subscriber list
+        // that was all dead connections only shows itself now. Nobody saw
+        // the dialog; waiting 60 s for nobody is worse than saying so.
+        if h.subs.is_empty() {
+            h.asks.retain(|a| a.id != id);
+            return ask_refuse(NO_TAB);
+        }
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(r) => r,
+        Err(RecvTimeoutError::Timeout) => {
+            let expired = {
+                let mut h = Hub::lock(&arc);
+                match h.asks.iter().position(|a| a.id == id) {
+                    Some(i) => {
+                        // Taking it out of `asks` is taking the right to
+                        // answer it; the sender is dropped unsent and this
+                        // thread answers instead.
+                        drop(h.asks.remove(i));
+                        h.broadcast(&Event::WorktreeAskClosed { id });
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if expired {
+                ask_refuse("nobody approved it in roost within 60 s")
+            } else {
+                // An answer removed it between the timeout and the lock, so
+                // that answer owns the reply and is already on its way —
+                // possibly a `Path`, with a record written. Refusing here
+                // instead would leave the terminal re-homed and Claude
+                // where it was. Unbounded by design: the approving thread
+                // always sends (its panics become a refusal), and the hook
+                // client bounds its own wait.
+                rx.recv().unwrap_or_else(|_| ask_refuse("roost lost the request; nothing was recorded"))
+            }
+        }
+        Err(RecvTimeoutError::Disconnected) => ask_refuse("roost lost the request; nothing was recorded"),
+    }
+}
+
+/// The approve path, off every lock (spec §3): create → R16 gate → record →
+/// (Task 10: hooks) → refresh both hubs → reply `Path` → `WorktreeReady` to
+/// the clicker → `ProjectsChanged`. Each step returns before the next on
+/// failure, and the record is written only once a worktree exists and the
+/// gate has passed.
+fn approve_ask(project: String, dir: std::path::PathBuf, clicker: ConnId, ask: PendingAsk) {
+    let PendingAsk { session, name, reply, .. } = ask;
+    // `created` is the owner URL once git has made the worktree, so the
+    // switcher is told about it even when a later step refuses.
+    let mut created: Option<String> = None;
+    let work = std::panic::AssertUnwindSafe(|| -> Result<String, String> {
+        let key_of = |n: &str| crate::projects::storage_key(&format!("{project}/.claude/worktrees/{n}"));
+        let c = crate::worktree::create_named(
+            &dir,
+            &crate::wsstate::state_dir(),
+            &name,
+            &key_of,
+            &crate::worktree::real_git,
+        )?;
+        let owner = format!("{project}/.claude/worktrees/{}", c.name);
+        created = Some(owner.clone());
+        // From here on a failure leaves the worktree on disk. That is
+        // deliberate: creating destroyed nothing, and removing it would be
+        // the destructive step this codebase demands positive evidence for —
+        // an empty worktree in the switcher is the honest leftover.
+        //
+        // R16: within one owner a name is held by at most one live session.
+        // A brand-new worktree has none, but the record is what would make
+        // two of them share a name, so it is checked rather than assumed.
+        if crate::session::live_names(&owner).contains(&session) {
+            return Err(format!("{} already has a terminal named {session}", c.name));
+        }
+        crate::home::record(&project, &session, &owner).map_err(|e| {
+            format!("{} was created, but roost could not record that {session} moved there: {e}", c.name)
+        })?;
+        // Task 10: install the worktree hook into the new worktree's own
+        // `.claude/settings.local.json` here (spec §8), before replying.
+        //
+        // Both hubs learn about the move before Claude does, so a
+        // `StartTerminal`/`NewTerminal` racing the reply already sees the
+        // resident. One lock at a time; never two.
+        for p in [&project, &owner] {
+            if let Some(arc) = open_hub(p) {
+                let mut h = Hub::lock(&arc);
+                h.refresh_live_sessions();
+                let snap = h.snapshot_event(&String::new());
+                h.broadcast(&snap);
+            }
+        }
+        Ok(c.path.to_string_lossy().into_owned())
+    });
+    let r = std::panic::catch_unwind(work).unwrap_or_else(|_| Err("worktree creation panicked".into()));
+    let ev = match &r {
+        Ok(_) => Event::WorktreeReady { url: created.clone().unwrap_or_default(), launch: None },
+        Err(msg) => Event::Error { msg: msg.clone() },
+    };
+    // Re-locked only to deliver: the clicker holds the blank tab
+    // `WorktreeReady` navigates (or hears why there is nothing to open).
+    // Before the reply rather than after, so by the time Claude is told
+    // anything the clicker's tab is already on its way — the owner hub was
+    // refreshed above, so that page shows the resident when it loads.
+    if let Some(arc) = open_hub(&project) {
+        Hub::lock(&arc).send_to(&clicker, &ev);
+    }
+    let _ = reply.send(match r {
+        Ok(path) => crate::hooksock::AskReply::Path { path },
+        Err(msg) => ask_refuse(msg),
+    });
+    // After every lock is released: `broadcast_all` locks each hub, this
+    // project's included (see `do_new_worktree`).
+    if let Some(owner) = created {
+        broadcast_all(&Event::ProjectsChanged { project: owner });
+        broadcast_all(&Event::ProjectsChanged { project });
+    }
 }
 
 /// Whether `project` has a hub at all — `ide.rs`'s `open_diff` needs this
@@ -7927,6 +8162,421 @@ mod tests {
         let got = rx.try_recv().expect("an answer");
         assert!(got.contains(r#""t":"Error""#), "expected a refusal, got {got}");
         got
+    }
+
+    // ---- Task 9: the worktree ask ----------------------------------------
+
+    /// Puts a bare `Hub::new` into `REGISTRY` with its `self_ref` set, the
+    /// two things `for_project` does that the ask path depends on — without
+    /// the watcher thread and IDE listener `for_project` also starts, which
+    /// these tests neither need nor want left running.
+    fn register_for_test(hub: Hub) -> Arc<Mutex<Hub>> {
+        let project = hub.project.clone();
+        let arc = Arc::new_cyclic(|w| {
+            let mut hub = hub;
+            hub.self_ref = w.clone();
+            Mutex::new(hub)
+        });
+        let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        reg.lock().unwrap_or_else(|e| e.into_inner()).insert(project, arc.clone());
+        arc
+    }
+
+    fn unregister_for_test(project: &str) {
+        if let Some(reg) = REGISTRY.get() {
+            reg.lock().unwrap_or_else(|e| e.into_inner()).remove(project);
+        }
+    }
+
+    fn init_repo(repo: &std::path::Path) {
+        std::fs::create_dir_all(repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(repo).args(args).status().unwrap().success());
+        }
+    }
+
+    /// A registered hub for `root/project` (a plain directory) with `session`
+    /// live in it and nobody connected. The caller holds both env locks and
+    /// has pointed `ROOST_ROOTS`/`ROOST_STATE_DIR` at `root`.
+    fn registered_hub_with_session(root: &std::path::Path, project: &str, session: &str) -> Arc<Mutex<Hub>> {
+        let dir = root.join(project);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::session::reserve_and_attach(project, session, &dir).unwrap();
+        register_for_test(Hub::new(project, dir))
+    }
+
+    /// The same, in a real git repository; also returns the repository's
+    /// canonical path, which is what `create_named` reports back.
+    fn registered_hub_in_git_repo_with_session(
+        root: &std::path::Path,
+        project: &str,
+        session: &str,
+    ) -> (Arc<Mutex<Hub>>, std::path::PathBuf) {
+        let repo = root.join(project);
+        init_repo(&repo);
+        crate::session::reserve_and_attach(project, session, &repo).unwrap();
+        let hub = register_for_test(Hub::new(project, repo.clone()));
+        (hub, repo.canonicalize().unwrap())
+    }
+
+    fn req(project: &str, session: &str, name: &str) -> crate::hooksock::AskRequest {
+        crate::hooksock::AskRequest {
+            op: "worktree_create".into(),
+            project: project.into(),
+            session: session.into(),
+            name: name.into(),
+            cwd: String::new(),
+            session_id: "sid-1".into(),
+        }
+    }
+
+    fn conn(h: &mut Hub) -> (ConnId, Receiver<String>) {
+        let (id, rx) = h.subscribe();
+        drain(&rx);
+        (id, rx)
+    }
+
+    /// Waits (≤5 s) for a `WorktreeAsk` on `rx` and returns its id. Every
+    /// other message is discarded.
+    fn wait_for_ask(rx: &Receiver<String>) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let m = rx.recv_timeout(left).expect("no WorktreeAsk within 5 s");
+            let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+            if v["t"] == "WorktreeAsk" {
+                return v["id"].as_str().unwrap().to_string();
+            }
+        }
+    }
+
+    fn ask_env(root: &std::path::Path) {
+        std::env::set_var("ROOST_CMD", "cat");
+        std::env::set_var("ROOST_STATE_DIR", root.join("state"));
+        std::env::set_var("ROOST_ROOTS", root);
+    }
+
+    fn ask_env_clear(projects: &[&str]) {
+        for p in projects {
+            crate::session::kill_project(p);
+            unregister_for_test(p);
+        }
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    fn spawn_ask(project: &str, session: &str, name: &str) -> std::thread::JoinHandle<crate::hooksock::AskReply> {
+        let r = req(project, session, name);
+        std::thread::spawn(move || ask_worktree_blocking(r))
+    }
+
+    use crate::hooksock::AskReply;
+
+    #[test]
+    fn an_ask_with_no_browser_is_refused_at_once() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-nobrowser";
+        let _hub = registered_hub_with_session(root.path(), p, "term3");
+        let r = ask_worktree_blocking(req(p, "term3", "fox"));
+        assert_eq!(r, AskReply::Refuse { refuse: "no roost tab is open on this project to approve it".into() });
+        // And a real project with no hub at all gets the same answer — the
+        // hub is never created by asking.
+        std::fs::create_dir_all(root.path().join("ask-nobrowser-nohub")).unwrap();
+        let r = ask_worktree_blocking(req("ask-nobrowser-nohub", "term3", "fox"));
+        assert_eq!(r, AskReply::Refuse { refuse: "no roost tab is open on this project to approve it".into() });
+        assert!(!is_open("ask-nobrowser-nohub"), "asking must never create a hub");
+        ask_env_clear(&[p]);
+    }
+
+    #[test]
+    fn approve_creates_records_and_replies_path() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-approve";
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let (_b, rxb) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id: id.clone(), approve: true });
+        let r = t.join().unwrap();
+        let owner = format!("{p}/.claude/worktrees/worktree-fox");
+        assert_eq!(r, AskReply::Path { path: repo.join(".claude/worktrees/worktree-fox").to_string_lossy().into() });
+        assert!(
+            matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Elsewhere(o) if o == owner),
+            "the re-home record names the new worktree"
+        );
+        // The clicker's `pendingTab` is navigated by `WorktreeReady`, which
+        // is delivered before the `Path` reply returns — so it is queued by
+        // now, and only the clicker has it.
+        let got_a = drain(&rxa);
+        assert!(
+            got_a.iter().any(|m| m.contains(r#""t":"WorktreeReady""#) && m.contains(&format!(r#""url":"{owner}""#))),
+            "the clicker must get WorktreeReady for {owner}: {got_a:?}"
+        );
+        let got_b = drain(&rxb);
+        assert!(!got_b.iter().any(|m| m.contains("WorktreeReady")), "WorktreeReady is the clicker's alone: {got_b:?}");
+        assert!(
+            got_b.iter().any(|m| m.contains(r#""t":"WorktreeAskClosed""#) && m.contains(&id)),
+            "the other browser's dialog is closed: {got_b:?}"
+        );
+        ask_env_clear(&[p, &owner]);
+    }
+
+    /// Revert-checked: answering without removing the ask (so the second
+    /// answer finds it still pending and runs a second create) failed 5/5
+    /// runs — observed both `assertion failed: matches!(t.join().unwrap(),
+    /// AskReply::Path { .. })` (the second, refused create answered Claude
+    /// first) and `the second answer was acted on: [.. two
+    /// WorktreeAskClosed ..]`. The brief's worktree count alone stayed green
+    /// under that revert, because `create_named` refuses the taken name.
+    #[test]
+    fn second_answer_to_an_ask_is_ignored() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-second";
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let (b, rxb) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id: id.clone(), approve: true });
+        Hub::lock(&hub).handle(&b, Intent::WorktreeAnswer { id, approve: true });
+        assert!(matches!(t.join().unwrap(), AskReply::Path { .. }));
+        // A second create (if one ran) is on its own thread; give it the
+        // time a create takes before looking.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(crate::worktree::list(&repo).len(), 2, "created exactly once");
+        // The worktree count alone cannot see a second run: `create_named`
+        // refuses the now-taken name, so a second attempt leaves the count
+        // at 2 too. What it *does* leave is an answer to the second clicker
+        // and a second close. Neither may exist.
+        let got_b = drain(&rxb);
+        assert!(
+            !got_b.iter().any(|m| m.contains(r#""t":"Error""#) || m.contains(r#""t":"WorktreeReady""#)),
+            "the second answer was acted on: {got_b:?}"
+        );
+        assert_eq!(
+            got_b.iter().filter(|m| m.contains(r#""t":"WorktreeAskClosed""#)).count(),
+            1,
+            "closed once: {got_b:?}"
+        );
+        ask_env_clear(&[p, &format!("{p}/.claude/worktrees/worktree-fox")]);
+    }
+
+    #[test]
+    fn refuse_writes_nothing() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-refuse";
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: false });
+        assert_eq!(t.join().unwrap(), AskReply::Refuse { refuse: "refused in roost".into() });
+        assert_eq!(crate::worktree::list(&repo).len(), 1);
+        assert!(matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here));
+        ask_env_clear(&[p]);
+    }
+
+    /// Revert-checked: dropping the timeout's `WorktreeAskClosed` broadcast
+    /// fails with `the expired ask's dialogs are closed: [WorktreeAsk only]`.
+    #[test]
+    fn an_unanswered_ask_is_refused_and_closed() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-timeout";
+        let (hub, _repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        let (_a, rxa) = conn(&mut Hub::lock(&hub));
+        let r = ask_worktree_blocking_with(req(p, "term3", "fox"), std::time::Duration::from_millis(200));
+        assert_eq!(r, AskReply::Refuse { refuse: "nobody approved it in roost within 60 s".into() });
+        let got = drain(&rxa);
+        let id = got
+            .iter()
+            .find_map(|m| {
+                let v: serde_json::Value = serde_json::from_str(m).ok()?;
+                (v["t"] == "WorktreeAsk").then(|| v["id"].as_str().unwrap().to_string())
+            })
+            .expect("the ask was broadcast");
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"WorktreeAskClosed""#) && m.contains(&format!(r#""id":"{id}""#))),
+            "the expired ask's dialogs are closed: {got:?}"
+        );
+        assert!(Hub::lock(&hub).asks.is_empty(), "the expired ask is gone");
+        ask_env_clear(&[p]);
+    }
+
+    /// Revert-checked: recording before `create_named` fails here with
+    /// `no record without a worktree` — a terminal re-homed into a worktree
+    /// git refused to make.
+    #[test]
+    fn a_failed_create_writes_no_record() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-failcreate";
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        // The name is taken: the branch already exists.
+        assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(["branch", "worktree-fox"]).status().unwrap().success());
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: true });
+        let r = t.join().unwrap();
+        assert!(matches!(&r, AskReply::Refuse { refuse } if refuse.contains("branch worktree-fox already exists")), "{r:?}");
+        assert!(matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here), "no record without a worktree");
+        let got = drain(&rxa);
+        assert!(got.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("already exists")), "the clicker hears why: {got:?}");
+        ask_env_clear(&[p]);
+    }
+
+    /// R22. Revert-checked: with the cap check disabled the fifth ask is
+    /// parked like the others and this fails with `left: Refuse { refuse:
+    /// "nobody approved it in roost within 60 s" }` against the cap's text.
+    #[test]
+    fn a_fifth_ask_from_one_project_is_refused() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-cap";
+        let hub = registered_hub_with_session(root.path(), p, "term");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let waiters: Vec<_> = (1..=MAX_PENDING_ASKS).map(|i| spawn_ask(p, &format!("term{i}"), "fox")).collect();
+        let ids: Vec<String> = (0..MAX_PENDING_ASKS).map(|_| wait_for_ask(&rxa)).collect();
+        let t0 = std::time::Instant::now();
+        // A short wait, so that with the cap gone this fails in a second
+        // with the timeout's text rather than hanging for 60.
+        let r = ask_worktree_blocking_with(req(p, "term9", "fox"), std::time::Duration::from_secs(1));
+        assert_eq!(r, AskReply::Refuse { refuse: format!("too many worktree requests waiting in {p}") });
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "refused at once, not after a wait");
+        // One per session still holds alongside it.
+        let r = ask_worktree_blocking(req(p, "term1", "fox"));
+        assert!(matches!(&r, AskReply::Refuse { .. }), "{r:?}");
+        for id in ids {
+            Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: false });
+        }
+        for w in waiters {
+            assert_eq!(w.join().unwrap(), AskReply::Refuse { refuse: "refused in roost".into() });
+        }
+        ask_env_clear(&[p]);
+    }
+
+    #[test]
+    fn a_second_ask_from_one_terminal_is_refused_while_the_first_waits() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-onepersession";
+        let hub = registered_hub_with_session(root.path(), p, "term3");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        let r = ask_worktree_blocking(req(p, "term3", "otter"));
+        assert_eq!(r, AskReply::Refuse { refuse: "an earlier request from this terminal is still waiting".into() });
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: false });
+        t.join().unwrap();
+        ask_env_clear(&[p]);
+    }
+
+    #[test]
+    fn an_invalid_session_or_name_is_refused_before_anything() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-invalid";
+        let hub = registered_hub_with_session(root.path(), p, "term3");
+        let (_a, rxa) = conn(&mut Hub::lock(&hub));
+        let r = ask_worktree_blocking(req(p, "../x", "fox"));
+        assert!(matches!(&r, AskReply::Refuse { refuse } if refuse.contains("terminal name")), "{r:?}");
+        let r = ask_worktree_blocking(req(p, "term3", "-rf"));
+        assert!(matches!(&r, AskReply::Refuse { refuse } if refuse.contains("must match")), "{r:?}");
+        assert!(drain(&rxa).iter().all(|m| !m.contains("WorktreeAsk")), "nothing was asked");
+        ask_env_clear(&[p]);
+    }
+
+    /// R16. Revert-checked: with the gate disabled this fails with `left:
+    /// Path { path: ".../ask-r16/.claude/worktrees/worktree-fox" }` — Claude
+    /// told to move, and a second live `term3` in one owner.
+    #[test]
+    fn the_record_gate_refuses_a_name_live_in_the_owner() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-r16";
+        let owner = format!("{p}/.claude/worktrees/worktree-fox");
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        // A live `term3` already keyed under the owner URL — the worktree
+        // itself cannot exist yet (create would refuse), so its cwd is the
+        // repository; the session map is keyed by URL, not by directory.
+        crate::session::reserve_and_attach(&owner, "term3", &repo).unwrap();
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: true });
+        let r = t.join().unwrap();
+        assert_eq!(r, AskReply::Refuse { refuse: "worktree-fox already has a terminal named term3".into() });
+        assert!(matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here), "no record past the gate");
+        // Creating destroys nothing: the worktree stays.
+        assert!(repo.join(".claude/worktrees/worktree-fox").is_dir());
+        ask_env_clear(&[p, &owner]);
+    }
+
+    /// Asserted in this thread straight after the reply, no sleep: the
+    /// refresh must have happened *before* `Path` was sent.
+    ///
+    /// Revert-checked twice: removing the refresh fails with `left: None,
+    /// right: Some("ask-refresh")`; moving it to after the reply fails the
+    /// same way 5/5 runs (that variant is a race the asker almost always
+    /// wins, so it is evidence, not proof).
+    #[test]
+    fn approve_refreshes_the_owner_hub_before_replying() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-refresh";
+        let owner = format!("{p}/.claude/worktrees/worktree-fox");
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        // The owner's hub is open before the worktree exists — a tab on a
+        // URL that does not resolve yet, exactly as a fast browser would be.
+        let owner_hub = register_for_test(Hub::new(&owner, repo.join(".claude/worktrees/worktree-fox")));
+        assert!(Hub::lock(&owner_hub).session_homes.is_empty());
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: true });
+        assert!(matches!(t.join().unwrap(), AskReply::Path { .. }));
+        assert_eq!(
+            Hub::lock(&owner_hub).session_homes.get("term3"),
+            Some(&p.to_string()),
+            "the owner hub knows its resident before Claude is told to move"
+        );
+        assert!(
+            !Hub::lock(&hub).ws.live_sessions.contains(&"term3".to_string()),
+            "and the home hub has let go of it"
+        );
+        ask_env_clear(&[p, &owner]);
     }
 
     #[test]
