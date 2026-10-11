@@ -28,6 +28,11 @@ on the mode, but the first implementation task re-runs the probe there.
 | Does `EnterWorktree` raise `CwdChanged`? | **No.** A plain `cd` does, with `old_cwd`/`new_cwd`. |
 | Does the process really change directory? | Yes. Same pid; `/proc/<pid>/cwd` and the `cwd` of every later hook (`PostToolUse`, `Stop`) are the worktree from the `EnterWorktree` result onward. |
 | `claude --worktree` at start-up? | `SessionStart.cwd` is already the worktree. |
+| The session that entered the worktree runs `/exit`? | **Claude Code removes the worktree itself** — directory and `.git/worktrees` entry gone within seconds — even though a hook created it. The branch survives. Observed for a clean worktree in `auto` permission mode; whether a dirty one prompts first (the docs say so) was not observed. |
+
+Re-observed in interactive mode on 2026-10-11 (plan Task 0): the first six rows
+hold unchanged, and `claude --resume <id> --fork-session` run from inside a
+worktree finds the session and starts with that worktree as its directory.
 
 Two consequences carry the design. The hook is the only moment roost can ask
 *before* the move, so the approval lives there. And `/proc/<pid>/cwd` tells
@@ -254,7 +259,17 @@ dismissible banner:
 
 "Move tab there" writes the record (§4). Never automatic: this path had no
 approval, and a stale `/proc` read is still a read. A `cwd` that cannot be
-read is "unknown" and shows nothing. This covers a Claude with hooks off, a
+read is "unknown" and shows nothing.
+
+**A worktree that Claude Code removed.** When the re-homed Claude exits, Claude
+Code deletes its clean worktree (table above). §4 already makes the terminal
+fall back to its home, record kept, nothing killed. What it does not do is
+say so: the owner's tab simply loses its terminal. So when a resident's owner
+stops resolving *and* `git worktree list` of the home, read successfully, no
+longer lists it, the home's browsers get a transient notice: "`worktree-x` was
+removed (Claude Code removes a clean worktree when its session exits);
+`term3` is back here". A `worktree list` that fails shows nothing. The
+branch is untouched; #157 decides what finishing does with it. This covers a Claude with hooks off, a
 worktree made while roost was down (§2's fallback), and the Move-back case of
 §4.
 
@@ -289,8 +304,10 @@ evidence" table does not grow, which is the test of whether §4 is right.
 - Merge, PR, prune, relaxing the removal gate — #157.
 - A Claude outside any roost terminal: its worktree is created in roost's
   convention (§2) and shows in the switcher; there is nothing to re-home.
-- Claude Code's own "remove this worktree?" on exit: it runs in the terminal.
-  A `WorktreeRemove` hook is #157's.
+- Taking over removal. Claude Code removes a clean worktree when its session
+  exits (and, per its docs, asks first for a dirty one) — roost only reports
+  it (§7). A `WorktreeRemove` hook, which might hand removal to roost, is
+  unverified and is #157's.
 - Choosing a base in the `+` dialog. HEAD, always.
 - Backing up `state/home/`. A restored workspace re-homes nothing; sessions
   come back in their home.

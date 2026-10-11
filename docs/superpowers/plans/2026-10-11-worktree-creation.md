@@ -1370,6 +1370,24 @@ Kind table:
 
 `ClaudeProc` ordering/dedup: `cwd` must be excluded from `changed_projects`' comparison (it projects the port out already — read its doc comment and do the same for cwd, or every `cd` rebroadcasts every project).
 
+**Also (spec §7, added after Task 0):** a re-homed terminal whose worktree Claude Code removed on exit. In `hub.rs`, when `refresh_live_sessions` finds a resident record whose owner no longer resolves, check `worktree::list(home_dir)`: if the list is non-empty (git answered) and does not contain the owner, send the home's browsers `Event::WorktreeGone { worktree: String, session: String }` once per (owner, session) per hub lifetime (a `HashSet` on `Hub`); an empty list (git did not answer) sends nothing. Client: transient banner "`worktree-x` was removed (Claude Code removes a clean worktree when its session exits); `term3` is back here". Test (two hubs, real git worktree removed with `git worktree remove` behind roost's back):
+
+```rust
+    #[test]
+    fn a_removed_owner_is_announced_once_in_the_home() {
+        let (home_hub, home, repo, wt_url, wt_dir) = home_hub_with_resident_in_real_worktree("term3");
+        let a = conn(&mut Hub::lock(&home_hub));
+        assert!(std::process::Command::new("git").args(["worktree", "remove", wt_dir.to_str().unwrap()]).current_dir(&repo).status().unwrap().success());
+        Hub::lock(&home_hub).refresh_live_sessions();
+        Hub::lock(&home_hub).refresh_live_sessions();
+        let gone: Vec<_> = received(&Hub::lock(&home_hub), &a).into_iter().filter(|e| matches!(e, Event::WorktreeGone { .. })).collect();
+        assert_eq!(gone.len(), 1, "announced exactly once");
+        assert!(matches!(crate::home::owner_of(&home, "term3"), crate::home::Owner::Elsewhere(o) if o == wt_url), "record kept");
+    }
+```
+
+Revert check: drop the once-per-hub `HashSet`; the test fails with 2.
+
 - [ ] **Step 1: Failing tests** (fake `/proc` with a `cwd` symlink per pid — `std::os::unix::fs::symlink(target, pid_dir.join("cwd"))`):
 
 ```rust
