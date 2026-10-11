@@ -14,6 +14,7 @@ pub mod fileops;
 pub mod gitignore;
 pub mod gitio;
 pub mod health;
+pub mod home;
 pub mod hub;
 pub mod http;
 pub mod ide;
