@@ -32,9 +32,16 @@ let pendingFocusDone = false;
 let pendingTab = null;
 // Worktree asks from a Claude's hook (hub::ask_worktree_blocking): id → the
 // function that closes this browser's dialog for it. Present only while that
-// dialog is really showing, so WorktreeAskClosed for any other id — answered
-// elsewhere before this browser ever showed it — is a no-op.
+// dialog is really showing.
 const worktreeAsks = new Map();
+// Asks not yet shown, oldest first, as { id, session, name }. Only one dialog
+// can be open at a time and a second askChoice resolves null at once, so an
+// ask arriving over another dialog — or over an earlier ask, since a project
+// may have four waiting — would otherwise never be shown, and its Claude would
+// be told after 60 s that nobody approved it when nobody was asked.
+const askQueue = [];
+let askShowing = false;
+let askRetry = null;
 // The config file's `show_hidden`, embedded by render.rs at page load and
 // kept live from the snapshot afterwards (followSettings), like AUTOSAVE. The
 // workspace's own toggle (state.show_hidden) overrides it when set; null
@@ -856,11 +863,15 @@ function onEvent(ev) {
       showClaudeHere(ev.pane, ev.terminals);
       break;
     case "WorktreeAsk":
-      showWorktreeAsk(ev.id, ev.session, ev.name);
+      askQueue.push({ id: ev.id, session: ev.session, name: ev.name });
+      showNextAsk();
       break;
     case "WorktreeAskClosed": {
       // Answered in another browser, or the server's 60 s ran out: either
-      // way an answer from here would be ignored, so the question goes.
+      // way an answer from here would be ignored, so the question goes —
+      // from the screen if it is showing, from the queue if it is waiting.
+      const i = askQueue.findIndex((a) => a.id === ev.id);
+      if (i >= 0) askQueue.splice(i, 1);
       const dismiss = worktreeAsks.get(ev.id);
       if (dismiss) dismiss();
       break;
@@ -3915,7 +3926,24 @@ async function showClaudeHere(pane, terminals) {
 // server refuses on its own at 60 s. Every string goes through askChoice's
 // textContent; `session` and `name` were validated server-side, but that is
 // not what keeps them out of markup.
-async function showWorktreeAsk(id, session, name) {
+//
+// Shown one at a time from `askQueue`. dialog.js has no "a dialog closed"
+// hook, so while another dialog holds the screen this looks again every
+// 250 ms — only while something is queued, and a closed ask is spliced out of
+// the queue by WorktreeAskClosed, so it can never be shown late.
+function showNextAsk() {
+  if (askShowing || !askQueue.length) return;
+  if (openDlg) {
+    if (!askRetry) askRetry = setTimeout(() => { askRetry = null; showNextAsk(); }, 250);
+    return;
+  }
+  showWorktreeAsk(askQueue.shift());
+}
+
+async function showWorktreeAsk(ask) {
+  const { id, session, name } = ask;
+  askShowing = true;
+  let shown = false;
   const pick = await askChoice({
     title: `Claude in ${session} wants a worktree`,
     lines: [`worktree-${name}`],
@@ -3924,9 +3952,16 @@ async function showWorktreeAsk(id, session, name) {
       { id: "refuse", label: "Refuse" },
     ],
     // A withdrawn dialog resolves null like Cancel, so it sends nothing.
-    bindDismiss: (dismiss) => worktreeAsks.set(id, dismiss),
+    bindDismiss: (dismiss) => { shown = true; worktreeAsks.set(id, dismiss); },
   });
   worktreeAsks.delete(id);
+  askShowing = false;
+  if (!shown) {
+    // Lost a race for the screen after all: back to the front, untouched.
+    askQueue.unshift(ask);
+    showNextAsk();
+    return;
+  }
   if (pick === "create") {
     // Opened right after the click's promise resolves, as showClaudeHere
     // does — still inside the click's user activation, so the popup blocker
@@ -3936,6 +3971,7 @@ async function showWorktreeAsk(id, session, name) {
   } else if (pick === "refuse") {
     send({ t: "WorktreeAnswer", id, approve: false });
   }
+  showNextAsk();
 }
 
 // Transient, dismissible: reuses .conflict's border/padding/button styling

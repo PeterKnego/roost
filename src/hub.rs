@@ -2978,10 +2978,10 @@ fn ask_inner(req: crate::hooksock::AskRequest, timeout: std::time::Duration) -> 
                 // where it was. Unbounded by design: the approving thread
                 // always sends (its panics become a refusal), and the hook
                 // client bounds its own wait.
-                rx.recv().unwrap_or_else(|_| ask_refuse("roost lost the request; nothing was recorded"))
+                rx.recv().unwrap_or_else(|_| ask_refuse("roost lost the request; check the worktree switcher"))
             }
         }
-        Err(RecvTimeoutError::Disconnected) => ask_refuse("roost lost the request; nothing was recorded"),
+        Err(RecvTimeoutError::Disconnected) => ask_refuse("roost lost the request; check the worktree switcher"),
     }
 }
 
