@@ -219,6 +219,9 @@ impl Workspace {
             // Same reasoning, same place it is filled: see
             // `WorkspaceView::session_homes`.
             session_homes: Default::default(),
+            // Same reasoning, same place it is filled: see
+            // `WorkspaceView::forkable`.
+            forkable: Vec::new(),
             is_git: self.is_git,
             show_hidden: self.show_hidden,
             // Filled by `hub::snapshot_event`, same reasoning as

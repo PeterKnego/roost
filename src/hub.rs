@@ -40,6 +40,18 @@ pub struct Hub {
     /// is derived from the records and the sockets, and a saved copy could
     /// only ever be stale.
     pub session_homes: std::collections::BTreeMap<String, String>,
+    /// Native (never resident) live session names this project has a
+    /// recorded Claude session id for (`claudesess::recorded`) — what the
+    /// `+` dialog's fork choices are built from. Rebuilt by
+    /// `refresh_live_sessions`, the same way and for the same reason as
+    /// `session_homes` just above: a small local file read per live
+    /// session, cheap at the per-project cap of 16, but `snapshot_event`
+    /// runs on every debounced `EditBuffer` and would turn "cheap once" into
+    /// a filesystem read per keystroke if it looked here instead. Native
+    /// only (never a resident's name) — forking means continuing the
+    /// conversation of a *terminal on this page*, and a resident's record
+    /// lives, and is forkable, at its own home's refresh instead.
+    pub forkable: Vec<String>,
     /// A handle back to this hub's own `Arc<Mutex<Hub>>`, set only by
     /// `for_project` (see there) — lets `do_close_project` spawn a thread
     /// that re-locks this same hub *later*, after the blocking work is
@@ -316,6 +328,7 @@ impl Hub {
             self_writes: HashMap::new(),
             watching: false,
             session_homes: Default::default(),
+            forkable: Vec::new(),
             self_ref: std::sync::Weak::new(),
             closing: false,
             notices_dirty: false,
@@ -611,6 +624,11 @@ impl Hub {
         // filled fresh on every snapshot from the in-memory `session_homes`
         // `refresh_live_sessions` just rebuilt.
         ws.session_homes = self.session_homes.clone();
+        // Same reasoning again: `refresh_live_sessions` just rebuilt this
+        // from the live, native session set, and copying it is free where
+        // recomputing it here — on every debounced `EditBuffer` — would not
+        // be (see `Hub::forkable`'s own doc comment).
+        ws.forkable = self.forkable.clone();
         // See the doc comment on `claude_hooks` for why this is cached
         // rather than read on every call.
         let cached = *self.claude_hooks.get_or_insert_with(|| {
@@ -846,10 +864,12 @@ impl Hub {
             Intent::InitGit => return self.do_init_git(from),
             Intent::CloseProject => return self.do_close_project(from),
             Intent::EndSession { session } => return self.do_end_session(from, session.clone()),
-            Intent::NewWorktree { launch } => return self.do_new_worktree(from, *launch),
+            Intent::NewWorktree { name, launch } => {
+                return self.do_new_worktree(from, name.clone(), launch.clone())
+            }
             Intent::RemoveWorktree { key } => return self.do_remove_worktree(from, key.clone()),
-            Intent::NewTerminal { pane, launch, force, resume } => {
-                return self.do_new_terminal(from, *pane, *launch, *force, resume.clone())
+            Intent::NewTerminal { pane, launch, force, resume, fork } => {
+                return self.do_new_terminal(from, *pane, *launch, *force, resume.clone(), fork.clone())
             }
             Intent::OpenPath { text } => return self.do_open_path(from, text.clone()),
             Intent::OpenAtLine { pane, rel, line } => {
@@ -1781,6 +1801,18 @@ impl Hub {
         // its own, and offering `git init` there embeds a repository inside its
         // parent.
         self.ws.is_git = crate::gitio::is_inside_work_tree(&self.dir);
+        // The `+` dialog's fork choices: native (never resident — see the
+        // field's own doc comment) live sessions this project has a
+        // recorded Claude session id for. `raw_live`, not
+        // `self.ws.live_sessions`, for the same reason the rehoming check
+        // above uses it: the latter already folds a resident's own name in
+        // as "live", and a resident is forked from its home's refresh, not
+        // this one.
+        self.forkable = raw_live
+            .iter()
+            .filter(|name| crate::claudesess::recorded(&self.project, name).is_some())
+            .cloned()
+            .collect();
     }
 
     /// The client's websocket connect to `/ws/{project}/term/{name}` is what
@@ -2059,11 +2091,41 @@ impl Hub {
     /// work runs on a thread when this hub has a self-handle, synchronously
     /// (unit tests, bare `Hub::new`) when it does not, and in both cases
     /// the hub is re-locked only to deliver the answer.
-    fn do_new_worktree(&mut self, from: &ConnId, launch: Option<crate::proto::Launch>) {
+    ///
+    /// `Fork`'s session id is resolved **before** any thread is spawned, not
+    /// inside `work`: the refusal (no recorded Claude session) is a fact
+    /// about this project right now, cheap to check (a small local file,
+    /// `claudesess`'s own read), and must reach the clicker without waiting
+    /// on a worktree that will not be created. Resolving it late would also
+    /// let the terminal's record change between the click and the git work
+    /// with no way to say which version of it was honoured.
+    fn do_new_worktree(
+        &mut self,
+        from: &ConnId,
+        name: Option<String>,
+        launch: Option<crate::proto::WorktreeLaunch>,
+    ) {
         if self.closing {
             let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
             return self.send_to(from, &ev);
         }
+        // What the new worktree's first terminal should start, and the
+        // Claude session id to fork — resolved now, never typed, never
+        // carried as anything but an id (CLAUDE.md: the server owns what
+        // lands on a command line).
+        let (reply_launch, fork_id) = match &launch {
+            Some(crate::proto::WorktreeLaunch::Claude) => (Some(crate::proto::Launch::Claude), None),
+            Some(crate::proto::WorktreeLaunch::Fork { session }) => {
+                match crate::claudesess::recorded(&self.project, session) {
+                    Some(rec) => (Some(crate::proto::Launch::Claude), Some(rec.session_id)),
+                    None => {
+                        let msg = format!("no recorded Claude session for {session}");
+                        return self.send_to(from, &Event::Error { msg });
+                    }
+                }
+            }
+            Some(crate::proto::WorktreeLaunch::Shell) | None => (None, None),
+        };
         let project = self.project.clone();
         let dir = self.dir.clone();
         let from = from.clone();
@@ -2074,7 +2136,46 @@ impl Hub {
         let finish_from = from.clone();
         let work = move || -> Result<String, String> {
             let key_of = |n: &str| crate::projects::storage_key(&format!("{project}/.claude/worktrees/{n}"));
-            let c = crate::worktree::create(&dir, &crate::wsstate::state_dir(), &key_of, &crate::worktree::real_git)?;
+            // Checked before any name is even chosen: a non-repository (or
+            // an unanswerable `git branch --list`) would otherwise make
+            // every generated candidate look "taken" and exhaust
+            // `wtname::generate`'s retries, reporting "could not find a
+            // free worktree name" instead of the real reason. `create_named`
+            // makes this same check again — redundant on the happy path,
+            // but it is what actually confines the generator's own git
+            // calls to a real repository.
+            if !crate::gitio::is_inside_work_tree(&dir) {
+                return Err("not a git repository".into());
+            }
+            let resolved = match name {
+                Some(n) => n,
+                None => {
+                    // "Taken" means a branch or a directory of that name
+                    // already exists — the same two checks `create_named`
+                    // itself makes, asked here so a name this loop would
+                    // reject is never even offered to it. An uncertain
+                    // answer (git did not respond, the stat failed for a
+                    // reason other than "not there") also counts as taken:
+                    // the cost of skipping a free name is trying another
+                    // candidate, while the cost of guessing wrong is
+                    // `create_named` failing the whole request on a name
+                    // nobody chose.
+                    let taken = |cand: &str| -> bool {
+                        let dir_name = crate::wtname::dir_name(cand);
+                        let branch_taken = crate::worktree::real_git(&dir, &["branch", "--list", &dir_name])
+                            .map(|o| !o.trim().is_empty())
+                            .unwrap_or(true);
+                        let path_taken = match std::fs::symlink_metadata(dir.join(".claude/worktrees").join(&dir_name)) {
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                            _ => true,
+                        };
+                        branch_taken || path_taken
+                    };
+                    crate::wtname::generate(&taken)
+                        .ok_or_else(|| "could not find a free worktree name".to_string())?
+                }
+            };
+            let c = crate::worktree::create_named(&dir, &crate::wsstate::state_dir(), &resolved, &key_of, &crate::worktree::real_git)?;
             Ok(format!("{project}/.claude/worktrees/{}", c.name))
         };
         // Delivers the reply under the hub lock and hands back the url on
@@ -2089,7 +2190,7 @@ impl Hub {
         let finish = move |h: &mut Hub, r: Result<String, String>| -> Option<String> {
             match r {
                 Ok(url) => {
-                    let ev = Event::WorktreeReady { url: url.clone(), launch };
+                    let ev = Event::WorktreeReady { url: url.clone(), launch: reply_launch, fork: fork_id };
                     h.send_to(&finish_from, &ev);
                     Some(url)
                 }
@@ -2314,6 +2415,7 @@ impl Hub {
         launch: Option<crate::proto::Launch>,
         force: bool,
         resume: Option<String>,
+        fork: Option<String>,
     ) {
         if self.closing {
             let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
@@ -2376,11 +2478,26 @@ impl Hub {
                 // survive that check falls through to a fresh launch rather
                 // than failing: the user asked for a Claude, and the worst
                 // case is they get a new one instead of an old one.
-                session: resume
+                // `fork` takes priority: it is the worktree page's own first
+                // terminal asking to continue a conversation this project
+                // just resolved for it (do_new_worktree), never a value from
+                // the ✻ history menu — `resume` is that one. Re-validated
+                // here against the class `claudesess` stores under, the same
+                // boundary `launch::keystrokes` crosses again before typing
+                // anything (CLAUDE.md: the server owns what lands on a
+                // command line, checked at every hop that carries an id).
+                session: fork
                     .filter(|id| {
-                        l == crate::proto::Launch::Claude && crate::claudehist::has(&self.dir, id)
+                        l == crate::proto::Launch::Claude && crate::claudesess::valid_session_id(id)
                     })
-                    .map(crate::launch::ClaudeSession::Resume)
+                    .map(crate::launch::ClaudeSession::Fork)
+                    .or_else(|| {
+                        resume
+                            .filter(|id| {
+                                l == crate::proto::Launch::Claude && crate::claudehist::has(&self.dir, id)
+                            })
+                            .map(crate::launch::ClaudeSession::Resume)
+                    })
                     .or_else(|| {
                         crate::launch::new_session_id().map(crate::launch::ClaudeSession::Fresh)
                     }),
@@ -3091,7 +3208,7 @@ fn approve_ask(project: String, dir: std::path::PathBuf, clicker: ConnId, ask: P
     });
     let r = std::panic::catch_unwind(work).unwrap_or_else(|_| Err("worktree creation panicked".into()));
     let ev = match &r {
-        Ok(_) => Event::WorktreeReady { url: created.clone().unwrap_or_default(), launch: None },
+        Ok(_) => Event::WorktreeReady { url: created.clone().unwrap_or_default(), launch: None, fork: None },
         Err(msg) => Event::Error { msg: msg.clone() },
     };
     // Re-locked only to deliver: the clicker holds the blank tab
@@ -3538,6 +3655,7 @@ mod tests {
             launch: Some(proto::Launch::Claude),
             force: true,
             resume: Some(id.to_string()),
+            fork: None,
         });
         // `claude`, not `term`: develop gave the ✻ click its own name sequence,
         // so the reservation this parks is on the name the click was allocated.
@@ -3592,6 +3710,7 @@ mod tests {
             launch: Some(proto::Launch::Claude),
             force: true,
             resume: Some("aaaa1111-2222-3333-4444-555555555555".to_string()),
+            fork: None,
         });
         // `claude`, not `term`: develop gave the ✻ click its own name sequence,
         // so the reservation this parks is on the name the click was allocated.
@@ -3805,7 +3924,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::proto::{self, Mode, Tab};
+    use crate::proto::{self, Mode, Tab, WorktreeLaunch};
 
     /// The three tests below that call `Hub::for_project` directly (not a
     /// bare `Hub::new()`) reach `ide::for_project` -> `idelock::ide_dir()`
@@ -5810,8 +5929,8 @@ mod tests {
         }
         drain(&rx);
 
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None, fork: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None, fork: None });
         drain(&rx);
 
         let names: Vec<String> = h.ws.panes[proto::RIGHT as usize]
@@ -5847,7 +5966,7 @@ mod tests {
         h.session_homes.insert("term".into(), "owner_names".into());
         drain(&rx);
 
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None, fork: None });
         drain(&rx);
 
         let names: Vec<String> = h.ws.panes[proto::RIGHT as usize]
@@ -5881,8 +6000,8 @@ mod tests {
         }
         drain(&rx);
 
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None, fork: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None, fork: None });
         drain(&rx);
         // ✻ is allocated `claude`, not whichever `termN` was free: a strip
         // reading `term, term1, term2` says nothing about which tab has an
@@ -5907,14 +6026,14 @@ mod tests {
         // its tab is closed before any browser attaches, and a later ✻ is
         // handed `claude2` back. The click that made it a claude shell is
         // gone, so its own reservation must not survive the close.
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None, fork: None });
         let idx = h.ws.panes[proto::RIGHT as usize]
             .tabs
             .iter()
             .position(|t| matches!(t, Tab::Terminal { session, .. } if session == "claude2"))
             .expect("✻ was handed claude2");
         h.handle(&c, Intent::CloseTab { pane: proto::RIGHT, idx });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None, fork: None });
         drain(&rx);
         // The plain + that followed took `term1`; `claude2` is free again, and
         // attaching it directly is what a browser that never saw the close
@@ -5942,13 +6061,13 @@ mod tests {
         for p in h.ws.panes.iter_mut() { p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. })); p.active = 0; }
         // First ✻: allocates `claude`; spawn it the way a browser would, so
         // the launch is consumed and recorded on the session.
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None, fork: None });
         let _att = crate::session::reserve_and_attach("prompt_second", "claude", d.path()).unwrap();
         assert_eq!(crate::session::launched_names("prompt_second").len(), 1, "fixture: a launched terminal exists");
         drain(&rxa); drain(&rxb);
         let version = h.ws.version;
 
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None, fork: None });
         let got = rxa.try_recv().expect("the clicker hears back");
         // `claude`, not `term`: a ✻ click is allocated a name that says what
         // the terminal is for.
@@ -5957,7 +6076,7 @@ mod tests {
         assert_eq!(h.ws.version, version, "no layout change");
         assert_eq!(crate::session::live_names("prompt_second").len(), 1, "no session allocated");
 
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: true, resume: None });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: true, resume: None, fork: None });
         assert!(h.ws.version > version, "force opens a terminal");
         assert!(rxb.try_recv().is_ok_and(|m| m.contains(r#""t":"State""#)), "…which everyone sees");
         crate::session::kill_project("prompt_second");
@@ -5976,11 +6095,11 @@ mod tests {
         let mut h = Hub::new("prompt_plus", d.path().to_path_buf());
         let (a, rxa) = h.subscribe();
         for p in h.ws.panes.iter_mut() { p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. })); p.active = 0; }
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None, fork: None });
         let _att = crate::session::reserve_and_attach("prompt_plus", "term", d.path()).unwrap();
         drain(&rxa);
         let version = h.ws.version;
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None, fork: None });
         assert!(h.ws.version > version, "a plain shell opens beside a Claude");
         crate::session::kill_project("prompt_plus");
     }
@@ -8091,7 +8210,7 @@ mod tests {
     }
 
     #[test]
-    fn new_worktree_creates_claude_1_announces_it_and_answers_the_clicker() {
+    fn new_worktree_creates_the_named_worktree_announces_it_and_answers_the_clicker() {
         // Revert-checked: with `WorktreeReady` sent via `broadcast` instead
         // of `send_to`, the `rxb` assertion below fails ("the reply is the
         // clicker's alone") — confirmed, then restored.
@@ -8119,14 +8238,14 @@ mod tests {
         let (a, rxa) = h.subscribe();
         let (_b, rxb) = h.subscribe();
         drain(&rxa); drain(&rxb);
-        h.handle(&a, Intent::NewWorktree { launch: Some(proto::Launch::Claude) });
+        h.handle(&a, Intent::NewWorktree { name: Some("fox".into()), launch: Some(WorktreeLaunch::Claude) });
         // Hub::new has no self_ref, so the work ran synchronously (the
         // do_end_session convention) and the reply is already queued.
         let got = rxa.try_recv().expect("clicker answered");
-        assert!(got.contains(r#""t":"WorktreeReady""#) && got.contains(r#""url":"repo/.claude/worktrees/claude-1""#) && got.contains(r#""launch":"claude""#), "{got}");
+        assert!(got.contains(r#""t":"WorktreeReady""#) && got.contains(r#""url":"repo/.claude/worktrees/worktree-fox""#) && got.contains(r#""launch":"claude""#), "{got}");
         assert!(rxb.try_recv().is_err(), "the reply is the clicker's alone");
-        assert!(repo.join(".claude/worktrees/claude-1/a.txt").is_file());
-        assert_eq!(crate::worktree::read_base(&crate::wsstate::state_dir(), "repo%2F.claude%2Fworktrees%2Fclaude-1").as_deref(), Some("main"));
+        assert!(repo.join(".claude/worktrees/worktree-fox/a.txt").is_file());
+        assert_eq!(crate::worktree::read_base(&crate::wsstate::state_dir(), "repo%2F.claude%2Fworktrees%2Fworktree-fox").as_deref(), Some("main"));
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
@@ -8143,9 +8262,125 @@ mod tests {
         let mut h = Hub::new("plain", d.path().to_path_buf());
         let (a, rxa) = h.subscribe();
         drain(&rxa);
-        h.handle(&a, Intent::NewWorktree { launch: None });
+        h.handle(&a, Intent::NewWorktree { name: None, launch: None });
         let got = rxa.try_recv().unwrap();
         assert!(got.contains(r#""t":"Error""#) && got.contains("not a git repository"), "{got}");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// An empty name is the dialog's "let roost pick one" — `wtname::generate`
+    /// with `taken` asking git/the filesystem the same two things
+    /// `create_named` itself checks, so a name this loop would have rejected
+    /// is never even offered to it.
+    ///
+    /// Revert-checked: making the `None` arm `return Err("no name given".into())`
+    /// before ever calling `wtname::generate` makes this fail — observed:
+    /// `panicked ... {"t":"Error","msg":"no name given"}` (the assertion's own
+    /// message is `got`, so the panic prints the reply, not an expression).
+    /// Restored.
+    #[test]
+    fn new_worktree_with_no_name_generates_one() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::NewWorktree { name: None, launch: None });
+        let got = rxa.try_recv().expect("clicker answered");
+        assert!(got.contains(r#""t":"WorktreeReady""#), "{got}");
+        let v: serde_json::Value = serde_json::from_str(&got).unwrap();
+        let url = v["url"].as_str().expect("a url").to_string();
+        let generated = url.rsplit('/').next().unwrap();
+        assert!(generated.starts_with("worktree-") && generated.len() > "worktree-".len(), "{generated}");
+        assert!(crate::wtname::valid(generated.trim_start_matches("worktree-")), "{generated}");
+        assert!(repo.join(".claude/worktrees").join(generated).is_dir(), "the generated name's worktree must actually exist");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// `WorktreeLaunch::Fork` resolves its session id from `claudesess`
+    /// before any git work runs, and echoes the resolved **id**, never the
+    /// terminal name the dialog offered — R4.
+    #[test]
+    fn new_worktree_forks_a_recorded_session_and_echoes_its_id() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let id = "864ee734-e3ab-434e-8278-745a850b16ad";
+        crate::claudesess::record(
+            "repo",
+            "term",
+            &crate::claudesess::Recorded { session_id: id.into(), transcript_path: None, event: "Stop".into() },
+        );
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::NewWorktree {
+            name: Some("fox".into()),
+            launch: Some(WorktreeLaunch::Fork { session: "term".into() }),
+        });
+        let got = rxa.try_recv().expect("clicker answered");
+        assert!(
+            got.contains(r#""t":"WorktreeReady""#)
+                && got.contains(r#""launch":"claude""#)
+                && got.contains(&format!(r#""fork":"{id}""#)),
+            "{got}"
+        );
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// `Fork`'s whole safety property: a terminal name offered by a stale
+    /// dialog, or simply typed by hand, must not create a worktree and must
+    /// not type anything — it must refuse, by name, before any git work runs.
+    ///
+    /// Revert-checked: dropping the `claudesess::recorded` lookup (treating
+    /// every `Fork` as if a session were always found, with a fabricated
+    /// id) makes this fail at the `"t":"Error"` assertion — confirmed with
+    /// `got` instead containing a `"t":"WorktreeReady"` for a worktree that
+    /// should never have been created. Restored.
+    #[test]
+    fn fork_without_a_recorded_session_is_refused() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", tmp.path().join("state"));
+        let (mut h, _home, _dir) = repo_with_worktree(tmp.path());
+        let (a, rx) = conn(&mut h);
+        h.handle(&a, Intent::NewWorktree {
+            name: Some("fox".into()),
+            launch: Some(WorktreeLaunch::Fork { session: "term9".into() }),
+        });
+        let got = rx.try_recv().expect("an answer");
+        assert!(
+            got.contains(r#""t":"Error""#) && got.contains("term9") && got.contains("no recorded Claude session"),
+            "{got}"
+        );
+        // Nothing was created: the only worktree in this repo is the
+        // fixture's own.
+        assert_eq!(crate::worktree::list(&h.dir).len(), 2, "no second worktree");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
@@ -8185,7 +8420,7 @@ mod tests {
         let hub = Hub::for_project("worktree-registered", repo.clone());
         let (a, rxa) = Hub::lock(&hub).subscribe();
         drain(&rxa);
-        Hub::lock(&hub).handle(&a, Intent::NewWorktree { launch: None });
+        Hub::lock(&hub).handle(&a, Intent::NewWorktree { name: None, launch: None });
         let got = rxa.recv_timeout(std::time::Duration::from_secs(5));
         assert!(got.is_ok(), "timed out waiting for WorktreeReady -- broadcast_all deadlocked against this hub's own lock");
         assert!(got.unwrap().contains(r#""t":"WorktreeReady""#));
@@ -8205,10 +8440,10 @@ mod tests {
             assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
         }
         let key_of = |n: &str| crate::projects::storage_key(&format!("repo/.claude/worktrees/{n}"));
-        let c = crate::worktree::create(&repo, &crate::wsstate::state_dir(), &key_of, &crate::worktree::real_git).unwrap();
-        (Hub::new("repo", repo), "repo/.claude/worktrees/claude-1".into(), c.path)
+        let c = crate::worktree::create_named(&repo, &crate::wsstate::state_dir(), "pier", &key_of, &crate::worktree::real_git).unwrap();
+        (Hub::new("repo", repo), "repo/.claude/worktrees/worktree-pier".into(), c.path)
     }
-    const WT_KEY: &str = "repo%2F.claude%2Fworktrees%2Fclaude-1";
+    const WT_KEY: &str = "repo%2F.claude%2Fworktrees%2Fworktree-pier";
 
     fn refusal_of(h: &mut Hub, a: &ConnId, rx: &Receiver<String>) -> String {
         h.handle(a, Intent::RemoveWorktree { key: WT_KEY.into() });

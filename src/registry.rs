@@ -1885,14 +1885,14 @@ mod tests {
                 run_git(repo, &["commit", "-qm", "init"]);
             }
 
-            // Both repos independently mint "claude-1" as their first free
-            // worktree name — the collision this test exists to catch.
+            // Both repos independently create a worktree of the same name —
+            // the collision this test exists to catch.
             let key_of_a = |n: &str| crate::projects::storage_key(&format!("a/.claude/worktrees/{n}"));
             let key_of_b = |n: &str| crate::projects::storage_key(&format!("b/.claude/worktrees/{n}"));
-            let ca = crate::worktree::create(&repo_a, state, &key_of_a, &crate::worktree::real_git).unwrap();
-            let cb = crate::worktree::create(&repo_b, state, &key_of_b, &crate::worktree::real_git).unwrap();
-            assert_eq!(ca.name, "claude-1");
-            assert_eq!(cb.name, "claude-1", "both repos mint claude-1 independently");
+            let ca = crate::worktree::create_named(&repo_a, state, "dup", &key_of_a, &crate::worktree::real_git).unwrap();
+            let cb = crate::worktree::create_named(&repo_b, state, "dup", &key_of_b, &crate::worktree::real_git).unwrap();
+            assert_eq!(ca.name, "worktree-dup");
+            assert_eq!(cb.name, "worktree-dup", "both repos independently create the same name");
 
             // Dirty in b's worktree only.
             fs::write(cb.path.join("untracked.txt"), "y").unwrap();

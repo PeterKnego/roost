@@ -17,6 +17,19 @@ const pendingLaunch = (() => {
   return l && LAUNCHES.includes(l) ? l : null;
 })();
 let pendingLaunchSent = false;
+// The same arrival carries `?fork=<session id>` when the `+` dialog's fork
+// choice created this worktree (R4): a Claude session id, never keystrokes,
+// read once at load and validated client-side against the same character
+// shape `claudesess::valid_session_id` checks server-side — the server's
+// check is the real boundary, this is only so a stray or hand-edited query
+// string doesn't send an obviously-wrong value down the wire at all.
+// Meaningless without `pendingLaunch` being "claude", and ignored then too
+// unless `fork` is also present — `newTerminal` only sends it alongside a
+// Claude launch.
+const pendingFork = (() => {
+  const f = new URLSearchParams(location.search).get("fork");
+  return f && /^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$/.test(f) ? f : null;
+})();
 // A row clicked on the overview arrives with ?focus=<session>, read once at
 // load and validated against the session-name shape the same way a
 // server-sent value would be — a stray or hand-edited query string must not
@@ -724,7 +737,7 @@ function onEvent(ev) {
       // reload does not start a second program.
       if (pendingLaunch && !pendingLaunchSent) {
         pendingLaunchSent = true;
-        newTerminal(3, pendingLaunch);
+        newTerminal(3, pendingLaunch, null, pendingFork);
         history.replaceState(null, "", location.pathname);
       }
       // A row clicked on the overview arrives with ?focus=<session>; focus
@@ -877,7 +890,14 @@ function onEvent(ev) {
       break;
     }
     case "WorktreeReady": {
-      const url = "/" + projectPath(ev.url) + (ev.launch ? `?launch=${encodeURIComponent(ev.launch)}` : "");
+      // `fork` is a Claude session id (R4), never typed here — the new
+      // page's own load reads `?fork=`, validates it again client-side
+      // (`pendingFork`), and the server validates it a third time
+      // (`claudesess::valid_session_id`) before anything reaches a shell.
+      const q = ev.launch
+        ? `?launch=${encodeURIComponent(ev.launch)}${ev.fork ? `&fork=${encodeURIComponent(ev.fork)}` : ""}`
+        : "";
+      const url = "/" + projectPath(ev.url) + q;
       if (pendingTab && !pendingTab.closed) {
         pendingTab.location = url;
       } else {
@@ -1594,7 +1614,7 @@ document.addEventListener("mousedown", (e) => {
   if (openClaudeMenu && !openClaudeMenu.contains(e.target)) closeClaudeMenu();
 }, true);
 
-function newTerminal(pane, launch, resume) {
+function newTerminal(pane, launch, resume, fork) {
   // No prompt: the server allocates term/term1/term2… from `live_names`, which
   // sees detached sessions the client has no tabs for. A name picked here could
   // collide with one of those, and since attaching creates only when absent,
@@ -1607,8 +1627,16 @@ function newTerminal(pane, launch, resume) {
   // `resume` names a conversation the ✻ menu offered. Omitted unless one was
   // chosen, so the plain and fresh-Claude messages stay the ones they have
   // always been.
+  //
+  // `fork` carries a Claude session id (R4) — only ever `pendingFork`, the
+  // freshly created worktree page's own `?fork=`, re-validated server-side
+  // before anything is typed. Omitted on every ordinary click, same as
+  // `resume`.
   if (!launch) return send({ t: "NewTerminal", pane });
-  send(resume ? { t: "NewTerminal", pane, launch, resume } : { t: "NewTerminal", pane, launch });
+  const msg = { t: "NewTerminal", pane, launch };
+  if (resume) msg.resume = resume;
+  if (fork) msg.fork = fork;
+  send(msg);
 }
 
 // The Edit/Preview switch lives in the filename stripe (`.path`), not on the
@@ -3891,6 +3919,53 @@ async function showConflict(ev) {
   else if (pick === "discard") send({ t: "CloseBuffer", rel: ev.rel });
 }
 
+// The `+` worktree dialog (#156): a name field, "continue <term>'s Claude
+// there (fork)" for each terminal `state.forkable` names, "start a fresh
+// Claude", and "just a shell". `preferFork`, optional, is a terminal name to
+// put first (and so, by `askChoice`'s own "first choice takes focus" rule,
+// preselected) — the ✻ shortcut's own terminal when it is forkable, say.
+// Absent that, a single fork candidate is preselected on its own: with
+// exactly one Claude to continue, that is almost always the answer, and
+// Enter should reach it without a click.
+//
+// The actual create is deferred entirely to here, never to the caller: a
+// click on `+` or on "Start in a new worktree" only opens this dialog, and
+// nothing is sent to the server — nothing is created — until a choice in
+// *this* dialog is made.
+async function openWorktreeDialog(preferFork) {
+  const forkable = (state && state.forkable) || [];
+  const favored = preferFork && forkable.includes(preferFork)
+    ? preferFork
+    : forkable.length === 1 ? forkable[0] : null;
+  const ordered = favored ? [favored, ...forkable.filter((t) => t !== favored)] : forkable;
+  const choices = ordered.map((session) => ({
+    id: `fork:${session}`,
+    label: `Continue ${session}'s Claude there (fork)`,
+  }));
+  choices.push({ id: "fresh", label: "Start a fresh Claude" });
+  choices.push({ id: "shell", label: "Just a shell" });
+  const pick = await askChoice({
+    title: "New worktree",
+    lines: ["Leave the name blank for roost to pick one."],
+    choices,
+    input: { placeholder: "name (optional)" },
+  });
+  if (!pick) return;
+  const name = (pick.value || "").trim() || null;
+  // Opened right after the click's promise resolves — still inside the
+  // browser's transient user activation, so the popup blocker allows it, the
+  // same way showClaudeHere's and showWorktreeAsk's own creates do.
+  // WorktreeReady navigates the tab once the server responds.
+  pendingTab = window.open("about:blank");
+  if (pick.id === "fresh") {
+    send({ t: "NewWorktree", name, launch: { k: "Claude" } });
+  } else if (pick.id === "shell") {
+    send({ t: "NewWorktree", name, launch: { k: "Shell" } });
+  } else {
+    send({ t: "NewWorktree", name, launch: { k: "Fork", session: pick.id.slice("fork:".length) } });
+  }
+}
+
 // The "a Claude is already here" prompt. Per-browser and transient: it is a
 // question to the person who clicked, not a state of the project. It used to
 // be a banner prepended to the pane; now the same in-page dialog every other
@@ -3908,12 +3983,11 @@ async function showClaudeHere(pane, terminals) {
     ],
   });
   if (pick === "worktree") {
-    // Opened right after the click's promise resolves — still inside the
-    // browser's transient user activation, so the popup blocker allows it;
-    // worktree-launch.mjs section C clicks with a real mouse event to prove
-    // that. WorktreeReady navigates the tab once the server responds.
-    pendingTab = window.open("about:blank");
-    send({ t: "NewWorktree", launch: "claude" });
+    // The worktree dialog itself decides fork vs fresh vs shell; all this
+    // passes along is which of the terminals already running a Claude (if
+    // any) is forkable, so that one is preselected instead of "fresh".
+    const forkable = (state && state.forkable) || [];
+    openWorktreeDialog(terminals.find((t) => forkable.includes(t)));
   } else if (pick === "here") {
     send({ t: "NewTerminal", pane, launch: "claude", force: true });
   }
@@ -4536,6 +4610,11 @@ if (wtBtn && wtPanel) {
   // the ⌘-click case, which stays on this page with the panel open. The
   // remove control is the other thing this popup's clicks can mean.
   wtPanel.onclick = async (e) => {
+    if (e.target.closest(".wtadd")) {
+      e.preventDefault();
+      openWorktreeDialog();
+      return;
+    }
     const rm = e.target.closest(".wtremove");
     if (rm) {
       // Everything the event carries is read before the first await: e is

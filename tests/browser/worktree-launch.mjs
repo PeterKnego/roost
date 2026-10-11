@@ -189,26 +189,40 @@ try {
   ok(JSON.parse(await evalIn(`JSON.stringify(__sessions(3))`)).length === 2, "and no terminal was opened (State snapshot unchanged)");
   ok((await evalIn(`document.querySelector('#dlg-choice .dlg-body').textContent`)).includes(first), `it names the terminal (${first})`);
 
-  console.log("\nC. start in a new worktree → a second tab on claude-1 with claude started");
-  // A real click: "Start in a new worktree" calls window.open, and the popup
-  // blocker only allows that inside a user activation. The dialog resolves a
-  // promise, so the open happens a microtask after the click — still inside
-  // Chromium's transient activation, which this section is what proves.
+  console.log("\nC. start in a new worktree → the + dialog → a second tab with claude started");
+  // A real click: "Start in a new worktree" no longer creates anything by
+  // itself (#156) — it opens the `+` dialog (same `#dlg-choice` element,
+  // reused), fork/fresh/shell, with a name field left blank here so the
+  // server generates one (`wtname::generate`), never `claude-N` any more.
   await clickReal(page, '#dlg-choice .dlg-choice[data-choice="worktree"]');
+  ok(
+    await until(() => evalIn(`document.getElementById("dlg-choice").open && document.querySelector('#dlg-choice .dlg-title').textContent === "New worktree"`), 10, "the + dialog"),
+    "\"Start in a new worktree\" opened the + dialog instead of creating immediately"
+  );
+  // No recorded Claude session exists (the fake `claude` never ran roost's
+  // hook), so there is nothing to fork — only "fresh" and "shell" are on
+  // offer. A real click again: this is what actually calls window.open,
+  // still inside Chromium's transient activation the same way section A's
+  // single click was — now one dialog hop later, but each click grants its
+  // own activation, which is what this section proves.
+  ok(!(await evalIn(`!!document.querySelector('#dlg-choice .dlg-choice[data-choice^="fork:"]')`)), "no fork choice is offered with nothing recorded");
+  await clickReal(page, '#dlg-choice .dlg-choice[data-choice="fresh"]');
   // `until` reports only true/false, never the value fn() computed — so the
   // matching target has to be re-read from the list after it resolves rather
   // than trusted to come out of the poll itself (an earlier draft did that
   // and crashed two lines later dereferencing `.webSocketDebuggerUrl` off a
-  // bare `true`).
-  let targets = null;
+  // bare `true`). The generated name is read back off that same URL — it is
+  // a random `adjective-verb-noun` (`wtname::generate`), never `claude-1`.
+  let targets = null, wtName = null;
   const foundTab = await until(async () => {
     const l = await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json();
-    targets = l.find((x) => x.url.includes(".claude/worktrees/claude-1")) || null;
+    targets = l.find((x) => x.url.includes("/.claude/worktrees/")) || null;
+    wtName = targets ? decodeURIComponent(targets.url.match(/\/\.claude\/worktrees\/([^/?]+)/)[1]) : null;
     return !!targets;
   }, 30, "a tab on the worktree");
-  ok(foundTab, "a second browser tab opened on the worktree project");
+  ok(foundTab && !!wtName && wtName.startsWith("worktree-"), `a second browser tab opened on the worktree project (name: ${wtName})`);
   const wt = await git(projDir, "worktree", "list", "--porcelain");
-  ok(wt.out.includes(`${projDir}/.claude/worktrees/claude-1`) && wt.out.includes("refs/heads/claude-1"), "git lists the worktree and its branch");
+  ok(wt.out.includes(`${projDir}/.claude/worktrees/${wtName}`) && wt.out.includes(`refs/heads/${wtName}`), "git lists the worktree and its branch");
   if (targets) {
     page2 = await attachTarget(targets.webSocketDebuggerUrl);
     await until(() => page2.evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "worktree app.js");
@@ -274,13 +288,13 @@ try {
   ok(sawRemove, "the remove control appears once the worktree is idle and clean");
   await evalIn(`document.querySelector("#wtstrip .wtremove").click(); 0`);
   await evalIn(`document.querySelector("#dlg-confirm .dlg-ok").click(); 0`);
-  ok(await until(async () => !(await git(projDir, "worktree", "list", "--porcelain")).out.includes("claude-1"), 20, "worktree gone"), "clicking it removes the worktree");
+  ok(await until(async () => !(await git(projDir, "worktree", "list", "--porcelain")).out.includes(wtName), 20, "worktree gone"), "clicking it removes the worktree");
   // `until`, like its neighbours: the branch goes in git step 2 of the same
   // closure that removed the worktree in step 1, so an immediate check can
   // land in the gap. Observed once on a slow host: worktree gone, branch
   // still listed, then gone a moment later.
-  ok(await until(async () => (await git(projDir, "branch", "--list", "claude-1")).out.trim() === "", 10, "branch gone"), "…and its branch");
-  ok(await until(async () => { try { await Deno.stat(`${projDir}/.claude/worktrees/claude-1`); return false; } catch { return true; } }, 5, "directory gone"), "the directory is gone");
+  ok(await until(async () => (await git(projDir, "branch", "--list", wtName)).out.trim() === "", 10, "branch gone"), "…and its branch");
+  ok(await until(async () => { try { await Deno.stat(`${projDir}/.claude/worktrees/${wtName}`); return false; } catch { return true; } }, 5, "directory gone"), "the directory is gone");
 } finally {
   page?.close(); page2?.close();
   browser.close();

@@ -71,6 +71,31 @@ pub enum Launch {
     PrLoop,
 }
 
+/// What the `+` worktree dialog asks the new worktree's first terminal to
+/// start. A sibling of `Launch`, not a reuse of it: `Fork` carries a value
+/// (a terminal name, from which the server looks up a recorded Claude
+/// session id — never the id itself, same reservation CLAUDE.md states for
+/// `NewTerminal.resume`), so this cannot stay a plain wire string the way
+/// `Launch` does. Tagged like `Tab` — a `k` field — rather than left
+/// externally tagged (serde's default), so `Claude`/`Shell` and `Fork` share
+/// one shape (`{"k":"..."}`) instead of one being a bare string and the
+/// other an object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "k")]
+pub enum WorktreeLaunch {
+    /// Continue the Claude running in terminal `session` of *this* project
+    /// (not the new worktree) via `claude --resume <id> --fork-session`.
+    /// `session` is a terminal name, a hint like `RemoveWorktree`'s own key:
+    /// the server re-derives the id from `claudesess::recorded` at the
+    /// moment this runs and refuses if nothing is recorded, rather than
+    /// trusting a value the dialog could have shown stale.
+    Fork { session: String },
+    /// Start a fresh Claude in the new worktree.
+    Claude,
+    /// No program — a bare shell.
+    Shell,
+}
+
 /// Which config file a `SetSetting` edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -159,6 +184,17 @@ pub enum Intent {
         /// `RemoveWorktree` says of its own.
         #[serde(default)]
         resume: Option<String>,
+        /// The Claude session id to continue via `claude --resume <id>
+        /// --fork-session`, carried as `?fork=` on a worktree page's URL
+        /// (R4) rather than typed into it: only the first terminal of a
+        /// freshly created worktree ever sets this, and only because the
+        /// `+` dialog resolved it server-side before the page existed. Not a
+        /// value from any menu — the id is re-validated against
+        /// `claudesess::valid_session_id` here, same boundary `resume`
+        /// crosses via `claudehist::has`, because a query string is exactly
+        /// as untrusted as a form field.
+        #[serde(default)]
+        fork: Option<String>,
     },
     /// A span matched in terminal output, sent **verbatim** —
     /// `~/projects/roost/src/a.rs:42` and all. Deliberately not pre-parsed by
@@ -185,13 +221,20 @@ pub enum Intent {
     OpenAtLine { pane: PaneId, rel: String, line: u32 },
     InitGit,
     CloseProject,
-    /// Create `.claude/worktrees/claude-N` off this project's HEAD. No name
-    /// from the browser: the server mints it, so nothing typed reaches a
-    /// path or a command line. `launch` is echoed back in `WorktreeReady`
-    /// so the new tab knows what to start.
+    /// Create a worktree off this project's HEAD, from the `+` dialog (R4).
+    /// `name` is optional and checked server-side by `wtname`/`create_named`
+    /// — empty means the server generates one with `wtname::generate` — so
+    /// nothing a browser typed reaches a path or a command line unvalidated.
+    /// `launch` says what the new worktree's first terminal should start;
+    /// it is echoed back (as a plain `Launch`, plus a resolved `fork` id for
+    /// `WorktreeLaunch::Fork`) in `WorktreeReady` so the new tab knows what
+    /// to start, without ever carrying the session id it was asked for —
+    /// that is looked up fresh from `claudesess::recorded`.
     NewWorktree {
         #[serde(default)]
-        launch: Option<Launch>,
+        name: Option<String>,
+        #[serde(default)]
+        launch: Option<WorktreeLaunch>,
     },
     /// Remove a finished worktree of this project. The server re-derives
     /// every "finished" check at this moment; the row that offered the
@@ -506,6 +549,15 @@ pub struct WorkspaceView {
     /// a future "ending a resident" confirmation.
     #[serde(default)]
     pub session_homes: std::collections::BTreeMap<String, String>,
+    /// Native live terminals with a recorded Claude session id
+    /// (`claudesess::recorded`) — the `+` dialog's fork choices (#156).
+    /// Filled in `hub::snapshot_event` from `Hub.forkable`, which
+    /// `refresh_live_sessions` rebuilds the same way it rebuilds
+    /// `session_homes`, for the same reason: never kept in `WsState`, and
+    /// never read on every snapshot (`EditBuffer` debounces onto this path),
+    /// since a recorded session is a small file read per candidate.
+    #[serde(default)]
+    pub forkable: Vec<String>,
     /// Whether the project directory is a git repository — drives the
     /// initialise-git offer on the placeholder.
     pub is_git: bool,
@@ -577,8 +629,14 @@ pub enum Event {
     CloseRefused { dirty: Vec<String> },
     ProjectClosed { ended: usize },
     /// The worktree exists and is registered. Sent to the clicker only —
-    /// it is the one holding the tab to navigate.
-    WorktreeReady { url: String, launch: Option<Launch> },
+    /// it is the one holding the tab to navigate. `fork`, present only for
+    /// `WorktreeLaunch::Fork`, is the Claude session id `claudesess::recorded`
+    /// resolved — never the typed-at keystrokes, and never the terminal name
+    /// the dialog offered: R4 puts the session id on the wire and nothing
+    /// else, so the new page's `?fork=` carries a value the server will
+    /// re-validate (`claudesess::valid_session_id`) before it ever reaches a
+    /// command line.
+    WorktreeReady { url: String, launch: Option<Launch>, fork: Option<String> },
     /// Claude in `session` asked for worktree `worktree-<name>` through the
     /// hook and is blocked until a browser answers with `WorktreeAnswer`.
     /// Broadcast to every browser of the project; `id` is a server counter,
@@ -683,6 +741,53 @@ mod tests {
         // A closed set: the client names a program roost knows, never a
         // command line of its own.
         assert!(decode(r#"{"t":"NewTerminal","pane":3,"launch":"rm -rf /"}"#).is_err());
+    }
+
+    /// R4: the worktree page's `?fork=` carries a Claude session id, decoded
+    /// the same way `resume` already is — present only when the dialog's
+    /// own lookup resolved one, absent on every older/plainer request.
+    #[test]
+    fn new_terminal_decodes_a_fork_id() {
+        let i = decode(r#"{"t":"NewTerminal","pane":3,"launch":"claude","fork":"864ee734-e3ab-434e-8278-745a850b16ad"}"#).unwrap();
+        assert!(
+            matches!(i, Intent::NewTerminal { pane: 3, launch: Some(Launch::Claude), fork: Some(ref f), .. } if f == "864ee734-e3ab-434e-8278-745a850b16ad"),
+            "got {i:?}"
+        );
+        // Absent on an older/plainer request — `#[serde(default)]`, not a
+        // required field.
+        let i = decode(r#"{"t":"NewTerminal","pane":3}"#).unwrap();
+        assert!(matches!(i, Intent::NewTerminal { fork: None, .. }), "got {i:?}");
+    }
+
+    /// The `+` dialog's three wire shapes (#156): a tag field (`k`), the
+    /// same style `Tab` uses, so `Claude`/`Shell` and `Fork`'s own payload
+    /// share one shape instead of one being a bare string and the other an
+    /// object serde's default external tagging would produce.
+    #[test]
+    fn new_worktree_decodes_each_launch_shape_and_an_optional_name() {
+        let i = decode(r#"{"t":"NewWorktree","name":"bright-fox","launch":{"k":"Fork","session":"term3"}}"#).unwrap();
+        assert!(
+            matches!(i, Intent::NewWorktree { name: Some(ref n), launch: Some(WorktreeLaunch::Fork { ref session }) } if n == "bright-fox" && session == "term3"),
+            "got {i:?}"
+        );
+        let i = decode(r#"{"t":"NewWorktree","launch":{"k":"Claude"}}"#).unwrap();
+        assert!(matches!(i, Intent::NewWorktree { name: None, launch: Some(WorktreeLaunch::Claude) }), "got {i:?}");
+        let i = decode(r#"{"t":"NewWorktree","launch":{"k":"Shell"}}"#).unwrap();
+        assert!(matches!(i, Intent::NewWorktree { launch: Some(WorktreeLaunch::Shell), .. }), "got {i:?}");
+        // No launch at all — the name field alone, blank for "generate one".
+        let i = decode(r#"{"t":"NewWorktree"}"#).unwrap();
+        assert!(matches!(i, Intent::NewWorktree { name: None, launch: None }), "got {i:?}");
+    }
+
+    #[test]
+    fn worktree_ready_carries_the_forked_session_id_never_the_terminal_name() {
+        let s = encode(&Event::WorktreeReady {
+            url: "repo/.claude/worktrees/worktree-fox".into(),
+            launch: Some(Launch::Claude),
+            fork: Some("864ee734-e3ab-434e-8278-745a850b16ad".into()),
+        });
+        assert!(s.contains(r#""fork":"864ee734-e3ab-434e-8278-745a850b16ad""#), "{s}");
+        assert!(!s.contains("term3"), "the terminal name the dialog offered must never be on the wire here");
     }
 
     #[test]
