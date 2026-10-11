@@ -50,10 +50,10 @@ pub mod version;
 pub mod watch;
 pub mod workspace;
 pub mod worktree;
-pub mod wtname;
 pub mod wsconn;
 pub mod wsio;
 pub mod wsstate;
+pub mod wtname;
 
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
