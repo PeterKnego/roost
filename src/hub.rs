@@ -231,22 +231,35 @@ fn resumable_terminal_sessions(lost: &[String], project: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether `project` may still end `kill_target`/`name` right now — always
-/// true for a native session (`kill_target == project`), and for a
-/// resident only when the re-home record, re-read at this exact moment,
-/// still names `project` as the owner.
+/// Whether `project` may still end `kill_target`/`name` right now — for a
+/// resident (`kill_target != project`), only when the re-home record,
+/// re-read at this exact moment, still names `project` as the owner; for a
+/// native session (`kill_target == project`), only when that same re-read
+/// says `Here` — never assumed from `kill_target == project` alone.
 ///
-/// R16, Important 1: `do_end_session` reads `kill_target` from
-/// `session_homes` once, under the hub lock, before the kill itself runs —
-/// on its own thread, or inline when none was spawned — so a "Move back"
-/// or a re-point landing in between would otherwise SIGKILL a session this
-/// owner no longer has any claim to. `session::kill_project_inner` already
-/// guards its own resident kills against the identical race the identical
-/// way (re-reading `home::owner_of` immediately before each one, `session.rs`
-/// ~1436) rather than trusting a snapshot taken before the close began.
+/// R16, Important 1 (resident branch): `do_end_session` reads
+/// `kill_target` from `session_homes` once, under the hub lock, before the
+/// kill itself runs — on its own thread, or inline when none was spawned —
+/// so a "Move back" or a re-point landing in between would otherwise
+/// SIGKILL a session this owner no longer has any claim to.
+///
+/// Fix round 2, New Issue 2 (native branch): `session_homes` holds
+/// residents *of* this project, so it says nothing about a *native*
+/// session that was itself re-homed *away* — `kill_target == project`
+/// still holds for it, with no record anywhere upstream to have refused
+/// on its behalf (the end-session confirm dialog's own staleness window,
+/// or a second browser, can land `EndSession` after exactly that move).
+/// Positive evidence is required on both branches now, the same rule
+/// `session::kill_project_inner` already applies to its own kills
+/// (`session.rs` ~1419-1430 for the native case, ~1436 for residents):
+/// `Elsewhere` and `Unknown` both refuse, never just "not `Elsewhere` of
+/// someone else."
 fn may_end(kill_target: &str, name: &str, project: &str) -> bool {
-    kill_target == project
-        || matches!(crate::home::owner_of(kill_target, name), crate::home::Owner::Elsewhere(o) if o == project)
+    if kill_target == project {
+        matches!(crate::home::owner_of(project, name), crate::home::Owner::Here)
+    } else {
+        matches!(crate::home::owner_of(kill_target, name), crate::home::Owner::Elsewhere(o) if o == project)
+    }
 }
 
 impl Hub {
@@ -847,10 +860,14 @@ impl Hub {
         // match and focus the resident's actual tab instead of creating a
         // second, native one and reserving `(this project, session)` for a
         // name this project's own `sock/` can never hold (R16 point 3).
+        //
+        // R17 (fix round 2): normalised unconditionally, not only when the
+        // intent arrives with `home: None` — a forged `OpenTab` naming a
+        // `home` of its own has no more claim to it than a bare one does.
+        // `session_homes` is the only source of truth for what `home`
+        // means on this page; nothing a client sends can override it.
         let intent = match intent {
-            Intent::OpenTab { pane, tab: Tab::Terminal { session, home: None } }
-                if self.session_homes.contains_key(&session) =>
-            {
+            Intent::OpenTab { pane, tab: Tab::Terminal { session, home: _ } } => {
                 let home = self.session_homes.get(&session).cloned();
                 Intent::OpenTab { pane, tab: Tab::Terminal { session, home } }
             }
@@ -1603,6 +1620,20 @@ impl Hub {
                         "roost: {} has a live native terminal {name} and a resident of the same name at {home} — keeping the native one, not tabbing the resident",
                         self.project
                     );
+                    // Fix round 2, New Issue 1: the hidden resident must
+                    // not stay routable through `session_homes` while its
+                    // name is shadowed — `do_end_session`'s `kill_target`
+                    // and the `OpenTab` home-fill-in above both read it,
+                    // and leaving this entry in would let a click on the
+                    // *visible* native tab's × SIGKILL the *hidden*
+                    // resident at its home (its record truly names this
+                    // owner, so `may_end` would pass), or let a bare
+                    // `OpenTab` for `name` push a second tab beside the
+                    // native one. The on-disk record is left alone — only
+                    // this hub's in-memory view of `name` reverts to
+                    // "native" — so the next refresh can pick the resident
+                    // back up the moment the native session actually ends.
+                    self.session_homes.remove(&name);
                     continue;
                 }
                 // Retarget in place — covers both a never-started
@@ -3758,8 +3789,13 @@ mod tests {
     /// directly here rather than actually won, since winning it for real
     /// would make this test flaky by construction. The native tab must
     /// survive untouched and the resident must not get a tab at all; the
-    /// record itself is left alone (not forgotten), so it is still there to
-    /// retry once the native session actually ends.
+    /// *on-disk* record is left alone (not forgotten), so it is still
+    /// there to retry once the native session actually ends — but (fix
+    /// round 2, New Issue 1) `session_homes`, the in-memory router
+    /// `do_end_session` and the `OpenTab` home-fill-in both read, must not
+    /// keep naming the hidden resident's home for this name, or a click on
+    /// the *visible* native tab's × routes straight to the *hidden*
+    /// resident's kill.
     ///
     /// Revert-checked: dropping the `raw_live.contains(&name)` breach guard
     /// (so retargeting proceeds regardless) fails — observed: `assertion
@@ -3797,11 +3833,105 @@ mod tests {
         );
         assert_eq!(
             owner_hub.session_homes.get("term"),
-            Some(&home.to_string()),
-            "the resident is still on record, just not tabbed — nothing here forgets it"
+            None,
+            "the hidden resident must not stay routable through session_homes while its name is shadowed"
+        );
+        assert!(
+            matches!(crate::home::owner_of(home, "term"), crate::home::Owner::Elsewhere(o) if o == owner),
+            "the on-disk record itself must be left alone, so the resident can be retried once the native session ends"
         );
 
         crate::session::kill_project(&owner);
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Fix round 2, New Issue 1: the breach branch above keeps the native
+    /// tab visible and the resident hidden — but before this fix,
+    /// `session_homes["term"]` still named the resident's home, so
+    /// `EndSession` on the *visible* native tab's × read `kill_target` from
+    /// there and SIGKILLed the *hidden* resident instead (`may_end` passed,
+    /// because the on-disk record genuinely names this owner). This is
+    /// `a_live_native_term_blocks_a_second_tab_for_a_resident_of_the_same_name`'s
+    /// same breach fixture, carried one step further: actually end the
+    /// session a user clicking the one visible tab would mean.
+    ///
+    /// Real dtach on both ends: this has to prove which *process* died, not
+    /// just which map entry changed.
+    ///
+    /// Revert-checked: dropping the `self.session_homes.remove(&name)` call
+    /// in the breach branch (restoring the New-Issue-1 defect) fails at
+    /// this test's own setup assertion — observed: `assertion 'left ==
+    /// right' failed\n  left: Some("r17-breach-home")\n right: None` —
+    /// `session_homes["term"]` still names the resident's home, which is
+    /// exactly the defect `EndSession` on the visible tab would then route
+    /// through to SIGKILL the hidden resident instead.
+    #[test]
+    fn end_session_on_the_visible_native_tab_of_a_breach_pair_ends_only_the_native_one() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "r17-breach-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let att_owner = crate::session::reserve_and_attach(&owner, "term", &owner_dir)
+            .expect("/usr/bin/dtach is a runtime prerequisite elsewhere in this project");
+        let att_home = crate::session::reserve_and_attach(home, "term", &home_dir)
+            .expect("/usr/bin/dtach is a runtime prerequisite elsewhere in this project");
+        let owner_sock = crate::session::socket_path(&owner, "term");
+        let home_sock = crate::session::socket_path(home, "term");
+        for sock in [&owner_sock, &home_sock] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !any_process_holds(sock) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(any_process_holds(sock), "setup: both real dtach masters must be up before this test can mean anything");
+        }
+        drop(att_owner);
+        drop(att_home);
+
+        crate::home::record(home, "term", &owner).unwrap();
+
+        // The breach: a live native `term` at the owner, and a resident of
+        // the same name recorded there. `Hub::for_project`'s own
+        // construction hits the breach branch in `refresh_live_sessions`
+        // immediately — the fix under test is that it must not leave the
+        // hidden resident routable through `session_homes`.
+        let owner_hub = Hub::for_project(&owner, owner_dir.clone());
+        assert_eq!(
+            Hub::lock(&owner_hub).session_homes.get("term"),
+            None,
+            "setup: the breach must not leave the hidden resident routable through session_homes"
+        );
+        let (c, _rx) = Hub::lock(&owner_hub).subscribe();
+
+        Hub::lock(&owner_hub).handle(&c, Intent::EndSession { session: "term".into() });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while any_process_holds(&owner_sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(
+            !any_process_holds(&owner_sock),
+            "the visible native tab's End Session must end the native session"
+        );
+        assert!(
+            any_process_holds(&home_sock),
+            "the hidden resident at its home must survive — End Session on the native tab must not reach it"
+        );
+
         crate::session::kill_project(home);
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
@@ -3891,6 +4021,91 @@ mod tests {
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
+    /// Fix round 2, New Issue 2: `may_end`'s native branch used to return
+    /// `true` the instant `kill_target == project`, with no record check —
+    /// but `session_homes` holds residents *of* this project, so it says
+    /// nothing about a *native* session that was itself re-homed *away*.
+    /// `EndSession{n}` sent at `n`'s own home, after `n` moved to a
+    /// worktree under it, must not fall through to an unconditional native
+    /// kill — that would SIGKILL the Claude that now belongs to the
+    /// worktree and forget its record out from under it. Reachable via the
+    /// End-session confirm dialog's own staleness window (app.js) or a
+    /// second browser that has not yet heard the `Rehomed` event.
+    ///
+    /// `Hub::for_project`, the thread path: the fix has to hold off the hub
+    /// lock exactly where the resident branch already does, not just in a
+    /// synchronous fallback.
+    ///
+    /// Revert-checked: reverting `may_end`'s native branch to
+    /// `kill_target == project` (no record check) reproduces the bug —
+    /// observed: no `Error` ever reaches `rx` (`got_refusal` stays false)
+    /// and `any_process_holds` on the home's own socket fails once that
+    /// assertion is reached — the kill proceeds unconditionally.
+    #[test]
+    fn end_session_on_a_home_refuses_a_native_name_rehomed_away() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "r17-nativekill-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let att = crate::session::reserve_and_attach(home, "term", &home_dir)
+            .expect("/usr/bin/dtach is a runtime prerequisite elsewhere in this project");
+        let sock = crate::session::socket_path(home, "term");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up before this test can mean anything");
+        drop(att);
+
+        // Re-homed away from its own home, to a worktree under it — this
+        // project's own `term` is no longer its to end, even though
+        // `session_homes` (residents *of* this project) has nothing to say
+        // about it either way: it is neither a resident here nor, any
+        // more, truly native.
+        crate::home::record(home, "term", &owner).unwrap();
+
+        let home_hub = Hub::for_project(home, home_dir.clone());
+        assert!(
+            Hub::lock(&home_hub).session_homes.get("term").is_none(),
+            "setup: term is not a resident of its own home"
+        );
+        let (c, rx) = Hub::lock(&home_hub).subscribe();
+        drain(&rx);
+
+        Hub::lock(&home_hub).handle(&c, Intent::EndSession { session: "term".into() });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut got_refusal = false;
+        while std::time::Instant::now() < deadline {
+            if drain(&rx).iter().any(|m| m.contains(r#""t":"Error""#)) {
+                got_refusal = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(got_refusal, "the clicker must be told nothing was ended");
+        assert!(
+            any_process_holds(&sock),
+            "a session re-homed away must survive an End Session issued at its own home"
+        );
+
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
     /// R16's Important 2: a client that still thinks a resident's name is
     /// native (`focusSession`'s own-state miss, or a session search result
     /// row — both send a bare `OpenTab{tab:{k:"Terminal", session}}` with
@@ -3947,6 +4162,49 @@ mod tests {
         assert!(
             !crate::session::has_reservation_for_test("r16-homeless-owner", "term3"),
             "a home-less OpenTab for a resident must not reserve this project's own name for it"
+        );
+
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// R17 (fix round 2, folded from the same lines as Important 2): the
+    /// `OpenTab` home-fill-in normalises `home` unconditionally now, not
+    /// only when the intent arrives with `home: None` — a forged
+    /// `OpenTab{Terminal{n, home: Some(x)}}` for a name that is actually
+    /// native has no more claim to `x` than a bare one would, and
+    /// `session_homes` is the only source of truth for what `home` means
+    /// on this page.
+    ///
+    /// Revert-checked: narrowing the `match` back to `home: None` (the
+    /// round-1 body) lets the forged `home` through unchanged — observed:
+    /// `assertion 'left == right' failed\n  left: [("term",
+    /// Some("elsewhere")), ("term", None)]\n right: [("term", None)]` — a
+    /// second tab is pushed under the forged home instead of the existing
+    /// native one being focused.
+    #[test]
+    fn a_forged_home_on_open_tab_is_normalized_to_the_truth() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("r17-forged-owner", d.path().to_path_buf());
+        // "term" is native here (default_layout's own placeholder) and not
+        // a resident of anything — `session_homes` has no entry for it.
+        assert!(h.session_homes.get("term").is_none(), "setup");
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::Terminal { session: "term".into(), home: Some("elsewhere".into()) },
+            },
+        );
+
+        assert_eq!(
+            terminal_tabs(&h),
+            vec![("term".to_string(), None)],
+            "still exactly one tab, and it must not have taken the forged home at face value"
         );
 
         std::env::remove_var("ROOST_STATE_DIR");
