@@ -193,6 +193,57 @@ pub fn create(
     Ok(Created { name, path, base })
 }
 
+/// `create`, with the name supplied (by Claude Code, or by roost's own
+/// generator) instead of minted as `claude-N`. A taken name is refused, not
+/// suffixed: the asker named this worktree, and giving it another one is the
+/// disagreement between roost and Claude Code that this exists to remove.
+pub fn create_named(
+    repo: &Path,
+    state_dir: &Path,
+    name: &str,
+    wt_key_of: &dyn Fn(&str) -> String,
+    run: GitRunner,
+) -> Result<Created, String> {
+    crate::wtname::check(name)?;
+    if !crate::gitio::is_inside_work_tree(repo) {
+        return Err("not a git repository".into());
+    }
+    let canon = repo.canonicalize().map_err(|e| format!("cannot resolve project directory: {e}"))?;
+    let ws = list(repo);
+    if ws.is_empty() {
+        return Err("git did not answer (worktree list)".into());
+    }
+    match ws.iter().find(|w| w.path.canonicalize().ok().as_deref() == Some(canon.as_path())) {
+        Some(w) if w.is_main => {}
+        _ => return Err("start worktrees from the main checkout".into()),
+    }
+    let dir = crate::wtname::dir_name(name);
+    let out = run(repo, &["branch", "--list", &dir])
+        .map_err(|e| format!("cannot tell whether branch {dir} exists: {e}"))?;
+    if !out.trim().is_empty() {
+        return Err(format!("branch {dir} already exists"));
+    }
+    match std::fs::symlink_metadata(repo.join(".claude/worktrees").join(&dir)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err(format!(".claude/worktrees/{dir} already exists")),
+        Err(e) => return Err(format!("cannot tell whether .claude/worktrees/{dir} exists: {e}")),
+    }
+    std::fs::create_dir_all(repo.join(".claude/worktrees")).map_err(|e| e.to_string())?;
+    let rel = format!(".claude/worktrees/{dir}");
+    let path = crate::projects::safe_resolve_parent(repo, &rel)?;
+    let base = match run(repo, &["symbolic-ref", "--short", "HEAD"]) {
+        Ok(b) if !b.trim().is_empty() => b.trim().to_string(),
+        _ => run(repo, &["rev-parse", "HEAD"]).map_err(|e| format!("cannot read HEAD: {e}"))?.trim().to_string(),
+    };
+    let key = wt_key_of(&dir);
+    write_base(state_dir, &key, &base)?;
+    if let Err(e) = run(repo, &["worktree", "add", "-b", &dir, &rel, "HEAD"]) {
+        let _ = std::fs::remove_file(base_file(state_dir, &key));
+        return Err(format!("git worktree add failed: {e}"));
+    }
+    Ok(Created { name: dir, path, base })
+}
+
 /// `git worktree remove` without `--force`, then `git branch -d` without
 /// `-D`. git's own refusals are gates that share no code with the caller's
 /// checks: a dirty tree stops step one, an unmerged branch stops step two.
@@ -601,5 +652,48 @@ mod tests {
         let err = remove(&repo, &c.path, "claude-1", &real_git).unwrap_err();
         assert!(err.contains("worktree remove"), "{err}");
         assert!(c.path.join("n.txt").is_file(), "nothing touched");
+    }
+
+    fn git_repo() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        for a in [&["init", "-q", "-b", "main"][..], &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "i"][..]] {
+            assert!(std::process::Command::new("git").args(a).current_dir(d.path()).status().unwrap().success());
+        }
+        d
+    }
+
+    #[test]
+    fn create_named_uses_claude_codes_convention_and_records_head() {
+        let repo = git_repo();
+        let st = tempfile::tempdir().unwrap();
+        let c = create_named(repo.path(), st.path(), "bright-fox", &|n| format!("k-{n}"), &real_git).unwrap();
+        assert_eq!(c.name, "worktree-bright-fox");
+        assert!(c.path.ends_with(".claude/worktrees/worktree-bright-fox"));
+        let br = real_git(&c.path, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(br.trim(), "worktree-bright-fox");
+        assert_eq!(read_base(st.path(), "k-worktree-bright-fox").as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn create_named_refuses_a_taken_name_instead_of_suffixing() {
+        let repo = git_repo();
+        let st = tempfile::tempdir().unwrap();
+        create_named(repo.path(), st.path(), "x", &|n| n.to_string(), &real_git).unwrap();
+        let e = create_named(repo.path(), st.path(), "x", &|n| n.to_string(), &real_git).unwrap_err();
+        // Revert-checked: without the `branch --list` early return, the error is
+        // `.claude/worktrees/worktree-x already exists` (the directory check fails
+        // because it exists after git created it), not `branch worktree-x already exists`.
+        assert!(e.starts_with("branch worktree-x already exists"), "{e}");
+        assert_eq!(list(repo.path()).len(), 2, "no second worktree");
+    }
+
+    #[test]
+    fn create_named_refuses_an_invalid_name_before_running_git() {
+        let ran = std::cell::Cell::new(false);
+        let run = |_: &Path, _: &[&str]| -> Result<String, String> { ran.set(true); Ok(String::new()) };
+        let st = tempfile::tempdir().unwrap();
+        let e = create_named(Path::new("/nonexistent"), st.path(), "--x", &|n| n.to_string(), &run).unwrap_err();
+        assert!(e.contains("must match"), "{e}");
+        assert!(!ran.get(), "git ran for a refused name");
     }
 }
