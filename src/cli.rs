@@ -452,6 +452,149 @@ pub fn run_wait(args: &[String]) -> i32 {
     }
 }
 
+/// `roost worktree-hook`'s decision, separated from the socket connect and
+/// the printing so every row of the spec's table (#156) is a test.
+#[derive(Debug)]
+pub enum HookOutcome {
+    Print(String),
+    Refuse(String),
+}
+
+/// `roost worktree-hook`'s decision, separated from its I/O so every row of
+/// the spec's table (§2) is a test. Falling back to creating when roost
+/// cannot be reached is deliberate and is the one permissive default in this
+/// codebase: creating a worktree destroys nothing, and refusing would break
+/// `claude --worktree` outside roost and across every roost restart.
+///
+/// `env_project`/`env_session` are parameters, not reads of `ROOST_PROJECT`/
+/// `ROOST_SESSION` — only `run_worktree_hook` reads the real environment, so
+/// a test never has to set process-wide state to drive this.
+pub fn worktree_hook_core(
+    payload: &serde_json::Value,
+    env_project: Option<String>,
+    env_session: Option<String>,
+    connect: &dyn Fn() -> std::io::Result<std::os::unix::net::UnixStream>,
+    fallback_create: &dyn Fn(&std::path::Path, &str, Option<&str>) -> Result<String, String>,
+) -> HookOutcome {
+    use std::io::{BufRead, BufReader, Write};
+    let s = |k: &str| payload.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let (name, cwd, sid) = (s("name"), s("cwd"), s("session_id"));
+    if let Err(e) = crate::wtname::check(&name) {
+        return HookOutcome::Refuse(e);
+    }
+    let fallback = |proj: Option<&str>| match fallback_create(std::path::Path::new(&cwd), &name, proj) {
+        Ok(p) => HookOutcome::Print(p),
+        Err(e) => HookOutcome::Refuse(e),
+    };
+    let (project, session) = match (env_project.clone(), env_session) {
+        (Some(p), Some(s)) => (p, s),
+        // No roost terminal: `claude --worktree` outside roost entirely.
+        // There is no project to pass the fallback either.
+        _ => return fallback(None),
+    };
+    let stream = match connect() {
+        Ok(s) => s,
+        // Both read as "roost is not here to ask" — a stale/missing socket
+        // file (`NotFound`) and a socket with nothing listening on it
+        // (`ConnectionRefused`, the shape a dead roost's unlinked-on-next-start
+        // socket leaves between restarts) — so both fall back the same way.
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
+            return fallback(Some(&project))
+        }
+        Err(e) => return HookOutcome::Refuse(format!("roost: cannot reach roost to approve a worktree: {e}")),
+    };
+    let req = serde_json::json!({
+        "op": "worktree_create",
+        "project": project,
+        "session": session,
+        "name": name,
+        "cwd": cwd,
+        "session_id": sid,
+    });
+    let mut w = &stream;
+    if writeln!(w, "{req}").is_err() {
+        return HookOutcome::Refuse("roost: could not send the request".into());
+    }
+    let mut line = String::new();
+    match BufReader::new(&stream).read_line(&mut line) {
+        Ok(0) | Err(_) => {
+            return HookOutcome::Refuse("roost: no answer from roost (it may have restarted); not creating".into())
+        }
+        Ok(_) => {}
+    }
+    let v: serde_json::Value = match serde_json::from_str(line.trim_end()) {
+        Ok(v) => v,
+        Err(_) => return HookOutcome::Refuse("roost: unreadable answer from roost; not creating".into()),
+    };
+    if let Some(p) = v.get("path").and_then(|p| p.as_str()) {
+        return HookOutcome::Print(p.to_string());
+    }
+    let why = v.get("refuse").and_then(|r| r.as_str()).unwrap_or("refused");
+    HookOutcome::Refuse(format!("roost: {why}"))
+}
+
+/// Pulled out of `run_worktree_hook` so the exit-code/stream mapping itself
+/// is one small pure function a test can drive directly, rather than only
+/// ever being exercised as a side effect of printing to real stdout/stderr.
+fn render_outcome(o: HookOutcome) -> (i32, String) {
+    match o {
+        HookOutcome::Print(p) => (0, p),
+        HookOutcome::Refuse(r) => (1, r),
+    }
+}
+
+/// `roost worktree-hook`: Claude Code's `WorktreeCreate` hook (#156). JSON on
+/// stdin; a path on stdout (exit 0) replaces Claude Code's own
+/// `git worktree add`, a reason on stderr (exit 1) refuses it.
+pub fn run_worktree_hook() -> i32 {
+    use std::io::Read;
+    let mut input = String::new();
+    if std::io::stdin().take(1 << 20).read_to_string(&mut input).is_err() {
+        eprintln!("roost worktree-hook: could not read the hook payload");
+        return 1;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) else {
+        eprintln!("roost worktree-hook: payload is not JSON");
+        return 1;
+    };
+    let outcome = worktree_hook_core(
+        &v,
+        std::env::var("ROOST_PROJECT").ok(),
+        std::env::var("ROOST_SESSION").ok(),
+        &|| std::os::unix::net::UnixStream::connect(crate::hooksock::socket_path()),
+        &|repo, name, env_project| {
+            // Keyed like the hub does when the project is known
+            // (`ROOST_PROJECT` set — roost is just unreachable right now),
+            // so an approval later from inside roost finds the same `.base`.
+            // With no project at all (outside roost entirely) there is no
+            // project URL to key by, so the absolute repo path is the only
+            // identifier available; that is a different key than the hub
+            // would use for the same worktree, so its state shows "base
+            // unknown" in the switcher until the two keyings are reconciled
+            // (#157).
+            let key_of = |d: &str| match env_project {
+                Some(project) => crate::projects::storage_key(&format!("{project}/.claude/worktrees/{d}")),
+                None => crate::projects::storage_key(&format!("{}/.claude/worktrees/{d}", repo.display())),
+            };
+            crate::worktree::create_named(repo, &crate::wsstate::state_dir(), name, &key_of, &crate::worktree::real_git)
+                .map(|c| c.path.to_string_lossy().into_owned())
+        },
+    );
+    let (code, line) = render_outcome(outcome);
+    // The path on stdout is the entire contract (Claude Code reads it as
+    // the decision) — nothing else, ever, may reach stdout, including
+    // whatever `create_named`'s `git` calls print: `worktree::real_git`
+    // runs through `gitio::run_git`, which pipes the child's stdout rather
+    // than inheriting this process's, so a verbose `git worktree add` can
+    // never leak onto this stdout.
+    if code == 0 {
+        println!("{line}");
+    } else {
+        eprintln!("{line}");
+    }
+    code
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,5 +827,198 @@ mod tests {
     fn a_cycle_or_pid_1_ends_the_walk() {
         assert_eq!(ancestor_tty(10, &table(&[(10, 10, 0)])), None, "self-parented");
         assert_eq!(ancestor_tty(10, &table(&[(10, 1, 0), (1, 0, 0)])), None, "init has no tty");
+    }
+
+    // --- `roost worktree-hook` (Task 8) ---
+
+    fn payload(name: &str) -> serde_json::Value {
+        serde_json::json!({"hook_event_name":"WorktreeCreate","session_id":"s1","cwd":"/repo","name":name})
+    }
+    fn no_socket() -> std::io::Result<std::os::unix::net::UnixStream> {
+        Err(std::io::ErrorKind::NotFound.into())
+    }
+
+    #[test]
+    fn outside_roost_creates_without_asking() {
+        let out = worktree_hook_core(
+            &payload("fox"),
+            None,
+            None,
+            &|| panic!("must not connect"),
+            &|_, n, p| {
+                assert_eq!(p, None, "no ROOST_PROJECT means no project to pass the fallback either");
+                Ok(format!("/repo/.claude/worktrees/worktree-{n}"))
+            },
+        );
+        assert!(matches!(out, HookOutcome::Print(p) if p.ends_with("worktree-fox")));
+    }
+
+    #[test]
+    fn roost_unreachable_falls_back_to_creating() {
+        let out = worktree_hook_core(
+            &payload("fox"),
+            Some("p".into()),
+            Some("term".into()),
+            &no_socket,
+            &|_, n, p| {
+                assert_eq!(p, Some("p"), "ROOST_PROJECT is set, so the fallback must see it too");
+                Ok(format!("/w/{n}"))
+            },
+        );
+        assert!(matches!(out, HookOutcome::Print(_)));
+    }
+
+    #[test]
+    fn a_refuse_reply_is_refused_with_its_reason() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            crate::hooksock::serve_one(b, &|_| crate::hooksock::AskReply::Refuse {
+                refuse: "nobody approved".into(),
+            })
+        });
+        let a = std::sync::Mutex::new(Some(a));
+        let out = worktree_hook_core(
+            &payload("fox"),
+            Some("p".into()),
+            Some("term".into()),
+            &|| Ok(a.lock().unwrap().take().unwrap()),
+            &|_, _, _| panic!("must not fall back"),
+        );
+        server.join().unwrap();
+        assert!(matches!(out, HookOutcome::Refuse(r) if r.contains("nobody approved")));
+    }
+
+    // R3 (controller correction): dropping the peer *before* the client
+    // writes anything exercises the "could not send the request" branch,
+    // not "no answer" — the write itself fails against an already-dead
+    // peer. The real "roost restarted mid-ask" case is that the server
+    // *received* the request and then vanished without replying: a thread
+    // here reads exactly one line off `b` (proving the request landed) and
+    // then drops it, closing the connection with no reply ever written.
+    #[test]
+    fn hook_exits_1_when_server_drops_connection() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(&b), &mut line);
+            // `b` drops here: the request was read, but no reply is ever sent.
+        });
+        let a = std::sync::Mutex::new(Some(a));
+        let out = worktree_hook_core(
+            &payload("fox"),
+            Some("p".into()),
+            Some("term".into()),
+            &|| Ok(a.lock().unwrap().take().unwrap()),
+            &|_, _, _| panic!("must not fall back"),
+        );
+        server.join().unwrap();
+        assert!(matches!(out, HookOutcome::Refuse(ref r) if r.contains("no answer")), "{out:?}");
+    }
+
+    // Controller ruling: "busy" (the connection-cap refusal in
+    // `hooksock::serve_listener`) travels through the same generic refuse
+    // path as any other reason, and must exit 1 with "busy" on stderr.
+    // Driven through `render_outcome` (not just the `HookOutcome` itself) so
+    // this actually pins the exit-code mapping `run_worktree_hook` uses,
+    // not merely that the reply was read correctly.
+    #[test]
+    fn a_busy_reply_exits_1_with_busy_on_stderr() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            crate::hooksock::serve_one(b, &|_| crate::hooksock::AskReply::Refuse { refuse: "busy".into() })
+        });
+        let a = std::sync::Mutex::new(Some(a));
+        let out = worktree_hook_core(
+            &payload("fox"),
+            Some("p".into()),
+            Some("term".into()),
+            &|| Ok(a.lock().unwrap().take().unwrap()),
+            &|_, _, _| panic!("must not fall back"),
+        );
+        server.join().unwrap();
+        let (code, line) = render_outcome(out);
+        assert_eq!(code, 1);
+        assert!(line.contains("busy"), "{line}");
+    }
+
+    #[test]
+    fn an_invalid_name_is_refused_before_anything() {
+        let out = worktree_hook_core(&payload("--evil"), None, None, &|| panic!(), &|_, _, _| panic!());
+        assert!(matches!(out, HookOutcome::Refuse(r) if r.contains("must match")));
+    }
+
+    // Controller ruling (R5): the fallback path must never let anything but
+    // the path reach stdout, including the `git` calls `create_named` makes
+    // on roost's behalf — Claude Code reads stdout as the decision. Drives
+    // `run_worktree_hook`'s real fallback end to end in a temp git repo,
+    // with no `ROOST_*` env set, so this is the "outside roost entirely"
+    // row of the table.
+    #[test]
+    fn fallback_end_to_end_creates_a_real_worktree() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let repo = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(run(&["init", "-q", "-b", "main"]).status.success());
+        assert!(run(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"])
+            .status
+            .success());
+
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let prev_project = std::env::var_os("ROOST_PROJECT");
+        let prev_session = std::env::var_os("ROOST_SESSION");
+        std::env::remove_var("ROOST_PROJECT");
+        std::env::remove_var("ROOST_SESSION");
+
+        let payload = serde_json::json!({
+            "hook_event_name": "WorktreeCreate",
+            "session_id": "s1",
+            "cwd": repo.path().to_string_lossy(),
+            "name": "e2eunit",
+        });
+        let out = worktree_hook_core(
+            &payload,
+            std::env::var("ROOST_PROJECT").ok(),
+            std::env::var("ROOST_SESSION").ok(),
+            &|| std::os::unix::net::UnixStream::connect(crate::hooksock::socket_path()),
+            &|repo, name, env_project| {
+                let key_of = |d: &str| match env_project {
+                    Some(project) => crate::projects::storage_key(&format!("{project}/.claude/worktrees/{d}")),
+                    None => crate::projects::storage_key(&format!("{}/.claude/worktrees/{d}", repo.display())),
+                };
+                crate::worktree::create_named(repo, &crate::wsstate::state_dir(), name, &key_of, &crate::worktree::real_git)
+                    .map(|c| c.path.to_string_lossy().into_owned())
+            },
+        );
+
+        std::env::remove_var("ROOST_STATE_DIR");
+        match prev_project {
+            Some(v) => std::env::set_var("ROOST_PROJECT", v),
+            None => std::env::remove_var("ROOST_PROJECT"),
+        }
+        match prev_session {
+            Some(v) => std::env::set_var("ROOST_SESSION", v),
+            None => std::env::remove_var("ROOST_SESSION"),
+        }
+
+        let HookOutcome::Print(p) = out else { panic!("expected Print, got {out:?}") };
+        let created = std::path::PathBuf::from(&p);
+        assert!(created.is_dir(), "{p} must exist");
+        let branch_out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&created)
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(branch_out.status.success());
+        let branch_name = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+        assert_eq!(branch_name, "worktree-e2eunit", "{branch_name}");
     }
 }
