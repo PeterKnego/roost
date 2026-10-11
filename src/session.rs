@@ -334,12 +334,19 @@ pub fn begin_close_except(project: &str, keep: &[String]) -> Vec<String> {
 /// this close will end — closing, in the same acquisition, so there is no
 /// moment between marking them and killing them in which an attach is
 /// authorised. Paired with [`end_close_ending`] on the same `ending`.
+///
+/// `keep` spares map entries and reservations from the drain; it does *not*
+/// exempt them from the refusal. Every name starts refused, and only
+/// [`exempt_from_close`] lifts that, after the caller has re-read what it
+/// will and will not kill. `keep` was read before the close began, so a name
+/// in it may have been moved back since — and an exemption granted from it
+/// would authorise an attach to a session this close then kills.
 pub fn begin_close_ending(project: &str, keep: &[String], ending: &[(String, String)]) -> Vec<String> {
     let skey = crate::projects::storage_key(project);
     let prefix = format!("{skey}/");
     let kept = |k: &str| k.strip_prefix(&prefix).is_some_and(|n| keep.iter().any(|x| x == n));
     let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
-    guard.closing.insert(skey, keep.iter().cloned().collect());
+    guard.closing.insert(skey, Default::default());
     for (home, name) in ending {
         *guard.closing_sessions.entry(key_for(home, name)).or_insert(0) += 1;
     }
@@ -357,6 +364,17 @@ pub fn begin_close_ending(project: &str, keep: &[String], ending: &[(String, Str
         }
     }
     names
+}
+
+/// Lets attaches to `names` through a close of `project` that is in progress.
+/// For names the close has re-read and decided not to end; a no-op once the
+/// close is over, so a late call cannot leave a mark behind.
+pub fn exempt_from_close(project: &str, names: &[String]) {
+    let skey = crate::projects::storage_key(project);
+    let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(exempt) = guard.closing.get_mut(&skey) {
+        exempt.extend(names.iter().cloned());
+    }
 }
 
 /// Closes a close. Until this runs every attach on the project is refused,
@@ -1291,7 +1309,7 @@ pub fn kill_project(project: &str) -> usize {
 /// [`kill_project`] with the owner check injected, so tests do not depend on
 /// the configured roots. `resolves(home, owner)` is `home::resolves`.
 pub(crate) fn kill_project_with(project: &str, resolves: &dyn Fn(&str, &str) -> bool) -> usize {
-    kill_project_inner(project, resolves, &|| {})
+    kill_project_inner(project, resolves, &|_| {})
 }
 
 /// Clears a close's marks when dropped — at the end of [`kill_project_inner`]
@@ -1308,11 +1326,24 @@ impl Drop for CloseMarks<'_> {
     }
 }
 
-/// The body of [`kill_project`]. `between` runs after the project's own
-/// sessions are ended and before its residents are: the window in which a
-/// resident's record can change under the close, which a test has to be able
-/// to enter without timing.
-pub(crate) fn kill_project_inner(project: &str, resolves: &dyn Fn(&str, &str) -> bool, between: &dyn Fn()) -> usize {
+/// Points inside [`kill_project_inner`] where a record can change under the
+/// close. A test enters each through the `at` hook instead of a timing race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseStage {
+    /// The close is marked; this project's records are not yet re-read.
+    BeforeOwnRead,
+    /// Re-read and decided; this project's own sessions are not yet ended.
+    BeforeOwnKills,
+    /// Own sessions ended; residents not yet re-read or ended.
+    BeforeResidents,
+}
+
+/// The body of [`kill_project`], with `at` called at each [`CloseStage`].
+pub(crate) fn kill_project_inner(
+    project: &str,
+    resolves: &dyn Fn(&str, &str) -> bool,
+    at: &dyn Fn(CloseStage),
+) -> usize {
     // Read before `begin_close_ending`, which holds the global session lock:
     // these are file reads. Every away name is kept, `Unknown` included — an
     // unreadable record is not permission to drain a session either.
@@ -1353,7 +1384,7 @@ pub(crate) fn kill_project_inner(project: &str, resolves: &dyn Fn(&str, &str) ->
     // killed. `kill_and_unlink` ends whatever holds each socket, which is the
     // dtach master, so it works whether or not this process ever attached.
     let mut all_names = removed_names;
-    for name in socket_names(project) {
+    for name in socket_names(project).into_iter().chain(keep) {
         if !all_names.contains(&name) {
             all_names.push(name);
         }
@@ -1364,15 +1395,31 @@ pub(crate) fn kill_project_inner(project: &str, resolves: &dyn Fn(&str, &str) ->
     // Re-read rather than taken from `keep`: a record written since then
     // must still spare its session, and a stale entry in `keep` only cost a
     // map entry that the kill below takes down with its pump anyway.
+    //
+    // The same re-read is what exempts. Everything stays refused until it
+    // has run, and only what it spares is let through: a name that was away
+    // when the close began and was moved back since is killed below, and an
+    // attach authorised to it in the meantime would land during that kill.
+    // The cost is that a resident which really is staying refuses for the
+    // few milliseconds these record reads take — a browser retrying a
+    // refused connect is recoverable, an attach racing a kill is not.
+    at(CloseStage::BeforeOwnRead);
+    let mut spared = Vec::new();
     all_names.retain(|n| match crate::home::owner_of(project, n) {
         crate::home::Owner::Here => true,
-        crate::home::Owner::Elsewhere(_) => false,
+        crate::home::Owner::Elsewhere(_) => {
+            spared.push(n.clone());
+            false
+        }
         crate::home::Owner::Unknown(why) => {
             eprintln!("roost: Close Project left {project}/{n} running: {why}");
+            spared.push(n.clone());
             false
         }
     });
+    exempt_from_close(project, &spared);
 
+    at(CloseStage::BeforeOwnKills);
     let mut ended = 0;
     for name in &all_names {
         if end_socket(project, name, "Close Project") {
@@ -1381,7 +1428,7 @@ pub(crate) fn kill_project_inner(project: &str, resolves: &dyn Fn(&str, &str) ->
     }
     // Inside the close span, like the project's own. `end_session` on the
     // home: the socket, the map key and every per-session record are there.
-    between();
+    at(CloseStage::BeforeResidents);
     for (home, name) in &residents {
         // Re-read, as the project's own names are above: `residents` was
         // computed before the close, and a "Move back" or a re-point since
@@ -2668,11 +2715,13 @@ mod tests {
 
     /// The record is re-pointed after `residents` was computed and before the
     /// resident is ended — a "Move back" landing mid-close. Driven through
-    /// the `between` hook, so no timing is involved.
+    /// the `at` hook at `CloseStage::BeforeResidents`, so no timing is involved.
     ///
     /// Revert-checked (Task 4 fix round 1): with the `owner_of` re-check
     /// before `end_session` deleted, fails on "an owner's close ended a
-    /// session re-homed away from it mid-close".
+    /// session re-homed away from it mid-close". Fix round 2: with the
+    /// `CloseMarks` guard replaced by `std::mem::forget(CloseMarks { .. })`,
+    /// fails on "once the close returns its marks are gone".
     #[test]
     fn owner_close_spares_a_resident_rehomed_away_mid_close() {
         let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2691,12 +2740,25 @@ mod tests {
         crate::home::record(&home, "term3", &owner).unwrap();
 
         let ran = std::cell::Cell::new(false);
-        let ended = kill_project_inner(&owner, &|_, _| true, &|| {
-            crate::home::record(&home, "term3", &other).unwrap();
-            ran.set(true);
+        let mid = std::cell::RefCell::new(None);
+        let ended = kill_project_inner(&owner, &|_, _| true, &|st| {
+            if st == CloseStage::BeforeResidents {
+                crate::home::record(&home, "term3", &other).unwrap();
+                *mid.borrow_mut() = Some(attach(&home, "term3", dir.path()).map(|_| ()));
+                ran.set(true);
+            }
         });
 
         assert!(ran.get(), "setup: the hook ran between computing residents and ending them");
+        assert_eq!(
+            mid.borrow().clone().and_then(|r| r.err()),
+            Some(AttachRefusal::Closing.to_string()),
+            "while the owner's close holds it, the resident's own key refuses"
+        );
+        assert!(
+            attach(&home, "term3", dir.path()).is_ok(),
+            "once the close returns its marks are gone, or the resident is unreachable for good"
+        );
         assert!(any_process_holds(&sock), "an owner's close ended a session re-homed away from it mid-close");
         assert_eq!(ended, 0);
         assert!(matches!(crate::home::owner_of(&home, "term3"), crate::home::Owner::Elsewhere(o) if o == other));
@@ -2748,6 +2810,9 @@ mod tests {
     /// Revert-checked (Task 4 fix round 1): with `is_closing` refusing every
     /// name of a closing project (the old whole-skey rule), fails on "an
     /// exempt resident must stay attachable…: Err(\"the project is closing\")".
+    /// Fix round 2: with the post-re-read `exempt_from_close` call removed,
+    /// the same message; with `Here` names exempted too, "everything else in
+    /// the home is still refused" (left: None).
     #[test]
     fn attach_to_a_kept_resident_is_allowed_while_its_home_closes() {
         let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2757,19 +2822,71 @@ mod tests {
         std::env::set_var("ROOST_STATE_DIR", state.path());
         let dir = tempfile::tempdir().unwrap();
         let home = format!("rehomehomeclosing{}", std::process::id());
+        let owner = format!("{home}/.claude/worktrees/worktree-x");
+
+        let _att3 = start_real_dtach(&home, "term3", dir.path());
+        let _att4 = start_real_dtach(&home, "term4", dir.path());
+        let _reap = ReapOnDrop(vec![sock_path(&home, "term3"), sock_path(&home, "term4")]);
+        crate::home::record(&home, "term3", &owner).unwrap();
+
+        let seen = std::cell::RefCell::new(None);
+        kill_project_inner(&home, &|_, _| true, &|st| {
+            if st == CloseStage::BeforeOwnKills {
+                *seen.borrow_mut() = Some((
+                    attach(&home, "term3", dir.path()).map(|_| ()),
+                    attach(&home, "term4", dir.path()).map(|_| ()),
+                ));
+            }
+        });
+        let (kept, other) = seen.into_inner().expect("setup: the hook ran");
+
+        assert!(kept.is_ok(), "an exempt resident must stay attachable during its home's close: {kept:?}");
+        assert_eq!(other.err(), Some(AttachRefusal::Closing.to_string()), "everything else in the home is still refused");
+        assert!(any_process_holds(&sock_path(&home, "term3")), "and the resident survives the close");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// A session re-homed when the home's close began and moved back before
+    /// the close re-reads it is killed by that close — so for that span it
+    /// must be refusable, never still exempt. On the `Probe` path an attach
+    /// authorised there is a `dtach -A` landing during the kill.
+    ///
+    /// Revert-checked (Task 4 fix round 2): on a142194, where the exempt set
+    /// was the pre-close `keep`, and again with `begin_close_ending` seeding
+    /// it from `keep`, fails on "a name the close is about to kill was still
+    /// exempt" (left: None).
+    #[test]
+    fn attach_to_a_session_moved_back_mid_home_close_is_refused() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let dir = tempfile::tempdir().unwrap();
+        let home = format!("rehomemovedback{}", std::process::id());
+        let owner = format!("{home}/.claude/worktrees/worktree-x");
 
         let _att = start_real_dtach(&home, "term3", dir.path());
         let sock = sock_path(&home, "term3");
         let _reap = ReapOnDrop(vec![sock.clone()]);
+        crate::home::record(&home, "term3", &owner).unwrap();
 
-        begin_close_except(&home, &["term3".to_string()]);
-        let kept = attach(&home, "term3", dir.path()).map(|_| ());
-        reserve(&home, "term4", None);
-        let other = attach(&home, "term4", dir.path()).map(|_| ());
-        end_close(&home);
+        let seen = std::cell::RefCell::new(None);
+        let ended = kill_project_inner(&home, &|_, _| true, &|st| match st {
+            CloseStage::BeforeOwnRead => crate::home::forget(&home, "term3"),
+            CloseStage::BeforeOwnKills => {
+                *seen.borrow_mut() = Some(attach(&home, "term3", dir.path()).map(|_| ()));
+            }
+            CloseStage::BeforeResidents => {}
+        });
 
-        assert!(kept.is_ok(), "an exempt resident must stay attachable during its home's close: {kept:?}");
-        assert_eq!(other.err(), Some(AttachRefusal::Closing.to_string()), "everything else in the home is still refused");
+        assert_eq!(
+            seen.into_inner().expect("setup: the hook ran").err(),
+            Some(AttachRefusal::Closing.to_string()),
+            "a name the close is about to kill was still exempt"
+        );
+        assert_eq!(ended, 1, "moved back, so it is the home's and is ended");
+        assert!(!any_process_holds(&sock));
         std::env::remove_var("ROOST_STATE_DIR");
     }
 }
