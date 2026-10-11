@@ -134,6 +134,19 @@ fn serve_one_with_deadline(stream: UnixStream, ask: &dyn Fn(AskRequest) -> AskRe
             Ok(0) => break,
             Ok(n) => {
                 if let Some(pos) = chunk[..n].iter().position(|&c| c == b'\n') {
+                    // R21a: the cap below only ran on a newline-free chunk,
+                    // so a chunk that happened to *contain* the newline
+                    // was accepted unconditionally, however large it made
+                    // the total — up to a whole chunk (4096 bytes) over
+                    // `MAX_REQUEST`. Checked here too, against the exact
+                    // size this line would have *including* the newline,
+                    // before ever accepting it.
+                    if (buf.len() + pos + 1) as u64 > MAX_REQUEST {
+                        return reply(
+                            &stream,
+                            &AskReply::Refuse { refuse: "request too large".into() },
+                        );
+                    }
                     buf.extend_from_slice(&chunk[..=pos]);
                     break;
                 }
@@ -145,8 +158,19 @@ fn serve_one_with_deadline(stream: UnixStream, ask: &dyn Fn(AskRequest) -> AskRe
             // A per-read timeout firing is not a failure, only a prompt to
             // re-check the total deadline above — `WouldBlock` is what a
             // nonblocking-style timeout reports on some platforms,
-            // `TimedOut` on others; treat both the same way.
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+            // `TimedOut` on others; treat both the same way. R21c:
+            // `Interrupted` (EINTR, a signal landing mid-syscall) is
+            // likewise not a failure and must retry the same way — folding
+            // it into the catch-all `Err(_) => break` below would read an
+            // ordinary, transient signal as "the peer is gone".
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
                 continue;
             }
             // Any other read error (peer reset, etc.) is treated like EOF:
@@ -215,8 +239,23 @@ pub fn start() -> Result<(), String> {
     // roost's own state root is not destructive (unlike anything this
     // module does to `state/hook` itself), so no positive-evidence dance
     // is needed here the way there is below for the socket file.
+    //
+    // R21b: `recursive(true)` + `.mode(0o700)` rather than
+    // `create_dir_all` followed by an unconditional `set_permissions` (the
+    // shape `wsstate::save` uses) — `DirBuilder`'s recursive creation only
+    // ever calls `mkdir` for a path segment that does not already exist,
+    // so the mode is applied solely to whatever this call actually
+    // creates. A directory that was already there — however it got its
+    // mode, including one an operator deliberately widened — is never
+    // touched, matching CLAUDE.md: only what this call created is ours to
+    // set the mode on.
+    use std::os::unix::fs::DirBuilderExt;
     let state = crate::wsstate::state_dir();
-    std::fs::create_dir_all(&state).map_err(|e| format!("create {}: {e}", state.display()))?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&state)
+        .map_err(|e| format!("create {}: {e}", state.display()))?;
 
     let dir = socket_dir();
     match std::fs::symlink_metadata(&dir) {
@@ -230,7 +269,8 @@ pub fn start() -> Result<(), String> {
             // bits that 0o700 does not set in the first place, so this
             // reliably produces 0700 without touching process-global state.
             // `verify_socket_dir` below is the actual guarantee, not this.
-            use std::os::unix::fs::DirBuilderExt;
+            // (`DirBuilderExt` is already imported above, for the state
+            // root's own `DirBuilder` call.)
             std::fs::DirBuilder::new()
                 .mode(0o700)
                 .create(&dir)
@@ -307,6 +347,33 @@ fn serve_listener<F>(l: UnixListener, cap: usize, me: u32, ask: F)
 where
     F: Fn(AskRequest) -> AskReply + Send + Sync + 'static,
 {
+    // A drop guard that frees one slot. Round 1 built this *inside* the
+    // spawned closure's body (`let _guard = Guard(counter);` as the first
+    // statement run once the thread actually started). That is wrong: if
+    // `Builder::spawn` itself fails — thread exhaustion, exactly the
+    // condition `cap` exists to defend against — the closure it was given
+    // is simply dropped, unrun. None of its *statements* ever execute, so
+    // no `Guard` value is ever constructed, so nothing decrements, and the
+    // slot leaks forever. Sixteen such failures (one per `MAX_CONNECTIONS`
+    // slot) would wedge this socket at permanent "busy".
+    //
+    // Constructing the guard here, on the accept thread, and only then
+    // moving the already-built value into the closure's *captured
+    // environment* fixes it: a closure that fails to spawn is dropped like
+    // any other owned value going out of scope, which runs the destructors
+    // of everything it captured — including this `Guard` — whether or not
+    // the closure's body ever ran. This specific path (forcing
+    // `Builder::spawn` to fail) has no portable way to trigger from a
+    // test, so this is a structural fix verified by inspection; the test
+    // below instead exercises the release mechanism end to end (a
+    // normally-completed connection frees its slot for the next one).
+    struct Guard(Arc<AtomicUsize>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     let ask = Arc::new(ask);
     // R20a: bounds how many connection threads this socket can have alive
     // at once, process-wide (there is exactly one hook socket per roost).
@@ -334,22 +401,12 @@ where
             continue; // `s` drops here, closing the connection.
         }
         in_flight.fetch_add(1, Ordering::SeqCst);
-        let counter = in_flight.clone();
+        // Built now, before `spawn` is even called — see the comment on
+        // `Guard` above for why that ordering is the entire fix.
+        let guard = Guard(in_flight.clone());
         let ask = ask.clone();
         let _ = std::thread::Builder::new().name("hooksock-conn".into()).spawn(move || {
-            // A drop guard, not a decrement at the end of the closure:
-            // `serve_one_with_deadline` never panics in practice (it is
-            // itself wrapped in `catch_unwind` below), but the guard means
-            // the slot is freed on *every* exit path from this closure,
-            // including one this comment did not anticipate, rather than
-            // only the one line currently at the bottom of it.
-            struct Guard(Arc<AtomicUsize>);
-            impl Drop for Guard {
-                fn drop(&mut self) {
-                    self.0.fetch_sub(1, Ordering::SeqCst);
-                }
-            }
-            let _guard = Guard(counter);
+            let _guard = guard;
             // A panic here must not take the process down: this thread is
             // fed bytes from a Claude-spawned process, and CLAUDE.md
             // requires no panic escape a socket thread regardless of how
@@ -487,6 +544,15 @@ mod tests {
     // `timeout 25 cargo test --lib hooksock::tests::a_trickling_peer -- --test-threads=1`
     // (exit code 124, no completed output), where the correct version
     // finishes in well under 1s. Restored from backup.
+    //
+    // R21d: tightened from `< 3s` to `< 1.8s` against the same 2.4s
+    // trickle, and now asserts the reply text itself — a per-read-timeout
+    // implementation (one that resets a fresh, full budget on every
+    // successful read, the exact bug this test exists to catch) would
+    // only ever time out somewhere past the 2.4s trickle finishes, not
+    // within 1.8s, so the old `< 3s` bound was loose enough that a
+    // sufficiently fast per-read implementation variant could in principle
+    // have slipped under it.
     #[test]
     fn a_trickling_peer_is_refused_by_the_total_deadline_not_per_read() {
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -508,10 +574,14 @@ mod tests {
         });
         t.join().unwrap();
         assert!(
-            start.elapsed() < Duration::from_secs(3),
+            start.elapsed() < Duration::from_millis(1800),
             "the TOTAL deadline must win even though every individual read keeps succeeding, took {:?}",
             start.elapsed()
         );
+        a.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut line = String::new();
+        BufReader::new(&a).read_line(&mut line).unwrap();
+        assert!(line.contains("timed out"), "{line}");
         // Cleanup, not part of the timed assertion above: lets the trickle
         // thread finish rather than leaking it, now that the server side
         // (and thus every write after this point) is already gone.
@@ -673,6 +743,44 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::symlink_metadata(socket_dir()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+        // R21b: the state root this call created (not only the `hook`
+        // subdirectory under it) must come out 0700 too.
+        let state_mode = std::fs::symlink_metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(state_mode, 0o700, "a freshly created state root must be 0700");
+
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    // R21b: a pre-existing state root — one `start()` did not create —
+    // must never have its mode changed, including down to something
+    // tighter. `wsstate::save` chmods `state_dir()` unconditionally on
+    // every save; copying that shape into `hooksock::start()` would mean
+    // every roost restart silently tightens a directory an operator may
+    // have deliberately widened (CLAUDE.md: only what this call created is
+    // ours to touch).
+    //
+    // Revert-checked (fix round 2): replacing the `DirBuilder::new()
+    // .recursive(true).mode(0o700).create(&state)` call with
+    // `wsstate::save`'s shape (`create_dir_all` followed by an
+    // unconditional `set_permissions(..., 0o700)`) makes this test fail —
+    // the pre-existing 0o755 root is chmod'd down to 0o700, so
+    // `assert_eq!(mode, 0o755, ...)` fails with `0o700 != 0o755`.
+    // Restored from backup.
+    #[test]
+    fn start_never_chmods_a_pre_existing_state_root() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("already_here");
+        std::fs::create_dir_all(&state).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("ROOST_STATE_DIR", &state);
+
+        let res = start();
+        assert!(res.is_ok(), "{res:?}");
+
+        let mode = std::fs::symlink_metadata(&state).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "a pre-existing state root must never be chmod'd, even tighter");
 
         std::env::remove_var("ROOST_STATE_DIR");
     }
@@ -722,5 +830,173 @@ mod tests {
         assert!(line.contains("refuse") && line.contains("busy"), "{line}");
 
         drop(held);
+    }
+
+    // R20a: round 1's `Guard` was constructed *inside* the spawned
+    // closure's body, so a thread that fails to spawn at all (thread
+    // exhaustion — exactly the condition the cap exists to defend
+    // against) drops the closure unrun, meaning the `Guard` statement
+    // never executes and nothing ever decrements: sixteen such failures
+    // would wedge this socket at permanent "busy". That specific path
+    // (forcing `Builder::spawn` to fail) has no portable way to trigger
+    // from a test, so this instead exercises the release mechanism itself
+    // end to end: connection A completes normally and connection B, after
+    // A is done, must not be refused.
+    //
+    // Revert-checked (fix round 2): making `Guard::drop` a no-op (deleting
+    // its `fetch_sub` call) makes this test fail — B stays "busy" for the
+    // full 2s poll budget below and the test panics with "the slot never
+    // freed after A finished: still busy after 2s". Restored from backup.
+    #[test]
+    fn a_finished_connection_frees_its_slot() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("slot.sock");
+        let l = UnixListener::bind(&path).unwrap();
+        // SAFETY: getuid takes no arguments, reads no memory, and cannot fail.
+        let me = unsafe { libc::getuid() };
+        std::thread::spawn(move || {
+            serve_listener(l, 1, me, |r| AskReply::Path { path: format!("/x/{}", r.name) })
+        });
+
+        let mut a = UnixStream::connect(&path).unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        writeln!(
+            a,
+            r#"{{"op":"worktree_create","project":"p","session":"term","name":"fox","cwd":"/p","session_id":"s"}}"#
+        )
+        .unwrap();
+        let mut a_line = String::new();
+        BufReader::new(&a).read_line(&mut a_line).unwrap();
+        assert_eq!(a_line.trim(), r#"{"path":"/x/fox"}"#, "setup: A must actually finish");
+        drop(a);
+
+        // The reply above only proves A's write happened — its connection
+        // thread still has to return (and its guard drop) afterward,
+        // which is a separate, very short window. Polling, bounded to 2s
+        // total, absorbs that ordinary scheduling gap without papering
+        // over a real leak: a real leak would never clear within the
+        // bound, so the loop still fails, just slightly later rather than
+        // on the very first attempt.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut b = UnixStream::connect(&path).unwrap();
+            b.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+            writeln!(
+                b,
+                r#"{{"op":"worktree_create","project":"p","session":"term","name":"bar","cwd":"/p","session_id":"s2"}}"#
+            )
+            .unwrap();
+            let mut b_line = String::new();
+            let _ = BufReader::new(&b).read_line(&mut b_line);
+            if !b_line.contains("busy") {
+                assert!(b_line.contains("bar"), "{b_line}");
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("the slot never freed after A finished: still busy after 2s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // R21a: the size cap only ran on a newline-free chunk, so a chunk that
+    // happened to *contain* the newline was accepted unconditionally,
+    // however large it made the total line — up to a whole read-chunk
+    // (4096 bytes) over `MAX_REQUEST`. This test controls the chunking
+    // directly (two separate writes, with a pause between them) rather
+    // than relying on how one big `write_all` happens to split across
+    // reads, so it reproduces the defect regardless of the internal chunk
+    // size: the first write fills `buf` to just under the cap with no
+    // newline in it; the second, small write arrives as its own read and
+    // contains the newline partway through — a case the old code accepted
+    // outright and the fix must still catch.
+    //
+    // Revert-checked (fix round 2): removing the
+    // `(buf.len() + pos + 1) as u64 > MAX_REQUEST` check (so only the
+    // no-newline branch's cap applies) makes this test fail — the reply
+    // is the normal, non-refusing one built from the request's `name`
+    // field, not a "too large" refusal, so `line.contains("too large")`
+    // is false. Restored from backup.
+    #[test]
+    fn a_newline_that_crosses_the_max_request_boundary_is_still_refused() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let t = std::thread::spawn(move || {
+            serve_one(b, &|r| AskReply::Path { path: format!("/x/{}", r.name) })
+        });
+        let mut a2 = a.try_clone().unwrap();
+        // Just under the cap, no newline: lands in `buf` via the
+        // no-newline branch without ever tripping its own `>= MAX_REQUEST`
+        // check.
+        let filler = vec![b'x'; MAX_REQUEST as usize - 50];
+        a2.write_all(&filler).unwrap();
+        // Give the reader time to drain the filler as its own read(s)
+        // before the second write arrives, so the newline below is
+        // guaranteed to land in a *separate* chunk from the filler rather
+        // than however the kernel happens to coalesce one big write.
+        std::thread::sleep(Duration::from_millis(100));
+        // 100 bytes + the newline: buf.len() (MAX_REQUEST - 50) + 100 is
+        // comfortably over MAX_REQUEST, with the newline inside this one
+        // chunk.
+        a2.write_all(&vec![b'y'; 100]).unwrap();
+        a2.write_all(b"\n").unwrap();
+        let mut line = String::new();
+        let _ = BufReader::new(a).read_line(&mut line);
+        t.join().unwrap();
+        assert!(line.contains("refuse") && line.contains("too large"), "{line}");
+    }
+
+    // R21a: the two tests the finding named directly — the exact boundary
+    // in each direction. (These two, run alone, do not reliably reproduce
+    // the specific defect above: `MAX_REQUEST` happens to be an exact
+    // multiple of this module's 4096-byte read-chunk size, so a single
+    // `write_all` of `MAX_REQUEST + 1` bytes gets caught by the
+    // *no-newline* branch's own cap after exactly `MAX_REQUEST` bytes,
+    // before the chunk containing the newline is ever read — the test
+    // above is the one that isolates the actual crossing-chunk defect.
+    // These are still worth having as plain boundary-correctness checks.)
+    fn padded_request(total_len_with_newline: usize) -> String {
+        let mut obj = serde_json::json!({
+            "op": "worktree_create",
+            "project": "p",
+            "session": "term",
+            "name": "fox",
+            "cwd": "/p",
+            "session_id": "s",
+            "pad": ""
+        });
+        let base_len = serde_json::to_string(&obj).unwrap().len() + 1; // + '\n'
+        assert!(total_len_with_newline >= base_len, "helper: total_len too small to pad down to");
+        obj["pad"] = serde_json::Value::String("x".repeat(total_len_with_newline - base_len));
+        let line = serde_json::to_string(&obj).unwrap();
+        assert_eq!(line.len() + 1, total_len_with_newline, "helper built the wrong length");
+        line
+    }
+
+    #[test]
+    fn a_request_of_exactly_max_request_bytes_is_accepted() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let t = std::thread::spawn(move || {
+            serve_one(b, &|r| AskReply::Path { path: format!("/x/{}", r.name) })
+        });
+        let mut a2 = a.try_clone().unwrap();
+        writeln!(a2, "{}", padded_request(MAX_REQUEST as usize)).unwrap();
+        let mut line = String::new();
+        BufReader::new(a).read_line(&mut line).unwrap();
+        t.join().unwrap();
+        assert!(line.contains("/x/fox"), "{line}");
+    }
+
+    #[test]
+    fn a_request_one_byte_over_max_request_is_refused_too_large() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let t = std::thread::spawn(move || {
+            serve_one(b, &|r| AskReply::Path { path: format!("/x/{}", r.name) })
+        });
+        let mut a2 = a.try_clone().unwrap();
+        writeln!(a2, "{}", padded_request(MAX_REQUEST as usize + 1)).unwrap();
+        let mut line = String::new();
+        BufReader::new(a).read_line(&mut line).unwrap();
+        t.join().unwrap();
+        assert!(line.contains("refuse") && line.contains("too large"), "{line}");
     }
 }
