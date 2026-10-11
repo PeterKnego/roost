@@ -1017,6 +1017,17 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
         // (a live session for a project that still exists must survive).
         let _ = std::fs::remove_dir(entry.path());
     }
+    // Re-home records whose session is positively gone, once per pass and
+    // after everything above has decided: a call, not an input — nothing in
+    // this sweep reads them. Same three outcomes as every other sidecar here:
+    // only `NotFound` forgets; a socket we cannot stat keeps its record.
+    crate::home::sweep(&|home, name| {
+        match std::fs::symlink_metadata(crate::session::socket_path(home, name)) {
+            Ok(_) => Some(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Err(_) => None,
+        }
+    });
     report
 }
 
@@ -2768,6 +2779,41 @@ mod tests {
     // `symlink_metadata` alone would not have caught. Restored; this test
     // passes again. (Non-root run; see the guard below for why this needs
     // it.)
+    /// Revert-checked (Task 4): removing the `home::sweep` call fails on
+    /// "reaped this pass: forgotten".
+    ///
+    /// A re-home record goes with its socket, and only on `NotFound` — the
+    /// same pass, after the sweep above has made its own decisions, so a
+    /// socket reaped as dead in this pass takes its record with it.
+    #[test]
+    fn reconcile_forgets_a_rehome_record_only_when_its_socket_is_gone() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        std::env::set_var("ROOST_STATE_DIR", &state);
+        let roots = vec![root.path().to_path_buf()];
+        std::fs::create_dir_all(root.path().join("repo")).unwrap();
+        let owner = "repo/.claude/worktrees/worktree-x";
+        let held = crate::session::socket_path("repo", "held");
+        let dead = crate::session::socket_path("repo", "dead");
+        std::fs::create_dir_all(held.parent().unwrap()).unwrap();
+        std::fs::write(&held, "").unwrap();
+        std::fs::write(&dead, "").unwrap();
+        for n in ["held", "dead", "nosock"] {
+            crate::home::record("repo", n, owner).unwrap();
+        }
+        // A holder for `held` only (a pid that is not ours to signal: the
+        // project exists, so a held socket is left alone, never killed).
+        let args = format!("dtach -A {} -E -r none bash", held.display());
+        reconcile_with(&roots, &|| Some(vec![(999_999, args.clone())]));
+
+        assert!(held.exists() && !dead.exists(), "setup: reconcile reaped the unheld socket only");
+        assert!(matches!(crate::home::owner_of("repo", "held"), crate::home::Owner::Elsewhere(_)), "held: kept");
+        assert!(matches!(crate::home::owner_of("repo", "dead"), crate::home::Owner::Here), "reaped this pass: forgotten");
+        assert!(matches!(crate::home::owner_of("repo", "nosock"), crate::home::Owner::Here), "no socket: forgotten");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
     #[test]
     fn a_base_file_for_a_worktree_that_no_longer_exists_is_reaped_and_one_that_does_is_kept() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

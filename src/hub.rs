@@ -35,6 +35,11 @@ pub struct Hub {
     /// `for_project` starts at most one watcher per project even though it
     /// runs on every connection.
     pub watching: bool,
+    /// Resident name → its home, for sessions re-homed into this project
+    /// (`home.rs`). Rebuilt by `refresh_live_sessions`, never persisted: it
+    /// is derived from the records and the sockets, and a saved copy could
+    /// only ever be stale.
+    pub session_homes: std::collections::BTreeMap<String, String>,
     /// A handle back to this hub's own `Arc<Mutex<Hub>>`, set only by
     /// `for_project` (see there) — lets `do_close_project` spawn a thread
     /// that re-locks this same hub *later*, after the blocking work is
@@ -240,6 +245,7 @@ impl Hub {
             next_id: 0,
             self_writes: HashMap::new(),
             watching: false,
+            session_homes: Default::default(),
             self_ref: std::sync::Weak::new(),
             closing: false,
             notices_dirty: false,
@@ -1470,7 +1476,13 @@ impl Hub {
     /// lock (`for_project`'s `or_insert_with`) — so that cost would stall
     /// every other project's connection setup, not just this one's.
     pub fn refresh_live_sessions(&mut self) {
-        self.ws.live_sessions = crate::session::live_names(&self.project);
+        // `owned_live_names`, which is `live_names` adjusted by the re-home
+        // records and is fork-free for the same reason.
+        let owned = crate::session::owned_live_names(&self.project);
+        self.session_homes =
+            owned.iter().filter_map(|(n, h)| Some((n.clone(), h.clone()?))).collect();
+        self.ws.live_sessions = owned.into_iter().map(|(n, _)| n).collect();
+        self.ws.live_sessions.dedup();
         // A shell that is running again is no longer lost. Without this the
         // note would survive the user starting a replacement in that very
         // tab, which is the one moment it stops being true.
@@ -1927,6 +1939,9 @@ impl Hub {
         // Names already on a tab but not yet connected are in no registry —
         // `next_free_name`'s `also_taken` is what stops two quick clicks from
         // both being handed `term`.
+        //
+        // Residents too: re-homed here, they show on this page under their
+        // name, though this project's own `sock/` has no such socket.
         let on_tabs: Vec<String> = self
             .ws
             .panes
@@ -1936,6 +1951,7 @@ impl Hub {
                 Tab::Terminal { session } => Some(session.clone()),
                 _ => None,
             })
+            .chain(self.session_homes.keys().cloned())
             .collect();
         // The prefix says what the terminal is for. A ✻ click gets `claude`,
         // `claude2`, … so the strip says which tab has an agent in it; a plain
@@ -4322,6 +4338,42 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["term", "term1"], "each click must get its own shell");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// A resident's name is taken in its owner, though the owner's own
+    /// `sock/` has no such socket — two tabs called `term` on one page.
+    ///
+    /// Revert-checked (Task 4): without the `session_homes` chain in
+    /// `do_new_terminal`'s `also_taken`, this allocates `["term"]`.
+    #[test]
+    fn new_terminal_in_an_owner_skips_a_residents_name() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("owner_names/.claude/worktrees/worktree-x", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        for p in h.ws.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+            p.active = 0;
+        }
+        // What `refresh_live_sessions` computes from a re-home record; set
+        // directly because resolving the owner reads the configured roots.
+        h.session_homes.insert("term".into(), "owner_names".into());
+        drain(&rx);
+
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
+        drain(&rx);
+
+        let names: Vec<String> = h.ws.panes[proto::RIGHT as usize]
+            .tabs
+            .iter()
+            .filter_map(|t| match t {
+                Tab::Terminal { session } => Some(session.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["term1"], "the resident already shows as `term` on this page");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 

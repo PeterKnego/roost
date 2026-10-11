@@ -102,9 +102,111 @@ pub fn residents_of(owner: &str) -> Vec<(String, String)> { residents_of_in(&cra
 pub fn away_from(home: &str) -> Vec<(String, Owner)> { away_from_in(&crate::wsstate::state_dir(), home) }
 pub fn sweep(sock_state: &dyn Fn(&str, &str) -> Option<bool>) { sweep_in(&crate::wsstate::state_dir(), sock_state) }
 
+/// Whether `owner` is still a place `home`'s re-homed session can be shown:
+/// one of `home`'s own `.claude/worktrees/<dir>`, still a directory.
+///
+/// Fork-free on purpose. `projects::resolve_project` on the owner URL would
+/// run `git worktree list` (its dot segment needs git to vouch for it), and
+/// this runs from `Hub::new` under the process-global hub-registry lock. So
+/// the owner is checked by shape against the home, and only the home — which
+/// has no dot segment, so resolves without git — goes through the resolver.
+///
+/// A `false` here destroys nothing: the session is shown in its home, and
+/// the record is kept (see the module doc and `session::owned_live_names`).
+pub fn resolves_in(roots: &[PathBuf], home: &str, owner: &str) -> bool {
+    let Some(dir) = owner.strip_prefix(home).and_then(|r| r.strip_prefix("/.claude/worktrees/")) else {
+        return false;
+    };
+    // roost's own `worktree-<name>` and the older `claude-N` both fit the
+    // session-name alphabet, except a `worktree-` name longer than 23. No
+    // shape admits `/`, `.` or `..`, which is what keeps `dir` one segment.
+    let shaped = crate::session::valid_name(dir)
+        || dir.strip_prefix("worktree-").is_some_and(crate::wtname::valid);
+    if !shaped {
+        return false;
+    }
+    // A home with a dot segment would send `resolve_project` to git. Every
+    // home is a main checkout, which has none; refusing one keeps this
+    // fork-free by construction rather than by that assumption.
+    if home.split('/').any(|s| s.starts_with('.')) {
+        return false;
+    }
+    let Some(home_dir) = crate::projects::resolve_project(roots, home) else { return false };
+    match std::fs::symlink_metadata(home_dir.join(".claude/worktrees").join(dir)) {
+        Ok(m) => m.is_dir(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        // Cannot tell: keep showing the session where its record says. This
+        // is display-only and destroys nothing either way, so it does not
+        // need positive evidence — but a worktree we merely could not stat
+        // is not one that was removed, and moving the tab back to the home
+        // on an EACCES would be the same misreading in a milder form.
+        Err(_) => true,
+    }
+}
+
+pub fn resolves(home: &str, owner: &str) -> bool {
+    resolves_in(&crate::projects::roots(), home, owner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `resolves_in` reads the disk with a plain directory standing in for a
+    /// worktree: it must not run git, so it cannot tell a real worktree from
+    /// a directory, and that is deliberate (it runs under the hub registry
+    /// lock).
+    #[test]
+    fn resolves_only_an_existing_dir_under_the_homes_own_claude_worktrees() {
+        let root = tempfile::tempdir().unwrap();
+        let wts = root.path().join("proj/.claude/worktrees");
+        std::fs::create_dir_all(wts.join("worktree-x")).unwrap();
+        std::fs::create_dir_all(wts.join("claude-3")).unwrap();
+        std::fs::write(wts.join("worktree-file"), "").unwrap();
+        std::fs::create_dir_all(root.path().join("other/.claude/worktrees/worktree-x")).unwrap();
+        let roots = vec![root.path().to_path_buf()];
+
+        assert!(resolves_in(&roots, "proj", "proj/.claude/worktrees/worktree-x"));
+        assert!(resolves_in(&roots, "proj", "proj/.claude/worktrees/claude-3"), "an existing claude-N worktree keeps resolving");
+        assert!(!resolves_in(&roots, "proj", "proj/.claude/worktrees/worktree-file"), "a file is not a worktree");
+        assert!(!resolves_in(&roots, "proj", "other/.claude/worktrees/worktree-x"), "an owner under another project's worktrees");
+        assert!(!resolves_in(&roots, "proj", "other"), "an owner that is not a worktree at all");
+        assert!(!resolves_in(&roots, "proj", "proj"), "the home itself");
+        // Each of these names a directory that exists, so only the shape
+        // check can refuse them.
+        assert!(!resolves_in(&roots, "proj", "proj/.claude/worktrees/.."), "a dot-dot segment");
+        assert!(!resolves_in(&roots, "proj", "proj/.claude/worktrees/worktree-x/.."));
+        assert!(!resolves_in(&roots, "proj", "proj/.claude/worktrees/../worktrees/worktree-x"));
+        assert!(!resolves_in(&roots, "proj", "proj/.claude/worktrees/worktree-x/"), "a trailing slash");
+        assert!(!resolves_in(&roots, "nosuch", "nosuch/.claude/worktrees/worktree-x"), "a home that does not resolve");
+        std::fs::create_dir_all(wts.join("worktree-x/.claude/worktrees/worktree-y")).unwrap();
+        assert!(
+            !resolves_in(&roots, "proj/.claude/worktrees/worktree-x", "proj/.claude/worktrees/worktree-x/.claude/worktrees/worktree-y"),
+            "a dotted home is refused before it can reach git"
+        );
+
+        std::fs::remove_dir_all(wts.join("worktree-x")).unwrap();
+        assert!(!resolves_in(&roots, "proj", "proj/.claude/worktrees/worktree-x"), "a removed worktree no longer resolves");
+    }
+
+    /// Display-only, so "cannot tell" keeps the session where its record
+    /// says — the opposite of the destructive default, on purpose.
+    #[test]
+    fn an_unreadable_worktrees_dir_resolves_rather_than_guessing_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let wts = root.path().join("proj/.claude/worktrees");
+        std::fs::create_dir_all(wts.join("worktree-x")).unwrap();
+        std::fs::set_permissions(&wts, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blind = matches!(std::fs::symlink_metadata(wts.join("worktree-x")), Err(ref e) if e.kind() != std::io::ErrorKind::NotFound);
+        let got = resolves_in(&[root.path().to_path_buf()], "proj", "proj/.claude/worktrees/worktree-x");
+        std::fs::set_permissions(&wts, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !blind {
+            eprintln!("skipped: this user can search a 0o000 directory");
+            return;
+        }
+        assert!(got, "an error other than NotFound must not read as a removed worktree");
+    }
 
     #[test]
     fn absent_record_is_here() {

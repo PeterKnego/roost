@@ -302,12 +302,28 @@ pub fn release(project: &str, name: &str) {
 /// construction: after this returns, this project's set of sessions cannot
 /// grow again until `end_close`.
 pub fn begin_close(project: &str) -> Vec<String> {
+    begin_close_except(project, &[])
+}
+
+/// [`begin_close`], leaving `keep`'s entries in the map and its reservations
+/// in place.
+///
+/// For sessions re-homed elsewhere (`home.rs`). Their map entry is keyed by
+/// this project because the key cannot move, but it is not this project's to
+/// drain: dropping it kills the dtach client — only a detach, the master
+/// survives — and stops the pump, so every browser viewing the session from
+/// its owner loses the terminal while the shell runs on unreachable. `keep`
+/// is computed by the caller before this, because reading the records is
+/// file I/O and this holds the global session lock.
+pub fn begin_close_except(project: &str, keep: &[String]) -> Vec<String> {
     let skey = crate::projects::storage_key(project);
     let prefix = format!("{skey}/");
+    let kept = |k: &str| k.strip_prefix(&prefix).is_some_and(|n| keep.iter().any(|x| x == n));
     let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
     guard.closing.insert(skey);
-    guard.reservations.retain(|k, _| !k.starts_with(&prefix));
-    let keys: Vec<String> = guard.map.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+    guard.reservations.retain(|k, _| !k.starts_with(&prefix) || kept(k));
+    let keys: Vec<String> =
+        guard.map.keys().filter(|k| k.starts_with(&prefix) && !kept(k)).cloned().collect();
     let mut names = Vec::with_capacity(keys.len());
     for k in keys {
         if let Some(mut s) = guard.map.remove(&k) {
@@ -981,6 +997,51 @@ pub fn live_names(project: &str) -> Vec<String> {
     out
 }
 
+/// What `project`'s workspace shows: its own live sessions minus those
+/// re-homed elsewhere, plus sessions re-homed into it from their home, as
+/// `(name, home)` with `None` for a native session.
+///
+/// Fork-free, like `live_names`: it runs from `Hub::new` under the hub
+/// registry lock, which is why the owner check is `home::resolves` and not
+/// `projects::resolve_project` on the owner URL (that runs git). A resident
+/// whose owner no longer resolves is shown in its home instead — the
+/// worktree was removed by hand — and its record is kept. An `Unknown`
+/// record shows in its home: display-only, and the home is where the socket
+/// is.
+pub fn owned_live_names(project: &str) -> Vec<(String, Option<String>)> {
+    owned_live_names_with(project, &crate::home::resolves)
+}
+
+/// [`owned_live_names`] with the owner check injected.
+pub(crate) fn owned_live_names_with(
+    project: &str,
+    resolves: &dyn Fn(&str, &str) -> bool,
+) -> Vec<(String, Option<String>)> {
+    let away: HashMap<String, crate::home::Owner> =
+        crate::home::away_from(project).into_iter().collect();
+    let mut out: Vec<(String, Option<String>)> = live_names(project)
+        .into_iter()
+        .filter(|n| match away.get(n) {
+            Some(crate::home::Owner::Elsewhere(o)) => !resolves(project, o),
+            _ => true,
+        })
+        .map(|n| (n, None))
+        .collect();
+    let mut home_live: HashMap<String, Vec<String>> = HashMap::new();
+    for (home, name) in crate::home::residents_of(project) {
+        if !resolves(&home, project) {
+            continue;
+        }
+        let live = home_live.entry(home.clone()).or_insert_with(|| live_names(&home));
+        if live.contains(&name) {
+            out.push((name, Some(home)));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Sessions of `project` this process spawned with a launch. A map scan
 /// only, like `live_names`: it runs under the hub on every ✻ click.
 pub fn launched_names(project: &str) -> Vec<(String, LaunchRequest)> {
@@ -1121,6 +1182,9 @@ pub fn end_session(project: &str, name: &str) -> bool {
     crate::cwds::forget(project, name);
     crate::claudesess::forget(project, name);
     crate::relaunch::forget(project, name);
+    // And where it was shown: a record outliving its session would re-home
+    // whatever `next_free_name` hands this name to next.
+    crate::home::forget(project, name);
     end_socket(project, name, "End session")
 }
 
@@ -1174,6 +1238,25 @@ pub fn next_free_name_with(project: &str, also_taken: &[String], prefix: &str) -
 }
 
 pub fn kill_project(project: &str) -> usize {
+    kill_project_with(project, &crate::home::resolves)
+}
+
+/// [`kill_project`] with the owner check injected, so tests do not depend on
+/// the configured roots. `resolves(home, owner)` is `home::resolves`.
+pub(crate) fn kill_project_with(project: &str, resolves: &dyn Fn(&str, &str) -> bool) -> usize {
+    // Read before `begin_close_except`, which holds the global session lock:
+    // these are file reads. Every away name is kept, `Unknown` included — an
+    // unreadable record is not permission to drain a session either.
+    let keep: Vec<String> = crate::home::away_from(project).into_iter().map(|(n, _)| n).collect();
+    // Residents re-homed *into* this project close with it — but only those
+    // this project actually shows (`owned_live_names`). One whose owner no
+    // longer resolves has fallen back to its home; `reconcile` closes a
+    // worktree whose directory was removed by hand through this very
+    // function, and a missing worktree is not evidence the session ended.
+    let residents: Vec<(String, String)> = crate::home::residents_of(project)
+        .into_iter()
+        .filter(|(home, _)| resolves(home, project))
+        .collect();
     // `begin_close` does the map drain, and marks the project closing in the
     // same acquisition — so from here on no attach can add to what this
     // function is about to walk. That ordering is the whole fix: the scan
@@ -1188,7 +1271,7 @@ pub fn kill_project(project: &str) -> usize {
     // them remembering, and the first thing that forgot left the project
     // permanently unable to open a terminal again, which is a worse failure
     // than the one being prevented.
-    let removed_names: Vec<String> = begin_close(project);
+    let removed_names: Vec<String> = begin_close_except(project, &keep);
 
     // Sessions that outlived a restart are not in the map above, but their
     // sockets are on disk — and they are exactly the long-running shells a user
@@ -1203,9 +1286,30 @@ pub fn kill_project(project: &str) -> usize {
         }
     }
 
+    // A re-homed session belongs to its owner, and an unreadable record is
+    // not permission to end it (`home.rs`). Only `Here` is ours to close.
+    // Re-read rather than taken from `keep`: a record written since then
+    // must still spare its session, and a stale entry in `keep` only cost a
+    // map entry that the kill below takes down with its pump anyway.
+    all_names.retain(|n| match crate::home::owner_of(project, n) {
+        crate::home::Owner::Here => true,
+        crate::home::Owner::Elsewhere(_) => false,
+        crate::home::Owner::Unknown(why) => {
+            eprintln!("roost: Close Project left {project}/{n} running: {why}");
+            false
+        }
+    });
+
     let mut ended = 0;
     for name in &all_names {
         if end_socket(project, name, "Close Project") {
+            ended += 1;
+        }
+    }
+    // Inside the close span, like the project's own. `end_session` on the
+    // home: the socket, the map key and every per-session record are there.
+    for (home, name) in &residents {
+        if end_session(home, name) {
             ended += 1;
         }
     }
@@ -2241,5 +2345,236 @@ mod tests {
             return;
         }
         assert!(err.contains("could not be read") && !err.contains("not installed"), "{err}");
+    }
+
+    // ---- Re-homed sessions (#156). The kill tests use the real dtach, not
+    // `ROOST_CMD=cat`: a `cat` child has no detached master, so "spared"
+    // and "killed" would look the same there. They panic rather than skip
+    // when dtach is missing — a skipped test of the destructive path proves
+    // nothing.
+
+    /// Kills whatever holds each socket on drop, so a failing assertion (or a
+    /// revert check) does not leave a dtach master running past the test.
+    struct ReapOnDrop(Vec<PathBuf>);
+    impl Drop for ReapOnDrop {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = crate::registry::kill_and_unlink(p);
+            }
+        }
+    }
+
+    /// `reserve_and_attach` on the real dtach, then waits until the detached
+    /// master is observable. Attached in this process, so the session also
+    /// has a `SESSIONS` entry and a pump — what `begin_close` drains.
+    fn start_real_dtach(project: &str, name: &str, dir: &Path) -> Attachment {
+        let att = reserve_and_attach(project, name, dir)
+            .unwrap_or_else(|e| panic!("dtach must be available for this test: {e}"));
+        let sock = sock_path(project, name);
+        let mut waited = 0;
+        while !(sock.exists() && any_process_holds(&sock)) && waited < 200 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            waited += 1;
+        }
+        assert!(any_process_holds(&sock), "test setup: a detached dtach master must be running");
+        assert!(has_session(project, name), "test setup: attached in this process, so a map entry exists");
+        att
+    }
+
+    /// The test the whole re-home design rests on.
+    ///
+    /// Revert-checked (Task 4):
+    /// - The `Elsewhere` arm of `kill_project`'s retain returning `true`:
+    ///   fails on "Close Project on the home killed a re-homed session".
+    /// - `begin_close_except` replaced with plain `begin_close`: the liveness
+    ///   and `Held` assertions still PASS — draining the entry kills only the
+    ///   dtach client, which is a detach; the master and shell survive. It
+    ///   fails on the map assertion below ("…drained a re-homed session's
+    ///   map entry…"), which is the real harm: the pump stops and the
+    ///   owner's viewers lose a terminal whose shell runs on unreachable.
+    ///   Without that assertion this test could not see the revert.
+    /// - The residents loop removed: fails on "the resident is counted as
+    ///   ended by its owner's close" (left 0, right 1).
+    #[test]
+    fn kill_project_of_home_spares_a_resident() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let dir = tempfile::tempdir().unwrap();
+        let home = format!("rehomespare{}", std::process::id());
+        let owner = format!("{home}/.claude/worktrees/worktree-x");
+        let yes = |_: &str, _: &str| true;
+
+        let _att = start_real_dtach(&home, "term3", dir.path());
+        let sock = sock_path(&home, "term3");
+        let _reap = ReapOnDrop(vec![sock.clone()]);
+        crate::home::record(&home, "term3", &owner).unwrap();
+
+        kill_project_with(&home, &yes);
+
+        assert!(any_process_holds(&sock), "Close Project on the home killed a re-homed session");
+        assert!(matches!(probe_socket(&sock), SocketState::Held));
+        assert!(
+            has_session(&home, "term3"),
+            "Close Project on the home drained a re-homed session's map entry: its pump stops \
+             and every browser viewing it from the owner loses the terminal"
+        );
+        assert_eq!(owned_live_names_with(&owner, &yes), vec![("term3".to_string(), Some(home.clone()))]);
+        assert!(owned_live_names_with(&home, &yes).is_empty(), "still listed under its home");
+
+        let ended = kill_project_with(&owner, &yes);
+        assert_eq!(ended, 1, "the resident is counted as ended by its owner's close");
+        assert!(!any_process_holds(&sock), "closing the owner must end its residents");
+        assert!(
+            matches!(crate::home::owner_of(&home, "term3"), crate::home::Owner::Here),
+            "and its record goes with it"
+        );
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// An empty record is half-written, not "not re-homed".
+    #[test]
+    fn kill_project_of_home_spares_an_unknown_record() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let dir = tempfile::tempdir().unwrap();
+        let home = format!("rehomeunknown{}", std::process::id());
+        let yes = |_: &str, _: &str| true;
+
+        let _att = start_real_dtach(&home, "term3", dir.path());
+        let sock = sock_path(&home, "term3");
+        let _reap = ReapOnDrop(vec![sock.clone()]);
+        let d = state.path().join("home").join(crate::projects::storage_key(&home));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("term3"), "").unwrap();
+        assert!(matches!(crate::home::owner_of(&home, "term3"), crate::home::Owner::Unknown(_)), "setup");
+
+        let ended = kill_project_with(&home, &yes);
+
+        assert_eq!(ended, 0);
+        assert!(any_process_holds(&sock), "an unreadable owner is not permission to kill");
+        assert!(has_session(&home, "term3"), "nor to drain its map entry");
+        assert_eq!(
+            owned_live_names_with(&home, &yes),
+            vec![("term3".to_string(), None)],
+            "unknown shows in its home"
+        );
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Revert-checked (Task 4): dropping the `resolves` filter on residents
+    /// in `kill_project_with` fails on `ended` (left 1, right 0) — the
+    /// fallen-back session was killed.
+    ///
+    /// Reconcile closes a project whose directory is confirmed gone. When
+    /// that project is a worktree removed by hand, its residents fall back
+    /// to their home — a missing worktree is not evidence the session ended.
+    #[test]
+    fn closing_an_owner_that_no_longer_resolves_leaves_its_residents() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let dir = tempfile::tempdir().unwrap();
+        let home = format!("rehomegone{}", std::process::id());
+        let owner = format!("{home}/.claude/worktrees/worktree-x");
+        let no = |_: &str, _: &str| false;
+
+        let _att = start_real_dtach(&home, "term3", dir.path());
+        let sock = sock_path(&home, "term3");
+        let _reap = ReapOnDrop(vec![sock.clone()]);
+        crate::home::record(&home, "term3", &owner).unwrap();
+
+        let ended = kill_project_with(&owner, &no);
+
+        assert_eq!(ended, 0);
+        assert!(any_process_holds(&sock), "closing a vanished owner ended a session that fell back to its home");
+        assert!(matches!(crate::home::owner_of(&home, "term3"), crate::home::Owner::Elsewhere(_)), "record kept");
+        assert_eq!(owned_live_names_with(&home, &no), vec![("term3".to_string(), None)], "shown in its home");
+        assert!(owned_live_names_with(&owner, &no).is_empty());
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    #[test]
+    fn end_session_forgets_the_record() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let dir = tempfile::tempdir().unwrap();
+        let home = format!("rehomeend{}", std::process::id());
+
+        let _att = start_real_dtach(&home, "term3", dir.path());
+        let sock = sock_path(&home, "term3");
+        let _reap = ReapOnDrop(vec![sock.clone()]);
+        crate::home::record(&home, "term3", "x/.claude/worktrees/worktree-w").unwrap();
+        assert!(matches!(crate::home::owner_of(&home, "term3"), crate::home::Owner::Elsewhere(_)), "setup");
+
+        assert!(end_session(&home, "term3"));
+        assert!(matches!(crate::home::owner_of(&home, "term3"), crate::home::Owner::Here));
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Listing needs no process: `live_names` reads the socket directory, so
+    /// a plain file stands in for a socket here.
+    fn fake_socket(project: &str, name: &str) {
+        let p = sock_path(project, name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "").unwrap();
+    }
+
+    #[test]
+    fn owner_next_free_name_skips_resident_names() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let home = "rehomenames";
+        let owner = format!("{home}/.claude/worktrees/worktree-x");
+        fake_socket(home, "term");
+        crate::home::record(home, "term", &owner).unwrap();
+        let taken: Vec<String> =
+            owned_live_names_with(&owner, &|_, _| true).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(taken, vec!["term".to_string()]);
+        assert_eq!(next_free_name(&owner, &taken).as_deref(), Some("term1"));
+        // And the home keeps the name taken: the socket path is still its.
+        assert_eq!(next_free_name(home, &[]).as_deref(), Some("term1"));
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    #[test]
+    fn a_resident_whose_owner_does_not_resolve_is_shown_in_its_home() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let home = "rehomefallback";
+        let owner = format!("{home}/.claude/worktrees/worktree-x");
+        fake_socket(home, "term3");
+        fake_socket(home, "term4");
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let no = |h: &str, o: &str| { seen.borrow_mut().push((h.to_string(), o.to_string())); false };
+        assert_eq!(
+            owned_live_names_with(home, &no),
+            vec![("term3".to_string(), None), ("term4".to_string(), None)]
+        );
+        assert!(owned_live_names_with(&owner, &no).is_empty());
+        assert!(seen.borrow().iter().all(|(h, o)| h == home && o == &owner), "asked about (home, owner): {:?}", seen.borrow());
+        // The record survives being ignored.
+        assert!(matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Elsewhere(_)));
+        // And a resident that is not live is not listed in its owner.
+        crate::home::record(home, "gone", &owner).unwrap();
+        assert_eq!(
+            owned_live_names_with(&owner, &|_, _| true),
+            vec![("term3".to_string(), Some(home.to_string()))]
+        );
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 }
