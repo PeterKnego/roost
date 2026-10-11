@@ -58,6 +58,12 @@ ureq = { version = "2.12", features = ["proxy-from-env"] }
 minisign-verify = "0.2"
 lzma-rs = "0.3"
 tar = "0.4"
+# Already in Cargo.lock as a transitive dependency of portable-pty, tar,
+# ring and others (see `cargo tree -i libc`). Promoted to direct here
+# because `hooksock.rs` calls `getsockopt`/`SO_PEERCRED` and `getuid`
+# itself; version pinned to what was already locked (0.2.189) so this adds
+# no new version to Cargo.lock.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

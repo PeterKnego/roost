@@ -883,6 +883,7 @@ dependencies = [
  "bytes",
  "futures-executor",
  "futures-util",
+ "libc",
  "lzma-rs",
  "minisign",
  "minisign-verify",

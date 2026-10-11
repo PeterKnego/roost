@@ -2819,6 +2819,13 @@ fn open_hub(project: &str) -> Option<Arc<Mutex<Hub>>> {
     map.get(project).cloned()
 }
 
+/// Filled in by Task 9. Blocks the calling (socket) thread, never a hub
+/// lock: `hooksock.rs`'s accept loop spawns one thread per connection
+/// precisely so this can block without stalling any other hook request.
+pub fn ask_worktree_blocking(_req: crate::hooksock::AskRequest) -> crate::hooksock::AskReply {
+    crate::hooksock::AskReply::Refuse { refuse: "not implemented".into() }
+}
+
 /// Whether `project` has a hub at all — `ide.rs`'s `open_diff` needs this
 /// before deciding to deliver a proposal to an owner: parking it there with
 /// no hub to receive it would make `open_proposal` silently do nothing
