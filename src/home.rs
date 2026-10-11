@@ -148,6 +148,31 @@ pub fn resolves(home: &str, owner: &str) -> bool {
     resolves_in(&crate::projects::roots(), home, owner)
 }
 
+/// The project a session actually shows in: `home` itself, unless the
+/// record names an owner that still `resolves`. Folds the two destructive-
+/// default traps `owner_of` already guards (`Unknown`, an owner that no
+/// longer resolves) into one answer every consumer can use without
+/// re-deriving the fallback: a session must always be shown *somewhere*,
+/// and "somewhere" is always its home when the owner is in any doubt.
+pub fn effective_owner(home: &str, name: &str) -> String {
+    effective_owner_with(&crate::wsstate::state_dir(), &resolves, home, name)
+}
+
+/// [`effective_owner`] with both the state dir and the `resolves` check
+/// injected, for tests that must stay fork-free (no project roots) or must
+/// not touch the real state dir.
+pub fn effective_owner_with(
+    state: &Path,
+    resolves: &dyn Fn(&str, &str) -> bool,
+    home: &str,
+    name: &str,
+) -> String {
+    match owner_of_in(state, home, name) {
+        Owner::Elsewhere(o) if resolves(home, &o) => o,
+        _ => home.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +309,42 @@ mod tests {
         // Without the validation guard, this reads outside the record dir and returns
         // Elsewhere("evil/owner"), which fails the assertion.
         assert!(matches!(owner_of_in(st.path(), "foo", "../outside"), Owner::Unknown(_)));
+    }
+
+    /// `effective_owner` is the one answer every consumer (removal gate,
+    /// Claude evidence, notices, IDE, overview) should use instead of
+    /// re-deriving the `Elsewhere`-and-resolves fold themselves: `Here` and
+    /// `Unknown` both mean "show it at home", and so does an owner that no
+    /// longer resolves.
+    ///
+    /// Revert-checked: changing the `if resolves(home, &o)` guard to always
+    /// take the `Elsewhere` branch (i.e. trusting the record regardless of
+    /// whether the owner still resolves) fails at the *second* assertion —
+    /// observed: `assertion 'left == right' failed: left: "foo/.claude/worktrees/w",
+    /// right: "foo"` — because that's the `no`-resolver case, reached before
+    /// the removed-worktree case ever runs.
+    #[test]
+    fn effective_owner_falls_back_to_home_unless_the_record_resolves() {
+        let st = tempfile::tempdir().unwrap();
+        let yes = |_: &str, _: &str| true;
+        let no = |_: &str, _: &str| false;
+
+        // No record at all: Here.
+        assert_eq!(effective_owner_with(st.path(), &yes, "foo", "term1"), "foo");
+
+        // A resolving Elsewhere: the owner.
+        record_in(st.path(), "foo", "term2", "foo/.claude/worktrees/w").unwrap();
+        assert_eq!(
+            effective_owner_with(st.path(), &yes, "foo", "term2"),
+            "foo/.claude/worktrees/w"
+        );
+
+        // An Elsewhere whose owner no longer resolves: home, record kept.
+        assert_eq!(effective_owner_with(st.path(), &no, "foo", "term2"), "foo");
+
+        // Unknown (empty record): home, never the raw record text.
+        let d = st.path().join("home").join(crate::projects::storage_key("foo"));
+        std::fs::write(d.join("term3"), "").unwrap();
+        assert_eq!(effective_owner_with(st.path(), &yes, "foo", "term3"), "foo");
     }
 }

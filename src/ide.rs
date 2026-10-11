@@ -390,7 +390,7 @@ impl Drop for ConnGuard {
         // taken, and the hub lock after that: conns -> pending -> hub, one
         // way only, which is the order `open_diff` and `do_answer_proposal`
         // already establish between the last two.
-        reclaim_pending_for(&self.project, self.id);
+        reclaim_pending_for(self.id);
     }
 }
 
@@ -405,22 +405,54 @@ impl Drop for ConnGuard {
 ///
 /// The requests themselves are dropped unanswered rather than replied to:
 /// the socket they came in on is gone, so there is nothing to answer to.
-fn reclaim_pending_for(project: &str, conn_id: u64) {
-    let orphaned: Vec<String> = {
+///
+/// Filters on `conn_id` alone, not `(project, conn_id)`: `Pending.project` is
+/// the *delivery* target — a re-homed Claude's proposals are parked under its
+/// owner, not its connection's own project (its home) — and by the time
+/// `ConnGuard::drop` gets here the `Target` holding that Claude's terminal
+/// has already been removed from `CONNS`, so the live owner cannot be
+/// recomputed. `conn_id` is unique for the process's lifetime regardless, so
+/// it alone is sufficient to find this connection's own rows; each row's own
+/// stored `project` says which hub to close the tab in.
+fn reclaim_pending_for(conn_id: u64) {
+    let orphaned: Vec<(String, String)> = {
         let mut map = pending().lock().unwrap_or_else(|e| e.into_inner());
-        let ids: Vec<String> = map
+        let rows: Vec<(String, String)> = map
             .iter()
-            .filter(|(_, p)| p.project == project && p.conn_id == conn_id)
-            .map(|(k, _)| k.clone())
+            .filter(|(_, p)| p.conn_id == conn_id)
+            .map(|(k, p)| (k.clone(), p.project.clone()))
             .collect();
-        for k in &ids {
+        for (k, _) in &rows {
             map.remove(k);
         }
-        ids
+        rows
     };
     // Outside the lock: this takes a hub lock and mirrors to every browser.
-    for k in &orphaned {
+    for (k, project) in &orphaned {
         crate::hub::close_proposal(project, k);
+    }
+}
+
+/// The project whose browsers should see this connection's `openDiff`
+/// traffic: the owner of the terminal this Claude sits in, when the terminal
+/// is known and its owner still resolves (`home::effective_owner`) — else
+/// this connection's own project, its home, exactly as before re-homing
+/// existed. A re-homed Claude's tab lives in the owner's workspace now
+/// (home.rs's module doc), so a proposal delivered to the home would open a
+/// tab in a panel nobody re-homed into is looking at.
+///
+/// Looked up fresh on every call rather than cached on `Conn`: the session a
+/// connection sits in is itself only known once `ide_connected` arrives
+/// (`set_session`), and a `cwd`/session can in principle change over a
+/// connection's life the same way `cwd` already does.
+fn delivery_project(project: &str, conn_id: u64) -> String {
+    let sess = {
+        let map = conns().lock().unwrap_or_else(|e| e.into_inner());
+        map.get(project).and_then(|v| v.iter().find(|t| t.id == conn_id)).map(|t| t.session.clone())
+    };
+    match sess {
+        Some(crate::idesess::Sess::In(s)) => crate::home::effective_owner(project, &s),
+        _ => project.to_string(),
     }
 }
 
@@ -977,10 +1009,18 @@ fn open_diff(
         },
     };
 
+    // Where this lands: the owner, for a Claude whose terminal was re-homed
+    // into a worktree, since that is the workspace its tab actually shows in
+    // now. Computed once and used for every browser-facing decision below —
+    // the dirty-buffer guard, the cap, and the parked row's own `project` —
+    // so `answer`/`close_tab`/`reclaim_pending_for` all agree on which hub
+    // this proposal belongs to.
+    let target = delivery_project(&conn.project, conn.id);
+
     // roost may be holding unsaved edits to this very file. Accepting would
     // discard them silently, which is the one thing the whole conflict-guard
     // exists to prevent.
-    if crate::hub::has_dirty_buffer(&conn.project, &rel) {
+    if crate::hub::has_dirty_buffer(&target, &rel) {
         return Some(err(id, -32002, format!("{rel} has unsaved changes in roost")));
     }
 
@@ -990,13 +1030,13 @@ fn open_diff(
         // Per project, not global: `PENDING` is process-wide, and a Claude in
         // a loop in one project must not be able to make every other
         // project's proposals start bouncing.
-        if map.values().filter(|p| p.project == conn.project).count() >= MAX_PENDING {
+        if map.values().filter(|p| p.project == target).count() >= MAX_PENDING {
             return Some(ok(id, text_result("DIFF_REJECTED")));
         }
         map.insert(
             pid.clone(),
             Pending {
-                project: conn.project.clone(),
+                project: target.clone(),
                 conn_id: conn.id,
                 rpc_id: id.clone(),
                 tab_name,
@@ -1009,7 +1049,7 @@ fn open_diff(
     // a pending proposal's lock is held for minutes if it is held at all.
     // Taking the hub lock only *after* releasing the pending one is also what
     // keeps the lock order total — see `Hub::do_answer_proposal`.
-    crate::hub::open_proposal(&conn.project, &pid, &rel, &old_text, &new_text);
+    crate::hub::open_proposal(&target, &pid, &rel, &old_text, &new_text);
 
     // No reply yet, and crucially the read loop is not blocked: Claude must
     // still be able to send `close_tab`, and a user who walked away must not
@@ -1029,11 +1069,15 @@ fn close_tab(
     conn: &Conn,
 ) -> Option<serde_json::Value> {
     let name = args["tab_name"].as_str().unwrap_or("");
+    // The same mapping `open_diff` used to park it — a withdrawal has to
+    // find the row under the project it was actually opened in, the owner
+    // for a re-homed Claude.
+    let target = delivery_project(&conn.project, conn.id);
     let withdrawn: Vec<String> = {
         let mut map = pending().lock().unwrap_or_else(|e| e.into_inner());
         let ids: Vec<String> = map
             .iter()
-            .filter(|(_, p)| p.project == conn.project && p.tab_name == name)
+            .filter(|(_, p)| p.project == target && p.tab_name == name)
             .map(|(k, _)| k.clone())
             .collect();
         for k in &ids {
@@ -1043,7 +1087,7 @@ fn close_tab(
     };
     // Outside the lock, for the same reason `open_diff` is.
     for k in &withdrawn {
-        crate::hub::close_proposal(&conn.project, k);
+        crate::hub::close_proposal(&target, k);
     }
     Some(ok(id, text_result("TAB_CLOSED")))
 }
@@ -2408,6 +2452,92 @@ mod tests {
         );
         assert!(h.proposals.is_empty(), "and so did the content behind it");
         drop(h);
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// A re-homed Claude's `openDiff` must land in the *owner*'s hub, not
+    /// the home's: the terminal's tab lives in the owner's workspace now
+    /// (home.rs's module doc), so a proposal delivered to the home would
+    /// open a tab in a panel nobody re-homed into is looking at.
+    ///
+    /// Built without a real socket — a `Target`/`ConnGuard` constructed
+    /// directly and `dispatch` called in-process, the same shape
+    /// `a_connection_records_the_session_it_was_told_about` uses — because
+    /// the thing under test is `open_diff`'s routing, not the handshake.
+    ///
+    /// `ROOST_ROOTS` and a real `.claude/worktrees/w1` directory under the
+    /// home are what let the production, fork-free `home::resolves` (not an
+    /// injected stub) confirm the owner before `open_diff` routes to it;
+    /// without them the record would be real but unresolved and the
+    /// proposal would fall back to home, proving nothing about the routing.
+    ///
+    /// Revert-checked: reverting `delivery_project` to always return its
+    /// `project` argument (ignoring the looked-up session) fails the first
+    /// assertion — observed: `panicked ... the proposal must land in the
+    /// owner's hub` — and the proposal is found in the home's hub instead
+    /// (confirmed separately).
+    #[test]
+    fn an_open_diff_from_a_rehomed_claude_lands_in_the_owners_hub_not_the_home() {
+        idelock::isolate_ide_dir_for_test();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", d.path());
+
+        let home = "diff-rehome-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = d.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let hub_home = crate::hub::Hub::for_project(home, home_dir.clone());
+        let hub_owner = crate::hub::Hub::for_project(&owner, owner_dir.clone());
+
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel::<String>();
+        let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut map = conns().lock().unwrap();
+            map.entry(home.to_string()).or_default().push(Target {
+                id,
+                reply: tx.clone(),
+                session: crate::idesess::Sess::Unknown,
+            });
+        }
+        let _guard = ConnGuard { project: home.to_string(), id };
+        set_session(home, id, crate::idesess::Sess::In("term3".into()));
+
+        let f = home_dir.join("a.rs");
+        std::fs::write(&f, "on disk").unwrap();
+        let mut conn = Conn::new(home, home_dir.clone(), tx, id);
+        let msg = rpc(
+            1,
+            "tools/call",
+            serde_json::json!({
+                "name": "openDiff",
+                "arguments": {
+                    "old_file_path": f.to_str().unwrap(),
+                    "new_file_path": f.to_str().unwrap(),
+                    "new_file_contents": "proposed",
+                    "tab_name": "p1",
+                }
+            }),
+        );
+        let reply = dispatch(&msg, &mut conn);
+        assert!(reply.is_none(), "openDiff parks rather than answering immediately");
+
+        assert!(
+            !crate::hub::Hub::lock(&hub_owner).proposals.is_empty(),
+            "the proposal must land in the owner's hub"
+        );
+        assert!(
+            crate::hub::Hub::lock(&hub_home).proposals.is_empty(),
+            "and not in the home's"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 

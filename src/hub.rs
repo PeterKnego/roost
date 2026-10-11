@@ -1831,7 +1831,12 @@ impl Hub {
                 }
                 crate::claudes::ClaudeEvidence::Absent => {}
             }
-            if !crate::session::live_names(&url).is_empty() {
+            // `owned_live_names`, not `live_names`: a resident's dtach
+            // socket is still under its *home*, so `live_names(&url)` alone
+            // would miss a running Claude re-homed into this worktree and
+            // let `git worktree remove` delete the directory out from
+            // under it.
+            if !crate::session::owned_live_names(&url).is_empty() {
                 return Err(format!("{name} has a live terminal"));
             }
             let state_dir = crate::wsstate::state_dir();
@@ -2638,9 +2643,17 @@ pub fn broadcast_to_project(project: &str, ev: &Event) {
 /// another project has nothing to attach to there. It cannot be shown in a
 /// panel that is about this project, and routing a click on it away from the
 /// project the user is working in is the behaviour that prompted the change.
+///
+/// `project` here is always the session's *home* — the pump has no notion
+/// of re-homing — so delivery is to `effective_owner(project, session)`
+/// instead: a re-homed session's tab lives in the owner's workspace now,
+/// and that is the panel a notice from it must land in. Computed before any
+/// lock is taken (CLAUDE.md: never hold a lock across blocking I/O, and this
+/// is a handful of small file reads/stats, never git).
 pub fn publish(project: &str, session: &str, p: crate::osc::Parsed) {
+    let target = crate::home::effective_owner(project, session);
     if let Some(notice) = crate::notify::record(project, session, p) {
-        broadcast_to_project(project, &Event::Notice { notice });
+        broadcast_to_project(&target, &Event::Notice { notice });
     }
 }
 
@@ -4081,6 +4094,72 @@ mod tests {
             "a worktree's tab must not be sent its parent project's notice, got {leaked:?}"
         );
 
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// `publish` runs on a session's pump thread, where the `project` it is
+    /// handed is always the session's *home* (the pump has no notion of
+    /// re-homing at all). A re-homed session's own tab lives in the
+    /// *owner*'s workspace now, so a notice raised there must be routed to
+    /// the owner hub, not the home's — the same "nobody else" shape as
+    /// `a_notice_reaches_its_own_projects_clients_and_nobody_elses` above,
+    /// but for the re-homing case rather than plain project scoping. Two
+    /// real hubs with a subscriber each, deliberately (CLAUDE.md's
+    /// single-subscriber trap): with one subscriber, routing to the home
+    /// and broadcasting to everyone are indistinguishable.
+    ///
+    /// `ROOST_ROOTS` and the real `.claude/worktrees/w1` directory are what
+    /// let the production, fork-free `home::resolves` (not an injected
+    /// stub) confirm the owner before `publish` routes to it — without
+    /// them the record would be real but unresolved, and the notice would
+    /// fall back to home, proving nothing about the routing this test is
+    /// for.
+    ///
+    /// Revert-checked: dropping the `effective_owner` remap in `publish`
+    /// (routing to `project` — the home — unconditionally) fails the first
+    /// assertion — observed: `panicked ... the owner's project must
+    /// receive it: Timeout` — because the notice lands at home instead
+    /// (confirmed separately that the home *does* receive it in that case).
+    #[test]
+    fn a_rehomed_sessions_notice_reaches_its_owner_not_its_home() {
+        isolate_ide_dir_for_tests();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", d.path());
+        crate::notify::reset_for_test();
+
+        let home = "notice-rehome-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = d.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let hub_home = Hub::for_project(home, home_dir.clone());
+        let hub_owner = Hub::for_project(&owner, owner_dir.clone());
+        let (_ca, rxa) = Hub::lock(&hub_home).subscribe();
+        let (_cb, rxb) = Hub::lock(&hub_owner).subscribe();
+        drain(&rxa);
+        drain(&rxb);
+
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        publish(home, "term3", crate::osc::Parsed { title: None, body: "for the owner".into() });
+
+        let got = rxb
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the owner's project must receive it");
+        assert!(got.contains(r#""t":"Notice""#), "expected a Notice, got {got}");
+        assert!(got.contains("for the owner"), "wrong notice: {got}");
+
+        let leaked = rxa.recv_timeout(std::time::Duration::from_millis(300));
+        assert!(
+            leaked.is_err(),
+            "a re-homed session's notice must not also land at home, got {leaked:?}"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
@@ -6375,6 +6454,46 @@ mod tests {
         assert!(got.contains("live terminal"), "{got}");
         assert!(dir.is_dir());
         crate::session::kill_project(&url);
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// A resident's socket lives under its *home* ("repo"), never under the
+    /// worktree it was re-homed into — so the removal gate must count
+    /// `owned_live_names(&url)`, not `live_names(&url)`, or a running
+    /// re-homed Claude's terminal would be invisible to it and `git
+    /// worktree remove` would delete the directory out from under it.
+    ///
+    /// `ROOST_ROOTS` is set so `home::resolves` (fork-free, no git) can
+    /// confirm the worktree dir under "repo" is real; without it the
+    /// resident would fall back to showing at home and this test would
+    /// prove nothing about the gate.
+    ///
+    /// Revert-checked: reverting the gate's `owned_live_names` back to
+    /// `live_names` fails `refusal_of`'s own assertion that the answer was
+    /// an `Error` — removal *succeeds* — observed: `panicked ... expected a
+    /// refusal, got {"t":"ProjectsChanged","project":"repo"}`.
+    #[test]
+    fn remove_refuses_a_worktree_with_a_live_resident() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let (mut h, url, dir) = repo_with_worktree(root.path());
+        let (a, rx) = h.subscribe();
+        drain(&rx);
+        // The resident's dtach socket is under its home, "repo" — re-homing
+        // never moves it (see home.rs's module doc) — while the record
+        // names the worktree as its owner.
+        let home_dir = h.dir.clone();
+        let _att = crate::session::reserve_and_attach("repo", "term3", &home_dir).unwrap();
+        crate::home::record("repo", "term3", &url).unwrap();
+        let got = refusal_of(&mut h, &a, &rx);
+        assert!(got.contains("terminal"), "{got}");
+        assert!(dir.is_dir());
+        crate::session::kill_project("repo");
+        std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 

@@ -1202,6 +1202,42 @@ fn known_projects_inner(roots: &[PathBuf], group: bool) -> Vec<ProjectStatus> {
     if group {
         group_worktrees(roots, &mut by_key);
     }
+    // A final, uniform correction pass: `owned_live_names(url)` is "what
+    // this project's workspace shows" for *any* project string, home or
+    // owner, so it is correct whether this row was discovered via a saved
+    // layout, a socket directory, or — a pure resident, re-homed by a `cd`
+    // and never itself opened — only just now via `group_worktrees` above
+    // (which always inserts a `live: 0` placeholder row for every worktree
+    // git reports). Running it over every row, not only the ones the
+    // earlier scans already touched, is what makes a resident's owner
+    // count correctly even when the owner has no socket or layout of its
+    // own, and makes a home whose only session is now away drop to 0
+    // rather than keep counting a socket file the re-home record says is
+    // no longer shown there.
+    for p in by_key.values_mut() {
+        let owned = crate::session::owned_live_names(&p.url);
+        p.live = owned.len();
+        // Age still comes only from sessions this process can inspect (see
+        // the per-key scan's identical comment above) — a restart-survived
+        // socket contributes to the count but not the age either way. Each
+        // name's age is read from wherever its session is actually
+        // *attached*: the home, for a resident, since re-homing never moves
+        // the dtach socket.
+        let mut by_home: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for (name, home) in owned {
+            by_home.entry(home.unwrap_or_else(|| p.url.clone())).or_default().push(name);
+        }
+        p.oldest_age_secs = by_home
+            .into_iter()
+            .filter_map(|(home, names)| {
+                crate::session::list_sessions(&home)
+                    .into_iter()
+                    .filter(|s| names.contains(&s.name))
+                    .filter_map(|s| s.age_secs)
+                    .max()
+            })
+            .max();
+    }
     order_with_children(by_key.into_values().collect())
 }
 
@@ -1283,7 +1319,10 @@ pub fn worktree_rows(roots: &[PathBuf], parent_key: &str) -> Vec<ProjectStatus> 
             None => (w.path.to_string_lossy().into_owned(), false),
         };
         let key = crate::projects::storage_key(&child_url);
-        let live = crate::session::session_rows(&child_url).len();
+        // `owned_live_names`, not `session_rows`: a resident's dtach socket
+        // is still under its home, so this worktree's own native-session
+        // count alone would miss a running Claude re-homed into it.
+        let live = crate::session::owned_live_names(&child_url).len();
         let wt = if reachable {
             let (base, base_recorded) = match crate::worktree::read_base(&state_dir, &key) {
                 Some(b) => (b, true),
@@ -1696,6 +1735,118 @@ mod tests {
             assert!(!child.reachable, "a worktree outside ROOTS must never be marked reachable");
             assert_eq!(child.parent.as_deref(), Some("repo"));
         });
+    }
+
+    /// A resident's dtach socket is physically under its *home*, never the
+    /// worktree the re-home record names as its owner (home.rs's module
+    /// doc) — so `worktree_rows`' per-worktree `live` count must come from
+    /// `owned_live_names(&child_url)`, which follows the record, not
+    /// `session_rows(&child_url)`, which only ever sees the worktree's own
+    /// native sessions and would report 0 for a running re-homed Claude.
+    ///
+    /// `ROOST_ROOTS` matters here in a way `with_state`'s other tests never
+    /// need: `owned_live_names` calls the production, fork-free
+    /// `home::resolves`, which reads `projects::roots()` from the
+    /// environment regardless of the `roots` slice this test passes
+    /// explicitly to `worktree_rows` — so without it the record would be
+    /// real but unresolved, and the resident would fall back to showing at
+    /// home, proving nothing about this function's own counting.
+    ///
+    /// Revert-checked: reverting the `live` line back to
+    /// `session_rows(&child_url).len()` fails the assertion — observed:
+    /// `panicked ... the resident must be counted under its owner:
+    /// assertion \`left == right\` failed\n  left: 0\n right: 1`.
+    #[test]
+    fn worktree_rows_counts_a_resident_not_just_its_own_native_sessions() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        fs::write(repo.join("a.txt"), "x").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-qm", "init"]);
+        run_git(&repo, &["worktree", "add", "-q", "-b", "feat", ".claude/worktrees/feat"]);
+        let child_url = "repo/.claude/worktrees/feat".to_string();
+
+        // The resident's socket is under its home, "repo"; only the record
+        // names the worktree as its owner.
+        let _att = crate::session::reserve_and_attach("repo", "term3", &repo).unwrap();
+        crate::home::record("repo", "term3", &child_url).unwrap();
+
+        let roots = vec![root.path().to_path_buf()];
+        let rows = worktree_rows(&roots, "repo");
+        let row = rows.iter().find(|r| r.url == child_url).expect("the worktree must be listed");
+        assert_eq!(row.live, 1, "the resident must be counted under its owner");
+
+        crate::session::kill_project("repo");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// `group_worktrees` inserts a row for every worktree git reports,
+    /// `live: 0`, whether or not anyone ever opened it or saved a layout
+    /// for it (see the sibling test above) — which is exactly what lets a
+    /// *pure* resident (re-homed by a `cd`, never shown as its own tab) get
+    /// a correct count here too: `known_projects_inner`'s final pass must
+    /// recompute every row's `live` from `owned_live_names`, not just the
+    /// rows a socket directory or saved layout already produced.
+    ///
+    /// Also pins the other half: the home's own `live` must drop to 0 once
+    /// its only session is away, which a raw socket-file *count* (the
+    /// pre-existing per-key floor) could never express — it has no session
+    /// names to exclude by.
+    ///
+    /// Revert-checked: reverting the final correction pass (so a row's
+    /// `live` is whatever the socket/layout scan already set, 0 for a never
+    /// -opened worktree) fails the worktree assertion — observed: `panicked
+    /// ... the resident must be counted under the worktree it was re-homed
+    /// into: assertion \`left == right\` failed\n  left: 0\n right: 1`.
+    #[test]
+    fn known_projects_counts_a_resident_under_a_worktree_that_was_never_separately_opened() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        std::env::set_var("ROOST_STATE_DIR", &state);
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        fs::write(repo.join("a.txt"), "x").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-qm", "init"]);
+        run_git(&repo, &["worktree", "add", "-q", "-b", "feat", ".claude/worktrees/feat"]);
+
+        // Only the repo has ever been opened: the worktree has neither its
+        // own saved layout nor any socket of its own.
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("repo.json"), "{}").unwrap();
+
+        let _att = crate::session::reserve_and_attach("repo", "term3", &repo).unwrap();
+        crate::home::record("repo", "term3", "repo/.claude/worktrees/feat").unwrap();
+
+        let ps = known_projects(&[root.path().to_path_buf()]);
+        let child = ps
+            .iter()
+            .find(|p| p.url == "repo/.claude/worktrees/feat")
+            .expect("the worktree must be listed even though it was never separately opened");
+        assert_eq!(child.live, 1, "the resident must be counted under the worktree it was re-homed into");
+        let parent = ps.iter().find(|p| p.key == "repo").unwrap();
+        assert_eq!(parent.live, 0, "and no longer under its home, now that it is away");
+
+        crate::session::kill_project("repo");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     // Regression: `known_projects_with_state` used to key its worktree

@@ -124,7 +124,24 @@ pub fn try_claude_terminals(proc_root: &std::path::Path) -> Option<Vec<ClaudePro
 }
 
 fn names_for(project: &str, scan: &[ClaudeProc]) -> Vec<String> {
-    scan.iter().filter(|c| c.project == project).map(|c| c.session.clone()).collect()
+    names_for_owned(&crate::wsstate::state_dir(), project, scan, &crate::home::resolves)
+}
+
+/// [`names_for`] mapped through re-homing: a Claude's terminal counts for
+/// its *effective owner*, not the raw `ROOST_PROJECT` its environment
+/// carries, so a re-homed Claude shows up (and the removal gate below sees
+/// it) under the worktree it was moved into rather than the main checkout
+/// it started in.
+fn names_for_owned(
+    state: &std::path::Path,
+    project: &str,
+    scan: &[ClaudeProc],
+    resolves: &dyn Fn(&str, &str) -> bool,
+) -> Vec<String> {
+    scan.iter()
+        .filter(|c| crate::home::effective_owner_with(state, resolves, &c.project, &c.session) == project)
+        .map(|c| c.session.clone())
+        .collect()
 }
 
 /// This terminal's Claude's `CLAUDE_CODE_SSE_PORT`, if there is a Claude
@@ -412,6 +429,41 @@ mod tests {
                 ClaudeProc { project: "other".into(), session: "term".into(), sse_port: None },
             ]
         );
+    }
+
+    /// A Claude whose terminal was re-homed into a worktree must count for
+    /// that worktree, not for the main checkout its `ROOST_PROJECT`
+    /// environment still names — this is what lets the removal gate
+    /// (`hub::do_remove_worktree`) see it and what makes `tick` wake both
+    /// projects on a re-home.
+    ///
+    /// Revert-checked: dropping the `effective_owner_with` mapping (i.e.
+    /// filtering on `c.project == project` directly, `names_for`'s old
+    /// body) fails the first assertion — observed:
+    /// `assertion 'left == right' failed: left: [], right: ["term3"]` —
+    /// and the second assertion (now vacuously true since nothing maps to
+    /// the home either) would no longer discriminate on its own.
+    #[test]
+    fn a_rehomed_claude_counts_for_its_owner_not_its_home() {
+        let st = tempfile::tempdir().unwrap();
+        crate::home::record_in(st.path(), "karpie", "term3", "karpie/.claude/worktrees/worktree-x")
+            .unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let mk = |pid: u32, comm: &str, env: &str| {
+            let p = d.path().join(pid.to_string());
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("comm"), format!("{comm}\n")).unwrap();
+            std::fs::write(p.join("environ"), env.replace('\n', "\0")).unwrap();
+        };
+        mk(100, "claude", "ROOST_PROJECT=karpie\nROOST_SESSION=term3\n");
+        let procs = claude_terminals(d.path());
+        // Always-true: the fake state dir has no project roots for a real
+        // `resolves` to find `karpie` under, so the real `home::resolves`
+        // would be fork-free but still can't look anything up here.
+        let yes = |_: &str, _: &str| true;
+        let owned = names_for_owned(st.path(), "karpie/.claude/worktrees/worktree-x", &procs, &yes);
+        assert_eq!(owned, vec!["term3".to_string()]);
+        assert!(names_for_owned(st.path(), "karpie", &procs, &yes).is_empty());
     }
 
     /// `sse_port_in`'s outer `Option` answers "is a Claude here at all";

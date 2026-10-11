@@ -1648,6 +1648,7 @@ pub fn human_age(secs: u64) -> String {
     }
 }
 
+#[derive(Debug)]
 pub struct OvSession {
     pub project_url: String,
     pub name: String,
