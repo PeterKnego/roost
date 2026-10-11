@@ -460,6 +460,15 @@ pub enum HookOutcome {
     Refuse(String),
 }
 
+/// Bounds the client's wait for a reply. Sits strictly between the server's
+/// own ask budget (`hub::ask_worktree_blocking`'s 60s, Task 9) and Claude
+/// Code's 120s hook-kill: long enough that a roost that is genuinely asking
+/// the user is never cut off before it would have answered on its own, but
+/// short enough that this process — not Claude Code's own kill — is what
+/// ends a wedged roost's hold on the hook, so the refusal names the real
+/// reason instead of a bare "killed" from the Claude Code side.
+pub const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// `roost worktree-hook`'s decision, separated from its I/O so every row of
 /// the spec's table (§2) is a test. Falling back to creating when roost
 /// cannot be reached is deliberate and is the one permissive default in this
@@ -475,6 +484,20 @@ pub fn worktree_hook_core(
     env_session: Option<String>,
     connect: &dyn Fn() -> std::io::Result<std::os::unix::net::UnixStream>,
     fallback_create: &dyn Fn(&std::path::Path, &str, Option<&str>) -> Result<String, String>,
+) -> HookOutcome {
+    worktree_hook_core_with_timeout(payload, env_project, env_session, connect, fallback_create, REPLY_TIMEOUT)
+}
+
+/// `worktree_hook_core`'s real body, with the reply timeout as a parameter
+/// so a test can drive it with ~200ms instead of actually waiting out the
+/// production `REPLY_TIMEOUT`.
+fn worktree_hook_core_with_timeout(
+    payload: &serde_json::Value,
+    env_project: Option<String>,
+    env_session: Option<String>,
+    connect: &dyn Fn() -> std::io::Result<std::os::unix::net::UnixStream>,
+    fallback_create: &dyn Fn(&std::path::Path, &str, Option<&str>) -> Result<String, String>,
+    reply_timeout: std::time::Duration,
 ) -> HookOutcome {
     use std::io::{BufRead, BufReader, Write};
     let s = |k: &str| payload.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -494,15 +517,32 @@ pub fn worktree_hook_core(
     };
     let stream = match connect() {
         Ok(s) => s,
-        // Both read as "roost is not here to ask" — a stale/missing socket
-        // file (`NotFound`) and a socket with nothing listening on it
-        // (`ConnectionRefused`, the shape a dead roost's unlinked-on-next-start
-        // socket leaves between restarts) — so both fall back the same way.
-        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
+        // All three read as "roost is not here to ask": a stale/missing
+        // socket file (`NotFound`); a socket with nothing listening on it
+        // (`ConnectionRefused`, the shape a dead roost's unlinked-on-next-
+        // start socket leaves between restarts); and a socket path too long
+        // for `sun_path` (`InvalidInput`) — if `connect()` cannot even
+        // address that path, roost's own `bind()` at startup could not
+        // have either, so nothing can be listening there. All three fall
+        // back the same way.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
             return fallback(Some(&project))
         }
         Err(e) => return HookOutcome::Refuse(format!("roost: cannot reach roost to approve a worktree: {e}")),
     };
+    // Covers both the write below and the reply read: a peer that accepted
+    // the connection and then wedged (or simply never answers) must not
+    // hang this process past Claude Code's own 120s hook kill — this is
+    // what makes that bounded instead of unbounded.
+    let _ = stream.set_read_timeout(Some(reply_timeout));
+    let _ = stream.set_write_timeout(Some(reply_timeout));
     let req = serde_json::json!({
         "op": "worktree_create",
         "project": project,
@@ -517,7 +557,20 @@ pub fn worktree_hook_core(
     }
     let mut line = String::new();
     match BufReader::new(&stream).read_line(&mut line) {
-        Ok(0) | Err(_) => {
+        Ok(0) => {
+            return HookOutcome::Refuse("roost: no answer from roost (it may have restarted); not creating".into())
+        }
+        // `WouldBlock`/`TimedOut`: platforms differ on which a
+        // `SO_RCVTIMEO` read reports when it actually expires (same split
+        // `hooksock.rs`'s own deadline handling has to account for), so
+        // both are read as the timeout firing, not a generic I/O failure.
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+            return HookOutcome::Refuse(format!(
+                "roost: no answer from roost within {} s; not creating",
+                reply_timeout.as_secs()
+            ))
+        }
+        Err(_) => {
             return HookOutcome::Refuse("roost: no answer from roost (it may have restarted); not creating".into())
         }
         Ok(_) => {}
@@ -945,6 +998,74 @@ mod tests {
     fn an_invalid_name_is_refused_before_anything() {
         let out = worktree_hook_core(&payload("--evil"), None, None, &|| panic!(), &|_, _, _| panic!());
         assert!(matches!(out, HookOutcome::Refuse(r) if r.contains("must match")));
+    }
+
+    // Fix round 1, finding 2: `connect()` returning `InvalidInput` (the
+    // socket path is longer than `sun_path` can hold) means `bind()` at
+    // that same path must have failed too, the same as if nothing were
+    // listening — so this is an "absent/refused" row, not a hard error.
+    //
+    // Revert-checked: removing `InvalidInput` from the fallback match arm's
+    // `matches!` makes this fail — `worktree_hook_core` returns
+    // `Refuse("roost: cannot reach roost to approve a worktree: invalid
+    // input parameter")` instead of falling back, so `matches!(out,
+    // HookOutcome::Print(_))` panics with that `Refuse(..)` value printed.
+    // Restored from backup.
+    #[test]
+    fn an_unbindable_socket_path_falls_back() {
+        let out = worktree_hook_core(
+            &payload("fox"),
+            Some("p".into()),
+            Some("term".into()),
+            &|| Err(std::io::ErrorKind::InvalidInput.into()),
+            &|_, n, p| {
+                assert_eq!(p, Some("p"));
+                Ok(format!("/w/{n}"))
+            },
+        );
+        assert!(matches!(out, HookOutcome::Print(_)), "{out:?}");
+    }
+
+    // Fix round 1, finding 1: the reply read had no bound at all, so a
+    // roost that accepted the connection and then wedged (or was paused by
+    // a debugger, or anything else that reads the request but never
+    // answers) would hang `worktree-hook` until Claude Code's own 120s hook
+    // kill. The server here reads the request (so this is genuinely "sent,
+    // then no answer", not "could not send") and then holds the connection
+    // open indefinitely with no reply — never dropped, so the only way this
+    // test's own read can return is the client's own timeout firing. The
+    // spawned thread leaks into the background once this test returns,
+    // which is harmless: nothing else references this socket pair, and the
+    // whole test process exits (killing it) regardless of its 60s sleep,
+    // the same leaked-accept-thread shape `hooksock.rs`'s own tests use.
+    //
+    // Revert-checked: removing the `set_read_timeout`/`set_write_timeout`
+    // calls in `worktree_hook_core_with_timeout` makes this hang rather
+    // than fail — `timeout 10 cargo test --lib
+    // cli::tests::hook_exits_1_when_server_never_replies_within_the_timeout
+    // -- --test-threads=1` was killed at the 10s wall clock (exit 143, no
+    // completed output), where the correct version finishes in well under
+    // 1s. Restored from backup.
+    #[test]
+    fn hook_exits_1_when_server_never_replies_within_the_timeout() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(&b), &mut line);
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        });
+        let a = std::sync::Mutex::new(Some(a));
+        let start = std::time::Instant::now();
+        let out = worktree_hook_core_with_timeout(
+            &payload("fox"),
+            Some("p".into()),
+            Some("term".into()),
+            &|| Ok(a.lock().unwrap().take().unwrap()),
+            &|_, _, _| panic!("must not fall back"),
+            std::time::Duration::from_millis(200),
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(1), "took {:?}", start.elapsed());
+        assert!(matches!(out, HookOutcome::Refuse(ref r) if r.contains("no answer")), "{out:?}");
     }
 
     // Controller ruling (R5): the fallback path must never let anything but
