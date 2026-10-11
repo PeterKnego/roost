@@ -2192,9 +2192,20 @@ impl Hub {
         // is already a real absolute path, not project-relative, so
         // sending it unchanged to the home's connection needs no
         // re-relativising the way `ide.rs`'s proposal delivery does.
-        let target_project =
-            session.as_ref().and_then(|s| self.session_homes.get(s)).cloned().unwrap_or_else(|| self.project.clone());
-        if let Err(e) = crate::ide::mention_to(&target_project, session.as_deref(), &abs, lines) {
+        //
+        // A resident goes through `mention_to_exact`, never plain
+        // `mention_to`: the home's `conns()` entry can also hold its own
+        // native terminals or a different resident, and `mention_to`'s
+        // `Sess::Unknown` match / lone-connection fallback — right for a
+        // project asking about its *own* ambiguity — would otherwise let
+        // an Alt+K aimed at one resident land on an unrelated Claude at the
+        // same home. A session that is *not* a resident takes the exact
+        // same path as before re-homing existed (self.project, lenient).
+        let result = match session.as_deref().and_then(|s| self.session_homes.get(s).map(|h| (h.clone(), s))) {
+            Some((home, s)) => crate::ide::mention_to_exact(&home, s, &abs, lines),
+            None => crate::ide::mention_to(&self.project, session.as_deref(), &abs, lines),
+        };
+        if let Err(e) = result {
             let ev = Event::Error { msg: e };
             self.send_to(from, &ev);
         }
@@ -2235,11 +2246,18 @@ impl Hub {
         // Unaimed, unlike `do_mention_path`: every connected Claude gets
         // this, so every one of this project's *residents* must also be
         // reached at their own home — their connection has no entry under
-        // `self.project` at all. Deduplicated by home, since several
-        // residents can share one.
-        let homes: std::collections::HashSet<&String> = self.session_homes.values().collect();
-        for home in homes {
-            let _ = crate::ide::selection_changed(home, &abs, &text, start, end);
+        // `self.project` at all. Grouped by home (several residents can
+        // share one) and delivered through the session-filtered
+        // `selection_changed_for_sessions`, never plain `selection_changed`
+        // (which is `notify_all`): a home's `conns()` entry can also hold
+        // its own native terminals' Claudes, or a resident re-homed into a
+        // *different* worktree, and this selection is about neither.
+        let mut by_home: std::collections::HashMap<&String, Vec<String>> = Default::default();
+        for (name, home) in &self.session_homes {
+            by_home.entry(home).or_default().push(name.clone());
+        }
+        for (home, names) in by_home {
+            let _ = crate::ide::selection_changed_for_sessions(home, &names, &abs, &text, start, end);
         }
     }
 
@@ -5856,16 +5874,99 @@ mod tests {
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
+    /// Ruling R13a: a resident's Alt+K must not fall back across projects.
+    /// `notify_selected`'s two ambiguity heuristics — matching
+    /// `Sess::Unknown`, and a lone connection winning regardless of its
+    /// session — are right when a project asks about its own connections
+    /// (an `Unknown` or a single Claude there could plausibly be the one
+    /// meant). Routed to a resident's *home* instead, they are wrong: an
+    /// `Unknown`/lone connection there is some other terminal entirely, and
+    /// term3 (the resident) has no connection at all in this fixture. The
+    /// mention must reach nobody, not that unrelated connection, and the
+    /// asker must see the same "no Claude" refusal `do_mention_path`
+    /// already gives for an ordinary (non-re-homed) miss.
+    ///
+    /// Revert-checked: calling `ide::mention_to` (which goes through
+    /// `notify_selected`, the a48248c body) instead of `mention_to_exact`
+    /// for the resident case fails the first assertion — observed:
+    /// `panicked ... the lone Unknown connection must not receive a
+    /// mention aimed at a different session` (the lone-connection fallback
+    /// delivers to it, since it is the only connection under the home —
+    /// confirmed separately that `rx_unknown.recv_timeout` succeeds there).
+    #[test]
+    fn an_aimed_mention_to_a_resident_does_not_fall_back_to_an_unrelated_home_connection() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "mention-fallback-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+        std::fs::write(owner_dir.join("a.rs"), "fn main() {}").unwrap();
+
+        crate::session::reserve_and_attach(home, "term3", &home_dir).unwrap();
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        // No connection at all for term3; the home's only connection is one
+        // roost could not place, the single-project heuristic this test
+        // exists to refuse.
+        let rx_unknown = crate::ide::register_fake_unknown_conn_for_test(home);
+
+        let mut h = Hub::new(&owner, owner_dir.clone());
+        assert_eq!(h.session_homes.get("term3"), Some(&home.to_string()), "setup");
+        let (asker, rx_asker) = h.subscribe();
+
+        h.handle(&asker, Intent::MentionPath {
+            rel: "a.rs".into(),
+            line_start: None,
+            line_end: None,
+            session: Some("term3".into()),
+        });
+
+        assert!(
+            rx_unknown.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "the lone Unknown connection must not receive a mention aimed at a different session"
+        );
+        let got: Vec<String> = rx_asker.try_iter().collect();
+        assert!(got.iter().any(|m| m.contains(r#""t":"Error""#)), "the asker must see a refusal: {got:?}");
+
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
     /// Finding 6's other half: a shared selection is unaimed — every
     /// connected Claude gets it — so from the owner's hub it must reach not
     /// only any native connection under the owner itself but every
     /// *resident's* connection too, each at its own home.
+    ///
+    /// Also pins the fix-round-2 half of finding 6: `notify_all(home)` (the
+    /// a48248c body) sends to *every* `Target` under the home — the home's
+    /// own native terminals, and any other resident re-homed into a
+    /// *different* worktree — not just this owner's own resident. `term9`
+    /// (a native home session) and `term5` (a resident of a different
+    /// owner, `w2`) must receive nothing.
     ///
     /// Revert-checked: removing the `self.session_homes.values()` loop from
     /// `do_share_selection` (the pre-fix-round body, which only ever calls
     /// `ide::selection_changed(&self.project, ...)`) fails — observed:
     /// `panicked ... the resident's Claude must receive the shared
     /// selection: Timeout`.
+    ///
+    /// Revert-checked again (fix round 2, and this is the real RED a48248c
+    /// itself produces): calling `ide::selection_changed(home, ...)`
+    /// (`notify_all`, a48248c's actual body) instead of the session-
+    /// filtered `selection_changed_for_sessions` fails the `term9`
+    /// assertion — observed: `panicked ... term9 (a native home session)
+    /// must not receive a re-homed selection` (the `recv_timeout` on
+    /// `rx_native` succeeds instead of timing out: `notify_all` sent to
+    /// every `Target` under the home, term9 included).
     #[test]
     fn a_shared_selection_from_the_owner_also_reaches_its_residents_claude() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -5880,6 +5981,7 @@ mod tests {
 
         let home = "shareselection-rehome-home";
         let owner = format!("{home}/.claude/worktrees/w1");
+        let owner2 = format!("{home}/.claude/worktrees/w2");
         let home_dir = root.path().join(home);
         std::fs::create_dir_all(&home_dir).unwrap();
         let owner_dir = home_dir.join(".claude/worktrees/w1");
@@ -5889,9 +5991,16 @@ mod tests {
         crate::session::reserve_and_attach(home, "term3", &home_dir).unwrap();
         crate::home::record(home, "term3", &owner).unwrap();
         let rx_home = crate::ide::register_fake_conn_for_test(home, "term3");
+        // A native home session — never re-homed at all.
+        let rx_native = crate::ide::register_fake_conn_for_test(home, "term9");
+        // A resident of a *different* owner under the same home.
+        crate::home::record(home, "term5", &owner2).unwrap();
+        let rx_other_owner = crate::ide::register_fake_conn_for_test(home, "term5");
 
         let mut h = Hub::new(&owner, owner_dir.clone());
         assert_eq!(h.session_homes.get("term3"), Some(&home.to_string()), "setup");
+        assert!(h.session_homes.get("term9").is_none(), "setup: term9 is native, not a resident of this owner");
+        assert!(h.session_homes.get("term5").is_none(), "setup: term5 belongs to owner2, not this owner");
         let (asker, _rx_asker) = h.subscribe();
 
         h.handle(&asker, Intent::ShareSelection {
@@ -5907,6 +6016,14 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("the resident's Claude must receive the shared selection");
         assert!(got.contains("selection_changed"), "{got}");
+        assert!(
+            rx_native.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "term9 (a native home session) must not receive a re-homed selection"
+        );
+        assert!(
+            rx_other_owner.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "term5 (a different owner's resident) must not receive it either"
+        );
 
         crate::session::kill_project(home);
         std::env::remove_var("ROOST_CONFIG");

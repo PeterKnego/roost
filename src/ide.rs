@@ -513,6 +513,67 @@ fn notify_all(project: &str, msg: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Sends `msg` only to the connections in `project` whose terminal is one
+/// of `names` — never every connection (`notify_all`'s job), and with
+/// neither of `notify_selected`'s two ambiguity heuristics: no
+/// `Sess::Unknown` match, no lone-connection fallback.
+///
+/// Exists for exactly one caller shape: a project whose `conns()` entry
+/// holds more than this request has any business reaching — a *home*,
+/// asked about on behalf of one specific re-homed session (an aimed
+/// mention) or a known set of them (an unaimed selection share). The home's
+/// own native terminals, and any other resident re-homed into a *different*
+/// worktree, share that same `conns()` entry; `notify_all`/`notify_selected`
+/// were built for a project asking about itself, where every connection
+/// under it is fair game. Neither heuristic generalises past that: an
+/// `Unknown` connection under the home could be any of its native
+/// terminals, not necessarily `names`' owner — matching it anyway is a
+/// guess this caller has no business making — and a lone connection that is
+/// not `Sess::In` of one of `names` is almost certainly a native terminal,
+/// not a stand-in for the one actually wanted.
+fn notify_sessions(project: &str, names: &[String], msg: &serde_json::Value) -> Result<(), String> {
+    let msg = msg.to_string();
+    let targets = targets_for_sessions(project, names);
+    if targets.is_empty() {
+        return Err("no Claude is connected to this project".into());
+    }
+    for t in &targets {
+        let _ = t.send(msg.clone());
+    }
+    Ok(())
+}
+
+/// The reply channels in `project` whose terminal is `Sess::In` of one of
+/// `names` — the exact-match core `notify_sessions`/`notify_exact` share.
+fn targets_for_sessions(project: &str, names: &[String]) -> Vec<std::sync::mpsc::Sender<String>> {
+    let map = conns().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(project)
+        .map(|v| {
+            v.iter()
+                .filter(|t| matches!(&t.session, crate::idesess::Sess::In(s) if names.iter().any(|n| n == s)))
+                .map(|t| t.reply.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Like `notify_sessions` with one name, but for an *aimed* request
+/// (`do_mention_path`'s re-routed case): the error names the specific
+/// terminal rather than the generic "no Claude is connected", matching
+/// `notify_selected`'s own wording for the same situation on a project
+/// asking about itself.
+fn notify_exact(project: &str, session: &str, msg: &serde_json::Value) -> Result<(), String> {
+    let msg = msg.to_string();
+    let targets = targets_for_sessions(project, std::slice::from_ref(&session.to_string()));
+    if targets.is_empty() {
+        return Err(format!("no Claude is running in terminal \"{session}\""));
+    }
+    for t in &targets {
+        let _ = t.send(msg.clone());
+    }
+    Ok(())
+}
+
 /// Records what `ide_connected` learned about this connection's terminal.
 ///
 /// Separate from registration because the two happen at different times and
@@ -719,6 +780,30 @@ pub fn mention_to(
     notify_selected(project, session, &msg)
 }
 
+/// `mention_to`, but for a session already known to be a specific resident
+/// re-routed to its `home` (`do_mention_path`'s own job, not this
+/// function's). Reaches only that one session's connection — `notify_exact`,
+/// never `notify_selected` — because `home`'s `conns()` entry may also hold
+/// its own native terminals or a different resident, and `notify_selected`'s
+/// `Sess::Unknown` match and lone-connection fallback exist for a project
+/// asking about itself, where they cannot cross into a terminal nobody
+/// meant. An Alt+K aimed at a specific resident must reach that resident or
+/// nothing — see finding 6's fix-round-2 half for the leak this replaces.
+pub fn mention_to_exact(
+    home: &str,
+    session: &str,
+    abs: &Path,
+    lines: Option<(u32, u32)>,
+) -> Result<(), String> {
+    let mut params = serde_json::json!({"filePath": abs.to_string_lossy()});
+    if let Some((a, b)) = lines {
+        params["lineStart"] = serde_json::json!(a);
+        params["lineEnd"] = serde_json::json!(b);
+    }
+    let msg = serde_json::json!({"jsonrpc": "2.0", "method": "at_mentioned", "params": params});
+    notify_exact(home, session, &msg)
+}
+
 /// Ships the editor's current selection to Claude as ambient context — the
 /// one notification in this module that carries file *contents* with no
 /// explicit user gesture behind it. `mention` and `openDiff` both require a
@@ -755,6 +840,39 @@ pub fn selection_changed(
         },
     });
     notify_all(project, &msg)
+}
+
+/// `selection_changed`, but reaching only `names`' own connections in
+/// `project` — `notify_sessions`, never `notify_all`. For a re-homed
+/// session's selection delivered to its home: `notify_all(home)` would
+/// leak the selection's file content to every other Claude connected to
+/// that home — its own native terminals, or a resident re-homed into a
+/// *different* worktree — none of which this selection is about. See
+/// finding 6's fix-round-2 half.
+pub fn selection_changed_for_sessions(
+    project: &str,
+    names: &[String],
+    abs: &Path,
+    text: &str,
+    start: (u32, u32),
+    end: (u32, u32),
+) -> Result<(), String> {
+    if !crate::config::share_selection() {
+        return Err("selection sharing is off (set share_selection = true in the global config)".into());
+    }
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "selection_changed",
+        "params": {
+            "filePath": abs.to_string_lossy(),
+            "text": text,
+            "selection": {
+                "start": {"line": start.0, "character": start.1},
+                "end":   {"line": end.0,   "character": end.1},
+            },
+        },
+    });
+    notify_sessions(project, names, &msg)
 }
 
 pub struct Conn {
@@ -935,6 +1053,23 @@ pub(crate) fn register_fake_conn_for_test(
     conns().lock().unwrap_or_else(|e| e.into_inner()).entry(project.to_string()).or_default().push(
         Target { id, reply: tx, session: crate::idesess::Sess::In(session.to_string()) },
     );
+    rx
+}
+
+/// Like `register_fake_conn_for_test`, but for a connection roost could not
+/// place at all (`Sess::Unknown`) — what `notify_selected`'s own ambiguity
+/// heuristics treat as "cannot rule out", and what `notify_exact`'s own
+/// tests need present to prove it does *not* do the same.
+#[cfg(test)]
+pub(crate) fn register_fake_unknown_conn_for_test(project: &str) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+    conns()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(project.to_string())
+        .or_default()
+        .push(Target { id, reply: tx, session: crate::idesess::Sess::Unknown });
     rx
 }
 

@@ -606,6 +606,23 @@ mod tests {
         assert_eq!(cached_sessions(&owner), vec!["term3".to_string()]);
         assert!(cached_sessions(home).is_empty(), "the home no longer shows it");
 
+        // Leave the shared cache empty for other tests — the same
+        // discipline `the_watcher_caches_a_walk_and_wakes_only_what_changed`
+        // and `an_unreadable_proc_leaves_the_cache_alone` follow (ruling
+        // R13b). Without this, `rehome-tick-fixture`'s owner row stays in
+        // the process-global `SCAN` indefinitely, which is invisible here
+        // only because this test happens to run alphabetically last among
+        // the ones that touch `SCAN`.
+        //
+        // Revert-checked: dropping the final `tick(proc_root.path())`
+        // (keeping only the `remove_dir_all` and the assertion) fails —
+        // observed: `panicked ... cleanup: the owner's cache entry must be
+        // gone too` — the directory is gone but the cache still holds the
+        // last walk's result until another `tick` runs.
+        std::fs::remove_dir_all(proc_root.path().join("100")).unwrap();
+        tick(proc_root.path());
+        assert!(cached_sessions(&owner).is_empty(), "cleanup: the owner's cache entry must be gone too");
+
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
     }
