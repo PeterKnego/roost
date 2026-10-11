@@ -27,6 +27,11 @@ fn dir_in(state: &Path, home: &str) -> PathBuf {
 }
 
 pub fn owner_of_in(state: &Path, home: &str, name: &str) -> Owner {
+    // Validate the session name before building any path; Unknown is the
+    // destroy-nothing direction, whereas Here would let Close Project act.
+    if !crate::session::valid_name(name) {
+        return Owner::Unknown(format!("invalid session name {name:?}"));
+    }
     match std::fs::read_to_string(dir_in(state, home).join(name)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Owner::Here,
         Err(e) => Owner::Unknown(format!("cannot read re-home record: {e}")),
@@ -165,5 +170,17 @@ mod tests {
         sweep_in(st.path(), &|_, _| Some(true)); // socket still there
         assert!(matches!(owner_of_in(st.path(), "foo", "term3"), Owner::Elsewhere(_)),
             "a vanished owner is not evidence the session ended");
+    }
+
+    #[test]
+    fn an_invalid_name_is_unknown_and_reads_nothing_outside_the_record_dir() {
+        let st = tempfile::tempdir().unwrap();
+        // A file the traversal would reach: state/home/<key(foo)>/../outside
+        std::fs::create_dir_all(st.path().join("home")).unwrap();
+        std::fs::write(st.path().join("home").join("outside"), "evil/owner\n").unwrap();
+        record_in(st.path(), "foo", "term", "x/w").unwrap(); // make the home dir exist
+        // Without the validation guard, this reads outside the record dir and returns
+        // Elsewhere("evil/owner"), which fails the assertion.
+        assert!(matches!(owner_of_in(st.path(), "foo", "../outside"), Owner::Unknown(_)));
     }
 }
