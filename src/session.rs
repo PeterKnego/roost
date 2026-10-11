@@ -294,6 +294,17 @@ pub fn reserve_if_absent(project: &str, name: &str) {
     guard.reservations.entry(key).or_default();
 }
 
+/// Whether `project/name` currently has a reservation — for `hub.rs`'s own
+/// test of R16's Important 2 (a home-less `OpenTab` for a resident must
+/// focus the resident's tab, not push a native one and reserve a name this
+/// project's own `sock/` can never hold), which has no business reaching
+/// into `sessions()`/`Registry` directly (both private to this module).
+#[cfg(test)]
+pub(crate) fn has_reservation_for_test(project: &str, name: &str) -> bool {
+    let key = format!("{}/{}", crate::projects::storage_key(project), name);
+    sessions().lock().unwrap_or_else(|e| e.into_inner()).reservations.contains_key(&key)
+}
+
 /// Drops a reservation without spawning — a tab closed before any browser
 /// attached. Without it a name stays permanently spawnable.
 pub fn release(project: &str, name: &str) {
