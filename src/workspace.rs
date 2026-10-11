@@ -237,11 +237,17 @@ fn tab_identity_eq(a: &Tab, b: &Tab) -> bool {
     match (a, b) {
         (Tab::File { rel: x, .. }, Tab::File { rel: y, .. }) => x == y,
         (Tab::Diff { rel: x }, Tab::Diff { rel: y }) => x == y,
-        // `home` is not part of a terminal tab's identity: a resident and a
-        // reopen of the same session name are the same tab regardless of
-        // which one happens to carry the field right now — `OpenTab` must
-        // focus the existing tab either way, never duplicate it.
-        (Tab::Terminal { session: x, .. }, Tab::Terminal { session: y, .. }) => x == y,
+        // R15: `home` *is* part of a terminal tab's identity, not an
+        // ignorable detail — a native tab and a resident may legally share
+        // a session name and differ only in `home` (a worktree's own
+        // never-started `term` placeholder beside an arriving resident
+        // re-homed from elsewhere, also named `term`). Matching on
+        // `session` alone would make `OpenTab` treat those two as "the
+        // same tab" and silently focus the wrong one instead of ever
+        // adding the second.
+        (Tab::Terminal { session: x, home: hx }, Tab::Terminal { session: y, home: hy }) => {
+            x == y && hx == hy
+        }
         // By id, never by the file it proposes to change: Claude may have two
         // proposals open for the same path, and they are two different
         // questions with two different pending requests behind them.

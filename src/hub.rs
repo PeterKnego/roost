@@ -1512,25 +1512,65 @@ impl Hub {
         // names a session this project never spawned, so this refresh — the
         // moment `session_homes` above just learned about it — is the only
         // place that can give a freshly re-homed terminal a tab on its
-        // *owner*'s page. Guarded on whether a tab already exists: calling
-        // `apply_layout`'s `OpenTab` unconditionally would, via `find_tab`,
-        // re-focus that pane on *every* refresh — i.e. on every unrelated
-        // intent — stealing attention from whatever tab the user actually
-        // has open.
-        let already_tabbed: std::collections::HashSet<String> = self
-            .ws
-            .panes
-            .iter()
-            .flat_map(|p| p.tabs.iter())
-            .filter_map(|t| match t {
-                Tab::Terminal { session, .. } => Some(session.clone()),
-                _ => None,
-            })
-            .collect();
+        // *owner*'s page.
+        //
+        // R15: tab identity here is `(session, home)`, not `session` alone
+        // — the primary approve flow (a Claude in the main checkout's own
+        // `term` asks for a worktree) lands on a project that has *never
+        // been opened before*, whose `default_layout` has already seeded a
+        // `Terminal{session:"term", home:None}` placeholder nobody ever
+        // started, since `term` is also `next_free_name`'s own first pick.
+        // Skipping on name alone would leave that dead placeholder sitting
+        // on top of the arriving resident forever. So a native, `home:None`
+        // tab only blocks the resident when it is a *real* tab — live now,
+        // or `sessions_seen` (this project's own history, the same evidence
+        // `lost_terminal_sessions` trusts) — in which case the resident
+        // gets its own, separate tab instead; otherwise the placeholder is
+        // retargeted to `home: Some(..)` in place, never duplicated.
+        //
+        // `raw_live` (the raw sockets under *this* project, `live_names` —
+        // not `self.ws.live_sessions`) is what "really live" has to mean
+        // here: `live_sessions` is `owned_live_names`'s output, which
+        // already carries a resident's own name as "live" for the client's
+        // attach-vs-placeholder decision — using it here would make the
+        // resident's own arrival look like evidence its name is natively
+        // live, so the placeholder would never be retargeted at all.
+        let raw_live = crate::session::live_names(&self.project);
+        let seen = self.ws.sessions_seen.clone();
         for (name, home) in self.session_homes.clone() {
-            if already_tabbed.contains(&name) {
+            let already_resident_tabbed = self.ws.panes.iter().flat_map(|p| p.tabs.iter()).any(|t| {
+                matches!(t, Tab::Terminal { session: s, home: Some(h) } if s == &name && h == &home)
+            });
+            if already_resident_tabbed {
                 continue;
             }
+            let mut retargeted = false;
+            for pane in self.ws.panes.iter_mut() {
+                for t in pane.tabs.iter_mut() {
+                    if let Tab::Terminal { session: s, home: tab_home } = t {
+                        if tab_home.is_none()
+                            && s == &name
+                            && !raw_live.contains(s)
+                            && !seen.contains(s)
+                        {
+                            *tab_home = Some(home.clone());
+                            retargeted = true;
+                        }
+                    }
+                }
+            }
+            if retargeted {
+                self.ws.version += 1;
+                continue;
+            }
+            // Neither an existing resident tab nor a retargetable
+            // placeholder: give it a fresh one. `apply_layout`'s `OpenTab`
+            // is itself guarded by `find_tab`/`tab_identity_eq`, which (R15)
+            // compares `(session, home)` — so it cannot match a native tab
+            // here (its `home` differs) and re-focus it instead of adding
+            // this one; it can only ever match this exact resident tab on a
+            // later refresh, which is the ordinary "already tabbed" case
+            // handled above, not this branch.
             let intent = Intent::OpenTab {
                 pane: crate::proto::LEFT_TOP,
                 tab: Tab::Terminal { session: name, home: Some(home) },
@@ -1542,14 +1582,11 @@ impl Hub {
 
         // The mirror image, found on the *home*'s own refresh: a native tab
         // (`home: None`) whose session is still truly alive here
-        // (`live_names`, the raw sockets — not `owned`, which the re-home
-        // filter above has already adjusted) but absent from
-        // `self.ws.live_sessions` just moved, rather than ended — that
-        // absence is exactly what `owned_live_names`'s own `Elsewhere`-and-
-        // resolves filter means. The owner's own refresh (above) is what
-        // gives it a tab there instead, so this page no longer has any
-        // business showing one.
-        let raw_live = crate::session::live_names(&self.project);
+        // (`raw_live`, computed above) but absent from `self.ws.live_sessions`
+        // just moved, rather than ended — that absence is exactly what
+        // `owned_live_names`'s own `Elsewhere`-and-resolves filter means.
+        // The owner's own refresh (above) is what gives it a tab there
+        // instead, so this page no longer has any business showing one.
         let project = self.project.clone();
         let mut rehomed: Vec<(String, String)> = Vec::new();
         for pane in &self.ws.panes {
@@ -3388,6 +3425,24 @@ mod tests {
         None
     }
 
+    /// Every terminal tab in the workspace, across every pane, as
+    /// `(session, home)` pairs — the fully faithful version
+    /// `terminal_tab_home` cannot be (R15): since a native tab and a
+    /// resident's tab may legally share a session name and differ only in
+    /// `home`, a test that needs to tell the two apart, or count them,
+    /// cannot settle for "the first match".
+    fn terminal_tabs(h: &Hub) -> Vec<(String, Option<String>)> {
+        h.ws
+            .panes
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .filter_map(|t| match t {
+                Tab::Terminal { session, home } => Some((session.clone(), home.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Two hubs sharing one live session: `home` is where its dtach socket
     /// actually lives, `owner` is a worktree under it recorded as where the
     /// tab now shows. Plain `Hub::new`, not `for_project` — this is about
@@ -3469,6 +3524,119 @@ mod tests {
         );
 
         crate::session::kill_project(&home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// R15: this is the primary approve flow, not an edge case — a Claude in
+    /// the main checkout's own `term` asks for a worktree, roost creates a
+    /// brand-new worktree project, and `Workspace::default_layout` seeds
+    /// that fresh project's own `Terminal{session:"term", home:None}`
+    /// placeholder before anything else happens to it. `term` is also
+    /// `next_free_name`'s own first pick, so this is not a contrived name
+    /// collision; it is the name every first terminal gets.
+    ///
+    /// Revert-checked: reverting the retarget-in-place loop to the
+    /// session-only `already_tabbed` check (the pre-R15 body) fails —
+    /// observed: `assertion 'left == right' failed\n  left: [("term",
+    /// None)]\n right: [("term", Some("r15-approve-home"))]` — the resident
+    /// never gets a tab at all, because the bare placeholder already
+    /// "counts" as one.
+    #[test]
+    fn a_fresh_worktree_placeholder_term_becomes_the_resident_term() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        // Setup sanity, independent of the hub under test: `default_layout`
+        // really does seed exactly this placeholder, or this test would
+        // pass by describing a layout that no longer exists.
+        assert_eq!(
+            crate::workspace::Workspace::default_layout().panes[proto::RIGHT as usize].tabs,
+            vec![Tab::Terminal { session: "term".into(), home: None }]
+        );
+
+        let home = "r15-approve-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        crate::session::reserve_and_attach(home, "term", &home_dir).unwrap();
+        crate::home::record(home, "term", &owner).unwrap();
+
+        // `Hub::new` runs `refresh_live_sessions` as part of construction
+        // (see its own doc comment) — the exact path under test, on a
+        // worktree that has never been opened before and so starts from
+        // `default_layout`'s own placeholder, with the resident already on
+        // record by the time it does.
+        let owner_hub = Hub::new(&owner, owner_dir);
+
+        assert_eq!(
+            terminal_tabs(&owner_hub),
+            vec![("term".to_string(), Some(home.to_string()))],
+            "the placeholder must become the resident's tab in place, not sit beside a second one"
+        );
+
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// R15's other half: a native tab this project's own session actually
+    /// used (`sessions_seen`, the same evidence `lost_terminal_sessions`
+    /// trusts) must never be retargeted just because a resident happens to
+    /// share its name — that would silently reattribute this project's own
+    /// terminal history to a session it never ran. Two tabs with the same
+    /// name and different homes become legal instead.
+    ///
+    /// Revert-checked: reverting the `!seen.contains(s)` half of the
+    /// placeholder guard (so a merely-unstarted-right-now tab is retargeted
+    /// regardless of history) fails — observed: `assertion 'left == right'
+    /// failed\n  left: [("term", Some("r15-seen-home"))]\n right: [("term",
+    /// None), ("term", Some("r15-seen-home"))]` — the native tab's `home`
+    /// is overwritten instead of a second tab being added.
+    #[test]
+    fn a_seen_native_term_is_not_retargeted_and_the_resident_gets_its_own_tab() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "r15-seen-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        crate::session::reserve_and_attach(home, "term", &home_dir).unwrap();
+
+        // Built before the re-home record exists, so this first
+        // construction's own internal refresh has nothing to retarget yet
+        // — it is the *owner's own history* being set up here, not a side
+        // effect of the resident's arrival.
+        let mut owner_hub = Hub::new(&owner, owner_dir);
+        owner_hub.ws.sessions_seen = vec!["term".to_string()];
+
+        crate::home::record(home, "term", &owner).unwrap();
+        owner_hub.refresh_live_sessions();
+
+        let mut tabs = terminal_tabs(&owner_hub);
+        tabs.sort();
+        assert_eq!(
+            tabs,
+            vec![("term".to_string(), None), ("term".to_string(), Some(home.to_string()))],
+            "the native tab with history must survive untouched, and the resident must get its own tab"
+        );
+
+        crate::session::kill_project(home);
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
     }
