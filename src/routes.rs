@@ -753,6 +753,63 @@ fn serve_download(w: &mut impl Write, dir: &Path, rel: &str) {
     stream_chunked(w, f, &head);
 }
 
+/// A folder as a zip (#162), streamed as `zipdl::write` produces it.
+///
+/// Chunked, for the reason `serve_download` gives: once the first byte is
+/// out the status is spent, so a transfer that fails part-way must reach the
+/// browser as a failure — the connection dropped without the terminating
+/// chunk — and never as a short archive that looks whole. Everything that
+/// can refuse already happened in `zipdl::plan`, before this was called.
+fn serve_zip(w: &mut impl Write, plan: crate::zipdl::Plan) {
+    let (fallback, encoded) = disposition_name(&format!("{}.zip", plan.name));
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\n\
+         Content-Disposition: attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}\r\n\
+         {}: {}\r\n{}: {}\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        NOSNIFF.0, NOSNIFF.1, SANDBOX.0, SANDBOX.1
+    );
+    if w.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let mut c = Chunked { w, buf: Vec::with_capacity(DOWNLOAD_CHUNK) };
+    if crate::zipdl::write(plan, &mut c).is_err() || c.flush().is_err() {
+        return; // the peer went away: no terminating chunk, so it reads as failed
+    }
+    let _ = c.w.write_all(b"0\r\n\r\n");
+    let _ = c.w.flush();
+}
+
+/// HTTP/1.1 chunked framing over a writer, `DOWNLOAD_CHUNK` at a time.
+/// `flush` emits what is buffered as one chunk; the terminating chunk is the
+/// caller's to write, and only on success.
+struct Chunked<'a, W: Write> {
+    w: &'a mut W,
+    buf: Vec<u8>,
+}
+
+impl<W: Write> Write for Chunked<'_, W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let room = DOWNLOAD_CHUNK - self.buf.len();
+        let n = room.min(data.len());
+        self.buf.extend_from_slice(&data[..n]);
+        if self.buf.len() == DOWNLOAD_CHUNK {
+            self.flush()?;
+        }
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        write!(self.w, "{:x}\r\n", self.buf.len())?;
+        self.w.write_all(&self.buf)?;
+        self.w.write_all(b"\r\n")?;
+        self.buf.clear();
+        Ok(())
+    }
+}
+
 /// 64 KB. Large enough that a big file is not a syscall storm, small enough
 /// that peak memory per transfer is uninteresting.
 const DOWNLOAD_CHUNK: usize = 64 * 1024;
@@ -978,6 +1035,25 @@ fn serve_frag(
         },
         // #120. The other half of upload: roost could put a file on the server
         // and had no way to hand one back.
+        // #162. A folder, zipped. `check=1` is the plan alone, as JSON: the
+        // download itself is a navigation, and a refusal served to a
+        // navigation would replace the workspace with an error page, so the
+        // client asks first.
+        ["download"] if req.query.get("zip").map(String::as_str) == Some("1") => {
+            let rel = req.query.get("path").map(String::as_str).unwrap_or("");
+            let plan = crate::zipdl::plan(&dir, rel, &filter);
+            if req.query.get("check").map(String::as_str) == Some("1") {
+                let v = match &plan {
+                    Ok(p) => serde_json::json!({"ok": true, "name": format!("{}.zip", p.name), "files": p.files, "bytes": p.bytes}),
+                    Err(e) => serde_json::json!({"ok": false, "error": e}),
+                };
+                return http::json(w, &v);
+            }
+            match plan {
+                Ok(p) => serve_zip(w, p),
+                Err(e) => http::respond(w, 409, "Conflict", "text/plain; charset=utf-8", e.as_bytes()),
+            }
+        }
         ["download"] => match req.query.get("path") {
             None => http::not_found(w, "missing path"),
             Some(rel) => serve_download(w, &dir, rel),
@@ -1411,6 +1487,66 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         route(&mut buf, &req, roots);
         buf
+    }
+
+    /// `dechunk_bytes`, plus whether the terminating chunk arrived — the one
+    /// signal a browser has that a transfer is whole.
+    fn dechunk_whole(body: &[u8]) -> (Vec<u8>, bool) {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Some(eol) = body[i..].windows(2).position(|w| w == b"\r\n") {
+            let n = usize::from_str_radix(std::str::from_utf8(&body[i..i + eol]).unwrap(), 16).unwrap();
+            i += eol + 2;
+            if n == 0 {
+                return (out, true);
+            }
+            out.extend_from_slice(&body[i..i + n]);
+            i += n + 2;
+        }
+        (out, false)
+    }
+
+    /// #162 end to end through the route: the name, the framing, and an
+    /// archive whose last record is the end-of-central-directory.
+    #[test]
+    fn a_folder_downloads_as_a_whole_chunked_zip() {
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join("p");
+        std::fs::create_dir_all(proj.join("docs/sub")).unwrap();
+        std::fs::write(proj.join("docs/a.md"), "# a\n").unwrap();
+        std::fs::write(proj.join("docs/sub/b.txt"), "b".repeat(200_000)).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let raw = frag_route_bytes(&roots, "/frag/p/download?path=docs&zip=1");
+        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&raw[..split]);
+        assert!(head.contains("200 OK") && head.contains("Content-Type: application/zip"), "{head}");
+        assert!(head.contains("filename=\"docs.zip\""), "{head}");
+        assert!(head.contains("Content-Security-Policy: sandbox"), "{head}");
+        let (zip, whole) = dechunk_whole(&raw[split + 4..]);
+        assert!(whole, "the terminating chunk was written");
+        assert_eq!(&zip[..4], b"PK\x03\x04");
+        assert_eq!(&zip[zip.len() - 22..zip.len() - 18], b"PK\x05\x06", "ends with the central directory's end record");
+        // docs/, docs/a.md, docs/sub/, docs/sub/b.txt
+        assert_eq!(u16::from_le_bytes([zip[zip.len() - 12], zip[zip.len() - 11]]), 4);
+    }
+
+    #[test]
+    fn the_zip_check_answers_the_plan_and_a_refusal_never_streams() {
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join("p");
+        std::fs::create_dir_all(proj.join("docs")).unwrap();
+        std::fs::write(proj.join("docs/a.md"), "hello").unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let ok = frag_route(&roots, "/frag/p/download?path=docs&zip=1&check=1");
+        assert!(ok.contains(r#""ok":true"#) && ok.contains(r#""files":1"#) && ok.contains(r#""name":"docs.zip""#), "{ok}");
+        let root = frag_route(&roots, "/frag/p/download?zip=1&check=1");
+        assert!(root.contains(r#""name":"p.zip""#), "no path means the project root: {root}");
+        let file = frag_route(&roots, "/frag/p/download?path=docs/a.md&zip=1&check=1");
+        assert!(file.contains(r#""ok":false"#) && file.contains("not a folder"), "{file}");
+        let refused = frag_route(&roots, "/frag/p/download?path=docs/a.md&zip=1");
+        assert!(refused.contains("409") && !refused.contains("application/zip"), "{refused}");
+        let escape = frag_route(&roots, "/frag/p/download?path=../&zip=1&check=1");
+        assert!(escape.contains(r#""ok":false"#), "{escape}");
     }
 
     /// The tree lists every file, so a .png can be clicked. Before this, the file

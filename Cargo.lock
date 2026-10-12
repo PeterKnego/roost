@@ -881,6 +881,8 @@ name = "roost"
 version = "0.7.0"
 dependencies = [
  "bytes",
+ "crc32fast",
+ "flate2",
  "futures-executor",
  "futures-util",
  "libc",
