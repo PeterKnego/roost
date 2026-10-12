@@ -379,44 +379,96 @@ function withTimeout(p, ms, what) {
 
 // ---- tools -----------------------------------------------------------------------------
 
+// The page's documents: the top one and every same-origin iframe's, nested,
+// each with the offset that turns its client coordinates into the top
+// page's. A cross-origin frame's document cannot be reached and is skipped.
+const FRAMES = `const roostDocs = () => {
+  const out = [];
+  const walk = (doc, dx, dy) => {
+    out.push({ doc, dx, dy });
+    for (const f of doc.querySelectorAll('iframe,frame')) {
+      let d = null;
+      try { d = f.contentDocument; } catch {}
+      if (!d || !d.documentElement) continue;
+      const r = f.getBoundingClientRect();
+      if (!r.width || !r.height) continue;
+      walk(d, dx + r.left + f.clientLeft, dy + r.top + f.clientTop);
+    }
+  };
+  walk(document, 0, 0);
+  return out;
+};
+const roostFind = (ref, selector) => {
+  for (const f of roostDocs()) {
+    const el = ref !== null ? f.doc.querySelector('[data-roost-ref="' + ref + '"]') : f.doc.querySelector(selector);
+    if (el) return { el, f };
+  }
+  return null;
+};`;
+
+const findArgs = (args) => args.ref !== undefined && args.ref !== null
+  ? `${JSON.stringify(String(args.ref))}, null`
+  : `null, ${JSON.stringify(String(args.selector || ""))}`;
+
 const READ_SCRIPT = (maxChars) => `(() => {
-  const sel = 'a[href],button,input:not([type=hidden]),textarea,select,summary,[role=button],[role=link],[role=checkbox],[role=tab],[contenteditable=""],[contenteditable=true]';
-  document.querySelectorAll('[data-roost-ref]').forEach((e) => e.removeAttribute('data-roost-ref'));
+  ${FRAMES}
+  const sel = 'a[href],button,input:not([type=hidden]),textarea,select,summary,[role=button],[role=link],[role=checkbox],[role=tab],[role=option],[role=gridcell],[contenteditable=""],[contenteditable=true]';
+  const docs = roostDocs();
   const out = [];
   let n = 0;
-  for (const el of document.querySelectorAll(sel)) {
-    const r = el.getBoundingClientRect();
-    const cs = getComputedStyle(el);
-    if (!r.width || !r.height || cs.visibility === 'hidden' || cs.display === 'none') continue;
-    if (++n > 300) break;
-    el.setAttribute('data-roost-ref', String(n));
-    const label = (el.getAttribute('aria-label') || el.innerText || el.placeholder || el.value || el.name || el.title || el.getAttribute('href') || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
-    const kind = el.tagName.toLowerCase() + (el.type && el.tagName === 'INPUT' ? ':' + el.type : '');
-    out.push('[' + n + '] ' + kind + ' "' + label + '"');
+  let text = '';
+  for (const { doc } of docs) {
+    doc.querySelectorAll('[data-roost-ref]').forEach((e) => e.removeAttribute('data-roost-ref'));
+    if (doc.body) text += (text ? '\\n' : '') + doc.body.innerText;
+    for (const el of doc.querySelectorAll(sel)) {
+      const r = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      if (!r.width || !r.height || cs.visibility === 'hidden' || cs.display === 'none') continue;
+      if (++n > 400) break;
+      el.setAttribute('data-roost-ref', String(n));
+      const label = (el.getAttribute('aria-label') || el.innerText || el.placeholder || el.value || el.name || el.title || el.getAttribute('href') || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
+      const kind = el.tagName.toLowerCase() + (el.type && el.tagName === 'INPUT' ? ':' + el.type : '') + (doc === document ? '' : ' (in frame)');
+      out.push('[' + n + '] ' + kind + ' "' + label + '"');
+    }
   }
-  const text = (document.body ? document.body.innerText : '').slice(0, ${maxChars});
-  return { title: document.title, url: location.href, text, truncated: !!document.body && document.body.innerText.length > ${maxChars}, elements: out };
+  return { title: document.title, url: location.href, text: text.slice(0, ${maxChars}), truncated: text.length > ${maxChars}, elements: out };
 })()`;
 
 const LOCATE_SCRIPT = (args) => `(() => {
-  const el = ${args.ref !== undefined && args.ref !== null
-    ? `document.querySelector('[data-roost-ref="' + ${JSON.stringify(String(args.ref))} + '"]')`
-    : `document.querySelector(${JSON.stringify(String(args.selector || ""))})`};
-  if (!el) return null;
+  ${FRAMES}
+  const hit = roostFind(${findArgs(args)});
+  if (!hit) return null;
+  const { el } = hit;
   el.scrollIntoView({ block: 'center', inline: 'center' });
+  // Each enclosing frame too, outermost last, or the element can sit in
+  // view inside a frame that is itself scrolled out of the page.
+  for (let w = el.ownerDocument.defaultView; w.frameElement; w = w.parent) w.frameElement.scrollIntoView({ block: 'center', inline: 'center' });
   const r = el.getBoundingClientRect();
-  return { x: r.left + r.width / 2, y: r.top + r.height / 2, what: el.tagName.toLowerCase() + ' "' + (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 60) + '"' };
+  let dx = 0, dy = 0;
+  for (let w = el.ownerDocument.defaultView; w.frameElement; w = w.parent) {
+    const fr = w.frameElement.getBoundingClientRect();
+    dx += fr.left + w.frameElement.clientLeft;
+    dy += fr.top + w.frameElement.clientTop;
+  }
+  return { x: dx + r.left + r.width / 2, y: dy + r.top + r.height / 2, what: el.tagName.toLowerCase() + ' "' + (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 60) + '"' };
 })()`;
 
 // Select the focused field's whole content, so the text typed next replaces it.
 const SELECT_ALL_SCRIPT = `(() => {
-  const el = document.activeElement;
+  let el = document.activeElement;
+  // Focus inside a same-origin iframe shows here as the iframe itself.
+  while (el && (el.tagName === 'IFRAME' || el.tagName === 'FRAME')) {
+    let d = null;
+    try { d = el.contentDocument; } catch {}
+    if (!d) break;
+    el = d.activeElement;
+  }
   if (!el) return false;
   if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') { try { el.select(); } catch {} return true; }
   if (el.isContentEditable) {
-    const range = document.createRange();
+    const range = el.ownerDocument.createRange();
     range.selectNodeContents(el);
-    const sel = getSelection();
+    const sel = el.ownerDocument.getSelection();
     sel.removeAllRanges();
     sel.addRange(range);
     return true;
@@ -442,9 +494,9 @@ const SET_FILES = `function (files) {
 
 // The located element itself when it is a file input, else null.
 const FILE_INPUT_SCRIPT = (args) => `(() => {
-  const el = ${args.ref !== undefined && args.ref !== null
-    ? `document.querySelector('[data-roost-ref="' + ${JSON.stringify(String(args.ref))} + '"]')`
-    : `document.querySelector(${JSON.stringify(String(args.selector || ""))})`};
+  ${FRAMES}
+  const hit = roostFind(${findArgs(args)});
+  const el = hit && hit.el;
   return el && el.tagName === 'INPUT' && el.type === 'file' ? el : null;
 })()`;
 
@@ -482,6 +534,16 @@ async function click(tabId, x, y) {
   for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
     await cdp(tabId, "Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount: type === "mouseMoved" ? 0 : 1 });
   }
+}
+
+// chrome_screenshot shrinks the viewport by this factor (device pixels,
+// capped to SHOT_LONG_SIDE); a point on the image divided by it is a CSS
+// pixel in the viewport, which is what Input.dispatchMouseEvent takes.
+async function shotScale(tabId) {
+  const m = await cdp(tabId, "Page.getLayoutMetrics");
+  const vp = m.cssVisualViewport || m.visualViewport;
+  const dpr = (await evaluate(tabId, "devicePixelRatio")) || 1;
+  return dpr * Math.min(1, SHOT_LONG_SIDE / (Math.max(vp.clientWidth, vp.clientHeight) * dpr));
 }
 
 async function screenshot(tab) {
@@ -569,7 +631,15 @@ async function runTool(gk, tool, args) {
       await guard(tab);
       await rememberTab(gk, tab.id);
       await attach(tab.id);
-      const at = await locate(tab.id, args);
+      let at;
+      if (Number.isFinite(args.x) && Number.isFinite(args.y)) {
+        // A point on the last screenshot: for what refs cannot reach, such
+        // as a cross-origin iframe or a canvas.
+        const k = await shotScale(tab.id);
+        at = { x: args.x / k, y: args.y / k, what: `point ${args.x},${args.y} on the screenshot` };
+      } else {
+        at = await locate(tab.id, args);
+      }
       await click(tab.id, at.x, at.y);
       await sleep(300);
       const now = await chrome.tabs.get(tab.id);

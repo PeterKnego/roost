@@ -55,7 +55,9 @@ const site = Deno.serve({ port: sitePort, hostname: "127.0.0.1", onListen() {} }
 <input type="file" id="f" multiple aria-label="files" onchange="document.getElementById('fv').textContent='files:' + [...this.files].map((f) => f.name + '/' + f.size + '/' + f.type).join(',')">
 <input type="file" id="hf" style="display:none" onchange="this.files[0].text().then((t) => document.getElementById('hv').textContent='picked:' + this.files[0].name + '=' + t)">
 <button id="pick" onclick="document.getElementById('hf').click()">Pick a file</button>
-<p id="fv"></p><p id="hv"></p>`, { headers: { "content-type": "text/html" } }));
+<p id="fv"></p><p id="hv"></p>
+<iframe srcdoc="<button onclick=&quot;parent.document.getElementById('h').textContent='framed'&quot;>Inside frame</button><input id=fi value=frame-stale>"></iframe>
+<button id="corner" style="position:fixed;right:0;bottom:0;width:160px;height:80px" onclick="document.getElementById('h').textContent='cornered'">corner</button>`, { headers: { "content-type": "text/html" } }));
 const target = `http://127.0.0.1:${sitePort}/`;
 
 // A profile of its own: the extension's storage persists in it, and a grant
@@ -194,6 +196,28 @@ try {
   const missing = await mcp.tool("chrome_upload", { selector: "#f", paths: [`${up}/nope.png`] });
   ok(missing.isError && /cannot read/.test(text(missing)), `F: a missing file fails before the browser is asked — ${text(missing)}`);
   await Deno.remove(up, { recursive: true });
+
+  const framed = JSON.parse(text(await mcp.tool("chrome_read")));
+  const inFrame = (framed.elements || []).find((e) => e.includes("Inside frame"));
+  ok(/\(in frame\)/.test(inFrame || ""), `F: chrome_read numbers a same-origin iframe's button — ${inFrame}`);
+  await mcp.tool("chrome_click", { ref: Number(/^\[(\d+)\]/.exec(inFrame || "")?.[1]) });
+  ok(JSON.parse(text(await mcp.tool("chrome_read"))).text.includes("framed"), "F: clicking it by ref clicks inside the frame");
+  const fin = (JSON.parse(text(await mcp.tool("chrome_read"))).elements || []).find((e) => e.includes("frame-stale"));
+  await mcp.tool("chrome_type", { ref: Number(/^\[(\d+)\]/.exec(fin || "")?.[1]), text: "frame-new" });
+  const finAfter = (JSON.parse(text(await mcp.tool("chrome_read"))).elements || []).find((e) => e.includes("(in frame)") && e.startsWith("[") && e.includes("input"));
+  ok(/"frame-new"/.test(finAfter || ""), `F: typing into a framed input replaces its value — ${fin} -> ${finAfter}`);
+
+  // A point on the screenshot: the corner button, 20 px in from the image's bottom right.
+  const shotForPoint = (await mcp.tool("chrome_screenshot")).content.find((c) => c.type === "image");
+  const jpeg = Uint8Array.from(atob(shotForPoint.data), (c) => c.charCodeAt(0));
+  let w = 0, hgt = 0;
+  for (let i = 2; i < jpeg.length;) {
+    const marker = jpeg[i + 1], len = (jpeg[i + 2] << 8) | jpeg[i + 3];
+    if (marker >= 0xc0 && marker <= 0xc3) { hgt = (jpeg[i + 5] << 8) | jpeg[i + 6]; w = (jpeg[i + 7] << 8) | jpeg[i + 8]; break; }
+    i += 2 + len;
+  }
+  const pt = await mcp.tool("chrome_click", { x: w - 20, y: hgt - 20 });
+  ok(!pt.isError && JSON.parse(text(await mcp.tool("chrome_read"))).text.includes("cornered"), `F: chrome_click at a screenshot point (${w}x${hgt}) hits what is drawn there — ${text(pt)}`);
 
   const con = JSON.parse(text(await mcp.tool("chrome_console")));
   ok((con.messages || []).some((m) => m.includes("button clicked")), `G: chrome_console has the page's log — ${JSON.stringify(con.messages)}`);

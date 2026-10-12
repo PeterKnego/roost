@@ -357,10 +357,12 @@ fn tools() -> Vec<Value> {
                    "tab_id": tab}, "required": ["url"]}}),
         json!({"name": "chrome_screenshot", "description": format!("Screenshot the visible part of a tab in the user's Chrome. {WHOSE}"),
                "inputSchema": {"type": "object", "properties": {"tab_id": tab}}}),
-        json!({"name": "chrome_read", "description": format!("Read a page in the user's Chrome: title, url, visible text, and numbered refs for links, buttons and inputs (use them with chrome_click/chrome_type). {WHOSE}"),
+        json!({"name": "chrome_read", "description": format!("Read a page in the user's Chrome: title, url, visible text, and numbered refs for links, buttons and inputs (use them with chrome_click/chrome_type), same-origin iframes included. {WHOSE}"),
                "inputSchema": {"type": "object", "properties": {"tab_id": tab, "max_chars": {"type": "integer", "description": "Text cap, default 20000."}}}}),
-        json!({"name": "chrome_click", "description": format!("Click an element (by ref from chrome_read, or a CSS selector) with a real mouse event. {WHOSE}"),
-               "inputSchema": {"type": "object", "properties": target(json!({}))}}),
+        json!({"name": "chrome_click", "description": format!("Click an element (by ref from chrome_read, or a CSS selector) with a real mouse event — or a point x,y on the last chrome_screenshot, for what has no ref (a cross-origin iframe, a canvas). {WHOSE}"),
+               "inputSchema": {"type": "object", "properties": target(json!({
+                   "x": {"type": "number", "description": "With y: a point in the screenshot's own pixels, instead of ref or selector."},
+                   "y": {"type": "number"}}))}}),
         json!({"name": "chrome_type", "description": format!("Focus an element and type text into it, replacing what it already holds, optionally pressing Enter. {WHOSE}"),
                "inputSchema": {"type": "object", "properties": target(json!({
                    "text": {"type": "string"},
