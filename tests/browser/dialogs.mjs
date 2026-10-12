@@ -315,6 +315,51 @@ try {
   await evalIn(`document.querySelector("#dlg-confirm .dlg-cancel").click(); 0`);
   await evalIn(`document.getElementById("noticepanel").hidden = true; 0`);
 
+  // N: worktree asks queue behind an open dialog instead of vanishing. One
+  // dialog shows at a time and a second askChoice resolves null at once, so
+  // before the queue an ask arriving over any open dialog was never shown —
+  // and its Claude was told 60 s later that nobody approved it. Events are
+  // fed through onEvent, the socket's own dispatcher; the answers go to the
+  // real server, which ignores ids it never issued. window.open is stubbed
+  // so the approve does not spawn a real tab, and recorded so the assertion
+  // that it ran cannot pass on silence.
+  await evalIn(`window.__opened = []; window.open = (u) => { window.__opened.push(u); return null; }; 0`);
+  await evalIn("window.__sent = []; 0");
+  await evalIn(`askConfirm({ title: "Something else" }); 0`);
+  ok(await evalIn(`document.getElementById("dlg-confirm").open`), "an unrelated dialog is open");
+  await evalIn(`onEvent({ t: "WorktreeAsk", id: "w1", session: "term1", name: "fox" });
+     onEvent({ t: "WorktreeAsk", id: "w2", session: "term2", name: "otter" });
+     onEvent({ t: "WorktreeAsk", id: "w3", session: "term3", name: "lynx" });
+     onEvent({ t: "WorktreeAskClosed", id: "w3" }); 0`);
+  await new Promise((r) => setTimeout(r, 600));
+  ok(!(await evalIn(`document.getElementById("dlg-choice").open`)), "the asks wait while it is open");
+  const askTitle = () => evalIn(`document.getElementById("dlg-choice").open ? document.querySelector("#dlg-choice .dlg-title").textContent : ""`);
+  await evalIn(`document.querySelector("#dlg-confirm .dlg-cancel").click(); 0`);
+  ok(await until(async () => (await askTitle()) === "Claude in term1 wants a worktree", 5, "first ask"),
+     "closing it shows the first queued ask");
+  ok((await evalIn(`document.querySelector("#dlg-choice .dlg-body").textContent`)) === "worktree-fox",
+     "naming the worktree");
+  await evalIn(`[...document.querySelectorAll("#dlg-choice .dlg-choice")].find((b) => b.textContent === "Refuse").click(); 0`);
+  ok(await until(async () => (await askTitle()) === "Claude in term2 wants a worktree", 5, "second ask"),
+     "answering it shows the second");
+  ok(JSON.stringify(await evalIn("JSON.stringify(window.__sent)")) ===
+     JSON.stringify(JSON.stringify([{ t: "WorktreeAnswer", id: "w1", approve: false }])),
+     "the first was refused, and only that was sent");
+  await evalIn(`[...document.querySelectorAll("#dlg-choice .dlg-choice")].find((b) => b.textContent === "Create and open in new tab").click(); 0`);
+  ok(await until(async () => (await evalIn("window.__sent.length")) === 2, 5, "approve sent"), "approving sends");
+  ok((await evalIn("JSON.stringify(window.__sent[1])")) === JSON.stringify({ t: "WorktreeAnswer", id: "w2", approve: true }),
+     "an approve for the second");
+  ok((await evalIn("JSON.stringify(window.__opened)")) === JSON.stringify(["about:blank"]), "and opens the tab it will navigate");
+  await new Promise((r) => setTimeout(r, 600));
+  ok(!(await evalIn(`document.getElementById("dlg-choice").open`)), "an ask closed while queued is never shown");
+  // A showing ask closed elsewhere goes away and answers nothing.
+  await evalIn(`onEvent({ t: "WorktreeAsk", id: "w4", session: "term4", name: "heron" }); 0`);
+  ok(await until(async () => (await askTitle()) === "Claude in term4 wants a worktree", 5, "fourth ask"), "a fresh ask shows at once");
+  await evalIn(`onEvent({ t: "WorktreeAskClosed", id: "w4" }); 0`);
+  ok(await until(async () => !(await evalIn(`document.getElementById("dlg-choice").open`)), 5, "withdrawn"),
+     "and is withdrawn when answered elsewhere");
+  ok((await evalIn("window.__sent.length")) === 2, "without sending an answer of its own");
+
   ok((await evalIn("window.__native.length")) === 0,
      "no code path in this file reached a native browser dialog");
 } finally {

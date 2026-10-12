@@ -208,11 +208,35 @@ function askPasteText() {
 // something (the save conflict: overwrite discards the disk's changes,
 // discard-mine discards yours), so Enter destroys nothing.
 //
+// `bindDismiss`, optional, is handed a function that closes this dialog as if
+// Cancel were pressed — for a question the server can withdraw (a worktree ask
+// another browser answered first). Called only once the dialog is really
+// showing, so a caller that never receives it never had a dialog to close.
+//
 // `detailHtml` is the one exception to "nothing here builds an HTML string":
 // it is set as innerHTML, and the only caller passes the diff render.rs
 // produced, which escapes every line before wrapping it. Never pass anything
 // that came from the DOM or from a path here.
-function askChoice({ title, lines = [], choices, detailHtml = "", focus = "first" }) {
+//
+// `input`, optional, adds a single text field above the buttons — the `+`
+// worktree dialog's name field (#156), the one choice-dialog caller that
+// needs free text rather than a fixed set of answers. Backward compatible on
+// purpose: without it this resolves a plain choice id or null exactly as
+// before, so every existing caller is untouched; only when a caller passes
+// `input` does a choice resolve as `{ id, value }` instead, carrying
+// whatever is in the field at the moment a button was clicked. `.dlg-choice`
+// is the shell every page using this dialog ships (render.rs); a page that
+// doesn't (none do yet) would simply never show a field, never asking for
+// one.
+//
+// `input.preview`, optional, is a `(value) => string` shown live in a span
+// beside the field — the worktree dialog's "→ worktree-<name>", so the
+// person sees the actual directory/branch name rather than working it out
+// from a prefix and whatever they typed. Recomputed on every keystroke, not
+// just at open, and plain text (`textContent`, same rule as everything
+// else here) since the value it reads came from the field a user is
+// actively typing into.
+function askChoice({ title, lines = [], choices, detailHtml = "", focus = "first", bindDismiss = null, input = null }) {
   const el = document.getElementById("dlg-choice");
   return runDialog(el, (finish) => {
     el.querySelector(".dlg-title").textContent = title;
@@ -226,6 +250,19 @@ function askChoice({ title, lines = [], choices, detailHtml = "", focus = "first
     const detail = el.querySelector(".dlg-detail");
     detail.innerHTML = detailHtml;
     detail.hidden = !detailHtml;
+    const inputEl = el.querySelector(".dlg-choice-input");
+    const previewEl = el.querySelector(".dlg-choice-input-preview");
+    if (inputEl) {
+      inputEl.hidden = !input;
+      inputEl.placeholder = input?.placeholder || "";
+      inputEl.value = input?.value || "";
+      if (previewEl) {
+        const preview = input?.preview || null;
+        previewEl.hidden = !preview;
+        previewEl.textContent = preview ? preview(inputEl.value) : "";
+        inputEl.oninput = preview ? () => { previewEl.textContent = preview(inputEl.value); } : null;
+      }
+    }
     const buttons = el.querySelector(".dlg-buttons");
     // Cancel is in the shell; the choices are rebuilt around it each time.
     buttons.querySelectorAll(".dlg-choice").forEach((b) => b.remove());
@@ -238,10 +275,16 @@ function askChoice({ title, lines = [], choices, detailHtml = "", focus = "first
       b.className = "dlg-choice";
       b.dataset.choice = c.id;
       b.textContent = c.label;
-      b.onclick = () => finish(c.id);
+      b.onclick = () => finish(input ? { id: c.id, value: inputEl ? inputEl.value : "" } : c.id);
       buttons.appendChild(b);
       first = first || b;
     }
+    if (bindDismiss) bindDismiss(() => finish(null));
+    // Focus stays on the first choice button even with `input` present —
+    // not the field — so "default to fork when exactly one fork option
+    // exists" (the caller puts it first) means Enter actually reaches it,
+    // the ordinary way a focused <button> answers Enter. The field is still
+    // one Tab or click away.
     return () => (focus === "cancel" ? cancelBtn : first || cancelBtn).focus();
   }, null);
 }

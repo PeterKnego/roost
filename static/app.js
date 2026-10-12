@@ -17,6 +17,19 @@ const pendingLaunch = (() => {
   return l && LAUNCHES.includes(l) ? l : null;
 })();
 let pendingLaunchSent = false;
+// The same arrival carries `?fork=<session id>` when the `+` dialog's fork
+// choice created this worktree (R4): a Claude session id, never keystrokes,
+// read once at load and validated client-side against the same character
+// shape `claudesess::valid_session_id` checks server-side — the server's
+// check is the real boundary, this is only so a stray or hand-edited query
+// string doesn't send an obviously-wrong value down the wire at all.
+// Meaningless without `pendingLaunch` being "claude", and ignored then too
+// unless `fork` is also present — `newTerminal` only sends it alongside a
+// Claude launch.
+const pendingFork = (() => {
+  const f = new URLSearchParams(location.search).get("fork");
+  return f && /^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$/.test(f) ? f : null;
+})();
 // A row clicked on the overview arrives with ?focus=<session>, read once at
 // load and validated against the session-name shape the same way a
 // server-sent value would be — a stray or hand-edited query string must not
@@ -30,6 +43,32 @@ let pendingFocusDone = false;
 // when WorktreeReady arrives. Opened on the click because a window.open after
 // a websocket round trip is not reliably inside the user gesture.
 let pendingTab = null;
+// Resolved, in arrival order, by the next "State" this connection receives
+// after a `requestFreshState()` call — RequestState carries no reply id of
+// its own, so this trusts the one thing the connection already guarantees:
+// the hub answers RequestState with a targeted `send_to`, synchronously
+// within handling it, so the very next State on this socket is that answer
+// and not some unrelated broadcast that happened to win a race. Used by
+// `openWorktreeDialog` so its fork choices come from a `forkable` the
+// server just recomputed, not whatever this connection's `state` held from
+// the last unrelated snapshot.
+let pendingStateWaiters = [];
+function requestFreshState() {
+  send({ t: "RequestState" });
+  return new Promise((resolve) => pendingStateWaiters.push(resolve));
+}
+// Worktree asks from a Claude's hook (hub::ask_worktree_blocking): id → the
+// function that closes this browser's dialog for it. Present only while that
+// dialog is really showing.
+const worktreeAsks = new Map();
+// Asks not yet shown, oldest first, as { id, session, name }. Only one dialog
+// can be open at a time and a second askChoice resolves null at once, so an
+// ask arriving over another dialog — or over an earlier ask, since a project
+// may have four waiting — would otherwise never be shown, and its Claude would
+// be told after 60 s that nobody approved it when nobody was asked.
+const askQueue = [];
+let askShowing = false;
+let askRetry = null;
 // The config file's `show_hidden`, embedded by render.rs at page load and
 // kept live from the snapshot afterwards (followSettings), like AUTOSAVE. The
 // workspace's own toggle (state.show_hidden) overrides it when set; null
@@ -648,6 +687,15 @@ function onEvent(ev) {
     case "State":
       myOrigin = myOrigin || ev.origin;
       state = ev.ws;
+      // Drained before anything else below runs: a waiter only ever wants
+      // to read `state` after this assignment, and resolving late (after
+      // render(), say) would buy nothing while risking a waiter's own
+      // continuation interleaving with this case's remaining work.
+      if (pendingStateWaiters.length) {
+        const waiting = pendingStateWaiters;
+        pendingStateWaiters = [];
+        for (const resolve of waiting) resolve();
+      }
       // Both: renderClaudeHooks() updates the bell's mark/tooltip even when
       // the notice panel is closed (it reads `state` directly, not the
       // panel's DOM), and renderNotices() is what keeps an *open* panel's
@@ -712,7 +760,7 @@ function onEvent(ev) {
       // reload does not start a second program.
       if (pendingLaunch && !pendingLaunchSent) {
         pendingLaunchSent = true;
-        newTerminal(3, pendingLaunch);
+        newTerminal(3, pendingLaunch, null, pendingFork);
         history.replaceState(null, "", location.pathname);
       }
       // A row clicked on the overview arrives with ?focus=<session>; focus
@@ -831,8 +879,13 @@ function onEvent(ev) {
       // just the one that asked — only attach if this client actually has
       // a Terminal tab on that session, or every mirroring tab would open
       // and immediately close a PTY socket for a session it never showed.
-      if (state && state.panes.some((p) => p.tabs.some((t) => t.k === "Terminal" && t.session === ev.session))) {
-        ensureTerm(ev.session);
+      if (state) {
+        let home;
+        const hasTab = state.panes.some((p) => p.tabs.some((t) => {
+          if (t.k === "Terminal" && t.session === ev.session) { home = t.home; return true; }
+          return false;
+        }));
+        if (hasTab) ensureTerm(ev.session, home);
       }
       if (pendingClaudeSend) claimClaudeSend(ev.session);
       render();
@@ -845,8 +898,29 @@ function onEvent(ev) {
     case "ClaudeHere":
       showClaudeHere(ev.pane, ev.terminals);
       break;
+    case "WorktreeAsk":
+      askQueue.push({ id: ev.id, session: ev.session, name: ev.name });
+      showNextAsk();
+      break;
+    case "WorktreeAskClosed": {
+      // Answered in another browser, or the server's 60 s ran out: either
+      // way an answer from here would be ignored, so the question goes —
+      // from the screen if it is showing, from the queue if it is waiting.
+      const i = askQueue.findIndex((a) => a.id === ev.id);
+      if (i >= 0) askQueue.splice(i, 1);
+      const dismiss = worktreeAsks.get(ev.id);
+      if (dismiss) dismiss();
+      break;
+    }
     case "WorktreeReady": {
-      const url = "/" + projectPath(ev.url) + (ev.launch ? `?launch=${encodeURIComponent(ev.launch)}` : "");
+      // `fork` is a Claude session id (R4), never typed here — the new
+      // page's own load reads `?fork=`, validates it again client-side
+      // (`pendingFork`), and the server validates it a third time
+      // (`claudesess::valid_session_id`) before anything reaches a shell.
+      const q = ev.launch
+        ? `?launch=${encodeURIComponent(ev.launch)}${ev.fork ? `&fork=${encodeURIComponent(ev.fork)}` : ""}`
+        : "";
+      const url = "/" + projectPath(ev.url) + q;
       if (pendingTab && !pendingTab.closed) {
         pendingTab.location = url;
       } else {
@@ -859,6 +933,54 @@ function onEvent(ev) {
       }
       pendingTab = null;
       document.body.dispatchEvent(new Event("projects"));
+      break;
+    }
+    case "Rehomed": {
+      // This browser's own tab for `ev.session` was just dropped — see
+      // `hub::refresh_live_sessions` — because the session moved to
+      // `ev.owner`'s page. There is no tab left here to update, so the
+      // same transient-banner-plus-link fallback `WorktreeReady` uses when
+      // its popup is blocked is the whole of what this can do: say where it
+      // went, and offer a way there.
+      showBanner(`${ev.session} moved to ${ev.owner.split("/").pop()} → `);
+      const a = document.createElement("a");
+      a.href = "/" + projectPath(ev.owner); a.target = "_blank"; a.textContent = "open it there";
+      document.querySelector(".error-banner:last-of-type b")?.append(a);
+      break;
+    }
+    case "ClaudeElsewhere": {
+      // A move roost was not asked about (spec §7) — never automatic, just
+      // an offer. `worktree` present means the session's Claude is now
+      // sitting in that worktree of this project ("Move tab there");
+      // absent means a resident's Claude cd'd back out to the main
+      // checkout ("Move back"). Either way the server decided which
+      // project's browsers see this; the client only renders it.
+      if (ev.worktree) {
+        const name = ev.worktree.split("/").pop();
+        showBanner(`${ev.session}'s Claude is working in ${name}`);
+        const box = document.querySelector(".error-banner:last-of-type");
+        const b = document.createElement("button");
+        b.textContent = "Move tab there";
+        b.onclick = () => { send({ t: "Rehome", session: ev.session, to: ev.worktree }); box?.remove(); };
+        box?.append(b);
+        offerWorktreeHooksOnce(box);
+      } else {
+        showBanner(`${ev.session}'s Claude is working in the main checkout`);
+        const box = document.querySelector(".error-banner:last-of-type");
+        const b = document.createElement("button");
+        b.textContent = "Move back";
+        b.onclick = () => { send({ t: "Rehome", session: ev.session, to: null }); box?.remove(); };
+        box?.append(b);
+      }
+      break;
+    }
+    case "WorktreeGone": {
+      // Claude Code removed a resident's worktree when its session exited
+      // (spec §7) — nothing to click, just the explanation for why the
+      // terminal is back here. The record was already forgotten
+      // server-side (R18), so End Session on it now works too.
+      const name = ev.worktree.split("/").pop();
+      showBanner(`${name} was removed (Claude Code removes a clean worktree when its session exits); ${ev.session} is back here`);
       break;
     }
     case "GitInit":
@@ -1006,6 +1128,14 @@ function onEvent(ev) {
       // safe even when this Error has nothing to do with a reveal: the flag
       // only ever changes whether the next RevealLine focuses.
       focusNextReveal = false;
+      // A worktree creation refused (a bad name race, a taken name, no
+      // recorded Claude for a fork) leaves the blank tab `openWorktreeDialog`
+      // opened with nothing to navigate it to — a tab stuck on about:blank
+      // forever, with no `WorktreeReady` ever coming to close the loop.
+      // Every refusal funnels through this same `Error` case, so closing it
+      // here covers all of them without naming any one cause.
+      if (pendingTab && !pendingTab.closed) pendingTab.close();
+      pendingTab = null;
       break;
     case "PathRefused":
       // Not showError: that funnels to the workspace banner, which is the
@@ -1550,7 +1680,7 @@ document.addEventListener("mousedown", (e) => {
   if (openClaudeMenu && !openClaudeMenu.contains(e.target)) closeClaudeMenu();
 }, true);
 
-function newTerminal(pane, launch, resume) {
+function newTerminal(pane, launch, resume, fork) {
   // No prompt: the server allocates term/term1/term2… from `live_names`, which
   // sees detached sessions the client has no tabs for. A name picked here could
   // collide with one of those, and since attaching creates only when absent,
@@ -1563,8 +1693,16 @@ function newTerminal(pane, launch, resume) {
   // `resume` names a conversation the ✻ menu offered. Omitted unless one was
   // chosen, so the plain and fresh-Claude messages stay the ones they have
   // always been.
+  //
+  // `fork` carries a Claude session id (R4) — only ever `pendingFork`, the
+  // freshly created worktree page's own `?fork=`, re-validated server-side
+  // before anything is typed. Omitted on every ordinary click, same as
+  // `resume`.
   if (!launch) return send({ t: "NewTerminal", pane });
-  send(resume ? { t: "NewTerminal", pane, launch, resume } : { t: "NewTerminal", pane, launch });
+  const msg = { t: "NewTerminal", pane, launch };
+  if (resume) msg.resume = resume;
+  if (fork) msg.fork = fork;
+  send(msg);
 }
 
 // The Edit/Preview switch lives in the filename stripe (`.path`), not on the
@@ -1618,7 +1756,7 @@ function mountTab(content, t) {
       content.appendChild(terminalPlaceholder(t.session));
       return;
     }
-    const e = ensureTerm(t.session);
+    const e = ensureTerm(t.session, t.home);
     content.appendChild(e.node);   // MOVE, not rebuild — the socket survives
     requestAnimationFrame(() => {
       try {
@@ -2861,7 +2999,7 @@ function wireTouchScroll(node, term, entry) {
   }, { passive: true });
 }
 
-function ensureTerm(session) {
+function ensureTerm(session, home) {
   // No "the socket died, rebuild it" branch any more: an entry now heals its
   // own socket (see connectTerm), so a caller cannot find a dead one here.
   // Rebuilding on the way past was also what made recovery depend on the
@@ -2932,8 +3070,13 @@ function ensureTerm(session) {
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(node);
+  // `home` names the project this session's dtach socket (and paste route)
+  // actually lives under, when a tab shows a terminal re-homed from
+  // elsewhere (`home.rs`); `undefined`/falsy for the overwhelming common
+  // case, a native terminal, which dials this page's own PROJECT exactly as
+  // before this field existed.
   const entry = { node, term, fit, sock: null, tries: 0, timer: null, attached: false, gone: false,
-                  selTimer: null, flashTimer: null, linkProviders: null };
+                  selTimer: null, flashTimer: null, linkProviders: null, home };
   registerTermLinks(term, entry);
   // Copy on select. xterm's rows are `user-select: none`, so a browser
   // selection over terminal text is impossible and xterm's own selection is
@@ -3043,7 +3186,11 @@ function ensureTerm(session) {
 // and no visible difference from a live idle shell — until the user happened
 // to switch tabs and back, which is what rebuilt the socket.
 function connectTerm(entry, session) {
-  const sock = new WebSocket(wsUrl(`/ws/${PROJECT}/term/${session}`));
+  // A resident's socket lives at its home, never at this page's own
+  // project (`home.rs`) — `entry.home`, set once in `ensureTerm` from the
+  // tab's own `home` field, names it; `|| PROJECT` is the native case,
+  // unchanged from before re-homing existed.
+  const sock = new WebSocket(wsUrl(`/ws/${entry.home || PROJECT}/term/${session}`));
   sock.binaryType = "arraybuffer";
   entry.sock = sock;
   sock.onmessage = (e) => {
@@ -3838,6 +3985,98 @@ async function showConflict(ev) {
   else if (pick === "discard") send({ t: "CloseBuffer", rel: ev.rel });
 }
 
+// The worktree name shape `wtname::check` enforces server-side — checked
+// again here so a bad name is caught before `window.open`, not after a
+// round trip the server was always going to refuse anyway.
+const WTNAME_RULE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
+
+// The `+` worktree dialog (#156): a name field, "continue <term>'s Claude
+// there (fork)" for each terminal `state.forkable` names, "start a fresh
+// Claude", and "just a shell". `preferredTerminals`, optional, is the
+// terminal(s) worth favoring for fork — the ✻ shortcut's own
+// already-running Claudes, in order — the first of them that turns out to
+// be forkable is put first (and so, by `askChoice`'s own "first choice
+// takes focus" rule, preselected). Absent any of those, or absent the
+// argument entirely (the plain `+` button), a single fork candidate is
+// preselected on its own: with exactly one Claude to continue, that is
+// almost always the answer, and Enter should reach it without a click.
+//
+// `requestFreshState` runs *before* any of this is built, not after: the
+// hook that records a Claude session (`roost claude-hook`, a separate
+// subprocess — see `claudesess::record_from_hook`) tells the hub nothing
+// when it writes, so `forkable` is only as fresh as the last refresh this
+// connection happened to get. A dialog built from whatever `state` already
+// held could show no fork option for a Claude that, by the time the user
+// is looking at this dialog, really is resumable. The wait costs one round
+// trip before the dialog is even shown — no activation is spent on it, so
+// it does not threaten the later `window.open`, which happens only after a
+// *second*, later click inside this dialog grants its own.
+//
+// The actual create is deferred entirely to here, never to the caller: a
+// click on `+` or on "Start in a new worktree" only opens this dialog, and
+// nothing is sent to the server — nothing is created — until a choice in
+// *this* dialog is made.
+async function openWorktreeDialog(preferredTerminals = []) {
+  await requestFreshState();
+  const forkable = (state && state.forkable) || [];
+  const candidates = Array.isArray(preferredTerminals) ? preferredTerminals : [preferredTerminals];
+  const favored = candidates.find((t) => forkable.includes(t))
+    || (forkable.length === 1 ? forkable[0] : null);
+  const ordered = favored ? [favored, ...forkable.filter((t) => t !== favored)] : forkable;
+  const choices = ordered.map((session) => ({
+    id: `fork:${session}`,
+    label: `Continue ${session}'s Claude there (fork)`,
+  }));
+  choices.push({ id: "fresh", label: "Start a fresh Claude" });
+  choices.push({ id: "shell", label: "Just a shell" });
+  // Looped rather than a single ask: a name that fails the shape check
+  // re-shows this same dialog with the rule quoted inline and whatever was
+  // typed kept, instead of silently opening a tab for a request the server
+  // was always going to refuse. Cancel/Escape still exits the loop (and the
+  // function) with nothing sent.
+  let typed = "";
+  let error = "";
+  for (;;) {
+    const lines = ["Leave the name blank for roost to pick one."];
+    if (error) lines.push(error);
+    const pick = await askChoice({
+      title: "New worktree",
+      lines,
+      choices,
+      input: {
+        placeholder: "name (optional)",
+        value: typed,
+        // The directory/branch name this will actually become — the spec's
+        // own dialog mock shows it beside the field rather than making the
+        // person work it out from "worktree-" plus whatever they typed.
+        preview: (v) => `→ worktree-${v.trim() || "<generated>"}`,
+      },
+    });
+    if (!pick) return;
+    typed = pick.value || "";
+    const name = typed.trim();
+    if (name && !WTNAME_RULE.test(name)) {
+      error = `"${name}" must match ${WTNAME_RULE}`;
+      continue;
+    }
+    // Opened right after the click's promise resolves — still inside the
+    // browser's transient user activation, so the popup blocker allows it,
+    // the same way showClaudeHere's and showWorktreeAsk's own creates do.
+    // WorktreeReady navigates the tab once the server responds; an Error
+    // instead closes it (see the "Error" case).
+    pendingTab = window.open("about:blank");
+    const wtname = name || null;
+    if (pick.id === "fresh") {
+      send({ t: "NewWorktree", name: wtname, launch: { k: "Claude" } });
+    } else if (pick.id === "shell") {
+      send({ t: "NewWorktree", name: wtname, launch: { k: "Shell" } });
+    } else {
+      send({ t: "NewWorktree", name: wtname, launch: { k: "Fork", session: pick.id.slice("fork:".length) } });
+    }
+    return;
+  }
+}
+
 // The "a Claude is already here" prompt. Per-browser and transient: it is a
 // question to the person who clicked, not a state of the project. It used to
 // be a banner prepended to the pane; now the same in-page dialog every other
@@ -3855,15 +4094,69 @@ async function showClaudeHere(pane, terminals) {
     ],
   });
   if (pick === "worktree") {
-    // Opened right after the click's promise resolves — still inside the
-    // browser's transient user activation, so the popup blocker allows it;
-    // worktree-launch.mjs section C clicks with a real mouse event to prove
-    // that. WorktreeReady navigates the tab once the server responds.
-    pendingTab = window.open("about:blank");
-    send({ t: "NewWorktree", launch: "claude" });
+    // Which of these is actually forkable is answered inside
+    // openWorktreeDialog itself, off the fresh state it asks for — not off
+    // whatever `state.forkable` held at this click, which is exactly the
+    // staleness this dialog exists to avoid.
+    openWorktreeDialog(terminals);
   } else if (pick === "here") {
     send({ t: "NewTerminal", pane, launch: "claude", force: true });
   }
+}
+
+// A Claude asked, through roost's worktree hook, for a worktree, and is
+// blocked until some browser of this project answers (spec §3). The first
+// answer from any browser wins; the server closes everyone else's dialog.
+// Cancel and Escape answer nothing — another browser still may, and the
+// server refuses on its own at 60 s. Every string goes through askChoice's
+// textContent; `session` and `name` were validated server-side, but that is
+// not what keeps them out of markup.
+//
+// Shown one at a time from `askQueue`. dialog.js has no "a dialog closed"
+// hook, so while another dialog holds the screen this looks again every
+// 250 ms — only while something is queued, and a closed ask is spliced out of
+// the queue by WorktreeAskClosed, so it can never be shown late.
+function showNextAsk() {
+  if (askShowing || !askQueue.length) return;
+  if (openDlg) {
+    if (!askRetry) askRetry = setTimeout(() => { askRetry = null; showNextAsk(); }, 250);
+    return;
+  }
+  showWorktreeAsk(askQueue.shift());
+}
+
+async function showWorktreeAsk(ask) {
+  const { id, session, name } = ask;
+  askShowing = true;
+  let shown = false;
+  const pick = await askChoice({
+    title: `Claude in ${session} wants a worktree`,
+    lines: [`worktree-${name}`],
+    choices: [
+      { id: "create", label: "Create and open in new tab" },
+      { id: "refuse", label: "Refuse" },
+    ],
+    // A withdrawn dialog resolves null like Cancel, so it sends nothing.
+    bindDismiss: (dismiss) => { shown = true; worktreeAsks.set(id, dismiss); },
+  });
+  worktreeAsks.delete(id);
+  askShowing = false;
+  if (!shown) {
+    // Lost a race for the screen after all: back to the front, untouched.
+    askQueue.unshift(ask);
+    showNextAsk();
+    return;
+  }
+  if (pick === "create") {
+    // Opened right after the click's promise resolves, as showClaudeHere
+    // does — still inside the click's user activation, so the popup blocker
+    // allows it. WorktreeReady navigates it once the worktree exists.
+    pendingTab = window.open("about:blank");
+    send({ t: "WorktreeAnswer", id, approve: true });
+  } else if (pick === "refuse") {
+    send({ t: "WorktreeAnswer", id, approve: false });
+  }
+  showNextAsk();
 }
 
 // Transient, dismissible: reuses .conflict's border/padding/button styling
@@ -3897,6 +4190,25 @@ function showBanner(text) {
   box.append(b, dismiss);
   document.body.appendChild(box);
   setTimeout(() => box.remove(), 8000);
+}
+
+// Offered alongside the "Move tab there" banner, once per project per
+// browser, when this project's `WorktreeCreate` hook is off: the move it
+// just saw is exactly what that hook would have asked about *before*
+// moving anything, instead of roost merely noticing after the fact. Every
+// `localStorage` access is wrapped — a private window or blocked site data
+// must not break the banner itself, just this one extra offer.
+function offerWorktreeHooksOnce(box) {
+  if (!box || worktreeHookState() !== "off") return;
+  const key = "roost.worktreeHooksOffered." + PROJECT;
+  try {
+    if (localStorage.getItem(key) === "1") return;
+    localStorage.setItem(key, "1");
+  } catch { /* private mode: offer every time rather than not at all */ }
+  const b = document.createElement("button");
+  b.textContent = "Let roost create Claude's worktrees";
+  b.onclick = () => { send({ t: "SetWorktreeHooks", on: true }); box.remove(); };
+  box.append(b);
 }
 
 function showError(msg) {
@@ -4428,6 +4740,11 @@ if (wtBtn && wtPanel) {
   // the ⌘-click case, which stays on this page with the panel open. The
   // remove control is the other thing this popup's clicks can mean.
   wtPanel.onclick = async (e) => {
+    if (e.target.closest(".wtadd")) {
+      e.preventDefault();
+      openWorktreeDialog();
+      return;
+    }
     const rm = e.target.closest(".wtremove");
     if (rm) {
       // Everything the event carries is read before the first await: e is
@@ -4828,6 +5145,49 @@ function hookRow() {
   return row;
 }
 
+// Same three-valued state as hookState() above, for
+// `claudehooks::Kind::Worktree` instead of `Kind::Notify`.
+function worktreeHookState() {
+  if (!state || state.worktree_hooks === undefined) return "unknown";
+  return state.worktree_hooks === null ? "unknown" : (state.worktree_hooks ? "on" : "off");
+}
+// A sibling of hookRow() immediately above: same confirm/escape pattern,
+// writing roost's other owned command (`roost worktree-hook`, installed
+// only on `WorktreeCreate`) into the same settings file.
+function worktreeHookRow() {
+  const row = document.createElement("div");
+  row.className = "hookrow";
+  const s = worktreeHookState();
+  const label = document.createElement("span");
+  if (s === "unknown") {
+    label.textContent = "Let roost create Claude's worktrees: cannot tell — .claude/settings.local.json could not be read or parsed";
+    row.appendChild(label);
+    return row;
+  }
+  label.textContent = `Let roost create Claude's worktrees: ${s}`;
+  row.appendChild(label);
+  const b = document.createElement("button");
+  b.textContent = s === "on" ? "Disable" : "Enable";
+  b.onclick = async (e) => {
+    e.stopPropagation();
+    const on = s !== "on";
+    const yes = await askConfirm({
+      title: "Let roost create Claude's worktrees",
+      // The second line is the one thing Claude Code's payload cannot tell
+      // roost: a subagent's `isolation: "worktree"` asks through the same
+      // hook as a terminal's own request, so it asks too (#156, R29).
+      lines: on ? ["Write a WorktreeCreate hook to .claude/settings.local.json?",
+                   "Subagent worktrees ask too, and are refused when no roost tab is open on this project."]
+                : ["Remove roost's worktree hook from .claude/settings.local.json?"],
+      confirm: on ? "Enable" : "Disable",
+      danger: !on,
+    });
+    if (yes) send({ t: "SetWorktreeHooks", on });
+  };
+  row.appendChild(b);
+  return row;
+}
+
 function renderNotices() {
   const n = unread();
   const count = document.getElementById("bellcount");
@@ -4840,6 +5200,7 @@ function renderNotices() {
   if (!panel || panel.hidden) return;
   panel.replaceChildren();
   panel.appendChild(hookRow());
+  panel.appendChild(worktreeHookRow());
   if (!notices.length) {
     const empty = document.createElement("div");
     empty.className = "notice-empty";
@@ -5130,6 +5491,14 @@ function sessionUnder(target) {
   return host ? host.dataset.session : null;
 }
 
+// The project a paste to `session` must reach: its home when the tab is a
+// resident (`terms` carries the same `home` the socket itself dials — see
+// `ensureTerm`/`connectTerm`), this page's own `PROJECT` otherwise, exactly
+// as before re-homing existed.
+function termHomeOrProject(session) {
+  return terms.get(session)?.home || PROJECT;
+}
+
 function firstImage(files) {
   return [...files].find((f) => f.type.startsWith("image/")) || null;
 }
@@ -5362,7 +5731,7 @@ document.addEventListener("drop", (e) => {
   if (session) {
     const img = e.dataTransfer.files.length ? firstImage(e.dataTransfer.files) : null;
     if (img) {
-      postFiles(`/paste/${PROJECT}/${session}`, [img], "paste");
+      postFiles(`/paste/${termHomeOrProject(session)}/${session}`, [img], "paste");
       return;
     }
     return showError("only images can be dropped on a terminal — drop other files on the Files pane");
@@ -5394,7 +5763,7 @@ document.addEventListener("paste", (e) => {
     if (!img) return; // not an image: xterm's text paste, untouched
     e.preventDefault();
     e.stopPropagation(); // xterm must not also act on this one
-    postFiles(`/paste/${PROJECT}/${session}`, [img], "paste");
+    postFiles(`/paste/${termHomeOrProject(session)}/${session}`, [img], "paste");
     return;
   }
   const dir = uploadTargetDir(document.activeElement) ?? uploadTargetDir(e.target);

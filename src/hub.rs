@@ -35,6 +35,23 @@ pub struct Hub {
     /// `for_project` starts at most one watcher per project even though it
     /// runs on every connection.
     pub watching: bool,
+    /// Resident name → its home, for sessions re-homed into this project
+    /// (`home.rs`). Rebuilt by `refresh_live_sessions`, never persisted: it
+    /// is derived from the records and the sockets, and a saved copy could
+    /// only ever be stale.
+    pub session_homes: std::collections::BTreeMap<String, String>,
+    /// Native (never resident) live session names this project has a
+    /// recorded Claude session id for (`claudesess::recorded`) — what the
+    /// `+` dialog's fork choices are built from. Rebuilt by
+    /// `refresh_live_sessions`, the same way and for the same reason as
+    /// `session_homes` just above: a small local file read per live
+    /// session, cheap at the per-project cap of 16, but `snapshot_event`
+    /// runs on every debounced `EditBuffer` and would turn "cheap once" into
+    /// a filesystem read per keystroke if it looked here instead. Native
+    /// only (never a resident's name) — forking means continuing the
+    /// conversation of a *terminal on this page*, and a resident's record
+    /// lives, and is forkable, at its own home's refresh instead.
+    pub forkable: Vec<String>,
     /// A handle back to this hub's own `Arc<Mutex<Hub>>`, set only by
     /// `for_project` (see there) — lets `do_close_project` spawn a thread
     /// that re-locks this same hub *later*, after the blocking work is
@@ -93,6 +110,12 @@ pub struct Hub {
     /// up at the next refresh or reconnect, not sooner, exactly as the spec's
     /// "Live following is deliberately not added" says.
     pub claude_hooks: Option<Option<bool>>,
+    /// Same cache, same three invalidation sites, for
+    /// `claudehooks::Kind::Worktree` instead of `Kind::Notify`. Kept as a
+    /// separate field rather than keying one cache by `Kind` because the two
+    /// are read and invalidated together everywhere that touches either —
+    /// a map would buy nothing and cost a lookup at both sites.
+    pub worktree_hooks: Option<Option<bool>>,
     /// Cached result of `config::settings_view(&self.dir)`, same shape and
     /// same reason as `claude_hooks` above: that call is a `load` of both
     /// config files plus a `raw_setting` read per key per file — on the
@@ -108,6 +131,39 @@ pub struct Hub {
     /// not reflected sooner, same as `claude_hooks`; the settings dialog
     /// opening will ask for a fresh `RequestState` itself (a later task).
     pub settings: Option<crate::proto::SettingsView>,
+    /// Worktree asks from Claude's hook that no browser has answered yet
+    /// (`ask_worktree_blocking`). Whoever *removes* an entry owns its
+    /// `reply` sender and is the only one who may answer it — the answer
+    /// handler, or the asker's own timeout — so exactly one reply is ever
+    /// sent, by construction rather than by a flag. Never persisted: the
+    /// hook connection it answers does not survive a restart either.
+    asks: Vec<PendingAsk>,
+}
+
+/// How long Claude's worktree ask waits for a browser before it is refused.
+/// Inside the hook client's own `cli::REPLY_TIMEOUT` (90 s), so the server
+/// always answers before the client gives up — a reply the client never
+/// reads would leave a worktree Claude was never told about.
+pub const ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// At most this many unanswered asks per project (R22). Each one holds a
+/// hook connection thread (bounded process-wide by `hooksock`) and a dialog
+/// in every browser; per project, like `ide::MAX_PENDING`, so one Claude in
+/// a loop cannot starve the others.
+pub const MAX_PENDING_ASKS: usize = 4;
+
+/// Process-wide, so an id never repeats across projects or hub rebuilds, and
+/// never derived from the request: the id travels to every browser and back,
+/// and nothing Claude sent should be able to choose it.
+static NEXT_ASK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+const NO_TAB: &str = "no roost tab is open on this project to approve it";
+
+struct PendingAsk {
+    id: String,
+    session: String,
+    name: String,
+    reply: Sender<crate::hooksock::AskReply>,
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Mutex<Hub>>>>> = OnceLock::new();
@@ -197,7 +253,7 @@ fn lost_terminal_sessions(ws: &crate::workspace::Workspace, project: &str) -> Ve
         .iter()
         .flat_map(|p| p.tabs.iter())
         .filter_map(|t| match t {
-            crate::proto::Tab::Terminal { session } => Some(session.clone()),
+            crate::proto::Tab::Terminal { session, .. } => Some(session.clone()),
             _ => None,
         })
         // Three conditions, and `sessions_seen` is the one that makes this a
@@ -226,6 +282,55 @@ fn resumable_terminal_sessions(lost: &[String], project: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `project` may still end `kill_target`/`name` right now — for a
+/// resident (`kill_target != project`), only when the re-home record,
+/// re-read at this exact moment, still names `project` as the owner; for a
+/// native session (`kill_target == project`), only when that same re-read
+/// says `Here` — never assumed from `kill_target == project` alone.
+///
+/// R16, Important 1 (resident branch): `do_end_session` reads
+/// `kill_target` from `session_homes` once, under the hub lock, before the
+/// kill itself runs — on its own thread, or inline when none was spawned —
+/// so a "Move back" or a re-point landing in between would otherwise
+/// SIGKILL a session this owner no longer has any claim to.
+///
+/// Fix round 2, New Issue 2 (native branch): `session_homes` holds
+/// residents *of* this project, so it says nothing about a *native*
+/// session that was itself re-homed *away* — `kill_target == project`
+/// still holds for it, with no record anywhere upstream to have refused
+/// on its behalf (the end-session confirm dialog's own staleness window,
+/// or a second browser, can land `EndSession` after exactly that move).
+/// Positive evidence is required on both branches now, the same rule
+/// `session::kill_project_inner` already applies to its own kills
+/// (`session.rs` ~1419-1430 for the native case, ~1436 for residents):
+/// `Elsewhere` and `Unknown` both refuse, never just "not `Elsewhere` of
+/// someone else."
+fn may_end(kill_target: &str, name: &str, project: &str) -> bool {
+    if kill_target == project {
+        matches!(crate::home::owner_of(project, name), crate::home::Owner::Here)
+    } else {
+        matches!(crate::home::owner_of(kill_target, name), crate::home::Owner::Elsewhere(o) if o == project)
+    }
+}
+
+/// The IDE half of Close Project. A terminal the close spared because it is
+/// re-homed elsewhere (or its record is unreadable) keeps running, and its
+/// Claude's `CLAUDE_CODE_SSE_PORT` names this project's listener for the
+/// life of its process: stopping it would remove the lock file and refuse
+/// every reconnect, and a reopened project's new port is one that
+/// environment never learns. So the listener stays while anything spared
+/// is live, and is stopped as before otherwise. A panic while deciding
+/// keeps it — an extra listener until the next close is recoverable, a
+/// stranded Claude is not.
+fn stop_ide_unless_spared(project: &str) {
+    let keep = std::panic::catch_unwind(|| crate::session::spares_live(project)).unwrap_or(true);
+    if keep {
+        eprintln!("roost: Close Project kept {project}'s IDE listener: a re-homed terminal it spared is still running");
+    } else {
+        crate::ide::stop(project);
+    }
+}
+
 impl Hub {
     pub fn new(project: &str, dir: std::path::PathBuf) -> Hub {
         let (ws, warn) = crate::wsstate::load(project);
@@ -240,12 +345,16 @@ impl Hub {
             next_id: 0,
             self_writes: HashMap::new(),
             watching: false,
+            session_homes: Default::default(),
+            forkable: Vec::new(),
             self_ref: std::sync::Weak::new(),
             closing: false,
             notices_dirty: false,
             proposals: HashMap::new(),
             claude_hooks: None,
+            worktree_hooks: None,
             settings: None,
+            asks: Vec::new(),
         };
         // A freshly loaded hub must report reality, not whatever the
         // persisted layout happened to say last time: sessions may have
@@ -528,6 +637,16 @@ impl Hub {
         // running host, not of the saved layout. Reading it back from disk
         // would mark tabs from a previous boot.
         ws.claude_sessions = crate::claudes::cached_sessions(&self.project);
+        // Same reasoning: a fact about which sockets are actually live right
+        // now, not about the saved layout, so it is never persisted and is
+        // filled fresh on every snapshot from the in-memory `session_homes`
+        // `refresh_live_sessions` just rebuilt.
+        ws.session_homes = self.session_homes.clone();
+        // Same reasoning again: `refresh_live_sessions` just rebuilt this
+        // from the live, native session set, and copying it is free where
+        // recomputing it here — on every debounced `EditBuffer` — would not
+        // be (see `Hub::forkable`'s own doc comment).
+        ws.forkable = self.forkable.clone();
         // See the doc comment on `claude_hooks` for why this is cached
         // rather than read on every call.
         let cached = *self.claude_hooks.get_or_insert_with(|| {
@@ -538,6 +657,15 @@ impl Hub {
             }
         });
         ws.claude_hooks = cached;
+        // Same cache, same reason, for `Kind::Worktree`.
+        let worktree_cached = *self.worktree_hooks.get_or_insert_with(|| {
+            match crate::claudehooks::state_of(&self.dir, crate::claudehooks::Kind::Worktree) {
+                crate::claudehooks::HookState::Present => Some(true),
+                crate::claudehooks::HookState::Absent => Some(false),
+                crate::claudehooks::HookState::Unknown(_) => None,
+            }
+        });
+        ws.worktree_hooks = worktree_cached;
         // See the doc comment on `settings` for why this is cached rather
         // than read on every call.
         ws.settings = self.settings.get_or_insert_with(|| crate::config::settings_view(&self.dir)).clone();
@@ -561,10 +689,16 @@ impl Hub {
     /// for a name (`✻` reserves before the tab exists). Nothing here removes
     /// reservations — `do_close_project` drops the whole project's in one
     /// go, which is the case that matters.
+    ///
+    /// `home: None` tabs only: a resident's reservation belongs under its
+    /// *home*, not here — that is where the browser's own follow-up connect
+    /// actually lands (it dials `tab.home`), and reserving the name under
+    /// this project too would park a second, never-consumed reservation at
+    /// an address nothing ever spawns through.
     fn sync_reservations(&self) {
         for p in &self.ws.panes {
             for t in &p.tabs {
-                if let Tab::Terminal { session } = t {
+                if let Tab::Terminal { session, home: None } = t {
                     crate::session::reserve_if_absent(&self.project, session);
                 }
             }
@@ -596,6 +730,7 @@ impl Hub {
                 // snapshot must show up here even though it does not show
                 // up on every keystroke.
                 self.claude_hooks = None;
+                self.worktree_hooks = None;
                 self.settings = None;
                 let ev = self.snapshot_event(from);
                 self.send_to(from, &ev);
@@ -645,6 +780,23 @@ impl Hub {
                 // comment — this is one of its three invalidation sites,
                 // matched here by `settings` for the same reason).
                 self.claude_hooks = None;
+                self.settings = None;
+                let snap = self.snapshot_event(from);
+                self.broadcast(&snap);
+                return;
+            }
+            Intent::SetWorktreeHooks { on } => {
+                // Sibling of SetClaudeHooks immediately above, same shape,
+                // for `Kind::Worktree` instead of `Kind::Notify`.
+                if let Err(e) = crate::claudehooks::set_kind(&self.dir, crate::claudehooks::Kind::Worktree, *on) {
+                    self.send_to(from, &Event::Error { msg: e });
+                    return;
+                }
+                self.ws.version += 1;
+                // Same invalidation as SetClaudeHooks, for the same reason:
+                // the write just made must not be shadowed by a cached read
+                // taken before it.
+                self.worktree_hooks = None;
                 self.settings = None;
                 let snap = self.snapshot_event(from);
                 self.broadcast(&snap);
@@ -730,10 +882,12 @@ impl Hub {
             Intent::InitGit => return self.do_init_git(from),
             Intent::CloseProject => return self.do_close_project(from),
             Intent::EndSession { session } => return self.do_end_session(from, session.clone()),
-            Intent::NewWorktree { launch } => return self.do_new_worktree(from, *launch),
+            Intent::NewWorktree { name, launch } => {
+                return self.do_new_worktree(from, name.clone(), launch.clone())
+            }
             Intent::RemoveWorktree { key } => return self.do_remove_worktree(from, key.clone()),
-            Intent::NewTerminal { pane, launch, force, resume } => {
-                return self.do_new_terminal(from, *pane, *launch, *force, resume.clone())
+            Intent::NewTerminal { pane, launch, force, resume, fork } => {
+                return self.do_new_terminal(from, *pane, *launch, *force, resume.clone(), fork.clone())
             }
             Intent::OpenPath { text } => return self.do_open_path(from, text.clone()),
             Intent::OpenAtLine { pane, rel, line } => {
@@ -760,6 +914,10 @@ impl Hub {
             Intent::AnswerProposal { id, accept, text } => {
                 return self.do_answer_proposal(from, id.clone(), *accept, text.clone())
             }
+            Intent::WorktreeAnswer { id, approve } => {
+                return self.do_worktree_answer(from, id.clone(), *approve)
+            }
+            Intent::Rehome { session, to } => return self.do_rehome(from, session.clone(), to.clone()),
             // A search performs an unbounded filesystem walk, so `wsconn.rs`
             // diverts it to a worker thread *before* this lock is taken —
             // that divert is the entire enforcement of CLAUDE.md's "never
@@ -800,6 +958,31 @@ impl Hub {
             }
             _ => {}
         }
+        // R16's invariant (at most one live terminal tab per name in an
+        // owner) means a client that still thinks a resident's name is
+        // native is simply wrong, not offering a legitimate second tab:
+        // `focusSession`'s own-state miss and a session search result row
+        // (app.js) both send a bare `OpenTab{tab:{k:"Terminal", session}}`
+        // with no `home` at all, because neither has any way to know it —
+        // a search hit is a session *name*, and `focusSession`'s pre-check
+        // is a race away from missing a tab that just arrived. Filling in
+        // `home` here, before `apply_layout`, is what makes `find_tab`
+        // match and focus the resident's actual tab instead of creating a
+        // second, native one and reserving `(this project, session)` for a
+        // name this project's own `sock/` can never hold (R16 point 3).
+        //
+        // R17 (fix round 2): normalised unconditionally, not only when the
+        // intent arrives with `home: None` — a forged `OpenTab` naming a
+        // `home` of its own has no more claim to it than a bare one does.
+        // `session_homes` is the only source of truth for what `home`
+        // means on this page; nothing a client sends can override it.
+        let intent = match intent {
+            Intent::OpenTab { pane, tab: Tab::Terminal { session, home: _ } } => {
+                let home = self.session_homes.get(&session).cloned();
+                Intent::OpenTab { pane, tab: Tab::Terminal { session, home } }
+            }
+            other => other,
+        };
         // CloseTab removes the tab from `self.ws` inside `apply_layout`
         // below, so the rel it pointed at (if any) must be captured before
         // that call, not after.
@@ -833,7 +1016,7 @@ impl Hub {
                 .get(*pane as usize)
                 .and_then(|p| p.tabs.get(*idx))
                 .and_then(|t| match t {
-                    Tab::Terminal { session } => Some(session.clone()),
+                    Tab::Terminal { session, .. } => Some(session.clone()),
                     _ => None,
                 }),
             _ => None,
@@ -1470,7 +1653,13 @@ impl Hub {
     /// lock (`for_project`'s `or_insert_with`) — so that cost would stall
     /// every other project's connection setup, not just this one's.
     pub fn refresh_live_sessions(&mut self) {
-        self.ws.live_sessions = crate::session::live_names(&self.project);
+        // `owned_live_names`, which is `live_names` adjusted by the re-home
+        // records and is fork-free for the same reason.
+        let owned = crate::session::owned_live_names(&self.project);
+        self.session_homes =
+            owned.iter().filter_map(|(n, h)| Some((n.clone(), h.clone()?))).collect();
+        self.ws.live_sessions = owned.into_iter().map(|(n, _)| n).collect();
+        self.ws.live_sessions.dedup();
         // A shell that is running again is no longer lost. Without this the
         // note would survive the user starting a replacement in that very
         // tab, which is the one moment it stops being true.
@@ -1483,11 +1672,223 @@ impl Hub {
         // loss for.
         let lost = self.ws.lost_sessions.clone();
         self.ws.resumable_sessions.retain(|s| lost.contains(s));
+
+        // A resident with no tab of its own yet. Nothing that opens a
+        // terminal tab (`OpenTab`, `StartTerminal`, a restored layout) ever
+        // names a session this project never spawned, so this refresh — the
+        // moment `session_homes` above just learned about it — is the only
+        // place that can give a freshly re-homed terminal a tab on its
+        // *owner*'s page.
+        //
+        // R16 — the invariant superseding R15 part 2: within an owner, a
+        // terminal name is held by at most one live session, native or
+        // resident, ever. R15 part 2 let a native and a resident tab of the
+        // same name coexist, which looked right in isolation but broke
+        // everything else that is keyed by name alone — `EndSession`
+        // (closing the native tab would `apply_layout`'s name-only
+        // `EndSession` match drop *both*, while the resident's shell at its
+        // home kept running, orphaned), the client's own `terms` Map (one
+        // entry per session name — a second tab of the same name reuses the
+        // first's live socket, so both tabs would show the same shell), and
+        // reservations/`lost_sessions`/`live_sessions` (also name-keyed).
+        // Two tabs sharing a name was never representable anywhere outside
+        // this one loop.
+        //
+        // `raw_live` (the raw sockets under *this* project, `live_names` —
+        // not `self.ws.live_sessions`) is what "really live" has to mean
+        // here: `live_sessions` is `owned_live_names`'s output, which
+        // already carries a resident's own name as "live" for the client's
+        // attach-vs-placeholder decision — using it here would make the
+        // resident's own arrival look like evidence its name is natively
+        // live, so a dead native tab would never be retargeted at all.
+        let raw_live = crate::session::live_names(&self.project);
+        for (name, home) in self.session_homes.clone() {
+            let already_resident_tabbed = self.ws.panes.iter().flat_map(|p| p.tabs.iter()).any(|t| {
+                matches!(t, Tab::Terminal { session: s, home: Some(h) } if s == &name && h == &home)
+            });
+            if already_resident_tabbed {
+                continue;
+            }
+            let native_exists = self
+                .ws
+                .panes
+                .iter()
+                .flat_map(|p| p.tabs.iter())
+                .any(|t| matches!(t, Tab::Terminal { session: s, home: None } if s == &name));
+            if native_exists {
+                if raw_live.contains(&name) {
+                    // The invariant says this cannot happen — a resident and
+                    // a live native session cannot share a name — but a
+                    // race between a browser's `StartTerminal` and this
+                    // refresh could, in principle, hand this project a live
+                    // native `name` the instant before a resident of the
+                    // same name is also recorded. Refusing to add a second
+                    // tab is what the invariant requires; logging rather
+                    // than panicking is what a socket/watcher thread
+                    // (CLAUDE.md) requires.
+                    eprintln!(
+                        "roost: {} has a live native terminal {name} and a resident of the same name at {home} — keeping the native one, not tabbing the resident",
+                        self.project
+                    );
+                    // Fix round 2, New Issue 1: the hidden resident must
+                    // not stay routable through `session_homes` while its
+                    // name is shadowed — `do_end_session`'s `kill_target`
+                    // and the `OpenTab` home-fill-in above both read it,
+                    // and leaving this entry in would let a click on the
+                    // *visible* native tab's × SIGKILL the *hidden*
+                    // resident at its home (its record truly names this
+                    // owner, so `may_end` would pass), or let a bare
+                    // `OpenTab` for `name` push a second tab beside the
+                    // native one. The on-disk record is left alone — only
+                    // this hub's in-memory view of `name` reverts to
+                    // "native" — so the next refresh can pick the resident
+                    // back up the moment the native session actually ends.
+                    self.session_homes.remove(&name);
+                    continue;
+                }
+                // Retarget in place — covers both a never-started
+                // placeholder (`default_layout`'s own seeded `term`, the
+                // primary approve flow: a Claude in the main checkout's own
+                // `term` asks for a worktree) and a seen-but-dead native tab
+                // alike, since neither is "really" this name any more than
+                // the resident now claiming it. No longer lost, and no
+                // longer offering a resume: the name just became a live
+                // tab again, the same way a replacement shell starting in
+                // that very spot already clears both below.
+                for pane in self.ws.panes.iter_mut() {
+                    for t in pane.tabs.iter_mut() {
+                        if let Tab::Terminal { session: s, home: tab_home } = t {
+                            if tab_home.is_none() && s == &name {
+                                *tab_home = Some(home.clone());
+                            }
+                        }
+                    }
+                }
+                self.ws.lost_sessions.retain(|s| s != &name);
+                self.ws.resumable_sessions.retain(|s| s != &name);
+                self.ws.version += 1;
+                continue;
+            }
+            // No tab at all, native or resident: give it one, at `RIGHT` —
+            // the pane `NewTerminal`/`focusSession` use for a terminal with
+            // no home of its own, so a resident lands exactly where a plain
+            // `+` click would have put it.
+            let intent = Intent::OpenTab {
+                pane: crate::proto::RIGHT,
+                tab: Tab::Terminal { session: name, home: Some(home) },
+            };
+            if let Ok(true) = workspace::apply_layout(&mut self.ws, &intent) {
+                self.ws.version += 1;
+            }
+        }
+
+        // R25a (fix round 1, finding 4): the reverse of the loop above — a
+        // resident tab (`home: Some(h)`) whose `(h, name)` no longer
+        // matches a *current* entry in the `session_homes` just rebuilt
+        // (the record was forgotten, or re-pointed to a third project) is
+        // stale and must go, or End Session on it would compute a
+        // `kill_target` of this owner, find nothing to kill, report
+        // success, and orphan the shell that is actually still running at
+        // `h`.
+        //
+        // Gated on positive evidence, not merely "absent from
+        // `session_homes`": `home::owner_of` is re-read here rather than
+        // trusted from the absence alone, because `Unknown` (an empty or
+        // unreadable record — possibly mid-write) is exactly as likely to
+        // produce that absence as a genuine forget is, and `Unknown` must
+        // destroy nothing — a half-written record is not evidence this
+        // tab's session actually moved anywhere.
+        //
+        // Filtered on `home` as well as `session`, not a blunt by-name
+        // `EndSession` (which matches any `Tab::Terminal` of that name
+        // regardless of `home` — see its own doc comment in
+        // `workspace.rs`): a genuinely live *native* tab sharing this
+        // name at this same project must never be swept up here.
+        let stale_residents: Vec<(String, String)> = self
+            .ws
+            .panes
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .filter_map(|t| match t {
+                Tab::Terminal { session, home: Some(h) }
+                    if !matches!(self.session_homes.get(session), Some(sh) if sh == h) =>
+                {
+                    Some((session.clone(), h.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (name, home) in stale_residents {
+            let positively_moved = match crate::home::owner_of(&home, &name) {
+                crate::home::Owner::Here => true,
+                crate::home::Owner::Elsewhere(ref o) => o != &self.project,
+                crate::home::Owner::Unknown(_) => false,
+            };
+            if !positively_moved {
+                continue;
+            }
+            for pane in self.ws.panes.iter_mut() {
+                let before = pane.tabs.len();
+                pane.tabs.retain(
+                    |t| !matches!(t, Tab::Terminal { session: s, home: Some(h) } if s == &name && h == &home),
+                );
+                if pane.tabs.len() != before {
+                    pane.active = pane.active.min(pane.tabs.len().saturating_sub(1));
+                    self.ws.version += 1;
+                }
+            }
+        }
+
+        // The mirror image, found on the *home*'s own refresh: a native tab
+        // (`home: None`) whose session is still truly alive here
+        // (`raw_live`, computed above) but absent from `self.ws.live_sessions`
+        // just moved, rather than ended — that absence is exactly what
+        // `owned_live_names`'s own `Elsewhere`-and-resolves filter means.
+        // The owner's own refresh (above) is what gives it a tab there
+        // instead, so this page no longer has any business showing one.
+        let project = self.project.clone();
+        let mut rehomed: Vec<(String, String)> = Vec::new();
+        for pane in &self.ws.panes {
+            for t in &pane.tabs {
+                if let Tab::Terminal { session, home: None } = t {
+                    if rehomed.iter().any(|(s, _)| s == session) {
+                        continue;
+                    }
+                    if raw_live.contains(session) && !self.ws.live_sessions.contains(session) {
+                        rehomed
+                            .push((session.clone(), crate::home::effective_owner(&project, session)));
+                    }
+                }
+            }
+        }
+        for (session, owner) in rehomed {
+            let ended = workspace::apply_layout(
+                &mut self.ws,
+                &Intent::EndSession { session: session.clone() },
+            );
+            if let Ok(true) = ended {
+                self.ws.version += 1;
+            }
+            self.broadcast(&Event::Rehomed { session, owner });
+        }
+
         // Any enclosing work tree counts, not just this directory's own `.git`
         // — see `gitio::is_inside_work_tree`. A nested project has no `.git` of
         // its own, and offering `git init` there embeds a repository inside its
         // parent.
         self.ws.is_git = crate::gitio::is_inside_work_tree(&self.dir);
+        // The `+` dialog's fork choices: native (never resident — see the
+        // field's own doc comment) live sessions this project has a
+        // recorded Claude session id for. `raw_live`, not
+        // `self.ws.live_sessions`, for the same reason the rehoming check
+        // above uses it: the latter already folds a resident's own name in
+        // as "live", and a resident is forked from its home's refresh, not
+        // this one.
+        self.forkable = raw_live
+            .iter()
+            .filter(|name| crate::claudesess::recorded(&self.project, name).is_some())
+            .cloned()
+            .collect();
     }
 
     /// The client's websocket connect to `/ws/{project}/term/{name}` is what
@@ -1498,6 +1899,20 @@ impl Hub {
     fn do_start_terminal(&mut self, from: &ConnId, session: String, resume: bool) {
         if !crate::session::valid_name(&session) {
             let ev = Event::Error { msg: format!("invalid session name: {session}") };
+            return self.send_to(from, &ev);
+        }
+        // A lost tab's "press Enter" placeholder retries its old name, which
+        // is the other way (besides a fresh `+`/`✻` click, already guarded
+        // by `do_new_terminal`'s `also_taken`) a browser can ask for a name
+        // already in play on this page. `self.session_homes` is exactly
+        // that: a resident's name, taken here though this project's own
+        // `sock/` has no such socket. Spawning anyway would land the
+        // browser in a brand-new, unrelated shell under the name a Claude
+        // at the resident's home is still running in.
+        if let Some(home) = self.session_homes.get(&session) {
+            let ev = Event::Error {
+                msg: format!("terminal {session} is in use by a terminal moved here from {home}"),
+            };
             return self.send_to(from, &ev);
         }
         // I4: a close in flight is killing every one of this project's
@@ -1643,20 +2058,49 @@ impl Hub {
             self.ws.version += 1;
         }
         let project = self.project.clone();
+        // A resident's dtach master lives at its *home*, never here
+        // (`home.rs`'s module doc): ending it must kill the real session
+        // there, or this would report success while leaving the shell —
+        // and any Claude in it — running untouched. `self.session_homes` is
+        // exactly `do_new_terminal`'s `also_taken` source: a name in it is
+        // a resident's, not a native tab's.
+        let kill_target = self.session_homes.get(&session).cloned().unwrap_or_else(|| project.clone());
         match self.self_ref.upgrade() {
             Some(hub_arc) => {
                 let thread_project = project.clone();
+                let thread_kill_target = kill_target.clone();
                 let thread_session = session.clone();
+                let thread_from = from.clone();
                 let spawned =
                     std::thread::Builder::new().name("end-session".into()).spawn(move || {
+                        // R16, Important 1: re-checked right here, as close
+                        // to the kill as the lock-free gap between reading
+                        // `kill_target` and this thread actually running
+                        // allows — see `may_end`'s own doc comment for why.
+                        if !may_end(&thread_kill_target, &thread_session, &thread_project) {
+                            eprintln!(
+                                "roost: End Session refused {thread_kill_target}/{thread_session}: no longer owned by {thread_project}"
+                            );
+                            let mut h = Hub::lock(&hub_arc);
+                            let ev = Event::Error {
+                                msg: format!(
+                                    "{thread_session} moved since this was asked; nothing was ended"
+                                ),
+                            };
+                            h.send_to(&thread_from, &ev);
+                            h.refresh_live_sessions();
+                            let snap = h.snapshot_event(&String::new());
+                            h.broadcast(&snap);
+                            return;
+                        }
                         // No panic may escape a socket thread; one here must not
                         // strand the hub lock and leave every later intent stuck.
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            crate::session::end_session(&thread_project, &thread_session)
+                            crate::session::end_session(&thread_kill_target, &thread_session)
                         }))
                         .unwrap_or_else(|_| {
                             eprintln!(
-                                "roost: end_session panicked ending {thread_project}/{thread_session}"
+                                "roost: end_session panicked ending {thread_kill_target}/{thread_session}"
                             );
                             false
                         });
@@ -1666,6 +2110,20 @@ impl Hub {
                             let snap = h.snapshot_event(&String::new());
                             h.broadcast(&snap);
                         }
+                        // The kill just happened at `thread_kill_target`, not
+                        // `thread_project`, for a resident — so that other
+                        // project's own browsers, if any are open, must hear
+                        // about it too. `open_hub`, not `for_project`: a
+                        // home with nobody connected has no hub to refresh
+                        // and nothing waiting to be told.
+                        if thread_kill_target != thread_project {
+                            if let Some(home_hub) = open_hub(&thread_kill_target) {
+                                let mut hh = Hub::lock(&home_hub);
+                                hh.refresh_live_sessions();
+                                let snap = hh.snapshot_event(&String::new());
+                                hh.broadcast(&snap);
+                            }
+                        }
                         // Ending a project's last session empties its row in
                         // every other project's ◆ panel; same placement
                         // rules as `do_close_project`'s nudge.
@@ -1673,12 +2131,30 @@ impl Hub {
                     });
                 if let Err(e) = spawned {
                     eprintln!("roost: could not spawn end-session thread for {project}: {e}");
-                    crate::session::end_session(&project, &session);
+                    if may_end(&kill_target, &session, &project) {
+                        crate::session::end_session(&kill_target, &session);
+                    } else {
+                        eprintln!(
+                            "roost: End Session refused {kill_target}/{session}: no longer owned by {project}"
+                        );
+                        self.send_to(from, &Event::Error {
+                            msg: format!("{session} moved since this was asked; nothing was ended"),
+                        });
+                    }
                     self.refresh_live_sessions();
                 }
             }
             None => {
-                crate::session::end_session(&project, &session);
+                if may_end(&kill_target, &session, &project) {
+                    crate::session::end_session(&kill_target, &session);
+                } else {
+                    eprintln!(
+                        "roost: End Session refused {kill_target}/{session}: no longer owned by {project}"
+                    );
+                    self.send_to(from, &Event::Error {
+                        msg: format!("{session} moved since this was asked; nothing was ended"),
+                    });
+                }
                 self.refresh_live_sessions();
             }
         }
@@ -1691,11 +2167,41 @@ impl Hub {
     /// work runs on a thread when this hub has a self-handle, synchronously
     /// (unit tests, bare `Hub::new`) when it does not, and in both cases
     /// the hub is re-locked only to deliver the answer.
-    fn do_new_worktree(&mut self, from: &ConnId, launch: Option<crate::proto::Launch>) {
+    ///
+    /// `Fork`'s session id is resolved **before** any thread is spawned, not
+    /// inside `work`: the refusal (no recorded Claude session) is a fact
+    /// about this project right now, cheap to check (a small local file,
+    /// `claudesess`'s own read), and must reach the clicker without waiting
+    /// on a worktree that will not be created. Resolving it late would also
+    /// let the terminal's record change between the click and the git work
+    /// with no way to say which version of it was honoured.
+    fn do_new_worktree(
+        &mut self,
+        from: &ConnId,
+        name: Option<String>,
+        launch: Option<crate::proto::WorktreeLaunch>,
+    ) {
         if self.closing {
             let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
             return self.send_to(from, &ev);
         }
+        // What the new worktree's first terminal should start, and the
+        // Claude session id to fork — resolved now, never typed, never
+        // carried as anything but an id (CLAUDE.md: the server owns what
+        // lands on a command line).
+        let (reply_launch, fork_id) = match &launch {
+            Some(crate::proto::WorktreeLaunch::Claude) => (Some(crate::proto::Launch::Claude), None),
+            Some(crate::proto::WorktreeLaunch::Fork { session }) => {
+                match crate::claudesess::recorded(&self.project, session) {
+                    Some(rec) => (Some(crate::proto::Launch::Claude), Some(rec.session_id)),
+                    None => {
+                        let msg = format!("no recorded Claude session for {session}");
+                        return self.send_to(from, &Event::Error { msg });
+                    }
+                }
+            }
+            Some(crate::proto::WorktreeLaunch::Shell) | None => (None, None),
+        };
         let project = self.project.clone();
         let dir = self.dir.clone();
         let from = from.clone();
@@ -1706,7 +2212,31 @@ impl Hub {
         let finish_from = from.clone();
         let work = move || -> Result<String, String> {
             let key_of = |n: &str| crate::projects::storage_key(&format!("{project}/.claude/worktrees/{n}"));
-            let c = crate::worktree::create(&dir, &crate::wsstate::state_dir(), &key_of, &crate::worktree::real_git)?;
+            // Checked before any name is even chosen: a non-repository (or
+            // an unanswerable `git branch --list`) would otherwise make
+            // every generated candidate look "taken" and exhaust
+            // `wtname::generate`'s retries, reporting "could not find a
+            // free worktree name" instead of the real reason. `create_named`
+            // makes this same check again — redundant on the happy path,
+            // but it is what actually confines the generator's own git
+            // calls to a real repository.
+            if !crate::gitio::is_inside_work_tree(&dir) {
+                return Err("not a git repository".into());
+            }
+            let resolved = match name {
+                Some(n) => n,
+                None => {
+                    // `worktree::name_taken` is the same two checks
+                    // `create_named` itself makes, asked ahead of it so a
+                    // name this loop would reject is never even offered to
+                    // it — see that function's own doc comment for why an
+                    // uncertain answer counts as taken too.
+                    let taken = |cand: &str| crate::worktree::name_taken(&dir, &crate::worktree::real_git, cand);
+                    crate::wtname::generate(&taken)
+                        .ok_or_else(|| "could not find a free worktree name".to_string())?
+                }
+            };
+            let c = crate::worktree::create_named(&dir, &crate::wsstate::state_dir(), &resolved, &key_of, &crate::worktree::real_git)?;
             Ok(format!("{project}/.claude/worktrees/{}", c.name))
         };
         // Delivers the reply under the hub lock and hands back the url on
@@ -1721,7 +2251,7 @@ impl Hub {
         let finish = move |h: &mut Hub, r: Result<String, String>| -> Option<String> {
             match r {
                 Ok(url) => {
-                    let ev = Event::WorktreeReady { url: url.clone(), launch };
+                    let ev = Event::WorktreeReady { url: url.clone(), launch: reply_launch, fork: fork_id };
                     h.send_to(&finish_from, &ev);
                     Some(url)
                 }
@@ -1754,6 +2284,222 @@ impl Hub {
                 let r = work();
                 if let Some(url) = finish(self, r) {
                     broadcast_all(&Event::ProjectsChanged { project: url });
+                }
+            }
+        }
+    }
+
+    /// A browser's answer to a parked worktree ask. Runs under the hub lock,
+    /// so it only settles the ask: removes it (taking ownership of its reply
+    /// sender), closes every browser's dialog, and either refuses or hands
+    /// the git work to a thread — the `do_new_worktree` shape. An `id` that
+    /// is no longer pending was answered by someone else or timed out; the
+    /// first answer won, and this one is dropped without a word.
+    fn do_worktree_answer(&mut self, from: &ConnId, id: String, approve: bool) {
+        let Some(i) = self.asks.iter().position(|a| a.id == id) else { return };
+        let ask = self.asks.remove(i);
+        self.broadcast(&Event::WorktreeAskClosed { id });
+        if !approve {
+            let _ = ask.reply.send(ask_refuse("refused in roost"));
+            return;
+        }
+        if self.closing {
+            let _ = ask.reply.send(ask_refuse("project is closing"));
+            return;
+        }
+        let (project, dir, clicker) = (self.project.clone(), self.dir.clone(), from.clone());
+        // The closure owns `ask`, so a failed spawn drops its sender unsent;
+        // this clone is how that one failure still answers.
+        let fallback = ask.reply.clone();
+        let spawned = std::thread::Builder::new()
+            .name("worktree-ask".into())
+            .spawn(move || approve_ask(project, dir, clicker, ask));
+        if spawned.is_err() {
+            let msg = "could not start worktree creation";
+            let _ = fallback.send(ask_refuse(msg));
+            self.send_to(from, &Event::Error { msg: msg.into() });
+        }
+    }
+
+    /// "Move tab there" / "Move back" (spec §7, #156 task 12): the
+    /// browser's answer to a `ClaudeElsewhere` offer — never automatic, see
+    /// `claudes::detect_moves`'s own doc comment. This is the one place
+    /// that writes or clears a re-home record on that path.
+    ///
+    /// Confined to a session this hub can actually speak for: its own
+    /// native session, or one of its own residents (`session_homes`) — R16's
+    /// rule, echoed here because the banner that offers this always sits on
+    /// exactly the page that holds the tab, and nothing else should be able
+    /// to move a session this page has no claim to.
+    ///
+    /// `to: Some(url)` is checked against `worktree::list` off the hub
+    /// lock — the `do_new_worktree` shape, since this is git — and against
+    /// R16 (`session::live_names(url)` must not already hold this name, the
+    /// same gate `do_new_terminal`'s resident arrival applies). `to: None`
+    /// needs no git at all: forgetting a record is never wrong, so both
+    /// branches share one `work` closure and one thread-or-sync dispatch.
+    fn do_rehome(&mut self, from: &ConnId, session: String, to: Option<String>) {
+        if !crate::session::valid_name(&session) {
+            let msg = format!("invalid session name {session:?}");
+            return self.send_to(from, &Event::Error { msg });
+        }
+        let resident_home = self.session_homes.get(&session).cloned();
+        let resident = resident_home.is_some();
+        let native = crate::session::live_names(&self.project).contains(&session);
+        if !resident && !native {
+            let msg = format!("{session} is not a session of this project");
+            return self.send_to(from, &Event::Error { msg });
+        }
+        let home = resident_home.unwrap_or_else(|| self.project.clone());
+        // Read before anything is written: the owner the record names
+        // *right now*, if any. A plain move-in or move-back has no prior
+        // owner worth a second thought — but a native session re-pointed
+        // straight from one worktree to another (or home) *from the
+        // home's own page* leaves that *old* owner with a stale resident
+        // tab unless it is refreshed too (fix round 1, finding 4's last
+        // point), and nothing else here would otherwise ever name it.
+        let prior_owner = match crate::home::owner_of(&home, &session) {
+            crate::home::Owner::Elsewhere(o) => Some(o),
+            _ => None,
+        };
+        // Two kinds of follow-up, since only one of them (R25a) may add a
+        // tab back rather than merely refresh what is already there — see
+        // `retab_native_if_missing`'s own doc comment for why that is not
+        // folded into a plain `refresh_and_broadcast` everywhere.
+        let mut plains: Vec<String> = Vec::new();
+        let mut retabs: Vec<String> = Vec::new();
+        match &to {
+            Some(url) => {
+                plains.push(url.clone());
+                if let Some(o) = &prior_owner {
+                    if o != url {
+                        plains.push(o.clone());
+                    }
+                }
+            }
+            None => {
+                retabs.push(home.clone());
+                if let Some(o) = &prior_owner {
+                    if o != &self.project {
+                        plains.push(o.clone());
+                    }
+                }
+            }
+        }
+
+        let from = from.clone();
+        let finish_from = from.clone();
+        let work_session = session.clone();
+        let work_home = home.clone();
+        let work_to = to.clone();
+        let work = move || -> Result<(), String> {
+            match work_to {
+                None => {
+                    crate::home::forget(&work_home, &work_session);
+                    Ok(())
+                }
+                Some(url) => {
+                    let Some(home_dir) =
+                        crate::projects::resolve_project(&crate::projects::roots(), &work_home)
+                    else {
+                        return Err(format!("{work_home}: not a project roost serves"));
+                    };
+                    let Ok(home_canon) = home_dir.canonicalize() else {
+                        return Err(format!("{work_home}: cannot resolve project directory"));
+                    };
+                    // Resolved through git's own list, never a string
+                    // prefix — the same reason `detect_moves` does.
+                    let is_worktree_of_home =
+                        crate::worktree::list(&home_dir).iter().filter(|w| !w.is_main).any(|w| {
+                            w.path
+                                .canonicalize()
+                                .ok()
+                                .and_then(|c| {
+                                    c.strip_prefix(&home_canon).ok().map(|rel| format!("{work_home}/{}", rel.display()))
+                                })
+                                .as_deref()
+                                == Some(url.as_str())
+                        });
+                    if !is_worktree_of_home {
+                        return Err(format!("{url}: not a worktree of {work_home}"));
+                    }
+                    // Folded by R25b: git vouching for the *path* is not
+                    // enough on its own — a worktree git happily lists but
+                    // placed as a plain sibling of the home (not under its
+                    // `.claude/worktrees/`) has no re-home convention to
+                    // read back later, so `home::owner_path` — the exact
+                    // shape every other re-home consumer requires — must
+                    // also recognise it.
+                    if crate::home::owner_path(&work_home, &url).is_none() {
+                        return Err(format!("{url}: not a {work_home}/.claude/worktrees worktree"));
+                    }
+                    // R16: a resident must never shadow a native session of
+                    // the same name at its new owner.
+                    if crate::session::live_names(&url).contains(&work_session) {
+                        return Err(format!("{work_session} already exists in {url}"));
+                    }
+                    crate::home::record(&work_home, &work_session, &url)
+                }
+            }
+        };
+        // Refreshes and replies on this hub in the one lock the thread (or
+        // the sync fallback) re-takes — the `do_new_worktree` shape. On
+        // success this hub's own `session_homes`/`live_sessions` are rebuilt
+        // and broadcast immediately — which, since the record has already
+        // changed, is also where R25a's stale-tab drop fires for *this*
+        // hub if it just stopped being a resident's owner. Every *other*
+        // affected project is handled separately below, off this lock
+        // entirely.
+        let finish = move |h: &mut Hub, r: &Result<(), String>| {
+            match r {
+                Err(msg) => h.send_to(&finish_from, &Event::Error { msg: msg.clone() }),
+                Ok(()) => {
+                    h.refresh_live_sessions();
+                    let snap = h.snapshot_event(&finish_from);
+                    h.broadcast(&snap);
+                }
+            }
+        };
+        match self.self_ref.upgrade() {
+            Some(arc) => {
+                let plains2 = plains.clone();
+                let retabs2 = retabs.clone();
+                let session2 = session.clone();
+                let home2 = home.clone();
+                let spawned = std::thread::Builder::new().name("rehome".into()).spawn(move || {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                        .unwrap_or_else(|_| Err("rehome panicked".into()));
+                    let ok = r.is_ok();
+                    {
+                        let mut h = Hub::lock(&arc);
+                        finish(&mut h, &r);
+                    }
+                    if ok {
+                        for p in &plains2 {
+                            crate::hub::refresh_and_broadcast(p);
+                        }
+                        for p in &retabs2 {
+                            crate::hub::retab_native_if_missing(p, &session2);
+                        }
+                        broadcast_all(&Event::ProjectsChanged { project: home2 });
+                    }
+                });
+                if spawned.is_err() {
+                    self.send_to(&from, &Event::Error { msg: "could not start rehome".into() });
+                }
+            }
+            None => {
+                let r = work();
+                let ok = r.is_ok();
+                finish(self, &r);
+                if ok {
+                    for p in &plains {
+                        crate::hub::refresh_and_broadcast(p);
+                    }
+                    for p in &retabs {
+                        crate::hub::retab_native_if_missing(p, &session);
+                    }
+                    broadcast_all(&Event::ProjectsChanged { project: home });
                 }
             }
         }
@@ -1819,7 +2565,12 @@ impl Hub {
                 }
                 crate::claudes::ClaudeEvidence::Absent => {}
             }
-            if !crate::session::live_names(&url).is_empty() {
+            // `owned_live_names`, not `live_names`: a resident's dtach
+            // socket is still under its *home*, so `live_names(&url)` alone
+            // would miss a running Claude re-homed into this worktree and
+            // let `git worktree remove` delete the directory out from
+            // under it.
+            if !crate::session::owned_live_names(&url).is_empty() {
                 return Err(format!("{name} has a live terminal"));
             }
             let state_dir = crate::wsstate::state_dir();
@@ -1909,6 +2660,7 @@ impl Hub {
         launch: Option<crate::proto::Launch>,
         force: bool,
         resume: Option<String>,
+        fork: Option<String>,
     ) {
         if self.closing {
             let ev = Event::Error { msg: "project is closing; try again in a moment".into() };
@@ -1927,15 +2679,19 @@ impl Hub {
         // Names already on a tab but not yet connected are in no registry —
         // `next_free_name`'s `also_taken` is what stops two quick clicks from
         // both being handed `term`.
+        //
+        // Residents too: re-homed here, they show on this page under their
+        // name, though this project's own `sock/` has no such socket.
         let on_tabs: Vec<String> = self
             .ws
             .panes
             .iter()
             .flat_map(|p| p.tabs.iter())
             .filter_map(|t| match t {
-                Tab::Terminal { session } => Some(session.clone()),
+                Tab::Terminal { session, .. } => Some(session.clone()),
                 _ => None,
             })
+            .chain(self.session_homes.keys().cloned())
             .collect();
         // The prefix says what the terminal is for. A ✻ click gets `claude`,
         // `claude2`, … so the strip says which tab has an agent in it; a plain
@@ -1967,17 +2723,32 @@ impl Hub {
                 // survive that check falls through to a fresh launch rather
                 // than failing: the user asked for a Claude, and the worst
                 // case is they get a new one instead of an old one.
-                session: resume
+                // `fork` takes priority: it is the worktree page's own first
+                // terminal asking to continue a conversation this project
+                // just resolved for it (do_new_worktree), never a value from
+                // the ✻ history menu — `resume` is that one. Re-validated
+                // here against the class `claudesess` stores under, the same
+                // boundary `launch::keystrokes` crosses again before typing
+                // anything (CLAUDE.md: the server owns what lands on a
+                // command line, checked at every hop that carries an id).
+                session: fork
                     .filter(|id| {
-                        l == crate::proto::Launch::Claude && crate::claudehist::has(&self.dir, id)
+                        l == crate::proto::Launch::Claude && crate::claudesess::valid_session_id(id)
                     })
-                    .map(crate::launch::ClaudeSession::Resume)
+                    .map(crate::launch::ClaudeSession::Fork)
+                    .or_else(|| {
+                        resume
+                            .filter(|id| {
+                                l == crate::proto::Launch::Claude && crate::claudehist::has(&self.dir, id)
+                            })
+                            .map(crate::launch::ClaudeSession::Resume)
+                    })
                     .or_else(|| {
                         crate::launch::new_session_id().map(crate::launch::ClaudeSession::Fresh)
                     }),
             }),
         );
-        let intent = Intent::OpenTab { pane, tab: Tab::Terminal { session: name.clone() } };
+        let intent = Intent::OpenTab { pane, tab: Tab::Terminal { session: name.clone(), home: None } };
         match workspace::apply_layout(&mut self.ws, &intent) {
             Ok(true) => {
                 // A layout change can add a terminal tab (OpenTab, MoveTab
@@ -2164,7 +2935,27 @@ impl Hub {
                 return self.send_to(from, &ev);
             }
         };
-        if let Err(e) = crate::ide::mention_to(&self.project, session.as_deref(), &abs, lines) {
+        // The named terminal's Claude is registered wherever its socket
+        // actually is — its home, for a resident, never this project
+        // (`self.project` may itself be the *owner* here, which has no
+        // conns() entry at all for a session that lives elsewhere). `abs`
+        // is already a real absolute path, not project-relative, so
+        // sending it unchanged to the home's connection needs no
+        // re-relativising the way `ide.rs`'s proposal delivery does.
+        //
+        // A resident goes through `mention_to_exact`, never plain
+        // `mention_to`: the home's `conns()` entry can also hold its own
+        // native terminals or a different resident, and `mention_to`'s
+        // `Sess::Unknown` match / lone-connection fallback — right for a
+        // project asking about its *own* ambiguity — would otherwise let
+        // an Alt+K aimed at one resident land on an unrelated Claude at the
+        // same home. A session that is *not* a resident takes the exact
+        // same path as before re-homing existed (self.project, lenient).
+        let result = match session.as_deref().and_then(|s| self.session_homes.get(s).map(|h| (h.clone(), s))) {
+            Some((home, s)) => crate::ide::mention_to_exact(&home, s, &abs, lines),
+            None => crate::ide::mention_to(&self.project, session.as_deref(), &abs, lines),
+        };
+        if let Err(e) = result {
             let ev = Event::Error { msg: e };
             self.send_to(from, &ev);
         }
@@ -2202,6 +2993,22 @@ impl Hub {
             }
         };
         let _ = crate::ide::selection_changed(&self.project, &abs, &text, start, end);
+        // Unaimed, unlike `do_mention_path`: every connected Claude gets
+        // this, so every one of this project's *residents* must also be
+        // reached at their own home — their connection has no entry under
+        // `self.project` at all. Grouped by home (several residents can
+        // share one) and delivered through the session-filtered
+        // `selection_changed_for_sessions`, never plain `selection_changed`
+        // (which is `notify_all`): a home's `conns()` entry can also hold
+        // its own native terminals' Claudes, or a resident re-homed into a
+        // *different* worktree, and this selection is about neither.
+        let mut by_home: std::collections::HashMap<&String, Vec<String>> = Default::default();
+        for (name, home) in &self.session_homes {
+            by_home.entry(home).or_default().push(name.clone());
+        }
+        for (home, names) in by_home {
+            let _ = crate::ide::selection_changed_for_sessions(home, &names, &abs, &text, start, end);
+        }
     }
 
     /// The human's Accept/Reject, which **is** the permission answer Claude
@@ -2388,7 +3195,7 @@ impl Hub {
                         // authenticating connections against a token no
                         // longer advertised in any lock file. stop() itself
                         // cannot panic (no unwrap, no I/O it doesn't guard).
-                        crate::ide::stop(&thread_project);
+                        stop_ide_unless_spared(&thread_project);
                         {
                             let mut h = Hub::lock(&hub_arc);
                             h.closing = false;
@@ -2431,7 +3238,7 @@ impl Hub {
             }
             None => {
                 let ended = crate::session::kill_project(&project);
-                crate::ide::stop(&project);
+                stop_ide_unless_spared(&project);
                 // Before the version bump, so the one bump covers the kill
                 // and the layout change together — two bumps for a single
                 // intent would make a client's `version` check see a state it
@@ -2475,6 +3282,207 @@ fn open_hub(project: &str) -> Option<Arc<Mutex<Hub>>> {
     let reg = REGISTRY.get()?;
     let map = reg.lock().unwrap_or_else(|e| e.into_inner());
     map.get(project).cloned()
+}
+
+fn ask_refuse(msg: impl Into<String>) -> crate::hooksock::AskReply {
+    crate::hooksock::AskReply::Refuse { refuse: msg.into() }
+}
+
+/// Claude's worktree hook asking the browsers of its project (spec §3).
+/// Blocks the calling (socket) thread for up to [`ASK_TIMEOUT`], never a
+/// hub lock: `hooksock.rs`'s accept loop spawns one thread per connection
+/// precisely so this can block without stalling any other hook request.
+pub fn ask_worktree_blocking(req: crate::hooksock::AskRequest) -> crate::hooksock::AskReply {
+    ask_worktree_blocking_with(req, ASK_TIMEOUT)
+}
+
+/// [`ask_worktree_blocking`] with the wait injected, so a test can watch a
+/// timeout in milliseconds. A panic anywhere in here becomes a refusal: the
+/// hook must always get an answer, and the default answer is no.
+pub fn ask_worktree_blocking_with(
+    req: crate::hooksock::AskRequest,
+    timeout: std::time::Duration,
+) -> crate::hooksock::AskReply {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ask_inner(req, timeout)))
+        .unwrap_or_else(|_| ask_refuse("roost failed while asking; nothing was created"))
+}
+
+fn ask_inner(req: crate::hooksock::AskRequest, timeout: std::time::Duration) -> crate::hooksock::AskReply {
+    use std::sync::mpsc::RecvTimeoutError;
+    // Both land in a path and a git argument later, so they are checked
+    // before anything else is looked at, let alone shown to a person.
+    if !crate::session::valid_name(&req.session) {
+        return ask_refuse(format!("invalid terminal name {:?}", req.session));
+    }
+    if let Err(e) = crate::wtname::check(&req.name) {
+        return ask_refuse(e);
+    }
+    // Off every lock: a dot-segment URL makes this ask git.
+    if crate::projects::resolve_project(&crate::projects::roots(), &req.project).is_none() {
+        return ask_refuse(format!("{} is not a project roost serves", req.project));
+    }
+    // Looked up, never created: a project nobody has open has no browser to
+    // ask, and building a hub would start a watcher for nobody.
+    let Some(arc) = open_hub(&req.project) else { return ask_refuse(NO_TAB) };
+    let id = NEXT_ASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_string();
+    let (tx, rx) = channel();
+    {
+        let mut h = Hub::lock(&arc);
+        if h.subs.is_empty() {
+            return ask_refuse(NO_TAB);
+        }
+        if h.asks.iter().any(|a| a.session == req.session) {
+            return ask_refuse("an earlier request from this terminal is still waiting");
+        }
+        if h.asks.len() >= MAX_PENDING_ASKS {
+            return ask_refuse(format!("too many worktree requests waiting in {}", req.project));
+        }
+        h.asks.push(PendingAsk { id: id.clone(), session: req.session.clone(), name: req.name.clone(), reply: tx });
+        h.broadcast(&Event::WorktreeAsk { id: id.clone(), session: req.session, name: req.name });
+        // `broadcast` is what prunes closed sockets, so a subscriber list
+        // that was all dead connections only shows itself now. Nobody saw
+        // the dialog; waiting 60 s for nobody is worse than saying so.
+        if h.subs.is_empty() {
+            h.asks.retain(|a| a.id != id);
+            return ask_refuse(NO_TAB);
+        }
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(r) => r,
+        Err(RecvTimeoutError::Timeout) => {
+            let expired = {
+                let mut h = Hub::lock(&arc);
+                match h.asks.iter().position(|a| a.id == id) {
+                    Some(i) => {
+                        // Taking it out of `asks` is taking the right to
+                        // answer it; the sender is dropped unsent and this
+                        // thread answers instead.
+                        drop(h.asks.remove(i));
+                        h.broadcast(&Event::WorktreeAskClosed { id });
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if expired {
+                ask_refuse("nobody approved it in roost within 60 s")
+            } else {
+                // An answer removed it between the timeout and the lock, so
+                // that answer owns the reply and is already on its way —
+                // possibly a `Path`, with a record written. Refusing here
+                // instead would leave the terminal re-homed and Claude
+                // where it was. Unbounded by design: the approving thread
+                // always sends (its panics become a refusal), and the hook
+                // client bounds its own wait.
+                rx.recv().unwrap_or_else(|_| ask_refuse("roost lost the request; check the worktree switcher"))
+            }
+        }
+        Err(RecvTimeoutError::Disconnected) => ask_refuse("roost lost the request; check the worktree switcher"),
+    }
+}
+
+/// The approve path, off every lock (spec §3): create → R16 gate → record →
+/// (Task 10: hooks) → refresh both hubs → reply `Path` → `WorktreeReady` to
+/// the clicker → `ProjectsChanged`. Each step returns before the next on
+/// failure, and the record is written only once a worktree exists and the
+/// gate has passed.
+fn approve_ask(project: String, dir: std::path::PathBuf, clicker: ConnId, ask: PendingAsk) {
+    let PendingAsk { session, name, reply, .. } = ask;
+    // `created` is the owner URL once git has made the worktree, so the
+    // switcher is told about it even when a later step refuses.
+    let mut created: Option<String> = None;
+    let work = std::panic::AssertUnwindSafe(|| -> Result<String, String> {
+        let key_of = |n: &str| crate::projects::storage_key(&format!("{project}/.claude/worktrees/{n}"));
+        let c = crate::worktree::create_named(
+            &dir,
+            &crate::wsstate::state_dir(),
+            &name,
+            &key_of,
+            &crate::worktree::real_git,
+        )?;
+        let owner = format!("{project}/.claude/worktrees/{}", c.name);
+        created = Some(owner.clone());
+        // From here on a failure leaves the worktree on disk. That is
+        // deliberate: creating destroyed nothing, and removing it would be
+        // the destructive step this codebase demands positive evidence for —
+        // an empty worktree in the switcher is the honest leftover.
+        //
+        // R16: within one owner a name is held by at most one live session.
+        // A brand-new worktree has none, but the record is what would make
+        // two of them share a name, so it is checked rather than assumed.
+        if crate::session::live_names(&owner).contains(&session) {
+            return Err(format!("{} already has a terminal named {session}", c.name));
+        }
+        crate::home::record(&project, &session, &owner).map_err(|e| {
+            format!("{} was created, but roost could not record that {session} moved there: {e}", c.name)
+        })?;
+        // Install the worktree hook into the new worktree's own
+        // `.claude/settings.local.json`, mirroring whatever the main
+        // checkout has: a worktree Claude never ran `roost worktree-hook`
+        // from `dir` to enable it, so it inherits the setting instead of
+        // starting cold every time. Off the hub lock — `dir` and `c.path`
+        // are plain paths, and `claudehooks::set_kind` does its own file
+        // I/O with no lock involved.
+        //
+        // Errors are logged and swallowed, not propagated: the worktree and
+        // its `home::record` already exist by this point, so failing the
+        // whole approve now would report a worktree creation failure for a
+        // worktree that in fact exists — the one thing CLAUDE.md's
+        // destruction table is about, in its "says something untrue" form.
+        // A fresh Claude started there without the hook just starts cold,
+        // same as any project that never had it installed.
+        if crate::claudehooks::state_of(&dir, crate::claudehooks::Kind::Worktree)
+            == crate::claudehooks::HookState::Present
+        {
+            if let Err(e) = crate::claudehooks::set_kind(&c.path, crate::claudehooks::Kind::Worktree, true) {
+                eprintln!("roost: could not install the worktree hook into {}: {e}", c.path.display());
+            }
+        }
+        // Both hubs learn about the move before Claude does, so a
+        // `StartTerminal`/`NewTerminal` racing the reply already sees the
+        // resident. One lock at a time; never two.
+        for p in [&project, &owner] {
+            if let Some(arc) = open_hub(p) {
+                let mut h = Hub::lock(&arc);
+                h.refresh_live_sessions();
+                let snap = h.snapshot_event(&String::new());
+                h.broadcast(&snap);
+            }
+        }
+        Ok(c.path.to_string_lossy().into_owned())
+    });
+    let r = std::panic::catch_unwind(work).unwrap_or_else(|_| Err("worktree creation panicked".into()));
+    let ev = match &r {
+        Ok(_) => Event::WorktreeReady { url: created.clone().unwrap_or_default(), launch: None, fork: None },
+        Err(msg) => Event::Error { msg: msg.clone() },
+    };
+    // Re-locked only to deliver: the clicker holds the blank tab
+    // `WorktreeReady` navigates (or hears why there is nothing to open).
+    // Before the reply rather than after, so by the time Claude is told
+    // anything the clicker's tab is already on its way — the owner hub was
+    // refreshed above, so that page shows the resident when it loads.
+    if let Some(arc) = open_hub(&project) {
+        Hub::lock(&arc).send_to(&clicker, &ev);
+    }
+    let _ = reply.send(match r {
+        Ok(path) => crate::hooksock::AskReply::Path { path },
+        Err(msg) => ask_refuse(msg),
+    });
+    // After every lock is released: `broadcast_all` locks each hub, this
+    // project's included (see `do_new_worktree`).
+    if let Some(owner) = created {
+        broadcast_all(&Event::ProjectsChanged { project: owner });
+        broadcast_all(&Event::ProjectsChanged { project });
+    }
+}
+
+/// Whether `project` has a hub at all — `ide.rs`'s `open_diff` needs this
+/// before deciding to deliver a proposal to an owner: parking it there with
+/// no hub to receive it would make `open_proposal` silently do nothing
+/// (see its own doc comment) while Claude waits forever and the row still
+/// holds one of that project's `MAX_PENDING` slots.
+pub fn is_open(project: &str) -> bool {
+    open_hub(project).is_some()
 }
 
 /// Whether roost is holding unsaved edits to `rel`.
@@ -2601,6 +3609,64 @@ pub fn broadcast_state_for(project: &str) {
     g.broadcast(&ev);
 }
 
+/// `refresh_live_sessions` plus a snapshot push, in one short hub lock, for
+/// a caller outside `hub.rs` that just changed something `session_homes`
+/// depends on (a forgotten re-home record, say) and holds no lock of its
+/// own. Unlike `broadcast_state_for`, which trusts `session_homes` to
+/// already be current, this rebuilds it first — see `claudes::sweep_gone_owners`,
+/// the one caller that needs this rather than the cheaper function. A
+/// project nobody has open has no hub and needs nothing.
+pub fn refresh_and_broadcast(project: &str) {
+    let Some(reg) = REGISTRY.get() else { return };
+    let hub = {
+        let map = reg.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(project).cloned()
+    };
+    let Some(h) = hub else { return };
+    let mut g = Hub::lock(&h);
+    g.refresh_live_sessions();
+    let ev = g.snapshot_event(&String::new());
+    g.broadcast(&ev);
+}
+
+/// R25a: gives `name` a plain native tab at `project`'s own `RIGHT` pane
+/// if it has none at all. Called only at the two positive transitions
+/// that actually regain a session — `Hub::do_rehome`'s "Move back", and
+/// the R18 forget in `claudes::sweep_gone_owners` — never folded into
+/// `refresh_live_sessions` itself: that runs on every refresh (every
+/// terminal-affecting intent, and `Hub::new`), and auto-adding a tab for
+/// *any* tabless native live session there would silently undo a
+/// deliberate detach-close the moment the next refresh ran. A project
+/// nobody has open has no hub and needs nothing.
+pub fn retab_native_if_missing(project: &str, name: &str) {
+    let Some(reg) = REGISTRY.get() else { return };
+    let hub = {
+        let map = reg.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(project).cloned()
+    };
+    let Some(h) = hub else { return };
+    let mut g = Hub::lock(&h);
+    g.refresh_live_sessions();
+    let exists = g
+        .ws
+        .panes
+        .iter()
+        .flat_map(|p| p.tabs.iter())
+        .any(|t| matches!(t, Tab::Terminal { session: s, .. } if s == name));
+    if !exists {
+        let intent = Intent::OpenTab {
+            pane: crate::proto::RIGHT,
+            tab: Tab::Terminal { session: name.to_string(), home: None },
+        };
+        if let Ok(true) = workspace::apply_layout(&mut g.ws, &intent) {
+            g.ws.version += 1;
+            g.persist();
+        }
+    }
+    let ev = g.snapshot_event(&String::new());
+    g.broadcast(&ev);
+}
+
 /// Send an event to the clients of one project and nobody else. Same lock
 /// order as `broadcast_all` — registry, then hub — but it clones a single
 /// `Arc` rather than the whole map.
@@ -2622,9 +3688,22 @@ pub fn broadcast_to_project(project: &str, ev: &Event) {
 /// another project has nothing to attach to there. It cannot be shown in a
 /// panel that is about this project, and routing a click on it away from the
 /// project the user is working in is the behaviour that prompted the change.
+///
+/// `project` here is always the session's *home* — the pump has no notion
+/// of re-homing — so delivery is to `effective_owner(project, session)`
+/// instead: a re-homed session's tab lives in the owner's workspace now,
+/// and that is the panel a notice from it must land in. Computed before any
+/// lock is taken (CLAUDE.md: never hold a lock across blocking I/O, and this
+/// is a handful of small file reads/stats, never git).
 pub fn publish(project: &str, session: &str, p: crate::osc::Parsed) {
-    if let Some(notice) = crate::notify::record(project, session, p) {
-        broadcast_to_project(project, &Event::Notice { notice });
+    let target = crate::home::effective_owner(project, session);
+    // Recorded under `target`, not `project`: `Notice.project` is what
+    // `notify::list_for` filters a reload or a mark-all-read/clear against,
+    // and a re-homed session's tab is the owner's now — filing it under the
+    // home would make it invisible to everything but a browser that stayed
+    // subscribed across this very call.
+    if let Some(notice) = crate::notify::record(&target, session, p) {
+        broadcast_to_project(&target, &Event::Notice { notice });
     }
 }
 
@@ -2879,6 +3958,7 @@ mod tests {
             launch: Some(proto::Launch::Claude),
             force: true,
             resume: Some(id.to_string()),
+            fork: None,
         });
         // `claude`, not `term`: develop gave the ✻ click its own name sequence,
         // so the reservation this parks is on the name the click was allocated.
@@ -2933,6 +4013,7 @@ mod tests {
             launch: Some(proto::Launch::Claude),
             force: true,
             resume: Some("aaaa1111-2222-3333-4444-555555555555".to_string()),
+            fork: None,
         });
         // `claude`, not `term`: develop gave the ✻ click its own name sequence,
         // so the reservation this parks is on the name the click was allocated.
@@ -2946,6 +4027,110 @@ mod tests {
         crate::session::kill_project(&project);
         std::env::remove_var("ROOST_CMD");
         match prev_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
+    }
+
+    /// Fix round 1, finding 3. `NewTerminal.fork` end to end, the same shape
+    /// as `a_chosen_conversation_from_the_menu_is_what_the_new_terminal_resumes`
+    /// above but for a fork rather than a plain resume: the id lands in
+    /// `ClaudeSession::Fork`, not `Resume`, and `keystrokes` types
+    /// `--fork-session` after it. No `claudehist`/`HOME` setup needed here —
+    /// `fork` is validated by shape alone (`claudesess::valid_session_id`),
+    /// never by "does this project have that conversation" (see this file's
+    /// own `NewTerminal.fork` doc comment for why that is not a missing
+    /// authorisation check).
+    ///
+    /// Revert-checked: swapping `do_new_terminal`'s `fork.filter(...).map(ClaudeSession::Fork)`
+    /// for `ClaudeSession::Resume` fails the second assertion — observed:
+    /// left: `Some(Fork("864ee734-…"))`, right: `Some(Resume("864ee734-…"))`.
+    /// Restored.
+    #[test]
+    fn new_terminal_with_a_valid_fork_parks_a_fork_launch() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let project = format!("forkterm{}", std::process::id());
+        let dir = d.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "864ee734-e3ab-434e-8278-745a850b16ad";
+
+        let mut h = Hub::new(&project, dir.clone());
+        let (c, rx) = h.subscribe();
+        for p in h.ws.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+            p.active = 0;
+        }
+        drain(&rx);
+        h.handle(&c, Intent::NewTerminal {
+            pane: proto::RIGHT,
+            launch: Some(proto::Launch::Claude),
+            force: true,
+            resume: None,
+            fork: Some(id.to_string()),
+        });
+        let att = crate::session::reserve_and_attach(&project, "claude", &dir).unwrap();
+        let l = att.launch.as_ref().expect("a fork must still ask for a Claude");
+        assert_eq!(l.session.as_ref(), Some(&crate::launch::ClaudeSession::Fork(id.to_string())));
+        assert_eq!(
+            crate::launch::keystrokes(l.launch, l.session.as_ref()),
+            format!("claude --resume {id} --fork-session\r").into_bytes()
+        );
+        crate::session::kill_project(&project);
+        std::env::remove_var("ROOST_CMD");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// The same shape as `an_id_this_project_does_not_have_falls_through_to_a_fresh_claude`,
+    /// for `fork`'s own validation: a shape-invalid id (one that could read
+    /// as a command-line option) must not reach `--resume`/`--fork-session`
+    /// and must not stop the launch — it degrades to a fresh Claude, same
+    /// as an unauthorised `resume` does.
+    ///
+    /// Revert-checked: dropping `do_new_terminal`'s `claudesess::valid_session_id`
+    /// guard on `fork` (filtering only on `l == Launch::Claude`, passing the
+    /// id straight to `ClaudeSession::Fork` otherwise) fails this test here,
+    /// at the hub layer — observed: `panicked ... an invalid fork id must
+    /// not stop the launch: Some(Fork("--dangerously-skip-permissions"))`.
+    /// `launch.rs`'s own `usable()` guard would still have degraded it at
+    /// typing time, but this pins that the *parked* `ClaudeSession` is
+    /// already `Fresh`, not a `Fork` carrying an unusable id waiting to be
+    /// degraded later. Restored.
+    #[test]
+    fn new_terminal_with_an_invalid_fork_falls_back_to_a_fresh_claude() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let project = format!("forktermbad{}", std::process::id());
+        let dir = d.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut h = Hub::new(&project, dir.clone());
+        let (c, rx) = h.subscribe();
+        for p in h.ws.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+            p.active = 0;
+        }
+        drain(&rx);
+        h.handle(&c, Intent::NewTerminal {
+            pane: proto::RIGHT,
+            launch: Some(proto::Launch::Claude),
+            force: true,
+            resume: None,
+            fork: Some("--dangerously-skip-permissions".into()),
+        });
+        let att = crate::session::reserve_and_attach(&project, "claude", &dir).unwrap();
+        let l = att.launch.as_ref().expect("a Claude was still asked for");
+        assert!(
+            matches!(l.session.as_ref(), Some(crate::launch::ClaudeSession::Fresh(_))),
+            "an invalid fork id must not stop the launch: {:?}",
+            l.session
+        );
+        crate::session::kill_project(&project);
+        std::env::remove_var("ROOST_CMD");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// #17's rule, now that there is something for it to rule out.
@@ -3018,7 +4203,7 @@ mod tests {
         }
         w.panes[crate::proto::RIGHT as usize].tabs = names
             .iter()
-            .map(|n| crate::proto::Tab::Terminal { session: (*n).to_string() })
+            .map(|n| crate::proto::Tab::Terminal { session: (*n).to_string(), home: None })
             .collect();
         w
     }
@@ -3146,7 +4331,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::proto::{self, Mode, Tab};
+    use crate::proto::{self, Mode, Tab, WorktreeLaunch};
 
     /// The three tests below that call `Hub::for_project` directly (not a
     /// bare `Hub::new()`) reach `ide::for_project` -> `idelock::ide_dir()`
@@ -3165,6 +4350,889 @@ mod tests {
             out.push(m);
         }
         out
+    }
+
+    /// Whether any pane carries a terminal tab for `session`, regardless of
+    /// whether it is native or a resident's.
+    fn has_terminal_tab(h: &Hub, session: &str) -> bool {
+        h.ws.panes.iter().flat_map(|p| p.tabs.iter()).any(
+            |t| matches!(t, Tab::Terminal { session: s, .. } if s == session),
+        )
+    }
+
+    /// The `home` carried by `session`'s terminal tab, if any pane has one —
+    /// `None` both when there is no such tab and when the tab is native, a
+    /// distinction this test module never needs to tell apart on its own
+    /// (every caller already knows which it is asking about).
+    fn terminal_tab_home(h: &Hub, session: &str) -> Option<String> {
+        for p in &h.ws.panes {
+            for t in &p.tabs {
+                if let Tab::Terminal { session: s, home } = t {
+                    if s == session {
+                        return home.clone();
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Every terminal tab in the workspace, across every pane, as
+    /// `(session, home)` pairs — the fully faithful version
+    /// `terminal_tab_home` cannot be (R15): since a native tab and a
+    /// resident's tab may legally share a session name and differ only in
+    /// `home`, a test that needs to tell the two apart, or count them,
+    /// cannot settle for "the first match".
+    fn terminal_tabs(h: &Hub) -> Vec<(String, Option<String>)> {
+        h.ws
+            .panes
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .filter_map(|t| match t {
+                Tab::Terminal { session, home } => Some((session.clone(), home.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Two hubs sharing one live session: `home` is where its dtach socket
+    /// actually lives, `owner` is a worktree under it recorded as where the
+    /// tab now shows. Plain `Hub::new`, not `for_project` — this is about
+    /// `refresh_live_sessions`'s own bookkeeping, which needs neither a
+    /// watcher thread nor an IDE lock file, and both hubs are handed back as
+    /// `Arc<Mutex<Hub>>` only so the test can `Hub::lock` either one the way
+    /// a real connection would.
+    ///
+    /// The home's own tab for `session` is added by hand
+    /// (`Workspace::default_layout`'s own seeded `term` tab is a different
+    /// name on purpose, so it cannot be mistaken for this fixture's subject)
+    /// — nothing that opens a tab runs here, because what is under test is
+    /// what happens to a tab that is already there once re-homing is
+    /// recorded, not how the tab got there.
+    fn two_hubs_with_session(
+        root: &std::path::Path,
+        session: &str,
+    ) -> (Arc<Mutex<Hub>>, Arc<Mutex<Hub>>, String, String) {
+        let home = format!("rehome-{session}-home");
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.join(&home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+        crate::session::reserve_and_attach(&home, session, &home_dir).unwrap();
+        let mut home_hub = Hub::new(&home, home_dir);
+        home_hub.ws.panes[proto::RIGHT as usize]
+            .tabs
+            .push(Tab::Terminal { session: session.to_string(), home: None });
+        let owner_hub = Hub::new(&owner, owner_dir);
+        (Arc::new(Mutex::new(home_hub)), Arc::new(Mutex::new(owner_hub)), home, owner)
+    }
+
+    /// Two hubs and two connections, so a broadcast to the wrong project is
+    /// visible — a single-subscriber fixture cannot tell `send_to` from
+    /// `broadcast`, and cannot tell "sent to the right hub" from "sent to
+    /// whichever hub happened to be open".
+    ///
+    /// Revert-checked (Step 5): removing the tab-drop half of
+    /// `refresh_live_sessions` (the loop that calls `EndSession` on a native
+    /// tab whose session just resolved elsewhere) fails at the first
+    /// assertion — observed: `assertion failed: !has_terminal_tab(&Hub::lock(&home_hub), "term3")`.
+    #[test]
+    fn rehoming_moves_the_tab_and_tells_the_home() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let (home_hub, owner_hub, home, owner) = two_hubs_with_session(root.path(), "term3");
+        crate::home::record(&home, "term3", &owner).unwrap();
+
+        let (_ah, rx_ah) = Hub::lock(&home_hub).subscribe();
+        let (_ao, rx_ao) = Hub::lock(&owner_hub).subscribe();
+        drain(&rx_ah);
+        drain(&rx_ao);
+
+        Hub::lock(&home_hub).refresh_live_sessions();
+        Hub::lock(&owner_hub).refresh_live_sessions();
+
+        assert!(!has_terminal_tab(&Hub::lock(&home_hub), "term3"), "the home must drop its own tab for a session that moved away");
+        assert_eq!(
+            terminal_tab_home(&Hub::lock(&owner_hub), "term3"),
+            Some(home.clone()),
+            "the owner must gain a tab naming the resident's real home"
+        );
+
+        let home_msgs = drain(&rx_ah);
+        assert!(
+            home_msgs.iter().any(|m| m.contains(r#""t":"Rehomed""#) && m.contains("term3") && m.contains(&owner)),
+            "the home's own browser must be told where its tab went: {home_msgs:?}"
+        );
+        let owner_msgs = drain(&rx_ao);
+        assert!(
+            !owner_msgs.iter().any(|m| m.contains(r#""t":"Rehomed""#)),
+            "the owner did not lose a tab, so it must not hear Rehomed: {owner_msgs:?}"
+        );
+
+        crate::session::kill_project(&home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// R15: this is the primary approve flow, not an edge case — a Claude in
+    /// the main checkout's own `term` asks for a worktree, roost creates a
+    /// brand-new worktree project, and `Workspace::default_layout` seeds
+    /// that fresh project's own `Terminal{session:"term", home:None}`
+    /// placeholder before anything else happens to it. `term` is also
+    /// `next_free_name`'s own first pick, so this is not a contrived name
+    /// collision; it is the name every first terminal gets.
+    ///
+    /// Revert-checked: reverting the retarget-in-place loop to the
+    /// session-only `already_tabbed` check (the pre-R15 body) fails —
+    /// observed: `assertion 'left == right' failed\n  left: [("term",
+    /// None)]\n right: [("term", Some("r15-approve-home"))]` — the resident
+    /// never gets a tab at all, because the bare placeholder already
+    /// "counts" as one.
+    #[test]
+    fn a_fresh_worktree_placeholder_term_becomes_the_resident_term() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        // Setup sanity, independent of the hub under test: `default_layout`
+        // really does seed exactly this placeholder, or this test would
+        // pass by describing a layout that no longer exists.
+        assert_eq!(
+            crate::workspace::Workspace::default_layout().panes[proto::RIGHT as usize].tabs,
+            vec![Tab::Terminal { session: "term".into(), home: None }]
+        );
+
+        let home = "r15-approve-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        crate::session::reserve_and_attach(home, "term", &home_dir).unwrap();
+        crate::home::record(home, "term", &owner).unwrap();
+
+        // `Hub::new` runs `refresh_live_sessions` as part of construction
+        // (see its own doc comment) — the exact path under test, on a
+        // worktree that has never been opened before and so starts from
+        // `default_layout`'s own placeholder, with the resident already on
+        // record by the time it does.
+        let owner_hub = Hub::new(&owner, owner_dir);
+
+        assert_eq!(
+            terminal_tabs(&owner_hub),
+            vec![("term".to_string(), Some(home.to_string()))],
+            "the placeholder must become the resident's tab in place, not sit beside a second one"
+        );
+
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// R16 supersedes R15 part 2: a native tab this project's own session
+    /// actually used (`sessions_seen`, the same evidence
+    /// `lost_terminal_sessions` trusts), but whose session is not live now,
+    /// is retargeted to the resident in place exactly like a never-seen
+    /// placeholder — the invariant (at most one live terminal tab per name
+    /// in an owner) has no "but it has history" exception, because a dead
+    /// tab's history belongs to a name, not to whichever session happens
+    /// to be using it next. The arriving resident must also clear it from
+    /// `lost_sessions`: a name that just became a live tab again is not
+    /// still waiting to be restored.
+    ///
+    /// Revert-checked: reintroducing a `!seen.contains(s)` guard on the
+    /// retarget (inside the still-current `native_exists` branch, which
+    /// unconditionally clears `lost_sessions`/`resumable_sessions` and
+    /// `continue`s regardless) means the tab is left native *and* no
+    /// resident tab is ever added — observed: `assertion 'left == right'
+    /// failed\n  left: [("term", None)]\n right: [("term",
+    /// Some("r16-seen-dead-home"))]`. The resident is silently dropped
+    /// rather than ending up beside the native tab, because this branch no
+    /// longer falls through to the "push a new one" case below it.
+    #[test]
+    fn a_seen_but_dead_native_term_tab_becomes_the_arriving_resident() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "r16-seen-dead-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        // Built with no live session anywhere under the owner and no
+        // re-home record yet, so this is the owner's own history being set
+        // up, not a side effect of the resident's arrival. `sessions_seen`
+        // and `lost_sessions` are set directly (the established pattern in
+        // this file — see `a_tab_that_never_had_a_shell_is_not_called_lost`)
+        // rather than earned through a real reboot.
+        let mut owner_hub = Hub::new(&owner, owner_dir);
+        owner_hub.ws.sessions_seen = vec!["term".to_string()];
+        owner_hub.ws.lost_sessions = vec!["term".to_string()];
+
+        crate::session::reserve_and_attach(home, "term", &home_dir).unwrap();
+        crate::home::record(home, "term", &owner).unwrap();
+        owner_hub.refresh_live_sessions();
+
+        assert_eq!(
+            terminal_tabs(&owner_hub),
+            vec![("term".to_string(), Some(home.to_string()))],
+            "the seen-but-dead native tab must become the resident's, not sit beside a second one"
+        );
+        assert!(
+            !owner_hub.ws.lost_sessions.contains(&"term".to_string()),
+            "a name that just gained a live tab is no longer lost"
+        );
+
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// R16's invariant breach case: a live native session and a recorded
+    /// resident cannot legitimately share a name, but a race (a browser's
+    /// own `StartTerminal` landing between two refreshes) could — driven
+    /// directly here rather than actually won, since winning it for real
+    /// would make this test flaky by construction. The native tab must
+    /// survive untouched and the resident must not get a tab at all; the
+    /// *on-disk* record is left alone (not forgotten), so it is still
+    /// there to retry once the native session actually ends — but (fix
+    /// round 2, New Issue 1) `session_homes`, the in-memory router
+    /// `do_end_session` and the `OpenTab` home-fill-in both read, must not
+    /// keep naming the hidden resident's home for this name, or a click on
+    /// the *visible* native tab's × routes straight to the *hidden*
+    /// resident's kill.
+    ///
+    /// Revert-checked: dropping the `raw_live.contains(&name)` breach guard
+    /// (so retargeting proceeds regardless) fails — observed: `assertion
+    /// 'left == right' failed\n  left: [("term", Some("r16-live-clash-home"))]\n
+    /// right: [("term", None)]` — the live native tab is silently
+    /// overwritten to point at the resident, which is exactly the bug this
+    /// guard exists to prevent (closing it would then SIGKILL the home's
+    /// real session).
+    #[test]
+    fn a_live_native_term_blocks_a_second_tab_for_a_resident_of_the_same_name() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "r16-live-clash-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        crate::session::reserve_and_attach(&owner, "term", &owner_dir).unwrap();
+        crate::session::reserve_and_attach(home, "term", &home_dir).unwrap();
+        crate::home::record(home, "term", &owner).unwrap();
+
+        let owner_hub = Hub::new(&owner, owner_dir);
+
+        assert_eq!(
+            terminal_tabs(&owner_hub),
+            vec![("term".to_string(), None)],
+            "the live native tab must survive untouched; the resident must not get a second tab of the same name"
+        );
+        assert_eq!(
+            owner_hub.session_homes.get("term"),
+            None,
+            "the hidden resident must not stay routable through session_homes while its name is shadowed"
+        );
+        assert!(
+            matches!(crate::home::owner_of(home, "term"), crate::home::Owner::Elsewhere(o) if o == owner),
+            "the on-disk record itself must be left alone, so the resident can be retried once the native session ends"
+        );
+
+        crate::session::kill_project(&owner);
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Fix round 2, New Issue 1: the breach branch above keeps the native
+    /// tab visible and the resident hidden — but before this fix,
+    /// `session_homes["term"]` still named the resident's home, so
+    /// `EndSession` on the *visible* native tab's × read `kill_target` from
+    /// there and SIGKILLed the *hidden* resident instead (`may_end` passed,
+    /// because the on-disk record genuinely names this owner). This is
+    /// `a_live_native_term_blocks_a_second_tab_for_a_resident_of_the_same_name`'s
+    /// same breach fixture, carried one step further: actually end the
+    /// session a user clicking the one visible tab would mean.
+    ///
+    /// Real dtach on both ends: this has to prove which *process* died, not
+    /// just which map entry changed.
+    ///
+    /// Revert-checked: dropping the `self.session_homes.remove(&name)` call
+    /// in the breach branch (restoring the New-Issue-1 defect) fails at
+    /// this test's own setup assertion — observed: `assertion 'left ==
+    /// right' failed\n  left: Some("r17-breach-home")\n right: None` —
+    /// `session_homes["term"]` still names the resident's home, which is
+    /// exactly the defect `EndSession` on the visible tab would then route
+    /// through to SIGKILL the hidden resident instead.
+    #[test]
+    fn end_session_on_the_visible_native_tab_of_a_breach_pair_ends_only_the_native_one() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "r17-breach-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let att_owner = crate::session::reserve_and_attach(&owner, "term", &owner_dir)
+            .expect("/usr/bin/dtach is a runtime prerequisite elsewhere in this project");
+        let att_home = crate::session::reserve_and_attach(home, "term", &home_dir)
+            .expect("/usr/bin/dtach is a runtime prerequisite elsewhere in this project");
+        let owner_sock = crate::session::socket_path(&owner, "term");
+        let home_sock = crate::session::socket_path(home, "term");
+        for sock in [&owner_sock, &home_sock] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !any_process_holds(sock) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(any_process_holds(sock), "setup: both real dtach masters must be up before this test can mean anything");
+        }
+        drop(att_owner);
+        drop(att_home);
+
+        crate::home::record(home, "term", &owner).unwrap();
+
+        // The breach: a live native `term` at the owner, and a resident of
+        // the same name recorded there. `Hub::for_project`'s own
+        // construction hits the breach branch in `refresh_live_sessions`
+        // immediately — the fix under test is that it must not leave the
+        // hidden resident routable through `session_homes`.
+        let owner_hub = Hub::for_project(&owner, owner_dir.clone());
+        assert_eq!(
+            Hub::lock(&owner_hub).session_homes.get("term"),
+            None,
+            "setup: the breach must not leave the hidden resident routable through session_homes"
+        );
+        let (c, _rx) = Hub::lock(&owner_hub).subscribe();
+
+        Hub::lock(&owner_hub).handle(&c, Intent::EndSession { session: "term".into() });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while any_process_holds(&owner_sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(
+            !any_process_holds(&owner_sock),
+            "the visible native tab's End Session must end the native session"
+        );
+        assert!(
+            any_process_holds(&home_sock),
+            "the hidden resident at its home must survive — End Session on the native tab must not reach it"
+        );
+
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Task 12 / R18, end to end: a real worktree removed with
+    /// `git worktree remove` behind roost's back (Claude Code's own cleanup
+    /// on a session's exit, done here by hand), a resident record that
+    /// still names it, and a real dtach session at the home that `may_end`
+    /// refuses to end while the record says `Elsewhere`.
+    /// `claudes::sweep_gone_owners` finds the positive evidence, forgets
+    /// the record off any lock, and the home's browsers hear
+    /// `WorktreeGone` exactly once — after which End Session on the home
+    /// hub actually ends the real dtach master.
+    ///
+    /// Revert-checked: commenting out the `home::forget` call inside
+    /// `sweep_gone_owners` makes the final `any_process_holds` assertion
+    /// fail — `owner_of` still answers `Elsewhere`, `may_end`'s native
+    /// branch still refuses, and `EndSession` sends `Error` instead of
+    /// killing anything; observed: `assertion failed: End Session must now
+    /// actually work: the record no longer says Elsewhere`. Restored.
+    #[test]
+    fn a_removed_worktree_releases_its_terminal_for_end_session() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "t12-r18-home";
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(args).status().unwrap().success());
+        }
+        std::fs::write(home_dir.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(args).status().unwrap().success());
+        }
+        let wt = home_dir.join(".claude/worktrees/w1");
+        assert!(std::process::Command::new("git")
+            .arg("-C").arg(&home_dir)
+            .args(["worktree", "add", "-b", "w1", wt.to_str().unwrap()])
+            .status().unwrap().success());
+        let owner = format!("{home}/.claude/worktrees/w1");
+
+        let att = crate::session::reserve_and_attach(home, "term3", &home_dir)
+            .expect("/usr/bin/dtach is a runtime prerequisite elsewhere in this project");
+        let sock = crate::session::socket_path(home, "term3");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up before this test can mean anything");
+        drop(att);
+
+        crate::home::record(home, "term3", &owner).unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C").arg(&home_dir)
+            .args(["worktree", "remove", wt.to_str().unwrap()])
+            .status().unwrap().success());
+
+        let home_hub = Hub::for_project(home, home_dir.clone());
+        let (c, rx) = Hub::lock(&home_hub).subscribe();
+        drain(&rx);
+
+        let home_dir_of = |p: &str| (p == home).then(|| home_dir.clone());
+        let announced = Mutex::new(std::collections::HashSet::new());
+        crate::claudes::sweep_gone_owners(&home_dir_of, &announced);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut got_gone = false;
+        while std::time::Instant::now() < deadline {
+            if drain(&rx).iter().any(|m| m.contains(r#""t":"WorktreeGone""#) && m.contains("term3")) {
+                got_gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(got_gone, "the home's browsers must hear WorktreeGone");
+        assert!(
+            matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here),
+            "R18: the record must be forgotten on positive evidence"
+        );
+        // Fix round 1, finding 4: the R18 forget is one of the two
+        // positive transitions that re-tabs the home — the session had no
+        // tab here at all before (nobody had opened one), and the sweep's
+        // `retab_native_if_missing` call must have given it one.
+        //
+        // Revert check: removing that call from `sweep_gone_owners` (so
+        // the home is left to a plain `refresh_and_broadcast` instead)
+        // fails this assertion, observed verbatim as its own message.
+        // Restored.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut home_has_tab = false;
+        while std::time::Instant::now() < deadline {
+            home_has_tab = Hub::lock(&home_hub).ws.panes.iter().flat_map(|p| p.tabs.iter())
+                .any(|t| matches!(t, Tab::Terminal { session, home: None } if session == "term3"));
+            if home_has_tab {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(home_has_tab, "the home must regain a plain native tab for term3");
+
+        Hub::lock(&home_hub).handle(&c, Intent::EndSession { session: "term3".into() });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !any_process_holds(&sock),
+            "End Session must now actually work: the record no longer says Elsewhere"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// The other half of R18: `git worktree list` not answering (a
+    /// directory that is not a repository at all, standing in for roost
+    /// losing the race with git, or the repo itself being gone) is "cannot
+    /// tell", never "gone" — `sweep_gone_owners` must forget nothing and
+    /// tell nobody.
+    #[test]
+    fn a_git_failure_forgets_nothing_and_sends_no_event() {
+        isolate_ide_dir_for_tests();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let home = "t12-r18-gitfail";
+        let not_a_repo = tempfile::tempdir().unwrap(); // no .git at all: git cannot answer
+        crate::home::record(home, "term3", &format!("{home}/.claude/worktrees/w1")).unwrap();
+
+        let home_hub = Hub::for_project(home, not_a_repo.path().to_path_buf());
+        let (_c, rx) = Hub::lock(&home_hub).subscribe();
+        drain(&rx);
+
+        let home_dir_of = |p: &str| (p == home).then(|| not_a_repo.path().to_path_buf());
+        let announced = Mutex::new(std::collections::HashSet::new());
+        crate::claudes::sweep_gone_owners(&home_dir_of, &announced);
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(drain(&rx).iter().all(|m| !m.contains("WorktreeGone")), "git did not answer: no event must be sent");
+        assert!(
+            matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Elsewhere(_)),
+            "git did not answer: the record must be kept"
+        );
+
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// R16's Important 1: `do_end_session` reads `kill_target` from a
+    /// `session_homes` snapshot under the hub lock, but the kill itself
+    /// runs later, on its own thread, off that lock — so a "Move back" or
+    /// a re-point landing in the gap must not go on to SIGKILL a session
+    /// this owner no longer has any claim to. Driven deterministically:
+    /// the record is forgotten *after* the hub's own snapshot (asserted
+    /// below) and *without* a refresh in between, which is what a real race
+    /// would also leave behind, just without the timing.
+    ///
+    /// Real dtach, not `ROOST_CMD=cat`: the home's session has to be a
+    /// process `any_process_holds` can actually find surviving (or not).
+    ///
+    /// Revert-checked: replacing the `may_end` re-check with the pre-fix
+    /// unconditional kill reproduces exactly the bug this guards against —
+    /// observed: `assertion failed: the clicker must be told nothing was
+    /// ended` (no `Error` ever arrives — the kill just happens) and the
+    /// follow-up `any_process_holds` assertion on the home's socket fails
+    /// too once that one is reached.
+    #[test]
+    fn end_session_of_a_resident_rehomed_away_since_is_refused() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "r16-raced-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let att = crate::session::reserve_and_attach(home, "term3", &home_dir)
+            .expect("/usr/bin/dtach is a runtime prerequisite elsewhere in this project");
+        let sock = crate::session::socket_path(home, "term3");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up before this test can mean anything");
+        drop(att);
+
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        let owner_hub = Hub::for_project(&owner, owner_dir.clone());
+        assert_eq!(
+            Hub::lock(&owner_hub).session_homes.get("term3"),
+            Some(&home.to_string()),
+            "setup: the owner hub must see term3 as a resident before the record changes"
+        );
+        let (c, rx) = Hub::lock(&owner_hub).subscribe();
+        drain(&rx);
+
+        // The race, driven directly: the record changes between the
+        // snapshot just asserted and the kill thread's own re-read, with no
+        // refresh in between to let the hub notice.
+        crate::home::forget(home, "term3");
+
+        Hub::lock(&owner_hub).handle(&c, Intent::EndSession { session: "term3".into() });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut got_refusal = false;
+        while std::time::Instant::now() < deadline {
+            if drain(&rx).iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("moved since this was asked")) {
+                got_refusal = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(got_refusal, "the clicker must be told nothing was ended");
+        assert!(
+            any_process_holds(&sock),
+            "the home's real session must survive a refused End Session"
+        );
+
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Fix round 2, New Issue 2: `may_end`'s native branch used to return
+    /// `true` the instant `kill_target == project`, with no record check —
+    /// but `session_homes` holds residents *of* this project, so it says
+    /// nothing about a *native* session that was itself re-homed *away*.
+    /// `EndSession{n}` sent at `n`'s own home, after `n` moved to a
+    /// worktree under it, must not fall through to an unconditional native
+    /// kill — that would SIGKILL the Claude that now belongs to the
+    /// worktree and forget its record out from under it. Reachable via the
+    /// End-session confirm dialog's own staleness window (app.js) or a
+    /// second browser that has not yet heard the `Rehomed` event.
+    ///
+    /// `Hub::for_project`, the thread path: the fix has to hold off the hub
+    /// lock exactly where the resident branch already does, not just in a
+    /// synchronous fallback.
+    ///
+    /// Revert-checked: reverting `may_end`'s native branch to
+    /// `kill_target == project` (no record check) reproduces the bug —
+    /// observed: no `Error` ever reaches `rx` (`got_refusal` stays false)
+    /// and `any_process_holds` on the home's own socket fails once that
+    /// assertion is reached — the kill proceeds unconditionally.
+    #[test]
+    fn end_session_on_a_home_refuses_a_native_name_rehomed_away() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "r17-nativekill-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let att = crate::session::reserve_and_attach(home, "term", &home_dir)
+            .expect("/usr/bin/dtach is a runtime prerequisite elsewhere in this project");
+        let sock = crate::session::socket_path(home, "term");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up before this test can mean anything");
+        drop(att);
+
+        // Re-homed away from its own home, to a worktree under it — this
+        // project's own `term` is no longer its to end, even though
+        // `session_homes` (residents *of* this project) has nothing to say
+        // about it either way: it is neither a resident here nor, any
+        // more, truly native.
+        crate::home::record(home, "term", &owner).unwrap();
+
+        let home_hub = Hub::for_project(home, home_dir.clone());
+        assert!(
+            Hub::lock(&home_hub).session_homes.get("term").is_none(),
+            "setup: term is not a resident of its own home"
+        );
+        let (c, rx) = Hub::lock(&home_hub).subscribe();
+        drain(&rx);
+
+        Hub::lock(&home_hub).handle(&c, Intent::EndSession { session: "term".into() });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut got_refusal = false;
+        while std::time::Instant::now() < deadline {
+            if drain(&rx).iter().any(|m| m.contains(r#""t":"Error""#)) {
+                got_refusal = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(got_refusal, "the clicker must be told nothing was ended");
+        assert!(
+            any_process_holds(&sock),
+            "a session re-homed away must survive an End Session issued at its own home"
+        );
+
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// R16's Important 2: a client that still thinks a resident's name is
+    /// native (`focusSession`'s own-state miss, or a session search result
+    /// row — both send a bare `OpenTab{tab:{k:"Terminal", session}}` with
+    /// no `home`, since neither has any way to know it) must still land on
+    /// the resident's actual tab, not push a second, native one and
+    /// reserve this project's own copy of a name its `sock/` can never
+    /// hold.
+    ///
+    /// Revert-checked: removing the `OpenTab` home-filling rewrite in
+    /// `handle` reproduces the bug — observed: `assertion 'left == right'
+    /// failed\n  left: [("term3", Some("r16-homeless-home")), ("term3", None)]\n
+    /// right: [("term3", Some("r16-homeless-home"))]` — a second, native
+    /// tab is pushed into `RIGHT` instead of the existing resident tab
+    /// being focused (the reservation assertion would fail too, for the
+    /// same reason, if this one were reached first).
+    #[test]
+    fn a_homeless_open_tab_for_a_resident_focuses_its_tab() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("r16-homeless-owner", d.path().to_path_buf());
+        // Clear every default-layout terminal tab; the only `term` tab in
+        // play is the resident's own, set up directly, since this test is
+        // about the `OpenTab` rewrite in `handle`, not about how a resident
+        // normally gets its tab (`refresh_live_sessions`, tested elsewhere).
+        for p in h.ws.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+        }
+        h.session_homes.insert("term3".into(), "r16-homeless-home".into());
+        h.ws.panes[proto::LEFT_BOTTOM as usize]
+            .tabs
+            .push(Tab::Terminal { session: "term3".into(), home: Some("r16-homeless-home".into()) });
+        // LEFT_BOTTOM is now [Changes (default_layout's own, active), the
+        // resident's tab] — active still on Changes, so focusing the
+        // resident is a real, observable change.
+        assert_eq!(h.ws.panes[proto::LEFT_BOTTOM as usize].active, 0, "setup: active starts on Changes");
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(
+            &c,
+            Intent::OpenTab { pane: proto::RIGHT, tab: Tab::Terminal { session: "term3".into(), home: None } },
+        );
+
+        assert_eq!(
+            terminal_tabs(&h),
+            vec![("term3".to_string(), Some("r16-homeless-home".to_string()))],
+            "still exactly one terminal tab, the resident's own"
+        );
+        assert_eq!(
+            h.ws.panes[proto::LEFT_BOTTOM as usize].active, 1,
+            "the resident's tab must become active, not be ignored in favour of a push elsewhere"
+        );
+        assert!(
+            !crate::session::has_reservation_for_test("r16-homeless-owner", "term3"),
+            "a home-less OpenTab for a resident must not reserve this project's own name for it"
+        );
+
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// R17 (fix round 2, folded from the same lines as Important 2): the
+    /// `OpenTab` home-fill-in normalises `home` unconditionally now, not
+    /// only when the intent arrives with `home: None` — a forged
+    /// `OpenTab{Terminal{n, home: Some(x)}}` for a name that is actually
+    /// native has no more claim to `x` than a bare one would, and
+    /// `session_homes` is the only source of truth for what `home` means
+    /// on this page.
+    ///
+    /// Revert-checked: narrowing the `match` back to `home: None` (the
+    /// round-1 body) lets the forged `home` through unchanged — observed:
+    /// `assertion 'left == right' failed\n  left: [("term",
+    /// Some("elsewhere")), ("term", None)]\n right: [("term", None)]` — a
+    /// second tab is pushed under the forged home instead of the existing
+    /// native one being focused.
+    #[test]
+    fn a_forged_home_on_open_tab_is_normalized_to_the_truth() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("r17-forged-owner", d.path().to_path_buf());
+        // "term" is native here (default_layout's own placeholder) and not
+        // a resident of anything — `session_homes` has no entry for it.
+        assert!(h.session_homes.get("term").is_none(), "setup");
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+
+        h.handle(
+            &c,
+            Intent::OpenTab {
+                pane: proto::MIDDLE,
+                tab: Tab::Terminal { session: "term".into(), home: Some("elsewhere".into()) },
+            },
+        );
+
+        assert_eq!(
+            terminal_tabs(&h),
+            vec![("term".to_string(), None)],
+            "still exactly one tab, and it must not have taken the forged home at face value"
+        );
+
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// R16 point 1's placement rule: a resident with no native tab at all
+    /// to retarget lands in `RIGHT` — the pane `NewTerminal`/`focusSession`
+    /// use for a terminal with no home of its own — not `LEFT_TOP`, R15's
+    /// placement.
+    ///
+    /// Revert-checked: changing the push's `pane` back to
+    /// `crate::proto::LEFT_TOP` fails — observed: `assertion 'left ==
+    /// right' failed\n  left: Some(Terminal { session: "term", home: None
+    /// })\n right: Some(Terminal { session: "term3", home:
+    /// Some("r16-right-pane-home") })` — `RIGHT`'s last tab is back to
+    /// `default_layout`'s own placeholder, because the resident landed in
+    /// `LEFT_TOP` instead.
+    #[test]
+    fn a_resident_tab_is_added_to_the_right_pane() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "r16-right-pane-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        // A name distinct from the owner's own default-layout placeholder
+        // ("term"), so there is no native tab here at all to retarget —
+        // the case this test is actually about.
+        crate::session::reserve_and_attach(home, "term3", &home_dir).unwrap();
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        let owner_hub = Hub::new(&owner, owner_dir);
+
+        assert_eq!(
+            owner_hub.ws.panes[proto::RIGHT as usize].tabs.last(),
+            Some(&Tab::Terminal { session: "term3".to_string(), home: Some(home.to_string()) }),
+            "a resident with no native tab must land in RIGHT, the pane NewTerminal/focusSession use"
+        );
+        assert!(
+            !owner_hub.ws.panes[proto::LEFT_TOP as usize]
+                .tabs
+                .iter()
+                .any(|t| matches!(t, Tab::Terminal { .. })),
+            "and must not land in LEFT_TOP, R15's placement"
+        );
+
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     #[test]
@@ -4068,6 +6136,115 @@ mod tests {
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
+    /// `publish` runs on a session's pump thread, where the `project` it is
+    /// handed is always the session's *home* (the pump has no notion of
+    /// re-homing at all). A re-homed session's own tab lives in the
+    /// *owner*'s workspace now, so a notice raised there must be routed to
+    /// the owner hub, not the home's — the same "nobody else" shape as
+    /// `a_notice_reaches_its_own_projects_clients_and_nobody_elses` above,
+    /// but for the re-homing case rather than plain project scoping. Two
+    /// real hubs with a subscriber each, deliberately (CLAUDE.md's
+    /// single-subscriber trap): with one subscriber, routing to the home
+    /// and broadcasting to everyone are indistinguishable.
+    ///
+    /// `ROOST_ROOTS` and the real `.claude/worktrees/w1` directory are what
+    /// let the production, fork-free `home::resolves` (not an injected
+    /// stub) confirm the owner before `publish` routes to it — without
+    /// them the record would be real but unresolved, and the notice would
+    /// fall back to home, proving nothing about the routing this test is
+    /// for.
+    ///
+    /// Revert-checked: dropping the `effective_owner` remap in `publish`
+    /// (routing to `project` — the home — unconditionally) fails the first
+    /// assertion — observed: `panicked ... the owner's project must
+    /// receive it: Timeout` — because the notice lands at home instead
+    /// (confirmed separately that the home *does* receive it in that case).
+    #[test]
+    fn a_rehomed_sessions_notice_reaches_its_owner_not_its_home() {
+        isolate_ide_dir_for_tests();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", d.path());
+        crate::notify::reset_for_test();
+
+        let home = "notice-rehome-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = d.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let hub_home = Hub::for_project(home, home_dir.clone());
+        let hub_owner = Hub::for_project(&owner, owner_dir.clone());
+        let (_ca, rxa) = Hub::lock(&hub_home).subscribe();
+        let (_cb, rxb) = Hub::lock(&hub_owner).subscribe();
+        drain(&rxa);
+        drain(&rxb);
+
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        publish(home, "term3", crate::osc::Parsed { title: None, body: "for the owner".into() });
+
+        let got = rxb
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the owner's project must receive it");
+        assert!(got.contains(r#""t":"Notice""#), "expected a Notice, got {got}");
+        assert!(got.contains("for the owner"), "wrong notice: {got}");
+
+        let leaked = rxa.recv_timeout(std::time::Duration::from_millis(300));
+        assert!(
+            leaked.is_err(),
+            "a re-homed session's notice must not also land at home, got {leaked:?}"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// The sibling test above proves *live* delivery; this proves the
+    /// *persisted* store agrees. `notify::record` still stored
+    /// `Notice.project` as the raw `project` argument until this fix —
+    /// `list_for`, which every reload and the mark-all-read/clear buttons
+    /// go through, filters on that field. So a browser that reloads the
+    /// owner's tab (rather than staying subscribed across the `publish`
+    /// call) would see no notice at all, and the home's mark-all-read could
+    /// never reach it either.
+    ///
+    /// Revert-checked: reverting `publish` to call
+    /// `notify::record(project, …)` (the home, not `target`) fails the
+    /// first assertion — observed: `panicked ... []` — the notice is
+    /// filed under the home instead, invisible to `list_for(&owner)`.
+    #[test]
+    fn a_rehomed_sessions_notice_persists_under_its_owner_not_its_home() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", d.path());
+        crate::notify::reset_for_test();
+
+        let home = "notice-persist-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = d.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        std::fs::create_dir_all(home_dir.join(".claude/worktrees/w1")).unwrap();
+
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        publish(home, "term3", crate::osc::Parsed { title: None, body: "persisted for owner".into() });
+
+        let owner_notices = crate::notify::list_for(&owner);
+        assert!(
+            owner_notices.iter().any(|n| n.body.contains("persisted for owner")),
+            "the notice must be filed under the owner: {owner_notices:?}"
+        );
+        let home_notices = crate::notify::list_for(home);
+        assert!(home_notices.is_empty(), "and not under the home: {home_notices:?}");
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
     #[test]
     fn dropped_subscribers_are_pruned() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -4309,19 +6486,55 @@ mod tests {
         }
         drain(&rx);
 
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None, fork: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None, fork: None });
         drain(&rx);
 
         let names: Vec<String> = h.ws.panes[proto::RIGHT as usize]
             .tabs
             .iter()
             .filter_map(|t| match t {
-                Tab::Terminal { session } => Some(session.clone()),
+                Tab::Terminal { session, .. } => Some(session.clone()),
                 _ => None,
             })
             .collect();
         assert_eq!(names, vec!["term", "term1"], "each click must get its own shell");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// A resident's name is taken in its owner, though the owner's own
+    /// `sock/` has no such socket — two tabs called `term` on one page.
+    ///
+    /// Revert-checked (Task 4): without the `session_homes` chain in
+    /// `do_new_terminal`'s `also_taken`, this allocates `["term"]`.
+    #[test]
+    fn new_terminal_in_an_owner_skips_a_residents_name() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("owner_names/.claude/worktrees/worktree-x", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        for p in h.ws.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+            p.active = 0;
+        }
+        // What `refresh_live_sessions` computes from a re-home record; set
+        // directly because resolving the owner reads the configured roots.
+        h.session_homes.insert("term".into(), "owner_names".into());
+        drain(&rx);
+
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None, fork: None });
+        drain(&rx);
+
+        let names: Vec<String> = h.ws.panes[proto::RIGHT as usize]
+            .tabs
+            .iter()
+            .filter_map(|t| match t {
+                Tab::Terminal { session, .. } => Some(session.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["term1"], "the resident already shows as `term` on this page");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
@@ -4344,8 +6557,8 @@ mod tests {
         }
         drain(&rx);
 
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None, fork: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None, fork: None });
         drain(&rx);
         // ✻ is allocated `claude`, not whichever `termN` was free: a strip
         // reading `term, term1, term2` says nothing about which tab has an
@@ -4370,14 +6583,14 @@ mod tests {
         // its tab is closed before any browser attaches, and a later ✻ is
         // handed `claude2` back. The click that made it a claude shell is
         // gone, so its own reservation must not survive the close.
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None, fork: None });
         let idx = h.ws.panes[proto::RIGHT as usize]
             .tabs
             .iter()
-            .position(|t| matches!(t, Tab::Terminal { session } if session == "claude2"))
+            .position(|t| matches!(t, Tab::Terminal { session, .. } if session == "claude2"))
             .expect("✻ was handed claude2");
         h.handle(&c, Intent::CloseTab { pane: proto::RIGHT, idx });
-        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
+        h.handle(&c, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None, fork: None });
         drain(&rx);
         // The plain + that followed took `term1`; `claude2` is free again, and
         // attaching it directly is what a browser that never saw the close
@@ -4405,13 +6618,13 @@ mod tests {
         for p in h.ws.panes.iter_mut() { p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. })); p.active = 0; }
         // First ✻: allocates `claude`; spawn it the way a browser would, so
         // the launch is consumed and recorded on the session.
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None, fork: None });
         let _att = crate::session::reserve_and_attach("prompt_second", "claude", d.path()).unwrap();
         assert_eq!(crate::session::launched_names("prompt_second").len(), 1, "fixture: a launched terminal exists");
         drain(&rxa); drain(&rxb);
         let version = h.ws.version;
 
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None, fork: None });
         let got = rxa.try_recv().expect("the clicker hears back");
         // `claude`, not `term`: a ✻ click is allocated a name that says what
         // the terminal is for.
@@ -4420,7 +6633,7 @@ mod tests {
         assert_eq!(h.ws.version, version, "no layout change");
         assert_eq!(crate::session::live_names("prompt_second").len(), 1, "no session allocated");
 
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: true, resume: None });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: true, resume: None, fork: None });
         assert!(h.ws.version > version, "force opens a terminal");
         assert!(rxb.try_recv().is_ok_and(|m| m.contains(r#""t":"State""#)), "…which everyone sees");
         crate::session::kill_project("prompt_second");
@@ -4439,11 +6652,11 @@ mod tests {
         let mut h = Hub::new("prompt_plus", d.path().to_path_buf());
         let (a, rxa) = h.subscribe();
         for p in h.ws.panes.iter_mut() { p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. })); p.active = 0; }
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: Some(proto::Launch::Claude), force: false, resume: None, fork: None });
         let _att = crate::session::reserve_and_attach("prompt_plus", "term", d.path()).unwrap();
         drain(&rxa);
         let version = h.ws.version;
-        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None });
+        h.handle(&a, Intent::NewTerminal { pane: proto::RIGHT, launch: None, force: false, resume: None, fork: None });
         assert!(h.ws.version > version, "a plain shell opens beside a Claude");
         crate::session::kill_project("prompt_plus");
     }
@@ -4464,11 +6677,11 @@ mod tests {
         }
         h.handle(
             &c,
-            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::Terminal { session: "term".into() } },
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::Terminal { session: "term".into(), home: None } },
         );
         h.handle(
             &c,
-            Intent::OpenTab { pane: proto::RIGHT, tab: Tab::Terminal { session: "term".into() } },
+            Intent::OpenTab { pane: proto::RIGHT, tab: Tab::Terminal { session: "term".into(), home: None } },
         );
         drain(&rx);
         drain(&rx_other);
@@ -4477,7 +6690,7 @@ mod tests {
 
         let remaining: Vec<&Tab> = h.ws.panes.iter().flat_map(|p| p.tabs.iter()).collect();
         assert!(
-            !remaining.iter().any(|t| matches!(t, Tab::Terminal { session } if session == "term")),
+            !remaining.iter().any(|t| matches!(t, Tab::Terminal { session, .. } if session == "term")),
             "the ended session must not keep a tab in any pane"
         );
         let msgs_other: Vec<String> = std::iter::from_fn(|| rx_other.try_recv().ok()).collect();
@@ -4486,6 +6699,376 @@ mod tests {
             "a second browser must be told its terminal tab is gone"
         );
         std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Minimal, test-only "is anything holding this path" check via `ps` —
+    /// the same shape as `session.rs`'s own private helper of the same
+    /// name, duplicated rather than exposed: both exist only to prove a real
+    /// process is or isn't there for one test's own known, plain tempdir
+    /// path, and a shared `pub(crate)` version would widen a process-table
+    /// scrape into the crate's real interface for no caller that needs it.
+    fn any_process_holds(path: &std::path::Path) -> bool {
+        let target = path.to_string_lossy();
+        let out = std::process::Command::new("ps")
+            .args(["-Ao", "args="])
+            .output()
+            .expect("ps must be runnable for this check to mean anything");
+        assert!(
+            out.status.success() && !out.stdout.is_empty(),
+            "ps failed or returned nothing; this test cannot trust its own assertions right now"
+        );
+        String::from_utf8_lossy(&out.stdout).lines().any(|l| l.contains(target.as_ref()))
+    }
+
+    /// Carried from Task 4: before this, `do_end_session` always ended
+    /// `self.project`/`session` — for a resident that kills nothing at all
+    /// (the owner's own `sock/` has no socket by that name) while still
+    /// reporting success, leaving the real shell at `home`, and any Claude
+    /// in it, running untouched forever.
+    ///
+    /// Real dtach, not `ROOST_CMD=cat`: a `cat` client has no detached
+    /// master to leave behind, so the exact bug this guards against —
+    /// ending the client without ending the master — cannot reproduce under
+    /// the substitute at all (see `session::
+    /// kill_project_ends_the_detached_dtach_master_and_shell_not_just_the_client`,
+    /// which exists for the identical reason). `/usr/bin/dtach` is a runtime
+    /// prerequisite elsewhere in this project, so a failure to attach here
+    /// is a real environment defect worth failing loudly on, not a reason
+    /// to skip.
+    ///
+    /// `Hub::for_project`, not a bare `Hub::new()`: `do_end_session`'s
+    /// thread-spawning path only runs once `self_ref` resolves (see its own
+    /// doc comment), and that threaded path — kill off the hub lock, then
+    /// re-lock to broadcast — is the one this test exists to exercise.
+    #[test]
+    fn end_session_on_a_resident_ends_the_real_session_at_its_home() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "endresident_home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let att = crate::session::reserve_and_attach(home, "term3", &home_dir)
+            .expect("/usr/bin/dtach is a runtime prerequisite elsewhere in this project");
+        let sock = crate::session::socket_path(home, "term3");
+        // dtach's own fork-and-detach takes an unpredictable, usually-small
+        // amount of wall time to complete — the same poll
+        // `kill_project_ends_the_detached_dtach_master_...` uses, for the
+        // same reason.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up before this test can mean anything");
+        drop(att);
+
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        let owner_hub = Hub::for_project(&owner, owner_dir.clone());
+        assert_eq!(
+            Hub::lock(&owner_hub).session_homes.get("term3"),
+            Some(&home.to_string()),
+            "setup: the owner hub must see term3 as a resident"
+        );
+        let (c, _rx) = Hub::lock(&owner_hub).subscribe();
+
+        Hub::lock(&owner_hub).handle(&c, Intent::EndSession { session: "term3".into() });
+
+        // The kill runs on its own thread, off the hub lock (see
+        // `do_end_session`'s doc comment) — give it a moment to actually
+        // finish before checking what it did.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(
+            !any_process_holds(&sock),
+            "ending a resident from the owner's page must kill the real session at its home"
+        );
+        assert!(
+            matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here),
+            "the re-home record must be forgotten once the session actually ends"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Waits for this close's `ProjectClosed`, which the close thread sends
+    /// only after it has decided about the IDE listener.
+    fn await_project_closed(rx: &Receiver<String>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let m = rx.recv_timeout(left).expect("the close must report ProjectClosed within 10s");
+            if m.contains(r#""t":"ProjectClosed""#) {
+                return;
+            }
+        }
+    }
+
+    /// Final-review I1: Close Project on a home that spared a re-homed
+    /// terminal must leave the home's IDE listener running. That Claude's
+    /// `CLAUDE_CODE_SSE_PORT` names exactly this listener (spec §4) and a
+    /// running process's environment cannot be changed, so a stopped
+    /// listener — and a reopened project's new port — is one its reconnects
+    /// can never find again. A close that spared nothing still stops it, as
+    /// before: a closed project must not keep authenticating against a
+    /// token no lock file advertises.
+    ///
+    /// Real dtach: "still live" is decided from the socket's holder, which a
+    /// `cat` stand-in does not have.
+    ///
+    /// Revert-checked (final fix wave): with `do_close_project` calling
+    /// `ide::stop` unconditionally again (the `spares_live` guard removed),
+    /// fails on "Close Project on the home stopped the IDE listener a
+    /// re-homed Claude still uses".
+    #[test]
+    fn close_project_keeps_the_ide_listener_while_a_rehomed_terminal_lives() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        let home = format!("idekeephome{}", std::process::id());
+        let owner = format!("{home}/.claude/worktrees/worktree-x");
+        let home_dir = root.path().join(&home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let hub = Hub::for_project(&home, home_dir.clone());
+        let port = crate::ide::port_for(&home).expect("setup: the home must have an IDE listener");
+        let lock = crate::idelock::ide_dir().join(format!("{port}.lock"));
+        assert!(lock.exists(), "setup: the listener's lock file must exist");
+
+        let att = crate::session::reserve_and_attach(&home, "term3", &home_dir)
+            .unwrap_or_else(|e| panic!("dtach is a runtime prerequisite of this test: {e}"));
+        let sock = crate::session::socket_path(&home, "term3");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up");
+        drop(att);
+        crate::home::record(&home, "term3", &owner).unwrap();
+
+        let (c, rx) = Hub::lock(&hub).subscribe();
+        Hub::lock(&hub).handle(&c, Intent::CloseProject);
+        await_project_closed(&rx);
+
+        let kept = (crate::ide::port_for(&home), lock.exists(), any_process_holds(&sock));
+        // Cleanup before asserting, so a failure does not leak a shell.
+        let _ = crate::registry::kill_and_unlink(&sock);
+        crate::home::forget(&home, "term3");
+        assert_eq!(kept.2, true, "setup: the close spared the re-homed terminal");
+        assert_eq!(
+            (kept.0, kept.1),
+            (Some(port), true),
+            "Close Project on the home stopped the IDE listener a re-homed Claude still uses"
+        );
+
+        // The same home with nothing spared: the listener goes, as before.
+        Hub::lock(&hub).handle(&c, Intent::CloseProject);
+        await_project_closed(&rx);
+        assert_eq!(crate::ide::port_for(&home), None, "a close that spared nothing stops the listener");
+        assert!(!lock.exists(), "and removes its lock file");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// What `session::probe_socket` asks, from outside `session`: does the
+    /// process listing name a holder for this exact socket path. A listing
+    /// that cannot be read panics rather than answering — a test that cannot
+    /// trust its evidence must not report.
+    fn probe_held(sock: &std::path::Path) -> bool {
+        let snap = crate::registry::holders_snapshot()
+            .expect("the process listing must be readable for this assertion to mean anything");
+        !crate::registry::pids_holding_path(&snap, sock).is_empty()
+    }
+
+    /// Spec §Testing, "Re-home is not destruction" — the test the whole
+    /// design rests on, end to end: a real dtach session in the home,
+    /// re-homed, then every sweep and lookup that could misread it — the
+    /// real `reconcile` (real roots, real state, real `ps`), Close Project on
+    /// the home, `refresh_live_sessions` on both hubs, and the record sweep.
+    /// The master must survive by pid *and* by `probe_socket`'s own
+    /// question, and be listed under the owner and not the home. Then
+    /// closing the owner ends it.
+    ///
+    /// Revert-checked (final fix wave): with `kill_project_inner`'s
+    /// `Elsewhere` arm keeping the name (`=> true`, i.e. the skip removed),
+    /// fails on "Close Project on the home killed a re-homed session".
+    #[test]
+    fn rehome_is_not_destruction() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let roots = vec![root.path().to_path_buf()];
+        assert_eq!(crate::projects::roots(), roots, "setup: the code under test sees these roots");
+
+        let home = format!("notdestroyed{}", std::process::id());
+        let owner = format!("{home}/.claude/worktrees/worktree-x");
+        let home_dir = root.path().join(&home);
+        let owner_dir = home_dir.join(".claude/worktrees/worktree-x");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let _att = crate::session::reserve_and_attach(&home, "term3", &home_dir)
+            .unwrap_or_else(|e| panic!("dtach is a runtime prerequisite of this test: {e}"));
+        let sock = crate::session::socket_path(&home, "term3");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up");
+        crate::home::record(&home, "term3", &owner).unwrap();
+        assert!(crate::home::resolves(&home, &owner), "setup: the owner resolves under the real roots");
+
+        let mut home_hub = Hub::new(&home, home_dir.clone());
+        let mut owner_hub = Hub::new(&owner, owner_dir.clone());
+
+        crate::registry::reconcile(&roots);
+        crate::session::kill_project(&home);
+        home_hub.refresh_live_sessions();
+        owner_hub.refresh_live_sessions();
+        crate::home::sweep(&|h, n| match std::fs::symlink_metadata(crate::session::socket_path(h, n)) {
+            Ok(_) => Some(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Err(_) => None,
+        });
+
+        let alive = any_process_holds(&sock);
+        let held = probe_held(&sock);
+        let reap = || {
+            let _ = crate::registry::kill_and_unlink(&sock);
+            crate::home::forget(&home, "term3");
+        };
+        if !(alive && held) {
+            reap();
+        }
+        assert!(alive, "Close Project on the home killed a re-homed session");
+        assert!(held, "the socket's holder is gone from the listing probe_socket reads");
+        assert!(
+            matches!(crate::home::owner_of(&home, "term3"), crate::home::Owner::Elsewhere(ref o) if *o == owner),
+            "the record survived every sweep"
+        );
+        assert_eq!(owner_hub.ws.live_sessions, vec!["term3".to_string()], "listed under its owner");
+        assert_eq!(owner_hub.session_homes.get("term3"), Some(&home), "as a resident of its home");
+        assert!(!home_hub.ws.live_sessions.contains(&"term3".to_string()), "and not under its home");
+
+        let ended = crate::session::kill_project(&owner);
+        let gone = !any_process_holds(&sock);
+        if !gone {
+            reap();
+        }
+        assert_eq!(ended, 1, "the owner's close counts its resident");
+        assert!(gone, "closing the owner must end its resident");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Spec §Testing, "Concurrent sweep": `reconcile` looping on one thread
+    /// while another records and forgets a live real-dtach session's re-home
+    /// for ~2 s. Nothing in `reconcile` reads the records — that is the
+    /// design — so no interleaving may end the session, and nothing may
+    /// wedge. Timed: both threads report over channels with a deadline, so a
+    /// deadlock fails here instead of hanging the suite. Both loops must have
+    /// actually turned over many times, or the test asserted nothing.
+    ///
+    /// Revert-checked (final fix wave), twice:
+    /// - survival: `reconcile`'s `home::sweep` closure changed to
+    ///   `kill_and_unlink` every recorded session's socket (a sweep that
+    ///   acts on the records) fails on "a re-home record/forget racing
+    ///   reconcile ended the session";
+    /// - the bound: a 30 s sleep added to `home::record_in` fails on
+    ///   "deadlock or stall: the record/forget thread did not finish"
+    ///   after 10 s, rather than hanging.
+    #[test]
+    fn reconcile_racing_rehome_records_kills_nothing() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let roots = vec![root.path().to_path_buf()];
+
+        let home = format!("sweeprace{}", std::process::id());
+        let owner = format!("{home}/.claude/worktrees/worktree-x");
+        let home_dir = root.path().join(&home);
+        std::fs::create_dir_all(home_dir.join(".claude/worktrees/worktree-x")).unwrap();
+
+        let _att = crate::session::reserve_and_attach(&home, "term3", &home_dir)
+            .unwrap_or_else(|e| panic!("dtach is a runtime prerequisite of this test: {e}"));
+        let sock = crate::session::socket_path(&home, "term3");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up");
+
+        let started = std::time::Instant::now();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sweep_tx, sweep_rx) = std::sync::mpsc::channel();
+        let (flip_tx, flip_rx) = std::sync::mpsc::channel();
+        {
+            let stop = stop.clone();
+            let roots = roots.clone();
+            std::thread::spawn(move || {
+                let mut passes = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    crate::registry::reconcile(&roots);
+                    passes += 1;
+                }
+                let _ = sweep_tx.send(passes);
+            });
+        }
+        {
+            let (home, owner) = (home.clone(), owner.clone());
+            std::thread::spawn(move || {
+                let mut flips = 0u32;
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < until {
+                    crate::home::record(&home, "term3", &owner).unwrap();
+                    crate::home::forget(&home, "term3");
+                    flips += 1;
+                }
+                let _ = flip_tx.send(flips);
+            });
+        }
+        let flips = flip_rx.recv_timeout(std::time::Duration::from_secs(10));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let passes = sweep_rx.recv_timeout(std::time::Duration::from_secs(10));
+        let elapsed = started.elapsed();
+
+        let alive = any_process_holds(&sock);
+        let held = probe_held(&sock);
+        let _ = crate::registry::kill_and_unlink(&sock);
+        crate::home::forget(&home, "term3");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+
+        let flips = flips.expect("deadlock or stall: the record/forget thread did not finish");
+        let passes = passes.expect("deadlock or stall: reconcile did not return");
+        eprintln!("concurrent sweep: {passes} reconcile passes, {flips} record/forget pairs, {elapsed:?}");
+        assert!(passes >= 5 && flips >= 50, "the race barely ran ({passes} passes, {flips} flips): proves nothing");
+        assert!(alive, "a re-home record/forget racing reconcile ended the session");
+        assert!(held, "the socket's holder is gone from the listing probe_socket reads");
     }
 
     /// The half of a close the user actually sees afterwards. `kill_project`
@@ -4507,7 +7090,7 @@ mod tests {
         let (c, _rx) = h.subscribe();
         h.handle(
             &c,
-            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::Terminal { session: "term1".into() } },
+            Intent::OpenTab { pane: proto::MIDDLE, tab: Tab::Terminal { session: "term1".into(), home: None } },
         );
         h.handle(
             &c,
@@ -4951,6 +7534,44 @@ mod tests {
             !msgs_other.iter().any(|m| m.contains(r#""t":"Error""#)),
             "an invalid session name is the requester's business, not every mirrored browser's"
         );
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Ruling 5 (carried from Task 4): `StartTerminal` restarts a lost tab
+    /// under its old name, which is the *other* way a browser can ask for a
+    /// name already in play — `do_new_terminal`'s `also_taken` only guards
+    /// the fresh-click path. Without this guard a name a resident holds on
+    /// this page would pass straight to `session::reserve`, and the
+    /// browser's own follow-up connect to `/ws/{project}/term/{session}`
+    /// would create a brand-new, unrelated shell under the name a Claude at
+    /// the resident's home is still running in.
+    ///
+    /// `session_homes` is set directly, the same as
+    /// `new_terminal_in_an_owner_skips_a_residents_name` above: resolving a
+    /// real re-home record reads the configured project roots, which this
+    /// test does not need to set up just to exercise the guard.
+    ///
+    /// Revert-checked: deleting the guard lets this reach `TerminalStarted`
+    /// instead — observed: `assertion failed:
+    /// msgs.iter().any(|m| m.contains("\"t\":\"Error\"") && m.contains("moved here from"))`.
+    #[test]
+    fn start_terminal_refuses_a_name_held_by_a_resident() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("startrefuse_owner", d.path().to_path_buf());
+        let (c, rx) = h.subscribe();
+        drain(&rx);
+        h.session_homes.insert("term3".into(), "startrefuse_home".into());
+
+        h.handle(&c, Intent::StartTerminal { session: "term3".into(), resume: false });
+
+        let msgs = drain(&rx);
+        assert!(
+            msgs.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("moved here from")),
+            "{msgs:?}"
+        );
+        assert!(!msgs.iter().any(|m| m.contains(r#""t":"TerminalStarted""#)));
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
@@ -5572,6 +8193,241 @@ mod tests {
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
+    /// Finding 6: an Alt+K aimed at a re-homed terminal, sent from the
+    /// *owner*'s hub (where that terminal's tab actually lives now). The
+    /// Claude it should reach is registered under the terminal's *home* —
+    /// `self.project` here is the owner, which has no `conns()` entry for
+    /// it at all — so `do_mention_path` must look the session up in
+    /// `self.session_homes` and route there instead.
+    ///
+    /// `register_fake_conn_for_test` stands in for a real IDE connection;
+    /// `term9` is an unrelated session under the same home, registered to
+    /// prove this is a *routed* mention (one session picked out), not a
+    /// broadcast that happens to work.
+    ///
+    /// Revert-checked: reverting `target_project` to always be
+    /// `self.project.clone()` (the pre-fix-round body) fails — observed:
+    /// `panicked ... the resident's own Claude must receive the mention:
+    /// Timeout`. (The mention is sent to `conns()[owner]`, which has no
+    /// entry at all, so `ide::mention_to` returns "no Claude is connected
+    /// to this project" and the refusal reaches `rx_asker` instead.)
+    #[test]
+    fn mention_from_a_rehomed_terminal_reaches_its_claude_at_home() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "mention-rehome-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+        std::fs::write(owner_dir.join("a.rs"), "fn main() {}").unwrap();
+
+        // `session_homes` only lists a resident whose terminal is actually
+        // live (`owned_live_names`) — a real dtach session at the home, not
+        // just the re-home record, the same discipline
+        // `remove_refuses_a_worktree_with_a_live_resident` follows.
+        crate::session::reserve_and_attach(home, "term3", &home_dir).unwrap();
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        // The resident's Claude is registered at its home, never the owner.
+        let rx_home = crate::ide::register_fake_conn_for_test(home, "term3");
+        // An unrelated session under the same home: proof this is routed,
+        // not broadcast.
+        let rx_other = crate::ide::register_fake_conn_for_test(home, "term9");
+
+        let mut h = Hub::new(&owner, owner_dir.clone());
+        assert_eq!(
+            h.session_homes.get("term3"),
+            Some(&home.to_string()),
+            "setup: the owner hub must see term3 as a resident"
+        );
+        let (asker, rx_asker) = h.subscribe();
+
+        h.handle(&asker, Intent::MentionPath {
+            rel: "a.rs".into(),
+            line_start: None,
+            line_end: None,
+            session: Some("term3".into()),
+        });
+
+        let got = rx_home
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the resident's own Claude must receive the mention");
+        assert!(got.contains("at_mentioned"), "{got}");
+        assert!(rx_other.try_recv().is_err(), "an unrelated session's Claude must not receive it");
+        assert!(
+            rx_asker.try_iter().collect::<Vec<_>>().is_empty(),
+            "no refusal, since the mention actually reached someone"
+        );
+
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Ruling R13a: a resident's Alt+K must not fall back across projects.
+    /// `notify_selected`'s two ambiguity heuristics — matching
+    /// `Sess::Unknown`, and a lone connection winning regardless of its
+    /// session — are right when a project asks about its own connections
+    /// (an `Unknown` or a single Claude there could plausibly be the one
+    /// meant). Routed to a resident's *home* instead, they are wrong: an
+    /// `Unknown`/lone connection there is some other terminal entirely, and
+    /// term3 (the resident) has no connection at all in this fixture. The
+    /// mention must reach nobody, not that unrelated connection, and the
+    /// asker must see the same "no Claude" refusal `do_mention_path`
+    /// already gives for an ordinary (non-re-homed) miss.
+    ///
+    /// Revert-checked: calling `ide::mention_to` (which goes through
+    /// `notify_selected`, the a48248c body) instead of `mention_to_exact`
+    /// for the resident case fails the first assertion — observed:
+    /// `panicked ... the lone Unknown connection must not receive a
+    /// mention aimed at a different session` (the lone-connection fallback
+    /// delivers to it, since it is the only connection under the home —
+    /// confirmed separately that `rx_unknown.recv_timeout` succeeds there).
+    #[test]
+    fn an_aimed_mention_to_a_resident_does_not_fall_back_to_an_unrelated_home_connection() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "mention-fallback-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+        std::fs::write(owner_dir.join("a.rs"), "fn main() {}").unwrap();
+
+        crate::session::reserve_and_attach(home, "term3", &home_dir).unwrap();
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        // No connection at all for term3; the home's only connection is one
+        // roost could not place, the single-project heuristic this test
+        // exists to refuse.
+        let rx_unknown = crate::ide::register_fake_unknown_conn_for_test(home);
+
+        let mut h = Hub::new(&owner, owner_dir.clone());
+        assert_eq!(h.session_homes.get("term3"), Some(&home.to_string()), "setup");
+        let (asker, rx_asker) = h.subscribe();
+
+        h.handle(&asker, Intent::MentionPath {
+            rel: "a.rs".into(),
+            line_start: None,
+            line_end: None,
+            session: Some("term3".into()),
+        });
+
+        assert!(
+            rx_unknown.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "the lone Unknown connection must not receive a mention aimed at a different session"
+        );
+        let got: Vec<String> = rx_asker.try_iter().collect();
+        assert!(got.iter().any(|m| m.contains(r#""t":"Error""#)), "the asker must see a refusal: {got:?}");
+
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Finding 6's other half: a shared selection is unaimed — every
+    /// connected Claude gets it — so from the owner's hub it must reach not
+    /// only any native connection under the owner itself but every
+    /// *resident's* connection too, each at its own home.
+    ///
+    /// Also pins the fix-round-2 half of finding 6: `notify_all(home)` (the
+    /// a48248c body) sends to *every* `Target` under the home — the home's
+    /// own native terminals, and any other resident re-homed into a
+    /// *different* worktree — not just this owner's own resident. `term9`
+    /// (a native home session) and `term5` (a resident of a different
+    /// owner, `w2`) must receive nothing.
+    ///
+    /// Revert-checked: removing the `self.session_homes.values()` loop from
+    /// `do_share_selection` (the pre-fix-round body, which only ever calls
+    /// `ide::selection_changed(&self.project, ...)`) fails — observed:
+    /// `panicked ... the resident's Claude must receive the shared
+    /// selection: Timeout`.
+    ///
+    /// Revert-checked again (fix round 2, and this is the real RED a48248c
+    /// itself produces): calling `ide::selection_changed(home, ...)`
+    /// (`notify_all`, a48248c's actual body) instead of the session-
+    /// filtered `selection_changed_for_sessions` fails the `term9`
+    /// assertion — observed: `panicked ... term9 (a native home session)
+    /// must not receive a re-homed selection` (the `recv_timeout` on
+    /// `rx_native` succeeds instead of timing out: `notify_all` sent to
+    /// every `Target` under the home, term9 included).
+    #[test]
+    fn a_shared_selection_from_the_owner_also_reaches_its_residents_claude() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let cfg = root.path().join("global.toml");
+        std::fs::write(&cfg, "share_selection = true\n").unwrap();
+        std::env::set_var("ROOST_CONFIG", &cfg);
+
+        let home = "shareselection-rehome-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let owner2 = format!("{home}/.claude/worktrees/w2");
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+        std::fs::write(owner_dir.join("a.rs"), "fn main() {}").unwrap();
+
+        crate::session::reserve_and_attach(home, "term3", &home_dir).unwrap();
+        crate::home::record(home, "term3", &owner).unwrap();
+        let rx_home = crate::ide::register_fake_conn_for_test(home, "term3");
+        // A native home session — never re-homed at all.
+        let rx_native = crate::ide::register_fake_conn_for_test(home, "term9");
+        // A resident of a *different* owner under the same home.
+        crate::home::record(home, "term5", &owner2).unwrap();
+        let rx_other_owner = crate::ide::register_fake_conn_for_test(home, "term5");
+
+        let mut h = Hub::new(&owner, owner_dir.clone());
+        assert_eq!(h.session_homes.get("term3"), Some(&home.to_string()), "setup");
+        assert!(h.session_homes.get("term9").is_none(), "setup: term9 is native, not a resident of this owner");
+        assert!(h.session_homes.get("term5").is_none(), "setup: term5 belongs to owner2, not this owner");
+        let (asker, _rx_asker) = h.subscribe();
+
+        h.handle(&asker, Intent::ShareSelection {
+            rel: "a.rs".into(),
+            text: "fn main".into(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 7,
+        });
+
+        let got = rx_home
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the resident's Claude must receive the shared selection");
+        assert!(got.contains("selection_changed"), "{got}");
+        assert!(
+            rx_native.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "term9 (a native home session) must not receive a re-homed selection"
+        );
+        assert!(
+            rx_other_owner.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "term5 (a different owner's resident) must not receive it either"
+        );
+
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_CONFIG");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
     /// A half-specified line range must be refused by name, not silently
     /// turned into a whole-file mention (the old `Option::zip` behavior) or
     /// a guessed single line. The refusal message is checked specifically —
@@ -6177,7 +9033,7 @@ mod tests {
     }
 
     #[test]
-    fn new_worktree_creates_claude_1_announces_it_and_answers_the_clicker() {
+    fn new_worktree_creates_the_named_worktree_announces_it_and_answers_the_clicker() {
         // Revert-checked: with `WorktreeReady` sent via `broadcast` instead
         // of `send_to`, the `rxb` assertion below fails ("the reply is the
         // clicker's alone") — confirmed, then restored.
@@ -6205,14 +9061,14 @@ mod tests {
         let (a, rxa) = h.subscribe();
         let (_b, rxb) = h.subscribe();
         drain(&rxa); drain(&rxb);
-        h.handle(&a, Intent::NewWorktree { launch: Some(proto::Launch::Claude) });
+        h.handle(&a, Intent::NewWorktree { name: Some("fox".into()), launch: Some(WorktreeLaunch::Claude) });
         // Hub::new has no self_ref, so the work ran synchronously (the
         // do_end_session convention) and the reply is already queued.
         let got = rxa.try_recv().expect("clicker answered");
-        assert!(got.contains(r#""t":"WorktreeReady""#) && got.contains(r#""url":"repo/.claude/worktrees/claude-1""#) && got.contains(r#""launch":"claude""#), "{got}");
+        assert!(got.contains(r#""t":"WorktreeReady""#) && got.contains(r#""url":"repo/.claude/worktrees/worktree-fox""#) && got.contains(r#""launch":"claude""#), "{got}");
         assert!(rxb.try_recv().is_err(), "the reply is the clicker's alone");
-        assert!(repo.join(".claude/worktrees/claude-1/a.txt").is_file());
-        assert_eq!(crate::worktree::read_base(&crate::wsstate::state_dir(), "repo%2F.claude%2Fworktrees%2Fclaude-1").as_deref(), Some("main"));
+        assert!(repo.join(".claude/worktrees/worktree-fox/a.txt").is_file());
+        assert_eq!(crate::worktree::read_base(&crate::wsstate::state_dir(), "repo%2F.claude%2Fworktrees%2Fworktree-fox").as_deref(), Some("main"));
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
@@ -6229,9 +9085,636 @@ mod tests {
         let mut h = Hub::new("plain", d.path().to_path_buf());
         let (a, rxa) = h.subscribe();
         drain(&rxa);
-        h.handle(&a, Intent::NewWorktree { launch: None });
+        h.handle(&a, Intent::NewWorktree { name: None, launch: None });
         let got = rxa.try_recv().unwrap();
         assert!(got.contains(r#""t":"Error""#) && got.contains("not a git repository"), "{got}");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// An empty name is the dialog's "let roost pick one" — `wtname::generate`
+    /// with `taken` asking git/the filesystem the same two things
+    /// `create_named` itself checks, so a name this loop would have rejected
+    /// is never even offered to it.
+    ///
+    /// Revert-checked: making the `None` arm `return Err("no name given".into())`
+    /// before ever calling `wtname::generate` makes this fail — observed:
+    /// `panicked ... {"t":"Error","msg":"no name given"}` (the assertion's own
+    /// message is `got`, so the panic prints the reply, not an expression).
+    /// Restored.
+    #[test]
+    fn new_worktree_with_no_name_generates_one() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::NewWorktree { name: None, launch: None });
+        let got = rxa.try_recv().expect("clicker answered");
+        assert!(got.contains(r#""t":"WorktreeReady""#), "{got}");
+        let v: serde_json::Value = serde_json::from_str(&got).unwrap();
+        let url = v["url"].as_str().expect("a url").to_string();
+        let generated = url.rsplit('/').next().unwrap();
+        assert!(generated.starts_with("worktree-") && generated.len() > "worktree-".len(), "{generated}");
+        assert!(crate::wtname::valid(generated.trim_start_matches("worktree-")), "{generated}");
+        assert!(repo.join(".claude/worktrees").join(generated).is_dir(), "the generated name's worktree must actually exist");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// `WorktreeLaunch::Fork` resolves its session id from `claudesess`
+    /// before any git work runs, and echoes the resolved **id**, never the
+    /// terminal name the dialog offered — R4.
+    #[test]
+    fn new_worktree_forks_a_recorded_session_and_echoes_its_id() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let id = "864ee734-e3ab-434e-8278-745a850b16ad";
+        crate::claudesess::record(
+            "repo",
+            "term",
+            &crate::claudesess::Recorded { session_id: id.into(), transcript_path: None, event: "Stop".into() },
+        );
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::NewWorktree {
+            name: Some("fox".into()),
+            launch: Some(WorktreeLaunch::Fork { session: "term".into() }),
+        });
+        let got = rxa.try_recv().expect("clicker answered");
+        assert!(
+            got.contains(r#""t":"WorktreeReady""#)
+                && got.contains(r#""launch":"claude""#)
+                && got.contains(&format!(r#""fork":"{id}""#)),
+            "{got}"
+        );
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// `Intent::Rehome { to: Some(url) }` ("Move tab there"): a native
+    /// session of this project, moved into a real worktree of it. Checked
+    /// against `worktree::list`, never a string the client typed.
+    #[test]
+    fn rehome_into_a_real_worktree_of_this_project_records_the_owner() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let wt = repo.join(".claude/worktrees/w1");
+        assert!(std::process::Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["worktree", "add", "-b", "w1", wt.to_str().unwrap()])
+            .status().unwrap().success());
+        let owner = "repo/.claude/worktrees/w1".to_string();
+
+        let _att = crate::session::reserve_and_attach("repo", "term", &repo).unwrap();
+
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::Rehome { session: "term".into(), to: Some(owner.clone()) });
+        assert!(rxa.try_recv().is_err() || !rxa.try_recv().unwrap().contains("Error"), "no refusal expected");
+        assert!(
+            matches!(crate::home::owner_of("repo", "term"), crate::home::Owner::Elsewhere(ref o) if *o == owner),
+            "the record must now name the worktree"
+        );
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// A url that is not a worktree of this project — checked against real
+    /// `worktree::list`, not trusted from the banner that offered it — is
+    /// refused, and no record is written.
+    #[test]
+    fn rehome_refuses_a_url_that_is_not_a_worktree_of_this_project() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let _att = crate::session::reserve_and_attach("repo", "term", &repo).unwrap();
+
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::Rehome { session: "term".into(), to: Some("repo/.claude/worktrees/nonexistent".into()) });
+        let got = rxa.try_recv().expect("an Error must be sent");
+        assert!(got.contains(r#""t":"Error""#) && got.contains("not a worktree of"), "{got}");
+        assert!(matches!(crate::home::owner_of("repo", "term"), crate::home::Owner::Here), "no record must be written");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// R16's gate, re-applied here: a name already live, natively, at the
+    /// target worktree must refuse rather than shadow it with a resident of
+    /// the same name.
+    #[test]
+    fn rehome_refuses_a_name_already_live_at_the_target() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let wt = repo.join(".claude/worktrees/w1");
+        assert!(std::process::Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["worktree", "add", "-b", "w1", wt.to_str().unwrap()])
+            .status().unwrap().success());
+        let owner = "repo/.claude/worktrees/w1".to_string();
+
+        let _att_home = crate::session::reserve_and_attach("repo", "term", &repo).unwrap();
+        // The name already exists natively at the target itself.
+        let _att_target = crate::session::reserve_and_attach(&owner, "term", &wt).unwrap();
+
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::Rehome { session: "term".into(), to: Some(owner) });
+        let got = rxa.try_recv().expect("an Error must be sent");
+        assert!(got.contains(r#""t":"Error""#) && got.contains("already exists"), "{got}");
+        assert!(matches!(crate::home::owner_of("repo", "term"), crate::home::Owner::Here), "no record must be written");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// `Intent::Rehome { to: None }` ("Move back"): sent from the owner's
+    /// own hub for one of its residents, it forgets the record without
+    /// touching git at all.
+    #[test]
+    fn rehome_back_forgets_a_residents_record() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let home = "rehomeback-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let _att = crate::session::reserve_and_attach(home, "term3", &home_dir).unwrap();
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        let mut owner_hub = Hub::new(&owner, owner_dir.clone());
+        assert_eq!(
+            owner_hub.session_homes.get("term3"),
+            Some(&home.to_string()),
+            "setup: the owner hub must see term3 as a resident"
+        );
+        let (a, rxa) = owner_hub.subscribe();
+        drain(&rxa);
+        owner_hub.handle(&a, Intent::Rehome { session: "term3".into(), to: None });
+        assert!(matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here), "the record must be forgotten");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// Fix round 1, ruling R25b: git vouching for a worktree's path is not
+    /// enough on its own — a worktree git happily lists but placed as a
+    /// plain subdirectory of the home (not under its own
+    /// `.claude/worktrees/`) has no re-home convention to read back later,
+    /// so `home::owner_path` — the exact shape every other re-home
+    /// consumer requires — must also recognise it.
+    ///
+    /// Revert check: removing the `home::owner_path` gate (keeping only
+    /// the git-list/`strip_prefix` check) fails this — the clicker gets a
+    /// `State` snapshot instead of an `Error`, observed in the panic's own
+    /// dump of it. Restored.
+    #[test]
+    fn rehome_refuses_a_worktree_not_under_claude_worktrees() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        // A real, git-vouched-for worktree — just not where the re-home
+        // convention requires one.
+        let wt = repo.join("other-worktrees/w1");
+        assert!(std::process::Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["worktree", "add", "-b", "w1", wt.to_str().unwrap()])
+            .status().unwrap().success());
+        let not_a_convention_url = "repo/other-worktrees/w1".to_string();
+
+        let _att = crate::session::reserve_and_attach("repo", "term", &repo).unwrap();
+
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::Rehome { session: "term".into(), to: Some(not_a_convention_url) });
+        let got = rxa.try_recv().expect("an Error must be sent");
+        assert!(got.contains(r#""t":"Error""#) && got.contains(".claude/worktrees"), "{got}");
+        assert!(matches!(crate::home::owner_of("repo", "term"), crate::home::Owner::Here), "no record must be written");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// Fix round 1, finding 4, end to end: "Move back" must not leave the
+    /// owner with a stale `Tab::Terminal{term3, home: Some(H)}` — before
+    /// R25a that tab survived the forget, so a later End Session on it
+    /// computed `kill_target = owner`, found nothing to kill, reported
+    /// success, and orphaned the real shell still running at `H`. After
+    /// the fix the owner loses the tab, the home regains a plain native
+    /// one, and End Session on *that* tab really ends the real dtach
+    /// master.
+    ///
+    /// `Hub::for_project`, not a bare `Hub::new`: the fix runs on
+    /// `do_rehome`'s spawned-thread path (`retab_native_if_missing`,
+    /// `refresh_and_broadcast`), which only exists for a hub registered in
+    /// `REGISTRY` — the same reason `end_session_of_a_resident_rehomed_away_since_is_refused`
+    /// needs it.
+    ///
+    /// Revert check: commenting out the `retab_native_if_missing` call in
+    /// `do_rehome`'s `None` branch (leaving only the owner-side cleanup
+    /// R25a's `refresh_live_sessions` fix already does) makes the "home
+    /// has a term3 tab" assertion below time out and fail. Restored.
+    #[test]
+    fn move_back_drops_the_owner_tab_and_retabs_the_session_at_home() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "r25a-moveback-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let att = crate::session::reserve_and_attach(home, "term3", &home_dir)
+            .expect("/usr/bin/dtach is a runtime prerequisite elsewhere in this project");
+        let sock = crate::session::socket_path(home, "term3");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up before this test can mean anything");
+        drop(att);
+
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        let owner_hub = Hub::for_project(&owner, owner_dir.clone());
+        assert!(
+            Hub::lock(&owner_hub).ws.panes.iter().flat_map(|p| p.tabs.iter())
+                .any(|t| matches!(t, Tab::Terminal { session, home: Some(h) } if session == "term3" && h == home)),
+            "setup: the owner must already have term3's resident tab"
+        );
+        let home_hub = Hub::for_project(home, home_dir.clone());
+
+        let (c, rx) = Hub::lock(&owner_hub).subscribe();
+        drain(&rx);
+        Hub::lock(&owner_hub).handle(&c, Intent::Rehome { session: "term3".into(), to: None });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let owner_clear = !Hub::lock(&owner_hub).ws.panes.iter().flat_map(|p| p.tabs.iter())
+                .any(|t| matches!(t, Tab::Terminal { session, .. } if session == "term3"));
+            let home_has_it = Hub::lock(&home_hub).ws.panes.iter().flat_map(|p| p.tabs.iter())
+                .any(|t| matches!(t, Tab::Terminal { session, home: None } if session == "term3"));
+            if owner_clear && home_has_it {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "owner_clear={owner_clear} home_has_it={home_has_it}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        drain(&rx);
+
+        // End Session on the home's own (regained) tab must really end the
+        // real dtach master — the whole point of dropping the owner's
+        // stale one.
+        let (c2, rx2) = Hub::lock(&home_hub).subscribe();
+        drain(&rx2);
+        Hub::lock(&home_hub).handle(&c2, Intent::EndSession { session: "term3".into() });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!any_process_holds(&sock), "End Session on the home's regained tab must really end the shell");
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Fix round 1, finding 4's safety rail: an `Unknown` record (empty or
+    /// unreadable — possibly mid-write) must NOT be read as "positively
+    /// moved". Dropping the owner's tab on the strength of `Unknown` would
+    /// orphan a terminal that is, as far as anyone can currently tell,
+    /// still exactly where its tab says.
+    ///
+    /// Revert check: changing the `Unknown` arm of `refresh_live_sessions`'s
+    /// R25a check from `false` to `true` fails this — observed: `an
+    /// Unknown record must not get the tab dropped`. Restored.
+    #[test]
+    fn an_unknown_record_keeps_the_owners_stale_looking_tab() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "r25a-unknown-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let _att = crate::session::reserve_and_attach(home, "term3", &home_dir).unwrap();
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        let mut owner_hub = Hub::new(&owner, owner_dir.clone());
+        assert!(
+            owner_hub.ws.panes.iter().flat_map(|p| p.tabs.iter())
+                .any(|t| matches!(t, Tab::Terminal { session, home: Some(h) } if session == "term3" && h == home)),
+            "setup: the owner must have term3's resident tab"
+        );
+
+        // Corrupt the record in place — an empty file is `Unknown`, not
+        // "forgotten" and not "still here".
+        let rec = crate::wsstate::state_dir().join("home").join(crate::projects::storage_key(home)).join("term3");
+        std::fs::write(&rec, "").unwrap();
+        assert!(matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Unknown(_)), "setup");
+
+        owner_hub.refresh_live_sessions();
+        assert!(
+            owner_hub.ws.panes.iter().flat_map(|p| p.tabs.iter())
+                .any(|t| matches!(t, Tab::Terminal { session, home: Some(h) } if session == "term3" && h == home)),
+            "an Unknown record must not get the tab dropped"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// Only a session native to this hub, or one of its own residents, can
+    /// be named — a forged or stale banner naming anything else (a plain
+    /// invalid shape, or a real session of some other project) is refused
+    /// before any filesystem write.
+    #[test]
+    fn rehome_refuses_a_session_this_hub_has_no_claim_to() {
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let d = tempfile::tempdir().unwrap();
+        let mut h = Hub::new("plain", d.path().to_path_buf());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+
+        h.handle(&a, Intent::Rehome { session: "../etc".into(), to: None });
+        let got = rxa.try_recv().expect("an Error must be sent");
+        assert!(got.contains(r#""t":"Error""#) && got.contains("invalid session name"), "{got}");
+
+        h.handle(&a, Intent::Rehome { session: "nosuch".into(), to: None });
+        let got = rxa.try_recv().expect("an Error must be sent");
+        assert!(got.contains(r#""t":"Error""#) && got.contains("is not a session of this project"), "{got}");
+
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// `Fork`'s whole safety property: a terminal name offered by a stale
+    /// dialog, or simply typed by hand, must not create a worktree and must
+    /// not type anything — it must refuse, by name, before any git work runs.
+    ///
+    /// Revert-checked: dropping the `claudesess::recorded` lookup (treating
+    /// every `Fork` as if a session were always found, with a fabricated
+    /// id) makes this fail at the `"t":"Error"` assertion — confirmed with
+    /// `got` instead containing a `"t":"WorktreeReady"` for a worktree that
+    /// should never have been created. Restored.
+    #[test]
+    fn fork_without_a_recorded_session_is_refused() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", tmp.path().join("state"));
+        let (mut h, _home, _dir) = repo_with_worktree(tmp.path());
+        let (a, rx) = conn(&mut h);
+        h.handle(&a, Intent::NewWorktree {
+            name: Some("fox".into()),
+            launch: Some(WorktreeLaunch::Fork { session: "term9".into() }),
+        });
+        let got = rx.try_recv().expect("an answer");
+        assert!(
+            got.contains(r#""t":"Error""#) && got.contains("term9") && got.contains("no recorded Claude session"),
+            "{got}"
+        );
+        // Nothing was created: the only worktree in this repo is the
+        // fixture's own.
+        assert_eq!(crate::worktree::list(&h.dir).len(), 2, "no second worktree");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Fix round 1, finding 1 — the hub-side half of it. The hook that
+    /// records a Claude session (`roost claude-hook`, `claudesess::record_from_hook`)
+    /// runs as a separate subprocess and writes straight to disk; it tells
+    /// the hub nothing when it does, so `Hub::forkable` — rebuilt only by
+    /// `refresh_live_sessions` — stays stale until something asks for the
+    /// truth again. `RequestState` is that something (same reasoning its
+    /// own doc comment gives for `claude_hooks`/`worktree_hooks`): this
+    /// pins that it actually recomputes `forkable` too, which is what the
+    /// client's `openWorktreeDialog`'s own `requestFreshState()` leans on.
+    ///
+    /// Revert-checked: commenting out `RequestState`'s own
+    /// `self.refresh_live_sessions()` call makes the second assertion fail
+    /// — observed: `panicked ... assertion failed: got.contains("\"forkable\":[\"term\"]")`,
+    /// with the second reply still carrying `"forkable":[]` — confirming
+    /// this test was already green *because* that call exists, not by
+    /// accident. Restored.
+    #[test]
+    fn request_state_recomputes_forkable_after_a_hook_writes_its_record() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let project = "forkable-fresh";
+        let dir = d.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::session::reserve_and_attach(project, "term", &dir).unwrap();
+        let mut h = Hub::new(project, dir);
+        let (a, rx) = conn(&mut h);
+        h.handle(&a, Intent::RequestState);
+        let got = rx.try_recv().expect("an answer");
+        assert!(got.contains(r#""forkable":[]"#), "no record yet: {got}");
+        // The hook writes its record now, exactly as the real `roost
+        // claude-hook` subprocess does — off every hub lock, telling this
+        // hub nothing directly.
+        crate::claudesess::record(project, "term", &crate::claudesess::Recorded {
+            session_id: "864ee734-e3ab-434e-8278-745a850b16ad".into(),
+            transcript_path: None,
+            event: "Stop".into(),
+        });
+        h.handle(&a, Intent::RequestState);
+        let got = rx.try_recv().expect("a second answer");
+        assert!(got.contains(r#""forkable":["term"]"#), "{got}");
+        crate::session::kill_project(project);
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Fix round 1, finding 3. `forkable` must name a native live session
+    /// with a record, exclude a native live session without one, and
+    /// exclude a *resident* re-homed in even if a record exists under this
+    /// project's own name — forking means continuing a conversation of a
+    /// terminal on this page, and a resident's own record is forkable from
+    /// its home's refresh instead (see `Hub::forkable`'s doc comment).
+    ///
+    /// The third case is deliberately adversarial: a resident's claudesess
+    /// record naturally lives under its true home (`ROOST_PROJECT` is set
+    /// at the shell's spawn, which never moves), so it could never
+    /// naturally collide with this project's own name. Writing it there
+    /// anyway is what actually distinguishes "`forkable` is built from
+    /// `raw_live`" from "`forkable` is built from `self.ws.live_sessions`"
+    /// — `self.ws.live_sessions` folds a resident in as live
+    /// (`owned_live_names`), so if `forkable` ever read that list instead,
+    /// this exact record would leak through; `raw_live` structurally never
+    /// contains a resident's name at all, record or no record.
+    ///
+    /// Revert-checked: changing `refresh_live_sessions`'s `self.forkable`
+    /// computation from `raw_live.iter()...` to
+    /// `self.ws.live_sessions.iter()...` makes the first assertion fail —
+    /// observed: `assertion failed: forkable == ["recorded"]`, left:
+    /// `["recorded", "term3"]`. Restored.
+    #[test]
+    fn forkable_lists_recorded_native_live_sessions_only() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        // `home::resolves` only recognises the worktree shape
+        // (`{home}/.claude/worktrees/{name}`) as a real owner — it is not a
+        // general cross-project relationship — so `owner` has to be a
+        // worktree-shaped child of `home`, not an unrelated project, or the
+        // resident below is never folded into `owner`'s own `live_sessions`
+        // at all and this test would prove nothing.
+        let home = "forkable-home";
+        let owner_url = format!("{home}/.claude/worktrees/w1");
+        let owner = owner_url.as_str();
+        let home_dir = root.path().join(home);
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        crate::session::reserve_and_attach(owner, "recorded", &owner_dir).unwrap();
+        crate::session::reserve_and_attach(owner, "plain", &owner_dir).unwrap();
+        crate::claudesess::record(owner, "recorded", &crate::claudesess::Recorded {
+            session_id: "864ee734-e3ab-434e-8278-745a850b16ad".into(),
+            transcript_path: None,
+            event: "Stop".into(),
+        });
+        // Native to `home`, re-homed into `owner` — `owner`'s own
+        // `live_sessions` folds it in as live; see the adversarial-record
+        // note above for why the record is written under `owner` here.
+        crate::session::reserve_and_attach(home, "term3", &home_dir).unwrap();
+        crate::home::record(home, "term3", owner).unwrap();
+        crate::claudesess::record(owner, "term3", &crate::claudesess::Recorded {
+            session_id: "aaaa1111-2222-3333-4444-555555555555".into(),
+            transcript_path: None,
+            event: "Stop".into(),
+        });
+
+        let mut h = Hub::new(owner, owner_dir);
+        let (a, rx) = conn(&mut h);
+        h.handle(&a, Intent::RequestState);
+        let snap = rx.try_recv().expect("an answer");
+        let v: serde_json::Value = serde_json::from_str(&snap).unwrap();
+        let forkable: Vec<String> = v["ws"]["forkable"]
+            .as_array().expect("forkable is an array")
+            .iter().map(|x| x.as_str().unwrap().to_string()).collect();
+        assert_eq!(forkable, vec!["recorded".to_string()], "{snap}");
+        // Setup check: if `term3` were not actually live on the owner's own
+        // page, excluding it from `forkable` would prove nothing.
+        assert!(
+            v["ws"]["live_sessions"].as_array().unwrap().iter().any(|x| x == "term3"),
+            "setup: term3 must be live on the owner's page: {snap}"
+        );
+
+        crate::session::kill_project(owner);
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
@@ -6271,7 +9754,7 @@ mod tests {
         let hub = Hub::for_project("worktree-registered", repo.clone());
         let (a, rxa) = Hub::lock(&hub).subscribe();
         drain(&rxa);
-        Hub::lock(&hub).handle(&a, Intent::NewWorktree { launch: None });
+        Hub::lock(&hub).handle(&a, Intent::NewWorktree { name: None, launch: None });
         let got = rxa.recv_timeout(std::time::Duration::from_secs(5));
         assert!(got.is_ok(), "timed out waiting for WorktreeReady -- broadcast_all deadlocked against this hub's own lock");
         assert!(got.unwrap().contains(r#""t":"WorktreeReady""#));
@@ -6291,16 +9774,496 @@ mod tests {
             assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
         }
         let key_of = |n: &str| crate::projects::storage_key(&format!("repo/.claude/worktrees/{n}"));
-        let c = crate::worktree::create(&repo, &crate::wsstate::state_dir(), &key_of, &crate::worktree::real_git).unwrap();
-        (Hub::new("repo", repo), "repo/.claude/worktrees/claude-1".into(), c.path)
+        let c = crate::worktree::create_named(&repo, &crate::wsstate::state_dir(), "pier", &key_of, &crate::worktree::real_git).unwrap();
+        (Hub::new("repo", repo), "repo/.claude/worktrees/worktree-pier".into(), c.path)
     }
-    const WT_KEY: &str = "repo%2F.claude%2Fworktrees%2Fclaude-1";
+    const WT_KEY: &str = "repo%2F.claude%2Fworktrees%2Fworktree-pier";
 
     fn refusal_of(h: &mut Hub, a: &ConnId, rx: &Receiver<String>) -> String {
         h.handle(a, Intent::RemoveWorktree { key: WT_KEY.into() });
         let got = rx.try_recv().expect("an answer");
         assert!(got.contains(r#""t":"Error""#), "expected a refusal, got {got}");
         got
+    }
+
+    // ---- Task 9: the worktree ask ----------------------------------------
+
+    /// Puts a bare `Hub::new` into `REGISTRY` with its `self_ref` set, the
+    /// two things `for_project` does that the ask path depends on — without
+    /// the watcher thread and IDE listener `for_project` also starts, which
+    /// these tests neither need nor want left running.
+    fn register_for_test(hub: Hub) -> Arc<Mutex<Hub>> {
+        let project = hub.project.clone();
+        let arc = Arc::new_cyclic(|w| {
+            let mut hub = hub;
+            hub.self_ref = w.clone();
+            Mutex::new(hub)
+        });
+        let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        reg.lock().unwrap_or_else(|e| e.into_inner()).insert(project, arc.clone());
+        arc
+    }
+
+    fn unregister_for_test(project: &str) {
+        if let Some(reg) = REGISTRY.get() {
+            reg.lock().unwrap_or_else(|e| e.into_inner()).remove(project);
+        }
+    }
+
+    fn init_repo(repo: &std::path::Path) {
+        std::fs::create_dir_all(repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(repo).args(args).status().unwrap().success());
+        }
+    }
+
+    /// A registered hub for `root/project` (a plain directory) with `session`
+    /// live in it and nobody connected. The caller holds both env locks and
+    /// has pointed `ROOST_ROOTS`/`ROOST_STATE_DIR` at `root`.
+    fn registered_hub_with_session(root: &std::path::Path, project: &str, session: &str) -> Arc<Mutex<Hub>> {
+        let dir = root.join(project);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::session::reserve_and_attach(project, session, &dir).unwrap();
+        register_for_test(Hub::new(project, dir))
+    }
+
+    /// The same, in a real git repository; also returns the repository's
+    /// canonical path, which is what `create_named` reports back.
+    fn registered_hub_in_git_repo_with_session(
+        root: &std::path::Path,
+        project: &str,
+        session: &str,
+    ) -> (Arc<Mutex<Hub>>, std::path::PathBuf) {
+        let repo = root.join(project);
+        init_repo(&repo);
+        crate::session::reserve_and_attach(project, session, &repo).unwrap();
+        let hub = register_for_test(Hub::new(project, repo.clone()));
+        (hub, repo.canonicalize().unwrap())
+    }
+
+    fn req(project: &str, session: &str, name: &str) -> crate::hooksock::AskRequest {
+        crate::hooksock::AskRequest {
+            op: "worktree_create".into(),
+            project: project.into(),
+            session: session.into(),
+            name: name.into(),
+            cwd: String::new(),
+            session_id: "sid-1".into(),
+        }
+    }
+
+    fn conn(h: &mut Hub) -> (ConnId, Receiver<String>) {
+        let (id, rx) = h.subscribe();
+        drain(&rx);
+        (id, rx)
+    }
+
+    /// Waits (≤5 s) for a `WorktreeAsk` on `rx` and returns its id. Every
+    /// other message is discarded.
+    fn wait_for_ask(rx: &Receiver<String>) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let m = rx.recv_timeout(left).expect("no WorktreeAsk within 5 s");
+            let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+            if v["t"] == "WorktreeAsk" {
+                return v["id"].as_str().unwrap().to_string();
+            }
+        }
+    }
+
+    fn ask_env(root: &std::path::Path) {
+        std::env::set_var("ROOST_CMD", "cat");
+        std::env::set_var("ROOST_STATE_DIR", root.join("state"));
+        std::env::set_var("ROOST_ROOTS", root);
+    }
+
+    fn ask_env_clear(projects: &[&str]) {
+        for p in projects {
+            crate::session::kill_project(p);
+            unregister_for_test(p);
+        }
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    fn spawn_ask(project: &str, session: &str, name: &str) -> std::thread::JoinHandle<crate::hooksock::AskReply> {
+        let r = req(project, session, name);
+        std::thread::spawn(move || ask_worktree_blocking(r))
+    }
+
+    use crate::hooksock::AskReply;
+
+    #[test]
+    fn an_ask_with_no_browser_is_refused_at_once() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-nobrowser";
+        let _hub = registered_hub_with_session(root.path(), p, "term3");
+        let r = ask_worktree_blocking(req(p, "term3", "fox"));
+        assert_eq!(r, AskReply::Refuse { refuse: "no roost tab is open on this project to approve it".into() });
+        // And a real project with no hub at all gets the same answer — the
+        // hub is never created by asking.
+        std::fs::create_dir_all(root.path().join("ask-nobrowser-nohub")).unwrap();
+        let r = ask_worktree_blocking(req("ask-nobrowser-nohub", "term3", "fox"));
+        assert_eq!(r, AskReply::Refuse { refuse: "no roost tab is open on this project to approve it".into() });
+        assert!(!is_open("ask-nobrowser-nohub"), "asking must never create a hub");
+        ask_env_clear(&[p]);
+    }
+
+    #[test]
+    fn approve_creates_records_and_replies_path() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-approve";
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let (_b, rxb) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id: id.clone(), approve: true });
+        let r = t.join().unwrap();
+        let owner = format!("{p}/.claude/worktrees/worktree-fox");
+        assert_eq!(r, AskReply::Path { path: repo.join(".claude/worktrees/worktree-fox").to_string_lossy().into() });
+        assert!(
+            matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Elsewhere(o) if o == owner),
+            "the re-home record names the new worktree"
+        );
+        // The clicker's `pendingTab` is navigated by `WorktreeReady`, which
+        // is delivered before the `Path` reply returns — so it is queued by
+        // now, and only the clicker has it.
+        let got_a = drain(&rxa);
+        assert!(
+            got_a.iter().any(|m| m.contains(r#""t":"WorktreeReady""#) && m.contains(&format!(r#""url":"{owner}""#))),
+            "the clicker must get WorktreeReady for {owner}: {got_a:?}"
+        );
+        let got_b = drain(&rxb);
+        assert!(!got_b.iter().any(|m| m.contains("WorktreeReady")), "WorktreeReady is the clicker's alone: {got_b:?}");
+        assert!(
+            got_b.iter().any(|m| m.contains(r#""t":"WorktreeAskClosed""#) && m.contains(&id)),
+            "the other browser's dialog is closed: {got_b:?}"
+        );
+        ask_env_clear(&[p, &owner]);
+    }
+
+    /// Task 10: when the main checkout has `Kind::Worktree` installed, a
+    /// freshly approved worktree inherits it — its own
+    /// `.claude/settings.local.json` gets the `WorktreeCreate` entry, not
+    /// the main checkout's file, which must stay untouched.
+    ///
+    /// Verified this can fail: commenting out the install call in
+    /// `approve_ask` (the Task 10 marker) fails the first assertion with
+    /// `No such file or directory (os error 2)` reading the new worktree's
+    /// settings file — nothing is installed there at all. Restored.
+    #[test]
+    fn approve_installs_the_worktree_hook_when_the_main_checkout_has_it() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-hook-on";
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        crate::claudehooks::set_kind(&repo, crate::claudehooks::Kind::Worktree, true).unwrap();
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: true });
+        let r = t.join().unwrap();
+        let AskReply::Path { path } = r else { panic!("expected Path, got {r:?}") };
+        let owner = format!("{p}/.claude/worktrees/worktree-fox");
+        let wt_settings = std::path::Path::new(&path).join(".claude/settings.local.json");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&wt_settings).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"]["WorktreeCreate"][0]["hooks"][0]["command"], "roost worktree-hook",
+            "the new worktree's own settings file carries the hook: {v}"
+        );
+        assert_eq!(
+            crate::claudehooks::state_of(&repo, crate::claudehooks::Kind::Worktree),
+            crate::claudehooks::HookState::Present,
+            "installing into the worktree must not disturb the main checkout's own file"
+        );
+        ask_env_clear(&[p, &owner]);
+    }
+
+    /// The other half: a main checkout that never enabled `Kind::Worktree`
+    /// leaves the new worktree with no settings file at all — approve must
+    /// not conjure one into existence just by running.
+    #[test]
+    fn approve_installs_nothing_when_the_main_checkout_lacks_the_hook() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-hook-off";
+        let (hub, _repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: true });
+        let r = t.join().unwrap();
+        let AskReply::Path { path } = r else { panic!("expected Path, got {r:?}") };
+        let owner = format!("{p}/.claude/worktrees/worktree-fox");
+        assert!(
+            !std::path::Path::new(&path).join(".claude/settings.local.json").exists(),
+            "no settings file at all when the main checkout never had the hook"
+        );
+        ask_env_clear(&[p, &owner]);
+    }
+
+    /// Revert-checked: answering without removing the ask (so the second
+    /// answer finds it still pending and runs a second create) failed 5/5
+    /// runs — observed both `assertion failed: matches!(t.join().unwrap(),
+    /// AskReply::Path { .. })` (the second, refused create answered Claude
+    /// first) and `the second answer was acted on: [.. two
+    /// WorktreeAskClosed ..]`. The brief's worktree count alone stayed green
+    /// under that revert, because `create_named` refuses the taken name.
+    #[test]
+    fn second_answer_to_an_ask_is_ignored() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-second";
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let (b, rxb) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id: id.clone(), approve: true });
+        Hub::lock(&hub).handle(&b, Intent::WorktreeAnswer { id, approve: true });
+        assert!(matches!(t.join().unwrap(), AskReply::Path { .. }));
+        // A second create (if one ran) is on its own thread; give it the
+        // time a create takes before looking.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(crate::worktree::list(&repo).len(), 2, "created exactly once");
+        // The worktree count alone cannot see a second run: `create_named`
+        // refuses the now-taken name, so a second attempt leaves the count
+        // at 2 too. What it *does* leave is an answer to the second clicker
+        // and a second close. Neither may exist.
+        let got_b = drain(&rxb);
+        assert!(
+            !got_b.iter().any(|m| m.contains(r#""t":"Error""#) || m.contains(r#""t":"WorktreeReady""#)),
+            "the second answer was acted on: {got_b:?}"
+        );
+        assert_eq!(
+            got_b.iter().filter(|m| m.contains(r#""t":"WorktreeAskClosed""#)).count(),
+            1,
+            "closed once: {got_b:?}"
+        );
+        ask_env_clear(&[p, &format!("{p}/.claude/worktrees/worktree-fox")]);
+    }
+
+    #[test]
+    fn refuse_writes_nothing() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-refuse";
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: false });
+        assert_eq!(t.join().unwrap(), AskReply::Refuse { refuse: "refused in roost".into() });
+        assert_eq!(crate::worktree::list(&repo).len(), 1);
+        assert!(matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here));
+        ask_env_clear(&[p]);
+    }
+
+    /// Revert-checked: dropping the timeout's `WorktreeAskClosed` broadcast
+    /// fails with `the expired ask's dialogs are closed: [WorktreeAsk only]`.
+    #[test]
+    fn an_unanswered_ask_is_refused_and_closed() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-timeout";
+        let (hub, _repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        let (_a, rxa) = conn(&mut Hub::lock(&hub));
+        let r = ask_worktree_blocking_with(req(p, "term3", "fox"), std::time::Duration::from_millis(200));
+        assert_eq!(r, AskReply::Refuse { refuse: "nobody approved it in roost within 60 s".into() });
+        let got = drain(&rxa);
+        let id = got
+            .iter()
+            .find_map(|m| {
+                let v: serde_json::Value = serde_json::from_str(m).ok()?;
+                (v["t"] == "WorktreeAsk").then(|| v["id"].as_str().unwrap().to_string())
+            })
+            .expect("the ask was broadcast");
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"WorktreeAskClosed""#) && m.contains(&format!(r#""id":"{id}""#))),
+            "the expired ask's dialogs are closed: {got:?}"
+        );
+        assert!(Hub::lock(&hub).asks.is_empty(), "the expired ask is gone");
+        ask_env_clear(&[p]);
+    }
+
+    /// Revert-checked: recording before `create_named` fails here with
+    /// `no record without a worktree` — a terminal re-homed into a worktree
+    /// git refused to make.
+    #[test]
+    fn a_failed_create_writes_no_record() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-failcreate";
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        // The name is taken: the branch already exists.
+        assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(["branch", "worktree-fox"]).status().unwrap().success());
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: true });
+        let r = t.join().unwrap();
+        assert!(matches!(&r, AskReply::Refuse { refuse } if refuse.contains("branch worktree-fox already exists")), "{r:?}");
+        assert!(matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here), "no record without a worktree");
+        let got = drain(&rxa);
+        assert!(got.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("already exists")), "the clicker hears why: {got:?}");
+        ask_env_clear(&[p]);
+    }
+
+    /// R22. Revert-checked: with the cap check disabled the fifth ask is
+    /// parked like the others and this fails with `left: Refuse { refuse:
+    /// "nobody approved it in roost within 60 s" }` against the cap's text.
+    #[test]
+    fn a_fifth_ask_from_one_project_is_refused() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-cap";
+        let hub = registered_hub_with_session(root.path(), p, "term");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let waiters: Vec<_> = (1..=MAX_PENDING_ASKS).map(|i| spawn_ask(p, &format!("term{i}"), "fox")).collect();
+        let ids: Vec<String> = (0..MAX_PENDING_ASKS).map(|_| wait_for_ask(&rxa)).collect();
+        let t0 = std::time::Instant::now();
+        // A short wait, so that with the cap gone this fails in a second
+        // with the timeout's text rather than hanging for 60.
+        let r = ask_worktree_blocking_with(req(p, "term9", "fox"), std::time::Duration::from_secs(1));
+        assert_eq!(r, AskReply::Refuse { refuse: format!("too many worktree requests waiting in {p}") });
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "refused at once, not after a wait");
+        // One per session still holds alongside it.
+        let r = ask_worktree_blocking(req(p, "term1", "fox"));
+        assert!(matches!(&r, AskReply::Refuse { .. }), "{r:?}");
+        for id in ids {
+            Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: false });
+        }
+        for w in waiters {
+            assert_eq!(w.join().unwrap(), AskReply::Refuse { refuse: "refused in roost".into() });
+        }
+        ask_env_clear(&[p]);
+    }
+
+    #[test]
+    fn a_second_ask_from_one_terminal_is_refused_while_the_first_waits() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-onepersession";
+        let hub = registered_hub_with_session(root.path(), p, "term3");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        let r = ask_worktree_blocking(req(p, "term3", "otter"));
+        assert_eq!(r, AskReply::Refuse { refuse: "an earlier request from this terminal is still waiting".into() });
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: false });
+        t.join().unwrap();
+        ask_env_clear(&[p]);
+    }
+
+    #[test]
+    fn an_invalid_session_or_name_is_refused_before_anything() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-invalid";
+        let hub = registered_hub_with_session(root.path(), p, "term3");
+        let (_a, rxa) = conn(&mut Hub::lock(&hub));
+        let r = ask_worktree_blocking(req(p, "../x", "fox"));
+        assert!(matches!(&r, AskReply::Refuse { refuse } if refuse.contains("terminal name")), "{r:?}");
+        let r = ask_worktree_blocking(req(p, "term3", "-rf"));
+        assert!(matches!(&r, AskReply::Refuse { refuse } if refuse.contains("must match")), "{r:?}");
+        assert!(drain(&rxa).iter().all(|m| !m.contains("WorktreeAsk")), "nothing was asked");
+        ask_env_clear(&[p]);
+    }
+
+    /// R16. Revert-checked: with the gate disabled this fails with `left:
+    /// Path { path: ".../ask-r16/.claude/worktrees/worktree-fox" }` — Claude
+    /// told to move, and a second live `term3` in one owner.
+    #[test]
+    fn the_record_gate_refuses_a_name_live_in_the_owner() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-r16";
+        let owner = format!("{p}/.claude/worktrees/worktree-fox");
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        // A live `term3` already keyed under the owner URL — the worktree
+        // itself cannot exist yet (create would refuse), so its cwd is the
+        // repository; the session map is keyed by URL, not by directory.
+        crate::session::reserve_and_attach(&owner, "term3", &repo).unwrap();
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: true });
+        let r = t.join().unwrap();
+        assert_eq!(r, AskReply::Refuse { refuse: "worktree-fox already has a terminal named term3".into() });
+        assert!(matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here), "no record past the gate");
+        // Creating destroys nothing: the worktree stays.
+        assert!(repo.join(".claude/worktrees/worktree-fox").is_dir());
+        ask_env_clear(&[p, &owner]);
+    }
+
+    /// Asserted in this thread straight after the reply, no sleep: the
+    /// refresh must have happened *before* `Path` was sent.
+    ///
+    /// Revert-checked twice: removing the refresh fails with `left: None,
+    /// right: Some("ask-refresh")`; moving it to after the reply fails the
+    /// same way 5/5 runs (that variant is a race the asker almost always
+    /// wins, so it is evidence, not proof).
+    #[test]
+    fn approve_refreshes_the_owner_hub_before_replying() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ask-refresh";
+        let owner = format!("{p}/.claude/worktrees/worktree-fox");
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        // The owner's hub is open before the worktree exists — a tab on a
+        // URL that does not resolve yet, exactly as a fast browser would be.
+        let owner_hub = register_for_test(Hub::new(&owner, repo.join(".claude/worktrees/worktree-fox")));
+        assert!(Hub::lock(&owner_hub).session_homes.is_empty());
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: true });
+        assert!(matches!(t.join().unwrap(), AskReply::Path { .. }));
+        assert_eq!(
+            Hub::lock(&owner_hub).session_homes.get("term3"),
+            Some(&p.to_string()),
+            "the owner hub knows its resident before Claude is told to move"
+        );
+        assert!(
+            !Hub::lock(&hub).ws.live_sessions.contains(&"term3".to_string()),
+            "and the home hub has let go of it"
+        );
+        ask_env_clear(&[p, &owner]);
     }
 
     #[test]
@@ -6323,6 +10286,46 @@ mod tests {
         assert!(got.contains("live terminal"), "{got}");
         assert!(dir.is_dir());
         crate::session::kill_project(&url);
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// A resident's socket lives under its *home* ("repo"), never under the
+    /// worktree it was re-homed into — so the removal gate must count
+    /// `owned_live_names(&url)`, not `live_names(&url)`, or a running
+    /// re-homed Claude's terminal would be invisible to it and `git
+    /// worktree remove` would delete the directory out from under it.
+    ///
+    /// `ROOST_ROOTS` is set so `home::resolves` (fork-free, no git) can
+    /// confirm the worktree dir under "repo" is real; without it the
+    /// resident would fall back to showing at home and this test would
+    /// prove nothing about the gate.
+    ///
+    /// Revert-checked: reverting the gate's `owned_live_names` back to
+    /// `live_names` fails `refusal_of`'s own assertion that the answer was
+    /// an `Error` — removal *succeeds* — observed: `panicked ... expected a
+    /// refusal, got {"t":"ProjectsChanged","project":"repo"}`.
+    #[test]
+    fn remove_refuses_a_worktree_with_a_live_resident() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let (mut h, url, dir) = repo_with_worktree(root.path());
+        let (a, rx) = h.subscribe();
+        drain(&rx);
+        // The resident's dtach socket is under its home, "repo" — re-homing
+        // never moves it (see home.rs's module doc) — while the record
+        // names the worktree as its owner.
+        let home_dir = h.dir.clone();
+        let _att = crate::session::reserve_and_attach("repo", "term3", &home_dir).unwrap();
+        crate::home::record("repo", "term3", &url).unwrap();
+        let got = refusal_of(&mut h, &a, &rx);
+        assert!(got.contains("terminal"), "{got}");
+        assert!(dir.is_dir());
+        crate::session::kill_project("repo");
+        std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 

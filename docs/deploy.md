@@ -110,6 +110,34 @@ A git worktree is its own project, and is discovered by asking
 `git worktree list`, not by walking the filesystem, so worktrees under
 `.claude/worktrees/` are found even though `.claude` is otherwise skipped.
 
+A project's "Let roost create Claude's worktrees" setting installs Claude
+Code's `WorktreeCreate` hook (`roost worktree-hook`), so that when a Claude
+running in a roost terminal asks for a worktree, roost — not Claude Code —
+creates it, and the terminal that asked is re-homed into the new worktree's
+project. With the setting on, the request shows up as a dialog in the
+browser: with no roost tab open on that project to click it, the request is
+refused outright, since nobody is there to approve it. Outside roost
+entirely (a Claude with no `ROOST_PROJECT` set) or whenever roost itself is
+unreachable — stopped, restarting, or the hook socket otherwise refused —
+the hook falls back to creating the worktree itself, roost's own naming
+convention and all: creating a worktree destroys nothing, so that is the one
+case where falling through to "just do it" is the safe default.
+
+Subagent worktrees ask too. A Claude that runs a subagent with
+`isolation: "worktree"` raises the same `WorktreeCreate` hook, and its payload
+carries nothing that tells it apart from the terminal's own request — no agent
+id or type, only a generated `agent-<hex>` name (observed on Claude Code
+2.1.296). So with the setting on, each such subagent shows the same dialog,
+re-homes the terminal when approved, and is refused at once when no roost tab
+is open on the project.
+
+Turn the setting off before **downgrading** to a roost that predates it. An
+older binary does not know the `worktree-hook` subcommand and reads it as a
+port number, so the hook exits 2 — and a non-zero `WorktreeCreate` hook is
+Claude Code's refusal: every `--worktree` start aborts and every
+`EnterWorktree` fails in that project until the entry is removed from
+`.claude/settings.local.json`.
+
 Terminals are **never started implicitly**. Opening a project creates a
 Terminal *tab*, not a session; the session begins only when the user presses
 Enter or clicks the placeholder. Before this, merely looking at a project

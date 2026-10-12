@@ -1470,6 +1470,17 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
     } else {
         String::new()
     };
+    // The `+` dialog (#156) only makes sense from the main checkout: a
+    // worktree's own page has no business minting a sibling of itself, and
+    // `create_named` would refuse it anyway ("start worktrees from the main
+    // checkout"). `branch` empty means this entry was never confirmed to be
+    // a git repository at all (see `ProjectStatus::branch`'s own doc
+    // comment) — offering the control there would open a dialog whose only
+    // possible answer is an error.
+    let offer_add = projects
+        .iter()
+        .find(|p| p.key == current_key)
+        .is_some_and(|p| p.parent.is_none() && !p.branch.is_empty());
     let mut out = format!(
         "<span id=\"wtlabel\" hx-swap-oob=\"true\">{label}</span><span class=\"wtstrip\">"
     );
@@ -1521,6 +1532,11 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
             esc(&p.url),
             esc(name),
         ));
+    }
+    if offer_add {
+        out.push_str(
+            "<button type=\"button\" class=\"wtadd\" title=\"start a new worktree\">+</button>",
+        );
     }
     out.push_str("</span>");
     out
@@ -1648,6 +1664,7 @@ pub fn human_age(secs: u64) -> String {
     }
 }
 
+#[derive(Debug)]
 pub struct OvSession {
     pub project_url: String,
     pub name: String,
@@ -2044,6 +2061,10 @@ pub fn workspace_page(
   <h2 class="dlg-title"></h2>
   <div class="dlg-body"></div>
   <div class="dlg-detail" hidden></div>
+  <span class="dlg-choice-input-row">
+    <input class="dlg-choice-input" type="text" autocomplete="off" spellcheck="false" hidden>
+    <span class="dlg-choice-input-preview" hidden></span>
+  </span>
   <div class="dlg-buttons">
     <button type="button" class="dlg-cancel">Cancel</button>
   </div>
@@ -4166,6 +4187,31 @@ mod tests {
         // A child names itself by its last path segment:
         let h = worktrees_strip("karpie%2F.claude%2Fworktrees%2Ffeat", &karpie_family());
         assert!(h.contains("· feat ▾"), "{h}");
+    }
+
+    /// The `+` control (#156) only on the main checkout's own page — never
+    /// on a child's, never on an unknown project, never on a plain
+    /// (non-git) directory.
+    ///
+    /// Revert-checked: dropping the `p.parent.is_none()` half of
+    /// `offer_add`'s guard (offering it to any known git entry) makes the
+    /// second assertion fail — observed `panicked ...` with `h` showing
+    /// `<button type="button" class="wtadd" ...>+</button>` rendered on the
+    /// child's own page (`karpie%2F.claude%2Fworktrees%2Ffeat`). Restored.
+    #[test]
+    fn the_add_control_appears_only_on_the_main_checkouts_own_page() {
+        let h = worktrees_strip("karpie", &karpie_family());
+        assert!(h.contains(r#"<button type="button" class="wtadd""#), "{h}");
+        // A child's own page: not the main checkout, no control.
+        let h = worktrees_strip("karpie%2F.claude%2Fworktrees%2Ffeat", &karpie_family());
+        assert!(!h.contains("wtadd"), "{h}");
+        // Unknown current key: no entry to confirm is a git repo at all.
+        let h = worktrees_strip("nosuch", &karpie_family());
+        assert!(!h.contains("wtadd"), "{h}");
+        // A plain (non-git) directory: `branch` empty, never confirmed a repo.
+        let plain = vec![wt("plain", "plain", None, 1, "", true)];
+        let h = worktrees_strip("plain", &plain);
+        assert!(!h.contains("wtadd"), "{h}");
     }
 
     /// The fixture must contain real metacharacters or this asserts nothing

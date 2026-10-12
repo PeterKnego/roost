@@ -291,18 +291,34 @@ fn build_overview_sessions(roots: &[PathBuf], sel: &str) -> Vec<render::OvSessio
         let launched: std::collections::HashSet<String> =
             crate::session::launched_names(&p.url).into_iter().map(|(n, _)| n).collect();
         let evidence = crate::claudes::claude_evidence_with_scan(&p.url, &scan);
-        for (name, pid, attached) in crate::session::session_rows(&p.url) {
-            let is_claude = launched.contains(&name)
-                || matches!(&evidence, crate::claudes::ClaudeEvidence::Present(ts) if ts.iter().any(|t| t == &name));
-            let age_secs = {
-                let sock = crate::session::socket_path(&p.url, &name);
-                let mut pids = registry::pids_holding_path(&holders, &sock);
-                if pid != 0 {
-                    pids.push(pid);
+        // `owned_live_names`, not `session_rows`: a resident's own name
+        // belongs here (it is this project's row, by the re-home record),
+        // but its *socket* — and so its pid/attached/age — is still under
+        // its home, since re-homing never moves it (home.rs's module doc).
+        // Grouped by that physical home so each one's `session_rows` is
+        // read once rather than once per name.
+        let owned = crate::session::owned_live_names(&p.url);
+        let mut by_home: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for (name, home) in &owned {
+            by_home.entry(home.clone().unwrap_or_else(|| p.url.clone())).or_default().push(name.clone());
+        }
+        for (src, names) in by_home {
+            for (name, pid, attached) in crate::session::session_rows(&src) {
+                if !names.contains(&name) {
+                    continue;
                 }
-                crate::session::oldest_age_of(&pids, &ages)
-            };
-            rows.push(render::OvSession { project_url: p.url.clone(), name, is_claude, age_secs, attached });
+                let is_claude = launched.contains(&name)
+                    || matches!(&evidence, crate::claudes::ClaudeEvidence::Present(ts) if ts.iter().any(|t| t == &name));
+                let age_secs = {
+                    let sock = crate::session::socket_path(&src, &name);
+                    let mut pids = registry::pids_holding_path(&holders, &sock);
+                    if pid != 0 {
+                        pids.push(pid);
+                    }
+                    crate::session::oldest_age_of(&pids, &ages)
+                };
+                rows.push(render::OvSession { project_url: p.url.clone(), name, is_claude, age_secs, attached });
+            }
         }
     }
     rows
@@ -1692,6 +1708,70 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let roots = vec![d.path().to_path_buf()];
         assert!(frag_route(&roots, "/frag/_worktrees?current=nosuch&state=1").contains("id=\"wtlabel\""));
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A resident's dtach socket is physically under its home, "repo" — the
+    /// overview's session rows must still name it under the worktree the
+    /// re-home record says owns it, and not under "repo" at all, or the
+    /// session list would show the same running Claude in the wrong panel
+    /// (or in both).
+    ///
+    /// `ROOST_ROOTS` is what lets the production, fork-free `home::resolves`
+    /// confirm the worktree before `owned_live_names` credits it — without
+    /// that env var the record would be real but unresolved and this would
+    /// prove nothing about the listing.
+    ///
+    /// Revert-checked: reverting `build_overview_sessions`'s per-project
+    /// loop back to `session::session_rows(&p.url)` (so the worktree row's
+    /// sessions only ever come from its own native names) fails the first
+    /// assertion — observed: `panicked ... the resident must be listed
+    /// under the worktree it was re-homed into: [OvSession { project_url:
+    /// "repo", name: "term3", ... }]` — the session is still listed under
+    /// its home.
+    #[test]
+    fn build_overview_sessions_lists_a_resident_under_its_owner_not_its_home() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        std::env::set_var("ROOST_STATE_DIR", &state);
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-qm", "init"]);
+        run_git(&repo, &["worktree", "add", "-q", "-b", "feat", ".claude/worktrees/feat"]);
+
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("repo.json"), "{}").unwrap();
+
+        let _att = crate::session::reserve_and_attach("repo", "term3", &repo).unwrap();
+        crate::home::record("repo", "term3", "repo/.claude/worktrees/feat").unwrap();
+
+        let roots = vec![root.path().to_path_buf()];
+        let rows = build_overview_sessions(&roots, "");
+        assert!(
+            rows.iter().any(|r| r.project_url == "repo/.claude/worktrees/feat" && r.name == "term3"),
+            "the resident must be listed under the worktree it was re-homed into: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.project_url == "repo" && r.name == "term3"),
+            "and not under its home: {rows:?}"
+        );
+
+        crate::session::kill_project("repo");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// `content_type` must classify the same way `assets::class_of` does —
