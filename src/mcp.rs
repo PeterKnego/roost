@@ -24,6 +24,10 @@ const CHROME_TIMEOUT: Duration = Duration::from_secs(200);
 const HANDOFF_SLACK: Duration = Duration::from_secs(30);
 /// The broker's largest answer is a screenshot well under this.
 const MAX_REPLY: usize = 12 * 1024 * 1024;
+/// `chrome_upload`'s files together, before base64. Kept so the request line
+/// stays under `browser::MAX_REQUEST` once encoded.
+const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+const MAX_UPLOAD_FILES: usize = 20;
 
 const PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -218,6 +222,16 @@ fn call_tool(st: &State, params: &Value) -> Value {
             }
         }
         tool => {
+            // The extension cannot read this host's disk: the files travel
+            // inside the call, read here, where Claude's own paths make sense.
+            let args = if tool == "chrome_upload" {
+                match attach_files(args) {
+                    Ok(a) => a,
+                    Err(e) => return tool_error(&e),
+                }
+            } else {
+                args
+            };
             let req = with(base, json!({"op": "chrome", "tool": tool, "args": args}));
             match (st.broker)(req, CHROME_TIMEOUT) {
                 Ok(v) => chrome_result(v),
@@ -225,6 +239,63 @@ fn call_tool(st: &State, params: &Value) -> Value {
             }
         }
     }
+}
+
+/// Replaces `paths` with `files: [{name, mime, data}]`, `data` in base64.
+fn attach_files(mut args: Value) -> Result<Value, String> {
+    let paths: Vec<String> = match args.as_object_mut().and_then(|o| o.remove("paths")) {
+        Some(Value::Array(a)) => a.into_iter().map(|p| p.as_str().map(String::from).ok_or("paths must be strings")).collect::<Result<_, _>>()?,
+        _ => return Err("pass paths: the files to upload".into()),
+    };
+    if paths.is_empty() || paths.len() > MAX_UPLOAD_FILES {
+        return Err(format!("pass 1 to {MAX_UPLOAD_FILES} paths"));
+    }
+    let mut total = 0;
+    let mut files = Vec::new();
+    for p in &paths {
+        let bytes = std::fs::read(p).map_err(|e| format!("cannot read {p}: {e}"))?;
+        total += bytes.len();
+        if total > MAX_UPLOAD_BYTES {
+            return Err(format!("the files come to more than {} MB together", MAX_UPLOAD_BYTES / (1024 * 1024)));
+        }
+        let path = std::path::Path::new(p);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.clone());
+        let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        files.push(json!({"name": name, "mime": mime_of(&ext), "data": base64(&bytes)}));
+    }
+    args["files"] = Value::Array(files);
+    Ok(args)
+}
+
+fn mime_of(ext: &str) -> &'static str {
+    match ext {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "mp4" => "video/mp4",
+        "txt" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "html" | "htm" => "text/html",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(A[(n >> 18) as usize & 63] as char);
+        out.push(A[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { A[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 fn format_handoff(msgs: &[Value]) -> String {
@@ -294,6 +365,9 @@ fn tools() -> Vec<Value> {
                "inputSchema": {"type": "object", "properties": target(json!({
                    "text": {"type": "string"},
                    "submit": {"type": "boolean", "description": "Press Enter afterwards."}})), "required": ["text"]}}),
+        json!({"name": "chrome_upload", "description": format!("Upload files from this host into a file input. Target the <input type=file> itself, or the button or drop area that opens the file picker: the picker is caught and filled, never shown. {WHOSE}"),
+               "inputSchema": {"type": "object", "properties": target(json!({
+                   "paths": {"type": "array", "items": {"type": "string"}, "description": "Files to upload, absolute or relative to Claude's working directory; up to 20, 10 MB together."}})), "required": ["paths"]}}),
         json!({"name": "chrome_close", "description": format!("Close a tab this Claude session opened with chrome_open. Any other tab — the user's own, or one navigated with new_tab:false — is refused. {WHOSE}"),
                "inputSchema": {"type": "object", "properties": {"tab_id": tab}}}),
         json!({"name": "chrome_console", "description": format!("Console messages and uncaught errors from a tab, collected since roost first attached to it (so call it once early, then again after reproducing). {WHOSE}"),
@@ -366,6 +440,32 @@ mod tests {
         let names: Vec<&str> = out[0]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"chrome_screenshot") && names.contains(&"handoff_read"), "{names:?}");
         assert!(names.iter().all(|n| !n.starts_with("browser_")), "{names:?}");
+    }
+
+    #[test]
+    fn base64_matches_the_standard_alphabet_and_padding() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(&[0xfb, 0xff]), "+/8=");
+    }
+
+    #[test]
+    fn an_upload_carries_the_files_and_not_their_paths() {
+        let d = std::env::temp_dir().join(format!("roost-upload-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("Shot.PNG");
+        std::fs::write(&f, b"foo").unwrap();
+        let a = attach_files(json!({"ref": 3, "paths": [f.to_str().unwrap()]})).unwrap();
+        assert!(a.get("paths").is_none(), "{a}");
+        assert_eq!(a["ref"], 3);
+        assert_eq!(a["files"], json!([{"name": "Shot.PNG", "mime": "image/png", "data": "Zm9v"}]));
+        let missing = attach_files(json!({"paths": [d.join("nope.png").to_str().unwrap()]})).unwrap_err();
+        assert!(missing.contains("cannot read"), "{missing}");
+        assert!(attach_files(json!({"paths": []})).is_err());
+        assert!(attach_files(json!({})).is_err());
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

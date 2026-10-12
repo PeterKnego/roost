@@ -51,7 +51,11 @@ const site = Deno.serve({ port: sitePort, hostname: "127.0.0.1", onListen() {} }
 <form onsubmit="event.preventDefault(); document.getElementById('h').textContent='typed:' + document.getElementById('q').value">
 <input id="q" aria-label="query" value="stale "></form>
 <textarea id="t" aria-label="notes" oninput="document.getElementById('tv').textContent='area:' + this.value">old words</textarea>
-<p id="tv"></p>`, { headers: { "content-type": "text/html" } }));
+<p id="tv"></p>
+<input type="file" id="f" multiple aria-label="files" onchange="document.getElementById('fv').textContent='files:' + [...this.files].map((f) => f.name + '/' + f.size + '/' + f.type).join(',')">
+<input type="file" id="hf" style="display:none" onchange="this.files[0].text().then((t) => document.getElementById('hv').textContent='picked:' + this.files[0].name + '=' + t)">
+<button id="pick" onclick="document.getElementById('hf').click()">Pick a file</button>
+<p id="fv"></p><p id="hv"></p>`, { headers: { "content-type": "text/html" } }));
 const target = `http://127.0.0.1:${sitePort}/`;
 
 // A profile of its own: the extension's storage persists in it, and a grant
@@ -171,6 +175,25 @@ try {
   ok(!area.isError, `F: chrome_type into a textarea — ${text(area)}`);
   const after3 = JSON.parse(text(await mcp.tool("chrome_read")));
   ok(after3.text.includes("area:new words"), `F: typing into a textarea replaces what it held — ${/area:.*/.exec(after3.text)?.[0]}`);
+
+  const up = await Deno.makeTempDir();
+  await Deno.writeTextFile(`${up}/a.txt`, "hello");
+  await Deno.writeFile(`${up}/b.png`, new Uint8Array([137, 80, 78, 71, 0, 255]));
+  const direct = await mcp.tool("chrome_upload", { selector: "#f", paths: [`${up}/a.txt`, `${up}/b.png`] });
+  ok(!direct.isError, `F: chrome_upload into a file input — ${text(direct)}`);
+  const after4 = JSON.parse(text(await mcp.tool("chrome_read")));
+  ok(after4.text.includes("files:a.txt/5/text/plain,b.png/6/image/png"), `F: the page got both files, bytes and type intact — ${/files:.*/.exec(after4.text)?.[0]}`);
+  const picked = await mcp.tool("chrome_upload", { selector: "#pick", paths: [`${up}/a.txt`] });
+  ok(!picked.isError, `F: chrome_upload through a button that opens the picker — ${text(picked)}`);
+  const after5 = JSON.parse(text(await mcp.tool("chrome_read")));
+  ok(after5.text.includes("picked:a.txt=hello"), `F: the picker was caught and filled, no dialog — ${/picked:.*/.exec(after5.text)?.[0]}`);
+  const tooMany = await mcp.tool("chrome_upload", { selector: "#pick", paths: [`${up}/a.txt`, `${up}/b.png`] });
+  ok(tooMany.isError && /one file/.test(text(tooMany)), `F: a single-file picker refuses two — ${text(tooMany)}`);
+  const noPicker = await mcp.tool("chrome_upload", { selector: "#h", paths: [`${up}/a.txt`] });
+  ok(noPicker.isError && /no file picker/.test(text(noPicker)), `F: a target that opens no picker says so — ${text(noPicker)}`);
+  const missing = await mcp.tool("chrome_upload", { selector: "#f", paths: [`${up}/nope.png`] });
+  ok(missing.isError && /cannot read/.test(text(missing)), `F: a missing file fails before the browser is asked — ${text(missing)}`);
+  await Deno.remove(up, { recursive: true });
 
   const con = JSON.parse(text(await mcp.tool("chrome_console")));
   ok((con.messages || []).some((m) => m.includes("button clicked")), `G: chrome_console has the page's log — ${JSON.stringify(con.messages)}`);

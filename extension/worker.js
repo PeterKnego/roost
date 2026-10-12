@@ -350,6 +350,15 @@ chrome.debugger.onEvent.addListener((src, method, params) => {
     pushConsole(src.tabId, `[${e.level}] ${e.text}${e.url ? ` (${e.url})` : ""}`);
   }
 });
+// chrome_upload waits here for the page to open its file picker.
+const choosers = new Map(); // tabId -> resolve
+
+chrome.debugger.onEvent.addListener((src, method, params) => {
+  if (method !== "Page.fileChooserOpened") return;
+  const resolve = choosers.get(src.tabId);
+  if (resolve) { choosers.delete(src.tabId); resolve(params); }
+});
+
 // The user pressed Cancel on Chrome's "is debugging this browser" bar, or the
 // tab closed: forget it, and the next call attaches afresh.
 chrome.debugger.onDetach.addListener((src) => {
@@ -414,6 +423,53 @@ const SELECT_ALL_SCRIPT = `(() => {
   }
   return false;
 })()`;
+
+// Puts the files into the file input `this` the way a person picking them
+// would leave it, then tells the page, which listens for change (React too).
+const SET_FILES = `function (files) {
+  const dt = new DataTransfer();
+  for (const f of files) {
+    const bin = atob(f.data);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    dt.items.add(new File([bytes], f.name, { type: f.mime }));
+  }
+  this.files = dt.files;
+  this.dispatchEvent(new Event('input', { bubbles: true }));
+  this.dispatchEvent(new Event('change', { bubbles: true }));
+  return this.files.length;
+}`;
+
+// The located element itself when it is a file input, else null.
+const FILE_INPUT_SCRIPT = (args) => `(() => {
+  const el = ${args.ref !== undefined && args.ref !== null
+    ? `document.querySelector('[data-roost-ref="' + ${JSON.stringify(String(args.ref))} + '"]')`
+    : `document.querySelector(${JSON.stringify(String(args.selector || ""))})`};
+  return el && el.tagName === 'INPUT' && el.type === 'file' ? el : null;
+})()`;
+
+// The file input to fill: the target itself, or the one whose picker a
+// click on the target opens. The picker is intercepted, so no dialog ever
+// appears in front of the user.
+async function fileInput(tabId, args, at) {
+  const direct = await cdp(tabId, "Runtime.evaluate", { expression: FILE_INPUT_SCRIPT(args) });
+  if (direct.result && direct.result.objectId) return { objectId: direct.result.objectId, multiple: null };
+  await cdp(tabId, "Page.enable");
+  await cdp(tabId, "Page.setInterceptFileChooserDialog", { enabled: true });
+  try {
+    const opened = new Promise((resolve) => choosers.set(tabId, resolve));
+    await click(tabId, at.x, at.y);
+    const ev = await withTimeout(opened, 5000, "a file picker opening").finally(() => choosers.delete(tabId));
+    const { object } = await cdp(tabId, "DOM.resolveNode", { backendNodeId: ev.backendNodeId });
+    return { objectId: object.objectId, multiple: ev.mode === "selectMultiple" };
+  } catch (e) {
+    throw new Error(/did not finish/.test(String(e && e.message))
+      ? "clicking it opened no file picker — target the <input type=file> or the button that opens it"
+      : e.message);
+  } finally {
+    await cdp(tabId, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {});
+  }
+}
 
 async function locate(tabId, args) {
   if ((args.ref === undefined || args.ref === null) && !args.selector) throw new Error("pass ref (from chrome_read) or selector");
@@ -539,6 +595,23 @@ async function runTool(gk, tool, args) {
         await sleep(300);
       }
       return { typed_into: at.what, tab_id: tab.id, submitted: !!args.submit };
+    }
+    case "chrome_upload": {
+      const tab = await resolveTab(args, gk);
+      await guard(tab);
+      await rememberTab(gk, tab.id);
+      await attach(tab.id);
+      const files = Array.isArray(args.files) ? args.files : [];
+      if (!files.length) throw new Error("no files to upload");
+      const at = await locate(tab.id, args);
+      const input = await fileInput(tab.id, args, at);
+      if (input.multiple === false && files.length > 1) throw new Error(`that picker takes one file, not ${files.length}`);
+      const r = await cdp(tab.id, "Runtime.callFunctionOn", {
+        objectId: input.objectId, functionDeclaration: SET_FILES, arguments: [{ value: files }], returnByValue: true,
+      });
+      if (r.exceptionDetails) throw new Error((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text);
+      await sleep(300);
+      return { uploaded: files.map((f) => f.name), into: at.what, tab_id: tab.id };
     }
     case "chrome_console": {
       const tab = await resolveTab(args, gk);

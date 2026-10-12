@@ -33,8 +33,9 @@ pub const MAX_PENDING: usize = 16;
 /// action itself then gets the rest. `roost mcp` waits a little longer than
 /// this, so the server always answers before the client gives up.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(180);
-/// `chrome_type`'s text is the only large argument a request carries.
-const MAX_REQUEST: usize = 256 * 1024;
+/// `chrome_upload`'s files are the largest argument a request carries: up to
+/// `mcp::MAX_UPLOAD_BYTES` (10 MB), base64 makes it 4/3 of that.
+const MAX_REQUEST: usize = 16 * 1024 * 1024;
 /// Total budget for reading one request. `roost mcp` writes its line at once;
 /// a peer that trickles is not one of ours.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(10);

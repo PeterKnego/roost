@@ -162,7 +162,7 @@ the call was sent to. Bounded like `openDiff`:
 | parked calls per asking project | 16 | a looping Claude must not starve other projects |
 | call wait | 180 s | consent waits for a human (120 s), then the action |
 | screenshot | viewport only, long side ≤ 2000 px, JPEG ≤ 3.5 MB | the workspace socket drops a connection over its 8 MB frame cap (and base64 adds a third), and the Claude API refuses images over ~5 MB or 8000 px; re-encoded smaller before it is refused |
-| request line | 256 KB | `chrome_type` text is the only large argument |
+| request line | 16 MB | `chrome_upload` carries its files, up to 10 MB before base64 |
 
 None of the waiting holds a lock: the parked call is a channel, and the
 socket thread blocks on `recv_timeout`. Whoever *removes* a parked call
@@ -202,6 +202,7 @@ description says which: *the user's own Chrome, with their logins*.
 | `chrome_click` | `tab_id?`, `ref` or `selector` | a real (trusted) mouse click at the element's centre |
 | `chrome_type` | `tab_id?`, `ref` or `selector`, `text`, `submit?` | focuses, inserts text, optionally presses Enter |
 | `chrome_console` | `tab_id?` | console messages and uncaught errors seen since the tab was first attached |
+| `chrome_upload` | `tab_id?`, `ref` or `selector`, `paths` | `roost mcp` reads the files and sends them in the call; the extension fills the file input, or intercepts the picker a click on the target opens (`Page.setInterceptFileChooserDialog`) and fills that |
 | `chrome_close` | `tab_id?` | closes the tab, **only** if this grant created it with `chrome_open` (new tab); anything else is refused |
 | `handoff_read` | `since?`, `wait_seconds?` (≤ 300) | handoff messages after `since`, waiting for one if there are none |
 | `handoff_send` | `text` | posts to the handoff page |
