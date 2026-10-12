@@ -2493,6 +2493,8 @@ async function fileMenu(e, rel, isDir = false) {
       items.push({ id: "claude", label: "Send to Claude" });
     }
   }
+  // #162. A folder — or blank tree space, which is the project root — zips.
+  if (isDir || !rel) items.push({ id: "zip", label: "Download as zip" });
   // Rename and Delete need a target. The prompt version offered them at the
   // project root and then silently did nothing, because its guards were
   // `choice === "3" && rel`. A menu can simply not offer them.
@@ -2512,6 +2514,8 @@ async function fileMenu(e, rel, isDir = false) {
     // file of any size. No intent and no XHR — this is a GET.
     window.location.href =
       `/frag/${PROJECT}/download?path=${rel.split("/").map(encodeURIComponent).join("/")}`;
+  } else if (choice === "zip") {
+    downloadZip(rel);
   } else if (choice === "claude") {
     sendToClaude(rel);
   } else if (choice === "upload") {
@@ -2525,6 +2529,23 @@ async function fileMenu(e, rel, isDir = false) {
       confirm: "Delete", danger: true });
     if (yes) send({ t: "DeleteFile", rel });
   }
+}
+
+/// A folder as a zip (#162). The plan is asked for first, as JSON, because
+/// the download itself is a navigation: a refusal (too many files, an
+/// unreadable folder) served to a navigation would replace this workspace with
+/// an error page. Only an archive that will be served is navigated to.
+async function downloadZip(rel) {
+  const q = rel ? `path=${rel.split("/").map(encodeURIComponent).join("/")}&` : "";
+  const url = `/frag/${PROJECT}/download?${q}zip=1`;
+  let plan;
+  try {
+    plan = await (await fetch(`${url}&check=1`)).json();
+  } catch {
+    return showError(`could not ask roost about ${rel || "the project"} — nothing was downloaded`);
+  }
+  if (!plan.ok) return showError(plan.error);
+  window.location.href = url;
 }
 
 /// Why a change row cannot be reverted, or "" if it can. A hint for the menu

@@ -110,7 +110,7 @@ Each terminal is a PTY owned by `roost` and wrapped in `dtach`, so sessions surv
 Open a file in one browser and it opens in every connected browser. Layout and unsaved buffers persist across restarts, stored outside the repo — so pane drags never show up in `git status`.
 
 ### Drag-n-drop files/images or paste images
-Drag-n-drop files into the file tree for instant upload to remote filesystem.
+Drag-n-drop files into the file tree for instant upload to remote filesystem. Right-click a file to download it, or a folder to download it as a zip.
 As for images, you can drag them or paste them into `claude` terminal and they will be uploaded and pasted directly into `claude` as image - this is a must-have feature when you just want to quickly paste a screenshot into claude for analysis.
 
 ### Claude Code integrates with the project

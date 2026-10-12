@@ -66,6 +66,11 @@ tar = "0.4"
 # already held 0.2.189 before this requirement was added, so adding it
 # resolved to that same version rather than introducing a new one.
 libc = "0.2"
+# Both already in Cargo.lock through ureq. Promoted to direct because
+# `zipdl.rs` writes a folder download as a zip by hand: raw deflate for the
+# entries and CRC-32 for their headers, with no zip crate on top.
+flate2 = "1"
+crc32fast = "1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -30,6 +30,7 @@ pub mod notify;
 pub mod origin;
 pub mod osc;
 pub mod paste;
+pub mod zipdl;
 pub mod procsess;
 pub mod projects;
 pub mod proto;

@@ -18,6 +18,8 @@
 //!       `download` -> section B fails on the bytes, because `raw` refuses a
 //!       non-image with a 404 page.
 //!   (c) dropping the `dirty` branch in the label -> section D fails.
+//!   (d) `downloadZip` navigating without asking `check=1` first -> section G
+//!       fails: the refusal replaces the workspace and no message is shown.
 //!
 //! Run: deno run -A tests/browser/download.mjs
 import { fixture, freePort, openPage, profileDir, startBrowser, startRoost, until, sleep }
@@ -30,7 +32,9 @@ const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) 
 const fx = await fixture({ autosave: false });
 const BODY = "line one\nline two\n";
 await Deno.writeTextFile(`${fx.dir}/build.log`, BODY);
-await Deno.mkdir(`${fx.dir}/sub`, { recursive: true });
+await Deno.mkdir(`${fx.dir}/sub/inner`, { recursive: true });
+await Deno.writeTextFile(`${fx.dir}/sub/inner/note.txt`, "zipped\n");
+await Deno.mkdir(`${fx.dir}/locked`, { recursive: true });
 const dlDir = `${fx.base}/downloads`;
 await Deno.mkdir(dlDir, { recursive: true });
 
@@ -99,6 +103,48 @@ try {
   const item = (dirty.items || []).find((i) => i.id === "download");
   ok(item && /saved version/i.test(item.label),
      `the label says which version (${JSON.stringify(item && item.label)})`);
+
+  console.log("\nE. a folder, and the project root, offer Download as zip; a file does not");
+  const zipOnDir = await openMenuOn('details[data-rel="sub"] > summary', null);
+  ok((zipOnDir.items || []).some((i) => i.id === "zip"), `zip offered on a folder (${JSON.stringify(zipOnDir.items)})`);
+  ok(!(onFile.items || []).some((i) => i.id === "zip"), "zip not offered on a file");
+  const onRoot = await evalIn(`(() => { window.__items = null;
+    askMenu = (o) => { window.__items = o.items.map((i) => i.id); return Promise.resolve(null); };
+    const t = document.querySelector("ul.tree").parentElement;
+    t.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 8, clientY: 8 }));
+    return true; })()`);
+  await sleep(350);
+  ok(onRoot && (await evalIn("JSON.stringify(window.__items)") || "").includes("zip"), "zip offered on blank tree space (the project root)");
+
+  console.log("\nF. choosing it lands <folder>.zip that unpacks to the folder");
+  await openMenuOn('details[data-rel="sub"] > summary', "zip");
+  const zipPath = `${dlDir}/sub.zip`;
+  const zipped = await until(async () => {
+    try { return (await Deno.stat(zipPath)).size > 0 && !(await Deno.stat(`${zipPath}.crdownload`).catch(() => null)); } catch { return false; }
+  }, 20, "sub.zip");
+  ok(zipped, `sub.zip landed at ${zipPath}`);
+  if (zipped) {
+    const py = new Deno.Command("python3", { args: ["-c",
+      `import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None; print(sorted(z.namelist())); print(z.read("sub/inner/note.txt").decode(), end="")`, zipPath],
+      stdout: "piped", stderr: "piped" });
+    const r = await py.output();
+    const out = new TextDecoder().decode(r.stdout);
+    ok(r.success && out.includes("'sub/inner/note.txt'") && out.endsWith("zipped\n"), `it unpacks with its contents — ${out.trim() || new TextDecoder().decode(r.stderr)}`);
+  }
+
+  console.log("\nG. a refusal is a message, not an error page in place of the workspace");
+  // Only meaningful when the permission can bite.
+  const isRoot = (await new Deno.Command("id", { args: ["-u"], stdout: "piped" }).output()).stdout;
+  if (new TextDecoder().decode(isRoot).trim() !== "0") {
+    await Deno.chmod(`${fx.dir}/locked`, 0o000);
+    await evalIn("window.__err = null; const _se = showError; showError = (m) => { window.__err = m; _se(m); }; true");
+    const before = await evalIn("location.href");
+    await openMenuOn('details[data-rel="locked"] > summary', "zip");
+    const said = await until(() => evalIn("window.__err"), 10, "the refusal");
+    await Deno.chmod(`${fx.dir}/locked`, 0o755);
+    ok(said && /cannot read/.test(await evalIn("window.__err")), `the user is told why — ${await evalIn("window.__err")}`);
+    ok(await evalIn("location.href") === before, "and the workspace is still the page");
+  }
 } finally {
   try { await page?.close(); } catch { /* already gone */ }
   browser.close();
