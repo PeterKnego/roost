@@ -146,11 +146,12 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   matching its own liveness check. Within one owner, a terminal name is held
   by at most one live session, native or resident. Ending a session
   or closing a project both need positive ownership evidence, same as every
-  other destructive path in this codebase. And `worktree::list` — the only
-  git call this feature adds — never runs under the hub lock or the
-  `REGISTRY` lock, for the same reason every other git invocation here
-  doesn't: a stalled `git worktree list` must not freeze every websocket or
-  wedge the sweep that every project's reconcile runs through.
+  other destructive path in this codebase. And the git calls this feature
+  adds — `worktree::list`, and `create_named`'s `git worktree add` with the
+  `branch --list` checks it and `name_taken` make — never run under the hub
+  lock or the `REGISTRY` lock, for the same reason every other git
+  invocation here doesn't: a stalled `git` must not freeze every websocket
+  or wedge the sweep that every project's reconcile runs through.
 - **Search shares the tree's filter but is not the tree.** `search.rs` walks
   with `projects::TreeFilter`, so `show_hidden` and the `hide` list mean the
   same thing in both — but it additionally refuses `.git` and any directory

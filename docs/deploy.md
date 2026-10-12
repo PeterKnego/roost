@@ -123,6 +123,21 @@ the hook falls back to creating the worktree itself, roost's own naming
 convention and all: creating a worktree destroys nothing, so that is the one
 case where falling through to "just do it" is the safe default.
 
+Subagent worktrees ask too. A Claude that runs a subagent with
+`isolation: "worktree"` raises the same `WorktreeCreate` hook, and its payload
+carries nothing that tells it apart from the terminal's own request — no agent
+id or type, only a generated `agent-<hex>` name (observed on Claude Code
+2.1.296). So with the setting on, each such subagent shows the same dialog,
+re-homes the terminal when approved, and is refused at once when no roost tab
+is open on the project.
+
+Turn the setting off before **downgrading** to a roost that predates it. An
+older binary does not know the `worktree-hook` subcommand and reads it as a
+port number, so the hook exits 2 — and a non-zero `WorktreeCreate` hook is
+Claude Code's refusal: every `--worktree` start aborts and every
+`EnterWorktree` fails in that project until the entry is removed from
+`.claude/settings.local.json`.
+
 Terminals are **never started implicitly**. Opening a project creates a
 Terminal *tab*, not a session; the session begins only when the user presses
 Enter or clicks the placeholder. Before this, merely looking at a project

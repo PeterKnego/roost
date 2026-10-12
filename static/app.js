@@ -5173,8 +5173,12 @@ function worktreeHookRow() {
     const on = s !== "on";
     const yes = await askConfirm({
       title: "Let roost create Claude's worktrees",
-      lines: [on ? "Write a WorktreeCreate hook to .claude/settings.local.json?"
-                 : "Remove roost's worktree hook from .claude/settings.local.json?"],
+      // The second line is the one thing Claude Code's payload cannot tell
+      // roost: a subagent's `isolation: "worktree"` asks through the same
+      // hook as a terminal's own request, so it asks too (#156, R29).
+      lines: on ? ["Write a WorktreeCreate hook to .claude/settings.local.json?",
+                   "Subagent worktrees ask too, and are refused when no roost tab is open on this project."]
+                : ["Remove roost's worktree hook from .claude/settings.local.json?"],
       confirm: on ? "Enable" : "Disable",
       danger: !on,
     });
