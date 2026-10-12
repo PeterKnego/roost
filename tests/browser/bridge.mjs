@@ -23,6 +23,8 @@
 //!       follow off, Claude's tab is left in front of the user's.
 //!   (f) chrome_type's select-all removed -> F fails: the input submits
 //!       "stale hello roost" and the textarea holds "old wordsnew words".
+//!   (g) SET_FILES building File/DataTransfer from the top frame's window ->
+//!       F fails: the framed input reports framefile:false.
 //!
 //! Run: deno run -A tests/browser/bridge.mjs
 import { fixture, freePort, openPage, attachTarget, profileDir, startBrowser, startRoost, until, sleep }
@@ -56,7 +58,7 @@ const site = Deno.serve({ port: sitePort, hostname: "127.0.0.1", onListen() {} }
 <input type="file" id="hf" style="display:none" onchange="this.files[0].text().then((t) => document.getElementById('hv').textContent='picked:' + this.files[0].name + '=' + t)">
 <button id="pick" onclick="document.getElementById('hf').click()">Pick a file</button>
 <p id="fv"></p><p id="hv"></p>
-<iframe srcdoc="<button onclick=&quot;parent.document.getElementById('h').textContent='framed'&quot;>Inside frame</button><input id=fi value=frame-stale>"></iframe>
+<iframe srcdoc="<button onclick=&quot;parent.document.getElementById('h').textContent='framed'&quot;>Inside frame</button><input id=fi value=frame-stale><input type=file id=ff onchange=&quot;parent.document.getElementById('h').textContent='framefile:' + (this.files[0] instanceof File) + '/' + this.files[0].name&quot;>"></iframe>
 <button id="corner" style="position:fixed;right:0;bottom:0;width:160px;height:80px" onclick="document.getElementById('h').textContent='cornered'">corner</button>`, { headers: { "content-type": "text/html" } }));
 const target = `http://127.0.0.1:${sitePort}/`;
 
@@ -206,6 +208,15 @@ try {
   await mcp.tool("chrome_type", { ref: Number(/^\[(\d+)\]/.exec(fin || "")?.[1]), text: "frame-new" });
   const finAfter = (JSON.parse(text(await mcp.tool("chrome_read"))).elements || []).find((e) => e.includes("(in frame)") && e.startsWith("[") && e.includes("input"));
   ok(/"frame-new"/.test(finAfter || ""), `F: typing into a framed input replaces its value — ${fin} -> ${finAfter}`);
+  // The file comes from the frame's own realm: a File built in the top frame
+  // fails the frame's instanceof, which is what broke Wix's uploader.
+  const fup = await Deno.makeTempDir();
+  await Deno.writeTextFile(`${fup}/c.txt`, "framed");
+  const ffi = (JSON.parse(text(await mcp.tool("chrome_read"))).elements || []).find((e) => e.includes("(in frame)") && e.includes("file"));
+  const fres = await mcp.tool("chrome_upload", { ref: Number(/^\[(\d+)\]/.exec(ffi || "")?.[1]), paths: [`${fup}/c.txt`] });
+  ok(!fres.isError, `F: chrome_upload into a framed file input — ${ffi} ${text(fres)}`);
+  ok(JSON.parse(text(await mcp.tool("chrome_read"))).text.includes("framefile:true/c.txt"), "F: the framed input got a File of its own window");
+  await Deno.remove(fup, { recursive: true });
 
   // A point on the screenshot: the corner button, 20 px in from the image's bottom right.
   const shotForPoint = (await mcp.tool("chrome_screenshot")).content.find((c) => c.type === "image");
