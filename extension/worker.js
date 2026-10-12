@@ -245,14 +245,34 @@ async function waitLoaded(tabId) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/// Pages Claude opens go into a tab group of its own per Claude session, in
-/// the window the user last used, so they can watch it work beside their own
-/// tabs. With `follow` on (the default) the new tab comes to the front; off,
-/// it opens behind and only a screenshot brings it forward, briefly.
+/// "roost - <repo> - <worktree>" for a project under `.claude/worktrees/`,
+/// where both Claude Code and roost put them, else "roost - <project>". A
+/// label only: a worktree living elsewhere is named like any project, and
+/// nothing decides anything by it.
+function groupTitle(project) {
+  let p = project;
+  try { p = decodeURIComponent(project); } catch { /* not encoded */ }
+  const wt = /^(.*)\/\.claude\/worktrees\/([^/]+)$/.exec(p);
+  return wt ? `roost - ${wt[1]} - ${wt[2].replace(/^worktree-/, "")}` : `roost - ${p}`;
+}
+
+/// A grant key is `origin|project|session|pid`; only the project may hold a
+/// "|" of its own.
+const grantProject = (gk) => gk.split("|").slice(1, -2).join("|");
+
+/// Pages Claude opens go into one tab group per roost project, in the window
+/// the user last used, so they can watch it work beside their own tabs. Per
+/// project, not per Claude session, because the title names the project:
+/// two sessions would otherwise make two groups the user cannot tell apart.
+/// Which session may close a tab is `opened`'s business, not the group's.
+/// With `follow` on (the default) the new tab comes to the front; off, it
+/// opens behind and only a screenshot brings it forward, briefly.
 async function claudeTab(url, gk) {
   const { follow } = await settings();
   const groups = await session("groups", {});
-  const group = groups[gk] !== undefined ? await chrome.tabGroups.get(groups[gk]).catch(() => null) : null;
+  const project = grantProject(gk);
+  const gkey = `${gk.split("|")[0]}|${project}`;
+  const group = groups[gkey] !== undefined ? await chrome.tabGroups.get(groups[gkey]).catch(() => null) : null;
   let windowId = group && group.windowId;
   if (!windowId) {
     const w = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
@@ -269,10 +289,8 @@ async function claudeTab(url, gk) {
     await chrome.tabs.group({ groupId: group.id, tabIds: [tab.id] });
   } else {
     const id = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId } });
-    // The grant key ends `|<session>|<pid>`; a project key may hold anything.
-    const parts = gk.split("|");
-    await chrome.tabGroups.update(id, { title: `Claude · ${parts[parts.length - 2]}`, color: "orange" });
-    groups[gk] = id;
+    await chrome.tabGroups.update(id, { title: groupTitle(project), color: "orange" });
+    groups[gkey] = id;
     await setSession("groups", groups);
   }
   return tab;
@@ -613,4 +631,4 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
 // Test hook: the browser suite drives the worker through the DevTools
 // protocol and needs to reach these without a UI.
-self.roostBridge = { settings, syncContentScripts, verify, deniedReason, sendToRoost };
+self.roostBridge = { settings, syncContentScripts, verify, deniedReason, sendToRoost, groupTitle };

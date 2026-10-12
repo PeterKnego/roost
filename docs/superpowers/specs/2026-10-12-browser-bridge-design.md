@@ -222,8 +222,9 @@ the tab's state.
 A background tab does not paint, and `Page.captureScreenshot` on one can
 hang or come back blank. So a screenshot makes its tab the active one in its
 own window first. `chrome_open` puts the pages it opens in a tab group of
-their own per Claude session ("Claude · <terminal>"), in the window the user
-last used, so the user can watch it work beside their own tabs. The option
+their own per roost project ("roost - <project>", or
+"roost - <repo> - <worktree>" for one under `.claude/worktrees/`), in the
+window the user last used, so the user can watch it work beside their own tabs. The option
 *Bring Claude's tabs to the front* (on by default) decides the cost of that:
 on, each new tab comes to the front as it opens; off, it opens behind, and a
 screenshot that has to bring one forward hands the user's own tab back

@@ -176,10 +176,12 @@ try {
     active: t.active, windowId: t.windowId,
     group: t.groupId === -1 ? null : (await chrome.tabGroups.get(t.groupId)).title }))`);
   const firstTab = await tabInfo(JSON.parse(text(opened)).tab_id);
-  ok(firstTab.group === "Claude · term" && firstTab.active, `O: an opened page is in the session's group, in front — ${JSON.stringify(firstTab)}`);
+  ok(firstTab.group === `roost - ${fx.project}` && firstTab.active, `O: an opened page is in the session's group, in front — ${JSON.stringify(firstTab)}`);
+  const wtTitle = await worker.evalIn(`roostBridge.groupTitle("repo/.claude/worktrees/worktree-bright-fox")`);
+  ok(wtTitle === "roost - repo - bright-fox", `O: a worktree's group names its repo and worktree — ${wtTitle}`);
   const second = JSON.parse(text(await mcp.tool("chrome_open", { url: `${target}?second` })));
   const secondTab = await tabInfo(second.tab_id);
-  ok(secondTab.group === "Claude · term" && secondTab.windowId === firstTab.windowId,
+  ok(secondTab.group === `roost - ${fx.project}` && secondTab.windowId === firstTab.windowId,
     `O: the session's next page joins the same group — ${JSON.stringify(secondTab)}`);
 
   // With follow off a page opens behind, and a screenshot borrows the front
@@ -189,7 +191,7 @@ try {
   const front = await worker.evalIn(`chrome.tabs.query({ active: true, windowId: ${secondTab.windowId} }).then(([t]) => t.id)`);
   const behind = JSON.parse(text(await mcp.tool("chrome_open", { url: `${target}?behind` })));
   const behindTab = await tabInfo(behind.tab_id);
-  ok(!behindTab.active && behindTab.group === "Claude · term", `O: with follow off, a page opens behind — ${JSON.stringify(behindTab)}`);
+  ok(!behindTab.active && behindTab.group === `roost - ${fx.project}`, `O: with follow off, a page opens behind — ${JSON.stringify(behindTab)}`);
   const behindShot = await mcp.tool("chrome_screenshot", { tab_id: behind.tab_id });
   const frontAfter = await worker.evalIn(`chrome.tabs.query({ active: true, windowId: ${secondTab.windowId} }).then(([t]) => t.id)`);
   ok((behindShot.content || []).some((c) => c.type === "image") && frontAfter === front,

@@ -48,7 +48,8 @@ under *Never drive these sites*.
 
 While Claude works in a tab, Chrome shows its "is debugging this browser"
 bar. Pressing *Cancel* there detaches it. Pages Claude opens go into an
-orange "Claude · <terminal>" tab group in your window and come to the front,
+orange "roost - <project>" tab group in your window (with the worktree
+name added for a worktree) and come to the front,
 so you can watch. To keep them behind your own tab instead, turn off *Bring
 Claude's tabs to the front* in the options.
 
