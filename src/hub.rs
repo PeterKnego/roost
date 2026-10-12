@@ -1764,6 +1764,63 @@ impl Hub {
             }
         }
 
+        // R25a (fix round 1, finding 4): the reverse of the loop above — a
+        // resident tab (`home: Some(h)`) whose `(h, name)` no longer
+        // matches a *current* entry in the `session_homes` just rebuilt
+        // (the record was forgotten, or re-pointed to a third project) is
+        // stale and must go, or End Session on it would compute a
+        // `kill_target` of this owner, find nothing to kill, report
+        // success, and orphan the shell that is actually still running at
+        // `h`.
+        //
+        // Gated on positive evidence, not merely "absent from
+        // `session_homes`": `home::owner_of` is re-read here rather than
+        // trusted from the absence alone, because `Unknown` (an empty or
+        // unreadable record — possibly mid-write) is exactly as likely to
+        // produce that absence as a genuine forget is, and `Unknown` must
+        // destroy nothing — a half-written record is not evidence this
+        // tab's session actually moved anywhere.
+        //
+        // Filtered on `home` as well as `session`, not a blunt by-name
+        // `EndSession` (which matches any `Tab::Terminal` of that name
+        // regardless of `home` — see its own doc comment in
+        // `workspace.rs`): a genuinely live *native* tab sharing this
+        // name at this same project must never be swept up here.
+        let stale_residents: Vec<(String, String)> = self
+            .ws
+            .panes
+            .iter()
+            .flat_map(|p| p.tabs.iter())
+            .filter_map(|t| match t {
+                Tab::Terminal { session, home: Some(h) }
+                    if !matches!(self.session_homes.get(session), Some(sh) if sh == h) =>
+                {
+                    Some((session.clone(), h.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (name, home) in stale_residents {
+            let positively_moved = match crate::home::owner_of(&home, &name) {
+                crate::home::Owner::Here => true,
+                crate::home::Owner::Elsewhere(ref o) => o != &self.project,
+                crate::home::Owner::Unknown(_) => false,
+            };
+            if !positively_moved {
+                continue;
+            }
+            for pane in self.ws.panes.iter_mut() {
+                let before = pane.tabs.len();
+                pane.tabs.retain(
+                    |t| !matches!(t, Tab::Terminal { session: s, home: Some(h) } if s == &name && h == &home),
+                );
+                if pane.tabs.len() != before {
+                    pane.active = pane.active.min(pane.tabs.len().saturating_sub(1));
+                    self.ws.version += 1;
+                }
+            }
+        }
+
         // The mirror image, found on the *home*'s own refresh: a native tab
         // (`home: None`) whose session is still truly alive here
         // (`raw_live`, computed above) but absent from `self.ws.live_sessions`
@@ -2276,16 +2333,41 @@ impl Hub {
             return self.send_to(from, &Event::Error { msg });
         }
         let home = resident_home.unwrap_or_else(|| self.project.clone());
-        // The one other project (besides this hub, refreshed inline by
-        // `finish` below) whose own `session_homes`/`live_sessions` this
-        // change can affect: the new owner on a move-in, the real home
-        // regained on a resident's move-back. A native session moving back
-        // (an already-`Here` forget) touches nobody else.
-        let other: Option<String> = match (&to, resident) {
-            (Some(url), _) => Some(url.clone()),
-            (None, true) => Some(home.clone()),
-            (None, false) => None,
+        // Read before anything is written: the owner the record names
+        // *right now*, if any. A plain move-in or move-back has no prior
+        // owner worth a second thought — but a native session re-pointed
+        // straight from one worktree to another (or home) *from the
+        // home's own page* leaves that *old* owner with a stale resident
+        // tab unless it is refreshed too (fix round 1, finding 4's last
+        // point), and nothing else here would otherwise ever name it.
+        let prior_owner = match crate::home::owner_of(&home, &session) {
+            crate::home::Owner::Elsewhere(o) => Some(o),
+            _ => None,
         };
+        // Two kinds of follow-up, since only one of them (R25a) may add a
+        // tab back rather than merely refresh what is already there — see
+        // `retab_native_if_missing`'s own doc comment for why that is not
+        // folded into a plain `refresh_and_broadcast` everywhere.
+        let mut plains: Vec<String> = Vec::new();
+        let mut retabs: Vec<String> = Vec::new();
+        match &to {
+            Some(url) => {
+                plains.push(url.clone());
+                if let Some(o) = &prior_owner {
+                    if o != url {
+                        plains.push(o.clone());
+                    }
+                }
+            }
+            None => {
+                retabs.push(home.clone());
+                if let Some(o) = &prior_owner {
+                    if o != &self.project {
+                        plains.push(o.clone());
+                    }
+                }
+            }
+        }
 
         let from = from.clone();
         let finish_from = from.clone();
@@ -2323,6 +2405,16 @@ impl Hub {
                     if !is_worktree_of_home {
                         return Err(format!("{url}: not a worktree of {work_home}"));
                     }
+                    // Folded by R25b: git vouching for the *path* is not
+                    // enough on its own — a worktree git happily lists but
+                    // placed as a plain sibling of the home (not under its
+                    // `.claude/worktrees/`) has no re-home convention to
+                    // read back later, so `home::owner_path` — the exact
+                    // shape every other re-home consumer requires — must
+                    // also recognise it.
+                    if crate::home::owner_path(&work_home, &url).is_none() {
+                        return Err(format!("{url}: not a {work_home}/.claude/worktrees worktree"));
+                    }
                     // R16: a resident must never shadow a native session of
                     // the same name at its new owner.
                     if crate::session::live_names(&url).contains(&work_session) {
@@ -2335,8 +2427,11 @@ impl Hub {
         // Refreshes and replies on this hub in the one lock the thread (or
         // the sync fallback) re-takes — the `do_new_worktree` shape. On
         // success this hub's own `session_homes`/`live_sessions` are rebuilt
-        // and broadcast immediately; the *other* project's hub (if any) is
-        // refreshed separately below, off this lock entirely.
+        // and broadcast immediately — which, since the record has already
+        // changed, is also where R25a's stale-tab drop fires for *this*
+        // hub if it just stopped being a resident's owner. Every *other*
+        // affected project is handled separately below, off this lock
+        // entirely.
         let finish = move |h: &mut Hub, r: &Result<(), String>| {
             match r {
                 Err(msg) => h.send_to(&finish_from, &Event::Error { msg: msg.clone() }),
@@ -2349,7 +2444,9 @@ impl Hub {
         };
         match self.self_ref.upgrade() {
             Some(arc) => {
-                let other2 = other.clone();
+                let plains2 = plains.clone();
+                let retabs2 = retabs.clone();
+                let session2 = session.clone();
                 let home2 = home.clone();
                 let spawned = std::thread::Builder::new().name("rehome".into()).spawn(move || {
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
@@ -2360,8 +2457,11 @@ impl Hub {
                         finish(&mut h, &r);
                     }
                     if ok {
-                        if let Some(o) = &other2 {
-                            crate::hub::refresh_and_broadcast(o);
+                        for p in &plains2 {
+                            crate::hub::refresh_and_broadcast(p);
+                        }
+                        for p in &retabs2 {
+                            crate::hub::retab_native_if_missing(p, &session2);
                         }
                         broadcast_all(&Event::ProjectsChanged { project: home2 });
                     }
@@ -2375,8 +2475,11 @@ impl Hub {
                 let ok = r.is_ok();
                 finish(self, &r);
                 if ok {
-                    if let Some(o) = &other {
-                        crate::hub::refresh_and_broadcast(o);
+                    for p in &plains {
+                        crate::hub::refresh_and_broadcast(p);
+                    }
+                    for p in &retabs {
+                        crate::hub::retab_native_if_missing(p, &session);
                     }
                     broadcast_all(&Event::ProjectsChanged { project: home });
                 }
@@ -3504,6 +3607,44 @@ pub fn refresh_and_broadcast(project: &str) {
     let Some(h) = hub else { return };
     let mut g = Hub::lock(&h);
     g.refresh_live_sessions();
+    let ev = g.snapshot_event(&String::new());
+    g.broadcast(&ev);
+}
+
+/// R25a: gives `name` a plain native tab at `project`'s own `RIGHT` pane
+/// if it has none at all. Called only at the two positive transitions
+/// that actually regain a session — `Hub::do_rehome`'s "Move back", and
+/// the R18 forget in `claudes::sweep_gone_owners` — never folded into
+/// `refresh_live_sessions` itself: that runs on every refresh (every
+/// terminal-affecting intent, and `Hub::new`), and auto-adding a tab for
+/// *any* tabless native live session there would silently undo a
+/// deliberate detach-close the moment the next refresh ran. A project
+/// nobody has open has no hub and needs nothing.
+pub fn retab_native_if_missing(project: &str, name: &str) {
+    let Some(reg) = REGISTRY.get() else { return };
+    let hub = {
+        let map = reg.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(project).cloned()
+    };
+    let Some(h) = hub else { return };
+    let mut g = Hub::lock(&h);
+    g.refresh_live_sessions();
+    let exists = g
+        .ws
+        .panes
+        .iter()
+        .flat_map(|p| p.tabs.iter())
+        .any(|t| matches!(t, Tab::Terminal { session: s, .. } if s == name));
+    if !exists {
+        let intent = Intent::OpenTab {
+            pane: crate::proto::RIGHT,
+            tab: Tab::Terminal { session: name.to_string(), home: None },
+        };
+        if let Ok(true) = workspace::apply_layout(&mut g.ws, &intent) {
+            g.ws.version += 1;
+            g.persist();
+        }
+    }
     let ev = g.snapshot_event(&String::new());
     g.broadcast(&ev);
 }
@@ -4681,6 +4822,26 @@ mod tests {
             matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here),
             "R18: the record must be forgotten on positive evidence"
         );
+        // Fix round 1, finding 4: the R18 forget is one of the two
+        // positive transitions that re-tabs the home — the session had no
+        // tab here at all before (nobody had opened one), and the sweep's
+        // `retab_native_if_missing` call must have given it one.
+        //
+        // Revert check: removing that call from `sweep_gone_owners` (so
+        // the home is left to a plain `refresh_and_broadcast` instead)
+        // fails this assertion, observed verbatim as its own message.
+        // Restored.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut home_has_tab = false;
+        while std::time::Instant::now() < deadline {
+            home_has_tab = Hub::lock(&home_hub).ws.panes.iter().flat_map(|p| p.tabs.iter())
+                .any(|t| matches!(t, Tab::Terminal { session, home: None } if session == "term3"));
+            if home_has_tab {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(home_has_tab, "the home must regain a plain native tab for term3");
 
         Hub::lock(&home_hub).handle(&c, Intent::EndSession { session: "term3".into() });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -8884,6 +9045,202 @@ mod tests {
         drain(&rxa);
         owner_hub.handle(&a, Intent::Rehome { session: "term3".into(), to: None });
         assert!(matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here), "the record must be forgotten");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// Fix round 1, ruling R25b: git vouching for a worktree's path is not
+    /// enough on its own — a worktree git happily lists but placed as a
+    /// plain subdirectory of the home (not under its own
+    /// `.claude/worktrees/`) has no re-home convention to read back later,
+    /// so `home::owner_path` — the exact shape every other re-home
+    /// consumer requires — must also recognise it.
+    ///
+    /// Revert check: removing the `home::owner_path` gate (keeping only
+    /// the git-list/`strip_prefix` check) fails this — the clicker gets a
+    /// `State` snapshot instead of an `Error`, observed in the panic's own
+    /// dump of it. Restored.
+    #[test]
+    fn rehome_refuses_a_worktree_not_under_claude_worktrees() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        // A real, git-vouched-for worktree — just not where the re-home
+        // convention requires one.
+        let wt = repo.join("other-worktrees/w1");
+        assert!(std::process::Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["worktree", "add", "-b", "w1", wt.to_str().unwrap()])
+            .status().unwrap().success());
+        let not_a_convention_url = "repo/other-worktrees/w1".to_string();
+
+        let _att = crate::session::reserve_and_attach("repo", "term", &repo).unwrap();
+
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::Rehome { session: "term".into(), to: Some(not_a_convention_url) });
+        let got = rxa.try_recv().expect("an Error must be sent");
+        assert!(got.contains(r#""t":"Error""#) && got.contains(".claude/worktrees"), "{got}");
+        assert!(matches!(crate::home::owner_of("repo", "term"), crate::home::Owner::Here), "no record must be written");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// Fix round 1, finding 4, end to end: "Move back" must not leave the
+    /// owner with a stale `Tab::Terminal{term3, home: Some(H)}` — before
+    /// R25a that tab survived the forget, so a later End Session on it
+    /// computed `kill_target = owner`, found nothing to kill, reported
+    /// success, and orphaned the real shell still running at `H`. After
+    /// the fix the owner loses the tab, the home regains a plain native
+    /// one, and End Session on *that* tab really ends the real dtach
+    /// master.
+    ///
+    /// `Hub::for_project`, not a bare `Hub::new`: the fix runs on
+    /// `do_rehome`'s spawned-thread path (`retab_native_if_missing`,
+    /// `refresh_and_broadcast`), which only exists for a hub registered in
+    /// `REGISTRY` — the same reason `end_session_of_a_resident_rehomed_away_since_is_refused`
+    /// needs it.
+    ///
+    /// Revert check: commenting out the `retab_native_if_missing` call in
+    /// `do_rehome`'s `None` branch (leaving only the owner-side cleanup
+    /// R25a's `refresh_live_sessions` fix already does) makes the "home
+    /// has a term3 tab" assertion below time out and fail. Restored.
+    #[test]
+    fn move_back_drops_the_owner_tab_and_retabs_the_session_at_home() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "r25a-moveback-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let att = crate::session::reserve_and_attach(home, "term3", &home_dir)
+            .expect("/usr/bin/dtach is a runtime prerequisite elsewhere in this project");
+        let sock = crate::session::socket_path(home, "term3");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up before this test can mean anything");
+        drop(att);
+
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        let owner_hub = Hub::for_project(&owner, owner_dir.clone());
+        assert!(
+            Hub::lock(&owner_hub).ws.panes.iter().flat_map(|p| p.tabs.iter())
+                .any(|t| matches!(t, Tab::Terminal { session, home: Some(h) } if session == "term3" && h == home)),
+            "setup: the owner must already have term3's resident tab"
+        );
+        let home_hub = Hub::for_project(home, home_dir.clone());
+
+        let (c, rx) = Hub::lock(&owner_hub).subscribe();
+        drain(&rx);
+        Hub::lock(&owner_hub).handle(&c, Intent::Rehome { session: "term3".into(), to: None });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let owner_clear = !Hub::lock(&owner_hub).ws.panes.iter().flat_map(|p| p.tabs.iter())
+                .any(|t| matches!(t, Tab::Terminal { session, .. } if session == "term3"));
+            let home_has_it = Hub::lock(&home_hub).ws.panes.iter().flat_map(|p| p.tabs.iter())
+                .any(|t| matches!(t, Tab::Terminal { session, home: None } if session == "term3"));
+            if owner_clear && home_has_it {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "owner_clear={owner_clear} home_has_it={home_has_it}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        drain(&rx);
+
+        // End Session on the home's own (regained) tab must really end the
+        // real dtach master — the whole point of dropping the owner's
+        // stale one.
+        let (c2, rx2) = Hub::lock(&home_hub).subscribe();
+        drain(&rx2);
+        Hub::lock(&home_hub).handle(&c2, Intent::EndSession { session: "term3".into() });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!any_process_holds(&sock), "End Session on the home's regained tab must really end the shell");
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Fix round 1, finding 4's safety rail: an `Unknown` record (empty or
+    /// unreadable — possibly mid-write) must NOT be read as "positively
+    /// moved". Dropping the owner's tab on the strength of `Unknown` would
+    /// orphan a terminal that is, as far as anyone can currently tell,
+    /// still exactly where its tab says.
+    ///
+    /// Revert check: changing the `Unknown` arm of `refresh_live_sessions`'s
+    /// R25a check from `false` to `true` fails this — observed: `an
+    /// Unknown record must not get the tab dropped`. Restored.
+    #[test]
+    fn an_unknown_record_keeps_the_owners_stale_looking_tab() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "r25a-unknown-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let _att = crate::session::reserve_and_attach(home, "term3", &home_dir).unwrap();
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        let mut owner_hub = Hub::new(&owner, owner_dir.clone());
+        assert!(
+            owner_hub.ws.panes.iter().flat_map(|p| p.tabs.iter())
+                .any(|t| matches!(t, Tab::Terminal { session, home: Some(h) } if session == "term3" && h == home)),
+            "setup: the owner must have term3's resident tab"
+        );
+
+        // Corrupt the record in place — an empty file is `Unknown`, not
+        // "forgotten" and not "still here".
+        let rec = crate::wsstate::state_dir().join("home").join(crate::projects::storage_key(home)).join("term3");
+        std::fs::write(&rec, "").unwrap();
+        assert!(matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Unknown(_)), "setup");
+
+        owner_hub.refresh_live_sessions();
+        assert!(
+            owner_hub.ws.panes.iter().flat_map(|p| p.tabs.iter())
+                .any(|t| matches!(t, Tab::Terminal { session, home: Some(h) } if session == "term3" && h == home)),
+            "an Unknown record must not get the tab dropped"
+        );
+
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
         std::env::remove_var("ROOST_CMD");

@@ -293,45 +293,91 @@ fn detect_moves_in(
     owner_of: &dyn Fn(&str, &str) -> crate::home::Owner,
 ) -> Vec<Move> {
     let mut out = Vec::new();
-    // One `worktree::list` per home for however many Claudes it has —
-    // R8's "N Claudes cost one git call per home".
+    // Both caches are keyed by `c.project` and filled at most once per
+    // distinct project per call. R8's "N Claudes cost one git call per
+    // home" already covered `worktree::list`; `home_dir_of` needs the
+    // same treatment (fix round 1, finding/R25c) — it stands in for
+    // `projects::resolve_project`, which itself runs git for a worktree
+    // URL (`is_vouched_worktree`), so this was a second, uncached git cost
+    // per Claude rather than per project.
+    let mut home_dirs: HashMap<String, Option<PathBuf>> = HashMap::new();
     let mut lists: HashMap<String, Vec<crate::worktree::Worktree>> = HashMap::new();
     for c in procs {
         // Unreadable cwd is "unknown", never "still at home" — report
         // nothing rather than guess (CLAUDE.md's evidence rule).
         let Some(cwd) = c.cwd.as_ref() else { continue };
         let Ok(cwd_canon) = cwd.canonicalize() else { continue };
-        let Some(home_dir) = home_dir_of(&c.project) else { continue };
+        let home_dir = home_dirs.entry(c.project.clone()).or_insert_with(|| home_dir_of(&c.project)).clone();
+        let Some(home_dir) = home_dir else { continue };
+        let Ok(home_canon) = home_dir.canonicalize() else { continue };
         let list = lists.entry(c.project.clone()).or_insert_with(|| crate::worktree::list(&home_dir));
         if list.is_empty() {
             continue; // git did not answer: no evidence either way
         }
-        if let Some(main) = list.iter().find(|w| w.is_main) {
-            if main.path.canonicalize().map(|p| p == cwd_canon).unwrap_or(false) {
-                if matches!(owner_of(&c.project, &c.session), crate::home::Owner::Elsewhere(_)) {
-                    out.push(Move::Back { home: c.project.clone(), session: c.session.clone() });
+
+        // Finding 3: `c.project` is only a genuine *home* — the main
+        // checkout re-homing is defined relative to — when its own
+        // resolved directory IS the main entry of its own
+        // `worktree::list`. A terminal native to a worktree *project*
+        // (`ROOST_PROJECT` itself names a `.claude/worktrees/<x>` url)
+        // resolves to that worktree's own directory instead, which can
+        // never be a home: there is no re-homing relationship from a
+        // worktree to itself. Without this guard, such a Claude's own
+        // worktree matched its own non-main entry below and built the
+        // self-referential url `repo/.claude/worktrees/w1/.claude/worktrees/w1`.
+        let is_real_home = list
+            .iter()
+            .find(|w| w.is_main)
+            .and_then(|m| m.path.canonicalize().ok())
+            .map(|p| p == home_canon)
+            .unwrap_or(false);
+        if !is_real_home {
+            continue;
+        }
+
+        // Finding 2: containment, not equality, and the LONGEST matching
+        // root wins. A linked worktree lives *under* the main checkout's
+        // own directory (`home/.claude/worktrees/<name>`), so the main
+        // checkout's own path is always a prefix of every one of its
+        // worktrees' paths too — checking containment without picking the
+        // most specific match would read `main/.claude/worktrees/wt/src`
+        // as "still in main" (it matches `main` as a prefix) instead of
+        // "in wt" (the correct, more specific answer). Resolved through
+        // git's own list, never a string prefix on top of that: a plain
+        // directory that merely looks like `.claude/worktrees/<x>` is not
+        // a worktree, and only git can tell the two apart.
+        let mut best: Option<(&crate::worktree::Worktree, PathBuf)> = None;
+        for w in list.iter() {
+            let Ok(wcanon) = w.path.canonicalize() else { continue };
+            if cwd_canon.starts_with(&wcanon) {
+                let longer = best.as_ref().map(|(_, b)| wcanon.as_os_str().len() > b.as_os_str().len()).unwrap_or(true);
+                if longer {
+                    best = Some((w, wcanon));
                 }
-                continue;
             }
         }
-        // Resolved through git's own list, never a string prefix: a plain
-        // directory that merely looks like `.claude/worktrees/<x>` is not a
-        // worktree, and only git can tell the two apart.
-        for w in list.iter().filter(|w| !w.is_main) {
-            let Ok(wt_canon) = w.path.canonicalize() else { continue };
-            if wt_canon != cwd_canon {
-                continue;
+        let Some((w, wcanon)) = best else { continue }; // cwd is nowhere under this home at all
+
+        if w.is_main {
+            if matches!(owner_of(&c.project, &c.session), crate::home::Owner::Elsewhere(_)) {
+                out.push(Move::Back { home: c.project.clone(), session: c.session.clone() });
             }
-            let Some(dirname) = w.path.file_name().and_then(|n| n.to_str()) else { continue };
-            let worktree = format!("{}/.claude/worktrees/{}", c.project, dirname);
-            let already_recorded = matches!(
-                owner_of(&c.project, &c.session),
-                crate::home::Owner::Elsewhere(ref o) if *o == worktree
-            );
-            if !already_recorded {
-                out.push(Move::Into { home: c.project.clone(), session: c.session.clone(), worktree });
-            }
-            break;
+            continue;
+        }
+
+        // Finding 3's other half: the worktree url is built exactly as
+        // `Hub::do_rehome` validates one — a canonical `strip_prefix` of
+        // the home's own directory — never a dirname guess, so the two
+        // can never disagree about what counts as "a worktree of this
+        // home".
+        let Ok(rel) = wcanon.strip_prefix(&home_canon) else { continue };
+        let worktree = format!("{}/{}", c.project, rel.display());
+        let already_recorded = matches!(
+            owner_of(&c.project, &c.session),
+            crate::home::Owner::Elsewhere(ref o) if *o == worktree
+        );
+        if !already_recorded {
+            out.push(Move::Into { home: c.project.clone(), session: c.session.clone(), worktree });
         }
     }
     out
@@ -403,40 +449,68 @@ pub fn detect_gone_owners(home_dir_of: &dyn Fn(&str) -> Option<PathBuf>) -> Vec<
     out
 }
 
-/// Acts on `detect_gone_owners`' evidence: forgets the record off-lock
-/// (the session becomes `Here` at its home again — R18, what lets
-/// `may_end` allow a native kill), tells the home's browsers once
-/// (`Event::WorktreeGone`), and refreshes the home hub. `home::forget` and
-/// `hub::broadcast_to_project`/`refresh_and_broadcast` each take their own
-/// lock briefly; none is held across the git calls `detect_gone_owners`
-/// already finished before this runs.
+/// Acts on `detect_gone_owners`' evidence: ALWAYS attempts the forget
+/// off-lock (fix round 1, finding 1 — see below for why "always"), tells
+/// the home's browsers once per *triple* (`Event::WorktreeGone`, gated by
+/// `announced`), and — only once the forget has actually taken — gives the
+/// home its tab back (R25a, `hub::retab_native_if_missing`, not a plain
+/// refresh: see that function's own doc comment for why this must be the
+/// one that calls it). `home::forget` and
+/// `hub::broadcast_to_project`/`retab_native_if_missing` each take their
+/// own lock briefly; none is held across the git calls
+/// `detect_gone_owners` already finished before this runs.
 ///
-/// `announced` is inserted into *before* the forget is attempted, not
-/// after: `home::forget` swallows its own I/O error, so there is no
-/// success/failure signal to retry on, and inserting only on confirmed
-/// success would spam a browser every tick for as long as some unusual I/O
-/// error kept the record alive. The ordinary case — the forget actually
-/// removes the file — already keeps `detect_gone_owners` from finding the
-/// same pair again on the very next tick; `announced` only has to cover the
-/// gap an unexpected failure would otherwise leave open.
+/// `announced` is keyed on `(home, session, owner)`, not `(home, session)`
+/// — finding 1's bug: term3 re-homed to worktree-x, removed, forgotten;
+/// later re-homed to worktree-y, removed too. A two-field key would see
+/// `(home, term3)` already in the set from the first removal and refuse
+/// to even *attempt* the second forget, leaving the record stuck
+/// `Elsewhere(y)` — not merely unannounced, genuinely never cleaned up,
+/// since nothing else in this module revisits a pair once it is in
+/// `announced`. The fix is two-fold: the forget is attempted
+/// unconditionally on every sweep that finds the evidence (gating it was
+/// the actual defect), and the three-field key means a *different* owner
+/// for the same `(home, session)` is simply a different key, never
+/// shadowed by the first.
+///
+/// The key is removed again the moment the record actually reads `Here`
+/// — bounding the set to only the pairs genuinely stuck (an unexpected
+/// I/O error on `forget`, which is silent — see its own doc comment — so
+/// there is no success/failure signal to gate on beyond re-reading the
+/// record). That removal is also what lets a *subsequent* removal of the
+/// *same* worktree (re-created and re-removed) announce again rather than
+/// staying silently suppressed forever.
 pub fn sweep_gone_owners(
     home_dir_of: &dyn Fn(&str) -> Option<PathBuf>,
-    announced: &Mutex<HashSet<(String, String)>>,
+    announced: &Mutex<HashSet<(String, String, String)>>,
 ) {
     for (home, name, owner) in detect_gone_owners(home_dir_of) {
-        let key = (home.clone(), name.clone());
-        {
-            let mut g = announced.lock().unwrap_or_else(|e| e.into_inner());
-            if !g.insert(key) {
-                continue; // already told this browser about this pair
-            }
-        }
+        // Always attempted, never gated on `announced` — the bug this
+        // fixes is exactly a forget that was skipped because an *earlier*
+        // owner for this same (home, session) had already been announced.
         crate::home::forget(&home, &name);
-        crate::hub::broadcast_to_project(
-            &home,
-            &crate::proto::Event::WorktreeGone { worktree: owner, session: name.clone() },
-        );
-        crate::hub::refresh_and_broadcast(&home);
+
+        let key = (home.clone(), name.clone(), owner.clone());
+        let first_time = {
+            let mut g = announced.lock().unwrap_or_else(|e| e.into_inner());
+            g.insert(key.clone())
+        };
+        if first_time {
+            crate::hub::broadcast_to_project(
+                &home,
+                &crate::proto::Event::WorktreeGone { worktree: owner, session: name.clone() },
+            );
+        }
+
+        if matches!(crate::home::owner_of(&home, &name), crate::home::Owner::Here) {
+            {
+                let mut g = announced.lock().unwrap_or_else(|e| e.into_inner());
+                g.remove(&key);
+            }
+            // The forget actually took, whether on this attempt or (after
+            // an earlier failure) a later one: give the home its tab back.
+            crate::hub::retab_native_if_missing(&home, &name);
+        }
     }
 }
 
@@ -454,11 +528,13 @@ fn offered_cell() -> &'static Mutex<HashMap<(String, String), Option<String>>> {
 }
 
 /// Process-level "already told" set for `sweep_gone_owners`'s
-/// `Event::WorktreeGone` — see that function's own doc comment for why it
-/// is inserted into before the forget, not after.
-static GONE_ANNOUNCED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+/// `Event::WorktreeGone`, keyed `(home, session, owner)` — see that
+/// function's own doc comment (fix round 1, finding 1) for why the owner
+/// is part of the key and why an entry is removed again once the record
+/// actually reads `Here`.
+static GONE_ANNOUNCED: OnceLock<Mutex<HashSet<(String, String, String)>>> = OnceLock::new();
 
-fn gone_announced_cell() -> &'static Mutex<HashSet<(String, String)>> {
+fn gone_announced_cell() -> &'static Mutex<HashSet<(String, String, String)>> {
     GONE_ANNOUNCED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
@@ -1056,6 +1132,93 @@ mod tests {
         assert!(moves.is_empty());
     }
 
+    // --- Fix round 1 -------------------------------------------------------
+
+    /// Finding 2: a Claude in a *subdirectory* of a worktree (`wt/src`,
+    /// not `wt` itself) must still be reported `Into` — the pre-fix
+    /// equality check reported nothing for it at all.
+    ///
+    /// Revert check: replacing the `starts_with`/longest-match loop with
+    /// the old `wt_canon != cwd_canon` equality fails this — observed:
+    /// `assertion 'left == right' failed: left: [], right: [Into { .. }]`.
+    /// Restored.
+    #[test]
+    fn a_claude_in_a_subdirectory_of_a_worktree_is_still_reported_into() {
+        let (root, repo, wt) = fake_proc_with_repo_and_worktree();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        mk_with_cwd(root.path(), 100, "ROOST_PROJECT=karpie\nROOST_SESSION=term3\n", &wt.join("src"));
+        let moves = detect_moves(root.path(), &|_| Some(repo.clone()), &|_, _| crate::home::Owner::Here);
+        assert_eq!(
+            moves,
+            vec![Move::Into { home: "karpie".into(), session: "term3".into(), worktree: "karpie/.claude/worktrees/feat".into() }]
+        );
+    }
+
+    /// Finding 2's mirror: a re-homed Claude in a *subdirectory* of the
+    /// main checkout (`main/src`, not `main` itself) must still be
+    /// reported `Back` — the pre-fix equality check reported nothing.
+    #[test]
+    fn a_rehomed_claude_in_a_subdirectory_of_main_is_still_reported_back() {
+        let (root, repo, _wt) = fake_proc_with_repo_and_worktree();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        mk_with_cwd(root.path(), 100, "ROOST_PROJECT=karpie\nROOST_SESSION=term3\n", &repo.join("src"));
+        let moves = detect_moves(root.path(), &|_| Some(repo.clone()), &|_, _| {
+            crate::home::Owner::Elsewhere("karpie/.claude/worktrees/feat".into())
+        });
+        assert_eq!(moves, vec![Move::Back { home: "karpie".into(), session: "term3".into() }]);
+    }
+
+    /// Finding 2's longest-match requirement, directly: `main` is always
+    /// a prefix of its own `.claude/worktrees/<x>`, so a cwd reached
+    /// *through* main's own path at `wt`'s location must still resolve to
+    /// `wt`, never be mistaken for "in main" just because main's shorter
+    /// canonical path also matches as a prefix.
+    ///
+    /// Revert check: picking the FIRST matching root instead of the
+    /// LONGEST (iterating `list` with `is_main` first, as `detect_moves_in`
+    /// used to before this fix, and returning on the first `starts_with`
+    /// hit) fails this — observed: `assertion 'left == right' failed:
+    /// left: [], right: [Into { .. }]` (main matched first, found no
+    /// `Elsewhere` to report `Back` for, and never looked further for
+    /// `wt`). Restored.
+    #[test]
+    fn a_cwd_reached_through_mains_own_path_still_resolves_to_the_worktree() {
+        let (root, repo, wt) = fake_proc_with_repo_and_worktree();
+        let via_main = repo.join(".claude/worktrees/feat/src");
+        std::fs::create_dir_all(&via_main).unwrap();
+        assert_eq!(via_main.canonicalize().unwrap(), wt.join("src").canonicalize().unwrap(), "setup: same real directory");
+        mk_with_cwd(root.path(), 100, "ROOST_PROJECT=karpie\nROOST_SESSION=term3\n", &via_main);
+        let moves = detect_moves(root.path(), &|_| Some(repo.clone()), &|_, _| crate::home::Owner::Here);
+        assert_eq!(
+            moves,
+            vec![Move::Into { home: "karpie".into(), session: "term3".into(), worktree: "karpie/.claude/worktrees/feat".into() }]
+        );
+    }
+
+    /// Finding 3: a terminal native to a worktree *project* — its own
+    /// `ROOST_PROJECT` already names the worktree url — must never be
+    /// offered a move at all. Before the fix, `home_dir_of("karpie/.claude/worktrees/feat")`
+    /// resolved to the worktree's own directory, which is listed as a
+    /// non-main entry of its OWN `worktree::list`, so the Claude's cwd
+    /// (sitting right there) matched it and built the self-referential
+    /// url `karpie/.claude/worktrees/feat/.claude/worktrees/feat`.
+    ///
+    /// Revert check: removing the `is_real_home` guard reproduces exactly
+    /// that — observed: `assertion 'left == right' failed: left:
+    /// [Into { worktree: "karpie/.claude/worktrees/feat/.claude/worktrees/feat", .. }],
+    /// right: []`. Restored.
+    #[test]
+    fn a_terminal_native_to_a_worktree_project_is_never_offered_a_move() {
+        let (root, repo, wt) = fake_proc_with_repo_and_worktree();
+        mk_with_cwd(root.path(), 100, "ROOST_PROJECT=karpie/.claude/worktrees/feat\nROOST_SESSION=term3\n", &wt);
+        let home_dir_of = |p: &str| match p {
+            "karpie" => Some(repo.clone()),
+            "karpie/.claude/worktrees/feat" => Some(wt.clone()),
+            _ => None,
+        };
+        assert!(detect_moves(root.path(), &home_dir_of, &|_, _| crate::home::Owner::Here).is_empty());
+    }
+
     /// R18's positive evidence: a real `.base`-less worktree removed with
     /// `git worktree remove` behind roost's back, and a stale re-home
     /// record still naming it. `detect_gone_owners` must find it only once
@@ -1175,11 +1338,156 @@ mod tests {
         let announced = Mutex::new(HashSet::new());
         sweep_gone_owners(&home_dir_of, &announced);
         assert!(matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here), "the record must be forgotten");
-        assert!(announced.lock().unwrap().contains(&(home.to_string(), "term3".to_string())));
+        // Fix round 1, finding 1: the entry is removed again the moment
+        // the record actually reads `Here` — bounding the set to only the
+        // pairs genuinely stuck — so it must NOT still be in `announced`
+        // after a successful forget. (Before the fix this asserted the
+        // opposite; see `two_sequential_removals_with_different_owners_both_forget_and_announce`
+        // for the scenario that two-field key broke.)
+        assert!(
+            !announced.lock().unwrap().contains(&(home.to_string(), "term3".to_string(), owner.clone())),
+            "a successfully forgotten pair must not linger in the set"
+        );
 
         // Second sweep: nothing left to find, nothing left to do.
         sweep_gone_owners(&home_dir_of, &announced);
         assert!(matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here));
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Fix round 1, finding 1's exact bug: term3 re-homed to worktree-x,
+    /// removed, forgotten; later re-homed to worktree-y, removed too. The
+    /// pre-fix two-field `(home, session)` key already had `(home, term3)`
+    /// in `announced` from the first removal and skipped even *attempting*
+    /// the second forget — the record stayed stuck `Elsewhere(y)` forever
+    /// (not merely unannounced: nothing else revisits a pair once it is in
+    /// the set). The fix makes `announced` three-field and makes the
+    /// forget itself unconditional.
+    ///
+    /// Revert check: reverting the key back to `(home, session)` and
+    /// re-introducing the `if !g.insert(key) { continue }` gate *before*
+    /// the forget reproduces this exactly — see the comment at the
+    /// revert site below.
+    #[test]
+    fn two_sequential_removals_with_different_owners_both_forget_and_announce() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let home = "r25-tworemovals-home";
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(args).status().unwrap().success());
+        }
+        std::fs::write(home_dir.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(args).status().unwrap().success());
+        }
+        let home_dir_of = |p: &str| (p == home).then(|| home_dir.clone());
+        let announced = Mutex::new(HashSet::new());
+
+        // First worktree, recorded, removed, swept: forgotten and announced.
+        let wx = home_dir.join(".claude/worktrees/worktree-x");
+        assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(["worktree", "add", "-b", "worktree-x", wx.to_str().unwrap()]).status().unwrap().success());
+        let owner_x = format!("{home}/.claude/worktrees/worktree-x");
+        crate::home::record(home, "term3", &owner_x).unwrap();
+        assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(["worktree", "remove", wx.to_str().unwrap()]).status().unwrap().success());
+        sweep_gone_owners(&home_dir_of, &announced);
+        assert!(matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here), "first removal must forget the record");
+
+        // Re-homed again, to a *different* worktree, removed too.
+        let wy = home_dir.join(".claude/worktrees/worktree-y");
+        assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(["worktree", "add", "-b", "worktree-y", wy.to_str().unwrap()]).status().unwrap().success());
+        let owner_y = format!("{home}/.claude/worktrees/worktree-y");
+        crate::home::record(home, "term3", &owner_y).unwrap();
+        assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(["worktree", "remove", wy.to_str().unwrap()]).status().unwrap().success());
+        sweep_gone_owners(&home_dir_of, &announced);
+        assert!(
+            matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here),
+            "the second removal, for a DIFFERENT owner, must also be forgotten — not silently stuck Elsewhere(y)"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// The other half of finding 1: a forget that FAILS once (the record's
+    /// directory made unwritable, a real permission failure rather than an
+    /// injected one) must still send the event exactly once, while the
+    /// forget itself is attempted again on the very next sweep — and
+    /// succeeds once the directory is writable again.
+    #[test]
+    fn a_failed_forget_announces_once_but_is_retried_until_it_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let home = "r25-failedforget-home";
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(args).status().unwrap().success());
+        }
+        std::fs::write(home_dir.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(args).status().unwrap().success());
+        }
+        let wt = home_dir.join(".claude/worktrees/w1");
+        assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(["worktree", "add", "-b", "w1", wt.to_str().unwrap()]).status().unwrap().success());
+        let owner = format!("{home}/.claude/worktrees/w1");
+        crate::home::record(home, "term3", &owner).unwrap();
+        assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(["worktree", "remove", wt.to_str().unwrap()]).status().unwrap().success());
+
+        // Lock the record's own directory so `std::fs::remove_file` fails
+        // with EACCES — a real forget failure, not an injected one. Read
+        // access (needed by `owner_of`'s own `read_to_string`, and by
+        // `all_homes`/`away_from`'s directory listing) survives; only the
+        // write needed to unlink the file is denied.
+        let rec_dir = crate::wsstate::state_dir().join("home").join(crate::projects::storage_key(home));
+        std::fs::set_permissions(&rec_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Confirm the lock actually bites before trusting it: a write
+        // that succeeds despite 0o555 means this user can bypass
+        // directory permissions (root), and the rest of the test would
+        // not mean what it claims to.
+        let probe = rec_dir.join(".probe-write");
+        let blind = std::fs::write(&probe, "x").is_err();
+        if !blind {
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(&rec_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipped: this user can write a 0o555 directory (likely root)");
+            return;
+        }
+
+        let home_dir_of = |p: &str| (p == home).then(|| home_dir.clone());
+        let announced = Mutex::new(HashSet::new());
+        sweep_gone_owners(&home_dir_of, &announced);
+        assert!(
+            matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Elsewhere(_)),
+            "the forget must have failed (directory unwritable)"
+        );
+        assert!(
+            announced.lock().unwrap().contains(&(home.to_string(), "term3".to_string(), owner.clone())),
+            "the event must be remembered as sent, so a retry does not resend it"
+        );
+
+        // Second sweep, still locked: same evidence, forget attempted
+        // again (and fails again), but the event must not fire twice.
+        sweep_gone_owners(&home_dir_of, &announced);
+        assert!(matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Elsewhere(_)));
+
+        // Unlock, sweep a third time: the retried forget now succeeds.
+        std::fs::set_permissions(&rec_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        sweep_gone_owners(&home_dir_of, &announced);
+        assert!(
+            matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here),
+            "the forget must be retried, and must succeed once the directory is writable again"
+        );
 
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
