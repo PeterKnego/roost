@@ -290,7 +290,7 @@ fn tools() -> Vec<Value> {
                "inputSchema": {"type": "object", "properties": {"tab_id": tab, "max_chars": {"type": "integer", "description": "Text cap, default 20000."}}}}),
         json!({"name": "chrome_click", "description": format!("Click an element (by ref from chrome_read, or a CSS selector) with a real mouse event. {WHOSE}"),
                "inputSchema": {"type": "object", "properties": target(json!({}))}}),
-        json!({"name": "chrome_type", "description": format!("Focus an element and type text into it, optionally pressing Enter. {WHOSE}"),
+        json!({"name": "chrome_type", "description": format!("Focus an element and type text into it, replacing what it already holds, optionally pressing Enter. {WHOSE}"),
                "inputSchema": {"type": "object", "properties": target(json!({
                    "text": {"type": "string"},
                    "submit": {"type": "boolean", "description": "Press Enter afterwards."}})), "required": ["text"]}}),

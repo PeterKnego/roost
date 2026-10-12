@@ -21,6 +21,8 @@
 //!       tab, navigated in place by Claude, is closed.
 //!   (e) the screenshot's hand-back of the front tab removed -> O fails: with
 //!       follow off, Claude's tab is left in front of the user's.
+//!   (f) chrome_type's select-all removed -> F fails: the input submits
+//!       "stale hello roost" and the textarea holds "old wordsnew words".
 //!
 //! Run: deno run -A tests/browser/bridge.mjs
 import { fixture, freePort, openPage, attachTarget, profileDir, startBrowser, startRoost, until, sleep }
@@ -47,7 +49,9 @@ const site = Deno.serve({ port: sitePort, hostname: "127.0.0.1", onListen() {} }
 <h1 id="h">untouched</h1>
 <button id="b" onclick="document.getElementById('h').textContent='clicked'; console.log('button clicked')">Press me</button>
 <form onsubmit="event.preventDefault(); document.getElementById('h').textContent='typed:' + document.getElementById('q').value">
-<input id="q" aria-label="query"></form>`, { headers: { "content-type": "text/html" } }));
+<input id="q" aria-label="query" value="stale "></form>
+<textarea id="t" aria-label="notes" oninput="document.getElementById('tv').textContent='area:' + this.value">old words</textarea>
+<p id="tv"></p>`, { headers: { "content-type": "text/html" } }));
 const target = `http://127.0.0.1:${sitePort}/`;
 
 // A profile of its own: the extension's storage persists in it, and a grant
@@ -162,7 +166,11 @@ try {
   const typed = await mcp.tool("chrome_type", { selector: "#q", text: "hello roost", submit: true });
   ok(!typed.isError, `F: chrome_type — ${text(typed)}`);
   const after2 = JSON.parse(text(await mcp.tool("chrome_read")));
-  ok(after2.text.includes("typed:hello roost"), "F: the typed text was submitted");
+  ok(after2.text.includes("typed:hello roost"), "F: the typed text was submitted, replacing the input's old value");
+  const area = await mcp.tool("chrome_type", { selector: "#t", text: "new words" });
+  ok(!area.isError, `F: chrome_type into a textarea — ${text(area)}`);
+  const after3 = JSON.parse(text(await mcp.tool("chrome_read")));
+  ok(after3.text.includes("area:new words"), `F: typing into a textarea replaces what it held — ${/area:.*/.exec(after3.text)?.[0]}`);
 
   const con = JSON.parse(text(await mcp.tool("chrome_console")));
   ok((con.messages || []).some((m) => m.includes("button clicked")), `G: chrome_console has the page's log — ${JSON.stringify(con.messages)}`);

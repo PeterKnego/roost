@@ -399,6 +399,22 @@ const LOCATE_SCRIPT = (args) => `(() => {
   return { x: r.left + r.width / 2, y: r.top + r.height / 2, what: el.tagName.toLowerCase() + ' "' + (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 60) + '"' };
 })()`;
 
+// Select the focused field's whole content, so the text typed next replaces it.
+const SELECT_ALL_SCRIPT = `(() => {
+  const el = document.activeElement;
+  if (!el) return false;
+  if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') { try { el.select(); } catch {} return true; }
+  if (el.isContentEditable) {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    return true;
+  }
+  return false;
+})()`;
+
 async function locate(tabId, args) {
   if ((args.ref === undefined || args.ref === null) && !args.selector) throw new Error("pass ref (from chrome_read) or selector");
   const at = await evaluate(tabId, LOCATE_SCRIPT(args));
@@ -510,6 +526,11 @@ async function runTool(gk, tool, args) {
       await attach(tab.id);
       const at = await locate(tab.id, args);
       await click(tab.id, at.x, at.y);
+      // Typing replaces what the field holds, the way a person selects all
+      // first: insertText alone lands at the caret, so a textarea that
+      // already has text (or an input that does not select on focus) would
+      // end up with the old and the new run together.
+      await evaluate(tab.id, SELECT_ALL_SCRIPT);
       await cdp(tab.id, "Input.insertText", { text: String(args.text ?? "") });
       if (args.submit) {
         const key = { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 };
