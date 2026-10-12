@@ -2276,8 +2276,10 @@ mod tests {
     /// detached master, so there is nothing to survive.
     #[test]
     fn a_session_that_outlived_a_restart_is_listed_and_can_be_closed() {
-        let _g1 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _g2 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // STATE before SESSION — the one total order (see SESSION_ENV_LOCK).
+        // This was the last test taking them the other way round.
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("ROOST_CMD");
         let state = tempfile::tempdir().unwrap();
         std::env::set_var("ROOST_STATE_DIR", state.path());
