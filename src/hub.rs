@@ -313,6 +313,24 @@ fn may_end(kill_target: &str, name: &str, project: &str) -> bool {
     }
 }
 
+/// The IDE half of Close Project. A terminal the close spared because it is
+/// re-homed elsewhere (or its record is unreadable) keeps running, and its
+/// Claude's `CLAUDE_CODE_SSE_PORT` names this project's listener for the
+/// life of its process: stopping it would remove the lock file and refuse
+/// every reconnect, and a reopened project's new port is one that
+/// environment never learns. So the listener stays while anything spared
+/// is live, and is stopped as before otherwise. A panic while deciding
+/// keeps it — an extra listener until the next close is recoverable, a
+/// stranded Claude is not.
+fn stop_ide_unless_spared(project: &str) {
+    let keep = std::panic::catch_unwind(|| crate::session::spares_live(project)).unwrap_or(true);
+    if keep {
+        eprintln!("roost: Close Project kept {project}'s IDE listener: a re-homed terminal it spared is still running");
+    } else {
+        crate::ide::stop(project);
+    }
+}
+
 impl Hub {
     pub fn new(project: &str, dir: std::path::PathBuf) -> Hub {
         let (ws, warn) = crate::wsstate::load(project);
@@ -3177,7 +3195,7 @@ impl Hub {
                         // authenticating connections against a token no
                         // longer advertised in any lock file. stop() itself
                         // cannot panic (no unwrap, no I/O it doesn't guard).
-                        crate::ide::stop(&thread_project);
+                        stop_ide_unless_spared(&thread_project);
                         {
                             let mut h = Hub::lock(&hub_arc);
                             h.closing = false;
@@ -3220,7 +3238,7 @@ impl Hub {
             }
             None => {
                 let ended = crate::session::kill_project(&project);
-                crate::ide::stop(&project);
+                stop_ide_unless_spared(&project);
                 // Before the version bump, so the one bump covers the kill
                 // and the layout change together — two bumps for a single
                 // intent would make a client's `version` check see a state it
@@ -6785,6 +6803,272 @@ mod tests {
 
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Waits for this close's `ProjectClosed`, which the close thread sends
+    /// only after it has decided about the IDE listener.
+    fn await_project_closed(rx: &Receiver<String>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let m = rx.recv_timeout(left).expect("the close must report ProjectClosed within 10s");
+            if m.contains(r#""t":"ProjectClosed""#) {
+                return;
+            }
+        }
+    }
+
+    /// Final-review I1: Close Project on a home that spared a re-homed
+    /// terminal must leave the home's IDE listener running. That Claude's
+    /// `CLAUDE_CODE_SSE_PORT` names exactly this listener (spec §4) and a
+    /// running process's environment cannot be changed, so a stopped
+    /// listener — and a reopened project's new port — is one its reconnects
+    /// can never find again. A close that spared nothing still stops it, as
+    /// before: a closed project must not keep authenticating against a
+    /// token no lock file advertises.
+    ///
+    /// Real dtach: "still live" is decided from the socket's holder, which a
+    /// `cat` stand-in does not have.
+    ///
+    /// Revert-checked (final fix wave): with `do_close_project` calling
+    /// `ide::stop` unconditionally again (the `spares_live` guard removed),
+    /// fails on "Close Project on the home stopped the IDE listener a
+    /// re-homed Claude still uses".
+    #[test]
+    fn close_project_keeps_the_ide_listener_while_a_rehomed_terminal_lives() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        let home = format!("idekeephome{}", std::process::id());
+        let owner = format!("{home}/.claude/worktrees/worktree-x");
+        let home_dir = root.path().join(&home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let hub = Hub::for_project(&home, home_dir.clone());
+        let port = crate::ide::port_for(&home).expect("setup: the home must have an IDE listener");
+        let lock = crate::idelock::ide_dir().join(format!("{port}.lock"));
+        assert!(lock.exists(), "setup: the listener's lock file must exist");
+
+        let att = crate::session::reserve_and_attach(&home, "term3", &home_dir)
+            .unwrap_or_else(|e| panic!("dtach is a runtime prerequisite of this test: {e}"));
+        let sock = crate::session::socket_path(&home, "term3");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up");
+        drop(att);
+        crate::home::record(&home, "term3", &owner).unwrap();
+
+        let (c, rx) = Hub::lock(&hub).subscribe();
+        Hub::lock(&hub).handle(&c, Intent::CloseProject);
+        await_project_closed(&rx);
+
+        let kept = (crate::ide::port_for(&home), lock.exists(), any_process_holds(&sock));
+        // Cleanup before asserting, so a failure does not leak a shell.
+        let _ = crate::registry::kill_and_unlink(&sock);
+        crate::home::forget(&home, "term3");
+        assert_eq!(kept.2, true, "setup: the close spared the re-homed terminal");
+        assert_eq!(
+            (kept.0, kept.1),
+            (Some(port), true),
+            "Close Project on the home stopped the IDE listener a re-homed Claude still uses"
+        );
+
+        // The same home with nothing spared: the listener goes, as before.
+        Hub::lock(&hub).handle(&c, Intent::CloseProject);
+        await_project_closed(&rx);
+        assert_eq!(crate::ide::port_for(&home), None, "a close that spared nothing stops the listener");
+        assert!(!lock.exists(), "and removes its lock file");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// What `session::probe_socket` asks, from outside `session`: does the
+    /// process listing name a holder for this exact socket path. A listing
+    /// that cannot be read panics rather than answering — a test that cannot
+    /// trust its evidence must not report.
+    fn probe_held(sock: &std::path::Path) -> bool {
+        let snap = crate::registry::holders_snapshot()
+            .expect("the process listing must be readable for this assertion to mean anything");
+        !crate::registry::pids_holding_path(&snap, sock).is_empty()
+    }
+
+    /// Spec §Testing, "Re-home is not destruction" — the test the whole
+    /// design rests on, end to end: a real dtach session in the home,
+    /// re-homed, then every sweep and lookup that could misread it — the
+    /// real `reconcile` (real roots, real state, real `ps`), Close Project on
+    /// the home, `refresh_live_sessions` on both hubs, and the record sweep.
+    /// The master must survive by pid *and* by `probe_socket`'s own
+    /// question, and be listed under the owner and not the home. Then
+    /// closing the owner ends it.
+    ///
+    /// Revert-checked (final fix wave): with `kill_project_inner`'s
+    /// `Elsewhere` arm keeping the name (`=> true`, i.e. the skip removed),
+    /// fails on "Close Project on the home killed a re-homed session".
+    #[test]
+    fn rehome_is_not_destruction() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let roots = vec![root.path().to_path_buf()];
+        assert_eq!(crate::projects::roots(), roots, "setup: the code under test sees these roots");
+
+        let home = format!("notdestroyed{}", std::process::id());
+        let owner = format!("{home}/.claude/worktrees/worktree-x");
+        let home_dir = root.path().join(&home);
+        let owner_dir = home_dir.join(".claude/worktrees/worktree-x");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let _att = crate::session::reserve_and_attach(&home, "term3", &home_dir)
+            .unwrap_or_else(|e| panic!("dtach is a runtime prerequisite of this test: {e}"));
+        let sock = crate::session::socket_path(&home, "term3");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up");
+        crate::home::record(&home, "term3", &owner).unwrap();
+        assert!(crate::home::resolves(&home, &owner), "setup: the owner resolves under the real roots");
+
+        let mut home_hub = Hub::new(&home, home_dir.clone());
+        let mut owner_hub = Hub::new(&owner, owner_dir.clone());
+
+        crate::registry::reconcile(&roots);
+        crate::session::kill_project(&home);
+        home_hub.refresh_live_sessions();
+        owner_hub.refresh_live_sessions();
+        crate::home::sweep(&|h, n| match std::fs::symlink_metadata(crate::session::socket_path(h, n)) {
+            Ok(_) => Some(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Err(_) => None,
+        });
+
+        let alive = any_process_holds(&sock);
+        let held = probe_held(&sock);
+        let reap = || {
+            let _ = crate::registry::kill_and_unlink(&sock);
+            crate::home::forget(&home, "term3");
+        };
+        if !(alive && held) {
+            reap();
+        }
+        assert!(alive, "Close Project on the home killed a re-homed session");
+        assert!(held, "the socket's holder is gone from the listing probe_socket reads");
+        assert!(
+            matches!(crate::home::owner_of(&home, "term3"), crate::home::Owner::Elsewhere(ref o) if *o == owner),
+            "the record survived every sweep"
+        );
+        assert_eq!(owner_hub.ws.live_sessions, vec!["term3".to_string()], "listed under its owner");
+        assert_eq!(owner_hub.session_homes.get("term3"), Some(&home), "as a resident of its home");
+        assert!(!home_hub.ws.live_sessions.contains(&"term3".to_string()), "and not under its home");
+
+        let ended = crate::session::kill_project(&owner);
+        let gone = !any_process_holds(&sock);
+        if !gone {
+            reap();
+        }
+        assert_eq!(ended, 1, "the owner's close counts its resident");
+        assert!(gone, "closing the owner must end its resident");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Spec §Testing, "Concurrent sweep": `reconcile` looping on one thread
+    /// while another records and forgets a live real-dtach session's re-home
+    /// for ~2 s. Nothing in `reconcile` reads the records — that is the
+    /// design — so no interleaving may end the session, and nothing may
+    /// wedge. Timed: both threads report over channels with a deadline, so a
+    /// deadlock fails here instead of hanging the suite. Both loops must have
+    /// actually turned over many times, or the test asserted nothing.
+    ///
+    /// Revert-checked (final fix wave), twice:
+    /// - survival: `reconcile`'s `home::sweep` closure changed to
+    ///   `kill_and_unlink` every recorded session's socket (a sweep that
+    ///   acts on the records) fails on "a re-home record/forget racing
+    ///   reconcile ended the session";
+    /// - the bound: a 30 s sleep added to `home::record_in` fails on
+    ///   "deadlock or stall: the record/forget thread did not finish"
+    ///   after 10 s, rather than hanging.
+    #[test]
+    fn reconcile_racing_rehome_records_kills_nothing() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let roots = vec![root.path().to_path_buf()];
+
+        let home = format!("sweeprace{}", std::process::id());
+        let owner = format!("{home}/.claude/worktrees/worktree-x");
+        let home_dir = root.path().join(&home);
+        std::fs::create_dir_all(home_dir.join(".claude/worktrees/worktree-x")).unwrap();
+
+        let _att = crate::session::reserve_and_attach(&home, "term3", &home_dir)
+            .unwrap_or_else(|e| panic!("dtach is a runtime prerequisite of this test: {e}"));
+        let sock = crate::session::socket_path(&home, "term3");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up");
+
+        let started = std::time::Instant::now();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sweep_tx, sweep_rx) = std::sync::mpsc::channel();
+        let (flip_tx, flip_rx) = std::sync::mpsc::channel();
+        {
+            let stop = stop.clone();
+            let roots = roots.clone();
+            std::thread::spawn(move || {
+                let mut passes = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    crate::registry::reconcile(&roots);
+                    passes += 1;
+                }
+                let _ = sweep_tx.send(passes);
+            });
+        }
+        {
+            let (home, owner) = (home.clone(), owner.clone());
+            std::thread::spawn(move || {
+                let mut flips = 0u32;
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < until {
+                    crate::home::record(&home, "term3", &owner).unwrap();
+                    crate::home::forget(&home, "term3");
+                    flips += 1;
+                }
+                let _ = flip_tx.send(flips);
+            });
+        }
+        let flips = flip_rx.recv_timeout(std::time::Duration::from_secs(10));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let passes = sweep_rx.recv_timeout(std::time::Duration::from_secs(10));
+        let elapsed = started.elapsed();
+
+        let alive = any_process_holds(&sock);
+        let held = probe_held(&sock);
+        let _ = crate::registry::kill_and_unlink(&sock);
+        crate::home::forget(&home, "term3");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+
+        let flips = flips.expect("deadlock or stall: the record/forget thread did not finish");
+        let passes = passes.expect("deadlock or stall: reconcile did not return");
+        eprintln!("concurrent sweep: {passes} reconcile passes, {flips} record/forget pairs, {elapsed:?}");
+        assert!(passes >= 5 && flips >= 50, "the race barely ran ({passes} passes, {flips} flips): proves nothing");
+        assert!(alive, "a re-home record/forget racing reconcile ended the session");
+        assert!(held, "the socket's holder is gone from the listing probe_socket reads");
     }
 
     /// The half of a close the user actually sees afterwards. `kill_project`

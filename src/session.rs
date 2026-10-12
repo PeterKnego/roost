@@ -1317,6 +1317,22 @@ pub fn kill_project(project: &str) -> usize {
     kill_project_with(project, &crate::home::resolves)
 }
 
+/// Whether a session `kill_project(project)` spares — one with an `Elsewhere`
+/// or `Unknown` record, re-read here as the close re-reads it — may still be
+/// running. Close Project asks before stopping `project`'s IDE listener: a
+/// re-homed Claude's `CLAUDE_CODE_SSE_PORT` names that listener for the
+/// life of its process (spec §4), so stopping it under a live one is a
+/// connection that can never be re-made.
+///
+/// Only "socket absent" or "socket on disk, nothing holds it" counts as not
+/// running. A listing that could not be trusted keeps the listener: an extra
+/// listener until the next close is recoverable, a stranded Claude is not.
+pub fn spares_live(project: &str) -> bool {
+    crate::home::away_from(project).into_iter().any(|(name, _)| {
+        !matches!(probe_socket(&sock_path(project, &name)), SocketState::Absent | SocketState::Unheld)
+    })
+}
+
 /// [`kill_project`] with the owner check injected, so tests do not depend on
 /// the configured roots. `resolves(home, owner)` is `home::resolves`.
 pub(crate) fn kill_project_with(project: &str, resolves: &dyn Fn(&str, &str) -> bool) -> usize {
