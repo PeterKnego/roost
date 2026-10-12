@@ -34,6 +34,10 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 /// them can get.
 const MAX_CONNECTIONS: usize = 16;
 
+/// How long the accept loop waits after a failed `accept` before the next.
+/// See the `Err` arm in `serve_incoming`.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Deserialize)]
 pub struct AskRequest {
     pub op: String,
@@ -347,6 +351,17 @@ fn serve_listener<F>(l: UnixListener, cap: usize, me: u32, ask: F)
 where
     F: Fn(AskRequest) -> AskReply + Send + Sync + 'static,
 {
+    serve_incoming(l.incoming(), cap, me, ask)
+}
+
+/// [`serve_listener`] over any source of accepted connections, so a test
+/// can hand it the accept *errors* a real listener only produces under
+/// descriptor exhaustion.
+fn serve_incoming<I, F>(incoming: I, cap: usize, me: u32, ask: F)
+where
+    I: Iterator<Item = std::io::Result<UnixStream>>,
+    F: Fn(AskRequest) -> AskReply + Send + Sync + 'static,
+{
     // A drop guard that frees one slot. Round 1 built this *inside* the
     // spawned closure's body (`let _guard = Guard(counter);` as the first
     // statement run once the thread actually started). That is wrong: if
@@ -387,8 +402,17 @@ where
     // makes it visible that one bad `accept` must not end the loop —
     // CLAUDE.md: no panic, and no silent exit either, may leave this
     // process's only hook listener dead.
-    for s in l.incoming() {
-        let Ok(s) = s else { continue };
+    for s in incoming {
+        let Ok(s) = s else {
+            // Backed off, not retried at once (final review h). The errors
+            // that persist — EMFILE/ENFILE with every descriptor in use —
+            // fail every call immediately, so a bare `continue` spins this
+            // thread at 100 % until a descriptor frees up, starving the very
+            // connection threads that would free one. A tenth of a second
+            // costs a hook nothing it would notice.
+            std::thread::sleep(ACCEPT_BACKOFF);
+            continue;
+        };
         if !peer_uid(&s).is_some_and(|u| peer_allowed(u, me)) {
             continue;
         }
@@ -422,6 +446,28 @@ where
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
+
+    /// Final-review h (M7): an accept error backs off before the next
+    /// accept. A persistent one — EMFILE, with every descriptor held —
+    /// returns at once on every call, so a bare `continue` spins a core at
+    /// 100 % for as long as the condition lasts, which is exactly when the
+    /// process can least afford it.
+    ///
+    /// Revert-checked (final fix wave): with the `ACCEPT_BACKOFF` sleep
+    /// removed from the `Err` arm, three errors are consumed in
+    /// microseconds and this fails on "accept errors were retried without
+    /// backing off".
+    #[test]
+    fn an_accept_error_backs_off_before_the_next_accept() {
+        let errors = std::iter::repeat_with(|| Err(std::io::Error::from_raw_os_error(24))).take(3);
+        let started = std::time::Instant::now();
+        serve_incoming(errors, 1, 0, |_| AskReply::Refuse { refuse: "unused".into() });
+        let took = started.elapsed();
+        assert!(
+            took >= ACCEPT_BACKOFF * 3,
+            "accept errors were retried without backing off: 3 errors in {took:?}"
+        );
+    }
 
     #[test]
     fn a_foreign_uid_is_refused() {
