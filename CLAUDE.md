@@ -109,11 +109,15 @@ These are load-bearing. Breaking one is a defect, not a style choice.
 
   `Kind::Worktree` installs `roost worktree-hook`, and only on
   `WorktreeCreate`, with `"timeout": 120` — long enough to outlast
-  `hub::ASK_TIMEOUT`'s 60s browser wait plus the round trip. It is allowed to
-  exit non-zero, but only when roost answered `refuse` or its answer could
-  not be read; any other event getting this command is the same mistake
-  `claude-hook`'s exit-0-always rule exists to prevent, for an event that has
-  nothing to do with worktrees: a non-zero exit there shows an error in every
+  `hub::ASK_TIMEOUT`'s 60s browser wait plus the round trip. Unlike
+  `claude-hook`, it is allowed to exit non-zero: exit 0 and a path on stdout
+  means a worktree now exists, created either by roost or by the hook's own
+  local fallback; every other outcome — a name `wtname::check` refuses, a
+  failed fallback, roost answering `refuse`, a reply it timed out waiting
+  for, or an answer it could not read — creates nothing and exits 1. Any
+  other event getting this command is the same mistake `claude-hook`'s
+  exit-0-always rule exists to prevent, for an event that has nothing to do
+  with worktrees: a non-zero exit there shows an error in every
   Claude session in the checkout.
 - **A session's home is forever; re-homing changes ownership, nothing else.**
   A session's dtach socket path, its `SESSIONS` key and its process
@@ -140,7 +144,7 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   finds a session's process by matching its socket path as a whole argument
   in the dtach master's argv, so a session that physically moved would stop
   matching its own liveness check. Within one owner, a terminal name is held
-  by at most one live session, native or resident (R16). Ending a session
+  by at most one live session, native or resident. Ending a session
   or closing a project both need positive ownership evidence, same as every
   other destructive path in this codebase. And `worktree::list` — the only
   git call this feature adds — never runs under the hub lock or the
