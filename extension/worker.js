@@ -350,6 +350,15 @@ chrome.debugger.onEvent.addListener((src, method, params) => {
     pushConsole(src.tabId, `[${e.level}] ${e.text}${e.url ? ` (${e.url})` : ""}`);
   }
 });
+// chrome_upload waits here for the page to open its file picker.
+const choosers = new Map(); // tabId -> resolve
+
+chrome.debugger.onEvent.addListener((src, method, params) => {
+  if (method !== "Page.fileChooserOpened") return;
+  const resolve = choosers.get(src.tabId);
+  if (resolve) { choosers.delete(src.tabId); resolve(params); }
+});
+
 // The user pressed Cancel on Chrome's "is debugging this browser" bar, or the
 // tab closed: forget it, and the next call attaches afresh.
 chrome.debugger.onDetach.addListener((src) => {
@@ -370,34 +379,149 @@ function withTimeout(p, ms, what) {
 
 // ---- tools -----------------------------------------------------------------------------
 
+// The page's documents: the top one and every same-origin iframe's, nested,
+// each with the offset that turns its client coordinates into the top
+// page's. A cross-origin frame's document cannot be reached and is skipped.
+const FRAMES = `const roostDocs = () => {
+  const out = [];
+  const walk = (doc, dx, dy) => {
+    out.push({ doc, dx, dy });
+    for (const f of doc.querySelectorAll('iframe,frame')) {
+      let d = null;
+      try { d = f.contentDocument; } catch {}
+      if (!d || !d.documentElement) continue;
+      const r = f.getBoundingClientRect();
+      if (!r.width || !r.height) continue;
+      walk(d, dx + r.left + f.clientLeft, dy + r.top + f.clientTop);
+    }
+  };
+  walk(document, 0, 0);
+  return out;
+};
+const roostFind = (ref, selector) => {
+  for (const f of roostDocs()) {
+    const el = ref !== null ? f.doc.querySelector('[data-roost-ref="' + ref + '"]') : f.doc.querySelector(selector);
+    if (el) return { el, f };
+  }
+  return null;
+};`;
+
+const findArgs = (args) => args.ref !== undefined && args.ref !== null
+  ? `${JSON.stringify(String(args.ref))}, null`
+  : `null, ${JSON.stringify(String(args.selector || ""))}`;
+
 const READ_SCRIPT = (maxChars) => `(() => {
-  const sel = 'a[href],button,input:not([type=hidden]),textarea,select,summary,[role=button],[role=link],[role=checkbox],[role=tab],[contenteditable=""],[contenteditable=true]';
-  document.querySelectorAll('[data-roost-ref]').forEach((e) => e.removeAttribute('data-roost-ref'));
+  ${FRAMES}
+  const sel = 'a[href],button,input:not([type=hidden]),textarea,select,summary,[role=button],[role=link],[role=checkbox],[role=tab],[role=option],[role=gridcell],[contenteditable=""],[contenteditable=true]';
+  const docs = roostDocs();
   const out = [];
   let n = 0;
-  for (const el of document.querySelectorAll(sel)) {
-    const r = el.getBoundingClientRect();
-    const cs = getComputedStyle(el);
-    if (!r.width || !r.height || cs.visibility === 'hidden' || cs.display === 'none') continue;
-    if (++n > 300) break;
-    el.setAttribute('data-roost-ref', String(n));
-    const label = (el.getAttribute('aria-label') || el.innerText || el.placeholder || el.value || el.name || el.title || el.getAttribute('href') || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
-    const kind = el.tagName.toLowerCase() + (el.type && el.tagName === 'INPUT' ? ':' + el.type : '');
-    out.push('[' + n + '] ' + kind + ' "' + label + '"');
+  let text = '';
+  for (const { doc } of docs) {
+    doc.querySelectorAll('[data-roost-ref]').forEach((e) => e.removeAttribute('data-roost-ref'));
+    if (doc.body) text += (text ? '\\n' : '') + doc.body.innerText;
+    for (const el of doc.querySelectorAll(sel)) {
+      const r = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      if (!r.width || !r.height || cs.visibility === 'hidden' || cs.display === 'none') continue;
+      if (++n > 400) break;
+      el.setAttribute('data-roost-ref', String(n));
+      const label = (el.getAttribute('aria-label') || el.innerText || el.placeholder || el.value || el.name || el.title || el.getAttribute('href') || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
+      const kind = el.tagName.toLowerCase() + (el.type && el.tagName === 'INPUT' ? ':' + el.type : '') + (doc === document ? '' : ' (in frame)');
+      out.push('[' + n + '] ' + kind + ' "' + label + '"');
+    }
   }
-  const text = (document.body ? document.body.innerText : '').slice(0, ${maxChars});
-  return { title: document.title, url: location.href, text, truncated: !!document.body && document.body.innerText.length > ${maxChars}, elements: out };
+  return { title: document.title, url: location.href, text: text.slice(0, ${maxChars}), truncated: text.length > ${maxChars}, elements: out };
 })()`;
 
 const LOCATE_SCRIPT = (args) => `(() => {
-  const el = ${args.ref !== undefined && args.ref !== null
-    ? `document.querySelector('[data-roost-ref="' + ${JSON.stringify(String(args.ref))} + '"]')`
-    : `document.querySelector(${JSON.stringify(String(args.selector || ""))})`};
-  if (!el) return null;
+  ${FRAMES}
+  const hit = roostFind(${findArgs(args)});
+  if (!hit) return null;
+  const { el } = hit;
   el.scrollIntoView({ block: 'center', inline: 'center' });
+  // Each enclosing frame too, outermost last, or the element can sit in
+  // view inside a frame that is itself scrolled out of the page.
+  for (let w = el.ownerDocument.defaultView; w.frameElement; w = w.parent) w.frameElement.scrollIntoView({ block: 'center', inline: 'center' });
   const r = el.getBoundingClientRect();
-  return { x: r.left + r.width / 2, y: r.top + r.height / 2, what: el.tagName.toLowerCase() + ' "' + (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 60) + '"' };
+  let dx = 0, dy = 0;
+  for (let w = el.ownerDocument.defaultView; w.frameElement; w = w.parent) {
+    const fr = w.frameElement.getBoundingClientRect();
+    dx += fr.left + w.frameElement.clientLeft;
+    dy += fr.top + w.frameElement.clientTop;
+  }
+  return { x: dx + r.left + r.width / 2, y: dy + r.top + r.height / 2, what: el.tagName.toLowerCase() + ' "' + (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 60) + '"' };
 })()`;
+
+// Select the focused field's whole content, so the text typed next replaces it.
+const SELECT_ALL_SCRIPT = `(() => {
+  let el = document.activeElement;
+  // Focus inside a same-origin iframe shows here as the iframe itself.
+  while (el && (el.tagName === 'IFRAME' || el.tagName === 'FRAME')) {
+    let d = null;
+    try { d = el.contentDocument; } catch {}
+    if (!d) break;
+    el = d.activeElement;
+  }
+  if (!el) return false;
+  if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') { try { el.select(); } catch {} return true; }
+  if (el.isContentEditable) {
+    const range = el.ownerDocument.createRange();
+    range.selectNodeContents(el);
+    const sel = el.ownerDocument.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    return true;
+  }
+  return false;
+})()`;
+
+// Puts the files into the file input `this` the way a person picking them
+// would leave it, then tells the page, which listens for change (React too).
+const SET_FILES = `function (files) {
+  const dt = new DataTransfer();
+  for (const f of files) {
+    const bin = atob(f.data);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    dt.items.add(new File([bytes], f.name, { type: f.mime }));
+  }
+  this.files = dt.files;
+  this.dispatchEvent(new Event('input', { bubbles: true }));
+  this.dispatchEvent(new Event('change', { bubbles: true }));
+  return this.files.length;
+}`;
+
+// The located element itself when it is a file input, else null.
+const FILE_INPUT_SCRIPT = (args) => `(() => {
+  ${FRAMES}
+  const hit = roostFind(${findArgs(args)});
+  const el = hit && hit.el;
+  return el && el.tagName === 'INPUT' && el.type === 'file' ? el : null;
+})()`;
+
+// The file input to fill: the target itself, or the one whose picker a
+// click on the target opens. The picker is intercepted, so no dialog ever
+// appears in front of the user.
+async function fileInput(tabId, args, at) {
+  const direct = await cdp(tabId, "Runtime.evaluate", { expression: FILE_INPUT_SCRIPT(args) });
+  if (direct.result && direct.result.objectId) return { objectId: direct.result.objectId, multiple: null };
+  await cdp(tabId, "Page.enable");
+  await cdp(tabId, "Page.setInterceptFileChooserDialog", { enabled: true });
+  try {
+    const opened = new Promise((resolve) => choosers.set(tabId, resolve));
+    await click(tabId, at.x, at.y);
+    const ev = await withTimeout(opened, 5000, "a file picker opening").finally(() => choosers.delete(tabId));
+    const { object } = await cdp(tabId, "DOM.resolveNode", { backendNodeId: ev.backendNodeId });
+    return { objectId: object.objectId, multiple: ev.mode === "selectMultiple" };
+  } catch (e) {
+    throw new Error(/did not finish/.test(String(e && e.message))
+      ? "clicking it opened no file picker — target the <input type=file> or the button that opens it"
+      : e.message);
+  } finally {
+    await cdp(tabId, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {});
+  }
+}
 
 async function locate(tabId, args) {
   if ((args.ref === undefined || args.ref === null) && !args.selector) throw new Error("pass ref (from chrome_read) or selector");
@@ -410,6 +534,16 @@ async function click(tabId, x, y) {
   for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
     await cdp(tabId, "Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount: type === "mouseMoved" ? 0 : 1 });
   }
+}
+
+// chrome_screenshot shrinks the viewport by this factor (device pixels,
+// capped to SHOT_LONG_SIDE); a point on the image divided by it is a CSS
+// pixel in the viewport, which is what Input.dispatchMouseEvent takes.
+async function shotScale(tabId) {
+  const m = await cdp(tabId, "Page.getLayoutMetrics");
+  const vp = m.cssVisualViewport || m.visualViewport;
+  const dpr = (await evaluate(tabId, "devicePixelRatio")) || 1;
+  return dpr * Math.min(1, SHOT_LONG_SIDE / (Math.max(vp.clientWidth, vp.clientHeight) * dpr));
 }
 
 async function screenshot(tab) {
@@ -497,7 +631,15 @@ async function runTool(gk, tool, args) {
       await guard(tab);
       await rememberTab(gk, tab.id);
       await attach(tab.id);
-      const at = await locate(tab.id, args);
+      let at;
+      if (Number.isFinite(args.x) && Number.isFinite(args.y)) {
+        // A point on the last screenshot: for what refs cannot reach, such
+        // as a cross-origin iframe or a canvas.
+        const k = await shotScale(tab.id);
+        at = { x: args.x / k, y: args.y / k, what: `point ${args.x},${args.y} on the screenshot` };
+      } else {
+        at = await locate(tab.id, args);
+      }
       await click(tab.id, at.x, at.y);
       await sleep(300);
       const now = await chrome.tabs.get(tab.id);
@@ -510,6 +652,11 @@ async function runTool(gk, tool, args) {
       await attach(tab.id);
       const at = await locate(tab.id, args);
       await click(tab.id, at.x, at.y);
+      // Typing replaces what the field holds, the way a person selects all
+      // first: insertText alone lands at the caret, so a textarea that
+      // already has text (or an input that does not select on focus) would
+      // end up with the old and the new run together.
+      await evaluate(tab.id, SELECT_ALL_SCRIPT);
       await cdp(tab.id, "Input.insertText", { text: String(args.text ?? "") });
       if (args.submit) {
         const key = { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 };
@@ -518,6 +665,23 @@ async function runTool(gk, tool, args) {
         await sleep(300);
       }
       return { typed_into: at.what, tab_id: tab.id, submitted: !!args.submit };
+    }
+    case "chrome_upload": {
+      const tab = await resolveTab(args, gk);
+      await guard(tab);
+      await rememberTab(gk, tab.id);
+      await attach(tab.id);
+      const files = Array.isArray(args.files) ? args.files : [];
+      if (!files.length) throw new Error("no files to upload");
+      const at = await locate(tab.id, args);
+      const input = await fileInput(tab.id, args, at);
+      if (input.multiple === false && files.length > 1) throw new Error(`that picker takes one file, not ${files.length}`);
+      const r = await cdp(tab.id, "Runtime.callFunctionOn", {
+        objectId: input.objectId, functionDeclaration: SET_FILES, arguments: [{ value: files }], returnByValue: true,
+      });
+      if (r.exceptionDetails) throw new Error((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text);
+      await sleep(300);
+      return { uploaded: files.map((f) => f.name), into: at.what, tab_id: tab.id };
     }
     case "chrome_console": {
       const tab = await resolveTab(args, gk);

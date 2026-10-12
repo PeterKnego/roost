@@ -21,6 +21,8 @@
 //!       tab, navigated in place by Claude, is closed.
 //!   (e) the screenshot's hand-back of the front tab removed -> O fails: with
 //!       follow off, Claude's tab is left in front of the user's.
+//!   (f) chrome_type's select-all removed -> F fails: the input submits
+//!       "stale hello roost" and the textarea holds "old wordsnew words".
 //!
 //! Run: deno run -A tests/browser/bridge.mjs
 import { fixture, freePort, openPage, attachTarget, profileDir, startBrowser, startRoost, until, sleep }
@@ -47,7 +49,15 @@ const site = Deno.serve({ port: sitePort, hostname: "127.0.0.1", onListen() {} }
 <h1 id="h">untouched</h1>
 <button id="b" onclick="document.getElementById('h').textContent='clicked'; console.log('button clicked')">Press me</button>
 <form onsubmit="event.preventDefault(); document.getElementById('h').textContent='typed:' + document.getElementById('q').value">
-<input id="q" aria-label="query"></form>`, { headers: { "content-type": "text/html" } }));
+<input id="q" aria-label="query" value="stale "></form>
+<textarea id="t" aria-label="notes" oninput="document.getElementById('tv').textContent='area:' + this.value">old words</textarea>
+<p id="tv"></p>
+<input type="file" id="f" multiple aria-label="files" onchange="document.getElementById('fv').textContent='files:' + [...this.files].map((f) => f.name + '/' + f.size + '/' + f.type).join(',')">
+<input type="file" id="hf" style="display:none" onchange="this.files[0].text().then((t) => document.getElementById('hv').textContent='picked:' + this.files[0].name + '=' + t)">
+<button id="pick" onclick="document.getElementById('hf').click()">Pick a file</button>
+<p id="fv"></p><p id="hv"></p>
+<iframe srcdoc="<button onclick=&quot;parent.document.getElementById('h').textContent='framed'&quot;>Inside frame</button><input id=fi value=frame-stale>"></iframe>
+<button id="corner" style="position:fixed;right:0;bottom:0;width:160px;height:80px" onclick="document.getElementById('h').textContent='cornered'">corner</button>`, { headers: { "content-type": "text/html" } }));
 const target = `http://127.0.0.1:${sitePort}/`;
 
 // A profile of its own: the extension's storage persists in it, and a grant
@@ -162,7 +172,52 @@ try {
   const typed = await mcp.tool("chrome_type", { selector: "#q", text: "hello roost", submit: true });
   ok(!typed.isError, `F: chrome_type — ${text(typed)}`);
   const after2 = JSON.parse(text(await mcp.tool("chrome_read")));
-  ok(after2.text.includes("typed:hello roost"), "F: the typed text was submitted");
+  ok(after2.text.includes("typed:hello roost"), "F: the typed text was submitted, replacing the input's old value");
+  const area = await mcp.tool("chrome_type", { selector: "#t", text: "new words" });
+  ok(!area.isError, `F: chrome_type into a textarea — ${text(area)}`);
+  const after3 = JSON.parse(text(await mcp.tool("chrome_read")));
+  ok(after3.text.includes("area:new words"), `F: typing into a textarea replaces what it held — ${/area:.*/.exec(after3.text)?.[0]}`);
+
+  const up = await Deno.makeTempDir();
+  await Deno.writeTextFile(`${up}/a.txt`, "hello");
+  await Deno.writeFile(`${up}/b.png`, new Uint8Array([137, 80, 78, 71, 0, 255]));
+  const direct = await mcp.tool("chrome_upload", { selector: "#f", paths: [`${up}/a.txt`, `${up}/b.png`] });
+  ok(!direct.isError, `F: chrome_upload into a file input — ${text(direct)}`);
+  const after4 = JSON.parse(text(await mcp.tool("chrome_read")));
+  ok(after4.text.includes("files:a.txt/5/text/plain,b.png/6/image/png"), `F: the page got both files, bytes and type intact — ${/files:.*/.exec(after4.text)?.[0]}`);
+  const picked = await mcp.tool("chrome_upload", { selector: "#pick", paths: [`${up}/a.txt`] });
+  ok(!picked.isError, `F: chrome_upload through a button that opens the picker — ${text(picked)}`);
+  const after5 = JSON.parse(text(await mcp.tool("chrome_read")));
+  ok(after5.text.includes("picked:a.txt=hello"), `F: the picker was caught and filled, no dialog — ${/picked:.*/.exec(after5.text)?.[0]}`);
+  const tooMany = await mcp.tool("chrome_upload", { selector: "#pick", paths: [`${up}/a.txt`, `${up}/b.png`] });
+  ok(tooMany.isError && /one file/.test(text(tooMany)), `F: a single-file picker refuses two — ${text(tooMany)}`);
+  const noPicker = await mcp.tool("chrome_upload", { selector: "#h", paths: [`${up}/a.txt`] });
+  ok(noPicker.isError && /no file picker/.test(text(noPicker)), `F: a target that opens no picker says so — ${text(noPicker)}`);
+  const missing = await mcp.tool("chrome_upload", { selector: "#f", paths: [`${up}/nope.png`] });
+  ok(missing.isError && /cannot read/.test(text(missing)), `F: a missing file fails before the browser is asked — ${text(missing)}`);
+  await Deno.remove(up, { recursive: true });
+
+  const framed = JSON.parse(text(await mcp.tool("chrome_read")));
+  const inFrame = (framed.elements || []).find((e) => e.includes("Inside frame"));
+  ok(/\(in frame\)/.test(inFrame || ""), `F: chrome_read numbers a same-origin iframe's button — ${inFrame}`);
+  await mcp.tool("chrome_click", { ref: Number(/^\[(\d+)\]/.exec(inFrame || "")?.[1]) });
+  ok(JSON.parse(text(await mcp.tool("chrome_read"))).text.includes("framed"), "F: clicking it by ref clicks inside the frame");
+  const fin = (JSON.parse(text(await mcp.tool("chrome_read"))).elements || []).find((e) => e.includes("frame-stale"));
+  await mcp.tool("chrome_type", { ref: Number(/^\[(\d+)\]/.exec(fin || "")?.[1]), text: "frame-new" });
+  const finAfter = (JSON.parse(text(await mcp.tool("chrome_read"))).elements || []).find((e) => e.includes("(in frame)") && e.startsWith("[") && e.includes("input"));
+  ok(/"frame-new"/.test(finAfter || ""), `F: typing into a framed input replaces its value — ${fin} -> ${finAfter}`);
+
+  // A point on the screenshot: the corner button, 20 px in from the image's bottom right.
+  const shotForPoint = (await mcp.tool("chrome_screenshot")).content.find((c) => c.type === "image");
+  const jpeg = Uint8Array.from(atob(shotForPoint.data), (c) => c.charCodeAt(0));
+  let w = 0, hgt = 0;
+  for (let i = 2; i < jpeg.length;) {
+    const marker = jpeg[i + 1], len = (jpeg[i + 2] << 8) | jpeg[i + 3];
+    if (marker >= 0xc0 && marker <= 0xc3) { hgt = (jpeg[i + 5] << 8) | jpeg[i + 6]; w = (jpeg[i + 7] << 8) | jpeg[i + 8]; break; }
+    i += 2 + len;
+  }
+  const pt = await mcp.tool("chrome_click", { x: w - 20, y: hgt - 20 });
+  ok(!pt.isError && JSON.parse(text(await mcp.tool("chrome_read"))).text.includes("cornered"), `F: chrome_click at a screenshot point (${w}x${hgt}) hits what is drawn there — ${text(pt)}`);
 
   const con = JSON.parse(text(await mcp.tool("chrome_console")));
   ok((con.messages || []).some((m) => m.includes("button clicked")), `G: chrome_console has the page's log — ${JSON.stringify(con.messages)}`);

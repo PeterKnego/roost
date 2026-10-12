@@ -50,9 +50,11 @@ unless a roost tab is open in it.
 | `chrome_open` | opens a page in a new tab in its tab group, or navigates a given tab |
 | `chrome_read` | the page's text, plus numbered links, buttons and inputs |
 | `chrome_click` | a real mouse click on an element |
-| `chrome_type` | types into an input, optionally pressing Enter |
+| `chrome_type` | types into an input or textarea, replacing what it holds, optionally pressing Enter |
 | `chrome_screenshot` | an image of the visible part of the tab |
 | `chrome_console` | console messages and uncaught errors |
+| `chrome_click` x,y | clicks a point on the last screenshot, for what has no ref (a cross-origin iframe, a canvas) |
+| `chrome_upload` | puts files from the roost host into a file input — the input itself, or a button that opens the picker (the picker is caught, no dialog appears) |
 | `chrome_close` | closes a tab — **only** one this Claude session opened itself |
 | `handoff_read` / `handoff_send` | the project's handoff page (below) |
 
