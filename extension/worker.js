@@ -24,7 +24,7 @@ const DENIED_HOSTS = ["chromewebstore.google.com", "chrome.google.com"];
 // ---- settings --------------------------------------------------------------
 
 async function settings() {
-  const s = await chrome.storage.local.get({ origins: [], key: "", unsafe: false, deny: [] });
+  const s = await chrome.storage.local.get({ origins: [], key: "", unsafe: false, deny: [], follow: true });
   return s;
 }
 
@@ -245,20 +245,37 @@ async function waitLoaded(tabId) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/// One unfocused window for pages Claude opens, so screenshotting them never
-/// changes what the user is looking at.
-async function claudeWindow(url) {
-  const id = await session("claudeWindow", null);
-  if (id !== null) {
-    const w = await chrome.windows.get(id).catch(() => null);
-    if (w) {
-      const tab = await chrome.tabs.create({ windowId: id, url, active: true });
-      return tab;
-    }
+/// Pages Claude opens go into a tab group of its own per Claude session, in
+/// the window the user last used, so they can watch it work beside their own
+/// tabs. With `follow` on (the default) the new tab comes to the front; off,
+/// it opens behind and only a screenshot brings it forward, briefly.
+async function claudeTab(url, gk) {
+  const { follow } = await settings();
+  const groups = await session("groups", {});
+  const group = groups[gk] !== undefined ? await chrome.tabGroups.get(groups[gk]).catch(() => null) : null;
+  let windowId = group && group.windowId;
+  if (!windowId) {
+    const w = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
+    windowId = w && !w.incognito ? w.id : null;
   }
-  const w = await chrome.windows.create({ url, focused: false, type: "normal", width: 1280, height: 900 });
-  await setSession("claudeWindow", w.id);
-  return w.tabs[0];
+  if (!windowId) {
+    // No normal window to join (all closed, or only incognito, where this
+    // extension does not run): start one.
+    const w = await chrome.windows.create({ type: "normal", focused: follow });
+    windowId = w.id;
+  }
+  const tab = await chrome.tabs.create({ windowId, url, active: follow });
+  if (group) {
+    await chrome.tabs.group({ groupId: group.id, tabIds: [tab.id] });
+  } else {
+    const id = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId } });
+    // The grant key ends `|<session>|<pid>`; a project key may hold anything.
+    const parts = gk.split("|");
+    await chrome.tabGroups.update(id, { title: `Claude · ${parts[parts.length - 2]}`, color: "orange" });
+    groups[gk] = id;
+    await setSession("groups", groups);
+  }
+  return tab;
 }
 
 // ---- the DevTools protocol -----------------------------------------------------------
@@ -378,11 +395,22 @@ async function click(tabId, x, y) {
 }
 
 async function screenshot(tab) {
-  // A background tab does not paint; make it the visible one in its window.
+  // A background tab does not paint; make it the visible one in its window,
+  // and with follow off, hand the user's own tab back afterwards.
+  let restore = null;
   if (!tab.active) {
+    if (!(await settings()).follow) [restore] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
     await chrome.tabs.update(tab.id, { active: true });
     await sleep(250);
   }
+  try {
+    return await capture(tab);
+  } finally {
+    if (restore) await chrome.tabs.update(restore.id, { active: true }).catch(() => {});
+  }
+}
+
+async function capture(tab) {
   await attach(tab.id);
   await cdp(tab.id, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
   const m = await cdp(tab.id, "Page.getLayoutMetrics");
@@ -420,7 +448,7 @@ async function runTool(gk, tool, args) {
         await guard(tab);
         tab = await chrome.tabs.update(tab.id, { url: u.href });
       } else {
-        tab = await claudeWindow(u.href);
+        tab = await claudeTab(u.href, gk);
         await recordOpened(gk, tab.id);
       }
       tab = await waitLoaded(tab.id);

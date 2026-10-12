@@ -19,6 +19,8 @@
 //!       timeout (`browser::ACK_TIMEOUT`, unit-tested) gets the call out.
 //!   (d) chrome_close's ownership check disabled -> N fails: the user's own
 //!       tab, navigated in place by Claude, is closed.
+//!   (e) the screenshot's hand-back of the front tab removed -> O fails: with
+//!       follow off, Claude's tab is left in front of the user's.
 //!
 //! Run: deno run -A tests/browser/bridge.mjs
 import { fixture, freePort, openPage, attachTarget, profileDir, startBrowser, startRoost, until, sleep }
@@ -168,6 +170,31 @@ try {
   const shot = await mcp.tool("chrome_screenshot");
   const img = (shot.content || []).find((c) => c.type === "image");
   ok(img && img.mimeType === "image/jpeg" && img.data.startsWith("/9j/"), `H: chrome_screenshot returns a JPEG as image content (${img ? img.data.length : 0} b64 chars)`);
+
+  // ---- where Claude's tabs go ----------------------------------------------------
+  const tabInfo = (id) => worker.evalIn(`chrome.tabs.get(${id}).then(async (t) => ({
+    active: t.active, windowId: t.windowId,
+    group: t.groupId === -1 ? null : (await chrome.tabGroups.get(t.groupId)).title }))`);
+  const firstTab = await tabInfo(JSON.parse(text(opened)).tab_id);
+  ok(firstTab.group === "Claude · term" && firstTab.active, `O: an opened page is in the session's group, in front — ${JSON.stringify(firstTab)}`);
+  const second = JSON.parse(text(await mcp.tool("chrome_open", { url: `${target}?second` })));
+  const secondTab = await tabInfo(second.tab_id);
+  ok(secondTab.group === "Claude · term" && secondTab.windowId === firstTab.windowId,
+    `O: the session's next page joins the same group — ${JSON.stringify(secondTab)}`);
+
+  // With follow off a page opens behind, and a screenshot borrows the front
+  // only for itself. The tab in front beforehand is the one that must be
+  // back afterwards, not merely "some tab other than Claude's".
+  await worker.evalIn(`chrome.storage.local.set({ follow: false }).then(() => true)`);
+  const front = await worker.evalIn(`chrome.tabs.query({ active: true, windowId: ${secondTab.windowId} }).then(([t]) => t.id)`);
+  const behind = JSON.parse(text(await mcp.tool("chrome_open", { url: `${target}?behind` })));
+  const behindTab = await tabInfo(behind.tab_id);
+  ok(!behindTab.active && behindTab.group === "Claude · term", `O: with follow off, a page opens behind — ${JSON.stringify(behindTab)}`);
+  const behindShot = await mcp.tool("chrome_screenshot", { tab_id: behind.tab_id });
+  const frontAfter = await worker.evalIn(`chrome.tabs.query({ active: true, windowId: ${secondTab.windowId} }).then(([t]) => t.id)`);
+  ok((behindShot.content || []).some((c) => c.type === "image") && frontAfter === front,
+    `O: its screenshot works and hands the front back — before ${front}, after ${frontAfter}`);
+  await worker.evalIn(`chrome.storage.local.set({ follow: true }).then(() => true)`);
 
   const roostTab = await mcp.tool("chrome_open", { url: `${roostOrigin}/${fx.project}` });
   ok(roostTab.isError && /roost tab/.test(text(roostTab)), `I: Claude may not drive roost itself — ${text(roostTab)}`);

@@ -3,7 +3,7 @@ const $ = (id) => document.getElementById(id);
 const say = (t) => { $("msg").textContent = t; };
 
 async function load() {
-  const s = await chrome.storage.local.get({ origins: [], key: "", unsafe: false, deny: [] });
+  const s = await chrome.storage.local.get({ origins: [], key: "", unsafe: false, deny: [], follow: true });
   const ul = $("origins");
   ul.replaceChildren();
   for (const o of s.origins) {
@@ -23,6 +23,7 @@ async function load() {
   $("keystate").textContent = s.key ? "A key is set." : "No key yet — calls will be refused.";
   $("deny").value = s.deny.join("\n");
   $("unsafe").checked = s.unsafe;
+  $("follow").checked = s.follow;
 }
 
 $("add").addEventListener("click", async () => {
@@ -63,6 +64,11 @@ $("unsafe").addEventListener("change", async (e) => {
   }
   await chrome.storage.local.set({ unsafe: e.target.checked });
   say(e.target.checked ? "Unsafe mode is ON." : "Unsafe mode is off.");
+});
+
+$("follow").addEventListener("change", async (e) => {
+  await chrome.storage.local.set({ follow: e.target.checked });
+  say(e.target.checked ? "Claude's tabs will come to the front." : "Claude's tabs will open behind yours.");
 });
 
 load();

@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "Lets a Claude running in roost look at and use this browser — with your consent, once per Claude session.",
   "minimum_chrome_version": "116",
-  "permissions": ["debugger", "tabs", "scripting", "storage", "contextMenus", "activeTab"],
+  "permissions": ["debugger", "tabs", "tabGroups", "scripting", "storage", "contextMenus", "activeTab"],
   "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
   "optional_host_permissions": ["https://*/*", "http://*/*"],
   "background": { "service_worker": "worker.js" },

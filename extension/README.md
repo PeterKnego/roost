@@ -47,8 +47,10 @@ browser pages, the Chrome Web Store, roost itself, and any domain you list
 under *Never drive these sites*.
 
 While Claude works in a tab, Chrome shows its "is debugging this browser"
-bar. Pressing *Cancel* there detaches it. Pages Claude opens go into a
-separate window, so they do not take over what you are looking at.
+bar. Pressing *Cancel* there detaches it. Pages Claude opens go into an
+orange "Claude · <terminal>" tab group in your window and come to the front,
+so you can watch. To keep them behind your own tab instead, turn off *Bring
+Claude's tabs to the front* in the options.
 
 ## Sending to Claude
 
