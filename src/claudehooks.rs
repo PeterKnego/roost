@@ -229,23 +229,30 @@ fn merge(doc: &mut serde_json::Value, kind: Kind, on: bool) {
         }
         return;
     }
+    // Every container is pruned only if *this call* emptied it (final
+    // review e). An empty array, an empty group or an empty `hooks` that
+    // was already empty is the user's — a placeholder, a half-finished hand
+    // edit — and dropping it rewrote a file roost had nothing to remove from.
     let Some(hooks) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) else { return };
+    let mut emptied_an_event = false;
     let events: Vec<String> = hooks.keys().cloned().collect();
     for event in events {
         let Some(groups) = hooks.get_mut(&event).and_then(|a| a.as_array_mut()) else { continue };
-        for g in groups.iter_mut() {
-            if let Some(entries) = g.get_mut("hooks").and_then(|h| h.as_array_mut()) {
-                entries.retain(|e| !is_ours(e, kind.command()));
-            }
-        }
-        groups.retain(|g| {
-            g.get("hooks").and_then(|h| h.as_array()).map_or(true, |e| !e.is_empty())
+        let mut emptied_a_group = false;
+        groups.retain_mut(|g| {
+            let Some(entries) = g.get_mut("hooks").and_then(|h| h.as_array_mut()) else { return true };
+            let before = entries.len();
+            entries.retain(|e| !is_ours(e, kind.command()));
+            let emptied_here = before > 0 && entries.is_empty();
+            emptied_a_group |= emptied_here;
+            !emptied_here
         });
-        if groups.is_empty() {
+        if emptied_a_group && groups.is_empty() {
             hooks.remove(&event);
+            emptied_an_event = true;
         }
     }
-    if hooks.is_empty() {
+    if emptied_an_event && hooks.is_empty() {
         obj.remove("hooks");
     }
 }
@@ -501,6 +508,63 @@ mod tests {
         set(d.path(), false).unwrap();
         let v: serde_json::Value = serde_json::from_str(&read(d.path())).unwrap();
         assert!(v.get("hooks").is_none(), "{v}");
+    }
+
+    /// Final-review e (M2): disable drops an event array or a group only
+    /// when *this call* emptied it. A foreign empty `"PreToolUse": []`, a
+    /// foreign group with an empty `hooks`, a foreign non-array value and a
+    /// foreign empty `"hooks": {}` are the user's, not leftovers of ours;
+    /// pruning them rewrote a hand-written file roost had nothing to remove
+    /// from.
+    ///
+    /// Revert-checked (final fix wave): with the pre-fix `merge` restored
+    /// (prune every empty array/group, and `hooks` whenever empty), fails on
+    /// "a disable with nothing of ours to remove rewrote the file" — the
+    /// three foreign empties were pruned and the file rewritten.
+    #[test]
+    fn disable_keeps_foreign_containers_it_did_not_empty() {
+        // Nothing of ours anywhere: the file must not be touched at all.
+        let d = proj();
+        let foreign = r#"{
+  "hooks": {
+    "PreToolUse": [],
+    "PostToolUse": [ { "matcher": "Bash", "hooks": [] } ],
+    "UserPromptSubmit": "not an array"
+  }
+}
+"#;
+        write(d.path(), foreign);
+        set(d.path(), false).unwrap();
+        assert_eq!(read(d.path()), foreign, "a disable with nothing of ours to remove rewrote the file");
+        set_kind(d.path(), Kind::Worktree, false).unwrap();
+        assert_eq!(read(d.path()), foreign, "nor may the worktree kind's disable");
+
+        let d = proj();
+        write(d.path(), "{\"hooks\": {}}\n");
+        set(d.path(), false).unwrap();
+        assert_eq!(read(d.path()), "{\"hooks\": {}}\n", "a foreign empty hooks object is not ours to drop");
+
+        // Ours beside them: ours goes, and every foreign container stays as
+        // it was, value for value.
+        let d = proj();
+        write(d.path(), &format!(r#"{{
+  "hooks": {{
+    "PreToolUse": [],
+    "PostToolUse": [ {{ "matcher": "Bash", "hooks": [] }} ],
+    "UserPromptSubmit": "not an array",
+    "Stop": [ {{ "hooks": [] }}, {{ "hooks": [ {OURS} ] }} ],
+    "Notification": [ {{ "hooks": [ {OURS} ] }} ]
+  }}
+}}
+"#));
+        set(d.path(), false).unwrap();
+        let v = read_json(d.path());
+        assert_eq!(v["hooks"]["PreToolUse"], serde_json::json!([]), "foreign empty array kept");
+        assert_eq!(v["hooks"]["PostToolUse"], serde_json::json!([{ "matcher": "Bash", "hooks": [] }]), "foreign empty group kept");
+        assert_eq!(v["hooks"]["UserPromptSubmit"], "not an array", "foreign non-array kept");
+        assert_eq!(v["hooks"]["Stop"], serde_json::json!([{ "hooks": [] }]), "the group we emptied goes, the foreign empty one beside it stays");
+        assert!(v["hooks"].get("Notification").is_none(), "an event this call emptied is dropped");
+        assert_eq!(state(d.path()), HookState::Absent);
     }
 
     /// Verified this can fail: replacing `.all(` with `.any(` in `state`
