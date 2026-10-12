@@ -10,6 +10,41 @@ added later never reaches the release page.
 Keep the newest section at the top, and say what a change means for someone
 running roost rather than what the diff did.
 
+## v0.8.0 — 2026-10-13 — a roost Claude can use your own Chrome
+
+The headline is the browser bridge: with the roost extension in Chrome, a
+Claude running in roost can work in the browser you are logged into. Around it,
+worktrees become something roost makes and follows, code reads better, and the
+tree learns a few new tricks.
+
+- **Browser bridge (#164, #165, #166).** `roost mcp` gives a roost Claude
+  `chrome_tabs/open/read/click/type/upload/screenshot/console/close` in your own
+  Chrome, through the roost extension, plus a handoff page for passing messages
+  to Claude in Chrome. Each Claude session asks you once, in an extension
+  window, before it does anything. `chrome_type` replaces what a field holds;
+  `chrome_upload` fills a file input, or catches the file picker a button opens;
+  read, click, type and upload reach into same-origin iframes. Setup:
+  `extension/README.md`; the release carries `roost-extension-0.8.0.zip`.
+- **roost creates worktrees, and the terminal follows (#159).** When Claude
+  asks for a worktree (`claude --worktree` or `EnterWorktree`), roost asks you,
+  creates it under `.claude/worktrees/`, opens it in a new tab, and moves the
+  asking terminal there without restarting it.
+- **Download a folder as a zip (#163).** Right-click a folder, or empty tree
+  space for the whole project. The archive is streamed, follows the tree's
+  filter and `.gitignore`, never leaves the project, and lists what it left
+  out in `ROOST-SKIPPED.txt`.
+- **Send to Claude from the tree (#148).** Right-click a file to put `@path`
+  into a Claude prompt, starting a Claude if none is running.
+- **PDFs open in the browser's own viewer (#149)** instead of an error.
+- **Code reads better.** Code text is 14px, and a new *Code font size* setting
+  (`code_font_size`, global or per project) changes it live (#152, #154).
+  The code editor and diffs scroll sideways instead of wrapping (#151, #153).
+  The terminal has a little more line height and lifts too-faint text to a
+  readable contrast (#150).
+- **A normal reload picks up a new roost (#155).** Every response carries
+  `Cache-Control`; versioned assets are cached for good, everything else is
+  checked with the server, so a deploy no longer needs a hard reload.
+
 ## v0.7.0 — 2026-09-30 — roost tells you when there is a newer roost
 
 roost now knows what the newest published version is, and says so. The
