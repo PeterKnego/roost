@@ -478,17 +478,22 @@ const SELECT_ALL_SCRIPT = `(() => {
 
 // Puts the files into the file input `this` the way a person picking them
 // would leave it, then tells the page, which listens for change (React too).
+// The input may sit in a same-origin iframe while this runs in the top
+// frame, so File, DataTransfer and Event come from the input's own window:
+// objects from the top frame's realm fail the iframe's instanceof checks
+// (Wix's uploader then reads no URI off the file).
 const SET_FILES = `function (files) {
-  const dt = new DataTransfer();
+  const w = this.ownerDocument.defaultView || window;
+  const dt = new w.DataTransfer();
   for (const f of files) {
     const bin = atob(f.data);
-    const bytes = new Uint8Array(bin.length);
+    const bytes = new w.Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    dt.items.add(new File([bytes], f.name, { type: f.mime }));
+    dt.items.add(new w.File([bytes], f.name, { type: f.mime }));
   }
   this.files = dt.files;
-  this.dispatchEvent(new Event('input', { bubbles: true }));
-  this.dispatchEvent(new Event('change', { bubbles: true }));
+  this.dispatchEvent(new w.Event('input', { bubbles: true }));
+  this.dispatchEvent(new w.Event('change', { bubbles: true }));
   return this.files.length;
 }`;
 
