@@ -17,6 +17,8 @@
 //!   (c) app.js's `pagehide` unregistering removed -> M fails: the server
 //!       still counts the departed page as a relay, and only the 5 s ack
 //!       timeout (`browser::ACK_TIMEOUT`, unit-tested) gets the call out.
+//!   (d) chrome_close's ownership check disabled -> N fails: the user's own
+//!       tab, navigated in place by Claude, is closed.
 //!
 //! Run: deno run -A tests/browser/bridge.mjs
 import { fixture, freePort, openPage, attachTarget, profileDir, startBrowser, startRoost, until, sleep }
@@ -91,7 +93,7 @@ const text = (r) => (r?.content || []).filter((c) => c.type === "text").map((c) 
 
 const cdpList = async () => (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json();
 
-let page, mcp, hand, worker;
+let page, mcp, hand, worker, mine;
 try {
   // ---- the extension, configured the way its options page would ----------------
   const findWorker = async () => (await cdpList()).find((t) => t.type === "service_worker" && t.url.endsWith("/worker.js"));
@@ -172,6 +174,26 @@ try {
   const file = await mcp.tool("chrome_open", { url: "file:///etc/passwd" });
   ok(file.isError && /http/.test(text(file)), `I: chrome_open refuses a file: URL — ${text(file)}`);
 
+  // ---- chrome_close: only what this session opened ------------------------------
+  // A tab the user opened, which Claude then navigates in place: driving it
+  // is allowed, closing it is not. The navigation is what makes this
+  // discriminating — a check on "was this session's last tab" would pass it.
+  mine = await openPage(browser.port, `${target}?mine`);
+  const listed = JSON.parse(text(await mcp.tool("chrome_tabs"))).tabs;
+  const mineId = listed.find((t) => String(t.url).includes("?mine"))?.id;
+  ok(typeof mineId === "number", `N: the user's own tab is listed — ${mineId}`);
+  const navigated = await mcp.tool("chrome_open", { url: `${target}?navigated`, new_tab: false, tab_id: mineId });
+  ok(!navigated.isError, `N: Claude may navigate the user's tab in place — ${text(navigated).slice(0, 80)}`);
+  const refused = await mcp.tool("chrome_close", { tab_id: mineId });
+  const stillThere = JSON.parse(text(await mcp.tool("chrome_tabs"))).tabs.some((t) => t.id === mineId);
+  ok(refused.isError && /not opened by this session/.test(text(refused)) && stillThere,
+    `N: chrome_close refuses the user's tab, and it stays open — ${text(refused)}`);
+
+  const own = JSON.parse(text(await mcp.tool("chrome_open", { url: `${target}?own` })));
+  const closed = await mcp.tool("chrome_close", { tab_id: own.tab_id });
+  const gone2 = !JSON.parse(text(await mcp.tool("chrome_tabs"))).tabs.some((t) => t.id === own.tab_id);
+  ok(!closed.isError && gone2, `N: chrome_close closes a tab this session opened — ${text(closed)}`);
+
   // ---- a call the page invents ---------------------------------------------------
   // What injected script in a roost page could do: post a call straight to
   // the content script. The extension must refuse it, because only the
@@ -224,6 +246,7 @@ try {
 } finally {
   try { await page?.close(); } catch {}
   try { await hand?.close(); } catch {}
+  try { await mine?.close(); } catch {}
   await mcp?.close();
   browser.close();
   await site.shutdown();

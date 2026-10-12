@@ -192,6 +192,26 @@ async function rememberTab(gk, tabId) {
   await setSession("lastTab", m);
 }
 
+/// Tabs a grant created with chrome_open, which are the only ones
+/// chrome_close may close. A tab's id is the evidence, recorded at creation:
+/// closing is destructive, and a user's own tab — even one Claude navigated
+/// with new_tab:false — is not Claude's to close. Session storage is wiped
+/// with the browser, the same lifetime as the tab ids it holds; when an
+/// extension reload wipes it early, every close is refused, which is the
+/// safe direction.
+async function openedTabs() { return session("opened", {}); }
+async function recordOpened(gk, tabId) {
+  const m = await openedTabs();
+  m[tabId] = gk;
+  await setSession("opened", m);
+}
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const m = await openedTabs();
+  if (!(tabId in m)) return;
+  delete m[tabId];
+  await setSession("opened", m);
+});
+
 async function resolveTab(args, gk) {
   if (args.tab_id !== undefined && args.tab_id !== null) {
     return chrome.tabs.get(Number(args.tab_id)).catch(() => { throw new Error(`no tab ${args.tab_id}`); });
@@ -401,6 +421,7 @@ async function runTool(gk, tool, args) {
         tab = await chrome.tabs.update(tab.id, { url: u.href });
       } else {
         tab = await claudeWindow(u.href);
+        await recordOpened(gk, tab.id);
       }
       tab = await waitLoaded(tab.id);
       await rememberTab(gk, tab.id);
@@ -462,6 +483,21 @@ async function runTool(gk, tool, args) {
         messages: st.console.slice(),
         note: st.fresh ? "collection started just now; reproduce the problem, then call chrome_console again" : undefined,
       };
+    }
+    case "chrome_close": {
+      const tab = await resolveTab(args, gk);
+      // Ownership, not the deny-list, decides here: a tab this session opened
+      // that has since wandered onto a denied page is still its own to close.
+      const owner = (await openedTabs())[tab.id];
+      if (owner !== gk) {
+        throw new Error(owner === undefined
+          ? `tab ${tab.id} was not opened by this session with chrome_open — only those can be closed`
+          : `tab ${tab.id} was opened by another Claude session — only that session can close it`);
+      }
+      await chrome.tabs.remove(tab.id);
+      const last = await lastTabs();
+      if (last[gk] === tab.id) { delete last[gk]; await setSession("lastTab", last); }
+      return { closed: tab.id };
     }
     default:
       throw new Error(`unknown tool ${tool}`);

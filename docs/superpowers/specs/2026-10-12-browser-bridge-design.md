@@ -202,6 +202,7 @@ description says which: *the user's own Chrome, with their logins*.
 | `chrome_click` | `tab_id?`, `ref` or `selector` | a real (trusted) mouse click at the element's centre |
 | `chrome_type` | `tab_id?`, `ref` or `selector`, `text`, `submit?` | focuses, inserts text, optionally presses Enter |
 | `chrome_console` | `tab_id?` | console messages and uncaught errors seen since the tab was first attached |
+| `chrome_close` | `tab_id?` | closes the tab, **only** if this grant created it with `chrome_open` (new tab); anything else is refused |
 | `handoff_read` | `since?`, `wait_seconds?` (≤ 300) | handoff messages after `since`, waiting for one if there are none |
 | `handoff_send` | `text` | posts to the handoff page |
 
