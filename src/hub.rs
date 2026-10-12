@@ -899,6 +899,7 @@ impl Hub {
             Intent::WorktreeAnswer { id, approve } => {
                 return self.do_worktree_answer(from, id.clone(), *approve)
             }
+            Intent::Rehome { session, to } => return self.do_rehome(from, session.clone(), to.clone()),
             // A search performs an unbounded filesystem walk, so `wsconn.rs`
             // diverts it to a worker thread *before* this lock is taken —
             // that divert is the entire enforcement of CLAUDE.md's "never
@@ -2245,6 +2246,144 @@ impl Hub {
         }
     }
 
+    /// "Move tab there" / "Move back" (spec §7, #156 task 12): the
+    /// browser's answer to a `ClaudeElsewhere` offer — never automatic, see
+    /// `claudes::detect_moves`'s own doc comment. This is the one place
+    /// that writes or clears a re-home record on that path.
+    ///
+    /// Confined to a session this hub can actually speak for: its own
+    /// native session, or one of its own residents (`session_homes`) — R16's
+    /// rule, echoed here because the banner that offers this always sits on
+    /// exactly the page that holds the tab, and nothing else should be able
+    /// to move a session this page has no claim to.
+    ///
+    /// `to: Some(url)` is checked against `worktree::list` off the hub
+    /// lock — the `do_new_worktree` shape, since this is git — and against
+    /// R16 (`session::live_names(url)` must not already hold this name, the
+    /// same gate `do_new_terminal`'s resident arrival applies). `to: None`
+    /// needs no git at all: forgetting a record is never wrong, so both
+    /// branches share one `work` closure and one thread-or-sync dispatch.
+    fn do_rehome(&mut self, from: &ConnId, session: String, to: Option<String>) {
+        if !crate::session::valid_name(&session) {
+            let msg = format!("invalid session name {session:?}");
+            return self.send_to(from, &Event::Error { msg });
+        }
+        let resident_home = self.session_homes.get(&session).cloned();
+        let resident = resident_home.is_some();
+        let native = crate::session::live_names(&self.project).contains(&session);
+        if !resident && !native {
+            let msg = format!("{session} is not a session of this project");
+            return self.send_to(from, &Event::Error { msg });
+        }
+        let home = resident_home.unwrap_or_else(|| self.project.clone());
+        // The one other project (besides this hub, refreshed inline by
+        // `finish` below) whose own `session_homes`/`live_sessions` this
+        // change can affect: the new owner on a move-in, the real home
+        // regained on a resident's move-back. A native session moving back
+        // (an already-`Here` forget) touches nobody else.
+        let other: Option<String> = match (&to, resident) {
+            (Some(url), _) => Some(url.clone()),
+            (None, true) => Some(home.clone()),
+            (None, false) => None,
+        };
+
+        let from = from.clone();
+        let finish_from = from.clone();
+        let work_session = session.clone();
+        let work_home = home.clone();
+        let work_to = to.clone();
+        let work = move || -> Result<(), String> {
+            match work_to {
+                None => {
+                    crate::home::forget(&work_home, &work_session);
+                    Ok(())
+                }
+                Some(url) => {
+                    let Some(home_dir) =
+                        crate::projects::resolve_project(&crate::projects::roots(), &work_home)
+                    else {
+                        return Err(format!("{work_home}: not a project roost serves"));
+                    };
+                    let Ok(home_canon) = home_dir.canonicalize() else {
+                        return Err(format!("{work_home}: cannot resolve project directory"));
+                    };
+                    // Resolved through git's own list, never a string
+                    // prefix — the same reason `detect_moves` does.
+                    let is_worktree_of_home =
+                        crate::worktree::list(&home_dir).iter().filter(|w| !w.is_main).any(|w| {
+                            w.path
+                                .canonicalize()
+                                .ok()
+                                .and_then(|c| {
+                                    c.strip_prefix(&home_canon).ok().map(|rel| format!("{work_home}/{}", rel.display()))
+                                })
+                                .as_deref()
+                                == Some(url.as_str())
+                        });
+                    if !is_worktree_of_home {
+                        return Err(format!("{url}: not a worktree of {work_home}"));
+                    }
+                    // R16: a resident must never shadow a native session of
+                    // the same name at its new owner.
+                    if crate::session::live_names(&url).contains(&work_session) {
+                        return Err(format!("{work_session} already exists in {url}"));
+                    }
+                    crate::home::record(&work_home, &work_session, &url)
+                }
+            }
+        };
+        // Refreshes and replies on this hub in the one lock the thread (or
+        // the sync fallback) re-takes — the `do_new_worktree` shape. On
+        // success this hub's own `session_homes`/`live_sessions` are rebuilt
+        // and broadcast immediately; the *other* project's hub (if any) is
+        // refreshed separately below, off this lock entirely.
+        let finish = move |h: &mut Hub, r: &Result<(), String>| {
+            match r {
+                Err(msg) => h.send_to(&finish_from, &Event::Error { msg: msg.clone() }),
+                Ok(()) => {
+                    h.refresh_live_sessions();
+                    let snap = h.snapshot_event(&finish_from);
+                    h.broadcast(&snap);
+                }
+            }
+        };
+        match self.self_ref.upgrade() {
+            Some(arc) => {
+                let other2 = other.clone();
+                let home2 = home.clone();
+                let spawned = std::thread::Builder::new().name("rehome".into()).spawn(move || {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                        .unwrap_or_else(|_| Err("rehome panicked".into()));
+                    let ok = r.is_ok();
+                    {
+                        let mut h = Hub::lock(&arc);
+                        finish(&mut h, &r);
+                    }
+                    if ok {
+                        if let Some(o) = &other2 {
+                            crate::hub::refresh_and_broadcast(o);
+                        }
+                        broadcast_all(&Event::ProjectsChanged { project: home2 });
+                    }
+                });
+                if spawned.is_err() {
+                    self.send_to(&from, &Event::Error { msg: "could not start rehome".into() });
+                }
+            }
+            None => {
+                let r = work();
+                let ok = r.is_ok();
+                finish(self, &r);
+                if ok {
+                    if let Some(o) = &other {
+                        crate::hub::refresh_and_broadcast(o);
+                    }
+                    broadcast_all(&Event::ProjectsChanged { project: home });
+                }
+            }
+        }
+    }
+
     /// `git worktree remove` (no `--force`), then `git branch -d` (no
     /// `-D`) off the hub lock, the `do_new_worktree` shape. Four independent
     /// gates are re-derived here — Claude evidence, a live terminal, dirty,
@@ -3349,6 +3488,26 @@ pub fn broadcast_state_for(project: &str) {
     g.broadcast(&ev);
 }
 
+/// `refresh_live_sessions` plus a snapshot push, in one short hub lock, for
+/// a caller outside `hub.rs` that just changed something `session_homes`
+/// depends on (a forgotten re-home record, say) and holds no lock of its
+/// own. Unlike `broadcast_state_for`, which trusts `session_homes` to
+/// already be current, this rebuilds it first — see `claudes::sweep_gone_owners`,
+/// the one caller that needs this rather than the cheaper function. A
+/// project nobody has open has no hub and needs nothing.
+pub fn refresh_and_broadcast(project: &str) {
+    let Some(reg) = REGISTRY.get() else { return };
+    let hub = {
+        let map = reg.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(project).cloned()
+    };
+    let Some(h) = hub else { return };
+    let mut g = Hub::lock(&h);
+    g.refresh_live_sessions();
+    let ev = g.snapshot_event(&String::new());
+    g.broadcast(&ev);
+}
+
 /// Send an event to the clients of one project and nobody else. Same lock
 /// order as `broadcast_all` — registry, then hub — but it clones a single
 /// `Arc` rather than the whole map.
@@ -4437,6 +4596,136 @@ mod tests {
 
         crate::session::kill_project(home);
         std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Task 12 / R18, end to end: a real worktree removed with
+    /// `git worktree remove` behind roost's back (Claude Code's own cleanup
+    /// on a session's exit, done here by hand), a resident record that
+    /// still names it, and a real dtach session at the home that `may_end`
+    /// refuses to end while the record says `Elsewhere`.
+    /// `claudes::sweep_gone_owners` finds the positive evidence, forgets
+    /// the record off any lock, and the home's browsers hear
+    /// `WorktreeGone` exactly once — after which End Session on the home
+    /// hub actually ends the real dtach master.
+    ///
+    /// Revert-checked: commenting out the `home::forget` call inside
+    /// `sweep_gone_owners` makes the final `any_process_holds` assertion
+    /// fail — `owner_of` still answers `Elsewhere`, `may_end`'s native
+    /// branch still refuses, and `EndSession` sends `Error` instead of
+    /// killing anything; observed: `assertion failed: End Session must now
+    /// actually work: the record no longer says Elsewhere`. Restored.
+    #[test]
+    fn a_removed_worktree_releases_its_terminal_for_end_session() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let home = "t12-r18-home";
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(args).status().unwrap().success());
+        }
+        std::fs::write(home_dir.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(args).status().unwrap().success());
+        }
+        let wt = home_dir.join(".claude/worktrees/w1");
+        assert!(std::process::Command::new("git")
+            .arg("-C").arg(&home_dir)
+            .args(["worktree", "add", "-b", "w1", wt.to_str().unwrap()])
+            .status().unwrap().success());
+        let owner = format!("{home}/.claude/worktrees/w1");
+
+        let att = crate::session::reserve_and_attach(home, "term3", &home_dir)
+            .expect("/usr/bin/dtach is a runtime prerequisite elsewhere in this project");
+        let sock = crate::session::socket_path(home, "term3");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(any_process_holds(&sock), "setup: the real dtach master must be up before this test can mean anything");
+        drop(att);
+
+        crate::home::record(home, "term3", &owner).unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C").arg(&home_dir)
+            .args(["worktree", "remove", wt.to_str().unwrap()])
+            .status().unwrap().success());
+
+        let home_hub = Hub::for_project(home, home_dir.clone());
+        let (c, rx) = Hub::lock(&home_hub).subscribe();
+        drain(&rx);
+
+        let home_dir_of = |p: &str| (p == home).then(|| home_dir.clone());
+        let announced = Mutex::new(std::collections::HashSet::new());
+        crate::claudes::sweep_gone_owners(&home_dir_of, &announced);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut got_gone = false;
+        while std::time::Instant::now() < deadline {
+            if drain(&rx).iter().any(|m| m.contains(r#""t":"WorktreeGone""#) && m.contains("term3")) {
+                got_gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(got_gone, "the home's browsers must hear WorktreeGone");
+        assert!(
+            matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here),
+            "R18: the record must be forgotten on positive evidence"
+        );
+
+        Hub::lock(&home_hub).handle(&c, Intent::EndSession { session: "term3".into() });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while any_process_holds(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !any_process_holds(&sock),
+            "End Session must now actually work: the record no longer says Elsewhere"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// The other half of R18: `git worktree list` not answering (a
+    /// directory that is not a repository at all, standing in for roost
+    /// losing the race with git, or the repo itself being gone) is "cannot
+    /// tell", never "gone" — `sweep_gone_owners` must forget nothing and
+    /// tell nobody.
+    #[test]
+    fn a_git_failure_forgets_nothing_and_sends_no_event() {
+        isolate_ide_dir_for_tests();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let home = "t12-r18-gitfail";
+        let not_a_repo = tempfile::tempdir().unwrap(); // no .git at all: git cannot answer
+        crate::home::record(home, "term3", &format!("{home}/.claude/worktrees/w1")).unwrap();
+
+        let home_hub = Hub::for_project(home, not_a_repo.path().to_path_buf());
+        let (_c, rx) = Hub::lock(&home_hub).subscribe();
+        drain(&rx);
+
+        let home_dir_of = |p: &str| (p == home).then(|| not_a_repo.path().to_path_buf());
+        let announced = Mutex::new(std::collections::HashSet::new());
+        crate::claudes::sweep_gone_owners(&home_dir_of, &announced);
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(drain(&rx).iter().all(|m| !m.contains("WorktreeGone")), "git did not answer: no event must be sent");
+        assert!(
+            matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Elsewhere(_)),
+            "git did not answer: the record must be kept"
+        );
+
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
@@ -8437,6 +8726,190 @@ mod tests {
                 && got.contains(&format!(r#""fork":"{id}""#)),
             "{got}"
         );
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// `Intent::Rehome { to: Some(url) }` ("Move tab there"): a native
+    /// session of this project, moved into a real worktree of it. Checked
+    /// against `worktree::list`, never a string the client typed.
+    #[test]
+    fn rehome_into_a_real_worktree_of_this_project_records_the_owner() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let wt = repo.join(".claude/worktrees/w1");
+        assert!(std::process::Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["worktree", "add", "-b", "w1", wt.to_str().unwrap()])
+            .status().unwrap().success());
+        let owner = "repo/.claude/worktrees/w1".to_string();
+
+        let _att = crate::session::reserve_and_attach("repo", "term", &repo).unwrap();
+
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::Rehome { session: "term".into(), to: Some(owner.clone()) });
+        assert!(rxa.try_recv().is_err() || !rxa.try_recv().unwrap().contains("Error"), "no refusal expected");
+        assert!(
+            matches!(crate::home::owner_of("repo", "term"), crate::home::Owner::Elsewhere(ref o) if *o == owner),
+            "the record must now name the worktree"
+        );
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// A url that is not a worktree of this project — checked against real
+    /// `worktree::list`, not trusted from the banner that offered it — is
+    /// refused, and no record is written.
+    #[test]
+    fn rehome_refuses_a_url_that_is_not_a_worktree_of_this_project() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let _att = crate::session::reserve_and_attach("repo", "term", &repo).unwrap();
+
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::Rehome { session: "term".into(), to: Some("repo/.claude/worktrees/nonexistent".into()) });
+        let got = rxa.try_recv().expect("an Error must be sent");
+        assert!(got.contains(r#""t":"Error""#) && got.contains("not a worktree of"), "{got}");
+        assert!(matches!(crate::home::owner_of("repo", "term"), crate::home::Owner::Here), "no record must be written");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// R16's gate, re-applied here: a name already live, natively, at the
+    /// target worktree must refuse rather than shadow it with a resident of
+    /// the same name.
+    #[test]
+    fn rehome_refuses_a_name_already_live_at_the_target() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let wt = repo.join(".claude/worktrees/w1");
+        assert!(std::process::Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["worktree", "add", "-b", "w1", wt.to_str().unwrap()])
+            .status().unwrap().success());
+        let owner = "repo/.claude/worktrees/w1".to_string();
+
+        let _att_home = crate::session::reserve_and_attach("repo", "term", &repo).unwrap();
+        // The name already exists natively at the target itself.
+        let _att_target = crate::session::reserve_and_attach(&owner, "term", &wt).unwrap();
+
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::Rehome { session: "term".into(), to: Some(owner) });
+        let got = rxa.try_recv().expect("an Error must be sent");
+        assert!(got.contains(r#""t":"Error""#) && got.contains("already exists"), "{got}");
+        assert!(matches!(crate::home::owner_of("repo", "term"), crate::home::Owner::Here), "no record must be written");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// `Intent::Rehome { to: None }` ("Move back"): sent from the owner's
+    /// own hub for one of its residents, it forgets the record without
+    /// touching git at all.
+    #[test]
+    fn rehome_back_forgets_a_residents_record() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let home = "rehomeback-home";
+        let owner = format!("{home}/.claude/worktrees/w1");
+        let home_dir = root.path().join(home);
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        let _att = crate::session::reserve_and_attach(home, "term3", &home_dir).unwrap();
+        crate::home::record(home, "term3", &owner).unwrap();
+
+        let mut owner_hub = Hub::new(&owner, owner_dir.clone());
+        assert_eq!(
+            owner_hub.session_homes.get("term3"),
+            Some(&home.to_string()),
+            "setup: the owner hub must see term3 as a resident"
+        );
+        let (a, rxa) = owner_hub.subscribe();
+        drain(&rxa);
+        owner_hub.handle(&a, Intent::Rehome { session: "term3".into(), to: None });
+        assert!(matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here), "the record must be forgotten");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// Only a session native to this hub, or one of its own residents, can
+    /// be named — a forged or stale banner naming anything else (a plain
+    /// invalid shape, or a real session of some other project) is refused
+    /// before any filesystem write.
+    #[test]
+    fn rehome_refuses_a_session_this_hub_has_no_claim_to() {
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let d = tempfile::tempdir().unwrap();
+        let mut h = Hub::new("plain", d.path().to_path_buf());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+
+        h.handle(&a, Intent::Rehome { session: "../etc".into(), to: None });
+        let got = rxa.try_recv().expect("an Error must be sent");
+        assert!(got.contains(r#""t":"Error""#) && got.contains("invalid session name"), "{got}");
+
+        h.handle(&a, Intent::Rehome { session: "nosuch".into(), to: None });
+        let got = rxa.try_recv().expect("an Error must be sent");
+        assert!(got.contains(r#""t":"Error""#) && got.contains("is not a session of this project"), "{got}");
+
         std::env::remove_var("ROOST_STATE_DIR");
     }
 

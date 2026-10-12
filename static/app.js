@@ -948,6 +948,41 @@ function onEvent(ev) {
       document.querySelector(".error-banner:last-of-type b")?.append(a);
       break;
     }
+    case "ClaudeElsewhere": {
+      // A move roost was not asked about (spec §7) — never automatic, just
+      // an offer. `worktree` present means the session's Claude is now
+      // sitting in that worktree of this project ("Move tab there");
+      // absent means a resident's Claude cd'd back out to the main
+      // checkout ("Move back"). Either way the server decided which
+      // project's browsers see this; the client only renders it.
+      if (ev.worktree) {
+        const name = ev.worktree.split("/").pop();
+        showBanner(`${ev.session}'s Claude is working in ${name}`);
+        const box = document.querySelector(".error-banner:last-of-type");
+        const b = document.createElement("button");
+        b.textContent = "Move tab there";
+        b.onclick = () => { send({ t: "Rehome", session: ev.session, to: ev.worktree }); box?.remove(); };
+        box?.append(b);
+        offerWorktreeHooksOnce(box);
+      } else {
+        showBanner(`${ev.session}'s Claude is working in the main checkout`);
+        const box = document.querySelector(".error-banner:last-of-type");
+        const b = document.createElement("button");
+        b.textContent = "Move back";
+        b.onclick = () => { send({ t: "Rehome", session: ev.session, to: null }); box?.remove(); };
+        box?.append(b);
+      }
+      break;
+    }
+    case "WorktreeGone": {
+      // Claude Code removed a resident's worktree when its session exited
+      // (spec §7) — nothing to click, just the explanation for why the
+      // terminal is back here. The record was already forgotten
+      // server-side (R18), so End Session on it now works too.
+      const name = ev.worktree.split("/").pop();
+      showBanner(`${name} was removed (Claude Code removes a clean worktree when its session exits); ${ev.session} is back here`);
+      break;
+    }
     case "GitInit":
       if (!ev.ok) showError("git init failed: " + ev.msg);
       // On success, is_git flips in the State snapshot that follows this
@@ -4155,6 +4190,25 @@ function showBanner(text) {
   box.append(b, dismiss);
   document.body.appendChild(box);
   setTimeout(() => box.remove(), 8000);
+}
+
+// Offered alongside the "Move tab there" banner, once per project per
+// browser, when this project's `WorktreeCreate` hook is off: the move it
+// just saw is exactly what that hook would have asked about *before*
+// moving anything, instead of roost merely noticing after the fact. Every
+// `localStorage` access is wrapped — a private window or blocked site data
+// must not break the banner itself, just this one extra offer.
+function offerWorktreeHooksOnce(box) {
+  if (!box || worktreeHookState() !== "off") return;
+  const key = "roost.worktreeHooksOffered." + PROJECT;
+  try {
+    if (localStorage.getItem(key) === "1") return;
+    localStorage.setItem(key, "1");
+  } catch { /* private mode: offer every time rather than not at all */ }
+  const b = document.createElement("button");
+  b.textContent = "Let roost create Claude's worktrees";
+  b.onclick = () => { send({ t: "SetWorktreeHooks", on: true }); box.remove(); };
+  box.append(b);
 }
 
 function showError(msg) {

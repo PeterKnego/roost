@@ -308,6 +308,17 @@ pub enum Intent {
     /// The first answer from any browser wins; an `id` that is no longer
     /// pending (someone else answered, or it timed out) is ignored.
     WorktreeAnswer { id: String, approve: bool },
+    /// "Move tab there" / "Move back" (spec §7, #156 task 12) — the
+    /// browser's answer to a `ClaudeElsewhere` offer, never automatic:
+    /// `claudes::detect_moves` only ever *offers*, this is the one place
+    /// that actually writes or clears the re-home record. `to: Some(url)`
+    /// re-homes `session` into the worktree `url` (which must be a
+    /// worktree of this project — re-checked server-side, never trusted
+    /// from the banner that offered it); `to: None` forgets whatever
+    /// record `session` has, moving it back to its home. Only a session
+    /// native to this hub, or one of its own residents, can be named —
+    /// the same confinement `EndSession`'s `may_end` already applies.
+    Rehome { session: String, #[serde(default)] to: Option<String> },
     /// What a revert would do (#125). Answered to the requester only, with a
     /// token over exactly what the dialog will show. `None` is "all".
     /// Diverted in wsconn: a plan is several git calls.
@@ -723,6 +734,24 @@ pub enum Event {
     /// this is a transient banner and a link to `owner`, not workspace
     /// state — nothing here is persisted.
     Rehomed { session: String, owner: String },
+    /// A Claude's cwd moving somewhere roost was not asked about (spec §7,
+    /// `claudes::detect_moves`). `worktree: Some(url)` means a native
+    /// session's Claude is now sitting inside that worktree of this
+    /// project — the client offers "Move tab there". `worktree: None`
+    /// means a resident's Claude has cd'd back out to its home's main
+    /// checkout — the client offers "Move back". Either way this is a
+    /// dismissible banner, never a workspace change by itself: nothing
+    /// here is persisted, and no record changes until `Intent::Rehome`
+    /// answers it.
+    ClaudeElsewhere { session: String, worktree: Option<String> },
+    /// Claude Code removed a resident's worktree when its session exited
+    /// (spec §7's "A worktree that Claude Code removed"). Sent to the
+    /// *home's* browsers once per (home, session) per process lifetime
+    /// (`claudes::sweep_gone_owners`'s `announced` set) — the owner's own
+    /// tab already lost its terminal the moment `resolves` went false, and
+    /// R18 has by now also forgotten the re-home record, so the session is
+    /// `Here` again. This event is only the explanation for why.
+    WorktreeGone { worktree: String, session: String },
 }
 
 pub fn decode(s: &str) -> Result<Intent, String> {
@@ -921,6 +950,31 @@ mod tests {
         assert!(s.contains(r#""t":"CloseRefused""#) && s.contains("a.rs"));
         let s = encode(&Event::GitInit { ok: false, msg: "boom".into() });
         assert!(s.contains(r#""ok":false"#) && s.contains("boom"));
+    }
+
+    /// `to: None` ("Move back") must decode with no `to` key at all — the
+    /// client never sends `"to":null` for it (see `a_saved_layout_...`'s
+    /// own reasoning for why `#[serde(default)]` matters here too).
+    #[test]
+    fn rehome_decodes_both_directions() {
+        let i = decode(r#"{"t":"Rehome","session":"term3","to":"repo/.claude/worktrees/w1"}"#).unwrap();
+        assert!(matches!(i, Intent::Rehome { session, to: Some(to) } if session == "term3" && to == "repo/.claude/worktrees/w1"));
+        let i = decode(r#"{"t":"Rehome","session":"term3"}"#).unwrap();
+        assert!(matches!(i, Intent::Rehome { session, to: None } if session == "term3"));
+    }
+
+    #[test]
+    fn claude_elsewhere_encodes_both_directions() {
+        let s = encode(&Event::ClaudeElsewhere { session: "term3".into(), worktree: Some("repo/.claude/worktrees/w1".into()) });
+        assert!(s.contains(r#""t":"ClaudeElsewhere""#) && s.contains(r#""worktree":"repo/.claude/worktrees/w1""#));
+        let s = encode(&Event::ClaudeElsewhere { session: "term3".into(), worktree: None });
+        assert!(s.contains(r#""worktree":null"#));
+    }
+
+    #[test]
+    fn worktree_gone_encodes_both_fields() {
+        let s = encode(&Event::WorktreeGone { worktree: "repo/.claude/worktrees/w1".into(), session: "term3".into() });
+        assert!(s.contains(r#""t":"WorktreeGone""#) && s.contains("w1") && s.contains("term3"));
     }
 
     #[test]

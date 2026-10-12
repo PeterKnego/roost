@@ -77,6 +77,21 @@ fn all_in(state: &Path) -> Vec<(String, String, Owner)> {
     out
 }
 
+/// Every home that has at least one re-home record under it — what Task
+/// 12's gone-worktree sweep (`claudes::detect_gone_owners`) needs to know
+/// which repositories to even ask git about: a record is the only reason to
+/// spend a `git worktree list` on a home at all, and a home with none must
+/// cost zero git calls (CLAUDE.md's "if the scan finds no Claudes and no
+/// records, it must spawn no git at all").
+pub fn all_homes_in(state: &Path) -> Vec<String> {
+    let mut out: Vec<String> = all_in(state).into_iter().map(|(h, _, _)| h).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub fn all_homes() -> Vec<String> { all_homes_in(&crate::wsstate::state_dir()) }
+
 pub fn residents_of_in(state: &Path, owner: &str) -> Vec<(String, String)> {
     all_in(state).into_iter()
         .filter_map(|(h, n, o)| matches!(&o, Owner::Elsewhere(x) if x == owner).then_some((h, n)))
@@ -121,14 +136,14 @@ pub fn resolves(home: &str, owner: &str) -> bool {
     resolves_in(&crate::projects::roots(), home, owner)
 }
 
-/// The owner's real directory when it `resolves`, rather than just a bool —
-/// what `ide.rs`'s `open_diff` needs to re-relativise a confined path
-/// against before delivering a proposal to the owner's hub instead of the
-/// home's. `resolves_in` is this with the directory discarded; see it for
-/// why this is fork-free and for the "cannot tell" direction (display-only,
-/// so it leans toward keeping the session at the owner here exactly as
-/// `resolves_in` leans toward keeping it shown there).
-pub fn owner_dir_in(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
+/// Where `owner` would live on disk, shape-validated against `home`,
+/// whether or not anything is there right now. `owner_dir_in` is this plus
+/// an existence check; Task 12's git-based gone-worktree detection
+/// (`claudes::detect_gone_owners`) needs the path itself even once the
+/// worktree is gone and nothing answers `symlink_metadata` any more — it
+/// compares this against `git worktree list`'s own (still-existing) entries
+/// rather than trusting a stat that a removed directory can never pass.
+fn owner_path_in(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
     let dir = owner.strip_prefix(home).and_then(|r| r.strip_prefix("/.claude/worktrees/"))?;
     // roost's own `worktree-<name>` and the older `claude-N` both fit the
     // session-name alphabet, except a `worktree-` name longer than 23. No
@@ -145,7 +160,22 @@ pub fn owner_dir_in(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBu
         return None;
     }
     let home_dir = crate::projects::resolve_project(roots, home)?;
-    let wt_dir = home_dir.join(".claude/worktrees").join(dir);
+    Some(home_dir.join(".claude/worktrees").join(dir))
+}
+
+pub fn owner_path(home: &str, owner: &str) -> Option<PathBuf> {
+    owner_path_in(&crate::projects::roots(), home, owner)
+}
+
+/// The owner's real directory when it `resolves`, rather than just a bool —
+/// what `ide.rs`'s `open_diff` needs to re-relativise a confined path
+/// against before delivering a proposal to the owner's hub instead of the
+/// home's. `resolves_in` is this with the directory discarded; see it for
+/// why this is fork-free and for the "cannot tell" direction (display-only,
+/// so it leans toward keeping the session at the owner here exactly as
+/// `resolves_in` leans toward keeping it shown there).
+pub fn owner_dir_in(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
+    let wt_dir = owner_path_in(roots, home, owner)?;
     match std::fs::symlink_metadata(&wt_dir) {
         Ok(m) if m.is_dir() => Some(wt_dir),
         Ok(_) => None,
@@ -321,6 +351,42 @@ mod tests {
         // this assertion to fail with: `assertion failed: matches!(..., Owner::Elsewhere(_))`
         // on the "unsure" record, because `None` becomes treated as absent.
         assert!(matches!(owner_of_in(st.path(), "foo", "unsure"), Owner::Elsewhere(_)), "cannot tell → keep");
+    }
+
+    /// What `claudes::detect_gone_owners` iterates over: every distinct
+    /// home that has at least one record, deduplicated even when it has
+    /// several — the "ask git once per home, not once per record" cost
+    /// bound depends on this not repeating a home.
+    ///
+    /// Revert check: dropping the `dedup()` (keeping only `sort()`) makes
+    /// the assertion fail — observed: `left: ["foo", "foo", "zed"], right:
+    /// ["foo", "zed"]`. Restored.
+    #[test]
+    fn all_homes_in_lists_each_home_with_a_record_once() {
+        let st = tempfile::tempdir().unwrap();
+        record_in(st.path(), "foo", "term1", "foo/.claude/worktrees/w1").unwrap();
+        record_in(st.path(), "foo", "term2", "foo/.claude/worktrees/w2").unwrap();
+        record_in(st.path(), "zed", "term1", "zed/.claude/worktrees/w1").unwrap();
+        let mut got = all_homes_in(st.path());
+        got.sort();
+        assert_eq!(got, vec!["foo".to_string(), "zed".to_string()]);
+        // A home with no record at all costs zero git calls elsewhere
+        // precisely because it is absent here.
+        assert!(all_homes_in(&tempfile::tempdir().unwrap().path().to_path_buf()).is_empty());
+    }
+
+    /// `owner_path_in` (via `owner_dir_in`) is what makes R18's git-based
+    /// comparison possible even once the worktree is gone: it must still
+    /// return the path the record names, with no existence check at all.
+    #[test]
+    fn owner_path_names_the_expected_location_whether_or_not_it_exists() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("proj")).unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let got = owner_path_in(&roots, "proj", "proj/.claude/worktrees/worktree-gone").unwrap();
+        assert_eq!(got, root.path().join("proj/.claude/worktrees/worktree-gone"));
+        assert!(!got.exists(), "the whole point: nothing needs to be there");
+        assert!(owner_path_in(&roots, "proj", "other/.claude/worktrees/x").is_none(), "wrong home");
     }
 
     #[test]
