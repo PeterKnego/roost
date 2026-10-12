@@ -1026,6 +1026,14 @@ dialog.roost::backdrop { background: rgba(0,0,0,.35); }
 .dlg-input { width: calc(100% - 28px); margin: 0 14px; padding: 5px 7px;
              background: var(--bg); color: var(--fg); font: inherit;
              border: 1px solid var(--border); border-radius: 4px; }
+/* askChoice's own optional field (#156's worktree name) and its live
+   "→ worktree-<name>" preview, side by side rather than `.dlg-input`'s
+   full-width — the preview needs room on the same line. */
+.dlg-choice-input-row { display: flex; align-items: center; gap: 8px; padding: 0 14px 10px; flex-wrap: wrap; }
+.dlg-choice-input { flex: 1 1 auto; min-width: 0; padding: 5px 7px;
+             background: var(--bg); color: var(--fg); font: inherit;
+             border: 1px solid var(--border); border-radius: 4px; }
+.dlg-choice-input-preview { font-size: 12px; color: var(--muted); white-space: nowrap; }
 /* Select mode (#110): the terminal's touch drags select instead of scrolling.
    Marked with an outline rather than only a colour, because the state changes
    what a drag *does* and has to be legible at a glance — and because a colour

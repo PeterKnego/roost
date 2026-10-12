@@ -43,6 +43,20 @@ let pendingFocusDone = false;
 // when WorktreeReady arrives. Opened on the click because a window.open after
 // a websocket round trip is not reliably inside the user gesture.
 let pendingTab = null;
+// Resolved, in arrival order, by the next "State" this connection receives
+// after a `requestFreshState()` call — RequestState carries no reply id of
+// its own, so this trusts the one thing the connection already guarantees:
+// the hub answers RequestState with a targeted `send_to`, synchronously
+// within handling it, so the very next State on this socket is that answer
+// and not some unrelated broadcast that happened to win a race. Used by
+// `openWorktreeDialog` so its fork choices come from a `forkable` the
+// server just recomputed, not whatever this connection's `state` held from
+// the last unrelated snapshot.
+let pendingStateWaiters = [];
+function requestFreshState() {
+  send({ t: "RequestState" });
+  return new Promise((resolve) => pendingStateWaiters.push(resolve));
+}
 // Worktree asks from a Claude's hook (hub::ask_worktree_blocking): id → the
 // function that closes this browser's dialog for it. Present only while that
 // dialog is really showing.
@@ -673,6 +687,15 @@ function onEvent(ev) {
     case "State":
       myOrigin = myOrigin || ev.origin;
       state = ev.ws;
+      // Drained before anything else below runs: a waiter only ever wants
+      // to read `state` after this assignment, and resolving late (after
+      // render(), say) would buy nothing while risking a waiter's own
+      // continuation interleaving with this case's remaining work.
+      if (pendingStateWaiters.length) {
+        const waiting = pendingStateWaiters;
+        pendingStateWaiters = [];
+        for (const resolve of waiting) resolve();
+      }
       // Both: renderClaudeHooks() updates the bell's mark/tooltip even when
       // the notice panel is closed (it reads `state` directly, not the
       // panel's DOM), and renderNotices() is what keeps an *open* panel's
@@ -1070,6 +1093,14 @@ function onEvent(ev) {
       // safe even when this Error has nothing to do with a reveal: the flag
       // only ever changes whether the next RevealLine focuses.
       focusNextReveal = false;
+      // A worktree creation refused (a bad name race, a taken name, no
+      // recorded Claude for a fork) leaves the blank tab `openWorktreeDialog`
+      // opened with nothing to navigate it to — a tab stuck on about:blank
+      // forever, with no `WorktreeReady` ever coming to close the loop.
+      // Every refusal funnels through this same `Error` case, so closing it
+      // here covers all of them without naming any one cause.
+      if (pendingTab && !pendingTab.closed) pendingTab.close();
+      pendingTab = null;
       break;
     case "PathRefused":
       // Not showError: that funnels to the workspace banner, which is the
@@ -3919,24 +3950,43 @@ async function showConflict(ev) {
   else if (pick === "discard") send({ t: "CloseBuffer", rel: ev.rel });
 }
 
+// The worktree name shape `wtname::check` enforces server-side — checked
+// again here so a bad name is caught before `window.open`, not after a
+// round trip the server was always going to refuse anyway.
+const WTNAME_RULE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
+
 // The `+` worktree dialog (#156): a name field, "continue <term>'s Claude
 // there (fork)" for each terminal `state.forkable` names, "start a fresh
-// Claude", and "just a shell". `preferFork`, optional, is a terminal name to
-// put first (and so, by `askChoice`'s own "first choice takes focus" rule,
-// preselected) — the ✻ shortcut's own terminal when it is forkable, say.
-// Absent that, a single fork candidate is preselected on its own: with
-// exactly one Claude to continue, that is almost always the answer, and
-// Enter should reach it without a click.
+// Claude", and "just a shell". `preferredTerminals`, optional, is the
+// terminal(s) worth favoring for fork — the ✻ shortcut's own
+// already-running Claudes, in order — the first of them that turns out to
+// be forkable is put first (and so, by `askChoice`'s own "first choice
+// takes focus" rule, preselected). Absent any of those, or absent the
+// argument entirely (the plain `+` button), a single fork candidate is
+// preselected on its own: with exactly one Claude to continue, that is
+// almost always the answer, and Enter should reach it without a click.
+//
+// `requestFreshState` runs *before* any of this is built, not after: the
+// hook that records a Claude session (`roost claude-hook`, a separate
+// subprocess — see `claudesess::record_from_hook`) tells the hub nothing
+// when it writes, so `forkable` is only as fresh as the last refresh this
+// connection happened to get. A dialog built from whatever `state` already
+// held could show no fork option for a Claude that, by the time the user
+// is looking at this dialog, really is resumable. The wait costs one round
+// trip before the dialog is even shown — no activation is spent on it, so
+// it does not threaten the later `window.open`, which happens only after a
+// *second*, later click inside this dialog grants its own.
 //
 // The actual create is deferred entirely to here, never to the caller: a
 // click on `+` or on "Start in a new worktree" only opens this dialog, and
 // nothing is sent to the server — nothing is created — until a choice in
 // *this* dialog is made.
-async function openWorktreeDialog(preferFork) {
+async function openWorktreeDialog(preferredTerminals = []) {
+  await requestFreshState();
   const forkable = (state && state.forkable) || [];
-  const favored = preferFork && forkable.includes(preferFork)
-    ? preferFork
-    : forkable.length === 1 ? forkable[0] : null;
+  const candidates = Array.isArray(preferredTerminals) ? preferredTerminals : [preferredTerminals];
+  const favored = candidates.find((t) => forkable.includes(t))
+    || (forkable.length === 1 ? forkable[0] : null);
   const ordered = favored ? [favored, ...forkable.filter((t) => t !== favored)] : forkable;
   const choices = ordered.map((session) => ({
     id: `fork:${session}`,
@@ -3944,25 +3994,51 @@ async function openWorktreeDialog(preferFork) {
   }));
   choices.push({ id: "fresh", label: "Start a fresh Claude" });
   choices.push({ id: "shell", label: "Just a shell" });
-  const pick = await askChoice({
-    title: "New worktree",
-    lines: ["Leave the name blank for roost to pick one."],
-    choices,
-    input: { placeholder: "name (optional)" },
-  });
-  if (!pick) return;
-  const name = (pick.value || "").trim() || null;
-  // Opened right after the click's promise resolves — still inside the
-  // browser's transient user activation, so the popup blocker allows it, the
-  // same way showClaudeHere's and showWorktreeAsk's own creates do.
-  // WorktreeReady navigates the tab once the server responds.
-  pendingTab = window.open("about:blank");
-  if (pick.id === "fresh") {
-    send({ t: "NewWorktree", name, launch: { k: "Claude" } });
-  } else if (pick.id === "shell") {
-    send({ t: "NewWorktree", name, launch: { k: "Shell" } });
-  } else {
-    send({ t: "NewWorktree", name, launch: { k: "Fork", session: pick.id.slice("fork:".length) } });
+  // Looped rather than a single ask: a name that fails the shape check
+  // re-shows this same dialog with the rule quoted inline and whatever was
+  // typed kept, instead of silently opening a tab for a request the server
+  // was always going to refuse. Cancel/Escape still exits the loop (and the
+  // function) with nothing sent.
+  let typed = "";
+  let error = "";
+  for (;;) {
+    const lines = ["Leave the name blank for roost to pick one."];
+    if (error) lines.push(error);
+    const pick = await askChoice({
+      title: "New worktree",
+      lines,
+      choices,
+      input: {
+        placeholder: "name (optional)",
+        value: typed,
+        // The directory/branch name this will actually become — the spec's
+        // own dialog mock shows it beside the field rather than making the
+        // person work it out from "worktree-" plus whatever they typed.
+        preview: (v) => `→ worktree-${v.trim() || "<generated>"}`,
+      },
+    });
+    if (!pick) return;
+    typed = pick.value || "";
+    const name = typed.trim();
+    if (name && !WTNAME_RULE.test(name)) {
+      error = `"${name}" must match ${WTNAME_RULE}`;
+      continue;
+    }
+    // Opened right after the click's promise resolves — still inside the
+    // browser's transient user activation, so the popup blocker allows it,
+    // the same way showClaudeHere's and showWorktreeAsk's own creates do.
+    // WorktreeReady navigates the tab once the server responds; an Error
+    // instead closes it (see the "Error" case).
+    pendingTab = window.open("about:blank");
+    const wtname = name || null;
+    if (pick.id === "fresh") {
+      send({ t: "NewWorktree", name: wtname, launch: { k: "Claude" } });
+    } else if (pick.id === "shell") {
+      send({ t: "NewWorktree", name: wtname, launch: { k: "Shell" } });
+    } else {
+      send({ t: "NewWorktree", name: wtname, launch: { k: "Fork", session: pick.id.slice("fork:".length) } });
+    }
+    return;
   }
 }
 
@@ -3983,11 +4059,11 @@ async function showClaudeHere(pane, terminals) {
     ],
   });
   if (pick === "worktree") {
-    // The worktree dialog itself decides fork vs fresh vs shell; all this
-    // passes along is which of the terminals already running a Claude (if
-    // any) is forkable, so that one is preselected instead of "fresh".
-    const forkable = (state && state.forkable) || [];
-    openWorktreeDialog(terminals.find((t) => forkable.includes(t)));
+    // Which of these is actually forkable is answered inside
+    // openWorktreeDialog itself, off the fresh state it asks for — not off
+    // whatever `state.forkable` held at this click, which is exactly the
+    // staleness this dialog exists to avoid.
+    openWorktreeDialog(terminals);
   } else if (pick === "here") {
     send({ t: "NewTerminal", pane, launch: "claude", force: true });
   }

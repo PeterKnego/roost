@@ -138,6 +138,27 @@ pub fn write_base(state_dir: &Path, wt_key: &str, base: &str) -> Result<(), Stri
     std::fs::rename(&tmp, &path).map_err(|e| { let _ = std::fs::remove_file(&tmp); e.to_string() })
 }
 
+/// Whether `name` is unavailable for a *new* worktree — the same two checks
+/// `create_named` itself makes (a branch of that name, or a
+/// `.claude/worktrees/<dir>` entry), asked ahead of it so `wtname::generate`
+/// never offers a candidate `create_named` would only go on to refuse.
+///
+/// An uncertain answer (git did not respond, the stat failed for a reason
+/// other than "not there") also counts as taken: the cost of skipping a free
+/// name is trying another candidate, while the cost of guessing wrong here
+/// is `create_named` failing the whole request on a name nobody chose.
+pub fn name_taken(repo: &Path, run: GitRunner, name: &str) -> bool {
+    let dir_name = crate::wtname::dir_name(name);
+    let branch_taken = run(repo, &["branch", "--list", &dir_name])
+        .map(|o| !o.trim().is_empty())
+        .unwrap_or(true);
+    let path_taken = match std::fs::symlink_metadata(repo.join(".claude/worktrees").join(&dir_name)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        _ => true,
+    };
+    branch_taken || path_taken
+}
+
 /// Record the base, `git worktree add` it, with the name supplied — by
 /// Claude Code's hook, or by the `+` dialog, which generates one with
 /// `wtname::generate` when the user left the field blank (#156). A taken
@@ -560,6 +581,28 @@ mod tests {
         assert_eq!(read_base(st.path(), "k-worktree-bright-fox").as_deref(), Some("main"));
     }
 
+    /// The `+` dialog's generator (`hub.rs`'s `do_new_worktree`) used to
+    /// inline this exact logic as a closure; factored out so it is testable
+    /// on its own rather than only indirectly through a generated name
+    /// nobody pins down. Four cases: a branch, a directory, neither, and
+    /// "cannot tell" — the last one taken, not folded into "absent".
+    ///
+    /// Revert-checked: replacing `branch_taken`'s `.unwrap_or(true)` with
+    /// `.unwrap_or(false)` makes the fourth assertion below fail — observed:
+    /// `assertion failed: name_taken(repo.path(), &flaky, "flaky")`, i.e. a
+    /// branch check that errored was treated as "not taken".
+    #[test]
+    fn name_taken_checks_branch_and_directory_and_treats_doubt_as_taken() {
+        let repo = git_repo();
+        assert!(!name_taken(repo.path(), &real_git, "free"), "neither exists");
+        real_git(repo.path(), &["branch", "worktree-has-branch"]).unwrap();
+        assert!(name_taken(repo.path(), &real_git, "has-branch"), "a branch exists");
+        std::fs::create_dir_all(repo.path().join(".claude/worktrees/worktree-has-dir")).unwrap();
+        assert!(name_taken(repo.path(), &real_git, "has-dir"), "a directory exists");
+        let flaky = |_: &Path, _: &[&str]| -> Result<String, String> { Err("fatal: index locked".into()) };
+        assert!(name_taken(repo.path(), &flaky, "flaky"), "cannot tell must count as taken");
+    }
+
     #[test]
     fn create_named_refuses_a_taken_name_instead_of_suffixing() {
         let repo = git_repo();
@@ -571,6 +614,62 @@ mod tests {
         // because it exists after git created it), not `branch worktree-x already exists`.
         assert!(e.starts_with("branch worktree-x already exists"), "{e}");
         assert_eq!(list(repo.path()).len(), 2, "no second worktree");
+    }
+
+    /// "Could not tell whether branch worktree-x exists" must refuse, not
+    /// fall through and let `git worktree add -b worktree-x` collide with a
+    /// branch this never checked — the `worktree::create` property R6's own
+    /// deletion dropped a test for (`a_failed_branch_check_refuses_rather_than_skipping`),
+    /// but the check it guards still lives here, in `create_named`.
+    ///
+    /// Revert-checked: replacing the `run(...).map_err(...)?` on the branch
+    /// check with `run(...).unwrap_or_default()` (folding "cannot tell" into
+    /// "empty, so absent") panics on the `.unwrap_err()` instead — observed:
+    /// `panicked ... called \`Result::unwrap_err()\` on an \`Ok\` value:
+    /// Created { name: "worktree-x", path: "...worktree-x", base: "main" }`.
+    /// Restored.
+    #[test]
+    fn create_named_refuses_when_it_cannot_tell_whether_the_branch_exists() {
+        let repo = git_repo();
+        let st = tempfile::tempdir().unwrap();
+        let flaky = |r: &Path, args: &[&str]| -> Result<String, String> {
+            if args.first() == Some(&"branch") { Err("fatal: index locked".into()) } else { real_git(r, args) }
+        };
+        let e = create_named(repo.path(), st.path(), "x", &|n| n.to_string(), &flaky).unwrap_err();
+        assert!(e.contains("cannot tell whether branch"), "{e}");
+        assert_eq!(list(repo.path()).len(), 1, "nothing was created");
+        assert!(read_base(st.path(), "x").is_none(), "no .base written");
+    }
+
+    /// The directory check is the second gate, independent of the branch
+    /// one — and it has to fire even when the directory is *empty*: an
+    /// empty `.claude/worktrees/worktree-x` with no branch of that name is
+    /// exactly the one case `git worktree add` would happily succeed into
+    /// on its own (confirmed directly: `git worktree add -b x
+    /// .claude/worktrees/x HEAD` into a pre-existing empty directory exits
+    /// 0 and populates it), so a non-empty fixture would not discriminate
+    /// this check from git's own backstop the way
+    /// `remove_refuses_a_dirty_worktree_without_force` warns about.
+    ///
+    /// Revert-checked: discarding the `symlink_metadata` result (so only
+    /// the branch check gates this) makes `git worktree add` run into the
+    /// pre-created empty directory and succeed — observed: this test's
+    /// `unwrap_err()` panics on `Ok(Created { name: "worktree-x", path:
+    /// "...worktree-x", base: "main" })`, and the directory that was empty
+    /// is now a populated worktree (`a.txt` in it). Restored.
+    #[test]
+    fn create_named_refuses_an_existing_directory_without_a_branch() {
+        let repo = git_repo();
+        let st = tempfile::tempdir().unwrap();
+        let dir = repo.path().join(".claude/worktrees/worktree-x");
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = create_named(repo.path(), st.path(), "x", &|n| n.to_string(), &real_git).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        assert_eq!(list(repo.path()).len(), 1, "nothing was created");
+        assert!(
+            std::fs::read_dir(&dir).unwrap().next().is_none(),
+            "the empty directory must stay empty, not get populated by git"
+        );
     }
 
     #[test]

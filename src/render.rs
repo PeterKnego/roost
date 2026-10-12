@@ -2061,7 +2061,10 @@ pub fn workspace_page(
   <h2 class="dlg-title"></h2>
   <div class="dlg-body"></div>
   <div class="dlg-detail" hidden></div>
-  <input class="dlg-choice-input" type="text" autocomplete="off" spellcheck="false" hidden>
+  <span class="dlg-choice-input-row">
+    <input class="dlg-choice-input" type="text" autocomplete="off" spellcheck="false" hidden>
+    <span class="dlg-choice-input-preview" hidden></span>
+  </span>
   <div class="dlg-buttons">
     <button type="button" class="dlg-cancel">Cancel</button>
   </div>

@@ -188,11 +188,22 @@ pub enum Intent {
         /// --fork-session`, carried as `?fork=` on a worktree page's URL
         /// (R4) rather than typed into it: only the first terminal of a
         /// freshly created worktree ever sets this, and only because the
-        /// `+` dialog resolved it server-side before the page existed. Not a
-        /// value from any menu — the id is re-validated against
-        /// `claudesess::valid_session_id` here, same boundary `resume`
-        /// crosses via `claudehist::has`, because a query string is exactly
-        /// as untrusted as a form field.
+        /// `+` dialog resolved it server-side before the page existed.
+        ///
+        /// Checked here against `claudesess::valid_session_id` — a shape
+        /// check, not an authorisation. `resume`'s own check
+        /// (`claudehist::has`) is different in kind: it asks whether *this
+        /// project* has that conversation, because the id there comes from
+        /// a menu row naming someone else's past session, and a stale,
+        /// forged or cross-project row must not become a `--resume`. `fork`
+        /// grants no comparable capability for the same shape check to
+        /// withhold — the browser that can set `?fork=<id>` is, by the
+        /// Origin check every workspace socket makes, already a page on
+        /// this exact project, which can already type anything it likes
+        /// into any of its own shells. The check here exists only to keep
+        /// an unusable id off a command line (the same reason `Fresh`'s own
+        /// minted id is checked too), not to decide whether the id is
+        /// "allowed".
         #[serde(default)]
         fork: Option<String>,
     },

@@ -2150,27 +2150,12 @@ impl Hub {
             let resolved = match name {
                 Some(n) => n,
                 None => {
-                    // "Taken" means a branch or a directory of that name
-                    // already exists — the same two checks `create_named`
-                    // itself makes, asked here so a name this loop would
-                    // reject is never even offered to it. An uncertain
-                    // answer (git did not respond, the stat failed for a
-                    // reason other than "not there") also counts as taken:
-                    // the cost of skipping a free name is trying another
-                    // candidate, while the cost of guessing wrong is
-                    // `create_named` failing the whole request on a name
-                    // nobody chose.
-                    let taken = |cand: &str| -> bool {
-                        let dir_name = crate::wtname::dir_name(cand);
-                        let branch_taken = crate::worktree::real_git(&dir, &["branch", "--list", &dir_name])
-                            .map(|o| !o.trim().is_empty())
-                            .unwrap_or(true);
-                        let path_taken = match std::fs::symlink_metadata(dir.join(".claude/worktrees").join(&dir_name)) {
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                            _ => true,
-                        };
-                        branch_taken || path_taken
-                    };
+                    // `worktree::name_taken` is the same two checks
+                    // `create_named` itself makes, asked ahead of it so a
+                    // name this loop would reject is never even offered to
+                    // it — see that function's own doc comment for why an
+                    // uncertain answer counts as taken too.
+                    let taken = |cand: &str| crate::worktree::name_taken(&dir, &crate::worktree::real_git, cand);
                     crate::wtname::generate(&taken)
                         .ok_or_else(|| "could not find a free worktree name".to_string())?
                 }
@@ -3724,6 +3709,110 @@ mod tests {
         crate::session::kill_project(&project);
         std::env::remove_var("ROOST_CMD");
         match prev_home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
+    }
+
+    /// Fix round 1, finding 3. `NewTerminal.fork` end to end, the same shape
+    /// as `a_chosen_conversation_from_the_menu_is_what_the_new_terminal_resumes`
+    /// above but for a fork rather than a plain resume: the id lands in
+    /// `ClaudeSession::Fork`, not `Resume`, and `keystrokes` types
+    /// `--fork-session` after it. No `claudehist`/`HOME` setup needed here —
+    /// `fork` is validated by shape alone (`claudesess::valid_session_id`),
+    /// never by "does this project have that conversation" (see this file's
+    /// own `NewTerminal.fork` doc comment for why that is not a missing
+    /// authorisation check).
+    ///
+    /// Revert-checked: swapping `do_new_terminal`'s `fork.filter(...).map(ClaudeSession::Fork)`
+    /// for `ClaudeSession::Resume` fails the second assertion — observed:
+    /// left: `Some(Fork("864ee734-…"))`, right: `Some(Resume("864ee734-…"))`.
+    /// Restored.
+    #[test]
+    fn new_terminal_with_a_valid_fork_parks_a_fork_launch() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let project = format!("forkterm{}", std::process::id());
+        let dir = d.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "864ee734-e3ab-434e-8278-745a850b16ad";
+
+        let mut h = Hub::new(&project, dir.clone());
+        let (c, rx) = h.subscribe();
+        for p in h.ws.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+            p.active = 0;
+        }
+        drain(&rx);
+        h.handle(&c, Intent::NewTerminal {
+            pane: proto::RIGHT,
+            launch: Some(proto::Launch::Claude),
+            force: true,
+            resume: None,
+            fork: Some(id.to_string()),
+        });
+        let att = crate::session::reserve_and_attach(&project, "claude", &dir).unwrap();
+        let l = att.launch.as_ref().expect("a fork must still ask for a Claude");
+        assert_eq!(l.session.as_ref(), Some(&crate::launch::ClaudeSession::Fork(id.to_string())));
+        assert_eq!(
+            crate::launch::keystrokes(l.launch, l.session.as_ref()),
+            format!("claude --resume {id} --fork-session\r").into_bytes()
+        );
+        crate::session::kill_project(&project);
+        std::env::remove_var("ROOST_CMD");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// The same shape as `an_id_this_project_does_not_have_falls_through_to_a_fresh_claude`,
+    /// for `fork`'s own validation: a shape-invalid id (one that could read
+    /// as a command-line option) must not reach `--resume`/`--fork-session`
+    /// and must not stop the launch — it degrades to a fresh Claude, same
+    /// as an unauthorised `resume` does.
+    ///
+    /// Revert-checked: dropping `do_new_terminal`'s `claudesess::valid_session_id`
+    /// guard on `fork` (filtering only on `l == Launch::Claude`, passing the
+    /// id straight to `ClaudeSession::Fork` otherwise) fails this test here,
+    /// at the hub layer — observed: `panicked ... an invalid fork id must
+    /// not stop the launch: Some(Fork("--dangerously-skip-permissions"))`.
+    /// `launch.rs`'s own `usable()` guard would still have degraded it at
+    /// typing time, but this pins that the *parked* `ClaudeSession` is
+    /// already `Fresh`, not a `Fork` carrying an unusable id waiting to be
+    /// degraded later. Restored.
+    #[test]
+    fn new_terminal_with_an_invalid_fork_falls_back_to_a_fresh_claude() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let project = format!("forktermbad{}", std::process::id());
+        let dir = d.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut h = Hub::new(&project, dir.clone());
+        let (c, rx) = h.subscribe();
+        for p in h.ws.panes.iter_mut() {
+            p.tabs.retain(|t| !matches!(t, Tab::Terminal { .. }));
+            p.active = 0;
+        }
+        drain(&rx);
+        h.handle(&c, Intent::NewTerminal {
+            pane: proto::RIGHT,
+            launch: Some(proto::Launch::Claude),
+            force: true,
+            resume: None,
+            fork: Some("--dangerously-skip-permissions".into()),
+        });
+        let att = crate::session::reserve_and_attach(&project, "claude", &dir).unwrap();
+        let l = att.launch.as_ref().expect("a Claude was still asked for");
+        assert!(
+            matches!(l.session.as_ref(), Some(crate::launch::ClaudeSession::Fresh(_))),
+            "an invalid fork id must not stop the launch: {:?}",
+            l.session
+        );
+        crate::session::kill_project(&project);
+        std::env::remove_var("ROOST_CMD");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// #17's rule, now that there is something for it to rule out.
@@ -8381,6 +8470,137 @@ mod tests {
         // Nothing was created: the only worktree in this repo is the
         // fixture's own.
         assert_eq!(crate::worktree::list(&h.dir).len(), 2, "no second worktree");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Fix round 1, finding 1 — the hub-side half of it. The hook that
+    /// records a Claude session (`roost claude-hook`, `claudesess::record_from_hook`)
+    /// runs as a separate subprocess and writes straight to disk; it tells
+    /// the hub nothing when it does, so `Hub::forkable` — rebuilt only by
+    /// `refresh_live_sessions` — stays stale until something asks for the
+    /// truth again. `RequestState` is that something (same reasoning its
+    /// own doc comment gives for `claude_hooks`/`worktree_hooks`): this
+    /// pins that it actually recomputes `forkable` too, which is what the
+    /// client's `openWorktreeDialog`'s own `requestFreshState()` leans on.
+    ///
+    /// Revert-checked: commenting out `RequestState`'s own
+    /// `self.refresh_live_sessions()` call makes the second assertion fail
+    /// — observed: `panicked ... assertion failed: got.contains("\"forkable\":[\"term\"]")`,
+    /// with the second reply still carrying `"forkable":[]` — confirming
+    /// this test was already green *because* that call exists, not by
+    /// accident. Restored.
+    #[test]
+    fn request_state_recomputes_forkable_after_a_hook_writes_its_record() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let project = "forkable-fresh";
+        let dir = d.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::session::reserve_and_attach(project, "term", &dir).unwrap();
+        let mut h = Hub::new(project, dir);
+        let (a, rx) = conn(&mut h);
+        h.handle(&a, Intent::RequestState);
+        let got = rx.try_recv().expect("an answer");
+        assert!(got.contains(r#""forkable":[]"#), "no record yet: {got}");
+        // The hook writes its record now, exactly as the real `roost
+        // claude-hook` subprocess does — off every hub lock, telling this
+        // hub nothing directly.
+        crate::claudesess::record(project, "term", &crate::claudesess::Recorded {
+            session_id: "864ee734-e3ab-434e-8278-745a850b16ad".into(),
+            transcript_path: None,
+            event: "Stop".into(),
+        });
+        h.handle(&a, Intent::RequestState);
+        let got = rx.try_recv().expect("a second answer");
+        assert!(got.contains(r#""forkable":["term"]"#), "{got}");
+        crate::session::kill_project(project);
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Fix round 1, finding 3. `forkable` must name a native live session
+    /// with a record, exclude a native live session without one, and
+    /// exclude a *resident* re-homed in even if a record exists under this
+    /// project's own name — forking means continuing a conversation of a
+    /// terminal on this page, and a resident's own record is forkable from
+    /// its home's refresh instead (see `Hub::forkable`'s doc comment).
+    ///
+    /// The third case is deliberately adversarial: a resident's claudesess
+    /// record naturally lives under its true home (`ROOST_PROJECT` is set
+    /// at the shell's spawn, which never moves), so it could never
+    /// naturally collide with this project's own name. Writing it there
+    /// anyway is what actually distinguishes "`forkable` is built from
+    /// `raw_live`" from "`forkable` is built from `self.ws.live_sessions`"
+    /// — `self.ws.live_sessions` folds a resident in as live
+    /// (`owned_live_names`), so if `forkable` ever read that list instead,
+    /// this exact record would leak through; `raw_live` structurally never
+    /// contains a resident's name at all, record or no record.
+    ///
+    /// Revert-checked: changing `refresh_live_sessions`'s `self.forkable`
+    /// computation from `raw_live.iter()...` to
+    /// `self.ws.live_sessions.iter()...` makes the first assertion fail —
+    /// observed: `assertion failed: forkable == ["recorded"]`, left:
+    /// `["recorded", "term3"]`. Restored.
+    #[test]
+    fn forkable_lists_recorded_native_live_sessions_only() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        // `home::resolves` only recognises the worktree shape
+        // (`{home}/.claude/worktrees/{name}`) as a real owner — it is not a
+        // general cross-project relationship — so `owner` has to be a
+        // worktree-shaped child of `home`, not an unrelated project, or the
+        // resident below is never folded into `owner`'s own `live_sessions`
+        // at all and this test would prove nothing.
+        let home = "forkable-home";
+        let owner_url = format!("{home}/.claude/worktrees/w1");
+        let owner = owner_url.as_str();
+        let home_dir = root.path().join(home);
+        let owner_dir = home_dir.join(".claude/worktrees/w1");
+        std::fs::create_dir_all(&owner_dir).unwrap();
+
+        crate::session::reserve_and_attach(owner, "recorded", &owner_dir).unwrap();
+        crate::session::reserve_and_attach(owner, "plain", &owner_dir).unwrap();
+        crate::claudesess::record(owner, "recorded", &crate::claudesess::Recorded {
+            session_id: "864ee734-e3ab-434e-8278-745a850b16ad".into(),
+            transcript_path: None,
+            event: "Stop".into(),
+        });
+        // Native to `home`, re-homed into `owner` — `owner`'s own
+        // `live_sessions` folds it in as live; see the adversarial-record
+        // note above for why the record is written under `owner` here.
+        crate::session::reserve_and_attach(home, "term3", &home_dir).unwrap();
+        crate::home::record(home, "term3", owner).unwrap();
+        crate::claudesess::record(owner, "term3", &crate::claudesess::Recorded {
+            session_id: "aaaa1111-2222-3333-4444-555555555555".into(),
+            transcript_path: None,
+            event: "Stop".into(),
+        });
+
+        let mut h = Hub::new(owner, owner_dir);
+        let (a, rx) = conn(&mut h);
+        h.handle(&a, Intent::RequestState);
+        let snap = rx.try_recv().expect("an answer");
+        let v: serde_json::Value = serde_json::from_str(&snap).unwrap();
+        let forkable: Vec<String> = v["ws"]["forkable"]
+            .as_array().expect("forkable is an array")
+            .iter().map(|x| x.as_str().unwrap().to_string()).collect();
+        assert_eq!(forkable, vec!["recorded".to_string()], "{snap}");
+        // Setup check: if `term3` were not actually live on the owner's own
+        // page, excluding it from `forkable` would prove nothing.
+        assert!(
+            v["ws"]["live_sessions"].as_array().unwrap().iter().any(|x| x == "term3"),
+            "setup: term3 must be live on the owner's page: {snap}"
+        );
+
+        crate::session::kill_project(owner);
+        crate::session::kill_project(home);
+        std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 

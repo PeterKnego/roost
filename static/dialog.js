@@ -228,6 +228,14 @@ function askPasteText() {
 // is the shell every page using this dialog ships (render.rs); a page that
 // doesn't (none do yet) would simply never show a field, never asking for
 // one.
+//
+// `input.preview`, optional, is a `(value) => string` shown live in a span
+// beside the field — the worktree dialog's "→ worktree-<name>", so the
+// person sees the actual directory/branch name rather than working it out
+// from a prefix and whatever they typed. Recomputed on every keystroke, not
+// just at open, and plain text (`textContent`, same rule as everything
+// else here) since the value it reads came from the field a user is
+// actively typing into.
 function askChoice({ title, lines = [], choices, detailHtml = "", focus = "first", bindDismiss = null, input = null }) {
   const el = document.getElementById("dlg-choice");
   return runDialog(el, (finish) => {
@@ -243,10 +251,17 @@ function askChoice({ title, lines = [], choices, detailHtml = "", focus = "first
     detail.innerHTML = detailHtml;
     detail.hidden = !detailHtml;
     const inputEl = el.querySelector(".dlg-choice-input");
+    const previewEl = el.querySelector(".dlg-choice-input-preview");
     if (inputEl) {
       inputEl.hidden = !input;
       inputEl.placeholder = input?.placeholder || "";
       inputEl.value = input?.value || "";
+      if (previewEl) {
+        const preview = input?.preview || null;
+        previewEl.hidden = !preview;
+        previewEl.textContent = preview ? preview(inputEl.value) : "";
+        inputEl.oninput = preview ? () => { previewEl.textContent = preview(inputEl.value); } : null;
+      }
     }
     const buttons = el.querySelector(".dlg-buttons");
     // Cancel is in the shell; the choices are rebuilt around it each time.
