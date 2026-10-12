@@ -16,9 +16,17 @@ logins, so it always asks first. Design and threat model:
    roost never registers this itself. Claude sessions started after this
    have the `chrome_*` and `handoff_*` tools.
 
-2. **Load the extension.** In Chrome, open `chrome://extensions`, turn on
-   *Developer mode*, choose *Load unpacked* and pick this `extension/`
-   directory (copy it to your laptop first if roost runs elsewhere).
+2. **Load the extension.** Download `roost-extension-<version>.zip` from the
+   [release](https://github.com/PeterKnego/roost/releases) matching your
+   roost, and unzip it where it can stay. In Chrome, open
+   `chrome://extensions`, turn on *Developer mode*, choose *Load unpacked* and
+   pick the `roost-extension` folder. From a checkout, this `extension/`
+   directory works the same way.
+
+   To update, unzip the new release **over the same folder** and press ↻ on
+   the extension. Chrome names an unpacked extension by its folder, so a new
+   folder is a new extension with empty settings: the key and roost addresses
+   would have to be entered again.
 
 3. **Pair it.** On the roost host, run `roost browser-key`. In the
    extension's options (right-click its toolbar icon → *Options*), paste
