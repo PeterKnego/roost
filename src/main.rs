@@ -14,6 +14,18 @@ fn main() {
         // socket and no token.
         Some("sessions") => std::process::exit(roost::cli::run_sessions(&args[1..])),
         Some("wait") => std::process::exit(roost::cli::run_wait(&args[1..])),
+        Some("mcp") => std::process::exit(roost::mcp::run()),
+        Some("browser-key") => match roost::browser::load_or_create_key() {
+            Ok(k) => {
+                println!("{k}");
+                eprintln!("Paste this into the roost extension's options in Chrome. Delete {} to make a new one.", roost::browser::key_path().display());
+                std::process::exit(0)
+            }
+            Err(e) => {
+                eprintln!("roost: {e}");
+                std::process::exit(1)
+            }
+        },
         Some("--version" | "-V") => {
             println!("roost {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);

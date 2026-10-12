@@ -71,6 +71,10 @@ libc = "0.2"
 # entries and CRC-32 for their headers, with no zip crate on top.
 flate2 = "1"
 crc32fast = "1"
+# Already in Cargo.lock through ureq's rustls. Promoted to direct because
+# `browser.rs` signs every call it relays to the browser extension with
+# HMAC-SHA256, and a hand-rolled HMAC is not a thing to own.
+ring = "0.17"
 
 [dev-dependencies]
 tempfile = "3"

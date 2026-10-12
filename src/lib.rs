@@ -16,6 +16,9 @@ pub mod gitio;
 pub mod health;
 pub mod home;
 pub mod hooksock;
+pub mod handoff;
+pub mod browser;
+pub mod mcp;
 pub mod hub;
 pub mod http;
 pub mod ide;
@@ -94,6 +97,11 @@ pub fn serve(listener: TcpListener, startup_roots: Vec<PathBuf>) {
     // must still serve every existing project rather than refuse to start.
     if let Err(e) = crate::hooksock::start() {
         eprintln!("roost: worktree hook socket not started: {e}");
+    }
+    // Not fatal either: without it only `roost mcp`'s browser and handoff
+    // tools are missing.
+    if let Err(e) = crate::browser::start() {
+        eprintln!("roost: browser bridge socket not started: {e}");
     }
     // An explicit operator setting, so silence here would look like "my edits
     // do nothing". The optional user directory is different: absent is normal

@@ -346,6 +346,15 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
                 // would stall every other browser on this project. See
                 // CLAUDE.md's "never hold a lock across blocking I/O".
                 let decoded = proto::decode(&t);
+                // A map lookup and a channel send, owned by the broker; it
+                // has no business taking this project's hub lock.
+                if let Ok(proto::Intent::BridgeReply { call, ok, result, error }) = decoded {
+                    let r = if ok { Ok(result) } else { Err(error) };
+                    if let Err(msg) = crate::browser::deliver(project, &id, &call, r) {
+                        Hub::lock(&hub).send_to(&id, &proto::Event::Error { msg });
+                    }
+                    continue;
+                }
                 if let Ok(proto::Intent::Search { q, seq }) = decoded {
                     searcher.submit(q, seq);
                     continue;
@@ -488,6 +497,9 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     // what UnsubGuard::drop performs. Joining first would deadlock waiting
     // for a thread that is itself waiting on us.
     drop(unsub);
+    // Every browser call this page was relaying fails now, with a reason,
+    // instead of at its timeout.
+    crate::browser::gone(project, &id);
     let _ = writer.join();
 }
 
