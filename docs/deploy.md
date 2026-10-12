@@ -110,6 +110,19 @@ A git worktree is its own project, and is discovered by asking
 `git worktree list`, not by walking the filesystem, so worktrees under
 `.claude/worktrees/` are found even though `.claude` is otherwise skipped.
 
+A project's "Let roost create Claude's worktrees" setting installs Claude
+Code's `WorktreeCreate` hook (`roost worktree-hook`), so that when a Claude
+running in a roost terminal asks for a worktree, roost — not Claude Code —
+creates it, and the terminal that asked is re-homed into the new worktree's
+project. With the setting on, the request shows up as a dialog in the
+browser: with no roost tab open on that project to click it, the request is
+refused outright, since nobody is there to approve it. Outside roost
+entirely (a Claude with no `ROOST_PROJECT` set) or whenever roost itself is
+unreachable — stopped, restarting, or the hook socket otherwise refused —
+the hook falls back to creating the worktree itself, roost's own naming
+convention and all: creating a worktree destroys nothing, so that is the one
+case where falling through to "just do it" is the safe default.
+
 Terminals are **never started implicitly**. Opening a project creates a
 Terminal *tab*, not a session; the session begins only when the user presses
 Enter or clicks the placeholder. Before this, merely looking at a project

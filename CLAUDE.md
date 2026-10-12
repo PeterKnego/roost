@@ -34,6 +34,13 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   the websocket handshakes do — *including refusing a request that carries
   none*, because a `multipart/form-data` POST is a CORS simple request that any
   page can submit cross-origin with no preflight. Keep the surface at two.
+  `state/hook/hook.sock` (`src/hooksock.rs`) is not a third: it is a Unix
+  socket in a 0700 directory roost owns, mode 0600, with the peer uid checked
+  via `SO_PEERCRED` rather than `Origin` — no browser can open a Unix socket
+  at all, so it is not HTTP and not part of the CSRF surface. A stale socket
+  file is unlinked only after `file_type().is_socket()` **and** a refused
+  `connect()`; on Linux, `connect()` to a plain regular file also returns
+  `ECONNREFUSED`, which is why the type check has to come first.
 - **Every browser-facing websocket checks `Origin`** in its handshake, and
   refuses a handshake that carries none. Handshakes bypass the same-origin
   policy, so a socket without this check is drive-by RCE; and every browser
@@ -81,16 +88,65 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   is not HTML strictness but the bound that keeps the sanitizer linear, each
   parse stops at the next `<` — removing it reintroduces a quadratic scan
   that took minutes on a few hundred kilobytes.
-- **roost writes exactly one Claude settings file**, the project's
-  `.claude/settings.local.json`, through `claudehooks::set`, and in it only
-  entries whose command is exactly `roost claude-hook`. Never the committed
-  `settings.json` (a clone would inherit a hook that runs roost) and never
-  `~/.claude/settings.json`. A file it cannot parse is `Unknown`, which
-  refuses to write: rewriting a settings file we could not read is how a
-  hand-edited one gets destroyed. And `roost claude-hook` always exits 0
-  and is silent without `ROOST_NOTIFY`, unlike `roost notify`'s deliberate
-  loud exit 1 — a `Stop` hook that exits non-zero shows an error in every
-  Claude session run outside roost in the same checkout.
+- **roost writes exactly one Claude settings file, and owns exactly two
+  commands in it.** The file is always the project's
+  `.claude/settings.local.json`, through `claudehooks::set_kind`/`state_of`,
+  and the only entries it ever touches are the ones whose command is one of
+  its own two, keyed by `Kind::{Notify, Worktree}`. Never the committed
+  `settings.json` (a clone
+  would inherit a hook that runs roost) and never `~/.claude/settings.json`.
+  A file it cannot parse is `Unknown`, which refuses to write: rewriting a
+  settings file we could not read is how a hand-edited one gets destroyed.
+  Enabling a kind writes only under that kind's own event(s); disabling
+  removes that kind's exact command from **any** event it is found under and
+  never touches another entry.
+
+  `Kind::Notify` installs `roost claude-hook` on `SessionStart`,
+  `Notification` and `Stop`. It always exits 0 and is silent without
+  `ROOST_NOTIFY`, unlike `roost notify`'s deliberate loud exit 1 — a `Stop`
+  hook that exits non-zero shows an error in every Claude session run
+  outside roost in the same checkout.
+
+  `Kind::Worktree` installs `roost worktree-hook`, and only on
+  `WorktreeCreate`, with `"timeout": 120` — long enough to outlast
+  `hub::ASK_TIMEOUT`'s 60s browser wait plus the round trip. It is allowed to
+  exit non-zero, but only when roost answered `refuse` or its answer could
+  not be read; any other event getting this command is the same mistake
+  `claude-hook`'s exit-0-always rule exists to prevent, for an event that has
+  nothing to do with worktrees: a non-zero exit there shows an error in every
+  Claude session in the checkout.
+- **A session's home is forever; re-homing changes ownership, nothing else.**
+  A session's dtach socket path, its `SESSIONS` key and its process
+  environment (`ROOST_PROJECT`/`ROOST_SESSION`, `CLAUDE_CODE_SSE_PORT`) all
+  name the project it was *started* in — its home — and none of them can
+  move: the socket path is baked into the dtach master's argv, the pump
+  thread exits when its key disappears from the map, and the environment is
+  the process's own. Approving a Claude's `WorktreeCreate` ask re-homes the
+  terminal that asked into the worktree's project without moving any of
+  that; `src/home.rs` records the new owner at
+  `state/home/<home key>/<name>` and nothing in the rest of the codebase
+  learns about it.
+
+  The record is read three ways, never two: `NotFound` means *here* (home
+  and owner are the same project), unreadable or empty means *unknown*, and
+  real contents name the owner. Unknown destroys nothing — treating it as
+  "here" would let Close Project on the home end a Claude that actually
+  belongs to a worktree.
+
+  **Reconciling home and owner is the vulnerability, not the cleanup.**
+  Moving the socket, re-keying the session map, or reading `ROOST_PROJECT`
+  as the current owner would each let a sweep or Close Project act on the
+  wrong project's say-so and kill a live Claude: `registry::pids_holding`
+  finds a session's process by matching its socket path as a whole argument
+  in the dtach master's argv, so a session that physically moved would stop
+  matching its own liveness check. Within one owner, a terminal name is held
+  by at most one live session, native or resident (R16). Ending a session
+  or closing a project both need positive ownership evidence, same as every
+  other destructive path in this codebase. And `worktree::list` — the only
+  git call this feature adds — never runs under the hub lock or the
+  `REGISTRY` lock, for the same reason every other git invocation here
+  doesn't: a stalled `git worktree list` must not freeze every websocket or
+  wedge the sweep that every project's reconcile runs through.
 - **Search shares the tree's filter but is not the tree.** `search.rs` walks
   with `projects::TreeFilter`, so `show_hidden` and the `hide` list mean the
   same thing in both — but it additionally refuses `.git` and any directory
@@ -142,7 +198,10 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   log and is tracked and re-emitted at attach time instead. Anything that
   changes what the pump stores has to keep that property, or exiting Claude
   paints over its own leftover frame again.
-- Caps: ≤16 sessions per project, ≤50 buffers with unsaved changes (a buffer
+- Caps: ≤16 sessions per project (`session::MAX_SESSIONS_PER_PROJECT`) — this
+  counts a session's **home**, not its owner, because `live_names` walks the
+  home project's own `sock/` directory and a re-homed session's socket never
+  moved there, ≤50 buffers with unsaved changes (a buffer
   holds no text at all until it actually differs from its file, so this bounds
   dirty files, not open ones), 1 MB scrollback *per screen
   buffer* (normal and alternate are kept apart, so an app cannot evict the
@@ -154,7 +213,19 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   project (`ide::MAX_PENDING`) — per project, not global, so one Claude in a
   loop cannot starve every other project — and 8 MB per websocket frame
   (`ide::MAX_FRAME_BYTES`), a coarse backstop against buffering an oversized
-  frame at all. Search is bounded by four at once (`search.rs`): 50 results per
+  frame at all. On the hook socket (`hooksock.rs`): ≤4 worktree asks parked
+  per project at once (`hub::MAX_PENDING_ASKS`) — per project, for the same
+  reason as `ide::MAX_PENDING` — ≤16 in-flight connections process-wide
+  (`hooksock::MAX_CONNECTIONS`, unlike `MAX_PENDING_ASKS` this one has no
+  project to scope by, since the client hasn't said which project it wants
+  yet when it first connects), a 10s deadline on reading one whole request
+  (`hooksock::REQUEST_DEADLINE`) and a 64 KiB bound on it
+  (`hooksock::MAX_REQUEST`). The ask itself waits up to 60s for a browser to
+  answer (`hub::ASK_TIMEOUT`), and `roost worktree-hook`'s own reply timeout
+  is 90s (`cli::REPLY_TIMEOUT`) — strictly between that 60s and Claude Code's
+  own 120s hook kill, so a wedged roost's hold on the hook ends with a
+  reason this process names, not a bare "killed" from Claude Code's side.
+  Search is bounded by four at once (`search.rs`): 50 results per
   category, 5 lines per file, 20 000 files examined, and a 1500 ms deadline —
   constants, deliberately not config keys, and every one of them *names itself*
   in the result when it fires. It is not the real limit: *both* sides of an

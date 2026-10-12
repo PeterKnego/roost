@@ -101,7 +101,7 @@ macOS is used daily; Windows is untested.
 ## Features
 
 ### A tab per project/worktree
-Every tab represents a project or worktree, and has panes in familiar IDE-like arrangement: file-tree, file-diffs, file preview/editor, terminal.
+Every tab represents a project or worktree, and has panes in familiar IDE-like arrangement: file-tree, file-diffs, file preview/editor, terminal. Ask Claude Code to create a worktree from inside a tab's terminal and roost creates it, bringing that terminal along into its own tab.
 
 ### Terminals that survive reload/re-attach/restart
 Each terminal is a PTY owned by `roost` and wrapped in `dtach`, so sessions survive a tab reload, network disconnect, laptop sleep, and even a `roost` restart.

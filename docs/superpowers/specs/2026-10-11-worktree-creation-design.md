@@ -86,7 +86,7 @@ shown in. They differ only for a re-homed session.
   user's `--worktree <name>` or its generated `bright-running-fox`; both fit.
 - roost's own generator (the `+` path, §6) makes the same
   `adjective-adjective-noun` shape from a word list shipped in the binary, and
-  retries on collision up to `MAX_WORKTREES` like `claude-N` does today.
+  retries on collision up to `wtname::generate`'s own `MAX_TRIES`.
 - A name that already exists as a branch or a directory is refused, not
   suffixed. Claude asked for that name; silently giving it another is the kind
   of disagreement this spec exists to remove.
@@ -102,7 +102,7 @@ with `"timeout": 120` in its entry so Claude Code waits out the dialog.
 to its tty and files under `state/claude/`. Approval needs a round trip, and
 nothing provides one, so this adds a channel:
 
-- A Unix socket at `state/hook.sock`, mode 0600, created at start-up (stale
+- A Unix socket at `state/hook/hook.sock`, mode 0600, created at start-up (stale
   file: `symlink_metadata`, then `connect`; refused → it is ours and dead,
   unlink; anything else → refuse to start the listener and log, never unlink
   a socket another roost may hold).

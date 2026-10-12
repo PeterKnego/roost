@@ -169,9 +169,11 @@ notice without watching it. `read_when_watching = false` turns this off (see
 
 The panel, the badge and the two buttons under it are all about that one
 project. A worktree counts as its own project here — `roost` and
-`roost/.claude/worktrees/claude-1` are separate workspaces with separate
-terminals, and they do not see each other's notices. "Clear" empties exactly
-the rows it is showing you and nothing else.
+`roost/.claude/worktrees/worktree-bright-fox` are separate workspaces with
+separate terminals, and they do not see each other's notices. (Worktrees
+roost creates now get an `adjective-adjective-noun` name instead of
+`claude-N`; existing `claude-N` worktrees keep working exactly the same way.)
+"Clear" empties exactly the rows it is showing you and nothing else.
 
 This used to be machine-wide: every tab listed every project's notices. It was
 changed because a notice you were not working on could take the tab you *were*
