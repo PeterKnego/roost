@@ -348,6 +348,10 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
                 let decoded = proto::decode(&t);
                 // A map lookup and a channel send, owned by the broker; it
                 // has no business taking this project's hub lock.
+                if let Ok(proto::Intent::BridgeAck { call }) = decoded {
+                    crate::browser::ack(project, &id, &call);
+                    continue;
+                }
                 if let Ok(proto::Intent::BridgeReply { call, ok, result, error }) = decoded {
                     let r = if ok { Ok(result) } else { Err(error) };
                     if let Err(msg) = crate::browser::deliver(project, &id, &call, r) {

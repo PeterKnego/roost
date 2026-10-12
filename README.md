@@ -118,6 +118,9 @@ A `claude` running in a terminal pane connects back to `roost` via the IDE proto
 
 <img src="docs/img/proposal.png" alt="A proposal tab showing the two lines Claude wants to delete, with Accept, Reject and Edit buttons, beside the terminal where Claude is asking for the same approval" width="900">
 
+### Let Claude use your real browser
+With the roost browser extension in Chrome, a `claude` in roost can list your tabs, open a page, screenshot it, read it, click and type, and read its console — in the browser you are logged into, not a headless one. Each Claude session asks you once, in an extension window, before it does anything. Right-click any page to send it, a selection or a screenshot to your roost Claude, and use the project's handoff page (`/frag/<project>/handoff`) to let Claude in Chrome and a roost Claude pass messages. Setup: [extension/README.md](extension/README.md).
+
 ### Desktop notifications
 Roost supports sending desktop notifications from any terminal. Clicking a notification will take you directly to that terminal.
 Also, Roost can install hooks into `claude` to enable a notification every time `claude` needs attention. See [docs/notifications.md](docs/notifications.md).

@@ -233,7 +233,11 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   Search is bounded by four at once (`search.rs`): 50 results per
   category, 5 lines per file, 20 000 files examined, and a 1500 ms deadline —
   constants, deliberately not config keys, and every one of them *names itself*
-  in the result when it fires. It is not the real limit: *both* sides of an
+  in the result when it fires. The browser bridge (`browser.rs`): ≤16 parked
+  calls per asking project, 180 s per call, 5 s for the relay tab's ack, and
+  screenshots ≤3.5 MB JPEG with the long side ≤2000 px (the workspace
+  socket's 8 MB frame cap drops the whole connection, terminals included);
+  the handoff log keeps ≤200 messages of ≤32 KB per project, in memory only. It is not the real limit: *both* sides of an
   `openDiff` are
   bounded by the same 2 MB `MAX_FILE_BYTES` as any other file, since a
   proposal is retained for the tab's life and broadcast whole to every

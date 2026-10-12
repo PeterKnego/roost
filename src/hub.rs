@@ -939,8 +939,8 @@ impl Hub {
                 self.send_to(from, &Event::Handoff { messages, full: true });
                 return;
             }
-            Intent::BridgeReply { .. } => {
-                unreachable!("BridgeReply is diverted in wsconn before this lock is taken")
+            Intent::BridgeReply { .. } | Intent::BridgeAck { .. } => {
+                unreachable!("BridgeReply and BridgeAck are diverted in wsconn before this lock is taken")
             }
             Intent::Rehome { session, to } => return self.do_rehome(from, session.clone(), to.clone()),
             // A search performs an unbounded filesystem walk, so `wsconn.rs`

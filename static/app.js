@@ -609,6 +609,9 @@ function connectControl() {
     ctrlWarned = false;
     setConnState("live");
     flushUnsentEdits();
+    // A new socket is a new connection id on the server, so the relay has
+    // to be registered again or calls go to a connection that is gone.
+    bridgeAnnounce(document.hasFocus());
   };
   sock.onmessage = (e) => { if (ctrl === sock) onEvent(JSON.parse(e.data)); };
   sock.onclose = () => {
@@ -901,6 +904,12 @@ function onEvent(ev) {
     case "WorktreeAsk":
       askQueue.push({ id: ev.id, session: ev.session, name: ev.name });
       showNextAsk();
+      break;
+    case "BridgeCall":
+      bridgeForward(ev);
+      break;
+    // The handoff log is the handoff page's; this page has no view of it.
+    case "Handoff":
       break;
     case "WorktreeAskClosed": {
       // Answered in another browser, or the server's 60 s ran out: either
@@ -3852,7 +3861,12 @@ function claudeTarget() {
 }
 
 function sendToClaude(rel) {
-  const text = claudeMention(rel);
+  sendTextToClaude(claudeMention(rel));
+}
+
+/// `sendToClaude` for text that is not a path mention — the browser
+/// extension's "send page / selection" lands here too.
+function sendTextToClaude(text) {
   const target = claudeTarget();
   if (target) {
     focusSession(target);
@@ -6736,3 +6750,95 @@ function matchesRel(content, rel) {
   if (!path.endsWith("/file")) return false;
   return new URLSearchParams(query || "").get("path") === rel;
 }
+
+// ---- the roost browser extension relay ------------------------------------
+//
+// The extension never connects to roost. Its content script, injected into
+// this page by the extension, talks to the page with postMessage, and the
+// page relays over the workspace socket it already has — so roost keeps two
+// authentication rules instead of growing a third for the extension, and
+// Cloudflare Access needs no service token. docs/superpowers/specs/
+// 2026-10-12-browser-bridge-design.md has the whole shape.
+//
+// This page is only a pipe. A BridgeCall's payload is signed by the server
+// and verified by the extension, which also owns consent, grants and unsafe
+// mode; nothing this script does (or anything injected into this page could
+// do) can make the browser act on a call no Claude made.
+
+/// Set once the content script has said hello, cleared when it says bye
+/// (the extension was reloaded and the script orphaned).
+let bridgeReady = false;
+
+function bridgePost(msg) {
+  window.postMessage({ roostBridge: 1, from: "page", ...msg }, location.origin);
+}
+
+function bridgeAnnounce(active) {
+  if (bridgeReady) send({ t: "BridgeHello", active: !!active, ready: true });
+}
+
+function bridgeForward(ev) {
+  if (!bridgeReady) {
+    // The server picked this connection, so it believed the script was
+    // here. Saying so beats a three-minute wait for an answer nobody will
+    // give.
+    send({ t: "BridgeReply", call: ev.call, ok: false, error: "the roost extension is no longer active in this tab — reload it" });
+    return;
+  }
+  bridgePost({ type: "call", call: ev.call, payload: ev.payload, sig: ev.sig });
+}
+
+/// What the extension sends from a page's context menu: text goes into the
+/// Claude terminal's prompt as a bracketed paste, a screenshot goes up the
+/// same route as an image pasted onto that terminal. Nothing is submitted.
+function bridgeReceive(msg) {
+  if (msg.text) sendTextToClaude(msg.text.endsWith("\n") ? msg.text : msg.text + "\n");
+  if (msg.image) {
+    const target = claudeTarget();
+    if (!target) return showError("no Claude is running in this project to send the screenshot to");
+    fetch(msg.image).then((r) => r.blob()).then((blob) => {
+      const file = new File([blob], "browser-screenshot.png", { type: blob.type || "image/png" });
+      postFiles(`/paste/${termHomeOrProject(target)}/${target}`, [file], "paste");
+    }).catch(() => showError("could not read the screenshot the extension sent"));
+  }
+}
+
+addEventListener("message", (e) => {
+  // Only this window's own messages, and only the extension side of the
+  // conversation: the page hears its own posts too, and an iframe (a
+  // preview) must never be able to speak for the extension.
+  if (e.source !== window || e.origin !== location.origin) return;
+  const m = e.data;
+  if (!m || m.roostBridge !== 1 || m.from !== "ext") return;
+  switch (m.type) {
+    case "hello":
+      bridgeReady = true;
+      bridgeAnnounce(document.hasFocus());
+      break;
+    case "bye":
+      if (bridgeReady) send({ t: "BridgeHello", active: false, ready: false });
+      bridgeReady = false;
+      break;
+    case "ack":
+      send({ t: "BridgeAck", call: String(m.call) });
+      break;
+    case "result":
+      send({ t: "BridgeReply", call: String(m.call), ok: !!m.ok, result: m.result ?? null, error: String(m.error || "") });
+      break;
+    case "send":
+      bridgeReceive(m);
+      break;
+  }
+});
+
+addEventListener("focus", () => bridgeAnnounce(true));
+// Leaving the page — possibly into the back/forward cache, socket and all —
+// stops it relaying; coming back from that cache asks the script again.
+addEventListener("pagehide", () => {
+  if (bridgeReady) send({ t: "BridgeHello", active: false, ready: false });
+  bridgeReady = false;
+});
+addEventListener("pageshow", (e) => { if (e.persisted) bridgePost({ type: "probe" }); });
+// A content script that loaded before this listener existed has already said
+// hello into the void; asking makes it say it again.
+bridgePost({ type: "probe" });

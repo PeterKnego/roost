@@ -1,0 +1,26 @@
+:root { color-scheme: light dark; --bg: #fff; --fg: #1b1f24; --muted: #59636e; --line: #d1d9e0; --soft: #f6f8fa; --accent: #0969da; --danger: #d1242f; }
+@media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --line: #3d444d; --soft: #151b23; --accent: #4493f8; --danger: #f85149; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, sans-serif; }
+main { padding: 16px; max-width: 720px; margin: 0 auto; }
+h1 { font-size: 18px; margin: 0 0 4px; }
+h2 { font-size: 14px; margin: 16px 0 6px; color: var(--muted); }
+.lede, .fine { color: var(--muted); margin: 0 0 12px; }
+.fine { font-size: 13px; margin-top: 12px; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 0; }
+dt { color: var(--muted); } dd { margin: 0; word-break: break-all; font-family: ui-monospace, monospace; }
+pre { background: var(--soft); border: 1px solid var(--line); border-radius: 6px; padding: 8px; max-height: 180px; overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 0; }
+.buttons { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
+button { min-height: 44px; font-size: 15px; border-radius: 6px; border: 1px solid var(--line); background: var(--soft); color: var(--fg); cursor: pointer; padding: 0 14px; }
+button:active { filter: brightness(.9); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--danger); }
+input[type=text], input[type=password], textarea { width: 100%; font: 15px ui-monospace, monospace; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); }
+textarea { min-height: 90px; }
+label { display: block; margin: 12px 0 4px; font-weight: 600; }
+.row { display: flex; gap: 8px; align-items: center; }
+.row input { flex: 1; }
+ul { padding-left: 18px; margin: 6px 0; }
+li { margin: 4px 0; word-break: break-all; }
+.warn { color: var(--danger); font-weight: 600; }
+section { border-top: 1px solid var(--line); padding-top: 8px; margin-top: 16px; }

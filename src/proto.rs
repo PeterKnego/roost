@@ -399,6 +399,9 @@ pub enum Intent {
         #[serde(default = "yes")]
         ready: bool,
     },
+    /// The extension's content script in this page has a `BridgeCall` —
+    /// proof the page is alive, sent before the call is acted on.
+    BridgeAck { call: String },
     /// The extension's answer to a `BridgeCall` this connection relayed.
     /// Diverted in `wsconn` before the hub lock: it is a map lookup and a
     /// channel send, and nothing about it belongs to this project's hub.

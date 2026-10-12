@@ -174,6 +174,16 @@ says so (`hub::send_to_conn` returns whether it delivered) and the next
 relay is tried; `Hub::send_to`'s silent no-op would read as delivered and
 wait three minutes.
 
+**A relay must prove it is alive.** The content script posts an `ack`
+the moment it has a call, before asking the worker, and the page forwards
+it as `BridgeAck`. No ack within 5 s and the broker unparks the call,
+drops that relay and tries the next. Found by the end-to-end test, not in
+review: a roost tab navigated away goes into the back/forward cache with
+its socket still open, so the server counted it as a relay and the call
+waited the full three minutes. The page also unregisters itself on
+`pagehide` and asks again on a cached `pageshow`, so the ordinary case
+needs no timeout at all; the ack is the backstop for a frozen tab.
+
 `roost mcp` waits 200 s for a `chrome` op and `wait + 30` s for
 `handoff_read`, always longer than the server does.
 

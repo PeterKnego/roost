@@ -90,7 +90,7 @@ pub fn gone(project: &str, conn: &str) {
         ids.into_iter().filter_map(|k| c.remove(&k)).collect()
     };
     for p in orphaned {
-        let _ = p.reply.send(Err(RELAY_CLOSED.into()));
+        let _ = p.reply.send(Msg::Done(Err(RELAY_CLOSED.into())));
     }
 }
 
@@ -106,7 +106,7 @@ struct Parked {
     asker: String,
     relay_project: String,
     relay_conn: String,
-    reply: Sender<Result<serde_json::Value, String>>,
+    reply: Sender<Msg>,
 }
 
 fn calls() -> &'static Mutex<HashMap<String, Parked>> {
@@ -132,12 +132,36 @@ pub struct Call {
 /// recording closure in tests. `false` means that connection is gone.
 pub type SendFn<'a> = &'a dyn Fn(&str, &str, &Event) -> bool;
 
+/// How long a relay tab has to say it received a call. The content script
+/// acknowledges before it even asks the worker, so this measures only "is
+/// that page alive": a tab navigated away into the back/forward cache, or
+/// frozen in the background, keeps its socket open and answers nothing, and
+/// without this a call sent there waited the full three minutes.
+pub const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What a parked call's channel carries.
+enum Msg {
+    /// The relay tab's content script has the call.
+    Ack,
+    Done(Result<serde_json::Value, String>),
+}
+
 /// Relays `call` to the most recent relay tab and waits for its answer.
 /// Blocks the calling socket thread, never a lock.
 ///
 /// `key` is passed in rather than loaded here so tests never touch the real
 /// state directory; `serve_request` loads it.
 pub fn call_blocking(call: Call, key: &str, timeout: Duration, send: SendFn) -> Result<serde_json::Value, String> {
+    call_blocking_with(call, key, timeout, ACK_TIMEOUT, send)
+}
+
+fn call_blocking_with(
+    call: Call,
+    key: &str,
+    timeout: Duration,
+    ack_timeout: Duration,
+    send: SendFn,
+) -> Result<serde_json::Value, String> {
     if !crate::session::valid_name(&call.session) {
         return Err(format!("invalid terminal name {:?}", call.session));
     }
@@ -156,8 +180,11 @@ pub fn call_blocking(call: Call, key: &str, timeout: Duration, send: SendFn) -> 
     })
     .to_string();
     let sig = sign(key, &payload);
+    let deadline = Instant::now() + timeout;
+    // Kept for the whole call, so the channel never reads as disconnected:
+    // every way a parked call ends sends on it explicitly.
     let (tx, rx) = channel();
-    let mut sent = false;
+    let mut tried = 0;
     for (rp, rc) in relay_order() {
         {
             let mut c = calls().lock().unwrap_or_else(|e| e.into_inner());
@@ -169,33 +196,78 @@ pub fn call_blocking(call: Call, key: &str, timeout: Duration, send: SendFn) -> 
                 Parked { asker: call.project.clone(), relay_project: rp.clone(), relay_conn: rc.clone(), reply: tx.clone() },
             );
         }
+        tried += 1;
         let ev = Event::BridgeCall { call: id.clone(), payload: payload.clone(), sig: sig.clone() };
-        if send(&rp, &rc, &ev) {
-            sent = true;
-            break;
+        if !send(&rp, &rc, &ev) {
+            // That connection is gone without its teardown having run yet;
+            // unpark and try the next one rather than wait on nobody.
+            unpark(&id);
+            gone(&rp, &rc);
+            continue;
         }
-        // That connection is gone without its teardown having run yet;
-        // unpark and try the next one rather than wait on nobody.
-        calls().lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-        gone(&rp, &rc);
-    }
-    if !sent {
-        return Err(NO_RELAY.into());
-    }
-    drop(tx);
-    match rx.recv_timeout(timeout) {
-        Ok(r) => r,
-        Err(RecvTimeoutError::Timeout) => {
-            let mine = calls().lock().unwrap_or_else(|e| e.into_inner()).remove(&id).is_some();
-            if mine {
-                Err(format!("your browser did not answer within {} s", timeout.as_secs()))
-            } else {
-                // A reply removed it between the timeout and the lock, and
-                // owns the answer: wait for it rather than call it lost.
-                rx.recv().unwrap_or_else(|_| Err(RELAY_CLOSED.into()))
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(ack_timeout.min(left)) {
+            Ok(Msg::Ack) => return wait_done(&id, &rx, deadline, timeout),
+            // An answer is also proof of life (a page from before acks).
+            Ok(Msg::Done(r)) => return r,
+            Err(_) => {
+                if unpark(&id) {
+                    // Alive on the server, silent in the browser: drop it so
+                    // the next call does not pick it either, and try the next.
+                    gone(&rp, &rc);
+                    continue;
+                }
+                // An answer or a teardown removed it first and owns the
+                // reply, which is on its way.
+                return wait_done(&id, &rx, deadline, timeout);
             }
         }
-        Err(RecvTimeoutError::Disconnected) => Err(RELAY_CLOSED.into()),
+    }
+    Err(if tried == 0 {
+        NO_RELAY.into()
+    } else {
+        "no roost tab relaying to your browser responded — reload roost in Chrome".into()
+    })
+}
+
+fn unpark(id: &str) -> bool {
+    calls().lock().unwrap_or_else(|e| e.into_inner()).remove(id).is_some()
+}
+
+fn wait_done(
+    id: &str,
+    rx: &std::sync::mpsc::Receiver<Msg>,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(Msg::Ack) => continue,
+            Ok(Msg::Done(r)) => return r,
+            Err(RecvTimeoutError::Timeout) if unpark(id) => {
+                return Err(format!("your browser did not answer within {} s", timeout.as_secs()))
+            }
+            // Removed by an answer or a teardown between the timeout and the
+            // lock: that side owns the reply and always sends it.
+            Err(RecvTimeoutError::Timeout) => loop {
+                if let Ok(Msg::Done(r)) = rx.recv() {
+                    return r;
+                }
+            },
+            Err(RecvTimeoutError::Disconnected) => return Err(RELAY_CLOSED.into()),
+        }
+    }
+}
+
+/// The relay tab's content script has the call. Not removed: the answer is
+/// still to come. Ignored from any connection the call was not sent to.
+pub fn ack(project: &str, conn: &str, call: &str) {
+    let c = calls().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = c.get(call) {
+        if p.relay_project == project && p.relay_conn == conn {
+            let _ = p.reply.send(Msg::Ack);
+        }
     }
 }
 
@@ -278,7 +350,7 @@ pub fn deliver(project: &str, conn: &str, call: &str, result: Result<serde_json:
             None => return Err("no such browser call — it was answered, timed out or withdrawn".into()),
         }
     };
-    p.reply.send(result).map_err(|_| "the asking Claude went away".to_string())
+    p.reply.send(Msg::Done(result)).map_err(|_| "the asking Claude went away".to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -553,6 +625,35 @@ mod tests {
         gone("br-skip-live", "live");
     }
 
+    /// A relay that takes the call and never acknowledges it — a tab in the
+    /// back/forward cache — is dropped and the next one asked. Revert-checked:
+    /// waiting for the answer directly instead of the ack hangs on `silent`
+    /// until the call's own timeout and fails on the elapsed bound.
+    #[test]
+    fn a_relay_that_never_acknowledges_is_dropped_for_the_next() {
+        let _g = serial();
+        hello("br-ack-live", "live", true);
+        hello("br-ack-silent", "silent", true);
+        let start = Instant::now();
+        let t = std::thread::spawn(move || {
+            let send = move |p: &str, _: &str, ev: &Event| {
+                if p == "br-ack-live" {
+                    let id = call_id(ev);
+                    std::thread::spawn(move || {
+                        ack("br-ack-live", "live", &id);
+                        deliver("br-ack-live", "live", &id, Ok(serde_json::json!("from live"))).unwrap();
+                    });
+                }
+                true
+            };
+            call_blocking_with(call("br-ack"), K, Duration::from_secs(10), Duration::from_millis(200), &send)
+        });
+        assert_eq!(t.join().unwrap().unwrap(), serde_json::json!("from live"));
+        assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+        assert!(!relay_order().iter().any(|(p, _)| p == "br-ack-silent"), "the silent relay was dropped");
+        gone("br-ack-live", "live");
+    }
+
     #[test]
     fn no_relay_is_an_immediate_refusal_that_names_the_fix() {
         let _g = serial();
@@ -622,7 +723,8 @@ mod tests {
             };
             call_blocking(call("br-sig-asker"), K, Duration::from_millis(300), &send)
         });
-        assert!(t.join().unwrap().unwrap_err().contains("did not answer"));
+        // Nobody answers; only what was sent matters here.
+        assert!(t.join().unwrap().is_err());
         let Some(Event::BridgeCall { payload, sig, .. }) = got.lock().unwrap().clone() else { panic!("nothing sent") };
         assert_eq!(sig, sign(K, &payload));
         let v: serde_json::Value = serde_json::from_str(&payload).unwrap();

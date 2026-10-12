@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>roost: allow Claude to use this browser?</title>
+<link rel="stylesheet" href="ui.css">
+</head><body>
+<main>
+<h1>A Claude in roost wants to use this browser</h1>
+<p class="lede">It would act with your logins. Only allow a Claude you started.</p>
+<dl id="who"></dl>
+<h2>First request</h2>
+<pre id="what"></pre>
+<div class="buttons">
+<button id="session" class="primary">Allow for this Claude session</button>
+<button id="once">Allow once</button>
+<button id="deny" class="danger">Deny</button>
+</div>
+<p class="fine">No answer in 2 minutes is Deny. Grants are forgotten when Chrome restarts, and can be revoked from the toolbar button.</p>
+</main>
+<script src="consent.js"></script>
+</body></html>

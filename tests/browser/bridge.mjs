@@ -1,0 +1,234 @@
+//! The browser bridge end to end (#161): a real Chromium with the roost
+//! extension loaded, a real roost, and `roost mcp` as the subprocess Claude
+//! would spawn. Nothing between the MCP request and the DevTools command in
+//! the target tab is substituted.
+//!
+//! What only this can show: that a call crosses all five hops (stdio, the
+//! broker socket, the workspace socket, postMessage, the extension worker)
+//! and its answer crosses back; that the consent window is what decides; that
+//! a call the page invents is refused by the extension, not the page; and
+//! that the handoff page and `handoff_*` reach each other.
+//!
+//! Revert-checks performed, all restored:
+//!   (a) the worker's signature check disabled -> J fails: the forged call is
+//!       treated as real and waits on a consent prompt.
+//!   (b) `allowed` returning true -> D fails: no consent window appears, and
+//!       Deny cannot refuse anything.
+//!   (c) app.js's `pagehide` unregistering removed -> M fails: the server
+//!       still counts the departed page as a relay, and only the 5 s ack
+//!       timeout (`browser::ACK_TIMEOUT`, unit-tested) gets the call out.
+//!
+//! Run: deno run -A tests/browser/bridge.mjs
+import { fixture, freePort, openPage, attachTarget, profileDir, startBrowser, startRoost, until, sleep }
+  from "./harness.mjs";
+
+const repoRoot = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
+let fail = 0;
+const ok = (c, m) => { console.log(`${c ? "  ok  " : "  FAIL"}  ${m}`); if (!c) fail++; };
+
+const fx = await fixture();
+const roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort() });
+const roostOrigin = `http://127.0.0.1:${roost.port}`;
+const meta = JSON.parse(new TextDecoder().decode(
+  (await new Deno.Command("cargo", { args: ["metadata", "--format-version", "1", "--no-deps"], cwd: repoRoot, stdout: "piped" }).output()).stdout,
+));
+const bin = `${meta.target_directory}/debug/roost`;
+const env = { ROOST_STATE_DIR: fx.stateDir, PATH: Deno.env.get("PATH") ?? "/usr/bin:/bin", HOME: Deno.env.get("HOME") ?? "/tmp" };
+
+// The page Claude is pointed at: a button that changes the page and logs, an
+// input that echoes what is submitted.
+const sitePort = await freePort();
+const site = Deno.serve({ port: sitePort, hostname: "127.0.0.1", onListen() {} }, () => new Response(`<!doctype html>
+<title>Bridge Target</title>
+<h1 id="h">untouched</h1>
+<button id="b" onclick="document.getElementById('h').textContent='clicked'; console.log('button clicked')">Press me</button>
+<form onsubmit="event.preventDefault(); document.getElementById('h').textContent='typed:' + document.getElementById('q').value">
+<input id="q" aria-label="query"></form>`, { headers: { "content-type": "text/html" } }));
+const target = `http://127.0.0.1:${sitePort}/`;
+
+// A profile of its own: the extension's storage persists in it, and a grant
+// or key left over from another run would make every check below meaningless.
+const prof = `${profileDir(repoRoot)}-bridge`;
+await Deno.remove(prof, { recursive: true }).catch(() => {});
+const ext = `${repoRoot}/extension`;
+const browser = await startBrowser(prof, [`--disable-extensions-except=${ext}`, `--load-extension=${ext}`]);
+
+// ---- roost mcp, as Claude spawns it ------------------------------------------
+function startMcp() {
+  const p = new Deno.Command(bin, {
+    args: ["mcp"], clearEnv: true, env: { ...env, ROOST_PROJECT: fx.project, ROOST_SESSION: "term" },
+    stdin: "piped", stdout: "piped", stderr: "null",
+  }).spawn();
+  const w = p.stdin.getWriter();
+  const waiting = new Map();
+  let id = 0;
+  (async () => {
+    let buf = "";
+    for await (const chunk of p.stdout.pipeThrough(new TextDecoderStream())) {
+      buf += chunk;
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        if (!line.trim()) continue;
+        const m = JSON.parse(line);
+        waiting.get(m.id)?.(m);
+        waiting.delete(m.id);
+      }
+    }
+  })();
+  const rpc = (method, params) => new Promise((res) => {
+    const i = ++id;
+    waiting.set(i, res);
+    w.write(new TextEncoder().encode(JSON.stringify({ jsonrpc: "2.0", id: i, method, params }) + "\n"));
+  });
+  return {
+    rpc,
+    tool: async (name, args = {}) => (await rpc("tools/call", { name, arguments: args })).result,
+    close: async () => { try { await w.close(); } catch {} try { p.kill("SIGKILL"); } catch {} await p.status; },
+  };
+}
+const text = (r) => (r?.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
+
+const cdpList = async () => (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json();
+
+let page, mcp, hand, worker;
+try {
+  // ---- the extension, configured the way its options page would ----------------
+  const findWorker = async () => (await cdpList()).find((t) => t.type === "service_worker" && t.url.endsWith("/worker.js"));
+  await until(findWorker, 20, "the extension's worker");
+  const swInfo = await findWorker();
+  ok(!!swInfo, "A: the extension loaded and its worker is running");
+  if (!swInfo) throw new Error("no extension worker — is this Chromium able to load extensions headless?");
+  // /json/list omits a worker's webSocketDebuggerUrl, but the endpoint is
+  // the same shape as a page's.
+  worker = await attachTarget(swInfo.webSocketDebuggerUrl || `ws://127.0.0.1:${browser.port}/devtools/page/${swInfo.id}`);
+  const key = new TextDecoder().decode((await new Deno.Command(bin, { args: ["browser-key"], clearEnv: true, env, stdout: "piped", stderr: "null" }).output()).stdout).trim();
+  ok(/^[0-9a-f]{64}$/.test(key), "A: `roost browser-key` prints a key");
+  await worker.evalIn(`chrome.storage.local.set(${JSON.stringify({ origins: [roostOrigin], key, unsafe: false, deny: [] })}).then(() => roostBridge.syncContentScripts()).then(() => true)`);
+
+  mcp = startMcp();
+  const init = await mcp.rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "0" } });
+  ok(init.result?.serverInfo?.name === "roost", "B: roost mcp initializes");
+
+  // No roost tab yet: a call says so at once rather than waiting.
+  const t0 = Date.now();
+  const none = await mcp.tool("chrome_tabs");
+  ok(none.isError && /extension/.test(text(none)) && Date.now() - t0 < 5000, `B: with no relay tab, a call fails at once and names the fix — ${text(none)}`);
+
+  // ---- the relay comes up --------------------------------------------------------
+  page = await openPage(browser.port, `${roostOrigin}/${fx.project}`);
+  const ready = await until(() => page.evalIn("typeof bridgeReady !== 'undefined' && bridgeReady"), 20, "the content script's hello");
+  ok(ready, "C: the roost page heard the content script and registered as a relay");
+
+  // ---- consent decides -----------------------------------------------------------
+  const answerConsent = async (answer) => {
+    const findConsent = async () => (await cdpList()).find((t) => t.url.includes("/consent.html"));
+    if (!await until(findConsent, 15, "the consent window")) return false;
+    const c = await findConsent();
+    const cp = await attachTarget(c.webSocketDebuggerUrl || `ws://127.0.0.1:${browser.port}/devtools/page/${c.id}`);
+    await until(() => cp.evalIn("document.querySelector('#who dd') !== null"), 10, "the consent details");
+    const shown = await cp.evalIn("document.getElementById('who').textContent");
+    await cp.evalIn(`document.getElementById(${JSON.stringify(answer)}).click()`);
+    return shown;
+  };
+  const denied = mcp.tool("chrome_open", { url: target });
+  const shown = await answerConsent("deny");
+  ok(typeof shown === "string" && shown.includes(fx.project) && shown.includes("term"), `D: the consent window names the project and terminal — ${shown}`);
+  const d = await denied;
+  ok(d.isError && /did not allow/.test(text(d)), `D: Deny refuses the call — ${text(d)}`);
+
+  const allowedCall = mcp.tool("chrome_open", { url: target });
+  await answerConsent("session");
+  const opened = await allowedCall;
+  ok(!opened.isError && /Bridge Target/.test(text(opened)), `D: Allow for this session opens the page — ${text(opened).slice(0, 120)}`);
+
+  // From here the grant holds: no window may appear.
+  const read = await mcp.tool("chrome_read");
+  const r = JSON.parse(text(read));
+  const btn = (r.elements || []).find((e) => e.includes("Press me"));
+  ok(!!btn && r.text.includes("untouched"), `E: chrome_read sees the page and numbers its button — ${btn}`);
+  ok(!(await cdpList()).some((t) => t.url.includes("/consent.html")), "E: a granted session is not asked again");
+
+  const ref = Number(/^\[(\d+)\]/.exec(btn || "")?.[1]);
+  const clicked = await mcp.tool("chrome_click", { ref });
+  ok(!clicked.isError, `F: chrome_click by ref — ${text(clicked)}`);
+  const after = JSON.parse(text(await mcp.tool("chrome_read")));
+  ok(after.text.includes("clicked"), "F: the click was a real click: the page changed");
+
+  const typed = await mcp.tool("chrome_type", { selector: "#q", text: "hello roost", submit: true });
+  ok(!typed.isError, `F: chrome_type — ${text(typed)}`);
+  const after2 = JSON.parse(text(await mcp.tool("chrome_read")));
+  ok(after2.text.includes("typed:hello roost"), "F: the typed text was submitted");
+
+  const con = JSON.parse(text(await mcp.tool("chrome_console")));
+  ok((con.messages || []).some((m) => m.includes("button clicked")), `G: chrome_console has the page's log — ${JSON.stringify(con.messages)}`);
+
+  const shot = await mcp.tool("chrome_screenshot");
+  const img = (shot.content || []).find((c) => c.type === "image");
+  ok(img && img.mimeType === "image/jpeg" && img.data.startsWith("/9j/"), `H: chrome_screenshot returns a JPEG as image content (${img ? img.data.length : 0} b64 chars)`);
+
+  const roostTab = await mcp.tool("chrome_open", { url: `${roostOrigin}/${fx.project}` });
+  ok(roostTab.isError && /roost tab/.test(text(roostTab)), `I: Claude may not drive roost itself — ${text(roostTab)}`);
+  const file = await mcp.tool("chrome_open", { url: "file:///etc/passwd" });
+  ok(file.isError && /http/.test(text(file)), `I: chrome_open refuses a file: URL — ${text(file)}`);
+
+  // ---- a call the page invents ---------------------------------------------------
+  // What injected script in a roost page could do: post a call straight to
+  // the content script. The extension must refuse it, because only the
+  // server holds the key.
+  // Bounded: an extension that did not check the signature would treat this
+  // as a real call from an ungranted session and open a consent prompt, and
+  // the result would never come.
+  const forged = await page.evalIn(`new Promise((res) => {
+    setTimeout(() => res({ ok: null, error: "no result in 10 s — the extension did not refuse the forged call outright" }), 10000);
+    addEventListener("message", function h(e) {
+      if (e.data && e.data.roostBridge === 1 && e.data.from === "ext" && e.data.type === "result" && e.data.call === "forged-1") { removeEventListener("message", h); res(e.data); }
+    });
+    const payload = JSON.stringify({ call: "forged-1", project: ${JSON.stringify(fx.project)}, session: "term", pid: 1, tool: "chrome_tabs", args: {}, issued: Date.now() });
+    window.postMessage({ roostBridge: 1, from: "page", type: "call", call: "forged-1", payload, sig: "0".repeat(64) }, location.origin);
+  })`);
+  ok(forged && forged.ok === false && /signature/.test(forged.error), `J: a call signed with the wrong key is refused by the extension — ${forged && forged.error}`);
+
+  // ---- your browser -> roost Claude ----------------------------------------------
+  await page.evalIn("window.__sent = null; sendTextToClaude = (t) => { window.__sent = t; }; true");
+  await page.cmd("Page.bringToFront");
+  await page.evalIn("dispatchEvent(new Event('focus')); true");
+  await sleep(300);
+  const delivered = await worker.evalIn(`roostBridge.sendToRoost({ text: "From my browser: Example\\nhttps://example.com/" })`);
+  await until(() => page.evalIn("window.__sent"), 5, "the page receiving the send");
+  const sent = await page.evalIn("window.__sent");
+  ok(delivered === true && typeof sent === "string" && sent.includes("https://example.com/"), `K: "send to roost Claude" reaches the page's Claude paste — ${JSON.stringify(sent)}`);
+
+  // ---- handoff, both ways --------------------------------------------------------
+  hand = await openPage(browser.port, `${roostOrigin}/frag/${fx.project}/handoff`);
+  await until(() => hand.evalIn("document.getElementById('status').textContent === 'connected'"), 10, "the handoff page to connect");
+  const reading = mcp.tool("handoff_read", { wait_seconds: 20 });
+  await sleep(300);
+  await hand.evalIn(`document.getElementById('message').value = 'please check the login page'; document.getElementById('send').requestSubmit(); true`);
+  const got = await reading;
+  ok(/please check the login page/.test(text(got)) && /from browser/.test(text(got)), `L: handoff_read wakes on the page's message — ${text(got).trim()}`);
+  await mcp.tool("handoff_send", { text: "login page is fine" });
+  const shownReply = await until(() => hand.evalIn("document.getElementById('log').textContent.includes('login page is fine')"), 5, "the reply on the page");
+  ok(shownReply, "L: handoff_send appears on the handoff page");
+
+  // ---- the relay goes away -------------------------------------------------------
+  // Navigating away closes the page's workspace socket, which is the
+  // teardown the broker hangs its "fail at once" on.
+  await page.cmd("Page.navigate", { url: "about:blank" });
+  await sleep(800);
+  const t1 = Date.now();
+  const gone = await mcp.tool("chrome_tabs");
+  ok(gone.isError && Date.now() - t1 < 5000, `M: with the relay tab closed, a call fails at once — ${text(gone)}`);
+} catch (e) {
+  ok(false, `threw: ${e.stack || e}`);
+} finally {
+  try { await page?.close(); } catch {}
+  try { await hand?.close(); } catch {}
+  await mcp?.close();
+  browser.close();
+  await site.shutdown();
+  await roost.close();
+  await fx.cleanup();
+}
+console.log(fail ? `${fail} FAILED` : "all ok");
+Deno.exit(fail ? 1 : 0);
