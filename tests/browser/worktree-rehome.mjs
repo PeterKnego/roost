@@ -37,8 +37,9 @@
 //! again, and D closes every page, so it comes last.
 //!
 //! Every absence asserted here is paired with a positive check that the
-//! thing would be visible if present: the main page's `term` tab is asserted
-//! present before the move; `worktree-slow`'s absence from `git worktree
+//! thing would be visible if present: the main page's tab for the moved
+//! terminal (the one `openTerm` returns, `term1` — not the seeded `term`,
+//! which never attaches) is asserted present before the move; `worktree-slow`'s absence from `git worktree
 //! list` beside `worktree-fox`'s presence; D's channel is proved with a
 //! `pid` answer before the refused request is sent; and E's fork choice is
 //! asserted *absent* from the snapshot the page already held, so the
@@ -63,6 +64,19 @@
 //!   is what says the close really ran, so "the resident survived" cannot
 //!   pass against a Close Project that did nothing. Restored with `cp`:
 //!   46 ok, 0 FAIL.
+//!
+//!   `openWorktreeDialog`'s `await requestFreshState();` (static/app.js)
+//!   deleted, binary rebuilt (assets are embedded). No Rust test reaches
+//!   it, so this is its only guard. Observed: E fails exactly 1, every other
+//!   section green —
+//!     ok    the page's current snapshot does not yet offer it as forkable
+//!       (timed out waiting for the fork choice)
+//!     FAIL  the + dialog offers "Continue term's Claude there (fork)" — from its own RequestState
+//!   The "not yet forkable" read sits right before the + click, after the
+//!   panel's own fetches, so the whole window in which only RequestState
+//!   could change the answer is covered. A missing fork choice dismisses
+//!   the dialog with a real Escape rather than crashing, so C and D still
+//!   report. Restored with `cp`: 46 ok, 0 FAIL.
 //!
 //! Run: deno run -A tests/browser/worktree-rehome.mjs
 import { attachTarget, fixture, freePort, openPage, profileDir, sleep, startBrowser, startRoost, until }
@@ -168,8 +182,6 @@ const roostBin = `${meta.target_directory}/debug/roost`;
 const fakebin = `${fx.base}/fakebin`;
 await Deno.mkdir(fakebin, { recursive: true });
 await Deno.writeTextFile(`${fx.base}/fake.c`, FAKE_C);
-const cc = await new Deno.Command("cc", { args: ["-O0", "-o", `${fakebin}/claude`, `${fx.base}/fake.c`], stdout: "inherit", stderr: "inherit" }).output();
-if (!cc.success) throw new Error("could not compile the fake claude");
 const fakeLog = `${fx.base}/fake.log`;
 await Deno.writeTextFile(fakeLog, "");
 // `--noprofile --norc` so the developer's real claude cannot be the one that
@@ -224,6 +236,14 @@ const openTerm = async (pg) => {
 };
 
 try {
+  // Inside the try, so `fx.cleanup` runs if it fails.
+  let cc;
+  try {
+    cc = await new Deno.Command("cc", { args: ["-O0", "-o", `${fakebin}/claude`, `${fx.base}/fake.c`], stdout: "inherit", stderr: "inherit" }).output();
+  } catch (e) {
+    throw new Error(`cc not found: the fake claude is compiled from C and needs a C compiler on PATH (${e.message})`);
+  }
+  if (!cc.success) throw new Error("cc failed to compile the fake claude");
   roost = await startRoost({ repoRoot, stateDir: fx.stateDir, roots: fx.roots, port: await freePort(), extraEnv: { SHELL: shell } });
   page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${project}`);
   ok(await ready(page), "main page loaded");
@@ -314,8 +334,8 @@ try {
   // settle window (closeproject.mjs, section B); reopen the way a user would.
   await sleep(1500);
   await page.evalIn(`location.href = ${JSON.stringify(`http://127.0.0.1:${roost.port}/${project}`)}; 0`);
-  await sleep(500);
-  ok(await ready(page), "main page reopened");
+  ok(await until(() => page.evalIn(`location.pathname === ${JSON.stringify(`/${project}`)}`), 15, "the project page")
+     && await ready(page), "main page reopened");
   await page.evalIn(helpers);
   await page.bringToFront();
   const sE = await openTerm(page);
@@ -328,15 +348,24 @@ try {
   await Deno.mkdir(`${fx.stateDir}/claude/${project}`, { recursive: true });
   await Deno.writeTextFile(`${fx.stateDir}/claude/${project}/${sE}.tmp`, JSON.stringify({ session_id: forkId, event: "SessionStart" }));
   await Deno.rename(`${fx.stateDir}/claude/${project}/${sE}.tmp`, `${fx.stateDir}/claude/${project}/${sE}.json`);
-  ok(!(await page.evalIn(`(state.forkable || []).includes(${SE})`)), "the page's current snapshot does not yet offer it as forkable");
   await page.evalIn(`document.getElementById("wtbtn").click(); 0`);
   ok(await until(() => page.evalIn(`!!document.querySelector("#wtstrip .wtadd")`), 15, "the + button"), "the worktree panel offers +");
+  // Read last thing before the + click, after the panel's own fetches: from
+  // here on only the dialog's RequestState can change the answer.
+  ok(!(await page.evalIn(`(state.forkable || []).includes(${SE})`)), "the page's current snapshot does not yet offer it as forkable");
   await page.evalIn(`document.querySelector("#wtstrip .wtadd").click(); 0`);
   const forkSel = `#dlg-choice .dlg-choice[data-choice="fork:${sE}"]`;
-  ok(await until(() => page.evalIn(`document.getElementById("dlg-choice").open
+  const offered = await until(() => page.evalIn(`document.getElementById("dlg-choice").open
       && document.querySelector('#dlg-choice .dlg-title').textContent === "New worktree"
-      && !!document.querySelector(${JSON.stringify(forkSel)})`), 15, "the fork choice"),
-     `the + dialog offers "Continue ${sE}'s Claude there (fork)" — from its own RequestState`);
+      && !!document.querySelector(${JSON.stringify(forkSel)})`), 15, "the fork choice");
+  ok(offered, `the + dialog offers "Continue ${sE}'s Claude there (fork)" — from its own RequestState`);
+  if (!offered) {
+    // Dismissed with a real Escape (README: a bare .close() leaves dialog.js's
+    // one-at-a-time gate shut), so C still gets to show its ask.
+    for (const type of ["keyDown", "keyUp"]) {
+      await page.cmd("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+    }
+  } else {
   await page.evalIn(`(() => { const i = document.querySelector("#dlg-choice .dlg-choice-input"); i.value = "wolf"; i.dispatchEvent(new Event("input")); })()`);
   await clickReal(page, forkSel);
   const tgtE = await findTab("/.claude/worktrees/worktree-wolf");
@@ -357,6 +386,7 @@ try {
     // The fake then actually ran with those arguments.
     if (where) ok(!!await waitFor(page3, where, new RegExp(`FAKE-READY argv=--resume ${forkId} --fork-session`), 20, "fake argv"),
       "and the claude it started received exactly those arguments");
+  }
   }
   timings.E = Date.now() - tE;
 
