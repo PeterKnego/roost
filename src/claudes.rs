@@ -372,6 +372,12 @@ fn detect_moves_in(
         // home".
         let Ok(rel) = wcanon.strip_prefix(&home_canon) else { continue };
         let worktree = format!("{}/{}", c.project, rel.display());
+        // Only a worktree a record can name (final review d): one outside
+        // `.claude/worktrees/` never `resolves`, so the move would be a
+        // record the session ignores and an offer that returns every tick.
+        if !crate::home::owner_shaped(&c.project, &worktree) {
+            continue;
+        }
         let already_recorded = matches!(
             owner_of(&c.project, &c.session),
             crate::home::Owner::Elsewhere(ref o) if *o == worktree
@@ -484,11 +490,41 @@ pub fn sweep_gone_owners(
     home_dir_of: &dyn Fn(&str) -> Option<PathBuf>,
     announced: &Mutex<HashSet<(String, String, String)>>,
 ) {
+    sweep_gone_owners_with(home_dir_of, announced, &|_, _| {})
+}
+
+/// [`sweep_gone_owners`] with `before_forget(home, name)` called between the
+/// evidence and the forget, so a test can land a re-point in exactly that
+/// window instead of racing for it.
+pub(crate) fn sweep_gone_owners_with(
+    home_dir_of: &dyn Fn(&str) -> Option<PathBuf>,
+    announced: &Mutex<HashSet<(String, String, String)>>,
+    before_forget: &dyn Fn(&str, &str),
+) {
     for (home, name, owner) in detect_gone_owners(home_dir_of) {
-        // Always attempted, never gated on `announced` — the bug this
-        // fixes is exactly a forget that was skipped because an *earlier*
-        // owner for this same (home, session) had already been announced.
-        crate::home::forget(&home, &name);
+        before_forget(&home, &name);
+        // Compare, then forget (final review c, amending R18). The evidence
+        // is about `owner`; a record re-pointed since — an approval moving
+        // this terminal into a new worktree mid-sweep — names another, and
+        // says nothing about that one. Not atomic: a write landing between
+        // this read and the unlink still loses, but the window shrinks from
+        // a `git worktree list` per home to two syscalls.
+        match crate::home::owner_of(&home, &name) {
+            crate::home::Owner::Elsewhere(ref o) if *o == owner => {
+                // Always attempted, never gated on `announced` — the bug
+                // this fixes is exactly a forget that was skipped because
+                // an *earlier* owner for this same (home, session) had
+                // already been announced.
+                crate::home::forget(&home, &name);
+            }
+            // Already gone: nothing to forget, and the tab still wants
+            // giving back below.
+            crate::home::Owner::Here => {}
+            other => {
+                eprintln!("roost: kept {home}/{name}'s re-home record: it no longer names the removed {owner} ({other:?})");
+                continue;
+            }
+        }
 
         let key = (home.clone(), name.clone(), owner.clone());
         let first_time = {
@@ -1081,6 +1117,28 @@ mod tests {
         );
     }
 
+    /// Final-review d: a worktree of the home that is not under its
+    /// `.claude/worktrees/` is never offered. A record naming one never
+    /// `resolves` (`home::owner_path` admits only that shape), so accepting
+    /// the offer writes a record the session ignores — the tab stays at
+    /// home and the banner comes back next tick, forever.
+    ///
+    /// Revert-checked (final fix wave): with the `home::owner_shaped`
+    /// filter removed from `detect_moves_in`, fails with `left: [Into {
+    /// .., worktree: "karpie/elsewhere" }], right: []`.
+    #[test]
+    fn a_worktree_outside_claude_worktrees_is_not_offered() {
+        let (root, repo, _wt) = fake_proc_with_repo_and_worktree();
+        let outside = repo.join("elsewhere");
+        assert!(std::process::Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["worktree", "add", "-q", "-b", "elsewhere", outside.to_str().unwrap()])
+            .status().unwrap().success());
+        mk_with_cwd(root.path(), 100, "ROOST_PROJECT=karpie\nROOST_SESSION=term3\n", &outside);
+        let moves = detect_moves(root.path(), &|p| (p == "karpie").then(|| repo.clone()), &|_, _| crate::home::Owner::Here);
+        assert_eq!(moves, vec![]);
+    }
+
     /// An unreadable `cwd` is "unknown", never "still at home" — reporting
     /// anything here would be exactly the evidence mistake CLAUDE.md's
     /// table is about, just in the "says something untrue" direction
@@ -1411,6 +1469,65 @@ mod tests {
             "the second removal, for a DIFFERENT owner, must also be forgotten — not silently stuck Elsewhere(y)"
         );
 
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Final-review c (amends R18): the evidence names the *gone* owner,
+    /// and a record re-pointed between that evidence and the forget — an
+    /// approval re-homing the same terminal into a new worktree, landing
+    /// mid-sweep — names a different one. Forgetting it anyway would drop a
+    /// live re-home on evidence about a worktree it no longer names. Driven
+    /// through `sweep_gone_owners_with`'s hook, not a timing race.
+    ///
+    /// Revert-checked (final fix wave): with the re-read before `forget`
+    /// removed (the unconditional `home::forget` restored), fails on "a
+    /// record re-pointed after the evidence was forgotten on evidence about
+    /// its old owner" — the record reads `Here`.
+    #[test]
+    fn a_record_repointed_between_evidence_and_forget_survives() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let home = "c-repointed-home";
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(args).status().unwrap().success());
+        }
+        std::fs::write(home_dir.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(args).status().unwrap().success());
+        }
+        let git_wt = |args: &[&str]| {
+            assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).arg("worktree").args(args).status().unwrap().success());
+        };
+        let wx = home_dir.join(".claude/worktrees/worktree-x");
+        let wy = home_dir.join(".claude/worktrees/worktree-y");
+        git_wt(&["add", "-q", "-b", "worktree-x", wx.to_str().unwrap()]);
+        git_wt(&["add", "-q", "-b", "worktree-y", wy.to_str().unwrap()]);
+        let owner_x = format!("{home}/.claude/worktrees/worktree-x");
+        let owner_y = format!("{home}/.claude/worktrees/worktree-y");
+        crate::home::record(home, "term3", &owner_x).unwrap();
+        git_wt(&["remove", wx.to_str().unwrap()]);
+
+        let home_dir_of = |p: &str| (p == home).then(|| home_dir.clone());
+        let announced = Mutex::new(HashSet::new());
+        let ran = std::cell::Cell::new(false);
+        sweep_gone_owners_with(&home_dir_of, &announced, &|h, n| {
+            assert_eq!((h, n), (home, "term3"));
+            crate::home::record(h, n, &owner_y).unwrap();
+            ran.set(true);
+        });
+
+        assert!(ran.get(), "setup: the sweep found the gone owner and reached the forget");
+        assert_eq!(
+            crate::home::owner_of(home, "term3"),
+            crate::home::Owner::Elsewhere(owner_y.clone()),
+            "a record re-pointed after the evidence was forgotten on evidence about its old owner"
+        );
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
     }

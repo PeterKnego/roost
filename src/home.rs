@@ -144,6 +144,17 @@ pub fn resolves(home: &str, owner: &str) -> bool {
 /// compares this against `git worktree list`'s own (still-existing) entries
 /// rather than trusting a stat that a removed directory can never pass.
 fn owner_path_in(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
+    let dir = owner_leaf(home, owner)?;
+    let home_dir = crate::projects::resolve_project(roots, home)?;
+    Some(home_dir.join(".claude/worktrees").join(dir))
+}
+
+/// The `<dir>` of `home/.claude/worktrees/<dir>`, when `owner` has the one
+/// shape a re-home record may name — [`owner_path`] without the disk. Pure,
+/// so a caller that has already found the home's directory another way
+/// (`claudes::detect_moves_in`) can ask "could a record naming this ever
+/// resolve" without a second resolve.
+fn owner_leaf<'a>(home: &str, owner: &'a str) -> Option<&'a str> {
     let dir = owner.strip_prefix(home).and_then(|r| r.strip_prefix("/.claude/worktrees/"))?;
     // roost's own `worktree-<name>` and the older `claude-N` both fit the
     // session-name alphabet, except a `worktree-` name longer than 23. No
@@ -159,8 +170,14 @@ fn owner_path_in(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> 
     if home.split('/').any(|s| s.starts_with('.')) {
         return None;
     }
-    let home_dir = crate::projects::resolve_project(roots, home)?;
-    Some(home_dir.join(".claude/worktrees").join(dir))
+    Some(dir)
+}
+
+/// Whether a record naming `owner` for a session of `home` could ever
+/// resolve: the shape half of [`owner_path`]. A worktree outside the home's
+/// `.claude/worktrees/` cannot, so it is never offered as a move target.
+pub fn owner_shaped(home: &str, owner: &str) -> bool {
+    owner_leaf(home, owner).is_some()
 }
 
 pub fn owner_path(home: &str, owner: &str) -> Option<PathBuf> {
