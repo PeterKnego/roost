@@ -390,6 +390,37 @@ pub enum Intent {
         end_line: u32,
         end_col: u32,
     },
+    /// This page's roost extension content script answered (`ready`), or
+    /// its window took focus (`active`), or the script was orphaned by an
+    /// extension reload (`ready: false`). See `browser.rs`.
+    BridgeHello {
+        #[serde(default)]
+        active: bool,
+        #[serde(default = "yes")]
+        ready: bool,
+    },
+    /// The extension's content script in this page has a `BridgeCall` —
+    /// proof the page is alive, sent before the call is acted on.
+    BridgeAck { call: String },
+    /// The extension's answer to a `BridgeCall` this connection relayed.
+    /// Diverted in `wsconn` before the hub lock: it is a map lookup and a
+    /// channel send, and nothing about it belongs to this project's hub.
+    BridgeReply {
+        call: String,
+        ok: bool,
+        #[serde(default)]
+        result: serde_json::Value,
+        #[serde(default)]
+        error: String,
+    },
+    /// A message typed (by a person or a browser agent) into the handoff page.
+    HandoffPost { text: String },
+    /// The handoff page asking for the whole log, on load and on reconnect.
+    HandoffSync,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Snapshot sent as `Event::State`. Deliberately carries buffer *metadata*
@@ -752,6 +783,15 @@ pub enum Event {
     /// R18 has by now also forgotten the re-home record, so the session is
     /// `Here` again. This event is only the explanation for why.
     WorktreeGone { worktree: String, session: String },
+    /// A browser tool call for this page to hand to the extension, unread.
+    /// `payload` is opaque JSON text and `sig` its HMAC (`browser::sign`):
+    /// the extension verifies the bytes it is given, so this page — which
+    /// relays it and could be running injected script — cannot invent one.
+    /// Sent to one connection, never broadcast.
+    BridgeCall { call: String, payload: String, sig: String },
+    /// Handoff messages: the whole log when `full` (an answer to
+    /// `HandoffSync`), else new ones for every client of the project.
+    Handoff { messages: Vec<crate::handoff::Message>, full: bool },
 }
 
 pub fn decode(s: &str) -> Result<Intent, String> {

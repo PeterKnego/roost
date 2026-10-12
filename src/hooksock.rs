@@ -76,7 +76,7 @@ pub fn peer_allowed(peer_uid: u32, our_uid: u32) -> bool {
 /// that process writes. Reading it is the entire authentication story here —
 /// no token, because the directory and file mode already keep everyone but
 /// us from connecting at all, and this is the belt to that belt-and-braces.
-fn peer_uid(s: &UnixStream) -> Option<u32> {
+pub(crate) fn peer_uid(s: &UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -208,7 +208,7 @@ fn serve_one_with_deadline(stream: UnixStream, ask: &dyn Fn(AskRequest) -> AskRe
 /// rather than risk creating a second directory over something unreadable.
 /// Checked every `start()`, not only at creation, because another process
 /// (or a hand-edit) could have widened the mode since this roost last ran.
-fn verify_socket_dir(dir: &Path) -> Result<(), String> {
+pub(crate) fn verify_socket_dir(dir: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     let md = std::fs::symlink_metadata(dir)
         .map_err(|e| format!("cannot stat {}: {e}", dir.display()))?;
@@ -237,6 +237,23 @@ fn verify_socket_dir(dir: &Path) -> Result<(), String> {
 /// caller: a project with an unwritable state dir still runs, just without
 /// `roost worktree-hook` able to reach it (Task 8 falls back).
 pub fn start() -> Result<(), String> {
+    let l = bind_private("hook.sock")?;
+    // SAFETY: getuid takes no arguments, reads no memory, and cannot fail.
+    let me = unsafe { libc::getuid() };
+    std::thread::Builder::new()
+        .name("hooksock".into())
+        .spawn(move || serve_listener(l, MAX_CONNECTIONS, me, |req| crate::hub::ask_worktree_blocking(req)))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Creates (or verifies) the private socket directory and binds `name` in
+/// it, removing a previous roost's socket file only on positive evidence that
+/// it is dead. Shared by `hook.sock` and `browser.rs`'s `browser.sock`: both
+/// are reached by Claude-spawned processes, both rest on the same 0700
+/// directory and `SO_PEERCRED` check, and two copies of the stale-socket
+/// logic would be two places to get CLAUDE.md's destruction rule wrong.
+pub(crate) fn bind_private(name: &str) -> Result<UnixListener, String> {
     // Finding 3: on a fresh install, nothing before this call has created
     // `state_dir()` itself — `wsstate::save` only creates it lazily, on a
     // project's first save, which may never have happened yet. Creating
@@ -285,7 +302,7 @@ pub fn start() -> Result<(), String> {
     }
     verify_socket_dir(&dir)?;
 
-    let p = socket_path();
+    let p = dir.join(name);
     match std::fs::symlink_metadata(&p) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("cannot stat {}: {e}", p.display())),
@@ -330,14 +347,7 @@ pub fn start() -> Result<(), String> {
     // same hole a world-readable directory would make it.
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("chmod {}: {e}", p.display()))?;
-
-    // SAFETY: getuid takes no arguments, reads no memory, and cannot fail.
-    let me = unsafe { libc::getuid() };
-    std::thread::Builder::new()
-        .name("hooksock".into())
-        .spawn(move || serve_listener(l, MAX_CONNECTIONS, me, |req| crate::hub::ask_worktree_blocking(req)))
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(l)
 }
 
 /// The accept loop's core, pulled out of `start()` so a test can drive it

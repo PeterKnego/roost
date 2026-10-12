@@ -917,6 +917,31 @@ impl Hub {
             Intent::WorktreeAnswer { id, approve } => {
                 return self.do_worktree_answer(from, id.clone(), *approve)
             }
+            Intent::BridgeHello { active, ready } => {
+                // The broker's registry, not the hub's: a relay serves every
+                // project. Nothing in the workspace changes, so no snapshot.
+                if *ready {
+                    crate::browser::hello(&self.project, from, *active);
+                } else {
+                    crate::browser::gone(&self.project, from);
+                }
+                return;
+            }
+            Intent::HandoffPost { text } => {
+                match crate::handoff::post(&self.project, "browser", text) {
+                    Ok(m) => self.broadcast(&Event::Handoff { messages: vec![m], full: false }),
+                    Err(msg) => self.send_to(from, &Event::Error { msg }),
+                }
+                return;
+            }
+            Intent::HandoffSync => {
+                let messages = crate::handoff::since(&self.project, 0);
+                self.send_to(from, &Event::Handoff { messages, full: true });
+                return;
+            }
+            Intent::BridgeReply { .. } | Intent::BridgeAck { .. } => {
+                unreachable!("BridgeReply and BridgeAck are diverted in wsconn before this lock is taken")
+            }
             Intent::Rehome { session, to } => return self.do_rehome(from, session.clone(), to.clone()),
             // A search performs an unbounded filesystem walk, so `wsconn.rs`
             // diverts it to a worker thread *before* this lock is taken —
@@ -3665,6 +3690,20 @@ pub fn retab_native_if_missing(project: &str, name: &str) {
     }
     let ev = g.snapshot_event(&String::new());
     g.broadcast(&ev);
+}
+
+/// Sends `ev` to one connection of one project, and says whether it could.
+/// `Hub::send_to` is silent about a connection that is gone, which is right
+/// for a reply nobody is waiting on and wrong for a browser call: read as
+/// delivered, it would wait minutes for an answer nobody was asked for.
+pub fn send_to_conn(project: &str, conn: &str, ev: &Event) -> bool {
+    let Some(arc) = open_hub(project) else { return false };
+    let mut h = Hub::lock(&arc);
+    if !h.subs.contains_key(conn) {
+        return false;
+    }
+    h.send_to(&conn.to_string(), ev);
+    h.subs.contains_key(conn)
 }
 
 /// Send an event to the clients of one project and nobody else. Same lock
@@ -10745,6 +10784,56 @@ mod tests {
         crate::wsstate::save("reloadproj", &h.ws).unwrap();
         let (after, _) = crate::wsstate::load("reloadproj");
         assert_eq!(after.show_hidden, Some(true), "the restored layout was written back over");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Two subscribers, so "every client hears a post" and "only the asker
+    /// gets the full log" are each distinguishable from the other.
+    #[test]
+    fn a_handoff_post_reaches_every_client_and_a_sync_only_the_asker() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let mut h = Hub::new("handoff-hub", d.path().to_path_buf());
+        let (a, rx_a) = h.subscribe();
+        let (_b, rx_b) = h.subscribe();
+        h.handle(&a, Intent::HandoffPost { text: "look at the login page".into() });
+        for rx in [&rx_a, &rx_b] {
+            let got = drain(rx);
+            assert!(
+                got.iter().any(|m| m.contains(r#""t":"Handoff""#) && m.contains("look at the login page") && m.contains(r#""from":"browser""#)),
+                "{got:?}"
+            );
+        }
+        h.handle(&a, Intent::HandoffSync);
+        assert!(drain(&rx_a).iter().any(|m| m.contains(r#""full":true"#) && m.contains("login page")));
+        assert!(drain(&rx_b).is_empty(), "a sync is answered to the asker only");
+        h.handle(&a, Intent::HandoffPost { text: " ".into() });
+        assert!(drain(&rx_a).iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("empty")));
+        assert!(drain(&rx_b).is_empty(), "a refused post is not broadcast");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// `send_to_conn` must say when it could not deliver: the broker reads
+    /// `false` as "try the next relay", and `Hub::send_to`'s silence would
+    /// have it wait three minutes on nobody.
+    #[test]
+    fn send_to_conn_delivers_to_one_connection_and_reports_a_missing_one() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        crate::idelock::isolate_ide_dir_for_test();
+        let hub = Hub::for_project("send-to-conn", d.path().to_path_buf());
+        let (a, rx_a) = Hub::lock(&hub).subscribe();
+        let (_b, rx_b) = Hub::lock(&hub).subscribe();
+        let ev = Event::BridgeCall { call: "1".into(), payload: "{}".into(), sig: "x".into() };
+        assert!(send_to_conn("send-to-conn", &a, &ev));
+        assert!(drain(&rx_a).iter().any(|m| m.contains("BridgeCall")));
+        assert!(drain(&rx_b).is_empty(), "sent to one connection, not broadcast");
+        assert!(!send_to_conn("send-to-conn", "c-nobody", &ev));
+        assert!(!send_to_conn("no-such-project-hub", &a, &ev));
+        drop(rx_a);
+        assert!(!send_to_conn("send-to-conn", &a, &ev), "a closed receiver is not a delivery");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 }

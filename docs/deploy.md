@@ -521,6 +521,13 @@ run, and reads every channel back.
 It never deletes a tag or a release. If CI fails after the tag is pushed it
 prints `gh run rerun <id> --failed`, which is what recovered v0.5.1.
 
+The release also carries the browser extension as
+`roost-extension-<version>.zip`, packed by `scripts/package-extension.sh` with
+the release's version stamped into its manifest (`version_name` keeps a
+prerelease's suffix, which Chrome's numeric `version` cannot). Its icons are
+drawn from `static/logo.svg` by `scripts/extension-icons.py`; rerun that after
+changing the logo.
+
 A version with a `-` in it is a prerelease: it builds all four targets and the
 packages, and publishes to neither the tap nor crates.io. Use one to exercise
 a change to the release itself.

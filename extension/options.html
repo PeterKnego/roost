@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>roost bridge options</title>
+<link rel="stylesheet" href="ui.css">
+</head><body>
+<main>
+<h1>roost bridge</h1>
+<p class="lede">Lets a Claude running in roost use this browser. Every Claude session asks you once.</p>
+
+<section>
+<label for="origin">roost addresses</label>
+<p class="fine">The roost pages that may relay calls, e.g. <code>https://roost.example.com</code> or <code>http://127.0.0.1:8444</code>.</p>
+<ul id="origins"></ul>
+<div class="row"><input id="origin" type="text" placeholder="https://roost.example.com" inputmode="url"><button id="add">Add</button></div>
+</section>
+
+<section>
+<label for="key">Key</label>
+<p class="fine">Run <code>roost browser-key</code> on the roost host and paste what it prints. Calls not signed with it are refused.</p>
+<div class="row"><input id="key" type="password" autocomplete="off" spellcheck="false"><button id="savekey">Save</button></div>
+<p id="keystate" class="fine"></p>
+</section>
+
+<section>
+<label for="deny">Never drive these sites</label>
+<p class="fine">One domain per line (subdomains included). Applies in unsafe mode too.</p>
+<textarea id="deny" spellcheck="false" placeholder="mybank.com"></textarea>
+<button id="savedeny">Save</button>
+</section>
+
+<section>
+<label><input id="follow" type="checkbox"> Bring Claude's tabs to the front</label>
+<p class="fine">Pages Claude opens go into a "Claude" tab group in your window. On, each one comes to the front as it opens, so you can watch. Off, they open behind your tab, and a screenshot shows one only for a moment before handing your tab back.</p>
+</section>
+
+<section>
+<label><input id="unsafe" type="checkbox"> Unsafe mode</label>
+<p class="fine">Every call from every roost Claude is allowed with no prompt. The toolbar badge shows <span class="warn">!!</span> while it is on.</p>
+</section>
+<p id="msg" class="fine" role="status"></p>
+</main>
+<script src="options.js"></script>
+</body></html>

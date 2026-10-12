@@ -1880,6 +1880,56 @@ fn theme_head(theme: &str, code_size: Option<u32>) -> (String, String) {
 /// setting (`config::share_selection`), and this function stays pure so its
 /// tests can drive both states without touching the developer's real
 /// `~/.config/roost/config.toml`.
+/// The handoff page: a message log a browser agent (Claude in Chrome, say)
+/// and a roost Claude share. Deliberately plain — one list, one textarea, one
+/// button, stable ids — because its main reader is an agent driving a
+/// browser, and every bit of chrome is something it has to find its way
+/// past. Everything it does goes over the project's workspace socket
+/// (`HandoffPost`, `HandoffSync`); the page itself is a GET.
+pub fn handoff_page(project: &str) -> String {
+    let p = esc(project);
+    let js = av("handoff.js");
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Handoff · {p}</title>
+<style>
+:root {{ color-scheme: light dark; --bg:#fff; --fg:#1b1f24; --muted:#59636e; --line:#d1d9e0; --me:#ddf4ff; --them:#f6f8fa; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg:#0d1117; --fg:#e6edf3; --muted:#9198a1; --line:#3d444d; --me:#0c2d6b; --them:#151b23; }} }}
+* {{ box-sizing: border-box; }}
+body {{ margin:0; background:var(--bg); color:var(--fg); font:16px/1.45 system-ui,sans-serif; }}
+main {{ max-width:860px; margin:0 auto; padding:16px; display:flex; flex-direction:column; gap:12px; min-height:100vh; }}
+h1 {{ font-size:18px; margin:0; }}
+#about {{ color:var(--muted); font-size:14px; margin:0; }}
+#status {{ font-size:13px; color:var(--muted); }}
+#log {{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px; flex:1; }}
+#log li {{ border:1px solid var(--line); border-radius:8px; padding:8px 10px; background:var(--them); }}
+#log li[data-from="browser"] {{ background:var(--me); }}
+#log .who {{ font-size:12px; color:var(--muted); }}
+#log pre {{ margin:4px 0 0; white-space:pre-wrap; word-break:break-word; font:inherit; }}
+form {{ display:flex; flex-direction:column; gap:8px; position:sticky; bottom:0; background:var(--bg); padding:8px 0; }}
+textarea {{ width:100%; min-height:96px; font:16px/1.4 ui-monospace,monospace; padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); }}
+button {{ min-height:44px; font-size:16px; border-radius:8px; border:1px solid var(--line); background:var(--them); color:var(--fg); }}
+button:active {{ filter:brightness(.9); }}
+@media (min-width: 641px) {{ form {{ flex-direction:row; align-items:flex-end; }} button {{ min-width:120px; }} }}
+</style></head>
+<body data-project="{p}">
+<main>
+<h1>Handoff · {p}</h1>
+<p id="about">Messages here reach the Claude running in roost for this project (it reads them with its handoff_read tool), and its replies appear below. Write a message in the box and press Send.</p>
+<div id="status" role="status">connecting…</div>
+<ol id="log" aria-live="polite"></ol>
+<form id="send">
+<textarea id="message" name="message" placeholder="Message for the roost Claude" aria-label="Message for the roost Claude"></textarea>
+<button id="send-button" type="submit">Send</button>
+</form>
+</main>
+<script src="/static/handoff.js?v={js}"></script>
+</body></html>
+"#
+    )
+}
+
 pub fn workspace_page(
     project: &str,
     key: &str,

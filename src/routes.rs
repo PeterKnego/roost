@@ -634,7 +634,7 @@ const IMMUTABLE: (&str, &str) = ("Cache-Control", "public, max-age=31536000, imm
 /// for that — it's the one hazard this dispatch-by-kind approach carries
 /// that a fully generic parse wouldn't.
 const FRAGMENT_KINDS: &[&str] =
-    &["tree", "file", "raw", "changes", "status", "diff", "proposal", "theme.css", "backup", "download"];
+    &["tree", "file", "raw", "changes", "status", "diff", "proposal", "theme.css", "backup", "download", "handoff"];
 
 
 /// A PDF for the browser's own viewer (#121), in a tab's `<iframe>` or opened
@@ -934,6 +934,12 @@ fn serve_frag(
         // it is asked for on a click and answered once — the same shape as the
         // project strip, and it keeps the list out of every snapshot, which
         // goes out on each debounced keystroke.
+        // A whole page, not a fragment, but it hangs off a project the same
+        // way, and `/frag/` is the one prefix a nested project key cannot
+        // collide with — `/{project}/handoff` would be read as a project
+        // named `…/handoff`. A GET; what it does goes over the workspace
+        // socket.
+        ["handoff"] => http::html(w, &render::handoff_page(project)),
         ["claudehist"] => {
             http::html(
                 w,
@@ -1547,6 +1553,22 @@ mod tests {
         assert!(refused.contains("409") && !refused.contains("application/zip"), "{refused}");
         let escape = frag_route(&roots, "/frag/p/download?path=../&zip=1&check=1");
         assert!(escape.contains(r#""ok":false"#), "{escape}");
+    }
+
+    /// The handoff page is served for a project — including one whose name
+    /// carries markup, which must arrive escaped — and is a whole page with
+    /// the stable ids an agent driving it looks for.
+    #[test]
+    fn the_handoff_page_is_a_whole_page_with_the_project_escaped() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("a&b")).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let out = frag_route(&roots, "/frag/a%26b/handoff");
+        assert!(out.contains("200 OK"), "{out}");
+        assert!(out.contains("<!doctype html>") && out.contains(r#"id="message""#) && out.contains(r#"id="log""#));
+        assert!(out.contains(r#"data-project="a&amp;b""#), "{out}");
+        assert!(!out.contains("a&b<"), "the raw name never reaches the page");
+        assert!(frag_route(&roots, "/frag/nosuch/handoff").contains("404"));
     }
 
     /// The tree lists every file, so a .png can be clicked. Before this, the file
