@@ -76,6 +76,12 @@ pub fn peer_allowed(peer_uid: u32, our_uid: u32) -> bool {
 /// that process writes. Reading it is the entire authentication story here —
 /// no token, because the directory and file mode already keep everyone but
 /// us from connecting at all, and this is the belt to that belt-and-braces.
+///
+/// Linux only. macOS and the BSDs have no `SO_PEERCRED` and no `ucred`, and
+/// the v0.8.0-rc.1 release failed to build for both macOS targets on exactly
+/// that — CI builds Linux only, so nothing said so until the tag. They get the
+/// same kernel fact from `getpeereid`, below.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn peer_uid(s: &UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
@@ -93,6 +99,19 @@ pub(crate) fn peer_uid(s: &UnixStream) -> Option<u32> {
         )
     };
     (rc == 0).then_some(cred.uid)
+}
+
+/// The same answer on macOS and the BSDs: the effective uid of the process
+/// that connected, as the kernel recorded it at `connect`.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn peer_uid(s: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: both out-pointers are to owned, initialised locals of the types
+    // `getpeereid` writes, and the return code is checked before either is read.
+    let rc = unsafe { libc::getpeereid(s.as_raw_fd(), &mut uid, &mut gid) };
+    (rc == 0).then_some(uid)
 }
 
 fn reply(mut s: &UnixStream, r: &AskReply) {

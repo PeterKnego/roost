@@ -128,7 +128,18 @@ pub(crate) fn start_in_with_ports(
     // record has to say what is true, and on the fallback path the hint is
     // exactly what was not true.
     crate::ideport::record_in(ports, project, port);
-    let token = idelock::new_token()?;
+    // Reused across restarts for the same reason the port is: a Claude that
+    // outlived the restart redials with the token it already holds (see
+    // `ideport::recorded_token_in`). Only a well-formed record is reused;
+    // anything else gets a fresh token, recorded for the next start.
+    let token = match crate::ideport::recorded_token_in(ports, project) {
+        Some(t) => t,
+        None => {
+            let t = idelock::new_token()?;
+            crate::ideport::record_token_in(ports, project, &t);
+            t
+        }
+    };
     let lock = idelock::write_in(dir, port, &token, &workspace)?;
     let stopped = Arc::new(AtomicBool::new(false));
     let ide = Arc::new(Ide { port, token: token.clone(), _lock: lock, stopped: stopped.clone() });
@@ -1693,6 +1704,60 @@ mod tests {
             .expect("second listener");
         assert_eq!(second.port, port, "the recorded port must be taken again");
         second.request_shutdown();
+    }
+
+    /// What a running `claude` does when roost restarts under it: it redials
+    /// the same port with the token it read before the restart. That must be
+    /// accepted, or every deploy leaves every running Claude unreachable by
+    /// Alt+K — observed 2026-10-12: "rejected ide ws handshake (token
+    /// mismatch)" at +1, +3, +7 and +15 s after the restart, then silence.
+    ///
+    /// Revert-checked: with `start_in_with_ports` minting `idelock::new_token()`
+    /// unconditionally (the pre-fix body) this fails with "a Claude
+    /// redialling with the pre-restart token must be accepted".
+    #[test]
+    fn a_claude_holding_the_pre_restart_token_reconnects_after_a_restart() {
+        let lockdir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let first = start_in_with_ports(lockdir.path(), &state.path().join("ide"), "tokensame", PathBuf::from("/tmp"))
+            .expect("first listener");
+        let (port, old_token) = (first.port, first.token.clone());
+        first.request_shutdown();
+        for _ in 0..40 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let second = start_in_with_ports(lockdir.path(), &state.path().join("ide"), "tokensame", PathBuf::from("/tmp"))
+            .expect("second listener");
+        assert_eq!(second.port, port, "setup: the recorded port must be taken again");
+        assert!(
+            connect(port, Some(&old_token), None).is_ok(),
+            "a Claude redialling with the pre-restart token must be accepted"
+        );
+        assert!(connect(port, Some("0123456789abcdef0123456789abcdef"), None).is_err(), "any other token is still refused");
+        second.request_shutdown();
+    }
+
+    /// A token record roost cannot make sense of is not a token: a fresh one is
+    /// minted, and the bad value opens nothing.
+    ///
+    /// Revert-checked: with `recorded_token_in` returning the file's contents
+    /// unvalidated, this fails — `assertion \`left != right\` failed, left:
+    /// "not-a-token"` — the corrupt record became the live token.
+    #[test]
+    fn a_corrupt_recorded_token_is_replaced_not_trusted() {
+        let lockdir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let ports = state.path().join("ide");
+        crate::ideport::record_token_in(&ports, "tokenbad", "0123456789abcdef0123456789abcdef");
+        std::fs::write(ports.join(format!("{}.token", crate::projects::storage_key("tokenbad"))), "not-a-token\n").unwrap();
+        let ide = start_in_with_ports(lockdir.path(), &ports, "tokenbad", PathBuf::from("/tmp")).expect("listener");
+        assert_ne!(ide.token, "not-a-token");
+        assert!(crate::ideport::valid_token(&ide.token), "a fresh, well-formed token: {:?}", ide.token);
+        assert!(connect(ide.port, Some("not-a-token"), None).is_err(), "the corrupt value must open nothing");
+        ide.request_shutdown();
     }
 
     /// The fallback, which is the whole reason the record is advisory: something

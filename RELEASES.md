@@ -41,6 +41,13 @@ tree learns a few new tricks.
   The code editor and diffs scroll sideways instead of wrapping (#151, #153).
   The terminal has a little more line height and lifts too-faint text to a
   readable contrast (#150).
+- **A running Claude reconnects after roost restarts (#170).** roost kept its
+  IDE port across a restart but not the token, so every Claude already running
+  was refused when it redialled and lost Alt+K and proposals until restarted by
+  hand. The token now survives with the port.
+- **macOS builds again.** v0.8.0-rc.1 did not build for macOS: the socket
+  roost's worktree hook and `roost mcp` connect through checked the peer with a
+  Linux-only call. macOS now uses `getpeereid`.
 - **A normal reload picks up a new roost (#155).** Every response carries
   `Cache-Control`; versioned assets are cached for good, everything else is
   checked with the server, so a deploy no longer needs a hard reload.
