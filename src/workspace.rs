@@ -145,7 +145,7 @@ impl Workspace {
         let mut panes = vec![Pane::default(); PANE_COUNT];
         panes[proto::LEFT_TOP as usize].tabs = vec![Tab::Tree];
         panes[proto::LEFT_BOTTOM as usize].tabs = vec![Tab::Changes];
-        panes[proto::RIGHT as usize].tabs = vec![Tab::Terminal { session: "term".into() }];
+        panes[proto::RIGHT as usize].tabs = vec![Tab::Terminal { session: "term".into(), home: None }];
         Workspace {
             version: 0,
             sizes: Sizes::default(),
@@ -216,12 +216,20 @@ impl Workspace {
             // Filled by `hub::snapshot_event`; `WsState` deliberately has no
             // such field (see the doc on `WorkspaceView::claude_sessions`).
             claude_sessions: vec![],
+            // Same reasoning, same place it is filled: see
+            // `WorkspaceView::session_homes`.
+            session_homes: Default::default(),
+            // Same reasoning, same place it is filled: see
+            // `WorkspaceView::forkable`.
+            forkable: Vec::new(),
             is_git: self.is_git,
             show_hidden: self.show_hidden,
             // Filled by `hub::snapshot_event`, same reasoning as
             // `claude_sessions` above: it is a fact about the filesystem,
             // not the workspace layout.
             claude_hooks: None,
+            // Same reasoning and same filler, for `Kind::Worktree`.
+            worktree_hooks: None,
             settings: proto::SettingsView::default(),
         }
     }
@@ -234,7 +242,17 @@ fn tab_identity_eq(a: &Tab, b: &Tab) -> bool {
     match (a, b) {
         (Tab::File { rel: x, .. }, Tab::File { rel: y, .. }) => x == y,
         (Tab::Diff { rel: x }, Tab::Diff { rel: y }) => x == y,
-        (Tab::Terminal { session: x }, Tab::Terminal { session: y }) => x == y,
+        // R15: `home` *is* part of a terminal tab's identity, not an
+        // ignorable detail — a native tab and a resident may legally share
+        // a session name and differ only in `home` (a worktree's own
+        // never-started `term` placeholder beside an arriving resident
+        // re-homed from elsewhere, also named `term`). Matching on
+        // `session` alone would make `OpenTab` treat those two as "the
+        // same tab" and silently focus the wrong one instead of ever
+        // adding the second.
+        (Tab::Terminal { session: x, home: hx }, Tab::Terminal { session: y, home: hy }) => {
+            x == y && hx == hy
+        }
         // By id, never by the file it proposes to change: Claude may have two
         // proposals open for the same path, and they are two different
         // questions with two different pending requests behind them.
@@ -325,7 +343,7 @@ pub fn apply_layout(w: &mut Workspace, intent: &Intent) -> Result<bool, String> 
             let mut changed = false;
             for p in w.panes.iter_mut() {
                 let before = p.tabs.len();
-                p.tabs.retain(|t| !matches!(t, Tab::Terminal { session: s } if s == session));
+                p.tabs.retain(|t| !matches!(t, Tab::Terminal { session: s, .. } if s == session));
                 if p.tabs.len() != before {
                     p.active = p.active.min(p.tabs.len().saturating_sub(1));
                     changed = true;
@@ -522,7 +540,7 @@ mod tests {
         assert!(w.panes[proto::MIDDLE as usize].tabs.is_empty());
         assert_eq!(
             w.panes[proto::RIGHT as usize].tabs,
-            vec![Tab::Terminal { session: "term".into() }]
+            vec![Tab::Terminal { session: "term".into(), home: None }]
         );
     }
 
@@ -533,7 +551,7 @@ mod tests {
     #[test]
     fn ending_a_session_clears_its_tabs_from_every_pane() {
         let mut w = Workspace::default_layout();
-        let term = |n: &str| Tab::Terminal { session: n.to_string() };
+        let term = |n: &str| Tab::Terminal { session: n.to_string(), home: None };
         // default_layout seeds RIGHT with a Terminal tab of its own; clear it
         // so the only sessions in play are the ones under test.
         for p in w.panes.iter_mut() {
@@ -549,11 +567,11 @@ mod tests {
         assert!(changed);
         let live: Vec<&Tab> = w.panes.iter().flat_map(|p| p.tabs.iter()).collect();
         assert!(
-            !live.iter().any(|t| matches!(t, Tab::Terminal { session } if session == "term")),
+            !live.iter().any(|t| matches!(t, Tab::Terminal { session, .. } if session == "term")),
             "no pane may keep a tab for the ended session"
         );
         assert!(
-            live.iter().any(|t| matches!(t, Tab::Terminal { session } if session == "term1")),
+            live.iter().any(|t| matches!(t, Tab::Terminal { session, .. } if session == "term1")),
             "a sibling session must survive"
         );
         for p in &w.panes {
@@ -574,7 +592,7 @@ mod tests {
     #[test]
     fn closing_a_project_clears_every_terminal_tab_and_leaves_the_others() {
         let mut w = Workspace::default_layout();
-        let term = |n: &str| Tab::Terminal { session: n.to_string() };
+        let term = |n: &str| Tab::Terminal { session: n.to_string(), home: None };
         apply_layout(&mut w, &Intent::OpenTab { pane: proto::MIDDLE, tab: file("a.txt") }).unwrap();
         apply_layout(&mut w, &Intent::OpenTab { pane: proto::MIDDLE, tab: term("term1") }).unwrap();
         apply_layout(&mut w, &Intent::OpenTab { pane: proto::RIGHT, tab: term("term2") }).unwrap();
@@ -633,7 +651,7 @@ mod tests {
     #[test]
     fn two_terminals_with_different_names_coexist() {
         let mut w = Workspace::default_layout();
-        let t = Tab::Terminal { session: "claude".into() };
+        let t = Tab::Terminal { session: "claude".into(), home: None };
         apply_layout(&mut w, &Intent::OpenTab { pane: proto::RIGHT, tab: t }).unwrap();
         assert_eq!(w.panes[proto::RIGHT as usize].tabs.len(), 2);
     }

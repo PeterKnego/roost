@@ -101,7 +101,7 @@ macOS is used daily; Windows is untested.
 ## Features
 
 ### A tab per project/worktree
-Every tab represents a project or worktree, and has panes in familiar IDE-like arrangement: file-tree, file-diffs, file preview/editor, terminal.
+Every tab represents a project or worktree, and has panes in familiar IDE-like arrangement: file-tree, file-diffs, file preview/editor, terminal. Ask Claude Code to create a worktree from inside a tab's terminal and roost creates it, bringing that terminal along into its own tab.
 
 ### Terminals that survive reload/re-attach/restart
 Each terminal is a PTY owned by `roost` and wrapped in `dtach`, so sessions survive a tab reload, network disconnect, laptop sleep, and even a `roost` restart.
@@ -110,13 +110,16 @@ Each terminal is a PTY owned by `roost` and wrapped in `dtach`, so sessions surv
 Open a file in one browser and it opens in every connected browser. Layout and unsaved buffers persist across restarts, stored outside the repo — so pane drags never show up in `git status`.
 
 ### Drag-n-drop files/images or paste images
-Drag-n-drop files into the file tree for instant upload to remote filesystem.
+Drag-n-drop files into the file tree for instant upload to remote filesystem. Right-click a file to download it, or a folder to download it as a zip.
 As for images, you can drag them or paste them into `claude` terminal and they will be uploaded and pasted directly into `claude` as image - this is a must-have feature when you just want to quickly paste a screenshot into claude for analysis.
 
 ### Claude Code integrates with the project
 A `claude` running in a terminal pane connects back to `roost` via the IDE protocol, the same as VS Code or JetBrains IDEs. This gives it unique integration abilities: paste image, links to @file, "live" links in the terminal that open when you click them and `claude` initiated file diff viewer (if in manual permission mode).
 
 <img src="docs/img/proposal.png" alt="A proposal tab showing the two lines Claude wants to delete, with Accept, Reject and Edit buttons, beside the terminal where Claude is asking for the same approval" width="900">
+
+### Let Claude use your real browser
+With the roost browser extension in Chrome, a `claude` in roost can list your tabs, open a page, screenshot it, read it, click and type, and read its console — in the browser you are logged into, not a headless one. Each Claude session asks you once, in an extension window, before it does anything. Right-click any page to send it, a selection or a screenshot to your roost Claude, and use the project's handoff page (`/frag/<project>/handoff`) to let Claude in Chrome and a roost Claude pass messages. Every release ships it as `roost-extension-<version>.zip`. Setup: [extension/README.md](extension/README.md).
 
 ### Desktop notifications
 Roost supports sending desktop notifications from any terminal. Clicking a notification will take you directly to that terminal.

@@ -58,6 +58,23 @@ ureq = { version = "2.12", features = ["proxy-from-env"] }
 minisign-verify = "0.2"
 lzma-rs = "0.3"
 tar = "0.4"
+# Already in Cargo.lock as a transitive dependency of portable-pty, tar,
+# ring and others (see `cargo tree -i libc`). Promoted to direct here
+# because `hooksock.rs` calls `getsockopt`/`SO_PEERCRED` and `getuid`
+# itself. "0.2" itself pins nothing — it is a caret requirement that would
+# accept any 0.2.x; what actually fixes the version is Cargo.lock, which
+# already held 0.2.189 before this requirement was added, so adding it
+# resolved to that same version rather than introducing a new one.
+libc = "0.2"
+# Both already in Cargo.lock through ureq. Promoted to direct because
+# `zipdl.rs` writes a folder download as a zip by hand: raw deflate for the
+# entries and CRC-32 for their headers, with no zip crate on top.
+flate2 = "1"
+crc32fast = "1"
+# Already in Cargo.lock through ureq's rustls. Promoted to direct because
+# `browser.rs` signs every call it relays to the browser extension with
+# HMAC-SHA256, and a hand-rolled HMAC is not a thing to own.
+ring = "0.17"
 
 [dev-dependencies]
 tempfile = "3"

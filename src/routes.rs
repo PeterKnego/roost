@@ -60,7 +60,7 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
     let segs: Vec<&str> = req.path.split('/').filter(|s| !s.is_empty()).collect();
     match segs.as_slice() {
         [] => serve_index(w, req, roots),
-        ["static", rest @ ..] => serve_static(w, &rest.join("/")),
+        ["static", rest @ ..] => serve_static(w, &rest.join("/"), req.query.get("v").map(String::as_str)),
         // Cross-project data (the header strip) has no single project to
         // hang off — `serve_frag` below always resolves a project first, so
         // this cannot be folded into it. Must come before the general frag
@@ -163,7 +163,7 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
         // Root scope, not /static/sw.js: a service worker may only control
         // URLs under its own path, and this one has to focus and navigate
         // workspace tabs at /{project}.
-        ["sw.js"] => serve_static(w, "sw.js"),
+        ["sw.js"] => serve_static(w, "sw.js", None),
         // The fragment *kind* (tree/file/…) is normally exactly the last
         // segment (every other fragment endpoint takes no path segments of
         // its own — `dir=`/`path=` arrive as query params, see serve_frag
@@ -291,18 +291,34 @@ fn build_overview_sessions(roots: &[PathBuf], sel: &str) -> Vec<render::OvSessio
         let launched: std::collections::HashSet<String> =
             crate::session::launched_names(&p.url).into_iter().map(|(n, _)| n).collect();
         let evidence = crate::claudes::claude_evidence_with_scan(&p.url, &scan);
-        for (name, pid, attached) in crate::session::session_rows(&p.url) {
-            let is_claude = launched.contains(&name)
-                || matches!(&evidence, crate::claudes::ClaudeEvidence::Present(ts) if ts.iter().any(|t| t == &name));
-            let age_secs = {
-                let sock = crate::session::socket_path(&p.url, &name);
-                let mut pids = registry::pids_holding_path(&holders, &sock);
-                if pid != 0 {
-                    pids.push(pid);
+        // `owned_live_names`, not `session_rows`: a resident's own name
+        // belongs here (it is this project's row, by the re-home record),
+        // but its *socket* — and so its pid/attached/age — is still under
+        // its home, since re-homing never moves it (home.rs's module doc).
+        // Grouped by that physical home so each one's `session_rows` is
+        // read once rather than once per name.
+        let owned = crate::session::owned_live_names(&p.url);
+        let mut by_home: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for (name, home) in &owned {
+            by_home.entry(home.clone().unwrap_or_else(|| p.url.clone())).or_default().push(name.clone());
+        }
+        for (src, names) in by_home {
+            for (name, pid, attached) in crate::session::session_rows(&src) {
+                if !names.contains(&name) {
+                    continue;
                 }
-                crate::session::oldest_age_of(&pids, &ages)
-            };
-            rows.push(render::OvSession { project_url: p.url.clone(), name, is_claude, age_secs, attached });
+                let is_claude = launched.contains(&name)
+                    || matches!(&evidence, crate::claudes::ClaudeEvidence::Present(ts) if ts.iter().any(|t| t == &name));
+                let age_secs = {
+                    let sock = crate::session::socket_path(&src, &name);
+                    let mut pids = registry::pids_holding_path(&holders, &sock);
+                    if pid != 0 {
+                        pids.push(pid);
+                    }
+                    crate::session::oldest_age_of(&pids, &ages)
+                };
+                rows.push(render::OvSession { project_url: p.url.clone(), name, is_claude, age_secs, attached });
+            }
         }
     }
     rows
@@ -486,6 +502,15 @@ pub const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "ic
 /// mismatch loses data, because `workspace.rs` is the actual guard.
 pub const NO_TEXT_EDIT_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf"];
 
+/// Extensions served as a document for the browser's own viewer (#121) — not
+/// on `IMAGE_EXT`, because that list also decides what a markdown `<img>` may
+/// embed, and a PDF is not a picture. Deny-by-default like the list above.
+pub const PDF_EXT: &[&str] = &["pdf"];
+
+pub fn is_pdf(rel: &str) -> bool {
+    PDF_EXT.contains(&crate::assets::ext_of(rel).as_str())
+}
+
 pub fn is_image(rel: &str) -> bool {
     IMAGE_EXT.contains(&crate::assets::ext_of(rel).as_str())
 }
@@ -504,6 +529,9 @@ fn serve_raw(w: &mut impl Write, dir: &Path, rel: &str) {
     let Some(rel) = crate::assets::normalize(rel) else {
         return http::not_found(w, "no such asset");
     };
+    if is_pdf(rel) {
+        return serve_pdf(w, dir, rel);
+    }
     if !is_image(rel) {
         return http::not_found(w, "not an image");
     }
@@ -556,7 +584,14 @@ fn read_confined(base: &Path, rel: &str) -> Option<Vec<u8>> {
 ///
 /// The class restriction on layer 2 is the enforcement mechanism, not a
 /// check that could be forgotten: a code-class path never consults it.
-fn serve_static(w: &mut impl Write, rel: &str) {
+///
+/// `v` is the request's `?v=`. Only the embedded layer may answer with a
+/// forever-cache, and only when `v` is the hash of the bytes being sent: the
+/// other two layers change without the build changing, so their `?v=` (a hash
+/// of the *embedded* copy) vouches for nothing; and a stale page asking with
+/// an old `v` must not have today's bytes stored under yesterday's URL. Every
+/// other answer falls to `respond_with`'s `no-cache`.
+fn serve_static(w: &mut impl Write, rel: &str, v: Option<&str>) {
     // Before any layer, so a traversal attempt cannot reveal which layers exist.
     let Some(rel) = crate::assets::normalize(rel) else {
         return http::not_found(w, "no such asset");
@@ -576,10 +611,17 @@ fn serve_static(w: &mut impl Write, rel: &str) {
     }
 
     match crate::assets::get(rel) {
+        Some(body) if v.is_some_and(|v| v == crate::render::av(rel)) => {
+            http::respond_with(w, 200, "OK", ctype, &[NOSNIFF, IMMUTABLE], body)
+        }
         Some(body) => http::respond_with(w, 200, "OK", ctype, &[NOSNIFF], body),
         None => http::not_found(w, "no such asset"),
     }
 }
+
+/// A year is the conventional "forever"; `immutable` stops a reload from even
+/// revalidating. Safe only because the URL changes whenever the bytes do.
+const IMMUTABLE: (&str, &str) = ("Cache-Control", "public, max-age=31536000, immutable");
 
 /// Every fragment kind `serve_frag` matches on — the closed set `route()`
 /// consults to tell an ordinary fragment request from a `.roost/theme/{rel}`
@@ -592,8 +634,86 @@ fn serve_static(w: &mut impl Write, rel: &str) {
 /// for that — it's the one hazard this dispatch-by-kind approach carries
 /// that a fully generic parse wouldn't.
 const FRAGMENT_KINDS: &[&str] =
-    &["tree", "file", "raw", "changes", "status", "diff", "proposal", "theme.css", "backup", "download"];
+    &["tree", "file", "raw", "changes", "status", "diff", "proposal", "theme.css", "backup", "download", "handoff"];
 
+
+/// A PDF for the browser's own viewer (#121), in a tab's `<iframe>` or opened
+/// on its own.
+///
+/// **Still `SANDBOX`.** #121 expected the built-in viewers to refuse a
+/// sandboxed document and planned a narrower policy for this route; the probe
+/// in its spec found both Chromium's and Firefox's viewer render under plain
+/// `sandbox`, so the route keeps exactly what every other project byte gets.
+/// The type comes from the extension and `nosniff` holds it there: an HTML
+/// file named `x.pdf` is offered to the PDF viewer, never rendered as a page.
+///
+/// Streamed, with no size cap, for the reason on `serve_download`: the cap
+/// bounds a whole-file read this path never makes. `MAX_FILE_BYTES` is not
+/// raised — images on the route above keep it.
+fn serve_pdf(w: &mut impl Write, dir: &Path, rel: &str) {
+    let (f, _) = match open_regular(dir, rel) {
+        Ok(opened) => opened,
+        Err(msg) => return http::not_found(w, msg),
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\n{}: {}\r\n{}: {}\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        NOSNIFF.0, NOSNIFF.1, SANDBOX.0, SANDBOX.1
+    );
+    stream_chunked(w, f, &head);
+}
+
+/// The file at `rel`, confined and open, if it is a regular file, with the
+/// path it resolved to. The
+/// pipeline both streaming routes share, in the order `serve_raw` uses:
+/// normalise, then canonicalise-and-confine. `safe_resolve` resolves
+/// symlinks, so what is checked here is the target, which is what gets read.
+fn open_regular(dir: &Path, rel: &str) -> Result<(std::fs::File, PathBuf), &'static str> {
+    let rel = crate::assets::normalize(rel).ok_or("no such file")?;
+    let path = projects::safe_resolve(dir, rel).map_err(|_| "no such file")?;
+    let meta = std::fs::metadata(&path).map_err(|_| "no such file")?;
+    if meta.is_dir() {
+        // Upload's own wording, because it is the same answer to the same
+        // question asked from the other direction.
+        return Err("folders are not downloaded — use git or scp for a directory");
+    }
+    // Matched on the type, not inferred from "not a directory". A FIFO or a
+    // device node in a cloned repository would block this connection thread on
+    // `read` forever — no error, no timeout, one thread gone per attempt.
+    if !meta.file_type().is_file() {
+        return Err("not a regular file");
+    }
+    let f = std::fs::File::open(&path).map_err(|_| "no such file")?;
+    Ok((f, path))
+}
+
+/// Writes `head`, then `f` as a chunked body, `DOWNLOAD_CHUNK` at a time.
+fn stream_chunked(w: &mut impl Write, mut f: std::fs::File, head: &str) {
+    if w.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let mut buf = vec![0u8; DOWNLOAD_CHUNK];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if write!(w, "{n:x}\r\n").is_err()
+                    || w.write_all(&buf[..n]).is_err()
+                    || w.write_all(b"\r\n").is_err()
+                {
+                    return; // the peer went away; nothing useful left to say
+                }
+            }
+            // A read error after the first chunk cannot change the status any
+            // more, so the connection is dropped *without* the terminating
+            // chunk. That is what makes the browser report a failed transfer
+            // instead of keeping what arrived as if it were the whole file.
+            Err(_) => return,
+        }
+    }
+    let _ = w.write_all(b"0\r\n\r\n");
+    let _ = w.flush();
+}
 
 /// One file from the tree, as a download (#120).
 ///
@@ -617,63 +737,77 @@ const FRAGMENT_KINDS: &[&str] =
 /// reason to download anything — are routinely past 2 MB. What it *does* cost
 /// is one connection thread for the length of the transfer.
 fn serve_download(w: &mut impl Write, dir: &Path, rel: &str) {
-    let Some(rel) = crate::assets::normalize(rel) else {
-        return http::not_found(w, "no such file");
-    };
-    // The same pipeline `serve_raw` uses, in the same order: normalise, then
-    // canonicalise-and-confine. `safe_resolve` resolves symlinks, so what is
-    // checked below is the target, which is what actually gets read.
-    let Ok(path) = projects::safe_resolve(dir, rel) else {
-        return http::not_found(w, "no such file");
-    };
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return http::not_found(w, "no such file");
-    };
-    if meta.is_dir() {
-        // Upload's own wording, because it is the same answer to the same
-        // question asked from the other direction.
-        return http::not_found(w, "folders are not downloaded — use git or scp for a directory");
-    }
-    // Matched on the type, not inferred from "not a directory". A FIFO or a
-    // device node in a cloned repository would block this connection thread on
-    // `read` forever — no error, no timeout, one thread gone per attempt.
-    if !meta.file_type().is_file() {
-        return http::not_found(w, "not a regular file");
-    }
-    let Ok(mut f) = std::fs::File::open(&path) else {
-        return http::not_found(w, "no such file");
+    let (f, path) = match open_regular(dir, rel) {
+        Ok(opened) => opened,
+        Err(msg) => return http::not_found(w, msg),
     };
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let (fallback, encoded) = disposition_name(&name);
-    let _ = write!(
-        w,
+    let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
          Content-Disposition: attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}\r\n\
          {}: {}\r\n{}: {}\r\n\
          Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
         NOSNIFF.0, NOSNIFF.1, SANDBOX.0, SANDBOX.1
     );
-    let mut buf = vec![0u8; DOWNLOAD_CHUNK];
-    loop {
-        match f.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if write!(w, "{n:x}\r\n").is_err()
-                    || w.write_all(&buf[..n]).is_err()
-                    || w.write_all(b"\r\n").is_err()
-                {
-                    return; // the peer went away; nothing useful left to say
-                }
-            }
-            // A read error after the first chunk cannot change the status any
-            // more, so the connection is dropped *without* the terminating
-            // chunk. That is what makes the browser report a failed download
-            // instead of saving what arrived as if it were the whole file.
-            Err(_) => return,
-        }
+    stream_chunked(w, f, &head);
+}
+
+/// A folder as a zip (#162), streamed as `zipdl::write` produces it.
+///
+/// Chunked, for the reason `serve_download` gives: once the first byte is
+/// out the status is spent, so a transfer that fails part-way must reach the
+/// browser as a failure — the connection dropped without the terminating
+/// chunk — and never as a short archive that looks whole. Everything that
+/// can refuse already happened in `zipdl::plan`, before this was called.
+fn serve_zip(w: &mut impl Write, plan: crate::zipdl::Plan) {
+    let (fallback, encoded) = disposition_name(&format!("{}.zip", plan.name));
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\n\
+         Content-Disposition: attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}\r\n\
+         {}: {}\r\n{}: {}\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        NOSNIFF.0, NOSNIFF.1, SANDBOX.0, SANDBOX.1
+    );
+    if w.write_all(head.as_bytes()).is_err() {
+        return;
     }
-    let _ = w.write_all(b"0\r\n\r\n");
-    let _ = w.flush();
+    let mut c = Chunked { w, buf: Vec::with_capacity(DOWNLOAD_CHUNK) };
+    if crate::zipdl::write(plan, &mut c).is_err() || c.flush().is_err() {
+        return; // the peer went away: no terminating chunk, so it reads as failed
+    }
+    let _ = c.w.write_all(b"0\r\n\r\n");
+    let _ = c.w.flush();
+}
+
+/// HTTP/1.1 chunked framing over a writer, `DOWNLOAD_CHUNK` at a time.
+/// `flush` emits what is buffered as one chunk; the terminating chunk is the
+/// caller's to write, and only on success.
+struct Chunked<'a, W: Write> {
+    w: &'a mut W,
+    buf: Vec<u8>,
+}
+
+impl<W: Write> Write for Chunked<'_, W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let room = DOWNLOAD_CHUNK - self.buf.len();
+        let n = room.min(data.len());
+        self.buf.extend_from_slice(&data[..n]);
+        if self.buf.len() == DOWNLOAD_CHUNK {
+            self.flush()?;
+        }
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        write!(self.w, "{:x}\r\n", self.buf.len())?;
+        self.w.write_all(&self.buf)?;
+        self.w.write_all(b"\r\n")?;
+        self.buf.clear();
+        Ok(())
+    }
 }
 
 /// 64 KB. Large enough that a big file is not a syscall storm, small enough
@@ -800,6 +934,12 @@ fn serve_frag(
         // it is asked for on a click and answered once — the same shape as the
         // project strip, and it keeps the list out of every snapshot, which
         // goes out on each debounced keystroke.
+        // A whole page, not a fragment, but it hangs off a project the same
+        // way, and `/frag/` is the one prefix a nested project key cannot
+        // collide with — `/{project}/handoff` would be read as a project
+        // named `…/handoff`. A GET; what it does goes over the workspace
+        // socket.
+        ["handoff"] => http::html(w, &render::handoff_page(project)),
         ["claudehist"] => {
             http::html(
                 w,
@@ -864,7 +1004,10 @@ fn serve_frag(
             // it rejects `..` outright — so without this, `docs/../shot.png`
             // renders a fragment whose picture then 404s, which reads to the
             // user as a corrupt file rather than a bad path.
-            Some(rel) if is_image(rel) => match crate::assets::normalize(rel) {
+            //
+            // A PDF takes the same arm: it has no text either, and its tab is
+            // nothing but an <iframe> on the same raw route (#121).
+            Some(rel) if is_image(rel) || is_pdf(rel) => match crate::assets::normalize(rel) {
                 None => http::html(w, &render::file_error_fragment(rel, "path outside project")),
                 Some(rel) => match projects::safe_resolve(&dir, rel) {
                     Ok(path) => {
@@ -876,7 +1019,11 @@ fn serve_frag(
                             // Not a failure worth refusing the page for: an unreadable mtime only
                             // costs the cache key, and 0 is a legitimate "I could not tell".
                             .unwrap_or(0);
-                        http::html(w, &render::image_fragment(project, rel, mtime_secs))
+                        if is_pdf(rel) {
+                            http::html(w, &render::pdf_fragment(project, rel, mtime_secs))
+                        } else {
+                            http::html(w, &render::image_fragment(project, rel, mtime_secs))
+                        }
                     },
                     Err(e) => http::html(w, &render::file_error_fragment(rel, &e)),
                 },
@@ -894,6 +1041,25 @@ fn serve_frag(
         },
         // #120. The other half of upload: roost could put a file on the server
         // and had no way to hand one back.
+        // #162. A folder, zipped. `check=1` is the plan alone, as JSON: the
+        // download itself is a navigation, and a refusal served to a
+        // navigation would replace the workspace with an error page, so the
+        // client asks first.
+        ["download"] if req.query.get("zip").map(String::as_str) == Some("1") => {
+            let rel = req.query.get("path").map(String::as_str).unwrap_or("");
+            let plan = crate::zipdl::plan(&dir, rel, &filter);
+            if req.query.get("check").map(String::as_str) == Some("1") {
+                let v = match &plan {
+                    Ok(p) => serde_json::json!({"ok": true, "name": format!("{}.zip", p.name), "files": p.files, "bytes": p.bytes}),
+                    Err(e) => serde_json::json!({"ok": false, "error": e}),
+                };
+                return http::json(w, &v);
+            }
+            match plan {
+                Ok(p) => serve_zip(w, p),
+                Err(e) => http::respond(w, 409, "Conflict", "text/plain; charset=utf-8", e.as_bytes()),
+            }
+        }
         ["download"] => match req.query.get("path") {
             None => http::not_found(w, "missing path"),
             Some(rel) => serve_download(w, &dir, rel),
@@ -1059,8 +1225,12 @@ mod tests {
     }
 
     fn serve(rel: &str) -> String {
+        serve_v(rel, None)
+    }
+
+    fn serve_v(rel: &str, v: Option<&str>) -> String {
         let mut buf: Vec<u8> = Vec::new();
-        serve_static(&mut buf, rel);
+        serve_static(&mut buf, rel, v);
         String::from_utf8_lossy(&buf).into_owned()
     }
 
@@ -1074,6 +1244,49 @@ mod tests {
         assert!(out.starts_with("HTTP/1.1 200 OK"));
         assert!(out.contains("X-Content-Type-Options: nosniff"));
         assert!(!out.contains("Content-Security-Policy"), "embedded assets are not untrusted");
+    }
+
+    /// The forever-cache needs both halves: the embedded layer, and a `v` that
+    /// is the hash of what is being sent. The old `v` case is the deploy this
+    /// exists for — a page from before it asks with yesterday's hash, and
+    /// must not get today's bytes cached for a year under that URL.
+    #[test]
+    fn only_the_current_version_of_an_embedded_asset_is_cached_for_good() {
+        let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_STATIC");
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let cur = crate::render::av("app.js");
+        let out = serve_v("app.js", Some(&cur));
+        assert!(out.contains("Cache-Control: public, max-age=31536000, immutable\r\n"), "current v: {}", &out[..200]);
+        assert_eq!(out.matches("Cache-Control:").count(), 1);
+        for v in [Some("00000000"), None] {
+            let out = serve_v("app.js", v);
+            assert!(out.contains("Cache-Control: no-cache\r\n") && !out.contains("immutable"), "v = {v:?}: {}", &out[..200]);
+        }
+    }
+
+    /// Both overlays change without the build changing, and their `?v=` is
+    /// the embedded copy's hash — so even the *current* `v` vouches for
+    /// nothing there. Fixtures carry a marker, so this cannot pass by the
+    /// overlay being skipped and the embedded file served instead.
+    #[test]
+    fn an_overlay_is_never_cached_for_good() {
+        let _g = ASSET_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = crate::render::av("style.css");
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("style.css"), "/*DEV*/").unwrap();
+        std::env::set_var("ROOST_STATIC", d.path());
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let out = serve_v("style.css", Some(&cur));
+        std::env::remove_var("ROOST_STATIC");
+        assert!(out.contains("/*DEV*/") && out.contains("Cache-Control: no-cache\r\n") && !out.contains("immutable"), "ROOST_STATIC: {out}");
+        let user = home.path().join(".config/roost/static");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("style.css"), "/*USER*/").unwrap();
+        let out = serve_v("style.css", Some(&cur));
+        assert!(out.contains("/*USER*/") && out.contains("Cache-Control: no-cache\r\n") && !out.contains("immutable"), "user dir: {out}");
     }
 
     #[test]
@@ -1280,6 +1493,82 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         route(&mut buf, &req, roots);
         buf
+    }
+
+    /// `dechunk_bytes`, plus whether the terminating chunk arrived — the one
+    /// signal a browser has that a transfer is whole.
+    fn dechunk_whole(body: &[u8]) -> (Vec<u8>, bool) {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Some(eol) = body[i..].windows(2).position(|w| w == b"\r\n") {
+            let n = usize::from_str_radix(std::str::from_utf8(&body[i..i + eol]).unwrap(), 16).unwrap();
+            i += eol + 2;
+            if n == 0 {
+                return (out, true);
+            }
+            out.extend_from_slice(&body[i..i + n]);
+            i += n + 2;
+        }
+        (out, false)
+    }
+
+    /// #162 end to end through the route: the name, the framing, and an
+    /// archive whose last record is the end-of-central-directory.
+    #[test]
+    fn a_folder_downloads_as_a_whole_chunked_zip() {
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join("p");
+        std::fs::create_dir_all(proj.join("docs/sub")).unwrap();
+        std::fs::write(proj.join("docs/a.md"), "# a\n").unwrap();
+        std::fs::write(proj.join("docs/sub/b.txt"), "b".repeat(200_000)).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let raw = frag_route_bytes(&roots, "/frag/p/download?path=docs&zip=1");
+        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&raw[..split]);
+        assert!(head.contains("200 OK") && head.contains("Content-Type: application/zip"), "{head}");
+        assert!(head.contains("filename=\"docs.zip\""), "{head}");
+        assert!(head.contains("Content-Security-Policy: sandbox"), "{head}");
+        let (zip, whole) = dechunk_whole(&raw[split + 4..]);
+        assert!(whole, "the terminating chunk was written");
+        assert_eq!(&zip[..4], b"PK\x03\x04");
+        assert_eq!(&zip[zip.len() - 22..zip.len() - 18], b"PK\x05\x06", "ends with the central directory's end record");
+        // docs/, docs/a.md, docs/sub/, docs/sub/b.txt
+        assert_eq!(u16::from_le_bytes([zip[zip.len() - 12], zip[zip.len() - 11]]), 4);
+    }
+
+    #[test]
+    fn the_zip_check_answers_the_plan_and_a_refusal_never_streams() {
+        let d = tempfile::tempdir().unwrap();
+        let proj = d.path().join("p");
+        std::fs::create_dir_all(proj.join("docs")).unwrap();
+        std::fs::write(proj.join("docs/a.md"), "hello").unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let ok = frag_route(&roots, "/frag/p/download?path=docs&zip=1&check=1");
+        assert!(ok.contains(r#""ok":true"#) && ok.contains(r#""files":1"#) && ok.contains(r#""name":"docs.zip""#), "{ok}");
+        let root = frag_route(&roots, "/frag/p/download?zip=1&check=1");
+        assert!(root.contains(r#""name":"p.zip""#), "no path means the project root: {root}");
+        let file = frag_route(&roots, "/frag/p/download?path=docs/a.md&zip=1&check=1");
+        assert!(file.contains(r#""ok":false"#) && file.contains("not a folder"), "{file}");
+        let refused = frag_route(&roots, "/frag/p/download?path=docs/a.md&zip=1");
+        assert!(refused.contains("409") && !refused.contains("application/zip"), "{refused}");
+        let escape = frag_route(&roots, "/frag/p/download?path=../&zip=1&check=1");
+        assert!(escape.contains(r#""ok":false"#), "{escape}");
+    }
+
+    /// The handoff page is served for a project — including one whose name
+    /// carries markup, which must arrive escaped — and is a whole page with
+    /// the stable ids an agent driving it looks for.
+    #[test]
+    fn the_handoff_page_is_a_whole_page_with_the_project_escaped() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("a&b")).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        let out = frag_route(&roots, "/frag/a%26b/handoff");
+        assert!(out.contains("200 OK"), "{out}");
+        assert!(out.contains("<!doctype html>") && out.contains(r#"id="message""#) && out.contains(r#"id="log""#));
+        assert!(out.contains(r#"data-project="a&amp;b""#), "{out}");
+        assert!(!out.contains("a&b<"), "the raw name never reaches the page");
+        assert!(frag_route(&roots, "/frag/nosuch/handoff").contains("404"));
     }
 
     /// The tree lists every file, so a .png can be clicked. Before this, the file
@@ -1577,6 +1866,70 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let roots = vec![d.path().to_path_buf()];
         assert!(frag_route(&roots, "/frag/_worktrees?current=nosuch&state=1").contains("id=\"wtlabel\""));
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A resident's dtach socket is physically under its home, "repo" — the
+    /// overview's session rows must still name it under the worktree the
+    /// re-home record says owns it, and not under "repo" at all, or the
+    /// session list would show the same running Claude in the wrong panel
+    /// (or in both).
+    ///
+    /// `ROOST_ROOTS` is what lets the production, fork-free `home::resolves`
+    /// confirm the worktree before `owned_live_names` credits it — without
+    /// that env var the record would be real but unresolved and this would
+    /// prove nothing about the listing.
+    ///
+    /// Revert-checked: reverting `build_overview_sessions`'s per-project
+    /// loop back to `session::session_rows(&p.url)` (so the worktree row's
+    /// sessions only ever come from its own native names) fails the first
+    /// assertion — observed: `panicked ... the resident must be listed
+    /// under the worktree it was re-homed into: [OvSession { project_url:
+    /// "repo", name: "term3", ... }]` — the session is still listed under
+    /// its home.
+    #[test]
+    fn build_overview_sessions_lists_a_resident_under_its_owner_not_its_home() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        std::env::set_var("ROOST_STATE_DIR", &state);
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-qm", "init"]);
+        run_git(&repo, &["worktree", "add", "-q", "-b", "feat", ".claude/worktrees/feat"]);
+
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("repo.json"), "{}").unwrap();
+
+        let _att = crate::session::reserve_and_attach("repo", "term3", &repo).unwrap();
+        crate::home::record("repo", "term3", "repo/.claude/worktrees/feat").unwrap();
+
+        let roots = vec![root.path().to_path_buf()];
+        let rows = build_overview_sessions(&roots, "");
+        assert!(
+            rows.iter().any(|r| r.project_url == "repo/.claude/worktrees/feat" && r.name == "term3"),
+            "the resident must be listed under the worktree it was re-homed into: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.project_url == "repo" && r.name == "term3"),
+            "and not under its home: {rows:?}"
+        );
+
+        crate::session::kill_project("repo");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// `content_type` must classify the same way `assets::class_of` does —
@@ -1893,6 +2246,131 @@ mod tests {
         // And the real name survives, percent-encoded, in the RFC 5987 form.
         assert!(disp.contains("filename*=UTF-8''"), "{disp}");
         assert!(disp.contains("%C4%8D"), "the real name was lost, not encoded: {disp}");
+    }
+
+    // ---- PDF (#121) ---------------------------------------------------------
+
+    fn pdf_fixture() -> (tempfile::TempDir, Vec<PathBuf>) {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("p/docs")).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        (d, roots)
+    }
+
+    /// Past the 2 MB cap, and more than one chunk: this is the test that fails
+    /// if the PDF goes through the image path's `MAX_FILE_BYTES` check (it did,
+    /// as "asset too large", before #121), and a single-chunk fixture would pass
+    /// a writer that sent only its first read. That images keep the cap is
+    /// `raw_refuses_an_oversize_image_and_a_symlink_out`, unchanged.
+    ///
+    /// Revert-checked: without the `is_pdf` branch in `serve_raw` this fails
+    /// with a 404 "not an image".
+    #[test]
+    fn a_pdf_past_the_cap_is_served_whole_with_the_headers_that_stop_it_rendering() {
+        let (d, roots) = pdf_fixture();
+        let mut want = b"%PDF-1.4\n".to_vec();
+        want.extend((0..(crate::projects::MAX_FILE_BYTES as u32 + 300_000)).map(|i| (i % 251) as u8));
+        std::fs::write(d.path().join("p/docs/paper.pdf"), &want).unwrap();
+
+        let raw = frag_route_bytes(&roots, "/frag/p/raw?path=docs/paper.pdf");
+        let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("headers end") + 4;
+        let head = String::from_utf8_lossy(&raw[..sep]);
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(head.contains("Content-Type: application/pdf"), "{head}");
+        assert!(head.contains("X-Content-Type-Options: nosniff"), "{head}");
+        // The probe in the spec found both browsers' viewers render under plain
+        // `sandbox`, so the PDF gets no exception from it.
+        assert!(head.contains("Content-Security-Policy: sandbox\r\n"), "{head}");
+        assert!(!head.contains("Content-Disposition"), "a viewer, not a download: {head}");
+        let got = dechunk_bytes(&raw[sep..]);
+        assert_eq!(got.len(), want.len(), "truncated at {} bytes", got.len());
+        assert_eq!(got, want, "the bytes changed somewhere in the chunking");
+    }
+
+    /// The type comes from the extension and is pinned by `nosniff`. The
+    /// fixture really is HTML with a script in it — one with nothing to
+    /// mis-sniff would pass against a route that sniffed.
+    #[test]
+    fn html_named_pdf_is_still_a_pdf() {
+        let (d, roots) = pdf_fixture();
+        std::fs::write(d.path().join("p/x.pdf"), "<!doctype html><script>alert(1)</script>").unwrap();
+        let out = frag_route(&roots, "/frag/p/raw?path=x.pdf");
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+        assert!(out.contains("Content-Type: application/pdf"), "{out}");
+        assert!(!out.contains("text/html"), "{out}");
+        assert!(out.contains("X-Content-Type-Options: nosniff"), "{out}");
+        assert!(out.contains("Content-Security-Policy: sandbox"), "{out}");
+    }
+
+    /// Bounded by its own timeout, like the download's FIFO test: a regression
+    /// hangs rather than fails. Revert-checked: without the regular-file check
+    /// in `open_regular` this fails at the 5 s `recv_timeout`.
+    #[test]
+    fn a_fifo_named_pdf_is_refused_promptly() {
+        #[cfg(unix)]
+        {
+            let (d, roots) = pdf_fixture();
+            let made = std::process::Command::new("mkfifo")
+                .arg(d.path().join("p/pipe.pdf"))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !made {
+                return; // no mkfifo on this host; skipped rather than faked
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(frag_route(&roots, "/frag/p/raw?path=pipe.pdf"));
+            });
+            let out = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("serve_pdf blocked on a FIFO instead of refusing it");
+            assert!(out.starts_with("HTTP/1.1 404"), "{out}");
+            assert!(out.contains("not a regular file"), "{out}");
+        }
+    }
+
+    /// The symlink's target exists, so only `safe_resolve`'s prefix check can
+    /// refuse it (CLAUDE.md, *Testing*).
+    #[test]
+    fn a_pdf_outside_the_project_is_refused() {
+        let (d, roots) = pdf_fixture();
+        std::fs::write(d.path().join("secret.pdf"), b"%PDF not yours").unwrap();
+        for q in ["../secret.pdf", "..%2Fsecret.pdf", "/etc/x.pdf"] {
+            let out = frag_route(&roots, &format!("/frag/p/raw?path={q}"));
+            assert!(out.starts_with("HTTP/1.1 404"), "{q} was served: {out}");
+            assert!(!out.contains("not yours"), "{q} leaked the file: {out}");
+        }
+        #[cfg(unix)]
+        {
+            let link = d.path().join("p/link.pdf");
+            std::os::unix::fs::symlink(d.path().join("secret.pdf"), &link).unwrap();
+            assert!(link.canonicalize().is_ok(), "setup: the link must resolve");
+            let out = frag_route(&roots, "/frag/p/raw?path=link.pdf");
+            assert!(out.starts_with("HTTP/1.1 404"), "a symlink out of the project was served: {out}");
+            assert!(!out.contains("not yours"), "{out}");
+        }
+    }
+
+    /// The `file` fragment for a PDF is the viewer, not the text path's
+    /// "binary file" error — which is what it was before #121. The name has
+    /// an `&` and a quote in it, so the escaping has something to escape.
+    /// Revert-checked: without `|| is_pdf(rel)` on the arm, the first
+    /// assertion fails and the fragment is the text path's error.
+    #[test]
+    fn the_file_fragment_for_a_pdf_is_a_frame_on_the_raw_route() {
+        let (d, roots) = pdf_fixture();
+        std::fs::write(d.path().join("p/docs/a&b\"c.pdf"), b"%PDF-1.4\n\0\0binary").unwrap();
+        let q = crate::http::percent_encode("docs/a&b\"c.pdf");
+        let out = frag_route(&roots, &format!("/frag/p/file?path={q}"));
+        assert!(out.contains("<iframe class=\"pdfview\""), "{out}");
+        assert!(!out.contains("binary"), "fell through to the text path: {out}");
+        // `&` in the query separator is escaped as an attribute value must be,
+        // and the name's own `&` and `"` are percent-encoded into the URL.
+        assert!(out.contains(&format!("src=\"/frag/p/raw?path={}&amp;v=", q.replace('&', "&amp;"))), "{out}");
+        assert!(out.contains("a&amp;b&quot;c.pdf"), "the path stripe must be escaped: {out}");
+        assert!(!out.contains("a&b\"c"), "an unescaped name reached the HTML: {out}");
+        assert!(out.contains("class=\"pdfopen\""), "the phone's way in: {out}");
     }
 
     /// Reassembles a chunked body. Asserting on the raw chunked text would pass

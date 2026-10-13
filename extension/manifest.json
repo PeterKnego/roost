@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "roost bridge",
+  "version": "0.1.0",
+  "description": "Lets a Claude running in roost look at and use this browser — with your consent, once per Claude session.",
+  "minimum_chrome_version": "116",
+  "permissions": ["debugger", "tabs", "tabGroups", "scripting", "storage", "contextMenus", "activeTab"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
+  "background": { "service_worker": "worker.js" },
+  "icons": { "16": "icons/icon-16.png", "32": "icons/icon-32.png", "48": "icons/icon-48.png", "128": "icons/icon-128.png" },
+  "action": {
+    "default_popup": "popup.html", "default_title": "roost bridge",
+    "default_icon": { "16": "icons/icon-16.png", "32": "icons/icon-32.png" }
+  },
+  "options_ui": { "page": "options.html", "open_in_tab": true }
+}

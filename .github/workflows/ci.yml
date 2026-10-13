@@ -82,6 +82,9 @@ jobs:
       - name: Package tests
         run: scripts/test/packages.sh
 
+      - name: Extension package test
+        run: scripts/test/extension.sh
+
       # `cargo publish --dry-run` needs no credential and builds the crate from
       # the PACKAGED tree rather than the working tree — the only thing that
       # catches Cargo.toml's `include` list drifting away from what build.rs

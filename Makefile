@@ -32,6 +32,7 @@ rpm:
 test-scripts:
 	@shellcheck scripts/*.sh scripts/test/*.sh
 	@scripts/test/packages.sh
+	@scripts/test/extension.sh
 
 test-install:
 	@scripts/test/install.sh

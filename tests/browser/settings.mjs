@@ -110,7 +110,7 @@ try {
   const labels = await one.evalIn(`[...document.querySelectorAll("#dlg-settings .dlg-row")].map((l) => l.dataset.key).join(",")`);
   // No theme row here: the theme is chosen on the Theme pane, which also
   // carries its source line and Clear.
-  ok(labels === "hide,show_hidden,autosave,follow_tree,read_when_watching,share_selection,worktree_prompt,relaunch,version_check,allowed_origins,max_upload_bytes,ide,roots", `rows in the spec's order, without theme (${labels})`);
+  ok(labels === "code_font_size,hide,show_hidden,autosave,follow_tree,read_when_watching,share_selection,worktree_prompt,relaunch,version_check,allowed_origins,max_upload_bytes,ide,roots", `rows in the spec's order, without theme (${labels})`);
   ok(/keystroke/.test(await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="autosave"] .doc').textContent`)), "each row explains what the setting does");
   {
     const h = await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="autosave"]').getBoundingClientRect().height`);
@@ -281,6 +281,35 @@ try {
   }
   ok(await until(async () => !(await one.evalIn(`document.getElementById("dlg-settings").open`)), 5, "closed"), "Enter closed the second dialog with nothing to write");
   ok(!/hide/.test(await Deno.readTextFile(projToml)), "and the escaped dialog's edit was not written behind it");
+
+  console.log("\nL. code_font_size: the number field writes an integer, both browsers resize live, Clear hands it back");
+  const termSizes = (p) => p.evalIn(`JSON.stringify([...terms.values()].map((e) => e.term.options.fontSize))`).then(JSON.parse);
+  const inlineSize = (p) => p.evalIn(`document.documentElement.style.getPropertyValue("--code-size")`);
+  // Starting state asserted, so the checks below cannot pass over a page
+  // that was already at 17, and so there is a terminal for them to inspect.
+  ok((await inlineSize(two)) === "", "no size is set inline to start with");
+  const before = await termSizes(one);
+  ok(before.length > 0 && before.every((s) => s === 14), `the terminal starts at 14px (${JSON.stringify(before)})`);
+  await one.evalIn(`document.getElementById("settings").click(); 0`);
+  await until(() => one.evalIn(`document.getElementById("dlg-settings").open`), 5, "dialog");
+  await one.evalIn(`document.querySelector('#dlg-settings .dlg-scope button[data-scope="project"]').click(); 0`);
+  ok((await one.evalIn(`document.querySelector('#dlg-settings .dlg-row[data-key="code_font_size"] input').type`)) === "number",
+     "the row is a number field");
+  await one.evalIn(`(() => { const i = document.querySelector('#dlg-settings .dlg-row[data-key="code_font_size"] input');
+     i.value = "17"; i.dispatchEvent(new Event("input")); })(); 0`);
+  await one.evalIn(`document.querySelector("#dlg-settings .dlg-ok").click(); 0`);
+  // Unquoted: a string here would be a config parse error at the next load.
+  ok(await until(async () => /code_font_size = 17\n/.test(await Deno.readTextFile(projToml)), 10, "file"),
+     "the project file holds code_font_size = 17, an integer");
+  ok(await until(async () => (await inlineSize(two)) === "17px", 10, "mirror"), "the other browser took --code-size: 17px without a reload");
+  // The terminal reads its size once at construction; this is what proves
+  // applyCodeSize reached the running instance and not just the stylesheet.
+  ok(await until(async () => (await termSizes(one)).every((s) => s === 17), 10, "term"),
+     `and the open terminal resized to 17px (${JSON.stringify(await termSizes(one))})`);
+  await one.evalIn(`send({ t: "SetSetting", scope: "project", key: "code_font_size" }); 0`);
+  ok(await until(async () => !/code_font_size/.test(await Deno.readTextFile(projToml)), 10, "cleared"), "Clear removed the key");
+  ok(await until(async () => (await inlineSize(two)) === "", 10, "uninlined"), "and the inline size is gone, back to the stylesheets");
+  ok(await until(async () => (await termSizes(one)).every((s) => s === 14), 10, "term back"), "and the terminal is back at 14px");
 
   // Revert-check 7 (section J, 2026-09-05): restoring Save's old body —
   // `settingsOpen = null; finish(true)` on the click, no `awaitingSave` —

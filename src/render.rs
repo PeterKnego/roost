@@ -803,6 +803,32 @@ pub fn image_fragment(project: &str, rel: &str, mtime_secs: u64) -> String {
     )
 }
 
+/// A PDF opened as a tab (#121): the browser's own viewer in an `<iframe>`,
+/// on the raw route, with `v` as the same cache key `image_fragment` uses.
+///
+/// The link beside the path is the phone's way in. A phone's browser draws no
+/// PDF inside a frame — Chrome on Android shows nothing, iOS Safari only the
+/// first page — but every one of them opens a PDF it navigates to, so the
+/// tab offers that rather than a blank pane. Useful on a desktop too, for a
+/// document worth a whole window.
+pub fn pdf_fragment(project: &str, rel: &str, mtime_secs: u64) -> String {
+    let src = format!(
+        "/frag/{}/raw?path={}&v={}",
+        crate::http::percent_encode(project),
+        crate::http::percent_encode(rel),
+        mtime_secs
+    );
+    format!(
+        "<div class=\"path\">{}</div>\
+         <a class=\"pdfopen\" href=\"{}\" target=\"_blank\" rel=\"noopener\">open in a new tab ↗</a>\
+         <iframe class=\"pdfview\" src=\"{}\" title=\"{}\"></iframe>",
+        esc(rel),
+        esc(&src),
+        esc(&src),
+        esc(rel)
+    )
+}
+
 // Whole-tree eager rendering (the old design) is what made this slow: a
 // 41k-entry project produced 895 KB of HTML and still hit the 4,000-entry
 // budget with ~90% of the tree missing. Instead we render one level at a
@@ -1082,13 +1108,17 @@ fn asset_hash(rels: &[&str]) -> String {
 /// The `?v=` for one asset, memoised per name.
 ///
 /// Every stylesheet and script roost ships carries one. Without it a browser
-/// applies its own heuristic — roost sends no `Cache-Control` at all — and a
+/// applied its own heuristic — roost sent no `Cache-Control` then — and a
 /// phone goes on running the previous release's `app.js` and `style.css` for
 /// as long as that heuristic says. It is not a theoretical staleness: a
 /// deployed CSS fix for terminal scrolling was reported as "still broken" from
 /// a phone that had never fetched it. The favicons had this from 2026-09-03;
 /// the files that actually change every release did not.
-fn av(rel: &str) -> String {
+///
+/// `routes::serve_static` compares a request's `?v=` against this to decide
+/// whether a response may be cached for good, so it must stay a hash of the
+/// *embedded* bytes — the only layer a version can vouch for.
+pub(crate) fn av(rel: &str) -> String {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
         std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -1440,6 +1470,17 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
     } else {
         String::new()
     };
+    // The `+` dialog (#156) only makes sense from the main checkout: a
+    // worktree's own page has no business minting a sibling of itself, and
+    // `create_named` would refuse it anyway ("start worktrees from the main
+    // checkout"). `branch` empty means this entry was never confirmed to be
+    // a git repository at all (see `ProjectStatus::branch`'s own doc
+    // comment) — offering the control there would open a dialog whose only
+    // possible answer is an error.
+    let offer_add = projects
+        .iter()
+        .find(|p| p.key == current_key)
+        .is_some_and(|p| p.parent.is_none() && !p.branch.is_empty());
     let mut out = format!(
         "<span id=\"wtlabel\" hx-swap-oob=\"true\">{label}</span><span class=\"wtstrip\">"
     );
@@ -1491,6 +1532,11 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
             esc(&p.url),
             esc(name),
         ));
+    }
+    if offer_add {
+        out.push_str(
+            "<button type=\"button\" class=\"wtadd\" title=\"start a new worktree\">+</button>",
+        );
     }
     out.push_str("</span>");
     out
@@ -1618,6 +1664,7 @@ pub fn human_age(secs: u64) -> String {
     }
 }
 
+#[derive(Debug)]
 pub struct OvSession {
     pub project_url: String,
     pub name: String,
@@ -1808,17 +1855,24 @@ dialog.roost, .dlg-title, .dlg-blocked { display: revert !important; visibility:
 /// shadowed — rename it; this is checked against the embedded set only, so
 /// rendering never touches the filesystem.) The daisyUI links go in the
 /// cascade order the bridge needs: variables, then bridge, then style.css.
-fn theme_head(theme: &str) -> (String, String) {
+///
+/// `code_size` is `Settings::code_font_size`, and goes on the same tag as an
+/// inline `--code-size`: inline on `<html>` outranks every `:root` rule, a
+/// project's `.roost/theme.css` included, which is the point — a size picked
+/// in Settings is the most specific answer there is. Unset, nothing is
+/// emitted and the stylesheets decide. A `u32`, so there is nothing to escape.
+fn theme_head(theme: &str, code_size: Option<u32>) -> (String, String) {
+    let style = code_size.map(|px| format!(" style=\"--code-size: {px}px\"")).unwrap_or_default();
     match crate::themes::kind(theme) {
         Some(crate::themes::ThemeKind::Daisy) => (
-            format!("<html data-theme=\"{theme}\">"),
+            format!("<html data-theme=\"{theme}\"{style}>"),
             "<link rel=\"stylesheet\" href=\"/static/vendor/daisyui-themes.css\">\n\
              <link rel=\"stylesheet\" href=\"/static/daisy-bridge.css\">"
                 .into(),
         ),
         // A roost file, or an unknown name linked as a file: that is how a
         // theme in the user directory is reached.
-        _ => ("<html>".into(), format!("<link rel=\"stylesheet\" href=\"/static/themes/{}.css\">", esc(theme))),
+        _ => (format!("<html{style}>"), format!("<link rel=\"stylesheet\" href=\"/static/themes/{}.css\">", esc(theme))),
     }
 }
 
@@ -1826,6 +1880,56 @@ fn theme_head(theme: &str) -> (String, String) {
 /// setting (`config::share_selection`), and this function stays pure so its
 /// tests can drive both states without touching the developer's real
 /// `~/.config/roost/config.toml`.
+/// The handoff page: a message log a browser agent (Claude in Chrome, say)
+/// and a roost Claude share. Deliberately plain — one list, one textarea, one
+/// button, stable ids — because its main reader is an agent driving a
+/// browser, and every bit of chrome is something it has to find its way
+/// past. Everything it does goes over the project's workspace socket
+/// (`HandoffPost`, `HandoffSync`); the page itself is a GET.
+pub fn handoff_page(project: &str) -> String {
+    let p = esc(project);
+    let js = av("handoff.js");
+    format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Handoff · {p}</title>
+<style>
+:root {{ color-scheme: light dark; --bg:#fff; --fg:#1b1f24; --muted:#59636e; --line:#d1d9e0; --me:#ddf4ff; --them:#f6f8fa; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg:#0d1117; --fg:#e6edf3; --muted:#9198a1; --line:#3d444d; --me:#0c2d6b; --them:#151b23; }} }}
+* {{ box-sizing: border-box; }}
+body {{ margin:0; background:var(--bg); color:var(--fg); font:16px/1.45 system-ui,sans-serif; }}
+main {{ max-width:860px; margin:0 auto; padding:16px; display:flex; flex-direction:column; gap:12px; min-height:100vh; }}
+h1 {{ font-size:18px; margin:0; }}
+#about {{ color:var(--muted); font-size:14px; margin:0; }}
+#status {{ font-size:13px; color:var(--muted); }}
+#log {{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:8px; flex:1; }}
+#log li {{ border:1px solid var(--line); border-radius:8px; padding:8px 10px; background:var(--them); }}
+#log li[data-from="browser"] {{ background:var(--me); }}
+#log .who {{ font-size:12px; color:var(--muted); }}
+#log pre {{ margin:4px 0 0; white-space:pre-wrap; word-break:break-word; font:inherit; }}
+form {{ display:flex; flex-direction:column; gap:8px; position:sticky; bottom:0; background:var(--bg); padding:8px 0; }}
+textarea {{ width:100%; min-height:96px; font:16px/1.4 ui-monospace,monospace; padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); }}
+button {{ min-height:44px; font-size:16px; border-radius:8px; border:1px solid var(--line); background:var(--them); color:var(--fg); }}
+button:active {{ filter:brightness(.9); }}
+@media (min-width: 641px) {{ form {{ flex-direction:row; align-items:flex-end; }} button {{ min-width:120px; }} }}
+</style></head>
+<body data-project="{p}">
+<main>
+<h1>Handoff · {p}</h1>
+<p id="about">Messages here reach the Claude running in roost for this project (it reads them with its handoff_read tool), and its replies appear below. Write a message in the box and press Send.</p>
+<div id="status" role="status">connecting…</div>
+<ol id="log" aria-live="polite"></ol>
+<form id="send">
+<textarea id="message" name="message" placeholder="Message for the roost Claude" aria-label="Message for the roost Claude"></textarea>
+<button id="send-button" type="submit">Send</button>
+</form>
+</main>
+<script src="/static/handoff.js?v={js}"></script>
+</body></html>
+"#
+    )
+}
+
 pub fn workspace_page(
     project: &str,
     key: &str,
@@ -1834,7 +1938,7 @@ pub fn workspace_page(
     sharing_on: bool,
     launches: &[&str],
 ) -> String {
-    let (html_open, theme_links) = theme_head(&s.theme);
+    let (html_open, theme_links) = theme_head(&s.theme, s.code_font_size);
     let warn = s
         .warning
         .as_deref()
@@ -2007,6 +2111,10 @@ pub fn workspace_page(
   <h2 class="dlg-title"></h2>
   <div class="dlg-body"></div>
   <div class="dlg-detail" hidden></div>
+  <span class="dlg-choice-input-row">
+    <input class="dlg-choice-input" type="text" autocomplete="off" spellcheck="false" hidden>
+    <span class="dlg-choice-input-preview" hidden></span>
+  </span>
   <div class="dlg-buttons">
     <button type="button" class="dlg-cancel">Cancel</button>
   </div>
@@ -3202,6 +3310,24 @@ mod tests {
         assert!(h.contains(r#"data-autosave="0""#), "and a configured false reaches the page");
     }
 
+    // Both directions: a constant style attribute would pass the first and
+    // pin every page to one size, overriding a project's own theme.css even
+    // where nobody set code_font_size; an emission gated wrongly would pass
+    // the second and leave the setting doing nothing.
+    #[test]
+    fn the_page_carries_the_code_font_size_only_when_set() {
+        let unset = workspace_page("proj", "proj", &Settings::default(), None, false, &[]);
+        assert!(unset.contains("<html><head>"), "unset leaves <html> bare, so the stylesheets decide");
+        assert!(!unset.contains("--code-size: "), "and puts no size anywhere inline");
+        let set = Settings { code_font_size: Some(17), ..Settings::default() };
+        let h = workspace_page("proj", "proj", &set, None, false, &[]);
+        assert!(h.contains(r#"<html style="--code-size: 17px"><head>"#), "a set size lands on <html>: {}", &h[..80]);
+        let daisy = Settings { theme: "nord".into(), code_font_size: Some(12), ..Settings::default() };
+        let h = workspace_page("proj", "proj", &daisy, None, false, &[]);
+        assert!(h.contains(r#"<html data-theme="nord" style="--code-size: 12px">"#),
+            "and survives a daisyUI theme, which builds its own <html> tag: {}", &h[..80]);
+    }
+
     // "Off unless a project asks for it, and visible whenever it is on" is
     // two separate properties, and this checks both directions of both: the
     // default page carries neither the "1" attribute nor the indicator text,
@@ -4111,6 +4237,31 @@ mod tests {
         // A child names itself by its last path segment:
         let h = worktrees_strip("karpie%2F.claude%2Fworktrees%2Ffeat", &karpie_family());
         assert!(h.contains("· feat ▾"), "{h}");
+    }
+
+    /// The `+` control (#156) only on the main checkout's own page — never
+    /// on a child's, never on an unknown project, never on a plain
+    /// (non-git) directory.
+    ///
+    /// Revert-checked: dropping the `p.parent.is_none()` half of
+    /// `offer_add`'s guard (offering it to any known git entry) makes the
+    /// second assertion fail — observed `panicked ...` with `h` showing
+    /// `<button type="button" class="wtadd" ...>+</button>` rendered on the
+    /// child's own page (`karpie%2F.claude%2Fworktrees%2Ffeat`). Restored.
+    #[test]
+    fn the_add_control_appears_only_on_the_main_checkouts_own_page() {
+        let h = worktrees_strip("karpie", &karpie_family());
+        assert!(h.contains(r#"<button type="button" class="wtadd""#), "{h}");
+        // A child's own page: not the main checkout, no control.
+        let h = worktrees_strip("karpie%2F.claude%2Fworktrees%2Ffeat", &karpie_family());
+        assert!(!h.contains("wtadd"), "{h}");
+        // Unknown current key: no entry to confirm is a git repo at all.
+        let h = worktrees_strip("nosuch", &karpie_family());
+        assert!(!h.contains("wtadd"), "{h}");
+        // A plain (non-git) directory: `branch` empty, never confirmed a repo.
+        let plain = vec![wt("plain", "plain", None, 1, "", true)];
+        let h = worktrees_strip("plain", &plain);
+        assert!(!h.contains("wtadd"), "{h}");
     }
 
     /// The fixture must contain real metacharacters or this asserts nothing

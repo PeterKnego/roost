@@ -42,7 +42,8 @@ ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name') \
 # expected .deb present and the other silently missing or wrong-arch — which,
 # given the arm64 .deb Architecture bug this same review round found, is
 # exactly the asset most likely to be absent or wrong. dist's own artifacts
-# each get a matching name here too; only the .deb/.rpm pairs are new.
+# each get a matching name here too, and so do the .deb/.rpm pairs and the
+# browser extension's zip.
 for want in \
   roost-x86_64-unknown-linux-musl.tar.xz roost-x86_64-unknown-linux-musl.tar.xz.sha256 \
   roost-aarch64-unknown-linux-musl.tar.xz roost-aarch64-unknown-linux-musl.tar.xz.sha256 \
@@ -50,7 +51,8 @@ for want in \
   roost-aarch64-apple-darwin.tar.xz roost-aarch64-apple-darwin.tar.xz.sha256 \
   roost-installer.sh roost.rb sha256.sum source.tar.gz source.tar.gz.sha256 \
   "roost_${VERSION}_amd64.deb" "roost_${VERSION}_arm64.deb" \
-  "roost-${VERSION}.x86_64.rpm" "roost-${VERSION}.aarch64.rpm"; do
+  "roost-${VERSION}.x86_64.rpm" "roost-${VERSION}.aarch64.rpm" \
+  "roost-extension-${VERSION}.zip"; do
   echo "$ASSETS" | grep -qx "$want" || die "release is missing $want"
 done
 ok "release published with every expected asset"

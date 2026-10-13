@@ -51,6 +51,14 @@ pub enum ClaudeSession {
     /// Learned from a Claude Code hook (`claudesess`), and passed as
     /// `--resume` to continue that conversation. #18 step 2.
     Resume(String),
+    /// Learned from `claudesess` the same way `Resume` is, but for a
+    /// conversation continued in a *different* terminal — the `+` worktree
+    /// dialog's "fork" choice (#156). Passed as `--resume <id>
+    /// --fork-session` rather than a bare `--resume`: the original terminal
+    /// is still running that conversation, so resuming it without
+    /// `--fork-session` would hand two Claudes the same transcript to
+    /// append to.
+    Fork(String),
 }
 
 impl ClaudeSession {
@@ -68,6 +76,7 @@ impl ClaudeSession {
         match self {
             ClaudeSession::Fresh(id) if valid_session_id(id) => Some(id),
             ClaudeSession::Resume(id) if crate::claudesess::valid_session_id(id) => Some(id),
+            ClaudeSession::Fork(id) if crate::claudesess::valid_session_id(id) => Some(id),
             _ => None,
         }
     }
@@ -87,6 +96,9 @@ pub fn keystrokes(launch: Launch, session: Option<&ClaudeSession>) -> Vec<u8> {
         }
         (Launch::Claude, Some((ClaudeSession::Resume(_), id))) => {
             format!("claude --resume {id}\r").into_bytes()
+        }
+        (Launch::Claude, Some((ClaudeSession::Fork(_), id))) => {
+            format!("claude --resume {id} --fork-session\r").into_bytes()
         }
         (Launch::Claude, _) => b"claude\r".to_vec(),
         // The prompt goes on the command line rather than being typed after
@@ -487,6 +499,38 @@ mod tests {
                 "{bad:?} left a --resume behind"
             );
         }
+    }
+
+    /// #156's `+` dialog "fork" choice. `--fork-session` is the whole reason
+    /// `Fork` is not just another `Resume`: the original terminal is still
+    /// appending to this transcript, so a bare `--resume` would hand the new
+    /// terminal the same conversation to append to as well.
+    ///
+    /// Revert-checked: dropping the `Fork` arm from `keystrokes` (falling
+    /// through to the bare-command arm) fails with left: `claude\r`,
+    /// right: `claude --resume 864ee734-…-16ad --fork-session\r`. Restored.
+    #[test]
+    fn fork_types_resume_with_fork_session() {
+        let id = "864ee734-e3ab-434e-8278-745a850b16ad";
+        assert_eq!(
+            keystrokes(Launch::Claude, Some(&ClaudeSession::Fork(id.into()))),
+            format!("claude --resume {id} --fork-session\r").into_bytes()
+        );
+    }
+
+    /// Same injection shape as `a_recorded_id_that_could_be_an_argument_is_never_typed`,
+    /// for `Fork`'s own arm: a recorded id is not roost's string, so the class
+    /// check `ClaudeSession::usable` applies to `Resume` must apply here too.
+    ///
+    /// Revert-checked: dropping `usable`'s `Fork` guard fails with
+    /// left: `claude --resume --x --fork-session\r`, right: `claude\r`.
+    /// Restored.
+    #[test]
+    fn a_fork_id_that_could_be_an_argument_degrades_to_bare_claude() {
+        assert_eq!(
+            keystrokes(Launch::Claude, Some(&ClaudeSession::Fork("--x".into()))),
+            b"claude\r".to_vec()
+        );
     }
 
     #[test]

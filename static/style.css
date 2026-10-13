@@ -117,6 +117,9 @@ header .vsep { width: 1px; height: 16px; background: var(--border); margin: 0 6p
 .wtf { color: var(--muted); font-size: 12px; }
 .wtf.on { color: var(--fg); }
 .wtremove { font: inherit; font-size: 12px; cursor: pointer; background: none; border: 1px solid var(--muted); border-radius: 3px; }
+.wtadd { font: inherit; font-size: 13px; cursor: pointer; background: none; border: 1px solid var(--muted); border-radius: 3px;
+         align-self: flex-start; margin-top: 2px; padding: 2px 8px; color: var(--fg); }
+.wtadd:hover { background: var(--bg); }
 .warn { color: #d29922; cursor: help; }
 /* Deliberately loud, not decorative: this is the only thing on the page that
    says a highlighted selection is leaving the machine, and it must not read
@@ -224,11 +227,30 @@ main { flex: 1; min-height: 0; }
    it apart. */
 .paneicons .newclaude svg { display: block; }
 .content { flex: 1 1 auto; overflow: auto; position: relative; }
+/* A PDF tab (#121): the viewer fills what is left under the path and scrolls
+   itself, so the pane must not scroll around it. */
+.content:has(> .pdfview) { display: flex; flex-direction: column; overflow: hidden; }
+.content > .pdfview { flex: 1 1 auto; min-height: 0; width: 100%; border: 0; background: var(--bg); }
+.content > .pdfopen { align-self: flex-end; padding: 6px 10px; font-size: 13px; color: var(--accent, #548af7);
+  text-decoration: none; min-height: 32px; box-sizing: border-box; }
+.content > .pdfopen:hover, .content > .pdfopen:active { text-decoration: underline; }
+/* A phone's browser draws no PDF in a frame (Android Chrome shows nothing,
+   iOS Safari one page), so there the link is the way in and the frame goes. */
+@media (max-width: 640px) {
+  .content > .pdfview { display: none; }
+  .content > .pdfopen { align-self: stretch; padding: 14px 16px; min-height: 44px; font-size: 16px; }
+}
 /* Inset from the card edge rather than bleeding into it: the fit addon sizes
    the grid from the host's *inner* box, so padding costs a column, not a
    clipped one. Left is roomier than right because the right edge is where the
    viewport's scrollbar sits. */
 .content .termhost { position: absolute; inset: 0; padding: 4px 2px 2px 7px; }
+/* The body's `antialiased` is right for UI chrome, but it is macOS's greyscale
+   smoothing, which visibly thins light-on-dark text — the cost lands on the
+   panes people read for hours. `auto` gives them back the platform's normal
+   weight; it changes rasterisation only, never metrics, so code-input's two
+   overlaid layers cannot drift apart over it. Elsewhere it is a no-op. */
+.termhost, .editor, .editwrap code-input, .codeview { -webkit-font-smoothing: auto; }
 /* xterm ships an unstyled viewport, so the browser's default scrollbar lands
    directly on the card's border — a bright bar against every dark theme. */
 .termhost .xterm-viewport { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
@@ -287,8 +309,13 @@ main { flex: 1; min-height: 0; }
              gap: 10px; height: 22px; padding: 0 10px; flex: none;
              background: var(--window); color: var(--muted); font-size: 11px; }
 #statusbar .right { margin-left: auto; }
-:root { --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
-.editor { width: 100%; height: 100%; border: 0; font: 13px/1.55 var(--mono); resize: none; padding: 8px 10px; background: var(--bg); color: var(--fg); outline: none; }
+:root { --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+        /* One size for every surface people read code in — terminal, editor,
+           code preview, proposal edit — so they cannot drift apart. The
+           terminal reads it off :root at construction, like --mono. 14 not
+           13: 13 read small beside a terminal running Claude for hours. */
+        --code-size: 14px; }
+.editor { width: 100%; height: 100%; border: 0; font: var(--code-size)/1.55 var(--mono); resize: none; padding: 8px 10px; background: var(--bg); color: var(--fg); outline: none; }
 /* Edit mode carries the same .path breadcrumb a preview does. The wrapper is
    what makes room for it: .editor is height:100%, so without a flex column
    above it the textarea would push its own last lines out of the pane. */
@@ -314,9 +341,9 @@ main { flex: 1; min-height: 0; }
    code-input inherits both to its pre, so setting them here is enough. */
 .editwrap code-input { flex: 1 1 auto; min-height: 0; height: auto; margin: 0;
                        background-color: var(--bg); color: var(--fg);
-                       font: 13px/1.55 var(--mono); tab-size: 4;
-                       /* Wrapping, as the plain textarea did — long lines are
-                          not worth a horizontal scroll in a 600px pane. Set
+                       font: var(--code-size)/1.55 var(--mono); tab-size: 4;
+                       /* Wrapping, as the plain textarea did, for prose —
+                          a code file opts out below. Set
                           on the element and nowhere else on purpose: both
                           layers take `white-space: inherit` from here, so
                           this is the one place that can change it without
@@ -336,6 +363,14 @@ main { flex: 1; min-height: 0; }
                           no drift. */
                        --padding-left: calc(10px + var(--ln-gutter, 0px)); --padding-right: 10px;
                        --code-input_default-caret-color: var(--fg); }
+/* A code file does not wrap. Wrapped code read badly in a 600px pane: rows
+   broke at every hyphen (`line-` / `height`) and the continuation started at
+   column 0, indistinguishable from a new statement. A hanging indent is not
+   available — the textarea is one text flow with no per-line box, and the two
+   layers must wrap identically or the colours walk off the caret — so the
+   choice was wrap badly or scroll, and scrolling is the library's own default.
+   Still set on the element, for the same both-layers reason as above. */
+.editwrap code-input[template="hl"] { white-space: pre; }
 /* The textarea inside carries .editor too, so the app's own selectors still
    find it — but .editor paints an opaque background, which over a highlighted
    layer would hide exactly what this is for. */
@@ -343,8 +378,9 @@ main { flex: 1; min-height: 0; }
    which is right when nothing wraps and wrong the moment something does: the
    longest line then sets the element's width and the whole editor grows to it
    — measured at 4739px inside a 590px pane, taking the pane's layout with it —
-   instead of wrapping at the pane's edge. */
-.editwrap code-input pre code { width: auto; max-width: 100%; }
+   instead of wrapping at the pane's edge. Not for a code file, which does not
+   wrap: there max-content is the width the host has to scroll across. */
+.editwrap code-input:not([template="hl"]) pre code { width: auto; max-width: 100%; }
 /* The containing block for this layer's line numbers, and where their counter
    starts. Safe to position: the vendor stylesheet gives `code-input textarea`
    z-index 1 and `code-input pre` z-index 0 outright, and z-index applies to a
@@ -464,7 +500,7 @@ details[open] > summary { background-image: var(--twisty-open); }
 .xy { display: inline-block; min-width: 2.2em; color: var(--muted); font-family: var(--mono); font-size: 11px; }
 .hint { color: var(--muted); padding: 16px; }
 .path { position: sticky; top: 0; background: var(--bg2); border-bottom: 1px solid var(--hairline, var(--border)); padding: 4px 10px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
-.codeview { padding: 10px 10px 10px calc(10px + var(--ln-gutter, 0px)); font: 13px/1.55 var(--mono);
+.codeview { padding: 10px 10px 10px calc(10px + var(--ln-gutter, 0px)); font: var(--code-size)/1.55 var(--mono);
             overflow-x: auto; background: var(--bg); position: relative; counter-reset: ln; }
 /* font too, not just the background: the UA stylesheet sets `code { font-family:
    monospace }`, which beats inheritance from .codeview and rendered a preview
@@ -491,9 +527,35 @@ details[open] > summary { background-image: var(--twisty-open); }
               width: calc(var(--ln-gutter, 0px) - 14px); text-align: right;
               color: var(--muted); opacity: .6;
               user-select: none; -webkit-user-select: none; pointer-events: none; }
+/* In a code file's editor, which scrolls sideways (it does not wrap), an
+   absolute number would scroll out of view with the text. Sticky keeps it at
+   the host's left edge instead, and the host is the right ancestor: it is the
+   only thing in code-input that scrolls. Sticky needs the box in flow, so its
+   margins net its inline advance to zero — the textarea has no such box, and a
+   number that took up width would push this layer's text off the caret. It
+   spans the whole gutter and paints the background so text scrolled under it
+   is hidden; the padding keeps the digits where the absolute rule puts them.
+   Normal position: x 0 to G+6 of the code box, the text starting at G+10. */
+.editwrap code-input[template="hl"] .ln::before {
+  position: sticky; left: 0; display: inline-block; box-sizing: border-box;
+  width: calc(var(--ln-gutter, 0px) + 6px); padding-right: 16px;
+  margin-left: calc(-1 * var(--ln-gutter, 0px) - 10px); margin-right: 4px;
+  background: var(--bg); opacity: 1;
+  color: color-mix(in oklab, var(--muted) 60%, var(--bg)); }
 
-.diffview { font: 12.5px/1.5 var(--mono); padding: 6px 0; }
+/* A diff scrolls sideways rather than wrapping, for the reason a code file's
+   editor does: wrapped code broke at every hyphen and went on at column 0, so
+   the continuation read as a line of its own — worse here, where it has no
+   +/- of its own either. The view is its own horizontal scroller, like
+   .codeview. One grid column at least as wide as the view and as wide as the
+   longest line, so every row shares one width and a short added line's
+   colour still reaches the right edge after scrolling over. .dl outside a
+   .diffview (the revert and save-conflict dialogs' detail) keeps wrapping:
+   those are small boxes with no room to scroll in. */
+.diffview { font: 12.5px/1.5 var(--mono); padding: 6px 0;
+            display: grid; grid-template-columns: minmax(max-content, 1fr); overflow-x: auto; }
 .dl { padding: 0 12px; white-space: pre-wrap; }
+.diffview .dl { white-space: pre; }
 .dl.add { background: var(--add-bg); color: var(--add-fg); }
 .dl.del { background: var(--del-bg); color: var(--del-fg); }
 .dl.hunk { color: var(--hunk); padding-top: 6px; }
@@ -767,7 +829,7 @@ ul.picker li .git:hover { text-decoration: underline; }
   height: 40%;
   min-height: 6em;
   margin: 0;
-  font: 13px/1.55 var(--mono);
+  font: var(--code-size)/1.55 var(--mono);
   background: var(--bg);
   color: var(--fg);
   border: 0;
@@ -964,6 +1026,14 @@ dialog.roost::backdrop { background: rgba(0,0,0,.35); }
 .dlg-input { width: calc(100% - 28px); margin: 0 14px; padding: 5px 7px;
              background: var(--bg); color: var(--fg); font: inherit;
              border: 1px solid var(--border); border-radius: 4px; }
+/* askChoice's own optional field (#156's worktree name) and its live
+   "→ worktree-<name>" preview, side by side rather than `.dlg-input`'s
+   full-width — the preview needs room on the same line. */
+.dlg-choice-input-row { display: flex; align-items: center; gap: 8px; padding: 0 14px 10px; flex-wrap: wrap; }
+.dlg-choice-input { flex: 1 1 auto; min-width: 0; padding: 5px 7px;
+             background: var(--bg); color: var(--fg); font: inherit;
+             border: 1px solid var(--border); border-radius: 4px; }
+.dlg-choice-input-preview { font-size: 12px; color: var(--muted); white-space: nowrap; }
 /* Select mode (#110): the terminal's touch drags select instead of scrolling.
    Marked with an outline rather than only a colour, because the state changes
    what a drag *does* and has to be legible at a glance — and because a colour
@@ -1059,8 +1129,9 @@ dialog.roost.dlg-wide { width: min(760px, 96vw); }
 .dlg-row .doc { color: var(--muted); font-size: 12px; line-height: 1.35; margin-top: 2px; }
 .dlg-row[data-kind="list"] { grid-template-columns: minmax(0, 1fr); }
 .dlg-row[data-kind="list"] textarea { grid-column: 1 / -1; }
-.dlg-row input[type="text"], .dlg-row textarea { width: 100%; font: inherit; font-size: 12px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 4px 7px; justify-self: end; }
+.dlg-row input[type="text"], .dlg-row input[type="number"], .dlg-row textarea { width: 100%; font: inherit; font-size: 12px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 4px 7px; justify-self: end; }
 .dlg-row textarea { min-height: 3.2em; resize: vertical; font-family: var(--mono); }
+.dlg-row input[type="number"] { width: 6em; }
 .dlg-row.ro-row { grid-template-columns: minmax(0, 1fr); }
 .dlg-row .ro { color: var(--fg); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; }
 .dlg-row .ro.empty { color: var(--muted); font-family: inherit; }

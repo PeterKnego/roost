@@ -110,6 +110,34 @@ A git worktree is its own project, and is discovered by asking
 `git worktree list`, not by walking the filesystem, so worktrees under
 `.claude/worktrees/` are found even though `.claude` is otherwise skipped.
 
+A project's "Let roost create Claude's worktrees" setting installs Claude
+Code's `WorktreeCreate` hook (`roost worktree-hook`), so that when a Claude
+running in a roost terminal asks for a worktree, roost — not Claude Code —
+creates it, and the terminal that asked is re-homed into the new worktree's
+project. With the setting on, the request shows up as a dialog in the
+browser: with no roost tab open on that project to click it, the request is
+refused outright, since nobody is there to approve it. Outside roost
+entirely (a Claude with no `ROOST_PROJECT` set) or whenever roost itself is
+unreachable — stopped, restarting, or the hook socket otherwise refused —
+the hook falls back to creating the worktree itself, roost's own naming
+convention and all: creating a worktree destroys nothing, so that is the one
+case where falling through to "just do it" is the safe default.
+
+Subagent worktrees ask too. A Claude that runs a subagent with
+`isolation: "worktree"` raises the same `WorktreeCreate` hook, and its payload
+carries nothing that tells it apart from the terminal's own request — no agent
+id or type, only a generated `agent-<hex>` name (observed on Claude Code
+2.1.296). So with the setting on, each such subagent shows the same dialog,
+re-homes the terminal when approved, and is refused at once when no roost tab
+is open on the project.
+
+Turn the setting off before **downgrading** to a roost that predates it. An
+older binary does not know the `worktree-hook` subcommand and reads it as a
+port number, so the hook exits 2 — and a non-zero `WorktreeCreate` hook is
+Claude Code's refusal: every `--worktree` start aborts and every
+`EnterWorktree` fails in that project until the entry is removed from
+`.claude/settings.local.json`.
+
 Terminals are **never started implicitly**. Opening a project creates a
 Terminal *tab*, not a session; the session begins only when the user presses
 Enter or clicks the placeholder. Before this, merely looking at a project
@@ -324,6 +352,14 @@ highlighter, which is a fixed stylesheet. A project theme goes in
 the user directory nor a project may supply JavaScript or HTML — only
 `$ROOST_STATIC` can, and only whoever starts the process can set it.
 
+Caching follows the layers. Every response says `Cache-Control: no-cache`, so
+a browser may keep a copy but asks before using it, and a normal reload after a
+deploy picks up the new build. The one exception is an embedded asset requested
+with the `?v=` hash of its current bytes, which is sent `immutable` for a year:
+a new build changes the hash and therefore the URL. The `$ROOST_STATIC` and
+user-directory layers never get that, even with the current `?v=`, because they
+change without the build changing; an edit there shows on the next reload.
+
 ## Running it in a container
 
 **A container sits beside the systemd unit; it does not replace it.** The one
@@ -485,6 +521,13 @@ run, and reads every channel back.
 It never deletes a tag or a release. If CI fails after the tag is pushed it
 prints `gh run rerun <id> --failed`, which is what recovered v0.5.1.
 
+The release also carries the browser extension as
+`roost-extension-<version>.zip`, packed by `scripts/package-extension.sh` with
+the release's version stamped into its manifest (`version_name` keeps a
+prerelease's suffix, which Chrome's numeric `version` cannot). Its icons are
+drawn from `static/logo.svg` by `scripts/extension-icons.py`; rerun that after
+changing the logo.
+
 A version with a `-` in it is a prerelease: it builds all four targets and the
 packages, and publishes to neither the tap nor crates.io. Use one to exercise
 a change to the release itself.
@@ -636,13 +679,31 @@ Globally or per project, and live: an open page follows a change on the next
 snapshot, no reload. Per-project for `autosave`'s reason — a checkout setting
 it changes only what you see as unread.
 
+### Code font size
+
+One size for every surface code is read in — terminals, the editor, code
+previews and the proposal editor — in whole pixels, 10–24:
+
+```toml
+code_font_size = 16
+```
+
+Globally or per project, and live: a save resizes every open page's text and
+its running terminals on the next snapshot, and refits them, so a running
+program redraws for the new column count. Unset, the size is the
+stylesheets' — 14px, or whatever a project's own `.roost/theme.css` sets as
+`--code-size`; once set, it wins over any theme CSS. A value outside the range
+in a hand-edited file is ignored rather than clamped, and a quoted `"16"` is a
+parse error reported by the ⚠ config marker. Per-project for `autosave`'s
+reason — a checkout setting it changes only how big its own text looks.
+
 ### The settings dialog
 
 The header's gear opens it. Two panes, **Settings** and **Theme**, and a
 scope switch, **Project** (`{project}/.roost/config.toml`) or **Global**
 (`~/.config/roost/config.toml`, or `$ROOST_CONFIG`). It writes the display
-keys only — `theme`, `hide`, `show_hidden`, `autosave`, `follow_tree`,
-`read_when_watching`, and in Global scope
+keys only — `theme`, `code_font_size`, `hide`, `show_hidden`, `autosave`,
+`follow_tree`, `read_when_watching`, and in Global scope
 also `share_selection` and `worktree_prompt`. `allowed_origins`,
 `max_upload_bytes`, `ide` and `roots` are shown read-only and have no write
 path from a page at all: the hub refuses them by name. Writes go through

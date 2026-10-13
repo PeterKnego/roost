@@ -22,7 +22,20 @@ pub enum Tab {
     Changes,
     File { rel: String, mode: Mode },
     Diff { rel: Option<String> },
-    Terminal { session: String },
+    Terminal {
+        session: String,
+        /// The project this terminal's dtach socket actually lives under,
+        /// when it differs from the page showing the tab (`home.rs`). Absent
+        /// for the overwhelming common case — a native terminal, same as
+        /// before this field existed — so an old saved layout, and every
+        /// native tab a fresh one writes, round-trips byte-identical to the
+        /// pre-re-homing wire shape; see
+        /// `a_saved_layout_without_home_still_loads`. Never set by a client:
+        /// only `hub::refresh_live_sessions` writes `Some`, the moment it
+        /// finds a live resident with no tab yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home: Option<String>,
+    },
     /// A change Claude has proposed and nobody has answered yet. Deliberately
     /// not `Tab::Diff`, which is a git diff of a tracked path: a proposal
     /// compares disk against content that has never been written, and it is
@@ -58,6 +71,31 @@ pub enum Launch {
     PrLoop,
 }
 
+/// What the `+` worktree dialog asks the new worktree's first terminal to
+/// start. A sibling of `Launch`, not a reuse of it: `Fork` carries a value
+/// (a terminal name, from which the server looks up a recorded Claude
+/// session id — never the id itself, same reservation CLAUDE.md states for
+/// `NewTerminal.resume`), so this cannot stay a plain wire string the way
+/// `Launch` does. Tagged like `Tab` — a `k` field — rather than left
+/// externally tagged (serde's default), so `Claude`/`Shell` and `Fork` share
+/// one shape (`{"k":"..."}`) instead of one being a bare string and the
+/// other an object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "k")]
+pub enum WorktreeLaunch {
+    /// Continue the Claude running in terminal `session` of *this* project
+    /// (not the new worktree) via `claude --resume <id> --fork-session`.
+    /// `session` is a terminal name, a hint like `RemoveWorktree`'s own key:
+    /// the server re-derives the id from `claudesess::recorded` at the
+    /// moment this runs and refuses if nothing is recorded, rather than
+    /// trusting a value the dialog could have shown stale.
+    Fork { session: String },
+    /// Start a fresh Claude in the new worktree.
+    Claude,
+    /// No program — a bare shell.
+    Shell,
+}
+
 /// Which config file a `SetSetting` edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,12 +104,16 @@ pub enum Scope {
     Project,
 }
 
-/// A config value as the dialog carries it. Untagged: `true`, `"nord"` and
-/// `["dist"]` are unambiguous on the wire and in TOML.
+/// A config value as the dialog carries it. Untagged: `true`, `15`, `"nord"`
+/// and `["dist"]` are unambiguous on the wire and in TOML. `Int` sits before
+/// `Str` only for readability — a JSON number never matches a string — and a
+/// quoted `"15"` stays a `Str`, which `config::validate` refuses for an
+/// integer key rather than writing `code_font_size = "15"` into the file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SettingValue {
     Bool(bool),
+    Int(i64),
     Str(String),
     List(Vec<String>),
 }
@@ -142,6 +184,28 @@ pub enum Intent {
         /// `RemoveWorktree` says of its own.
         #[serde(default)]
         resume: Option<String>,
+        /// The Claude session id to continue via `claude --resume <id>
+        /// --fork-session`, carried as `?fork=` on a worktree page's URL
+        /// (R4) rather than typed into it: only the first terminal of a
+        /// freshly created worktree ever sets this, and only because the
+        /// `+` dialog resolved it server-side before the page existed.
+        ///
+        /// Checked here against `claudesess::valid_session_id` — a shape
+        /// check, not an authorisation. `resume`'s own check
+        /// (`claudehist::has`) is different in kind: it asks whether *this
+        /// project* has that conversation, because the id there comes from
+        /// a menu row naming someone else's past session, and a stale,
+        /// forged or cross-project row must not become a `--resume`. `fork`
+        /// grants no comparable capability for the same shape check to
+        /// withhold — the browser that can set `?fork=<id>` is, by the
+        /// Origin check every workspace socket makes, already a page on
+        /// this exact project, which can already type anything it likes
+        /// into any of its own shells. The check here exists only to keep
+        /// an unusable id off a command line (the same reason `Fresh`'s own
+        /// minted id is checked too), not to decide whether the id is
+        /// "allowed".
+        #[serde(default)]
+        fork: Option<String>,
     },
     /// A span matched in terminal output, sent **verbatim** —
     /// `~/projects/roost/src/a.rs:42` and all. Deliberately not pre-parsed by
@@ -168,13 +232,20 @@ pub enum Intent {
     OpenAtLine { pane: PaneId, rel: String, line: u32 },
     InitGit,
     CloseProject,
-    /// Create `.claude/worktrees/claude-N` off this project's HEAD. No name
-    /// from the browser: the server mints it, so nothing typed reaches a
-    /// path or a command line. `launch` is echoed back in `WorktreeReady`
-    /// so the new tab knows what to start.
+    /// Create a worktree off this project's HEAD, from the `+` dialog (R4).
+    /// `name` is optional and checked server-side by `wtname`/`create_named`
+    /// — empty means the server generates one with `wtname::generate` — so
+    /// nothing a browser typed reaches a path or a command line unvalidated.
+    /// `launch` says what the new worktree's first terminal should start;
+    /// it is echoed back (as a plain `Launch`, plus a resolved `fork` id for
+    /// `WorktreeLaunch::Fork`) in `WorktreeReady` so the new tab knows what
+    /// to start, without ever carrying the session id it was asked for —
+    /// that is looked up fresh from `claudesess::recorded`.
     NewWorktree {
         #[serde(default)]
-        launch: Option<Launch>,
+        name: Option<String>,
+        #[serde(default)]
+        launch: Option<WorktreeLaunch>,
     },
     /// Remove a finished worktree of this project. The server re-derives
     /// every "finished" check at this moment; the row that offered the
@@ -189,6 +260,12 @@ pub enum Intent {
     /// `.claude/settings.local.json`. Applies to the project, not the
     /// connection: every browser on it sees the new state.
     SetClaudeHooks { on: bool },
+    /// Enable or disable `claudehooks::Kind::Worktree` (`roost
+    /// worktree-hook`, on `WorktreeCreate` only) in this project's
+    /// `.claude/settings.local.json`. A sibling of `SetClaudeHooks`, kept
+    /// as its own intent rather than a second field on that one because the
+    /// two toggle independently — see `Hub::worktree_hooks`.
+    SetWorktreeHooks { on: bool },
     /// Write one key into one config file, or clear it (`value: None`) so
     /// inheritance resumes. Validated in `config::validate` before any
     /// file is touched; see the settings-dialog spec.
@@ -227,6 +304,21 @@ pub enum Intent {
     /// `accept: false` with a `text` is still a rejection — the text is only
     /// ever read on the accepting path.
     AnswerProposal { id: String, accept: bool, text: Option<String> },
+    /// A browser's answer to a `WorktreeAsk` Claude's hook is blocked on.
+    /// The first answer from any browser wins; an `id` that is no longer
+    /// pending (someone else answered, or it timed out) is ignored.
+    WorktreeAnswer { id: String, approve: bool },
+    /// "Move tab there" / "Move back" (spec §7, #156 task 12) — the
+    /// browser's answer to a `ClaudeElsewhere` offer, never automatic:
+    /// `claudes::detect_moves` only ever *offers*, this is the one place
+    /// that actually writes or clears the re-home record. `to: Some(url)`
+    /// re-homes `session` into the worktree `url` (which must be a
+    /// worktree of this project — re-checked server-side, never trusted
+    /// from the banner that offered it); `to: None` forgets whatever
+    /// record `session` has, moving it back to its home. Only a session
+    /// native to this hub, or one of its own residents, can be named —
+    /// the same confinement `EndSession`'s `may_end` already applies.
+    Rehome { session: String, #[serde(default)] to: Option<String> },
     /// What a revert would do (#125). Answered to the requester only, with a
     /// token over exactly what the dialog will show. `None` is "all".
     /// Diverted in wsconn: a plan is several git calls.
@@ -298,6 +390,37 @@ pub enum Intent {
         end_line: u32,
         end_col: u32,
     },
+    /// This page's roost extension content script answered (`ready`), or
+    /// its window took focus (`active`), or the script was orphaned by an
+    /// extension reload (`ready: false`). See `browser.rs`.
+    BridgeHello {
+        #[serde(default)]
+        active: bool,
+        #[serde(default = "yes")]
+        ready: bool,
+    },
+    /// The extension's content script in this page has a `BridgeCall` —
+    /// proof the page is alive, sent before the call is acted on.
+    BridgeAck { call: String },
+    /// The extension's answer to a `BridgeCall` this connection relayed.
+    /// Diverted in `wsconn` before the hub lock: it is a map lookup and a
+    /// channel send, and nothing about it belongs to this project's hub.
+    BridgeReply {
+        call: String,
+        ok: bool,
+        #[serde(default)]
+        result: serde_json::Value,
+        #[serde(default)]
+        error: String,
+    },
+    /// A message typed (by a person or a browser agent) into the handoff page.
+    HandoffPost { text: String },
+    /// The handoff page asking for the whole log, on load and on reconnect.
+    HandoffSync,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Snapshot sent as `Event::State`. Deliberately carries buffer *metadata*
@@ -467,6 +590,27 @@ pub struct WorkspaceView {
     /// `claudes::cached_sessions`, never stored in the workspace: it is a
     /// fact about the host's processes, not about the layout.
     pub claude_sessions: Vec<String>,
+    /// Resident name → its home, for every terminal re-homed into this
+    /// project (`home.rs`). Filled in `hub::snapshot_event` from
+    /// `Hub.session_homes`, the same way `claude_sessions` is derived there —
+    /// never kept in `WsState`, since it is rebuilt from the live records and
+    /// sockets on every refresh and a saved copy could only ever be stale.
+    /// Each resident's own `Tab::Terminal.home` already carries the same
+    /// fact for the client's own use (dialing the terminal and paste sockets
+    /// at the session's real home); this is the same information keyed for
+    /// a consumer that has a session name but no tab to read it off, such as
+    /// a future "ending a resident" confirmation.
+    #[serde(default)]
+    pub session_homes: std::collections::BTreeMap<String, String>,
+    /// Native live terminals with a recorded Claude session id
+    /// (`claudesess::recorded`) — the `+` dialog's fork choices (#156).
+    /// Filled in `hub::snapshot_event` from `Hub.forkable`, which
+    /// `refresh_live_sessions` rebuilds the same way it rebuilds
+    /// `session_homes`, for the same reason: never kept in `WsState`, and
+    /// never read on every snapshot (`EditBuffer` debounces onto this path),
+    /// since a recorded session is a small file read per candidate.
+    #[serde(default)]
+    pub forkable: Vec<String>,
     /// Whether the project directory is a git repository — drives the
     /// initialise-git offer on the placeholder.
     pub is_git: bool,
@@ -489,6 +633,11 @@ pub struct WorkspaceView {
     /// same reason. The file is still the truth; a hand edit shows at the
     /// next invalidation, not necessarily the next snapshot.
     pub claude_hooks: Option<bool>,
+    /// Same shape and reasoning as `claude_hooks` immediately above, for
+    /// `claudehooks::Kind::Worktree` instead: `Some(true)` present,
+    /// `Some(false)` absent, `None` unreadable/unparseable. Derived from
+    /// `Hub::worktree_hooks`, invalidated at the same three sites.
+    pub worktree_hooks: Option<bool>,
     /// Filled by `hub::snapshot_event` from a fresh `config::settings_view`;
     /// never persisted (it is a read of the files, not workspace state).
     #[serde(default)]
@@ -533,8 +682,22 @@ pub enum Event {
     CloseRefused { dirty: Vec<String> },
     ProjectClosed { ended: usize },
     /// The worktree exists and is registered. Sent to the clicker only —
-    /// it is the one holding the tab to navigate.
-    WorktreeReady { url: String, launch: Option<Launch> },
+    /// it is the one holding the tab to navigate. `fork`, present only for
+    /// `WorktreeLaunch::Fork`, is the Claude session id `claudesess::recorded`
+    /// resolved — never the typed-at keystrokes, and never the terminal name
+    /// the dialog offered: R4 puts the session id on the wire and nothing
+    /// else, so the new page's `?fork=` carries a value the server will
+    /// re-validate (`claudesess::valid_session_id`) before it ever reaches a
+    /// command line.
+    WorktreeReady { url: String, launch: Option<Launch>, fork: Option<String> },
+    /// Claude in `session` asked for worktree `worktree-<name>` through the
+    /// hook and is blocked until a browser answers with `WorktreeAnswer`.
+    /// Broadcast to every browser of the project; `id` is a server counter,
+    /// never derived from the request.
+    WorktreeAsk { id: String, session: String, name: String },
+    /// The ask `id` is settled — answered by some browser, or timed out —
+    /// so every other browser's dialog for it closes.
+    WorktreeAskClosed { id: String },
     /// The set of projects with live sessions changed — `project` started
     /// its first shell, ended its last, or was closed. Machine-wide, sent to
     /// every project's clients via `hub::broadcast_all` — unlike `Notice`,
@@ -592,6 +755,43 @@ pub enum Event {
     /// `stale`: refused because what the user saw no longer holds; the client
     /// re-asks for a preview rather than leaving them with a dead dialog.
     Reverted { rel: Option<String>, ok: bool, msg: String, stale: bool },
+    /// A terminal this browser held a native tab for has just been re-homed
+    /// into `owner` — `hub::refresh_live_sessions` found the tab here no
+    /// longer resolving to this project and dropped it. Sent only to this
+    /// (the home's) browsers, never to the owner's: the owner's own refresh
+    /// is what gives the tab a home there, carried in the ordinary `State`
+    /// snapshot, and a second "it arrived" announcement on top of that would
+    /// be the same fact said twice from two different events. Client-side
+    /// this is a transient banner and a link to `owner`, not workspace
+    /// state — nothing here is persisted.
+    Rehomed { session: String, owner: String },
+    /// A Claude's cwd moving somewhere roost was not asked about (spec §7,
+    /// `claudes::detect_moves`). `worktree: Some(url)` means a native
+    /// session's Claude is now sitting inside that worktree of this
+    /// project — the client offers "Move tab there". `worktree: None`
+    /// means a resident's Claude has cd'd back out to its home's main
+    /// checkout — the client offers "Move back". Either way this is a
+    /// dismissible banner, never a workspace change by itself: nothing
+    /// here is persisted, and no record changes until `Intent::Rehome`
+    /// answers it.
+    ClaudeElsewhere { session: String, worktree: Option<String> },
+    /// Claude Code removed a resident's worktree when its session exited
+    /// (spec §7's "A worktree that Claude Code removed"). Sent to the
+    /// *home's* browsers once per (home, session) per process lifetime
+    /// (`claudes::sweep_gone_owners`'s `announced` set) — the owner's own
+    /// tab already lost its terminal the moment `resolves` went false, and
+    /// R18 has by now also forgotten the re-home record, so the session is
+    /// `Here` again. This event is only the explanation for why.
+    WorktreeGone { worktree: String, session: String },
+    /// A browser tool call for this page to hand to the extension, unread.
+    /// `payload` is opaque JSON text and `sig` its HMAC (`browser::sign`):
+    /// the extension verifies the bytes it is given, so this page — which
+    /// relays it and could be running injected script — cannot invent one.
+    /// Sent to one connection, never broadcast.
+    BridgeCall { call: String, payload: String, sig: String },
+    /// Handoff messages: the whole log when `full` (an answer to
+    /// `HandoffSync`), else new ones for every client of the project.
+    Handoff { messages: Vec<crate::handoff::Message>, full: bool },
 }
 
 pub fn decode(s: &str) -> Result<Intent, String> {
@@ -623,6 +823,53 @@ mod tests {
         assert!(decode(r#"{"t":"NewTerminal","pane":3,"launch":"rm -rf /"}"#).is_err());
     }
 
+    /// R4: the worktree page's `?fork=` carries a Claude session id, decoded
+    /// the same way `resume` already is — present only when the dialog's
+    /// own lookup resolved one, absent on every older/plainer request.
+    #[test]
+    fn new_terminal_decodes_a_fork_id() {
+        let i = decode(r#"{"t":"NewTerminal","pane":3,"launch":"claude","fork":"864ee734-e3ab-434e-8278-745a850b16ad"}"#).unwrap();
+        assert!(
+            matches!(i, Intent::NewTerminal { pane: 3, launch: Some(Launch::Claude), fork: Some(ref f), .. } if f == "864ee734-e3ab-434e-8278-745a850b16ad"),
+            "got {i:?}"
+        );
+        // Absent on an older/plainer request — `#[serde(default)]`, not a
+        // required field.
+        let i = decode(r#"{"t":"NewTerminal","pane":3}"#).unwrap();
+        assert!(matches!(i, Intent::NewTerminal { fork: None, .. }), "got {i:?}");
+    }
+
+    /// The `+` dialog's three wire shapes (#156): a tag field (`k`), the
+    /// same style `Tab` uses, so `Claude`/`Shell` and `Fork`'s own payload
+    /// share one shape instead of one being a bare string and the other an
+    /// object serde's default external tagging would produce.
+    #[test]
+    fn new_worktree_decodes_each_launch_shape_and_an_optional_name() {
+        let i = decode(r#"{"t":"NewWorktree","name":"bright-fox","launch":{"k":"Fork","session":"term3"}}"#).unwrap();
+        assert!(
+            matches!(i, Intent::NewWorktree { name: Some(ref n), launch: Some(WorktreeLaunch::Fork { ref session }) } if n == "bright-fox" && session == "term3"),
+            "got {i:?}"
+        );
+        let i = decode(r#"{"t":"NewWorktree","launch":{"k":"Claude"}}"#).unwrap();
+        assert!(matches!(i, Intent::NewWorktree { name: None, launch: Some(WorktreeLaunch::Claude) }), "got {i:?}");
+        let i = decode(r#"{"t":"NewWorktree","launch":{"k":"Shell"}}"#).unwrap();
+        assert!(matches!(i, Intent::NewWorktree { launch: Some(WorktreeLaunch::Shell), .. }), "got {i:?}");
+        // No launch at all — the name field alone, blank for "generate one".
+        let i = decode(r#"{"t":"NewWorktree"}"#).unwrap();
+        assert!(matches!(i, Intent::NewWorktree { name: None, launch: None }), "got {i:?}");
+    }
+
+    #[test]
+    fn worktree_ready_carries_the_forked_session_id_never_the_terminal_name() {
+        let s = encode(&Event::WorktreeReady {
+            url: "repo/.claude/worktrees/worktree-fox".into(),
+            launch: Some(Launch::Claude),
+            fork: Some("864ee734-e3ab-434e-8278-745a850b16ad".into()),
+        });
+        assert!(s.contains(r#""fork":"864ee734-e3ab-434e-8278-745a850b16ad""#), "{s}");
+        assert!(!s.contains("term3"), "the terminal name the dialog offered must never be on the wire here");
+    }
+
     #[test]
     fn decodes_open_tab() {
         let i = decode(r#"{"t":"OpenTab","pane":2,"tab":{"k":"File","rel":"src/main.rs","mode":"Preview"}}"#).unwrap();
@@ -641,6 +888,25 @@ mod tests {
         assert!(matches!(i, Intent::MoveTab { from: 2, idx: 0, to: 3, at: 1 }));
         let i = decode(r#"{"t":"OpenTab","pane":3,"tab":{"k":"Terminal","session":"shell"}}"#).unwrap();
         assert!(matches!(i, Intent::OpenTab { tab: Tab::Terminal { .. }, .. }));
+    }
+
+    /// `home` is new; every saved layout on disk and every client that has
+    /// not been told about re-homing yet sends and expects the old shape —
+    /// no `home` key at all. `#[serde(default)]` is what keeps the read side
+    /// working, and `skip_serializing_if` is what keeps the write side from
+    /// drifting away from it the moment a native tab round-trips through the
+    /// server once: without it, a fresh `State` broadcast for a tab nobody
+    /// ever re-homed would start carrying `"home":null`, which is still
+    /// parseable but is no longer the byte-identical wire shape this pins.
+    #[test]
+    fn a_saved_layout_without_home_still_loads() {
+        let t: Tab = serde_json::from_str(r#"{"k":"Terminal","session":"term"}"#).unwrap();
+        assert_eq!(t, Tab::Terminal { session: "term".into(), home: None });
+        assert_eq!(
+            serde_json::to_string(&t).unwrap(),
+            r#"{"k":"Terminal","session":"term"}"#,
+            "byte-identical when native"
+        );
     }
 
     #[test]
@@ -724,6 +990,31 @@ mod tests {
         assert!(s.contains(r#""t":"CloseRefused""#) && s.contains("a.rs"));
         let s = encode(&Event::GitInit { ok: false, msg: "boom".into() });
         assert!(s.contains(r#""ok":false"#) && s.contains("boom"));
+    }
+
+    /// `to: None` ("Move back") must decode with no `to` key at all — the
+    /// client never sends `"to":null` for it (see `a_saved_layout_...`'s
+    /// own reasoning for why `#[serde(default)]` matters here too).
+    #[test]
+    fn rehome_decodes_both_directions() {
+        let i = decode(r#"{"t":"Rehome","session":"term3","to":"repo/.claude/worktrees/w1"}"#).unwrap();
+        assert!(matches!(i, Intent::Rehome { session, to: Some(to) } if session == "term3" && to == "repo/.claude/worktrees/w1"));
+        let i = decode(r#"{"t":"Rehome","session":"term3"}"#).unwrap();
+        assert!(matches!(i, Intent::Rehome { session, to: None } if session == "term3"));
+    }
+
+    #[test]
+    fn claude_elsewhere_encodes_both_directions() {
+        let s = encode(&Event::ClaudeElsewhere { session: "term3".into(), worktree: Some("repo/.claude/worktrees/w1".into()) });
+        assert!(s.contains(r#""t":"ClaudeElsewhere""#) && s.contains(r#""worktree":"repo/.claude/worktrees/w1""#));
+        let s = encode(&Event::ClaudeElsewhere { session: "term3".into(), worktree: None });
+        assert!(s.contains(r#""worktree":null"#));
+    }
+
+    #[test]
+    fn worktree_gone_encodes_both_fields() {
+        let s = encode(&Event::WorktreeGone { worktree: "repo/.claude/worktrees/w1".into(), session: "term3".into() });
+        assert!(s.contains(r#""t":"WorktreeGone""#) && s.contains("w1") && s.contains("term3"));
     }
 
     #[test]
@@ -923,6 +1214,13 @@ mod tests {
 
     #[test]
     fn set_setting_decodes_each_value_shape_and_a_clear() {
+        // A JSON number is an Int, and a quoted one stays a Str — which is
+        // what lets config::validate refuse "15" for an integer key instead
+        // of writing a TOML string the loader cannot read as a size.
+        let n: Intent = serde_json::from_str(r#"{"t":"SetSetting","scope":"project","key":"code_font_size","value":15}"#).unwrap();
+        assert_eq!(n, Intent::SetSetting { scope: Scope::Project, key: "code_font_size".into(), value: Some(SettingValue::Int(15)) });
+        let q: Intent = serde_json::from_str(r#"{"t":"SetSetting","scope":"project","key":"code_font_size","value":"15"}"#).unwrap();
+        assert_eq!(q, Intent::SetSetting { scope: Scope::Project, key: "code_font_size".into(), value: Some(SettingValue::Str("15".into())) });
         let b: Intent = serde_json::from_str(r#"{"t":"SetSetting","scope":"project","key":"autosave","value":false}"#).unwrap();
         assert_eq!(b, Intent::SetSetting { scope: Scope::Project, key: "autosave".into(), value: Some(SettingValue::Bool(false)) });
         let s: Intent = serde_json::from_str(r#"{"t":"SetSetting","scope":"global","key":"theme","value":"nord"}"#).unwrap();

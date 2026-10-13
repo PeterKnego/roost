@@ -106,6 +106,15 @@ pub fn respond(w: &mut impl Write, status: u16, reason: &str, ctype: &str, body:
 /// `respond` plus caller-supplied headers, for the security headers static
 /// assets carry. Kept as a separate entry point so the dozens of existing
 /// `respond` call sites need no change.
+///
+/// Every response says `Cache-Control: no-cache` unless the caller sends its
+/// own. With no caching header at all a browser picks its own freshness, and
+/// one did: a page left open across a deploy needed a *hard* reload before it
+/// fetched the new `dialog.js`, so the Settings dialog kept sending the old
+/// shape of a value the new server refused. `no-cache` still lets a browser
+/// keep a copy; it only has to ask first. The one exception is a versioned
+/// embedded asset (`routes::serve_static`), which can be kept for good
+/// because a new build gives it a new URL.
 pub fn respond_with(
     w: &mut impl Write,
     status: u16,
@@ -121,6 +130,9 @@ pub fn respond_with(
     );
     for (k, v) in extra {
         let _ = write!(w, "{k}: {v}\r\n");
+    }
+    if !extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("cache-control")) {
+        let _ = write!(w, "Cache-Control: no-cache\r\n");
     }
     let _ = write!(w, "\r\n");
     let _ = w.write_all(body);
@@ -284,6 +296,26 @@ mod tests {
         assert!(head.contains("Content-Length: 6"));
         assert_eq!(body, "body{}", "the body must follow the blank line, not precede it");
         assert_eq!(head.matches("Content-Type:").count(), 1, "no duplicated headers");
+    }
+
+    /// Exactly one Cache-Control either way: the default when the caller has
+    /// none, and the caller's own — not both — when it does. Two would leave
+    /// the browser to pick, and the forever-cache case depends on winning.
+    #[test]
+    fn every_response_says_no_cache_unless_the_caller_says_otherwise() {
+        let mut buf = Cursor::new(Vec::new());
+        respond(&mut buf, 404, "Not Found", "text/plain", b"gone");
+        let out = String::from_utf8(buf.into_inner()).unwrap();
+        assert_eq!(out.matches("Cache-Control:").count(), 1, "{out}");
+        assert!(out.contains("Cache-Control: no-cache\r\n"), "{out}");
+        let mut buf = Cursor::new(Vec::new());
+        respond_with(&mut buf, 200, "OK", "text/css", &[("cache-control", "max-age=60")], b"x");
+        let out = String::from_utf8(buf.into_inner()).unwrap();
+        assert_eq!(out.to_ascii_lowercase().matches("cache-control:").count(), 1, "the caller's replaces the default: {out}");
+        assert!(out.contains("cache-control: max-age=60\r\n"), "{out}");
+        let mut buf = Cursor::new(Vec::new());
+        html(&mut buf, "<p>page</p>");
+        assert!(String::from_utf8(buf.into_inner()).unwrap().contains("Cache-Control: no-cache\r\n"), "pages included");
     }
 
     #[test]

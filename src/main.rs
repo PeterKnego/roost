@@ -5,11 +5,27 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("notify") => std::process::exit(roost::cli::run_notify(&args[1..])),
         Some("claude-hook") => std::process::exit(roost::cli::run_claude_hook()),
+        // #156. Claude Code's `WorktreeCreate` hook: asks a running roost
+        // over the Task 7 socket, or falls back to creating the worktree
+        // itself when roost cannot be reached.
+        Some("worktree-hook") => std::process::exit(roost::cli::run_worktree_hook()),
         // #118. Read-only, and local: a process in a roost terminal already
         // has ROOST_PROJECT/ROOST_SESSION, so these need no endpoint, no
         // socket and no token.
         Some("sessions") => std::process::exit(roost::cli::run_sessions(&args[1..])),
         Some("wait") => std::process::exit(roost::cli::run_wait(&args[1..])),
+        Some("mcp") => std::process::exit(roost::mcp::run()),
+        Some("browser-key") => match roost::browser::load_or_create_key() {
+            Ok(k) => {
+                println!("{k}");
+                eprintln!("Paste this into the roost extension's options in Chrome. Delete {} to make a new one.", roost::browser::key_path().display());
+                std::process::exit(0)
+            }
+            Err(e) => {
+                eprintln!("roost: {e}");
+                std::process::exit(1)
+            }
+        },
         Some("--version" | "-V") => {
             println!("roost {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);

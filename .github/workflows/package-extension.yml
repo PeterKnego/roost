@@ -1,0 +1,38 @@
+# Packs the browser bridge extension as a release asset,
+# roost-extension-<version>.zip. It needs no binary, so unlike the Linux
+# packages it waits on nothing but the plan, and it runs on a pull request
+# too: a manifest that names a missing file fails the PR rather than the tag.
+name: Package browser extension
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  package-extension:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Pack the extension
+        # The plan goes in through the environment, never `${{ }}` inside the
+        # script — build-linux-packages.yml has the incident that taught this.
+        env:
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -euo pipefail
+          VERSION=$(jq -r '.releases[0].app_version' <<<"$PLAN")
+          scripts/package-extension.sh "$VERSION" target/distrib
+          ls -la target/distrib/
+
+      # v7, to match the upload-artifact release.yml uses: build-linux-packages.yml
+      # explains why a mismatched version silently drops the artifact.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-extension
+          path: target/distrib/roost-extension-*.zip

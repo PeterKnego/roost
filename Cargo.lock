@@ -881,8 +881,11 @@ name = "roost"
 version = "0.7.0"
 dependencies = [
  "bytes",
+ "crc32fast",
+ "flate2",
  "futures-executor",
  "futures-util",
+ "libc",
  "lzma-rs",
  "minisign",
  "minisign-verify",
@@ -890,6 +893,7 @@ dependencies = [
  "notify",
  "portable-pty",
  "pulldown-cmark",
+ "ring",
  "serde",
  "serde_json",
  "tar",

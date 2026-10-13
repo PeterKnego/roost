@@ -90,6 +90,11 @@ publish-jobs = ["homebrew", "./publish-crates-io"]
 # `custom-build-linux-packages`, but ungated — so on a pull request it would
 # hit the `release` environment and show as a failed check. Re-add the gate
 # after a `dist init` too.
+#
+# The third is `custom-package-extension` itself, and its clause in `host`:
+# dist would generate it from `global-artifacts-jobs` with `needs` on
+# build-local-artifacts, but the extension zip needs no binary, so it waits on
+# the plan alone and runs on pull requests. Re-add both after a `dist init`.
 allow-dirty = ["ci"]
 
 # dist's default grant for a custom publish job is `{id-token, packages}`, and
@@ -106,7 +111,7 @@ github-custom-job-permissions = { "publish-crates-io" = { "id-token" = "write", 
 # a job there sees one target's output. The global phase is the first point at
 # which all four binaries exist and can be downloaded.
 # Listed for the record; release.yml is hand-edited (allow-dirty), so the job block there is what runs.
-global-artifacts-jobs = ["./build-linux-packages", "./sign-release-artifacts"]
+global-artifacts-jobs = ["./build-linux-packages", "./sign-release-artifacts", "./package-extension"]
 
 # dtach is a *runtime* prerequisite, not a build one — roost spawns it, it is
 # not linked against. `stage = ["run"]` is what turns this into a `depends_on`

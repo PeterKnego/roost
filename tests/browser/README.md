@@ -28,6 +28,7 @@ deno run -A tests/browser/autosave.mjs   # the editor writes itself out, and sto
 deno run -A tests/browser/tabwrap.mjs    # the tab strip wraps, and re-fits the terminal under it
 deno run -A tests/browser/shiftenter.mjs # shift+enter sends LF, so Claude inserts a newline
 deno run -A tests/browser/hledit.mjs     # a code file stays highlighted while you edit it
+deno run -A tests/browser/diffwrap.mjs   # a diff scrolls sideways, and every row's colour spans it
 deno run -A tests/browser/edit-by-default.mjs # clicking a text file opens an editor, not a preview
 deno run -A tests/browser/preview-follows.mjs # a previewed file follows the file on disk
 deno run -A tests/browser/buffer-lifecycle.mjs # navigating a file is not an edit; undoing one comes back clean
@@ -38,6 +39,7 @@ deno run -A tests/browser/resume.mjs     # the offer to continue the Claude a re
 deno run -A tests/browser/claudemenu.mjs # the ✻ menu: New plus this project's past conversations, and no menu at all when there are none (needs its own HOME — the history is Claude Code's directory, not roost's)
 deno run -A tests/browser/worktrees.mjs # the header's worktree switcher chip + panel
 deno run -A tests/browser/worktree-launch.mjs # the ✻ prompt, worktree creation into a second tab, switcher state and removal; needs a real CDP click for window.open
+deno run -A tests/browser/worktree-rehome.mjs # Claude's WorktreeCreate hook end to end: ask, approve, re-home, close and fork (#156)
 deno run -A tests/browser/overview.mjs   # the front page (/): live session list, clicking one focuses it, ?at= reaches the picker, and selecting a project narrows/widens the session list
 deno run -A tests/browser/claudetab.mjs  # a terminal tab running a Claude wears the Claude mark: the /proc watcher, the data-claude attribute, and the CSS that turns it into a different picture
 deno run -A tests/browser/changes.mjs    # the Changes pane and the header chip follow the working tree, not just `.git/index`
@@ -65,6 +67,7 @@ deno run -A tests/browser/paste.mjs      # the terminal key bar's paste button (
 deno run -A tests/browser/nodtach.mjs    # a host without dtach says so on the terminal, and does not reconnect into the refusal (#123)
 deno run -A tests/browser/revert.mjs     # revert from the Changes pane and a Diff tab: the git menu, the disabled hints, cancel vs confirm, and the stash on disk (#125)
 deno run -A tests/browser/backup.mjs     # backing a workspace up and restoring it into a *different* project (#18 step 3) — needs its own HOME, like claudemenu.mjs
+deno run -A tests/browser/bridge.mjs     # the browser bridge (#161): the extension loaded in Chromium, roost mcp's chrome_* tools through consent, a forged call refused, and the handoff page both ways
 ```
 
 Each scenario is its own file and its own roost, so they can be run in any

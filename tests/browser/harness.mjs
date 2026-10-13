@@ -97,7 +97,7 @@ export async function findBrowser() {
   return null;
 }
 
-export async function startBrowser(profileDir) {
+export async function startBrowser(profileDir, extraArgs = []) {
   const bin = await findBrowser();
   if (!bin) {
     console.log("SKIP: no chromium found. `snap install chromium`, or set CHROME=/path/to/chrome.");
@@ -109,6 +109,7 @@ export async function startBrowser(profileDir) {
     args: [
       "--headless", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
       `--user-data-dir=${profileDir}`, `--remote-debugging-port=${port}`,
+      ...extraArgs,
     ],
     stdout: "null", stderr: "null",
   }).spawn();

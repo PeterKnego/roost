@@ -92,8 +92,6 @@ pub fn real_git_unbounded(repo: &Path, args: &[&str]) -> Result<String, String> 
     crate::gitio::run_git_unbounded(repo, args)
 }
 
-pub const MAX_WORKTREES: u32 = 64;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct State {
     pub dirty: Option<bool>,
@@ -140,15 +138,43 @@ pub fn write_base(state_dir: &Path, wt_key: &str, base: &str) -> Result<(), Stri
     std::fs::rename(&tmp, &path).map_err(|e| { let _ = std::fs::remove_file(&tmp); e.to_string() })
 }
 
-/// Mint `claude-N`, record its base, `git worktree add`. Every failure
-/// returns before anything later runs; a failed check is a refusal, never a
-/// skip to N+1 — "I could not tell whether claude-1 exists" is not "it does".
-pub fn create(
+/// Whether `name` is unavailable for a *new* worktree — the same two checks
+/// `create_named` itself makes (a branch of that name, or a
+/// `.claude/worktrees/<dir>` entry), asked ahead of it so `wtname::generate`
+/// never offers a candidate `create_named` would only go on to refuse.
+///
+/// An uncertain answer (git did not respond, the stat failed for a reason
+/// other than "not there") also counts as taken: the cost of skipping a free
+/// name is trying another candidate, while the cost of guessing wrong here
+/// is `create_named` failing the whole request on a name nobody chose.
+pub fn name_taken(repo: &Path, run: GitRunner, name: &str) -> bool {
+    let dir_name = crate::wtname::dir_name(name);
+    let branch_taken = run(repo, &["branch", "--list", &dir_name])
+        .map(|o| !o.trim().is_empty())
+        .unwrap_or(true);
+    let path_taken = match std::fs::symlink_metadata(repo.join(".claude/worktrees").join(&dir_name)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        _ => true,
+    };
+    branch_taken || path_taken
+}
+
+/// Record the base, `git worktree add` it, with the name supplied — by
+/// Claude Code's hook, or by the `+` dialog, which generates one with
+/// `wtname::generate` when the user left the field blank (#156). A taken
+/// name is refused, not suffixed: the asker named this worktree, and giving
+/// it another one is the disagreement this exists to remove. (Minting
+/// `claude-N` itself, roost's original and now-retired convention, used to
+/// live here as a separate `create`; every caller now names the worktree
+/// before this runs.)
+pub fn create_named(
     repo: &Path,
     state_dir: &Path,
+    name: &str,
     wt_key_of: &dyn Fn(&str) -> String,
     run: GitRunner,
 ) -> Result<Created, String> {
+    crate::wtname::check(name)?;
     if !crate::gitio::is_inside_work_tree(repo) {
         return Err("not a git repository".into());
     }
@@ -157,40 +183,35 @@ pub fn create(
     if ws.is_empty() {
         return Err("git did not answer (worktree list)".into());
     }
-    let me = ws.iter().find(|w| w.path.canonicalize().ok().as_deref() == Some(canon.as_path()));
-    match me {
+    match ws.iter().find(|w| w.path.canonicalize().ok().as_deref() == Some(canon.as_path())) {
         Some(w) if w.is_main => {}
         _ => return Err("start worktrees from the main checkout".into()),
     }
-    let mut name = None;
-    for n in 1..=MAX_WORKTREES {
-        let cand = format!("claude-{n}");
-        let out = run(repo, &["branch", "--list", &cand])
-            .map_err(|e| format!("cannot tell whether branch {cand} exists: {e}"))?;
-        if !out.trim().is_empty() {
-            continue;
-        }
-        match std::fs::symlink_metadata(repo.join(".claude/worktrees").join(&cand)) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => { name = Some(cand); break; }
-            Ok(_) => continue,
-            Err(e) => return Err(format!("cannot tell whether .claude/worktrees/{cand} exists: {e}")),
-        }
+    let dir = crate::wtname::dir_name(name);
+    let out = run(repo, &["branch", "--list", &dir])
+        .map_err(|e| format!("cannot tell whether branch {dir} exists: {e}"))?;
+    if !out.trim().is_empty() {
+        return Err(format!("branch {dir} already exists"));
     }
-    let name = name.ok_or_else(|| format!("too many worktrees ({MAX_WORKTREES})"))?;
+    match std::fs::symlink_metadata(repo.join(".claude/worktrees").join(&dir)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err(format!(".claude/worktrees/{dir} already exists")),
+        Err(e) => return Err(format!("cannot tell whether .claude/worktrees/{dir} exists: {e}")),
+    }
     std::fs::create_dir_all(repo.join(".claude/worktrees")).map_err(|e| e.to_string())?;
-    let path = crate::projects::safe_resolve_parent(repo, &format!(".claude/worktrees/{name}"))?;
+    let rel = format!(".claude/worktrees/{dir}");
+    let path = crate::projects::safe_resolve_parent(repo, &rel)?;
     let base = match run(repo, &["symbolic-ref", "--short", "HEAD"]) {
         Ok(b) if !b.trim().is_empty() => b.trim().to_string(),
         _ => run(repo, &["rev-parse", "HEAD"]).map_err(|e| format!("cannot read HEAD: {e}"))?.trim().to_string(),
     };
-    let key = wt_key_of(&name);
+    let key = wt_key_of(&dir);
     write_base(state_dir, &key, &base)?;
-    let rel = format!(".claude/worktrees/{name}");
-    if let Err(e) = run(repo, &["worktree", "add", "-b", &name, &rel, "HEAD"]) {
+    if let Err(e) = run(repo, &["worktree", "add", "-b", &dir, &rel, "HEAD"]) {
         let _ = std::fs::remove_file(base_file(state_dir, &key));
         return Err(format!("git worktree add failed: {e}"));
     }
-    Ok(Created { name, path, base })
+    Ok(Created { name: dir, path, base })
 }
 
 /// `git worktree remove` without `--force`, then `git branch -d` without
@@ -401,69 +422,6 @@ mod tests {
     }
     fn key_of(n: &str) -> String { format!("repo%2F.claude%2Fworktrees%2F{n}") }
 
-    #[test]
-    fn create_mints_the_next_free_name_and_records_the_base() {
-        // Revert-checked: writing `.base` after `worktree add` instead of
-        // before passes this test but fails `base_is_written_before_git_runs`.
-        let root = tempfile::tempdir().unwrap();
-        let repo = repo_with_commit(root.path());
-        let state = root.path().join("state");
-        let c1 = create(&repo, &state, &key_of, &real_git).unwrap();
-        assert_eq!(c1.name, "claude-1");
-        assert_eq!(c1.path, repo.join(".claude/worktrees/claude-1"));
-        assert_eq!(c1.base, "main");
-        assert!(c1.path.join("a.txt").is_file(), "checked out");
-        assert_eq!(read_base(&state, &key_of("claude-1")).as_deref(), Some("main"));
-        assert!(list(&repo).iter().any(|w| w.branch == "claude-1" && !w.is_main));
-        let c2 = create(&repo, &state, &key_of, &real_git).unwrap();
-        assert_eq!(c2.name, "claude-2");
-    }
-
-    // Revert-checked: ignoring the branch-existence check's output (minting
-    // straight off the directory check) still picks "claude-1" as the free
-    // name, and `git worktree add -b claude-1` then collides with the branch
-    // this test pre-created — observed: `create` returns
-    // `Err("git worktree add failed: ... fatal: a branch named 'claude-1' already exists")`,
-    // and `.unwrap()` on it panics.
-    #[test]
-    fn a_branch_without_a_directory_still_takes_its_number() {
-        let root = tempfile::tempdir().unwrap();
-        let repo = repo_with_commit(root.path());
-        real_git(&repo, &["branch", "claude-1"]).unwrap();
-        let c = create(&repo, &root.path().join("state"), &key_of, &real_git).unwrap();
-        assert_eq!(c.name, "claude-2");
-    }
-
-    // Revert-checked: dropping the directory `symlink_metadata` check (minting
-    // straight off the branch check) makes this test mint "claude-1" again —
-    // observed: `assertion 'left == right' failed ... left: "claude-1", right: "claude-2"`.
-    #[test]
-    fn a_directory_without_a_branch_still_takes_its_number() {
-        let root = tempfile::tempdir().unwrap();
-        let repo = repo_with_commit(root.path());
-        std::fs::create_dir_all(repo.join(".claude/worktrees/claude-1")).unwrap();
-        let c = create(&repo, &root.path().join("state"), &key_of, &real_git).unwrap();
-        assert_eq!(c.name, "claude-2");
-    }
-
-    // Revert-checked: replacing the `run(...).map_err(...)?` on the branch
-    // check with `run(...).unwrap_or_default()` (folding "cannot tell" into
-    // "empty, so absent") makes this test mint claude-1 anyway instead of
-    // refusing — observed: panic "called `Result::unwrap_err()` on an `Ok`
-    // value: Created { name: \"claude-1\", path: \"...claude-1\", base: \"main\" }".
-    #[test]
-    fn a_failed_branch_check_refuses_rather_than_skipping() {
-        // "Could not tell whether claude-1 exists" must not become claude-2.
-        let root = tempfile::tempdir().unwrap();
-        let repo = repo_with_commit(root.path());
-        let flaky = |r: &Path, args: &[&str]| -> Result<String, String> {
-            if args.first() == Some(&"branch") { Err("fatal: index locked".into()) } else { real_git(r, args) }
-        };
-        let err = create(&repo, &root.path().join("state"), &key_of, &flaky).unwrap_err();
-        assert!(err.contains("cannot tell") && err.contains("claude-1"), "{err}");
-        assert!(list(&repo).len() == 1, "nothing was created");
-    }
-
     // Revert-checked: swapping the order — calling `worktree add` before
     // `write_base` — makes `seen` false (the base file does not exist yet
     // when git runs) — observed: `assertion failed: seen.get()`, message
@@ -476,27 +434,27 @@ mod tests {
         let seen = std::cell::Cell::new(false);
         let failing = |r: &Path, args: &[&str]| -> Result<String, String> {
             if args.first() == Some(&"worktree") {
-                seen.set(read_base(&state, &key_of("claude-1")).is_some());
+                seen.set(read_base(&state, &key_of("worktree-x")).is_some());
                 Err("fatal: disk full".into())
             } else { real_git(r, args) }
         };
-        let err = create(&repo, &state, &key_of, &failing).unwrap_err();
+        let err = create_named(&repo, &state, "x", &key_of, &failing).unwrap_err();
         assert!(err.contains("disk full"), "{err}");
         assert!(seen.get(), ".base existed when git ran");
-        assert!(read_base(&state, &key_of("claude-1")).is_none(), "…and is gone after git failed");
+        assert!(read_base(&state, &key_of("worktree-x")).is_none(), "…and is gone after git failed");
     }
 
     // Revert-checked: replacing `Some(w) if w.is_main` with `Some(_)` (never
-    // checking is_main) lets the linked worktree mint its own nested
-    // "claude-2" instead of erroring — observed: panic "called
-    // `Result::unwrap_err()` on an `Ok` value: Created { name: \"claude-2\",
-    // path: \"...claude-1/.claude/worktrees/claude-2\", base: \"claude-1\" }".
+    // checking is_main) lets the linked worktree create its own nested
+    // worktree instead of erroring — observed: panic "called
+    // `Result::unwrap_err()` on an `Ok` value: Created { name:
+    // \"worktree-inner\", path: \"...worktree-x/.claude/worktrees/worktree-inner\", base: \"x\" }".
     #[test]
     fn a_linked_worktree_cannot_create_worktrees() {
         let root = tempfile::tempdir().unwrap();
         let repo = repo_with_commit(root.path());
-        let c = create(&repo, &root.path().join("state"), &key_of, &real_git).unwrap();
-        let err = create(&c.path, &root.path().join("state"), &key_of, &real_git).unwrap_err();
+        let c = create_named(&repo, &root.path().join("state"), "x", &key_of, &real_git).unwrap();
+        let err = create_named(&c.path, &root.path().join("state"), "inner", &key_of, &real_git).unwrap_err();
         assert!(err.contains("main checkout"), "{err}");
     }
 
@@ -508,7 +466,7 @@ mod tests {
     #[test]
     fn a_non_repository_is_refused_by_name() {
         let root = tempfile::tempdir().unwrap();
-        let err = create(root.path(), &root.path().join("state"), &key_of, &real_git).unwrap_err();
+        let err = create_named(root.path(), &root.path().join("state"), "x", &key_of, &real_git).unwrap_err();
         assert!(err.contains("not a git repository"), "{err}");
     }
 
@@ -532,7 +490,7 @@ mod tests {
     fn state_reads_dirty_and_ahead_against_the_recorded_base() {
         let root = tempfile::tempdir().unwrap();
         let repo = repo_with_commit(root.path());
-        let c = create(&repo, &root.path().join("state"), &key_of, &real_git).unwrap();
+        let c = create_named(&repo, &root.path().join("state"), "x", &key_of, &real_git).unwrap();
         assert_eq!(state(&c.path, "main", &real_git), State { dirty: Some(false), ahead: Some(0) });
         std::fs::write(c.path.join("new.txt"), "y").unwrap();
         assert_eq!(state(&c.path, "main", &real_git).dirty, Some(true));
@@ -540,7 +498,7 @@ mod tests {
         real_git(&c.path, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "wt"]).unwrap();
         assert_eq!(state(&c.path, "main", &real_git), State { dirty: Some(false), ahead: Some(1) });
         // Merged into the base: ahead drops to 0 even though main moved.
-        real_git(&repo, &["merge", "-q", "--no-edit", "claude-1"]).unwrap();
+        real_git(&repo, &["merge", "-q", "--no-edit", "worktree-x"]).unwrap();
         assert_eq!(state(&c.path, "main", &real_git).ahead, Some(0));
     }
 
@@ -563,10 +521,10 @@ mod tests {
         // std::io::ErrorKind::NotFound)`. Restored.
         let root = tempfile::tempdir().unwrap();
         let repo = repo_with_commit(root.path());
-        let c = create(&repo, &root.path().join("state"), &key_of, &real_git).unwrap();
-        assert_eq!(remove(&repo, &c.path, "claude-1", &real_git).unwrap(), None);
+        let c = create_named(&repo, &root.path().join("state"), "x", &key_of, &real_git).unwrap();
+        assert_eq!(remove(&repo, &c.path, "worktree-x", &real_git).unwrap(), None);
         assert!(matches!(std::fs::symlink_metadata(&c.path), Err(e) if e.kind() == std::io::ErrorKind::NotFound));
-        assert!(real_git(&repo, &["branch", "--list", "claude-1"]).unwrap().trim().is_empty());
+        assert!(real_git(&repo, &["branch", "--list", "worktree-x"]).unwrap().trim().is_empty());
     }
 
     #[test]
@@ -579,13 +537,13 @@ mod tests {
         // `.expect("a note")` on a `None`). Restored.
         let root = tempfile::tempdir().unwrap();
         let repo = repo_with_commit(root.path());
-        let c = create(&repo, &root.path().join("state"), &key_of, &real_git).unwrap();
+        let c = create_named(&repo, &root.path().join("state"), "x", &key_of, &real_git).unwrap();
         std::fs::write(c.path.join("n.txt"), "y").unwrap();
         real_git(&c.path, &["add", "."]).unwrap();
         real_git(&c.path, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "wt"]).unwrap();
-        let note = remove(&repo, &c.path, "claude-1", &real_git).unwrap().expect("a note");
-        assert!(note.contains("claude-1") && note.contains("unmerged"), "{note}");
-        assert!(!real_git(&repo, &["branch", "--list", "claude-1"]).unwrap().trim().is_empty(), "branch kept");
+        let note = remove(&repo, &c.path, "worktree-x", &real_git).unwrap().expect("a note");
+        assert!(note.contains("worktree-x") && note.contains("unmerged"), "{note}");
+        assert!(!real_git(&repo, &["branch", "--list", "worktree-x"]).unwrap().trim().is_empty(), "branch kept");
     }
 
     #[test]
@@ -596,10 +554,131 @@ mod tests {
         // Restored.
         let root = tempfile::tempdir().unwrap();
         let repo = repo_with_commit(root.path());
-        let c = create(&repo, &root.path().join("state"), &key_of, &real_git).unwrap();
+        let c = create_named(&repo, &root.path().join("state"), "x", &key_of, &real_git).unwrap();
         std::fs::write(c.path.join("n.txt"), "y").unwrap();
-        let err = remove(&repo, &c.path, "claude-1", &real_git).unwrap_err();
+        let err = remove(&repo, &c.path, "worktree-x", &real_git).unwrap_err();
         assert!(err.contains("worktree remove"), "{err}");
         assert!(c.path.join("n.txt").is_file(), "nothing touched");
+    }
+
+    fn git_repo() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        for a in [&["init", "-q", "-b", "main"][..], &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "i"][..]] {
+            assert!(std::process::Command::new("git").args(a).current_dir(d.path()).status().unwrap().success());
+        }
+        d
+    }
+
+    #[test]
+    fn create_named_uses_claude_codes_convention_and_records_head() {
+        let repo = git_repo();
+        let st = tempfile::tempdir().unwrap();
+        let c = create_named(repo.path(), st.path(), "bright-fox", &|n| format!("k-{n}"), &real_git).unwrap();
+        assert_eq!(c.name, "worktree-bright-fox");
+        assert!(c.path.ends_with(".claude/worktrees/worktree-bright-fox"));
+        let br = real_git(&c.path, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(br.trim(), "worktree-bright-fox");
+        assert_eq!(read_base(st.path(), "k-worktree-bright-fox").as_deref(), Some("main"));
+    }
+
+    /// The `+` dialog's generator (`hub.rs`'s `do_new_worktree`) used to
+    /// inline this exact logic as a closure; factored out so it is testable
+    /// on its own rather than only indirectly through a generated name
+    /// nobody pins down. Four cases: a branch, a directory, neither, and
+    /// "cannot tell" — the last one taken, not folded into "absent".
+    ///
+    /// Revert-checked: replacing `branch_taken`'s `.unwrap_or(true)` with
+    /// `.unwrap_or(false)` makes the fourth assertion below fail — observed:
+    /// `assertion failed: name_taken(repo.path(), &flaky, "flaky")`, i.e. a
+    /// branch check that errored was treated as "not taken".
+    #[test]
+    fn name_taken_checks_branch_and_directory_and_treats_doubt_as_taken() {
+        let repo = git_repo();
+        assert!(!name_taken(repo.path(), &real_git, "free"), "neither exists");
+        real_git(repo.path(), &["branch", "worktree-has-branch"]).unwrap();
+        assert!(name_taken(repo.path(), &real_git, "has-branch"), "a branch exists");
+        std::fs::create_dir_all(repo.path().join(".claude/worktrees/worktree-has-dir")).unwrap();
+        assert!(name_taken(repo.path(), &real_git, "has-dir"), "a directory exists");
+        let flaky = |_: &Path, _: &[&str]| -> Result<String, String> { Err("fatal: index locked".into()) };
+        assert!(name_taken(repo.path(), &flaky, "flaky"), "cannot tell must count as taken");
+    }
+
+    #[test]
+    fn create_named_refuses_a_taken_name_instead_of_suffixing() {
+        let repo = git_repo();
+        let st = tempfile::tempdir().unwrap();
+        create_named(repo.path(), st.path(), "x", &|n| n.to_string(), &real_git).unwrap();
+        let e = create_named(repo.path(), st.path(), "x", &|n| n.to_string(), &real_git).unwrap_err();
+        // Revert-checked: without the `branch --list` early return, the error is
+        // `.claude/worktrees/worktree-x already exists` (the directory check fails
+        // because it exists after git created it), not `branch worktree-x already exists`.
+        assert!(e.starts_with("branch worktree-x already exists"), "{e}");
+        assert_eq!(list(repo.path()).len(), 2, "no second worktree");
+    }
+
+    /// "Could not tell whether branch worktree-x exists" must refuse, not
+    /// fall through and let `git worktree add -b worktree-x` collide with a
+    /// branch this never checked — the `worktree::create` property R6's own
+    /// deletion dropped a test for (`a_failed_branch_check_refuses_rather_than_skipping`),
+    /// but the check it guards still lives here, in `create_named`.
+    ///
+    /// Revert-checked: replacing the `run(...).map_err(...)?` on the branch
+    /// check with `run(...).unwrap_or_default()` (folding "cannot tell" into
+    /// "empty, so absent") panics on the `.unwrap_err()` instead — observed:
+    /// `panicked ... called \`Result::unwrap_err()\` on an \`Ok\` value:
+    /// Created { name: "worktree-x", path: "...worktree-x", base: "main" }`.
+    /// Restored.
+    #[test]
+    fn create_named_refuses_when_it_cannot_tell_whether_the_branch_exists() {
+        let repo = git_repo();
+        let st = tempfile::tempdir().unwrap();
+        let flaky = |r: &Path, args: &[&str]| -> Result<String, String> {
+            if args.first() == Some(&"branch") { Err("fatal: index locked".into()) } else { real_git(r, args) }
+        };
+        let e = create_named(repo.path(), st.path(), "x", &|n| n.to_string(), &flaky).unwrap_err();
+        assert!(e.contains("cannot tell whether branch"), "{e}");
+        assert_eq!(list(repo.path()).len(), 1, "nothing was created");
+        assert!(read_base(st.path(), "x").is_none(), "no .base written");
+    }
+
+    /// The directory check is the second gate, independent of the branch
+    /// one — and it has to fire even when the directory is *empty*: an
+    /// empty `.claude/worktrees/worktree-x` with no branch of that name is
+    /// exactly the one case `git worktree add` would happily succeed into
+    /// on its own (confirmed directly: `git worktree add -b x
+    /// .claude/worktrees/x HEAD` into a pre-existing empty directory exits
+    /// 0 and populates it), so a non-empty fixture would not discriminate
+    /// this check from git's own backstop the way
+    /// `remove_refuses_a_dirty_worktree_without_force` warns about.
+    ///
+    /// Revert-checked: discarding the `symlink_metadata` result (so only
+    /// the branch check gates this) makes `git worktree add` run into the
+    /// pre-created empty directory and succeed — observed: this test's
+    /// `unwrap_err()` panics on `Ok(Created { name: "worktree-x", path:
+    /// "...worktree-x", base: "main" })`, and the directory that was empty
+    /// is now a populated worktree (`a.txt` in it). Restored.
+    #[test]
+    fn create_named_refuses_an_existing_directory_without_a_branch() {
+        let repo = git_repo();
+        let st = tempfile::tempdir().unwrap();
+        let dir = repo.path().join(".claude/worktrees/worktree-x");
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = create_named(repo.path(), st.path(), "x", &|n| n.to_string(), &real_git).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        assert_eq!(list(repo.path()).len(), 1, "nothing was created");
+        assert!(
+            std::fs::read_dir(&dir).unwrap().next().is_none(),
+            "the empty directory must stay empty, not get populated by git"
+        );
+    }
+
+    #[test]
+    fn create_named_refuses_an_invalid_name_before_running_git() {
+        let ran = std::cell::Cell::new(false);
+        let run = |_: &Path, _: &[&str]| -> Result<String, String> { ran.set(true); Ok(String::new()) };
+        let st = tempfile::tempdir().unwrap();
+        let e = create_named(Path::new("/nonexistent"), st.path(), "--x", &|n| n.to_string(), &run).unwrap_err();
+        assert!(e.contains("must match"), "{e}");
+        assert!(!ran.get(), "git ran for a refused name");
     }
 }
