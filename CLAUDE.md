@@ -60,6 +60,15 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   by the lock-file token `src/ide.rs` implements. Making `ide.rs` "consistent"
   with the bullet above — or dropping its token check because the Origin check
   above looks like it already covers it — reintroduces it.
+
+  The token survives a restart, like the port (`ideport`, `<key>.token`, mode
+  0600, reused only when it has `idelock::new_token`'s shape). A `claude` that
+  outlived a deploy redials the same port with the token it already holds;
+  minting a fresh one per start refused every such redial ("token mismatch")
+  and left every running Claude unreachable by Alt+K. Persisting it widens
+  nothing: the same user can already read it from `~/.claude/ide/<port>.lock`,
+  and the browser half of the CVE is closed by the Origin refusal, not by the
+  token being fresh.
 - **Every filesystem path is confined** before use: `projects::safe_resolve`
   for existing targets, `projects::safe_resolve_parent` for creation and rename
   destinations (it canonicalises the parent and validates the final component,

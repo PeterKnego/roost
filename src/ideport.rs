@@ -118,9 +118,95 @@ pub fn record_in(dir: &Path, project: &str, port: u16) {
     }
 }
 
+/// The listener's auth token, kept beside its port for the same reason the
+/// port is kept: a `claude` that was running when roost restarted redials the
+/// recorded port with the token it read *before* the restart, and Claude Code
+/// does redial (observed 2026-10-12, four tries over 15 s). A token minted
+/// fresh on every start turned each of those into "token mismatch", leaving
+/// every surviving Claude unreachable by Alt+K until it was restarted by hand.
+///
+/// This does not widen who can connect. The same token is already in
+/// `~/.claude/ide/<port>.lock` for the life of the listener, readable by the
+/// same user; the record is mode 0600 in roost's own state dir. The browser
+/// half of CVE-2025-52882 is closed by `ide.rs` refusing any handshake that
+/// carries an `Origin`, and that is unchanged.
+fn token_path(dir: &Path, project: &str) -> PathBuf {
+    dir.join(format!("{}.token", crate::projects::storage_key(project)))
+}
+
+/// The shape `idelock::new_token` produces: 32 lowercase hex characters. A
+/// record of any other shape is not reused — reusing a short or empty value
+/// would be a weaker secret than the one it replaced.
+pub fn valid_token(t: &str) -> bool {
+    t.len() == 32 && t.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The recorded token, or `None` for anything unusable — no file, unreadable,
+/// or the wrong shape. Like the port, it is a hint: the caller mints a fresh
+/// one instead, which costs only the reconnect this record exists to save.
+pub fn recorded_token_in(dir: &Path, project: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(token_path(dir, project)).ok()?;
+    let t = raw.trim();
+    valid_token(t).then(|| t.to_string())
+}
+
+/// Records `token`, atomically and privately: the temp file is created 0600
+/// (`create_new`, so never through something already at that name) before a
+/// byte of the secret is written, then renamed into place. Best-effort, like
+/// `record_in` — failing only means the next start mints a new token.
+pub fn record_token_in(dir: &Path, project: &str, token: &str) {
+    if !valid_token(token) || std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let tmp = dir.join(format!(".{}.token.tmp.{}", crate::projects::storage_key(project), std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let written = opts.open(&tmp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(format!("{token}\n").as_bytes())
+    });
+    if written.is_err() || std::fs::rename(&tmp, token_path(dir, project)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Revert-checked: without `opts.mode(0o600)` the file is created 0664 and
+    /// this fails — "a secret must not be group- or world-readable", left: 436,
+    /// right: 384.
+    #[test]
+    fn a_recorded_token_reads_back_and_is_private() {
+        let d = tempfile::tempdir().unwrap();
+        let t = "0123456789abcdef0123456789abcdef";
+        record_token_in(d.path(), "karpie", t);
+        assert_eq!(recorded_token_in(d.path(), "karpie").as_deref(), Some(t));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(token_path(d.path(), "karpie")).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a secret must not be group- or world-readable");
+        }
+    }
+
+    #[test]
+    fn a_token_of_the_wrong_shape_is_neither_recorded_nor_returned() {
+        let d = tempfile::tempdir().unwrap();
+        record_token_in(d.path(), "karpie", "short");
+        assert!(!token_path(d.path(), "karpie").exists(), "an invalid token must not be written");
+        for bad in ["", "short", "0123456789ABCDEF0123456789ABCDEF", "0123456789abcdef0123456789abcdeg"] {
+            std::fs::write(token_path(d.path(), "karpie"), bad).unwrap();
+            assert_eq!(recorded_token_in(d.path(), "karpie"), None, "{bad:?} must not be reused");
+        }
+    }
 
     #[test]
     fn a_recorded_port_reads_back() {
