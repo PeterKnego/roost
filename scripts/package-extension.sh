@@ -13,6 +13,14 @@
 # The zip is deterministic — sorted entries, one fixed timestamp — so the same
 # commit and version always give the same bytes, as the other release
 # artifacts do.
+#
+# Two zips from the one tree. roost-extension-<version>.zip keeps everything
+# under a roost-extension/ folder, because unzipping it should give a folder to
+# point "Load unpacked" at. The Chrome Web Store refuses exactly that layout
+# ("manifest file is missing"): it wants manifest.json at the root. So
+# roost-extension-<version>-webstore.zip is the same files at the root, minus
+# the README, which a store package has no reader for. extension/store/ — the
+# listing's text and pictures — goes in neither.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/lib.sh
@@ -48,16 +56,34 @@ missing = sorted(n for n in named if not (src / n).is_file())
 if missing:
     sys.exit(f"  ✗ the manifest names files extension/ does not have: {', '.join(missing)}")
 
-files = sorted(p for p in src.rglob("*") if p.is_file() and p.name != "manifest.json")
+files = sorted(
+    p for p in src.rglob("*")
+    if p.is_file() and p.name != "manifest.json" and p.relative_to(src).parts[0] != "store"
+)
+stamped = json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
+
+def pack(dest, prefix, skip=()):
+    n = 0
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+        def put(name, data):
+            info = zipfile.ZipInfo(f"{prefix}{name}", date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            z.writestr(info, data)
+        put("manifest.json", stamped)
+        n += 1
+        for p in files:
+            rel = p.relative_to(src).as_posix()
+            if rel in skip:
+                continue
+            put(rel, p.read_bytes())
+            n += 1
+    return n
+
 dest = out / f"roost-extension-{version}.zip"
-with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
-    def put(name, data):
-        info = zipfile.ZipInfo(f"roost-extension/{name}", date_time=(1980, 1, 1, 0, 0, 0))
-        info.compress_type = zipfile.ZIP_DEFLATED
-        info.external_attr = 0o644 << 16
-        z.writestr(info, data)
-    put("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
-    for p in files:
-        put(p.relative_to(src).as_posix(), p.read_bytes())
-print(f"  ✓ {dest} ({len(files) + 1} files, manifest version {manifest['version']}, shown as {version})")
+n = pack(dest, "roost-extension/")
+print(f"  ✓ {dest} ({n} files, manifest version {manifest['version']}, shown as {version})")
+store = out / f"roost-extension-{version}-webstore.zip"
+n = pack(store, "", skip={"README.md"})
+print(f"  ✓ {store} ({n} files at the root, for the Chrome Web Store)")
 EOF

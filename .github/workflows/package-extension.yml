@@ -1,5 +1,6 @@
-# Packs the browser bridge extension as a release asset,
-# roost-extension-<version>.zip. It needs no binary, so unlike the Linux
+# Packs the browser bridge extension as release assets,
+# roost-extension-<version>.zip and its Chrome Web Store layout,
+# roost-extension-<version>-webstore.zip. It needs no binary, so unlike the Linux
 # packages it waits on nothing but the plan, and it runs on a pull request
 # too: a manifest that names a missing file fails the PR rather than the tag.
 name: Package browser extension
