@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "roost"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "crc32fast",
