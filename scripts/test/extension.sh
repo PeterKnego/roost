@@ -7,6 +7,8 @@
 #       the tree's development version.
 #   (b) the missing-file check removed -> "a missing icon is refused" fails:
 #       the zip is written with a manifest Chrome will refuse to load.
+#   (c) the `store` exclusion removed from package-extension.sh -> "the store
+#       listing stays out" fails: the listing's screenshots ship in every zip.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 . scripts/lib.sh
@@ -40,8 +42,24 @@ done
   || die "icon-128.png is not a PNG"
 ok "every file the extension needs is in the zip"
 
+[ "$(grep -c '^roost-extension/store/' <<<"$LISTING" || true)" = 0 ] || die "the store listing's files leaked into the extension zip"
+ok "the store listing stays out of the extension zip"
+
+# The store's copy: the same files with manifest.json at the root, which is
+# the only layout the Chrome Web Store accepts.
+STORE="$TMP/a/roost-extension-9.8.7-rc.1-webstore.zip"
+[ -f "$STORE" ] || die "no web store zip at $STORE"
+SLIST=$(unzip -Z1 "$STORE")
+grep -qx manifest.json <<<"$SLIST" || die "the web store zip has no manifest.json at its root"
+[ "$(unzip -p "$STORE" manifest.json | jq -r .version)" = 9.8.7 ] || die "the web store zip's manifest is not stamped"
+[ "$(grep -c / <<<"$SLIST" | tr -d ' ')" = "$(grep -c '^icons/' <<<"$SLIST" | tr -d ' ')" ] || die "the web store zip has a folder other than icons/: $SLIST"
+[ "$(sed 's|^roost-extension/||' <<<"$LISTING" | grep -vx README.md | sort)" = "$(sort <<<"$SLIST")" ] \
+  || die "the web store zip holds different files from the extension zip"
+ok "the web store zip is the same files, at the root"
+
 scripts/package-extension.sh 9.8.7-rc.1 "$TMP/b" >/dev/null
 cmp -s "$ZIP" "$TMP/b/roost-extension-9.8.7-rc.1.zip" || die "two packs of the same tree differ"
+cmp -s "$STORE" "$TMP/b/roost-extension-9.8.7-rc.1-webstore.zip" || die "two web store packs of the same tree differ"
 ok "packing is deterministic"
 
 if OUT=$(scripts/package-extension.sh 9.8 "$TMP/c" 2>&1); then die "a two-part version was accepted"; fi

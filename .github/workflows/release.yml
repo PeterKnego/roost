@@ -245,7 +245,9 @@ jobs:
       plan: ${{ needs.plan.outputs.val }}
     secrets: inherit
   # Hand-added (allow-dirty in dist-workspace.toml): the browser bridge
-  # extension as roost-extension-<version>.zip. Needs only the plan, so it
+  # extension as roost-extension-<version>.zip, and the same files laid out
+  # for the Chrome Web Store as roost-extension-<version>-webstore.zip
+  # (scripts/package-extension.sh says why). Needs only the plan, so it
   # also runs on a pull request, where it checks the extension still packs.
   custom-package-extension:
     needs:
