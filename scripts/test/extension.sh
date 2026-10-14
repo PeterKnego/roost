@@ -53,7 +53,9 @@ SLIST=$(unzip -Z1 "$STORE")
 grep -qx manifest.json <<<"$SLIST" || die "the web store zip has no manifest.json at its root"
 [ "$(unzip -p "$STORE" manifest.json | jq -r .version)" = 9.8.7 ] || die "the web store zip's manifest is not stamped"
 [ "$(grep -c / <<<"$SLIST" | tr -d ' ')" = "$(grep -c '^icons/' <<<"$SLIST" | tr -d ' ')" ] || die "the web store zip has a folder other than icons/: $SLIST"
-[ "$(sed 's|^roost-extension/||' <<<"$LISTING" | grep -vx README.md | sort)" = "$(sort <<<"$SLIST")" ] \
+# Every entry in the plain zip starts with that prefix (checked above), so
+# stripping it everywhere strips exactly the leading folder.
+[ "$(grep -vx README.md <<<"${LISTING//roost-extension\//}" | sort)" = "$(sort <<<"$SLIST")" ] \
   || die "the web store zip holds different files from the extension zip"
 ok "the web store zip is the same files, at the root"
 
