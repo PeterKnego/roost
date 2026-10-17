@@ -111,6 +111,16 @@ pub fn set_state_dir_for_test() {
     std::env::set_var("ROOST_STATE_DIR", d);
 }
 
+/// A temp-file suffix unique per *call*, not just per process: `pid.n`.
+/// Since #158 two threads of one roost (the claudes tick and an HTTP
+/// reconcile) can write the same sidecar at once, and a pid-only temp name
+/// would let one thread's `rename` publish the other's half-written file —
+/// the exact window the temp-then-rename discipline exists to close.
+pub fn tmp_suffix() -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!("{}.{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
 pub fn state_dir() -> PathBuf {
     if let Ok(d) = std::env::var("ROOST_STATE_DIR") {
         if !d.is_empty() {

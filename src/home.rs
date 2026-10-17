@@ -48,7 +48,7 @@ pub fn record_in(state: &Path, home: &str, name: &str, owner: &str) -> Result<()
     }
     let dir = dir_in(state, home);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
+    let tmp = dir.join(format!(".{name}.tmp.{}", crate::wsstate::tmp_suffix()));
     std::fs::write(&tmp, format!("{owner}\n")).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, dir.join(name)).map_err(|e| { let _ = std::fs::remove_file(&tmp); e.to_string() })
 }
@@ -56,7 +56,77 @@ pub fn record_in(state: &Path, home: &str, name: &str, owner: &str) -> Result<()
 pub fn forget_in(state: &Path, home: &str, name: &str) {
     if crate::session::valid_name(name) {
         let _ = std::fs::remove_file(dir_in(state, home).join(name));
+        let _ = std::fs::remove_file(identity_path(state, home, name));
     }
+}
+
+/// `.<name>.ino` beside the record: the owner directory's `(device, inode)`
+/// when the re-home was made (#158 §5). A worktree whose only terminals were
+/// re-homed into it has no session of its own, so `registry::move_evidence`
+/// has no shell to look through when it is renamed; this is what lets the
+/// R18 sweep recognise the same directory under its new name, from the
+/// resident's own Claude's cwd. A dot-file, so `all_in` and every other
+/// enumeration of this directory skip it.
+fn identity_path(state: &Path, home: &str, name: &str) -> PathBuf {
+    dir_in(state, home).join(format!(".{name}.ino"))
+}
+
+#[cfg(unix)]
+pub fn record_identity_in(state: &Path, home: &str, name: &str, owner_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    if !crate::session::valid_name(name) {
+        return Err(format!("bad session name {name:?}"));
+    }
+    let m = std::fs::metadata(owner_dir).map_err(|e| e.to_string())?;
+    let dir = dir_in(state, home);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let tmp = dir.join(format!(".{name}.ino.tmp.{}", crate::wsstate::tmp_suffix()));
+    let out = (|| {
+        std::fs::write(&tmp, format!("{} {}\n", m.dev(), m.ino())).map_err(|e| e.to_string())?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, identity_path(state, home, name)).map_err(|e| e.to_string())
+    })();
+    if out.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    out
+}
+
+#[cfg(not(unix))]
+pub fn record_identity_in(_state: &Path, _home: &str, _name: &str, _owner_dir: &Path) -> Result<(), String> { Ok(()) }
+
+/// The recorded owner identity. Three outcomes: `Ok(None)` — none recorded
+/// (a re-home older than this file), which is no evidence; `Ok(Some)`; and
+/// `Err` — unreadable or damaged, which is "cannot tell" and must suspend
+/// whatever would have acted on its absence.
+pub fn identity_of_in(state: &Path, home: &str, name: &str) -> Result<Option<(u64, u64)>, String> {
+    if !crate::session::valid_name(name) {
+        return Err(format!("bad session name {name:?}"));
+    }
+    match std::fs::read_to_string(identity_path(state, home, name)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+        Ok(s) => {
+            let mut it = s.split_whitespace();
+            match (it.next().and_then(|d| d.parse().ok()), it.next().and_then(|i| i.parse().ok()), it.next()) {
+                (Some(d), Some(i), None) => Ok(Some((d, i))),
+                _ => Err(format!("damaged identity record {s:?}")),
+            }
+        }
+    }
+}
+
+pub fn forget_identity(home: &str, name: &str) {
+    if crate::session::valid_name(name) {
+        let _ = std::fs::remove_file(identity_path(&crate::wsstate::state_dir(), home, name));
+    }
+}
+pub fn record_identity(home: &str, name: &str, owner_dir: &Path) -> Result<(), String> {
+    record_identity_in(&crate::wsstate::state_dir(), home, name, owner_dir)
+}
+pub fn identity_of(home: &str, name: &str) -> Result<Option<(u64, u64)>, String> {
+    identity_of_in(&crate::wsstate::state_dir(), home, name)
 }
 
 /// Every record, as (home, name, owner). Dot-files (temps) skipped.
@@ -118,7 +188,8 @@ pub fn away_from(home: &str) -> Vec<(String, Owner)> { away_from_in(&crate::wsst
 pub fn sweep(sock_state: &dyn Fn(&str, &str) -> Option<bool>) { sweep_in(&crate::wsstate::state_dir(), sock_state) }
 
 /// Whether `owner` is still a place `home`'s re-homed session can be shown:
-/// one of `home`'s own `.claude/worktrees/<dir>`, still a directory.
+/// one of `home`'s own `.claude/worktrees/<dir>`, still a directory — or the
+/// one owner `home`'s `.moved-to` names (see [`resolves_with`]).
 ///
 /// Fork-free on purpose. `projects::resolve_project` on the owner URL would
 /// run `git worktree list` (its dot segment needs git to vouch for it), and
@@ -129,7 +200,21 @@ pub fn sweep(sock_state: &dyn Fn(&str, &str) -> Option<bool>) { sweep_in(&crate:
 /// A `false` here destroys nothing: the session is shown in its home, and
 /// the record is kept (see the module doc and `session::owned_live_names`).
 pub fn resolves_in(roots: &[PathBuf], home: &str, owner: &str) -> bool {
-    owner_dir_in(roots, home, owner).is_some()
+    resolves_with(&crate::wsstate::state_dir(), roots, home, owner)
+}
+
+/// [`resolves_in`] with the state dir injected. The one widening (#158 §5):
+/// an owner equal to `home`'s `.moved-to`, while that owner still resolves.
+/// Nothing else widens — a record naming any other owner outside the home's
+/// `.claude/worktrees/` still does not resolve.
+///
+/// Still fork-free: `resolve_recorded_project`, not `resolve_project`, since
+/// the owner of a renamed worktree has a dot segment and `resolve_project`
+/// would ask git about it under the hub registry lock. The `.moved-to` is
+/// the evidence git vouched; it was written only once `resolve_project`
+/// had, and is rewritten or removed by every `reconcile`.
+pub fn resolves_with(state: &Path, roots: &[PathBuf], home: &str, owner: &str) -> bool {
+    owner_dir_with(state, roots, home, owner).is_some()
 }
 
 pub fn resolves(home: &str, owner: &str) -> bool {
@@ -192,6 +277,24 @@ pub fn owner_path(home: &str, owner: &str) -> Option<PathBuf> {
 /// so it leans toward keeping the session at the owner here exactly as
 /// `resolves_in` leans toward keeping it shown there).
 pub fn owner_dir_in(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
+    owner_dir_with(&crate::wsstate::state_dir(), roots, home, owner)
+}
+
+/// [`owner_dir_in`] with the state dir injected, and the one place the
+/// `.moved-to` widening (#158 §5) lives — so every caller, `resolves` and
+/// `ide.rs`'s delivery alike, sees a followed session's owner the same way.
+/// The `.claude/worktrees` shape is tried first; failing that, an owner
+/// equal to `home`'s `.moved-to` is its directory when that still resolves,
+/// through the fork-free `resolve_recorded_project` (see [`resolves_with`]).
+pub fn owner_dir_with(state: &Path, roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
+    shaped_owner_dir(roots, home, owner).or_else(|| {
+        (moved_to_in(state, home).as_deref() == Some(owner))
+            .then(|| crate::projects::resolve_recorded_project(roots, owner))
+            .flatten()
+    })
+}
+
+fn shaped_owner_dir(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
     let wt_dir = owner_path_in(roots, home, owner)?;
     match std::fs::symlink_metadata(&wt_dir) {
         Ok(m) if m.is_dir() => Some(wt_dir),
@@ -233,6 +336,167 @@ pub fn effective_owner_with(
         Owner::Elsewhere(o) if resolves(home, &o) => o,
         _ => home.to_string(),
     }
+}
+
+/// `sock/<home key>/.moved-to`: where the sweep found `home`'s directory
+/// now lives (#158 §5), as the project URL it resolves as. Written only by
+/// `registry::reconcile`, only on #178's inode evidence, and only when that
+/// URL resolves under the roots.
+fn moved_to_path(state: &Path, home: &str) -> PathBuf {
+    state.join("sock").join(crate::projects::storage_key(home)).join(".moved-to")
+}
+
+/// The URL `home` was renamed to, or `None`. Not three-valued at this
+/// boundary: absent, unreadable, empty and malformed all read `None`, which
+/// means "do not follow, do not widen". That is the destroy-nothing
+/// direction for the widenings (the sessions stay where #178 left them), but
+/// not everywhere — so the R18 sweep does not read this file at all: it
+/// asks `registry::record_move` for live evidence instead, and treats a
+/// "cannot tell" there as a reason to keep the record, not to forget it.
+pub fn moved_to_in(state: &Path, home: &str) -> Option<String> {
+    let s = std::fs::read_to_string(moved_to_path(state, home)).ok()?;
+    let s = s.strip_suffix('\n').unwrap_or(&s);
+    // One line naming a URL: anything else is a damaged or foreign file.
+    if s.is_empty() || s.bytes().any(|b| b.is_ascii_control()) || s.starts_with('/') {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+pub fn moved_to(home: &str) -> Option<String> { moved_to_in(&crate::wsstate::state_dir(), home) }
+
+/// A no-clobber copy: `dst` is written only when it is positively absent,
+/// through a pid-unique temp file and a `hard_link` (which, unlike `rename`,
+/// refuses an existing target — so a file the new key gained meanwhile is
+/// never overwritten). `Ok(false)` when there was nothing to do; any "cannot
+/// tell" about `dst` is nothing to do.
+fn copy_if_absent(src: &Path, dst: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(dst) {
+        Ok(_) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Ok(false),
+    }
+    let bytes = match std::fs::read(src) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("cannot read {}: {e}", src.display())),
+    };
+    let dir = dst.parent().ok_or("no parent")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let leaf = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = dir.join(format!(".{leaf}.copy.tmp.{}", crate::wsstate::tmp_suffix()));
+    let out = (|| {
+        std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        match std::fs::hard_link(&tmp, dst) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e.to_string()),
+        }
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    out
+}
+
+/// Spec §5 steps a–d: `old_url`'s directory is now `new_url`'s, so its live
+/// sessions become residents of the new project, records naming the old
+/// URL as owner name the new one, and the new key inherits the old key's
+/// `.base` and layout when it has none. `new_live` is `session::live_names
+/// (new_url)` — the R16 gate. Idempotent; returns whether anything changed.
+///
+/// `prev` is the target an earlier follow re-pointed things at, when that
+/// target has since been renamed on (A→B→C, `prev` = B): what that follow
+/// wrote is this follow's to move on, in both (a) and (b).
+///
+/// Records and copies only: no hub, no lock, no git. Its caller
+/// (`registry::follow_moves`) refreshes hubs afterwards, one at a time.
+pub fn follow_move_in(
+    state: &Path,
+    old_url: &str,
+    new_url: &str,
+    live: &[String],
+    new_live: &[String],
+    prev: Option<&str>,
+) -> bool {
+    let mut changed = false;
+    let prev = prev.filter(|p| *p != new_url);
+    let followed_before = |o: &str| prev == Some(o);
+    // (a) A session that is `Here` follows, and so does one an earlier
+    // follow sent to `prev`. Any other `Elsewhere` was re-homed by its own
+    // Claude's move and stays where that put it; `Unknown` is "cannot
+    // tell", and cannot-tell writes nothing.
+    for n in live {
+        match owner_of_in(state, old_url, n) {
+            Owner::Here => {}
+            Owner::Elsewhere(ref o) if followed_before(o) => {}
+            _ => continue,
+        }
+        // R16: a resident never shadows a native session of the same name.
+        if new_live.contains(n) {
+            eprintln!("roost: {old_url}/{n} did not follow the rename to {new_url}: {n} already exists there");
+            continue;
+        }
+        match record_in(state, old_url, n, new_url) {
+            Ok(()) => changed = true,
+            Err(e) => eprintln!("roost: {old_url}/{n} did not follow the rename to {new_url}: {e}"),
+        }
+    }
+    // (b) Residents of the old URL (a main checkout's terminals re-homed
+    // into the moved worktree). Re-read right before each write, like the
+    // R18 sweep's compare-before-forget: a record re-pointed since the scan
+    // names somewhere else and is not this move's to rewrite.
+    let ours = |o: &Owner| matches!(o, Owner::Elsewhere(o) if o == old_url || followed_before(o));
+    for (home, name, owner) in all_in(state) {
+        if !ours(&owner) {
+            continue;
+        }
+        // The old key's own sessions are (a)'s, with its R16 gate.
+        if home == old_url {
+            continue;
+        }
+        // Only to an owner a record of this home may name at all: anything
+        // else could never resolve, so it is left for R18 to forget rather
+        // than rewritten into a record that points nowhere.
+        if !owner_shaped(&home, new_url) {
+            eprintln!("roost: {home}/{name}'s owner {old_url} was renamed to {new_url}, outside {home}/.claude/worktrees; not following");
+            continue;
+        }
+        if !ours(&owner_of_in(state, &home, &name)) {
+            continue;
+        }
+        // `.<name>.ino` is left as it is: a rename keeps the inode, and
+        // `git worktree move` cannot cross devices.
+        match record_in(state, &home, &name, new_url) {
+            Ok(()) => changed = true,
+            Err(e) => eprintln!("roost: {home}/{name}'s owner {old_url} was renamed to {new_url}, but its record was not rewritten: {e}"),
+        }
+    }
+    // (c) and (d): only when the new key has none. A rename keeps every
+    // path relative to the project root, so the old layout's file tabs and
+    // the old base both still mean the same thing.
+    let (ok, nk) = (crate::projects::storage_key(old_url), crate::projects::storage_key(new_url));
+    for (src, dst) in [
+        (crate::worktree::base_file(state, &ok), crate::worktree::base_file(state, &nk)),
+        (state.join(format!("{ok}.json")), state.join(format!("{nk}.json"))),
+    ] {
+        match copy_if_absent(&src, &dst) {
+            Ok(c) => changed |= c,
+            Err(e) => eprintln!("roost: not copied after the rename to {new_url}: {e}"),
+        }
+    }
+    changed
+}
+
+/// [`follow_move_in`] against the real state dir, with the R16 gate read
+/// from the new project's own live sessions. Never call under a lock:
+/// `session::live_names` takes `SESSIONS`.
+pub fn follow_move(old_url: &str, new_url: &str, live: &[String], prev: Option<&str>) -> bool {
+    let new_live = crate::session::live_names(new_url);
+    follow_move_in(&crate::wsstate::state_dir(), old_url, new_url, live, &new_live, prev)
 }
 
 #[cfg(test)]
@@ -299,6 +563,39 @@ mod tests {
         assert_eq!(dir, wts.join("worktree-x"));
 
         assert!(owner_dir_in(&roots, "proj", "proj/.claude/worktrees/worktree-gone").is_none());
+    }
+
+    /// What `ide.rs`'s `delivery_target` and `hub::rehome_to` ask: a
+    /// followed session's owner directory is the new project's, so a
+    /// proposal from its Claude reaches the new project's hub rather than
+    /// falling back to the old key's, which never exists. The home here is
+    /// dotted — a renamed worktree — which the shape rule refuses outright.
+    ///
+    /// Revert-checked, run and restored: with `owner_dir_with`'s `.moved-to`
+    /// arm removed, fails "a followed session's owner is the new project's
+    /// directory" — left `None`, which `delivery_target` answers with the
+    /// old key.
+    #[test]
+    fn a_followed_sessions_owner_dir_is_the_new_projects_directory() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        let root = tempfile::tempdir().unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let old = "repo/.claude/worktrees/worktree-a";
+        let new = "repo/.claude/worktrees/worktree-b";
+        std::fs::create_dir_all(root.path().join(new)).unwrap();
+        std::fs::create_dir_all(root.path().join("unrelated")).unwrap();
+        assert_eq!(owner_dir_with(s, &roots, old, new), None, "setup: no .moved-to, no owner directory");
+
+        let p = moved_to_path(s, old);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, format!("{new}\n")).unwrap();
+        assert_eq!(
+            owner_dir_with(s, &roots, old, new),
+            Some(root.path().join(new).canonicalize().unwrap()),
+            "a followed session's owner is the new project's directory"
+        );
+        assert_eq!(owner_dir_with(s, &roots, old, "unrelated"), None, "and only that owner's");
     }
 
     /// Display-only, so "cannot tell" keeps the session where its record
@@ -469,5 +766,163 @@ mod tests {
         let d = st.path().join("home").join(crate::projects::storage_key("foo"));
         std::fs::write(d.join("term3"), "").unwrap();
         assert_eq!(effective_owner_with(st.path(), &yes, "foo", "term3"), "foo");
+    }
+
+    /// Spec §5 (a)–(d) in one pass, with every branch that must write
+    /// nothing given a fixture that would expose it: a native session of the
+    /// same name at the new key (R16), a session already re-homed elsewhere,
+    /// an `Unknown` record, a resident of some other owner, and a layout the
+    /// new key already has.
+    ///
+    /// Revert-checked, each run and restored: (a)'s `Here` filter removed
+    /// (every live name recorded) fails "a session already re-homed
+    /// elsewhere stays there" — left `Elsewhere(".../worktree-b")`; (b)'s
+    /// owner filter made to skip everything fails "(b) a resident of the old
+    /// URL follows" — left `Elsewhere(".../worktree-a")`. `copy_if_absent`'s
+    /// present-`dst` early return removed alone still passes (`hard_link`
+    /// refuses the existing target too, so no-clobber is held twice); with
+    /// that removed *and* `hard_link` swapped for `rename`, fails "the new
+    /// key's own layout is never overwritten" — left `"{\"old\":1}"`; the
+    /// `owner_shaped` gate in (b) removed fails "(b) only to an owner the
+    /// record's home may name" — left `Elsewhere(".../worktree-b")`.
+    #[test]
+    fn follow_move_rewrites_owner_records_and_copies_state_only_when_absent() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        let old = "repo/.claude/worktrees/worktree-a";
+        let new = "repo/.claude/worktrees/worktree-b";
+        let other = "repo/.claude/worktrees/other";
+        record_in(s, old, "away", other).unwrap();
+        let d = s.join("home").join(crate::projects::storage_key(old));
+        std::fs::write(d.join("unsure"), "").unwrap();
+        record_in(s, "repo", "term3", old).unwrap();
+        record_in(s, "repo", "term4", other).unwrap();
+        // A record no home may name `new` for: left for R18, never rewritten.
+        record_in(s, "zed", "term5", old).unwrap();
+        let (ok, nk) = (crate::projects::storage_key(old), crate::projects::storage_key(new));
+        crate::worktree::write_base(s, &ok, "main").unwrap();
+        std::fs::write(s.join(format!("{ok}.json")), r#"{"old":1}"#).unwrap();
+        std::fs::write(s.join(format!("{nk}.json")), r#"{"new":1}"#).unwrap();
+
+        let live: Vec<String> = ["shell", "busy", "away", "unsure"].map(String::from).to_vec();
+        assert!(follow_move_in(s, old, new, &live, &["busy".to_string()], None));
+
+        assert_eq!(owner_of_in(s, old, "shell"), Owner::Elsewhere(new.into()), "(a) a live session follows");
+        assert_eq!(owner_of_in(s, old, "busy"), Owner::Here, "R16: the new key's native busy is not shadowed");
+        assert_eq!(owner_of_in(s, old, "away"), Owner::Elsewhere(other.into()), "a session already re-homed elsewhere stays there");
+        assert!(matches!(owner_of_in(s, old, "unsure"), Owner::Unknown(_)), "cannot tell writes nothing");
+        assert_eq!(owner_of_in(s, "repo", "term3"), Owner::Elsewhere(new.into()), "(b) a resident of the old URL follows");
+        assert_eq!(owner_of_in(s, "repo", "term4"), Owner::Elsewhere(other.into()), "(b) another owner's resident is untouched");
+        assert_eq!(owner_of_in(s, "zed", "term5"), Owner::Elsewhere(old.into()), "(b) only to an owner the record's home may name");
+        assert_eq!(crate::worktree::read_base(s, &nk).as_deref(), Some("main"), "(c) the base is copied to a key that had none");
+        assert_eq!(std::fs::read_to_string(s.join(format!("{nk}.json"))).unwrap(), r#"{"new":1}"#, "the new key's own layout is never overwritten");
+
+        assert!(!follow_move_in(s, old, new, &live, &["busy".to_string()], None), "a second pass changes nothing");
+
+        std::fs::remove_file(s.join(format!("{nk}.json"))).unwrap();
+        assert!(follow_move_in(s, old, new, &live, &[], None));
+        assert_eq!(std::fs::read_to_string(s.join(format!("{nk}.json"))).unwrap(), r#"{"old":1}"#, "(d) the layout is copied to a key that had none");
+        assert_eq!(owner_of_in(s, old, "busy"), Owner::Elsewhere(new.into()), "once the name is free there, it follows too");
+        assert!(std::fs::read_dir(s).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(".tmp.")), "no temp file left behind");
+    }
+
+    /// `None` for everything but one line naming a URL. Pins the parse,
+    /// which the widenings and the gone-owner sweep all trust: a damaged
+    /// file must never name an owner.
+    ///
+    /// Revert-checked: without the control-byte refusal, fails on
+    /// `"proj2\nproj3\n"` — left `Some("proj2\nproj3")`. Restored.
+    #[test]
+    fn moved_to_reads_only_one_line_naming_a_url() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        let p = moved_to_path(s, "proj");
+        assert_eq!(moved_to_in(s, "proj"), None, "absent");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        for (body, want) in [
+            ("proj2\n", Some("proj2")),
+            ("proj2", Some("proj2")),
+            ("", None),
+            ("\n", None),
+            ("proj2\nproj3\n", None),
+            ("/abs/path\n", None),
+        ] {
+            std::fs::write(&p, body).unwrap();
+            assert_eq!(moved_to_in(s, "proj").as_deref(), want, "{body:?}");
+        }
+    }
+
+    /// The owner identity beside a record: three outcomes on read, never
+    /// listed as a record itself, and gone with the record it belongs to —
+    /// a stale one would let a later owner's rename be "recognised" by a
+    /// directory the terminal never lived in.
+    ///
+    /// Revert-checked, run and restored: without `forget_in`'s identity
+    /// removal, fails "forgetting the record forgets its identity" — left
+    /// `Ok(Some(..))`.
+    #[test]
+    fn an_identity_lives_and_dies_with_its_record() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(identity_of_in(s, "foo", "term3"), Ok(None), "none recorded is no evidence");
+        record_in(s, "foo", "term3", "foo/.claude/worktrees/w").unwrap();
+        record_identity_in(s, "foo", "term3", dir.path()).unwrap();
+        assert!(matches!(identity_of_in(s, "foo", "term3"), Ok(Some(_))));
+        assert_eq!(all_in(s).len(), 1, "the identity file is not a record");
+        std::fs::write(identity_path(s, "foo", "term3"), "garbage").unwrap();
+        assert!(identity_of_in(s, "foo", "term3").is_err(), "damaged is cannot-tell, not none");
+        record_identity_in(s, "foo", "term3", dir.path()).unwrap();
+        forget_in(s, "foo", "term3");
+        assert_eq!(identity_of_in(s, "foo", "term3"), Ok(None), "forgetting the record forgets its identity");
+    }
+
+    /// #158 §5's widening is gated: an owner outside `.claude/worktrees`
+    /// resolves only when `sock/<home key>/.moved-to` names exactly that
+    /// owner, and that owner is still a directory under the roots.
+    ///
+    /// Revert-checked, run and restored (re-run once the arm moved into
+    /// `owner_dir_with`): accepting any owner once a `.moved-to` exists
+    /// (`is_some()` for the equality) fails "a .moved-to
+    /// vouches for its one owner, not any"; dropping the resolve check fails
+    /// "a named owner that no longer resolves does not"; `resolve_project`
+    /// in place of `resolve_recorded_project` fails "the record is git's
+    /// vouching".
+    #[test]
+    fn a_record_naming_an_unrelated_owner_still_does_not_resolve() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        for d in ["proj", "renamed", "unrelated"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::create_dir_all(outer.path().join("escape")).unwrap();
+        let roots = vec![root.clone()];
+
+        assert!(!resolves_with(s, &roots, "proj", "renamed"), "no .moved-to: an arbitrary owner does not resolve");
+        assert!(!resolves_with(s, &roots, "proj", "unrelated"));
+
+        let p = moved_to_path(s, "proj");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "renamed\n").unwrap();
+        assert!(resolves_with(s, &roots, "proj", "renamed"), "the owner .moved-to names resolves");
+        assert!(!resolves_with(s, &roots, "proj", "unrelated"), "a .moved-to vouches for its one owner, not any");
+        assert!(!resolves_with(s, &roots, "other", "renamed"), "nor for another home's records");
+
+        std::fs::remove_dir_all(root.join("renamed")).unwrap();
+        assert!(!resolves_with(s, &roots, "proj", "renamed"), "a named owner that no longer resolves does not");
+
+        // A dotted owner goes through the fork-free resolver: this is a
+        // plain directory git never heard of, so `resolve_project` (which
+        // asks git about any dot segment) would refuse it — and run git
+        // under the hub registry lock to do so.
+        std::fs::create_dir_all(root.join("proj2/.claude/worktrees/worktree-b")).unwrap();
+        std::fs::write(&p, "proj2/.claude/worktrees/worktree-b\n").unwrap();
+        assert!(resolves_with(s, &roots, "proj", "proj2/.claude/worktrees/worktree-b"), "the record is git's vouching");
+        // `escape` exists, beside the root rather than under it, so only
+        // confinement can refuse it.
+        std::fs::write(&p, "../escape\n").unwrap();
+        assert!(!resolves_with(s, &roots, "proj", "../escape"), "confinement still applies");
     }
 }

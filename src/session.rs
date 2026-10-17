@@ -98,6 +98,34 @@ pub fn default_command(project: &str, name: &str) -> Vec<String> {
     ]
 }
 
+/// [`default_command`], except that with `may_spawn` false a dtach client
+/// is `-a` (attach, or fail) rather than `-A` (attach, or create): what
+/// `attach_existing` runs, so a socket that went between its probe and its
+/// spawn ends in a failed attach, not a new shell under a renamed key.
+///
+/// `-a` takes no command — dtach refuses one with "Invalid number of
+/// arguments" and exits — so the shell and its arguments are dropped with
+/// the flag swap; the client options before them are kept.
+///
+/// Fails closed: a command without that shape (a `ROOST_CMD` override, or
+/// a `default_command` that changed) is an `Err` for `attach_existing`,
+/// never the unrewritten command, which could create a session.
+fn command_for(project: &str, name: &str, may_spawn: bool) -> Result<Vec<String>, String> {
+    let mut cmd = default_command(project, name);
+    if may_spawn {
+        return Ok(cmd);
+    }
+    let z = cmd.iter().position(|a| a == "-z");
+    match (cmd.first().map(String::as_str), cmd.get(1).map(String::as_str), z) {
+        (Some("dtach"), Some("-A"), Some(z)) => {
+            cmd[1] = "-a".into();
+            cmd.truncate(z + 1);
+            Ok(cmd)
+        }
+        _ => Err(format!("cannot attach without the risk of starting a session: {:?} is not a dtach -A command", cmd.first())),
+    }
+}
+
 /// The executable a terminal's command names, found on `PATH` and only there.
 ///
 /// Resolved here rather than left to portable-pty for two reasons. Its lookup
@@ -419,6 +447,10 @@ enum Decision {
     /// Nothing local says yes; ask the filesystem whether a session survived
     /// a restart. Deliberately *not* decided under the lock — see `attach`.
     Probe,
+    /// Would be a `Spawn`, but this connect came through a renamed project's
+    /// old URL (`attach_existing`), and no shell starts under a key whose
+    /// directory is gone.
+    Renamed,
     Refuse(AttachRefusal),
 }
 
@@ -469,12 +501,20 @@ impl Registry {
     ///
     /// Order matters: `Closing` outranks even an existing session, because a
     /// session that exists during a close is one that is about to stop.
-    fn decide(&mut self, skey: &str, key: &str) -> Decision {
+    ///
+    /// `may_spawn` false is `attach_existing`: a reservation is then a spawn
+    /// that is not this connect's to make, so it is answered `Renamed` and
+    /// left where it is — refused before it is consumed, not consumed and
+    /// then refused.
+    fn decide(&mut self, skey: &str, key: &str, may_spawn: bool) -> Decision {
         if self.is_closing(skey, key) {
             return Decision::Refuse(AttachRefusal::Closing);
         }
         if self.map.contains_key(key) {
             return Decision::Join;
+        }
+        if !may_spawn && self.reservations.contains_key(key) {
+            return Decision::Renamed;
         }
         if let Some(r) = self.reservations.remove(key) {
             return Decision::Spawn(r);
@@ -554,6 +594,29 @@ fn session_env(
 /// iteration, only around the read()-independent fan-out, so `attach` can
 /// never block behind a PTY that has nothing to say.
 pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, String> {
+    attach_as(project, name, dir, None)
+}
+
+/// [`attach`] through a renamed project's old URL (#158 §5b): `project` is
+/// the old key, whose directory is gone, and `dir` the directory its
+/// `.moved-to` resolves to. It reaches a session that is already running —
+/// a `Join`, or a `Probe` that finds the master held — and refuses anything
+/// that would start one with "project was renamed to `new_url`".
+///
+/// Two things `attach` does on a rejoin are withheld, both for the same
+/// reason. The dtach client is `-a`, not `-A`: `-A` creates a session when
+/// the socket has gone since the probe, which would be a new shell under the
+/// old key after all. And `.origin` is not rewritten: it records where the
+/// old key lived, the evidence `registry::reconcile` follows the rename by,
+/// and `dir` is somewhere else.
+pub fn attach_existing(project: &str, name: &str, dir: &Path, new_url: &str) -> Result<Attachment, String> {
+    attach_as(project, name, dir, Some(new_url))
+}
+
+/// `renamed_to` is `None` for [`attach`] and the new URL for
+/// [`attach_existing`]; the one body keeps the two from drifting apart on
+/// the lock discipline, which is most of what this function is.
+fn attach_as(project: &str, name: &str, dir: &Path, renamed_to: Option<&str>) -> Result<Attachment, String> {
     if !valid_name(name) {
         return Err("invalid session name".into());
     }
@@ -579,7 +642,7 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
     // CLAUDE.md already records shipping once.
     let decision = {
         let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
-        guard.decide(&skey, &key)
+        guard.decide(&skey, &key, renamed_to.is_none())
     };
     // Only a `Probe` is a session that outlived a previous roost: it requires
     // a socket that still exists *and* is held. A `Spawn` is a brand-new
@@ -590,6 +653,9 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
         Decision::Join => None,
         Decision::Spawn(r) => Some(r),
         Decision::Refuse(why) => return Err(why.to_string()),
+        Decision::Renamed => {
+            return Err(format!("project was renamed to {}", renamed_to.unwrap_or_default()))
+        }
         Decision::Probe => {
             // Restart survival, and the only case that has to ask the
             // filesystem: this process never attached, so the map is empty,
@@ -607,8 +673,11 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
     // Resolved before the lock, not at the spawn: the lookup stats every PATH
     // entry, and filesystem I/O under the global session lock stalls every
     // session's output. Consulted only if this attach turns out to spawn.
-    let cmd = default_command(project, name);
-    let resolved = cmd.first().map(|c| resolve_command(c));
+    // Kept as a `Result` until the spawn: an `attach_existing` whose command
+    // cannot be made attach-only must refuse to spawn, but a `Join` spawns
+    // nothing and needs no command at all.
+    let cmd = command_for(project, name, renamed_to.is_none());
+    let resolved = cmd.as_ref().ok().and_then(|c| c.first()).map(|c| resolve_command(c));
 
     let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
     // Re-checked after the probe released the lock: a close may have started
@@ -625,6 +694,7 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
     let spawned = !map.contains_key(&key);
     let mut launch = None;
     if spawned {
+        let cmd = cmd?;
         let program = match resolved {
             None => return Err("empty command".into()),
             Some(r) => r?,
@@ -661,7 +731,9 @@ pub fn attach(project: &str, name: &str, dir: &Path) -> Result<Attachment, Strin
                 // so no re-resolution is needed. See
                 // `registry::confirmed_gone`'s doc comment for why this
                 // matters.
-                crate::registry::record_origin(project, dir);
+                if renamed_to.is_none() {
+                    crate::registry::record_origin(project, dir);
+                }
             }
         }
         let pty = native_pty_system();
@@ -2539,6 +2611,164 @@ mod tests {
         assert!(any_process_holds(&sock), "test setup: a detached dtach master must be running");
         assert!(has_session(project, name), "test setup: attached in this process, so a map entry exists");
         att
+    }
+
+    /// #158 §5b: through a renamed project's old URL, `attach_existing`
+    /// rejoins the session that survived the rename and never starts one.
+    /// The master is started directly, not through `attach`, so this process
+    /// has no map entry for it — a master that outlived a restart — and the
+    /// attach must take the `Probe` path to find it.
+    ///
+    /// Revert-checked, run and restored: `decide(.., true)` for
+    /// `attach_existing` (letting it spawn) fails "attach_existing spawned a
+    /// new session under a renamed project's key"; the `.origin` write left
+    /// unconditional fails "the old key's .origin is evidence of where it
+    /// lived" — and that is also what the first RED run, with
+    /// `attach_existing` a plain `attach`, failed on; keeping the shell
+    /// arguments on the `-a` client fails "no answer from the existing
+    /// master", the output ending in dtach's "Invalid number of arguments".
+    #[test]
+    fn attach_existing_joins_a_live_session_and_never_spawns() {
+        use std::os::unix::fs::MetadataExt;
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let old_dir = tempfile::tempdir().unwrap();
+        let new_dir = tempfile::tempdir().unwrap();
+        let k = format!("movedkey{}", std::process::id());
+        let new_url = "renamed-elsewhere";
+
+        let sock = sock_path(&k, "shell");
+        let fresh = sock_path(&k, "fresh");
+        let _reap = ReapOnDrop(vec![sock.clone(), fresh.clone()]);
+        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        crate::registry::record_origin(&k, old_dir.path());
+        let origin = sock.parent().unwrap().join(".origin");
+        let origin_before = std::fs::read(&origin).unwrap();
+        let st = std::process::Command::new("dtach")
+            .args(["-n", sock.to_str().unwrap(), "-E", "sh", "-c", "tr a-z A-Z; sleep 30"])
+            .current_dir(old_dir.path())
+            .status()
+            .unwrap_or_else(|e| panic!("dtach must be available for this test: {e}"));
+        assert!(st.success(), "test setup: dtach -n failed");
+        let mut waited = 0;
+        while !any_process_holds(&sock) && waited < 200 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            waited += 1;
+        }
+        let masters = crate::registry::pids_holding_path(&crate::registry::holders_snapshot().unwrap(), &sock);
+        assert!(!masters.is_empty(), "test setup: a detached master must be running");
+        assert!(!has_session(&k, "shell"), "test setup: no map entry, so the attach must probe");
+        let ino = std::fs::symlink_metadata(&sock).unwrap().ino();
+
+        let att = attach_existing(&k, "shell", new_dir.path(), new_url)
+            .unwrap_or_else(|e| panic!("attach_existing must reach the existing session: {e}"));
+        assert!(has_session(&k, "shell"));
+        // A map entry is not an attachment: a client dtach refused exits at
+        // once, and the entry is there regardless. Nor is an echo — the
+        // client's own pty echoes what is typed into it with nothing behind
+        // it at all, which made the first version of this check pass with
+        // the client refused. The master upper-cases, so only it can answer.
+        write_input(&att.key, b"reached-the-master\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while !String::from_utf8_lossy(&seen).contains("REACHED-THE-MASTER") {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match att.rx.recv_timeout(left) {
+                Ok(chunk) => seen.extend_from_slice(&chunk),
+                Err(_) => panic!("no answer from the existing master: {:?}", String::from_utf8_lossy(&seen)),
+            }
+        }
+        let after = crate::registry::pids_holding_path(&crate::registry::holders_snapshot().unwrap(), &sock);
+        assert!(masters.iter().all(|p| after.contains(p)), "the same master still holds the socket: {masters:?} vs {after:?}");
+        assert_eq!(std::fs::symlink_metadata(&sock).unwrap().ino(), ino, "the existing socket, not a new one");
+        assert_eq!(
+            std::fs::read(&origin).unwrap(),
+            origin_before,
+            "the old key's .origin is evidence of where it lived, and must not be rewritten to the new directory"
+        );
+        detach(&att.key, att.id);
+
+        reserve(&k, "fresh", None);
+        let err = match attach_existing(&k, "fresh", new_dir.path(), new_url) {
+            Ok(_) => panic!("attach_existing spawned a new session under a renamed project's key"),
+            Err(e) => e,
+        };
+        assert!(err.contains("renamed") && err.contains(new_url), "{err}");
+        assert!(
+            matches!(std::fs::symlink_metadata(&fresh), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+            "no socket created under the old key"
+        );
+        assert!(!has_session(&k, "fresh"), "no map entry left behind");
+        assert!(has_reservation_for_test(&k, "fresh"), "a refused attach consumes nothing");
+        release(&k, "fresh");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// The race `attach_existing`'s probe cannot close by itself: a socket
+    /// that goes after the probe saw it held. `dtach -A` would then create a
+    /// session; `-a` fails.
+    ///
+    /// Revert-checked, run and restored: with `command_for`'s rewrite
+    /// removed, fails "attach_existing's client must never create" — left
+    /// `"-A"`.
+    #[test]
+    fn attach_existing_runs_a_dtach_client_that_cannot_create() {
+        let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let full = default_command("p", "shell");
+        assert_eq!(command_for("p", "shell", true).unwrap(), full, "attach still creates");
+        let existing = command_for("p", "shell", false).unwrap();
+        assert_eq!(existing[..2], ["dtach", "-a"], "attach_existing's client must never create");
+        assert_eq!(existing[2..], full[2..7], "the same socket and client options, and no command for -a to refuse");
+    }
+
+    /// `command_for` fails closed. With a command that is not `dtach -A`
+    /// (`ROOST_CMD=cat` here), `attach_existing` on a session that *is*
+    /// held — so the probe authorises the attach — must refuse rather than
+    /// run the command as it stands, which could create a session.
+    ///
+    /// Revert-checked, run and restored: with `command_for` returning the
+    /// unrewritten command for a shape it does not recognise, fails
+    /// "attach_existing ran a command it could not make attach-only" — it
+    /// spawned `cat` and took a map entry.
+    #[test]
+    fn attach_existing_refuses_a_command_it_cannot_make_attach_only() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let dir = tempfile::tempdir().unwrap();
+        let k = format!("failclosed{}", std::process::id());
+        let sock = sock_path(&k, "shell");
+        let _reap = ReapOnDrop(vec![sock.clone()]);
+        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let st = std::process::Command::new("dtach")
+            .args(["-n", sock.to_str().unwrap(), "sleep", "30"])
+            .status()
+            .unwrap_or_else(|e| panic!("dtach must be available for this test: {e}"));
+        assert!(st.success(), "test setup: dtach -n failed");
+        let mut waited = 0;
+        while !any_process_holds(&sock) && waited < 200 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            waited += 1;
+        }
+        assert!(any_process_holds(&sock), "test setup: a held socket, so only the command can refuse");
+
+        assert!(command_for(&k, "shell", false).is_ok(), "setup: the real dtach command is rewritable");
+        std::env::set_var("ROOST_CMD", "cat");
+        let got = attach_existing(&k, "shell", dir.path(), "renamed-elsewhere");
+        let spawned = has_session(&k, "shell");
+        std::env::remove_var("ROOST_CMD");
+        match got {
+            Ok(_) => panic!("attach_existing ran a command it could not make attach-only"),
+            Err(e) => assert!(e.contains("not a dtach -A command"), "{e}"),
+        }
+        assert!(!spawned, "no map entry, so nothing was spawned");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// The test the whole re-home design rests on.

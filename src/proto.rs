@@ -665,6 +665,17 @@ pub enum Event {
     /// exactly that). Sent with `send_to` and never broadcast — one person's
     /// mis-click must not flash every window in the project.
     PathRefused { text: String, msg: String },
+    /// A terminal link that `resolve_terminal_path` refused, but that
+    /// `projects::project_for_abs` could place inside a *different* roost
+    /// project (#158 §3) — `project` is that project's url, `rel` the
+    /// file's path inside it, `line` the `:line` suffix the terminal text
+    /// carried, if any. Sent with `send_to` and never broadcast, for the
+    /// same reason `PathRefused` is: one terminal's click is not every
+    /// browser's business. The client renders "That's in `<project>` —
+    /// open", with the link navigating to the other project's page and
+    /// nothing opening here — the new page's own server confines the
+    /// `OpenPath` it sends once `?open=` is read there.
+    PathElsewhere { project: String, rel: String, line: Option<u32> },
     /// Results for one query. Sent with `send_to` and never broadcast: a
     /// query is one browser's business, and the overlay that asked is
     /// client-local by design.
@@ -783,6 +794,19 @@ pub enum Event {
     /// R18 has by now also forgotten the re-home record, so the session is
     /// `Here` again. This event is only the explanation for why.
     WorktreeGone { worktree: String, session: String },
+    /// A worktree of this checkout that roost did not make has appeared —
+    /// `git worktree add` from any tool, at any path (#158 §2). Broadcast to
+    /// this project's browsers once per worktree; one that already existed
+    /// when the watcher started, or that roost itself is making, never sends
+    /// this. `url` is the worktree's roost project when its directory is one
+    /// under a root, `None` when it lies outside every root (the banner then
+    /// has nothing to link to).
+    WorktreeAppeared { path: String, branch: String, url: Option<String> },
+    /// A project or worktree directory was renamed, and its live terminals
+    /// followed it (#158 §5): `from` is the old URL, `to` the new one. Sent
+    /// to both projects' browsers once per rename — the old page gets a link
+    /// to the new one, the new page the explanation for its new tabs.
+    ProjectMoved { from: String, to: String },
     /// A browser tool call for this page to hand to the extension, unread.
     /// `payload` is opaque JSON text and `sig` its HMAC (`browser::sign`):
     /// the extension verifies the bytes it is given, so this page — which
@@ -1017,6 +1041,34 @@ mod tests {
         assert!(s.contains(r#""t":"WorktreeGone""#) && s.contains("w1") && s.contains("term3"));
     }
 
+    /// The client branches on `url` being null, so `None` must encode as
+    /// `null` and not be skipped.
+    ///
+    /// Revert-checked: with `#[serde(skip_serializing_if =
+    /// "Option::is_none")]` on `url`, this fails — observed:
+    /// `{"t":"WorktreeAppeared","path":"/elsewhere/x","branch":"x"}`.
+    /// Restored.
+    #[test]
+    fn worktree_appeared_encodes_its_url_or_null() {
+        let s = encode(&Event::WorktreeAppeared { path: "/r/uc-rel".into(), branch: "docs/rel".into(), url: Some("uc-rel".into()) });
+        assert!(s.contains(r#""t":"WorktreeAppeared""#) && s.contains(r#""branch":"docs/rel""#) && s.contains(r#""url":"uc-rel""#), "{s}");
+        let s = encode(&Event::WorktreeAppeared { path: "/elsewhere/x".into(), branch: "x".into(), url: None });
+        assert!(s.contains(r#""url":null"#), "{s}");
+    }
+
+    /// The banner reads both fields by name; a rename of either would
+    /// leave it printing `undefined`.
+    ///
+    /// Revert-checked: with `#[serde(rename = "old")]` on `from`, fails —
+    /// observed `{"t":"ProjectMoved","old":"repo/.claude/worktrees/worktree-a",…}`.
+    /// Restored.
+    #[test]
+    fn project_moved_encodes_from_and_to() {
+        let s = encode(&Event::ProjectMoved { from: "repo/.claude/worktrees/worktree-a".into(), to: "repo/.claude/worktrees/worktree-b".into() });
+        assert!(s.contains(r#""t":"ProjectMoved""#), "{s}");
+        assert!(s.contains(r#""from":"repo/.claude/worktrees/worktree-a""#) && s.contains(r#""to":"repo/.claude/worktrees/worktree-b""#), "{s}");
+    }
+
     #[test]
     fn decodes_the_notice_intents() {
         let i = decode(r#"{"t":"MarkNoticeRead","id":7}"#).unwrap();
@@ -1172,6 +1224,26 @@ mod tests {
         assert!(s.contains(r#""t":"PathRefused""#), "got {s}");
         assert!(s.contains(r#""text":"src/gone.rs""#), "got {s}");
         assert!(s.contains(r#""msg":"cannot read src/gone.rs""#), "got {s}");
+    }
+
+    /// The client branches on `line` being present, so `None` must encode as
+    /// `null` and not be skipped — the same risk `worktree_appeared_encodes_its_url_or_null`
+    /// (Task 5) pins for `WorktreeAppeared.url`.
+    ///
+    /// Revert-checked: adding `#[serde(skip_serializing_if = "Option::is_none")]`
+    /// to `PathElsewhere.line` fails this test — observed:
+    /// `{"t":"PathElsewhere","project":"other","rel":"a.md"}` (no `"line"` key
+    /// at all, so the `Some` assertion below finds no `"line":7` and the
+    /// `None` assertion's `contains(r#""line":null"#)` also fails). Restored.
+    #[test]
+    fn path_elsewhere_encodes_its_line_or_null() {
+        let s = encode(&Event::PathElsewhere { project: "other".into(), rel: "a.md".into(), line: Some(7) });
+        assert!(
+            s.contains(r#""t":"PathElsewhere""#) && s.contains(r#""project":"other""#) && s.contains(r#""rel":"a.md""#) && s.contains(r#""line":7"#),
+            "{s}"
+        );
+        let s = encode(&Event::PathElsewhere { project: "other".into(), rel: "a.md".into(), line: None });
+        assert!(s.contains(r#""line":null"#), "{s}");
     }
 
     #[test]

@@ -106,9 +106,12 @@ pub fn new_token() -> Result<String, String> {
 }
 
 fn temp_name(port: u16) -> String {
-    // Pid-unique: two roost instances share this directory, and a shared temp
-    // name lets one truncate the other's in-flight write.
-    format!(".{}.{}.roost.tmp", port, std::process::id())
+    // Unique per call, not just per pid: two roost instances share this
+    // directory, and since `Lock::rewrite` one process can write the same
+    // port's lock from several threads at once (a sweep, the claudes tick,
+    // a term socket). A shared temp name lets one `File::create` truncate
+    // the inode another is about to rename into place.
+    format!(".{}.{}.roost.tmp", port, crate::wsstate::tmp_suffix())
 }
 
 pub struct Lock {
@@ -228,6 +231,22 @@ pub fn sweep_strays() -> SweepReport {
 }
 
 pub fn write_in(dir: &Path, port: u16, token: &str, workspace: &Path) -> Result<Lock, String> {
+    Ok(Lock { path: write_body(dir, port, token, workspace)? })
+}
+
+impl Lock {
+    /// Rewrites this lock file in place with a new workspace — same port,
+    /// same token, same path — for a listener whose project directory was
+    /// renamed (`ide::retarget`). In place rather than a new `Lock`: dropping
+    /// the old one would remove the very path the new one just wrote.
+    pub fn rewrite(&self, port: u16, token: &str, workspace: &Path) -> Result<(), String> {
+        let dir = self.path.parent().ok_or("lock file has no directory")?;
+        write_body(dir, port, token, workspace).map(|_| ())
+    }
+}
+
+/// Atomic: a temp file then `rename`, so Claude Code never reads half a lock.
+fn write_body(dir: &Path, port: u16, token: &str, workspace: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let body = serde_json::json!({
         "pid": std::process::id(),
@@ -247,7 +266,7 @@ pub fn write_in(dir: &Path, port: u16, token: &str, workspace: &Path) -> Result<
         let _ = std::fs::remove_file(&tmp);
         format!("{}: {e}", path.display())
     })?;
-    Ok(Lock { path })
+    Ok(path)
 }
 
 pub fn write(port: u16, token: &str, workspace: &Path) -> Result<Lock, String> {
@@ -418,6 +437,52 @@ mod tests {
         assert!(temp_name(5599).contains(&std::process::id().to_string()));
         assert_ne!(temp_name(5599), temp_name(5600));
         let _ = write_in(d.path(), 5599, "cafe", ws.path()).unwrap();
+    }
+
+    /// Two `rewrite`s of one lock file racing from two threads, released
+    /// together by a barrier, many times over. Not deterministic — the
+    /// interleaving that loses is a window, not a schedule this test can
+    /// force — so it pins the outcome over 200 rounds: both writes succeed,
+    /// the file always parses and names one of the two workspaces, and no
+    /// temp file is left behind.
+    ///
+    /// Revert-checked, run and restored: with `temp_name` back to the
+    /// pid-only `.{port}.{pid}.roost.tmp`, fails "both rewrites succeed" —
+    /// the loser's `rename` finds its temp file already renamed away by the
+    /// winner (`No such file or directory`) — in 3 runs of 3, at round 0.
+    #[test]
+    fn concurrent_rewrites_never_leave_a_torn_lock_file() {
+        let d = tempfile::tempdir().unwrap();
+        let (wa, wb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let lock = std::sync::Arc::new(write_in(d.path(), 5601, "cafe", wa.path()).unwrap());
+        let names = [wa.path().to_string_lossy().into_owned(), wb.path().to_string_lossy().into_owned()];
+        for round in 0..200 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = [wa.path().to_path_buf(), wb.path().to_path_buf()]
+                .into_iter()
+                .map(|ws| {
+                    let (lock, barrier) = (lock.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        lock.rewrite(5601, "cafe", &ws)
+                    })
+                })
+                .collect();
+            for h in handles {
+                if let Err(e) = h.join().unwrap() {
+                    panic!("both rewrites succeed (round {round}): {e}");
+                }
+            }
+            let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(lock.path()).unwrap())
+                .unwrap_or_else(|e| panic!("the lock file parses (round {round}): {e}"));
+            let named = v["workspaceFolders"][0].as_str().unwrap_or_default().to_string();
+            assert!(names.contains(&named), "names one of the two workspaces (round {round}): {named:?}");
+        }
+        let left: Vec<String> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["5601.lock".to_string()], "no temp file left behind");
     }
 
     #[test]

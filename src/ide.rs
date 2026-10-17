@@ -44,6 +44,16 @@ pub struct Ide {
     /// already parked in `accept(2)` inside `TcpListener::incoming()` — see
     /// `request_shutdown` for how it actually gets observed.
     stopped: Arc<AtomicBool>,
+    /// The directory paths are confined against, shared with every
+    /// connection this listener serves. Shared rather than copied so that
+    /// `retarget` reaches connections already open: a Claude whose project
+    /// was renamed under it keeps its connection, and its next `openDiff`
+    /// is confined against the new directory.
+    workspace: Arc<Mutex<PathBuf>>,
+    /// Serialises `retarget`'s lock-file rewrites, so the file always ends
+    /// naming the latest workspace. A leaf lock, local to this one file:
+    /// nothing is taken while holding it but `workspace`, for a clone.
+    rewriting: Mutex<()>,
 }
 
 impl Ide {
@@ -142,7 +152,8 @@ pub(crate) fn start_in_with_ports(
     };
     let lock = idelock::write_in(dir, port, &token, &workspace)?;
     let stopped = Arc::new(AtomicBool::new(false));
-    let ide = Arc::new(Ide { port, token: token.clone(), _lock: lock, stopped: stopped.clone() });
+    let shared = Arc::new(Mutex::new(workspace));
+    let ide = Arc::new(Ide { port, token: token.clone(), _lock: lock, stopped: stopped.clone(), workspace: shared.clone(), rewriting: Mutex::new(()) });
     let project = project.to_string();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -155,12 +166,12 @@ pub(crate) fn start_in_with_ports(
             let Ok(stream) = stream else { continue };
             let token = token.clone();
             let project = project.clone();
-            let workspace = workspace.clone();
+            let workspace = shared.clone();
             std::thread::spawn(move || {
                 // A panic here must not take the process down with it: this
                 // thread is fed attacker-influenced bytes.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    serve_conn(stream, &token, &project, &workspace);
+                    serve_conn(stream, &token, &project, workspace);
                 }));
             });
         }
@@ -301,6 +312,63 @@ fn lost_the_race(project: &str, existing: Arc<Ide>, built: Result<Arc<Ide>, Stri
 
 pub fn for_project(project: &str, workspace: PathBuf) -> Option<Arc<Ide>> {
     for_project_in(&idelock::ide_dir(), project, workspace, crate::config::ide_enabled())
+}
+
+/// The workspace `project`'s running listener confines paths against, or
+/// `None` when it has no listener.
+pub fn workspace_of(project: &str) -> Option<PathBuf> {
+    let ide = registry().lock().unwrap_or_else(|e| e.into_inner()).get(project).cloned()?;
+    let w = ide.workspace.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    Some(w)
+}
+
+/// Points `project`'s running listener at `workspace`, when it is somewhere
+/// else: what a rename needs (#158 §5b). `for_project` hands back an
+/// existing listener unchanged, and the old key's was built over the
+/// directory that was renamed away, so without this every `openDiff` from a
+/// followed Claude is refused as outside the project until a restart.
+///
+/// In place, not a stop and a rebuild. `stop` ends only the accept loop —
+/// open connections keep their workspace — and the old listener releases
+/// its port asynchronously, so a rebuild could lose the port the Claude
+/// redials. Swapping the shared workspace reaches the open connections
+/// and keeps the port, the token and the connection. The lock file is
+/// rewritten to name the new directory too.
+///
+/// The registry and workspace locks are held for a lookup or an assignment
+/// only. The lock-file write runs under `Ide::rewriting` alone — a leaf lock
+/// local to this file, never the hub or session registry. Returns whether
+/// anything changed.
+pub fn retarget(project: &str, workspace: &Path) -> bool {
+    let Some(ide) = registry().lock().unwrap_or_else(|e| e.into_inner()).get(project).cloned() else {
+        return false;
+    };
+    let changed = {
+        let mut w = ide.workspace.lock().unwrap_or_else(|e| e.into_inner());
+        if *w == workspace {
+            false
+        } else {
+            *w = workspace.to_path_buf();
+            true
+        }
+    };
+    if changed {
+        // Under `rewriting`, and with the workspace re-read inside it rather
+        // than the value set above: two retargets on two threads (a sweep, the
+        // claudes tick, a term socket) would otherwise each write what they
+        // set, in whichever order their renames land — and the file could end
+        // naming a workspace the listener has already left. Re-reading alone
+        // would not close that (the stale reader can still rename last);
+        // serialising alone would not either (the last to take the lock may
+        // not hold the latest value). Both together: whoever writes last
+        // writes what is current.
+        let _w = ide.rewriting.lock().unwrap_or_else(|e| e.into_inner());
+        let current = ide.workspace.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Err(e) = ide._lock.rewrite(ide.port, &ide.token, &current) {
+            eprintln!("roost: IDE listener for {project} now serves {}, but its lock file was not rewritten: {e}", current.display());
+        }
+    }
+    changed
 }
 
 pub fn port_for(project: &str) -> Option<u16> {
@@ -895,7 +963,8 @@ pub struct Conn {
     /// situations with the same representation here only because both mean
     /// "do not trust a path against it yet".
     pub cwd: Option<PathBuf>,
-    pub workspace: PathBuf,
+    /// Shared with the listener (see `Ide::workspace`); read per request.
+    workspace: Arc<Mutex<PathBuf>>,
     pub project: String,
     /// This connection's outbound channel, drained by its own read loop (see
     /// `serve_conn`: there is no writer thread — two writers over one fd let
@@ -914,7 +983,22 @@ impl Conn {
         reply: std::sync::mpsc::Sender<String>,
         id: u64,
     ) -> Self {
+        Self::sharing(project, Arc::new(Mutex::new(workspace)), reply, id)
+    }
+
+    /// A connection to a listener, seeing that listener's workspace as it
+    /// is at each request rather than as it was at the handshake.
+    pub fn sharing(
+        project: &str,
+        workspace: Arc<Mutex<PathBuf>>,
+        reply: std::sync::mpsc::Sender<String>,
+        id: u64,
+    ) -> Self {
         Conn { id, cwd: None, workspace, project: project.to_string(), reply, closed: false }
+    }
+
+    pub fn workspace(&self) -> PathBuf {
+        self.workspace.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -1186,7 +1270,8 @@ fn open_diff(
     // project root — or widen the boundary past the project roost is serving.
     // It stays useful for what it was learned for (knowing which project a
     // connection belongs to), not for confinement.
-    let (rel, abs) = match confined_target(&conn.workspace, path) {
+    let workspace = conn.workspace();
+    let (rel, abs) = match confined_target(&workspace, path) {
         Ok(v) => v,
         Err(e) => return Some(err(id, -32602, format!("path outside project: {e}"))),
     };
@@ -1214,7 +1299,7 @@ fn open_diff(
     // `answer`/`reclaim_pending_for` all agree on which hub and which file
     // this proposal belongs to. See `delivery_target`'s own doc comment for
     // why a canonical compare, not `rel`'s text, decides "inside".
-    let (target, target_rel) = delivery_target(&conn.project, conn.id, &conn.workspace, &rel);
+    let (target, target_rel) = delivery_target(&conn.project, conn.id, &workspace, &rel);
 
     // roost may be holding unsaved edits to this very file. Accepting would
     // discard them silently, which is the one thing the whole conflict-guard
@@ -1371,7 +1456,7 @@ fn dispatch(msg: &serde_json::Value, conn: &mut Conn) -> Option<serde_json::Valu
     }
 }
 
-fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
+fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: Arc<Mutex<PathBuf>>) {
     let config = WebSocketConfig { max_message_size: Some(MAX_FRAME_BYTES), ..Default::default() };
     // Built before the handshake, not after: registration happens inside the
     // handshake callback below (see the comment there for why that ordering
@@ -1497,7 +1582,7 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: &Path) {
         eprintln!("roost: could not set a read timeout on an ide connection; mentions to it may be delayed");
     }
 
-    let mut conn = Conn::new(project, workspace.to_path_buf(), reply_tx.clone(), conn_id);
+    let mut conn = Conn::sharing(project, workspace, reply_tx.clone(), conn_id);
     // Only conn's and the registry's own clones should keep the channel
     // open from here — this one has done its job.
     drop(reply_tx);
@@ -2745,6 +2830,132 @@ mod tests {
         set_session(home, id, crate::idesess::Sess::In("term3".into()));
         let conn = Conn::new(home, home_dir.clone(), tx, id);
         (owner, home_dir, owner_dir, conn)
+    }
+
+    /// #158 §5b: the old key's listener was built over directory A before
+    /// the rename. After `follow_moves`, a connection that was already open
+    /// — the followed Claude never redials — has its `openDiff` for a path
+    /// under B confined against B, and the lock file names B.
+    ///
+    /// Revert-checked, run and restored: with the retarget loop in
+    /// `follow_moves` skipped, fails "an openDiff under the new directory is
+    /// not outside the project" — the answer was `path outside project: …`.
+    #[test]
+    fn a_followed_listener_confines_open_connections_to_the_new_directory() {
+        idelock::isolate_ide_dir_for_test();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", d.path());
+        let (old, new) = ("mvide-old", "mvide-new");
+        let a = d.path().join(old);
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("x.rs"), "on disk").unwrap();
+        let ide = for_project_in(&idelock::ide_dir(), old, a.canonicalize().unwrap(), true).expect("a listener");
+        let (tx, _rx) = std::sync::mpsc::channel::<String>();
+        let mut conn = Conn::sharing(old, ide.workspace.clone(), tx, NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed));
+
+        std::fs::rename(&a, d.path().join(new)).unwrap();
+        let b = d.path().join(new).canonicalize().unwrap();
+        let f = b.join("x.rs");
+        assert!(confined_target(&conn.workspace(), f.to_str().unwrap()).is_err(), "setup: B is outside A");
+
+        crate::registry::follow_moves(&[crate::registry::Moved {
+            old_url: old.into(),
+            new_url: new.into(),
+            live: vec![],
+            fresh: true,
+            prev: None,
+            inside: vec![],
+        }]);
+
+        let msg = rpc(
+            1,
+            "tools/call",
+            serde_json::json!({
+                "name": "openDiff",
+                "arguments": {
+                    "old_file_path": f.to_str().unwrap(),
+                    "new_file_path": f.to_str().unwrap(),
+                    "new_file_contents": "proposed",
+                    "tab_name": "p1",
+                }
+            }),
+        );
+        let reply = dispatch(&msg, &mut conn);
+        let answer = reply.as_ref().map(|v| v.to_string()).unwrap_or_default();
+        assert!(!answer.contains("outside project"), "an openDiff under the new directory is not outside the project: {answer}");
+        // Not refused for any other reason either: an accepted proposal gets
+        // no reply yet (it waits for the browser) and is parked under this
+        // connection. Revert-checked, run and restored: with the retarget
+        // loop in `follow_moves` skipped, fails on the line above; with the
+        // file made unreadable (chmod 000) before the call — a refusal that
+        // is not "outside project" — fails "the proposal was accepted and
+        // parked" with `cannot show a diff of x.rs: …`.
+        assert!(reply.is_none(), "the proposal was accepted and parked, not answered: {answer}");
+        let parked: Vec<String> = pending()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, p)| p.conn_id == conn.id && p.tab_name == "p1")
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(parked.len(), 1, "the proposal was accepted and parked under this connection");
+        pending().lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| !parked.contains(k));
+        let lock: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(idelock::ide_dir().join(format!("{}.lock", ide.port))).unwrap()).unwrap();
+        assert_eq!(lock["workspaceFolders"], serde_json::json!([b.to_str().unwrap()]), "the lock file names the new directory");
+        assert!(!retarget(old, &b), "a second retarget to the same place changes nothing");
+
+        drop(ide);
+        stop(old);
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// `delivery_target` for a followed session (#158 §5b): the record names
+    /// the new project, which is no `.claude/worktrees` shape at all, and the
+    /// old key's `.moved-to` names it — so a proposal is delivered to the
+    /// new project's hub, under its own relative path, not to the old key's.
+    ///
+    /// Revert-checked, run and restored: with `home::owner_dir_with`'s
+    /// `.moved-to` arm removed, fails "a followed session's proposals go to
+    /// the new project" — left `("mvdel-old", "a.rs")`, the old key.
+    #[test]
+    fn delivery_for_a_followed_session_targets_the_new_project() {
+        idelock::isolate_ide_dir_for_test();
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::env::set_var("ROOST_STATE_DIR", &state);
+        std::env::set_var("ROOST_ROOTS", d.path());
+        let (old, new) = ("mvdel-old", "mvdel-new");
+        let new_dir = d.path().join(new);
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(new_dir.join("a.rs"), "x").unwrap();
+        let new_dir = new_dir.canonicalize().unwrap();
+        crate::home::record(old, "term3", new).unwrap();
+        let key_dir = state.join("sock").join(crate::projects::storage_key(old));
+        std::fs::create_dir_all(&key_dir).unwrap();
+        std::fs::write(key_dir.join(".moved-to"), format!("{new}\n")).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel::<String>();
+        let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        conns().lock().unwrap().entry(old.to_string()).or_default().push(Target {
+            id,
+            reply: tx,
+            session: crate::idesess::Sess::Unknown,
+        });
+        set_session(old, id, crate::idesess::Sess::In("term3".into()));
+        let _hub_new = crate::hub::Hub::for_project(new, new_dir.clone());
+
+        assert_eq!(
+            delivery_target(old, id, &new_dir, "a.rs"),
+            (new.to_string(), "a.rs".to_string()),
+            "a followed session's proposals go to the new project"
+        );
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// The positive case: a file that genuinely lies inside the worktree
