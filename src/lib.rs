@@ -92,6 +92,14 @@ pub fn serve(listener: TcpListener, startup_roots: Vec<PathBuf>) {
             report.dead_sockets, report.gone_projects
         );
     }
+    // A rename found at startup follows here, as on every throttled pass:
+    // after the sweep, with nothing locked (#158 §5). Every one, not only
+    // those this pass wrote: a previous run that died between writing
+    // `.moved-to` and following would otherwise leave its sessions stranded
+    // for good, and following is idempotent.
+    let moved: Vec<registry::Moved> =
+        report.moved.into_iter().map(|m| registry::Moved { fresh: true, ..m }).collect();
+    registry::follow_moves(&moved);
     // Not fatal: the hook is how `roost worktree-hook` (Task 8) reaches a
     // running server at all, but a project with an unwritable state dir
     // must still serve every existing project rather than refuse to start.

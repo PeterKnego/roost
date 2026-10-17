@@ -1028,6 +1028,22 @@ function onEvent(ev) {
       document.body.dispatchEvent(new Event("projects"));
       break;
     }
+    case "ProjectMoved": {
+      // A project or worktree directory was renamed and its live terminals
+      // followed (#158 §5). Sent to both pages: the old one gets a way to
+      // the new page, the new one the reason for its new tabs. URLs came
+      // from the filesystem, so text only and the link through projectPath.
+      const from = ev.from.split("/").pop();
+      const to = ev.to.split("/").pop();
+      showBanner(`${from} was renamed to ${to}; its terminals followed`);
+      if (ev.to !== PROJECT) {
+        const a = document.createElement("a");
+        a.href = "/" + projectPath(ev.to); a.textContent = " open " + to;
+        document.querySelector(".error-banner:last-of-type b")?.append(a);
+      }
+      document.body.dispatchEvent(new Event("projects"));
+      break;
+    }
     case "WorktreeGone": {
       // Claude Code removed a resident's worktree when its session exited
       // (spec §7) — nothing to click, just the explanation for why the

@@ -131,6 +131,103 @@ pub fn known_projects_with_state(roots: &[PathBuf]) -> Vec<ProjectStatus> {
 pub struct ReapReport {
     pub dead_sockets: usize,
     pub gone_projects: usize,
+    /// Projects this pass found renamed rather than deleted (#178's inode
+    /// evidence) whose new directory resolves under the roots. Acted on by
+    /// [`follow_moves`], never inside the sweep: following refreshes hubs,
+    /// and the sweep runs under `reconcile_gate`.
+    pub moved: Vec<Moved>,
+}
+
+/// One followable rename: `old_url`'s live sessions (`live`) are now
+/// working in `new_url`'s directory. `fresh` when this pass wrote or
+/// rewrote `.moved-to` — the only pass that follows and announces; a later
+/// pass seeing the same unchanged record has nothing new to say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moved {
+    pub old_url: String,
+    pub new_url: String,
+    pub live: Vec<String>,
+    pub fresh: bool,
+}
+
+/// The follow-up to a sweep's [`ReapReport::moved`] (#158 §5): re-home each
+/// renamed key's sessions (`home::follow_move`), refresh both projects' hubs
+/// and tell their browsers. Must run with no lock held — not `REGISTRY`,
+/// not `SESSIONS`, not a hub, not `reconcile_gate`: each call below takes
+/// its own lock briefly and releases it before the next, which is what
+/// keeps a hub thread that reaches `reconcile` from deadlocking against it.
+pub fn follow_moves(moved: &[Moved]) {
+    for m in moved.iter().filter(|m| m.fresh) {
+        crate::home::follow_move(&m.old_url, &m.new_url, &m.live);
+        eprintln!("roost: {} was renamed to {}; its {} session(s) followed", m.old_url, m.new_url, m.live.len());
+        crate::hub::refresh_and_broadcast(&m.old_url);
+        crate::hub::refresh_and_broadcast(&m.new_url);
+        let ev = crate::proto::Event::ProjectMoved { from: m.old_url.clone(), to: m.new_url.clone() };
+        crate::hub::broadcast_to_project(&m.old_url, &ev);
+        crate::hub::broadcast_to_project(&m.new_url, &ev);
+        crate::hub::broadcast_all(&crate::proto::Event::ProjectsChanged { project: m.new_url.clone() });
+    }
+}
+
+/// `dir` as the project URL it would be under the first root containing
+/// it — `/`-separated, relative — or `None` when it is under no root (or is
+/// a root itself, or is not UTF-8). The caller still has to confirm it with
+/// `projects::resolve_project`: being under a root is not being a project.
+fn url_under_roots(roots: &[PathBuf], dir: &std::path::Path) -> Option<String> {
+    for r in roots {
+        let Ok(base) = r.canonicalize() else { continue };
+        let Ok(rel) = dir.strip_prefix(&base) else { continue };
+        let segs: Option<Vec<&str>> = rel.components().map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        }).collect();
+        let segs = segs?;
+        if segs.is_empty() {
+            return None;
+        }
+        return Some(segs.join("/"));
+    }
+    None
+}
+
+/// Whether `key_dir` holds anything but dotfiles — a session socket, live or
+/// not yet reaped. "Cannot look" answers yes: it only ever keeps a file.
+fn key_has_sockets(key_dir: &std::path::Path) -> bool {
+    match std::fs::read_dir(key_dir) {
+        Ok(rd) => rd.flatten().any(|e| !e.file_name().to_string_lossy().starts_with('.')),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+fn moved_to_marker_path(key_dir: &std::path::Path) -> PathBuf {
+    key_dir.join(".moved-to")
+}
+
+/// Writes `sock/<key>/.moved-to` (atomic, 0600, pid-unique temp — the same
+/// discipline as `write_origin`) and says whether it changed anything.
+/// Rewritten only when the URL differs: a second rename moves it on, an
+/// unchanged one costs one small read per pass.
+fn write_moved_to(key_dir: &std::path::Path, new_url: &str) -> Result<bool, String> {
+    let bytes = format!("{new_url}\n").into_bytes();
+    let marker = moved_to_marker_path(key_dir);
+    if std::fs::read(&marker).map(|cur| cur == bytes).unwrap_or(false) {
+        return Ok(false);
+    }
+    let tmp = key_dir.join(format!(".moved-to.tmp.{}", std::process::id()));
+    let out = (|| {
+        std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(&tmp, &marker).map_err(|e| e.to_string())
+    })();
+    if out.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    out.map(|()| true)
 }
 
 /// Inverse of the storage-key encoding used by `wsstate` and `session`. Not
@@ -588,7 +685,7 @@ fn write_origin(key_dir: &std::path::Path, dir: &std::path::Path) {
 ///
 /// `.origin` alone cannot tell "deleted" from "moved": both leave the recorded
 /// path `NotFound`. The inode can — a rename keeps it, a delete destroys it —
-/// and `moved_not_deleted` looks for it from the sessions' own shells. A
+/// and `move_evidence` looks for it from the sessions' own shells. A
 /// sidecar rather than a second line in `.origin`, so the marker older
 /// binaries read as a path stays byte-identical.
 fn origin_identity_path(key_dir: &std::path::Path) -> std::path::PathBuf {
@@ -700,14 +797,6 @@ pub(crate) fn move_evidence(_key_dir: &std::path::Path, _snapshot: &[(u32, Strin
     MoveEvidence::None
 }
 
-/// True when a project the sweep is about to call gone was **moved**, or when
-/// that cannot be ruled out — either way, nothing may be killed (#178).
-/// Delegates to `move_evidence`, keeping only the yes/no the sweep needs; a
-/// later caller (#158) wants the "moved to where" that `move_evidence` keeps.
-fn moved_not_deleted(key_dir: &std::path::Path, snapshot: &[(u32, String)], proc_root: &std::path::Path) -> bool {
-    !matches!(move_evidence(key_dir, snapshot, proc_root), MoveEvidence::None)
-}
-
 /// Records the resolved absolute directory a project maps to, so a *later*
 /// check for "is this project gone" can consult this exact path directly —
 /// independent of whatever `ROOST_ROOTS` the process performing that
@@ -808,6 +897,11 @@ fn confirmed_gone(key_dir: &std::path::Path, roots: &[PathBuf], url: &str) -> bo
     match crate::projects::resolve_project(roots, url) {
         Some(dir) => {
             write_origin(key_dir, &dir);
+            // The URL resolves again (moved back, or a new directory made
+            // under the old name): a `.moved-to` from an earlier rename now
+            // describes a different directory, and must stop widening or
+            // redirecting anything for this key.
+            let _ = std::fs::remove_file(moved_to_marker_path(key_dir));
             false
         }
         None => match std::fs::read(origin_marker_path(key_dir)) {
@@ -929,7 +1023,7 @@ static ROOTS_WERE_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 static PROCESS_LIST_WAS_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
-    let mut report = ReapReport { dead_sockets: 0, gone_projects: 0 };
+    let mut report = ReapReport { dead_sockets: 0, gone_projects: 0, moved: Vec::new() };
     let roots_ok = !roots.is_empty() && roots.iter().all(|r| r.canonicalize().is_ok());
     let roots_were_ok = ROOTS_WERE_OK.swap(roots_ok, std::sync::atomic::Ordering::Relaxed);
     if !roots_ok && roots_were_ok {
@@ -984,7 +1078,12 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
                         }
                     }
                 }
-                if !found_or_uncertain {
+                // A key with a socket still in `sock/` may be a rename this
+                // pass has yet to see (#158 §5): the sock sweep below runs
+                // after this one, and following copies this `.base` to the
+                // new key. Kept until its sessions are gone — a pass later
+                // for a real delete, and the base the rename needs otherwise.
+                if !found_or_uncertain && !key_has_sockets(&sock_root().join(key)) {
                     let _ = std::fs::remove_file(e.path());
                 }
             }
@@ -1052,16 +1151,34 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
         // not evidence the directory is gone; only a key whose resolved
         // path was previously recorded, and is now confirmed missing,
         // counts.
+        let mut moved_to: Option<String> = None;
         let project_gone = roots_ok
             && confirmed_gone(&entry.path(), roots, &url)
-            && if moved_not_deleted(&entry.path(), &snapshot, std::path::Path::new("/proc")) {
-                // #178: `NotFound` at the recorded path, but a live shell is
-                // still inside the same directory under another name.
-                eprintln!("roost: not reaping {key} — its directory was moved, not deleted (a live session is still in it)");
-                false
-            } else {
-                true
+            && match move_evidence(&entry.path(), &snapshot, std::path::Path::new("/proc")) {
+                MoveEvidence::None => true,
+                MoveEvidence::CannotTell => {
+                    eprintln!("roost: not reaping {key} — its directory is gone, but whether it was moved cannot be told from its sessions' shells");
+                    false
+                }
+                MoveEvidence::Moved(new_dir) => {
+                    // #178: `NotFound` at the recorded path, but a live shell
+                    // is still inside the same directory under another name.
+                    // #158 §5: followed only when that name is a project
+                    // under the roots, confirmed by the resolver itself.
+                    let new_url = url_under_roots(roots, &new_dir)
+                        .filter(|u| crate::projects::resolve_project(roots, u).as_deref() == Some(new_dir.as_path()));
+                    match &new_url {
+                        Some(u) => eprintln!("roost: not reaping {key} — its directory was moved to {u}, not deleted"),
+                        None => eprintln!(
+                            "roost: not reaping {key} — its directory was moved to {}, not deleted; moved outside the roots, not following",
+                            new_dir.display()
+                        ),
+                    }
+                    moved_to = new_url;
+                    false
+                }
             };
+        let mut live_here: Vec<String> = Vec::new();
         // In-process sessions first, once per project rather than once per
         // socket file below: `session::kill_project` now ends each session's
         // dtach master too (via `kill_and_unlink`, the same helper the loop
@@ -1098,6 +1215,9 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
             let pids = pids_holding(&snapshot, &sock.path());
             let held_before = !pids.is_empty();
             let name = sock.file_name().to_string_lossy().into_owned();
+            if held_before && crate::session::valid_name(&name) {
+                live_here.push(name.clone());
+            }
 
             if held_before && project_gone {
                 // Covers a session this process never had in memory (one
@@ -1142,6 +1262,18 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
                 }
                 ReapAction::Leave => {} // live process, project still exists: untouched
                 ReapAction::RemoveKilled => unreachable!("only reached via the project_gone branch above"),
+            }
+        }
+        // Written after the sockets are walked, so the record names the
+        // live sessions that follow. A failed write follows nothing: no
+        // record is no widening and no re-home, which is #178's behaviour.
+        if let Some(new_url) = moved_to {
+            match write_moved_to(&entry.path(), &new_url) {
+                Ok(fresh) => {
+                    live_here.sort();
+                    report.moved.push(Moved { old_url: url.clone(), new_url, live: live_here, fresh });
+                }
+                Err(e) => eprintln!("roost: {key} was moved to {new_url}, but its .moved-to could not be written ({e}); not following"),
             }
         }
         // Sidecars whose session is positively gone. dtach unlinks its own
@@ -1211,9 +1343,17 @@ fn reconcile_throttled(roots: &[PathBuf]) {
     // socket thread.
     let mut last = reconcile_gate().lock().unwrap_or_else(|e| e.into_inner());
     let now = std::time::Instant::now();
-    if should_reconcile(*last, now) {
-        let _ = reconcile(roots);
+    let report = should_reconcile(*last, now).then(|| {
+        let r = reconcile(roots);
         *last = Some(now);
+        r
+    });
+    // Released before following: `follow_moves` locks hubs, and a hub thread
+    // that reached `reconcile` would otherwise wait on this gate while we
+    // waited on its hub.
+    drop(last);
+    if let Some(r) = report {
+        follow_moves(&r.moved);
     }
 }
 
@@ -2374,6 +2514,127 @@ mod tests {
                 move_evidence(&sock_dir, &snap, std::path::Path::new("/proc")),
                 MoveEvidence::Moved(moved_to.canonicalize().unwrap()),
             );
+            kill_test_pids(&sock_path);
+        });
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let st = std::process::Command::new("git").arg("-C").arg(dir).args(args).status().unwrap();
+        assert!(st.success(), "git {args:?} in {}", dir.display());
+    }
+
+    /// #158 §5: a worktree renamed with `git worktree move` while a session
+    /// is working in it. The sweep must write `.moved-to` naming the new URL,
+    /// and following must make the session a resident of the new project and
+    /// hand the new key the old key's `.base` — all without moving the
+    /// session itself: its socket, and so its liveness, stay at the old key.
+    ///
+    /// `owned_live_names_with` is given the resolver Task 8 widens
+    /// `home::resolves` to (an owner equal to the home's `.moved-to`), since
+    /// the shape-only resolver this task leaves in place cannot see a
+    /// resident whose home is itself a worktree.
+    ///
+    /// Revert-checked, run and restored: `home::follow_move` skipped in
+    /// `follow_moves` fails "the session follows the rename" — left `Here`;
+    /// `key_has_sockets` forced to `false` in the `.base` sweep fails "the
+    /// new key inherits the base" — left `None`, the old `.base` reaped by
+    /// the same pass, before following could copy it; the `.moved-to`
+    /// removal in `confirmed_gone` dropped fails "a stale .moved-to is
+    /// removed once the old URL resolves again".
+    #[test]
+    fn a_renamed_worktree_takes_its_sessions_with_it() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = tempfile::tempdir().unwrap();
+            let roots = vec![root.path().to_path_buf()];
+            let repo = root.path().join("mvrepo");
+            fs::create_dir_all(&repo).unwrap();
+            git_in(&repo, &["init", "-q", "-b", "main"]);
+            git_in(&repo, &["config", "user.email", "t@t"]);
+            git_in(&repo, &["config", "user.name", "t"]);
+            fs::write(repo.join("a.txt"), "x").unwrap();
+            git_in(&repo, &["add", "."]);
+            git_in(&repo, &["commit", "-qm", "init"]);
+            git_in(&repo, &["worktree", "add", "-q", "-b", "worktree-a", ".claude/worktrees/worktree-a"]);
+            let old = "mvrepo/.claude/worktrees/worktree-a";
+            let new = "mvrepo/.claude/worktrees/worktree-b";
+            let (old_key, new_key) = (crate::projects::storage_key(old), crate::projects::storage_key(new));
+            crate::worktree::write_base(state, &old_key, "main").unwrap();
+
+            let sock_dir = state.join("sock").join(&old_key);
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            spawn_detached_dtach_in(&sock_path, &repo.join(".claude/worktrees/worktree-a"))
+                .unwrap_or_else(|| panic!("dtach must be available for this test"));
+            let confirming = reconcile(&roots);
+            assert!(confirming.gone_projects == 0 && confirming.moved.is_empty(), "test setup: nothing moved yet");
+            assert!(origin_identity_path(&sock_dir).exists(), "test setup: the identity is recorded");
+
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+            let report = reconcile(&roots);
+            assert_eq!(report.gone_projects, 0, "a renamed worktree is not a gone one");
+            assert_eq!(
+                report.moved,
+                vec![Moved { old_url: old.into(), new_url: new.into(), live: vec!["shell".into()], fresh: true }]
+            );
+            follow_moves(&report.moved);
+
+            assert_eq!(fs::read_to_string(sock_dir.join(".moved-to")).unwrap(), format!("{new}\n"));
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(sock_dir.join(".moved-to")).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, ".moved-to is private");
+            }
+            assert_eq!(crate::home::moved_to(old).as_deref(), Some(new));
+            assert_eq!(crate::home::owner_of(old, "shell"), crate::home::Owner::Elsewhere(new.into()), "the session follows the rename");
+            let widened = |h: &str, o: &str| crate::home::moved_to(h).as_deref() == Some(o);
+            assert!(
+                crate::session::owned_live_names_with(new, &widened).contains(&("shell".to_string(), Some(old.to_string()))),
+                "the new project lists the session as its resident"
+            );
+            assert_eq!(crate::worktree::read_base(state, &new_key).as_deref(), Some("main"), "the new key inherits the base");
+            assert!(socket_has_process(&sock_path), "the master is still alive, at its home socket");
+
+            let again = reconcile(&roots);
+            assert_eq!(again.moved.len(), 1);
+            assert!(!again.moved[0].fresh, "an unchanged .moved-to is not a new rename");
+
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-b", ".claude/worktrees/worktree-a"]);
+            let back = reconcile(&roots);
+            assert!(back.moved.is_empty(), "the old URL resolves again: nothing is moved");
+            assert!(!sock_dir.join(".moved-to").exists(), "a stale .moved-to is removed once the old URL resolves again");
+            kill_test_pids(&sock_path);
+        });
+    }
+
+    /// Spec §5, out of scope by design: a directory moved outside every root
+    /// has no URL to follow to. #178 still keeps the session alive, and
+    /// nothing is written.
+    ///
+    /// Revert-checked, run and restored: with `url_under_roots` replaced by
+    /// the bare leaf name (any directory "resolves" as `out-renamed`) and the
+    /// `resolve_project` confirmation dropped, fails "nothing is followed to
+    /// outside the roots" — `moved` held `Moved { new_url: "out-renamed", … }`.
+    #[test]
+    fn a_move_outside_every_root_writes_nothing() {
+        with_state(|state| {
+            let sock_dir = state.join("sock/out-proj");
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            let root = tempfile::tempdir().unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            let project_dir = root.path().join("out-proj");
+            fs::create_dir_all(&project_dir).unwrap();
+            spawn_detached_dtach_in(&sock_path, &project_dir).unwrap_or_else(|| panic!("dtach must be available for this test"));
+            let _ = reconcile(&[root.path().to_path_buf()]);
+
+            fs::rename(&project_dir, elsewhere.path().join("out-renamed")).unwrap();
+            let report = reconcile(&[root.path().to_path_buf()]);
+
+            assert_eq!(report.gone_projects, 0, "#178: a moved project is not a gone project");
+            assert!(report.moved.is_empty(), "nothing is followed to outside the roots: {:?}", report.moved);
+            assert!(!sock_dir.join(".moved-to").exists(), "no .moved-to for a directory under no root");
+            assert!(socket_has_process(&sock_path), "the session survives, stranded as #178 leaves it");
             kill_test_pids(&sock_path);
         });
     }

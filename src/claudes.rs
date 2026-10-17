@@ -504,6 +504,31 @@ pub(crate) fn sweep_gone_owners_with(
     before_forget: &dyn Fn(&str, &str),
 ) {
     for (home, name, owner) in detect_gone_owners(home_dir_of) {
+        // #158 §5: git no longer lists the owner because it was *renamed*,
+        // and the sweep that saw its inode recorded where to. Follow that
+        // instead of forgetting — but only to an owner that resolves, so a
+        // stale or damaged record still falls through to R18. Off-lock,
+        // like the rest of this sweep, so the resolver may ask git.
+        if let Some(to) = crate::home::moved_to(&owner)
+            .filter(|n| crate::projects::resolve_project(&crate::projects::roots(), n).is_some())
+        {
+            before_forget(&home, &name);
+            // The same compare-before-write as the forget below: a record
+            // re-pointed since the evidence is not this rename's to move.
+            if !matches!(crate::home::owner_of(&home, &name), crate::home::Owner::Elsewhere(ref o) if *o == owner) {
+                continue;
+            }
+            match crate::home::record(&home, &name, &to) {
+                Ok(()) => {
+                    eprintln!("roost: {home}/{name}'s owner {owner} was renamed to {to}; the record follows it");
+                    crate::hub::refresh_and_broadcast(&home);
+                    crate::hub::refresh_and_broadcast(&owner);
+                    crate::hub::refresh_and_broadcast(&to);
+                }
+                Err(e) => eprintln!("roost: {home}/{name}'s owner {owner} was renamed to {to}, but the record was not rewritten: {e}"),
+            }
+            continue;
+        }
         before_forget(&home, &name);
         // Compare, then forget (final review c, amending R18). The evidence
         // is about `owner`; a record re-pointed since — an approval moving
@@ -1657,6 +1682,63 @@ mod tests {
             crate::home::Owner::Elsewhere(owner_y.clone()),
             "a record re-pointed after the evidence was forgotten on evidence about its old owner"
         );
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// #158 §5: a main-checkout terminal re-homed into worktree A, and A
+    /// renamed to B. Git no longer lists A — exactly R18's evidence that A
+    /// is gone — but A's `.moved-to` names B, so the record must follow to
+    /// B rather than be forgotten (which would drop the terminal back into
+    /// the main checkout). `.moved-to` is written by hand here: the registry
+    /// test `a_renamed_worktree_takes_its_sessions_with_it` covers who
+    /// writes it; this one covers the sweep reading it.
+    ///
+    /// Revert-checked, run and restored: with the `moved_to` check removed,
+    /// fails "the record follows the rename instead of being forgotten" —
+    /// left `Here`.
+    #[test]
+    fn a_rehomed_terminal_follows_its_owners_rename() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let home = "r158-renamed-owner-home";
+        let home_dir = root.path().join(home);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git").arg("-C").arg(&home_dir).args(args).status().unwrap().success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(home_dir.join("a.txt"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        git(&["worktree", "add", "-q", "-b", "worktree-a", ".claude/worktrees/worktree-a"]);
+        let a = format!("{home}/.claude/worktrees/worktree-a");
+        let b = format!("{home}/.claude/worktrees/worktree-b");
+        crate::home::record(home, "term3", &a).unwrap();
+        git(&["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+        let key_dir = state.path().join("sock").join(crate::projects::storage_key(&a));
+        std::fs::create_dir_all(&key_dir).unwrap();
+        std::fs::write(key_dir.join(".moved-to"), format!("{b}\n")).unwrap();
+
+        let home_dir_of = |p: &str| (p == home).then(|| home_dir.clone());
+        assert_eq!(
+            detect_gone_owners(&home_dir_of),
+            vec![(home.to_string(), "term3".to_string(), a.clone())],
+            "setup: git no longer lists A, so R18 sees it as gone"
+        );
+        sweep_gone_owners(&home_dir_of, &Mutex::new(HashSet::new()));
+        assert_eq!(
+            crate::home::owner_of(home, "term3"),
+            crate::home::Owner::Elsewhere(b.clone()),
+            "the record follows the rename instead of being forgotten"
+        );
+        assert!(detect_gone_owners(&home_dir_of).is_empty(), "B resolves: nothing left for R18");
+
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
     }

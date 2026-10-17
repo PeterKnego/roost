@@ -802,6 +802,11 @@ pub enum Event {
     /// under a root, `None` when it lies outside every root (the banner then
     /// has nothing to link to).
     WorktreeAppeared { path: String, branch: String, url: Option<String> },
+    /// A project or worktree directory was renamed, and its live terminals
+    /// followed it (#158 §5): `from` is the old URL, `to` the new one. Sent
+    /// to both projects' browsers once per rename — the old page gets a link
+    /// to the new one, the new page the explanation for its new tabs.
+    ProjectMoved { from: String, to: String },
     /// A browser tool call for this page to hand to the extension, unread.
     /// `payload` is opaque JSON text and `sig` its HMAC (`browser::sign`):
     /// the extension verifies the bytes it is given, so this page — which
@@ -1049,6 +1054,19 @@ mod tests {
         assert!(s.contains(r#""t":"WorktreeAppeared""#) && s.contains(r#""branch":"docs/rel""#) && s.contains(r#""url":"uc-rel""#), "{s}");
         let s = encode(&Event::WorktreeAppeared { path: "/elsewhere/x".into(), branch: "x".into(), url: None });
         assert!(s.contains(r#""url":null"#), "{s}");
+    }
+
+    /// The banner reads both fields by name; a rename of either would
+    /// leave it printing `undefined`.
+    ///
+    /// Revert-checked: with `#[serde(rename = "old")]` on `from`, fails —
+    /// observed `{"t":"ProjectMoved","old":"repo/.claude/worktrees/worktree-a",…}`.
+    /// Restored.
+    #[test]
+    fn project_moved_encodes_from_and_to() {
+        let s = encode(&Event::ProjectMoved { from: "repo/.claude/worktrees/worktree-a".into(), to: "repo/.claude/worktrees/worktree-b".into() });
+        assert!(s.contains(r#""t":"ProjectMoved""#), "{s}");
+        assert!(s.contains(r#""from":"repo/.claude/worktrees/worktree-a""#) && s.contains(r#""to":"repo/.claude/worktrees/worktree-b""#), "{s}");
     }
 
     #[test]

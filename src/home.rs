@@ -235,6 +235,134 @@ pub fn effective_owner_with(
     }
 }
 
+/// `sock/<home key>/.moved-to`: where the sweep found `home`'s directory
+/// now lives (#158 §5), as the project URL it resolves as. Written only by
+/// `registry::reconcile`, only on #178's inode evidence, and only when that
+/// URL resolves under the roots.
+fn moved_to_path(state: &Path, home: &str) -> PathBuf {
+    state.join("sock").join(crate::projects::storage_key(home)).join(".moved-to")
+}
+
+/// The URL `home` was renamed to, or `None`. Not three-valued at this
+/// boundary on purpose: absent, unreadable, empty and malformed all read
+/// `None`, and `None` only ever means "do not follow, do not widen" — the
+/// direction that destroys nothing (the sessions stay where #178 left them).
+pub fn moved_to_in(state: &Path, home: &str) -> Option<String> {
+    let s = std::fs::read_to_string(moved_to_path(state, home)).ok()?;
+    let s = s.strip_suffix('\n').unwrap_or(&s);
+    // One line naming a URL: anything else is a damaged or foreign file.
+    if s.is_empty() || s.bytes().any(|b| b.is_ascii_control()) || s.starts_with('/') {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+pub fn moved_to(home: &str) -> Option<String> { moved_to_in(&crate::wsstate::state_dir(), home) }
+
+/// A no-clobber copy: `dst` is written only when it is positively absent,
+/// through a pid-unique temp file and a `hard_link` (which, unlike `rename`,
+/// refuses an existing target — so a file the new key gained meanwhile is
+/// never overwritten). `Ok(false)` when there was nothing to do; any "cannot
+/// tell" about `dst` is nothing to do.
+fn copy_if_absent(src: &Path, dst: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(dst) {
+        Ok(_) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Ok(false),
+    }
+    let bytes = match std::fs::read(src) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("cannot read {}: {e}", src.display())),
+    };
+    let dir = dst.parent().ok_or("no parent")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let leaf = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = dir.join(format!(".{leaf}.copy.tmp.{}", std::process::id()));
+    let out = (|| {
+        std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        match std::fs::hard_link(&tmp, dst) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e.to_string()),
+        }
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    out
+}
+
+/// Spec §5 steps a–d: `old_url`'s directory is now `new_url`'s, so its live
+/// sessions become residents of the new project, records naming the old
+/// URL as owner name the new one, and the new key inherits the old key's
+/// `.base` and layout when it has none. `new_live` is `session::live_names
+/// (new_url)` — the R16 gate. Idempotent; returns whether anything changed.
+///
+/// Records and copies only: no hub, no lock, no git. Its caller
+/// (`registry::follow_moves`) refreshes hubs afterwards, one at a time.
+pub fn follow_move_in(state: &Path, old_url: &str, new_url: &str, live: &[String], new_live: &[String]) -> bool {
+    let mut changed = false;
+    // (a) Only a session that is `Here` follows. `Elsewhere(other)` was
+    // re-homed by its own Claude's move and stays where that put it;
+    // `Unknown` is "cannot tell", and cannot-tell writes nothing.
+    for n in live {
+        if !matches!(owner_of_in(state, old_url, n), Owner::Here) {
+            continue;
+        }
+        // R16: a resident never shadows a native session of the same name.
+        if new_live.contains(n) {
+            eprintln!("roost: {old_url}/{n} did not follow the rename to {new_url}: {n} already exists there");
+            continue;
+        }
+        match record_in(state, old_url, n, new_url) {
+            Ok(()) => changed = true,
+            Err(e) => eprintln!("roost: {old_url}/{n} did not follow the rename to {new_url}: {e}"),
+        }
+    }
+    // (b) Residents of the old URL (a main checkout's terminals re-homed
+    // into the moved worktree). Re-read right before each write, like the
+    // R18 sweep's compare-before-forget: a record re-pointed since the scan
+    // names somewhere else and is not this move's to rewrite.
+    for (home, name, owner) in all_in(state) {
+        if !matches!(&owner, Owner::Elsewhere(o) if o == old_url) {
+            continue;
+        }
+        if !matches!(owner_of_in(state, &home, &name), Owner::Elsewhere(ref o) if o == old_url) {
+            continue;
+        }
+        match record_in(state, &home, &name, new_url) {
+            Ok(()) => changed = true,
+            Err(e) => eprintln!("roost: {home}/{name}'s owner {old_url} was renamed to {new_url}, but its record was not rewritten: {e}"),
+        }
+    }
+    // (c) and (d): only when the new key has none. A rename keeps every
+    // path relative to the project root, so the old layout's file tabs and
+    // the old base both still mean the same thing.
+    let (ok, nk) = (crate::projects::storage_key(old_url), crate::projects::storage_key(new_url));
+    for (src, dst) in [
+        (crate::worktree::base_file(state, &ok), crate::worktree::base_file(state, &nk)),
+        (state.join(format!("{ok}.json")), state.join(format!("{nk}.json"))),
+    ] {
+        match copy_if_absent(&src, &dst) {
+            Ok(c) => changed |= c,
+            Err(e) => eprintln!("roost: not copied after the rename to {new_url}: {e}"),
+        }
+    }
+    changed
+}
+
+/// [`follow_move_in`] against the real state dir, with the R16 gate read
+/// from the new project's own live sessions. Never call under a lock:
+/// `session::live_names` takes `SESSIONS`.
+pub fn follow_move(old_url: &str, new_url: &str, live: &[String]) -> bool {
+    let new_live = crate::session::live_names(new_url);
+    follow_move_in(&crate::wsstate::state_dir(), old_url, new_url, live, &new_live)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +597,84 @@ mod tests {
         let d = st.path().join("home").join(crate::projects::storage_key("foo"));
         std::fs::write(d.join("term3"), "").unwrap();
         assert_eq!(effective_owner_with(st.path(), &yes, "foo", "term3"), "foo");
+    }
+
+    /// Spec §5 (a)–(d) in one pass, with every branch that must write
+    /// nothing given a fixture that would expose it: a native session of the
+    /// same name at the new key (R16), a session already re-homed elsewhere,
+    /// an `Unknown` record, a resident of some other owner, and a layout the
+    /// new key already has.
+    ///
+    /// Revert-checked, each run and restored: (a)'s `Here` filter removed
+    /// (every live name recorded) fails "a session already re-homed
+    /// elsewhere stays there" — left `Elsewhere(".../worktree-b")`; (b)'s
+    /// owner filter made to skip everything fails "(b) a resident of the old
+    /// URL follows" — left `Elsewhere(".../worktree-a")`. `copy_if_absent`'s
+    /// present-`dst` early return removed alone still passes (`hard_link`
+    /// refuses the existing target too, so no-clobber is held twice); with
+    /// that removed *and* `hard_link` swapped for `rename`, fails "the new
+    /// key's own layout is never overwritten" — left `"{\"old\":1}"`.
+    #[test]
+    fn follow_move_rewrites_owner_records_and_copies_state_only_when_absent() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        let old = "repo/.claude/worktrees/worktree-a";
+        let new = "repo/.claude/worktrees/worktree-b";
+        let other = "repo/.claude/worktrees/other";
+        record_in(s, old, "away", other).unwrap();
+        let d = s.join("home").join(crate::projects::storage_key(old));
+        std::fs::write(d.join("unsure"), "").unwrap();
+        record_in(s, "repo", "term3", old).unwrap();
+        record_in(s, "repo", "term4", other).unwrap();
+        let (ok, nk) = (crate::projects::storage_key(old), crate::projects::storage_key(new));
+        crate::worktree::write_base(s, &ok, "main").unwrap();
+        std::fs::write(s.join(format!("{ok}.json")), r#"{"old":1}"#).unwrap();
+        std::fs::write(s.join(format!("{nk}.json")), r#"{"new":1}"#).unwrap();
+
+        let live: Vec<String> = ["shell", "busy", "away", "unsure"].map(String::from).to_vec();
+        assert!(follow_move_in(s, old, new, &live, &["busy".to_string()]));
+
+        assert_eq!(owner_of_in(s, old, "shell"), Owner::Elsewhere(new.into()), "(a) a live session follows");
+        assert_eq!(owner_of_in(s, old, "busy"), Owner::Here, "R16: the new key's native busy is not shadowed");
+        assert_eq!(owner_of_in(s, old, "away"), Owner::Elsewhere(other.into()), "a session already re-homed elsewhere stays there");
+        assert!(matches!(owner_of_in(s, old, "unsure"), Owner::Unknown(_)), "cannot tell writes nothing");
+        assert_eq!(owner_of_in(s, "repo", "term3"), Owner::Elsewhere(new.into()), "(b) a resident of the old URL follows");
+        assert_eq!(owner_of_in(s, "repo", "term4"), Owner::Elsewhere(other.into()), "(b) another owner's resident is untouched");
+        assert_eq!(crate::worktree::read_base(s, &nk).as_deref(), Some("main"), "(c) the base is copied to a key that had none");
+        assert_eq!(std::fs::read_to_string(s.join(format!("{nk}.json"))).unwrap(), r#"{"new":1}"#, "the new key's own layout is never overwritten");
+
+        assert!(!follow_move_in(s, old, new, &live, &["busy".to_string()]), "a second pass changes nothing");
+
+        std::fs::remove_file(s.join(format!("{nk}.json"))).unwrap();
+        assert!(follow_move_in(s, old, new, &live, &[]));
+        assert_eq!(std::fs::read_to_string(s.join(format!("{nk}.json"))).unwrap(), r#"{"old":1}"#, "(d) the layout is copied to a key that had none");
+        assert_eq!(owner_of_in(s, old, "busy"), Owner::Elsewhere(new.into()), "once the name is free there, it follows too");
+        assert!(std::fs::read_dir(s).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(".tmp.")), "no temp file left behind");
+    }
+
+    /// `None` for everything but one line naming a URL. Pins the parse,
+    /// which the widenings and the gone-owner sweep all trust: a damaged
+    /// file must never name an owner.
+    ///
+    /// Revert-checked: without the control-byte refusal, fails on
+    /// `"proj2\nproj3\n"` — left `Some("proj2\nproj3")`. Restored.
+    #[test]
+    fn moved_to_reads_only_one_line_naming_a_url() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        let p = moved_to_path(s, "proj");
+        assert_eq!(moved_to_in(s, "proj"), None, "absent");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        for (body, want) in [
+            ("proj2\n", Some("proj2")),
+            ("proj2", Some("proj2")),
+            ("", None),
+            ("\n", None),
+            ("proj2\nproj3\n", None),
+            ("/abs/path\n", None),
+        ] {
+            std::fs::write(&p, body).unwrap();
+            assert_eq!(moved_to_in(s, "proj").as_deref(), want, "{body:?}");
+        }
     }
 }
