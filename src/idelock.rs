@@ -246,8 +246,20 @@ impl Lock {
 }
 
 /// Atomic: a temp file then `rename`, so Claude Code never reads half a lock.
+///
+/// Private (#184): the body carries `authToken`, the only thing the IDE
+/// socket asks of a client — `ide.rs` refuses any `Origin`, so a token is the
+/// whole boundary. `File::create` took the umask, which left every lock 0664
+/// on the deploy host. The temp file is born 0600 before a byte of the token
+/// is written, and `rename` keeps that mode; `create_new` also refuses to
+/// follow anything already sitting at the temp path.
 fn write_body(dir: &Path, port: u16, token: &str, workspace: &Path) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let tmp = dir.join(temp_name(port));
+    write_body_via(dir, &tmp, port, token, workspace)
+}
+
+fn write_body_via(dir: &Path, tmp: &Path, port: u16, token: &str, workspace: &Path) -> Result<PathBuf, String> {
+    ensure_dir(dir)?;
     let body = serde_json::json!({
         "pid": std::process::id(),
         "workspaceFolders": [workspace.to_string_lossy()],
@@ -256,17 +268,79 @@ fn write_body(dir: &Path, port: u16, token: &str, workspace: &Path) -> Result<Pa
         "authToken": token,
     })
     .to_string();
-    let tmp = dir.join(temp_name(port));
     let path = dir.join(format!("{port}.lock"));
-    let mut f = std::fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
-    f.sync_all().map_err(|e| e.to_string())?;
-    drop(f);
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("{}: {e}", path.display())
-    })?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    // From here the temp file is ours: any failure removes it, not only a
+    // failed rename — a half-written temp holds the token too.
+    let written = f
+        .write_all(body.as_bytes())
+        .and_then(|()| f.sync_all())
+        .map_err(|e| e.to_string())
+        .and_then(|()| {
+            drop(f);
+            std::fs::rename(tmp, &path).map_err(|e| format!("{}: {e}", path.display()))
+        });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(tmp);
+        return Err(e);
+    }
     Ok(path)
+}
+
+/// Creates the IDE directory 0700 when roost is the one creating it. One
+/// that already exists is left exactly as found — Claude Code and every
+/// other IDE on the host share it, and chmodding a directory roost does not
+/// own is not this file's call — but if it is open to group or other, say
+/// so once: the lock files are private regardless, the directory listing
+/// (which ports have an IDE) is not.
+fn ensure_dir(dir: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => {
+            warn_if_open(dir);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut b = std::fs::DirBuilder::new();
+            b.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                b.mode(0o700);
+            }
+            b.create(dir).map_err(|e| format!("{}: {e}", dir.display()))
+        }
+        // Cannot look: let the open below report it rather than guessing.
+        Err(_) => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn dir_is_open(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(dir).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
+}
+
+#[cfg(not(unix))]
+fn dir_is_open(_dir: &Path) -> bool {
+    false
+}
+
+fn warn_if_open(dir: &Path) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if dir_is_open(dir) && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "roost: {} is readable by group or other users; roost's lock files in it are 0600, \
+             but `chmod 700` it to hide which ports have an IDE",
+            dir.display()
+        );
+    }
 }
 
 pub fn write(port: u16, token: &str, workspace: &Path) -> Result<Lock, String> {
@@ -509,5 +583,80 @@ mod tests {
         let nested = d.path().join("claude/ide");
         let lock = write_in(&nested, 5599, "cafe", ws.path()).unwrap();
         assert!(lock.path().exists());
+    }
+
+    #[cfg(unix)]
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// #184: the lock file carries `authToken`, which is all the IDE socket
+    /// asks of a client — so it must be as private as `<key>.token` is.
+    /// Exact `0o600`, not "no group/other bits", so the assertion fails under
+    /// either common umask without this test touching the process-global
+    /// one. Covers `rewrite` too: it is the second writer, added by #181.
+    /// Revert-checked: without `opts.mode(0o600)` this fails — left: 436
+    /// (0664, the deploy host's umask), right: 384.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_and_its_rewrite_are_private() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let lock = write_in(d.path(), 5600, "cafe", ws.path()).unwrap();
+        assert_eq!(mode_of(lock.path()), 0o600, "a lock file holds the IDE token");
+        let ws2 = tempfile::tempdir().unwrap();
+        lock.rewrite(5600, "cafe", ws2.path()).unwrap();
+        assert_eq!(mode_of(lock.path()), 0o600, "a rewritten lock file holds it too");
+    }
+
+    /// The directory roost creates itself is 0700; one it finds is left
+    /// alone (see `warn_if_open`). Revert-checked: without `b.mode(0o700)`
+    /// this fails — left: 509 (0775), right: 448.
+    #[cfg(unix)]
+    #[test]
+    fn an_ide_dir_roost_creates_is_private() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let nested = d.path().join("cfg/ide");
+        write_in(&nested, 5601, "cafe", ws.path()).unwrap();
+        assert_eq!(mode_of(&nested), 0o700, "roost's own ide directory");
+    }
+
+    /// A pre-existing directory is never chmodded: it is shared with every
+    /// other IDE and Claude Code created it, not roost. Revert-checked: with
+    /// `ensure_dir` chmodding an existing directory to 0700 this fails —
+    /// left: 448, right: 493 (0755).
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_ide_dir_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        write_in(d.path(), 5602, "cafe", ws.path()).unwrap();
+        assert_eq!(mode_of(d.path()), 0o755);
+        assert!(dir_is_open(d.path()), "0755 is readable by others, so it warrants the warning");
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!dir_is_open(d.path()));
+    }
+
+    /// A temp file left by a previous crash at the same name must not be
+    /// written through: `create_new` refuses it, so a planted symlink at the
+    /// temp path can never redirect the token elsewhere. Revert-checked:
+    /// with `create(true).truncate(true)` in place of `create_new` the write
+    /// follows the link and this fails on "create_new must refuse".
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_temp_symlink_is_not_written_through() {
+        let d = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("stolen");
+        let ws = tempfile::tempdir().unwrap();
+        let tmp = d.path().join("planted");
+        std::os::unix::fs::symlink(&target, &tmp).unwrap();
+        let r = write_body_via(d.path(), &tmp, 5603, "cafe", ws.path());
+        assert!(r.is_err(), "create_new must refuse an existing temp path");
+        assert!(!target.exists(), "the token must not land at the symlink's target");
     }
 }
