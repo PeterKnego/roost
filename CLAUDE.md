@@ -254,7 +254,7 @@ These are load-bearing. Breaking one is a defect, not a style choice.
 
 ## Absence of evidence is not evidence of absence
 
-**Eleven separate defects in one feature were the same mistake**: code concluded
+**Twelve separate defects were the same mistake**: code concluded
 something was gone, dead, or empty because the *check* failed, then destroyed it.
 Every one could kill a user's long-running shell or overwrite their file.
 
@@ -271,9 +271,13 @@ Every one could kill a user's long-running shell or overwrite their file.
 | An empty or truncated `.origin` marker | the directory was deleted | the recorded session |
 | `Path::is_dir()` swallowing `EACCES` | the directory was deleted | the recorded session |
 | `Path::exists()` on a dangling symlink | the destination is free | the symlink's target |
+| A project directory renamed (`git worktree move`, `mv`) | the directory was deleted | every live session working in it |
 
-The last one is in a different module from the rest, so treat this as systemic,
-not as a `registry.rs` quirk.
+The `Path::exists()` row is in a different module from the rest, so treat this
+as systemic, not as a `registry.rs` quirk. The rename row is the `.origin`
+safeguard defeated: the recorded path really is `NotFound`, and only the
+directory's inode, reached from a live shell's cwd, tells a move from a delete
+(`registry::moved_not_deleted`, #178).
 
 **The rule:** "I could not determine X" is a third outcome, never folded into
 "X is false". Concretely:

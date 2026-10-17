@@ -577,6 +577,105 @@ fn write_origin(key_dir: &std::path::Path, dir: &std::path::Path) {
     if std::fs::rename(&tmp, &marker).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
+    write_origin_identity(key_dir, dir);
+}
+
+/// The project directory's `(device, inode)`, kept beside `.origin` (#178).
+///
+/// `.origin` alone cannot tell "deleted" from "moved": both leave the recorded
+/// path `NotFound`. The inode can — a rename keeps it, a delete destroys it —
+/// and `moved_not_deleted` looks for it from the sessions' own shells. A
+/// sidecar rather than a second line in `.origin`, so the marker older
+/// binaries read as a path stays byte-identical.
+fn origin_identity_path(key_dir: &std::path::Path) -> std::path::PathBuf {
+    key_dir.join(".origin-ino")
+}
+
+#[cfg(unix)]
+fn write_origin_identity(key_dir: &std::path::Path, dir: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(m) = std::fs::metadata(dir) else { return };
+    let bytes = format!("{} {}\n", m.dev(), m.ino()).into_bytes();
+    let marker = origin_identity_path(key_dir);
+    if std::fs::read(&marker).map(|cur| cur == bytes).unwrap_or(false) {
+        return;
+    }
+    let tmp = key_dir.join(format!(".origin-ino.tmp.{}", std::process::id()));
+    if std::fs::write(&tmp, &bytes).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    if std::fs::rename(&tmp, &marker).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(not(unix))]
+fn write_origin_identity(_key_dir: &std::path::Path, _dir: &std::path::Path) {}
+
+/// True when a project the sweep is about to call gone was **moved**, or when
+/// that cannot be ruled out — either way, nothing may be killed (#178).
+///
+/// The evidence is a live session's shell: its `/proc/<pid>/cwd` still resolves
+/// (not `… (deleted)`), and some directory on that path has the
+/// `(device, inode)` recorded for the project. A rename keeps the inode; a
+/// delete destroys it. No recorded identity (a marker from an older roost) is
+/// no evidence, and the sweep proceeds exactly as before. A shell roost cannot
+/// name, or a cwd it cannot read, is "cannot tell" and suspends the kill: a
+/// stale row is recoverable, a killed shell is not.
+#[cfg(unix)]
+fn moved_not_deleted(key_dir: &std::path::Path, snapshot: &[(u32, String)], proc_root: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some((dev, ino)) = std::fs::read_to_string(origin_identity_path(key_dir)).ok().and_then(|s| {
+        let mut it = s.split_whitespace();
+        Some((it.next()?.parse::<u64>().ok()?, it.next()?.parse::<u64>().ok()?))
+    }) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(key_dir) else { return true };
+    let own = match crate::procsess::session_of(proc_root, std::process::id()) {
+        crate::procsess::Sid::In(s) => Some(s),
+        _ => None,
+    };
+    for e in entries.flatten() {
+        if e.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let pids = pids_holding(snapshot, &e.path());
+        if pids.is_empty() {
+            continue;
+        }
+        let Some(shells) = crate::procsess::target_sessions(proc_root, &pids, own) else { return true };
+        for shell in shells {
+            let cwd = match std::fs::read_link(proc_root.join(shell.to_string()).join("cwd")) {
+                Ok(p) => p,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return true,
+            };
+            if cwd.to_string_lossy().ends_with(" (deleted)") {
+                continue;
+            }
+            let mut at = Some(cwd.as_path());
+            while let Some(p) = at {
+                if let Ok(m) = std::fs::symlink_metadata(p) {
+                    if m.dev() == dev && m.ino() == ino {
+                        return true;
+                    }
+                }
+                at = p.parent();
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn moved_not_deleted(_key_dir: &std::path::Path, _snapshot: &[(u32, String)], _proc_root: &std::path::Path) -> bool {
+    false
 }
 
 /// Records the resolved absolute directory a project maps to, so a *later*
@@ -923,7 +1022,16 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
         // not evidence the directory is gone; only a key whose resolved
         // path was previously recorded, and is now confirmed missing,
         // counts.
-        let project_gone = roots_ok && confirmed_gone(&entry.path(), roots, &url);
+        let project_gone = roots_ok
+            && confirmed_gone(&entry.path(), roots, &url)
+            && if moved_not_deleted(&entry.path(), &snapshot, std::path::Path::new("/proc")) {
+                // #178: `NotFound` at the recorded path, but a live shell is
+                // still inside the same directory under another name.
+                eprintln!("roost: not reaping {key} — its directory was moved, not deleted (a live session is still in it)");
+                false
+            } else {
+                true
+            };
         // In-process sessions first, once per project rather than once per
         // socket file below: `session::kill_project` now ends each session's
         // dtach master too (via `kill_and_unlink`, the same helper the loop
@@ -2158,6 +2266,72 @@ mod tests {
                 "the dtach process itself must be killed, not merely forgotten by deleting its socket"
             );
             assert!(!sock_path.exists(), "the socket must be removed only once the process is confirmed gone");
+        });
+    }
+
+    /// `spawn_detached_dtach`, with the session's program started inside `cwd`
+    /// — where a real roost shell starts — so `/proc/<shell>/cwd` says
+    /// something about the project directory.
+    fn spawn_detached_dtach_in(sock_path: &std::path::Path, cwd: &std::path::Path) -> Option<()> {
+        let status = std::process::Command::new("dtach")
+            .args(["-n", sock_path.to_str().unwrap(), "sleep", "30"])
+            .current_dir(cwd)
+            .status()
+            .ok()?;
+        status.success().then_some(())
+    }
+
+    /// #178: `git worktree move`, or a plain `mv` of a project, leaves the
+    /// recorded path `NotFound` — but the directory was moved, not deleted,
+    /// and the shell inside it is still working in it. A shell whose cwd
+    /// still reaches the recorded directory (same device and inode) is
+    /// positive evidence of a move, and the sweep must not kill it.
+    ///
+    /// Revert-checked: on the pre-fix code, and again with the inode match in
+    /// `moved_not_deleted` disabled, this fails — "a moved project is not a
+    /// gone project", the session reaped.
+    #[test]
+    fn a_live_session_whose_project_was_moved_is_not_killed() {
+        with_state(|state| {
+            let sock_dir = state.join("sock/moved-proj");
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            let root = tempfile::tempdir().unwrap();
+            let project_dir = root.path().join("moved-proj");
+            fs::create_dir_all(&project_dir).unwrap();
+            spawn_detached_dtach_in(&sock_path, &project_dir).expect("dtach must be available for this test");
+            assert!(socket_has_process(&sock_path), "test setup: the session must be live");
+
+            let confirming = reconcile(&[root.path().to_path_buf()]);
+            assert_eq!(confirming.gone_projects, 0, "test setup: nothing reaped while the directory exists");
+
+            fs::rename(&project_dir, root.path().join("renamed-proj")).unwrap();
+            let report = reconcile(&[root.path().to_path_buf()]);
+
+            assert_eq!(report.gone_projects, 0, "a moved project is not a gone project");
+            assert!(socket_has_process(&sock_path), "the shell working in the moved directory must survive");
+            kill_test_pids(&sock_path);
+        });
+    }
+
+    /// The other half of the same evidence: a shell whose cwd was *in* the
+    /// project when the project was deleted reads `(deleted)`, which is not a
+    /// move — the session is reaped exactly as before.
+    #[test]
+    fn a_live_session_inside_a_deleted_project_is_still_killed() {
+        with_state(|state| {
+            let sock_dir = state.join("sock/deleted-in");
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            let root = tempfile::tempdir().unwrap();
+            let project_dir = root.path().join("deleted-in");
+            fs::create_dir_all(&project_dir).unwrap();
+            spawn_detached_dtach_in(&sock_path, &project_dir).expect("dtach must be available for this test");
+            let _ = reconcile(&[root.path().to_path_buf()]);
+            fs::remove_dir_all(&project_dir).unwrap();
+            let report = reconcile(&[root.path().to_path_buf()]);
+            assert_eq!(report.gone_projects, 1, "a deleted project's session is still reaped");
+            assert!(!socket_has_process(&sock_path), "and its process really ended");
         });
     }
 
