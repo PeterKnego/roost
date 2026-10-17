@@ -327,11 +327,26 @@ pub(crate) fn record_move_with(
     // The record first, the shells second: once a rename has been followed,
     // its sessions' shells are free to `cd` out of the directory, and the
     // record plus the directory's own inode is still positive evidence.
+    let mut live: Vec<String> = std::fs::read_dir(key_dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| crate::session::valid_name(n))
+                .filter(|n| !pids_holding(snapshot, &key_dir.join(n)).is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    live.sort();
     // And the directory's siblings last (#182): a rename made while no
     // shell was under the inode — the first one, or a later hop after a
-    // `cd` — leaves the directory itself as the only witness.
+    // `cd` — leaves the directory itself as the only witness. Only for a
+    // key that still holds a live session, which is what this evidence
+    // exists to save from a reap: with none, the recorded identity may
+    // describe a directory long since followed and left, and a new
+    // directory's resident must not be handed to it (the scan found B for
+    // `a_moved_to_does_not_outlive_its_sessions` before this gate).
     let evidence = moved_to_evidence(roots, key_dir).unwrap_or_else(|| match move_evidence(key_dir, snapshot, proc_root) {
-        MoveEvidence::None => sibling_evidence(roots, key_dir),
+        MoveEvidence::None if !live.is_empty() => sibling_evidence(roots, key_dir),
         e => e,
     });
     let new_dir = match evidence {
@@ -355,16 +370,6 @@ pub(crate) fn record_move_with(
         return MoveRecord::Unfollowable;
     };
     say(format!("roost: not reaping {key} — its directory was moved to {new_url}, not deleted"));
-    let mut live: Vec<String> = std::fs::read_dir(key_dir)
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| crate::session::valid_name(n))
-                .filter(|n| !pids_holding(snapshot, &key_dir.join(n)).is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    live.sort();
     // The target this key was followed to before, when this pass moves it
     // on (a second rename). Only while that URL no longer resolves: a
     // directory standing there now is a different one — the evidence above
@@ -3183,7 +3188,10 @@ mod tests {
     /// The final assertion is held twice: with that removal *and* R18
     /// trusting a resolving `.moved-to` (the first fix's branch put back
     /// ahead of `record_move`), fails "R18 forgets a resident of the new A"
-    /// — left `Elsewhere(".../worktree-b")`.
+    /// — left `Elsewhere(".../worktree-b")`. And again by #182's sibling
+    /// scan run for a key with no live session: the stale identity is B's,
+    /// the scan finds B, and R18 hands the new A's resident to it — the same
+    /// failure, which is why `record_move_with` gates the scan on `live`.
     #[test]
     fn a_moved_to_does_not_outlive_its_sessions() {
         with_state(|state| {
