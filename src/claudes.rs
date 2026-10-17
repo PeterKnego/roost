@@ -275,8 +275,10 @@ fn changed_projects(old: &[ClaudeProc], new: &[ClaudeProc]) -> Vec<String> {
 /// A move roost was not asked about (spec §7). `Into` is a native Claude
 /// whose cwd has landed inside one of its home's own worktrees; `Back` is a
 /// resident's Claude that has cd'd back out to its home's main checkout.
-/// Both are offers a browser accepts or ignores — nothing here writes a
-/// re-home record by itself (`hub::do_rehome` is the only writer).
+/// Both are offers a browser accepts or ignores, with one exception: an
+/// `Into` that is exactly the move an approved `WorktreeCreate` expected is
+/// taken by `offer_moves_at`, through `hub::rehome_to` — the same writer
+/// `hub::do_rehome` uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Move {
     Into { home: String, session: String, worktree: String },
@@ -574,6 +576,53 @@ fn gone_announced_cell() -> &'static Mutex<HashSet<(String, String, String)>> {
     GONE_ANNOUNCED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// How long an approved `WorktreeCreate` stays the explanation for its
+/// Claude's cwd landing in that worktree (spec §1). Long enough for a
+/// Claude to act on the `Path` reply and for one `POLL` to see it; short
+/// enough that a subagent's approval, which never moves the parent, is
+/// forgotten before anything else can be mistaken for it.
+pub const EXPECT_MOVE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+type Expectations = Mutex<HashMap<(String, String), (String, std::time::Instant)>>;
+
+/// Approved-but-not-yet-seen moves, `(home, session) → (worktree url,
+/// approved at)`. In memory only: a restart loses an entry, which only
+/// turns the automatic move into the ordinary offer.
+static EXPECTED: OnceLock<Expectations> = OnceLock::new();
+
+fn expected_cell() -> &'static Expectations {
+    EXPECTED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Records that `(home, session)`'s Claude was just told to work in
+/// `worktree_url`. Approval is what Claude *intends*; the hook cannot tell
+/// the Claude's own `EnterWorktree` from a subagent's `isolation:
+/// "worktree"`, so nothing moves until `/proc` shows that Claude's cwd
+/// actually inside the worktree — see `offer_moves_at`.
+pub fn expect_move(home: &str, session: &str, worktree_url: &str) {
+    expect_move_in(expected_cell(), home, session, worktree_url, std::time::Instant::now());
+}
+
+/// `expect_move` against an explicit map and clock. One entry per
+/// `(home, session)`: a newer approval replaces the older outright.
+pub(crate) fn expect_move_in(
+    expect: &Expectations,
+    home: &str,
+    session: &str,
+    worktree_url: &str,
+    now: std::time::Instant,
+) {
+    let mut g = expect.lock().unwrap_or_else(|e| e.into_inner());
+    g.insert((home.to_string(), session.to_string()), (worktree_url.to_string(), now));
+}
+
+/// The worktree `(home, session)` is currently expected to move into.
+#[cfg(test)]
+pub(crate) fn expectation_for(home: &str, session: &str) -> Option<String> {
+    let g = expected_cell().lock().unwrap_or_else(|e| e.into_inner());
+    g.get(&(home.to_string(), session.to_string())).map(|(u, _)| u.clone())
+}
+
 /// Delivers `Event::ClaudeElsewhere` for every `Move` whose (home, session)
 /// state changed since the last tick that saw one. `Into` goes to the home
 /// — the page still showing the session natively, with the offer to move
@@ -584,17 +633,79 @@ fn gone_announced_cell() -> &'static Mutex<HashSet<(String, String, String)>> {
 /// the same "cannot tell, do nothing" direction as everywhere else in this
 /// module.
 fn offer_moves(moves: &[Move], last: &Mutex<HashMap<(String, String), Option<String>>>) {
+    offer_moves_at(
+        moves,
+        last,
+        expected_cell(),
+        std::time::Instant::now(),
+        &crate::hub::rehome_to,
+        &crate::hub::broadcast_to_project,
+    );
+}
+
+/// `offer_moves` with the expectation map, the clock, the re-home and the
+/// broadcast injected.
+///
+/// The one exception to "a move is only ever offered": an `Into` that is
+/// exactly the worktree an approval named for this `(home, session)`, seen
+/// within `EXPECT_MOVE_WINDOW`, is the approved move landing, so it is
+/// taken without asking again. The evidence is the Claude's own cwd, which
+/// a subagent's worktree never changes. Every other `Into` — an expired
+/// expectation, a different worktree, an expectation a restart lost, or
+/// one `rehome` refused (R16) — gets the ordinary offer. A refused one
+/// keeps its expectation to expire on its own (spec §1).
+///
+/// `rehome` is called with no lock held: it takes hub locks one at a time
+/// and broadcasts to every hub.
+pub(crate) fn offer_moves_at(
+    moves: &[Move],
+    last: &Mutex<HashMap<(String, String), Option<String>>>,
+    expect: &Expectations,
+    now: std::time::Instant,
+    rehome: &dyn Fn(&str, &str, &str) -> Result<(), String>,
+    broadcast: &dyn Fn(&str, &crate::proto::Event),
+) {
+    // The window is enforced here and only here: whatever survives this
+    // sweep is fresh.
+    expect
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, (_, at)| now.saturating_duration_since(*at) <= EXPECT_MOVE_WINDOW);
     for mv in moves {
         match mv {
             Move::Into { home, session, worktree } => {
                 let key = (home.clone(), session.clone());
+                let expected = {
+                    let g = expect.lock().unwrap_or_else(|e| e.into_inner());
+                    g.get(&key).is_some_and(|(url, _)| url == worktree)
+                };
+                if expected {
+                    match rehome(home, session, worktree) {
+                        Ok(()) => {
+                            {
+                                let mut g = expect.lock().unwrap_or_else(|e| e.into_inner());
+                                // Only the entry that was acted on: an
+                                // approval that landed during `rehome` names
+                                // something else and stays.
+                                if g.get(&key).is_some_and(|(url, _)| url == worktree) {
+                                    g.remove(&key);
+                                }
+                            }
+                            last.lock().unwrap_or_else(|e| e.into_inner()).insert(key, Some(worktree.clone()));
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("roost: {session} entered {worktree} as approved, but was not moved: {e}");
+                        }
+                    }
+                }
                 let fresh = Some(worktree.clone());
                 let changed = {
                     let mut g = last.lock().unwrap_or_else(|e| e.into_inner());
                     g.insert(key, fresh.clone()) != Some(fresh)
                 };
                 if changed {
-                    crate::hub::broadcast_to_project(
+                    broadcast(
                         home,
                         &crate::proto::Event::ClaudeElsewhere { session: session.clone(), worktree: Some(worktree.clone()) },
                     );
@@ -608,10 +719,7 @@ fn offer_moves(moves: &[Move], last: &Mutex<HashMap<(String, String), Option<Str
                 };
                 if changed {
                     if let crate::home::Owner::Elsewhere(owner) = crate::home::owner_of(home, session) {
-                        crate::hub::broadcast_to_project(
-                            &owner,
-                            &crate::proto::Event::ClaudeElsewhere { session: session.clone(), worktree: None },
-                        );
+                        broadcast(&owner, &crate::proto::Event::ClaudeElsewhere { session: session.clone(), worktree: None });
                     }
                 }
             }
@@ -1608,5 +1716,204 @@ mod tests {
 
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    // --- §1: a terminal moves only when its Claude does (#158) ------------
+
+    type Rehomes = std::cell::RefCell<Vec<(String, String, String)>>;
+    type Broadcasts = std::cell::RefCell<Vec<(String, crate::proto::Event)>>;
+
+    const WX: &str = "h/.claude/worktrees/worktree-x";
+    const WY: &str = "h/.claude/worktrees/worktree-y";
+
+    fn into(worktree: &str) -> Move {
+        Move::Into { home: "h".into(), session: "term3".into(), worktree: worktree.into() }
+    }
+
+    fn expecting(url: &str, at: std::time::Instant) -> Mutex<HashMap<(String, String), (String, std::time::Instant)>> {
+        let m = Mutex::new(HashMap::new());
+        m.lock().unwrap().insert(("h".to_string(), "term3".to_string()), (url.to_string(), at));
+        m
+    }
+
+    /// Runs one `offer_moves_at` with a rehome that records and answers
+    /// `answer`, and a broadcaster that records.
+    fn run(
+        moves: &[Move],
+        last: &Mutex<HashMap<(String, String), Option<String>>>,
+        expect: &Mutex<HashMap<(String, String), (String, std::time::Instant)>>,
+        now: std::time::Instant,
+        answer: Result<(), String>,
+    ) -> (Vec<(String, String, String)>, Vec<(String, crate::proto::Event)>) {
+        let rehomes: Rehomes = Default::default();
+        let sent: Broadcasts = Default::default();
+        offer_moves_at(
+            moves,
+            last,
+            expect,
+            now,
+            &|h, s, o| {
+                rehomes.borrow_mut().push((h.to_string(), s.to_string(), o.to_string()));
+                answer.clone()
+            },
+            &|p, ev| sent.borrow_mut().push((p.to_string(), ev.clone())),
+        );
+        (rehomes.into_inner(), sent.into_inner())
+    }
+
+    fn is_offer_of(sent: &[(String, crate::proto::Event)], worktree: &str) -> bool {
+        sent.iter().any(|(p, ev)| {
+            p == "h"
+                && matches!(ev, crate::proto::Event::ClaudeElsewhere { session, worktree: Some(w) }
+                    if session == "term3" && w == worktree)
+        })
+    }
+
+    /// The approved move landing: the watcher re-homes on its own, offers
+    /// nothing, and the expectation is spent.
+    ///
+    /// Revert-checked: dropping the `last` insert on `Ok` fails the last
+    /// assertion — observed: `left: None, right: Some(Some("h/.claude/
+    /// worktrees/worktree-x"))`. Restored.
+    #[test]
+    fn an_expected_move_rehomes_without_an_offer() {
+        let t0 = std::time::Instant::now();
+        let last = Mutex::new(HashMap::new());
+        let expect = expecting(WX, t0);
+        let (rehomes, sent) = run(&[into(WX)], &last, &expect, t0 + std::time::Duration::from_secs(3), Ok(()));
+        assert_eq!(rehomes, vec![("h".to_string(), "term3".to_string(), WX.to_string())], "re-homed once, to x");
+        assert!(sent.is_empty(), "no ClaudeElsewhere offer for an approved move: {sent:?}");
+        assert!(expect.lock().unwrap().is_empty(), "the expectation is consumed");
+        assert_eq!(
+            last.lock().unwrap().get(&("h".to_string(), "term3".to_string())),
+            Some(&Some(WX.to_string())),
+            "recorded as seen, so a later tick does not offer it either"
+        );
+    }
+
+    /// The tick after a successful re-home. `detect_moves_in` normally
+    /// yields nothing then (the record reads `Elsewhere(x)` —
+    /// `an_already_recorded_move_is_not_reported_again`), but should the
+    /// same `Into` be seen once more (a record write `owner_of` cannot read
+    /// back yet), it must be neither re-homed nor offered.
+    ///
+    /// Revert-checked with the `last` insert on `Ok` dropped — observed:
+    /// `no offer for a move already taken: [("h", ClaudeElsewhere {
+    /// session: "term3", worktree: Some(".../worktree-x") })]`. Restored.
+    #[test]
+    fn a_rehomed_move_seen_again_is_neither_offered_nor_moved_again() {
+        let t0 = std::time::Instant::now();
+        let last = Mutex::new(HashMap::new());
+        let expect = expecting(WX, t0);
+        let _ = run(&[into(WX)], &last, &expect, t0 + std::time::Duration::from_secs(3), Ok(()));
+        let (rehomes, sent) = run(&[into(WX)], &last, &expect, t0 + std::time::Duration::from_secs(6), Ok(()));
+        assert!(rehomes.is_empty(), "the expectation was spent: {rehomes:?}");
+        assert!(sent.is_empty(), "no offer for a move already taken: {sent:?}");
+    }
+
+    /// The subagent case: approval left an expectation, but the parent
+    /// Claude never moved. Past the window it is gone and nothing happened.
+    ///
+    /// Revert-checked with the window `retain` made to keep everything —
+    /// observed: `the expired expectation is removed`. Restored.
+    #[test]
+    fn an_expectation_without_a_move_expires_and_moves_nothing() {
+        let t0 = std::time::Instant::now();
+        let last = Mutex::new(HashMap::new());
+        let expect = expecting(WX, t0);
+        // Inside the window, with no move: kept.
+        let (rehomes, sent) = run(&[], &last, &expect, t0 + std::time::Duration::from_secs(29), Ok(()));
+        assert!(rehomes.is_empty() && sent.is_empty());
+        assert_eq!(expect.lock().unwrap().len(), 1, "still fresh at 29 s");
+        // Past it: swept.
+        let (rehomes, sent) = run(&[], &last, &expect, t0 + std::time::Duration::from_secs(31), Ok(()));
+        assert!(rehomes.is_empty(), "nothing re-homed: {rehomes:?}");
+        assert!(sent.is_empty(), "nothing offered: {sent:?}");
+        assert!(expect.lock().unwrap().is_empty(), "the expired expectation is removed");
+        assert!(last.lock().unwrap().is_empty(), "and nothing recorded as offered");
+    }
+
+    /// Revert-checked (brief step 5b): with the window `retain` made to keep
+    /// everything, fails — observed: `too late to be the approved move:
+    /// [("h", "term3", "h/.claude/worktrees/worktree-x")]`. Restored.
+    #[test]
+    fn a_late_move_gets_the_offer_not_an_automatic_move() {
+        let t0 = std::time::Instant::now();
+        let last = Mutex::new(HashMap::new());
+        let expect = expecting(WX, t0);
+        let (rehomes, sent) = run(&[into(WX)], &last, &expect, t0 + std::time::Duration::from_secs(31), Ok(()));
+        assert!(rehomes.is_empty(), "too late to be the approved move: {rehomes:?}");
+        assert!(is_offer_of(&sent, WX), "the existing offer instead: {sent:?}");
+        assert!(expect.lock().unwrap().is_empty(), "expired");
+    }
+
+    /// Revert-checked (brief step 5c): with the URL equality dropped (any
+    /// expectation for the key qualifies), fails — observed: `y was never
+    /// approved: [("h", "term3", "h/.claude/worktrees/worktree-y")]`; so
+    /// does `a_newer_expectation_replaces_the_older` (`x was superseded`).
+    /// Restored.
+    #[test]
+    fn an_expected_move_into_a_different_worktree_is_offered_not_taken() {
+        let t0 = std::time::Instant::now();
+        let last = Mutex::new(HashMap::new());
+        let expect = expecting(WX, t0);
+        let (rehomes, sent) = run(&[into(WY)], &last, &expect, t0 + std::time::Duration::from_secs(3), Ok(()));
+        assert!(rehomes.is_empty(), "y was never approved: {rehomes:?}");
+        assert!(is_offer_of(&sent, WY), "offered y: {sent:?}");
+        assert_eq!(
+            expect.lock().unwrap().get(&("h".to_string(), "term3".to_string())).map(|(u, _)| u.as_str()),
+            Some(WX),
+            "the expectation for x is untouched"
+        );
+    }
+
+    #[test]
+    fn a_newer_expectation_replaces_the_older() {
+        let t0 = std::time::Instant::now();
+        let last = Mutex::new(HashMap::new());
+        let expect = Mutex::new(HashMap::new());
+        expect_move_in(&expect, "h", "term3", WX, t0);
+        expect_move_in(&expect, "h", "term3", WY, t0 + std::time::Duration::from_secs(1));
+        assert_eq!(expect.lock().unwrap().len(), 1, "one entry per (home, session)");
+        // The older approval's worktree is no longer the expected one.
+        let (rehomes, sent) = run(&[into(WX)], &last, &expect, t0 + std::time::Duration::from_secs(2), Ok(()));
+        assert!(rehomes.is_empty(), "x was superseded: {rehomes:?}");
+        assert!(is_offer_of(&sent, WX), "{sent:?}");
+        let (rehomes, sent) = run(&[into(WY)], &last, &expect, t0 + std::time::Duration::from_secs(3), Ok(()));
+        assert_eq!(rehomes, vec![("h".to_string(), "term3".to_string(), WY.to_string())], "re-homed to y");
+        assert!(sent.is_empty(), "{sent:?}");
+        assert!(expect.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_expectation_lost_to_a_restart_falls_back_to_the_offer() {
+        let t0 = std::time::Instant::now();
+        let last = Mutex::new(HashMap::new());
+        let expect = Mutex::new(HashMap::new());
+        let (rehomes, sent) = run(&[into(WX)], &last, &expect, t0, Ok(()));
+        assert!(rehomes.is_empty(), "{rehomes:?}");
+        assert!(is_offer_of(&sent, WX), "{sent:?}");
+    }
+
+    /// Spec §1: R16 refusing leaves the expectation to expire on its own,
+    /// and the existing offer takes over.
+    ///
+    /// Revert-checked: an `Err` arm that drops the expectation and skips
+    /// the offer fails — observed: `refused, so the offer: []`. Restored.
+    #[test]
+    fn a_refused_expected_move_keeps_the_expectation_and_offers() {
+        let t0 = std::time::Instant::now();
+        let last = Mutex::new(HashMap::new());
+        let expect = expecting(WX, t0);
+        let (rehomes, sent) = run(
+            &[into(WX)],
+            &last,
+            &expect,
+            t0 + std::time::Duration::from_secs(3),
+            Err(format!("term3 already exists in {WX}")),
+        );
+        assert_eq!(rehomes.len(), 1, "the re-home was attempted: {rehomes:?}");
+        assert!(is_offer_of(&sent, WX), "refused, so the offer: {sent:?}");
+        assert_eq!(expect.lock().unwrap().len(), 1, "the expectation is kept until it expires");
     }
 }

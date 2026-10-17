@@ -2391,23 +2391,18 @@ impl Hub {
         // tab back rather than merely refresh what is already there — see
         // `retab_native_if_missing`'s own doc comment for why that is not
         // folded into a plain `refresh_and_broadcast` everywhere.
+        //
+        // `Some(url)` needs neither: `rehome_to` already refreshes the home,
+        // the prior owner and the new owner and broadcasts `ProjectsChanged`
+        // itself, so only the requester's own `finish` snapshot remains.
         let mut plains: Vec<String> = Vec::new();
         let mut retabs: Vec<String> = Vec::new();
-        match &to {
-            Some(url) => {
-                plains.push(url.clone());
-                if let Some(o) = &prior_owner {
-                    if o != url {
-                        plains.push(o.clone());
-                    }
-                }
-            }
-            None => {
-                retabs.push(home.clone());
-                if let Some(o) = &prior_owner {
-                    if o != &self.project {
-                        plains.push(o.clone());
-                    }
+        let follow_up = to.is_none();
+        if follow_up {
+            retabs.push(home.clone());
+            if let Some(o) = &prior_owner {
+                if o != &self.project {
+                    plains.push(o.clone());
                 }
             }
         }
@@ -2458,13 +2453,13 @@ impl Hub {
                     if crate::home::owner_path(&work_home, &url).is_none() {
                         return Err(format!("{url}: not a {work_home}/.claude/worktrees worktree"));
                     }
-                    // From here on it's the same path Task 4's claudes
-                    // watcher will call with no connection and no git of
-                    // its own: R16, record, refresh. `rehome_to` does its
-                    // own refresh of home/prior-owner/new-owner, off any
-                    // lock — this closure already runs there, in the
-                    // spawned thread (or, in the sync fallback below, with
-                    // no hub lock taken for `work` either).
+                    // From here on it's the same path the claudes watcher
+                    // calls with no connection and no git of its own (an
+                    // expected move landing): R16, record, refresh.
+                    // `rehome_to` does its own refresh of home/prior-owner/
+                    // new-owner, off any lock — this closure already runs
+                    // there, in the spawned thread (or, in the sync fallback
+                    // below, with no hub lock taken for `work` either).
                     crate::hub::rehome_to(&work_home, &work_session, &url)
                 }
             }
@@ -2501,7 +2496,7 @@ impl Hub {
                         let mut h = Hub::lock(&arc);
                         finish(&mut h, &r);
                     }
-                    if ok {
+                    if ok && follow_up {
                         for p in &plains2 {
                             crate::hub::refresh_and_broadcast(p);
                         }
@@ -2519,7 +2514,7 @@ impl Hub {
                 let r = work();
                 let ok = r.is_ok();
                 finish(self, &r);
-                if ok {
+                if ok && follow_up {
                     for p in &plains {
                         crate::hub::refresh_and_broadcast(p);
                     }
@@ -3434,15 +3429,13 @@ fn approve_ask(project: String, dir: std::path::PathBuf, clicker: ConnId, ask: P
         // the destructive step this codebase demands positive evidence for —
         // an empty worktree in the switcher is the honest leftover.
         //
-        // R16: within one owner a name is held by at most one live session.
-        // A brand-new worktree has none, but the record is what would make
-        // two of them share a name, so it is checked rather than assumed.
-        if crate::session::live_names(&owner).contains(&session) {
-            return Err(format!("{} already has a terminal named {session}", c.name));
-        }
-        crate::home::record(&project, &session, &owner).map_err(|e| {
-            format!("{} was created, but roost could not record that {session} moved there: {e}", c.name)
-        })?;
+        // No re-home here (#158 §1): the ask is indistinguishable from a
+        // subagent's `isolation: "worktree"`, which never moves the parent
+        // Claude, so approving records only that this terminal's Claude is
+        // expected there. The claudes watcher re-homes it — R16 included,
+        // through `rehome_to` — once `/proc` shows that Claude's cwd inside
+        // this exact worktree.
+        crate::claudes::expect_move(&project, &session, &owner);
         // Install the worktree hook into the new worktree's own
         // `.claude/settings.local.json`, mirroring whatever the main
         // checkout has: a worktree Claude never ran `roost worktree-hook`
@@ -3451,9 +3444,9 @@ fn approve_ask(project: String, dir: std::path::PathBuf, clicker: ConnId, ask: P
         // are plain paths, and `claudehooks::set_kind` does its own file
         // I/O with no lock involved.
         //
-        // Errors are logged and swallowed, not propagated: the worktree and
-        // its `home::record` already exist by this point, so failing the
-        // whole approve now would report a worktree creation failure for a
+        // Errors are logged and swallowed, not propagated: the worktree
+        // already exists by this point, so failing the whole approve now
+        // would report a worktree creation failure for a
         // worktree that in fact exists — the one thing CLAUDE.md's
         // destruction table is about, in its "says something untrue" form.
         // A fresh Claude started there without the hook just starts cold,
@@ -3465,9 +3458,9 @@ fn approve_ask(project: String, dir: std::path::PathBuf, clicker: ConnId, ask: P
                 eprintln!("roost: could not install the worktree hook into {}: {e}", c.path.display());
             }
         }
-        // Both hubs learn about the move before Claude does, so a
-        // `StartTerminal`/`NewTerminal` racing the reply already sees the
-        // resident. One lock at a time; never two.
+        // Both hubs refresh before Claude is told anything, so a page that
+        // loads the new worktree from `WorktreeReady` sees it as it now
+        // is. One lock at a time; never two.
         for p in [&project, &owner] {
             if let Some(arc) = open_hub(p) {
                 let mut h = Hub::lock(&arc);
@@ -3698,9 +3691,9 @@ pub fn retab_native_if_missing(project: &str, name: &str) {
 /// refresh home and owner hubs one lock at a time and `broadcast_all`.
 /// Must be called with no hub lock held. Errors are user-facing text.
 ///
-/// The one re-home path both `Hub::do_rehome`'s `Some(to)` branch and (Task
-/// 4) the `claudes` watcher thread call — the watcher has no `ConnId` and
-/// no hub lock of its own already taken, so this reads the prior owner
+/// The one re-home path both `Hub::do_rehome`'s `Some(to)` branch and the
+/// `claudes` watcher thread (`offer_moves_at`) call — the watcher has no
+/// `ConnId` and no hub lock of its own already taken, so this reads the prior owner
 /// itself rather than trusting a value a caller computed earlier that
 /// might now be stale: a resident moved a second time leaves its
 /// *previous* owner showing a stale resident tab unless that hub, too, is
@@ -3710,12 +3703,15 @@ pub fn retab_native_if_missing(project: &str, name: &str) {
 /// `do_rehome`'s git validation (`worktree::list`, `home::owner_path`)
 /// runs before this is ever reached and is not repeated here — by the
 /// time `owner` gets here it is already known to be a worktree of `home`
-/// in the `.claude/worktrees` convention. Task 4's caller establishes the
-/// same fact by watching the Claude it asked actually land there, not by
-/// running git again.
+/// in the `.claude/worktrees` convention. The watcher establishes the
+/// same fact by watching the Claude it asked actually land there
+/// (`claudes::detect_moves_in` resolved it through git's own list on that
+/// tick), not by running git again.
 pub fn rehome_to(home: &str, session: &str, owner: &str) -> Result<(), String> {
     // Read before anything is written, same as `do_rehome` used to: the
-    // owner the record names *right now*, if any.
+    // owner the record names *right now*, if any. An `Unknown` record is
+    // "no prior owner" and is overwritten on the new owner's evidence —
+    // which the claudes watcher now reaches with no click at all.
     let prior_owner = match crate::home::owner_of(home, session) {
         crate::home::Owner::Elsewhere(o) => Some(o),
         _ => None,
@@ -9384,8 +9380,8 @@ mod tests {
         std::env::remove_var("ROOST_CMD");
     }
 
-    /// `rehome_to` is the one path both `do_rehome` and (Task 4) the
-    /// `claudes` watcher thread call, and unlike `do_rehome` it has no
+    /// `rehome_to` is the one path both `do_rehome` and the `claudes`
+    /// watcher thread call, and unlike `do_rehome` it has no
     /// `ConnId`/hub of its own to validate against — it must apply R16
     /// itself and refresh every affected hub before returning. Fixture
     /// copied verbatim from `rehome_refuses_a_name_already_live_at_the_target`
@@ -9452,6 +9448,54 @@ mod tests {
             "the owner hub's session_homes must already show term3 as a resident right after rehome_to returns"
         );
 
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// A resident moved a second time, worktree to worktree, through
+    /// `rehome_to` directly — the claudes watcher's path, which has no
+    /// `do_rehome` around it to refresh anything. The *previous* owner's hub
+    /// must drop the resident before `rehome_to` returns (no sleep), or
+    /// that page keeps a tab for a terminal that now lives elsewhere.
+    ///
+    /// Revert-checked: deleting `rehome_to`'s prior-owner
+    /// `refresh_and_broadcast` fails the last assertion — observed: `left:
+    /// Some("rehometo-prior"), right: None`. Restored.
+    #[test]
+    fn rehome_to_refreshes_the_prior_owner() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let home = "rehometo-prior";
+        let repo = root.path().join(home);
+        init_repo(&repo);
+        let mut wts = Vec::new();
+        for n in ["w1", "w2"] {
+            let wt = repo.join(format!(".claude/worktrees/{n}"));
+            assert!(std::process::Command::new("git")
+                .arg("-C").arg(&repo)
+                .args(["worktree", "add", "-q", "-b", n, wt.to_str().unwrap()])
+                .status().unwrap().success());
+            wts.push((format!("{home}/.claude/worktrees/{n}"), wt));
+        }
+        let _att = crate::session::reserve_and_attach(home, "term3", &repo).unwrap();
+        let _home_hub = Hub::for_project(home, repo.clone());
+        let w1_hub = Hub::for_project(&wts[0].0, wts[0].1.clone());
+        let w2_hub = Hub::for_project(&wts[1].0, wts[1].1.clone());
+
+        crate::hub::rehome_to(home, "term3", &wts[0].0).expect("h -> w1");
+        assert_eq!(Hub::lock(&w1_hub).session_homes.get("term3"), Some(&home.to_string()), "setup: w1 holds the resident");
+
+        crate::hub::rehome_to(home, "term3", &wts[1].0).expect("w1 -> w2");
+        assert_eq!(Hub::lock(&w2_hub).session_homes.get("term3"), Some(&home.to_string()), "w2 holds it now");
+        assert_eq!(Hub::lock(&w1_hub).session_homes.get("term3"), None, "w1 must have let go before rehome_to returned");
+
+        crate::session::kill_project(home);
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
         std::env::remove_var("ROOST_CMD");
@@ -10076,8 +10120,18 @@ mod tests {
         ask_env_clear(&[p]);
     }
 
+    /// Was `approve_creates_records_and_replies_path`. Since #158 §1 the
+    /// approval no longer re-homes: it creates the worktree, replies
+    /// `Path`, and leaves an expectation for the claudes watcher — the
+    /// record still reads `Here`.
+    ///
+    /// Revert-checked (brief step 5a): restoring `home::record` in
+    /// `approve_ask` fails — observed: `approval writes no re-home record:
+    /// Elsewhere("ask-approve/.claude/worktrees/worktree-fox")`. Removing
+    /// the `expect_move` call fails with `left: None, right:
+    /// Some("ask-approve/.claude/worktrees/worktree-fox")`. Both restored.
     #[test]
-    fn approve_creates_records_and_replies_path() {
+    fn approve_no_longer_rehomes() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
@@ -10093,8 +10147,14 @@ mod tests {
         let owner = format!("{p}/.claude/worktrees/worktree-fox");
         assert_eq!(r, AskReply::Path { path: repo.join(".claude/worktrees/worktree-fox").to_string_lossy().into() });
         assert!(
-            matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Elsewhere(o) if o == owner),
-            "the re-home record names the new worktree"
+            matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here),
+            "approval writes no re-home record: {:?}",
+            crate::home::owner_of(p, "term3")
+        );
+        assert_eq!(
+            crate::claudes::expectation_for(p, "term3"),
+            Some(owner.clone()),
+            "the watcher is told to expect term3's Claude in the new worktree"
         );
         // The clicker's `pendingTab` is navigated by `WorktreeReady`, which
         // is delivered before the `Path` reply returns — so it is queued by
@@ -10236,6 +10296,7 @@ mod tests {
         assert_eq!(t.join().unwrap(), AskReply::Refuse { refuse: "refused in roost".into() });
         assert_eq!(crate::worktree::list(&repo).len(), 1);
         assert!(matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here));
+        assert_eq!(crate::claudes::expectation_for(p, "term3"), None, "a refusal expects no move");
         ask_env_clear(&[p]);
     }
 
@@ -10288,6 +10349,7 @@ mod tests {
         let r = t.join().unwrap();
         assert!(matches!(&r, AskReply::Refuse { refuse } if refuse.contains("branch worktree-fox already exists")), "{r:?}");
         assert!(matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here), "no record without a worktree");
+        assert_eq!(crate::claudes::expectation_for(p, "term3"), None, "and no expected move into one");
         let got = drain(&rxa);
         assert!(got.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("already exists")), "the clicker hears why: {got:?}");
         ask_env_clear(&[p]);
@@ -10360,11 +10422,20 @@ mod tests {
         ask_env_clear(&[p]);
     }
 
-    /// R16. Revert-checked: with the gate disabled this fails with `left:
-    /// Path { path: ".../ask-r16/.claude/worktrees/worktree-fox" }` — Claude
-    /// told to move, and a second live `term3` in one owner.
+    /// Was `the_record_gate_refuses_a_name_live_in_the_owner`, whose subject
+    /// — approval refusing because R16 would refuse the re-home record — is
+    /// gone with #158 §1: approval writes no record, so it has nothing to
+    /// gate. It now asserts the opposite. The ask is approved and answered
+    /// `Path`, the record stays `Here`, and the expectation is left for the
+    /// watcher, whose `rehome_to` applies R16 when the Claude actually
+    /// arrives (`a_refused_expected_move_keeps_the_expectation_and_offers`
+    /// in claudes.rs covers what happens then).
+    ///
+    /// Revert-checked: restoring the old gate in `approve_ask` fails —
+    /// observed: `left: Refuse { refuse: "worktree-fox already has a
+    /// terminal named term3" }, right: Path { .. }`. Restored.
     #[test]
-    fn the_record_gate_refuses_a_name_live_in_the_owner() {
+    fn approval_no_longer_gates_on_a_name_live_in_the_owner() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
@@ -10381,22 +10452,25 @@ mod tests {
         let id = wait_for_ask(&rxa);
         Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: true });
         let r = t.join().unwrap();
-        assert_eq!(r, AskReply::Refuse { refuse: "worktree-fox already has a terminal named term3".into() });
-        assert!(matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here), "no record past the gate");
-        // Creating destroys nothing: the worktree stays.
+        assert_eq!(r, AskReply::Path { path: repo.join(".claude/worktrees/worktree-fox").to_string_lossy().into() });
+        assert!(matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here), "approval writes no record");
+        assert_eq!(crate::claudes::expectation_for(p, "term3"), Some(owner.clone()));
         assert!(repo.join(".claude/worktrees/worktree-fox").is_dir());
         ask_env_clear(&[p, &owner]);
     }
 
-    /// Asserted in this thread straight after the reply, no sleep: the
-    /// refresh must have happened *before* `Path` was sent.
+    /// Was `approve_refreshes_the_owner_hub_before_replying`, whose subject
+    /// — the owner hub showing its new resident before Claude is told to
+    /// move — is the re-home #158 §1 removed from approval. It now asserts
+    /// the opposite, straight after the reply with no sleep: an open owner
+    /// hub has *no* resident, and the home hub still holds the terminal,
+    /// because nothing moves until the watcher sees the Claude arrive.
     ///
-    /// Revert-checked twice: removing the refresh fails with `left: None,
-    /// right: Some("ask-refresh")`; moving it to after the reply fails the
-    /// same way 5/5 runs (that variant is a race the asker almost always
-    /// wins, so it is evidence, not proof).
+    /// Revert-checked: restoring `home::record` in `approve_ask` fails —
+    /// observed: `the owner hub has no resident until the Claude is seen
+    /// there; left: Some("ask-refresh"), right: None`. Restored.
     #[test]
-    fn approve_refreshes_the_owner_hub_before_replying() {
+    fn approve_leaves_the_terminal_at_home() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
@@ -10415,12 +10489,12 @@ mod tests {
         assert!(matches!(t.join().unwrap(), AskReply::Path { .. }));
         assert_eq!(
             Hub::lock(&owner_hub).session_homes.get("term3"),
-            Some(&p.to_string()),
-            "the owner hub knows its resident before Claude is told to move"
+            None,
+            "the owner hub has no resident until the Claude is seen there"
         );
         assert!(
-            !Hub::lock(&hub).ws.live_sessions.contains(&"term3".to_string()),
-            "and the home hub has let go of it"
+            Hub::lock(&hub).ws.live_sessions.contains(&"term3".to_string()),
+            "and the home hub still holds it"
         );
         ask_env_clear(&[p, &owner]);
     }
