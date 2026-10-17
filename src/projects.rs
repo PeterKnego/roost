@@ -459,6 +459,42 @@ pub(crate) fn abs_to_rel(project_dir: &Path, abs: &Path) -> Result<String, Strin
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// The absolute path a terminal link's `text` names, and the line it points
+/// at — the input `hub::do_open_path` hands to [`project_for_abs`] once
+/// [`resolve_terminal_path`] has already refused `text`.
+///
+/// Deliberately a separate, narrower function rather than a shared helper
+/// `resolve_terminal_path` also calls: that function's `~`/absolute branches
+/// each go straight on to call `abs_to_rel`, comparing against *this*
+/// project, which is exactly the check this one must not do — its only job
+/// is handing `project_for_abs` a path to check against every *other*
+/// project. Sharing the branch would mean threading a "skip the compare"
+/// flag through `resolve_terminal_path` for one caller, which is more
+/// coupling than the few duplicated lines are worth, and
+/// `resolve_terminal_path`'s own behaviour and tests stay untouched this way.
+///
+/// Relative text returns `None`: a relative path can only name something
+/// inside the project that printed it (an escaping `../` is already refused
+/// by `resolve_terminal_path`'s own `safe_resolve` call), so it is never
+/// "elsewhere" (spec §3) and has nothing to resolve against without a
+/// project directory to join it to. No filesystem call happens here — a
+/// missing `HOME` for a `~/` path, like a missing confining project
+/// directory, becomes `None`, never a guess.
+pub fn terminal_abs(text: &str) -> Option<(PathBuf, Option<u32>)> {
+    let bare = strip_line_suffix(text.trim());
+    if bare.is_empty() {
+        return None;
+    }
+    let abs = if let Some(rest) = bare.strip_prefix("~/") {
+        PathBuf::from(std::env::var_os("HOME")?).join(rest)
+    } else if bare.starts_with('/') {
+        PathBuf::from(bare)
+    } else {
+        return None;
+    };
+    Some((abs, trailing_line(text)))
+}
+
 /// Which roost project contains `abs`, and `abs`'s path relative to that
 /// project's root.
 ///
@@ -1223,6 +1259,54 @@ mod tests {
     }
 
     fn nix_is_root() -> bool { unsafe { libc::getuid() == 0 } }
+
+    /// Covers the one property `resolve_terminal_path`'s own tests don't
+    /// have to: `terminal_abs` never canonicalises or confines, so it
+    /// answers for a path that does not exist on disk at all — the whole
+    /// point of running it on `do_open_path`'s already-refused branch,
+    /// before `project_for_abs` gets a chance to say whether the path is
+    /// real.
+    ///
+    /// Revert-checked: changing the absolute branch to
+    /// `Path::new(bare).canonicalize().ok()?` (i.e. requiring the path to
+    /// actually exist, the way `resolve_terminal_path`'s own `abs_to_rel`
+    /// does) fails this test — observed `None` where
+    /// `Some(("/does/not/exist/a.md", Some(7)))` was expected. Restored.
+    #[test]
+    fn terminal_abs_does_not_touch_the_filesystem() {
+        assert_eq!(
+            terminal_abs("/does/not/exist/a.md:7"),
+            Some((PathBuf::from("/does/not/exist/a.md"), Some(7)))
+        );
+    }
+
+    /// The one case the plan calls out by name: "relative paths are never
+    /// elsewhere". A relative link has no project directory to resolve
+    /// against here, and can only ever name something inside the project
+    /// that printed it — `resolve_terminal_path`'s own `safe_resolve` call
+    /// is what refuses a `../` escape, not this function.
+    ///
+    /// Revert-checked: changing the relative branch's `return None` to
+    /// `PathBuf::from(bare)` fails this test — observed
+    /// `Some(("src/a.rs", None))` where `None` was expected. Restored.
+    #[test]
+    fn terminal_abs_is_none_for_a_relative_path() {
+        assert_eq!(terminal_abs("src/a.rs"), None);
+        assert_eq!(terminal_abs("./src/a.rs:3"), None);
+    }
+
+    /// Revert-checked: dropping `.join(rest)` (keeping only the bare `HOME`
+    /// value) fails this test — observed `Some(("/home/claude", None))`
+    /// where `Some(("/home/claude/notes.md", None))` was expected.
+    /// Restored.
+    #[test]
+    fn terminal_abs_expands_home() {
+        let home = std::env::var("HOME").expect("tests run with HOME set");
+        assert_eq!(
+            terminal_abs("~/notes.md"),
+            Some((PathBuf::from(home).join("notes.md"), None))
+        );
+    }
 
     #[test]
     fn project_for_abs_finds_the_repo_and_the_relative_path() {

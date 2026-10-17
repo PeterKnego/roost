@@ -39,6 +39,23 @@ const pendingFocus = (() => {
   return f && /^[A-Za-z0-9_-]{1,32}$/.test(f) ? f : null;   // session-name shape
 })();
 let pendingFocusDone = false;
+// A terminal link's "That's in <project> — open" banner (PathElsewhere,
+// #158 §3) navigates here with ?open=<rel>[:line], read once at load —
+// alongside pendingFocus and pendingLaunch above, and before either of
+// their own `history.replaceState` calls run, so all three are already
+// captured from the original query string regardless of which one strips
+// it first. Validated the same way a server-sent value would be: relative
+// (a leading "/" would be absolute, which this never sends), no ".."
+// segment, and bounded in length — a stray or hand-edited query string
+// must not send an arbitrary string into OpenPath, even though the
+// receiving project's own server confines it again before anything opens.
+const pendingOpen = (() => {
+  const o = new URLSearchParams(location.search).get("open");
+  if (!o || o.length > 4096 || o.startsWith("/")) return null;
+  if (o.split("/").some((seg) => seg === "..")) return null;
+  return o;
+})();
+let pendingOpenSent = false;
 // The blank tab opened synchronously on the "new worktree" click, navigated
 // when WorktreeReady arrives. Opened on the click because a window.open after
 // a websocket round trip is not reliably inside the user gesture.
@@ -777,6 +794,16 @@ function onEvent(ev) {
         }
         history.replaceState(null, "", location.pathname);
       }
+      // A "That's in <project> — open" banner (PathElsewhere) arrives with
+      // ?open=<rel>[:line]; send it once, after the first State, the same
+      // OpenPath a terminal link sends — this project's own server
+      // confines it again, exactly as it would for a click here. Then
+      // strip it so a reload doesn't resend it.
+      if (pendingOpen && !pendingOpenSent) {
+        pendingOpenSent = true;
+        send({ t: "OpenPath", text: pendingOpen });
+        history.replaceState(null, "", location.pathname);
+      }
       break;
     case "BufferText": {
       // Skip our own text or the cursor jumps; empty origin = external change
@@ -1186,6 +1213,29 @@ function onEvent(ev) {
         pendingLink = null;
       }
       break;
+    case "PathElsewhere": {
+      // A terminal link `resolve_terminal_path` refused, but
+      // `projects::project_for_abs` could place in a *different* roost
+      // project (#158 §3). Only an offer: nothing opens here. The event
+      // carries no `text`, so — unlike PathRefused — this cannot match it
+      // back to `pendingLink`'s click; clearing focusNextReveal still
+      // applies, the same reasoning the PathRefused case gives: no
+      // RevealLine is coming for this click either.
+      focusNextReveal = false;
+      const name = ev.project.split("/").pop();
+      showBanner(`That's in ${name} — `);
+      const a = document.createElement("a");
+      const open = ev.rel + (ev.line ? ":" + ev.line : "");
+      // The new page's own server confines this OpenPath exactly as this
+      // one would confine a click here — `ev.rel`/`ev.project` are server
+      // output either way, so building the link from them is no different
+      // in kind from the href WorktreeAppeared builds from `ev.url`.
+      a.href = "/" + projectPath(ev.project) + "?open=" + encodeURIComponent(open);
+      a.target = "_blank";
+      a.textContent = "open";
+      document.querySelector(".error-banner:last-of-type b")?.append(a);
+      break;
+    }
     case "SearchResults":
       // A late answer to a query the user has typed past must not paint over
       // what they are looking at now. The server drops most of these; this is

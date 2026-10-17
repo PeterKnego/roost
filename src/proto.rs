@@ -665,6 +665,17 @@ pub enum Event {
     /// exactly that). Sent with `send_to` and never broadcast — one person's
     /// mis-click must not flash every window in the project.
     PathRefused { text: String, msg: String },
+    /// A terminal link that `resolve_terminal_path` refused, but that
+    /// `projects::project_for_abs` could place inside a *different* roost
+    /// project (#158 §3) — `project` is that project's url, `rel` the
+    /// file's path inside it, `line` the `:line` suffix the terminal text
+    /// carried, if any. Sent with `send_to` and never broadcast, for the
+    /// same reason `PathRefused` is: one terminal's click is not every
+    /// browser's business. The client renders "That's in `<project>` —
+    /// open", with the link navigating to the other project's page and
+    /// nothing opening here — the new page's own server confines the
+    /// `OpenPath` it sends once `?open=` is read there.
+    PathElsewhere { project: String, rel: String, line: Option<u32> },
     /// Results for one query. Sent with `send_to` and never broadcast: a
     /// query is one browser's business, and the overlay that asked is
     /// client-local by design.
@@ -1195,6 +1206,26 @@ mod tests {
         assert!(s.contains(r#""t":"PathRefused""#), "got {s}");
         assert!(s.contains(r#""text":"src/gone.rs""#), "got {s}");
         assert!(s.contains(r#""msg":"cannot read src/gone.rs""#), "got {s}");
+    }
+
+    /// The client branches on `line` being present, so `None` must encode as
+    /// `null` and not be skipped — the same risk `worktree_appeared_encodes_its_url_or_null`
+    /// (Task 5) pins for `WorktreeAppeared.url`.
+    ///
+    /// Revert-checked: adding `#[serde(skip_serializing_if = "Option::is_none")]`
+    /// to `PathElsewhere.line` fails this test — observed:
+    /// `{"t":"PathElsewhere","project":"other","rel":"a.md"}` (no `"line"` key
+    /// at all, so the `Some` assertion below finds no `"line":7` and the
+    /// `None` assertion's `contains(r#""line":null"#)` also fails). Restored.
+    #[test]
+    fn path_elsewhere_encodes_its_line_or_null() {
+        let s = encode(&Event::PathElsewhere { project: "other".into(), rel: "a.md".into(), line: Some(7) });
+        assert!(
+            s.contains(r#""t":"PathElsewhere""#) && s.contains(r#""project":"other""#) && s.contains(r#""rel":"a.md""#) && s.contains(r#""line":7"#),
+            "{s}"
+        );
+        let s = encode(&Event::PathElsewhere { project: "other".into(), rel: "a.md".into(), line: None });
+        assert!(s.contains(r#""line":null"#), "{s}");
     }
 
     #[test]

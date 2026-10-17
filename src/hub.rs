@@ -2909,6 +2909,27 @@ impl Hub {
         let rel = match crate::projects::resolve_terminal_path(&self.dir, &text) {
             Ok(rel) => rel,
             Err(msg) => {
+                // Before giving up: `resolve_terminal_path` only ever
+                // confines against *this* project, so a link into a
+                // different roost project reads as the same "outside this
+                // project" refusal it gives an escape to nowhere in
+                // particular. `terminal_abs` recovers the absolute path it
+                // would have compared (never touching disk itself), and
+                // `project_for_abs` — fork-free, safe under the hub lock —
+                // says whether some *other* project actually owns it
+                // (spec §3, #158). `url == self.project` means it doesn't:
+                // either a directory, an unreadable file, or anything else
+                // `resolve_terminal_path` refuses for a reason that has
+                // nothing to do with confinement, and the original refusal
+                // is exactly right for that.
+                if let Some((abs, line)) = crate::projects::terminal_abs(&text) {
+                    if let Some((url, rel)) = crate::projects::project_for_abs(&crate::projects::roots(), &abs) {
+                        if url != self.project {
+                            let ev = Event::PathElsewhere { project: url, rel, line };
+                            return self.send_to(from, &ev);
+                        }
+                    }
+                }
                 let ev = Event::PathRefused { text, msg };
                 return self.send_to(from, &ev);
             }
@@ -8426,6 +8447,142 @@ mod tests {
             h.ws.version, version_before,
             "a refusal must not bump ws.version — that's what gates a broadcasted snapshot"
         );
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Two connections, deliberately — see
+    /// `open_path_refusal_reaches_only_the_client_that_asked`'s own comment
+    /// for why one subscriber cannot tell `send_to` from `broadcast`.
+    ///
+    /// A terminal link `resolve_terminal_path` refuses because it names a
+    /// file outside this project must still offer somewhere to go when
+    /// `projects::project_for_abs` can place it in a *different* roost
+    /// project (spec §3, #158) — here, `other`, found under the same
+    /// `ROOST_ROOTS` root as `self`.
+    #[test]
+    fn a_terminal_link_into_another_project_offers_it() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let self_dir = root.path().join("self");
+        std::fs::create_dir_all(self_dir.join(".git")).unwrap();
+        let other_dir = root.path().join("other");
+        std::fs::create_dir_all(other_dir.join(".git")).unwrap();
+        std::fs::write(other_dir.join("a.md"), "x").unwrap();
+
+        let mut h = Hub::new("self", self_dir);
+        let (asker, rx_asker) = h.subscribe();
+        let (_other_conn, rx_other_conn) = h.subscribe();
+
+        let abs = other_dir.join("a.md").canonicalize().unwrap();
+        h.handle(&asker, Intent::OpenPath { text: format!("{}:7", abs.display()) });
+
+        let got: Vec<String> = rx_asker.try_iter().collect();
+        assert!(
+            got.iter().any(|m| {
+                m.contains(r#""t":"PathElsewhere""#)
+                    && m.contains(r#""project":"other""#)
+                    && m.contains(r#""rel":"a.md""#)
+                    && m.contains(r#""line":7"#)
+            }),
+            "the asker should have been offered the other project: {got:?}"
+        );
+
+        // Not just "no PathElsewhere" — nothing at all, the same bar
+        // `open_path_refusal_reaches_only_the_client_that_asked` holds
+        // `PathRefused` to.
+        let others: Vec<String> = rx_other_conn.try_iter().collect();
+        assert!(
+            others.is_empty(),
+            "an elsewhere-offer must reach only the asker, got: {others:?}"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// A path outside *every* configured root (not just outside this
+    /// project) has nowhere for `projects::project_for_abs` to place it
+    /// either, so the refusal must stay the plain "outside this project"
+    /// `PathRefused` — never a `PathElsewhere` with nothing behind it.
+    #[test]
+    fn a_link_under_no_project_is_still_outside() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let self_dir = root.path().join("self");
+        std::fs::create_dir_all(&self_dir).unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("a.md"), "x").unwrap();
+
+        let mut h = Hub::new("self", self_dir);
+        let (asker, rx_asker) = h.subscribe();
+
+        let abs = outside.path().join("a.md").canonicalize().unwrap();
+        h.handle(&asker, Intent::OpenPath { text: abs.to_str().unwrap().to_string() });
+
+        let got: Vec<String> = rx_asker.try_iter().collect();
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"PathRefused""#) && m.contains("outside this project")),
+            "expected the existing outside-project refusal, got: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|m| m.contains("PathElsewhere")),
+            "no project should have been offered: {got:?}"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Revert-checked (Step 5): deleting the `url != self.project` guard —
+    /// so any `project_for_abs` hit becomes a `PathElsewhere`, even to this
+    /// project itself — fails this test, with the actual panic message:
+    /// `a directory inside this project must keep its existing refusal,
+    ///  got: ["{\"t\":\"PathElsewhere\",\"project\":\"self\",\"rel\":\"sub\",
+    ///  \"line\":null}"]`. Restored.
+    ///
+    /// A *literally* missing file cannot exercise this guard:
+    /// `project_for_abs` canonicalises `abs` first, so a nonexistent leaf
+    /// already answers `None` regardless of the guard (see
+    /// `terminal_abs_does_not_touch_the_filesystem`'s own doc for why that
+    /// canonicalisation lives in `project_for_abs`, not here). A directory
+    /// is the realistic case that reaches the guard with something to
+    /// check: it exists, canonicalises, and resolves to this project's own
+    /// url, while `resolve_terminal_path` still refuses it — not for being
+    /// outside anything, but for not being an openable file.
+    #[test]
+    fn a_missing_file_in_this_project_is_not_offered_as_elsewhere() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let self_dir = root.path().join("self");
+        std::fs::create_dir_all(self_dir.join(".git")).unwrap();
+        std::fs::create_dir_all(self_dir.join("sub")).unwrap();
+
+        let mut h = Hub::new("self", self_dir.clone());
+        let (asker, rx_asker) = h.subscribe();
+
+        let abs = self_dir.join("sub").canonicalize().unwrap();
+        h.handle(&asker, Intent::OpenPath { text: abs.to_str().unwrap().to_string() });
+
+        let got: Vec<String> = rx_asker.try_iter().collect();
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"PathRefused""#) && m.contains("is a directory")),
+            "a directory inside this project must keep its existing refusal, got: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|m| m.contains("PathElsewhere")),
+            "this project must never be offered as 'elsewhere' to itself, got: {got:?}"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
