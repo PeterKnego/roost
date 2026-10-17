@@ -1,5 +1,8 @@
 //! Claude's `WorktreeCreate` hook, end to end: ask, approve, re-home, close
-//! and fork (#156).
+//! and fork (#156) — and the worktrees roost did not make (#158): the tab
+//! moves only when its Claude does, a plain `git worktree add` is announced,
+//! a terminal link into another project offers it, and a renamed worktree
+//! takes its terminals with it.
 //!
 //! No Rust test can reach `static/app.js`, and this feature's promise is a
 //! chain that crosses it twice: a hook process asks the server over its Unix
@@ -22,6 +25,10 @@
 //!     payload on stdin; exit 0 prints `HOOK-PATH <name> <path>` and
 //!     `chdir`s there, as Claude Code does; non-zero prints
 //!     `HOOK-REFUSED <name> <stderr>`. Either way `HOOK-MS <name> <ms>`.
+//!   `worktree-nochdir <name>` is the same hook, but on exit 0 it prints
+//!     `STAYED <name> <cwd>` and does not `chdir` — what a subagent's
+//!     `isolation: "worktree"` looks like from outside: the ask is
+//!     identical, and the parent Claude never moves.
 //!   `pid <tag>` prints `PID <tag> <getpid()>`; `pwd <tag>` prints
 //!     `CWD <tag> <getcwd()>`.
 //!   Every line it prints is also appended to `$FAKE_LOG`, which is how
@@ -32,9 +39,24 @@
 //! the hook reaches the hook socket of *this* run's server exactly as a real
 //! Claude's hook would.
 //!
-//! Scenario order is A, B, E, C, D: B needs A's re-homed shell, E needs a
-//! main-page terminal B did not end, C reuses E's terminal to run the fake
-//! again, and D closes every page, so it comes last.
+//! Scenario order is A (with A′), F, B, E, C, G, H, D. A′ needs A's main
+//! page and its banner record, which also holds F's announcement beside A's
+//! roost-made worktrees; B needs A's re-homed shell, E needs a main-page
+//! terminal B did not end, C reuses E's terminal to run the fake again; G
+//! links into the `sib` worktree F created, and H renames the `sib` page G
+//! opened; D closes every page, so it comes last.
+//!
+//! A no longer expects the move at approval (#158 §1). Approving leaves an
+//! expectation; the claudes watcher, one `/proc` pass every 3 s, re-homes
+//! the tab only once it sees that terminal's Claude inside the worktree. So
+//! A's clock starts at `HOOK-PATH` (printed just before the `chdir`) and
+//! allows 6 s, two ticks. A′ runs `worktree-nochdir` and watches the main
+//! page for 35 s — past the expectation's 30 s life.
+//!
+//! Banners live 8 s, so each page keeps a record of every banner it has
+//! shown (`__banners`, a MutationObserver installed with the helpers) and
+//! absences are read off that record, not off a snapshot a banner could
+//! have come and gone between.
 //!
 //! Every absence asserted here is paired with a positive check that the
 //! thing would be visible if present: the main page's tab for the moved
@@ -43,7 +65,21 @@
 //! list` beside `worktree-fox`'s presence; D's channel is proved with a
 //! `pid` answer before the refused request is sent; and E's fork choice is
 //! asserted *absent* from the snapshot the page already held, so the
-//! dialog's own `RequestState` round trip is what makes it appear.
+//! dialog's own `RequestState` round trip is what makes it appear. A′'s
+//! "no `term2 moved to` notice" is read from the same record that holds
+//! A's `term1 moved to worktree-fox`, and its "worktree-owl's page has no
+//! `term2`" is the same `__tabOf` check that found `term1` on
+//! worktree-fox's page. F's "fox and owl were never announced" sits beside
+//! sib's announcement on that same record. G's "main did not open its own
+//! hello.md" is read before and after the click, and F proved that a plain
+//! `/sib` page has no hello.md tab, so G's `?open=` is what opened it there.
+//! H reads the followed terminal only once the page really is `/sib2`: the
+//! old page still shows the same session, so reading it there would pass
+//! with nothing having followed.
+//!
+//! H's sweep is one load of `/` in a real tab, after the 3 s throttle. A
+//! bare `fetch` of `/` sweeps nothing — the page is a static shell and the
+//! sweep is its project list's fragment — which is how H first failed.
 //!
 //! Scenario D drives the terminal with `dtach -p` (push stdin into the
 //! session's socket) — no page and no pty helper needed, and it writes into
@@ -77,6 +113,23 @@
 //!   could change the answer is covered. A missing fork choice dismisses
 //!   the dialog with a real Escape rather than crashing, so C and D still
 //!   report. Restored with `cp`: 46 ok, 0 FAIL.
+//!
+//!   #158 Task 4's change reverted: `approve_ask` (src/hub.rs) re-homes at
+//!   approval again — `let _ = crate::home::record(&project, &session,
+//!   &owner);` added right after `expect_move` — binary rebuilt. Observed:
+//!   F, B, E, C, G, H and D green; A and A′ fail 6 —
+//!     (timed out waiting for the hook's path on main)
+//!     FAIL  the hook answered with a path (read on main)
+//!     (timed out waiting for the hook's answer)
+//!     FAIL  the hook answered and the fake stayed where it was
+//!     FAIL  for 35 s the main page kept `term2`'s tab (gone at 0.1 s)
+//!     FAIL  and the worktree-owl page has no `term2` (the same check that found `term1` on worktree-fox's)
+//!     FAIL  no `term2 moved to` notice was ever shown — where `term1`'s was
+//!     FAIL  the main page's terminal still answers, same process (… → undefined)
+//!   The no-chdir half is the subject: the tab left at approval, before the
+//!   hook had even answered. The two "hook answered" failures are the same
+//!   move seen earlier — the tab is gone from main before the reply prints
+//!   there. Restored with `cp`: 86 ok, 0 FAIL.
 //!
 //! Run: deno run -A tests/browser/worktree-rehome.mjs
 import { attachTarget, fixture, freePort, openPage, profileDir, sleep, startBrowser, startRoost, until }
@@ -126,7 +179,8 @@ int main(int argc, char **argv) {
     char cwd[4096]; if (!getcwd(cwd, sizeof cwd)) strcpy(cwd, "?");
     if (!strcmp(cmd, "pid")) { char p[32]; snprintf(p, sizeof p, "%d", (int)getpid()); say("PID %s %s", arg, p); }
     else if (!strcmp(cmd, "pwd")) say("CWD %s %s", arg, cwd);
-    else if (!strcmp(cmd, "worktree")) {
+    else if (!strcmp(cmd, "worktree") || !strcmp(cmd, "worktree-nochdir")) {
+      int stay = !strcmp(cmd, "worktree-nochdir");
       const char *roost = getenv("FAKE_ROOST");
       char payload[8192];
       snprintf(payload, sizeof payload,
@@ -150,7 +204,8 @@ int main(int argc, char **argv) {
       char ms[32]; snprintf(ms, sizeof ms, "%ld", now_ms() - t);
       if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
         say("HOOK-PATH %s %s", arg, o);
-        if (chdir(o)) say("CHDIR-FAILED %s %s", arg, o);
+        if (stay) say("STAYED %s %s", arg, cwd);
+        else if (chdir(o)) say("CHDIR-FAILED %s %s", arg, o);
       } else {
         say("HOOK-REFUSED %s %s", arg, e);
       }
@@ -194,17 +249,60 @@ await Deno.writeFile(shell, enc.encode(
 ), { mode: 0o755 });
 
 const browser = await startBrowser(profileDir(repoRoot));
-let page, page2, page3, roost;
+let page, page2, page3, pS, roost;
 // Joins soft-wrapped rows (xterm's isWrapped), so a long path is one line.
 const helpers = `window.__txt = (s) => { const e = terms.get(s); if (!e) return ""; const b = e.term.buffer.active; let o = "";
     for (let i = 0; i < b.length; i++) { o += b.getLine(i).translateToString(true); const n = b.getLine(i + 1); if (!n || !n.isWrapped) o += "\\n"; } return o; };
   window.__sessions = (pi) => state.panes[pi].tabs.filter((t) => t.k === "Terminal").map((t) => t.session);
-  window.__tabOf = (s) => state.panes.flatMap((p) => p.tabs).find((t) => t.k === "Terminal" && t.session === s) || null;`;
+  window.__tabOf = (s) => state.panes.flatMap((p) => p.tabs).find((t) => t.k === "Terminal" && t.session === s) || null;
+  // Every banner this page has shown, kept after its 8 s life ends, so an
+  // absence over a 35 s window is read off a record rather than a snapshot
+  // that a banner could have come and gone between.
+  if (!window.__banners) {
+    window.__banners = [];
+    const seen = new WeakMap();
+    const rec = () => { for (const el of document.querySelectorAll(".error-banner")) {
+      let r = seen.get(el); if (!r) { r = {}; seen.set(el, r); window.__banners.push(r); }
+      r.text = el.querySelector("b")?.textContent || ""; r.count = el.dataset.count || "1";
+      r.hrefs = [...el.querySelectorAll("a")].map((a) => a.getAttribute("href")); } };
+    new MutationObserver(rec).observe(document.body, { childList: true, subtree: true, characterData: true });
+  }
+  window.__bannersWith = (sub) => window.__banners.filter((r) => r.text.includes(sub));`;
+const bannersWith = async (pg, sub) => JSON.parse(await pg.evalIn(`JSON.stringify(__bannersWith(${JSON.stringify(sub)}))`));
+// The first of the element's own boxes, not its bounding rect: a link that
+// wraps across two lines in a banner has a bounding rect whose centre is the
+// banner's padding, and a click there goes nowhere (H's link did exactly that).
 const clickReal = async (pg, selector) => {
-  const r = JSON.parse(await pg.evalIn(`JSON.stringify(document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect())`));
+  const r = JSON.parse(await pg.evalIn(`JSON.stringify(document.querySelector(${JSON.stringify(selector)}).getClientRects()[0])`));
   const x = r.x + r.width / 2, y = r.y + r.height / 2;
   await pg.cmd("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
   await pg.cmd("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+};
+/// termlinks.mjs's clickLink, modifier always held: hover with Control down
+/// so xterm's linkifier captures the link, then a modifier-held press and
+/// release at the same point, which is what xterm activates on. The row is
+/// matched whole and bottom-up, so the echoed command line is never it.
+const clickLink = async (pg, needle, session) => {
+  const seat = await pg.evalIn(`(() => {
+    const entry = terms.get(${JSON.stringify(session)});
+    if (!entry) return null;
+    const rows = [...document.querySelectorAll(".xterm-rows div")].filter((x) => entry.node.contains(x));
+    const n = rows.filter((x) => x.textContent.trim() === ${JSON.stringify(needle)}).pop();
+    if (!n) return null;
+    const b = n.getBoundingClientRect();
+    const scr = entry.node.querySelector(".xterm-screen").getBoundingClientRect();
+    return { x: Math.round(scr.left + 4.5 * scr.width / entry.term.cols), y: Math.round(b.top + b.height / 2) };
+  })()`);
+  if (!seat) return false;
+  const ctrl = (type, m) => pg.cmd("Input.dispatchKeyEvent", { type, key: "Control", code: "ControlLeft", windowsVirtualKeyCode: 17, nativeVirtualKeyCode: 17, modifiers: m });
+  await ctrl("rawKeyDown", 2); await sleep(150);
+  await pg.cmd("Input.dispatchMouseEvent", { type: "mouseMoved", x: seat.x, y: seat.y, buttons: 0 });
+  await sleep(200);
+  await pg.cmd("Input.dispatchMouseEvent", { type: "mousePressed", x: seat.x, y: seat.y, button: "left", buttons: 1, clickCount: 1, modifiers: 2 });
+  await pg.cmd("Input.dispatchMouseEvent", { type: "mouseReleased", x: seat.x, y: seat.y, button: "left", buttons: 0, clickCount: 1, modifiers: 2 });
+  await sleep(200);
+  await ctrl("keyUp", 0); await sleep(150);
+  return true;
 };
 const ready = (pg) => until(() => pg.evalIn("typeof terms !== 'undefined' && ctrl && ctrl.readyState === 1 && !!state"), 30, "app.js");
 const type = (pg, s, text) => pg.evalIn(`terms.get(${JSON.stringify(s)}).term.input(${JSON.stringify(text)})`);
@@ -223,6 +321,18 @@ const findTab = async (needle) => {
   }, 30, `a tab on ${needle}`);
   return t;
 };
+/// A browser tab whose path is exactly `path` (query ignored, since a page
+/// opened with `?open=` strips it as soon as it has sent it).
+const findTabAt = async (path) => {
+  let t = null;
+  await until(async () => {
+    const l = await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json();
+    t = l.find((x) => x.type === "page" && (() => { try { return new URL(x.url).pathname === path; } catch { return false; } })()) || null;
+    return !!t;
+  }, 30, `a tab at ${path}`);
+  return t;
+};
+const closeTab = async (t) => { if (t) await fetch(`http://127.0.0.1:${browser.port}/json/close/${t.id}`); };
 const timings = {};
 /// Opens a terminal with the pane's own + and returns its name once attached.
 const openTerm = async (pg) => {
@@ -272,11 +382,17 @@ try {
       && document.querySelector('#dlg-choice .dlg-body').textContent.includes("worktree-fox")`), 15, "the ask dialog"),
      "the ask appears as an in-page dialog naming the terminal and worktree-fox");
   await clickReal(page, '#dlg-choice .dlg-choice[data-choice="create"]');
-  // Read on the main page first: the Rehomed banner lives 8 s.
-  ok(await until(() => page.evalIn(`[...document.querySelectorAll(".error-banner b")].some((b) => b.textContent.includes(${JSON.stringify(sA + " moved to worktree-fox")}))`), 15, "the moved-to notice"),
+  // Approval no longer moves anything (§1): the hook answers, the fake
+  // `chdir`s, and only then can the claudes watcher — one `/proc` pass every
+  // 3 s — see this Claude inside the worktree and re-home the tab. So the
+  // clock starts at HOOK-PATH, which the fake prints immediately before its
+  // `chdir`, and the bound is two ticks.
+  ok(!!await waitFor(page, sA, /^HOOK-PATH fox \S+/m, 20, "the hook's path on main"), "the hook answered with a path (read on main)");
+  const hookAt = Date.now();
+  ok(await until(() => page.evalIn(`!__sessions(3).includes(${SA}) && !__tabOf(${SA})`), 6, "the tab to go"),
+     `within 6 s of the chdir the main page's \`${sA}\` tab is gone (${((Date.now() - hookAt) / 1000).toFixed(1)} s)`);
+  ok(await until(async () => (await bannersWith(page, `${sA} moved to worktree-fox`)).length > 0, 5, "the moved-to notice"),
      `the main page shows \`${sA} moved to worktree-fox\``);
-  ok(await until(() => page.evalIn(`!__sessions(3).includes(${SA}) && !__tabOf(${SA})`), 15, "the tab to go"),
-     `and its \`${sA}\` tab is gone`);
   const tgt = await findTab("/.claude/worktrees/worktree-fox");
   ok(!!tgt && new URL(tgt.url).pathname.endsWith(`/${project}/.claude/worktrees/worktree-fox`),
      `a new page opened at …/.claude/worktrees/worktree-fox (${tgt?.url})`);
@@ -286,8 +402,9 @@ try {
     page2 = await attachTarget(tgt.webSocketDebuggerUrl);
     ok(await ready(page2), "worktree page loaded");
     await page2.evalIn(helpers);
-    ok(await until(() => page2.evalIn(`terms.has(${SA}) && __tabOf(${SA})?.home === ${JSON.stringify(project)}`), 30, "the resident"),
-       `the worktree page shows \`${sA}\` as a resident (home = the main project)`);
+    const left = Math.max(0.5, 6 - (Date.now() - hookAt) / 1000);
+    ok(await until(() => page2.evalIn(`terms.has(${SA}) && __tabOf(${SA})?.home === ${JSON.stringify(project)}`), left, "the resident"),
+       `within 6 s of the chdir the worktree page shows \`${sA}\` as a resident, home = main (${((Date.now() - hookAt) / 1000).toFixed(1)} s)`);
     ok(!!await waitFor(page2, sA, /^PRE42MOVE$/m, 20, "the replayed marker"),
        "its scrollback carries the marker typed before the move");
     const hp = await waitFor(page2, sA, /^HOOK-PATH fox (\S+)/m, 20, "the hook's path");
@@ -299,7 +416,94 @@ try {
     const cwd = (await waitFor(page2, sA, /^CWD a3 (\S+)/m, 10, "pwd a3"))?.[1];
     ok(!!cwd && cwd.endsWith(`/${project}/.claude/worktrees/worktree-fox`), `and it is in the worktree (${cwd})`);
   }
+
+  // A second terminal, and this time the Claude does not follow its own
+  // worktree — which is what a subagent's `isolation: "worktree"` looks like
+  // from here: the same ask, the same approval, and the parent stays put.
+  console.log(`A′. approve, but the Claude never chdirs: the tab stays (${stamp()})`);
+  await page.bringToFront();
+  const sO = await openTerm(page);
+  const SO = JSON.stringify(sO);
+  ok(!!sO && sO !== sA && await page.evalIn(`!!__tabOf(${SO})`), `a second main terminal, \`${sO}\``);
+  ok(!!await waitFor(page, sO, /\$\s*$/m, 30, "a prompt"), "it is at a prompt");
+  await type(page, sO, "claude\r");
+  ok(!!await waitFor(page, sO, /FAKE-READY/, 10, "the fake"), "the fake claude is running in it");
+  await type(page, sO, "pid o1\r");
+  const pidO = (await waitFor(page, sO, /^PID o1 (\d+)/m, 10, "pid o1"))?.[1];
+  await type(page, sO, "worktree-nochdir owl\r");
+  ok(await until(() => page.evalIn(`document.getElementById("dlg-choice").open
+      && document.querySelector('#dlg-choice .dlg-title').textContent === ${JSON.stringify(`Claude in ${sO} wants a worktree`)}
+      && document.querySelector('#dlg-choice .dlg-body').textContent.includes("worktree-owl")`), 15, "the owl ask"),
+     "the ask for worktree-owl appears");
+  await clickReal(page, '#dlg-choice .dlg-choice[data-choice="create"]');
+  ok(!!await waitFor(page, sO, /^STAYED owl \S+/m, 20, "the hook's answer"), "the hook answered and the fake stayed where it was");
+  const owlAt = Date.now();
+  const tgtO = await findTab("/.claude/worktrees/worktree-owl");
+  let pageO = null;
+  if (tgtO) {
+    pageO = await attachTarget(tgtO.webSocketDebuggerUrl);
+    ok(await ready(pageO), "the worktree-owl page opened and loaded");
+    await pageO.evalIn(helpers);
+  } else ok(false, "the worktree-owl page opened");
+  // Polled the whole window, not read once at the end: the expectation is
+  // live for 30 s, so a wrong move could happen at any tick of it.
+  await page.bringToFront();
+  let leftAt = null;
+  while (Date.now() - owlAt < 35_000) {
+    if (leftAt === null && !(await page.evalIn(`__sessions(3).includes(${SO}) && !!__tabOf(${SO})`))) leftAt = Date.now() - owlAt;
+    await sleep(500);
+  }
+  ok(leftAt === null, `for 35 s the main page kept \`${sO}\`'s tab${leftAt === null ? "" : ` (gone at ${(leftAt / 1000).toFixed(1)} s)`}`);
+  if (pageO) ok(await pageO.evalIn(`!__tabOf(${SO}) && !terms.has(${SO}) && Array.isArray(state.panes)`),
+     `and the worktree-owl page has no \`${sO}\` (the same check that found \`${sA}\` on worktree-fox's)`);
+  ok((await bannersWith(page, `${sO} moved to`)).length === 0
+     && (await bannersWith(page, `${sA} moved to worktree-fox`)).length > 0,
+     `no \`${sO} moved to\` notice was ever shown — where \`${sA}\`'s was`);
+  // Tolerant, as B's are: a tab that wrongly moved has no terminal here,
+  // and that is reported by the waitFor below, not by a crash.
+  await type(page, sO, "pid o2\r").catch(() => {});
+  const pidO2 = (await waitFor(page, sO, /^PID o2 (\d+)/m, 10, "pid o2"))?.[1];
+  ok(!!pidO && pidO2 === pidO, `the main page's terminal still answers, same process (${pidO} → ${pidO2})`);
+  ok((await git("worktree", "list", "--porcelain")).out.includes(`${projDir}/.claude/worktrees/worktree-owl`), "and git lists worktree-owl");
+  await closeTab(tgtO); pageO?.close();
   timings.A = Date.now() - tA;
+
+  // ------------------------------------------------------------------ F
+  let tF = Date.now();
+  console.log(`\nF. a plain \`git worktree add\` is announced once, with a link (${stamp()})`);
+  // The positive this section pairs with A's absences: a worktree roost did
+  // NOT make. Run from Deno, nothing roost is told about.
+  const wtAdd = await git("worktree", "add", "-q", "../sib", "-b", "sib");
+  ok(wtAdd.ok, `git worktree add ../sib -b sib ${wtAdd.ok ? "" : wtAdd.err}`);
+  const sibText = "worktree sib (sib) appeared";
+  ok(await until(async () => (await bannersWith(page, sibText)).length > 0, 15, "the appeared banner"),
+     `the main page shows \`${sibText} — open\``);
+  await sleep(4000);
+  const sibB = await bannersWith(page, sibText);
+  ok(sibB.length === 1 && sibB[0].count === "1", `exactly once (${JSON.stringify(sibB)})`);
+  ok(sibB[0]?.hrefs?.length === 1 && sibB[0].hrefs[0] === "/sib", `its link is /sib (${sibB[0]?.hrefs})`);
+  ok((await bannersWith(page, "appeared")).every((r) => r.text.startsWith(sibText)),
+     "and worktree-fox and worktree-owl, which roost made, were never announced");
+  // A working link: click it for real (target=_blank, a user gesture) and
+  // the page it opens is sib's project page. It also proves that a plain
+  // /sib page holds no hello.md tab, which G's ?open= is then measured
+  // against.
+  let sibTab = null;
+  const sibBox = `[...document.querySelectorAll(".error-banner")].find((e) => e.dataset.text.startsWith(${JSON.stringify(sibText)}))`;
+  if (await page.evalIn(`!!${sibBox}`)) {
+    await page.evalIn(`${sibBox}.querySelector("a").setAttribute("data-t9", "sib"); 0`);
+    await clickReal(page, `a[data-t9="sib"]`);
+    sibTab = await findTabAt("/sib");
+  }
+  ok(!!sibTab, `clicking it opens a tab at /sib (${sibTab?.url})`);
+  if (sibTab) {
+    const ps = await attachTarget(sibTab.webSocketDebuggerUrl);
+    ok(await ready(ps) && await ps.evalIn(`PROJECT === "sib"`), "which loads sib's own project page");
+    ok(!(await ps.evalIn(`state.panes.some((p) => p.tabs.some((t) => t.k === "File" && t.rel === "hello.md"))`)),
+       "with no hello.md tab of its own");
+    ps.close(); await closeTab(sibTab);
+  }
+  timings.F = Date.now() - tF;
 
   // ------------------------------------------------------------------ B
   let tB = Date.now();
@@ -413,11 +617,120 @@ try {
   ok(!(await git("branch", "--list", "worktree-slow")).out.trim(), "and there is no worktree-slow branch");
   timings.C = Date.now() - tC;
 
+  // ------------------------------------------------------------------ G
+  let tG = Date.now();
+  console.log(`\nG. a terminal link into another project offers it (${stamp()})`);
+  await page.bringToFront();
+  // The fixture's absolute path is long (it lives under $TMPDIR) and the
+  // terminal pane is a fixed 520 px column, so the path would wrap, and
+  // clickLink matches a row whole. A wide window, and the column widened on
+  // #grid itself — state renders set --right-w on <html>, which an inline
+  // value on #grid outranks — keep it one row.
+  await page.cmd("Emulation.setDeviceMetricsOverride", { width: 2400, height: 900, deviceScaleFactor: 1, mobile: false });
+  await page.evalIn(`document.getElementById("grid").style.setProperty("--right-w", "1500px"); 0`);
+  const sG = await openTerm(page);
+  const SG = JSON.stringify(sG);
+  ok(!!sG && !!await waitFor(page, sG, /\$\s*$/m, 30, "a prompt"), `a shell on main (${sG})`);
+  const absQ = `${fx.roots}/sib/hello.md`;
+  await type(page, sG, `echo ${absQ}\r`);
+  // The output row is the path alone; the command row has `$ echo` before it.
+  ok(!!await waitFor(page, sG, new RegExp(`^${absQ.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "m"), 10, "the printed path"),
+     `the terminal shows sib's ${absQ}`);
+  const mainHello = `state.panes.some((p) => p.tabs.some((t) => t.k === "File" && t.rel === "hello.md"))`;
+  ok(!(await page.evalIn(mainHello)), "main has no hello.md tab of its own before the click");
+  const cols = await page.evalIn(`terms.get(${SG}).term.cols`);
+  const clicked = await clickLink(page, absQ, sG);
+  ok(clicked, `the path's row was found whole and modifier-clicked (${absQ.length} chars, ${cols} columns)`);
+  const elseText = "That's in sib — open";
+  ok(await until(async () => (await bannersWith(page, elseText)).length > 0, 10, "That's in sib"),
+     `the main page shows \`${elseText}\``);
+  const elseB = (await bannersWith(page, elseText))[0];
+  ok(elseB?.hrefs?.length === 1 && elseB.hrefs[0] === "/sib?open=hello.md", `its link is /sib?open=hello.md (${elseB?.hrefs})`);
+  await sleep(1000);
+  ok(!(await page.evalIn(mainHello)), "and main did not open its own hello.md instead");
+  let sibTabG = null;
+  const elseBox = `[...document.querySelectorAll(".error-banner")].find((e) => e.dataset.text === ${JSON.stringify("That's in sib — ")})`;
+  if (await page.evalIn(`!!${elseBox}`)) {
+    await page.evalIn(`${elseBox}.querySelector("a").setAttribute("data-t9", "else"); 0`);
+    await clickReal(page, `a[data-t9="else"]`);
+    sibTabG = await findTabAt("/sib");
+  }
+  ok(!!sibTabG, `clicking it opens a tab on sib (${sibTabG?.url})`);
+  if (sibTabG) {
+    pS = await attachTarget(sibTabG.webSocketDebuggerUrl);
+    ok(await ready(pS) && await pS.evalIn(`PROJECT === "sib"`), "sib's page loaded");
+    await pS.evalIn(helpers);
+    // F proved a plain /sib page has no hello.md tab; this one is ?open='s.
+    ok(await until(() => pS.evalIn(`state.panes.some((p) => { const t = p.tabs[p.active]; return t && t.k === "File" && t.rel === "hello.md"; })`), 15, "hello.md active"),
+       "and hello.md is open there, the active tab of its pane");
+  }
+  timings.G = Date.now() - tG;
+
+  // ------------------------------------------------------------------ H
+  let tH = Date.now();
+  console.log(`\nH. git worktree move: the terminal follows the rename (${stamp()})`);
+  if (pS) {
+    await pS.bringToFront();
+    const sH = await openTerm(pS);
+    const SH = JSON.stringify(sH);
+    ok(!!sH && !!await waitFor(pS, sH, /\$\s*$/m, 30, "a prompt"), `a shell on sib's page (${sH})`);
+    await type(pS, sH, `echo "SH-$((2+3))-$$"\r`);
+    const pidH = (await waitFor(pS, sH, /^SH-5-(\d+)$/m, 10, "the shell's pid"))?.[1];
+    ok(!!pidH, `its shell's pid (${pidH})`);
+    const mv = await git("worktree", "move", `${fx.roots}/sib`, `${fx.roots}/sib2`);
+    ok(mv.ok, `git worktree move sib sib2 ${mv.ok ? "" : mv.err}`);
+    // One sweep: past the 3 s throttle, then one load of the front page in
+    // a real tab. `/` itself is a static shell; the sweep is its project
+    // list's fragment (`project_rows` → `reconcile_throttled`), which only a
+    // page that runs its htmx fetches reaches — a bare fetch of `/` sweeps
+    // nothing, which is how this section first failed.
+    await sleep(3500);
+    const front = await openPage(browser.port, `http://127.0.0.1:${roost.port}/`);
+    const movedText = "sib was renamed to sib2; its terminals followed";
+    ok(await until(async () => (await bannersWith(pS, movedText)).length > 0, 10, "ProjectMoved"),
+       `the old page shows \`${movedText}\``);
+    const mvB = (await bannersWith(pS, movedText))[0];
+    ok(mvB?.hrefs?.length === 1 && mvB.hrefs[0] === "/sib2", `with a link to /sib2 (${mvB?.hrefs})`);
+    front.close();
+    for (const t of await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) {
+      if (t.type === "page" && new URL(t.url).pathname === "/") await closeTab(t);
+    }
+    const onMain = await bannersWith(page, "sib2");
+    console.log(`    (main page's banners naming sib2: ${JSON.stringify(onMain.map((r) => r.text))})`);
+    ok((await git("worktree", "list", "--porcelain")).out.includes(`${fx.roots}/sib2`), "git lists sib2");
+    const movedBox = `[...document.querySelectorAll(".error-banner")].find((e) => e.dataset.text === ${JSON.stringify(movedText)})`;
+    // Brought to the front first: the `/` tab opened above is the active one,
+    // and a real click goes to the page on top.
+    await pS.bringToFront();
+    const boxLive = await pS.evalIn(`!!${movedBox}`);
+    if (boxLive) {
+      await pS.evalIn(`${movedBox}.querySelector("a").setAttribute("data-t9", "moved"); 0`);
+      await clickReal(pS, `a[data-t9="moved"]`);
+    } else console.log("    (the banner was already gone when its link was to be clicked)");
+    const onNew = await until(() => pS.evalIn(`location.pathname === "/sib2"`), 15, "/sib2") && await ready(pS)
+       && await pS.evalIn(`PROJECT === "sib2"`);
+    ok(onNew, "following it loads sib2's page");
+    // Only on sib2's page: the old page still shows the same session, so
+    // reading it there would pass with nothing having followed.
+    if (onNew) {
+      await pS.evalIn(helpers);
+      ok(await until(() => pS.evalIn(`terms.has(${SH}) && __tabOf(${SH})?.home === "sib"`), 20, "the followed terminal"),
+         `sib2's page shows \`${sH}\`, as a resident whose home is still sib`);
+      // `pwd -P`: bash's own $PWD is the name it cd'd by, which the rename
+      // does not update; the kernel's cwd is the directory itself.
+      await type(pS, sH, `echo "SH-$((3+4))-$$-$(pwd -P)"\r`);
+      const after = await waitFor(pS, sH, /^SH-7-(\d+)-(\S+)$/m, 10, "the shell after the move");
+      ok(!!after && after[1] === pidH, `the same shell answers there (${pidH} → ${after?.[1]})`);
+      ok(!!after && after[2] === `${fx.roots}/sib2`, `and it is in the renamed directory (${after?.[2]})`);
+    } else ok(false, "so the followed terminal could not be looked for there");
+  } else ok(false, "H needs G's sib page");
+  timings.H = Date.now() - tH;
+
   // ------------------------------------------------------------------ D
   let tD = Date.now();
   console.log(`\nD. no browser: refused at once (${stamp()})`);
-  page?.close(); page2?.close(); page3?.close();
-  page = page2 = page3 = null;
+  page?.close(); page2?.close(); page3?.close(); pS?.close();
+  page = page2 = page3 = pS = null;
   for (const t of await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) {
     if (t.type === "page") await fetch(`http://127.0.0.1:${browser.port}/json/close/${t.id}`);
   }
@@ -444,7 +757,7 @@ try {
   ok(!(await git("worktree", "list", "--porcelain")).out.includes("worktree-lonely"), "and no worktree-lonely was created");
   timings.D = Date.now() - tD;
 } finally {
-  page?.close(); page2?.close(); page3?.close();
+  page?.close(); page2?.close(); page3?.close(); pS?.close();
   browser.close();
   if (roost) await roost.close();
   await fx.cleanup();
