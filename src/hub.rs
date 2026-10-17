@@ -3971,6 +3971,22 @@ pub fn rehome_to(home: &str, session: &str, owner: &str) -> Result<(), String> {
         return Err(format!("{session} already exists in {owner}"));
     }
     crate::home::record(home, session, owner)?;
+    // The owner directory's identity, so a later rename of a worktree with
+    // no session of its own can still be recognised (#158 §5). Best-effort:
+    // without it a rename is forgotten by R18, exactly as before.
+    match crate::home::owner_dir(home, owner) {
+        Some(dir) => {
+            if let Err(e) = crate::home::record_identity(home, session, &dir) {
+                // A previous owner's identity must not stand in for this one.
+                crate::home::forget_identity(home, session);
+                eprintln!("roost: {home}/{session} re-homed to {owner}, but its identity was not recorded: {e}");
+            }
+        }
+        None => {
+            crate::home::forget_identity(home, session);
+            eprintln!("roost: {home}/{session} re-homed to {owner}, whose directory did not resolve; identity not recorded");
+        }
+    }
     // One hub lock at a time, never two: each of these opens, locks, and
     // releases a single hub before the next one is even looked up.
     refresh_and_broadcast(home);
@@ -5155,7 +5171,7 @@ mod tests {
 
         let home_dir_of = |p: &str| (p == home).then(|| home_dir.clone());
         let announced = Mutex::new(std::collections::HashSet::new());
-        crate::claudes::sweep_gone_owners(&home_dir_of, &announced);
+        crate::claudes::sweep_gone_owners(&home_dir_of, &announced, &[]);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut got_gone = false;
@@ -5227,7 +5243,7 @@ mod tests {
 
         let home_dir_of = |p: &str| (p == home).then(|| not_a_repo.path().to_path_buf());
         let announced = Mutex::new(std::collections::HashSet::new());
-        crate::claudes::sweep_gone_owners(&home_dir_of, &announced);
+        crate::claudes::sweep_gone_owners(&home_dir_of, &announced, &[]);
 
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(drain(&rx).iter().all(|m| !m.contains("WorktreeGone")), "git did not answer: no event must be sent");

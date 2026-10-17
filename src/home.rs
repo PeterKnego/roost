@@ -56,7 +56,77 @@ pub fn record_in(state: &Path, home: &str, name: &str, owner: &str) -> Result<()
 pub fn forget_in(state: &Path, home: &str, name: &str) {
     if crate::session::valid_name(name) {
         let _ = std::fs::remove_file(dir_in(state, home).join(name));
+        let _ = std::fs::remove_file(identity_path(state, home, name));
     }
+}
+
+/// `.<name>.ino` beside the record: the owner directory's `(device, inode)`
+/// when the re-home was made (#158 §5). A worktree whose only terminals were
+/// re-homed into it has no session of its own, so `registry::move_evidence`
+/// has no shell to look through when it is renamed; this is what lets the
+/// R18 sweep recognise the same directory under its new name, from the
+/// resident's own Claude's cwd. A dot-file, so `all_in` and every other
+/// enumeration of this directory skip it.
+fn identity_path(state: &Path, home: &str, name: &str) -> PathBuf {
+    dir_in(state, home).join(format!(".{name}.ino"))
+}
+
+#[cfg(unix)]
+pub fn record_identity_in(state: &Path, home: &str, name: &str, owner_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    if !crate::session::valid_name(name) {
+        return Err(format!("bad session name {name:?}"));
+    }
+    let m = std::fs::metadata(owner_dir).map_err(|e| e.to_string())?;
+    let dir = dir_in(state, home);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let tmp = dir.join(format!(".{name}.ino.tmp.{}", std::process::id()));
+    let out = (|| {
+        std::fs::write(&tmp, format!("{} {}\n", m.dev(), m.ino())).map_err(|e| e.to_string())?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, identity_path(state, home, name)).map_err(|e| e.to_string())
+    })();
+    if out.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    out
+}
+
+#[cfg(not(unix))]
+pub fn record_identity_in(_state: &Path, _home: &str, _name: &str, _owner_dir: &Path) -> Result<(), String> { Ok(()) }
+
+/// The recorded owner identity. Three outcomes: `Ok(None)` — none recorded
+/// (a re-home older than this file), which is no evidence; `Ok(Some)`; and
+/// `Err` — unreadable or damaged, which is "cannot tell" and must suspend
+/// whatever would have acted on its absence.
+pub fn identity_of_in(state: &Path, home: &str, name: &str) -> Result<Option<(u64, u64)>, String> {
+    if !crate::session::valid_name(name) {
+        return Err(format!("bad session name {name:?}"));
+    }
+    match std::fs::read_to_string(identity_path(state, home, name)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+        Ok(s) => {
+            let mut it = s.split_whitespace();
+            match (it.next().and_then(|d| d.parse().ok()), it.next().and_then(|i| i.parse().ok()), it.next()) {
+                (Some(d), Some(i), None) => Ok(Some((d, i))),
+                _ => Err(format!("damaged identity record {s:?}")),
+            }
+        }
+    }
+}
+
+pub fn forget_identity(home: &str, name: &str) {
+    if crate::session::valid_name(name) {
+        let _ = std::fs::remove_file(identity_path(&crate::wsstate::state_dir(), home, name));
+    }
+}
+pub fn record_identity(home: &str, name: &str, owner_dir: &Path) -> Result<(), String> {
+    record_identity_in(&crate::wsstate::state_dir(), home, name, owner_dir)
+}
+pub fn identity_of(home: &str, name: &str) -> Result<Option<(u64, u64)>, String> {
+    identity_of_in(&crate::wsstate::state_dir(), home, name)
 }
 
 /// Every record, as (home, name, owner). Dot-files (temps) skipped.
@@ -244,9 +314,12 @@ fn moved_to_path(state: &Path, home: &str) -> PathBuf {
 }
 
 /// The URL `home` was renamed to, or `None`. Not three-valued at this
-/// boundary on purpose: absent, unreadable, empty and malformed all read
-/// `None`, and `None` only ever means "do not follow, do not widen" — the
-/// direction that destroys nothing (the sessions stay where #178 left them).
+/// boundary: absent, unreadable, empty and malformed all read `None`, which
+/// means "do not follow, do not widen". That is the destroy-nothing
+/// direction for the widenings (the sessions stay where #178 left them), but
+/// not everywhere — so the R18 sweep does not read this file at all: it
+/// asks `registry::record_move` for live evidence instead, and treats a
+/// "cannot tell" there as a reason to keep the record, not to forget it.
 pub fn moved_to_in(state: &Path, home: &str) -> Option<String> {
     let s = std::fs::read_to_string(moved_to_path(state, home)).ok()?;
     let s = s.strip_suffix('\n').unwrap_or(&s);
@@ -329,6 +402,13 @@ pub fn follow_move_in(state: &Path, old_url: &str, new_url: &str, live: &[String
     // names somewhere else and is not this move's to rewrite.
     for (home, name, owner) in all_in(state) {
         if !matches!(&owner, Owner::Elsewhere(o) if o == old_url) {
+            continue;
+        }
+        // Only to an owner a record of this home may name at all: anything
+        // else could never resolve, so it is left for R18 to forget rather
+        // than rewritten into a record that points nowhere.
+        if !owner_shaped(&home, new_url) {
+            eprintln!("roost: {home}/{name}'s owner {old_url} was renamed to {new_url}, outside {home}/.claude/worktrees; not following");
             continue;
         }
         if !matches!(owner_of_in(state, &home, &name), Owner::Elsewhere(ref o) if o == old_url) {
@@ -613,7 +693,9 @@ mod tests {
     /// present-`dst` early return removed alone still passes (`hard_link`
     /// refuses the existing target too, so no-clobber is held twice); with
     /// that removed *and* `hard_link` swapped for `rename`, fails "the new
-    /// key's own layout is never overwritten" — left `"{\"old\":1}"`.
+    /// key's own layout is never overwritten" — left `"{\"old\":1}"`; the
+    /// `owner_shaped` gate in (b) removed fails "(b) only to an owner the
+    /// record's home may name" — left `Elsewhere(".../worktree-b")`.
     #[test]
     fn follow_move_rewrites_owner_records_and_copies_state_only_when_absent() {
         let st = tempfile::tempdir().unwrap();
@@ -626,6 +708,8 @@ mod tests {
         std::fs::write(d.join("unsure"), "").unwrap();
         record_in(s, "repo", "term3", old).unwrap();
         record_in(s, "repo", "term4", other).unwrap();
+        // A record no home may name `new` for: left for R18, never rewritten.
+        record_in(s, "zed", "term5", old).unwrap();
         let (ok, nk) = (crate::projects::storage_key(old), crate::projects::storage_key(new));
         crate::worktree::write_base(s, &ok, "main").unwrap();
         std::fs::write(s.join(format!("{ok}.json")), r#"{"old":1}"#).unwrap();
@@ -640,6 +724,7 @@ mod tests {
         assert!(matches!(owner_of_in(s, old, "unsure"), Owner::Unknown(_)), "cannot tell writes nothing");
         assert_eq!(owner_of_in(s, "repo", "term3"), Owner::Elsewhere(new.into()), "(b) a resident of the old URL follows");
         assert_eq!(owner_of_in(s, "repo", "term4"), Owner::Elsewhere(other.into()), "(b) another owner's resident is untouched");
+        assert_eq!(owner_of_in(s, "zed", "term5"), Owner::Elsewhere(old.into()), "(b) only to an owner the record's home may name");
         assert_eq!(crate::worktree::read_base(s, &nk).as_deref(), Some("main"), "(c) the base is copied to a key that had none");
         assert_eq!(std::fs::read_to_string(s.join(format!("{nk}.json"))).unwrap(), r#"{"new":1}"#, "the new key's own layout is never overwritten");
 
@@ -676,5 +761,30 @@ mod tests {
             std::fs::write(&p, body).unwrap();
             assert_eq!(moved_to_in(s, "proj").as_deref(), want, "{body:?}");
         }
+    }
+
+    /// The owner identity beside a record: three outcomes on read, never
+    /// listed as a record itself, and gone with the record it belongs to —
+    /// a stale one would let a later owner's rename be "recognised" by a
+    /// directory the terminal never lived in.
+    ///
+    /// Revert-checked, run and restored: without `forget_in`'s identity
+    /// removal, fails "forgetting the record forgets its identity" — left
+    /// `Ok(Some(..))`.
+    #[test]
+    fn an_identity_lives_and_dies_with_its_record() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(identity_of_in(s, "foo", "term3"), Ok(None), "none recorded is no evidence");
+        record_in(s, "foo", "term3", "foo/.claude/worktrees/w").unwrap();
+        record_identity_in(s, "foo", "term3", dir.path()).unwrap();
+        assert!(matches!(identity_of_in(s, "foo", "term3"), Ok(Some(_))));
+        assert_eq!(all_in(s).len(), 1, "the identity file is not a record");
+        std::fs::write(identity_path(s, "foo", "term3"), "garbage").unwrap();
+        assert!(identity_of_in(s, "foo", "term3").is_err(), "damaged is cannot-tell, not none");
+        record_identity_in(s, "foo", "term3", dir.path()).unwrap();
+        forget_in(s, "foo", "term3");
+        assert_eq!(identity_of_in(s, "foo", "term3"), Ok(None), "forgetting the record forgets its identity");
     }
 }
