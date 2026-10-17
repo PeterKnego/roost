@@ -11378,6 +11378,17 @@ mod tests {
         ask_env_clear(&[]);
     }
 
+    /// What this pins is the absence of a crash and a confirm that keeps
+    /// working after a path came and went — not much more. The first
+    /// assertion is close to unfalsifiable: `confirm_worktrees` builds
+    /// events only from the listing it is given, so no plausible revert of
+    /// it announces a path git no longer lists. It is kept because the case
+    /// is real (a `git worktree add` undone inside the debounce window) and
+    /// must not panic on the watcher's thread.
+    ///
+    /// Revert-checked on the control: with `apply_worktrees` broadcasting
+    /// nothing (`.take(0)`), the first assertion still passes and the control
+    /// fails — observed: `left: 0, right: 1`. Restored.
     #[test]
     fn a_worktree_added_and_removed_before_confirming_is_not_announced() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -11461,11 +11472,21 @@ mod tests {
         ask_env_clear(&[p]);
     }
 
-    /// What the watcher calls: it must return at once (the batch loop holds
-    /// this hub's lock), and the thread it starts must take that lock only
-    /// after git has answered. Called with the guard held, as the batch loop
-    /// does — a `worktree::list` run inline would still pass, so the timing
-    /// assertion is what says "spawned".
+    /// What the watcher calls, called with the guard held as the batch loop
+    /// does. It pins two things: the confirm does not run inline under the
+    /// caller's lock, and a thread does run it and announce.
+    ///
+    /// It does **not** pin that `git worktree list` runs off-lock inside
+    /// that thread: a thread that took the hub lock first and listed under
+    /// it would pass here just the same. That rule rests on
+    /// `worktrees_changed`'s structure (observe, then lock), not on this
+    /// test.
+    ///
+    /// Revert-checked: with `worktrees_changed` confirming inline
+    /// (`apply_worktrees(observe_worktrees(..))` then return), this fails —
+    /// observed: `assertion failed: appeared(&rxa).is_empty()`. With it
+    /// returning without spawning, it fails — observed: `the confirm thread
+    /// announced nothing: Timeout`. Both restored.
     #[test]
     fn worktrees_changed_confirms_on_its_own_thread() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

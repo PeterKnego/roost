@@ -12,8 +12,8 @@ pub enum Class {
     Tree,
     Status,
     Buffer(String),
-    /// `.git/worktrees` or anything under it: a worktree of this checkout
-    /// may have been added or removed, by anything (#158 §2).
+    /// `.git/worktrees` or an `<id>` directly in it: a worktree of this
+    /// checkout may have been added or removed, by anything (#158 §2).
     Worktrees,
     Ignore,
 }
@@ -46,10 +46,18 @@ pub fn classify(rel: &str, open_buffers: &[String], filter: &crate::projects::Tr
     Class::Tree
 }
 
-/// `.git/worktrees` itself or anything beneath it — where `git worktree add`
-/// records every linked worktree of a main checkout.
+/// `.git/worktrees` itself or one `<id>` directly beneath it — where `git
+/// worktree add` records every linked worktree of a main checkout.
 fn is_worktrees_admin(rel: &str) -> bool {
-    rel == ".git/worktrees" || rel.starts_with(".git/worktrees/")
+    match rel.strip_prefix(".git/worktrees") {
+        Some("") => true,
+        // Exactly one segment below: an `<id>/` coming or going. Anything
+        // deeper is git's own writes inside a linked worktree's admin dir on
+        // every command run there; the recursive root watch on macOS and
+        // Windows reports those, and each would cost a `git worktree list`.
+        Some(rest) => rest.strip_prefix('/').is_some_and(|id| !id.is_empty() && !id.contains('/')),
+        None => false,
+    }
 }
 
 /// True when `dir` is a main checkout, the only kind with worktrees of its
@@ -368,8 +376,10 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                     for path in &ev.paths {
                         let Ok(rel) = path.strip_prefix(&base) else { continue };
                         let rel = rel.to_string_lossy().replace('\\', "/");
+                        // The whole subtree, not just what `classify` counts:
+                        // nothing under `.git/worktrees` is ever walked.
                         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                        if is_worktrees_admin(&rel) {
+                        if rel == ".git/worktrees" || rel.starts_with(".git/worktrees/") {
                             // Never `watch_tree`'d: that would walk into every
                             // `<id>/` and turn each git command run in a linked
                             // worktree into a `git worktree list`. The directory
@@ -596,11 +606,21 @@ mod tests {
     /// ran it and wherever the worktree lives — so this, and not the
     /// worktree's own directory, is what tells roost one appeared (#158 §2).
     /// The directory itself counts too: the first worktree creates it, and
-    /// on Linux nothing inside it is seen until it is watched.
+    /// on Linux nothing inside it is seen until it is watched. Deeper paths
+    /// do not: they are git's writes on every command in a linked worktree.
+    ///
+    /// Revert-checked: with `classify`'s `Worktrees` arm removed, this fails
+    /// — observed: `left: Ignore, right: Worktrees` for `.git/worktrees`.
+    /// With the old any-depth match (`starts_with(".git/worktrees/")`)
+    /// restored, it fails — observed: `left: Worktrees, right: Ignore` for
+    /// `.git/worktrees/x/HEAD`. Both restored.
     #[test]
     fn git_worktrees_admin_paths_are_their_own_class() {
-        for rel in [".git/worktrees", ".git/worktrees/x", ".git/worktrees/x/HEAD"] {
+        for rel in [".git/worktrees", ".git/worktrees/x"] {
             assert_eq!(classify(rel, &bufs(), &TreeFilter::default()), Class::Worktrees, "{rel}");
+        }
+        for rel in [".git/worktrees/x/HEAD", ".git/worktrees/x/logs/HEAD", ".git/worktrees/"] {
+            assert_eq!(classify(rel, &bufs(), &TreeFilter::default()), Class::Ignore, "{rel}");
         }
         // The prefix, not a substring: a sibling name is still git's noise.
         assert_eq!(classify(".git/worktreesx", &bufs(), &TreeFilter::default()), Class::Ignore);

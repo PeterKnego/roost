@@ -1027,6 +1027,11 @@ mod tests {
 
     /// The client branches on `url` being null, so `None` must encode as
     /// `null` and not be skipped.
+    ///
+    /// Revert-checked: with `#[serde(skip_serializing_if =
+    /// "Option::is_none")]` on `url`, this fails — observed:
+    /// `{"t":"WorktreeAppeared","path":"/elsewhere/x","branch":"x"}`.
+    /// Restored.
     #[test]
     fn worktree_appeared_encodes_its_url_or_null() {
         let s = encode(&Event::WorktreeAppeared { path: "/r/uc-rel".into(), branch: "docs/rel".into(), url: Some("uc-rel".into()) });
