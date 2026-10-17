@@ -983,6 +983,24 @@ function onEvent(ev) {
       }
       break;
     }
+    case "WorktreeAppeared": {
+      // A worktree roost did not make (#158 §2) — a plain `git worktree add`
+      // from any tool, at any path. Nothing moves; this only says so, with a
+      // way there when the worktree is a roost project. Every part of it
+      // came from git, so it goes in as text and the link through
+      // `projectPath`, never as markup.
+      const name = ev.path.split("/").pop();
+      if (ev.url) {
+        showBanner(`worktree ${name} (${ev.branch}) appeared — `);
+        const a = document.createElement("a");
+        a.href = "/" + projectPath(ev.url); a.target = "_blank"; a.textContent = "open";
+        document.querySelector(".error-banner:last-of-type b")?.append(a);
+      } else {
+        showBanner(`worktree ${name} (${ev.branch}) appeared, outside roost's roots`);
+      }
+      document.body.dispatchEvent(new Event("projects"));
+      break;
+    }
     case "WorktreeGone": {
       // Claude Code removed a resident's worktree when its session exited
       // (spec §7) — nothing to click, just the explanation for why the

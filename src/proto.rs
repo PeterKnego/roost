@@ -783,6 +783,14 @@ pub enum Event {
     /// R18 has by now also forgotten the re-home record, so the session is
     /// `Here` again. This event is only the explanation for why.
     WorktreeGone { worktree: String, session: String },
+    /// A worktree of this checkout that roost did not make has appeared —
+    /// `git worktree add` from any tool, at any path (#158 §2). Broadcast to
+    /// this project's browsers once per worktree; one that already existed
+    /// when the watcher started, or that roost itself is making, never sends
+    /// this. `url` is the worktree's roost project when its directory is one
+    /// under a root, `None` when it lies outside every root (the banner then
+    /// has nothing to link to).
+    WorktreeAppeared { path: String, branch: String, url: Option<String> },
     /// A browser tool call for this page to hand to the extension, unread.
     /// `payload` is opaque JSON text and `sig` its HMAC (`browser::sign`):
     /// the extension verifies the bytes it is given, so this page — which
@@ -1015,6 +1023,16 @@ mod tests {
     fn worktree_gone_encodes_both_fields() {
         let s = encode(&Event::WorktreeGone { worktree: "repo/.claude/worktrees/w1".into(), session: "term3".into() });
         assert!(s.contains(r#""t":"WorktreeGone""#) && s.contains("w1") && s.contains("term3"));
+    }
+
+    /// The client branches on `url` being null, so `None` must encode as
+    /// `null` and not be skipped.
+    #[test]
+    fn worktree_appeared_encodes_its_url_or_null() {
+        let s = encode(&Event::WorktreeAppeared { path: "/r/uc-rel".into(), branch: "docs/rel".into(), url: Some("uc-rel".into()) });
+        assert!(s.contains(r#""t":"WorktreeAppeared""#) && s.contains(r#""branch":"docs/rel""#) && s.contains(r#""url":"uc-rel""#), "{s}");
+        let s = encode(&Event::WorktreeAppeared { path: "/elsewhere/x".into(), branch: "x".into(), url: None });
+        assert!(s.contains(r#""url":null"#), "{s}");
     }
 
     #[test]

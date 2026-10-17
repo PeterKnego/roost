@@ -12,6 +12,9 @@ pub enum Class {
     Tree,
     Status,
     Buffer(String),
+    /// `.git/worktrees` or anything under it: a worktree of this checkout
+    /// may have been added or removed, by anything (#158 §2).
+    Worktrees,
     Ignore,
 }
 
@@ -30,6 +33,7 @@ pub fn classify(rel: &str, open_buffers: &[String], filter: &crate::projects::Tr
     if first == ".git" {
         return match rel {
             ".git/index" | ".git/HEAD" => Class::Status,
+            _ if is_worktrees_admin(rel) => Class::Worktrees,
             _ => Class::Ignore,
         };
     }
@@ -40,6 +44,20 @@ pub fn classify(rel: &str, open_buffers: &[String], filter: &crate::projects::Tr
         return Class::Buffer(rel.to_string());
     }
     Class::Tree
+}
+
+/// `.git/worktrees` itself or anything beneath it — where `git worktree add`
+/// records every linked worktree of a main checkout.
+fn is_worktrees_admin(rel: &str) -> bool {
+    rel == ".git/worktrees" || rel.starts_with(".git/worktrees/")
+}
+
+/// True when `dir` is a main checkout, the only kind with worktrees of its
+/// own: its `.git` is a directory. A linked worktree's `.git` is a file, and
+/// anything that cannot be stat'ed is not watched this way — a missed banner
+/// is the recoverable side.
+fn is_main_checkout(dir: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(dir.join(".git")).map(|m| m.is_dir()).unwrap_or(false)
 }
 
 /// True when this event was caused by roost's own save. Consumes the
@@ -266,6 +284,19 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
     // platforms — index/HEAD drive the status pane, so watch that one
     // directory deliberately regardless of which path was taken above.
     let _ = watcher.watch(&dir.join(".git"), RecursiveMode::NonRecursive);
+    // And `.git/worktrees`, where every `git worktree add` lands whoever ran
+    // it (#158 §2). Non-recursive: the add and the removal of `<id>/` are
+    // the news; git's own writes inside an `<id>/` on every command in that
+    // worktree are not. Absent until the first worktree is made, in which
+    // case the `.git` watch above sees it created and the batch loop adds
+    // this then.
+    let main_checkout = is_main_checkout(&dir);
+    if main_checkout {
+        let wt = dir.join(".git/worktrees");
+        if std::fs::symlink_metadata(&wt).map(|m| m.is_dir()).unwrap_or(false) {
+            let _ = watcher.watch(&wt, RecursiveMode::NonRecursive);
+        }
+    }
 
     let base = dir.clone();
     let project_name = project.to_string();
@@ -336,7 +367,25 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                 for ev in &events {
                     for path in &ev.paths {
                         let Ok(rel) = path.strip_prefix(&base) else { continue };
-                        rels.push(rel.to_string_lossy().replace('\\', "/"));
+                        let rel = rel.to_string_lossy().replace('\\', "/");
+                        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                        if is_worktrees_admin(&rel) {
+                            // Never `watch_tree`'d: that would walk into every
+                            // `<id>/` and turn each git command run in a linked
+                            // worktree into a `git worktree list`. The directory
+                            // alone, non-recursively, when it appears — and
+                            // again if `git worktree prune` removed it and a
+                            // later add made it anew, since inotify drops a
+                            // watch with its directory.
+                            if rel == ".git/worktrees"
+                                && main_checkout
+                                && std::fs::symlink_metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+                            {
+                                let _ = keep.watch(path, RecursiveMode::NonRecursive);
+                            }
+                            rels.push(rel);
+                            continue;
+                        }
                         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                         {
                             let skip = path
@@ -353,6 +402,7 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                                 watch_tree(&mut keep, &project_name, path.clone(), &mut watched);
                             }
                         }
+                        rels.push(rel);
                     }
                 }
 
@@ -434,6 +484,7 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                 open.dedup();
                 let mut tree = false;
                 let mut status = false;
+                let mut worktrees = false;
                 // A single save (temp file + rename) fires several raw
                 // events (Create, Modify(Name), Modify(Data)) for the same
                 // path within one debounced batch. Collect the distinct
@@ -466,7 +517,7 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                     // `.gitignore` edit, say) does not refresh the pane it
                     // would appear in, which the ⟳ button recovers; the
                     // storm does not have a recovery.
-                    if !matches!(class, Class::Ignore) {
+                    if !matches!(class, Class::Ignore | Class::Worktrees) {
                         status = true;
                     }
                     match class {
@@ -479,6 +530,10 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                         Class::Buffer(r) => {
                             buffer_rels.insert(r);
                         }
+                        // `.git/worktrees` is git's bookkeeping, not a
+                        // working-tree path, so it is not a status change
+                        // either — only a question for `git worktree list`.
+                        Class::Worktrees => worktrees = true,
                         Class::Ignore => {}
                     }
                 }
@@ -498,6 +553,11 @@ pub fn spawn(project: &str, dir: PathBuf, hub: Arc<Mutex<Hub>>, debounce: Durati
                 }
                 if status {
                     h.broadcast(&crate::proto::Event::StatusChanged);
+                }
+                if worktrees {
+                    // Only spawns: the confirm runs `git worktree list`,
+                    // which must not run under this lock.
+                    h.worktrees_changed(&hub);
                 }
             }));
             if let Err(payload) = outcome {
@@ -530,6 +590,21 @@ mod tests {
     fn other_git_internals_are_ignored() {
         assert!(matches!(classify(".git/objects/ab/cdef", &bufs(), &TreeFilter::default()), Class::Ignore));
         assert!(matches!(classify(".git/logs/HEAD", &bufs(), &TreeFilter::default()), Class::Ignore));
+    }
+
+    /// `git worktree add` always makes `<main>/.git/worktrees/<id>/`, whoever
+    /// ran it and wherever the worktree lives — so this, and not the
+    /// worktree's own directory, is what tells roost one appeared (#158 §2).
+    /// The directory itself counts too: the first worktree creates it, and
+    /// on Linux nothing inside it is seen until it is watched.
+    #[test]
+    fn git_worktrees_admin_paths_are_their_own_class() {
+        for rel in [".git/worktrees", ".git/worktrees/x", ".git/worktrees/x/HEAD"] {
+            assert_eq!(classify(rel, &bufs(), &TreeFilter::default()), Class::Worktrees, "{rel}");
+        }
+        // The prefix, not a substring: a sibling name is still git's noise.
+        assert_eq!(classify(".git/worktreesx", &bufs(), &TreeFilter::default()), Class::Ignore);
+        assert_eq!(classify(".git/objects/ab/cdef", &bufs(), &TreeFilter::default()), Class::Ignore);
     }
 
     #[test]
@@ -977,6 +1052,97 @@ mod tests {
         let (dirs, hit_cap) = collect_watch_dirs(d.path().to_path_buf(), 5, 5);
         assert!(hit_cap);
         assert!(dirs.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn git_ok(repo: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A real repository at `root/name` with one commit, and a hub on it
+    /// whose known worktrees are seeded the way `for_project` seeds them,
+    /// watched by a live watcher. The caller holds both env locks.
+    #[cfg(target_os = "linux")]
+    fn watched_repo(root: &std::path::Path, name: &str, before: &[&str]) -> (std::path::PathBuf, Arc<Mutex<Hub>>, std::sync::mpsc::Receiver<String>) {
+        let repo = root.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        git_ok(&repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"]);
+        for b in before {
+            git_ok(&repo, &["worktree", "add", "-q", &format!("../{b}"), "-b", b]);
+        }
+        let hub = Arc::new(Mutex::new(Hub::new(name, repo.clone())));
+        let seen = crate::hub::seen_worktrees(crate::worktree::list(&repo), &[root.to_path_buf()]);
+        Hub::lock(&hub).seed_worktrees(seen);
+        assert!(spawn(name, repo.clone(), hub.clone(), Duration::from_millis(20)));
+        let rx = Hub::lock(&hub).subscribe().1;
+        (repo, hub, rx)
+    }
+
+    /// The dev/prod trap in this feature's shape: inotify reports nothing
+    /// from a directory nobody watched, and `.git/worktrees` does not exist
+    /// until the first `git worktree add`. The first add is seen through the
+    /// `.git` watch (its `worktrees` is created); the second only if that
+    /// creation also put a watch on `.git/worktrees` itself.
+    ///
+    /// Revert-checked: with the batch loop's `keep.watch(.git/worktrees)`
+    /// removed, the first add is still announced and the second fails —
+    /// observed: `the second add is seen only through a watch added when
+    /// .git/worktrees appeared`. Restored.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worktrees_added_after_start_reach_the_browser_through_a_live_watcher() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let (repo, _hub, rx) = watched_repo(root.path(), "watch_wt_fresh", &[]);
+        assert!(!repo.join(".git/worktrees").exists(), "the fixture must start without .git/worktrees");
+
+        git_ok(&repo, &["worktree", "add", "-q", "../one", "-b", "one"]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        assert!(wait_for(&rx, r#""branch":"one""#, deadline), "the first add creates .git/worktrees, which the .git watch sees");
+        git_ok(&repo, &["worktree", "add", "-q", "../two", "-b", "two"]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        assert!(
+            wait_for(&rx, r#""branch":"two""#, deadline),
+            "the second add is seen only through a watch added when .git/worktrees appeared"
+        );
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// `.git/worktrees` already there at start: only `spawn`'s own watch on
+    /// it can see the add, since its creation event happened before roost.
+    ///
+    /// Revert-checked: with `spawn`'s `.git/worktrees` watch removed this
+    /// fails — observed: `an existing .git/worktrees is watched from the
+    /// start`. Restored.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_worktree_added_beside_an_existing_one_reaches_the_browser() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let (repo, _hub, rx) = watched_repo(root.path(), "watch_wt_existing", &["old"]);
+        git_ok(&repo, &["worktree", "add", "-q", "../new", "-b", "new"]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut got = Vec::new();
+        while let Ok(m) = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            let done = m.contains(r#""branch":"new""#);
+            got.push(m);
+            if done {
+                break;
+            }
+        }
+        assert!(got.iter().any(|m| m.contains(r#""branch":"new""#)), "an existing .git/worktrees is watched from the start: {got:?}");
+        assert!(!got.iter().any(|m| m.contains(r#""branch":"old""#)), "the one there at start is never news: {got:?}");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// Polls a hub subscriber for a broadcast message containing `needle`

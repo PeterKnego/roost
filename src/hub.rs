@@ -138,6 +138,82 @@ pub struct Hub {
     /// sent, by construction rather than by a flag. Never persisted: the
     /// hook connection it answers does not survive a restart either.
     asks: Vec<PendingAsk>,
+    /// The non-main worktrees of this checkout as git last reported them
+    /// (canonical paths), so a new one is told apart from one that was
+    /// always there (#158 §2). `None` until git has answered once: with no
+    /// answer there is nothing to diff against, and the first answer seeds
+    /// it silently rather than announcing every worktree as new.
+    known_worktrees: Option<std::collections::BTreeSet<std::path::PathBuf>>,
+    /// Worktrees roost is itself about to `git worktree add`, noted before
+    /// the add (`note_created_worktree`). Kept apart from `known_worktrees`
+    /// rather than inserted into it: a confirm whose `git worktree list`
+    /// ran *before* the add finished would drop a not-yet-listed path from
+    /// the known set as removed, and the add's own watch event would then
+    /// announce a worktree whose page roost already opened. An entry is
+    /// consumed when it shows up, and dropped after `MADE_WORKTREE_TTL` if
+    /// the add never happened.
+    worktrees_made: Vec<(std::path::PathBuf, std::time::Instant)>,
+    /// A confirm thread is running (`worktrees_changed`). At most one per
+    /// hub, so two `git worktree list` answers can never be applied out of
+    /// order — an older list landing last would forget a worktree, and the
+    /// next event would announce it a second time.
+    worktrees_confirming: bool,
+    /// Another watch event arrived while a confirm was running; it runs once
+    /// more when it finishes, so the change that event saw is not lost.
+    worktrees_again: bool,
+}
+
+/// How long a worktree roost said it would make stays exempt from the
+/// banner while it has not appeared yet. Far longer than any `git worktree
+/// add`; bounded so a failed add cannot keep a path exempt forever.
+const MADE_WORKTREE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// One non-main worktree as `git worktree list` reported it, resolved off
+/// every lock into what `Event::WorktreeAppeared` carries.
+pub struct SeenWorktree {
+    /// Canonical, so it compares equal to what `note_created_worktree`
+    /// records and to the same worktree in the next listing.
+    pub path: std::path::PathBuf,
+    pub branch: String,
+    /// The worktree's roost project URL when its root is a project under a
+    /// root (`projects::project_for_abs` with an empty `rel`).
+    pub url: Option<String>,
+}
+
+/// `None` when git did not answer: `worktree::list` is empty only then,
+/// since a repository always lists at least its main checkout. "No answer"
+/// is never folded into "no worktrees" — that would read as every worktree
+/// removed, and the next answer would announce them all again.
+pub fn seen_worktrees(listed: Vec<crate::worktree::Worktree>, roots: &[std::path::PathBuf]) -> Option<Vec<SeenWorktree>> {
+    if listed.is_empty() {
+        return None;
+    }
+    Some(
+        listed
+            .into_iter()
+            .filter(|w| !w.is_main)
+            .map(|w| {
+                // A listed worktree whose directory is gone (prunable) does
+                // not canonicalise; it is still a worktree git knows about.
+                let path = w.path.canonicalize().unwrap_or(w.path);
+                let url = crate::projects::project_for_abs(roots, &path)
+                    .and_then(|(url, rel)| if rel.is_empty() { Some(url) } else { None });
+                SeenWorktree { path, branch: w.branch, url }
+            })
+            .collect(),
+    )
+}
+
+/// The production observation: git, then the resolver. Runs git, so it is
+/// called with no lock held, ever. Only a main checkout (`.git` a
+/// directory) has worktrees of its own to see; anything else answers
+/// `None` without running git at all.
+fn observe_worktrees(dir: &std::path::Path) -> Option<Vec<SeenWorktree>> {
+    match std::fs::symlink_metadata(dir.join(".git")) {
+        Ok(m) if m.is_dir() => {}
+        _ => return None,
+    }
+    seen_worktrees(crate::worktree::list(dir), &crate::projects::roots())
 }
 
 /// How long Claude's worktree ask waits for a browser before it is refused.
@@ -355,6 +431,10 @@ impl Hub {
             worktree_hooks: None,
             settings: None,
             asks: Vec::new(),
+            known_worktrees: None,
+            worktrees_made: Vec::new(),
+            worktrees_confirming: false,
+            worktrees_again: false,
         };
         // A freshly loaded hub must report reality, not whatever the
         // persisted layout happened to say last time: sessions may have
@@ -540,6 +620,12 @@ impl Hub {
             let arc2 = arc.clone();
             let project2 = project.to_string();
             std::thread::spawn(move || {
+                // Seeded before the watcher exists, so no watch event can
+                // confirm against an empty baseline first; `git worktree
+                // list` is the reason this is out here, on this thread, with
+                // no lock held until the answer is in.
+                let seen = std::panic::catch_unwind(|| observe_worktrees(&dir)).unwrap_or(None);
+                Hub::lock(&arc2).seed_worktrees(seen);
                 let ok = crate::watch::spawn(&project2, dir, arc2.clone(), std::time::Duration::from_millis(ms));
                 let mut h = Hub::lock(&arc2);
                 h.ws.watch_degraded = !ok;
@@ -2261,6 +2347,14 @@ impl Hub {
                         .ok_or_else(|| "could not find a free worktree name".to_string())?
                 }
             };
+            // Before the add, so its watch event finds it expected (#158
+            // §2): this flow opens the page itself. Never under this hub's
+            // lock — `work` runs on its own thread whenever the hub is in
+            // the registry, and only a bare test hub (never registered, so
+            // `note_created_worktree` finds nothing to lock) runs it inline.
+            if let Some(p) = planned_worktree_path(&dir, &resolved) {
+                note_created_worktree(&project, &p);
+            }
             let c = crate::worktree::create_named(&dir, &crate::wsstate::state_dir(), &resolved, &key_of, &crate::worktree::real_git)?;
             Ok(format!("{project}/.claude/worktrees/{}", c.name))
         };
@@ -3306,6 +3400,134 @@ fn open_hub(project: &str) -> Option<Arc<Mutex<Hub>>> {
     map.get(project).cloned()
 }
 
+// ---- #158 §2: a worktree that appears from anywhere -----------------------
+
+impl Hub {
+    /// The known set as the watcher found it at start, so a worktree that
+    /// already existed is never announced. Applies only while nothing has
+    /// been seeded yet: a confirm that already ran knows better than a
+    /// listing taken before it.
+    pub fn seed_worktrees(&mut self, seen: Option<Vec<SeenWorktree>>) {
+        if let (None, Some(seen)) = (&self.known_worktrees, seen) {
+            self.known_worktrees = Some(seen.into_iter().map(|w| w.path).collect());
+        }
+    }
+
+    /// Diffs a listing against the known set and returns one
+    /// `WorktreeAppeared` per path that is new. Pure apart from `self`, so
+    /// tests hand it a listing; the watcher's thread hands it git's.
+    ///
+    /// Three outcomes, never two: `None` (git did not answer) changes
+    /// nothing at all; an answer with no known set yet only seeds it, since
+    /// without a baseline every worktree would read as new; and only an
+    /// answer against a baseline announces. A path that dropped out is
+    /// forgotten without a word — finishing a worktree is #157's.
+    pub fn confirm_worktrees(&mut self, seen: Option<Vec<SeenWorktree>>) -> Vec<Event> {
+        let Some(seen) = seen else { return Vec::new() };
+        let now = std::time::Instant::now();
+        self.worktrees_made.retain(|(_, at)| now.duration_since(*at) < MADE_WORKTREE_TTL);
+        let Some(known) = &self.known_worktrees else {
+            self.known_worktrees = Some(seen.into_iter().map(|w| w.path).collect());
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        for w in &seen {
+            if known.contains(&w.path) {
+                continue;
+            }
+            if let Some(i) = self.worktrees_made.iter().position(|(p, _)| *p == w.path) {
+                self.worktrees_made.remove(i);
+                continue;
+            }
+            events.push(Event::WorktreeAppeared {
+                path: w.path.to_string_lossy().into_owned(),
+                branch: w.branch.clone(),
+                url: w.url.clone(),
+            });
+        }
+        self.known_worktrees = Some(seen.into_iter().map(|w| w.path).collect());
+        events
+    }
+
+    /// `confirm_worktrees`, then tell this project's browsers.
+    pub fn apply_worktrees(&mut self, seen: Option<Vec<SeenWorktree>>) {
+        for ev in self.confirm_worktrees(seen) {
+            self.broadcast(&ev);
+        }
+    }
+
+    /// The watcher saw `.git/worktrees` change. Called with this hub's lock
+    /// held (the batch loop's `h`), so it only starts a thread: `git
+    /// worktree list` runs there with no lock, and the lock is retaken just
+    /// long enough to diff and broadcast. One thread at a time per hub — an
+    /// event that lands while one runs asks it to go round once more.
+    ///
+    /// `me` is this hub's own `Arc`, passed in rather than taken from
+    /// `self_ref` so a watcher on a hub `for_project` did not build (the
+    /// watch tests') still confirms.
+    pub fn worktrees_changed(&mut self, me: &Arc<Mutex<Hub>>) {
+        if self.worktrees_confirming {
+            self.worktrees_again = true;
+            return;
+        }
+        self.worktrees_confirming = true;
+        let arc = me.clone();
+        let dir = self.dir.clone();
+        let spawned = std::thread::Builder::new().name("worktrees-confirm".into()).spawn(move || loop {
+            let seen = std::panic::catch_unwind(|| observe_worktrees(&dir)).unwrap_or_else(|_| {
+                eprintln!("roost: worktree listing panicked; no worktree banner this time");
+                None
+            });
+            let mut h = Hub::lock(&arc);
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.apply_worktrees(seen))).is_err() {
+                eprintln!("roost: worktree confirm panicked; no worktree banner this time");
+            }
+            if h.worktrees_again {
+                h.worktrees_again = false;
+                continue;
+            }
+            h.worktrees_confirming = false;
+            break;
+        });
+        if spawned.is_err() {
+            // No thread, so no one will clear the flag; leaving it set would
+            // silence every later event for the life of the process.
+            self.worktrees_confirming = false;
+        }
+    }
+
+    /// Remembers that roost is about to make the worktree at `path`, so its
+    /// appearance is not announced. `path` must be canonical, as
+    /// `seen_worktrees` reports.
+    fn note_made_worktree(&mut self, path: std::path::PathBuf) {
+        self.worktrees_made.retain(|(p, _)| *p != path);
+        self.worktrees_made.push((path, std::time::Instant::now()));
+    }
+}
+
+/// Called by roost's own creation paths **before** their `git worktree
+/// add`, so the watch event that add raises finds the worktree already
+/// expected. Locks the project's hub through the registry, so the caller
+/// must hold no hub lock — both callers run off-lock on their own threads.
+/// A project with no open hub has no watcher and nothing to tell.
+pub fn note_created_worktree(project: &str, path: &std::path::Path) {
+    if let Some(arc) = open_hub(project) {
+        Hub::lock(&arc).note_made_worktree(path.to_path_buf());
+    }
+}
+
+/// Where `create_named` will put worktree `name` of `dir`, canonical as
+/// `git worktree list` reports it — computed before the add, when the
+/// worktree itself does not yet exist to be canonicalised. `None` when the
+/// project directory cannot be resolved, in which case `create_named`
+/// refuses for the same reason.
+fn planned_worktree_path(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let base = dir.canonicalize().ok()?;
+    let parent = base.join(".claude/worktrees");
+    let parent = parent.canonicalize().unwrap_or(parent);
+    Some(parent.join(crate::wtname::dir_name(name)))
+}
+
 fn ask_refuse(msg: impl Into<String>) -> crate::hooksock::AskReply {
     crate::hooksock::AskReply::Refuse { refuse: msg.into() }
 }
@@ -3415,6 +3637,12 @@ fn approve_ask(project: String, dir: std::path::PathBuf, clicker: ConnId, ask: P
     let mut created: Option<String> = None;
     let work = std::panic::AssertUnwindSafe(|| -> Result<String, String> {
         let key_of = |n: &str| crate::projects::storage_key(&format!("{project}/.claude/worktrees/{n}"));
+        // Before the add, so the watch event it raises is not announced as a
+        // worktree roost did not make (#158 §2) — the clicker's tab is
+        // already being navigated there. Off every lock, like all of this.
+        if let Some(p) = planned_worktree_path(&dir, &name) {
+            note_created_worktree(&project, &p);
+        }
         let c = crate::worktree::create_named(
             &dir,
             &crate::wsstate::state_dir(),
@@ -11029,5 +11257,240 @@ mod tests {
         drop(rx_a);
         assert!(!send_to_conn("send-to-conn", &a, &ev), "a closed receiver is not a delivery");
         std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    // ---- #158 §2: a worktree that appears from anywhere ----------------
+
+    fn git_ok(repo: &std::path::Path, args: &[&str]) {
+        let st = std::process::Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+        assert!(st.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&st.stderr));
+    }
+
+    /// Every `WorktreeAppeared` on `rx`, decoded.
+    fn appeared(rx: &Receiver<String>) -> Vec<serde_json::Value> {
+        drain(rx)
+            .iter()
+            .map(|m| serde_json::from_str::<serde_json::Value>(m).unwrap())
+            .filter(|v| v["t"] == "WorktreeAppeared")
+            .collect()
+    }
+
+    fn seen(repo: &std::path::Path, root: &std::path::Path) -> Option<Vec<SeenWorktree>> {
+        seen_worktrees(crate::worktree::list(repo), &[root.to_path_buf()])
+    }
+
+    /// The motivating miss: a Claude ran a plain `git worktree add` and roost
+    /// showed nothing. Two connections, so a reply sent to one browser
+    /// instead of broadcast would fail the second half.
+    ///
+    /// Revert-checked: with `confirm_worktrees` building no event, this
+    /// fails — observed: `exactly one banner per browser: []`, `left: 0,
+    /// right: 1`. Restored.
+    #[test]
+    fn a_plain_git_worktree_add_is_announced_once() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let repo = root.path().join("wt-appear");
+        init_repo(&repo);
+        let mut h = Hub::new("wt-appear", repo.clone());
+        let (_a, rxa) = conn(&mut h);
+        let (_b, rxb) = conn(&mut h);
+        h.seed_worktrees(seen(&repo, root.path()));
+
+        git_ok(&repo, &["worktree", "add", "-q", "../sib", "-b", "sib"]);
+        h.apply_worktrees(seen(&repo, root.path()));
+        let sib = root.path().join("sib").canonicalize().unwrap();
+        for rx in [&rxa, &rxb] {
+            let got = appeared(rx);
+            assert_eq!(got.len(), 1, "exactly one banner per browser: {got:?}");
+            assert_eq!(got[0]["branch"], "sib");
+            assert_eq!(got[0]["path"], sib.to_string_lossy().as_ref());
+            assert_eq!(got[0]["url"], "sib", "a sibling under the root is a roost project");
+        }
+        // The same listing again — a second watch event for the same add.
+        h.apply_worktrees(seen(&repo, root.path()));
+        assert!(appeared(&rxa).is_empty() && appeared(&rxb).is_empty(), "announced once, not per event");
+
+        // Outside every root: still announced, with nothing to link to.
+        let far = outside.path().join("far");
+        git_ok(&repo, &["worktree", "add", "-q", far.to_str().unwrap(), "-b", "far"]);
+        h.apply_worktrees(seen(&repo, root.path()));
+        let got = appeared(&rxa);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0]["branch"], "far");
+        assert!(got[0]["url"].is_null(), "outside the roots there is no project URL: {got:?}");
+        ask_env_clear(&[]);
+    }
+
+    /// Revert check (a): with `seed_worktrees` made a no-op, the first
+    /// confirm seeds instead and nothing is announced — observed:
+    /// `exactly the new one, never the old one: []`. Restored.
+    #[test]
+    fn a_worktree_that_existed_at_start_is_never_announced() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let repo = root.path().join("wt-start");
+        init_repo(&repo);
+        git_ok(&repo, &["worktree", "add", "-q", "../old", "-b", "old"]);
+        let mut h = Hub::new("wt-start", repo.clone());
+        let (_a, rxa) = conn(&mut h);
+        h.seed_worktrees(seen(&repo, root.path()));
+        // No confirm in between: a confirm with nothing seeded seeds by
+        // itself, which would make this test pass with the seeding gone.
+        // The first event after start is the add.
+        git_ok(&repo, &["worktree", "add", "-q", "../new", "-b", "new"]);
+        h.apply_worktrees(seen(&repo, root.path()));
+        let got = appeared(&rxa);
+        let branches: Vec<&str> = got.iter().filter_map(|v| v["branch"].as_str()).collect();
+        assert_eq!(branches, vec!["new"], "exactly the new one, never the old one: {got:?}");
+        ask_env_clear(&[]);
+    }
+
+    /// Revert check (b): with an unanswered listing read as "no worktrees"
+    /// (`seen_worktrees` returning `Some(vec![])` for an empty list), the
+    /// known set is emptied and the next real answer announces the old
+    /// worktree again — observed: `git not answering forgot nothing:
+    /// [Object {"t": String("WorktreeAppeared"), …, "branch": String("old"),
+    /// "url": String("old")}]`. Restored.
+    #[test]
+    fn an_unanswered_git_list_changes_nothing() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let repo = root.path().join("wt-silent");
+        init_repo(&repo);
+        git_ok(&repo, &["worktree", "add", "-q", "../old", "-b", "old"]);
+        let mut h = Hub::new("wt-silent", repo.clone());
+        let (_a, rxa) = conn(&mut h);
+        h.seed_worktrees(seen(&repo, root.path()));
+        // What `worktree::list` hands back when git times out or fails.
+        h.apply_worktrees(seen_worktrees(Vec::new(), &[root.path().to_path_buf()]));
+        assert!(appeared(&rxa).is_empty(), "no answer is not an event");
+        h.apply_worktrees(seen(&repo, root.path()));
+        let got = appeared(&rxa);
+        assert!(got.is_empty(), "git not answering forgot nothing: {got:?}");
+        ask_env_clear(&[]);
+    }
+
+    #[test]
+    fn a_worktree_added_and_removed_before_confirming_is_not_announced() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let repo = root.path().join("wt-blip");
+        init_repo(&repo);
+        let mut h = Hub::new("wt-blip", repo.clone());
+        let (_a, rxa) = conn(&mut h);
+        h.seed_worktrees(seen(&repo, root.path()));
+        git_ok(&repo, &["worktree", "add", "-q", "../blip", "-b", "blip"]);
+        git_ok(&repo, &["worktree", "remove", "../blip"]);
+        h.apply_worktrees(seen(&repo, root.path()));
+        assert!(appeared(&rxa).is_empty(), "gone by the time git was asked: nothing to open");
+        // Control: the same hub still announces a worktree that stays, so
+        // the silence above was the diff and not a dead confirm.
+        git_ok(&repo, &["worktree", "add", "-q", "../stays", "-b", "stays"]);
+        h.apply_worktrees(seen(&repo, root.path()));
+        assert_eq!(appeared(&rxa).len(), 1);
+        ask_env_clear(&[]);
+    }
+
+    /// Both of roost's own creation paths note the worktree before their
+    /// `git worktree add`; those flows open the page themselves.
+    ///
+    /// Revert-checked: with the `note_created_worktree` call removed from
+    /// `approve_ask`, this fails — observed: `roost made this one: [Object
+    /// {"t": String("WorktreeAppeared"), …, "branch":
+    /// String("worktree-fox"), …}]`. Restored.
+    #[test]
+    fn a_worktree_roost_made_is_not_announced() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "wt-made";
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let (_b, rxb) = conn(&mut Hub::lock(&hub));
+        Hub::lock(&hub).seed_worktrees(seen(&repo, root.path()));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: true });
+        assert!(matches!(t.join().unwrap(), AskReply::Path { .. }), "the worktree was made");
+        Hub::lock(&hub).apply_worktrees(seen(&repo, root.path()));
+        for rx in [&rxa, &rxb] {
+            let got = appeared(rx);
+            assert!(got.is_empty(), "roost made this one: {got:?}");
+        }
+        ask_env_clear(&[p]);
+    }
+
+    /// The `+` dialog's path. Revert-checked: with the
+    /// `note_created_worktree` call removed from `do_new_worktree`, this
+    /// fails — observed: `the + dialog made this one: [Object {"t":
+    /// String("WorktreeAppeared"), …, "branch": String("worktree-bright-fox"),
+    /// …}]`. Restored.
+    #[test]
+    fn a_worktree_from_the_plus_dialog_is_not_announced() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "wt-plus";
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        Hub::lock(&hub).seed_worktrees(seen(&repo, root.path()));
+        Hub::lock(&hub).handle(&a, Intent::NewWorktree { name: Some("bright-fox".into()), launch: None });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let m = rxa.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).expect("no WorktreeReady");
+            assert!(!m.contains(r#""t":"Error""#), "{m}");
+            if m.contains(r#""t":"WorktreeReady""#) {
+                break;
+            }
+        }
+        Hub::lock(&hub).apply_worktrees(seen(&repo, root.path()));
+        let got = appeared(&rxa);
+        assert!(got.is_empty(), "the + dialog made this one: {got:?}");
+        ask_env_clear(&[p]);
+    }
+
+    /// What the watcher calls: it must return at once (the batch loop holds
+    /// this hub's lock), and the thread it starts must take that lock only
+    /// after git has answered. Called with the guard held, as the batch loop
+    /// does — a `worktree::list` run inline would still pass, so the timing
+    /// assertion is what says "spawned".
+    #[test]
+    fn worktrees_changed_confirms_on_its_own_thread() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let repo = root.path().join("wt-thread");
+        init_repo(&repo);
+        let hub = Arc::new(Mutex::new(Hub::new("wt-thread", repo.clone())));
+        let (_a, rxa) = conn(&mut Hub::lock(&hub));
+        Hub::lock(&hub).seed_worktrees(seen(&repo, root.path()));
+        git_ok(&repo, &["worktree", "add", "-q", "../sib", "-b", "sib"]);
+        {
+            let mut h = Hub::lock(&hub);
+            h.worktrees_changed(&hub);
+            // Still holding the lock: the confirm cannot have run yet.
+            assert!(appeared(&rxa).is_empty());
+        }
+        let m = rxa.recv_timeout(std::time::Duration::from_secs(20)).expect("the confirm thread announced nothing");
+        assert!(m.contains(r#""t":"WorktreeAppeared""#) && m.contains(r#""branch":"sib""#), "{m}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while Hub::lock(&hub).worktrees_confirming {
+            assert!(std::time::Instant::now() < deadline, "the confirm thread never finished");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        ask_env_clear(&[]);
     }
 }
