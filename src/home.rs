@@ -188,7 +188,8 @@ pub fn away_from(home: &str) -> Vec<(String, Owner)> { away_from_in(&crate::wsst
 pub fn sweep(sock_state: &dyn Fn(&str, &str) -> Option<bool>) { sweep_in(&crate::wsstate::state_dir(), sock_state) }
 
 /// Whether `owner` is still a place `home`'s re-homed session can be shown:
-/// one of `home`'s own `.claude/worktrees/<dir>`, still a directory.
+/// one of `home`'s own `.claude/worktrees/<dir>`, still a directory — or the
+/// one owner `home`'s `.moved-to` names (see [`resolves_with`]).
 ///
 /// Fork-free on purpose. `projects::resolve_project` on the owner URL would
 /// run `git worktree list` (its dot segment needs git to vouch for it), and
@@ -199,7 +200,23 @@ pub fn sweep(sock_state: &dyn Fn(&str, &str) -> Option<bool>) { sweep_in(&crate:
 /// A `false` here destroys nothing: the session is shown in its home, and
 /// the record is kept (see the module doc and `session::owned_live_names`).
 pub fn resolves_in(roots: &[PathBuf], home: &str, owner: &str) -> bool {
+    resolves_with(&crate::wsstate::state_dir(), roots, home, owner)
+}
+
+/// [`resolves_in`] with the state dir injected. The one widening (#158 §5):
+/// an owner equal to `home`'s `.moved-to`, while that owner still resolves.
+/// Nothing else widens — a record naming any other owner outside the home's
+/// `.claude/worktrees/` still does not resolve.
+///
+/// Still fork-free: `resolve_recorded_project`, not `resolve_project`, since
+/// the owner of a renamed worktree has a dot segment and `resolve_project`
+/// would ask git about it under the hub registry lock. The `.moved-to` is
+/// the evidence git vouched; it was written only once `resolve_project`
+/// had, and is rewritten or removed by every `reconcile`.
+pub fn resolves_with(state: &Path, roots: &[PathBuf], home: &str, owner: &str) -> bool {
     owner_dir_in(roots, home, owner).is_some()
+        || (moved_to_in(state, home).as_deref() == Some(owner)
+            && crate::projects::resolve_recorded_project(roots, owner).is_some())
 }
 
 pub fn resolves(home: &str, owner: &str) -> bool {
@@ -788,5 +805,53 @@ mod tests {
         record_identity_in(s, "foo", "term3", dir.path()).unwrap();
         forget_in(s, "foo", "term3");
         assert_eq!(identity_of_in(s, "foo", "term3"), Ok(None), "forgetting the record forgets its identity");
+    }
+
+    /// #158 §5's widening is gated: an owner outside `.claude/worktrees`
+    /// resolves only when `sock/<home key>/.moved-to` names exactly that
+    /// owner, and that owner is still a directory under the roots.
+    ///
+    /// Revert-checked, run and restored: accepting any owner once a
+    /// `.moved-to` exists (`is_some()` for the equality) fails "a .moved-to
+    /// vouches for its one owner, not any"; dropping the resolve check fails
+    /// "a named owner that no longer resolves does not"; `resolve_project`
+    /// in place of `resolve_recorded_project` fails "the record is git's
+    /// vouching".
+    #[test]
+    fn a_record_naming_an_unrelated_owner_still_does_not_resolve() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("root");
+        for d in ["proj", "renamed", "unrelated"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::create_dir_all(outer.path().join("escape")).unwrap();
+        let roots = vec![root.clone()];
+
+        assert!(!resolves_with(s, &roots, "proj", "renamed"), "no .moved-to: an arbitrary owner does not resolve");
+        assert!(!resolves_with(s, &roots, "proj", "unrelated"));
+
+        let p = moved_to_path(s, "proj");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "renamed\n").unwrap();
+        assert!(resolves_with(s, &roots, "proj", "renamed"), "the owner .moved-to names resolves");
+        assert!(!resolves_with(s, &roots, "proj", "unrelated"), "a .moved-to vouches for its one owner, not any");
+        assert!(!resolves_with(s, &roots, "other", "renamed"), "nor for another home's records");
+
+        std::fs::remove_dir_all(root.join("renamed")).unwrap();
+        assert!(!resolves_with(s, &roots, "proj", "renamed"), "a named owner that no longer resolves does not");
+
+        // A dotted owner goes through the fork-free resolver: this is a
+        // plain directory git never heard of, so `resolve_project` (which
+        // asks git about any dot segment) would refuse it — and run git
+        // under the hub registry lock to do so.
+        std::fs::create_dir_all(root.join("proj2/.claude/worktrees/worktree-b")).unwrap();
+        std::fs::write(&p, "proj2/.claude/worktrees/worktree-b\n").unwrap();
+        assert!(resolves_with(s, &roots, "proj", "proj2/.claude/worktrees/worktree-b"), "the record is git's vouching");
+        // `escape` exists, beside the root rather than under it, so only
+        // confinement can refuse it.
+        std::fs::write(&p, "../escape\n").unwrap();
+        assert!(!resolves_with(s, &roots, "proj", "../escape"), "confinement still applies");
     }
 }

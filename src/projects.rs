@@ -207,6 +207,25 @@ pub fn list_projects(roots: &[PathBuf]) -> Vec<Project> {
 /// sufficient, since a symlink planted partway down a project's own tree
 /// (not just in the URL text) could still resolve outside the root.
 pub fn resolve_project(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
+    resolve_project_with(roots, name, &crate::worktree::is_vouched_worktree)
+}
+
+/// [`resolve_project`] for a URL roost itself recorded *after*
+/// `resolve_project` vouched for it — `sock/<key>/.moved-to`, which
+/// `registry::record_move_with` writes only when the URL resolved. The
+/// record stands in for git's vouching of a dot segment, so this never
+/// forks: it is what lets `home::resolves`, which runs under the hub
+/// registry lock, follow a rename into a `.claude/worktrees/` path. Every
+/// other check, confinement included, is unchanged.
+pub fn resolve_recorded_project(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
+    resolve_project_with(roots, name, &|_, _| true)
+}
+
+fn resolve_project_with(
+    roots: &[PathBuf],
+    name: &str,
+    vouched: &dyn Fn(&[PathBuf], &str) -> bool,
+) -> Option<PathBuf> {
     let segs: Vec<&str> = name.split('/').collect();
     if RESERVED.contains(&segs[0]) {
         return None;
@@ -218,7 +237,7 @@ pub fn resolve_project(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
     // projects — with one exception: git itself vouching for the path as a
     // worktree. Confinement below is unchanged and still does the real work,
     // because a cloned repo could name a worktree anywhere.
-    if segs.iter().any(|s| s.starts_with('.')) && !crate::worktree::is_vouched_worktree(roots, name) {
+    if segs.iter().any(|s| s.starts_with('.')) && !vouched(roots, name) {
         return None;
     }
     for root in roots {

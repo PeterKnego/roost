@@ -73,11 +73,16 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // `journalctl --user -u roost` afterwards) has nothing at all to go
     // on. Diagnosing an intermittent "live_sessions stayed empty" needed
     // exactly this and did not have it.
-    let Some(dir) = crate::projects::resolve_project(roots, &project) else {
+    let Some((dir, renamed_to)) = target(roots, &project, &crate::home::moved_to) else {
         eprintln!("roost: term socket refused — project {project:?} does not resolve under the roots");
         let _ = ws_read.close(None);
         return;
     };
+    if let Some(new) = &renamed_to {
+        eprintln!(
+            "roost: term socket for {project:?}, renamed to {new:?} — attaching {name} to an existing session only"
+        );
+    }
     // The guard that used to stand here asked `Hub::is_closing`, which takes
     // the *hub* mutex — while the spawn it was guarding is serialised by the
     // *session* mutex. A check on a different lock from the operation it
@@ -129,8 +134,19 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // no lock file, so `claude` silently comes up with no IDE at all.
     // `tests/integration.rs::reopening_a_closed_project_rebuilds_its_ide_listener`
     // is what fails if this goes.
-    crate::ide::for_project(&project, dir.clone());
-    let att = match session::attach(&project, name, &dir) {
+    //
+    // Skipped for a renamed project's old URL: what it guarantees is the
+    // environment of a shell being *spawned*, and `attach_existing` spawns
+    // none. Run there it would start a listener for the old key over the
+    // new directory — a second IDE endpoint for a project that has its own.
+    if renamed_to.is_none() {
+        crate::ide::for_project(&project, dir.clone());
+    }
+    let attached = match &renamed_to {
+        Some(new) => session::attach_existing(&project, name, &dir, new),
+        None => session::attach(&project, name, &dir),
+    };
+    let att = match attached {
         Ok(a) => a,
         Err(e) => {
             eprintln!("roost: term socket refused — attach {project}/{name} failed: {e}");
@@ -237,7 +253,13 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // subscriber whose queue fills, killing this tab's socket before it
     // ever started reading. With `out` already running first, the channel
     // is being drained the whole time this contends for the hub lock.
-    {
+    //
+    // Not for a renamed project's old URL. An attach there changes no
+    // liveness (the session was already running, and its page is the new
+    // project's, which lists it as a resident), and `Hub::for_project` on
+    // the old URL would build a hub, watcher and IDE listener for a project
+    // whose directory is gone, over the new one's.
+    if renamed_to.is_none() {
         let hub = crate::hub::Hub::for_project(&project, dir.clone());
         let mut h = crate::hub::Hub::lock(&hub);
         h.refresh_live_sessions();
@@ -252,7 +274,7 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // too, and a nudge per mere reconnect would have every browser on the
     // machine refetch (and `known_projects` fork `ps` per session) each time
     // one tab reloads.
-    if att.spawned {
+    if att.spawned && renamed_to.is_none() {
         crate::hub::broadcast_all(&crate::proto::Event::ProjectsChanged { project: project.clone() });
     }
 
@@ -292,6 +314,33 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     let _ = out.join();
 }
 
+/// Where a terminal socket for `project` attaches, and whether only to an
+/// existing session: `project`'s own directory, or — when that does not
+/// resolve — the directory its `.moved-to` (`moved_to`) names, with that
+/// new URL (#158 §5b). `None` is the refusal. The project's own directory
+/// wins whenever it resolves: a `.moved-to` that outlived a move back is
+/// stale, and `reconcile` removes it.
+///
+/// `moved_to` is read only for a project that does not resolve, and only
+/// when the URL has a session key's shape: it names a file under `sock/`.
+/// `resolve_project` on the new URL may run git (a renamed worktree has a
+/// dot segment); this runs on the connection's own thread with no lock held.
+fn target(
+    roots: &[PathBuf],
+    project: &str,
+    moved_to: &dyn Fn(&str) -> Option<String>,
+) -> Option<(PathBuf, Option<String>)> {
+    if let Some(dir) = crate::projects::resolve_project(roots, project) {
+        return Some((dir, None));
+    }
+    if !session::valid_project(project) {
+        return None;
+    }
+    let new = moved_to(project)?;
+    let dir = crate::projects::resolve_project(roots, &new)?;
+    Some((dir, Some(new)))
+}
+
 /// An attach error cut to fit a websocket Close reason, which RFC 6455 caps at
 /// 123 bytes. Cut at a character boundary: tungstenite refuses a reason that
 /// is not valid UTF-8, and a refused frame is a close with no reason at all,
@@ -311,6 +360,40 @@ fn close_reason(err: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The term socket's half of #158 §5b: a URL that does not resolve is
+    /// refused unless its `.moved-to` names one that does, and then only as
+    /// an attach to an existing session (the `Some(new)`).
+    ///
+    /// Revert-checked, run and restored: without the `resolve_project` on
+    /// the new URL, fails "a .moved-to naming nothing that resolves is still
+    /// a refusal"; with `moved_to` consulted before the project's own
+    /// directory, fails "a project that resolves ignores a stale .moved-to".
+    #[test]
+    fn a_renamed_projects_old_url_attaches_existing_sessions_in_the_new_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("now-here")).unwrap();
+        std::fs::create_dir_all(root.path().join("still-here")).unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let new_dir = root.path().join("now-here").canonicalize().unwrap();
+
+        assert_eq!(target(&roots, "was-here", &|_| None), None, "no .moved-to: the old refusal");
+        assert_eq!(
+            target(&roots, "was-here", &|p| (p == "was-here").then(|| "now-here".to_string())),
+            Some((new_dir, Some("now-here".to_string()))),
+            "the new directory, existing sessions only"
+        );
+        assert_eq!(
+            target(&roots, "was-here", &|_| Some("nowhere".into())),
+            None,
+            "a .moved-to naming nothing that resolves is still a refusal"
+        );
+        assert_eq!(
+            target(&roots, "still-here", &|_| Some("now-here".into())),
+            Some((root.path().join("still-here").canonicalize().unwrap(), None)),
+            "a project that resolves ignores a stale .moved-to"
+        );
+    }
 
     #[test]
     fn a_short_reason_is_sent_whole() {

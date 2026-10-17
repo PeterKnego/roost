@@ -2599,10 +2599,16 @@ mod tests {
     /// hand the new key the old key's `.base` — all without moving the
     /// session itself: its socket, and so its liveness, stay at the old key.
     ///
-    /// `owned_live_names_with` is given the resolver Task 8 widens
-    /// `home::resolves` to (an owner equal to the home's `.moved-to`), since
-    /// the shape-only resolver this task leaves in place cannot see a
-    /// resident whose home is itself a worktree.
+    /// `owned_live_names` is the real one, under `ROOST_ROOTS`: only the
+    /// `.moved-to` widening of `home::resolves` lets it see a resident whose
+    /// home is itself a worktree (#158 §5b). And through the old URL,
+    /// `session::attach_existing` — what `term.rs` calls for it — reaches the
+    /// session and refuses to start one.
+    ///
+    /// Revert-checked, run and restored (Task 8): with the `.moved-to` arm of
+    /// `home::resolves_with` removed, fails "the new project lists the
+    /// session as its resident" — the real resolver, not a stand-in, now
+    /// carries it.
     ///
     /// Revert-checked, run and restored: `home::follow_move` skipped in
     /// `follow_moves` fails "the session follows the rename" — left `Here`;
@@ -2615,7 +2621,9 @@ mod tests {
     fn a_renamed_worktree_takes_its_sessions_with_it() {
         with_state(|state| {
             let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("ROOST_CMD");
             let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
             let roots = vec![root.path().to_path_buf()];
             let repo = root.path().join("mvrepo");
             fs::create_dir_all(&repo).unwrap();
@@ -2657,11 +2665,25 @@ mod tests {
             }
             assert_eq!(crate::home::moved_to(old).as_deref(), Some(new));
             assert_eq!(crate::home::owner_of(old, "shell"), crate::home::Owner::Elsewhere(new.into()), "the session follows the rename");
-            let widened = |h: &str, o: &str| crate::home::moved_to(h).as_deref() == Some(o);
             assert!(
-                crate::session::owned_live_names_with(new, &widened).contains(&("shell".to_string(), Some(old.to_string()))),
+                crate::session::owned_live_names(new).contains(&("shell".to_string(), Some(old.to_string()))),
                 "the new project lists the session as its resident"
             );
+            let new_dir = crate::projects::resolve_project(&roots, new).expect("the new URL resolves");
+            let att = crate::session::attach_existing(old, "shell", &new_dir, new)
+                .unwrap_or_else(|e| panic!("an attach through the old URL reaches the existing session: {e}"));
+            crate::session::detach(&att.key, att.id);
+            crate::session::reserve(old, "fresh", None);
+            let err = match crate::session::attach_existing(old, "fresh", &new_dir, new) {
+                Ok(_) => panic!("an attach that would spawn under the old key spawned"),
+                Err(e) => e,
+            };
+            assert!(err.contains("renamed"), "{err}");
+            assert!(
+                matches!(fs::symlink_metadata(sock_dir.join("fresh")), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+                "no socket under the old key"
+            );
+            crate::session::release(old, "fresh");
             assert_eq!(crate::worktree::read_base(state, &new_key).as_deref(), Some("main"), "the new key inherits the base");
             assert!(socket_has_process(&sock_path), "the master is still alive, at its home socket");
 
@@ -2675,12 +2697,13 @@ mod tests {
             assert_eq!(back.gone_projects, 0, "moving back ends nothing");
             assert!(!sock_dir.join(".moved-to").exists(), "a stale .moved-to is removed once the old URL resolves again");
             assert!(
-                crate::session::owned_live_names_with(old, &widened).contains(&("shell".to_string(), None)),
+                crate::session::owned_live_names(old).contains(&("shell".to_string(), None)),
                 "moved back: the session shows natively at A again, whatever its record says"
             );
-            assert!(!crate::session::owned_live_names_with(new, &widened).iter().any(|(n, _)| n == "shell"), "and no longer at B");
+            assert!(!crate::session::owned_live_names(new).iter().any(|(n, _)| n == "shell"), "and no longer at B");
             assert!(socket_has_process(&sock_path), "moving back ends nothing");
             kill_test_pids(&sock_path);
+            std::env::remove_var("ROOST_ROOTS");
         });
     }
 
