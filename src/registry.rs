@@ -157,6 +157,23 @@ pub struct Moved {
 /// its own lock briefly and releases it before the next, which is what
 /// keeps a hub thread that reaches `reconcile` from deadlocking against it.
 pub fn follow_moves(moved: &[Moved]) {
+    // Every move, not only fresh ones, and first: a Claude in a followed
+    // session goes on editing whether or not anyone reopens a page, and the
+    // old key's listener — built over the directory that was renamed away —
+    // refuses every path under the new one until it is retargeted. Cheap
+    // when there is nothing to do: a registry lookup, and the resolve (which
+    // may run git) only for a key that has a listener at all. Runs with no
+    // lock held, like the rest of this function.
+    for m in moved {
+        if crate::ide::workspace_of(&m.old_url).is_none() {
+            continue;
+        }
+        if let Some(dir) = crate::projects::resolve_project(&crate::projects::roots(), &m.new_url) {
+            if crate::ide::retarget(&m.old_url, &dir) {
+                eprintln!("roost: the IDE listener for {} now serves {}", m.old_url, dir.display());
+            }
+        }
+    }
     for m in moved.iter().filter(|m| m.fresh) {
         crate::home::follow_move(&m.old_url, &m.new_url, &m.live);
         eprintln!("roost: {} was renamed to {}; its {} session(s) followed", m.old_url, m.new_url, m.live.len());

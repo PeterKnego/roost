@@ -135,26 +135,40 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // `tests/integration.rs::reopening_a_closed_project_rebuilds_its_ide_listener`
     // is what fails if this goes.
     //
-    // Also run for a renamed project's old URL (#158 §5b), keyed by the old
-    // URL — the session's home, the key its port and token are persisted
-    // under — with the new directory as its workspace. The followed Claude's
-    // environment holds the old key's `CLAUDE_CODE_SSE_PORT`, and after a
-    // restart nothing else rebuilds the listener it redials: no hub is ever
-    // opened for a URL that no longer resolves. Skipping this left Alt+K
-    // dead for every followed Claude after every deploy (#170's failure).
-    //
-    // Accepted trade-off: that listener writes a second lock file whose
-    // workspace is the new directory, beside the new project's own, so a
-    // fresh `claude` started in the new project may pick either. Both reach
-    // roost and deliver to the new project's page (`delivery_target` follows
-    // the record to the owner). No collision with the new project's own
-    // listener: the registry, the port record and the token are all keyed by
-    // project, and the lock file is named by port.
-    crate::ide::for_project(&project, dir.clone());
+    // A renamed project's old URL gets its listener below instead, after
+    // `attach_existing` succeeds: nothing is spawned there, so the ordering
+    // need above does not apply.
+    if renamed_to.is_none() {
+        crate::ide::for_project(&project, dir.clone());
+    }
     let attached = match &renamed_to {
         Some(new) => session::attach_existing(&project, name, &dir, new),
         None => session::attach(&project, name, &dir),
     };
+    // #158 §5b: the old URL's listener — keyed by the old URL, the session's
+    // home and the key its port and token are persisted under — over the
+    // new directory. The followed Claude's environment holds the old key's
+    // `CLAUDE_CODE_SSE_PORT`, and after a restart nothing else rebuilds the
+    // listener it redials: no hub is ever opened for a URL that no longer
+    // resolves. Skipping this left Alt+K dead for every followed Claude after
+    // every deploy (#170's failure). Only on a successful attach, so the
+    // listener exists only where a followed session really does. And
+    // retargeted, since `for_project` hands back an existing listener as it
+    // is — built, before the rename, over the directory that is gone.
+    //
+    // Accepted cost, for this slice (noted for the final review): that
+    // listener's lock file names the new directory, beside the new
+    // project's own lock file. A fresh `claude` started in the new project
+    // may pick the old key's. Its `ROOST_PROJECT` is the new project, so
+    // `idesess::session_of_in` reads it as `Outside`, delivery targets the
+    // old key, and its proposals park against a hub nobody opens: they do
+    // *not* reach the new project's page. No collision otherwise: the
+    // registry, the port record and the token are all keyed by project, and
+    // the lock file is named by port.
+    if let (Ok(_), Some(_)) = (&attached, &renamed_to) {
+        crate::ide::for_project(&project, dir.clone());
+        crate::ide::retarget(&project, &dir);
+    }
     let att = match attached {
         Ok(a) => a,
         Err(e) => {

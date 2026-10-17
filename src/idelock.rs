@@ -228,6 +228,22 @@ pub fn sweep_strays() -> SweepReport {
 }
 
 pub fn write_in(dir: &Path, port: u16, token: &str, workspace: &Path) -> Result<Lock, String> {
+    Ok(Lock { path: write_body(dir, port, token, workspace)? })
+}
+
+impl Lock {
+    /// Rewrites this lock file in place with a new workspace — same port,
+    /// same token, same path — for a listener whose project directory was
+    /// renamed (`ide::retarget`). In place rather than a new `Lock`: dropping
+    /// the old one would remove the very path the new one just wrote.
+    pub fn rewrite(&self, port: u16, token: &str, workspace: &Path) -> Result<(), String> {
+        let dir = self.path.parent().ok_or("lock file has no directory")?;
+        write_body(dir, port, token, workspace).map(|_| ())
+    }
+}
+
+/// Atomic: a temp file then `rename`, so Claude Code never reads half a lock.
+fn write_body(dir: &Path, port: u16, token: &str, workspace: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let body = serde_json::json!({
         "pid": std::process::id(),
@@ -247,7 +263,7 @@ pub fn write_in(dir: &Path, port: u16, token: &str, workspace: &Path) -> Result<
         let _ = std::fs::remove_file(&tmp);
         format!("{}: {e}", path.display())
     })?;
-    Ok(Lock { path })
+    Ok(path)
 }
 
 pub fn write(port: u16, token: &str, workspace: &Path) -> Result<Lock, String> {
