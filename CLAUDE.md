@@ -134,11 +134,24 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   name the project it was *started* in — its home — and none of them can
   move: the socket path is baked into the dtach master's argv, the pump
   thread exits when its key disappears from the map, and the environment is
-  the process's own. Approving a Claude's `WorktreeCreate` ask re-homes the
-  terminal that asked into the worktree's project without moving any of
-  that; `src/home.rs` records the new owner at
-  `state/home/<home key>/<name>` and nothing in the rest of the codebase
-  learns about it.
+  the process's own. A session is re-homed only on positive evidence that
+  its own Claude process moved — the claudes watcher seeing, within
+  `claudes::EXPECT_MOVE_WINDOW` (30s), that Claude's `/proc` cwd land inside
+  the exact worktree an approval named — or on the user's own "Move tab
+  there". Approving a `WorktreeCreate` ask (`hub::approve_ask`) no longer
+  re-homes by itself; it only records that expectation
+  (`claudes::expect_move`) for the watcher to act on. The re-home itself
+  still runs through `hub::rehome_to`, which writes the new owner via
+  `src/home.rs` at `state/home/<home key>/<name>`, and nothing in the rest
+  of the codebase learns about it.
+
+  **Reconciling the hook's intent with the process's evidence is the
+  vulnerability, not the cleanup.** Claude Code fires `WorktreeCreate` with
+  no distinguishing field for `EnterWorktree`, `claude --worktree`, and a
+  subagent's `isolation: "worktree"` — so re-homing straight off the ask
+  would move a terminal whose own Claude never moved, on a subagent's
+  say-so. Only that Claude's own process actually entering the worktree is
+  evidence it asked.
 
   The record is read three ways, never two: `NotFound` means *here* (home
   and owner are the same project), unreadable or empty means *unknown*, and
@@ -161,6 +174,15 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   lock or the `REGISTRY` lock, for the same reason every other git
   invocation here doesn't: a stalled `git` must not freeze every websocket
   or wedge the sweep that every project's reconcile runs through.
+
+  **A renamed project's sessions follow it the same way: on evidence, not
+  on request.** `.moved-to` (`sock/<old key>/.moved-to`) is written only
+  when `registry::move_evidence` confirms #178's inode evidence and the
+  directory's new path resolves as a project. `home::resolves` and
+  `term.rs` widen only for an owner that a `.moved-to` names — nothing else
+  does. `term.rs`'s widened path is attach-only: it calls
+  `session::attach_existing`, a `dtach -a` that fails closed, so a key
+  whose directory is gone can be joined but never made to spawn.
 - **Search shares the tree's filter but is not the tree.** `search.rs` walks
   with `projects::TreeFilter`, so `show_hidden` and the `hide` list mean the
   same thing in both — but it additionally refuses `.git` and any directory
@@ -239,6 +261,11 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   is 90s (`cli::REPLY_TIMEOUT`) — strictly between that 60s and Claude Code's
   own 120s hook kill, so a wedged roost's hold on the hook ends with a
   reason this process names, not a bare "killed" from Claude Code's side.
+  An approved worktree move stays expected for 30s
+  (`claudes::EXPECT_MOVE_WINDOW`) — long enough for Claude to act on the
+  reply and for one watcher tick to see it, short enough that a subagent's
+  approval, which never moves the parent, expires before anything else
+  could be mistaken for it.
   Search is bounded by four at once (`search.rs`): 50 results per
   category, 5 lines per file, 20 000 files examined, and a 1500 ms deadline —
   constants, deliberately not config keys, and every one of them *names itself*
@@ -277,7 +304,7 @@ The `Path::exists()` row is in a different module from the rest, so treat this
 as systemic, not as a `registry.rs` quirk. The rename row is the `.origin`
 safeguard defeated: the recorded path really is `NotFound`, and only the
 directory's inode, reached from a live shell's cwd, tells a move from a delete
-(`registry::moved_not_deleted`, #178).
+(`registry::move_evidence`, #178).
 
 **The rule:** "I could not determine X" is a third outcome, never folded into
 "X is false". Concretely:
