@@ -3821,13 +3821,6 @@ pub fn proposal_by_id(project: &str, id: &str) -> Option<ProposalSides> {
     sides
 }
 
-/// Send an event to every connected client of every project. Notices are
-/// machine-wide: a browser on one project must still learn that another one
-/// wants attention.
-///
-/// The registry lock is dropped before any hub lock is taken. `for_project`
-/// already established that order (registry, then hub); taking them the other
-/// way round here would deadlock against a connection racing in.
 /// [`Hub::rename_known_worktree`] on every open hub — whichever main
 /// checkout listed the renamed worktree. Registry, then one hub at a time,
 /// never both, like `broadcast_all`. Call with no lock held.
@@ -3845,6 +3838,13 @@ pub fn rename_known_worktree(olds: &[std::path::PathBuf], new: &std::path::Path)
     }
 }
 
+/// Send an event to every connected client of every project. Notices are
+/// machine-wide: a browser on one project must still learn that another one
+/// wants attention.
+///
+/// The registry lock is dropped before any hub lock is taken. `for_project`
+/// already established that order (registry, then hub); taking them the other
+/// way round here would deadlock against a connection racing in.
 pub fn broadcast_all(ev: &Event) {
     let Some(reg) = REGISTRY.get() else { return };
     let hubs: Vec<Arc<Mutex<Hub>>> = {
@@ -11563,6 +11563,7 @@ mod tests {
             live: vec![],
             fresh: true,
             prev: None,
+            inside: vec![],
         }]);
         drain(&rx);
         Hub::lock(&hub).apply_worktrees(seen(&repo, root.path()));

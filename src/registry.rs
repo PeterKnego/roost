@@ -152,6 +152,12 @@ pub struct Moved {
     /// of an earlier follow, now itself renamed away (A→B→C). Records
     /// re-pointed at it by that follow are re-pointed at `new_url`.
     pub prev: Option<String>,
+    /// The `live` sessions whose shell is working inside the new directory
+    /// right now. A pass that is not fresh follows a `Here` session only if
+    /// it is one of these: the key may also hold an occupant's own
+    /// sessions (a new directory at the old name), which are not the
+    /// renamed directory's to claim.
+    pub inside: Vec<String>,
 }
 
 /// The follow-up to a sweep's [`ReapReport::moved`] (#158 §5): re-home each
@@ -179,19 +185,40 @@ pub fn follow_moves(moved: &[Moved]) {
         }
     }
     for m in moved {
+        // Who follows. The first follow of a key takes every live session:
+        // the directory moved, and they are all its. Any later pass — not
+        // fresh, a second rename, or a key with an occupant (a new
+        // directory at the old name, whose own sessions share the key) —
+        // takes only sessions whose shell is working in the new directory,
+        // or ones an earlier follow sent to `prev`: a `Here` session
+        // elsewhere may be the occupant's own, and is not this rename's.
+        let key_dir = sock_root().join(crate::projects::storage_key(&m.old_url));
+        let no_occupant = matches!(std::fs::symlink_metadata(occupant_identity_path(&key_dir)), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        let names: Vec<String> = if m.fresh && m.prev.is_none() && no_occupant {
+            m.live.clone()
+        } else {
+            m.live
+                .iter()
+                .filter(|n| {
+                    m.inside.contains(n)
+                        || matches!(crate::home::owner_of(&m.old_url, n), crate::home::Owner::Elsewhere(o) if m.prev.as_deref() == Some(o.as_str()))
+                })
+                .cloned()
+                .collect()
+        };
         if !m.fresh {
             // Not news, but maybe unfinished: a session that did not follow
             // on the fresh pass (a failed write, a restart in between) is
             // followed now. Quietly — the banner went out once already —
             // and only when something actually changed.
-            if follow_pending(m) && crate::home::follow_move(&m.old_url, &m.new_url, &m.live, m.prev.as_deref()) {
+            if follow_pending(m, &names) && crate::home::follow_move(&m.old_url, &m.new_url, &names, m.prev.as_deref()) {
                 eprintln!("roost: {}'s sessions caught up with its rename to {}", m.old_url, m.new_url);
                 crate::hub::refresh_and_broadcast(&m.old_url);
                 crate::hub::refresh_and_broadcast(&m.new_url);
             }
             continue;
         }
-        crate::home::follow_move(&m.old_url, &m.new_url, &m.live, m.prev.as_deref());
+        crate::home::follow_move(&m.old_url, &m.new_url, &names, m.prev.as_deref());
         eprintln!("roost: {} was renamed to {}; its {} session(s) followed", m.old_url, m.new_url, m.live.len());
         // `git worktree move` touches only `.git/worktrees/<id>/gitdir`,
         // which the watcher ignores, so the main checkout's hub still knows
@@ -223,9 +250,9 @@ pub fn follow_moves(moved: &[Moved]) {
 /// Whether a non-fresh follow has anything left to do: a live session of
 /// the old key still `Here` (and not held back by R16 — that one would only
 /// log its refusal every pass), or still naming the previous target.
-fn follow_pending(m: &Moved) -> bool {
+fn follow_pending(m: &Moved, names: &[String]) -> bool {
     let new_live = crate::session::live_names(&m.new_url);
-    m.live.iter().any(|n| match crate::home::owner_of(&m.old_url, n) {
+    names.iter().any(|n| match crate::home::owner_of(&m.old_url, n) {
         crate::home::Owner::Here => !new_live.contains(n),
         crate::home::Owner::Elsewhere(o) => m.prev.as_deref() == Some(o.as_str()),
         crate::home::Owner::Unknown(_) => false,
@@ -340,9 +367,12 @@ pub(crate) fn record_move_with(
         .ok()
         .and_then(|b| parse_moved_to(&b))
         .filter(|p| *p != new_url)
-        .filter(|p| crate::projects::resolve_project(roots, p).is_none());
+        // Positively absent, not merely unresolved: a resolver that ran git
+        // and failed would otherwise hand a live directory's records on.
+        .filter(|p| roots.iter().all(|r| matches!(std::fs::symlink_metadata(r.join(p)), Err(e) if e.kind() == std::io::ErrorKind::NotFound)));
+    let inside: Vec<String> = live.iter().filter(|n| shell_inside(&key_dir.join(n), snapshot, proc_root, &new_dir)).cloned().collect();
     match write_moved_to(key_dir, &new_url) {
-        Ok(fresh) => MoveRecord::Followable(Moved { old_url: old_url.to_string(), new_url, live, fresh, prev }),
+        Ok(fresh) => MoveRecord::Followable(Moved { old_url: old_url.to_string(), new_url, live, fresh, prev, inside }),
         // Positive evidence of a followable rename that could not be
         // recorded is not "unfollowable": R18 must keep the record and try
         // again, not forget a terminal whose worktree is alive under B.
@@ -351,6 +381,30 @@ pub(crate) fn record_move_with(
             MoveRecord::CannotTell
         }
     }
+}
+
+/// Whether a shell of the session at `sock` is working inside `dir` (its
+/// cwd's ancestry reaches `dir`'s `(dev, ino)`). Anything that cannot be
+/// read is "no": this only ever licenses writing a record.
+#[cfg(unix)]
+fn shell_inside(sock: &std::path::Path, snapshot: &[(u32, String)], proc_root: &std::path::Path, dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(d) = std::fs::metadata(dir) else { return false };
+    let id = (d.dev(), d.ino());
+    let own = match crate::procsess::session_of(proc_root, std::process::id()) {
+        crate::procsess::Sid::In(s) => Some(s),
+        _ => None,
+    };
+    let Some(shells) = crate::procsess::target_sessions(proc_root, &pids_holding(snapshot, sock), own) else { return false };
+    shells.iter().any(|shell| {
+        let Ok(cwd) = std::fs::read_link(proc_root.join(shell.to_string()).join("cwd")) else { return false };
+        cwd.ancestors().any(|p| std::fs::symlink_metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == id))
+    })
+}
+
+#[cfg(not(unix))]
+fn shell_inside(_sock: &std::path::Path, _snapshot: &[(u32, String)], _proc_root: &std::path::Path, _dir: &std::path::Path) -> bool {
+    false
 }
 
 /// [`record_move_with`] for `old_url`'s own key, with a fresh process
@@ -389,9 +443,20 @@ fn parse_moved_to(bytes: &[u8]) -> Option<String> {
 
 /// The recorded `(device, inode)` of the key's directory (`.origin-ino`).
 fn recorded_identity(key_dir: &std::path::Path) -> Option<(u64, u64)> {
-    let s = std::fs::read_to_string(origin_identity_path(key_dir)).ok()?;
+    identity_at(&origin_identity_path(key_dir))
+}
+
+fn identity_at(path: &std::path::Path) -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string(path).ok()?;
     let mut it = s.split_whitespace();
     Some((it.next()?.parse::<u64>().ok()?, it.next()?.parse::<u64>().ok()?))
+}
+
+/// Every directory identity the key's live sessions may be working in: the
+/// recorded one, and an occupant's while a new directory holds the old
+/// name. Empty means no evidence can be had at all.
+fn identities(key_dir: &std::path::Path) -> Vec<(u64, u64)> {
+    recorded_identity(key_dir).into_iter().chain(identity_at(&occupant_identity_path(key_dir))).collect()
 }
 
 /// What the key's own `.moved-to` says, checked against the directory
@@ -408,7 +473,10 @@ fn recorded_identity(key_dir: &std::path::Path) -> Option<(u64, u64)> {
 #[cfg(unix)]
 fn moved_to_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> Option<MoveEvidence> {
     use std::os::unix::fs::MetadataExt;
-    let (dev, ino) = recorded_identity(key_dir)?;
+    let ids = identities(key_dir);
+    if ids.is_empty() {
+        return None;
+    }
     let raw = match std::fs::read(moved_to_marker_path(key_dir)) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -419,18 +487,22 @@ fn moved_to_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> Option<Mov
     let Some(url) = parse_moved_to(&raw) else { return Some(MoveEvidence::CannotTell) };
     if let Some(dir) = crate::projects::resolve_project(roots, &url) {
         return match std::fs::symlink_metadata(&dir) {
-            Ok(m) if m.dev() == dev && m.ino() == ino => Some(MoveEvidence::Moved(dir)),
+            Ok(m) if ids.contains(&(m.dev(), m.ino())) => Some(MoveEvidence::Moved(dir)),
             Ok(_) => None,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => Some(MoveEvidence::CannotTell),
         };
     }
     // Not resolving is "not there" only when every root says NotFound; a
-    // path we cannot stat may be the very directory, unreadable.
+    // path we cannot stat may be the very directory, unreadable. And a
+    // directory standing there with the recorded identity is the very
+    // directory, whatever the resolver said: for a worktree URL it asks
+    // git, and a git that failed vouches for nothing (final review N1).
     for r in roots {
         match std::fs::symlink_metadata(r.join(&url)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Some(MoveEvidence::CannotTell),
+            Ok(m) if ids.contains(&(m.dev(), m.ino())) => return Some(MoveEvidence::CannotTell),
             Ok(_) => {}
         }
     }
@@ -892,6 +964,10 @@ fn write_origin(key_dir: &std::path::Path, dir: &std::path::Path) {
     // the next pass read "moved back" and drop the `.moved-to` they hang
     // on. `.origin` itself names the same path either way.
     if occupied_by_another(key_dir, dir) {
+        // Its identity goes in a sidecar of its own instead, so that a
+        // rename of *this* directory is still told from its delete (the
+        // sweep matches shells against either identity).
+        write_identity_at(&occupant_identity_path(key_dir), key_dir, dir);
         return;
     }
     // First, not after the unchanged-marker return below: a project whose
@@ -937,16 +1013,36 @@ fn origin_identity_path(key_dir: &std::path::Path) -> std::path::PathBuf {
     key_dir.join(".origin-ino")
 }
 
-#[cfg(unix)]
+/// The identity of a *different* directory occupying a renamed key's old
+/// name (#158 §5, I2): the key's sessions now fall in two groups — the
+/// followed ones, in the renamed directory (`.origin-ino`), and the
+/// occupant's own (this). Written only while `.moved-to` lives, and removed
+/// with it.
+fn occupant_identity_path(key_dir: &std::path::Path) -> std::path::PathBuf {
+    key_dir.join(".occupant-ino")
+}
+
+/// Ends a rename's redirect for this key: `.moved-to` and the occupant's
+/// identity go together.
+fn remove_moved_to(key_dir: &std::path::Path) {
+    let _ = std::fs::remove_file(moved_to_marker_path(key_dir));
+    let _ = std::fs::remove_file(occupant_identity_path(key_dir));
+}
+
 fn write_origin_identity(key_dir: &std::path::Path, dir: &std::path::Path) {
+    write_identity_at(&origin_identity_path(key_dir), key_dir, dir);
+}
+
+#[cfg(unix)]
+fn write_identity_at(marker: &std::path::Path, key_dir: &std::path::Path, dir: &std::path::Path) {
     use std::os::unix::fs::MetadataExt;
     let Ok(m) = std::fs::metadata(dir) else { return };
     let bytes = format!("{} {}\n", m.dev(), m.ino()).into_bytes();
-    let marker = origin_identity_path(key_dir);
-    if std::fs::read(&marker).map(|cur| cur == bytes).unwrap_or(false) {
+    if std::fs::read(marker).map(|cur| cur == bytes).unwrap_or(false) {
         return;
     }
-    let tmp = key_dir.join(format!(".origin-ino.tmp.{}", crate::wsstate::tmp_suffix()));
+    let leaf = marker.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = key_dir.join(format!("{leaf}.tmp.{}", crate::wsstate::tmp_suffix()));
     if std::fs::write(&tmp, &bytes).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return;
@@ -955,13 +1051,13 @@ fn write_origin_identity(key_dir: &std::path::Path, dir: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     }
-    if std::fs::rename(&tmp, &marker).is_err() {
+    if std::fs::rename(&tmp, marker).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
 }
 
 #[cfg(not(unix))]
-fn write_origin_identity(_key_dir: &std::path::Path, _dir: &std::path::Path) {}
+fn write_identity_at(_marker: &std::path::Path, _key_dir: &std::path::Path, _dir: &std::path::Path) {}
 
 /// What a live shell says about a project whose recorded path is `NotFound`.
 ///
@@ -994,9 +1090,10 @@ pub(crate) enum MoveEvidence {
 #[cfg(unix)]
 pub(crate) fn move_evidence(key_dir: &std::path::Path, snapshot: &[(u32, String)], proc_root: &std::path::Path) -> MoveEvidence {
     use std::os::unix::fs::MetadataExt;
-    let Some((dev, ino)) = recorded_identity(key_dir) else {
+    let ids = identities(key_dir);
+    if ids.is_empty() {
         return MoveEvidence::None;
-    };
+    }
     let Ok(entries) = std::fs::read_dir(key_dir) else { return MoveEvidence::CannotTell };
     let own = match crate::procsess::session_of(proc_root, std::process::id()) {
         crate::procsess::Sid::In(s) => Some(s),
@@ -1023,7 +1120,7 @@ pub(crate) fn move_evidence(key_dir: &std::path::Path, snapshot: &[(u32, String)
             let mut at = Some(cwd.as_path());
             while let Some(p) = at {
                 if let Ok(m) = std::fs::symlink_metadata(p) {
-                    if m.dev() == dev && m.ino() == ino {
+                    if ids.contains(&(m.dev(), m.ino())) {
                         return MoveEvidence::Moved(p.to_path_buf());
                     }
                 }
@@ -1147,13 +1244,15 @@ fn confirmed_gone(key_dir: &std::path::Path, roots: &[PathBuf], url: &str) -> bo
             // last session.
             if occupied_by_another(key_dir, &dir) {
                 log_occupied_once(key_dir, &dir);
+                // Records the occupant's identity (and nothing else).
+                write_origin(key_dir, &dir);
                 return false;
             }
             write_origin(key_dir, &dir);
             // Moved back: a `.moved-to` from the earlier rename now
             // describes a different place, and must stop widening or
             // redirecting anything for this key.
-            let _ = std::fs::remove_file(moved_to_marker_path(key_dir));
+            remove_moved_to(key_dir);
             false
         }
         None => match std::fs::read(origin_marker_path(key_dir)) {
@@ -1545,7 +1644,7 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
         // it and nothing should be widened by it — and a later directory
         // under the old name must not inherit the redirect.
         if !any_held {
-            let _ = std::fs::remove_file(moved_to_marker_path(&entry.path()));
+            remove_moved_to(&entry.path());
         }
         // Sidecars whose session is positively gone. dtach unlinks its own
         // socket when the program exits, so the two `forget` call sites miss
@@ -2855,7 +2954,7 @@ mod tests {
             assert_eq!(report.gone_projects, 0, "a renamed worktree is not a gone one");
             assert_eq!(
                 report.moved,
-                vec![Moved { old_url: old.into(), new_url: new.into(), live: vec!["shell".into()], fresh: true, prev: None }]
+                vec![Moved { old_url: old.into(), new_url: new.into(), live: vec!["shell".into()], fresh: true, prev: None, inside: vec!["shell".into()] }]
             );
             follow_moves(&report.moved);
 
@@ -3201,7 +3300,7 @@ mod tests {
             assert_eq!(second.gone_projects, 0);
             assert_eq!(
                 second.moved,
-                vec![Moved { old_url: a.into(), new_url: c.into(), live: vec!["shell".into()], fresh: true, prev: Some(b.into()) }]
+                vec![Moved { old_url: a.into(), new_url: c.into(), live: vec!["shell".into()], fresh: true, prev: Some(b.into()), inside: vec!["shell".into()] }]
             );
             follow_moves(&second.moved);
             let shell = crate::home::owner_of(a, "shell");
@@ -3287,6 +3386,151 @@ mod tests {
             assert!(kept_after_attach, "a new session's attach in the new A does not undo it");
             assert_eq!(ended, 0, "Close Project on the new A ends nothing of B's");
             assert!(alive, "the followed session's master is alive");
+        });
+    }
+
+    /// Waits until a session leader of `sock_path` has `/` as its cwd.
+    fn wait_leader_at_root(sock_path: &std::path::Path) -> bool {
+        (0..100).any(|_| {
+            let at_root = leaders_of(sock_path)
+                .iter()
+                .any(|p| fs::read_link(format!("/proc/{p}/cwd")).is_ok_and(|c| c == std::path::Path::new("/")));
+            if !at_root {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            at_root
+        })
+    }
+
+    /// Final review N1: C1's evidence, with git failing. A worktree URL
+    /// resolves only once git vouches for it, and `worktree::list` turns a
+    /// git error into an empty list — so with the followed shell `cd`'d out
+    /// of B, a transient git failure used to read as "B does not resolve",
+    /// then "no evidence", then a SIGKILL, while B stood there with the
+    /// recorded inode. The seam: the main checkout's `.git/HEAD` moved
+    /// aside, which makes every git call there fail.
+    ///
+    /// Revert-checked, run and restored: with the identity-match arm in
+    /// `moved_to_evidence`'s root loop removed, fails "a git failure is
+    /// cannot tell" — observed `NoEvidence`; and with the direct call
+    /// skipped, the reconcile reaps (`gone_projects` 1).
+    #[test]
+    fn a_git_failure_is_not_evidence_that_a_followed_directory_is_gone() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let repo = repo_with_worktree_a(root.path(), "gitfailrepo");
+            let a = "gitfailrepo/.claude/worktrees/worktree-a";
+            let b = "gitfailrepo/.claude/worktrees/worktree-b";
+            let sock_dir = state.join("sock").join(crate::projects::storage_key(a));
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            let flag = root.path().join("leave-now");
+            spawn_detached_sh_in(
+                &sock_path,
+                &repo.join(".claude/worktrees/worktree-a"),
+                r#"while [ ! -e "$1" ]; do sleep 0.05; done; cd /; exec sleep 60"#,
+                &[flag.to_str().unwrap()],
+            )
+            .unwrap_or_else(|| panic!("dtach must be available for this test"));
+            let _ = reconcile(&roots);
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+            follow_moves(&reconcile(&roots).moved);
+            fs::write(&flag, "").unwrap();
+            assert!(wait_leader_at_root(&sock_path), "setup: the session leader has left B");
+
+            fs::rename(repo.join(".git/HEAD"), repo.join(".git/HEAD.away")).unwrap();
+            let unresolved = crate::projects::resolve_project(&roots, b).is_none();
+            let b_there = repo.join(".claude/worktrees/worktree-b").is_dir();
+            let snap = process_snapshot().expect("ps");
+            let got = record_move_with(&roots, a, &sock_dir, &snap, std::path::Path::new("/proc"), false);
+            let pass = reconcile(&roots);
+            let alive = socket_has_process(&sock_path);
+            fs::rename(repo.join(".git/HEAD.away"), repo.join(".git/HEAD")).unwrap();
+            kill_test_pids(&sock_path);
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert!(unresolved && b_there, "setup: B is there, but git cannot vouch for it");
+            assert!(matches!(got, MoveRecord::CannotTell), "a git failure is cannot tell: {got:?}");
+            assert_eq!(pass.gone_projects, 0, "and the session is not reaped");
+            assert!(alive, "its master is alive");
+        });
+    }
+
+    /// Final review N2: the identity I2 keeps for a renamed key's followed
+    /// sessions is not the occupant's. A→B followed; a new A made, with its
+    /// own live session; the followed session ends; the new A is renamed to
+    /// D with its shell inside. The shell scan matched only the old
+    /// identity, so with B gone that rename read as a delete and the
+    /// occupant's session was killed. Now the occupant's identity is kept
+    /// beside it (`.occupant-ino`, written by the new session's attach) and
+    /// matched too. And while B is still there, the pass is not fresh and
+    /// the occupant's session — working in D, not B — is not re-homed into
+    /// B; once B is gone, it follows D.
+    ///
+    /// The reviewer's order was "remove B, then rename"; renaming first and
+    /// removing B after covers that pass *and* the B-alive one.
+    ///
+    /// Revert-checked, run and restored: with `move_evidence` matching only
+    /// the recorded identity (`recorded_identity(key_dir).into_iter()`
+    /// instead of `identities`), fails "the occupant's session survives the
+    /// rename of the new A" — left: 1, right: 0. With `follow_moves`'
+    /// restricted list given every live name (the `inside` filter made
+    /// `true ||`), fails "not re-homed into B" — left
+    /// `Elsewhere(".../worktree-b")`, right `Here`.
+    #[test]
+    fn a_rename_of_the_new_directory_at_the_old_name_is_followed_not_reaped() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("ROOST_CMD");
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let repo = repo_with_worktree_a(root.path(), "occmvrepo");
+            let a = "occmvrepo/.claude/worktrees/worktree-a";
+            let b = "occmvrepo/.claude/worktrees/worktree-b";
+            let d = "occmvrepo/.claude/worktrees/worktree-d";
+            let sock_dir = state.join("sock").join(crate::projects::storage_key(a));
+            fs::create_dir_all(&sock_dir).unwrap();
+            let followed = sock_dir.join("shell");
+            spawn_detached_dtach_in(&followed, &repo.join(".claude/worktrees/worktree-a"))
+                .unwrap_or_else(|| panic!("dtach must be available for this test"));
+            let _ = reconcile(&roots);
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+            follow_moves(&reconcile(&roots).moved);
+            assert_eq!(crate::home::owner_of(a, "shell"), crate::home::Owner::Elsewhere(b.into()), "setup: followed");
+
+            git_in(&repo, &["worktree", "add", "-q", "-b", "worktree-a2", ".claude/worktrees/worktree-a"]);
+            let new_a = crate::projects::resolve_project(&roots, a).expect("setup: the new A resolves");
+            let own = sock_dir.join("own");
+            spawn_detached_dtach_in(&own, &new_a).unwrap_or_else(|| panic!("dtach must be available for this test"));
+            crate::registry::record_origin(a, &new_a); // the new session's attach
+            kill_test_pids(&followed);
+
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-d"]);
+            let with_b = reconcile(&roots);
+            follow_moves(&with_b.moved);
+            let owner_with_b = crate::home::owner_of(a, "own");
+            let alive_with_b = socket_has_process(&own);
+
+            git_in(&repo, &["worktree", "remove", "--force", ".claude/worktrees/worktree-b"]);
+            let without_b = reconcile(&roots);
+            follow_moves(&without_b.moved);
+            let owner = crate::home::owner_of(a, "own");
+            let owned_d = crate::session::owned_live_names(d);
+            let alive = socket_has_process(&own);
+            kill_test_pids(&own);
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert_eq!(with_b.gone_projects, 0, "B alive: nothing reaped");
+            assert!(alive_with_b, "B alive: the occupant's session lives");
+            assert_eq!(owner_with_b, crate::home::Owner::Here, "not re-homed into B");
+            assert_eq!(without_b.gone_projects, 0, "the occupant's session survives the rename of the new A");
+            assert!(alive, "its master is alive");
+            assert_eq!(owner, crate::home::Owner::Elsewhere(d.into()), "it follows D");
+            assert!(owned_d.contains(&("own".to_string(), Some(a.to_string()))), "D lists it: {owned_d:?}");
         });
     }
 

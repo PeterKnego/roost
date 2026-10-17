@@ -2866,6 +2866,7 @@ mod tests {
             live: vec![],
             fresh: true,
             prev: None,
+            inside: vec![],
         }]);
 
         let msg = rpc(
