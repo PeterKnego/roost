@@ -50,6 +50,10 @@ pub struct Ide {
     /// was renamed under it keeps its connection, and its next `openDiff`
     /// is confined against the new directory.
     workspace: Arc<Mutex<PathBuf>>,
+    /// Serialises `retarget`'s lock-file rewrites, so the file always ends
+    /// naming the latest workspace. A leaf lock, local to this one file:
+    /// nothing is taken while holding it but `workspace`, for a clone.
+    rewriting: Mutex<()>,
 }
 
 impl Ide {
@@ -149,7 +153,7 @@ pub(crate) fn start_in_with_ports(
     let lock = idelock::write_in(dir, port, &token, &workspace)?;
     let stopped = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(Mutex::new(workspace));
-    let ide = Arc::new(Ide { port, token: token.clone(), _lock: lock, stopped: stopped.clone(), workspace: shared.clone() });
+    let ide = Arc::new(Ide { port, token: token.clone(), _lock: lock, stopped: stopped.clone(), workspace: shared.clone(), rewriting: Mutex::new(()) });
     let project = project.to_string();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -331,8 +335,10 @@ pub fn workspace_of(project: &str) -> Option<PathBuf> {
 /// and keeps the port, the token and the connection. The lock file is
 /// rewritten to name the new directory too.
 ///
-/// Each lock is held for a lookup or an assignment only; the lock-file
-/// write happens with none held. Returns whether anything changed.
+/// The registry and workspace locks are held for a lookup or an assignment
+/// only. The lock-file write runs under `Ide::rewriting` alone — a leaf lock
+/// local to this file, never the hub or session registry. Returns whether
+/// anything changed.
 pub fn retarget(project: &str, workspace: &Path) -> bool {
     let Some(ide) = registry().lock().unwrap_or_else(|e| e.into_inner()).get(project).cloned() else {
         return false;
@@ -347,8 +353,19 @@ pub fn retarget(project: &str, workspace: &Path) -> bool {
         }
     };
     if changed {
-        if let Err(e) = ide._lock.rewrite(ide.port, &ide.token, workspace) {
-            eprintln!("roost: IDE listener for {project} now serves {}, but its lock file was not rewritten: {e}", workspace.display());
+        // Under `rewriting`, and with the workspace re-read inside it rather
+        // than the value set above: two retargets on two threads (a sweep, the
+        // claudes tick, a term socket) would otherwise each write what they
+        // set, in whichever order their renames land — and the file could end
+        // naming a workspace the listener has already left. Re-reading alone
+        // would not close that (the stale reader can still rename last);
+        // serialising alone would not either (the last to take the lock may
+        // not hold the latest value). Both together: whoever writes last
+        // writes what is current.
+        let _w = ide.rewriting.lock().unwrap_or_else(|e| e.into_inner());
+        let current = ide.workspace.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Err(e) = ide._lock.rewrite(ide.port, &ide.token, &current) {
+            eprintln!("roost: IDE listener for {project} now serves {}, but its lock file was not rewritten: {e}", current.display());
         }
     }
     changed
