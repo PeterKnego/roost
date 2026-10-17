@@ -6,6 +6,7 @@ This is the first slice of #158, the follow-up to #156. It answers #158's subage
 2. a worktree that appears from anywhere gets a banner;
 3. a terminal link into another project offers to open that project;
 4. Claude is steered toward `EnterWorktree`, through documentation only.
+5. a renamed project or worktree takes its terminals with it, which builds on #178's fix that stopped the sweep killing them.
 
 ## Why the hook cannot be the trigger
 
@@ -84,10 +85,50 @@ Otherwise the reply stays "path is outside this project".
 
 roost writes nothing into a project's CLAUDE.md: the hard constraint limits it to its two owned hook commands in `settings.local.json`. `docs/deploy.md`, next to the setting, adds a suggested line for a project's CLAUDE.md: *create worktrees with the EnterWorktree tool, so they land in `.claude/worktrees/` and roost can ask and follow*.
 
+## 5. A renamed project or worktree takes its terminals with it
+
+Since #178 (PRs #179, #180), the sweep no longer kills a project's sessions when its directory was **moved** rather than deleted. The test it uses: a live session's shell `cwd` still reaches the recorded `(device, inode)` (`registry::moved_not_deleted`). Those sessions survive, but they are stranded:
+- their project URL no longer resolves, so `term.rs` refuses the attach (`resolve_project` → `None`);
+- no page lists them;
+- terminals re-homed *into* the moved worktree are forgotten by the R18 sweep, because git no longer lists the old path, and they fall back to the main checkout.
+
+This section makes them follow the directory. Session identity cannot move (the hard constraint), so this is the re-home alias again, with one new piece of evidence-backed state.
+
+**The move record.**
+- When `moved_not_deleted` finds the inode, it also has the shell's current path to it: the directory carrying the inode on that cwd's ancestor chain.
+- If that path resolves as a project under the roots (`projects::resolve_project(roots, new_url)` returns that same directory), the sweep writes `sock/<old key>/.moved-to` containing `new_url`. The write is atomic, 0600, and in the key directory like `.origin`.
+- A path under no root writes nothing: the sessions stay alive and stranded, exactly as #178 leaves them, and the sweep logs it.
+- `.moved-to` is rewritten if a later pass finds a different path, for example after a second rename.
+
+**Following.** On writing `.moved-to`, for each live session `n` of the old key:
+- **(a)** `home::record(old_url, n, new_url)`, so every session of the moved project becomes a resident of the new one. That reuses all of #156's resident machinery: tabs with `home`, `session_homes`, Close Project, the R16 gate, notices, IDE delivery and the overview.
+- **(b)** For every re-home record whose owner is `old_url` (main-checkout terminals re-homed into the moved worktree), the owner is rewritten to `new_url`.
+- **(c)** The old key's `.base` (`state/worktrees/<old key>.base`) is copied to the new key if the new key has none, so the removal gate's "ahead" still knows the base.
+- **(d)** The old layout (`state/<old key>.json`) is copied to the new key if the new key has none. Its file tabs keep working, because a rename does not change paths relative to the project root.
+- **(e)** The new project's hub, if open, gets `Event::ProjectMoved { from, to }`, shown as a transient banner: "`worktree-a` was renamed to `worktree-b`; its terminals followed". The old URL's open pages get the same event with a link to the new page.
+
+Every write is atomic, and all of it runs on the sweep's thread with no hub lock held.
+
+**Two narrow widenings, both gated on `.moved-to`:**
+- **`home::resolves(home, owner)`.** It currently accepts only `<home>/.claude/worktrees/<dir>`. It also accepts an owner equal to the content of `sock/<home key>/.moved-to`, when that owner resolves. Nothing else widens: a record naming an arbitrary owner without a matching `.moved-to` still does not resolve.
+- **`term.rs`.** When `resolve_project(project)` fails and `sock/<key>/.moved-to` names a URL that resolves, the websocket may attach to an **existing** session only. `session::attach` takes its `Probe` path, and a `Spawn` decision is refused with "project was renamed to `<new>`". The resolved new directory is used where `attach` needs a directory. No new shell is ever started under a key whose directory is gone.
+
+**Ordering with the R18 sweep.** `sweep_gone_owners` currently forgets a record when git no longer lists its owner. Before forgetting, it now checks `sock/<owner key>/.moved-to`:
+- if present and resolving, it rewrites the record's owner (step b) instead of forgetting it;
+- the compare-before-forget re-read stays.
+
+**Cleanup.** Nothing new. When the old key's last session ends, its socket is reaped as before, and the key directory, `.origin`, `.origin-ino` and `.moved-to` go with it. The copied `.base` and layout belong to the new key from then on.
+
+**Out of scope.**
+- A directory moved outside every root.
+- A rename while roost is stopped and no session survives it: there is no shell, so there is no evidence and nothing to follow.
+- Renaming the *branch* only (`git branch -m`), which already works: the switcher label changes, and nothing is keyed by branch.
+
 ## CLAUDE.md changes
 
 - **Re-homing bullet:** a terminal is re-homed only on positive evidence that its own Claude process moved. That means the watcher seeing its cwd enter the worktree it asked for, or the user's "Move tab there". Re-homing on the hook is named as the vulnerability-not-cleanup: a subagent's worktree request is indistinguishable from the parent's.
 - **Settings-file bullet:** unchanged. The hook still exits 0 with a path exactly when a worktree was created.
+- **Re-homing bullet, second part:** a renamed project's sessions follow it only through a `.moved-to` record, which is written solely on #178's inode evidence. `home::resolves` and `term.rs` widen only for an owner that a `.moved-to` names. A widened `term.rs` attaches to existing sessions and never spawns under a key whose directory is gone.
 
 ## Not in this slice
 
@@ -123,7 +164,18 @@ Each test is written to fail with its code reverted, and is watched doing so.
   - a `.claude/worktrees/<name>` path is accepted, and another dot segment is not.
 - `a_terminal_link_into_another_project_offers_it` and `a_link_under_no_project_is_still_outside`.
 
+- `a_renamed_worktree_takes_its_sessions_with_it`: real git, `git worktree move`, real dtach, a session started inside the worktree, then one sweep. Expect:
+  - `.moved-to` names the new URL;
+  - the session is a resident of the new project (listed by `owned_live_names(new)`);
+  - an attach through the old URL reaches the existing session;
+  - an attach that would spawn under the old key is refused with the "renamed" message.
+- `a_rehomed_terminal_follows_its_owners_rename`: a main-checkout terminal re-homed into worktree A; A is moved to B. Expect the record's owner to be B, not forgotten, even though git no longer lists A.
+- `a_move_outside_every_root_writes_nothing`: the session survives (#178), and no `.moved-to` is written.
+- `a_record_naming_an_unrelated_owner_still_does_not_resolve` (the widening is gated): without `.moved-to`, `home::resolves` refuses an owner outside `.claude/worktrees`.
+- `the_old_layout_and_base_are_copied_only_when_the_new_key_has_none`.
+
 **Browser (`tests/browser/`):**
 - Extend `worktree-rehome.mjs`. Approve, then the fake Claude `chdir`s: the terminal follows within one tick. Approve, then the fake does not `chdir` (a subagent): the tab stays on the main page.
 - A new case: `git worktree add` at a sibling path while the page is open shows the banner with a working link.
 - A new case: clicking a terminal link into another project shows "That's in …", and its link opens that project at the file.
+- A new case: with a terminal open on a worktree page, `git worktree move` it. Within one sweep the banner names the new worktree, and the terminal is usable from the new page with the same PID.
