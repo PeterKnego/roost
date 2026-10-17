@@ -459,6 +459,136 @@ pub(crate) fn abs_to_rel(project_dir: &Path, abs: &Path) -> Result<String, Strin
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Which roost project contains `abs`, and `abs`'s path relative to that
+/// project's root.
+///
+/// Fork-free on purpose: `hub::do_open_path` calls this under the hub lock
+/// to turn a terminal link into "That's in `<project>` — open", and the hub
+/// lock is held across everything that handler does — spawning `git` there
+/// would block the whole hub, including every other project's websocket,
+/// on however long that process takes. `symlink_metadata` is the only
+/// filesystem call this makes.
+///
+/// `abs` is canonicalised here, not just compared — a caller passes
+/// whatever a terminal printed or a symlinked `cwd` resolves to, the same
+/// trust level `abs_to_rel` treats terminal-scraped paths at. Roots are
+/// canonicalised too, so a symlinked root still matches. A canonicalize
+/// failure is folded into "no project", never into "found nothing" — see
+/// the `symlink_metadata` match below for the same distinction one level
+/// down.
+///
+/// The project is the *nearest* ancestor of `abs`, under some root, that
+/// has a `.git` entry — a directory for an ordinary clone, a file for a
+/// linked worktree. There is no plain-directory fallback: an `abs` under a
+/// root with no `.git` anywhere above it names no project, the same as a
+/// path outside every root. Walking outward (not just checking the
+/// immediate parent) is what lets a file several directories deep inside a
+/// project resolve correctly.
+///
+/// `symlink_metadata`, not `exists()`: CLAUDE.md's "absence of evidence"
+/// rule applies here exactly as it does to a destructive path — concluding
+/// "no project" because a permission-denied directory *looked* like it had
+/// no `.git` would misdirect a browser toward opening the wrong thing, or
+/// toward nothing, and say nothing about why. `NotFound` means keep
+/// walking, and so does `NotADirectory` — the first probe is `abs` itself,
+/// which is a file far more often than a directory, and `<file>/.git` is a
+/// structurally certain "no", not a "cannot tell" — but any other error
+/// means stop and answer `None`, not "maybe further up".
+///
+/// A discovered URL still goes through the same dot-segment rule
+/// `resolve_project` enforces — the one dot-segment shape roost's own
+/// worktrees take (`<project>/.claude/worktrees/<name>`) is let through
+/// when `<name>` is a worktree name either side could have minted
+/// (`wtname::valid` for roost's own, `session::valid_name` for Claude
+/// Code's older `claude-N`); anything else with a dot segment is refused,
+/// matching `resolve_project`'s own refusal of `.claude`/`.git`/`.hidden`
+/// as project names.
+pub fn project_for_abs(roots: &[PathBuf], abs: &Path) -> Option<(String, String)> {
+    let abs = abs.canonicalize().ok()?;
+    for root in roots {
+        let Ok(root) = root.canonicalize() else { continue };
+        if !abs.starts_with(&root) {
+            continue;
+        }
+        let mut probe: &Path = &abs;
+        loop {
+            match std::fs::symlink_metadata(probe.join(".git")) {
+                Ok(_) => {
+                    let url_rel = probe.strip_prefix(&root).ok()?;
+                    let url = path_to_url(url_rel);
+                    if !discovered_url_is_valid(&url) {
+                        return None;
+                    }
+                    let rel = abs.strip_prefix(probe).ok()?;
+                    return Some((url, path_to_url(rel)));
+                }
+                // `NotADirectory` happens whenever `probe` is itself a file
+                // (the common case: `abs` names a file, so the first probe
+                // is that file, and `<file>/.git` cannot exist) — that is
+                // not "cannot tell", it is a structurally certain "no", so
+                // it keeps walking exactly like `NotFound` rather than
+                // falling into the catch-all below.
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {}
+                // Revert-check (CLAUDE.md "Testing"): collapsing this arm
+                // into the one above it — treating every error here as
+                // `NotFound` — does NOT turn `an_unreadable_ancestor_is_none_not_a_guess`
+                // red. That test's `locked` directory sits on `abs`'s own
+                // path, so the `abs.canonicalize()` call above already
+                // requires the same search permission this probe would
+                // need, and fails first with the same `PermissionDenied`
+                // (confirmed with a debug print: the top gate's `Err` arm
+                // fired, this loop was never entered). This branch is
+                // genuinely reachable only by an error that isn't also a
+                // failure to canonicalize `abs` itself — e.g. a transient
+                // I/O error or a stale NFS handle arriving between the two
+                // calls — which a unit test can't deterministically force.
+                // Kept anyway: collapsing it is the exact CLAUDE.md mistake
+                // ("I could not determine X" folded into "X is false") the
+                // day one of those errors actually occurs.
+                Err(_) => return None, // cannot tell — never guess "no project" past here
+            }
+            if probe == root {
+                break;
+            }
+            probe = probe.parent()?;
+        }
+    }
+    None
+}
+
+/// `/`-joined, matching how a project URL is written everywhere else in
+/// this codebase — never the platform separator, so this is correct on the
+/// one platform roost runs on and would still be correct on another.
+fn path_to_url(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Mirrors `resolve_project`'s dot-segment rule for a URL discovered by
+/// walking the filesystem rather than typed by a caller: empty segments
+/// (and so the empty string itself — a root that is directly a git repo
+/// names no project, the same as `resolve_project` refusing an empty name)
+/// are never valid, and a dot segment is only ever vouched for in the one
+/// shape roost's own worktrees take.
+fn discovered_url_is_valid(url: &str) -> bool {
+    let segs: Vec<&str> = url.split('/').collect();
+    if segs.iter().any(|s| s.is_empty()) {
+        return false;
+    }
+    if !segs.iter().any(|s| s.starts_with('.')) {
+        return true;
+    }
+    let n = segs.len();
+    if n >= 4 && segs[n - 3] == ".claude" && segs[n - 2] == "worktrees" {
+        let name = segs[n - 1];
+        let leading_clean = segs[..n - 3].iter().all(|s| !s.starts_with('.'));
+        return leading_clean && (crate::wtname::valid(name) || crate::session::valid_name(name));
+    }
+    false
+}
+
 /// Confine a path whose *target does not exist yet* (creation, rename
 /// destination). `safe_resolve` canonicalizes the target and so cannot be
 /// used here. Canonicalize the parent instead, confine that, then validate
@@ -1085,5 +1215,76 @@ mod tests {
         // first match wins, so the same set listed differently resolves a
         // duplicate project name to a different directory.
         assert!(roots_conflict(Some("/b:/a"), &cfg).is_some(), "reordering changes which root wins");
+    }
+
+    fn nix_is_root() -> bool { unsafe { libc::getuid() == 0 } }
+
+    #[test]
+    fn project_for_abs_finds_the_repo_and_the_relative_path() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("uc-rel");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        std::fs::write(repo.join("docs/a.md"), "x").unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let abs = repo.join("docs/a.md").canonicalize().unwrap();
+        assert_eq!(project_for_abs(&roots, &abs), Some(("uc-rel".into(), "docs/a.md".into())));
+    }
+
+    #[test]
+    fn a_worktree_under_dot_claude_resolves_and_another_dot_segment_does_not() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = root.path().join("p/.claude/worktrees/worktree-x");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: ...").unwrap(); // linked worktree: .git is a file
+        let roots = vec![root.path().to_path_buf()];
+        assert_eq!(project_for_abs(&roots, &wt.canonicalize().unwrap()).map(|p| p.0),
+                   Some("p/.claude/worktrees/worktree-x".into()));
+        let odd = root.path().join("p/.hidden/q");
+        std::fs::create_dir_all(odd.join(".git")).unwrap();
+        assert_eq!(project_for_abs(&roots, &odd.canonicalize().unwrap()), None);
+    }
+
+    #[test]
+    fn a_path_under_no_root_is_none() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        assert_eq!(project_for_abs(&[root.path().to_path_buf()], &other.path().canonicalize().unwrap()), None);
+    }
+
+    #[test]
+    fn a_path_under_another_root_resolves_there() {
+        let (r1, r2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::create_dir_all(r2.path().join("x/.git")).unwrap();
+        let roots = vec![r1.path().to_path_buf(), r2.path().to_path_buf()];
+        assert_eq!(project_for_abs(&roots, &r2.path().join("x").canonicalize().unwrap()).map(|p| p.0), Some("x".into()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_path_resolves_to_its_target_project() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("uc-rel/.git")).unwrap();
+        std::fs::write(root.path().join("uc-rel/a.md"), "x").unwrap();
+        std::os::unix::fs::symlink(root.path().join("uc-rel"), root.path().join("cur")).unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        // Callers pass what the terminal printed; project_for_abs canonicalises.
+        assert_eq!(project_for_abs(&roots, &root.path().join("cur/a.md")),
+                   Some(("uc-rel".into(), "a.md".into())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_ancestor_is_none_not_a_guess() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let locked = root.path().join("locked");
+        std::fs::create_dir_all(locked.join("inner")).unwrap();
+        let abs = locked.join("inner").canonicalize().unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let got = project_for_abs(&[root.path().to_path_buf()], &abs);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if nix_is_root() { return; } // root reads through 0o000; nothing to assert
+        assert_eq!(got, None);
     }
 }
