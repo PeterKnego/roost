@@ -552,6 +552,11 @@ fn path_from_marker(bytes: &[u8]) -> PathBuf {
 /// Best-effort throughout: a failure here just means a later pass falls back
 /// to "no marker, never reap" — the safe direction to fail in.
 fn write_origin(key_dir: &std::path::Path, dir: &std::path::Path) {
+    // First, not after the unchanged-marker return below: a project whose
+    // `.origin` predates `.origin-ino` takes that return on every pass, and
+    // would never gain the identity the rename check needs (#178). It does
+    // its own unchanged check, so this costs one small read per pass.
+    write_origin_identity(key_dir, dir);
     let bytes = marker_bytes(dir);
     let marker = origin_marker_path(key_dir);
     if std::fs::read(&marker).map(|cur| cur == bytes).unwrap_or(false) {
@@ -577,7 +582,6 @@ fn write_origin(key_dir: &std::path::Path, dir: &std::path::Path) {
     if std::fs::rename(&tmp, &marker).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    write_origin_identity(key_dir, dir);
 }
 
 /// The project directory's `(device, inode)`, kept beside `.origin` (#178).
@@ -2311,6 +2315,37 @@ mod tests {
             assert_eq!(report.gone_projects, 0, "a moved project is not a gone project");
             assert!(socket_has_process(&sock_path), "the shell working in the moved directory must survive");
             kill_test_pids(&sock_path);
+        });
+    }
+
+    /// The upgrade case: a project whose `.origin` was written by a roost that
+    /// predates `.origin-ino` must gain the identity on the next confirming
+    /// pass. Found live after deploying #179: 1 of 40 projects had one,
+    /// because `write_origin` returned early on an unchanged `.origin` before
+    /// ever reaching the identity write — so the rename protection never
+    /// switched on for any project that already existed.
+    ///
+    /// Revert-checked: this failed on a5dced3 (the deployed #179) with "a
+    /// confirming pass must backfill .origin-ino for a project whose .origin
+    /// is unchanged".
+    #[test]
+    fn an_existing_origin_gains_its_identity_on_the_next_pass() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let project_dir = root.path().join("old-proj");
+            fs::create_dir_all(&project_dir).unwrap();
+            let key_dir = state.join("sock/old-proj");
+            fs::create_dir_all(&key_dir).unwrap();
+            // Exactly what an older roost left: `.origin` up to date, no identity.
+            fs::write(origin_marker_path(&key_dir), marker_bytes(&project_dir)).unwrap();
+            assert!(!origin_identity_path(&key_dir).exists(), "test setup: no identity yet");
+
+            let _ = reconcile(&[root.path().to_path_buf()]);
+
+            assert!(
+                origin_identity_path(&key_dir).exists(),
+                "a confirming pass must backfill .origin-ino for a project whose .origin is unchanged"
+            );
         });
     }
 
