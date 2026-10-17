@@ -2458,12 +2458,14 @@ impl Hub {
                     if crate::home::owner_path(&work_home, &url).is_none() {
                         return Err(format!("{url}: not a {work_home}/.claude/worktrees worktree"));
                     }
-                    // R16: a resident must never shadow a native session of
-                    // the same name at its new owner.
-                    if crate::session::live_names(&url).contains(&work_session) {
-                        return Err(format!("{work_session} already exists in {url}"));
-                    }
-                    crate::home::record(&work_home, &work_session, &url)
+                    // From here on it's the same path Task 4's claudes
+                    // watcher will call with no connection and no git of
+                    // its own: R16, record, refresh. `rehome_to` does its
+                    // own refresh of home/prior-owner/new-owner, off any
+                    // lock — this closure already runs there, in the
+                    // spawned thread (or, in the sync fallback below, with
+                    // no hub lock taken for `work` either).
+                    crate::hub::rehome_to(&work_home, &work_session, &url)
                 }
             }
         };
@@ -3690,6 +3692,51 @@ pub fn retab_native_if_missing(project: &str, name: &str) {
     }
     let ev = g.snapshot_event(&String::new());
     g.broadcast(&ev);
+}
+
+/// Re-homes `(home, session)` to `owner`: R16 gate, `home::record`, then
+/// refresh home and owner hubs one lock at a time and `broadcast_all`.
+/// Must be called with no hub lock held. Errors are user-facing text.
+///
+/// The one re-home path both `Hub::do_rehome`'s `Some(to)` branch and (Task
+/// 4) the `claudes` watcher thread call — the watcher has no `ConnId` and
+/// no hub lock of its own already taken, so this reads the prior owner
+/// itself rather than trusting a value a caller computed earlier that
+/// might now be stale: a resident moved a second time leaves its
+/// *previous* owner showing a stale resident tab unless that hub, too, is
+/// refreshed — the same reasoning `do_rehome`'s own `prior_owner` existed
+/// for before this extraction.
+///
+/// `do_rehome`'s git validation (`worktree::list`, `home::owner_path`)
+/// runs before this is ever reached and is not repeated here — by the
+/// time `owner` gets here it is already known to be a worktree of `home`
+/// in the `.claude/worktrees` convention. Task 4's caller establishes the
+/// same fact by watching the Claude it asked actually land there, not by
+/// running git again.
+pub fn rehome_to(home: &str, session: &str, owner: &str) -> Result<(), String> {
+    // Read before anything is written, same as `do_rehome` used to: the
+    // owner the record names *right now*, if any.
+    let prior_owner = match crate::home::owner_of(home, session) {
+        crate::home::Owner::Elsewhere(o) => Some(o),
+        _ => None,
+    };
+    // R16: a resident must never shadow a native session of the same name
+    // at its new owner.
+    if crate::session::live_names(owner).contains(&session.to_string()) {
+        return Err(format!("{session} already exists in {owner}"));
+    }
+    crate::home::record(home, session, owner)?;
+    // One hub lock at a time, never two: each of these opens, locks, and
+    // releases a single hub before the next one is even looked up.
+    refresh_and_broadcast(home);
+    if let Some(o) = &prior_owner {
+        if o != owner {
+            refresh_and_broadcast(o);
+        }
+    }
+    refresh_and_broadcast(owner);
+    broadcast_all(&Event::ProjectsChanged { project: home.to_string() });
+    Ok(())
 }
 
 /// Sends `ev` to one connection of one project, and says whether it could.
@@ -9332,6 +9379,79 @@ mod tests {
         let got = rxa.try_recv().expect("an Error must be sent");
         assert!(got.contains(r#""t":"Error""#) && got.contains("already exists"), "{got}");
         assert!(matches!(crate::home::owner_of("repo", "term"), crate::home::Owner::Here), "no record must be written");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// `rehome_to` is the one path both `do_rehome` and (Task 4) the
+    /// `claudes` watcher thread call, and unlike `do_rehome` it has no
+    /// `ConnId`/hub of its own to validate against — it must apply R16
+    /// itself and refresh every affected hub before returning. Fixture
+    /// copied verbatim from `rehome_refuses_a_name_already_live_at_the_target`
+    /// (the colliding native session at the target, case 1) and
+    /// `rehome_into_a_real_worktree_of_this_project_records_the_owner`
+    /// (the plain worktree, case 2), called directly rather than through
+    /// `Intent::Rehome`.
+    ///
+    /// Revert check: commenting out the `live_names(owner)` gate inside
+    /// `rehome_to` makes case 1 fail — observed: it returns `Ok(())` and
+    /// records "term3" as a resident of the worktree instead of refusing,
+    /// shadowing the native session already there. Restored.
+    #[test]
+    fn rehome_to_refuses_a_name_already_live_in_the_owner_and_records_otherwise() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let home = "rehometo-repo";
+        let repo = root.path().join(home);
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let wt = repo.join(".claude/worktrees/w1");
+        assert!(std::process::Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["worktree", "add", "-b", "w1", wt.to_str().unwrap()])
+            .status().unwrap().success());
+        let owner = format!("{home}/.claude/worktrees/w1");
+
+        let _att_home = crate::session::reserve_and_attach(home, "term3", &repo).unwrap();
+        // Case 1: the name already exists natively at the target itself.
+        let _att_target = crate::session::reserve_and_attach(&owner, "term3", &wt).unwrap();
+
+        let err = crate::hub::rehome_to(home, "term3", &owner)
+            .expect_err("must refuse a name already live at the target");
+        assert_eq!(err, format!("term3 already exists in {owner}"), "do_rehome's own R16 text, unchanged");
+        assert!(matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here), "no record must be written");
+
+        // Case 2: end the collision, so the name is free at the target,
+        // and register both hubs via `Hub::for_project` so the owner's
+        // `session_homes` can be checked with no sleep right after
+        // `rehome_to` returns — it must refresh the owner hub itself.
+        assert!(crate::session::end_session(&owner, "term3"), "setup: the colliding session must end");
+        let _home_hub = Hub::for_project(home, repo.clone());
+        let owner_hub = Hub::for_project(&owner, wt.clone());
+
+        crate::hub::rehome_to(home, "term3", &owner).expect("must record the move now the name is free");
+        assert!(
+            matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Elsewhere(ref o) if *o == owner),
+            "the record must now name the worktree"
+        );
+        assert_eq!(
+            Hub::lock(&owner_hub).session_homes.get("term3"),
+            Some(&home.to_string()),
+            "the owner hub's session_homes must already show term3 as a resident right after rehome_to returns"
+        );
+
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
         std::env::remove_var("ROOST_CMD");
