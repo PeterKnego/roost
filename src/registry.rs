@@ -327,7 +327,13 @@ pub(crate) fn record_move_with(
     // The record first, the shells second: once a rename has been followed,
     // its sessions' shells are free to `cd` out of the directory, and the
     // record plus the directory's own inode is still positive evidence.
-    let evidence = moved_to_evidence(roots, key_dir).unwrap_or_else(|| move_evidence(key_dir, snapshot, proc_root));
+    // And the directory's siblings last (#182): a rename made while no
+    // shell was under the inode — the first one, or a later hop after a
+    // `cd` — leaves the directory itself as the only witness.
+    let evidence = moved_to_evidence(roots, key_dir).unwrap_or_else(|| match move_evidence(key_dir, snapshot, proc_root) {
+        MoveEvidence::None => sibling_evidence(roots, key_dir),
+        e => e,
+    });
     let new_dir = match evidence {
         MoveEvidence::None => return MoveRecord::NoEvidence,
         MoveEvidence::CannotTell => {
@@ -512,6 +518,68 @@ fn moved_to_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> Option<Mov
 #[cfg(not(unix))]
 fn moved_to_evidence(_roots: &[PathBuf], _key_dir: &std::path::Path) -> Option<MoveEvidence> {
     None
+}
+
+/// The last evidence asked for before a gone key is reaped (#182): the
+/// directory itself, looked for by identity among the siblings of where it
+/// was last known to be — the parent of `.origin`'s recorded path, and of
+/// `.moved-to`'s target. That is where `git worktree move` and a same-parent
+/// `mv` put it, and it needs no shell: a session whose shell `cd`d out, or
+/// that never had one inside, is otherwise indistinguishable from a delete.
+///
+/// `Moved(dir)` on a match (the caller still requires its URL to resolve
+/// under the roots before following); `CannotTell` when a sibling directory
+/// cannot be listed or an entry cannot be stat'd; `None` when nothing there
+/// carries the identity, which leaves a real delete a delete. No git —
+/// `worktree::list` turns a failed git into an empty list, which would read
+/// "could not ask" as "not there".
+#[cfg(unix)]
+fn sibling_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> MoveEvidence {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let ids = identities(key_dir);
+    if ids.is_empty() {
+        return MoveEvidence::None;
+    }
+    let mut parents: Vec<PathBuf> = Vec::new();
+    if let Ok(recorded) = std::fs::read(origin_marker_path(key_dir)) {
+        let p = std::path::Path::new(std::ffi::OsStr::from_bytes(&recorded));
+        parents.extend(p.parent().filter(|d| d.is_absolute()).map(|d| d.to_path_buf()));
+    }
+    if let Some(url) = std::fs::read(moved_to_marker_path(key_dir)).ok().and_then(|b| parse_moved_to(&b)) {
+        parents.extend(roots.iter().filter_map(|r| r.join(&url).parent().map(|d| d.to_path_buf())));
+    }
+    parents.sort();
+    parents.dedup();
+    for parent in &parents {
+        let entries = match std::fs::read_dir(parent) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return MoveEvidence::CannotTell,
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { return MoveEvidence::CannotTell };
+            let path = entry.path();
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.is_dir() && ids.contains(&(m.dev(), m.ino())) => {
+                    return match path.canonicalize() {
+                        Ok(dir) => MoveEvidence::Moved(dir),
+                        Err(_) => MoveEvidence::CannotTell,
+                    };
+                }
+                Ok(_) => {}
+                // Renamed or removed between the listing and the stat.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return MoveEvidence::CannotTell,
+            }
+        }
+    }
+    MoveEvidence::None
+}
+
+#[cfg(not(unix))]
+fn sibling_evidence(_roots: &[PathBuf], _key_dir: &std::path::Path) -> MoveEvidence {
+    MoveEvidence::None
 }
 
 /// Writes `sock/<key>/.moved-to` (atomic, 0600, pid-unique temp — the same
@@ -3250,6 +3318,171 @@ mod tests {
             std::env::remove_var("ROOST_ROOTS");
             assert!(gone.gone_projects >= 1, "B deleted: the session is reaped");
             assert!(!alive, "and its master is ended");
+        });
+    }
+
+    /// A session whose leader sits in `/` after the flag file appears: the
+    /// shape every sibling-scan test needs (no shell under any inode).
+    fn spawn_leaver(sock_path: &std::path::Path, dir: &std::path::Path, flag: &std::path::Path) {
+        spawn_detached_sh_in(
+            sock_path,
+            dir,
+            r#"while [ ! -e "$1" ]; do sleep 0.05; done; cd /; exec sleep 60"#,
+            &[flag.to_str().unwrap()],
+        )
+        .unwrap_or_else(|| panic!("dtach must be available for this test"));
+    }
+
+    fn wait_left(sock_path: &std::path::Path, flag: &std::path::Path) {
+        fs::write(flag, "").unwrap();
+        let left = (0..100).any(|_| {
+            let at_root = leaders_of(sock_path)
+                .iter()
+                .any(|p| fs::read_link(format!("/proc/{p}/cwd")).is_ok_and(|c| c == std::path::Path::new("/")));
+            if !at_root {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            at_root
+        });
+        assert!(left, "setup: the session leader has left its directory");
+    }
+
+    /// #182: A→B followed, the shell `cd`s out of B, then B→C. `.moved-to`
+    /// names B, which is gone; no shell is under the inode. C — a sibling of
+    /// B carrying the recorded identity — is the evidence, and the session
+    /// follows it rather than being reaped. Removing C instead is still the
+    /// delete it always was.
+    ///
+    /// Revert-checked, run and restored: with `record_move_with` not
+    /// consulting `sibling_evidence`, fails "a second rename with no shell
+    /// inside is not a delete" — left: 1, right: 0, the master SIGKILLed.
+    #[test]
+    fn a_second_rename_after_the_shell_left_is_followed_not_reaped() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let repo = repo_with_worktree_a(root.path(), "hoprepo");
+            let a = "hoprepo/.claude/worktrees/worktree-a";
+            let b = "hoprepo/.claude/worktrees/worktree-b";
+            let c = "hoprepo/.claude/worktrees/worktree-c";
+            let sock_dir = state.join("sock").join(crate::projects::storage_key(a));
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            let flag = root.path().join("leave-now");
+            spawn_leaver(&sock_path, &repo.join(".claude/worktrees/worktree-a"), &flag);
+            let _ = reconcile(&roots);
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+            let first = reconcile(&roots);
+            assert_eq!(first.moved.len(), 1, "setup: the first rename is found from the shell in B");
+            follow_moves(&first.moved);
+            wait_left(&sock_path, &flag);
+
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-b", ".claude/worktrees/worktree-c"]);
+            let second = reconcile(&roots);
+            let alive = socket_has_process(&sock_path);
+            if second.gone_projects != 0 || !alive {
+                kill_test_pids(&sock_path);
+                std::env::remove_var("ROOST_ROOTS");
+            }
+            assert_eq!(second.gone_projects, 0, "a second rename with no shell inside is not a delete");
+            assert!(alive, "its master is alive");
+            assert_eq!(second.moved.iter().map(|m| m.new_url.as_str()).collect::<Vec<_>>(), vec![c], "found at C");
+            assert!(second.moved[0].fresh, "a new target is a new rename");
+            follow_moves(&second.moved);
+            assert_eq!(crate::home::owner_of(a, "shell"), crate::home::Owner::Elsewhere(c.into()), "and followed to C");
+            let _ = b;
+
+            git_in(&repo, &["worktree", "remove", "--force", ".claude/worktrees/worktree-c"]);
+            let gone = reconcile(&roots);
+            let alive = socket_has_process(&sock_path);
+            kill_test_pids(&sock_path);
+            std::env::remove_var("ROOST_ROOTS");
+            assert!(gone.gone_projects >= 1, "C deleted: the session is reaped");
+            assert!(!alive, "and its master is ended");
+        });
+    }
+
+    /// #178's own gap, closed by the same scan: the very first rename, made
+    /// while no shell is inside A. There is no `.moved-to` yet, so the
+    /// siblings of A's recorded path are where the identity is looked for.
+    ///
+    /// Revert-checked, run and restored: without the sibling scan, fails "a
+    /// rename with no shell inside is not a delete" — left: 1, right: 0.
+    #[test]
+    fn a_first_rename_with_no_shell_inside_is_followed_not_reaped() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let repo = repo_with_worktree_a(root.path(), "firstrepo");
+            let a = "firstrepo/.claude/worktrees/worktree-a";
+            let b = "firstrepo/.claude/worktrees/worktree-b";
+            let sock_dir = state.join("sock").join(crate::projects::storage_key(a));
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            let flag = root.path().join("leave-now");
+            spawn_leaver(&sock_path, &repo.join(".claude/worktrees/worktree-a"), &flag);
+            let _ = reconcile(&roots);
+            assert!(sock_dir.join(".origin-ino").exists(), "setup: A's identity is recorded");
+            wait_left(&sock_path, &flag);
+
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+            let after = reconcile(&roots);
+            let alive = socket_has_process(&sock_path);
+            kill_test_pids(&sock_path);
+            std::env::remove_var("ROOST_ROOTS");
+            assert_eq!(after.gone_projects, 0, "a rename with no shell inside is not a delete");
+            assert!(alive, "its master is alive");
+            assert_eq!(after.moved.iter().map(|m| m.new_url.as_str()).collect::<Vec<_>>(), vec![b], "found at B");
+        });
+    }
+
+    /// A sibling directory that cannot be listed is "cannot tell", never
+    /// "not there": the sweep keeps the session rather than guessing.
+    ///
+    /// Revert-checked, run and restored: with an unlistable parent skipped
+    /// (`Err(_) => continue`) instead of answering `CannotTell`, fails "an
+    /// unlistable sibling directory is not evidence of a delete" — left: 1,
+    /// right: 0. Without the scan at all it fails the same way.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_parent_suspends_the_sweep() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads through 0o000; nothing to assert
+        }
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let repo = repo_with_worktree_a(root.path(), "lockrepo");
+            let a = "lockrepo/.claude/worktrees/worktree-a";
+            let sock_dir = state.join("sock").join(crate::projects::storage_key(a));
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            let flag = root.path().join("leave-now");
+            spawn_leaver(&sock_path, &repo.join(".claude/worktrees/worktree-a"), &flag);
+            let _ = reconcile(&roots);
+            wait_left(&sock_path, &flag);
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+            let parent = repo.join(".claude/worktrees");
+            // Search but not read: the sweep can still stat A's recorded
+            // path and see it `NotFound` (so A is "gone"), but cannot list
+            // the siblings that might hold it under another name. 0o400 —
+            // read, no search — would fail that stat first, and the test
+            // would pass without reaching the scan.
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o300)).unwrap();
+            let after = reconcile(&roots);
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+            let alive = socket_has_process(&sock_path);
+            kill_test_pids(&sock_path);
+            std::env::remove_var("ROOST_ROOTS");
+            assert_eq!(after.gone_projects, 0, "an unlistable sibling directory is not evidence of a delete");
+            assert!(alive, "its master is alive");
         });
     }
 
