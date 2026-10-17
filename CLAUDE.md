@@ -306,8 +306,12 @@ Every one could kill a user's long-running shell or overwrite their file.
 The `Path::exists()` row is in a different module from the rest, so treat this
 as systemic, not as a `registry.rs` quirk. The rename row is the `.origin`
 safeguard defeated: the recorded path really is `NotFound`, and only the
-directory's inode, reached from a live shell's cwd, tells a move from a delete
-(`registry::move_evidence`, #178).
+directory's inode tells a move from a delete. It is looked for three ways, in
+order, and a delete is concluded only when all three come back empty: the
+directory a `.moved-to` names, a live shell's cwd (`registry::move_evidence`,
+#178), and the siblings of where it last was (`registry::sibling_evidence`,
+#182 — a rename made with no shell inside leaves only the directory itself as
+a witness). A sibling that cannot be listed or stat'd is "cannot tell".
 
 **The rule:** "I could not determine X" is a third outcome, never folded into
 "X is false". Concretely:
