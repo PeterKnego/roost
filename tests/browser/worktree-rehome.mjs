@@ -646,6 +646,25 @@ try {
      `the main page shows \`${elseText}\``);
   const elseB = (await bannersWith(page, elseText))[0];
   ok(elseB?.hrefs?.length === 1 && elseB.hrefs[0] === "/sib?open=hello.md", `its link is /sib?open=hello.md (${elseB?.hrefs})`);
+  // The same click again: the identical text dedupes into the same banner,
+  // whose count update used to rewrite the line and delete its link — and
+  // whose new link went to whichever div came last on the page. Another
+  // banner shown in between makes that a different banner. Revert-checked,
+  // run and restored: with app.js's banner code as it was (count via
+  // `b.textContent`, links via `.error-banner:last-of-type b`), fails "two
+  // identical clicks leave one banner with one link ([[]])"; without the
+  // banner in between, that old code passed.
+  await page.evalIn(`showBanner("an unrelated banner"); 0`);
+  ok(await clickLink(page, absQ, sG), "the same path clicked a second time");
+  const elseLive = `[...document.querySelectorAll(".error-banner")].filter((e) => e.dataset.text === ${JSON.stringify("That's in sib — ")})`;
+  ok(await until(() => page.evalIn(`${elseLive}.some((e) => e.dataset.count === "2")`), 10, "the deduped count"),
+     "the second click is counted on the same banner");
+  const twice = JSON.parse(await page.evalIn(`JSON.stringify(${elseLive}.map((e) => [...e.querySelectorAll("a")].map((a) => a.getAttribute("href"))))`));
+  ok(twice.length === 1 && twice[0].length === 1 && twice[0][0] === "/sib?open=hello.md",
+     `two identical clicks leave one banner with one link (${JSON.stringify(twice)})`);
+  // Banners stack at one fixed spot: the unrelated one, newer, would sit on
+  // top of the link the next step clicks.
+  await page.evalIn(`document.querySelectorAll(".error-banner").forEach((e) => { if (e.dataset.text === "an unrelated banner") e.remove(); }); 0`);
   await sleep(1000);
   ok(!(await page.evalIn(mainHello)), "and main did not open its own hello.md instead");
   let sibTabG = null;

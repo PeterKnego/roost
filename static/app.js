@@ -962,10 +962,10 @@ function onEvent(ev) {
       } else {
         // The popup was blocked (or something else closed it): fall back to
         // a link rather than lose the worktree the server already created.
-        showBanner(`opened ${ev.url.split("/").pop()} — `);
+        const box = showBanner(`opened ${ev.url.split("/").pop()} — `);
         const a = document.createElement("a");
         a.href = url; a.target = "_blank"; a.textContent = "click to go there";
-        document.querySelector(".error-banner:last-of-type b")?.append(a);
+        bannerLink(box, a);
       }
       pendingTab = null;
       document.body.dispatchEvent(new Event("projects"));
@@ -978,10 +978,10 @@ function onEvent(ev) {
       // same transient-banner-plus-link fallback `WorktreeReady` uses when
       // its popup is blocked is the whole of what this can do: say where it
       // went, and offer a way there.
-      showBanner(`${ev.session} moved to ${ev.owner.split("/").pop()} → `);
+      const box = showBanner(`${ev.session} moved to ${ev.owner.split("/").pop()} → `);
       const a = document.createElement("a");
       a.href = "/" + projectPath(ev.owner); a.target = "_blank"; a.textContent = "open it there";
-      document.querySelector(".error-banner:last-of-type b")?.append(a);
+      bannerLink(box, a);
       break;
     }
     case "ClaudeElsewhere": {
@@ -993,20 +993,18 @@ function onEvent(ev) {
       // project's browsers see this; the client only renders it.
       if (ev.worktree) {
         const name = ev.worktree.split("/").pop();
-        showBanner(`${ev.session}'s Claude is working in ${name}`);
-        const box = document.querySelector(".error-banner:last-of-type");
+        const box = showBanner(`${ev.session}'s Claude is working in ${name}`);
         const b = document.createElement("button");
         b.textContent = "Move tab there";
         b.onclick = () => { send({ t: "Rehome", session: ev.session, to: ev.worktree }); box?.remove(); };
-        box?.append(b);
+        bannerButton(box, "rehome", b);
         offerWorktreeHooksOnce(box);
       } else {
-        showBanner(`${ev.session}'s Claude is working in the main checkout`);
-        const box = document.querySelector(".error-banner:last-of-type");
+        const box = showBanner(`${ev.session}'s Claude is working in the main checkout`);
         const b = document.createElement("button");
         b.textContent = "Move back";
         b.onclick = () => { send({ t: "Rehome", session: ev.session, to: null }); box?.remove(); };
-        box?.append(b);
+        bannerButton(box, "rehome", b);
       }
       break;
     }
@@ -1018,10 +1016,10 @@ function onEvent(ev) {
       // `projectPath`, never as markup.
       const name = ev.path.split("/").pop();
       if (ev.url) {
-        showBanner(`worktree ${name} (${ev.branch}) appeared — `);
+        const box = showBanner(`worktree ${name} (${ev.branch}) appeared — `);
         const a = document.createElement("a");
         a.href = "/" + projectPath(ev.url); a.target = "_blank"; a.textContent = "open";
-        document.querySelector(".error-banner:last-of-type b")?.append(a);
+        bannerLink(box, a);
       } else {
         showBanner(`worktree ${name} (${ev.branch}) appeared, outside roost's roots`);
       }
@@ -1035,11 +1033,11 @@ function onEvent(ev) {
       // from the filesystem, so text only and the link through projectPath.
       const from = ev.from.split("/").pop();
       const to = ev.to.split("/").pop();
-      showBanner(`${from} was renamed to ${to}; its terminals followed`);
+      const box = showBanner(`${from} was renamed to ${to}; its terminals followed`);
       if (ev.to !== PROJECT) {
         const a = document.createElement("a");
         a.href = "/" + projectPath(ev.to); a.textContent = " open " + to;
-        document.querySelector(".error-banner:last-of-type b")?.append(a);
+        bannerLink(box, a);
       }
       document.body.dispatchEvent(new Event("projects"));
       break;
@@ -1239,7 +1237,7 @@ function onEvent(ev) {
       // RevealLine is coming for this click either.
       focusNextReveal = false;
       const name = ev.project.split("/").pop();
-      showBanner(`That's in ${name} — `);
+      const box = showBanner(`That's in ${name} — `);
       const a = document.createElement("a");
       const open = ev.rel + (ev.line ? ":" + ev.line : "");
       // The new page's own server confines this OpenPath exactly as this
@@ -1249,7 +1247,7 @@ function onEvent(ev) {
       a.href = "/" + projectPath(ev.project) + "?open=" + encodeURIComponent(open);
       a.target = "_blank";
       a.textContent = "open";
-      document.querySelector(".error-banner:last-of-type b")?.append(a);
+      bannerLink(box, a);
       break;
     }
     case "SearchResults":
@@ -4290,13 +4288,27 @@ function showBanner(text) {
   // keystroke with no Claude attached stacked sixteen identical banners down
   // the page, each with its own dismiss button and its own 8s timer. The
   // information in the sixteenth is the same as in the first.
+  //
+  // Returns the banner's box — the existing one when deduped — so a caller
+  // adds its link or button to *this* banner. Looking it up afterwards
+  // (`.error-banner:last-of-type`, which matches by element type, not by
+  // class) found whichever div came last, often another banner.
   const existing = [...document.querySelectorAll(".error-banner")]
     .find((el) => el.dataset.text === text);
   if (existing) {
     const n = Number(existing.dataset.count || "1") + 1;
     existing.dataset.count = String(n);
-    existing.querySelector("b").textContent = `${text} (${n}×)`;
-    return;
+    // The count has its own span after everything else in the line, so
+    // updating it never rewrites — and so never deletes — a link in it.
+    const b = existing.querySelector("b");
+    let count = b.querySelector(".banner-count");
+    if (!count) {
+      count = document.createElement("span");
+      count.className = "banner-count";
+      b.append(count);
+    }
+    count.textContent = ` (${n}×)`;
+    return existing;
   }
   const box = document.createElement("div");
   box.className = "conflict error-banner";
@@ -4309,6 +4321,26 @@ function showBanner(text) {
   box.append(b, dismiss);
   document.body.appendChild(box);
   setTimeout(() => box.remove(), 8000);
+  return box;
+}
+
+// A banner's one link, in its text line: replaces the link an identical
+// earlier banner got (a deduped banner keeps exactly one, the latest — two
+// clicks on different files in the same project share the text), and goes
+// before the count.
+function bannerLink(box, a) {
+  const b = box?.querySelector("b");
+  if (!b) return;
+  b.querySelector("a")?.remove();
+  b.insertBefore(a, b.querySelector(".banner-count"));
+}
+
+// A banner's one action button of `role`, replaced the same way.
+function bannerButton(box, role, button) {
+  if (!box) return;
+  box.querySelector(`button[data-role="${role}"]`)?.remove();
+  button.dataset.role = role;
+  box.append(button);
 }
 
 // Offered alongside the "Move tab there" banner, once per project per
