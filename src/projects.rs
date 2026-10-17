@@ -514,6 +514,11 @@ pub fn project_for_abs(roots: &[PathBuf], abs: &Path) -> Option<(String, String)
         loop {
             match std::fs::symlink_metadata(probe.join(".git")) {
                 Ok(_) => {
+                    // Invariant: probe is always on the path from `root`
+                    // to `abs` (it starts at `abs` and only ever steps to
+                    // `.parent()`, stopping at `root`), so both strips
+                    // below always succeed; the `?` is a safety net, not a
+                    // reachable early exit.
                     let url_rel = probe.strip_prefix(&root).ok()?;
                     let url = path_to_url(url_rel);
                     if !discovered_url_is_valid(&url) {
@@ -529,27 +534,27 @@ pub fn project_for_abs(roots: &[PathBuf], abs: &Path) -> Option<(String, String)
                 // it keeps walking exactly like `NotFound` rather than
                 // falling into the catch-all below.
                 Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {}
-                // Revert-check (CLAUDE.md "Testing"): collapsing this arm
-                // into the one above it — treating every error here as
-                // `NotFound` — does NOT turn `an_unreadable_ancestor_is_none_not_a_guess`
-                // red. That test's `locked` directory sits on `abs`'s own
-                // path, so the `abs.canonicalize()` call above already
-                // requires the same search permission this probe would
-                // need, and fails first with the same `PermissionDenied`
-                // (confirmed with a debug print: the top gate's `Err` arm
-                // fired, this loop was never entered). This branch is
-                // genuinely reachable only by an error that isn't also a
-                // failure to canonicalize `abs` itself — e.g. a transient
-                // I/O error or a stale NFS handle arriving between the two
-                // calls — which a unit test can't deterministically force.
-                // Kept anyway: collapsing it is the exact CLAUDE.md mistake
-                // ("I could not determine X" folded into "X is false") the
-                // day one of those errors actually occurs.
+                // `canonicalize(abs)` above only needs search permission on
+                // `abs`'s *parents* — it never traverses into `abs` itself,
+                // only looks it up within its parent. So a directory `abs`
+                // that denies search on itself still canonicalises cleanly,
+                // and this is the probe that then hits `PermissionDenied`:
+                // `abs.join(".git")` needs search on `abs` to look up
+                // `.git` inside it. Folding that into "not there, keep
+                // walking" would surface the repo one level up instead of
+                // refusing — see
+                // `an_unsearchable_target_directory_is_none_not_its_parent_repo`.
                 Err(_) => return None, // cannot tell — never guess "no project" past here
             }
             if probe == root {
                 break;
             }
+            // Invariant: this line only runs when `probe != root` and
+            // `probe` is confined under `root` (checked on loop entry and
+            // preserved by always stepping to `.parent()`), so `probe` is
+            // a strict descendant of `root` and always has a parent — at
+            // worst `root` itself. The `?` is a safety net, not a
+            // reachable early exit.
             probe = probe.parent()?;
         }
     }
@@ -1273,6 +1278,13 @@ mod tests {
                    Some(("uc-rel".into(), "a.md".into())));
     }
 
+    /// Covers the top-level `abs.canonicalize()` gate, plainly: `locked` is
+    /// an ancestor *above* `abs` (`abs` is `locked/inner`), so
+    /// `project_for_abs`'s own re-canonicalisation of `abs` is what fails
+    /// here with `PermissionDenied`, before the ancestor walk ever starts.
+    /// It does not exercise the walk's own `Err(_) => None` arm — see
+    /// `an_unsearchable_target_directory_is_none_not_its_parent_repo` below
+    /// for the probe that escapes this gate and reaches that arm instead.
     #[cfg(unix)]
     #[test]
     fn an_unreadable_ancestor_is_none_not_a_guess() {
@@ -1286,5 +1298,63 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         if nix_is_root() { return; } // root reads through 0o000; nothing to assert
         assert_eq!(got, None);
+    }
+
+    /// The escape the test above cannot reach: `canonicalize(abs)` only
+    /// needs search permission on `abs`'s *parents* (it looks `abs` up
+    /// within its parent, never traverses into it), so a target directory
+    /// that denies search on itself still canonicalises cleanly — `repo`
+    /// one level up keeps its own search permission throughout, untouched.
+    /// It's the walk's own first probe, `abs.join(".git")`, that needs
+    /// search on `abs` to look `.git` up inside it, and that is what hits
+    /// `PermissionDenied`. That must answer `None`, not fall through to the
+    /// real repo one level up.
+    ///
+    /// Revert check: changing the walk's `Err(_) => return None` arm to
+    /// `Err(_) => {}` (treat as `NotFound`, keep walking) turns this test
+    /// red —
+    /// `assertion `left == right` failed\n  left: Some(("repo", "locked"))\n right: None`
+    /// — exactly the wrong repo. Restored from a `cp` backup; see the fix
+    /// report for the full command and output.
+    #[cfg(unix)]
+    #[test]
+    fn an_unsearchable_target_directory_is_none_not_its_parent_repo() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("repo/.git")).unwrap();
+        let locked = root.path().join("repo/locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Don't pre-canonicalise: `project_for_abs` must do it itself, and
+        // that has to succeed here (it only needs search on `repo`, not on
+        // `locked`) for this to actually reach the walk's own check rather
+        // than the top gate the previous test covers.
+        let got = project_for_abs(&[root.path().to_path_buf()], &locked);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if nix_is_root() { return; } // root reads through 0o000; nothing to assert
+        assert_eq!(got, None);
+    }
+
+    /// Nested projects (`karpie/src`) are real roost URLs, so the worktree
+    /// exception's leading segment can be more than one: `karpie/src`
+    /// ahead of `.claude/worktrees/<name>` resolves, same as a single
+    /// leading segment does above — but a dot segment anywhere in that
+    /// leading part (`.x`) still isn't vouched for and stays refused.
+    #[test]
+    fn a_nested_projects_worktree_resolves_and_a_dot_segment_before_it_does_not() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = root.path().join("karpie/src/.claude/worktrees/w");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: ...").unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        assert_eq!(
+            project_for_abs(&roots, &wt.canonicalize().unwrap()).map(|p| p.0),
+            Some("karpie/src/.claude/worktrees/w".into())
+        );
+
+        let odd = root.path().join("karpie/.x/src/.claude/worktrees/w");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(odd.join(".git"), "gitdir: ...").unwrap();
+        assert_eq!(project_for_abs(&roots, &odd.canonicalize().unwrap()), None);
     }
 }
