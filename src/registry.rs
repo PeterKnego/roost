@@ -621,26 +621,44 @@ fn write_origin_identity(key_dir: &std::path::Path, dir: &std::path::Path) {
 #[cfg(not(unix))]
 fn write_origin_identity(_key_dir: &std::path::Path, _dir: &std::path::Path) {}
 
-/// True when a project the sweep is about to call gone was **moved**, or when
-/// that cannot be ruled out — either way, nothing may be killed (#178).
+/// What a live shell says about a project whose recorded path is `NotFound`.
+///
+/// Three-valued on purpose (see CLAUDE.md, "absence of evidence is not
+/// evidence of absence"): "cannot tell" must never collapse into "no
+/// evidence of a move", because the two license opposite actions — the first
+/// suspends the kill, the second lets the sweep proceed as before #178.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MoveEvidence {
+    /// No evidence of a move (no identity recorded, or no shell inside it).
+    None,
+    /// The recorded directory is alive at this absolute path.
+    Moved(std::path::PathBuf),
+    /// Could not tell (unnamed shell, unreadable cwd, unreadable key dir).
+    CannotTell,
+}
+
+/// Where a project the sweep is about to call gone actually went, according
+/// to a live session's shell — or whether that cannot be ruled out, in which
+/// case nothing may be killed (#178).
 ///
 /// The evidence is a live session's shell: its `/proc/<pid>/cwd` still resolves
 /// (not `… (deleted)`), and some directory on that path has the
-/// `(device, inode)` recorded for the project. A rename keeps the inode; a
-/// delete destroys it. No recorded identity (a marker from an older roost) is
-/// no evidence, and the sweep proceeds exactly as before. A shell roost cannot
-/// name, or a cwd it cannot read, is "cannot tell" and suspends the kill: a
-/// stale row is recoverable, a killed shell is not.
+/// `(device, inode)` recorded for the project — that directory is the new
+/// path. A rename keeps the inode; a delete destroys it. No recorded identity
+/// (a marker from an older roost) is no evidence, and the sweep proceeds
+/// exactly as before. A shell roost cannot name, or a cwd it cannot read, is
+/// "cannot tell" and suspends the kill: a stale row is recoverable, a killed
+/// shell is not.
 #[cfg(unix)]
-fn moved_not_deleted(key_dir: &std::path::Path, snapshot: &[(u32, String)], proc_root: &std::path::Path) -> bool {
+pub(crate) fn move_evidence(key_dir: &std::path::Path, snapshot: &[(u32, String)], proc_root: &std::path::Path) -> MoveEvidence {
     use std::os::unix::fs::MetadataExt;
     let Some((dev, ino)) = std::fs::read_to_string(origin_identity_path(key_dir)).ok().and_then(|s| {
         let mut it = s.split_whitespace();
         Some((it.next()?.parse::<u64>().ok()?, it.next()?.parse::<u64>().ok()?))
     }) else {
-        return false;
+        return MoveEvidence::None;
     };
-    let Ok(entries) = std::fs::read_dir(key_dir) else { return true };
+    let Ok(entries) = std::fs::read_dir(key_dir) else { return MoveEvidence::CannotTell };
     let own = match crate::procsess::session_of(proc_root, std::process::id()) {
         crate::procsess::Sid::In(s) => Some(s),
         _ => None,
@@ -653,12 +671,12 @@ fn moved_not_deleted(key_dir: &std::path::Path, snapshot: &[(u32, String)], proc
         if pids.is_empty() {
             continue;
         }
-        let Some(shells) = crate::procsess::target_sessions(proc_root, &pids, own) else { return true };
+        let Some(shells) = crate::procsess::target_sessions(proc_root, &pids, own) else { return MoveEvidence::CannotTell };
         for shell in shells {
             let cwd = match std::fs::read_link(proc_root.join(shell.to_string()).join("cwd")) {
                 Ok(p) => p,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => return true,
+                Err(_) => return MoveEvidence::CannotTell,
             };
             if cwd.to_string_lossy().ends_with(" (deleted)") {
                 continue;
@@ -667,19 +685,27 @@ fn moved_not_deleted(key_dir: &std::path::Path, snapshot: &[(u32, String)], proc
             while let Some(p) = at {
                 if let Ok(m) = std::fs::symlink_metadata(p) {
                     if m.dev() == dev && m.ino() == ino {
-                        return true;
+                        return MoveEvidence::Moved(p.to_path_buf());
                     }
                 }
                 at = p.parent();
             }
         }
     }
-    false
+    MoveEvidence::None
 }
 
 #[cfg(not(unix))]
-fn moved_not_deleted(_key_dir: &std::path::Path, _snapshot: &[(u32, String)], _proc_root: &std::path::Path) -> bool {
-    false
+pub(crate) fn move_evidence(_key_dir: &std::path::Path, _snapshot: &[(u32, String)], _proc_root: &std::path::Path) -> MoveEvidence {
+    MoveEvidence::None
+}
+
+/// True when a project the sweep is about to call gone was **moved**, or when
+/// that cannot be ruled out — either way, nothing may be killed (#178).
+/// Delegates to `move_evidence`, keeping only the yes/no the sweep needs; a
+/// later caller (#158) wants the "moved to where" that `move_evidence` keeps.
+fn moved_not_deleted(key_dir: &std::path::Path, snapshot: &[(u32, String)], proc_root: &std::path::Path) -> bool {
+    !matches!(move_evidence(key_dir, snapshot, proc_root), MoveEvidence::None)
 }
 
 /// Records the resolved absolute directory a project maps to, so a *later*
@@ -2314,6 +2340,40 @@ mod tests {
 
             assert_eq!(report.gone_projects, 0, "a moved project is not a gone project");
             assert!(socket_has_process(&sock_path), "the shell working in the moved directory must survive");
+            kill_test_pids(&sock_path);
+        });
+    }
+
+    /// `move_evidence` names the *new* path, not just yes/no — #158 needs
+    /// that to follow the rename. The shell sits in a subdirectory, so this
+    /// also pins down which ancestor the match has to be: the one carrying
+    /// the recorded inode, not the cwd itself.
+    ///
+    /// Revert-checked: returning `MoveEvidence::Moved(cwd.clone())` instead
+    /// of the matching ancestor fails this test with
+    /// `Moved(".../ev-renamed/sub")` where `Moved(".../ev-renamed")` was
+    /// expected — the cwd one level too deep, because `sub` itself does not
+    /// carry the recorded inode, only its parent does.
+    #[test]
+    fn move_evidence_names_the_new_directory() {
+        with_state(|state| {
+            let sock_dir = state.join("sock/ev-proj");
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            let root = tempfile::tempdir().unwrap();
+            let project_dir = root.path().join("ev-proj");
+            fs::create_dir_all(project_dir.join("sub")).unwrap();
+            // The shell sits in a subdirectory: the evidence is the ancestor
+            // that carries the recorded inode, not the cwd itself.
+            spawn_detached_dtach_in(&sock_path, &project_dir.join("sub")).expect("dtach must be available");
+            let _ = reconcile(&[root.path().to_path_buf()]);
+            let moved_to = root.path().join("ev-renamed");
+            fs::rename(&project_dir, &moved_to).unwrap();
+            let snap = process_snapshot().expect("ps");
+            assert_eq!(
+                move_evidence(&sock_dir, &snap, std::path::Path::new("/proc")),
+                MoveEvidence::Moved(moved_to.canonicalize().unwrap()),
+            );
             kill_test_pids(&sock_path);
         });
     }
