@@ -68,7 +68,10 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   and left every running Claude unreachable by Alt+K. Persisting it widens
   nothing: the same user can already read it from `~/.claude/ide/<port>.lock`,
   and the browser half of the CVE is closed by the Origin refusal, not by the
-  token being fresh.
+  token being fresh. That argument holds only because the lock file is as
+  private as the token file: `idelock::write_body` creates it 0600 (it took
+  the umask until #184, which left it 0664), and never chmods the shared
+  `~/.claude/ide` it did not create — it warns once if that is open.
 - **Every filesystem path is confined** before use: `projects::safe_resolve`
   for existing targets, `projects::safe_resolve_parent` for creation and rename
   destinations (it canonicalises the parent and validates the final component,
