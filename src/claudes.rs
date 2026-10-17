@@ -527,6 +527,32 @@ enum GoneOwner {
 /// "Cannot tell" from either suspends; it never folds into "not moved".
 /// Off every lock (called from `tick`, inside its `catch_unwind`).
 fn follow_gone_owner(home: &str, name: &str, owner: &str, procs: &[ClaudeProc]) -> GoneOwner {
+    let out = follow_gone_owner_inner(home, name, owner, procs);
+    if out != GoneOwner::Suspend {
+        // The record was followed or is about to be forgotten: a later
+        // suspension of it is news again.
+        let mut g = suspended_logged().lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|(h, n, _)| !(h == home && n == name));
+    }
+    out
+}
+
+/// `(home, name, reason)` already logged as suspended, so a record that
+/// stays "cannot tell" says so once rather than every `POLL`.
+fn suspended_logged() -> &'static Mutex<HashSet<(String, String, &'static str)>> {
+    static S: OnceLock<Mutex<HashSet<(String, String, &'static str)>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn suspend(home: &str, name: &str, reason: &'static str, why: &str) -> GoneOwner {
+    let first = suspended_logged().lock().unwrap_or_else(|e| e.into_inner()).insert((home.to_string(), name.to_string(), reason));
+    if first {
+        eprintln!("roost: not forgetting {home}/{name}'s re-home record: {why}");
+    }
+    GoneOwner::Suspend
+}
+
+fn follow_gone_owner_inner(home: &str, name: &str, owner: &str, procs: &[ClaudeProc]) -> GoneOwner {
     let roots = crate::projects::roots();
     match crate::registry::record_move(&roots, owner) {
         crate::registry::MoveRecord::Followable(m) => {
@@ -535,26 +561,41 @@ fn follow_gone_owner(home: &str, name: &str, owner: &str, procs: &[ClaudeProc]) 
             }
             return rewrite_owner(home, name, owner, &m.new_url);
         }
-        crate::registry::MoveRecord::CannotTell => return GoneOwner::Suspend,
+        crate::registry::MoveRecord::CannotTell => {
+            return suspend(home, name, "owner-sessions", &format!("whether {owner} was renamed cannot be told from its own sessions"));
+        }
         crate::registry::MoveRecord::NoEvidence | crate::registry::MoveRecord::Unfollowable => {}
     }
     let (dev, ino) = match crate::home::identity_of(home, name) {
         Ok(Some(id)) => id,
         Ok(None) => return GoneOwner::NotMoved,
-        Err(e) => {
-            eprintln!("roost: kept {home}/{name}'s re-home record this tick: its owner identity cannot be read ({e})");
-            return GoneOwner::Suspend;
-        }
+        Err(e) => return suspend(home, name, "identity", &format!("its owner identity cannot be read ({e})")),
     };
     let Some(c) = procs.iter().find(|c| c.project == home && c.session == name) else { return GoneOwner::NotMoved };
-    let Some(cwd) = &c.cwd else { return GoneOwner::Suspend };
+    let Some(cwd) = &c.cwd else {
+        return suspend(home, name, "cwd", "its Claude's cwd cannot be read");
+    };
     if cwd.to_string_lossy().ends_with(" (deleted)") {
         return GoneOwner::NotMoved;
     }
-    let found = {
+    // Three outcomes per ancestor, as everywhere a "not found" licenses a
+    // forget: absent → keep walking; cannot look → the match may be right
+    // there, so suspend; present → compare.
+    let mut found = None;
+    for p in cwd.ancestors() {
         use std::os::unix::fs::MetadataExt;
-        cwd.ancestors().find(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.dev() == dev && m.ino() == ino))
-    };
+        match std::fs::symlink_metadata(p) {
+            Ok(m) if m.dev() == dev && m.ino() == ino => {
+                found = Some(p);
+                break;
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return suspend(home, name, "ancestor", &format!("{} on its Claude's cwd cannot be looked at ({e})", p.display()));
+            }
+        }
+    }
     let Some(new_dir) = found else { return GoneOwner::NotMoved };
     let Some(to) = crate::registry::url_under_roots(&roots, new_dir)
         .filter(|u| u != owner)
@@ -592,6 +633,8 @@ fn rewrite_owner(home: &str, name: &str, owner: &str, to: &str) -> GoneOwner {
         crate::home::Owner::Elsewhere(_) => return GoneOwner::Followed,
         _ => return GoneOwner::NotMoved,
     }
+    // `.<name>.ino` is left as it is: a rename keeps the inode, and
+    // `git worktree move` cannot cross devices.
     match crate::home::record(home, name, to) {
         Ok(()) => {
             eprintln!("roost: {home}/{name}'s owner {owner} was renamed to {to}; the record follows it");
@@ -1846,6 +1889,52 @@ mod tests {
         assert_eq!(followed, crate::home::Owner::Elsewhere(b.clone()), "the record follows the rename instead of being forgotten");
         assert_eq!(suspended, crate::home::Owner::Elsewhere(a.clone()), "an unreadable cwd keeps the record this tick");
         assert!(!key_dir.exists(), "A never had a key directory, so no .moved-to is made for it");
+    }
+
+    /// The identity walk keeps CLAUDE.md's third outcome: an ancestor of the
+    /// Claude's cwd that cannot be stat'd may be exactly the renamed
+    /// directory, so it suspends the forget for this tick rather than reading
+    /// as "no match". Here the worktree is moved under a directory then made
+    /// unsearchable, so the match itself is behind the `EACCES`.
+    ///
+    /// Revert-checked, run and restored: with the walk back to
+    /// `symlink_metadata(p).is_ok_and(..)`, fails "an unreadable ancestor
+    /// keeps the record" — left `Here`, the record forgotten.
+    #[test]
+    fn an_unreadable_ancestor_suspends_rather_than_forgets() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let home = "r158-locked-home";
+        let home_dir = r158_repo(root.path(), home);
+        let a = format!("{home}/.claude/worktrees/worktree-a");
+        crate::hub::rehome_to(home, "term3", &a).unwrap();
+        let locked = root.path().canonicalize().unwrap().join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let b_dir = locked.join("worktree-b");
+        assert!(std::process::Command::new("git").arg("-C").arg(&home_dir)
+            .args(["worktree", "move", ".claude/worktrees/worktree-a", b_dir.to_str().unwrap()]).status().unwrap().success());
+        std::fs::create_dir_all(b_dir.join("sub")).unwrap();
+        let procs = vec![ClaudeProc { project: home.into(), session: "term3".into(), owner: a.clone(), sse_port: None, cwd: Some(b_dir.join("sub")) }];
+        let home_dir_of = |p: &str| (p == home).then(|| home_dir.clone());
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blind = matches!(std::fs::symlink_metadata(&b_dir), Err(ref e) if e.kind() != std::io::ErrorKind::NotFound);
+        if blind {
+            sweep_gone_owners(&home_dir_of, &Mutex::new(HashSet::new()), &procs);
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let got = crate::home::owner_of(home, "term3");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        if !blind {
+            eprintln!("skipped: this user can search a 0o000 directory");
+            return;
+        }
+        assert_eq!(got, crate::home::Owner::Elsewhere(a.clone()), "an unreadable ancestor keeps the record");
     }
 
     /// The reader half, with `.moved-to` written by hand and no session

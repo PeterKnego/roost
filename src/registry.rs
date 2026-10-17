@@ -206,10 +206,11 @@ fn key_has_sockets(key_dir: &std::path::Path) -> bool {
 pub(crate) enum MoveRecord {
     /// No evidence of a move: the sweep proceeds as before #178.
     NoEvidence,
-    /// Could not tell; suspend anything that would act on "not moved".
+    /// Could not tell — or moved followably but `.moved-to` could not be
+    /// written; suspend anything that would act on "not moved".
     CannotTell,
-    /// Moved, but not somewhere roost can follow (outside the roots, or the
-    /// record could not be written). Alive, stranded, as #178 leaves it.
+    /// Moved, but not somewhere roost can follow (outside the roots). Alive,
+    /// stranded, as #178 leaves it.
     Unfollowable,
     /// Moved to a project under the roots; `.moved-to` now names it.
     Followable(Moved),
@@ -227,12 +228,16 @@ pub(crate) fn record_move_with(
     key_dir: &std::path::Path,
     snapshot: &[(u32, String)],
     proc_root: &std::path::Path,
+    log: bool,
 ) -> MoveRecord {
+    // `log` is reconcile's: the R18 sweep words (and rate-limits) its own,
+    // since "not reaping" is the wrong verb for a record it is not forgetting.
+    let say = |m: String| if log { eprintln!("{m}") };
     let key = key_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let new_dir = match move_evidence(key_dir, snapshot, proc_root) {
         MoveEvidence::None => return MoveRecord::NoEvidence,
         MoveEvidence::CannotTell => {
-            eprintln!("roost: not reaping {key} — its directory is gone, but whether it was moved cannot be told from its sessions' shells");
+            say(format!("roost: not reaping {key} — its directory is gone, but whether it was moved cannot be told from its sessions' shells"));
             return MoveRecord::CannotTell;
         }
         MoveEvidence::Moved(d) => d,
@@ -243,13 +248,13 @@ pub(crate) fn record_move_with(
         .filter(|u| u != old_url)
         .filter(|u| crate::projects::resolve_project(roots, u).as_deref() == Some(new_dir.as_path()));
     let Some(new_url) = new_url else {
-        eprintln!(
+        say(format!(
             "roost: not reaping {key} — its directory was moved to {}, not deleted; moved outside the roots, not following",
             new_dir.display()
-        );
+        ));
         return MoveRecord::Unfollowable;
     };
-    eprintln!("roost: not reaping {key} — its directory was moved to {new_url}, not deleted");
+    say(format!("roost: not reaping {key} — its directory was moved to {new_url}, not deleted"));
     let mut live: Vec<String> = std::fs::read_dir(key_dir)
         .map(|rd| {
             rd.flatten()
@@ -262,9 +267,12 @@ pub(crate) fn record_move_with(
     live.sort();
     match write_moved_to(key_dir, &new_url) {
         Ok(fresh) => MoveRecord::Followable(Moved { old_url: old_url.to_string(), new_url, live, fresh }),
+        // Positive evidence of a followable rename that could not be
+        // recorded is not "unfollowable": R18 must keep the record and try
+        // again, not forget a terminal whose worktree is alive under B.
         Err(e) => {
-            eprintln!("roost: {key} was moved to {new_url}, but its .moved-to could not be written ({e}); not following");
-            MoveRecord::Unfollowable
+            say(format!("roost: {key} was moved to {new_url}, but its .moved-to could not be written ({e}); not following yet"));
+            MoveRecord::CannotTell
         }
     }
 }
@@ -282,7 +290,7 @@ pub(crate) fn record_move(roots: &[PathBuf], old_url: &str) -> MoveRecord {
         Ok(_) => {}
     }
     let Some(snapshot) = process_snapshot() else { return MoveRecord::CannotTell };
-    record_move_with(roots, old_url, &key_dir, &snapshot, std::path::Path::new("/proc"))
+    record_move_with(roots, old_url, &key_dir, &snapshot, std::path::Path::new("/proc"), false)
 }
 
 fn moved_to_marker_path(key_dir: &std::path::Path) -> PathBuf {
@@ -299,7 +307,7 @@ pub(crate) fn write_moved_to(key_dir: &std::path::Path, new_url: &str) -> Result
     if std::fs::read(&marker).map(|cur| cur == bytes).unwrap_or(false) {
         return Ok(false);
     }
-    let tmp = key_dir.join(format!(".moved-to.tmp.{}", std::process::id()));
+    let tmp = key_dir.join(format!(".moved-to.tmp.{}", crate::wsstate::tmp_suffix()));
     let out = (|| {
         std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
         #[cfg(unix)]
@@ -751,7 +759,7 @@ fn write_origin(key_dir: &std::path::Path, dir: &std::path::Path) {
     // strand one of these, but it is a dotfile (skipped by every enumeration
     // of this directory) and the unchanged-content skip above means the
     // write path runs at most once per changed resolution, not once per pass.
-    let tmp = key_dir.join(format!(".origin.tmp.{}", std::process::id()));
+    let tmp = key_dir.join(format!(".origin.tmp.{}", crate::wsstate::tmp_suffix()));
     if std::fs::write(&tmp, &bytes).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return;
@@ -786,7 +794,7 @@ fn write_origin_identity(key_dir: &std::path::Path, dir: &std::path::Path) {
     if std::fs::read(&marker).map(|cur| cur == bytes).unwrap_or(false) {
         return;
     }
-    let tmp = key_dir.join(format!(".origin-ino.tmp.{}", std::process::id()));
+    let tmp = key_dir.join(format!(".origin-ino.tmp.{}", crate::wsstate::tmp_suffix()));
     if std::fs::write(&tmp, &bytes).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return;
@@ -1238,7 +1246,7 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
         // counts.
         let project_gone = roots_ok
             && confirmed_gone(&entry.path(), roots, &url)
-            && match record_move_with(roots, &url, &entry.path(), &snapshot, std::path::Path::new("/proc")) {
+            && match record_move_with(roots, &url, &entry.path(), &snapshot, std::path::Path::new("/proc"), true) {
                 MoveRecord::NoEvidence => true,
                 // Moved (followable or not) or cannot tell: never killed.
                 MoveRecord::CannotTell | MoveRecord::Unfollowable => false,
@@ -2730,6 +2738,45 @@ mod tests {
             assert_eq!(got, crate::home::Owner::Elsewhere(b.into()), "R18 follows the rename it found first");
             assert_eq!(moved_to.as_deref(), Some(&*format!("{b}\n")), "and records it, as reconcile would have");
             assert_eq!(shell, crate::home::Owner::Elsewhere(b.into()), "A's own session follows too");
+        });
+    }
+
+    /// Positive evidence of a followable rename whose `.moved-to` cannot be
+    /// written is "cannot tell", not "unfollowable": the R18 sweep must keep
+    /// the record and retry, rather than forget a terminal whose worktree is
+    /// alive under its new name. The key directory is made read-only, so the
+    /// temp file cannot be created.
+    ///
+    /// Revert-checked, run and restored: with the write-failure arm back to
+    /// `MoveRecord::Unfollowable`, fails "an unrecordable rename is cannot
+    /// tell" — observed `Unfollowable`.
+    #[test]
+    fn a_rename_that_cannot_be_recorded_is_cannot_tell() {
+        use std::os::unix::fs::PermissionsExt;
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let roots = vec![root.path().to_path_buf()];
+            let repo = repo_with_worktree_a(root.path(), "rorepo");
+            let a = "rorepo/.claude/worktrees/worktree-a";
+            let sock_dir = state.join("sock").join(crate::projects::storage_key(a));
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            spawn_detached_dtach_in(&sock_path, &repo.join(".claude/worktrees/worktree-a"))
+                .unwrap_or_else(|| panic!("dtach must be available for this test"));
+            let _ = reconcile(&roots);
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+
+            fs::set_permissions(&sock_dir, fs::Permissions::from_mode(0o500)).unwrap();
+            let writable = fs::write(sock_dir.join(".probe"), "").is_ok();
+            let snap = process_snapshot().expect("ps");
+            let got = record_move_with(&roots, a, &sock_dir, &snap, std::path::Path::new("/proc"), false);
+            fs::set_permissions(&sock_dir, fs::Permissions::from_mode(0o700)).unwrap();
+            kill_test_pids(&sock_path);
+            if writable {
+                eprintln!("skipped: this user can write a 0o500 directory");
+                return;
+            }
+            assert!(matches!(got, MoveRecord::CannotTell), "an unrecordable rename is cannot tell: {got:?}");
         });
     }
 

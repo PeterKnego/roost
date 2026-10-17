@@ -48,7 +48,7 @@ pub fn record_in(state: &Path, home: &str, name: &str, owner: &str) -> Result<()
     }
     let dir = dir_in(state, home);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
+    let tmp = dir.join(format!(".{name}.tmp.{}", crate::wsstate::tmp_suffix()));
     std::fs::write(&tmp, format!("{owner}\n")).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, dir.join(name)).map_err(|e| { let _ = std::fs::remove_file(&tmp); e.to_string() })
 }
@@ -80,7 +80,7 @@ pub fn record_identity_in(state: &Path, home: &str, name: &str, owner_dir: &Path
     let m = std::fs::metadata(owner_dir).map_err(|e| e.to_string())?;
     let dir = dir_in(state, home);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let tmp = dir.join(format!(".{name}.ino.tmp.{}", std::process::id()));
+    let tmp = dir.join(format!(".{name}.ino.tmp.{}", crate::wsstate::tmp_suffix()));
     let out = (|| {
         std::fs::write(&tmp, format!("{} {}\n", m.dev(), m.ino())).map_err(|e| e.to_string())?;
         use std::os::unix::fs::PermissionsExt;
@@ -351,7 +351,7 @@ fn copy_if_absent(src: &Path, dst: &Path) -> Result<bool, String> {
     let dir = dst.parent().ok_or("no parent")?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let leaf = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = dir.join(format!(".{leaf}.copy.tmp.{}", std::process::id()));
+    let tmp = dir.join(format!(".{leaf}.copy.tmp.{}", crate::wsstate::tmp_suffix()));
     let out = (|| {
         std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
         #[cfg(unix)]
@@ -414,6 +414,8 @@ pub fn follow_move_in(state: &Path, old_url: &str, new_url: &str, live: &[String
         if !matches!(owner_of_in(state, &home, &name), Owner::Elsewhere(ref o) if o == old_url) {
             continue;
         }
+        // `.<name>.ino` is left as it is: a rename keeps the inode, and
+        // `git worktree move` cannot cross devices.
         match record_in(state, &home, &name, new_url) {
             Ok(()) => changed = true,
             Err(e) => eprintln!("roost: {home}/{name}'s owner {old_url} was renamed to {new_url}, but its record was not rewritten: {e}"),
