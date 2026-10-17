@@ -408,16 +408,32 @@ fn copy_if_absent(src: &Path, dst: &Path) -> Result<bool, String> {
 /// `.base` and layout when it has none. `new_live` is `session::live_names
 /// (new_url)` — the R16 gate. Idempotent; returns whether anything changed.
 ///
+/// `prev` is the target an earlier follow re-pointed things at, when that
+/// target has since been renamed on (A→B→C, `prev` = B): what that follow
+/// wrote is this follow's to move on, in both (a) and (b).
+///
 /// Records and copies only: no hub, no lock, no git. Its caller
 /// (`registry::follow_moves`) refreshes hubs afterwards, one at a time.
-pub fn follow_move_in(state: &Path, old_url: &str, new_url: &str, live: &[String], new_live: &[String]) -> bool {
+pub fn follow_move_in(
+    state: &Path,
+    old_url: &str,
+    new_url: &str,
+    live: &[String],
+    new_live: &[String],
+    prev: Option<&str>,
+) -> bool {
     let mut changed = false;
-    // (a) Only a session that is `Here` follows. `Elsewhere(other)` was
-    // re-homed by its own Claude's move and stays where that put it;
-    // `Unknown` is "cannot tell", and cannot-tell writes nothing.
+    let prev = prev.filter(|p| *p != new_url);
+    let followed_before = |o: &str| prev == Some(o);
+    // (a) A session that is `Here` follows, and so does one an earlier
+    // follow sent to `prev`. Any other `Elsewhere` was re-homed by its own
+    // Claude's move and stays where that put it; `Unknown` is "cannot
+    // tell", and cannot-tell writes nothing.
     for n in live {
-        if !matches!(owner_of_in(state, old_url, n), Owner::Here) {
-            continue;
+        match owner_of_in(state, old_url, n) {
+            Owner::Here => {}
+            Owner::Elsewhere(ref o) if followed_before(o) => {}
+            _ => continue,
         }
         // R16: a resident never shadows a native session of the same name.
         if new_live.contains(n) {
@@ -433,8 +449,13 @@ pub fn follow_move_in(state: &Path, old_url: &str, new_url: &str, live: &[String
     // into the moved worktree). Re-read right before each write, like the
     // R18 sweep's compare-before-forget: a record re-pointed since the scan
     // names somewhere else and is not this move's to rewrite.
+    let ours = |o: &Owner| matches!(o, Owner::Elsewhere(o) if o == old_url || followed_before(o));
     for (home, name, owner) in all_in(state) {
-        if !matches!(&owner, Owner::Elsewhere(o) if o == old_url) {
+        if !ours(&owner) {
+            continue;
+        }
+        // The old key's own sessions are (a)'s, with its R16 gate.
+        if home == old_url {
             continue;
         }
         // Only to an owner a record of this home may name at all: anything
@@ -444,7 +465,7 @@ pub fn follow_move_in(state: &Path, old_url: &str, new_url: &str, live: &[String
             eprintln!("roost: {home}/{name}'s owner {old_url} was renamed to {new_url}, outside {home}/.claude/worktrees; not following");
             continue;
         }
-        if !matches!(owner_of_in(state, &home, &name), Owner::Elsewhere(ref o) if o == old_url) {
+        if !ours(&owner_of_in(state, &home, &name)) {
             continue;
         }
         // `.<name>.ino` is left as it is: a rename keeps the inode, and
@@ -473,9 +494,9 @@ pub fn follow_move_in(state: &Path, old_url: &str, new_url: &str, live: &[String
 /// [`follow_move_in`] against the real state dir, with the R16 gate read
 /// from the new project's own live sessions. Never call under a lock:
 /// `session::live_names` takes `SESSIONS`.
-pub fn follow_move(old_url: &str, new_url: &str, live: &[String]) -> bool {
+pub fn follow_move(old_url: &str, new_url: &str, live: &[String], prev: Option<&str>) -> bool {
     let new_live = crate::session::live_names(new_url);
-    follow_move_in(&crate::wsstate::state_dir(), old_url, new_url, live, &new_live)
+    follow_move_in(&crate::wsstate::state_dir(), old_url, new_url, live, &new_live, prev)
 }
 
 #[cfg(test)]
@@ -784,7 +805,7 @@ mod tests {
         std::fs::write(s.join(format!("{nk}.json")), r#"{"new":1}"#).unwrap();
 
         let live: Vec<String> = ["shell", "busy", "away", "unsure"].map(String::from).to_vec();
-        assert!(follow_move_in(s, old, new, &live, &["busy".to_string()]));
+        assert!(follow_move_in(s, old, new, &live, &["busy".to_string()], None));
 
         assert_eq!(owner_of_in(s, old, "shell"), Owner::Elsewhere(new.into()), "(a) a live session follows");
         assert_eq!(owner_of_in(s, old, "busy"), Owner::Here, "R16: the new key's native busy is not shadowed");
@@ -796,10 +817,10 @@ mod tests {
         assert_eq!(crate::worktree::read_base(s, &nk).as_deref(), Some("main"), "(c) the base is copied to a key that had none");
         assert_eq!(std::fs::read_to_string(s.join(format!("{nk}.json"))).unwrap(), r#"{"new":1}"#, "the new key's own layout is never overwritten");
 
-        assert!(!follow_move_in(s, old, new, &live, &["busy".to_string()]), "a second pass changes nothing");
+        assert!(!follow_move_in(s, old, new, &live, &["busy".to_string()], None), "a second pass changes nothing");
 
         std::fs::remove_file(s.join(format!("{nk}.json"))).unwrap();
-        assert!(follow_move_in(s, old, new, &live, &[]));
+        assert!(follow_move_in(s, old, new, &live, &[], None));
         assert_eq!(std::fs::read_to_string(s.join(format!("{nk}.json"))).unwrap(), r#"{"old":1}"#, "(d) the layout is copied to a key that had none");
         assert_eq!(owner_of_in(s, old, "busy"), Owner::Elsewhere(new.into()), "once the name is free there, it follows too");
         assert!(std::fs::read_dir(s).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(".tmp.")), "no temp file left behind");

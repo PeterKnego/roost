@@ -556,9 +556,9 @@ fn follow_gone_owner_inner(home: &str, name: &str, owner: &str, procs: &[ClaudeP
     let roots = crate::projects::roots();
     match crate::registry::record_move(&roots, owner) {
         crate::registry::MoveRecord::Followable(m) => {
-            if m.fresh {
-                crate::registry::follow_moves(std::slice::from_ref(&m));
-            }
+            // Fresh or not: `follow_moves` itself follows quietly whatever
+            // an earlier pass left unfollowed, and announces only fresh.
+            crate::registry::follow_moves(std::slice::from_ref(&m));
             return rewrite_owner(home, name, owner, &m.new_url);
         }
         crate::registry::MoveRecord::CannotTell => {

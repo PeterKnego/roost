@@ -3470,6 +3470,20 @@ impl Hub {
         events
     }
 
+    /// A worktree in the known set was renamed (#158 §5): any of `olds`
+    /// becomes `new`, so the rename is never announced as a worktree that
+    /// appeared. Returns whether this hub knew one of them.
+    pub fn rename_known_worktree(&mut self, olds: &[std::path::PathBuf], new: &std::path::Path) -> bool {
+        let Some(known) = &mut self.known_worktrees else { return false };
+        let before = known.len();
+        known.retain(|p| !olds.contains(p));
+        if known.len() == before {
+            return false;
+        }
+        known.insert(new.to_path_buf());
+        true
+    }
+
     /// `confirm_worktrees`, then tell this project's browsers.
     pub fn apply_worktrees(&mut self, seen: Option<Vec<SeenWorktree>>) {
         for ev in self.confirm_worktrees(seen) {
@@ -3814,6 +3828,23 @@ pub fn proposal_by_id(project: &str, id: &str) -> Option<ProposalSides> {
 /// The registry lock is dropped before any hub lock is taken. `for_project`
 /// already established that order (registry, then hub); taking them the other
 /// way round here would deadlock against a connection racing in.
+/// [`Hub::rename_known_worktree`] on every open hub — whichever main
+/// checkout listed the renamed worktree. Registry, then one hub at a time,
+/// never both, like `broadcast_all`. Call with no lock held.
+pub fn rename_known_worktree(olds: &[std::path::PathBuf], new: &std::path::Path) {
+    if olds.is_empty() {
+        return;
+    }
+    let Some(reg) = REGISTRY.get() else { return };
+    let hubs: Vec<Arc<Mutex<Hub>>> = {
+        let map = reg.lock().unwrap_or_else(|e| e.into_inner());
+        map.values().cloned().collect()
+    };
+    for h in hubs {
+        Hub::lock(&h).rename_known_worktree(olds, new);
+    }
+}
+
 pub fn broadcast_all(ev: &Event) {
     let Some(reg) = REGISTRY.get() else { return };
     let hubs: Vec<Arc<Mutex<Hub>>> = {
@@ -11496,6 +11527,55 @@ mod tests {
         assert_eq!(got[0]["branch"], "far");
         assert!(got[0]["url"].is_null(), "outside the roots there is no project URL: {got:?}");
         ask_env_clear(&[]);
+    }
+
+    /// Final review M1: `git worktree move` rewrites only
+    /// `.git/worktrees/<id>/gitdir`, which the watcher ignores, so the main
+    /// checkout's known set kept A's path — and the next unrelated worktree
+    /// event announced B as having appeared. Following the rename (#158 §5)
+    /// re-points the known set; a genuinely new worktree is still announced.
+    ///
+    /// Revert-checked, run and restored: with the `rename_known_worktree`
+    /// call in `registry::follow_moves` removed, fails "a renamed worktree
+    /// is not one that appeared" — the banner for `worktree-a` (its branch)
+    /// at `.../worktree-b`.
+    #[test]
+    fn a_followed_rename_is_not_announced_as_a_new_worktree() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let repo = root.path().join("wt-renamed");
+        init_repo(&repo);
+        git_ok(&repo, &["worktree", "add", "-q", "-b", "worktree-a", ".claude/worktrees/worktree-a"]);
+        let (a, b) = ("wt-renamed/.claude/worktrees/worktree-a", "wt-renamed/.claude/worktrees/worktree-b");
+        let a_dir = repo.join(".claude/worktrees/worktree-a").canonicalize().unwrap();
+        let hub = register_for_test(Hub::new("wt-renamed", repo.clone()));
+        let (_c, rx) = conn(&mut Hub::lock(&hub));
+        Hub::lock(&hub).seed_worktrees(seen(&repo, root.path()));
+        // What a session's attach in A leaves behind: the key's `.origin`.
+        crate::registry::record_origin(a, &a_dir);
+
+        git_ok(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+        crate::registry::follow_moves(&[crate::registry::Moved {
+            old_url: a.into(),
+            new_url: b.into(),
+            live: vec![],
+            fresh: true,
+            prev: None,
+        }]);
+        drain(&rx);
+        Hub::lock(&hub).apply_worktrees(seen(&repo, root.path()));
+        let renamed = appeared(&rx);
+
+        git_ok(&repo, &["worktree", "add", "-q", "-b", "fresh", ".claude/worktrees/fresh"]);
+        Hub::lock(&hub).apply_worktrees(seen(&repo, root.path()));
+        let fresh = appeared(&rx);
+        ask_env_clear(&["wt-renamed"]);
+
+        assert!(renamed.is_empty(), "a renamed worktree is not one that appeared: {renamed:?}");
+        let branches: Vec<&str> = fresh.iter().filter_map(|v| v["branch"].as_str()).collect();
+        assert_eq!(branches, vec!["fresh"], "a new one still is, and only it: {fresh:?}");
     }
 
     /// Revert check (a): with `seed_worktrees` made a no-op, the first

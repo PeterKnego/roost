@@ -2865,6 +2865,7 @@ mod tests {
             new_url: new.into(),
             live: vec![],
             fresh: true,
+            prev: None,
         }]);
 
         let msg = rpc(
@@ -2880,8 +2881,26 @@ mod tests {
                 }
             }),
         );
-        let answer = dispatch(&msg, &mut conn).map(|v| v.to_string()).unwrap_or_default();
+        let reply = dispatch(&msg, &mut conn);
+        let answer = reply.as_ref().map(|v| v.to_string()).unwrap_or_default();
         assert!(!answer.contains("outside project"), "an openDiff under the new directory is not outside the project: {answer}");
+        // Not refused for any other reason either: an accepted proposal gets
+        // no reply yet (it waits for the browser) and is parked under this
+        // connection. Revert-checked, run and restored: with the retarget
+        // loop in `follow_moves` skipped, fails on the line above; with the
+        // file made unreadable (chmod 000) before the call — a refusal that
+        // is not "outside project" — fails "the proposal was accepted and
+        // parked" with `cannot show a diff of x.rs: …`.
+        assert!(reply.is_none(), "the proposal was accepted and parked, not answered: {answer}");
+        let parked: Vec<String> = pending()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, p)| p.conn_id == conn.id && p.tab_name == "p1")
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(parked.len(), 1, "the proposal was accepted and parked under this connection");
+        pending().lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| !parked.contains(k));
         let lock: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(idelock::ide_dir().join(format!("{}.lock", ide.port))).unwrap()).unwrap();
         assert_eq!(lock["workspaceFolders"], serde_json::json!([b.to_str().unwrap()]), "the lock file names the new directory");
