@@ -214,9 +214,7 @@ pub fn resolves_in(roots: &[PathBuf], home: &str, owner: &str) -> bool {
 /// the evidence git vouched; it was written only once `resolve_project`
 /// had, and is rewritten or removed by every `reconcile`.
 pub fn resolves_with(state: &Path, roots: &[PathBuf], home: &str, owner: &str) -> bool {
-    owner_dir_in(roots, home, owner).is_some()
-        || (moved_to_in(state, home).as_deref() == Some(owner)
-            && crate::projects::resolve_recorded_project(roots, owner).is_some())
+    owner_dir_with(state, roots, home, owner).is_some()
 }
 
 pub fn resolves(home: &str, owner: &str) -> bool {
@@ -279,6 +277,24 @@ pub fn owner_path(home: &str, owner: &str) -> Option<PathBuf> {
 /// so it leans toward keeping the session at the owner here exactly as
 /// `resolves_in` leans toward keeping it shown there).
 pub fn owner_dir_in(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
+    owner_dir_with(&crate::wsstate::state_dir(), roots, home, owner)
+}
+
+/// [`owner_dir_in`] with the state dir injected, and the one place the
+/// `.moved-to` widening (#158 §5) lives — so every caller, `resolves` and
+/// `ide.rs`'s delivery alike, sees a followed session's owner the same way.
+/// The `.claude/worktrees` shape is tried first; failing that, an owner
+/// equal to `home`'s `.moved-to` is its directory when that still resolves,
+/// through the fork-free `resolve_recorded_project` (see [`resolves_with`]).
+pub fn owner_dir_with(state: &Path, roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
+    shaped_owner_dir(roots, home, owner).or_else(|| {
+        (moved_to_in(state, home).as_deref() == Some(owner))
+            .then(|| crate::projects::resolve_recorded_project(roots, owner))
+            .flatten()
+    })
+}
+
+fn shaped_owner_dir(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
     let wt_dir = owner_path_in(roots, home, owner)?;
     match std::fs::symlink_metadata(&wt_dir) {
         Ok(m) if m.is_dir() => Some(wt_dir),
@@ -526,6 +542,39 @@ mod tests {
         assert_eq!(dir, wts.join("worktree-x"));
 
         assert!(owner_dir_in(&roots, "proj", "proj/.claude/worktrees/worktree-gone").is_none());
+    }
+
+    /// What `ide.rs`'s `delivery_target` and `hub::rehome_to` ask: a
+    /// followed session's owner directory is the new project's, so a
+    /// proposal from its Claude reaches the new project's hub rather than
+    /// falling back to the old key's, which never exists. The home here is
+    /// dotted — a renamed worktree — which the shape rule refuses outright.
+    ///
+    /// Revert-checked, run and restored: with `owner_dir_with`'s `.moved-to`
+    /// arm removed, fails "a followed session's owner is the new project's
+    /// directory" — left `None`, which `delivery_target` answers with the
+    /// old key.
+    #[test]
+    fn a_followed_sessions_owner_dir_is_the_new_projects_directory() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        let root = tempfile::tempdir().unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let old = "repo/.claude/worktrees/worktree-a";
+        let new = "repo/.claude/worktrees/worktree-b";
+        std::fs::create_dir_all(root.path().join(new)).unwrap();
+        std::fs::create_dir_all(root.path().join("unrelated")).unwrap();
+        assert_eq!(owner_dir_with(s, &roots, old, new), None, "setup: no .moved-to, no owner directory");
+
+        let p = moved_to_path(s, old);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, format!("{new}\n")).unwrap();
+        assert_eq!(
+            owner_dir_with(s, &roots, old, new),
+            Some(root.path().join(new).canonicalize().unwrap()),
+            "a followed session's owner is the new project's directory"
+        );
+        assert_eq!(owner_dir_with(s, &roots, old, "unrelated"), None, "and only that owner's");
     }
 
     /// Display-only, so "cannot tell" keeps the session where its record
@@ -811,8 +860,9 @@ mod tests {
     /// resolves only when `sock/<home key>/.moved-to` names exactly that
     /// owner, and that owner is still a directory under the roots.
     ///
-    /// Revert-checked, run and restored: accepting any owner once a
-    /// `.moved-to` exists (`is_some()` for the equality) fails "a .moved-to
+    /// Revert-checked, run and restored (re-run once the arm moved into
+    /// `owner_dir_with`): accepting any owner once a `.moved-to` exists
+    /// (`is_some()` for the equality) fails "a .moved-to
     /// vouches for its one owner, not any"; dropping the resolve check fails
     /// "a named owner that no longer resolves does not"; `resolve_project`
     /// in place of `resolve_recorded_project` fails "the record is git's

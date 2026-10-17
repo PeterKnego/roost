@@ -2605,8 +2605,9 @@ mod tests {
     /// `session::attach_existing` — what `term.rs` calls for it — reaches the
     /// session and refuses to start one.
     ///
-    /// Revert-checked, run and restored (Task 8): with the `.moved-to` arm of
-    /// `home::resolves_with` removed, fails "the new project lists the
+    /// Revert-checked, run and restored (Task 8, and again once the arm moved
+    /// into `owner_dir_with`): with the `.moved-to` arm of
+    /// `home::owner_dir_with` removed, fails "the new project lists the
     /// session as its resident" — the real resolver, not a stand-in, now
     /// carries it.
     ///

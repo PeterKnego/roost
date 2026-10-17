@@ -106,15 +106,24 @@ pub fn default_command(project: &str, name: &str) -> Vec<String> {
 /// `-a` takes no command — dtach refuses one with "Invalid number of
 /// arguments" and exits — so the shell and its arguments are dropped with
 /// the flag swap; the client options before them are kept.
-fn command_for(project: &str, name: &str, may_spawn: bool) -> Vec<String> {
+///
+/// Fails closed: a command without that shape (a `ROOST_CMD` override, or
+/// a `default_command` that changed) is an `Err` for `attach_existing`,
+/// never the unrewritten command, which could create a session.
+fn command_for(project: &str, name: &str, may_spawn: bool) -> Result<Vec<String>, String> {
     let mut cmd = default_command(project, name);
-    if !may_spawn && cmd.first().is_some_and(|c| c == "dtach") && cmd.get(1).is_some_and(|f| f == "-A") {
-        if let Some(z) = cmd.iter().position(|a| a == "-z") {
+    if may_spawn {
+        return Ok(cmd);
+    }
+    let z = cmd.iter().position(|a| a == "-z");
+    match (cmd.first().map(String::as_str), cmd.get(1).map(String::as_str), z) {
+        (Some("dtach"), Some("-A"), Some(z)) => {
             cmd[1] = "-a".into();
             cmd.truncate(z + 1);
+            Ok(cmd)
         }
+        _ => Err(format!("cannot attach without the risk of starting a session: {:?} is not a dtach -A command", cmd.first())),
     }
-    cmd
 }
 
 /// The executable a terminal's command names, found on `PATH` and only there.
@@ -664,8 +673,11 @@ fn attach_as(project: &str, name: &str, dir: &Path, renamed_to: Option<&str>) ->
     // Resolved before the lock, not at the spawn: the lookup stats every PATH
     // entry, and filesystem I/O under the global session lock stalls every
     // session's output. Consulted only if this attach turns out to spawn.
+    // Kept as a `Result` until the spawn: an `attach_existing` whose command
+    // cannot be made attach-only must refuse to spawn, but a `Join` spawns
+    // nothing and needs no command at all.
     let cmd = command_for(project, name, renamed_to.is_none());
-    let resolved = cmd.first().map(|c| resolve_command(c));
+    let resolved = cmd.as_ref().ok().and_then(|c| c.first()).map(|c| resolve_command(c));
 
     let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
     // Re-checked after the probe released the lock: a close may have started
@@ -682,6 +694,7 @@ fn attach_as(project: &str, name: &str, dir: &Path, renamed_to: Option<&str>) ->
     let spawned = !map.contains_key(&key);
     let mut launch = None;
     if spawned {
+        let cmd = cmd?;
         let program = match resolved {
             None => return Err("empty command".into()),
             Some(r) => r?,
@@ -2706,10 +2719,56 @@ mod tests {
         let _g = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("ROOST_CMD");
         let full = default_command("p", "shell");
-        assert_eq!(command_for("p", "shell", true), full, "attach still creates");
-        let existing = command_for("p", "shell", false);
+        assert_eq!(command_for("p", "shell", true).unwrap(), full, "attach still creates");
+        let existing = command_for("p", "shell", false).unwrap();
         assert_eq!(existing[..2], ["dtach", "-a"], "attach_existing's client must never create");
         assert_eq!(existing[2..], full[2..7], "the same socket and client options, and no command for -a to refuse");
+    }
+
+    /// `command_for` fails closed. With a command that is not `dtach -A`
+    /// (`ROOST_CMD=cat` here), `attach_existing` on a session that *is*
+    /// held — so the probe authorises the attach — must refuse rather than
+    /// run the command as it stands, which could create a session.
+    ///
+    /// Revert-checked, run and restored: with `command_for` returning the
+    /// unrewritten command for a shape it does not recognise, fails
+    /// "attach_existing ran a command it could not make attach-only" — it
+    /// spawned `cat` and took a map entry.
+    #[test]
+    fn attach_existing_refuses_a_command_it_cannot_make_attach_only() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let dir = tempfile::tempdir().unwrap();
+        let k = format!("failclosed{}", std::process::id());
+        let sock = sock_path(&k, "shell");
+        let _reap = ReapOnDrop(vec![sock.clone()]);
+        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let st = std::process::Command::new("dtach")
+            .args(["-n", sock.to_str().unwrap(), "sleep", "30"])
+            .status()
+            .unwrap_or_else(|e| panic!("dtach must be available for this test: {e}"));
+        assert!(st.success(), "test setup: dtach -n failed");
+        let mut waited = 0;
+        while !any_process_holds(&sock) && waited < 200 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            waited += 1;
+        }
+        assert!(any_process_holds(&sock), "test setup: a held socket, so only the command can refuse");
+
+        assert!(command_for(&k, "shell", false).is_ok(), "setup: the real dtach command is rewritable");
+        std::env::set_var("ROOST_CMD", "cat");
+        let got = attach_existing(&k, "shell", dir.path(), "renamed-elsewhere");
+        let spawned = has_session(&k, "shell");
+        std::env::remove_var("ROOST_CMD");
+        match got {
+            Ok(_) => panic!("attach_existing ran a command it could not make attach-only"),
+            Err(e) => assert!(e.contains("not a dtach -A command"), "{e}"),
+        }
+        assert!(!spawned, "no map entry, so nothing was spawned");
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     /// The test the whole re-home design rests on.

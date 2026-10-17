@@ -135,13 +135,22 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // `tests/integration.rs::reopening_a_closed_project_rebuilds_its_ide_listener`
     // is what fails if this goes.
     //
-    // Skipped for a renamed project's old URL: what it guarantees is the
-    // environment of a shell being *spawned*, and `attach_existing` spawns
-    // none. Run there it would start a listener for the old key over the
-    // new directory — a second IDE endpoint for a project that has its own.
-    if renamed_to.is_none() {
-        crate::ide::for_project(&project, dir.clone());
-    }
+    // Also run for a renamed project's old URL (#158 §5b), keyed by the old
+    // URL — the session's home, the key its port and token are persisted
+    // under — with the new directory as its workspace. The followed Claude's
+    // environment holds the old key's `CLAUDE_CODE_SSE_PORT`, and after a
+    // restart nothing else rebuilds the listener it redials: no hub is ever
+    // opened for a URL that no longer resolves. Skipping this left Alt+K
+    // dead for every followed Claude after every deploy (#170's failure).
+    //
+    // Accepted trade-off: that listener writes a second lock file whose
+    // workspace is the new directory, beside the new project's own, so a
+    // fresh `claude` started in the new project may pick either. Both reach
+    // roost and deliver to the new project's page (`delivery_target` follows
+    // the record to the owner). No collision with the new project's own
+    // listener: the registry, the port record and the token are all keyed by
+    // project, and the lock file is named by port.
+    crate::ide::for_project(&project, dir.clone());
     let attached = match &renamed_to {
         Some(new) => session::attach_existing(&project, name, &dir, new),
         None => session::attach(&project, name, &dir),

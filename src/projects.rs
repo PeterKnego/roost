@@ -216,8 +216,9 @@ pub fn resolve_project(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
 /// record stands in for git's vouching of a dot segment, so this never
 /// forks: it is what lets `home::resolves`, which runs under the hub
 /// registry lock, follow a rename into a `.claude/worktrees/` path. Every
-/// other check, confinement included, is unchanged.
-pub fn resolve_recorded_project(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
+/// other check, confinement included, is unchanged. The dot-segment vouching
+/// is waived only because every caller passes a `.moved-to`'s contents.
+pub(crate) fn resolve_recorded_project(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
     resolve_project_with(roots, name, &|_, _| true)
 }
 
