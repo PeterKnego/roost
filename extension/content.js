@@ -7,6 +7,16 @@
 (() => {
   const post = (m) => window.postMessage({ roostBridge: 1, from: "ext", ...m }, location.origin);
   const alive = () => { try { return !!chrome.runtime && !!chrome.runtime.id; } catch { return false; } };
+
+  // Once per page. The worker both registers this script and injects it into
+  // roost tabs already open when the address list changes, and a page that
+  // loads while that happens gets both: two copies forward every call, the
+  // second is refused as a replay ("that call was already handled"), and that
+  // refusal can reach roost before the real answer. Found by the Firefox
+  // test, where it happened on almost every call. A copy orphaned by an
+  // extension reload is not alive, and does not keep its successor out.
+  if (typeof window.__roostBridgeAlive === "function" && window.__roostBridgeAlive()) return;
+  window.__roostBridgeAlive = alive;
   let pending = 0;
   let keepalive = null;
   let dead = false;

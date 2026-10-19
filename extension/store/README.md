@@ -144,3 +144,34 @@ Certify all three statements:
   takes days rather than hours.
 - Reviewers may ask how to test it. A test instructions box is under
   *Distribution*; the Setup steps above are enough to paste there.
+
+---
+
+## Firefox: addons.mozilla.org
+
+Upload `roost-extension-<version>-firefox.zip` from the release page.
+
+- **Platforms**: Firefox only. **Uncheck Firefox for Android**: the extension
+  needs popup windows for consent, which Android does not have, and
+  `web-ext lint` warns about it for that reason alone.
+- **Source code**: not needed. Nothing is minified, transpiled or bundled;
+  the zip is the source.
+- **Name / summary / description**: the same as the Chrome listing above.
+  AMO's summary is capped at 250 characters; the manifest description fits.
+- **Categories**: Web Development (or Developer Tools, if offered).
+- **License**: MIT or Apache-2.0 (dual), as the repository.
+- **Privacy policy**: the same URL as above. The data collection consent is
+  in the manifest (`data_collection_permissions`: website content and
+  browsing activity), so Firefox shows it at install and AMO does not ask for
+  it separately.
+- **Notes to reviewer**: something like this:
+
+  > roost bridge relays signed requests from a roost server the user runs
+  > (https://github.com/PeterKnego/roost) to the browser, after a per-session
+  > consent window. Firefox has no debugger API, so page actions run through
+  > scripting.executeScript and screenshots through tabs.captureTab; both
+  > need the optional <all_urls>, requested from the consent window's Allow
+  > click. The extension makes no network requests of its own.
+  > To test without a roost: the options page and consent window can be
+  > inspected; driving needs `roost` 0.8+ (`roost browser-key`, then add its
+  > address in the options).

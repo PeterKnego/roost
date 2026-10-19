@@ -67,6 +67,14 @@ The extension asks for:
 - **host access**: to the roost addresses you add (loopback by default), and
   to nothing else. Each address is asked for when you add it.
 
+In **Firefox**, which has no debugger API, the extension does the same work
+with **scripting** (running its page code in the tab a session acts on) and
+**tabs.captureTab**, and so asks for the optional **access to all websites**
+when you first allow a Claude session. It changes what the extension *can*
+reach, not what it does: it still acts only on a call you allowed, and sends
+results only to your roost. The Firefox package declares the same two kinds
+of data in its manifest (`websiteContent`, `browsingActivity`).
+
 ## Your control
 
 - Every Claude session asks before its first action, and no answer means no.
