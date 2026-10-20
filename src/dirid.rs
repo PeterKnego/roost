@@ -361,6 +361,15 @@ mod tests {
     /// time, not an error — see `DirId`'s doc), so `format`/`parse_line`
     /// must round-trip a negative `bsec` exactly, not just the positive
     /// case every other test here happens to use.
+    ///
+    /// Revert-checked: changed `format` to write `id.bsec.unsigned_abs()`
+    /// instead of `id.bsec` (dropping the sign; `parse_line` untouched).
+    /// Observed failure: `assertion `left == right` failed: a negative
+    /// bsec must round-trip through format/parse_line\n  left:
+    /// Some(Full(DirId { dev: 7, ino: 11, bsec: 5, bnsec: 250 }))\n right:
+    /// Some(Full(DirId { dev: 7, ino: 11, bsec: -5, bnsec: 250 }))` — the
+    /// sign was lost on the way out, so the parsed-back identity no longer
+    /// matched the original. Restored.
     #[test]
     fn a_birth_time_before_the_epoch_round_trips() {
         let id = DirId { dev: 7, ino: 11, bsec: -5, bnsec: 250 };
