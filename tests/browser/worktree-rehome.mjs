@@ -261,7 +261,10 @@ const helpers = `window.__txt = (s) => { const e = terms.get(s); if (!e) return 
   if (!window.__banners) {
     window.__banners = [];
     const seen = new WeakMap();
-    const rec = () => { for (const el of document.querySelectorAll(".error-banner")) {
+    // The appeared banners (#188) are not \`.error-banner\`s: they live in
+    // their own \`#appeared\` container and stay until dismissed. Both are
+    // recorded, so one record answers "was it ever shown" for either kind.
+    const rec = () => { for (const el of document.querySelectorAll(".error-banner, #appeared .appeared-banner")) {
       let r = seen.get(el); if (!r) { r = {}; seen.set(el, r); window.__banners.push(r); }
       r.text = el.querySelector("b")?.textContent || ""; r.count = el.dataset.count || "1";
       r.hrefs = [...el.querySelectorAll("a")].map((a) => a.getAttribute("href")); } };
@@ -489,7 +492,7 @@ try {
   // /sib page holds no hello.md tab, which G's ?open= is then measured
   // against.
   let sibTab = null;
-  const sibBox = `[...document.querySelectorAll(".error-banner")].find((e) => e.dataset.text.startsWith(${JSON.stringify(sibText)}))`;
+  const sibBox = `[...document.querySelectorAll("#appeared .appeared-banner")].find((e) => (e.querySelector("b")?.textContent || "").startsWith(${JSON.stringify(sibText)}))`;
   if (await page.evalIn(`!!${sibBox}`)) {
     await page.evalIn(`${sibBox}.querySelector("a").setAttribute("data-t9", "sib"); 0`);
     await clickReal(page, `a[data-t9="sib"]`);
