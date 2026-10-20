@@ -2798,7 +2798,8 @@ impl Hub {
         let work_parent = parent.clone();
         let work = move || -> Result<Option<Event>, String> {
             let parent = work_parent;
-            let parent_dir = crate::projects::resolve_project(&crate::projects::roots(), &parent)
+            let roots = crate::projects::roots();
+            let parent_dir = crate::projects::resolve_project(&roots, &parent)
                 .ok_or_else(|| format!("{parent} does not resolve under roost's roots; nothing was allowed"))?;
             let listed = crate::worktree::list(&parent_dir);
             if listed.is_empty() {
@@ -2813,6 +2814,38 @@ impl Hub {
             if !is_listed {
                 return Err(not_listed());
             }
+            // One directory, one project key. git lists every worktree from
+            // any checkout of the repository, so both checks below are
+            // needed: without them a worktree already openable under the
+            // roots, or one recorded under a sibling worktree named as
+            // `parent`, gets a second key — its sessions, buffers, Close
+            // Project and overview rows split between the two, and a record
+            // under a non-main parent that nothing ever prunes. A worktree
+            // under a dot directory inside a root has no project URL
+            // (`project_for_abs` answers `None`) and stays allowable.
+            if let Some((url, rel)) = crate::projects::project_for_abs(&roots, &canon) {
+                if rel.is_empty() {
+                    return Err(format!("{} is already under roost's roots — open it at {url}", canon.display()));
+                }
+            }
+            let parent_canon = parent_dir
+                .canonicalize()
+                .map_err(|e| format!("cannot resolve {parent}'s directory: {e}"))?;
+            let main = listed.iter().find(|w| w.is_main);
+            let parent_is_main = main
+                .and_then(|m| m.path.canonicalize().ok())
+                .is_some_and(|c| c == parent_canon);
+            if !parent_is_main {
+                let from = main
+                    .and_then(|m| crate::projects::project_for_abs(&roots, &m.path))
+                    .filter(|(_, rel)| rel.is_empty())
+                    .map(|(url, _)| url)
+                    .unwrap_or_else(|| "its main checkout's page".into());
+                return Err(format!("{parent} is not the repository's main checkout; allow it from {from}"));
+            }
+            // The listing is matched by canonical path here and the identity
+            // pinned later, inside `outside::allow`; the window between the
+            // two is tiny and only the user's own rename can land in it.
             // The original `path`, not `canon`: `outside::allow` refuses a
             // path that is not its own canonicalisation, and that refusal
             // must see what the browser sent.
@@ -11932,6 +11965,70 @@ mod tests {
         repo: std::path::PathBuf,
         outside_dir: std::path::PathBuf,
         wt: std::path::PathBuf,
+        /// Hubs this test put in `REGISTRY`, unregistered on drop.
+        registered: Vec<String>,
+        /// A `.git` this test made unreadable, restored on drop.
+        muted: Option<std::path::PathBuf>,
+    }
+
+    impl OutsideFix {
+        fn register(&mut self, hub: Hub) -> Arc<Mutex<Hub>> {
+            self.registered.push(hub.project.clone());
+            register_for_test(hub)
+        }
+
+        fn mute_git(&mut self) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let git_dir = self.repo.join(".git");
+            self.muted = Some(git_dir.clone());
+            std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+            git_dir
+        }
+
+        fn unmute_git(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(d) = self.muted.take() {
+                let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        /// A real roost-shaped git worktree of the parent, inside the roots:
+        /// `<project>/.claude/worktrees/worktree-x`, branch `x`. Returns its
+        /// URL and directory, asserting the URL resolves.
+        fn add_sibling(&self) -> (String, std::path::PathBuf) {
+            let sib = format!("{}/.claude/worktrees/worktree-x", self.project);
+            let sib_dir = self.repo.join(".claude/worktrees/worktree-x");
+            let st = std::process::Command::new("git")
+                .arg("-C").arg(&self.repo)
+                .args(["worktree", "add", "-q"]).arg(&sib_dir).args(["-b", "x"])
+                .status().unwrap();
+            assert!(st.success(), "setup: the sibling worktree");
+            assert!(
+                crate::projects::resolve_project(&crate::projects::roots(), &sib).is_some(),
+                "setup: the sibling page's own URL must resolve"
+            );
+            (sib, sib_dir)
+        }
+    }
+
+    /// Cleanup on every exit, a timed-out wait's panic included: a `.git`
+    /// left at 000, a hub left in `REGISTRY` or the env left pointing at a
+    /// deleted tempdir would each leak into whichever test runs next. Runs
+    /// before the tempdir fields drop, so the permission restore lets them
+    /// delete.
+    ///
+    /// Revert-checked: a panic injected right after the wait in
+    /// `allow_refuses_when_git_does_not_answer` left no tempdir behind; with
+    /// the guard's `muted` cleared first (as with no guard), the same panic
+    /// left `<tmp>/orepo-mute/.git` at `d---------` and the tempdir undeleted.
+    impl Drop for OutsideFix {
+        fn drop(&mut self) {
+            self.unmute_git();
+            for p in &self.registered {
+                unregister_for_test(p);
+            }
+            outside_env_clear();
+        }
     }
 
     fn outside_fixture(project: &str, wt_name: &str) -> OutsideFix {
@@ -11955,7 +12052,17 @@ mod tests {
             !crate::projects::roots().iter().any(|r| wt.starts_with(r)),
             "setup: the worktree must be under no root, or this tests nothing"
         );
-        OutsideFix { _root: root, _outside: outside, _state: state, project: project.into(), repo, outside_dir, wt }
+        OutsideFix {
+            _root: root,
+            _outside: outside,
+            _state: state,
+            project: project.into(),
+            repo,
+            outside_dir,
+            wt,
+            registered: Vec::new(),
+            muted: None,
+        }
     }
 
     fn outside_env_clear() {
@@ -12006,8 +12113,8 @@ mod tests {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ROOST_CMD", "cat");
-        let fx = outside_fixture("orepo-allow", "wt");
-        let hub = register_for_test(Hub::new(&fx.project, fx.repo.clone()));
+        let mut fx = outside_fixture("orepo-allow", "wt");
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
         let (a, rxa) = Hub::lock(&hub).subscribe();
         let (_b, rxb) = Hub::lock(&hub).subscribe();
         drain(&rxa);
@@ -12022,8 +12129,6 @@ mod tests {
         // connection's queue already holds everything it will ever get.
         let other = drain(&rxb);
         let resolved = crate::projects::resolve_project(&crate::projects::roots(), &url);
-        unregister_for_test(&fx.project);
-        outside_env_clear();
         assert!(got.contains(&format!(r#""url":"{url}""#)), "{got}");
         assert!(!other.iter().any(|m| m.contains("OutsideAllowed")), "the other connection must not get OutsideAllowed: {other:?}");
         assert!(
@@ -12046,10 +12151,10 @@ mod tests {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ROOST_CMD", "cat");
-        let fx = outside_fixture("orepo-unlisted", "wt");
+        let mut fx = outside_fixture("orepo-unlisted", "wt");
         let plain = fx.outside_dir.join("plain");
         std::fs::create_dir(&plain).unwrap();
-        let hub = register_for_test(Hub::new(&fx.project, fx.repo.clone()));
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
         let (a, rxa) = Hub::lock(&hub).subscribe();
         drain(&rxa);
         Hub::lock(&hub).handle(
@@ -12058,8 +12163,6 @@ mod tests {
         );
         let got = await_any_of(&rxa, &[r#""t":"Error""#, "OutsideAllowed"]);
         let records = outside_records_on_disk(&fx.project);
-        unregister_for_test(&fx.project);
-        outside_env_clear();
         assert!(got.contains(r#""t":"Error""#), "expected a refusal, got {got}");
         assert!(
             got.contains(&format!("{} is not a worktree of {}", plain.display(), fx.project)),
@@ -12093,7 +12196,6 @@ mod tests {
     /// orepo-mute` instead of "git did not answer; nothing was allowed".
     #[test]
     fn allow_refuses_when_git_does_not_answer() {
-        use std::os::unix::fs::PermissionsExt;
         if unsafe { libc::geteuid() } == 0 {
             eprintln!("running as root: an unreadable .git is still readable; skipping");
             return;
@@ -12101,22 +12203,19 @@ mod tests {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ROOST_CMD", "cat");
-        let fx = outside_fixture("orepo-mute", "wt");
-        let hub = register_for_test(Hub::new(&fx.project, fx.repo.clone()));
+        let mut fx = outside_fixture("orepo-mute", "wt");
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
         let (a, rxa) = Hub::lock(&hub).subscribe();
         drain(&rxa);
-        let git_dir = fx.repo.join(".git");
-        std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        fx.mute_git();
         let listed = crate::worktree::list(&fx.repo);
         Hub::lock(&hub).handle(
             &a,
             Intent::AllowOutsideWorktree { parent: fx.project.clone(), path: fx.wt.display().to_string() },
         );
         let got = await_any_of(&rxa, &[r#""t":"Error""#, "OutsideAllowed"]);
-        std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fx.unmute_git();
         let records = outside_records_on_disk(&fx.project);
-        unregister_for_test(&fx.project);
-        outside_env_clear();
         assert!(listed.is_empty(), "setup: git must not answer through an unreadable .git ({} listed)", listed.len());
         assert!(got.contains("git did not answer; nothing was allowed"), "{got}");
         assert!(records.is_empty(), "a refusal writes nothing: {records:?}");
@@ -12128,32 +12227,24 @@ mod tests {
     /// never under the page that sent it.
     ///
     /// Revert-checked: with the work using the sending hub's own `project`
-    /// instead of `parent`, fails on the url assertion — the reply was
-    /// `{"t":"OutsideAllowed","url":"orepo-sib/.claude/worktrees/worktree-x/.claude/outside/wt"}`:
-    /// git lists the outside worktree from the sibling's checkout too, so
-    /// every check passed and the record landed under the wrong project.
+    /// instead of `parent`, fails on the url assertion. Before fix round 1
+    /// the reply was
+    /// `{"t":"OutsideAllowed","url":"orepo-sib/.claude/worktrees/worktree-x/.claude/outside/wt"}`
+    /// (git lists the outside worktree from the sibling's checkout too); since
+    /// the main-checkout refusal it is
+    /// `{"t":"Error","msg":"orepo-sib/.claude/worktrees/worktree-x is not the repository's main checkout; allow it from orepo-sib"}`.
     #[test]
     fn allow_from_a_sibling_page_uses_the_named_parent() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ROOST_CMD", "cat");
-        let fx = outside_fixture("orepo-sib", "wt");
-        let sib = format!("{}/.claude/worktrees/worktree-x", fx.project);
+        let mut fx = outside_fixture("orepo-sib", "wt");
         // A real git worktree of the parent, so the sibling's own URL
         // resolves too — otherwise a hub that wrongly used its own project
         // would fail on "does not resolve" and never reach the record write
         // this test exists to place.
-        let sib_dir = fx.repo.join(".claude/worktrees/worktree-x");
-        let st = std::process::Command::new("git")
-            .arg("-C").arg(&fx.repo)
-            .args(["worktree", "add", "-q"]).arg(&sib_dir).args(["-b", "x"])
-            .status().unwrap();
-        assert!(st.success(), "setup: the sibling worktree");
-        assert!(
-            crate::projects::resolve_project(&crate::projects::roots(), &sib).is_some(),
-            "setup: the sibling page's own URL must resolve"
-        );
-        let hub = register_for_test(Hub::new(&sib, sib_dir.clone()));
+        let (sib, sib_dir) = fx.add_sibling();
+        let hub = fx.register(Hub::new(&sib, sib_dir.clone()));
         let (a, rxa) = Hub::lock(&hub).subscribe();
         drain(&rxa);
         Hub::lock(&hub).handle(
@@ -12163,12 +12254,77 @@ mod tests {
         let got = await_any_of(&rxa, &[r#""t":"Error""#, "OutsideAllowed"]);
         let at_parent = outside_records_on_disk(&fx.project);
         let at_sib = outside_records_on_disk(&sib);
-        unregister_for_test(&sib);
-        outside_env_clear();
         let url = crate::outside::url_for(&fx.project, "wt");
         assert!(got.contains(&format!(r#""url":"{url}""#)), "{got}");
         assert_eq!(at_parent, vec!["wt".to_string()]);
         assert!(at_sib.is_empty(), "nothing is recorded under the sending page: {at_sib:?}");
+    }
+
+    /// Fix round 1, item 1(a): a worktree already under the roots has a
+    /// project key of its own. Allowing it too would give one directory two
+    /// keys — sessions, buffers, Close Project and overview rows split
+    /// between them. git lists it as a non-main worktree, so only the
+    /// in-roots refusal stands between it and a record.
+    ///
+    /// Revert-checked: with the `project_for_abs` refusal removed, fails on
+    /// "the refusal says where it already opens", got
+    /// `{"t":"OutsideAllowed","url":"orepo-inroots/.claude/outside/worktree-x"}`.
+    #[test]
+    fn allow_refuses_a_worktree_already_under_the_roots() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-inroots", "wt");
+        let (sib, sib_dir) = fx.add_sibling();
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
+        let (a, rxa) = Hub::lock(&hub).subscribe();
+        drain(&rxa);
+        Hub::lock(&hub).handle(
+            &a,
+            Intent::AllowOutsideWorktree { parent: fx.project.clone(), path: sib_dir.display().to_string() },
+        );
+        let got = await_any_of(&rxa, &[r#""t":"Error""#, "OutsideAllowed"]);
+        let records = outside_records_on_disk(&fx.project);
+        assert!(
+            got.contains("already under roost's roots") && got.contains(&format!("open it at {sib}")),
+            "the refusal says where it already opens: {got}"
+        );
+        assert!(records.is_empty(), "a refusal writes nothing: {records:?}");
+    }
+
+    /// Fix round 1, item 1(b): `parent` must be the repository's main
+    /// checkout. git lists every worktree from any of them, so a sibling
+    /// worktree named as `parent` passes the listing check — and the record
+    /// would land under the sibling's key, a second key for the same
+    /// directory that the parent's prune never sees. The *sender* may be a
+    /// sibling's page (`allow_from_a_sibling_page_uses_the_named_parent`);
+    /// the named parent may not.
+    ///
+    /// Revert-checked: with the main-checkout refusal removed, fails on
+    /// "the refusal names the main checkout", got
+    /// `{"t":"OutsideAllowed","url":"orepo-notmain/.claude/worktrees/worktree-x/.claude/outside/wt"}`.
+    #[test]
+    fn allow_refuses_a_parent_that_is_not_the_main_checkout() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-notmain", "wt");
+        let (sib, sib_dir) = fx.add_sibling();
+        let hub = fx.register(Hub::new(&sib, sib_dir.clone()));
+        let (a, rxa) = Hub::lock(&hub).subscribe();
+        drain(&rxa);
+        Hub::lock(&hub).handle(
+            &a,
+            Intent::AllowOutsideWorktree { parent: sib.clone(), path: fx.wt.display().to_string() },
+        );
+        let got = await_any_of(&rxa, &[r#""t":"Error""#, "OutsideAllowed"]);
+        let at_sib = outside_records_on_disk(&sib);
+        let at_parent = outside_records_on_disk(&fx.project);
+        assert!(
+            got.contains(&format!("{sib} is not the repository's main checkout; allow it from {}", fx.project)),
+            "the refusal names the main checkout: {got}"
+        );
+        assert!(at_sib.is_empty() && at_parent.is_empty(), "a refusal writes nothing: {at_sib:?} {at_parent:?}");
     }
 
     /// The deferred fallback from Task 1: a basename `wtname::check` refuses
@@ -12184,8 +12340,8 @@ mod tests {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ROOST_CMD", "cat");
-        let fx = outside_fixture("orepo-badname", "_wt");
-        let hub = register_for_test(Hub::new(&fx.project, fx.repo.clone()));
+        let mut fx = outside_fixture("orepo-badname", "_wt");
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
         let (a, rxa) = Hub::lock(&hub).subscribe();
         drain(&rxa);
         Hub::lock(&hub).handle(
@@ -12194,8 +12350,6 @@ mod tests {
         );
         let got = await_any_of(&rxa, &[r#""t":"Error""#, "OutsideAllowed"]);
         let records = outside_records_on_disk(&fx.project);
-        unregister_for_test(&fx.project);
-        outside_env_clear();
         assert!(got.contains(r#""t":"Error""#), "expected a refusal, got {got}");
         assert!(got.contains(r#"worktree name \"_wt\" must match"#), "the refusal names the name and its rule: {got}");
         assert!(records.is_empty(), "a refusal leaves no record and no temp file: {records:?}");
@@ -12211,11 +12365,11 @@ mod tests {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ROOST_CMD", "cat");
-        let fx = outside_fixture("orepo-revoke", "wt");
+        let mut fx = outside_fixture("orepo-revoke", "wt");
         crate::outside::allow(&fx.project, &fx.wt).unwrap();
         let url = crate::outside::url_for(&fx.project, "wt");
         let before = crate::projects::resolve_project(&crate::projects::roots(), &url);
-        let hub = register_for_test(Hub::new(&fx.project, fx.repo.clone()));
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
         let (a, rxa) = Hub::lock(&hub).subscribe();
         drain(&rxa);
         Hub::lock(&hub).handle(&a, Intent::RevokeOutsideWorktree { parent: fx.project.clone(), name: "wt".into() });
@@ -12225,8 +12379,6 @@ mod tests {
         // A malformed name is refused with a message, not silently ignored.
         Hub::lock(&hub).handle(&a, Intent::RevokeOutsideWorktree { parent: fx.project.clone(), name: "../x".into() });
         let bad = await_any_of(&rxa, &[r#""t":"Error""#, r#""t":"ProjectsChanged""#]);
-        unregister_for_test(&fx.project);
-        outside_env_clear();
         assert_eq!(before, Some(fx.wt.clone()), "setup: the record must resolve before the revoke");
         assert!(got.contains("ProjectsChanged"), "{got}");
         assert!(records.is_empty(), "the record is gone: {records:?}");
@@ -12253,7 +12405,7 @@ mod tests {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("ROOST_CMD"); // real dtach: "alive" is the socket's holder
-        let fx = outside_fixture("orepo-live", "wt");
+        let mut fx = outside_fixture("orepo-live", "wt");
         crate::outside::allow(&fx.project, &fx.wt).unwrap();
         let url = crate::outside::url_for(&fx.project, "wt");
         let dir = crate::projects::resolve_project(&crate::projects::roots(), &url)
@@ -12294,7 +12446,7 @@ mod tests {
                 .unwrap_or(false)
         };
         let live_before = crate::session::live_names(&url);
-        let hub = register_for_test(Hub::new(&fx.project, fx.repo.clone()));
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
         let (a, rxa) = Hub::lock(&hub).subscribe();
         drain(&rxa);
         Hub::lock(&hub).handle(&a, Intent::RevokeOutsideWorktree { parent: fx.project.clone(), name: "wt".into() });
@@ -12305,8 +12457,6 @@ mod tests {
         // Cleanup before asserting, so a failure does not leak a shell. Only
         // this test's own socket's holders — never a broad pkill.
         drop(_end);
-        unregister_for_test(&fx.project);
-        outside_env_clear();
         assert!(!before.is_empty(), "setup: the real dtach master must be up");
         assert_eq!(live_before, vec!["term1".to_string()], "setup: roost must count the session live");
         assert!(got.contains("ProjectsChanged"), "{got}");
