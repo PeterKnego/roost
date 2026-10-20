@@ -104,7 +104,8 @@ All tests use real git and real dtach where liveness is asserted. Every test is 
 
 **(b)**
 - With an occupant present, B renamed to C: the followed session's record follows to C.
-- With C made unfindable (moved to a different parent): the record is **kept**, and `kill_project` on the new A does not end the session.
+- In the shape R18 reaches: a main checkout A, with a resident re-homed into its worktree, is renamed to B and followed. An occupant then stands at A's URL, and B is moved to a different parent, so the record's directory cannot be found. The record is **kept**, and `kill_project` on the new A does not end the session. In the worktree-shaped variant the home is unchanged, so §2's table says forget, and the record is correctly forgotten into its own home.
+- R18 never reaches a record homed at a worktree key, because `owner_leaf` refuses an owner outside the home's own `.claude/worktrees/`. Such a record is protected by §1's removal of the key-level re-point, not by §2.
 
 **(c)**
 - Occupant 1 is followed to D.
