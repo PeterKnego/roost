@@ -1994,6 +1994,21 @@ pub fn workspace_page(
     sharing_on: bool,
     launches: &[&str],
 ) -> String {
+    workspace_page_in(&crate::wsstate::state_dir(), project, key, s, theme_rel, sharing_on, launches)
+}
+
+/// `workspace_page` over an explicit state directory, which is where the
+/// outside allow records live — so a test can plant one without touching
+/// the process environment.
+fn workspace_page_in(
+    state: &std::path::Path,
+    project: &str,
+    key: &str,
+    s: &Settings,
+    theme_rel: Option<&'static str>,
+    sharing_on: bool,
+    launches: &[&str],
+) -> String {
     let (html_open, theme_links) = theme_head(&s.theme, s.code_font_size);
     let warn = s
         .warning
@@ -2034,6 +2049,15 @@ pub fn workspace_page(
     } else {
         ""
     };
+    // A virtual outside URL (#188) names its real directory, which the page
+    // header shows as a persistent note — the URL alone reads like an
+    // ordinary worktree of the parent. Read from roost's own record, never
+    // inferred from the URL: the page was only served because that record
+    // resolved, and the recorded path is what it resolved to.
+    let outside_attr = crate::outside::split_url(project)
+        .and_then(|(parent, name)| crate::outside::read_in(state, parent, name))
+        .map(|r| format!(" data-outside=\"{}\"", esc(&r.path.to_string_lossy())))
+        .unwrap_or_default();
     let theme_css = match theme_rel {
         Some(rel) => format!("<link rel=\"stylesheet\" href=\"/frag/{proj_url}/{rel}\">"),
         None => String::new(),
@@ -2062,7 +2086,7 @@ pub fn workspace_page(
 <script src="/static/vendor/code-input-auto-close-brackets.min.js"></script>
 <script src="/static/vendor/code-input-find-and-replace.min.js"></script>
 <script src="/static/vendor/code-input-go-to-line.min.js"></script>
-</head><body data-project="{proj_txt}" data-key="{qkey}" data-show-hidden="{sh}" data-autosave="{autosave}" data-follow-tree="{follow_tree}" data-share-selection="{share_selection}" data-launches="{launches}">
+</head><body data-project="{proj_txt}" data-key="{qkey}" data-show-hidden="{sh}" data-autosave="{autosave}" data-follow-tree="{follow_tree}" data-share-selection="{share_selection}" data-launches="{launches}"{outside_attr}>
 <header>
   <a class="home" href="/" title="all projects">{SVG_HOME}</a><button id="projname" class="proj" title="switch project">{proj_txt}{SVG_CARET}</button>
   <button id="wtbtn" title="branch and worktrees">{SVG_BRANCH}<span id="gitinfo" hx-get="/frag/{proj_url}/status" hx-trigger="load, refresh from:body, git from:body"></span><span id="wtlabel"></span></button>
@@ -3351,6 +3375,34 @@ mod tests {
         let on = Settings { show_hidden: true, ..Settings::default() };
         let h = workspace_page("proj", "proj", &on, None, false, &[]);
         assert!(h.contains(r#"data-show-hidden="1""#), "and a configured true reaches the page");
+    }
+
+    /// A page at a virtual outside URL names its real directory on `<body>`
+    /// (#188 §2, "The page"), for app.js to show as the header note; any
+    /// other page carries no such attribute. The recorded path comes from a
+    /// filesystem name, so the fixture carries every metacharacter `esc`
+    /// handles, under a parent that needs one too.
+    ///
+    /// Revert-checked: with `esc(&p)` dropped (the raw path interpolated)
+    /// this fails `h.contains(want)` — the page carries
+    /// `data-outside="/x/a"b<c&d>/wt"`, which ends the attribute at the `"`
+    /// and opens a tag at the `<`; with the attribute not rendered at all it
+    /// fails the same assertion.
+    #[test]
+    fn the_page_carries_its_outside_path_escaped() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = state.path().join("outside").join(crate::projects::storage_key("a<b"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("wt"), "/x/a\"b<c&d>/wt\n1 2 3 4\n").unwrap();
+        let s = Settings::default();
+        let h = workspace_page_in(state.path(), "a<b/.claude/outside/wt", "a<b%2F.claude%2Foutside%2Fwt", &s, None, false, &[]);
+        let want = r#"data-outside="/x/a&quot;b&lt;c&amp;d&gt;/wt""#;
+        assert!(h.contains(want), "{h}");
+        assert!(!h.contains("a\"b<c"), "the raw path never reaches the page: {h}");
+        let plain = workspace_page_in(state.path(), "a<b", "a<b", &s, None, false, &[]);
+        assert!(!plain.contains("data-outside"), "an ordinary page has no note: {plain}");
+        let unrecorded = workspace_page_in(state.path(), "a<b/.claude/outside/nope", "k", &s, None, false, &[]);
+        assert!(!unrecorded.contains("data-outside"), "no record, no note: {unrecorded}");
     }
 
     // The client reads this once per page load to decide whether to run its

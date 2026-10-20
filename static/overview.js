@@ -94,6 +94,21 @@
   // Delegated: htmx replaces the panes wholesale, so nothing may be bound to
   // a row.
   document.addEventListener("click", (e) => {
+    // #188's two controls sit inside a row, and an allowed row is a
+    // reachable one: without returning first, a click on Revoke would also
+    // select the row below and fetch its worktrees.
+    const allow = e.target.closest("#ovprojects .wtallow");
+    if (allow) {
+      e.preventDefault();
+      allowOutside(allow.dataset.parent, allow.dataset.path);
+      return;
+    }
+    const revoke = e.target.closest("#ovprojects .wtrevoke");
+    if (revoke) {
+      e.preventDefault();
+      revokeOutside(revoke.dataset.parent, revoke.dataset.name);
+      return;
+    }
     const caret = e.target.closest("#ovprojects .ovcaret:not(.placeholder):not(.empty)");
     if (caret) {
       e.preventDefault();
@@ -165,6 +180,77 @@
       ws.onerror = () => finish({ t: "Error", msg: "could not reach roost" });
       ws.onclose = () => finish({ t: "Error", msg: "connection closed before a reply" });
     });
+  }
+
+  // #188's Allow… and Revoke. Both are intents on the *parent's* workspace
+  // socket, which this page does not hold, so each opens one for the one
+  // exchange and closes it, the way `sendRoots` does for /ws/_roots. That
+  // socket opens with a State and may carry any broadcast meanwhile, so
+  // `answers` picks out the one event that means this intent was handled;
+  // an Error always does. The project goes into the URL raw, exactly as
+  // app.js's own `/ws/${PROJECT}/_workspace` does: the server matches the
+  // path's segments without percent-decoding them.
+  const ONE_SHOT_MS = 10000;
+  function sendWorkspace(parent, intent, answers) {
+    return new Promise((resolve) => {
+      const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/${parent}/_workspace`);
+      let done = false;
+      const timer = setTimeout(
+        () => finish({ t: "Error", msg: `roost did not answer within ${ONE_SHOT_MS / 1000} s` }),
+        ONE_SHOT_MS,
+      );
+      const finish = (v) => {
+        if (!done) { done = true; clearTimeout(timer); resolve(v); }
+        try { ws.close(); } catch {}
+      };
+      ws.onopen = () => ws.send(JSON.stringify(intent));
+      ws.onmessage = (e) => {
+        let ev;
+        try { ev = JSON.parse(e.data); } catch { return finish({ t: "Error", msg: "unreadable reply" }); }
+        if (ev.t === "Error" || answers(ev)) finish(ev);
+      };
+      ws.onerror = () => finish({ t: "Error", msg: "could not reach roost" });
+      ws.onclose = () => finish({ t: "Error", msg: "connection closed before a reply" });
+    });
+  }
+
+  // The outcome is said in the dialog roost already uses for asking, since
+  // this page has no banner of its own; a path is data, so it is text.
+  async function tell(title, line) {
+    await askChoice({ title, lines: [line], choices: [{ id: "ok", label: "OK" }] });
+  }
+
+  function refreshBoth() {
+    const sel = selNow();
+    refresh("proj", sel);
+    refresh("sess", sel);
+  }
+
+  async function allowOutside(parent, path) {
+    if (!parent || !path) return;
+    const yes = await askConfirm({ title: "Open outside worktree",
+      lines: [`Open ${path} in roost?`,
+              "It is outside roost's roots; roost will open only this worktree."],
+      confirm: "Allow" });
+    if (!yes) return;
+    const reply = await sendWorkspace(parent, { t: "AllowOutsideWorktree", parent, path },
+      (ev) => ev.t === "OutsideAllowed");
+    refreshBoth();
+    if (reply.t === "Error") return tell("Not allowed", reply.msg);
+  }
+
+  async function revokeOutside(parent, name) {
+    if (!parent || !name) return;
+    const yes = await askConfirm({ title: "Revoke outside worktree",
+      lines: [`Stop opening ${name} in roost?`, "Running terminals keep running."],
+      confirm: "Revoke" });
+    if (!yes) return;
+    // Success sends nothing to the clicker; the ProjectsChanged naming this
+    // parent is the sign it is done. Another project's would not be.
+    const reply = await sendWorkspace(parent, { t: "RevokeOutsideWorktree", parent, name },
+      (ev) => ev.t === "ProjectsChanged" && ev.project === parent);
+    refreshBoth();
+    if (reply.t === "Error") return tell("Not revoked", reply.msg);
   }
 
   // The roots roost is serving, read back out of the header this page already
@@ -258,6 +344,8 @@
   // Double-click opens, the way a double click has always meant "go in" —
   // the picker this page replaced used it to descend.
   document.addEventListener("dblclick", (e) => {
+    // A double click on Revoke is two clicks on Revoke, never "go in".
+    if (e.target.closest(".wtallow, .wtrevoke")) return;
     const row = e.target.closest("#ovprojects .ovrow:not(.unreachable)");
     const go = row && row.querySelector(".ovgo");
     if (!go) return;
