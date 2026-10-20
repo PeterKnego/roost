@@ -96,10 +96,20 @@ pub fn known_projects_with_state(roots: &[PathBuf]) -> Vec<ProjectStatus> {
     for p in ps.iter().filter(|p| p.parent.is_none()) {
         if let Some(pd) = crate::projects::resolve_project(roots, &p.url) {
             for w in crate::worktree::list(&pd).into_iter().filter(|w| !w.is_main) {
-                let Some(child_url) = rel_under_roots(roots, &w.path) else { continue };
-                let child_key = crate::projects::storage_key(&child_url);
-                if let Ok(c) = w.path.canonicalize() {
-                    dirs.insert(child_key, c);
+                match rel_under_roots(roots, &w.path) {
+                    Some(child_url) => {
+                        if let Ok(c) = w.path.canonicalize() {
+                            dirs.insert(crate::projects::storage_key(&child_url), c);
+                        }
+                    }
+                    // An allowed outside worktree (#188): its row is keyed
+                    // by the virtual URL, and its state is the real
+                    // directory's, which `resolve` just vouched for.
+                    None => {
+                        if let Some((virt, real)) = allowed_outside(&p.url, &w.path) {
+                            dirs.insert(crate::projects::storage_key(&virt), PathBuf::from(real));
+                        }
+                    }
                 }
             }
         }
@@ -1931,6 +1941,18 @@ fn known_projects_inner(roots: &[PathBuf], group: bool) -> Vec<ProjectStatus> {
             // caller is already paying for worktree discovery.
             || (group && crate::worktree::is_vouched_worktree(roots, &p.url))
     });
+    // A virtual outside URL (#188) whose record was revoked, pruned, or no
+    // longer matches its directory survives the retain above only on a live
+    // session — and that session must stay visible, since revoking ends no
+    // shell. But its page no longer resolves, so it is not a link. Fork-free
+    // (`resolve` is two reads and a stat).
+    for p in by_key.values_mut() {
+        if let Some((parent, name)) = crate::outside::split_url(&p.url) {
+            if crate::outside::resolve(parent, name).is_none() {
+                p.reachable = false;
+            }
+        }
+    }
     if group {
         group_worktrees(roots, &mut by_key);
     }
@@ -2686,6 +2708,79 @@ mod tests {
                 crate::outside::read("repo", &rec2.name).is_none(),
                 "the overview's listing must prune the record too"
             );
+        });
+    }
+
+    /// #188 §2 for the header switcher: `known_projects_with_state` keys
+    /// its directory map by the row's storage key, so an allowed outside
+    /// row (keyed by its virtual URL) needs its own entry there, pointing at
+    /// the real directory — or its chips are silently missing. `dirty ==
+    /// Some(false)` is git answering about the real, clean checkout.
+    ///
+    /// Revert-checked: deleting the `allowed_outside` fallback from that
+    /// loop fails the first assertion — observed `panicked ... an allowed row
+    /// gets the switcher's state: ProjectStatus { key:
+    /// "repo%2F.claude%2Foutside%2Fwt", ... reachable: true, outside:
+    /// Some(".../wt"), wt: None }`. Restored.
+    #[test]
+    fn known_projects_with_state_gives_an_allowed_outside_row_its_state() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let wt = repo_with_outside_worktree(state, root.path(), outside.path());
+            let rec = crate::outside::allow("repo", &wt).unwrap();
+            let url = crate::outside::url_for("repo", &rec.name);
+
+            let ps = known_projects_with_state(&[root.path().to_path_buf()]);
+            let row = ps.iter().find(|p| p.url == url).expect("the allowed row must be listed");
+            let st = row.wt.as_ref().unwrap_or_else(|| panic!("an allowed row gets the switcher's state: {row:?}"));
+            assert_eq!(st.dirty, Some(false), "git status must have run on the real path: {st:?}");
+            assert!(row.outside.is_some(), "{row:?}");
+        });
+    }
+
+    /// Revoking ends no shell (spec §1), so a live session under a revoked
+    /// virtual URL keeps its row — but that URL no longer resolves, so the
+    /// row must not be a link. Uses a real dtach socket (a `ROOST_CMD=cat`
+    /// session creates none, so the row would vanish rather than dim).
+    /// Before the revoke the same row is reachable,
+    /// which is what shows the flip is the revoke's doing.
+    ///
+    /// Revert-checked: deleting the `split_url`/`resolve` pass after
+    /// `known_projects_inner`'s retain fails the last assertion — observed
+    /// `revoked: still listed, still live, no longer a link` with `left:
+    /// Some((true, 1))`, `right: Some((false, 1))`. Restored.
+    #[test]
+    fn a_live_session_under_a_revoked_outside_url_is_listed_unreachable() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let wt = repo_with_outside_worktree(state, root.path(), outside.path());
+            let rec = crate::outside::allow("repo", &wt).unwrap();
+            let url = crate::outside::url_for("repo", &rec.name);
+            let key = crate::projects::storage_key(&url);
+            let roots = vec![root.path().to_path_buf()];
+
+            // A real dtach session under the virtual URL's key, as one
+            // started on that page leaves it: the socket the listing counts.
+            let sock_dir = state.join("sock").join(&key);
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock = sock_dir.join("term1");
+            if spawn_detached_dtach(&sock).is_none() {
+                eprintln!("skipped: dtach unavailable");
+                return;
+            }
+            let ps = known_projects(&roots);
+            let before = ps.iter().find(|p| p.key == key).map(|p| (p.reachable, p.live));
+            crate::outside::revoke("repo", &rec.name).unwrap();
+            let ps = known_projects(&roots);
+            let after = ps.iter().find(|p| p.key == key).map(|p| (p.reachable, p.live));
+            let alive = sock.exists();
+            kill_test_pids(&sock);
+
+            assert_eq!(before, Some((true, 1)), "fixture: allowed and live, the row is a link");
+            assert!(alive, "listing must not have reaped the session");
+            assert_eq!(after, Some((false, 1)), "revoked: still listed, still live, no longer a link");
         });
     }
 
