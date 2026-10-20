@@ -7,6 +7,7 @@
 //! production on 2026-08-17.
 use std::path::PathBuf;
 
+#[derive(Debug, Clone)]
 pub struct ProjectStatus {
     /// Storage key, percent-encoded (`karpie%2Fsrc`).
     pub key: String,
@@ -35,6 +36,14 @@ pub struct ProjectStatus {
     /// rather than silently omitted. Always true for entries not discovered
     /// via worktree grouping.
     pub reachable: bool,
+    /// The real directory of a worktree outside every root that the user
+    /// allowed (#188, `outside.rs`) and whose record still resolves with its
+    /// pinned identity. Such a row's `url` is the virtual
+    /// `<parent>/.claude/outside/<name>`, so this is the only place the real
+    /// path survives — for the tooltip, nothing else. `None` for every other
+    /// row, including an outside worktree whose record no longer matches:
+    /// that one is `reachable: false` again, offered Allow… afresh.
+    pub outside: Option<String>,
     /// Populated only by `known_projects_with_state`, only for reachable
     /// linked worktrees. `known_projects` always leaves this `None` — it is
     /// two git calls per worktree, paid only when the switcher panel opens.
@@ -1829,6 +1838,7 @@ fn known_projects_inner(roots: &[PathBuf], group: bool) -> Vec<ProjectStatus> {
                     branch: String::new(),
                     parent: None,
                     reachable: true,
+                    outside: None,
                     wt: None,
                 },
             );
@@ -1895,6 +1905,7 @@ fn known_projects_inner(roots: &[PathBuf], group: bool) -> Vec<ProjectStatus> {
                     branch: String::new(),
                     parent: None,
                     reachable: true,
+                    outside: None,
                     wt: None,
                 });
                 slot.live = live;
@@ -2014,6 +2025,7 @@ pub fn project_rows(roots: &[PathBuf]) -> Vec<ProjectStatus> {
             branch: String::new(),
             parent: None,
             reachable: true,
+            outside: None,
             wt: None,
         });
     }
@@ -2034,10 +2046,19 @@ pub fn worktree_rows(roots: &[PathBuf], parent_key: &str) -> Vec<ProjectStatus> 
     let main_branch = head_branch(&pd);
     let scan = crate::claudes::claude_terminals(std::path::Path::new("/proc"));
     let mut out = Vec::new();
-    for w in crate::worktree::list(&pd).into_iter().filter(|w| !w.is_main) {
+    let listed = crate::worktree::list(&pd);
+    let canon = listed_paths(&listed);
+    for w in listed.into_iter().filter(|w| !w.is_main) {
+        let mut outside = None;
         let (child_url, reachable) = match rel_under_roots(roots, &w.path) {
             Some(u) => (u, true),
-            None => (w.path.to_string_lossy().into_owned(), false),
+            None => match allowed_outside(&url, &w.path) {
+                Some((virt, real)) => {
+                    outside = Some(real);
+                    (virt, true)
+                }
+                None => (w.path.to_string_lossy().into_owned(), false),
+            },
         };
         let key = crate::projects::storage_key(&child_url);
         // `owned_live_names`, not `session_rows`: a resident's dtach socket
@@ -2071,11 +2092,43 @@ pub fn worktree_rows(roots: &[PathBuf], parent_key: &str) -> Vec<ProjectStatus> 
             branch: w.branch,
             parent: Some(parent_key.to_string()),
             reachable,
+            outside,
             wt,
         });
     }
+    // As in `group_worktrees`: never prune on a listing git did not give.
+    if !canon.is_empty() {
+        crate::outside::prune(&url, &canon);
+    }
     out.sort_by(|a, b| a.key.cmp(&b.key));
     out
+}
+
+/// Every path a `git worktree list` reported, main included, canonicalised
+/// the way `outside`'s records are, for `outside::prune`. The main checkout
+/// is part of the evidence: a listing of the main worktree alone is git
+/// positively answering "nothing else", and a list narrowed to non-main
+/// entries would turn that answer into an empty slice, which `prune`
+/// refuses. A path that cannot be canonicalised (git still lists a
+/// worktree whose directory is gone or unreadable) is kept as git spelled
+/// it rather than dropped — dropping it would read "could not look" as
+/// "not listed" and prune a record git still vouches for.
+fn listed_paths(listed: &[crate::worktree::Worktree]) -> Vec<PathBuf> {
+    listed.iter().map(|w| w.path.canonicalize().unwrap_or_else(|_| w.path.clone())).collect()
+}
+
+/// The virtual URL and real path of an outside worktree the user allowed
+/// under `parent_url` (#188), only when its record still resolves with the
+/// identity it was pinned at. A record that `find` returns but `resolve`
+/// refuses is a directory that changed under the record (deleted,
+/// recreated, swapped) — shown as not allowed, never as the old allow.
+/// Fork-free (`outside`'s reads and a stat), though both callers are
+/// off-lock anyway.
+fn allowed_outside(parent_url: &str, path: &std::path::Path) -> Option<(String, String)> {
+    let canon = path.canonicalize().ok()?;
+    let rec = crate::outside::find(parent_url, &canon)?;
+    let real = crate::outside::resolve(parent_url, &rec.name)?;
+    Some((crate::outside::url_for(parent_url, &rec.name), real.to_string_lossy().into_owned()))
 }
 
 /// For every already-known entry that is a git repository, asks git for its
@@ -2102,7 +2155,9 @@ fn group_worktrees(roots: &[PathBuf], by_key: &mut std::collections::BTreeMap<St
         if !dir.join(".git").is_dir() {
             continue;
         }
-        for w in crate::worktree::list(&dir) {
+        let listed = crate::worktree::list(&dir);
+        let canon = listed_paths(&listed);
+        for w in listed {
             if w.is_main {
                 // The repo's own entry is the main worktree; its branch is
                 // git's branch, not a separate row.
@@ -2111,8 +2166,16 @@ fn group_worktrees(roots: &[PathBuf], by_key: &mut std::collections::BTreeMap<St
                 }
                 continue;
             }
-            match rel_under_roots(roots, &w.path) {
-                Some(child_url) => {
+            // An allowed outside worktree (#188) is placed exactly as one
+            // under a root is, under its virtual URL — including adopting
+            // an entry a saved layout under that URL already put at the
+            // top level. `outside` is the only difference.
+            let placed = match rel_under_roots(roots, &w.path) {
+                Some(u) => Some((u, None)),
+                None => allowed_outside(&url, &w.path).map(|(virt, real)| (virt, Some(real))),
+            };
+            match placed {
+                Some((child_url, outside)) => {
                     let child_key = crate::projects::storage_key(&child_url);
                     // Belt-and-braces: the `.is_dir()` gate above should
                     // already make a repo's own key impossible to reach here
@@ -2131,10 +2194,12 @@ fn group_worktrees(roots: &[PathBuf], by_key: &mut std::collections::BTreeMap<St
                         branch: String::new(),
                         parent: None,
                         reachable: true,
+                        outside: None,
                         wt: None,
                     });
                     slot.branch = w.branch;
                     slot.parent = Some(key.clone());
+                    slot.outside = outside;
                 }
                 None => {
                     // git reports this worktree, but its path canonicalises
@@ -2155,10 +2220,18 @@ fn group_worktrees(roots: &[PathBuf], by_key: &mut std::collections::BTreeMap<St
                         branch: w.branch,
                         parent: Some(key.clone()),
                         reachable: false,
+                        outside: None,
                         wt: None,
                     });
                 }
             }
+        }
+        // Only a listing git actually gave: an empty one is git not
+        // answering, and must cost no allow its record (CLAUDE.md, absence
+        // of evidence). `outside::prune` refuses it too; this is the line
+        // that holds the distinction, that one the second.
+        if !canon.is_empty() {
+            crate::outside::prune(&url, &canon);
         }
     }
 }
@@ -2455,6 +2528,213 @@ mod tests {
                 .expect("a worktree outside ROOTS must still be listed, not omitted");
             assert!(!child.reachable, "a worktree outside ROOTS must never be marked reachable");
             assert_eq!(child.parent.as_deref(), Some("repo"));
+        });
+    }
+
+    /// A repo under `root` (known through a saved layout, so
+    /// `group_worktrees` lists it at all) plus one real linked worktree,
+    /// `<outside>/wt` on branch `side`, under no root. Returns the
+    /// worktree's canonical path — the form `outside::allow` insists on.
+    fn repo_with_outside_worktree(
+        state: &std::path::Path,
+        root: &std::path::Path,
+        outside: &std::path::Path,
+    ) -> PathBuf {
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        fs::write(repo.join("a.txt"), "x").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-qm", "init"]);
+        let wt = outside.join("wt");
+        run_git(&repo, &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()]);
+        fs::create_dir_all(state).unwrap();
+        fs::write(state.join("repo.json"), "{}").unwrap();
+        wt.canonicalize().unwrap()
+    }
+
+    /// #188 §2: an allowed outside worktree is an ordinary reachable row in
+    /// both listings, under its virtual URL, carrying the real path — and
+    /// in the overview's rows its chips are computed on that real path
+    /// (`dirty: Some(false)` is git answering about a clean checkout; the
+    /// virtual URL names no directory, so git run there could only fail).
+    /// The record survives both listings, which list it: a prune that
+    /// compared un-canonicalised paths would have deleted it here.
+    ///
+    /// Revert-checked: making `allowed_outside` return `None` (the pre-#188
+    /// behaviour) fails the first assertion — observed `panicked ... the
+    /// allowed row must be reachable: ProjectStatus { key:
+    /// "%2Fhome%2F...%2F.tmpzKr1jj%2Fwt", url: ".../.tmpzKr1jj/wt", ...
+    /// reachable: false, outside: None, wt: None }`. Restored.
+    #[test]
+    fn an_allowed_outside_worktree_is_a_reachable_row() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let wt = repo_with_outside_worktree(state, root.path(), outside.path());
+            let rec = crate::outside::allow("repo", &wt).unwrap();
+            let url = crate::outside::url_for("repo", &rec.name);
+            let roots = vec![root.path().to_path_buf()];
+
+            let ps = known_projects(&roots);
+            let row = ps.iter().find(|p| p.branch == "side").expect("the worktree must be listed");
+            assert!(row.reachable, "the allowed row must be reachable: {row:?}");
+            assert_eq!(row.url, url);
+            assert_eq!(row.key, crate::projects::storage_key(&url));
+            assert_eq!(row.outside.as_deref(), Some(wt.to_str().unwrap()));
+            assert_eq!(row.parent.as_deref(), Some("repo"));
+
+            let rows = worktree_rows(&roots, "repo");
+            let row = rows.iter().find(|p| p.branch == "side").expect("the worktree must be listed");
+            assert!(row.reachable, "{row:?}");
+            assert_eq!(row.url, url);
+            assert_eq!(row.outside.as_deref(), Some(wt.to_str().unwrap()));
+            let st = row.wt.as_ref().expect("an allowed row gets worktree state like any reachable row");
+            assert_eq!(st.dirty, Some(false), "git status must have run on the real path: {st:?}");
+
+            assert!(crate::outside::read("repo", &rec.name).is_some(), "a listed record must not be pruned");
+        });
+    }
+
+    /// No record, or a record whose identity no longer matches the
+    /// directory (the spec's third row): unreachable, the raw path as the
+    /// url, no `outside`. The mismatched record is the case that tells
+    /// "looked the record up" from "resolved it": `outside::find` alone
+    /// returns it, and only `resolve`'s identity check refuses it.
+    ///
+    /// Revert-checked: dropping the `outside::resolve` check from
+    /// `allowed_outside` (taking `find`'s `rec.path` as-is) fails the
+    /// mismatched-record assertion — observed `panicked ... a record whose
+    /// identity does not match must not make the row reachable:
+    /// ProjectStatus { key: "repo%2F.claude%2Foutside%2Fwt", url:
+    /// "repo/.claude/outside/wt", ... reachable: true, outside:
+    /// Some(".../.tmpP2j5ag/wt"), wt: None }`. Restored.
+    #[test]
+    fn an_unallowed_one_stays_unreachable() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let wt = repo_with_outside_worktree(state, root.path(), outside.path());
+            let roots = vec![root.path().to_path_buf()];
+            let raw = wt.to_string_lossy().into_owned();
+
+            let check = |what: &str| {
+                let ps = known_projects(&roots);
+                let row = ps.iter().find(|p| p.branch == "side").expect("listed");
+                assert!(!row.reachable && row.outside.is_none() && row.url == raw, "{what}: {row:?}");
+                let rows = worktree_rows(&roots, "repo");
+                let row = rows.iter().find(|p| p.branch == "side").expect("listed");
+                assert!(!row.reachable && row.outside.is_none() && row.url == raw, "{what}: {row:?}");
+                assert!(row.wt.is_none(), "{what}: no git state for an unreachable row: {row:?}");
+            };
+            check("no record at all");
+
+            // A well-formed record naming this very path, with an identity
+            // that cannot be this directory's.
+            let dir = state.join("outside").join("repo");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("wt"), format!("{raw}\n1 2 3 4\n")).unwrap();
+            assert!(crate::outside::find("repo", &wt).is_some(), "fixture: find must see the record");
+            assert!(crate::outside::resolve("repo", "wt").is_none(), "fixture: resolve must refuse it");
+            check("a record whose identity does not match must not make the row reachable");
+        });
+    }
+
+    /// #188 §1 Revocation: a listing git did answer, without the recorded
+    /// path, deletes the record — in both listings. What git answers after
+    /// `worktree remove` is the main worktree alone, so this also pins that
+    /// the main checkout's path is part of what is handed to `prune`: a
+    /// listing narrowed to non-main worktrees would be empty here, and
+    /// `prune` (rightly) refuses to act on an empty one.
+    ///
+    /// Revert-checked, three ways, each observed and restored:
+    /// - `listed_paths` filtering out the main worktree: `panicked ... the
+    ///   switcher's listing must prune the record of a worktree git no
+    ///   longer reports`;
+    /// - deleting the `prune` call from `group_worktrees`: the same;
+    /// - deleting the `prune` call from `worktree_rows`: `panicked ... the
+    ///   overview's listing must prune the record too`.
+    #[test]
+    fn a_nonempty_listing_without_the_path_prunes_its_record() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let wt = repo_with_outside_worktree(state, root.path(), outside.path());
+            let repo = root.path().join("repo");
+            let roots = vec![root.path().to_path_buf()];
+
+            let rec = crate::outside::allow("repo", &wt).unwrap();
+            run_git(&repo, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+            let _ = known_projects(&roots);
+            assert!(
+                crate::outside::read("repo", &rec.name).is_none(),
+                "the switcher's listing must prune the record of a worktree git no longer reports"
+            );
+
+            // The overview's listing, separately: a second worktree, allowed
+            // after the switcher already ran, so only `worktree_rows` can
+            // remove its record.
+            let wt2 = outside.path().join("wt2");
+            run_git(&repo, &["worktree", "add", "-q", "-b", "side2", wt2.to_str().unwrap()]);
+            let wt2 = wt2.canonicalize().unwrap();
+            let rec2 = crate::outside::allow("repo", &wt2).unwrap();
+            run_git(&repo, &["worktree", "remove", "--force", wt2.to_str().unwrap()]);
+            let _ = worktree_rows(&roots, "repo");
+            assert!(
+                crate::outside::read("repo", &rec2.name).is_none(),
+                "the overview's listing must prune the record too"
+            );
+        });
+    }
+
+    /// Restores a directory's mode on drop, so a failing assertion cannot
+    /// leave a tempdir behind that its own cleanup cannot enter.
+    struct RestoreMode(PathBuf, u32);
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    /// An empty listing is git not answering, never "no worktrees left"
+    /// (CLAUDE.md, absence of evidence): neither listing may prune on it.
+    /// `worktree::list` has no injection seam, so git is made unable to
+    /// answer for real by an unreadable `.git`. The row vanishing from both
+    /// listings is the positive check that git really did fail — without
+    /// it this would pass just as well with git answering normally.
+    ///
+    /// Revert-checked: replacing both callers' `!canon.is_empty()` guards
+    /// with `true` *and* deleting `outside::prune_in`'s own empty-listing
+    /// guard fails the last assertion — observed `panicked ... an empty
+    /// listing must prune nothing`. Replacing only the callers' guards
+    /// leaves this green (observed, 4 passed): `prune_in`'s guard is a
+    /// second line, and either one alone holds. Restored.
+    #[test]
+    fn an_empty_listing_prunes_nothing() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root reads an unreadable .git anyway");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let wt = repo_with_outside_worktree(state, root.path(), outside.path());
+            let roots = vec![root.path().to_path_buf()];
+            let rec = crate::outside::allow("repo", &wt).unwrap();
+
+            let dotgit = root.path().join("repo").join(".git");
+            let _restore = RestoreMode(dotgit.clone(), 0o755);
+            fs::set_permissions(&dotgit, fs::Permissions::from_mode(0o000)).unwrap();
+
+            let ps = known_projects(&roots);
+            assert!(!ps.iter().any(|p| p.branch == "side"), "fixture: git must not have answered: {ps:?}");
+            let rows = worktree_rows(&roots, "repo");
+            assert!(rows.is_empty(), "fixture: git must not have answered: {rows:?}");
+            assert!(crate::outside::read("repo", &rec.name).is_some(), "an empty listing must prune nothing");
         });
     }
 

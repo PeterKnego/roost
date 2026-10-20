@@ -1427,6 +1427,44 @@ fn worktree_chips(w: &crate::registry::WorktreeStatus, key: &str, live: usize, s
     format!("{claude} {dirty} {ahead}{remove}")
 }
 
+/// The #188 control on a worktree row outside every root, shared by the
+/// switcher and the overview: Allow… on one not (or no longer) allowed,
+/// Revoke on one that is. Both name the parent by URL — the intents take
+/// a URL, and the switcher sits on sibling worktrees' pages too, so the
+/// page is not the parent. Allow carries git's path for the hub to
+/// re-check against a fresh listing; Revoke carries only the record's
+/// name, since the path is the record's business. Empty for every other
+/// row, and for an orphan with no parent to allow it under.
+///
+/// Not gated like `show_remove`: the switcher's handler is in `app.js`,
+/// and the overview, which loads `overview.js` instead, gets its own in
+/// the client task (#188) — the overview's ✕ is suppressed because there
+/// it would be the one destructive control with no confirm wired up, and
+/// neither of these destroys anything.
+fn outside_control(p: &crate::registry::ProjectStatus) -> String {
+    if p.outside.is_some() {
+        match crate::outside::split_url(&p.url) {
+            Some((parent, name)) => format!(
+                " <button class=\"wtrevoke\" data-parent=\"{}\" data-name=\"{}\" title=\"stop opening this worktree in roost\">Revoke</button>",
+                esc(parent),
+                esc(name)
+            ),
+            None => String::new(),
+        }
+    } else if !p.reachable {
+        match p.parent.as_deref() {
+            Some(parent_key) => format!(
+                " <button class=\"wtallow\" data-parent=\"{}\" data-path=\"{}\" title=\"open this worktree in roost, though it is outside roost's roots\">Allow…</button>",
+                esc(&crate::registry::decode_key(parent_key)),
+                esc(&p.url)
+            ),
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    }
+}
+
 /// The worktree switcher: the header chip's label (out-of-band, so one
 /// fragment feeds two places) plus one row per member of the current
 /// repository's worktree family.
@@ -1508,28 +1546,38 @@ pub fn worktrees_strip(current_key: &str, projects: &[crate::registry::ProjectSt
         if p.key == current_key {
             cls.push_str(" current");
         }
+        let control = outside_control(p);
         if !p.reachable {
             cls.push_str(" unreachable");
             out.push_str(&format!(
-                "<span class=\"{cls}\" title=\"worktree outside roost's roots — cannot be opened\">{marker} {}{branch}</span>",
+                "<span class=\"wtrow\"><span class=\"{cls}\" title=\"worktree outside roost's roots — cannot be opened\">{marker} {}{branch}</span>{control}</span>",
                 esc(name)
             ));
             continue;
+        }
+        if p.outside.is_some() {
+            cls.push_str(" outside");
         }
         // Per-worktree state (Claude, dirty, ahead) and, when every axis is
         // positively clean, a remove control. Only present when the caller
         // asked for it (`known_projects_with_state`) — `p.wt` is `None`
         // otherwise, and `None` renders no state at all, never "clean".
+        // Never ✕ on an allowed outside worktree: its directory is outside
+        // every root, and deleting it is not roost's to offer.
         let state_html = match &p.wt {
             None => String::new(),
-            Some(w) => format!(" · {}", worktree_chips(w, &p.key, p.live, true)),
+            Some(w) => format!(" · {}", worktree_chips(w, &p.key, p.live, p.outside.is_none())),
+        };
+        let title = match &p.outside {
+            Some(real) => format!("outside roost's roots: {real}"),
+            None => p.url.clone(),
         };
         // A `<button>` cannot nest inside an `<a>` (invalid HTML), so the row
         // is a flex span wrapping the link and the state/control separately.
         out.push_str(&format!(
-            "<span class=\"wtrow\"><a class=\"{cls}\" href=\"/{}\" title=\"{}\">{marker} {}{branch}</a>{state_html}</span>",
+            "<span class=\"wtrow\"><a class=\"{cls}\" href=\"/{}\" title=\"{}\">{marker} {}{branch}</a>{state_html}{control}</span>",
             crate::http::percent_encode(&p.url),
-            esc(&p.url),
+            esc(&title),
             esc(name),
         ));
     }
@@ -1618,13 +1666,21 @@ fn ov_row(p: &crate::registry::ProjectStatus, sel: &str, expanded: bool) -> Stri
         .as_deref()
         .map(|pk| format!(" data-parent=\"{}\"", esc(pk)))
         .unwrap_or_default();
+    let control = outside_control(p);
     if !p.reachable {
         return format!(
-            "<li class=\"{cls} unreachable\" data-key=\"{}\"{parent_attr} title=\"worktree outside roost's roots — cannot be opened\">{caret}{marker} {}{branch}{chips}</li>",
+            "<li class=\"{cls} unreachable\" data-key=\"{}\"{parent_attr} title=\"worktree outside roost's roots — cannot be opened\">{caret}{marker} {}{branch}{chips}{control}</li>",
             esc(&p.key),
             esc(name)
         );
     }
+    let name_title = match &p.outside {
+        Some(real) => {
+            cls.push_str(" outside");
+            format!(" title=\"outside roost's roots: {}\"", esc(real))
+        }
+        None => String::new(),
+    };
     // Opening is a property of the project, not of something running inside
     // it: a project with no sessions had no way to be opened at all, because
     // the only link on the page that reached a workspace was a session row.
@@ -1637,7 +1693,7 @@ fn ov_row(p: &crate::registry::ProjectStatus, sel: &str, expanded: bool) -> Stri
         esc(&p.url)
     );
     format!(
-        "<li class=\"{cls}\" data-key=\"{}\"{parent_attr}>{caret}<a class=\"ovname\" href=\"/{}\">{marker} {}{branch}</a>{chips}{open}</li>",
+        "<li class=\"{cls}\" data-key=\"{}\"{parent_attr}>{caret}<a class=\"ovname\" href=\"/{}\"{name_title}>{marker} {}{branch}</a>{chips}{control}{open}</li>",
         esc(&p.key),
         crate::http::percent_encode(&p.url),
         esc(name)
@@ -3870,12 +3926,14 @@ mod tests {
                 key: "karpie".into(), url: "karpie".into(),
                 live: 2, oldest_age_secs: Some(8 * 3600), has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
+                outside: None,
                 wt: None,
             },
             crate::registry::ProjectStatus {
                 key: "glow".into(), url: "glow".into(),
                 live: 0, oldest_age_secs: None, has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
+                outside: None,
                 wt: None,
             },
         ];
@@ -3913,6 +3971,7 @@ mod tests {
             key: "solo".into(), url: "solo".into(),
             live: 1, oldest_age_secs: Some(3600), has_layout: true,
             branch: String::new(), parent: None, reachable: true,
+            outside: None,
             wt: None,
         }];
         let h = projects_strip("other", &one);
@@ -3925,6 +3984,7 @@ mod tests {
             key: "duo".into(), url: "duo".into(),
             live: 2, oldest_age_secs: None, has_layout: true,
             branch: String::new(), parent: None, reachable: true,
+            outside: None,
             wt: None,
         }];
         assert!(projects_strip("other", &two).contains("2 sessions"), "two must stay plural");
@@ -3936,6 +3996,7 @@ mod tests {
             key: "karpie".into(), url: "karpie".into(),
             live: 3, oldest_age_secs: None, has_layout: false,
             branch: String::new(), parent: None, reachable: true,
+            outside: None,
             wt: None,
         }];
         let h = projects_strip("other", &ps);
@@ -3957,6 +4018,7 @@ mod tests {
                 key: "a%3Cb".into(), url: "a<b".into(),
                 live: 1, oldest_age_secs: None, has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
+                outside: None,
                 wt: None,
             },
             // storage_key only escapes '/' and '%' — a raw '"' from a
@@ -3969,6 +4031,7 @@ mod tests {
                 key: "a\" onmouseover=x".into(), url: "b".into(),
                 live: 1, oldest_age_secs: None, has_layout: true,
                 branch: String::new(), parent: None, reachable: true,
+                outside: None,
                 wt: None,
             },
         ];
@@ -3995,6 +4058,7 @@ mod tests {
                 key: "ultima_marketing".into(), url: "ultima_marketing".into(),
                 live: 2, oldest_age_secs: Some(60), has_layout: true,
                 branch: "main".into(), parent: None, reachable: true,
+                outside: None,
                 wt: None,
             },
             crate::registry::ProjectStatus {
@@ -4004,6 +4068,7 @@ mod tests {
                 branch: "site-launch".into(),
                 parent: Some("ultima_marketing".into()),
                 reachable: true,
+                outside: None,
                 wt: None,
             },
         ];
@@ -4037,6 +4102,7 @@ mod tests {
                 key: "repo".into(), url: "repo".into(),
                 live: 1, oldest_age_secs: None, has_layout: true,
                 branch: "main".into(), parent: None, reachable: true,
+                outside: None,
                 wt: None,
             },
             crate::registry::ProjectStatus {
@@ -4049,6 +4115,7 @@ mod tests {
                 key: "%2Felsewhere%2Fstray".into(), url: "/elsewhere/stray".into(),
                 live: 1, oldest_age_secs: None, has_layout: false,
                 branch: "wip".into(), parent: Some("repo".into()), reachable: false,
+                outside: None,
                 wt: None,
             },
         ];
@@ -4149,6 +4216,7 @@ mod tests {
             branch: branch.into(),
             parent: parent.map(|s| s.to_string()),
             reachable,
+            outside: None,
             wt: None,
         }
     }
@@ -4295,8 +4363,8 @@ mod tests {
         use crate::registry::{ProjectStatus, WorktreeStatus};
         use crate::claudes::ClaudeEvidence;
         let mk = |wt: WorktreeStatus, live: usize| vec![
-            ProjectStatus { key: "r".into(), url: "r".into(), live: 1, oldest_age_secs: None, has_layout: true, branch: "main".into(), parent: None, reachable: true, wt: None },
-            ProjectStatus { key: "r%2F.claude%2Fworktrees%2Fclaude-1".into(), url: "r/.claude/worktrees/claude-1".into(), live, oldest_age_secs: None, has_layout: false, branch: "claude-1".into(), parent: Some("r".into()), reachable: true, wt: Some(wt) },
+            ProjectStatus { key: "r".into(), url: "r".into(), live: 1, oldest_age_secs: None, has_layout: true, branch: "main".into(), parent: None, reachable: true, outside: None, wt: None },
+            ProjectStatus { key: "r%2F.claude%2Fworktrees%2Fclaude-1".into(), url: "r/.claude/worktrees/claude-1".into(), live, oldest_age_secs: None, has_layout: false, branch: "claude-1".into(), parent: Some("r".into()), reachable: true, outside: None, wt: Some(wt) },
         ];
         let clean = WorktreeStatus { claude: ClaudeEvidence::Absent, dirty: Some(false), ahead: Some(0), base: "main".into(), base_recorded: true };
         let out = worktrees_strip("r", &mk(clean.clone(), 0));
@@ -4318,7 +4386,7 @@ mod tests {
     }
 
     fn ps_row(key: &str, url: &str, live: usize, branch: &str, parent: Option<&str>, wt: Option<crate::registry::WorktreeStatus>) -> crate::registry::ProjectStatus {
-        crate::registry::ProjectStatus { key: key.into(), url: url.into(), live, oldest_age_secs: None, has_layout: true, branch: branch.into(), parent: parent.map(str::to_string), reachable: true, wt }
+        crate::registry::ProjectStatus { key: key.into(), url: url.into(), live, oldest_age_secs: None, has_layout: true, branch: branch.into(), parent: parent.map(str::to_string), reachable: true, outside: None, wt }
     }
 
     #[test]
@@ -4373,6 +4441,7 @@ mod tests {
             url: format!("repo/.claude/worktrees/{name}"),
             live: 0, oldest_age_secs: None, has_layout: false,
             branch: branch.into(), parent: Some("repo".into()), reachable: true,
+            outside: None,
             wt: Some(WorktreeStatus { claude: crate::claudes::ClaudeEvidence::Absent,
                 dirty: Some(false), ahead: Some(0), base: "main".into(), base_recorded: true }),
         };
@@ -4397,6 +4466,91 @@ mod tests {
         ];
         let out = overview_projects("", &ps, false);
         assert!(out.contains("unreachable"), "{out}");
+    }
+
+    /// An outside worktree git reports, under the parent `a<b` (a storage
+    /// key that decodes to itself), at a path carrying every metacharacter
+    /// `esc` handles.
+    fn unallowed_outside_family() -> Vec<crate::registry::ProjectStatus> {
+        vec![
+            wt("a<b", "a<b", None, 0, "main", true),
+            wt("x", "/x/a\"b<c&d>/wt", Some("a<b"), 0, "side", false),
+        ]
+    }
+
+    /// #188 §2: an unreachable row offers Allow…, naming its parent's URL
+    /// and its real path, both escaped, in the switcher and the overview.
+    /// The fixture path holds `"`, `<`, `&` and `>`: an unescaped `"` would
+    /// close `data-path` early and let the rest of a cloned repo's chosen
+    /// path be parsed as attributes.
+    ///
+    /// Revert-checked: interpolating `p.url` raw into `data-path` fails the
+    /// first assertion — observed `panicked at src/render.rs ...: ... <span
+    /// class="wt unreachable" ...>○ wt ...</span> <button class="wtallow"
+    /// data-parent="a&lt;b" data-path="/x/a"b<c&d>/wt" ...`. Restored.
+    #[test]
+    fn the_allow_button_escapes_its_path() {
+        let ps = unallowed_outside_family();
+        let want = r#"<button class="wtallow" data-parent="a&lt;b" data-path="/x/a&quot;b&lt;c&amp;d&gt;/wt""#;
+        let h = worktrees_strip("a<b", &ps);
+        assert!(h.contains(want), "{h}");
+        assert!(!h.contains("a\"b<c"), "{h}");
+        let o = overview_worktree_rows("", &ps[1..]);
+        assert!(o.contains(want), "{o}");
+        assert!(!o.contains("a\"b<c"), "{o}");
+        // Only the unreachable row offers it: the root is reachable, and an
+        // ordinary in-roots child has nothing to allow.
+        assert_eq!(h.matches("wtallow").count(), 1, "{h}");
+        let k = worktrees_strip("karpie", &karpie_family());
+        assert!(!k.contains("wtallow"), "{k}");
+    }
+
+    /// An allowed outside row: a link to its virtual URL with the `outside`
+    /// class and the real path (escaped) in its tooltip, Revoke naming the
+    /// record, and no remove control even though the state alone would
+    /// offer one — removing a directory outside the roots is not roost's
+    /// to do. The same row with `outside: None` does get ✕, which is what
+    /// shows the fixture really is removable.
+    ///
+    /// Revert-checked, both observed and restored:
+    /// - passing `show_remove: true` in the switcher (dropping the
+    ///   `p.outside.is_none()` gate) fails `!h.contains("wtremove")` —
+    ///   `panicked ... <a class="wt outside" href="/a%3Cb/.claude/outside/wt"
+    ///   ...> · ... clean ...` with the ✕ rendered after the chips;
+    /// - dropping `esc` on the overview's tooltip path fails the overview's
+    ///   escaping assertion — `panicked ... <a class="ovname" ...
+    ///   title="outside roost's roots: /x/a"b<c&d>/wt">`.
+    #[test]
+    fn an_outside_row_has_revoke_and_no_remove() {
+        use crate::claudes::ClaudeEvidence;
+        let clean = crate::registry::WorktreeStatus {
+            claude: ClaudeEvidence::Absent, dirty: Some(false), ahead: Some(0),
+            base: "main".into(), base_recorded: false,
+        };
+        let mut row = wt("a%3Cb%2F.claude%2Foutside%2Fwt", "a<b/.claude/outside/wt", Some("a<b"), 0, "side", true);
+        row.wt = Some(clean);
+        row.outside = Some("/x/a\"b<c&d>/wt".into());
+        assert!(crate::registry::removable(row.wt.as_ref().unwrap(), row.live), "fixture must be removable");
+        let root = wt("a<b", "a<b", None, 0, "main", true);
+
+        let h = worktrees_strip("a<b", &[root.clone(), row.clone()]);
+        assert!(h.contains(r#"<button class="wtrevoke" data-parent="a&lt;b" data-name="wt""#), "{h}");
+        assert!(!h.contains("wtremove"), "{h}");
+        assert!(h.contains(r#"class="wt outside" href="/a%3Cb/.claude/outside/wt""#), "{h}");
+        assert!(h.contains("/x/a&quot;b&lt;c&amp;d&gt;/wt"), "{h}");
+        assert!(!h.contains("a\"b<c") && !h.contains("wtallow"), "{h}");
+
+        let o = overview_worktree_rows("", &[row.clone()]);
+        assert!(o.contains(r#"<button class="wtrevoke" data-parent="a&lt;b" data-name="wt""#), "{o}");
+        assert!(o.contains("ovrow child outside"), "{o}");
+        assert!(o.contains("/x/a&quot;b&lt;c&amp;d&gt;/wt") && !o.contains("a\"b<c"), "{o}");
+        assert!(!o.contains("wtremove") && !o.contains("wtallow"), "{o}");
+
+        // Positive control: the same state on an ordinary row offers ✕.
+        let mut plain = row.clone();
+        plain.outside = None;
+        let h = worktrees_strip("a<b", &[root, plain]);
+        assert!(h.contains("wtremove") && !h.contains("wtrevoke"), "{h}");
     }
 
     #[test]
