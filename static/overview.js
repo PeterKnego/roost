@@ -245,10 +245,12 @@
       lines: [`Stop opening ${name} in roost?`, "Running terminals keep running."],
       confirm: "Revoke" });
     if (!yes) return;
-    // Success sends nothing to the clicker; the ProjectsChanged naming this
-    // parent is the sign it is done. Another project's would not be.
+    // OutsideRevoked is this connection's own answer. Not ProjectsChanged:
+    // a terminal spawn, a prune or a cold hub's seed sends that for the
+    // parent too, and resolving on it would report success and hide an
+    // Error still on its way.
     const reply = await sendWorkspace(parent, { t: "RevokeOutsideWorktree", parent, name },
-      (ev) => ev.t === "ProjectsChanged" && ev.project === parent);
+      (ev) => ev.t === "OutsideRevoked" && ev.parent === parent && ev.name === name);
     refreshBoth();
     if (reply.t === "Error") return tell("Not revoked", reply.msg);
   }

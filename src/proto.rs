@@ -743,6 +743,13 @@ pub enum Event {
     /// browser learns of the change through the refreshed snapshot and
     /// `ProjectsChanged`.
     OutsideAllowed { url: String },
+    /// The allow record `parent`/`name` is deleted. Sent to the clicker
+    /// only, after every switcher has heard `ProjectsChanged`: it is the
+    /// one event that means *this* revoke was handled, where a
+    /// `ProjectsChanged { parent }` can also come from a terminal spawn, a
+    /// prune, or a cold hub's seed, and waiting on that hid a later
+    /// `Error` (#188 final review).
+    OutsideRevoked { parent: String, name: String },
     /// Claude in `session` asked for worktree `worktree-<name>` through the
     /// hook and is blocked until a browser answers with `WorktreeAnswer`.
     /// Broadcast to every browser of the project; `id` is a server counter,
@@ -978,6 +985,17 @@ mod tests {
         let v = AppearedView { path: "/o/wt".into(), branch: "side".into(), url: None, outside: true, allowed: false };
         let s = serde_json::to_string(&v).unwrap();
         assert_eq!(s, r#"{"path":"/o/wt","branch":"side","url":null,"outside":true,"allowed":false}"#);
+    }
+
+    /// Revert-checked: with the variant's `name` field renamed to `wt`
+    /// (cp backup, restored), fails `left:
+    /// "{\"t\":\"OutsideRevoked\",\"parent\":\"repo\",\"wt\":\"wt\"}"` — the
+    /// client reads `ev.parent` and `ev.name`, so the wire names are the
+    /// contract.
+    #[test]
+    fn outside_revoked_encodes_parent_and_name() {
+        let s = encode(&Event::OutsideRevoked { parent: "repo".into(), name: "wt".into() });
+        assert_eq!(s, r#"{"t":"OutsideRevoked","parent":"repo","name":"wt"}"#);
     }
 
     #[test]

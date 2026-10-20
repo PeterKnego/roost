@@ -40,7 +40,7 @@ deno run -A tests/browser/claudemenu.mjs # the ✻ menu: New plus this project's
 deno run -A tests/browser/worktrees.mjs # the header's worktree switcher chip + panel
 deno run -A tests/browser/worktree-launch.mjs # the ✻ prompt, worktree creation into a second tab, switcher state and removal; needs a real CDP click for window.open
 deno run -A tests/browser/worktree-rehome.mjs # Claude's WorktreeCreate hook end to end: ask, approve, re-home, close and fork (#156)
-deno run -A tests/browser/outside.mjs    # a worktree outside roost's roots: the persistent appeared banner, Allow… into a virtual URL, and Revoke (#188)
+deno run -A tests/browser/outside.mjs    # a worktree outside roost's roots: the persistent appeared banner, Allow… into a virtual URL, and Revoke — from the switcher and the overview (#188)
 deno run -A tests/browser/overview.mjs   # the front page (/): live session list, clicking one focuses it, ?at= reaches the picker, and selecting a project narrows/widens the session list
 deno run -A tests/browser/claudetab.mjs  # a terminal tab running a Claude wears the Claude mark: the /proc watcher, the data-claude attribute, and the CSS that turns it into a different picture
 deno run -A tests/browser/changes.mjs    # the Changes pane and the header chip follow the working tree, not just `.git/index`

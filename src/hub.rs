@@ -2925,8 +2925,10 @@ impl Hub {
     /// record and nothing else. No session, layout or `.base` under the
     /// virtual URL is touched — the page stops resolving and a live session
     /// stays alive, kept from the sweep by its `.origin`'s real path. On
-    /// success nothing is sent to the clicker specifically; every page,
-    /// the clicker's included, hears `ProjectsChanged`.
+    /// success every page, the clicker's included, hears `ProjectsChanged`,
+    /// and the clicker alone then gets `OutsideRevoked` — the overview
+    /// waits on that, since a `ProjectsChanged` for the parent can come
+    /// from anything else that changes it.
     fn do_revoke_outside(&mut self, from: &ConnId, parent: String, name: String) {
         if let Err(msg) = outside_parent_ok(&parent) {
             return self.send_to(from, &Event::Error { msg });
@@ -2934,7 +2936,7 @@ impl Hub {
         let work_parent = parent.clone();
         let work = move || -> Result<Option<Event>, String> {
             crate::outside::revoke(&work_parent, &name).map_err(|e| format!("cannot revoke {name}: {e}"))?;
-            Ok(None)
+            Ok(Some(Event::OutsideRevoked { parent: work_parent, name }))
         };
         self.run_outside(from, parent, "revoke-outside", work);
     }
@@ -12598,6 +12600,45 @@ mod tests {
         assert!(records.is_empty(), "the record is gone: {records:?}");
         assert_eq!(after, None);
         assert!(bad.contains(r#""t":"Error""#) && bad.contains("invalid worktree name"), "{bad}");
+    }
+
+    /// The overview's revoke used to resolve on any `ProjectsChanged` for
+    /// the parent, which a terminal spawn or a prune also sends, so it could
+    /// report success and hide a later `Error`. `OutsideRevoked` is the
+    /// clicker's own answer: sent to it alone, naming what was revoked,
+    /// after the broadcast. Two connections, so `send_to` and `broadcast`
+    /// are distinguishable; the other one hearing `ProjectsChanged` is what
+    /// shows its queue was live.
+    ///
+    /// Revert-checked (cp backup, restored): with the work closure's reply
+    /// back to `Ok(None)`, fails `timed out waiting for
+    /// "t":"OutsideRevoked"; got [{"t":"State",…}, …]`; with `send_to` in
+    /// `run_outside`'s reply replaced by `broadcast`, fails `the other
+    /// connection must not get OutsideRevoked: [… {"t":"OutsideRevoked",
+    /// "parent":"orepo-revack","name":"wt"}]`.
+    #[test]
+    fn revoke_answers_the_clicker_alone_with_outside_revoked() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-revack", "wt");
+        crate::outside::allow(&fx.project, &fx.wt).unwrap();
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
+        let (a, rxa) = Hub::lock(&hub).subscribe();
+        let (_b, rxb) = Hub::lock(&hub).subscribe();
+        drain(&rxa);
+        drain(&rxb);
+        Hub::lock(&hub).handle(&a, Intent::RevokeOutsideWorktree { parent: fx.project.clone(), name: "wt".into() });
+        let (got, _) = await_containing(&rxa, r#""t":"OutsideRevoked""#);
+        // The reply is sent last, after the broadcasts, so by now the other
+        // connection's queue holds everything it will get.
+        let other = drain(&rxb);
+        assert_eq!(got, format!(r#"{{"t":"OutsideRevoked","parent":"{}","name":"wt"}}"#, fx.project));
+        assert!(!other.iter().any(|m| m.contains("OutsideRevoked")), "the other connection must not get OutsideRevoked: {other:?}");
+        assert!(
+            other.iter().any(|m| m.contains(r#""t":"ProjectsChanged""#)),
+            "the other connection must hear the change: {other:?}"
+        );
     }
 
     /// Spec §1 "Revocation never touches sessions" / Review Focus 5: a live

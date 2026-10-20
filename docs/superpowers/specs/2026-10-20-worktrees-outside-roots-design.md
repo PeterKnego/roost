@@ -41,7 +41,7 @@ The record lives only in roost's state directory, never in a repository or in pr
 
 **Revocation.** Losing access destroys nothing, so every doubt fails closed.
 - An identity mismatch, or a directory that is gone, resolves to `None`.
-- A **Revoke** action on an allowed row sends `RevokeOutsideWorktree { parent, name }`, which deletes the record.
+- A **Revoke** action on an allowed row sends `RevokeOutsideWorktree { parent, name }`, which deletes the record. On success every page hears `ProjectsChanged` and the sender alone then gets `OutsideRevoked { parent, name }`, its own answer: a `ProjectsChanged` for the parent can come from anything else that changes it, so it cannot stand for "this revoke was handled".
 - When a listing of the parent's worktrees comes back non-empty without the recorded path, the record is deleted. This happens in the switcher, the overview, or the hub's worktree confirm. An empty listing changes nothing.
 - Revocation never touches sessions, layout or `.base` under that URL. The page stops resolving, and a live session stays alive. #178 and #182 keep it from being reaped, since `.origin` records the real path.
 

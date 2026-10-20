@@ -24,6 +24,13 @@
 //!      project: both pages lose it, and a reload does not bring it back.
 //!   S. Revoke from the switcher, confirmed. The row is dim with Allow…
 //!      again, and the virtual URL answers 404 "no such project".
+//!   T. The overview (`/`, `static/overview.js`, which is not app.js):
+//!      select proj, Allow… on wt's dim child row, confirm — the row becomes
+//!      a reachable link with Revoke and `/api/projects` stops listing the
+//!      virtual URL as a project of its own; Revoke, confirm — dim with
+//!      Allow… again, and the click did not select the row it sits in. Each
+//!      one-shot exchange is waited out (its socket closed) before "no error
+//!      dialog" is read, so a late Error cannot hide behind a fast assert.
 //!
 //! Every absence is paired with a positive check that the thing was visible
 //! before on the same page: the dim row and its Allow… are asserted present
@@ -69,6 +76,28 @@
 //!   resolving — exactly what S exists to catch. Restored with `cp`,
 //!   rebuilt: 41 ok, 0 FAIL.
 //!
+//!   T's checks (#188 final review), each applied, watched failing,
+//!   restored with `cp`:
+//!   - `do_revoke_outside` replying `Ok(None)` again (no `OutsideRevoked`):
+//!     T fails 1 — `FAIL and no error dialog (Not revoked roost did not
+//!     answer within 10 s …)`. The overview now waits on its own answer, so
+//!     a missing one is an error the user sees, not a success inferred from
+//!     somebody else's `ProjectsChanged`. A first draft counted
+//!     `close()` calls, which `finish` makes twice per socket, and passed
+//!     under this same revert; it counts distinct sockets now.
+//!   - `registry::project_rows`' outside retain removed (I1): T fails 1 —
+//!     `FAIL and /api/projects lists proj but not the allowed URL … (["proj",
+//!     "proj%2F.claude%2Foutside%2Fwt"])`. The overview's own list stayed
+//!     green: `build_overview_projects` drops a top-level copy under an
+//!     expanded parent, which is why the check reads the API.
+//!   - overview.js's allow sending `Noop` instead of `AllowOutsideWorktree`:
+//!     T fails 3 — the error dialog (`Not allowed unknown variant `Noop``),
+//!     the row never becoming reachable, and the API check; the run then
+//!     throws on the missing Revoke button.
+//!   - the `return` after `revokeOutside` in overview.js's click handler
+//!     removed: T fails 1 — `FAIL the click on Revoke did not select the
+//!     row it sits in`.
+//!
 //! Run: deno run -A tests/browser/outside.mjs
 import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startRoost, until }
   from "./harness.mjs";
@@ -105,7 +134,7 @@ const shell = `${fx.base}/shell`;
 await Deno.writeFile(shell, enc.encode(`#!/bin/sh\nexec /bin/bash --noprofile --norc "$@"\n`), { mode: 0o755 });
 
 const browser = await startBrowser(profileDir(repoRoot));
-let page, page2, pO, pR, roost;
+let page, page2, pO, pR, pV, roost;
 // Joins soft-wrapped rows, so a long path is one line.
 const helpers = `window.__txt = (s) => { const e = terms.get(s); if (!e) return ""; const b = e.term.buffer.active; let o = "";
     for (let i = 0; i < b.length; i++) { o += b.getLine(i).translateToString(true); const n = b.getLine(i + 1); if (!n || !n.isWrapped) o += "\\n"; } return o; };
@@ -287,8 +316,69 @@ try {
   ok(await until(() => pR.evalIn(`document.readyState === "complete" && document.body.innerText.trim() === "no such project"`), 15, "the 404 page"),
      "a browser opening it gets the same answer");
   ok(await pR.evalIn(`typeof state === "undefined" && !document.getElementById("wtbtn")`), "and no workspace");
+
+  // ------------------------------------------------------------------ T
+  console.log(`\nT. the overview's Allow… and Revoke (${stamp()})`);
+  pV = await openPage(browser.port, `${base}/`);
+  const vKey = "proj%2F.claude%2Foutside%2Fwt";
+  ok(await until(() => pV.evalIn(`!!document.querySelector('#ovprojects .ovrow[data-key="proj"]')`), 20, "the overview's proj row"),
+     "the overview lists proj");
+  // Every one-shot exchange ends in `finish`, which closes its socket —
+  // on the answer, or on the 10 s timeout with an Error. Counting closed
+  // sockets is what lets "no error dialog" be read after the reply, not
+  // before it. Distinct sockets, not close() calls: `finish` closes again
+  // from the socket's own onclose, so one exchange makes two calls, and a
+  // call count let the revoke's wait be satisfied by the allow's socket —
+  // the first revert-check of this section passed that way.
+  await pV.evalIn(`window.__socks = new Set(); window.__closed = 0; { const c = WebSocket.prototype.close;
+    WebSocket.prototype.close = function (...a) { __socks.add(this); window.__closed = __socks.size; return c.apply(this, a); }; } 0`);
+  const ovRow = (pg) => pg.evalIn(`JSON.stringify((() => {
+    const r = [...document.querySelectorAll('#ovprojects .ovrow.child[data-parent="proj"]')].find((e) =>
+      e.querySelector('.wtallow')?.dataset.path === ${JSON.stringify(wtPath)} || e.querySelector('.wtrevoke')?.dataset.name === "wt");
+    if (!r) return null;
+    const a = r.querySelector("a.ovname");
+    return { dim: r.classList.contains("unreachable"), allow: !!r.querySelector(".wtallow"), revoke: !!r.querySelector(".wtrevoke"),
+             href: a ? decodeURIComponent(a.getAttribute("href")) : null };
+  })())`).then(JSON.parse);
+  const strayTop = (pg) => pg.evalIn(`!!document.querySelector('#ovprojects .ovrow:not(.child)[data-key="${vKey}"]')`);
+  const errOpen = (pg) => pg.evalIn(`document.getElementById("dlg-choice").open ? document.getElementById("dlg-choice").textContent.trim() : ""`);
+  // Revoked in S but its terminal from Q still running: the one top-level
+  // row an outside URL may have (registry::project_rows), unreachable. The
+  // positive half of the "not top-level once allowed" check below.
+  ok(await until(() => strayTop(pV), 10, "the revoked-but-live row"),
+     "before the allow, the revoked URL's live session is its own top-level row");
+  // The same list over /api/projects, which has no expanded parent to fold
+  // a duplicate into (build_overview_projects drops a top-level copy only
+  // under a parent that is open, so the overview alone cannot show I1 once
+  // proj is selected).
+  const apiKeys = async () => (await (await fetch(`${base}/api/projects`)).json()).map((p) => p.key);
+  let keys = await apiKeys();
+  ok(keys.includes("proj") && keys.includes(vKey), `and /api/projects lists it beside proj (${JSON.stringify(keys)})`);
+  await pV.evalIn(`document.querySelector('#ovprojects .ovrow[data-key="proj"]').click(); 0`);
+  let rv = null;
+  await until(async () => { rv = await ovRow(pV); return !!rv; }, 15, "wt's overview row");
+  ok(rv?.dim && rv.allow && !rv.revoke && rv.href === null, `selecting proj lists wt dim, unlinked, with Allow… (${JSON.stringify(rv)})`);
+  await pV.evalIn(`[...document.querySelectorAll('#ovprojects .wtallow')].find((b) => b.dataset.path === ${JSON.stringify(wtPath)}).click(); 0`);
+  await confirmDialog(pV, "Allow");
+  ok(await until(() => pV.evalIn(`window.__closed >= 1`), 15, "the allow's reply"), "the allow's one-shot socket got its answer");
+  ok((await errOpen(pV)) === "", `and no error dialog (${await errOpen(pV)})`);
+  await until(async () => { rv = await ovRow(pV); return !!rv && !rv.dim; }, 15, "wt's row to become reachable");
+  ok(rv && !rv.dim && rv.revoke && !rv.allow && rv.href === `/${virtual}`,
+     `after the allow, wt's overview row is reachable, links to /${virtual}, with Revoke (${JSON.stringify(rv)})`);
+  keys = await apiKeys();
+  ok(keys.includes("proj") && !keys.includes(vKey),
+     `and /api/projects lists proj but not the allowed URL, a child and not a project (#188 I1) (${JSON.stringify(keys)})`);
+
+  await pV.evalIn(`[...document.querySelectorAll('#ovprojects .wtrevoke')].find((b) => b.dataset.name === "wt").click(); 0`);
+  await confirmDialog(pV, "Revoke");
+  ok(await until(() => pV.evalIn(`window.__closed >= 2`), 15, "the revoke's reply"), "the revoke's one-shot socket got its answer");
+  ok((await errOpen(pV)) === "", `and no error dialog (${await errOpen(pV)})`);
+  ok(await pV.evalIn(`location.pathname === "/" && new URLSearchParams(location.search).get("sel") === "proj"`),
+     "the click on Revoke did not select the row it sits in");
+  await until(async () => { rv = await ovRow(pV); return !!rv && rv.dim; }, 15, "wt's row to dim");
+  ok(rv?.dim && rv.allow && !rv.revoke && rv.href === null, `after the revoke, wt's overview row is dim with Allow… again (${JSON.stringify(rv)})`);
 } finally {
-  for (const p of [pR, pO, page2, page]) { try { p?.close(); } catch {} }
+  for (const p of [pV, pR, pO, page2, page]) { try { p?.close(); } catch {} }
   browser.close();
   await roost?.close();
   await fx.cleanup();
