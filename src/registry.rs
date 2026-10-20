@@ -2841,6 +2841,136 @@ mod tests {
         });
     }
 
+    /// I2 of #188's final review: revoking an allow, or the directory being
+    /// replaced under it, makes the virtual URL stop resolving — and
+    /// `resolve_project` answering `None` must never read as "deleted" to a
+    /// sweep. The earlier survival tests asserted after the revoke intent,
+    /// which contains no kill code, so they could not tell protection from
+    /// no sweep at all. This one runs the real sweep, `reconcile`, against
+    /// a real dtach master working in the outside directory, with `.origin`
+    /// recording its real path, in each state the URL can be in: (a)
+    /// allowed, (b) revoked, (c) re-allowed and then its directory replaced
+    /// at the same path, so a record exists but its identity no longer
+    /// matches. The complement — the directory really deleted — is reaped,
+    /// which is what shows the sweep was live and able to kill all along.
+    ///
+    /// Revert-checked: with `confirmed_gone`'s `None` arm replaced by
+    /// `true` (cp backup, restored), fails at state (c) — `replaced: nothing
+    /// reaped` with `left: 1, right: 0`, the master SIGKILLed. State (b)
+    /// stayed green under that revert: the directory still stands at its
+    /// recorded path with its recorded inode, so #178/#182's move evidence
+    /// (the shell's cwd, and the sibling scan) rescued it as a second line,
+    /// reading it as `Unfollowable`. In (c) the inode changed and the
+    /// shell's cwd is `(deleted)`, so `.origin`'s recorded path was the
+    /// only thing standing between a replaced directory and a dead shell.
+    /// The companion test below pins (b)'s two layers.
+    #[test]
+    fn a_live_session_under_an_outside_url_survives_the_sweep_until_its_directory_is_deleted() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let wt = repo_with_outside_worktree(state, root.path(), outside.path());
+            let roots = vec![root.path().to_path_buf()];
+            let rec = crate::outside::allow("repo", &wt).unwrap();
+            let url = crate::outside::url_for("repo", &rec.name);
+            let key = crate::projects::storage_key(&url);
+            let sock_dir = state.join("sock").join(&key);
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            spawn_detached_dtach_in(&sock_path, &wt).expect("dtach must be available for this test");
+            record_origin(&url, &wt);
+            assert_eq!(
+                fs::read(sock_dir.join(".origin")).ok().map(|b| String::from_utf8_lossy(&b).trim_end().to_string()),
+                Some(wt.display().to_string()),
+                "setup: .origin records the real path, not the virtual URL"
+            );
+            assert!(socket_has_process(&sock_path), "setup: the session is live");
+
+            // Each check kills the master before failing, so a failure leaves
+            // no `sleep 30` behind.
+            let check = |what: &str, report: ReapReport| {
+                let alive = socket_has_process(&sock_path);
+                if report.gone_projects != 0 || !alive {
+                    kill_test_pids(&sock_path);
+                }
+                assert_eq!(report.gone_projects, 0, "{what}: nothing reaped");
+                assert!(alive, "{what}: the master is alive");
+            };
+
+            assert!(crate::projects::resolve_project(&roots, &url).is_some(), "(a) setup: the URL resolves");
+            check("allowed", reconcile(&roots));
+
+            crate::outside::revoke("repo", &rec.name).unwrap();
+            assert!(crate::projects::resolve_project(&roots, &url).is_none(), "(b) setup: the URL no longer resolves");
+            check("revoked", reconcile(&roots));
+
+            let again = crate::outside::allow("repo", &wt).unwrap();
+            assert_eq!(again.name, rec.name, "(c) setup: re-allowed under the same name");
+            fs::remove_dir_all(&wt).unwrap();
+            fs::create_dir(&wt).unwrap();
+            assert!(crate::outside::read("repo", &rec.name).is_some(), "(c) setup: the record is still there");
+            assert!(
+                crate::projects::resolve_project(&roots, &url).is_none(),
+                "(c) setup: the identity no longer matches, so the URL does not resolve"
+            );
+            check("replaced", reconcile(&roots));
+
+            // The complement: really deleted. The shell's cwd is a deleted
+            // directory, so there is no move evidence either.
+            fs::remove_dir_all(&wt).unwrap();
+            let gone = reconcile(&roots);
+            let alive = socket_has_process(&sock_path);
+            kill_test_pids(&sock_path);
+            assert!(gone.gone_projects >= 1, "deleted: the session is reaped ({})", gone.gone_projects);
+            assert!(!alive, "deleted: its master is ended");
+        });
+    }
+
+    /// The companion to the test above for state (b) alone: a session
+    /// under the virtual key whose shell is in `/`, not in the outside
+    /// directory, so #178's shell-cwd evidence cannot vouch for it.
+    /// Revoked, the URL no longer resolves; `.origin`'s recorded path,
+    /// still present, and #182's sibling scan are what stand against
+    /// "gone".
+    ///
+    /// Two layers hold this, and either alone is enough — the same shape as
+    /// `an_empty_listing_prunes_nothing`. Revert-checked (cp backup,
+    /// restored): with only `confirmed_gone`'s `None` arm replaced by
+    /// `true`, this stays green (observed) — `sibling_evidence` (#182)
+    /// finds the recorded inode standing at its own path and the sweep
+    /// reads it as `Unfollowable`. With that revert *and*
+    /// `record_move_with`'s `sibling_evidence` call replaced by
+    /// `MoveEvidence::None`, fails `revoked: nothing reaped` with `left: 1,
+    /// right: 0`, the master SIGKILLed.
+    #[test]
+    fn a_revoked_outside_url_is_not_reaped_on_a_shell_outside_its_directory() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let wt = repo_with_outside_worktree(state, root.path(), outside.path());
+            let roots = vec![root.path().to_path_buf()];
+            let rec = crate::outside::allow("repo", &wt).unwrap();
+            let url = crate::outside::url_for("repo", &rec.name);
+            let sock_dir = state.join("sock").join(crate::projects::storage_key(&url));
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            spawn_detached_dtach_in(&sock_path, std::path::Path::new("/")).expect("dtach must be available for this test");
+            record_origin(&url, &wt);
+            let first = reconcile(&roots);
+            assert_eq!(first.gone_projects, 0, "setup: allowed, nothing reaped");
+
+            crate::outside::revoke("repo", &rec.name).unwrap();
+            assert!(crate::projects::resolve_project(&roots, &url).is_none(), "setup: the URL no longer resolves");
+            let report = reconcile(&roots);
+            let alive = socket_has_process(&sock_path);
+            kill_test_pids(&sock_path);
+            assert_eq!(report.gone_projects, 0, "revoked: nothing reaped");
+            assert!(alive, "revoked: the master is alive");
+        });
+    }
+
     /// Restores a directory's mode on drop, so a failing assertion cannot
     /// leave a tempdir behind that its own cleanup cannot enter.
     struct RestoreMode(PathBuf, u32);
