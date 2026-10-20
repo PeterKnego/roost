@@ -2029,9 +2029,21 @@ pub fn head_branch(dir: &std::path::Path) -> String {
 /// Worktree-shaped keys are left out — a worktree is a child row, loaded by
 /// `worktree_rows` when its project is opened. Without that filter a saved
 /// layout for one would sit at the top level showing its whole dot-path.
+///
+/// An allowed outside worktree's virtual URL (#188) is the same kind of
+/// child, so it is left out on the same grounds — but only while its record
+/// still resolves, because only then does `worktree_rows` list it under its
+/// parent. One that no longer resolves (revoked, pruned, its directory
+/// replaced) survived `known_projects_inner`'s retain only on a live
+/// session, already marked unreachable there; dropping it here too would
+/// hide a running shell the user can no longer reach from any other row.
 pub fn project_rows(roots: &[PathBuf]) -> Vec<ProjectStatus> {
     let mut ps = known_projects_inner(roots, false);
     ps.retain(|p| !p.url.contains("/.claude/worktrees/"));
+    ps.retain(|p| match crate::outside::split_url(&p.url) {
+        Some((parent, name)) => crate::outside::resolve(parent, name).is_none(),
+        None => true,
+    });
     let known: std::collections::HashSet<String> = ps.iter().map(|p| p.key.clone()).collect();
     for p in crate::projects::list_projects(roots) {
         let key = crate::projects::storage_key(&p.name);
@@ -2708,6 +2720,51 @@ mod tests {
                 crate::outside::read("repo", &rec2.name).is_none(),
                 "the overview's listing must prune the record too"
             );
+        });
+    }
+
+    /// I1 of #188's final review: a saved layout under an allowed outside
+    /// worktree's virtual key put it at the overview's *top level* as well as
+    /// under its parent — `project_rows` filtered only `.claude/worktrees/`,
+    /// so the row came through as `parent: None, reachable: true`, its whole
+    /// dot-path as a project name. It is a child: `worktree_rows` lists it,
+    /// and the header switcher's grouping adopts the layout's row under its
+    /// parent rather than listing it twice. The positive halves (the parent
+    /// is at the top level, the child is in `worktree_rows`, the switcher
+    /// has it exactly once) are what keep the absence from passing on a
+    /// listing that simply failed.
+    ///
+    /// Revert-checked: with the new `split_url`/`resolve` retain removed
+    /// from `project_rows` (cp backup, restored), fails on `an allowed
+    /// outside worktree is a child, never a top-level project:
+    /// [ProjectStatus { key: "repo%2F.claude%2Foutside%2Fwt", url:
+    /// "repo/.claude/outside/wt", … has_layout: true, … parent: None,
+    /// reachable: true, … }]`.
+    #[test]
+    fn an_allowed_outside_worktree_with_a_layout_is_not_a_top_level_project() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let wt = repo_with_outside_worktree(state, root.path(), outside.path());
+            let roots = vec![root.path().to_path_buf()];
+            let rec = crate::outside::allow("repo", &wt).unwrap();
+            let url = crate::outside::url_for("repo", &rec.name);
+            let key = crate::projects::storage_key(&url);
+            fs::write(state.join(format!("{key}.json")), "{}").unwrap();
+
+            let top = project_rows(&roots);
+            assert!(top.iter().any(|p| p.url == "repo" && p.parent.is_none()), "fixture: the parent is listed: {top:?}");
+            let stray: Vec<_> = top.iter().filter(|p| p.url == url).collect();
+            assert!(stray.is_empty(), "an allowed outside worktree is a child, never a top-level project: {stray:?}");
+
+            let kids = worktree_rows(&roots, "repo");
+            let child = kids.iter().find(|p| p.url == url).unwrap_or_else(|| panic!("the overview lists it under its parent: {kids:?}"));
+            assert!(child.reachable, "{child:?}");
+
+            let sw = known_projects(&roots);
+            let in_switcher: Vec<_> = sw.iter().filter(|p| p.url == url).collect();
+            assert_eq!(in_switcher.len(), 1, "the switcher lists it once: {sw:?}");
+            assert_eq!(in_switcher[0].parent.as_deref(), Some("repo"), "under its parent: {sw:?}");
         });
     }
 
