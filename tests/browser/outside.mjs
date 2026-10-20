@@ -53,6 +53,22 @@
 //!   same URL, and its dimmed row is what speaks for the revoke itself.
 //!   Restored with `cp`, rebuilt: 41 ok, 0 FAIL.
 //!
+//!   A second check (task 8, #188), covering S, which the one above never
+//!   exercises (it stays green under that revert): `outside::revoke_in`
+//!   made a no-op (`Ok(())`, backup via `cp`, never `git checkout`), binary
+//!   rebuilt. Observed: P, Q and R green, S fails 5 —
+//!     ok    the confirm dialog opens, its button reads "Revoke" (Revoke)
+//!     FAIL  after the revoke, the row is dim with Allow… again
+//!     FAIL  and no longer a link with Revoke
+//!     FAIL  GET /proj/.claude/outside/wt answers 200 (not 404) — the row
+//!       stayed a link and the URL kept resolving as a workspace
+//!     FAIL  a browser opening it gets the same answer
+//!     FAIL  and no workspace
+//!   The record the hub asked to delete was never deleted, so the row the
+//!   switcher renders from it never dims and the virtual URL keeps
+//!   resolving — exactly what S exists to catch. Restored with `cp`,
+//!   rebuilt: 41 ok, 0 FAIL.
+//!
 //! Run: deno run -A tests/browser/outside.mjs
 import { fixture, freePort, openPage, profileDir, sleep, startBrowser, startRoost, until }
   from "./harness.mjs";

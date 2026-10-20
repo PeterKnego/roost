@@ -83,7 +83,7 @@ The record lives only in roost's state directory, never in a repository or in pr
 
 **Showing.**
 - The hub's `State` snapshot carries the list, so a page that connects later, or a page after a restart, sees every entry.
-- Each entry renders as a banner that does not auto-dismiss, built the way #181's M2 fix builds banners: `showBanner` returns its box, and the link or button attaches to that box.
+- Each entry renders as a banner that does not auto-dismiss. It is not built with `showBanner` (#181's M2 fix): that helper auto-dismisses after 8 s and dedupes by text, both wrong for a banner meant to persist, and two unrelated worktrees sharing a basename must not merge into one. Instead these render in their own `#appeared` container, keyed by path (`appearedBoxes` in `static/app.js`), reconciled against the hub's `State` on every update rather than rebuilt from scratch, so a click on a button mid-update is never yanked out from under it.
 - Banner text depends on where the worktree is:
   - under the roots, or outside and allowed: "worktree `<name>` (`<branch>`) appeared — open", linking to its page;
   - outside and not allowed: "… appeared, outside roost's roots — Allow…", which opens the §1 dialog.
