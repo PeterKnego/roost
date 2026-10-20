@@ -256,19 +256,6 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
             .collect();
         (id, rx, dir, snapshot)
     };
-    // #188 §3: opening a worktree's page dismisses its banner on the
-    // parent. After the first `State` and off this hub's lock, on its own
-    // thread: it may lock the *parent's* hub, and a socket thread holding
-    // one hub lock while taking another is the deadlock `for_project`'s
-    // comment above warns of.
-    {
-        let (url, dir) = (project.to_string(), dir.clone());
-        let _ = std::thread::Builder::new().name("appeared-clear".into()).spawn(move || {
-            if std::panic::catch_unwind(|| crate::hub::clear_appeared_on_open(&url, &dir)).is_err() {
-                eprintln!("roost: {url}: clearing its appeared banner panicked; it stays until dismissed");
-            }
-        });
-    }
     // Built here — the first statement after the lock is released — not below
     // the replay, so it covers everything between the subscription and the
     // read loop: the disk reads, `replay_buffer`, and the `try_clone` early
@@ -284,6 +271,19 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     // the same thread. A leaked subscriber is recoverable; a socket thread
     // wedged holding the hub lock takes the whole project with it.
     let unsub = UnsubGuard { hub: hub.clone(), id: id.clone() };
+    // #188 §3: opening a worktree's page dismisses its banner on the
+    // parent. After the first `State` and off this hub's lock, on its own
+    // thread: it may lock the *parent's* hub, and a socket thread holding
+    // one hub lock while taking another is the deadlock `for_project`'s
+    // comment above warns of. A page that is no worktree spawns nothing.
+    if let Some(parent) = crate::hub::worktree_parent(project, &dir) {
+        let (url, dir) = (project.to_string(), dir.clone());
+        let _ = std::thread::Builder::new().name("appeared-clear".into()).spawn(move || {
+            if std::panic::catch_unwind(|| crate::hub::clear_appeared_on_open(&parent, &dir)).is_err() {
+                eprintln!("roost: {url}: clearing its appeared banner panicked; it stays until dismissed");
+            }
+        });
+    }
     // Disk reads happen with the hub lock already dropped. Only a rel that
     // was Clean at snapshot time needs one — an edited buffer's text is
     // already in hand and reading its file too would be pure waste.

@@ -25,10 +25,12 @@
 //! be asked, never evidence that every worktree is gone.
 //!
 //! Writes are atomic (a `tmp_suffix` temp file, `create_new`, 0600, then
-//! `rename`) and serialised by `WRITE_LOCK`, a leaf lock held only across
-//! one small read-modify-write of roost's own state — the same cost the hub
-//! already accepts under its lock for `home::record`. Nothing is ever
-//! acquired while holding it.
+//! `rename`) and serialised by `WRITE_LOCK`, held only across one small
+//! read-modify-write of roost's own state — the same cost the hub already
+//! accepts under its lock for `home::record`. The only lock taken while it
+//! is held is `log_damaged_once`'s `LOGGED` (`load_in` runs inside the
+//! read-modify-write), and that one takes nothing at all, so both are
+//! leaves: no hub or registry lock is ever acquired under either.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
