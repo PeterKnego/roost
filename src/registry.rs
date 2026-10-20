@@ -4137,6 +4137,7 @@ mod tests {
 
             git_in(&repo, &["worktree", "add", "-q", "-b", "worktree-a2", ".claude/worktrees/worktree-a"]);
             crate::home::record("stalerepo", "term4", a).unwrap();
+            record_origin("stalerepo", &repo); // as attach writes it for term4's socket
             git_in(&repo, &["worktree", "remove", ".claude/worktrees/worktree-a"]);
             let home_dir_of = |p: &str| (p == "stalerepo").then(|| repo.clone());
             crate::claudes::sweep_gone_owners(&home_dir_of, &std::sync::Mutex::new(Default::default()), &[]);
@@ -6272,6 +6273,263 @@ mod tests {
             assert!(matches!(direct, Found::CannotTell(_)), "git that cannot vouch is cannot tell: {direct:?}");
             assert_eq!(kept, crate::home::Owner::Elsewhere(a.clone()), "the record is kept, not forgotten");
             assert_eq!(later, crate::home::Owner::Elsewhere(b), "and follows B once git answers");
+        });
+    }
+
+    /// Ends every test pid holding these sockets when dropped, so a failed
+    /// assertion cannot leak a dtach master (#192's bug class).
+    struct KillOnDrop(Vec<PathBuf>);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                kill_test_pids(p);
+            }
+        }
+    }
+
+    /// A git repo at `dir` with one commit and an empty `.claude/worktrees`
+    /// — the parent `detect_gone_owners` canonicalises — but no worktree.
+    fn plain_repo(dir: &std::path::Path) {
+        fs::create_dir_all(dir.join(".claude/worktrees")).unwrap();
+        git_in(dir, &["init", "-q", "-b", "main"]);
+        git_in(dir, &["config", "user.email", "t@t"]);
+        git_in(dir, &["config", "user.name", "t"]);
+        fs::write(dir.join("b.txt"), "y").unwrap();
+        git_in(dir, &["add", "b.txt"]);
+        git_in(dir, &["commit", "-qm", "occupant"]);
+    }
+
+    /// #183 chain (b), at the home R18 forgets into. Main checkout A has a
+    /// live resident `term3` re-homed into its worktree W, and a live session
+    /// of its own. A is renamed to B and followed (`.moved-to`), a new
+    /// repository — the occupant — is made at A's URL, and B is moved to a
+    /// different parent, so W's directory (the record's identity) is
+    /// nowhere R18 looks. R18 then has positive evidence that W is gone from
+    /// the home's `git worktree list` and none that it moved: before #183
+    /// Task 5 it forgot the record, `Here` became the occupant, and the
+    /// occupant's Close Project ended a shell working in B. The record must
+    /// be kept, `reconcile` must not reap it, and `kill_project(A)` must
+    /// spare it.
+    ///
+    /// The records R18 reaches are a main checkout's, because
+    /// `detect_gone_owners` asks only for owners under the home's own
+    /// `.claude/worktrees/`; A's own followed session (home A, owner B) is
+    /// asserted alongside, and is spared by the same Close Project.
+    ///
+    /// Revert-checked, run and restored: with `sweep_gone_owners_with`
+    /// forgetting unconditionally (the `home_is_its_own` gate removed), fails
+    /// "the record is kept, not forgotten into the occupant" — left `Here`.
+    /// With that assertion removed too, fails "the occupant's Close Project
+    /// does not end it": the session was handed to the occupant and killed.
+    #[test]
+    fn a_followed_record_is_kept_not_forgotten_into_an_occupant() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("ROOST_CMD");
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let (a, b) = ("chbrepo", "chbrepo-b");
+            let repo = repo_with_worktree_a(root.path(), a);
+            let w = format!("{a}/.claude/worktrees/worktree-a");
+            let key = state.join("sock").join(crate::projects::storage_key(a));
+            fs::create_dir_all(&key).unwrap();
+            let (resident, own) = (key.join("term3"), key.join("shell"));
+            let _pids = KillOnDrop(vec![resident.clone(), own.clone()]);
+            spawn_detached_dtach_in(&resident, &repo.join(".claude/worktrees/worktree-a")).expect("dtach must be available for this test");
+            spawn_detached_dtach_in(&own, &repo).expect("dtach must be available for this test");
+            let _ = reconcile(&roots);
+            crate::hub::rehome_to(a, "term3", &w).unwrap();
+            let original = recorded_identity(&key);
+
+            fs::rename(&repo, root.path().join(b)).unwrap();
+            follow_moves(&reconcile(&roots).moved);
+            let own_followed = crate::home::owner_of(a, "shell");
+            let occupant = root.path().join(a);
+            plain_repo(&occupant);
+            let _ = reconcile(&roots); // the occupied pass
+            let away = root.path().join("away");
+            fs::create_dir_all(&away).unwrap();
+            fs::rename(root.path().join(b), away.join(b)).unwrap();
+
+            let home_dir_of = |p: &str| crate::projects::resolve_project(&roots, p);
+            let detected = crate::claudes::detect_gone_owners(&home_dir_of);
+            crate::claudes::sweep_gone_owners(&home_dir_of, &std::sync::Mutex::new(Default::default()), &[]);
+            let after_r18 = crate::home::owner_of(a, "term3");
+            let report = reconcile(&roots);
+            let after_reconcile = socket_has_process(&resident);
+            crate::session::kill_project(a);
+            let survived = socket_has_process(&resident);
+            let own_survived = socket_has_process(&own);
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert_ne!(recorded_identity(&key), Some(full_id(&occupant)), "setup: A's recorded identity is not the occupant's");
+            assert!(matches!(original, Some(crate::dirid::Stored::Full(_))), "setup: A's identity is recorded in full: {original:?}");
+            assert_eq!(own_followed, crate::home::Owner::Elsewhere(b.into()), "setup: A's own session followed B");
+            assert_eq!(detected, vec![(a.to_string(), "term3".to_string(), w.clone())], "setup: R18 has evidence that W is gone");
+            assert_eq!(after_r18, crate::home::Owner::Elsewhere(w.clone()), "the record is kept, not forgotten into the occupant");
+            assert_eq!(report.gone_projects, 0, "reconcile reaps nothing");
+            assert!(after_reconcile, "the resident survives reconcile");
+            assert!(survived, "the occupant's Close Project does not end it");
+            assert!(own_survived, "nor A's own followed session");
+        });
+    }
+
+    /// #183 chain (b) when the second rename can be found: a main-checkout
+    /// resident re-homed into A, A renamed to B and followed, an occupant
+    /// made at A, then B renamed to C beside it. The record follows to C by
+    /// its own identity — the sibling scan, with no Claude left to look
+    /// from — and the occupant's Close Project does not touch it. The first
+    /// follow is made through the resident's Claude's cwd, so the second is
+    /// the sibling scan's alone.
+    ///
+    /// Revert-checked, run and restored: with `find_by_identity`'s candidate
+    /// (2), the sibling scan, skipped, fails "the record follows B's rename
+    /// to C" — left `Here`, the record forgotten into the main checkout,
+    /// which is the record's own (Same) home.
+    #[test]
+    fn chain_b_follows_to_c_when_c_is_findable() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("ROOST_CMD");
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let home = "chcrepo";
+            let repo = repo_with_worktree_a(root.path(), home);
+            let [a, b, c] = ["a", "b", "c"].map(|x| format!("{home}/.claude/worktrees/worktree-{x}"));
+            let key = state.join("sock").join(crate::projects::storage_key(home));
+            fs::create_dir_all(&key).unwrap();
+            let resident = key.join("term3");
+            let _pids = KillOnDrop(vec![resident.clone()]);
+            spawn_detached_dtach_in(&resident, &repo).expect("dtach must be available for this test");
+            let _ = reconcile(&roots);
+            crate::hub::rehome_to(home, "term3", &a).unwrap();
+            let home_dir_of = |p: &str| crate::projects::resolve_project(&roots, p);
+
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+            let b_dir = repo.join(".claude/worktrees/worktree-b").canonicalize().unwrap();
+            let procs = vec![crate::claudes::ClaudeProc {
+                project: home.into(),
+                session: "term3".into(),
+                owner: a.clone(),
+                sse_port: None,
+                cwd: Some(b_dir),
+            }];
+            crate::claudes::sweep_gone_owners(&home_dir_of, &std::sync::Mutex::new(Default::default()), &procs);
+            let to_b = crate::home::owner_of(home, "term3");
+
+            git_in(&repo, &["worktree", "add", "-q", "-b", "worktree-a2", ".claude/worktrees/worktree-a"]);
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-b", ".claude/worktrees/worktree-c"]);
+            let c_dir = repo.join(".claude/worktrees/worktree-c");
+            crate::claudes::sweep_gone_owners(&home_dir_of, &std::sync::Mutex::new(Default::default()), &[]);
+            let to_c = crate::home::owner_of(home, "term3");
+            let id = crate::home::identity_of(home, "term3");
+            crate::session::kill_project(&a);
+            let alive = socket_has_process(&resident);
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert_eq!(to_b, crate::home::Owner::Elsewhere(b.clone()), "setup: the record followed A's rename to B");
+            assert_eq!(to_c, crate::home::Owner::Elsewhere(c.clone()), "the record follows B's rename to C");
+            assert_eq!(id, Ok(Some(full_id(&c_dir))), "and carries C's identity");
+            assert!(alive, "the occupant's Close Project does not end it");
+        });
+    }
+
+    /// The case R18 exists for, which #183 must keep: Claude Code removed a
+    /// worktree, so a main-checkout terminal re-homed into it comes home.
+    /// The home is the directory its key recorded, so the forget proceeds.
+    ///
+    /// Revert-checked, run and restored: with the forget gated on `Gone`
+    /// alone (`Same` kept), fails "a removed worktree's resident comes
+    /// home" — left `Elsewhere("rmrepo/.claude/worktrees/worktree-a")`.
+    #[test]
+    fn a_removed_worktrees_resident_still_comes_home() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("ROOST_CMD");
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let home = "rmrepo";
+            let repo = repo_with_worktree_a(root.path(), home);
+            let a = format!("{home}/.claude/worktrees/worktree-a");
+            let key = state.join("sock").join(crate::projects::storage_key(home));
+            fs::create_dir_all(&key).unwrap();
+            let resident = key.join("term3");
+            let _pids = KillOnDrop(vec![resident.clone()]);
+            spawn_detached_dtach_in(&resident, &repo).expect("dtach must be available for this test");
+            let _ = reconcile(&roots);
+            crate::hub::rehome_to(home, "term3", &a).unwrap();
+            git_in(&repo, &["worktree", "remove", "--force", ".claude/worktrees/worktree-a"]);
+
+            let home_dir_of = |p: &str| crate::projects::resolve_project(&roots, p);
+            crate::claudes::sweep_gone_owners(&home_dir_of, &std::sync::Mutex::new(Default::default()), &[]);
+            let got = crate::home::owner_of(home, "term3");
+            let alive = socket_has_process(&resident);
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert!(matches!(recorded_identity(&key), Some(crate::dirid::Stored::Full(_))), "setup: the home's identity is recorded");
+            assert_eq!(got, crate::home::Owner::Here, "a removed worktree's resident comes home");
+            assert!(alive, "and is not ended by coming home");
+        });
+    }
+
+    /// #183 Review Focus 4: a record whose home has no key directory at all
+    /// — no sockets, no markers — so nothing says which directory the home
+    /// was. While the home URL still resolves that is "cannot tell", and the
+    /// record is kept (nothing can be running under a key with no
+    /// directory; `home::sweep` drops the record with its socket). Once the
+    /// URL is gone — nothing at `<root>/<home>` — the forget proceeds, as
+    /// today: `Here` names nothing a page or Close Project can act on. A
+    /// non-directory standing at `<root>/<home>` does not resolve but is not
+    /// gone either: kept. Detection needs the home to resolve (it asks the
+    /// home's own git), so the home is moved away in the window between the
+    /// evidence and the forget, through `sweep_gone_owners_with`'s hook.
+    ///
+    /// Revert-checked, run and restored: with a missing key directory read
+    /// as `Same`, fails "no key directory, and the URL resolves: kept" —
+    /// left `Here`. With the root walk's `Ok(_)` arm read as `NotFound`,
+    /// fails "something at the URL that does not resolve: kept" — left
+    /// `Here`.
+    #[test]
+    fn a_home_with_no_key_dir_is_forgotten_only_when_its_url_is_gone() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let home = "nokeyrepo";
+            let repo = repo_with_worktree_a(root.path(), home);
+            let a = format!("{home}/.claude/worktrees/worktree-a");
+            crate::hub::rehome_to(home, "term3", &a).unwrap();
+            git_in(&repo, &["worktree", "remove", "--force", ".claude/worktrees/worktree-a"]);
+            let key = state.join("sock").join(crate::projects::storage_key(home));
+            let home_dir_of = |p: &str| crate::projects::resolve_project(&[root.path().to_path_buf()], p);
+            let moved = root.path().join("elsewhere");
+            let sweep = |hook: &dyn Fn(&str, &str)| {
+                crate::claudes::sweep_gone_owners_with(&home_dir_of, &std::sync::Mutex::new(Default::default()), &[], hook);
+                crate::home::owner_of(home, "term3")
+            };
+
+            let resolving = sweep(&|_, _| {});
+            let reached = std::cell::Cell::new(false);
+            let a_file = sweep(&|_, _| {
+                fs::rename(&repo, &moved).unwrap();
+                fs::write(&repo, "not a directory").unwrap();
+                reached.set(true);
+            });
+            if reached.get() {
+                fs::remove_file(&repo).unwrap();
+                fs::rename(&moved, &repo).unwrap();
+            }
+            let gone = sweep(&|_, _| fs::rename(&repo, &moved).unwrap());
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert!(!key.exists(), "setup: the home has no key directory");
+            assert_eq!(resolving, crate::home::Owner::Elsewhere(a.clone()), "no key directory, and the URL resolves: kept");
+            assert!(reached.get(), "setup: the sweep had evidence and reached the forget");
+            assert_eq!(a_file, crate::home::Owner::Elsewhere(a.clone()), "something at the URL that does not resolve: kept");
+            assert_eq!(gone, crate::home::Owner::Here, "the URL gone: forgotten");
         });
     }
 }
