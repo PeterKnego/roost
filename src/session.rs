@@ -749,13 +749,29 @@ fn attach_as(project: &str, name: &str, dir: &Path, renamed_to: Option<&str>) ->
                 }
                 // The directory this shell starts in, for when it later
                 // leaves every directory the key has had (#183 §3, decision
-                // 3). A brand-new master only: `spawned` is also true for a
-                // `Probe`, whose shell outlived a restart and started
-                // wherever it started — rewriting its start with today's
-                // `dir` would be evidence about a shell that never began
-                // here. Best-effort, and a failure leaves no file rather
-                // than a stale one: no start identity only means "stays".
-                if renamed_to.is_none() && !rejoining {
+                // 3). Only for a master `dtach -A` is about to *create*,
+                // and the socket is the only thing that says so. Neither
+                // `spawned` nor `!rejoining` does: after a restart
+                // `Hub::new`'s `sync_reservations` reserves every layout tab,
+                // surviving masters included, so a reconnecting browser gets
+                // `Decision::Spawn` for a shell that outlived the restart and
+                // `-A` joins it. Rewriting its start then would name today's
+                // `dir` for a shell that began somewhere else — through an
+                // occupant, a live session sent to the wrong project, where
+                // Close Project ends it.
+                //
+                // So: socket `NotFound` writes (overwriting a dead session's
+                // leftover start, since names are reused); present, or a stat
+                // that errors, writes nothing — a missing start only means
+                // "stays". What remains open is the master dying between
+                // this stat and `dtach -A`: `-A` then creates a new shell
+                // whose start is the dead one's leftover, if it had one. A
+                // write failure removes the file rather than leave it stale.
+                let creating = matches!(
+                    std::fs::symlink_metadata(sock_path(project, name)),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+                );
+                if renamed_to.is_none() && !rejoining && creating {
                     if let Err(e) = crate::registry::record_start_identity(sock_dir, name, dir) {
                         eprintln!("roost: {project}/{name}'s start directory was not recorded: {e}");
                     }
@@ -2781,10 +2797,18 @@ mod tests {
     /// its start. A spawn of a reused name overwrites a dead session's
     /// leftover start, and the session's end removes it.
     ///
-    /// Revert-checked, run and restored: with the spawn's `!rejoining` gate
-    /// dropped (an attach that spawns in this process's terms overwrites),
-    /// fails "a rejoin after a restart keeps the start" — left dir2's
-    /// identity, right dir1's. With the spawn's write removed, fails "a
+    /// And the case production actually takes after a restart (review,
+    /// fix round 1): `Hub::new`'s `sync_reservations` reserves every layout
+    /// tab, so a surviving master is reached by `Decision::Spawn`, not
+    /// `Probe` — `rejoining` false, `dtach -A` joining it. A test whose
+    /// rejoin had no reservation was the dev/prod substitution: it passed
+    /// with the start rewritten on every real reconnect.
+    ///
+    /// Revert-checked, run and restored: with the gate back to bare
+    /// `!rejoining` (no socket check), fails "a reserved rejoin after a
+    /// restart keeps the start" — left dir2's identity, right dir1's. With
+    /// the spawn's `!rejoining` gate dropped as well, fails "a rejoin after
+    /// a restart keeps the start" — the same. With the spawn's write removed, fails "a
     /// spawn records where it started" — left `Ok(None)`. With
     /// `kill_and_unlink`'s `forget_start_identity` removed, fails "ending
     /// the session removes its start" — left `Ok(Some(..))`.
@@ -2799,7 +2823,7 @@ mod tests {
         let dir2 = tempfile::tempdir().unwrap();
         let k = format!("startkey{}", std::process::id());
         let (shell, probe, reused) = (sock_path(&k, "shell"), sock_path(&k, "probe"), sock_path(&k, "reused"));
-        let _reap = ReapOnDrop(vec![shell.clone(), probe.clone(), reused.clone()]);
+        let _reap = ReapOnDrop(vec![shell.clone(), probe.clone(), reused.clone(), sock_path(&k, "kept")]);
         let key_dir = shell.parent().unwrap().to_path_buf();
         let id = |d: &Path| Some(crate::dirid::Stored::Full(crate::dirid::of(d).unwrap().unwrap()));
         let start = |n: &str| crate::registry::start_identity(&key_dir, n);
@@ -2829,23 +2853,49 @@ mod tests {
         let rejoined = attach(&k, "probe", dir2.path()).expect("a rejoin");
         let after_probe = start("probe");
 
+        // The same survivor, reached the way a restarted roost reaches it:
+        // its layout tab reserved, so `decide` answers `Spawn`.
+        let kept = sock_path(&k, "kept");
+        crate::registry::record_start_identity(&key_dir, "kept", dir1.path()).unwrap();
+        let st = std::process::Command::new("dtach")
+            .args(["-n", kept.to_str().unwrap(), "-E", "sleep", "30"])
+            .current_dir(dir1.path())
+            .status()
+            .unwrap_or_else(|e| panic!("dtach must be available for this test: {e}"));
+        assert!(st.success(), "test setup: dtach -n failed");
+        let mut waited = 0;
+        while !any_process_holds(&kept) && waited < 200 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            waited += 1;
+        }
+        let masters = crate::registry::pids_holding_path(&crate::registry::holders_snapshot().unwrap(), &kept);
+        assert!(!masters.is_empty(), "test setup: a surviving master");
+        reserve_if_absent(&k, "kept");
+        assert!(has_reservation_for_test(&k, "kept") && !has_session(&k, "kept"), "test setup: reserved, no map entry: decide answers Spawn");
+        let reattached = attach(&k, "kept", dir2.path()).expect("a reserved rejoin");
+        let after_kept = start("kept");
+        let after = crate::registry::pids_holding_path(&crate::registry::holders_snapshot().unwrap(), &kept);
+        assert!(masters.iter().all(|p| after.contains(p)), "test setup: dtach -A joined the surviving master, not a new one");
+
         // A name whose last session left its start behind.
         crate::registry::record_start_identity(&key_dir, "reused", dir2.path()).unwrap();
         let fresh = start_real_dtach(&k, "reused", dir1.path());
         let after_reuse = start("reused");
 
-        for a in [&att, &joined, &rejoined, &fresh] {
+        for a in [&att, &joined, &rejoined, &reattached, &fresh] {
             detach(&a.key, a.id);
         }
         let ended = end_session(&k, "shell");
         let after_end = start("shell");
         end_session(&k, "probe");
         end_session(&k, "reused");
+        end_session(&k, "kept");
         std::env::remove_var("ROOST_STATE_DIR");
 
         assert_eq!(spawned, Ok(id(dir1.path())), "a spawn records where it started");
         assert_eq!(after_join, Ok(id(dir1.path())), "a join keeps the start");
         assert_eq!(after_probe, Ok(id(dir1.path())), "a rejoin after a restart keeps the start");
+        assert_eq!(after_kept, Ok(id(dir1.path())), "a reserved rejoin after a restart keeps the start");
         assert_eq!(after_reuse, Ok(id(dir1.path())), "a reused name's spawn overwrites the dead session's start");
         assert!(ended, "setup: the session ended");
         assert_eq!(after_end, Ok(None), "ending the session removes its start");

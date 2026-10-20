@@ -1485,12 +1485,23 @@ pub(crate) fn start_identity(key_dir: &std::path::Path, name: &str) -> Result<Op
 }
 
 /// Drops the start identity of a socket that has just been unlinked, from
-/// the same two places as `modes::forget` and for the same reason. One left
-/// behind (dtach's own unlink on `exit`) is harmless: a dot-file no
-/// enumeration reads, overwritten by the next spawn of that name. There is
-/// deliberately no orphan sweep: the spawn writes it before dtach has made
-/// the socket, and a sweep seeing a start with no socket in that window
-/// would take the new session's evidence away.
+/// the same two places as `modes::forget` and for the same reason.
+///
+/// Unlike `.modes.*`, an orphan here (dtach's own unlink on `exit`) gets no
+/// `sweep_orphans`, and the two reasons `modes.rs` gives for its sweep do
+/// not carry over:
+/// - *A new session inheriting a dead one's state.* `modes::load` reads
+///   whatever is there. The spawn here overwrites the start whenever the
+///   socket is positively absent (`session::attach_as`), so inheriting needs
+///   the master to die inside that check-to-`dtach -A` window, and a sweep
+///   would not close that window either.
+/// - *Blocking the key directory's `remove_dir`.* `.origin` is never removed,
+///   so a key that ever spawned a dtach session keeps its directory anyway.
+///   There is at most one start file per name.
+///
+/// And a sweep would add a race of its own. The spawn writes the start before
+/// dtach has made the socket, and a sweep that saw a start with no socket in
+/// that window would take the new session's evidence away.
 fn forget_start_identity(sock_path: &std::path::Path) {
     let (Some(dir), Some(name)) = (sock_path.parent(), sock_path.file_name().and_then(|n| n.to_str())) else { return };
     let _ = std::fs::remove_file(start_identity_path(dir, name));
