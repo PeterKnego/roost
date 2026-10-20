@@ -227,6 +227,16 @@ fn resolve_project_with(
     name: &str,
     vouched: &dyn Fn(&[PathBuf], &str) -> bool,
 ) -> Option<PathBuf> {
+    // The virtual outside-worktree URL (#188) resolves only through its own
+    // record — never by falling through to the checks below and trying the
+    // literal path on disk. The record is the only authority: a
+    // `<parent>/.claude/outside/<name>` directory planted in a repository is
+    // never consulted, by this arm or by anything after it. Checked first so
+    // `resolve_recorded_project` (which waives the dot-segment vouching below)
+    // gets the same guarantee.
+    if let Some((parent, name)) = crate::outside::split_url(name) {
+        return crate::outside::resolve(parent, name);
+    }
     let segs: Vec<&str> = name.split('/').collect();
     if RESERVED.contains(&segs[0]) {
         return None;
@@ -698,6 +708,21 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Copied from `registry.rs`'s own `with_state` (src/registry.rs:2228):
+    /// `projects` has no state-dir helper of its own, and the outside-worktree
+    /// arm's tests need one — `outside::resolve` reads
+    /// `wsstate::state_dir()/outside/…`, which is only safe to point at a
+    /// tempdir while this lock is held, since `ROOST_STATE_DIR` is process-wide
+    /// and `cargo test` runs this file's tests concurrently with every other.
+    fn with_state<T>(f: impl FnOnce(&Path) -> T) -> T {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path());
+        let out = f(d.path());
+        std::env::remove_var("ROOST_STATE_DIR");
+        out
+    }
+
     // The whole rule in one place. Each assertion pairs the two settings so a
     // filter that ignored `show_hidden` entirely (returning a constant) fails
     // one half of every pair.
@@ -872,6 +897,125 @@ mod tests {
         assert!(safe_resolve(&alpha, "../beta").is_err());
         assert!(safe_resolve(&alpha, "/etc/passwd").is_err());
         assert!(safe_resolve(&alpha, "missing.txt").is_err());
+    }
+
+    /// The virtual `<parent>/.claude/outside/<name>` URL resolves only
+    /// through its allow record (#188 Task 2). `roots` is passed through
+    /// unused by the new arm — it is a tempdir of its own, deliberately not
+    /// containing `p` at all, to show the resolution never touches it.
+    #[test]
+    fn an_allowed_outside_worktree_resolves() {
+        with_state(|_state| {
+            let outside = tempfile::tempdir().unwrap();
+            let wt = outside.path().join("wt");
+            fs::create_dir(&wt).unwrap();
+            let rec = crate::outside::allow("p", &wt).unwrap();
+
+            let roots = vec![tempfile::tempdir().unwrap().path().to_path_buf()];
+            let url = crate::outside::url_for("p", &rec.name);
+
+            let got = resolve_project(&roots, &url).expect("an allowed outside worktree must resolve");
+            assert_eq!(got, wt.canonicalize().unwrap());
+        });
+    }
+
+    /// Review Focus 2: a directory planted at the literal virtual path must
+    /// never be mistaken for the one the record names, even when a record
+    /// for a *different* directory exists under the very same name.
+    #[test]
+    fn a_planted_outside_dir_resolves_nowhere() {
+        with_state(|_state| {
+            let root = tempfile::tempdir().unwrap();
+            let planted = root.path().join("p/.claude/outside/wt");
+            fs::create_dir_all(&planted).unwrap();
+            let roots = vec![root.path().to_path_buf()];
+
+            assert_eq!(
+                resolve_project(&roots, "p/.claude/outside/wt"),
+                None,
+                "a planted directory with no record must not resolve"
+            );
+
+            // A record for a different directory, under the same name "wt" —
+            // the resolve must return the recorded directory, never the one
+            // planted on disk at the literal virtual path.
+            let outside = tempfile::tempdir().unwrap();
+            let real = outside.path().join("wt");
+            fs::create_dir(&real).unwrap();
+            let rec = crate::outside::allow("p", &real).unwrap();
+            assert_eq!(rec.name, "wt", "setup: the record must share the planted directory's name");
+
+            let got = resolve_project(&roots, "p/.claude/outside/wt").expect("the record must resolve");
+            assert_eq!(got, real.canonicalize().unwrap());
+            assert_ne!(got, planted.canonicalize().unwrap(), "must never resolve to the planted directory");
+        });
+    }
+
+    /// Pins existing behaviour, not new: once resolved, an allowed outside
+    /// worktree's directory is an ordinary project directory to
+    /// `safe_resolve`, so a `..` escape and a symlink pointing outside it are
+    /// refused exactly as for any other project. This names what it pins —
+    /// `safe_resolve`'s own confinement — so a future change to resolution
+    /// cannot quietly also weaken what happens once inside.
+    #[test]
+    fn a_path_escaping_an_allowed_worktree_is_refused() {
+        with_state(|_state| {
+            let outside = tempfile::tempdir().unwrap();
+            let wt = outside.path().join("wt");
+            fs::create_dir(&wt).unwrap();
+            fs::write(wt.join("inside.txt"), "hi").unwrap();
+
+            let rec = crate::outside::allow("p", &wt).unwrap();
+            let roots = vec![tempfile::tempdir().unwrap().path().to_path_buf()];
+            let url = crate::outside::url_for("p", &rec.name);
+            let resolved = resolve_project(&roots, &url).expect("the allowed worktree must resolve");
+
+            assert!(safe_resolve(&resolved, "../x").is_err(), "a `..` escape must be refused");
+
+            let escape_target = outside.path().join("elsewhere");
+            fs::create_dir(&escape_target).unwrap();
+            let link = wt.join("link");
+            std::os::unix::fs::symlink(&escape_target, &link).unwrap();
+            assert!(
+                safe_resolve(&resolved, "link").is_err(),
+                "a symlink inside the worktree pointing outside it must be refused"
+            );
+        });
+    }
+
+    /// The arm reads a couple of files and takes one `metadata()` call — no
+    /// subprocess. Proven here by making git itself unreachable (`PATH` set
+    /// to an empty directory) and asserting the resolve still succeeds.
+    /// `PATH` is process-wide, like `ROOST_STATE_DIR`, so this holds
+    /// `with_state`'s env lock for the whole body and restores `PATH` before
+    /// returning.
+    #[test]
+    fn the_arm_never_forks() {
+        with_state(|_state| {
+            let outside = tempfile::tempdir().unwrap();
+            let wt = outside.path().join("wt");
+            fs::create_dir(&wt).unwrap();
+            let rec = crate::outside::allow("p", &wt).unwrap();
+            let roots = vec![tempfile::tempdir().unwrap().path().to_path_buf()];
+            let url = crate::outside::url_for("p", &rec.name);
+
+            let empty_path_dir = tempfile::tempdir().unwrap();
+            let old_path = std::env::var_os("PATH");
+            std::env::set_var("PATH", empty_path_dir.path());
+
+            let got = resolve_project(&roots, &url);
+
+            match old_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+
+            assert_eq!(
+                got,
+                Some(wt.canonicalize().unwrap()),
+                "the arm must resolve without forking git, even with git unreachable"
+            );
+        });
     }
 
     // Revert-the-fix check (CLAUDE.md: "the technique that actually works"),
