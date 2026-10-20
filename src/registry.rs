@@ -214,8 +214,16 @@ pub fn follow_moves(moved: &[Moved]) {
         let roots = crate::projects::roots();
         let new_dir = crate::projects::resolve_project(&roots, &m.new_url);
         let shells = shells_at(&roots, m, new_dir.as_deref());
-        let targets: std::collections::BTreeSet<&str> =
-            shells.iter().filter_map(|s| s.url.as_deref().ok()).filter(|u| *u != m.new_url).collect();
+        let starts = starts_at(&roots, m);
+        let targets: std::collections::BTreeSet<&str> = shells
+            .iter()
+            .filter_map(|s| s.url.as_deref().ok())
+            .chain(starts.iter().filter_map(|s| match &s.start {
+                crate::home::Start::At(u, _) => Some(u.as_str()),
+                _ => None,
+            }))
+            .filter(|u| *u != m.new_url)
+            .collect();
         let refresh_targets = || {
             for t in &targets {
                 crate::hub::refresh_and_broadcast(t);
@@ -228,8 +236,8 @@ pub fn follow_moves(moved: &[Moved]) {
             // an occupant renamed while the first target still stands) is
             // followed now. Quietly — the banner went out once already —
             // and only when something actually changed.
-            if crate::home::own_follow_pending(&m.old_url, &m.new_url, new_dir.as_deref(), &m.live, &shells, m.prev.as_deref())
-                && crate::home::follow_move(&m.old_url, &m.new_url, new_dir.as_deref(), &m.live, &shells, m.prev.as_deref())
+            if crate::home::own_follow_pending(&m.old_url, &m.new_url, new_dir.as_deref(), &m.live, &shells, &starts, m.prev.as_deref())
+                && crate::home::follow_move(&m.old_url, &m.new_url, new_dir.as_deref(), &m.live, &shells, &starts, m.prev.as_deref())
             {
                 eprintln!("roost: {}'s sessions caught up with their shells", m.old_url);
                 crate::hub::refresh_and_broadcast(&m.old_url);
@@ -238,7 +246,7 @@ pub fn follow_moves(moved: &[Moved]) {
             }
             continue;
         }
-        crate::home::follow_move(&m.old_url, &m.new_url, new_dir.as_deref(), &m.live, &shells, m.prev.as_deref());
+        crate::home::follow_move(&m.old_url, &m.new_url, new_dir.as_deref(), &m.live, &shells, &starts, m.prev.as_deref());
         eprintln!("roost: {} was renamed to {}; its {} session(s) follow their own shells", m.old_url, m.new_url, m.live.len());
         // `git worktree move` touches only `.git/worktrees/<id>/gitdir`,
         // which the watcher ignores, so the main checkout's hub still knows
@@ -294,6 +302,36 @@ fn shells_at(roots: &[PathBuf], m: &Moved, new_dir: Option<&std::path::Path>) ->
                 })
                 .clone();
             crate::home::ShellAt { name: name.clone(), url, dir: dir.clone() }
+        })
+        .collect()
+}
+
+/// Decision 3's fallback, for each of `m`'s live sessions whose shell is in
+/// none of the key's directories (no entry in `m.shells`) and that this
+/// rename may move (`home::start_wanted`): where the directory it was
+/// spawned in is now, found the way a record's own identity is
+/// (`find_by_identity`, with no cwd — the shell has left, so its cwd is not
+/// evidence). Only a full identity is looked for; a legacy pair or none is
+/// `Missing`, and the session stays. Runs git for a worktree URL, so never
+/// under a lock, like [`shells_at`].
+fn starts_at(roots: &[PathBuf], m: &Moved) -> Vec<crate::home::StartAt> {
+    use crate::home::Start;
+    let key_dir = key_dir_of(&m.old_url);
+    m.live
+        .iter()
+        .filter(|n| !m.shells.iter().any(|(s, _)| s == *n))
+        .filter(|n| crate::home::start_wanted(&m.old_url, n, &m.new_url, m.prev.as_deref()))
+        .map(|n| {
+            let start = match start_identity(&key_dir, n) {
+                Ok(Some(crate::dirid::Stored::Full(id))) => match find_by_identity(roots, &m.old_url, &id, None) {
+                    Found::At(dir, url) => Start::At(url, dir),
+                    Found::Nowhere => Start::Nowhere,
+                    Found::CannotTell(e) => Start::CannotTell(e),
+                },
+                Ok(Some(crate::dirid::Stored::Legacy { .. })) | Ok(None) => Start::Missing,
+                Err(e) => Start::CannotTell(e),
+            };
+            crate::home::StartAt { name: n.clone(), start }
         })
         .collect()
 }
@@ -1171,6 +1209,7 @@ fn kill_and_unlink_with(sock_path: &std::path::Path, snapshot_fn: SnapshotFn, pr
     // detach, where the shell is still alive behind its dtach master and its
     // contract is still true.
     crate::modes::forget(sock_path);
+    forget_start_identity(sock_path);
     true
 }
 
@@ -1394,6 +1433,67 @@ fn origin_identity_path(key_dir: &std::path::Path) -> std::path::PathBuf {
 /// it.
 fn occupant_identity_path(key_dir: &std::path::Path) -> std::path::PathBuf {
     key_dir.join(".occupant-ino")
+}
+
+/// `.<name>.start-ino`, beside `name`'s socket: the identity of the
+/// directory that session was spawned in (#183 §3, decision 3). Evidence
+/// about *one terminal*, for when its shell has `cd`'d out of every
+/// directory the key has had and so says nothing: a key whose old name has
+/// held an occupant has sessions started in two different directories, and
+/// only each one's own start says which. Not an identity change — the
+/// session's home is still the key it is filed under. A dot-file, so every
+/// enumeration of the key's sockets skips it.
+fn start_identity_path(key_dir: &std::path::Path, name: &str) -> PathBuf {
+    key_dir.join(format!(".{name}.start-ino"))
+}
+
+/// Writes `name`'s start identity: `dir`'s, four fields, atomic and 0600.
+/// Called only where a session is actually spawned — a rejoin or a join is
+/// the same shell, and its start did not move. Overwrites whatever is there,
+/// and on any failure removes it instead: a name is reused once its session
+/// ends (dtach unlinks its own socket on `exit`, and nothing else runs), and
+/// a new shell inheriting a dead one's start would follow a directory it
+/// never worked in. No start identity only means "stays" (§3).
+pub(crate) fn record_start_identity(key_dir: &std::path::Path, name: &str, dir: &std::path::Path) -> Result<(), String> {
+    if !crate::session::valid_name(name) {
+        return Err(format!("bad session name {name:?}"));
+    }
+    let path = start_identity_path(key_dir, name);
+    let out = match crate::dirid::of(dir) {
+        Ok(Some(id)) => crate::dirid::write_lines(&path, &[crate::dirid::format(&id)]),
+        Ok(None) => Err(format!("{} is not there", dir.display())),
+        Err(e) => Err(e),
+    };
+    if out.is_err() {
+        let _ = std::fs::remove_file(&path);
+    }
+    out
+}
+
+/// `name`'s start identity: `Ok(None)` only for `NotFound` (a session older
+/// than this change, or one whose write failed); unreadable or damaged is
+/// `Err`, never folded into "none".
+pub(crate) fn start_identity(key_dir: &std::path::Path, name: &str) -> Result<Option<crate::dirid::Stored>, String> {
+    if !crate::session::valid_name(name) {
+        return Err(format!("bad session name {name:?}"));
+    }
+    match std::fs::read_to_string(start_identity_path(key_dir, name)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{name}'s start identity cannot be read ({e})")),
+        Ok(s) => crate::dirid::parse_line(s.trim()).map(Some).ok_or_else(|| format!("{name}'s start identity is damaged ({s:?})")),
+    }
+}
+
+/// Drops the start identity of a socket that has just been unlinked, from
+/// the same two places as `modes::forget` and for the same reason. One left
+/// behind (dtach's own unlink on `exit`) is harmless: a dot-file no
+/// enumeration reads, overwritten by the next spawn of that name. There is
+/// deliberately no orphan sweep: the spawn writes it before dtach has made
+/// the socket, and a sweep seeing a start with no socket in that window
+/// would take the new session's evidence away.
+fn forget_start_identity(sock_path: &std::path::Path) {
+    let (Some(dir), Some(name)) = (sock_path.parent(), sock_path.file_name().and_then(|n| n.to_str())) else { return };
+    let _ = std::fs::remove_file(start_identity_path(dir, name));
 }
 
 /// Ends a rename's redirect for this key: `.moved-to` and the occupant's
@@ -2099,6 +2199,7 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
                     if !socket_has_process_with(&sock.path(), snapshot_fn) {
                         let _ = std::fs::remove_file(sock.path());
                         crate::modes::forget(&sock.path());
+                        forget_start_identity(&sock.path());
                         report.dead_sockets += 1;
                         eprintln!("roost: reaped dead socket {}", sock.path().display());
                     }
@@ -4400,6 +4501,11 @@ mod tests {
     /// Revert-checked, run and restored: with `own_follow`'s `Stays` arm
     /// answering the key's target, fails "and stays Here: nothing about
     /// this terminal says B" — left `Elsewhere(".../worktree-b")`.
+    ///
+    /// Decision 3 closed this gap for a session spawned through `attach`,
+    /// which records its start (the test below). This one's master is
+    /// started directly, so it has no start identity — a session older than
+    /// that change — and for it the contract above still holds.
     #[test]
     fn a_first_rename_with_no_shell_inside_is_not_reaped_and_stays_here() {
         with_state(|state| {
@@ -4433,6 +4539,230 @@ mod tests {
             assert_eq!(after.moved.iter().map(|m| m.new_url.as_str()).collect::<Vec<_>>(), vec![b], "found at B");
             assert_eq!(fresh, vec![true], "setup: the fresh pass, the one that used to take every live session");
             assert_eq!(owner, crate::home::Owner::Here, "and stays Here: nothing about this terminal says B");
+        });
+    }
+
+    /// #183 decision 3, the regression Task 6's review found: the very
+    /// first rename A→B, made after the shell `cd`'d out of A. Its shell
+    /// says nothing, but its start identity — A's, recorded at spawn — is
+    /// found at B (the `.moved-to` target this pass wrote), so it follows B,
+    /// with a record carrying B's identity. The next, ordinary pass changes
+    /// nothing.
+    ///
+    /// Revert-checked, run and restored: with `own_follow`'s start-identity
+    /// fallback removed, fails "the session whose shell left follows its
+    /// start to B" — left `Here`.
+    #[test]
+    fn a_session_whose_shell_left_follows_its_start_identity() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let repo = repo_with_worktree_a(root.path(), "startrepo");
+            let a = "startrepo/.claude/worktrees/worktree-a";
+            let b = "startrepo/.claude/worktrees/worktree-b";
+            let sock_dir = state.join("sock").join(crate::projects::storage_key(a));
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            let flag = root.path().join("leave-now");
+            let _guard = KillOnDrop(vec![sock_path.clone()]);
+            let a_dir = repo.join(".claude/worktrees/worktree-a").canonicalize().unwrap();
+            spawn_leaver(&sock_path, &a_dir, &flag);
+            record_start_identity(&sock_dir, "shell", &a_dir).unwrap(); // what its spawn writes
+            let _ = reconcile(&roots);
+            wait_left(&sock_path, &flag);
+
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+            let b_dir = repo.join(".claude/worktrees/worktree-b").canonicalize().unwrap();
+            let after = reconcile(&roots);
+            let shells = after.moved.iter().map(|m| m.shells.len()).collect::<Vec<_>>();
+            follow_moves(&after.moved);
+            let owner = crate::home::owner_of(a, "shell");
+            let id = crate::home::identity_of(a, "shell");
+            follow_moves(&reconcile(&roots).moved);
+            let later = crate::home::owner_of(a, "shell");
+            let alive = socket_has_process(&sock_path);
+            drop(_guard);
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert_eq!(after.gone_projects, 0, "not reaped");
+            assert_eq!(after.moved.iter().map(|m| (m.new_url.as_str(), m.fresh)).collect::<Vec<_>>(), vec![(b, true)], "setup: the fresh A→B pass");
+            assert_eq!(shells, vec![0], "setup: no shell in any of the key's directories");
+            assert_eq!(owner, crate::home::Owner::Elsewhere(b.into()), "the session whose shell left follows its start to B");
+            assert_eq!(id, Ok(Some(full_id(&b_dir))), "its record carries B's identity");
+            assert_eq!(later, owner, "and the next pass changes nothing");
+            assert!(alive, "its master is alive");
+        });
+    }
+
+    /// Decision 3's "no evidence" side: with no usable start identity — none
+    /// at all, or a legacy two-field pair (which may keep, never follow) —
+    /// a session whose shell left stays `Here`, as before; a damaged one is
+    /// "cannot tell", and stays too. None of the three is reaped.
+    ///
+    /// Revert-checked, run and restored: with `own_follow` answering
+    /// `Start::Missing` with the key's target (`To(new_url, new_dir)`),
+    /// fails "no start identity: stays" — left `Elsewhere(".../worktree-b")`.
+    /// With `starts_at` answering an unreadable or damaged start with the
+    /// key's target, fails "a damaged start is cannot tell: stays" — the
+    /// same.
+    #[test]
+    fn a_session_with_no_start_identity_still_stays() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let repo = repo_with_worktree_a(root.path(), "nostartrepo");
+            let a = "nostartrepo/.claude/worktrees/worktree-a";
+            let sock_dir = state.join("sock").join(crate::projects::storage_key(a));
+            fs::create_dir_all(&sock_dir).unwrap();
+            let names = ["none", "legacy", "damaged"];
+            let socks: Vec<PathBuf> = names.iter().map(|n| sock_dir.join(n)).collect();
+            let flag = root.path().join("leave-now");
+            let _guard = KillOnDrop(socks.clone());
+            let a_dir = repo.join(".claude/worktrees/worktree-a").canonicalize().unwrap();
+            for s in &socks {
+                spawn_leaver(s, &a_dir, &flag);
+            }
+            let Some(crate::dirid::Stored::Full(aid)) = Some(full_id(&a_dir)) else { unreachable!() };
+            fs::write(start_identity_path(&sock_dir, "legacy"), format!("{} {}\n", aid.dev, aid.ino)).unwrap();
+            fs::write(start_identity_path(&sock_dir, "damaged"), "not an identity\n").unwrap();
+            let _ = reconcile(&roots);
+            for s in &socks {
+                wait_left(s, &flag);
+            }
+
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+            let after = reconcile(&roots);
+            follow_moves(&after.moved);
+            let owners: Vec<_> = names.iter().map(|n| crate::home::owner_of(a, n)).collect();
+            let alive = socks.iter().all(|s| socket_has_process(s));
+            drop(_guard);
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert_eq!(after.gone_projects, 0, "not reaped");
+            assert_eq!(after.moved.len(), 1, "setup: the rename was found");
+            assert_eq!(owners[0], crate::home::Owner::Here, "no start identity: stays");
+            assert_eq!(owners[1], crate::home::Owner::Here, "a legacy start never licenses a follow");
+            assert_eq!(owners[2], crate::home::Owner::Here, "a damaged start is cannot tell: stays");
+            assert!(alive, "nothing was ended");
+        });
+    }
+
+    /// A session's start identity is a sidecar of its socket, and goes with
+    /// it — and only its own: from `kill_and_unlink` (session end, Close
+    /// Project, a gone project's reap) and from `reconcile`'s dead-socket
+    /// arm. A live session's start survives the sweep that reaps its
+    /// neighbour.
+    ///
+    /// Revert-checked, run and restored: with the dead-socket arm's
+    /// `forget_start_identity` removed, fails "the dead socket's start goes
+    /// with it" — left `Ok(Some(..))`; with `kill_and_unlink_with`'s
+    /// removed, fails "kill_and_unlink removes its start" — the same.
+    #[test]
+    fn the_start_identity_is_removed_with_its_socket() {
+        with_state(|state| {
+            let key_dir = state.join("sock/startgone");
+            fs::create_dir_all(&key_dir).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let (live, dead) = (key_dir.join("live"), key_dir.join("dead"));
+            let _guard = KillOnDrop(vec![live.clone()]);
+            spawn_detached_dtach_in(&live, dir.path()).unwrap_or_else(|| panic!("dtach must be available for this test"));
+            let mut waited = 0;
+            while !socket_has_process(&live) && waited < 200 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                waited += 1;
+            }
+            fs::write(&dead, "").unwrap(); // no process holds it
+            for n in ["live", "dead"] {
+                record_start_identity(&key_dir, n, dir.path()).unwrap();
+            }
+            let report = reconcile(&[PathBuf::from("/nonexistent-root")]);
+            let (dead_after, live_after) = (start_identity(&key_dir, "dead"), start_identity(&key_dir, "live"));
+            let killed = kill_and_unlink(&live);
+            let live_end = start_identity(&key_dir, "live");
+            drop(_guard);
+
+            assert!(report.dead_sockets >= 1 && !dead.exists(), "setup: the dead socket was reaped");
+            assert_eq!(dead_after, Ok(None), "the dead socket's start goes with it");
+            assert_eq!(live_after, Ok(Some(full_id(dir.path()))), "a live session's start survives the sweep");
+            assert!(killed, "setup: the live session ended");
+            assert_eq!(live_end, Ok(None), "kill_and_unlink removes its start");
+        });
+    }
+
+    /// #183 chain (d) with every shell gone: A's session followed to B and
+    /// then `cd`'d out; an occupant made at A, its session spawned there
+    /// and `cd`'d out too; the occupant renamed to D while B stands. No
+    /// shell is in any of the key's directories, so each follows its own
+    /// start: the occupant's (O1's identity) to D, found beside A's old
+    /// path, and the earlier one's (A's original identity) is B's, where it
+    /// already is.
+    ///
+    /// Revert-checked, run and restored: with `own_follow`'s start-identity
+    /// fallback removed, fails "the occupant's session follows its start to
+    /// D" — left `Here`. With `starts_at` reading every session's start as
+    /// the followed one's (A's original identity: key-level evidence, not
+    /// the terminal's own), fails the same assertion — left
+    /// `Elsewhere(".../worktree-b")`, the occupant's session sent to B.
+    #[test]
+    fn chain_d_cd_out_sessions_follow_their_own_starts() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("ROOST_CMD");
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let repo = repo_with_worktree_a(root.path(), "startdrepo");
+            let a = "startdrepo/.claude/worktrees/worktree-a";
+            let b = "startdrepo/.claude/worktrees/worktree-b";
+            let d = "startdrepo/.claude/worktrees/worktree-d";
+            let sock_dir = state.join("sock").join(crate::projects::storage_key(a));
+            fs::create_dir_all(&sock_dir).unwrap();
+            let (followed, own) = (sock_dir.join("shell"), sock_dir.join("own"));
+            let (flag_shell, flag_own) = (root.path().join("leave-shell"), root.path().join("leave-own"));
+            let guard = KillOnDrop(vec![followed.clone(), own.clone()]);
+
+            let a_dir = repo.join(".claude/worktrees/worktree-a").canonicalize().unwrap();
+            spawn_leaver(&followed, &a_dir, &flag_shell);
+            record_start_identity(&sock_dir, "shell", &a_dir).unwrap();
+            let _ = reconcile(&roots);
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+            follow_moves(&reconcile(&roots).moved);
+            assert_eq!(crate::home::owner_of(a, "shell"), crate::home::Owner::Elsewhere(b.into()), "setup: A's session followed B");
+
+            git_in(&repo, &["worktree", "add", "-q", "-b", "worktree-a2", ".claude/worktrees/worktree-a"]);
+            let new_a = crate::projects::resolve_project(&roots, a).expect("setup: the new A resolves");
+            spawn_leaver(&own, &new_a, &flag_own);
+            record_start_identity(&sock_dir, "own", &new_a).unwrap();
+            record_origin(a, &new_a); // the occupant's session's attach
+            let _ = reconcile(&roots); // the occupied pass
+            assert!(occupant_lines(&sock_dir).contains(&Some(full_id(&new_a))), "setup: the occupant's identity is listed");
+            wait_left(&followed, &flag_shell);
+            wait_left(&own, &flag_own);
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-d"]);
+            let d_dir = repo.join(".claude/worktrees/worktree-d").canonicalize().unwrap();
+
+            let pass = reconcile(&roots);
+            let shells: Vec<usize> = pass.moved.iter().map(|m| m.shells.len()).collect();
+            follow_moves(&pass.moved);
+            let own_owner = crate::home::owner_of(a, "own");
+            let own_id = crate::home::identity_of(a, "own");
+            let shell_owner = crate::home::owner_of(a, "shell");
+            let owned_d = crate::session::owned_live_names(d);
+            let alive = socket_has_process(&followed) && socket_has_process(&own);
+            drop(guard);
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert_eq!(pass.gone_projects, 0, "nothing reaped");
+            assert_eq!(shells, vec![0], "setup: one move, and no shell in any of the key's directories");
+            assert_eq!(own_owner, crate::home::Owner::Elsewhere(d.into()), "the occupant's session follows its start to D");
+            assert_eq!(own_id, Ok(Some(full_id(&d_dir))), "its record carries D's identity");
+            assert_eq!(shell_owner, crate::home::Owner::Elsewhere(b.into()), "the earlier one's start is B's, and it stays there");
+            assert!(owned_d.contains(&("own".to_string(), Some(a.to_string()))), "D lists it: {owned_d:?}");
+            assert!(alive, "nothing was ended on the way");
         });
     }
 

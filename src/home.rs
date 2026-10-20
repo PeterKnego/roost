@@ -474,11 +474,41 @@ pub enum NoTarget {
     NotAProject,
 }
 
+/// One of a renamed key's own sessions whose shell gives no evidence (it is
+/// in none of the key's directories), and what its own start identity
+/// says — `registry::start_identity` looked up the way #183 §1 finds a
+/// record's directory (`registry::find_by_identity`). Resolved by the
+/// caller, off every lock, because finding it may run git.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartAt {
+    pub name: String,
+    pub start: Start,
+}
+
+/// Where a session's start identity is now (#183 §3, decision 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Start {
+    /// The directory carrying it, as a project URL that resolves to it.
+    At(String, PathBuf),
+    /// No candidate carries it.
+    Nowhere,
+    /// No usable start identity: none recorded (a session older than this
+    /// change) or a legacy pair, which may keep but never licenses a follow.
+    Missing,
+    /// It could not be read, or a candidate could not be looked at.
+    CannotTell(String),
+}
+
 /// Why a session stays: the line [`log_stays_once`] writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum StayReason {
     Left,
     Shell(NoTarget),
+    /// Its shell left, and its start identity is found nowhere.
+    StartNowhere,
+    /// Its shell left, and where its start is cannot be told: suspended,
+    /// looked for again on the next pass.
+    StartUnknown,
 }
 
 /// What part (a) of [`follow_move_in`] would do for one of the key's own
@@ -505,10 +535,25 @@ enum OwnFollow {
 /// evidence but the record still does. Any other `Elsewhere` was re-homed
 /// by its own Claude's move and stays where that put it.
 ///
+/// Last, for a session whose shell is in none of the key's directories at
+/// all, its own start identity (`starts`, decision 3): the directory it was
+/// spawned in, wherever that is now. Only then — a shell in one of the
+/// key's directories is the stronger evidence, even where it is no target.
+///
 /// Never "the key moved, so all of its sessions did": a key whose old name
 /// has held an occupant has sessions working in two different directories,
-/// and only each one's own shell says which.
-fn own_follow(state: &Path, old_url: &str, n: &str, new_url: &str, new_dir: Option<&Path>, shells: &[ShellAt], prev: Option<&str>) -> OwnFollow {
+/// and only each one's own shell, or its own start, says which.
+#[allow(clippy::too_many_arguments)]
+fn own_follow(
+    state: &Path,
+    old_url: &str,
+    n: &str,
+    new_url: &str,
+    new_dir: Option<&Path>,
+    shells: &[ShellAt],
+    starts: &[StartAt],
+    prev: Option<&str>,
+) -> OwnFollow {
     let owner = owner_of_in(state, old_url, n);
     let found = shells.iter().find(|s| s.name == n);
     let shell = found.and_then(|s| s.url.as_ref().ok().map(|u| (u, &s.dir)));
@@ -533,21 +578,42 @@ fn own_follow(state: &Path, old_url: &str, n: &str, new_url: &str, new_dir: Opti
             }
         }
     }
+    if found.is_none() {
+        match starts.iter().find(|s| s.name == n).map(|s| &s.start) {
+            Some(Start::At(u, d)) => {
+                if matches!(&owner, Owner::Elsewhere(o) if o == u) {
+                    return OwnFollow::There;
+                }
+                return OwnFollow::To(u.clone(), d.clone());
+            }
+            Some(Start::Nowhere) => {
+                log_stays_once(old_url, n, StayReason::StartNowhere, || stays_line(old_url, n, StayReason::StartNowhere, None));
+                return OwnFollow::Stays;
+            }
+            Some(Start::CannotTell(e)) => {
+                log_stays_once(old_url, n, StayReason::StartUnknown, || {
+                    format!("roost: {old_url}/{n} did not follow {old_url}'s rename yet: its shell has left, and where it started cannot be told ({e})")
+                });
+                return OwnFollow::Stays;
+            }
+            Some(Start::Missing) | None => {}
+        }
+    }
     let why = match found.map(|s| (&s.url, &s.dir)) {
         Some((Err(k), dir)) => (StayReason::Shell(*k), Some(dir.as_path())),
         _ => (StayReason::Left, None),
     };
-    log_stays_once(old_url, n, why.0, why.1);
+    log_stays_once(old_url, n, why.0, || stays_line(old_url, n, why.0, why.1));
     OwnFollow::Stays
 }
 
 /// Once per session and reason for the life of the process: a stranded
 /// session is re-examined every pass, and its reason rarely changes.
-fn log_stays_once(old_url: &str, n: &str, why: StayReason, dir: Option<&Path>) {
+fn log_stays_once(old_url: &str, n: &str, why: StayReason, line: impl FnOnce() -> String) {
     static SAID: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(String, StayReason)>>> = std::sync::OnceLock::new();
     let first = SAID.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).insert((format!("{old_url}/{n}"), why));
     if first {
-        eprintln!("{}", stays_line(old_url, n, why, dir));
+        eprintln!("{}", line());
     }
 }
 
@@ -563,6 +629,11 @@ fn stays_line(old_url: &str, n: &str, why: StayReason, dir: Option<&Path>) -> St
         StayReason::Left => format!(
             "roost: {old_url}/{n} did not follow {old_url}'s rename: its shell has left every directory the key has had, so nothing says where it belongs"
         ),
+        StayReason::StartNowhere => format!(
+            "roost: {old_url}/{n} did not follow {old_url}'s rename: its shell has left, and the directory it started in is found nowhere"
+        ),
+        // Built by its caller, which has the reason in hand.
+        StayReason::StartUnknown => format!("roost: {old_url}/{n} did not follow {old_url}'s rename yet: where it started cannot be told"),
     }
 }
 
@@ -586,8 +657,12 @@ fn stays_line(old_url: &str, n: &str, why: StayReason, dir: Option<&Path>) -> St
 /// need not be `new_url` — an occupant renamed to D while B still stands
 /// takes its sessions to D, and the earlier-followed ones stay with B.
 ///
+/// `starts` is (a)'s fallback, for a session with no entry in `shells`:
+/// where the directory it was spawned in is now (decision 3).
+///
 /// Records and copies only: no hub, no lock, no git. Its caller
-/// (`registry::follow_moves`) resolves `shells` and refreshes hubs.
+/// (`registry::follow_moves`) resolves `shells` and `starts` and refreshes
+/// hubs.
 #[allow(clippy::too_many_arguments)]
 pub fn follow_move_in(
     state: &Path,
@@ -596,6 +671,7 @@ pub fn follow_move_in(
     new_dir: Option<&Path>,
     live: &[String],
     shells: &[ShellAt],
+    starts: &[StartAt],
     live_in: &dyn Fn(&str) -> Vec<String>,
     prev: Option<&str>,
 ) -> bool {
@@ -607,7 +683,7 @@ pub fn follow_move_in(
     // that target is found by the record itself (R18, or the fallback in
     // `own_follow`) once the shell has wandered off.
     for n in live {
-        let OwnFollow::To(url, dir) = own_follow(state, old_url, n, new_url, new_dir, shells, prev) else { continue };
+        let OwnFollow::To(url, dir) = own_follow(state, old_url, n, new_url, new_dir, shells, starts, prev) else { continue };
         // R16: a resident never shadows a native session of the same name.
         if live_in(&url).contains(n) {
             eprintln!("roost: {old_url}/{n} did not follow the rename to {url}: {n} already exists there");
@@ -690,21 +766,36 @@ pub fn follow_move_in(
 /// [`follow_move_in`] against the real state dir, with the R16 gate read
 /// from each target's own live sessions. Never call under a lock:
 /// `session::live_names` takes `SESSIONS`.
-pub fn follow_move(old_url: &str, new_url: &str, new_dir: Option<&Path>, live: &[String], shells: &[ShellAt], prev: Option<&str>) -> bool {
-    follow_move_in(&crate::wsstate::state_dir(), old_url, new_url, new_dir, live, shells, &crate::session::live_names, prev)
+pub fn follow_move(old_url: &str, new_url: &str, new_dir: Option<&Path>, live: &[String], shells: &[ShellAt], starts: &[StartAt], prev: Option<&str>) -> bool {
+    follow_move_in(&crate::wsstate::state_dir(), old_url, new_url, new_dir, live, shells, starts, &crate::session::live_names, prev)
 }
 
 /// Whether part (a) of a non-fresh follow has anything left to do: one of
 /// the key's own sessions whose evidence names somewhere it is not yet
 /// owned by, and that R16 would not hold back (that one would only log its
 /// refusal every pass). Never call under a lock, as [`follow_move`].
-pub fn own_follow_pending(old_url: &str, new_url: &str, new_dir: Option<&Path>, live: &[String], shells: &[ShellAt], prev: Option<&str>) -> bool {
+pub fn own_follow_pending(old_url: &str, new_url: &str, new_dir: Option<&Path>, live: &[String], shells: &[ShellAt], starts: &[StartAt], prev: Option<&str>) -> bool {
     let state = crate::wsstate::state_dir();
     let prev = prev.filter(|p| *p != new_url);
-    live.iter().any(|n| match own_follow(&state, old_url, n, new_url, new_dir, shells, prev) {
+    live.iter().any(|n| match own_follow(&state, old_url, n, new_url, new_dir, shells, starts, prev) {
         OwnFollow::To(url, _) => !crate::session::live_names(&url).contains(n),
         _ => false,
     })
+}
+
+/// Whether part (a) would consult session `n`'s start identity at all: a
+/// session that is `Here`, or that an earlier follow sent to `prev` — the
+/// ones this rename may move. Anything else was re-homed by its own
+/// Claude's move, or is already settled, and looking for its start would
+/// only cost a scan (and maybe a git call) every pass for an answer
+/// `own_follow` ignores.
+pub fn start_wanted(old_url: &str, n: &str, new_url: &str, prev: Option<&str>) -> bool {
+    let prev = prev.filter(|p| *p != new_url);
+    match owner_of(old_url, n) {
+        Owner::Here => true,
+        Owner::Elsewhere(o) => prev == Some(o.as_str()),
+        Owner::Unknown(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -1059,7 +1150,7 @@ mod tests {
         let mut shells = shells;
         shells.push(ShellAt { name: "athome".into(), url: Err(NoTarget::AtHome), dir: elsewhere.clone() });
         let live: Vec<String> = ["shell", "busy", "away", "unsure", "todee", "left", "athome"].map(String::from).to_vec();
-        assert!(follow_move_in(s, old, new, Some(&new_dir), &live, &shells, &busy_in_new, None));
+        assert!(follow_move_in(s, old, new, Some(&new_dir), &live, &shells, &[], &busy_in_new, None));
 
         assert_eq!(owner_of_in(s, old, "shell"), Owner::Elsewhere(new.into()), "(a) a live session follows");
         assert_eq!(owner_of_in(s, old, "busy"), Owner::Here, "R16: the new key's native busy is not shadowed");
@@ -1085,10 +1176,10 @@ mod tests {
         assert_eq!(crate::worktree::read_base(s, &nk).as_deref(), Some("main"), "(c) the base is copied to a key that had none");
         assert_eq!(std::fs::read_to_string(s.join(format!("{nk}.json"))).unwrap(), r#"{"new":1}"#, "the new key's own layout is never overwritten");
 
-        assert!(!follow_move_in(s, old, new, Some(&new_dir), &live, &shells, &busy_in_new, None), "a second pass changes nothing");
+        assert!(!follow_move_in(s, old, new, Some(&new_dir), &live, &shells, &[], &busy_in_new, None), "a second pass changes nothing");
 
         std::fs::remove_file(s.join(format!("{nk}.json"))).unwrap();
-        assert!(follow_move_in(s, old, new, Some(&new_dir), &live, &shells, &|_| vec![], None));
+        assert!(follow_move_in(s, old, new, Some(&new_dir), &live, &shells, &[], &|_| vec![], None));
         assert_eq!(std::fs::read_to_string(s.join(format!("{nk}.json"))).unwrap(), r#"{"old":1}"#, "(d) the layout is copied to a key that had none");
         assert_eq!(owner_of_in(s, old, "busy"), Owner::Elsewhere(new.into()), "once the name is free there, it follows too");
         assert!(std::fs::read_dir(s).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(".tmp.")), "no temp file left behind");
@@ -1312,6 +1403,43 @@ mod tests {
         // confinement can refuse it.
         std::fs::write(&p, "../escape\n").unwrap();
         assert!(!resolves_with(s, &roots, "proj", "term", "../escape"), "confinement still applies");
+    }
+
+    /// Decision 3's precedence: a session's own shell, in one of the key's
+    /// directories, outranks its start identity — whether that shell names
+    /// a target (`inside` follows D, not its start's B) or names none
+    /// (`athome` is at home in the old URL's directory, and stays). Only a
+    /// session with no shell entry at all (`left`) follows its start.
+    ///
+    /// Revert-checked, run and restored: with the start fallback consulted
+    /// whatever the shell said (`if true` for `if found.is_none()`), fails
+    /// "a shell at home outranks its start" — left `Elsewhere("r/b")`.
+    #[test]
+    fn a_shell_outranks_its_start_identity() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        let dirs = tempfile::tempdir().unwrap();
+        let (a, b, d) = (dirs.path().join("a"), dirs.path().join("b"), dirs.path().join("d"));
+        for p in [&a, &b, &d] {
+            std::fs::create_dir(p).unwrap();
+        }
+        let shells = vec![
+            ShellAt { name: "inside".into(), url: Ok("r/d".into()), dir: d.clone() },
+            ShellAt { name: "athome".into(), url: Err(NoTarget::AtHome), dir: a.clone() },
+        ];
+        let to_b = Start::At("r/b".into(), b.clone());
+        let starts: Vec<StartAt> =
+            ["inside", "athome", "left"].iter().map(|n| StartAt { name: n.to_string(), start: to_b.clone() }).collect();
+        let live: Vec<String> = ["inside", "athome", "left"].map(String::from).to_vec();
+        assert!(follow_move_in(s, "r/a", "r/b", Some(&b), &live, &shells, &starts, &|_| vec![], None));
+        assert_eq!(owner_of_in(s, "r/a", "inside"), Owner::Elsewhere("r/d".into()), "a shell with a target outranks its start");
+        assert_eq!(owner_of_in(s, "r/a", "athome"), Owner::Here, "a shell at home outranks its start");
+        assert_eq!(owner_of_in(s, "r/a", "left"), Owner::Elsewhere("r/b".into()), "a shell that left: its start decides");
+        assert_eq!(
+            identity_of_in(s, "r/a", "left"),
+            Ok(Some(crate::dirid::Stored::Full(crate::dirid::of(&b).unwrap().unwrap()))),
+            "and its record carries its start's directory"
+        );
     }
 
     /// Fix round 1, item 4: the log tells a session at home in the old
