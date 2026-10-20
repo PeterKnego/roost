@@ -1736,12 +1736,29 @@ mod tests {
     /// outside page (spec §2, "The page"). Only the *exact* shape
     /// `outside::split_url` accepts, with a parent that is itself valid.
     ///
-    /// Revert-checked: removing the `if let Some((parent, _name)) =
-    /// crate::outside::split_url(project) { return valid_project(parent); }`
-    /// arm made the very first assertion fail — `panicked at src/session.rs:
-    /// the shape #188 mints` (the plain dot-segment check below rejects
-    /// `.claude/outside/..` the same way it rejects `.claude/anything-else`,
-    /// since only the worktrees exception is still there). Restored.
+    /// Revert-checked, two separate reverts:
+    /// 1. Removing the whole `if let Some((parent, _name)) =
+    ///    crate::outside::split_url(project) { return valid_project(parent);
+    ///    }` arm made the very first assertion fail — `panicked at
+    ///    src/session.rs: the shape #188 mints` (the plain dot-segment check
+    ///    below rejects `.claude/outside/..` the same way it rejects
+    ///    `.claude/anything-else`, since only the worktrees exception is
+    ///    still there). This revert alone does not touch the two
+    ///    *refusal* assertions below (`a/../b/..`, `.hidden/..`): under the
+    ///    old rule (no outside exception at all) those were already refused,
+    ///    so they would have passed trivially regardless of this fix —
+    ///    hence revert 2.
+    /// 2. With the arm's body narrowed to `return true` instead of
+    ///    recursing onto `valid_project(parent)` — so any string matching
+    ///    `split_url`'s shape is accepted outright, parent unchecked — the
+    ///    `a/../b/..` assertion failed on its own: `panicked at
+    ///    src/session.rs: an invalid parent (traversal) is refused too`.
+    ///    The `.hidden/..` assertion is never reached in that same run (the
+    ///    panic stops the test at the first failure), so it was checked
+    ///    separately, with the earlier assertions skipped: `panicked at
+    ///    src/session.rs: an invalid parent (leading dot) is refused too —
+    ///    ISOLATED REVERT-CHECK RUN`.
+    /// All restored.
     #[test]
     fn valid_project_accepts_the_outside_worktree_shape_with_a_valid_parent() {
         assert!(valid_project("repo/.claude/outside/wt"), "the shape #188 mints");

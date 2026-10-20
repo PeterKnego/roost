@@ -1049,18 +1049,33 @@ mod tests {
     /// check, so this test stands on its own without Task 3: it is the arm's
     /// *own* revalidation under test, not whatever wrote the record.
     ///
-    /// Revert-checked: with the `if RESERVED.contains(&first) ||
-    /// !crate::session::valid_project(parent) { return None; }` guard
-    /// deleted (so a successful `split_url` always falls through to
-    /// `outside::resolve`), the first assertion failed — `assertion \`left
-    /// == right\` failed: a reserved parent must not resolve\n  left:
-    /// Some("/home/.../wt")\n right: None` — and the panic stopped the test
-    /// there, so this run did not separately exercise the `.git` case below
-    /// it. `outside::resolve` itself has no opinion on the parent string at
-    /// all — it just reads the record and checks the directory's identity —
-    /// and the `.git` case is refused by the exact same guard on the exact
-    /// same `valid_project` call, so there is no reason to expect it would
-    /// have survived where the `static` case did not. Restored.
+    /// The two halves are not redundant with each other — each is refused by
+    /// a *different* clause of the guard, which is the whole reason the test
+    /// has two cases instead of one:
+    /// - `static` is refused only by `RESERVED.contains(&first)`:
+    ///   `valid_project("static")` is `true` (no dot, no empty segment), so
+    ///   the `valid_project` half of the guard has nothing to say about it.
+    /// - `.git` is refused only by `!crate::session::valid_project(parent)`:
+    ///   `RESERVED` (`static`/`ws`/`frag`) does not contain `.git` at all.
+    ///
+    /// Revert-checked, two separate reverts, one per clause:
+    /// 1. With the whole guard deleted (so a successful `split_url` always
+    ///    falls through to `outside::resolve`, which has no opinion on the
+    ///    parent string at all), the first assertion failed — `assertion
+    ///    \`left == right\` failed: a reserved parent must not resolve\n
+    ///    left: Some("/home/.../wt")\n right: None` — proving `RESERVED`
+    ///    alone was what refused `static` (removing both clauses together
+    ///    doesn't by itself show *which* clause each case depends on, which
+    ///    is why revert 2 isolates them).
+    /// 2. With only the `!crate::session::valid_project(parent)` clause
+    ///    removed — `if RESERVED.contains(&first) { return None; }` — the
+    ///    `static` assertion passed (still refused by `RESERVED` alone), and
+    ///    the `.git` assertion failed on its own: `assertion \`left ==
+    ///    right\` failed: an invalid (dot-segment) parent must not
+    ///    resolve\n  left: Some("/home/.../wt2")\n right: None`. This is
+    ///    the one that shows the two halves are testing different clauses,
+    ///    not the same guard twice.
+    /// Both restored.
     #[test]
     fn an_outside_url_under_a_reserved_or_invalid_parent_does_not_resolve() {
         with_state(|_state| {
@@ -1102,23 +1117,32 @@ mod tests {
     /// ENOENT trap. Asserting on the message, not just `is_err()`, is what
     /// tells the two failure reasons apart.
     ///
-    /// Revert-checked, two separate reverts:
+    /// Revert-checked, three separate reverts:
     /// 1. With `safe_resolve`'s confinement check widened to `if true ||
     ///    canon.starts_with(&base)`, the `..` case's `unwrap_err()` panicked
     ///    on the very first assertion, having gotten `Ok` back instead of
     ///    `Err` — `called \`Result::unwrap_err()\` on an \`Ok\` value:
-    ///    "/home/.../elsewhere"` — so this run did not separately reach the
-    ///    symlink assertion below it; the same confinement check guards
-    ///    both, and the symlink target differs in every identity field from
-    ///    anything under the worktree, so there is no risk it would have
-    ///    passed by the `..` case's coincidence.
+    ///    "/home/.../elsewhere"` — so this run alone did not reach the
+    ///    symlink assertion below it; see revert 3 for that half checked on
+    ///    its own.
     /// 2. Separately, with the whole arm moved to after the dot-segment
     ///    check (item 2's check, not item 1's), the setup's own `.expect`
     ///    (`resolve_project(..).expect("the allowed worktree must
     ///    resolve")`) panicked before either confinement assertion was
     ///    reached at all, for the same reason as the two tests above —
     ///    `panicked at src/projects.rs: the allowed worktree must resolve`.
-    /// Both restored.
+    /// 3. The symlink half checked on its own, isolated from the `..` half:
+    ///    with the same `if true || ..` widening as revert 1, and the two
+    ///    blocks in this test temporarily reordered so the symlink assertion
+    ///    ran *first* (restored immediately after), its `unwrap_err()`
+    ///    panicked on its own — `called \`Result::unwrap_err()\` on an
+    ///    \`Ok\` value: "/home/.../elsewhere"` (the symlink's own target,
+    ///    read back through `canonicalize`, which is exactly why this is not
+    ///    the ENOENT trap: the link's target genuinely exists, so
+    ///    `canonicalize` succeeds and execution reaches the `starts_with`
+    ///    check this half means to pin — it is that check, neutered, that
+    ///    then lets it through).
+    /// All three restored.
     #[test]
     fn a_path_escaping_an_allowed_worktree_is_refused() {
         with_state(|_state| {
