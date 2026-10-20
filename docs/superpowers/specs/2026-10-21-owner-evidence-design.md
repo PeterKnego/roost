@@ -22,6 +22,7 @@ Rename-following decides who owns a terminal from evidence about a **key as a wh
    - Occupant identities become a list.
 
    The alternatives were per-key directory generations, and refusing occupants. Both were declined.
+3. **A session whose shell has left follows its own start identity** (decided during implementation, after review showed the first-rename regression): each session records the identity of the directory it was started in.
 
 ## §1. Every record carries the identity of the directory it points at
 **The file.** `state/home/<home key>/.<name>.ino` holds the owner directory's identity as one line: `dev ino btime_secs btime_nsec`. This is the identity #191 established, because ext4 reuses a freed inode in 50 of 50 `rm` + `mkdir` cycles.
@@ -81,7 +82,12 @@ For each live native session of a key:
 - If the session leader's cwd has an ancestor carrying one of the key's identities at a directory P, where P resolves under the roots and is not the key's current directory, that session follows P:
   - a record to P's URL, with P's identity as its `.ino`;
   - the R16 gate (a name already live in P is refused, as today).
-- A session whose shell has left its directory gives no evidence. It stays where it is, and this is logged once.
+- **A session whose shell has left its directory falls back to its own start identity** (decision 3, 2026-10-21).
+  - When a session is started, roost records the identity of the directory it was started in, at `sock/<key>/.<name>.start-ino`, in the four-field format. This is per-terminal evidence that does not depend on where the shell is now.
+  - When the shell gives no evidence, the session follows the directory that carries its own start identity, found the way §1 finds a record's identity (the `.moved-to` target, then the siblings of the old path). The same rules apply: Full only, resolves under the roots, the R16 gate, and the target's `.ino` is written.
+  - With no start identity (Legacy, missing, or a session older than this change), the session stays where it is, logged once. With an unreadable one, or a stat error while looking, the session stays and is suspended.
+  - This keeps chain (d)'s two populations apart even after their shells leave: the occupant's sessions carry O1 and follow D, and the earlier-followed sessions carry A's original identity and follow B.
+  - The file is removed when the session's socket is reaped or the session ends, together with the socket.
 
 So an occupant renamed to D while B exists takes its own sessions to D, and A's earlier-followed sessions stay with B.
 

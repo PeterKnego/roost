@@ -245,6 +245,33 @@ pub fn write_lines(path: &Path, lines: &[String]) -> Result<(), String>;
 
 ---
 
+### Task 6b: A session whose shell left follows its own start identity (decision 3)
+
+**Files:**
+- `src/registry.rs`: `record_start_identity(key_dir, name, dir)` and `start_identity(key_dir, name) -> Result<Option<dirid::Stored>, String>`. The file is `sock/<key>/.<name>.start-ino`, a dot-file, so session enumeration skips it. It is written atomically with `dirid::write_lines`.
+- The writer is called where a session is **spawned**, next to `record_origin` in `session::attach_as` (src/session.rs about :748), with the spawn directory. Only a spawn writes it; an attach to an existing session never does.
+- The file is removed wherever a session's socket is unlinked: `registry::kill_and_unlink` / `kill_and_unlink_with`, the reap paths in `reconcile_with`, and session end. Grep every `remove_file` of a socket path.
+- `home::follow_move_in` part (a), Task 6's rule, gains one fallback. When a session's shell gives no evidence, the `Stays` / "left" case, read its start identity:
+  - **Full(id):** `registry::find_by_identity(roots, old_url, &id, None)`, then:
+    - `At(dir, url)`, with `url` not equal to the key's current URL, means follow: write the record and the `.ino`, behind the R16 gate.
+    - `Nowhere` means stay, logged once.
+    - `CannotTell` means suspend.
+  - **Legacy, missing, or a session older than this change:** stay, as today.
+  - **Unreadable:** stay and suspend.
+
+**Tests** (real git and dtach, Drop-guarded):
+- `a_session_whose_shell_left_follows_its_start_identity`: A→B rename with the session's shell `cd`'d out before it. The session follows B. This is the regression from Task 6's review.
+- `chain_d_cd_out_sessions_follow_their_own_starts`: an occupant session (start = O1) and an earlier-followed session (start = A's original identity), both cd'd out. The occupant is renamed to D. Each follows its own directory: the occupant's session to D, the earlier one to B.
+- `an_attach_does_not_overwrite_the_start_identity`
+- `the_start_identity_is_removed_with_its_socket`
+- `a_session_with_no_start_identity_still_stays` (regression)
+
+**Revert checks:** drop the fallback, and the first two tests fail. Make an attach overwrite the start identity, and the third fails. Record each failure.
+
+**Commit:** `registry, home: a session whose shell left follows the directory it started in (#183)`
+
+---
+
 ### Task 7: CLAUDE.md and the full suite
 
 **Files:**
