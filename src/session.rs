@@ -41,9 +41,22 @@ pub fn valid_name(name: &str) -> bool {
 /// by `resolve_project`, before this project had a `dir` to reach here with.
 /// Without this, no worktree's terminal can ever start: `attach` rejects
 /// the project string before it gets anywhere near a shell.
+///
+/// A second, separate exception for #188's outside-worktree page (spec §2,
+/// "The page"): `outside::split_url` already pins the shape to exactly
+/// `<parent>/.claude/outside/<name>`, with a `wtname`-valid name and nothing
+/// after it, so this just recurses onto `parent` — the same every-other-rule
+/// a plain project string goes through, applied one level up. Without this,
+/// `valid_project` refuses the virtual URL outright (its dot segment matches
+/// neither this nor the worktrees exception above), so `attach` could never
+/// start a terminal on an allowed outside page, and end-session/cwd
+/// recording could not name it either.
 pub(crate) fn valid_project(project: &str) -> bool {
     if project.is_empty() {
         return false;
+    }
+    if let Some((parent, _name)) = crate::outside::split_url(project) {
+        return valid_project(parent);
     }
     let segs: Vec<&str> = project.split('/').collect();
     if segs.iter().any(|s| s.is_empty()) {
@@ -1715,6 +1728,30 @@ mod tests {
         assert!(!valid_project("repo/.claude/worktrees/claude-1/extra"), "not a deeper path under it");
         assert!(!valid_project(".claude/worktrees/claude-1"), "not at the top level either");
         assert!(!valid_project("repo/.git"), "no exception for any other dotfile");
+    }
+
+    /// #188 item 3: the virtual outside-worktree URL
+    /// (`<parent>/.claude/outside/<name>`) must be `valid_project` too, or no
+    /// terminal, cwd record, or end-session could ever work on an allowed
+    /// outside page (spec §2, "The page"). Only the *exact* shape
+    /// `outside::split_url` accepts, with a parent that is itself valid.
+    ///
+    /// Revert-checked: removing the `if let Some((parent, _name)) =
+    /// crate::outside::split_url(project) { return valid_project(parent); }`
+    /// arm made the very first assertion fail — `panicked at src/session.rs:
+    /// the shape #188 mints` (the plain dot-segment check below rejects
+    /// `.claude/outside/..` the same way it rejects `.claude/anything-else`,
+    /// since only the worktrees exception is still there). Restored.
+    #[test]
+    fn valid_project_accepts_the_outside_worktree_shape_with_a_valid_parent() {
+        assert!(valid_project("repo/.claude/outside/wt"), "the shape #188 mints");
+        assert!(valid_project("karpie/src/.claude/outside/wt"), "a nested project's outside worktree too");
+        assert!(!valid_project("repo/.claude/outside/wt/extra"), "not a deeper path under it");
+        assert!(!valid_project("repo/.claude/outside/--bad"), "an invalid worktree name");
+        assert!(!valid_project("repo/.claude/outside"), "missing the worktree name");
+        assert!(!valid_project(".claude/outside/wt"), "not at the top level either");
+        assert!(!valid_project("a/../b/.claude/outside/wt"), "an invalid parent (traversal) is refused too");
+        assert!(!valid_project(".hidden/.claude/outside/wt"), "an invalid parent (leading dot) is refused too");
     }
 
     #[test]

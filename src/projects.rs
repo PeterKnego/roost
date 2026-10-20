@@ -234,8 +234,36 @@ fn resolve_project_with(
     // never consulted, by this arm or by anything after it. Checked first so
     // `resolve_recorded_project` (which waives the dot-segment vouching below)
     // gets the same guarantee.
-    if let Some((parent, name)) = crate::outside::split_url(name) {
-        return crate::outside::resolve(parent, name);
+    //
+    // Decided *exhaustively*, not just for the exact shape: anything merely
+    // shaped like one (containing the outside segment at all) is decided
+    // right here too, even when `split_url` goes on to refuse it — extra
+    // segments after `<name>`, or two outside segments nested in the same
+    // string, are refused by returning `None`, never by falling through.
+    // Without this, such a string skips `split_url` (which returns `None`
+    // for it) and lands on the ordinary dot-segment path below; for
+    // `resolve_recorded_project` specifically, that path's vouching is
+    // waived unconditionally, so a malformed virtual URL could resolve
+    // straight to whatever a repository happens to have on disk at that
+    // literal path — exactly the thing this whole arm exists to prevent.
+    // `debug_assert` pins the literal below to `outside::SEGMENT` so the two
+    // cannot silently drift apart.
+    debug_assert_eq!(crate::outside::SEGMENT, ".claude/outside");
+    if name.contains("/.claude/outside/") {
+        return crate::outside::split_url(name).and_then(|(parent, name)| {
+            // Task 3's hub already checks the parent before ever writing a
+            // record (it must resolve under the roots and git must list the
+            // path as one of its worktrees); this is a second, cheap,
+            // fork-free layer at resolve time — the parent named by a URL
+            // being resolved *right now* must still be a shape this process
+            // would ever treat as a project at all, not merely a shape that
+            // was true when the record was written.
+            let first = parent.split('/').next().unwrap_or("");
+            if RESERVED.contains(&first) || !crate::session::valid_project(parent) {
+                return None;
+            }
+            crate::outside::resolve(parent, name)
+        });
     }
     let segs: Vec<&str> = name.split('/').collect();
     if RESERVED.contains(&segs[0]) {
@@ -901,8 +929,19 @@ mod tests {
 
     /// The virtual `<parent>/.claude/outside/<name>` URL resolves only
     /// through its allow record (#188 Task 2). `roots` is passed through
-    /// unused by the new arm — it is a tempdir of its own, deliberately not
-    /// containing `p` at all, to show the resolution never touches it.
+    /// unused by the new arm: `tempfile::tempdir().unwrap().path().to_path_buf()`
+    /// never binds the `TempDir` itself, so it is dropped — and its
+    /// directory removed from disk — at the end of that one statement,
+    /// before `resolve_project` is even called. By the time the arm would
+    /// run, `roots` doesn't name a directory that still exists at all; the
+    /// test passing anyway is exactly what shows the arm never canonicalizes
+    /// or otherwise touches `roots`.
+    ///
+    /// Revert-checked: with the whole arm moved to after the dot-segment
+    /// check (so `resolve_project`'s real, unvouched-for `p` gets refused
+    /// there before ever reaching the arm), `.expect` panicked — `panicked
+    /// at src/projects.rs: an allowed outside worktree must resolve`.
+    /// Restored.
     #[test]
     fn an_allowed_outside_worktree_resolves() {
         with_state(|_state| {
@@ -922,6 +961,14 @@ mod tests {
     /// Review Focus 2: a directory planted at the literal virtual path must
     /// never be mistaken for the one the record names, even when a record
     /// for a *different* directory exists under the very same name.
+    ///
+    /// Revert-checked: with the whole arm moved to after the dot-segment
+    /// check, the *first* assertion (no record yet, expect `None`) still
+    /// passed — coincidentally, since the unvouched dot-segment check
+    /// already returns `None` on its own before ever reaching the arm — but
+    /// the second `.expect` (after writing the record, expect `Some`)
+    /// panicked for the same reason as the test above: `panicked at
+    /// src/projects.rs: the record must resolve`. Restored.
     #[test]
     fn a_planted_outside_dir_resolves_nowhere() {
         with_state(|_state| {
@@ -951,12 +998,127 @@ mod tests {
         });
     }
 
+    /// Fix round 1, item 4: a URL merely *shaped* like a virtual outside URL
+    /// — containing the segment but not matching `split_url`'s exact shape
+    /// (an extra segment after `<name>`, or two outside segments nested in
+    /// the same string) — must fail closed, through `resolve_recorded_project`
+    /// too, not fall through to the ordinary dot-segment path and find
+    /// whatever a repository happens to have planted on disk at that literal
+    /// path. Real directories are planted at both malformed shapes so a
+    /// wrongful fall-through has something real to (wrongly) return.
+    ///
+    /// Revert-checked: with the outer `if name.contains("/.claude/outside/")
+    /// { .. }` fail-closed wrapper removed — replaced by a plain `if let
+    /// Some((parent, name)) = crate::outside::split_url(name) { ..still
+    /// validate parent..; return crate::outside::resolve(parent, name); }`,
+    /// so a `split_url` failure simply falls through instead of forcing
+    /// `None` — the loop below failed on its first iteration, at the
+    /// `resolve_recorded_project` assertion: `assertion \`left == right\`
+    /// failed: "p/.claude/outside/wt/x" must not resolve even through
+    /// resolve_recorded_project\n  left:
+    /// Some("/home/.../p/.claude/outside/wt/x")\n  right: None`.
+    /// `resolve_recorded_project`'s unconditionally-waived vouching let the
+    /// dot-segment check through, and the confinement loop then found the
+    /// planted directory on disk. `resolve_project` itself did not fail on
+    /// this run (real git still refuses to vouch for an unreal worktree),
+    /// which is exactly why this fix matters specifically for
+    /// `resolve_recorded_project` — it is the one this closes a hole in.
+    /// Restored.
+    #[test]
+    fn a_malformed_virtual_url_resolves_nowhere_even_through_the_recorded_path() {
+        with_state(|_state| {
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir_all(root.path().join("p/.claude/outside/wt/x")).unwrap();
+            fs::create_dir_all(root.path().join("a/.claude/outside/b/.claude/outside/c")).unwrap();
+            let roots = vec![root.path().to_path_buf()];
+
+            for bad in ["p/.claude/outside/wt/x", "a/.claude/outside/b/.claude/outside/c"] {
+                assert_eq!(resolve_project(&roots, bad), None, "{bad:?} must not resolve");
+                assert_eq!(
+                    resolve_recorded_project(&roots, bad),
+                    None,
+                    "{bad:?} must not resolve even through resolve_recorded_project"
+                );
+            }
+        });
+    }
+
+    /// Fix round 1, item 5: the arm re-validates the parent at resolve time,
+    /// a second layer on top of Task 3's hub check at allow time. Records are
+    /// planted directly via `outside::allow`, bypassing any hub-side parent
+    /// check, so this test stands on its own without Task 3: it is the arm's
+    /// *own* revalidation under test, not whatever wrote the record.
+    ///
+    /// Revert-checked: with the `if RESERVED.contains(&first) ||
+    /// !crate::session::valid_project(parent) { return None; }` guard
+    /// deleted (so a successful `split_url` always falls through to
+    /// `outside::resolve`), the first assertion failed — `assertion \`left
+    /// == right\` failed: a reserved parent must not resolve\n  left:
+    /// Some("/home/.../wt")\n right: None` — and the panic stopped the test
+    /// there, so this run did not separately exercise the `.git` case below
+    /// it. `outside::resolve` itself has no opinion on the parent string at
+    /// all — it just reads the record and checks the directory's identity —
+    /// and the `.git` case is refused by the exact same guard on the exact
+    /// same `valid_project` call, so there is no reason to expect it would
+    /// have survived where the `static` case did not. Restored.
+    #[test]
+    fn an_outside_url_under_a_reserved_or_invalid_parent_does_not_resolve() {
+        with_state(|_state| {
+            let outside = tempfile::tempdir().unwrap();
+            let roots = vec![tempfile::tempdir().unwrap().path().to_path_buf()];
+
+            let wt = outside.path().join("wt");
+            fs::create_dir(&wt).unwrap();
+            crate::outside::allow("static", &wt).unwrap();
+            assert_eq!(
+                resolve_project(&roots, "static/.claude/outside/wt"),
+                None,
+                "a reserved parent must not resolve"
+            );
+
+            let wt2 = outside.path().join("wt2");
+            fs::create_dir(&wt2).unwrap();
+            crate::outside::allow(".git", &wt2).unwrap();
+            assert_eq!(
+                resolve_project(&roots, ".git/.claude/outside/wt2"),
+                None,
+                "an invalid (dot-segment) parent must not resolve"
+            );
+        });
+    }
+
     /// Pins existing behaviour, not new: once resolved, an allowed outside
     /// worktree's directory is an ordinary project directory to
     /// `safe_resolve`, so a `..` escape and a symlink pointing outside it are
     /// refused exactly as for any other project. This names what it pins —
-    /// `safe_resolve`'s own confinement — so a future change to resolution
-    /// cannot quietly also weaken what happens once inside.
+    /// `safe_resolve`'s own `starts_with` confinement check — so a future
+    /// change to resolution cannot quietly also weaken what happens once
+    /// inside.
+    ///
+    /// Both targets (`elsewhere`) are real, pre-existing directories, not a
+    /// nonexistent `"../x"`: a target that doesn't exist fails at
+    /// `canonicalize` ("not found") before `safe_resolve` ever reaches the
+    /// `starts_with` confinement check this test means to pin — CLAUDE.md's
+    /// ENOENT trap. Asserting on the message, not just `is_err()`, is what
+    /// tells the two failure reasons apart.
+    ///
+    /// Revert-checked, two separate reverts:
+    /// 1. With `safe_resolve`'s confinement check widened to `if true ||
+    ///    canon.starts_with(&base)`, the `..` case's `unwrap_err()` panicked
+    ///    on the very first assertion, having gotten `Ok` back instead of
+    ///    `Err` — `called \`Result::unwrap_err()\` on an \`Ok\` value:
+    ///    "/home/.../elsewhere"` — so this run did not separately reach the
+    ///    symlink assertion below it; the same confinement check guards
+    ///    both, and the symlink target differs in every identity field from
+    ///    anything under the worktree, so there is no risk it would have
+    ///    passed by the `..` case's coincidence.
+    /// 2. Separately, with the whole arm moved to after the dot-segment
+    ///    check (item 2's check, not item 1's), the setup's own `.expect`
+    ///    (`resolve_project(..).expect("the allowed worktree must
+    ///    resolve")`) panicked before either confinement assertion was
+    ///    reached at all, for the same reason as the two tests above —
+    ///    `panicked at src/projects.rs: the allowed worktree must resolve`.
+    /// Both restored.
     #[test]
     fn a_path_escaping_an_allowed_worktree_is_refused() {
         with_state(|_state| {
@@ -964,31 +1126,56 @@ mod tests {
             let wt = outside.path().join("wt");
             fs::create_dir(&wt).unwrap();
             fs::write(wt.join("inside.txt"), "hi").unwrap();
+            // A real sibling directory, not "../x" — see the ENOENT-trap note
+            // above.
+            let elsewhere = outside.path().join("elsewhere");
+            fs::create_dir(&elsewhere).unwrap();
 
             let rec = crate::outside::allow("p", &wt).unwrap();
             let roots = vec![tempfile::tempdir().unwrap().path().to_path_buf()];
             let url = crate::outside::url_for("p", &rec.name);
             let resolved = resolve_project(&roots, &url).expect("the allowed worktree must resolve");
 
-            assert!(safe_resolve(&resolved, "../x").is_err(), "a `..` escape must be refused");
+            let err = safe_resolve(&resolved, "../elsewhere").unwrap_err();
+            assert!(err.contains("path outside project"), "a `..` escape to an existing sibling must be refused, got {err:?}");
 
-            let escape_target = outside.path().join("elsewhere");
-            fs::create_dir(&escape_target).unwrap();
             let link = wt.join("link");
-            std::os::unix::fs::symlink(&escape_target, &link).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+            let err = safe_resolve(&resolved, "link").unwrap_err();
             assert!(
-                safe_resolve(&resolved, "link").is_err(),
-                "a symlink inside the worktree pointing outside it must be refused"
+                err.contains("path outside project"),
+                "a symlink inside the worktree pointing outside it must be refused, got {err:?}"
             );
         });
     }
 
-    /// The arm reads a couple of files and takes one `metadata()` call — no
-    /// subprocess. Proven here by making git itself unreachable (`PATH` set
-    /// to an empty directory) and asserting the resolve still succeeds.
+    /// What this actually proves, stated honestly: resolution of the virtual
+    /// URL does not *depend* on git succeeding — not that the arm's code
+    /// contains no `Command::new`, which this test cannot see. It makes git
+    /// itself unreachable (`PATH` set to an empty directory, so even a
+    /// `git` on the real `PATH` could not be found) and asserts the resolve
+    /// still succeeds.
+    ///
     /// `PATH` is process-wide, like `ROOST_STATE_DIR`, so this holds
     /// `with_state`'s env lock for the whole body and restores `PATH` before
-    /// returning.
+    /// returning — safe only because `cargo test` is run with
+    /// `--test-threads=1` throughout this project (including in CI), so no
+    /// other test is concurrently reading `PATH` while it is pointed at the
+    /// empty directory.
+    ///
+    /// Revert-checked: with the whole arm moved to after the dot-segment
+    /// check, this failed too — `assertion \`left == right\` failed: the
+    /// arm must resolve without forking git, even with git unreachable\n
+    /// left: None\n right: Some("/home/.../wt")`. That `None` is not
+    /// evidence the arm ever tried to fork anything: it comes from
+    /// `resolve_project`'s unvouched dot-segment check refusing `p` (a real
+    /// directory, but not a real git worktree) *before* the arm — now moved
+    /// later — is ever reached, the same mechanism as the three tests above.
+    /// This test is discriminating about position, not about forking per
+    /// se; the "no fork" claim rests on reading `outside::resolve`'s own
+    /// implementation (two file reads and a `metadata()` call), not on
+    /// anything this particular assertion could observe on its own.
+    /// Restored.
     #[test]
     fn the_arm_never_forks() {
         with_state(|_state| {
