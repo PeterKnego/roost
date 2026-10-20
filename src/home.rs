@@ -71,50 +71,67 @@ fn identity_path(state: &Path, home: &str, name: &str) -> PathBuf {
     dir_in(state, home).join(format!(".{name}.ino"))
 }
 
-#[cfg(unix)]
+/// Writes the owner directory's full four-field identity (`dirid::format`),
+/// atomically and 0600 via `dirid::write_lines`. `dirid::of` already refuses
+/// to produce an identity when the directory is gone or its birth time is
+/// unreadable (`Ok(None)` / `Err`); both cases are errors here too — a
+/// record whose `.ino` cannot be trusted is exactly the case that must never
+/// license a follow (see the module doc on `identity_path` and #183 §1).
 pub fn record_identity_in(state: &Path, home: &str, name: &str, owner_dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
     if !crate::session::valid_name(name) {
         return Err(format!("bad session name {name:?}"));
     }
-    let m = std::fs::metadata(owner_dir).map_err(|e| e.to_string())?;
+    let id = crate::dirid::of(owner_dir)?.ok_or_else(|| format!("{} does not exist", owner_dir.display()))?;
     let dir = dir_in(state, home);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let tmp = dir.join(format!(".{name}.ino.tmp.{}", crate::wsstate::tmp_suffix()));
-    let out = (|| {
-        std::fs::write(&tmp, format!("{} {}\n", m.dev(), m.ino())).map_err(|e| e.to_string())?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, identity_path(state, home, name)).map_err(|e| e.to_string())
-    })();
-    if out.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    out
+    crate::dirid::write_lines(&identity_path(state, home, name), &[crate::dirid::format(&id)])
 }
 
-#[cfg(not(unix))]
-pub fn record_identity_in(_state: &Path, _home: &str, _name: &str, _owner_dir: &Path) -> Result<(), String> { Ok(()) }
-
 /// The recorded owner identity. Three outcomes: `Ok(None)` — none recorded
-/// (a re-home older than this file), which is no evidence; `Ok(Some)`; and
-/// `Err` — unreadable or damaged, which is "cannot tell" and must suspend
-/// whatever would have acted on its absence.
-pub fn identity_of_in(state: &Path, home: &str, name: &str) -> Result<Option<(u64, u64)>, String> {
+/// (a re-home older than this file, or one whose identity could not be read
+/// at write time), which is no evidence; `Ok(Some(Full|Legacy))`; and
+/// `Err` — unreadable, or damaged (`dirid::parse_line` gave `None`), which is
+/// "cannot tell" and must suspend whatever would have acted on its absence.
+/// Damaged must never read as `Ok(None)`: the difference between "nothing
+/// was ever recorded" and "something was recorded but cannot be trusted" is
+/// exactly the distinction CLAUDE.md's "absence of evidence" rule exists for.
+pub fn identity_of_in(state: &Path, home: &str, name: &str) -> Result<Option<crate::dirid::Stored>, String> {
     if !crate::session::valid_name(name) {
         return Err(format!("bad session name {name:?}"));
     }
     match std::fs::read_to_string(identity_path(state, home, name)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.to_string()),
-        Ok(s) => {
-            let mut it = s.split_whitespace();
-            match (it.next().and_then(|d| d.parse().ok()), it.next().and_then(|i| i.parse().ok()), it.next()) {
-                (Some(d), Some(i), None) => Ok(Some((d, i))),
-                _ => Err(format!("damaged identity record {s:?}")),
-            }
-        }
+        Ok(s) => crate::dirid::parse_line(s.trim()).map(Some).ok_or_else(|| format!("damaged identity record {s:?}")),
     }
+}
+
+/// Upgrades a Legacy `.ino` to Full once `owner_dir`'s current `(dev, ino)`
+/// still matches the legacy pair: the record was never wrong, only written
+/// before birth time existed, so this is the one case where adding it is
+/// safe. Every other case — no file, already Full, a legacy pair that no
+/// longer matches — writes nothing and returns `false`; a stat error on
+/// `owner_dir` (via `dirid::of`) is `Err`, same as everywhere else evidence
+/// about a directory is read. `dirid::matches` is deliberately not used
+/// here: that function answers "does this stored value name this directory
+/// at all," which for a `Legacy` value is true for *any* birth time, whereas
+/// upgrading requires the stronger "the (dev, ino) pair itself still holds
+/// right now" — checked directly against `owner_dir`'s current identity.
+pub fn upgrade_identity_in(state: &Path, home: &str, name: &str, owner_dir: &Path) -> Result<bool, String> {
+    if !crate::session::valid_name(name) {
+        return Err(format!("bad session name {name:?}"));
+    }
+    let Some(crate::dirid::Stored::Legacy { dev, ino }) = identity_of_in(state, home, name)? else {
+        return Ok(false);
+    };
+    let Some(id) = crate::dirid::of(owner_dir)? else {
+        return Ok(false);
+    };
+    if id.dev != dev || id.ino != ino {
+        return Ok(false);
+    }
+    crate::dirid::write_lines(&identity_path(state, home, name), &[crate::dirid::format(&id)])?;
+    Ok(true)
 }
 
 pub fn forget_identity(home: &str, name: &str) {
@@ -125,8 +142,11 @@ pub fn forget_identity(home: &str, name: &str) {
 pub fn record_identity(home: &str, name: &str, owner_dir: &Path) -> Result<(), String> {
     record_identity_in(&crate::wsstate::state_dir(), home, name, owner_dir)
 }
-pub fn identity_of(home: &str, name: &str) -> Result<Option<(u64, u64)>, String> {
+pub fn identity_of(home: &str, name: &str) -> Result<Option<crate::dirid::Stored>, String> {
     identity_of_in(&crate::wsstate::state_dir(), home, name)
+}
+pub fn upgrade_identity(home: &str, name: &str, owner_dir: &Path) -> Result<bool, String> {
+    upgrade_identity_in(&crate::wsstate::state_dir(), home, name, owner_dir)
 }
 
 /// Every record, as (home, name, owner). Dot-files (temps) skipped.
@@ -875,6 +895,126 @@ mod tests {
         record_identity_in(s, "foo", "term3", dir.path()).unwrap();
         forget_in(s, "foo", "term3");
         assert_eq!(identity_of_in(s, "foo", "term3"), Ok(None), "forgetting the record forgets its identity");
+    }
+
+    /// `record_identity_in` writes `dirid::format`'s four whitespace-
+    /// separated fields, through `dirid::write_lines` (atomic, 0600) — not
+    /// the old two-field `dev ino` line.
+    ///
+    /// Revert-checked, run and restored: reverting the write to the old
+    /// `format!("{} {}", m.dev(), m.ino())` line (bypassing `dirid`
+    /// entirely) fails the first assertion — observed: `assertion `left ==
+    /// right` failed: the written line is dirid::format's\n  left:
+    /// "64512 9730054\n"\n right: "64512 9730054 1792502522
+    /// 575264209\n"` (values from this run).
+    #[test]
+    fn a_record_identity_is_four_fields_and_0600() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        let owner_dir = tempfile::tempdir().unwrap();
+        record_in(s, "foo", "term3", "foo/.claude/worktrees/w").unwrap();
+        record_identity_in(s, "foo", "term3", owner_dir.path()).unwrap();
+
+        let id = crate::dirid::of(owner_dir.path()).unwrap().unwrap();
+        let path = identity_path(s, "foo", "term3");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body, format!("{}\n", crate::dirid::format(&id)), "the written line is dirid::format's");
+        assert_eq!(body.split_whitespace().count(), 4, "a full identity is four fields");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "dirid::write_lines' 0600, same as every other identity file");
+        }
+    }
+
+    /// A pre-#183 two-field `.ino` reads as `Stored::Legacy`, not rejected
+    /// and not silently treated as a full match.
+    #[test]
+    fn a_legacy_ino_reads_as_legacy() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        record_in(s, "foo", "term3", "foo/.claude/worktrees/w").unwrap();
+        std::fs::create_dir_all(dir_in(s, "foo")).unwrap();
+        std::fs::write(identity_path(s, "foo", "term3"), "64512 123\n").unwrap();
+        assert_eq!(identity_of_in(s, "foo", "term3"), Ok(Some(crate::dirid::Stored::Legacy { dev: 64512, ino: 123 })));
+    }
+
+    /// Review Focus 3: a Legacy `.ino` whose `(dev, ino)` still matches its
+    /// owner directory's identity right now is upgraded to Full in place —
+    /// the record was never wrong, it just predates birth time.
+    ///
+    /// Revert-checked, run and restored: see
+    /// `a_legacy_ino_is_not_upgraded_onto_a_different_directory`'s comment
+    /// for the shared revert (ignoring the `(dev, ino)` comparison) — that
+    /// check is run against *that* test since this one would pass either
+    /// way (a real match upgrades under both the fixed and broken code).
+    #[test]
+    fn a_legacy_ino_is_upgraded_when_its_owner_matches() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        let owner_dir = tempfile::tempdir().unwrap();
+        let id = crate::dirid::of(owner_dir.path()).unwrap().unwrap();
+        record_in(s, "foo", "term3", "foo/.claude/worktrees/w").unwrap();
+        std::fs::create_dir_all(dir_in(s, "foo")).unwrap();
+        std::fs::write(identity_path(s, "foo", "term3"), format!("{} {}\n", id.dev, id.ino)).unwrap();
+
+        assert_eq!(upgrade_identity_in(s, "foo", "term3", owner_dir.path()), Ok(true));
+        assert_eq!(identity_of_in(s, "foo", "term3"), Ok(Some(crate::dirid::Stored::Full(id))), "upgraded in place to Full");
+    }
+
+    /// A Legacy pair that does not match `owner_dir`'s current `(dev, ino)`
+    /// must not be upgraded: that would stamp a birth time onto evidence
+    /// that was never confirmed to be this directory in the first place.
+    ///
+    /// Revert-checked, run and restored: changing `upgrade_identity_in`'s
+    /// `if id.dev != dev || id.ino != ino { return Ok(false); }` guard to
+    /// always continue (upgrading on any Legacy record regardless of match)
+    /// fails here — observed: `assertion `left == right` failed\n  left:
+    /// Ok(true)\n  right: Ok(false)` — and the stored record would have
+    /// become `Full` with a birth time belonging to `owner_dir`, not the
+    /// directory the Legacy pair actually named. Restored.
+    #[test]
+    fn a_legacy_ino_is_not_upgraded_onto_a_different_directory() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        let owner_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let other_id = crate::dirid::of(other_dir.path()).unwrap().unwrap();
+        record_in(s, "foo", "term3", "foo/.claude/worktrees/w").unwrap();
+        std::fs::create_dir_all(dir_in(s, "foo")).unwrap();
+        // The stored Legacy pair names `other_dir`'s identity, not
+        // `owner_dir`'s — two distinct existing directories can never share
+        // a (dev, ino), so this is a genuine mismatch, not a coincidence.
+        std::fs::write(identity_path(s, "foo", "term3"), format!("{} {}\n", other_id.dev, other_id.ino)).unwrap();
+
+        assert_eq!(upgrade_identity_in(s, "foo", "term3", owner_dir.path()), Ok(false));
+        assert_eq!(
+            identity_of_in(s, "foo", "term3"),
+            Ok(Some(crate::dirid::Stored::Legacy { dev: other_id.dev, ino: other_id.ino })),
+            "left untouched, not upgraded onto the wrong directory"
+        );
+    }
+
+    /// A damaged `.ino` (`dirid::parse_line` returns `None`) must be `Err`,
+    /// never `Ok(None)` — the difference between "no identity was ever
+    /// recorded" and "something was recorded but cannot be trusted" is
+    /// exactly what licenses a follow versus what must suspend one.
+    ///
+    /// Revert-checked, run and restored: changing the `Ok(s) => ...`
+    /// arm to `Ok(s) => Ok(crate::dirid::parse_line(s.trim()))` (folding a
+    /// damaged line into `Ok(None)` instead of `Err`) fails here — observed
+    /// (a plain `assert!`, so only the message prints): `panicked at
+    /// src/home.rs:...: damaged must not read as no evidence`. Restored.
+    #[test]
+    fn a_damaged_ino_is_err_not_none() {
+        let st = tempfile::tempdir().unwrap();
+        let s = st.path();
+        record_in(s, "foo", "term3", "foo/.claude/worktrees/w").unwrap();
+        std::fs::create_dir_all(dir_in(s, "foo")).unwrap();
+        std::fs::write(identity_path(s, "foo", "term3"), "garbage\n").unwrap();
+        assert!(identity_of_in(s, "foo", "term3").is_err(), "damaged must not read as no evidence");
     }
 
     /// #158 §5's widening is gated: an owner outside `.claude/worktrees`

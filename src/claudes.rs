@@ -566,8 +566,12 @@ fn follow_gone_owner_inner(home: &str, name: &str, owner: &str, procs: &[ClaudeP
         }
         crate::registry::MoveRecord::NoEvidence | crate::registry::MoveRecord::Unfollowable => {}
     }
+    // Task 4 rewrites this function to compare the full `DirId` (and to
+    // treat a `Legacy` match as keep-only, never a follow). Until then,
+    // take (dev, ino) from either stored form, exactly as today.
     let (dev, ino) = match crate::home::identity_of(home, name) {
-        Ok(Some(id)) => id,
+        Ok(Some(crate::dirid::Stored::Full(id))) => (id.dev, id.ino),
+        Ok(Some(crate::dirid::Stored::Legacy { dev, ino })) => (dev, ino),
         Ok(None) => return GoneOwner::NotMoved,
         Err(e) => return suspend(home, name, "identity", &format!("its owner identity cannot be read ({e})")),
     };
