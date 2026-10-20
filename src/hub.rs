@@ -4396,7 +4396,7 @@ pub fn rehome_to(home: &str, session: &str, owner: &str) -> Result<(), String> {
     // The owner directory's identity, so a later rename of a worktree with
     // no session of its own can still be recognised (#158 §5). Best-effort:
     // without it a rename is forgotten by R18, exactly as before.
-    match crate::home::owner_dir(home, owner) {
+    match crate::home::owner_dir(home, session, owner) {
         Some(dir) => {
             if let Err(e) = crate::home::record_identity(home, session, &dir) {
                 // A previous owner's identity must not stand in for this one.
@@ -7705,7 +7705,7 @@ mod tests {
         }
         assert!(any_process_holds(&sock), "setup: the real dtach master must be up");
         crate::home::record(&home, "term3", &owner).unwrap();
-        assert!(crate::home::resolves(&home, &owner), "setup: the owner resolves under the real roots");
+        assert!(crate::home::resolves(&home, "term3", &owner), "setup: the owner resolves under the real roots");
 
         let mut home_hub = Hub::new(&home, home_dir.clone());
         let mut owner_hub = Hub::new(&owner, owner_dir.clone());

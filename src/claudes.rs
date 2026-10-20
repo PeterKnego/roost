@@ -438,7 +438,7 @@ pub fn detect_gone_owners(home_dir_of: &dyn Fn(&str) -> Option<PathBuf>) -> Vec<
         }
         let listed: Vec<PathBuf> = list.iter().filter_map(|w| w.path.canonicalize().ok()).collect();
         for (name, owner) in elsewhere {
-            if crate::home::resolves(&home, &owner) {
+            if crate::home::resolves(&home, &name, &owner) {
                 continue; // still there
             }
             // The leaf no longer exists (that is the whole point), so only
@@ -684,7 +684,7 @@ fn follow_gone_owner_inner(home: &str, name: &str, owner: &str, procs: &[ClaudeP
             // and an owner git no longer lists usually does not — that lost
             // follow is accepted: forgetting is recoverable, following a
             // reused inode is not.
-            let upgraded = match crate::home::owner_dir(home, owner) {
+            let upgraded = match crate::home::owner_dir(home, name, owner) {
                 Some(dir) => crate::home::upgrade_identity(home, name, &dir),
                 None => Ok(false),
             };

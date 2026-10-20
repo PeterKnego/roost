@@ -1176,21 +1176,21 @@ pub fn owned_live_names(project: &str) -> Vec<(String, Option<String>)> {
 /// [`owned_live_names`] with the owner check injected.
 pub(crate) fn owned_live_names_with(
     project: &str,
-    resolves: &dyn Fn(&str, &str) -> bool,
+    resolves: &dyn Fn(&str, &str, &str) -> bool,
 ) -> Vec<(String, Option<String>)> {
     let away: HashMap<String, crate::home::Owner> =
         crate::home::away_from(project).into_iter().collect();
     let mut out: Vec<(String, Option<String>)> = live_names(project)
         .into_iter()
         .filter(|n| match away.get(n) {
-            Some(crate::home::Owner::Elsewhere(o)) => !resolves(project, o),
+            Some(crate::home::Owner::Elsewhere(o)) => !resolves(project, n, o),
             _ => true,
         })
         .map(|n| (n, None))
         .collect();
     let mut home_live: HashMap<String, Vec<String>> = HashMap::new();
     for (home, name) in crate::home::residents_of(project) {
-        if !resolves(&home, project) {
+        if !resolves(&home, &name, project) {
             continue;
         }
         let live = home_live.entry(home.clone()).or_insert_with(|| live_names(&home));
@@ -1420,7 +1420,7 @@ pub fn spares_live(project: &str) -> bool {
 
 /// [`kill_project`] with the owner check injected, so tests do not depend on
 /// the configured roots. `resolves(home, owner)` is `home::resolves`.
-pub(crate) fn kill_project_with(project: &str, resolves: &dyn Fn(&str, &str) -> bool) -> usize {
+pub(crate) fn kill_project_with(project: &str, resolves: &dyn Fn(&str, &str, &str) -> bool) -> usize {
     kill_project_inner(project, resolves, &|_| {})
 }
 
@@ -1453,7 +1453,7 @@ pub(crate) enum CloseStage {
 /// The body of [`kill_project`], with `at` called at each [`CloseStage`].
 pub(crate) fn kill_project_inner(
     project: &str,
-    resolves: &dyn Fn(&str, &str) -> bool,
+    resolves: &dyn Fn(&str, &str, &str) -> bool,
     at: &dyn Fn(CloseStage),
 ) -> usize {
     // Read before `begin_close_ending`, which holds the global session lock:
@@ -1467,7 +1467,7 @@ pub(crate) fn kill_project_inner(
     // function, and a missing worktree is not evidence the session ended.
     let residents: Vec<(String, String)> = crate::home::residents_of(project)
         .into_iter()
-        .filter(|(home, _)| resolves(home, project))
+        .filter(|(home, name)| resolves(home, name, project))
         .collect();
     // `begin_close` does the map drain, and marks the project closing in the
     // same acquisition — so from here on no attach can add to what this
@@ -2849,7 +2849,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = format!("rehomespare{}", std::process::id());
         let owner = format!("{home}/.claude/worktrees/worktree-x");
-        let yes = |_: &str, _: &str| true;
+        let yes = |_: &str, _: &str, _: &str| true;
 
         let _att = start_real_dtach(&home, "term3", dir.path());
         let sock = sock_path(&home, "term3");
@@ -2888,7 +2888,7 @@ mod tests {
         std::env::set_var("ROOST_STATE_DIR", state.path());
         let dir = tempfile::tempdir().unwrap();
         let home = format!("rehomeunknown{}", std::process::id());
-        let yes = |_: &str, _: &str| true;
+        let yes = |_: &str, _: &str, _: &str| true;
 
         let _att = start_real_dtach(&home, "term3", dir.path());
         let sock = sock_path(&home, "term3");
@@ -2928,7 +2928,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = format!("rehomegone{}", std::process::id());
         let owner = format!("{home}/.claude/worktrees/worktree-x");
-        let no = |_: &str, _: &str| false;
+        let no = |_: &str, _: &str, _: &str| false;
 
         let _att = start_real_dtach(&home, "term3", dir.path());
         let sock = sock_path(&home, "term3");
@@ -2984,7 +2984,7 @@ mod tests {
         fake_socket(home, "term");
         crate::home::record(home, "term", &owner).unwrap();
         let taken: Vec<String> =
-            owned_live_names_with(&owner, &|_, _| true).into_iter().map(|(n, _)| n).collect();
+            owned_live_names_with(&owner, &|_, _, _| true).into_iter().map(|(n, _)| n).collect();
         assert_eq!(taken, vec!["term".to_string()]);
         assert_eq!(next_free_name(&owner, &taken).as_deref(), Some("term1"));
         // And the home keeps the name taken: the socket path is still its.
@@ -3004,7 +3004,7 @@ mod tests {
         crate::home::record(home, "term3", &owner).unwrap();
 
         let seen = std::cell::RefCell::new(Vec::new());
-        let no = |h: &str, o: &str| { seen.borrow_mut().push((h.to_string(), o.to_string())); false };
+        let no = |h: &str, _: &str, o: &str| { seen.borrow_mut().push((h.to_string(), o.to_string())); false };
         assert_eq!(
             owned_live_names_with(home, &no),
             vec![("term3".to_string(), None), ("term4".to_string(), None)]
@@ -3016,7 +3016,7 @@ mod tests {
         // And a resident that is not live is not listed in its owner.
         crate::home::record(home, "gone", &owner).unwrap();
         assert_eq!(
-            owned_live_names_with(&owner, &|_, _| true),
+            owned_live_names_with(&owner, &|_, _, _| true),
             vec![("term3".to_string(), Some(home.to_string()))]
         );
         std::env::remove_var("ROOST_STATE_DIR");
@@ -3054,7 +3054,7 @@ mod tests {
 
         let ran = std::cell::Cell::new(false);
         let mid = std::cell::RefCell::new(None);
-        let ended = kill_project_inner(&owner, &|_, _| true, &|st| {
+        let ended = kill_project_inner(&owner, &|_, _, _| true, &|st| {
             if st == CloseStage::BeforeResidents {
                 crate::home::record(&home, "term3", &other).unwrap();
                 *mid.borrow_mut() = Some(attach(&home, "term3", dir.path()).map(|_| ()));
@@ -3143,7 +3143,7 @@ mod tests {
         crate::home::record(&home, "term3", &owner).unwrap();
 
         let seen = std::cell::RefCell::new(None);
-        kill_project_inner(&home, &|_, _| true, &|st| {
+        kill_project_inner(&home, &|_, _, _| true, &|st| {
             if st == CloseStage::BeforeOwnKills {
                 *seen.borrow_mut() = Some((
                     attach(&home, "term3", dir.path()).map(|_| ()),
@@ -3185,7 +3185,7 @@ mod tests {
         crate::home::record(&home, "term3", &owner).unwrap();
 
         let seen = std::cell::RefCell::new(None);
-        let ended = kill_project_inner(&home, &|_, _| true, &|st| match st {
+        let ended = kill_project_inner(&home, &|_, _, _| true, &|st| match st {
             CloseStage::BeforeOwnRead => crate::home::forget(&home, "term3"),
             CloseStage::BeforeOwnKills => {
                 *seen.borrow_mut() = Some(attach(&home, "term3", dir.path()).map(|_| ()));

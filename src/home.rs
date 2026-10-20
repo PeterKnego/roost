@@ -208,9 +208,10 @@ pub fn residents_of(owner: &str) -> Vec<(String, String)> { residents_of_in(&cra
 pub fn away_from(home: &str) -> Vec<(String, Owner)> { away_from_in(&crate::wsstate::state_dir(), home) }
 pub fn sweep(sock_state: &dyn Fn(&str, &str) -> Option<bool>) { sweep_in(&crate::wsstate::state_dir(), sock_state) }
 
-/// Whether `owner` is still a place `home`'s re-homed session can be shown:
-/// one of `home`'s own `.claude/worktrees/<dir>`, still a directory — or the
-/// one owner `home`'s `.moved-to` names (see [`resolves_with`]).
+/// Whether `owner` is still a place `home`'s re-homed session `name` can be
+/// shown: one of `home`'s own `.claude/worktrees/<dir>`, still a directory —
+/// or the one owner `home`'s `.moved-to` names, or an owner whose directory
+/// carries `name`'s own recorded identity (see [`resolves_with`]).
 ///
 /// Fork-free on purpose. `projects::resolve_project` on the owner URL would
 /// run `git worktree list` (its dot segment needs git to vouch for it), and
@@ -220,26 +221,31 @@ pub fn sweep(sock_state: &dyn Fn(&str, &str) -> Option<bool>) { sweep_in(&crate:
 ///
 /// A `false` here destroys nothing: the session is shown in its home, and
 /// the record is kept (see the module doc and `session::owned_live_names`).
-pub fn resolves_in(roots: &[PathBuf], home: &str, owner: &str) -> bool {
-    resolves_with(&crate::wsstate::state_dir(), roots, home, owner)
+pub fn resolves_in(roots: &[PathBuf], home: &str, name: &str, owner: &str) -> bool {
+    resolves_with(&crate::wsstate::state_dir(), roots, home, name, owner)
 }
 
-/// [`resolves_in`] with the state dir injected. The one widening (#158 §5):
-/// an owner equal to `home`'s `.moved-to`, while that owner still resolves.
-/// Nothing else widens — a record naming any other owner outside the home's
-/// `.claude/worktrees/` still does not resolve.
+/// [`resolves_in`] with the state dir injected. Two widenings, and nothing
+/// else widens — a record naming any other owner outside the home's
+/// `.claude/worktrees/` still does not resolve:
+/// - (#158 §5) an owner equal to `home`'s `.moved-to`, while that owner
+///   still resolves;
+/// - (#183 §3) an owner whose directory carries session `name`'s own full
+///   `.ino` identity — per record, never the key's (see [`owner_dir_with`]).
 ///
 /// Still fork-free: `resolve_recorded_project`, not `resolve_project`, since
 /// the owner of a renamed worktree has a dot segment and `resolve_project`
 /// would ask git about it under the hub registry lock. The `.moved-to` is
 /// the evidence git vouched; it was written only once `resolve_project`
-/// had, and is rewritten or removed by every `reconcile`.
-pub fn resolves_with(state: &Path, roots: &[PathBuf], home: &str, owner: &str) -> bool {
-    owner_dir_with(state, roots, home, owner).is_some()
+/// had, and is rewritten or removed by every `reconcile`. The `.ino` was
+/// written by the follow that wrote the record, after `resolve_project`
+/// vouched for that URL, and is matched against the directory now there.
+pub fn resolves_with(state: &Path, roots: &[PathBuf], home: &str, name: &str, owner: &str) -> bool {
+    owner_dir_with(state, roots, home, name, owner).is_some()
 }
 
-pub fn resolves(home: &str, owner: &str) -> bool {
-    resolves_in(&crate::projects::roots(), home, owner)
+pub fn resolves(home: &str, name: &str, owner: &str) -> bool {
+    resolves_in(&crate::projects::roots(), home, name, owner)
 }
 
 /// Where `owner` would live on disk, shape-validated against `home`,
@@ -297,8 +303,8 @@ pub fn owner_path(home: &str, owner: &str) -> Option<PathBuf> {
 /// why this is fork-free and for the "cannot tell" direction (display-only,
 /// so it leans toward keeping the session at the owner here exactly as
 /// `resolves_in` leans toward keeping it shown there).
-pub fn owner_dir_in(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
-    owner_dir_with(&crate::wsstate::state_dir(), roots, home, owner)
+pub fn owner_dir_in(roots: &[PathBuf], home: &str, name: &str, owner: &str) -> Option<PathBuf> {
+    owner_dir_with(&crate::wsstate::state_dir(), roots, home, name, owner)
 }
 
 /// [`owner_dir_in`] with the state dir injected, and the one place the
@@ -308,12 +314,21 @@ pub fn owner_dir_in(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBu
 /// owner equal to `home`'s `.moved-to` is its directory when that still
 /// resolves, through the fork-free `resolve_recorded_project` (see
 /// [`resolves_with`]); and failing that, an owner whose directory carries
-/// one of `home`'s key identities in full. That last is where a session
-/// that followed its own shell went when it is not the key's one target:
-/// an occupant renamed to D while B, the `.moved-to`, still stands. Without
-/// it, D's sessions were followed on paper and shown nowhere — the old URL
-/// no longer resolves, and D would not list them.
-pub fn owner_dir_with(state: &Path, roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
+/// session `name`'s *own* recorded identity (`.<name>.ino`, full) — the
+/// directory that record was written for, still standing under the URL it
+/// names. That last is where a session that followed its own shell went
+/// when it is not the key's one target: an occupant renamed to D while B,
+/// the `.moved-to`, still stands. Without it, D's sessions were followed on
+/// paper and shown nowhere — the old URL no longer resolves, and D would
+/// not list them.
+///
+/// Per record, never per key (#183): the key may have had up to nine
+/// directories, and another of them standing at the owner's URL — D renamed
+/// on to E, a second occupant renamed into D's name — says nothing about
+/// where *this* terminal works. A key-level match there would let Close
+/// Project on the new D end a session whose shell is in E. An unreadable,
+/// damaged, absent or legacy `.ino` adds nothing: this only widens.
+pub fn owner_dir_with(state: &Path, roots: &[PathBuf], home: &str, name: &str, owner: &str) -> Option<PathBuf> {
     shaped_owner_dir(roots, home, owner)
         .or_else(|| {
             (moved_to_in(state, home).as_deref() == Some(owner))
@@ -321,8 +336,9 @@ pub fn owner_dir_with(state: &Path, roots: &[PathBuf], home: &str, owner: &str) 
                 .flatten()
         })
         .or_else(|| {
-            let key_dir = state.join("sock").join(crate::projects::storage_key(home));
-            crate::projects::resolve_recorded_project(roots, owner).filter(|d| crate::registry::carries_identity(&key_dir, d))
+            let Ok(Some(crate::dirid::Stored::Full(id))) = identity_of_in(state, home, name) else { return None };
+            crate::projects::resolve_recorded_project(roots, owner)
+                .filter(|d| matches!(crate::dirid::of(d), Ok(Some(here)) if here == id))
         })
 }
 
@@ -341,8 +357,8 @@ fn shaped_owner_dir(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBu
     }
 }
 
-pub fn owner_dir(home: &str, owner: &str) -> Option<PathBuf> {
-    owner_dir_in(&crate::projects::roots(), home, owner)
+pub fn owner_dir(home: &str, name: &str, owner: &str) -> Option<PathBuf> {
+    owner_dir_in(&crate::projects::roots(), home, name, owner)
 }
 
 /// The project a session actually shows in: `home` itself, unless the
@@ -360,12 +376,12 @@ pub fn effective_owner(home: &str, name: &str) -> String {
 /// not touch the real state dir.
 pub fn effective_owner_with(
     state: &Path,
-    resolves: &dyn Fn(&str, &str) -> bool,
+    resolves: &dyn Fn(&str, &str, &str) -> bool,
     home: &str,
     name: &str,
 ) -> String {
     match owner_of_in(state, home, name) {
-        Owner::Elsewhere(o) if resolves(home, &o) => o,
+        Owner::Elsewhere(o) if resolves(home, name, &o) => o,
         _ => home.to_string(),
     }
 }
@@ -437,15 +453,32 @@ fn copy_if_absent(src: &Path, dst: &Path) -> Result<bool, String> {
 
 /// One of a renamed key's own sessions, and the directory its shell is
 /// working in: an ancestor of its session leader's cwd carrying one of the
-/// key's full identities (`registry::identities`), confirmed by the resolver
-/// to be project `url` — and not the key's own current directory. The
-/// evidence #183 §3 lets a native session follow on: about *that* terminal,
-/// never about the key as a whole.
+/// key's full identities (`registry::identities`). `url` is that directory
+/// as the resolver confirmed it — a project under the roots, and not the
+/// key's own current directory — or why it is not one. The evidence #183 §3
+/// lets a native session follow on: about *that* terminal, never about the
+/// key as a whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellAt {
     pub name: String,
-    pub url: String,
+    pub url: Result<String, NoTarget>,
     pub dir: PathBuf,
+}
+
+/// Why a shell found in one of the key's directories gives nowhere to go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NoTarget {
+    /// The directory standing at the old URL itself: the session is at home.
+    AtHome,
+    /// Not a project under the roots (or the resolver would not vouch).
+    NotAProject,
+}
+
+/// Why a session stays: the line [`log_stays_once`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum StayReason {
+    Left,
+    Shell(NoTarget),
 }
 
 /// What part (a) of [`follow_move_in`] would do for one of the key's own
@@ -477,9 +510,10 @@ enum OwnFollow {
 /// and only each one's own shell says which.
 fn own_follow(state: &Path, old_url: &str, n: &str, new_url: &str, new_dir: Option<&Path>, shells: &[ShellAt], prev: Option<&str>) -> OwnFollow {
     let owner = owner_of_in(state, old_url, n);
-    let shell = shells.iter().find(|s| s.name == n);
-    if let (Owner::Elsewhere(o), Some(s)) = (&owner, shell) {
-        if *o == s.url {
+    let found = shells.iter().find(|s| s.name == n);
+    let shell = found.and_then(|s| s.url.as_ref().ok().map(|u| (u, &s.dir)));
+    if let (Owner::Elsewhere(o), Some((u, _))) = (&owner, shell) {
+        if o == u {
             return OwnFollow::There;
         }
     }
@@ -488,8 +522,8 @@ fn own_follow(state: &Path, old_url: &str, n: &str, new_url: &str, new_dir: Opti
         Owner::Elsewhere(o) if prev == Some(o.as_str()) => true,
         _ => return OwnFollow::NotOurs,
     };
-    if let Some(s) = shell {
-        return OwnFollow::To(s.url.clone(), s.dir.clone());
+    if let Some((u, d)) = shell {
+        return OwnFollow::To(u.clone(), d.clone());
     }
     if from_prev {
         if let Some(dir) = new_dir {
@@ -499,17 +533,36 @@ fn own_follow(state: &Path, old_url: &str, n: &str, new_url: &str, new_dir: Opti
             }
         }
     }
-    log_stays_once(old_url, n);
+    let why = match found.map(|s| (&s.url, &s.dir)) {
+        Some((Err(k), dir)) => (StayReason::Shell(*k), Some(dir.as_path())),
+        _ => (StayReason::Left, None),
+    };
+    log_stays_once(old_url, n, why.0, why.1);
     OwnFollow::Stays
 }
 
-/// Once per session for the life of the process: a stranded session is
-/// re-examined every pass, and its reason does not change.
-fn log_stays_once(old_url: &str, n: &str) {
-    static SAID: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
-    let first = SAID.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).insert(format!("{old_url}/{n}"));
+/// Once per session and reason for the life of the process: a stranded
+/// session is re-examined every pass, and its reason rarely changes.
+fn log_stays_once(old_url: &str, n: &str, why: StayReason, dir: Option<&Path>) {
+    static SAID: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(String, StayReason)>>> = std::sync::OnceLock::new();
+    let first = SAID.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).insert((format!("{old_url}/{n}"), why));
     if first {
-        eprintln!("roost: {old_url}/{n} did not follow {old_url}'s rename: its shell is outside every directory the key has had, so nothing says where it belongs");
+        eprintln!("{}", stays_line(old_url, n, why, dir));
+    }
+}
+
+/// The line itself: a session at home in the old URL's directory is not a
+/// session stranded by the rename, and must not read as one.
+fn stays_line(old_url: &str, n: &str, why: StayReason, dir: Option<&Path>) -> String {
+    let d = dir.map(|d| d.display().to_string()).unwrap_or_default();
+    match why {
+        StayReason::Shell(NoTarget::AtHome) => format!("roost: {old_url}/{n} stays with {old_url}: its shell is working in {d}, the directory at that URL"),
+        StayReason::Shell(NoTarget::NotAProject) => {
+            format!("roost: {old_url}/{n} did not follow {old_url}'s rename: its shell is in {d}, which is not a project under the roots")
+        }
+        StayReason::Left => format!(
+            "roost: {old_url}/{n} did not follow {old_url}'s rename: its shell has left every directory the key has had, so nothing says where it belongs"
+        ),
     }
 }
 
@@ -672,27 +725,27 @@ mod tests {
         std::fs::create_dir_all(root.path().join("other/.claude/worktrees/worktree-x")).unwrap();
         let roots = vec![root.path().to_path_buf()];
 
-        assert!(resolves_in(&roots, "proj", "proj/.claude/worktrees/worktree-x"));
-        assert!(resolves_in(&roots, "proj", "proj/.claude/worktrees/claude-3"), "an existing claude-N worktree keeps resolving");
-        assert!(!resolves_in(&roots, "proj", "proj/.claude/worktrees/worktree-file"), "a file is not a worktree");
-        assert!(!resolves_in(&roots, "proj", "other/.claude/worktrees/worktree-x"), "an owner under another project's worktrees");
-        assert!(!resolves_in(&roots, "proj", "other"), "an owner that is not a worktree at all");
-        assert!(!resolves_in(&roots, "proj", "proj"), "the home itself");
+        assert!(resolves_in(&roots, "proj", "term", "proj/.claude/worktrees/worktree-x"));
+        assert!(resolves_in(&roots, "proj", "term", "proj/.claude/worktrees/claude-3"), "an existing claude-N worktree keeps resolving");
+        assert!(!resolves_in(&roots, "proj", "term", "proj/.claude/worktrees/worktree-file"), "a file is not a worktree");
+        assert!(!resolves_in(&roots, "proj", "term", "other/.claude/worktrees/worktree-x"), "an owner under another project's worktrees");
+        assert!(!resolves_in(&roots, "proj", "term", "other"), "an owner that is not a worktree at all");
+        assert!(!resolves_in(&roots, "proj", "term", "proj"), "the home itself");
         // Each of these names a directory that exists, so only the shape
         // check can refuse them.
-        assert!(!resolves_in(&roots, "proj", "proj/.claude/worktrees/.."), "a dot-dot segment");
-        assert!(!resolves_in(&roots, "proj", "proj/.claude/worktrees/worktree-x/.."));
-        assert!(!resolves_in(&roots, "proj", "proj/.claude/worktrees/../worktrees/worktree-x"));
-        assert!(!resolves_in(&roots, "proj", "proj/.claude/worktrees/worktree-x/"), "a trailing slash");
-        assert!(!resolves_in(&roots, "nosuch", "nosuch/.claude/worktrees/worktree-x"), "a home that does not resolve");
+        assert!(!resolves_in(&roots, "proj", "term", "proj/.claude/worktrees/.."), "a dot-dot segment");
+        assert!(!resolves_in(&roots, "proj", "term", "proj/.claude/worktrees/worktree-x/.."));
+        assert!(!resolves_in(&roots, "proj", "term", "proj/.claude/worktrees/../worktrees/worktree-x"));
+        assert!(!resolves_in(&roots, "proj", "term", "proj/.claude/worktrees/worktree-x/"), "a trailing slash");
+        assert!(!resolves_in(&roots, "nosuch", "term", "nosuch/.claude/worktrees/worktree-x"), "a home that does not resolve");
         std::fs::create_dir_all(wts.join("worktree-x/.claude/worktrees/worktree-y")).unwrap();
         assert!(
-            !resolves_in(&roots, "proj/.claude/worktrees/worktree-x", "proj/.claude/worktrees/worktree-x/.claude/worktrees/worktree-y"),
+            !resolves_in(&roots, "proj/.claude/worktrees/worktree-x", "term", "proj/.claude/worktrees/worktree-x/.claude/worktrees/worktree-y"),
             "a dotted home is refused before it can reach git"
         );
 
         std::fs::remove_dir_all(wts.join("worktree-x")).unwrap();
-        assert!(!resolves_in(&roots, "proj", "proj/.claude/worktrees/worktree-x"), "a removed worktree no longer resolves");
+        assert!(!resolves_in(&roots, "proj", "term", "proj/.claude/worktrees/worktree-x"), "a removed worktree no longer resolves");
     }
 
     /// `owner_dir_in` is `resolves_in` with the directory kept rather than
@@ -713,11 +766,11 @@ mod tests {
         std::fs::create_dir_all(wts.join("worktree-x")).unwrap();
         let roots = vec![root.path().to_path_buf()];
 
-        let dir = owner_dir_in(&roots, "proj", "proj/.claude/worktrees/worktree-x")
+        let dir = owner_dir_in(&roots, "proj", "term", "proj/.claude/worktrees/worktree-x")
             .expect("an existing worktree resolves");
         assert_eq!(dir, wts.join("worktree-x"));
 
-        assert!(owner_dir_in(&roots, "proj", "proj/.claude/worktrees/worktree-gone").is_none());
+        assert!(owner_dir_in(&roots, "proj", "term", "proj/.claude/worktrees/worktree-gone").is_none());
     }
 
     /// What `ide.rs`'s `delivery_target` and `hub::rehome_to` ask: a
@@ -740,17 +793,17 @@ mod tests {
         let new = "repo/.claude/worktrees/worktree-b";
         std::fs::create_dir_all(root.path().join(new)).unwrap();
         std::fs::create_dir_all(root.path().join("unrelated")).unwrap();
-        assert_eq!(owner_dir_with(s, &roots, old, new), None, "setup: no .moved-to, no owner directory");
+        assert_eq!(owner_dir_with(s, &roots, old, "term", new), None, "setup: no .moved-to, no owner directory");
 
         let p = moved_to_path(s, old);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, format!("{new}\n")).unwrap();
         assert_eq!(
-            owner_dir_with(s, &roots, old, new),
+            owner_dir_with(s, &roots, old, "term", new),
             Some(root.path().join(new).canonicalize().unwrap()),
             "a followed session's owner is the new project's directory"
         );
-        assert_eq!(owner_dir_with(s, &roots, old, "unrelated"), None, "and only that owner's");
+        assert_eq!(owner_dir_with(s, &roots, old, "term", "unrelated"), None, "and only that owner's");
     }
 
     /// Display-only, so "cannot tell" keeps the session where its record
@@ -763,7 +816,7 @@ mod tests {
         std::fs::create_dir_all(wts.join("worktree-x")).unwrap();
         std::fs::set_permissions(&wts, std::fs::Permissions::from_mode(0o000)).unwrap();
         let blind = matches!(std::fs::symlink_metadata(wts.join("worktree-x")), Err(ref e) if e.kind() != std::io::ErrorKind::NotFound);
-        let got = resolves_in(&[root.path().to_path_buf()], "proj", "proj/.claude/worktrees/worktree-x");
+        let got = resolves_in(&[root.path().to_path_buf()], "proj", "term", "proj/.claude/worktrees/worktree-x");
         std::fs::set_permissions(&wts, std::fs::Permissions::from_mode(0o755)).unwrap();
         if !blind {
             eprintln!("skipped: this user can search a 0o000 directory");
@@ -901,8 +954,8 @@ mod tests {
     #[test]
     fn effective_owner_falls_back_to_home_unless_the_record_resolves() {
         let st = tempfile::tempdir().unwrap();
-        let yes = |_: &str, _: &str| true;
-        let no = |_: &str, _: &str| false;
+        let yes = |_: &str, _: &str, _: &str| true;
+        let no = |_: &str, _: &str, _: &str| false;
 
         // No record at all: Here.
         assert_eq!(effective_owner_with(st.path(), &yes, "foo", "term1"), "foo");
@@ -1000,10 +1053,12 @@ mod tests {
         // of the key's directories (an occupant renamed to D), `left`'s is
         // in none; `away`'s is in B, but its own Claude re-homed it.
         let d_url = "repo/.claude/worktrees/worktree-d";
-        let at = |n: &str, url: &str, dir: &Path| ShellAt { name: n.into(), url: url.into(), dir: dir.to_path_buf() };
+        let at = |n: &str, url: &str, dir: &Path| ShellAt { name: n.into(), url: Ok(url.into()), dir: dir.to_path_buf() };
         let shells = vec![at("shell", new, &new_dir), at("busy", new, &new_dir), at("away", new, &new_dir), at("todee", d_url, &elsewhere)];
         let busy_in_new = |u: &str| if u == new { vec!["busy".to_string()] } else { vec![] };
-        let live: Vec<String> = ["shell", "busy", "away", "unsure", "todee", "left"].map(String::from).to_vec();
+        let mut shells = shells;
+        shells.push(ShellAt { name: "athome".into(), url: Err(NoTarget::AtHome), dir: elsewhere.clone() });
+        let live: Vec<String> = ["shell", "busy", "away", "unsure", "todee", "left", "athome"].map(String::from).to_vec();
         assert!(follow_move_in(s, old, new, Some(&new_dir), &live, &shells, &busy_in_new, None));
 
         assert_eq!(owner_of_in(s, old, "shell"), Owner::Elsewhere(new.into()), "(a) a live session follows");
@@ -1012,6 +1067,7 @@ mod tests {
         assert!(matches!(owner_of_in(s, old, "unsure"), Owner::Unknown(_)), "cannot tell writes nothing");
         assert_eq!(owner_of_in(s, old, "todee"), Owner::Elsewhere(d_url.into()), "(a) a session follows its own shell, not the key's move");
         assert_eq!(owner_of_in(s, old, "left"), Owner::Here, "(a) a shell outside every directory is no evidence: it stays");
+        assert_eq!(owner_of_in(s, old, "athome"), Owner::Here, "(a) a shell at home in the old URL's directory stays");
         let id_of = |d: &Path| Ok(Some(crate::dirid::Stored::Full(crate::dirid::of(d).unwrap().unwrap())));
         assert_eq!(identity_of_in(s, old, "shell"), id_of(&new_dir), "(a) a followed session's record carries its directory's identity");
         assert_eq!(identity_of_in(s, old, "todee"), id_of(&elsewhere), "(a) its own directory's, not the key's new one");
@@ -1232,18 +1288,18 @@ mod tests {
         std::fs::create_dir_all(outer.path().join("escape")).unwrap();
         let roots = vec![root.clone()];
 
-        assert!(!resolves_with(s, &roots, "proj", "renamed"), "no .moved-to: an arbitrary owner does not resolve");
-        assert!(!resolves_with(s, &roots, "proj", "unrelated"));
+        assert!(!resolves_with(s, &roots, "proj", "term", "renamed"), "no .moved-to: an arbitrary owner does not resolve");
+        assert!(!resolves_with(s, &roots, "proj", "term", "unrelated"));
 
         let p = moved_to_path(s, "proj");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, "renamed\n").unwrap();
-        assert!(resolves_with(s, &roots, "proj", "renamed"), "the owner .moved-to names resolves");
-        assert!(!resolves_with(s, &roots, "proj", "unrelated"), "a .moved-to vouches for its one owner, not any");
-        assert!(!resolves_with(s, &roots, "other", "renamed"), "nor for another home's records");
+        assert!(resolves_with(s, &roots, "proj", "term", "renamed"), "the owner .moved-to names resolves");
+        assert!(!resolves_with(s, &roots, "proj", "term", "unrelated"), "a .moved-to vouches for its one owner, not any");
+        assert!(!resolves_with(s, &roots, "other", "term", "renamed"), "nor for another home's records");
 
         std::fs::remove_dir_all(root.join("renamed")).unwrap();
-        assert!(!resolves_with(s, &roots, "proj", "renamed"), "a named owner that no longer resolves does not");
+        assert!(!resolves_with(s, &roots, "proj", "term", "renamed"), "a named owner that no longer resolves does not");
 
         // A dotted owner goes through the fork-free resolver: this is a
         // plain directory git never heard of, so `resolve_project` (which
@@ -1251,10 +1307,28 @@ mod tests {
         // under the hub registry lock to do so.
         std::fs::create_dir_all(root.join("proj2/.claude/worktrees/worktree-b")).unwrap();
         std::fs::write(&p, "proj2/.claude/worktrees/worktree-b\n").unwrap();
-        assert!(resolves_with(s, &roots, "proj", "proj2/.claude/worktrees/worktree-b"), "the record is git's vouching");
+        assert!(resolves_with(s, &roots, "proj", "term", "proj2/.claude/worktrees/worktree-b"), "the record is git's vouching");
         // `escape` exists, beside the root rather than under it, so only
         // confinement can refuse it.
         std::fs::write(&p, "../escape\n").unwrap();
-        assert!(!resolves_with(s, &roots, "proj", "../escape"), "confinement still applies");
+        assert!(!resolves_with(s, &roots, "proj", "term", "../escape"), "confinement still applies");
+    }
+
+    /// Fix round 1, item 4: the log tells a session at home in the old
+    /// URL's directory apart from one whose shell left — the first is not
+    /// stranded, and "outside every directory" was false of it.
+    ///
+    /// Revert-checked, run and restored: with the `AtHome` arm answering
+    /// the `Left` line, fails "at home is not left" (the two lines equal).
+    #[test]
+    fn a_session_at_home_is_not_logged_as_one_that_left() {
+        let d = Path::new("/r/repo/.claude/worktrees/worktree-a");
+        let home = stays_line("u", "own", StayReason::Shell(NoTarget::AtHome), Some(d));
+        let left = stays_line("u", "own", StayReason::Left, None);
+        let stray = stays_line("u", "own", StayReason::Shell(NoTarget::NotAProject), Some(d));
+        assert_ne!(home, left, "at home is not left");
+        assert!(home.contains("stays with u") && home.contains(&d.display().to_string()), "{home}");
+        assert!(left.contains("has left every directory"), "{left}");
+        assert!(stray.contains("not a project under the roots") && stray != home, "{stray}");
     }
 }

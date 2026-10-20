@@ -220,7 +220,7 @@ pub fn resolve_project(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
 /// is waived only because every caller passes a URL roost recorded after
 /// vouching for it: a `.moved-to`'s contents, or a re-home record's owner
 /// that `home::owner_dir_with` then accepts only when the directory carries
-/// one of the home key's identities in full (#183 §3).
+/// that record's own full `.ino` identity (#183 §3).
 pub(crate) fn resolve_recorded_project(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
     resolve_project_with(roots, name, &|_, _| true)
 }
