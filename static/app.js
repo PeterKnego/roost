@@ -769,6 +769,7 @@ function onEvent(ev) {
       // after `state` itself was just replaced above.
       state.proposals = proposals;
       render();
+      renderAppeared(state.appeared || []);
       // Toggling visibility changes what the *server* renders, not how the
       // client draws it, so the State that carries the new value has to be
       // followed by a re-fetch. refreshTree (not a remount) keeps whatever
@@ -1008,22 +1009,24 @@ function onEvent(ev) {
       }
       break;
     }
-    case "WorktreeAppeared": {
-      // A worktree roost did not make (#158 §2) — a plain `git worktree add`
-      // from any tool, at any path. Nothing moves; this only says so, with a
-      // way there when the worktree is a roost project. Every part of it
-      // came from git, so it goes in as text and the link through
-      // `projectPath`, never as markup.
-      const name = ev.path.split("/").pop();
-      if (ev.url) {
-        const box = showBanner(`worktree ${name} (${ev.branch}) appeared — `);
-        const a = document.createElement("a");
-        a.href = "/" + projectPath(ev.url); a.target = "_blank"; a.textContent = "open";
-        bannerLink(box, a);
-      } else {
-        showBanner(`worktree ${name} (${ev.branch}) appeared, outside roost's roots`);
-      }
+    case "WorktreeAppeared":
+      // No banner from this event any more (#188 §3). It reached only the
+      // pages connected at that moment and its banner was gone after 8 s;
+      // the hub now records every appearance and the State snapshot that
+      // follows carries the whole list, which `renderAppeared` shows until
+      // it is dismissed. The event still arrives, and still means the
+      // switcher has a new row to show.
       document.body.dispatchEvent(new Event("projects"));
+      break;
+    case "OutsideAllowed": {
+      // Sent to this connection only, after the allow record was written
+      // and every switcher already told. The URL is roost's own virtual
+      // `<parent>/.claude/outside/<name>`, but its parts came from the
+      // filesystem, so it is still built through `projectPath`.
+      const box = showBanner("Allowed — ");
+      const a = document.createElement("a");
+      a.href = "/" + projectPath(ev.url); a.target = "_blank"; a.textContent = "open";
+      bannerLink(box, a);
       break;
     }
     case "ProjectMoved": {
@@ -4324,6 +4327,123 @@ function showBanner(text) {
   return box;
 }
 
+// #188's two outside-worktree actions, shared by the header switcher and
+// the appeared banners. Both take their arguments already read out of the
+// DOM: the caller's element may be gone by the time the dialog answers.
+async function allowOutsideFlow(parent, path) {
+  if (!parent || !path) return;
+  const yes = await askConfirm({ title: "Open outside worktree",
+    lines: [`Open ${path} in roost?`,
+            "It is outside roost's roots; roost will open only this worktree."],
+    confirm: "Allow" });
+  if (yes) send({ t: "AllowOutsideWorktree", parent, path });
+}
+
+async function revokeOutsideFlow(parent, name) {
+  if (!parent || !name) return;
+  const yes = await askConfirm({ title: "Revoke outside worktree",
+    lines: [`Stop opening ${name} in roost?`, "Running terminals keep running."],
+    confirm: "Revoke" });
+  if (yes) send({ t: "RevokeOutsideWorktree", parent, name });
+}
+
+// The appeared list (#188 §3): one banner per worktree roost did not make,
+// kept until it is dismissed — here or in any other browser, by opening the
+// worktree's page, or by git no longer listing it. The server owns the
+// list and every State carries all of it, so this only reconciles boxes
+// against it, keyed by path: a State arrives on every debounced keystroke,
+// and rebuilding each time would duplicate nothing but would yank a button
+// out from under a click. Its own container, not `showBanner`, which
+// dedupes by text and removes after 8 s — both wrong for a banner meant to
+// stay, and two worktrees with one basename must not merge.
+const appearedBoxes = new Map(); // path -> { box, sig }
+function renderAppeared(list) {
+  let wrap = document.getElementById("appeared");
+  if (!wrap) {
+    if (!list.length) return;
+    wrap = document.createElement("div");
+    wrap.id = "appeared";
+    document.body.appendChild(wrap);
+  }
+  const want = new Set(list.map((e) => e.path));
+  for (const [path, { box }] of appearedBoxes) {
+    if (!want.has(path)) { box.remove(); appearedBoxes.delete(path); }
+  }
+  const order = [];
+  for (const entry of list) {
+    const sig = JSON.stringify([entry.branch, entry.url, entry.outside, entry.allowed]);
+    let rec = appearedBoxes.get(entry.path);
+    if (!rec || rec.sig !== sig) {
+      const box = appearedBox(entry);
+      if (rec) rec.box.replaceWith(box);
+      rec = { box, sig };
+      appearedBoxes.set(entry.path, rec);
+    }
+    order.push(rec.box);
+  }
+  // Reordered only when the order actually differs, for the same reason
+  // boxes are kept: moving a node mid-click can lose the click.
+  const same = order.length === wrap.children.length && order.every((b, i) => wrap.children[i] === b);
+  if (!same) wrap.replaceChildren(...order);
+}
+
+// Every part of an entry came from git or the filesystem, so it goes in as
+// text, and the one href through `projectPath`.
+function appearedBox(entry) {
+  const name = entry.path.split("/").pop();
+  const box = document.createElement("div");
+  box.className = "conflict appeared-banner";
+  box.dataset.path = entry.path;
+  const b = document.createElement("b");
+  box.append(b);
+  if (entry.outside && !entry.allowed) {
+    b.textContent = `worktree ${name} (${entry.branch}) appeared, outside roost's roots — `;
+    const allow = document.createElement("button");
+    allow.textContent = "Allow…";
+    allow.dataset.role = "allow";
+    const path = entry.path;
+    allow.onclick = () => allowOutsideFlow(PROJECT, path);
+    box.append(allow);
+  } else if (entry.url) {
+    b.textContent = `worktree ${name} (${entry.branch}) appeared — `;
+    const a = document.createElement("a");
+    a.href = "/" + projectPath(entry.url); a.target = "_blank"; a.textContent = "open";
+    b.append(a);
+  } else {
+    // Under a root but not a project of its own (a nested directory, say):
+    // there is no page to link to and nothing to allow, only the news.
+    b.textContent = `worktree ${name} (${entry.branch}) appeared`;
+  }
+  const dismiss = document.createElement("button");
+  dismiss.textContent = "Dismiss";
+  dismiss.dataset.role = "dismiss";
+  dismiss.onclick = () => {
+    send({ t: "DismissAppeared", path: entry.path });
+    // Gone here at once; the broadcast State that follows takes it off
+    // every other browser, and would put it back here if the send failed.
+    const rec = appearedBoxes.get(entry.path);
+    if (rec) { rec.box.remove(); appearedBoxes.delete(entry.path); }
+  };
+  box.append(dismiss);
+  return box;
+}
+
+// The persistent header note on an allowed outside worktree's page (#188
+// §2): its URL reads like any worktree of its parent, so the page says
+// where it really is. The path is the server's own record, from an
+// attribute it escaped; it goes in as text.
+{
+  const real = document.body.dataset.outside;
+  const wt = document.getElementById("wtbtn");
+  if (real && wt) {
+    const note = document.createElement("span");
+    note.id = "outsidenote";
+    note.textContent = `outside roost's roots: ${real}`;
+    note.title = real;
+    wt.after(note);
+  }
+}
+
 // A banner's one link, in its text line: replaces the link an identical
 // earlier banner got (a deduped banner keeps exactly one, the latest — two
 // clicks on different files in the same project share the text), and goes
@@ -4910,6 +5030,21 @@ if (wtBtn && wtPanel) {
                 "roost re-checks that it is clean, idle and merged first."],
         confirm: "Remove", danger: true });
       if (yes) send({ t: "RemoveWorktree", key });
+      return;
+    }
+    // #188's two controls on a worktree outside every root. Same rule as
+    // ✕ above: the dataset is read before the dialog's await, since the
+    // row can be re-rendered out from under it while the dialog is open.
+    const allow = e.target.closest(".wtallow");
+    if (allow) {
+      e.preventDefault();
+      allowOutsideFlow(allow.dataset.parent, allow.dataset.path);
+      return;
+    }
+    const revoke = e.target.closest(".wtrevoke");
+    if (revoke) {
+      e.preventDefault();
+      revokeOutsideFlow(revoke.dataset.parent, revoke.dataset.name);
       return;
     }
     if (e.target.closest("a")) wtPanel.hidden = true;

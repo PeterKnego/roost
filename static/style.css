@@ -117,6 +117,16 @@ header .vsep { width: 1px; height: 16px; background: var(--border); margin: 0 6p
 .wtf { color: var(--muted); font-size: 12px; }
 .wtf.on { color: var(--fg); }
 .wtremove { font: inherit; font-size: 12px; cursor: pointer; background: none; border: 1px solid var(--muted); border-radius: 3px; }
+/* #188's two controls on a worktree outside every root, and the marker on
+   an allowed one's row. Modelled on .wtremove. Allow… sits beside a row
+   that is dimmed because it cannot be opened, and the button is the way to
+   open it, so it is never dimmed with the row — see .ovrow.unreachable. */
+.wtallow, .wtrevoke { font: inherit; font-size: 12px; cursor: pointer; background: none;
+                      border: 1px solid var(--muted); border-radius: 3px; color: var(--fg);
+                      opacity: 1; flex: none; }
+.wtallow { border-color: var(--accent); }
+.wtallow:hover, .wtrevoke:hover { background: var(--bg); }
+.wtstrip .wt.outside::after, .ovrow.outside .ovname::after { content: " · outside"; color: var(--muted); font-size: 12px; }
 .wtadd { font: inherit; font-size: 13px; cursor: pointer; background: none; border: 1px solid var(--muted); border-radius: 3px;
          align-self: flex-start; margin-top: 2px; padding: 2px 8px; color: var(--fg); }
 .wtadd:hover { background: var(--bg); }
@@ -458,6 +468,15 @@ main { flex: 1; min-height: 0; }
    no "content" to prepend into), so this variant floats above everything
    instead of the .conflict base's normal in-flow placement. */
 .conflict.error-banner { position: fixed; top: 12px; right: 12px; z-index: 1000; max-width: 420px; }
+/* #188's appeared banners stay until dismissed, so they get their own
+   corner rather than sitting under the transient ones at the top. */
+#appeared { position: fixed; bottom: 12px; right: 12px; z-index: 999; max-width: 420px;
+            display: flex; flex-direction: column; gap: 6px; }
+#appeared .conflict { margin: 0; }
+#appeared .conflict a { color: var(--accent); }
+/* The persistent note on an allowed outside worktree's page. */
+#outsidenote { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+               color: var(--warn, #d79921); font-size: 12px; font-family: var(--mono); }
 /* showClaudeHere's prompt: .conflict already supplies the border/padding and
    the button margin, so this only overrides what makes the "start in a new
    worktree" choice read as the recommended one. */
@@ -888,6 +907,11 @@ header .roots .root + .root::before { content: ""; display: inline-block; width:
 .ovrow.current { background: var(--tab-on); }
 .ovrow.child { padding-left: 22px; }
 .ovrow.unreachable { opacity: .35; }
+/* An unopenable outside row carrying Allow…: opacity on the <li> would dim
+   the button with it (a child cannot be less transparent than its parent),
+   so that row is dimmed by colour instead and the button stays readable. */
+.ovrow.unreachable:has(.wtallow) { opacity: 1; color: var(--muted); }
+.ovrow.unreachable:has(.wtallow) > :not(.wtallow) { opacity: .5; }
 #ovprojects .branch { color: var(--muted); font-size: 12px; }
 .ovcaret { display: inline-block; width: 1em; flex: none; color: var(--muted); cursor: pointer; }
 .ovcaret.placeholder { cursor: default; }

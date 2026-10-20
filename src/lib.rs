@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod appeared;
 pub mod assets;
 pub mod backup;
 pub mod bind;
@@ -32,6 +33,7 @@ pub mod modes;
 pub mod notify;
 pub mod origin;
 pub mod osc;
+pub mod outside;
 pub mod paste;
 pub mod zipdl;
 pub mod procsess;
