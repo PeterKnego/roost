@@ -489,9 +489,9 @@ pub fn detect_gone_owners(home_dir_of: &dyn Fn(&str) -> Option<PathBuf>) -> Vec<
 /// *same* worktree (re-created and re-removed) announce again rather than
 /// staying silently suppressed forever.
 ///
-/// `procs` is the tick's own Claude scan (`fresh`): the second source of
-/// rename evidence (see [`follow_gone_owner`]) reads a resident's Claude's
-/// cwd from it rather than walking `/proc` a second time.
+/// `procs` is the tick's own Claude scan (`fresh`): the last place
+/// [`follow_gone_owner`] looks for a record's directory is its resident
+/// Claude's cwd, read from it rather than walking `/proc` a second time.
 pub fn sweep_gone_owners(
     home_dir_of: &dyn Fn(&str) -> Option<PathBuf>,
     announced: &Mutex<HashSet<(String, String, String)>>,
@@ -513,19 +513,21 @@ enum GoneOwner {
 }
 
 /// #158 §5, before R18 forgets `(home, name) → owner`: was `owner` renamed
-/// rather than removed? Two sources of evidence, both positive:
+/// rather than removed? Only one kind of evidence moves a record (#183 §1):
+/// the owner directory's full identity — `(dev, ino, btime)`, recorded in
+/// `.<name>.ino` when the record was written (`home::identity_of`) — found
+/// at a directory that resolves under the roots, by
+/// `registry::find_by_identity`: the owner key's `.moved-to` target, the
+/// owner's old siblings, or this resident's own Claude's cwd ancestry.
+/// Evidence about the owner's key as a whole (what `reconcile` asks
+/// `registry::record_move_with`) is never asked here: the key may since have
+/// held an occupant, and its residents are not the first directory's. A
+/// legacy two-field identity is upgraded when it still can be, and
+/// otherwise moves nothing.
 ///
-/// 1. The owner's own sessions (`registry::record_move`, the same function
-///    `reconcile` uses — run here because no page load may have triggered a
-///    `reconcile` since the rename, and this sweep runs every tick). A
-///    `.moved-to` alone is never trusted: one outlives its evidence.
-/// 2. This resident's own Claude: its cwd's ancestry reaching the owner
-///    directory's `(dev, ino)` recorded at re-home time (`home::identity_of`)
-///    — the only evidence there is for a worktree with no session of its
-///    own, whose terminals were all re-homed into it.
-///
-/// "Cannot tell" from either suspends; it never folds into "not moved".
-/// Off every lock (called from `tick`, inside its `catch_unwind`).
+/// "Cannot tell" suspends; it never folds into "not moved". Off every lock
+/// (called from `tick`, inside its `catch_unwind`): `find_by_identity` may
+/// run git.
 fn follow_gone_owner(home: &str, name: &str, owner: &str, procs: &[ClaudeProc]) -> GoneOwner {
     let out = follow_gone_owner_inner(home, name, owner, procs);
     if out != GoneOwner::Suspend {
@@ -554,65 +556,63 @@ fn suspend(home: &str, name: &str, reason: &'static str, why: &str) -> GoneOwner
 
 fn follow_gone_owner_inner(home: &str, name: &str, owner: &str, procs: &[ClaudeProc]) -> GoneOwner {
     let roots = crate::projects::roots();
-    match crate::registry::record_move(&roots, owner) {
-        crate::registry::MoveRecord::Followable(m) => {
-            // Fresh or not: `follow_moves` itself follows quietly whatever
-            // an earlier pass left unfollowed, and announces only fresh.
-            crate::registry::follow_moves(std::slice::from_ref(&m));
-            return rewrite_owner(home, name, owner, &m.new_url);
+    // The record's own identity is the only evidence that can move it
+    // (#183 §1). `owner`'s key may since have held an occupant whose
+    // residents are not the first directory's, so what the key says about
+    // itself — `record_move(owner)`, which this used to ask first — would
+    // hand this terminal to a directory it never worked in (chain a).
+    let id = match crate::home::identity_of(home, name) {
+        Ok(Some(crate::dirid::Stored::Full(id))) => id,
+        Ok(Some(crate::dirid::Stored::Legacy { .. })) => {
+            // A pre-birth-time pair never licenses a follow. It is upgraded
+            // only while the owner still resolves with the same (dev, ino),
+            // and an owner git no longer lists usually does not — that lost
+            // follow is accepted: forgetting is recoverable, following a
+            // reused inode is not.
+            let upgraded = match crate::home::owner_dir(home, owner) {
+                Some(dir) => crate::home::upgrade_identity(home, name, &dir),
+                None => Ok(false),
+            };
+            match upgraded {
+                Ok(true) => match crate::home::identity_of(home, name) {
+                    Ok(Some(crate::dirid::Stored::Full(id))) => id,
+                    Ok(_) => return GoneOwner::NotMoved,
+                    Err(e) => return suspend(home, name, "identity", &format!("its owner identity cannot be read ({e})")),
+                },
+                Ok(false) => return GoneOwner::NotMoved,
+                Err(e) => return suspend(home, name, "identity", &format!("its legacy owner identity cannot be checked ({e})")),
+            }
         }
-        crate::registry::MoveRecord::CannotTell => {
-            return suspend(home, name, "owner-sessions", &format!("whether {owner} was renamed cannot be told from its own sessions"));
-        }
-        crate::registry::MoveRecord::NoEvidence | crate::registry::MoveRecord::Unfollowable => {}
-    }
-    // Task 4 rewrites this function to compare the full `DirId` (and to
-    // treat a `Legacy` match as keep-only, never a follow). Until then,
-    // take (dev, ino) from either stored form, exactly as today.
-    let (dev, ino) = match crate::home::identity_of(home, name) {
-        Ok(Some(crate::dirid::Stored::Full(id))) => (id.dev, id.ino),
-        Ok(Some(crate::dirid::Stored::Legacy { dev, ino })) => (dev, ino),
         Ok(None) => return GoneOwner::NotMoved,
         Err(e) => return suspend(home, name, "identity", &format!("its owner identity cannot be read ({e})")),
     };
-    let Some(c) = procs.iter().find(|c| c.project == home && c.session == name) else { return GoneOwner::NotMoved };
-    let Some(cwd) = &c.cwd else {
-        return suspend(home, name, "cwd", "its Claude's cwd cannot be read");
-    };
-    if cwd.to_string_lossy().ends_with(" (deleted)") {
-        return GoneOwner::NotMoved;
-    }
-    // Three outcomes per ancestor, as everywhere a "not found" licenses a
-    // forget: absent → keep walking; cannot look → the match may be right
-    // there, so suspend; present → compare.
-    let mut found = None;
-    for p in cwd.ancestors() {
-        use std::os::unix::fs::MetadataExt;
-        match std::fs::symlink_metadata(p) {
-            Ok(m) if m.dev() == dev && m.ino() == ino => {
-                found = Some(p);
-                break;
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return suspend(home, name, "ancestor", &format!("{} on its Claude's cwd cannot be looked at ({e})", p.display()));
-            }
+    // This resident's own Claude, the third place to look. A cwd that
+    // cannot be read may be exactly inside the renamed directory, so it is
+    // "cannot tell" — but only once the other candidates found nothing.
+    let claude = procs.iter().find(|c| c.project == home && c.session == name);
+    let cwd = claude.and_then(|c| c.cwd.as_deref()).filter(|c| !c.to_string_lossy().ends_with(" (deleted)"));
+    let (new_dir, to) = match crate::registry::find_by_identity(&roots, owner, &id, cwd) {
+        crate::registry::Found::At(dir, url) => (dir, url),
+        crate::registry::Found::CannotTell(why) => {
+            return suspend(home, name, "find", &format!("whether {owner} was renamed cannot be told ({why})"));
         }
-    }
-    let Some(new_dir) = found else { return GoneOwner::NotMoved };
-    let Some(to) = crate::registry::url_under_roots(&roots, new_dir)
-        .filter(|u| u != owner)
-        .filter(|u| crate::projects::resolve_project(&roots, u).as_deref() == Some(new_dir))
-    else {
-        return GoneOwner::NotMoved;
+        crate::registry::Found::Nowhere => {
+            if claude.is_some_and(|c| c.cwd.is_none()) {
+                return suspend(home, name, "cwd", "its Claude's cwd cannot be read");
+            }
+            return GoneOwner::NotMoved;
+        }
     };
-    let out = rewrite_owner(home, name, owner, &to);
+    let out = rewrite_owner(home, name, owner, &to, &new_dir);
     if out == GoneOwner::Followed {
-        // Only into a key directory that already exists: one that never had
-        // a session has nothing a `.moved-to` could widen.
-        let key_dir = crate::wsstate::state_dir().join("sock").join(crate::projects::storage_key(owner));
-        if std::fs::symlink_metadata(&key_dir).is_ok_and(|m| m.is_dir()) {
+        // Only into a key directory that already exists — one that never had
+        // a session has nothing a `.moved-to` could widen — and only when
+        // the directory found is the key's *own*: `.moved-to` says where the
+        // key's directory went, and one record's evidence about an occupant
+        // must not redirect the key's earlier-followed sessions to it.
+        let key_dir = crate::registry::key_dir_of(owner);
+        let own = matches!(crate::registry::recorded_identity(&key_dir), Some(crate::dirid::Stored::Full(k)) if k == id);
+        if own && std::fs::symlink_metadata(&key_dir).is_ok_and(|m| m.is_dir()) {
             if let Err(e) = crate::registry::write_moved_to(&key_dir, &to) {
                 eprintln!("roost: {owner} was renamed to {to}, but its .moved-to was not written: {e}");
             }
@@ -625,22 +625,27 @@ fn follow_gone_owner_inner(home: &str, name: &str, owner: &str, procs: &[ClaudeP
 /// forget does. Only to an owner a record of `home` may name at all — any
 /// other is left to R18's forget, never rewritten into a record that could
 /// not resolve.
-fn rewrite_owner(home: &str, name: &str, owner: &str, to: &str) -> GoneOwner {
+fn rewrite_owner(home: &str, name: &str, owner: &str, to: &str, new_dir: &std::path::Path) -> GoneOwner {
     if !crate::home::owner_shaped(home, to) {
         eprintln!("roost: {home}/{name}'s owner {owner} was renamed to {to}, outside {home}/.claude/worktrees; not following");
         return GoneOwner::NotMoved;
     }
     match crate::home::owner_of(home, name) {
         crate::home::Owner::Elsewhere(ref o) if o == owner => {}
-        // Already rewritten (by `follow_moves` just above), or re-pointed
-        // since the evidence: either way not this rename's to change.
+        // Re-pointed since the evidence: not this rename's to change.
         crate::home::Owner::Elsewhere(_) => return GoneOwner::Followed,
         _ => return GoneOwner::NotMoved,
     }
-    // `.<name>.ino` is left as it is: a rename keeps the inode, and
-    // `git worktree move` cannot cross devices.
     match crate::home::record(home, name, to) {
         Ok(()) => {
+            // Every writer of a record writes its target's identity (#183
+            // §1). One that cannot be read leaves no `.ino` at all rather
+            // than the old one: that record can never be followed again,
+            // only kept or forgotten.
+            if let Err(e) = crate::home::record_identity(home, name, new_dir) {
+                crate::home::forget_identity(home, name);
+                eprintln!("roost: {home}/{name} followed {owner} to {to}, but its identity was not recorded: {e}");
+            }
             eprintln!("roost: {home}/{name}'s owner {owner} was renamed to {to}; the record follows it");
             crate::hub::refresh_and_broadcast(home);
             crate::hub::refresh_and_broadcast(owner);
@@ -1848,17 +1853,22 @@ mod tests {
     /// Spec §5: a main-checkout terminal re-homed into worktree A, which has
     /// no session of its own, and A renamed to B. Nothing writes a
     /// `.moved-to` — A's key has no shell for `move_evidence` to look
-    /// through — so the only evidence is the resident's own Claude: its cwd
-    /// reaches the directory whose `(dev, ino)` `rehome_to` recorded. The
-    /// directory is real and really moved by git, so the identity is too;
-    /// only the Claude's process entry is constructed.
+    /// through — so the only evidence is the record's own identity, the
+    /// directory's `(dev, ino, btime)` `rehome_to` recorded, found beside A
+    /// by `registry::find_by_identity` (#183 §1). The directory is real and
+    /// really moved by git, so the identity is too; only the Claudes'
+    /// process entries are constructed.
+    ///
+    /// Then B is removed: nothing carries the identity any more, and a
+    /// resident whose Claude's cwd cannot be read keeps its record for the
+    /// tick (it may be exactly inside a directory no candidate reached),
+    /// while one with no Claude is forgotten as before.
     ///
     /// Revert-checked, each run and restored: the identity lookup in
     /// `follow_gone_owner` replaced by `return GoneOwner::NotMoved` fails
     /// "the record follows the rename instead of being forgotten" — left
-    /// `Here`; an unreadable cwd (`None`) treated as `NotMoved` instead of
-    /// `Suspend` fails "an unreadable cwd keeps the record this tick" —
-    /// left `Here`.
+    /// `Here`; the `Nowhere` arm's unreadable-cwd suspend removed fails "an
+    /// unreadable cwd keeps the record this tick" — left `Here`.
     #[test]
     fn a_rehomed_terminal_follows_its_owners_rename() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1885,14 +1895,26 @@ mod tests {
         let home_dir_of = |p: &str| (p == home).then(|| home_dir.clone());
         sweep_gone_owners(&home_dir_of, &Mutex::new(HashSet::new()), &procs);
         let followed = crate::home::owner_of(home, "term3");
-        let suspended = crate::home::owner_of(home, "term4");
+        let blind_followed = crate::home::owner_of(home, "term4");
         let key_dir = state.path().join("sock").join(crate::projects::storage_key(&a));
+
+        assert!(std::process::Command::new("git").arg("-C").arg(&home_dir)
+            .args(["worktree", "remove", "--force", ".claude/worktrees/worktree-b"]).status().unwrap().success());
+        let blind = vec![ClaudeProc { project: home.into(), session: "term3".into(), owner: b.clone(), sse_port: None, cwd: None }];
+        sweep_gone_owners(&home_dir_of, &Mutex::new(HashSet::new()), &blind);
+        let suspended = crate::home::owner_of(home, "term3");
+        let no_claude = crate::home::owner_of(home, "term4");
+        sweep_gone_owners(&home_dir_of, &Mutex::new(HashSet::new()), &[]);
+        let forgotten = crate::home::owner_of(home, "term3");
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
 
         assert_eq!(followed, crate::home::Owner::Elsewhere(b.clone()), "the record follows the rename instead of being forgotten");
-        assert_eq!(suspended, crate::home::Owner::Elsewhere(a.clone()), "an unreadable cwd keeps the record this tick");
+        assert_eq!(blind_followed, crate::home::Owner::Elsewhere(b.clone()), "an unreadable cwd does not matter once the identity is found");
         assert!(!key_dir.exists(), "A never had a key directory, so no .moved-to is made for it");
+        assert_eq!(suspended, crate::home::Owner::Elsewhere(b.clone()), "an unreadable cwd keeps the record this tick");
+        assert_eq!(no_claude, crate::home::Owner::Here, "with no Claude and no directory, the record is forgotten");
+        assert_eq!(forgotten, crate::home::Owner::Here, "and so is the first, once nothing is left to look at");
     }
 
     /// The identity walk keeps CLAUDE.md's third outcome: an ancestor of the

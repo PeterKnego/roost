@@ -204,6 +204,10 @@ pub fn follow_moves(moved: &[Moved]) {
         }
     }
     for m in moved {
+        // Off every lock (it may run git), and only when there is following
+        // to do: the directory whose identity a resident's record must carry
+        // to be re-pointed along with the key (#183 §1).
+        let resolve = || crate::projects::resolve_project(&crate::projects::roots(), &m.new_url);
         // Who follows. The first follow of a key takes every live session:
         // the directory moved, and they are all its. Any later pass — not
         // fresh, a second rename, or a key with an occupant (a new
@@ -230,20 +234,21 @@ pub fn follow_moves(moved: &[Moved]) {
             // on the fresh pass (a failed write, a restart in between) is
             // followed now. Quietly — the banner went out once already —
             // and only when something actually changed.
-            if follow_pending(m, &names) && crate::home::follow_move(&m.old_url, &m.new_url, &names, m.prev.as_deref()) {
+            if follow_pending(m, &names) && crate::home::follow_move(&m.old_url, &m.new_url, resolve().as_deref(), &names, m.prev.as_deref()) {
                 eprintln!("roost: {}'s sessions caught up with its rename to {}", m.old_url, m.new_url);
                 crate::hub::refresh_and_broadcast(&m.old_url);
                 crate::hub::refresh_and_broadcast(&m.new_url);
             }
             continue;
         }
-        crate::home::follow_move(&m.old_url, &m.new_url, &names, m.prev.as_deref());
+        let new_dir = resolve();
+        crate::home::follow_move(&m.old_url, &m.new_url, new_dir.as_deref(), &names, m.prev.as_deref());
         eprintln!("roost: {} was renamed to {}; its {} session(s) followed", m.old_url, m.new_url, m.live.len());
         // `git worktree move` touches only `.git/worktrees/<id>/gitdir`,
         // which the watcher ignores, so the main checkout's hub still knows
         // the old path — and would announce the new one as having appeared
         // on its next unrelated worktree event.
-        if let Some(new_dir) = crate::projects::resolve_project(&crate::projects::roots(), &m.new_url) {
+        if let Some(new_dir) = &new_dir {
             let key_dir = sock_root().join(crate::projects::storage_key(&m.old_url));
             let mut olds: Vec<PathBuf> = std::fs::read(origin_marker_path(&key_dir))
                 .ok()
@@ -255,7 +260,7 @@ pub fn follow_moves(moved: &[Moved]) {
                 // the same way: a root, canonicalised, joined with the URL.
                 olds.extend(crate::projects::roots().iter().filter_map(|r| r.canonicalize().ok()).map(|r| r.join(p)));
             }
-            crate::hub::rename_known_worktree(&olds, &new_dir);
+            crate::hub::rename_known_worktree(&olds, new_dir);
         }
         crate::hub::refresh_and_broadcast(&m.old_url);
         crate::hub::refresh_and_broadcast(&m.new_url);
@@ -326,11 +331,11 @@ pub(crate) enum MoveRecord {
 }
 
 /// Evidence to record: `move_evidence` on `key_dir`, the new directory's URL
-/// confirmed by the resolver itself, and `.moved-to` written. The one place
-/// that does this, for both `reconcile` and the R18 sweep
-/// (`claudes::sweep_gone_owners_with`), so they can never disagree about
-/// what counts as a followable rename. Takes no lock; may run git (through
-/// `resolve_project` on a worktree URL).
+/// confirmed by the resolver itself, and `.moved-to` written — what
+/// `reconcile` decides about a key as a whole. Never what moves a resident's
+/// record: the R18 sweep asks [`find_by_identity`] about that record's own
+/// directory instead (#183 §1), since a key may since have held an occupant.
+/// Takes no lock; may run git (through `resolve_project` on a worktree URL).
 pub(crate) fn record_move_with(
     roots: &[PathBuf],
     old_url: &str,
@@ -442,22 +447,6 @@ fn shell_inside(sock: &std::path::Path, snapshot: &[(u32, String)], proc_root: &
 #[cfg(not(unix))]
 fn shell_inside(_sock: &std::path::Path, _snapshot: &[(u32, String)], _proc_root: &std::path::Path, _dir: &std::path::Path) -> bool {
     false
-}
-
-/// [`record_move_with`] for `old_url`'s own key, with a fresh process
-/// listing — what the R18 sweep calls when git says an owner is gone and no
-/// `reconcile` may have run since the rename. A key directory that is not
-/// there is no evidence; one that cannot be looked at, or a `ps` that cannot
-/// be trusted, is "cannot tell".
-pub(crate) fn record_move(roots: &[PathBuf], old_url: &str) -> MoveRecord {
-    let key_dir = key_dir_of(old_url);
-    match std::fs::symlink_metadata(&key_dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return MoveRecord::NoEvidence,
-        Err(_) => return MoveRecord::CannotTell,
-        Ok(_) => {}
-    }
-    let Some(snapshot) = process_snapshot() else { return MoveRecord::CannotTell };
-    record_move_with(roots, old_url, &key_dir, &snapshot, std::path::Path::new("/proc"), false)
 }
 
 fn moved_to_marker_path(key_dir: &std::path::Path) -> PathBuf {
@@ -626,53 +615,226 @@ fn moved_to_evidence(_roots: &[PathBuf], _key_dir: &std::path::Path) -> Option<M
 /// "could not ask" as "not there".
 #[cfg(unix)]
 fn sibling_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> MoveEvidence {
-    use std::os::unix::ffi::OsStrExt;
     let ids = identities(key_dir);
     if ids.is_empty() {
         return MoveEvidence::None;
     }
-    let mut parents: Vec<PathBuf> = Vec::new();
-    if let Ok(recorded) = std::fs::read(origin_marker_path(key_dir)) {
-        let p = std::path::Path::new(std::ffi::OsStr::from_bytes(&recorded));
-        parents.extend(p.parent().filter(|d| d.is_absolute()).map(|d| d.to_path_buf()));
-    }
+    let mut parents: Vec<PathBuf> = origin_parent(key_dir).into_iter().collect();
     if let Some(url) = std::fs::read(moved_to_marker_path(key_dir)).ok().and_then(|b| parse_moved_to(&b)) {
         parents.extend(roots.iter().filter_map(|r| r.join(&url).parent().map(|d| d.to_path_buf())));
     }
-    parents.sort();
-    parents.dedup();
     // A full match wins over a weak one wherever each was found: the weak
     // one protects, but only the full one can be followed.
     let mut weak: Option<PathBuf> = None;
+    let scanned = scan_siblings(parents, |path, m| match hit(&ids, m) {
+        Hit::No => std::ops::ControlFlow::Continue(()),
+        Hit::Weak if weak.is_some() => std::ops::ControlFlow::Continue(()),
+        h => {
+            let Ok(dir) = path.canonicalize() else { return std::ops::ControlFlow::Break(MoveEvidence::CannotTell) };
+            if h == Hit::Full {
+                return std::ops::ControlFlow::Break(moved(dir, h));
+            }
+            weak = Some(dir);
+            std::ops::ControlFlow::Continue(())
+        }
+    });
+    match scanned {
+        Err(_) => MoveEvidence::CannotTell,
+        Ok(Some(e)) => e,
+        Ok(None) => weak.map_or(MoveEvidence::None, |dir| moved(dir, Hit::Weak)),
+    }
+}
+
+/// The parent of the key's recorded `.origin` path — where its directory
+/// was last known to be, and so where a same-parent rename put it.
+#[cfg(unix)]
+fn origin_parent(key_dir: &std::path::Path) -> Option<PathBuf> {
+    let recorded = std::fs::read(origin_marker_path(key_dir)).ok()?;
+    let p = path_from_marker(recorded.strip_suffix(b"\n").unwrap_or(&recorded));
+    p.parent().filter(|d| d.is_absolute()).map(|d| d.to_path_buf())
+}
+
+/// The one scan behind #182's sibling evidence and #183's
+/// [`find_by_identity`]: every directory entry of every one of `parents`
+/// (deduplicated), with its own `symlink_metadata`, handed to `visit` until
+/// it breaks. A parent or entry that vanished meanwhile is skipped — a rename
+/// between the listing and the stat is ordinary — and one that cannot be
+/// listed or stat'd is `Err`: the match may be exactly what could not be
+/// looked at. No git: `worktree::list` turns a failed git into an empty
+/// list, which would read "could not ask" as "not there".
+#[cfg(unix)]
+fn scan_siblings<T>(
+    mut parents: Vec<PathBuf>,
+    mut visit: impl FnMut(&std::path::Path, &std::fs::Metadata) -> std::ops::ControlFlow<T>,
+) -> Result<Option<T>, String> {
+    parents.sort();
+    parents.dedup();
     for parent in &parents {
         let entries = match std::fs::read_dir(parent) {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return MoveEvidence::CannotTell,
+            Err(e) => return Err(format!("{} cannot be listed ({e})", parent.display())),
         };
         for entry in entries {
-            let Ok(entry) = entry else { return MoveEvidence::CannotTell };
+            let entry = entry.map_err(|e| format!("{} cannot be listed ({e})", parent.display()))?;
             let path = entry.path();
             match std::fs::symlink_metadata(&path) {
-                Ok(m) if m.is_dir() => match hit(&ids, &m) {
-                    Hit::No => {}
-                    Hit::Weak if weak.is_some() => {}
-                    h => {
-                        let Ok(dir) = path.canonicalize() else { return MoveEvidence::CannotTell };
-                        if h == Hit::Full {
-                            return moved(dir, h);
-                        }
-                        weak = Some(dir);
+                Ok(m) if m.is_dir() => {
+                    if let std::ops::ControlFlow::Break(t) = visit(&path, &m) {
+                        return Ok(Some(t));
                     }
-                },
+                }
                 Ok(_) => {}
-                // Renamed or removed between the listing and the stat.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return MoveEvidence::CannotTell,
+                Err(e) => return Err(format!("{} cannot be looked at ({e})", path.display())),
             }
         }
     }
-    weak.map_or(MoveEvidence::None, |dir| moved(dir, Hit::Weak))
+    Ok(None)
+}
+
+/// Where [`find_by_identity`] found a record's directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Found {
+    /// The directory carrying the identity, canonical, and the URL that
+    /// resolves to it under the roots.
+    At(PathBuf, String),
+    /// No candidate carries it: a delete, or a move roost cannot see.
+    Nowhere,
+    /// A candidate could not be looked at — it may be exactly the one.
+    CannotTell(String),
+}
+
+/// #183 §1: where is the directory carrying `id`, for a record that pointed
+/// at `old_url`? Evidence about *this record's* directory — never about
+/// `old_url`'s key as a whole, which may since have held an occupant whose
+/// residents are not the first directory's (chain a). Candidates, in order:
+///
+/// 1. the `.moved-to` target of `old_url`'s key, when that key dir exists;
+/// 2. the entries beside `old_url`'s last known path — the parent of the
+///    key's `.origin`, and of `<root>/<old_url>` for each root ([`scan_siblings`]);
+/// 3. the ancestors of `cwd` (a resident Claude's), when given.
+///
+/// A candidate counts only when it carries `id` as a **Full** identity
+/// (birth time included: ext4 hands a freed inode to the next directory
+/// made, so `(dev, ino)` alone cannot say which directory this is), its URL
+/// resolves under the roots to that same directory, and that URL is not
+/// `old_url`. `NotFound` anywhere means try the next; any other error is
+/// `CannotTell`, and so is a directory sharing `id`'s `(dev, ino)` whose
+/// birth time cannot be read. Fork-free except `resolve_project`, which may
+/// run git — so never call this under a hub, `REGISTRY`, `SESSIONS` or any
+/// other lock.
+pub(crate) fn find_by_identity(roots: &[PathBuf], old_url: &str, id: &crate::dirid::DirId, cwd: Option<&std::path::Path>) -> Found {
+    find_by_identity_in(roots, &key_dir_of(old_url), old_url, id, cwd)
+}
+
+#[cfg(unix)]
+fn find_by_identity_in(
+    roots: &[PathBuf],
+    key_dir: &std::path::Path,
+    old_url: &str,
+    id: &crate::dirid::DirId,
+    cwd: Option<&std::path::Path>,
+) -> Found {
+    use std::ops::ControlFlow::{Break, Continue};
+    // Is `path` (whose metadata is `md`) the directory, followable?
+    // `Ok(None)` = not this one; `Err` = cannot tell.
+    let accept = |path: &std::path::Path, md: &std::fs::Metadata| -> Result<Option<(PathBuf, String)>, String> {
+        use std::os::unix::fs::MetadataExt;
+        match crate::dirid::of_metadata(md) {
+            Ok(here) if here == *id => {}
+            Ok(_) => return Ok(None),
+            Err(e) if md.dev() == id.dev && md.ino() == id.ino => return Err(format!("{}: {e}", path.display())),
+            Err(_) => return Ok(None),
+        }
+        let dir = match path.canonicalize() {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("{} cannot be resolved ({e})", path.display())),
+        };
+        let Some(url) = url_under_roots(roots, &dir).filter(|u| u != old_url) else { return Ok(None) };
+        if crate::projects::resolve_project(roots, &url).as_deref() != Some(dir.as_path()) {
+            return Ok(None);
+        }
+        Ok(Some((dir, url)))
+    };
+    let stat = |path: &std::path::Path, follow: bool| -> Result<Option<std::fs::Metadata>, String> {
+        let r = if follow { std::fs::metadata(path) } else { std::fs::symlink_metadata(path) };
+        match r {
+            Ok(m) => Ok(Some(m)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{} cannot be looked at ({e})", path.display())),
+        }
+    };
+    let found = |r: Result<Option<(PathBuf, String)>, String>| match r {
+        Ok(Some((dir, url))) => Some(Found::At(dir, url)),
+        Ok(None) => None,
+        Err(e) => Some(Found::CannotTell(e)),
+    };
+
+    // (1) Where the key itself was followed to.
+    match stat(key_dir, false) {
+        Err(e) => return Found::CannotTell(e),
+        Ok(None) => {}
+        Ok(Some(_)) => match std::fs::read(moved_to_marker_path(key_dir)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Found::CannotTell(format!("{}'s .moved-to cannot be read ({e})", key_dir.display())),
+            Ok(raw) => {
+                let Some(url) = parse_moved_to(&raw) else {
+                    return Found::CannotTell(format!("{}'s .moved-to is damaged", key_dir.display()));
+                };
+                for r in roots {
+                    let path = r.join(&url);
+                    match stat(&path, true) {
+                        Err(e) => return Found::CannotTell(e),
+                        Ok(None) => {}
+                        Ok(Some(m)) => {
+                            if let Some(f) = found(accept(&path, &m)) {
+                                return f;
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    }
+
+    // (2) Beside where it was last known to be.
+    let mut parents: Vec<PathBuf> = origin_parent(key_dir).into_iter().collect();
+    parents.extend(roots.iter().filter_map(|r| r.join(old_url).parent().map(|d| d.to_path_buf())));
+    match scan_siblings(parents, |path, m| match found(accept(path, m)) {
+        Some(f) => Break(f),
+        None => Continue(()),
+    }) {
+        Err(e) => return Found::CannotTell(e),
+        Ok(Some(f)) => return f,
+        Ok(None) => {}
+    }
+
+    // (3) Up from the resident Claude's own cwd.
+    for p in cwd.into_iter().flat_map(|c| c.ancestors()) {
+        match stat(p, false) {
+            Err(e) => return Found::CannotTell(e),
+            Ok(None) => {}
+            Ok(Some(m)) => {
+                if let Some(f) = found(accept(p, &m)) {
+                    return f;
+                }
+            }
+        }
+    }
+    Found::Nowhere
+}
+
+#[cfg(not(unix))]
+fn find_by_identity_in(
+    _roots: &[PathBuf],
+    _key_dir: &std::path::Path,
+    _old_url: &str,
+    _id: &crate::dirid::DirId,
+    _cwd: Option<&std::path::Path>,
+) -> Found {
+    Found::Nowhere
 }
 
 #[cfg(not(unix))]
@@ -3829,9 +3991,17 @@ mod tests {
     /// `.moved-to` yet; the sweep must find the evidence itself (A's native
     /// session) rather than forget the main-checkout terminal re-homed into A.
     ///
-    /// Revert-checked, run and restored: with `follow_gone_owner`'s
-    /// `record_move` branch removed, fails "R18 follows the rename it found
-    /// first" — left `Here`, the record forgotten.
+    /// #183: the evidence is the resident record's own identity, found by
+    /// `find_by_identity` beside A's recorded `.origin` — not A's key as a
+    /// whole, so A's own session is left for `reconcile` to follow.
+    ///
+    /// Revert-checked, run and restored: with `find_by_identity`'s sibling
+    /// scan (candidate 2) skipped, fails "R18 follows the rename it found
+    /// first" — left `Here`, the record forgotten. (Before #183: with
+    /// `follow_gone_owner`'s `record_move` branch removed, the same.) With
+    /// `follow_gone_owner_inner`'s `.moved-to` write disabled, fails "and
+    /// records it, as reconcile would have" — left `None`: B carries A's
+    /// own recorded identity, so this is the case the gate lets through.
     #[test]
     fn the_gone_owner_sweep_follows_a_rename_no_reconcile_has_seen() {
         with_state(|state| {
@@ -3849,6 +4019,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("dtach must be available for this test"));
             let _ = reconcile(&roots); // records A's identity; nothing after this
             crate::home::record("ordrepo", "term3", a).unwrap();
+            crate::home::record_identity("ordrepo", "term3", &repo.join(".claude/worktrees/worktree-a")).unwrap();
 
             git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
             let home_dir_of = |p: &str| (p == "ordrepo").then(|| repo.clone());
@@ -3856,12 +4027,15 @@ mod tests {
 
             let got = crate::home::owner_of("ordrepo", "term3");
             let moved_to = fs::read_to_string(sock_dir.join(".moved-to")).ok();
+            let shell_after_r18 = crate::home::owner_of(a, "shell");
+            follow_moves(&reconcile(&roots).moved);
             let shell = crate::home::owner_of(a, "shell");
             kill_test_pids(&sock_path);
             std::env::remove_var("ROOST_ROOTS");
             assert_eq!(got, crate::home::Owner::Elsewhere(b.into()), "R18 follows the rename it found first");
             assert_eq!(moved_to.as_deref(), Some(&*format!("{b}\n")), "and records it, as reconcile would have");
-            assert_eq!(shell, crate::home::Owner::Elsewhere(b.into()), "A's own session follows too");
+            assert_eq!(shell_after_r18, crate::home::Owner::Here, "R18 moves only the record it found; A's own session is reconcile's");
+            assert_eq!(shell, crate::home::Owner::Elsewhere(b.into()), "which follows it on the next pass");
         });
     }
 
@@ -4257,6 +4431,8 @@ mod tests {
             spawn_detached_dtach_in(&home_sock, &repo).unwrap_or_else(|| panic!("dtach must be available for this test"));
             let _ = reconcile(&roots);
             crate::home::record("tworepo", "term3", a).unwrap();
+            // #183 §1: (b) follows a record only on its own identity.
+            crate::home::record_identity("tworepo", "term3", &repo.join(".claude/worktrees/worktree-a")).unwrap();
 
             git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
             follow_moves(&reconcile(&roots).moved);
@@ -5772,5 +5948,261 @@ mod tests {
         assert!(!never.has_layout && never.live == 0 && never.reachable, "listed as plain and idle");
         // Opened-ness is still visible: only that one has a layout.
         assert!(ps.iter().find(|p| p.key == "opened").unwrap().has_layout);
+    }
+
+    /// #183 chain (a)'s state. A renamed to B and A's session `shell`
+    /// followed; a new A (the occupant) made at the old name, and a live
+    /// main-checkout terminal `term3` re-homed into it — so its record names
+    /// A and carries the *occupant's* identity; then the occupant renamed to
+    /// D while B still stands. Real git, real dtach.
+    struct ChainA {
+        repo: PathBuf,
+        a: String,
+        b: String,
+        d: String,
+        followed: PathBuf,
+        resident: PathBuf,
+    }
+
+    fn chain_a(state: &std::path::Path, root: &std::path::Path, name: &str) -> ChainA {
+        let roots = vec![root.to_path_buf()];
+        let repo = repo_with_worktree_a(root, name);
+        let a = format!("{name}/.claude/worktrees/worktree-a");
+        let b = format!("{name}/.claude/worktrees/worktree-b");
+        let d = format!("{name}/.claude/worktrees/worktree-d");
+        let sock_dir = state.join("sock").join(crate::projects::storage_key(&a));
+        fs::create_dir_all(&sock_dir).unwrap();
+        let followed = sock_dir.join("shell");
+        spawn_detached_dtach_in(&followed, &repo.join(".claude/worktrees/worktree-a"))
+            .unwrap_or_else(|| panic!("dtach must be available for this test"));
+        let _ = reconcile(&roots);
+        git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+        follow_moves(&reconcile(&roots).moved);
+        assert_eq!(crate::home::owner_of(&a, "shell"), crate::home::Owner::Elsewhere(b.clone()), "setup: A's session followed B");
+
+        git_in(&repo, &["worktree", "add", "-q", "-b", "worktree-a2", ".claude/worktrees/worktree-a"]);
+        let new_a = crate::projects::resolve_project(&roots, &a).expect("setup: the new A resolves");
+        let resident = state.join("sock").join(crate::projects::storage_key(name)).join("term3");
+        fs::create_dir_all(resident.parent().unwrap()).unwrap();
+        spawn_detached_dtach_in(&resident, &repo).unwrap_or_else(|| panic!("dtach must be available for this test"));
+        crate::hub::rehome_to(name, "term3", &a).unwrap();
+        let occupant = full_id(&new_a);
+        assert_eq!(crate::home::identity_of(name, "term3"), Ok(Some(occupant)), "setup: the resident carries the occupant's identity");
+        assert_ne!(occupant, full_id(&repo.join(".claude/worktrees/worktree-b")), "setup: the occupant is not B");
+        let _ = reconcile(&roots); // the occupied pass
+
+        git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-d"]);
+        ChainA { repo, a, b, d, followed, resident }
+    }
+
+    /// #183 chain (a): the occupant's resident is re-pointed to D, where its
+    /// own identity is — never to B, where A's *key* says its directory
+    /// went. Through `follow_moves` (part (b) of `home::follow_move_in`,
+    /// which used to re-point every record owned by A; the pass is made
+    /// fresh, as roost's startup makes every pass) and through R18 with the
+    /// resident's Claude working in D (whose first arm used to take
+    /// `record_move(A)`'s key-level `Followable(B)`).
+    ///
+    /// Revert-checked, run and restored: on the pre-#183 code, fails
+    /// "follow_moves does not re-point the occupant's resident to B" — left
+    /// `Elsewhere(".../worktree-b")`. With the key-level `record_move` arm
+    /// restored at the top of `follow_gone_owner_inner` (the rest of this
+    /// task kept), fails "R18 follows the resident to D, by its own
+    /// identity" — left `Elsewhere("chainarepo/.claude/worktrees/worktree-b")`.
+    /// With `follow_gone_owner_inner`'s `.moved-to` write ungated (no
+    /// "the key's own directory" check), fails "A's .moved-to still names B"
+    /// — left `"chainarepo/.claude/worktrees/worktree-d\n"`.
+    #[test]
+    fn an_occupants_resident_is_not_repointed_to_b() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("ROOST_CMD");
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let home = "chainarepo";
+            let c = chain_a(state, root.path(), home);
+            let d_dir = c.repo.join(".claude/worktrees/worktree-d").canonicalize().unwrap();
+
+            let pass = reconcile(&roots);
+            let a_to_b = pass.moved.iter().any(|m| m.old_url == c.a && m.new_url == c.b);
+            let fresh: Vec<Moved> = pass.moved.into_iter().map(|m| Moved { fresh: true, ..m }).collect();
+            follow_moves(&fresh);
+            let after_follow_moves = crate::home::owner_of(home, "term3");
+
+            let procs = vec![crate::claudes::ClaudeProc {
+                project: home.into(),
+                session: "term3".into(),
+                owner: c.a.clone(),
+                sse_port: None,
+                cwd: Some(d_dir.clone()),
+            }];
+            let home_dir_of = |p: &str| (p == home).then(|| c.repo.clone());
+            crate::claudes::sweep_gone_owners(&home_dir_of, &std::sync::Mutex::new(Default::default()), &procs);
+            let after_r18 = crate::home::owner_of(home, "term3");
+            let moved_to = fs::read_to_string(key_dir_of(&c.a).join(".moved-to")).ok();
+            let shell = crate::home::owner_of(&c.a, "shell");
+
+            follow_moves(&reconcile(&roots).moved);
+            let after_again = crate::home::owner_of(home, "term3");
+            let alive = socket_has_process(&c.resident) && socket_has_process(&c.followed);
+            kill_test_pids(&c.followed);
+            kill_test_pids(&c.resident);
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert!(a_to_b, "setup: the pass still reports A→B, the move part (b) used to apply to every record of A");
+            assert_eq!(after_follow_moves, crate::home::Owner::Elsewhere(c.a.clone()), "follow_moves does not re-point the occupant's resident to B");
+            assert_eq!(after_r18, crate::home::Owner::Elsewhere(c.d.clone()), "R18 follows the resident to D, by its own identity");
+            assert_eq!(moved_to.as_deref(), Some(&*format!("{}\n", c.b)), "A's .moved-to still names B: one resident's evidence is not the key's");
+            assert_eq!(shell, crate::home::Owner::Elsewhere(c.b.clone()), "A's followed session stays B's");
+            assert_eq!(after_again, crate::home::Owner::Elsewhere(c.d.clone()), "a later pass leaves the resident with D");
+            assert!(alive, "nothing was ended on the way");
+        });
+    }
+
+    /// #183 Review Focus 2: chain (a) with no Claude in the resident — it
+    /// exited, so there is no cwd to look up from. The sibling scan alone
+    /// finds D, beside A's recorded `.origin`, by the record's own identity.
+    ///
+    /// Revert-checked, run and restored: on the pre-#183 code, fails "the
+    /// sibling scan finds D" — left `Elsewhere(".../worktree-b")`, the
+    /// key-level arm; with `find_by_identity`'s candidate (2) skipped, fails
+    /// the same assertion — left `Here`, the record forgotten.
+    #[test]
+    fn a_resident_with_no_claude_follows_by_its_identity() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("ROOST_CMD");
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let home = "nocladrepo";
+            let c = chain_a(state, root.path(), home);
+            let d_dir = c.repo.join(".claude/worktrees/worktree-d");
+
+            let home_dir_of = |p: &str| (p == home).then(|| c.repo.clone());
+            crate::claudes::sweep_gone_owners(&home_dir_of, &std::sync::Mutex::new(Default::default()), &[]);
+            let got = crate::home::owner_of(home, "term3");
+            let id = crate::home::identity_of(home, "term3");
+            let alive = socket_has_process(&c.resident);
+            kill_test_pids(&c.followed);
+            kill_test_pids(&c.resident);
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert_eq!(got, crate::home::Owner::Elsewhere(c.d.clone()), "the sibling scan finds D");
+            assert_eq!(id, Ok(Some(full_id(&d_dir))), "and the record still carries D's identity");
+            assert!(alive, "the resident's master is alive");
+        });
+    }
+
+    /// #183 Review Focus 1, on ext4 where the reuse is real: the record's
+    /// target is removed and a directory made at the same path, which ext4
+    /// gives the same inode (it is made again until it does, so the fixture
+    /// cannot pass without the reuse); that directory becomes a worktree and
+    /// is renamed to C beside it. C has the record's `(dev, ino)` and a new
+    /// birth time: it is not the record's directory, and the record must not
+    /// follow into it — by the sibling scan, or by a Claude working in C.
+    ///
+    /// Revert-checked, run and restored: with `find_by_identity`'s compare
+    /// cut to `(dev, ino)` (`here.dev == id.dev && here.ino == id.ino`),
+    /// fails "nothing carries the record's identity" — left
+    /// `At(".../worktree-c", "recrepo/.claude/worktrees/worktree-c")` — and
+    /// "the record does not follow into a directory that merely reused its
+    /// inode", left `Elsewhere("recrepo/.claude/worktrees/worktree-c")`.
+    #[test]
+    fn a_recreated_target_is_not_the_records_directory() {
+        use std::os::unix::fs::MetadataExt;
+        with_state(|_state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = ext4_tempdir();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let home = "recrepo";
+            let repo = repo_with_worktree_a(root.path(), home);
+            let a = format!("{home}/.claude/worktrees/worktree-a");
+            let c = format!("{home}/.claude/worktrees/worktree-c");
+            let a_dir = repo.join(".claude/worktrees/worktree-a");
+            crate::hub::rehome_to(home, "term3", &a).unwrap();
+            let Ok(Some(crate::dirid::Stored::Full(old))) = crate::home::identity_of(home, "term3") else {
+                panic!("setup: rehome_to records a full identity")
+            };
+
+            fs::remove_dir_all(&a_dir).unwrap();
+            let fillers = root.path().join("fillers");
+            fs::create_dir_all(&fillers).unwrap();
+            let reused = (0..64).any(|k| {
+                fs::create_dir(&a_dir).unwrap();
+                let same = fs::symlink_metadata(&a_dir).unwrap().ino() == old.ino;
+                if !same {
+                    fs::rename(&a_dir, fillers.join(k.to_string())).unwrap();
+                }
+                same
+            });
+            assert!(reused, "setup: ext4 handed the record's inode to a new directory at its path");
+            git_in(&repo, &["worktree", "prune"]);
+            git_in(&repo, &["worktree", "add", "-q", "-b", "worktree-a2", ".claude/worktrees/worktree-a"]);
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-c"]);
+            let c_dir = repo.join(".claude/worktrees/worktree-c").canonicalize().unwrap();
+            let now = crate::dirid::of(&c_dir).unwrap().unwrap();
+
+            let direct = find_by_identity(&roots, &a, &old, Some(&c_dir));
+            let procs = vec![crate::claudes::ClaudeProc {
+                project: home.into(),
+                session: "term3".into(),
+                owner: a.clone(),
+                sse_port: None,
+                cwd: Some(c_dir.clone()),
+            }];
+            let home_dir_of = |p: &str| (p == home).then(|| repo.clone());
+            crate::claudes::sweep_gone_owners(&home_dir_of, &std::sync::Mutex::new(Default::default()), &procs);
+            let got = crate::home::owner_of(home, "term3");
+            let id = crate::home::identity_of(home, "term3");
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert!((now.dev, now.ino) == (old.dev, old.ino) && now != old, "setup: C has the record's (dev, ino), and a new birth time");
+            assert_eq!(direct, Found::Nowhere, "nothing carries the record's identity");
+            assert_ne!(got, crate::home::Owner::Elsewhere(c.clone()), "the record does not follow into a directory that merely reused its inode");
+            assert_ne!(id, Ok(Some(crate::dirid::Stored::Full(now))), "nor takes on its identity");
+        });
+    }
+
+    /// #183 §1: every writer of a record writes its target's identity —
+    /// `claudes::rewrite_owner` included. A rename keeps the identity, so
+    /// the content alone cannot show a write; the `.ino` file's own inode
+    /// can (an atomic rewrite is a new file).
+    ///
+    /// Revert-checked, run and restored: with `rewrite_owner`'s
+    /// `record_identity` call removed, fails "the rewrite wrote the .ino" —
+    /// left and right the same inode, the old file left in place. Before
+    /// the implementation, failed earlier, "setup: the record followed B" —
+    /// left `Here`: with no Claude, the old cwd walk was the only evidence.
+    #[test]
+    fn a_rewritten_record_carries_its_new_identity() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let home = "rwrepo";
+            let repo = repo_with_worktree_a(root.path(), home);
+            let a = format!("{home}/.claude/worktrees/worktree-a");
+            let b = format!("{home}/.claude/worktrees/worktree-b");
+            crate::hub::rehome_to(home, "term3", &a).unwrap();
+            let ino_path = state.join("home").join(crate::projects::storage_key(home)).join(".term3.ino");
+            let before = fs::metadata(&ino_path).expect("setup: rehome_to wrote the .ino").ino();
+
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+            let home_dir_of = |p: &str| (p == home).then(|| repo.clone());
+            crate::claudes::sweep_gone_owners(&home_dir_of, &std::sync::Mutex::new(Default::default()), &[]);
+            let got = crate::home::owner_of(home, "term3");
+            let id = crate::home::identity_of(home, "term3");
+            let md = fs::metadata(&ino_path).ok();
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert_eq!(got, crate::home::Owner::Elsewhere(b), "setup: the record followed B");
+            assert_eq!(id, Ok(Some(full_id(&repo.join(".claude/worktrees/worktree-b")))), "it carries B's full identity");
+            let md = md.expect("the .ino is there");
+            assert_ne!(md.ino(), before, "the rewrite wrote the .ino");
+            assert_eq!(md.permissions().mode() & 0o777, 0o600, "privately");
+        });
     }
 }

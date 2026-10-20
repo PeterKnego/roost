@@ -370,9 +370,10 @@ fn moved_to_path(state: &Path, home: &str) -> PathBuf {
 /// boundary: absent, unreadable, empty and malformed all read `None`, which
 /// means "do not follow, do not widen". That is the destroy-nothing
 /// direction for the widenings (the sessions stay where #178 left them), but
-/// not everywhere — so the R18 sweep does not read this file at all: it
-/// asks `registry::record_move` for live evidence instead, and treats a
-/// "cannot tell" there as a reason to keep the record, not to forget it.
+/// not everywhere — so the R18 sweep does not read this file through here:
+/// `registry::find_by_identity` reads it three-valued, trusts its target
+/// only when that directory carries the record's own identity, and treats a
+/// "cannot tell" as a reason to keep the record, not to forget it.
 pub fn moved_to_in(state: &Path, home: &str) -> Option<String> {
     let s = std::fs::read_to_string(moved_to_path(state, home)).ok()?;
     let s = s.strip_suffix('\n').unwrap_or(&s);
@@ -432,12 +433,17 @@ fn copy_if_absent(src: &Path, dst: &Path) -> Result<bool, String> {
 /// target has since been renamed on (A→B→C, `prev` = B): what that follow
 /// wrote is this follow's to move on, in both (a) and (b).
 ///
+/// `new_dir` is `new_url`'s directory, as its caller resolved it: (b)
+/// re-points a record only when that record's own identity is the one
+/// found there (#183 §1), and `None` re-points none.
+///
 /// Records and copies only: no hub, no lock, no git. Its caller
 /// (`registry::follow_moves`) refreshes hubs afterwards, one at a time.
 pub fn follow_move_in(
     state: &Path,
     old_url: &str,
     new_url: &str,
+    new_dir: Option<&Path>,
     live: &[String],
     new_live: &[String],
     prev: Option<&str>,
@@ -469,7 +475,14 @@ pub fn follow_move_in(
     // into the moved worktree). Re-read right before each write, like the
     // R18 sweep's compare-before-forget: a record re-pointed since the scan
     // names somewhere else and is not this move's to rewrite.
+    //
+    // And each one only on evidence about *its* directory (#183 §1): its
+    // own `.ino`, as a full identity, equal to the new directory's. That the
+    // old key's directory moved here says nothing about a record written
+    // while an occupant held the old name (chain a) — that one's directory
+    // is wherever its identity is, which R18 looks for record by record.
     let ours = |o: &Owner| matches!(o, Owner::Elsewhere(o) if o == old_url || followed_before(o));
+    let new_id = new_dir.and_then(|d| crate::dirid::of(d).ok().flatten());
     for (home, name, owner) in all_in(state) {
         if !ours(&owner) {
             continue;
@@ -485,13 +498,23 @@ pub fn follow_move_in(
             eprintln!("roost: {home}/{name}'s owner {old_url} was renamed to {new_url}, outside {home}/.claude/worktrees; not following");
             continue;
         }
+        let (Some(new_id), Some(new_dir)) = (new_id, new_dir) else { continue };
+        if !matches!(identity_of_in(state, &home, &name), Ok(Some(crate::dirid::Stored::Full(id))) if id == new_id) {
+            continue;
+        }
         if !ours(&owner_of_in(state, &home, &name)) {
             continue;
         }
-        // `.<name>.ino` is left as it is: a rename keeps the inode, and
-        // `git worktree move` cannot cross devices.
         match record_in(state, &home, &name, new_url) {
-            Ok(()) => changed = true,
+            Ok(()) => {
+                changed = true;
+                // Every writer of a record writes its target's identity; one
+                // that cannot be read leaves none rather than a stale one.
+                if let Err(e) = record_identity_in(state, &home, &name, new_dir) {
+                    let _ = std::fs::remove_file(identity_path(state, &home, &name));
+                    eprintln!("roost: {home}/{name} followed {old_url} to {new_url}, but its identity was not recorded: {e}");
+                }
+            }
             Err(e) => eprintln!("roost: {home}/{name}'s owner {old_url} was renamed to {new_url}, but its record was not rewritten: {e}"),
         }
     }
@@ -514,9 +537,9 @@ pub fn follow_move_in(
 /// [`follow_move_in`] against the real state dir, with the R16 gate read
 /// from the new project's own live sessions. Never call under a lock:
 /// `session::live_names` takes `SESSIONS`.
-pub fn follow_move(old_url: &str, new_url: &str, live: &[String], prev: Option<&str>) -> bool {
+pub fn follow_move(old_url: &str, new_url: &str, new_dir: Option<&Path>, live: &[String], prev: Option<&str>) -> bool {
     let new_live = crate::session::live_names(new_url);
-    follow_move_in(&crate::wsstate::state_dir(), old_url, new_url, live, &new_live, prev)
+    follow_move_in(&crate::wsstate::state_dir(), old_url, new_url, new_dir, live, &new_live, prev)
 }
 
 #[cfg(test)]
@@ -805,6 +828,13 @@ mod tests {
     /// key's own layout is never overwritten" — left `"{\"old\":1}"`; the
     /// `owner_shaped` gate in (b) removed fails "(b) only to an owner the
     /// record's home may name" — left `Elsewhere(".../worktree-b")`.
+    ///
+    /// #183, revert-checked, each run and restored: (b)'s identity check
+    /// removed fails "(b) not a record whose directory is another one" —
+    /// left `Elsewhere(".../worktree-b")`; the `record_identity_in` after
+    /// (b)'s rewrite removed fails "(b) and that .ino was written by the
+    /// follow, not left over" (the content alone cannot tell: a rename keeps
+    /// the identity, so only the file's own inode shows a write).
     #[test]
     fn follow_move_rewrites_owner_records_and_copies_state_only_when_absent() {
         let st = tempfile::tempdir().unwrap();
@@ -815,17 +845,37 @@ mod tests {
         record_in(s, old, "away", other).unwrap();
         let d = s.join("home").join(crate::projects::storage_key(old));
         std::fs::write(d.join("unsure"), "").unwrap();
+        // `new`'s directory, and a different one: (b) follows a record only
+        // when its own identity is the one found at `new_dir` (#183 §1).
+        let dirs = tempfile::tempdir().unwrap();
+        let new_dir = dirs.path().join("b");
+        let elsewhere = dirs.path().join("d");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
         record_in(s, "repo", "term3", old).unwrap();
+        record_identity_in(s, "repo", "term3", &new_dir).unwrap();
         record_in(s, "repo", "term4", other).unwrap();
+        record_identity_in(s, "repo", "term4", &new_dir).unwrap();
         // A record no home may name `new` for: left for R18, never rewritten.
         record_in(s, "zed", "term5", old).unwrap();
+        record_identity_in(s, "zed", "term5", &new_dir).unwrap();
+        // Owned by the old URL, but its directory is another one (an
+        // occupant's resident), or unknown: neither is this move's.
+        record_in(s, "repo", "term6", old).unwrap();
+        record_identity_in(s, "repo", "term6", &elsewhere).unwrap();
+        record_in(s, "repo", "term7", old).unwrap();
+        let ino_file = |n: &str| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(dir_in(s, "repo").join(format!(".{n}.ino"))).unwrap().ino()
+        };
+        let term3_ino_before = ino_file("term3");
         let (ok, nk) = (crate::projects::storage_key(old), crate::projects::storage_key(new));
         crate::worktree::write_base(s, &ok, "main").unwrap();
         std::fs::write(s.join(format!("{ok}.json")), r#"{"old":1}"#).unwrap();
         std::fs::write(s.join(format!("{nk}.json")), r#"{"new":1}"#).unwrap();
 
         let live: Vec<String> = ["shell", "busy", "away", "unsure"].map(String::from).to_vec();
-        assert!(follow_move_in(s, old, new, &live, &["busy".to_string()], None));
+        assert!(follow_move_in(s, old, new, Some(&new_dir), &live, &["busy".to_string()], None));
 
         assert_eq!(owner_of_in(s, old, "shell"), Owner::Elsewhere(new.into()), "(a) a live session follows");
         assert_eq!(owner_of_in(s, old, "busy"), Owner::Here, "R16: the new key's native busy is not shadowed");
@@ -834,13 +884,21 @@ mod tests {
         assert_eq!(owner_of_in(s, "repo", "term3"), Owner::Elsewhere(new.into()), "(b) a resident of the old URL follows");
         assert_eq!(owner_of_in(s, "repo", "term4"), Owner::Elsewhere(other.into()), "(b) another owner's resident is untouched");
         assert_eq!(owner_of_in(s, "zed", "term5"), Owner::Elsewhere(old.into()), "(b) only to an owner the record's home may name");
+        assert_eq!(owner_of_in(s, "repo", "term6"), Owner::Elsewhere(old.into()), "(b) not a record whose directory is another one");
+        assert_eq!(owner_of_in(s, "repo", "term7"), Owner::Elsewhere(old.into()), "(b) not a record with no identity");
+        assert_eq!(
+            identity_of_in(s, "repo", "term3"),
+            Ok(Some(crate::dirid::Stored::Full(crate::dirid::of(&new_dir).unwrap().unwrap()))),
+            "(b) the followed record carries the new directory's identity"
+        );
+        assert_ne!(ino_file("term3"), term3_ino_before, "(b) and that .ino was written by the follow, not left over");
         assert_eq!(crate::worktree::read_base(s, &nk).as_deref(), Some("main"), "(c) the base is copied to a key that had none");
         assert_eq!(std::fs::read_to_string(s.join(format!("{nk}.json"))).unwrap(), r#"{"new":1}"#, "the new key's own layout is never overwritten");
 
-        assert!(!follow_move_in(s, old, new, &live, &["busy".to_string()], None), "a second pass changes nothing");
+        assert!(!follow_move_in(s, old, new, Some(&new_dir), &live, &["busy".to_string()], None), "a second pass changes nothing");
 
         std::fs::remove_file(s.join(format!("{nk}.json"))).unwrap();
-        assert!(follow_move_in(s, old, new, &live, &[], None));
+        assert!(follow_move_in(s, old, new, Some(&new_dir), &live, &[], None));
         assert_eq!(std::fs::read_to_string(s.join(format!("{nk}.json"))).unwrap(), r#"{"old":1}"#, "(d) the layout is copied to a key that had none");
         assert_eq!(owner_of_in(s, old, "busy"), Owner::Elsewhere(new.into()), "once the name is free there, it follows too");
         assert!(std::fs::read_dir(s).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(".tmp.")), "no temp file left behind");
