@@ -76,6 +76,34 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   for existing targets, `projects::safe_resolve_parent` for creation and rename
   destinations (it canonicalises the parent and validates the final component,
   because the target does not exist yet).
+
+  **The one exception** is an allowed outside worktree (#188). A cloned
+  repository's worktree metadata can point a worktree anywhere, so a project
+  URL of the shape `<parent>/.claude/outside/<name>` resolves outside the
+  roots only through a roost-written allow record at
+  `state/outside/<parent key>/<name>`, written after a user confirms, on
+  git's own listing of the path as a worktree of a project under the roots.
+  `projects::resolve_project_with`'s first arm (`src/projects.rs:252-266`)
+  decides this shape exhaustively and hands it to `outside::resolve`
+  (`src/outside.rs:184-193`) before any of the ordinary checks run; nothing
+  with the outside segment ever falls through to try the literal path on
+  disk. The identity it checks is three-part — `(dev, ino, birth time)`, not
+  just `(dev, ino)` — because a probe of this project's own ext4 filesystem
+  found `rm` followed by `mkdir` at the same path reusing the just-freed
+  inode every time; birth time was the one field that changed on every
+  recreation (`src/outside.rs:12-23`). An unreadable birth time refuses the
+  allow and fails the resolve, the same as a mismatch. `AllowOutsideWorktree`
+  also refuses a path already under a root and a worktree of anything but
+  the parent's *main* checkout, so one directory can never end up with two
+  project keys (`src/hub.rs:2879-2906`).
+
+  It is narrow on purpose: the record lives only in roost's own state, never
+  in a repository or in project config, so a clone cannot allow itself, and
+  it names one directory by identity — anything that does not match resolves
+  to `None`. Never make these "consistent" with the rest of this bullet:
+  resolving the virtual path through disk, accepting a record without an
+  identity match, or letting project config or a repository write records.
+  Each is the vulnerability, not the cleanup.
 - **Session names match `^[A-Za-z0-9_-]{1,32}$`** — they land in a dtach socket
   path and a command line.
 - **A text file opens in Edit; only a file with a rendered form opens in
@@ -280,7 +308,10 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   `openDiff` are
   bounded by the same 2 MB `MAX_FILE_BYTES` as any other file, since a
   proposal is retained for the tab's life and broadcast whole to every
-  connected browser.
+  connected browser. Outside worktrees (#188): ≤32 allow records per parent
+  (`outside::OUTSIDE_CAP`), and ≤16 appeared-worktree entries per project
+  (`appeared::APPEARED_CAP`), oldest dropped first, each naming itself when
+  it fires.
 
 ## Absence of evidence is not evidence of absence
 
