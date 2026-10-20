@@ -25,7 +25,7 @@ On 2026-10-19 a Claude in `ultima_cluster` ran a plain `git worktree add ~/scrat
   - `parent` resolves under the roots, and `git worktree list` of it reports `path` as a non-main worktree. An empty list is git not answering: refuse, writing nothing.
   - `path` is absolute and equals its own canonicalisation, i.e. no symlink anywhere in it, and it is a directory.
   - `name` passes `wtname::check`. It is the basename, with `-2`, `-3`, … appended if a record for this parent already uses that name.
-- If all three hold, the hub writes `state/outside/<parent key>/<name>`: atomic (`wsstate::tmp_suffix` temp, then `rename`), mode 0600. The file holds two lines: the canonical path, and `dev ino btime_secs btime_nsec`; an unreadable birth time refuses the allow and fails the resolve.
+- If all three hold, the hub writes `state/outside/<parent key>/<name>`: atomic (`wsstate::tmp_suffix` temp, then `hard_link`; `rename` only when rewriting a stale record), mode 0600. The file holds two lines: the canonical path, and `dev ino btime_secs btime_nsec`; an unreadable birth time refuses the allow and fails the resolve.
 - It then refreshes the parent hub, so the row turns clickable, and replies to the sender with the new URL.
 
 The record lives only in roost's state directory, never in a repository or in project config. A cloned repo therefore cannot allow itself.

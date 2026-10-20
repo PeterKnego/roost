@@ -58,6 +58,10 @@
 //! the allow cap and the re-allow dedupe (`allow_in`): a directory listing
 //! that could not actually be read must refuse the allow outright, not be
 //! read as "zero existing records," which would silently bypass both.
+//!
+//! One race this module does not close: concurrent `allow_in` calls for the
+//! same new path are not deduplicated against each other, so the caller
+//! must serialise allows — Task 3's hub does.
 
 use std::path::{Path, PathBuf};
 
@@ -209,10 +213,19 @@ pub fn list_in(state: &Path, parent: &str) -> Vec<Record> {
 /// `list_in`'s real outcome, with the read failure kept distinct from "zero
 /// records": `Ok(vec![])` only for a parent directory that does not exist
 /// yet (the ordinary case, before any allow), never for one that exists but
-/// could not be read. `allow_in` uses this specifically so an unreadable
-/// records directory refuses the allow instead of silently bypassing the
-/// cap and the re-allow dedupe, both of which are counting on this listing
-/// being complete.
+/// could not be fully read. `allow_in` uses this specifically so an
+/// unreadable records directory, or a single damaged record inside an
+/// otherwise-readable one, refuses the allow instead of silently bypassing
+/// the cap and the re-allow dedupe, both of which are counting on this
+/// listing being complete. A present, non-dotfile entry that `read_in`
+/// cannot turn into a `Record` is exactly that: the file exists (this isn't
+/// a race with something else deleting it — dotfiles aside, nothing but
+/// this module's own writers ever touch this directory), so "damaged" and
+/// "unreadable" are the only explanations, and both mean the dedupe and
+/// the cap are about to be computed over an incomplete list. Silently
+/// dropping that one entry, as earlier versions of this function did, let
+/// the same real directory be allowed under a second name once its first
+/// record went bad.
 fn list_result_in(state: &Path, parent: &str) -> Result<Vec<Record>, String> {
     let Some(dir) = dir_in(state, parent) else { return Ok(Vec::new()) };
     let entries = match std::fs::read_dir(&dir) {
@@ -228,8 +241,14 @@ fn list_result_in(state: &Path, parent: &str) -> Result<Vec<Record>, String> {
         if name.starts_with('.') {
             continue;
         }
-        if let Some(rec) = read_in(state, parent, &name) {
-            out.push(rec);
+        match read_in(state, parent, &name) {
+            Some(rec) => out.push(rec),
+            None => {
+                return Err(format!(
+                    "a record in {} cannot be read; revoke or remove it before allowing another",
+                    dir.display()
+                ));
+            }
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -477,14 +496,27 @@ pub fn prune(parent: &str, listed: &[PathBuf]) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// This project's own production filesystem, ext4 — not
-    /// `std::env::temp_dir()` (`/tmp` here is tmpfs). `a_recreated_directory_does_not_resolve`
-    /// and `a_symlink_to_a_fresh_directory_does_not_resolve` need a real
+    /// A directory on this project's own production filesystem, ext4 — not
+    /// `std::env::temp_dir()` (`/tmp` is tmpfs on most hosts, including this
+    /// one). `a_recreated_directory_does_not_resolve` and
+    /// `a_symlink_to_a_fresh_directory_does_not_resolve` need a real
     /// recreate on the real filesystem roost actually runs on, because the
     /// whole point of this fix round is that tmpfs and ext4 disagree about
     /// inode reuse.
+    ///
+    /// `$HOME`, not a hardcoded path: a hardcoded `/home/claude/scratch/tmp`
+    /// does not exist on CI (GitHub's `ubuntu-latest` runners), so both
+    /// tests would panic in setup there rather than ever running — the
+    /// first version of this helper shipped exactly that break. `$HOME`
+    /// sits on the ext4 root on both this host and GH runners; falling
+    /// back to `std::env::temp_dir()` only if `$HOME` is unset is a
+    /// courtesy for some other environment this is run in, not a
+    /// correctness requirement — the assertions below hold on any
+    /// filesystem, so a fallback onto tmpfs does not make the test lie, it
+    /// only means this one run didn't get to probe ext4's inode reuse.
     fn ext4_tempdir() -> tempfile::TempDir {
-        tempfile::Builder::new().prefix("outside-ext4-").tempdir_in("/home/claude/scratch/tmp").unwrap()
+        let base = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        tempfile::Builder::new().prefix("outside-ext4-").tempdir_in(base).unwrap()
     }
 
     /// Revert-checked: deleting the `if !crate::wtname::valid(name) { return
@@ -594,11 +626,13 @@ mod tests {
     /// this host's production filesystem, so without birth time in the
     /// comparison this would (almost always) wrongly resolve.
     ///
-    /// Revert-checked (same narrowing as the test above, same run): this
-    /// failed too — `assertion `left == right` failed: a recreated
-    /// directory must not resolve\n  left: Some(..)\n right: None` —
-    /// confirming the inode really was reused on this run, on real ext4.
-    /// Restored.
+    /// Revert-checked (same narrowing as the test above, same run; re-run
+    /// again after `ext4_tempdir` moved from a hardcoded path to `$HOME`):
+    /// this failed too — `assertion `left == right` failed: a recreated
+    /// directory must not resolve\n  left:
+    /// Some("/home/claude/outside-ext4-l41oMz/wt")\n right: None` —
+    /// confirming the inode really was reused on this run, on real ext4,
+    /// under `$HOME` specifically. Restored.
     #[test]
     fn a_recreated_directory_does_not_resolve() {
         let state = tempfile::tempdir().unwrap();
@@ -619,11 +653,13 @@ mod tests {
     /// so this is not merely "symlink elsewhere," it is the specific case
     /// where `(dev, ino)` alone would have matched by coincidence.
     ///
-    /// Revert-checked (same narrowing, same run, as the two tests above):
-    /// this failed too — `assertion `left == right` failed: a symlink to a
-    /// freshly made directory must not resolve\n  left: Some(..)\n right:
-    /// None` — confirming `other` really did reuse `wt`'s inode on this
-    /// run. Restored.
+    /// Revert-checked (same narrowing, same run, as the two tests above;
+    /// re-run again under `$HOME` after `ext4_tempdir` stopped hardcoding
+    /// a path): this failed too — `assertion `left == right` failed: a
+    /// symlink to a freshly made directory must not resolve\n  left:
+    /// Some("/home/claude/outside-ext4-aRj2c5/wt")\n right: None` —
+    /// confirming `other` really did reuse `wt`'s inode on this run, under
+    /// `$HOME`. Restored.
     #[test]
     fn a_symlink_to_a_fresh_directory_does_not_resolve() {
         let state = tempfile::tempdir().unwrap();
@@ -918,6 +954,40 @@ mod tests {
 
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err(), "an unlistable records directory must refuse the allow, got {result:?}");
+    }
+
+    /// Distinct from the test above: there, the whole directory was
+    /// unreadable. Here the directory itself is fine — `read_dir` and the
+    /// cap/dedupe loop both succeed — but one entry inside it is a
+    /// present, validly-named, but damaged record. Silently skipping it (as
+    /// `list_result_in` used to) would let `wt2` get a *second* name, since
+    /// the damaged entry counts toward neither the cap nor the dedupe.
+    ///
+    /// Revert-checked: replacing the `match read_in(..) { .. None => return
+    /// Err(..) }` arm with the old `if let Some(rec) = read_in(..) {
+    /// out.push(rec); }` (silently skipping the damaged entry) made this
+    /// fail — `unwrap_err()` panicked with `called Result::unwrap_err() on
+    /// an Ok value: Record { name: "wt2", path: "…/wt2", id: (..) }`.
+    /// Restored.
+    #[test]
+    fn a_damaged_record_blocks_further_allows() {
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let wt = outside.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        allow_in(state.path(), "p", &wt).unwrap();
+
+        let dir = dir_in(state.path(), "p").unwrap();
+        std::fs::write(dir.join("ghost"), "not even close to a record\n").unwrap();
+
+        let wt2 = outside.path().join("wt2");
+        std::fs::create_dir(&wt2).unwrap();
+        let err = allow_in(state.path(), "p", &wt2).unwrap_err();
+        assert!(err.contains("cannot be read"), "got {err:?}");
+        assert!(
+            dir.join("wt2").symlink_metadata().is_err(),
+            "the refused allow must not have written a second record"
+        );
     }
 
     /// Revert-checked: dropping the `..`-segment check in `dir_in` (keeping
