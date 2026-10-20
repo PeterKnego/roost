@@ -28,7 +28,7 @@
   - the name passes `wtname::check`.
 - No other code writes records. That includes project config and anything read from a repository.
 - Record files are written with a `wsstate::tmp_suffix()` temp file, `OpenOptions::create_new` + `mode(0o600)`, then `rename`.
-- Record format: line 1 is the canonical path, line 2 is `dev ino`. Anything else is damaged, and a damaged record is `None`.
+- Record format: line 1 is the canonical path, line 2 is `dev ino btime_secs btime_nsec`. Anything else is damaged, and a damaged record is `None`; an unreadable birth time refuses the allow and fails the resolve.
 
 **Revocation**
 - Losing access fails closed. Revocation deletes only the record. It never touches sessions, layout, `.base` or `.origin`.
