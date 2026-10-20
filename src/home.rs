@@ -134,11 +134,12 @@ pub fn upgrade_identity_in(state: &Path, home: &str, name: &str, owner_dir: &Pat
     Ok(true)
 }
 
-pub fn forget_identity(home: &str, name: &str) {
+pub fn forget_identity_in(state: &Path, home: &str, name: &str) {
     if crate::session::valid_name(name) {
-        let _ = std::fs::remove_file(identity_path(&crate::wsstate::state_dir(), home, name));
+        let _ = std::fs::remove_file(identity_path(state, home, name));
     }
 }
+pub fn forget_identity(home: &str, name: &str) { forget_identity_in(&crate::wsstate::state_dir(), home, name) }
 pub fn record_identity(home: &str, name: &str, owner_dir: &Path) -> Result<(), String> {
     record_identity_in(&crate::wsstate::state_dir(), home, name, owner_dir)
 }
@@ -511,7 +512,7 @@ pub fn follow_move_in(
                 // Every writer of a record writes its target's identity; one
                 // that cannot be read leaves none rather than a stale one.
                 if let Err(e) = record_identity_in(state, &home, &name, new_dir) {
-                    let _ = std::fs::remove_file(identity_path(state, &home, &name));
+                    forget_identity_in(state, &home, &name);
                     eprintln!("roost: {home}/{name} followed {old_url} to {new_url}, but its identity was not recorded: {e}");
                 }
             }

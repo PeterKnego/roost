@@ -603,22 +603,14 @@ fn follow_gone_owner_inner(home: &str, name: &str, owner: &str, procs: &[ClaudeP
             return GoneOwner::NotMoved;
         }
     };
-    let out = rewrite_owner(home, name, owner, &to, &new_dir);
-    if out == GoneOwner::Followed {
-        // Only into a key directory that already exists — one that never had
-        // a session has nothing a `.moved-to` could widen — and only when
-        // the directory found is the key's *own*: `.moved-to` says where the
-        // key's directory went, and one record's evidence about an occupant
-        // must not redirect the key's earlier-followed sessions to it.
-        let key_dir = crate::registry::key_dir_of(owner);
-        let own = matches!(crate::registry::recorded_identity(&key_dir), Some(crate::dirid::Stored::Full(k)) if k == id);
-        if own && std::fs::symlink_metadata(&key_dir).is_ok_and(|m| m.is_dir()) {
-            if let Err(e) = crate::registry::write_moved_to(&key_dir, &to) {
-                eprintln!("roost: {owner} was renamed to {to}, but its .moved-to was not written: {e}");
-            }
-        }
-    }
-    out
+    // No `.moved-to` is written here. A key holding live sockets is
+    // reconcile's to record, and recording it fresh is what makes that pass
+    // announce the rename and retarget the hub's known worktrees — a marker
+    // written first by this sweep (which ticks every 3 s, so usually wins)
+    // turned that pass non-fresh. A key holding none has its `.moved-to`
+    // removed by the next reconcile anyway (spec §5 "Cleanup"). The record
+    // itself carries everything a later follow of it needs: its identity.
+    rewrite_owner(home, name, owner, &to, &new_dir)
 }
 
 /// The rewrite half of [`follow_gone_owner`]: compare, then write, as R18's
@@ -1915,6 +1907,35 @@ mod tests {
         assert_eq!(suspended, crate::home::Owner::Elsewhere(b.clone()), "an unreadable cwd keeps the record this tick");
         assert_eq!(no_claude, crate::home::Owner::Here, "with no Claude and no directory, the record is forgotten");
         assert_eq!(forgotten, crate::home::Owner::Here, "and so is the first, once nothing is left to look at");
+    }
+
+    /// #183 §1: a followed record whose new identity cannot be recorded is
+    /// still rewritten, but carries no `.ino` rather than the old one — it
+    /// can never be followed again on a stale identity. `record_identity`
+    /// errs for a directory that is not there, which is the seam.
+    ///
+    /// Revert-checked, run and restored: with `rewrite_owner`'s
+    /// `forget_identity` on that branch removed, fails "the old identity is
+    /// gone, not left standing" — left `Ok(Some(Full(DirId { .. })))`.
+    #[test]
+    fn a_rewrite_whose_identity_cannot_be_read_leaves_no_ino() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let home = "r183-noid-home";
+        let owner = format!("{home}/.claude/worktrees/worktree-a");
+        let to = format!("{home}/.claude/worktrees/worktree-b");
+        let some_dir = tempfile::tempdir().unwrap();
+        crate::home::record(home, "term3", &owner).unwrap();
+        crate::home::record_identity(home, "term3", some_dir.path()).unwrap();
+        let out = rewrite_owner(home, "term3", &owner, &to, std::path::Path::new("/nonexistent"));
+        let got = crate::home::owner_of(home, "term3");
+        let id = crate::home::identity_of(home, "term3");
+        std::env::remove_var("ROOST_STATE_DIR");
+
+        assert_eq!(out, GoneOwner::Followed);
+        assert_eq!(got, crate::home::Owner::Elsewhere(to), "the record is rewritten");
+        assert_eq!(id, Ok(None), "the old identity is gone, not left standing");
     }
 
     /// The identity walk keeps CLAUDE.md's third outcome: an ancestor of the
