@@ -93,16 +93,25 @@ fn birth(md: &std::fs::Metadata) -> Result<(i64, u32), String> {
     }
 }
 
+/// The identity from metadata already in hand — for a caller that also
+/// needs the metadata's own `(dev, ino)` when the birth time turns out to be
+/// unreadable (`registry`'s scans compare a `Legacy` record against it).
+/// `Err` only for an unreadable birth time; there is no fallback.
+#[cfg(unix)]
+pub fn of_metadata(md: &std::fs::Metadata) -> Result<DirId, String> {
+    use std::os::unix::fs::MetadataExt;
+    let (bsec, bnsec) = birth(md)?;
+    Ok(DirId { dev: md.dev(), ino: md.ino(), bsec, bnsec })
+}
+
 #[cfg(unix)]
 fn id_from(result: std::io::Result<std::fs::Metadata>) -> Result<Option<DirId>, String> {
-    use std::os::unix::fs::MetadataExt;
     let md = match result {
         Ok(md) => md,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.to_string()),
     };
-    let (bsec, bnsec) = birth(&md)?;
-    Ok(Some(DirId { dev: md.dev(), ino: md.ino(), bsec, bnsec }))
+    of_metadata(&md).map(Some)
 }
 
 #[cfg(not(unix))]

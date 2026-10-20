@@ -374,7 +374,14 @@ pub(crate) fn record_move_with(
             say(format!("roost: not reaping {key} — its directory is gone, but whether it was moved cannot be told from its sessions' shells"));
             return MoveRecord::CannotTell;
         }
-        MoveEvidence::Moved(d) => d,
+        MoveEvidence::Moved { dir, legacy: true } => {
+            say(format!(
+                "roost: not reaping {key} — its directory was moved to {}, not deleted; matched only by a pre-birth-time identity, not following",
+                dir.display()
+            ));
+            return MoveRecord::Unfollowable;
+        }
+        MoveEvidence::Moved { dir, legacy: false } => dir,
     };
     // #178: a live shell is still inside the same directory under another
     // name. Followed only when that name is a project under the roots.
@@ -414,13 +421,13 @@ pub(crate) fn record_move_with(
 }
 
 /// Whether a shell of the session at `sock` is working inside `dir` (its
-/// cwd's ancestry reaches `dir`'s `(dev, ino)`). Anything that cannot be
-/// read is "no": this only ever licenses writing a record.
+/// cwd's ancestry reaches `dir`'s full identity, birth time included).
+/// Anything that cannot be read is "no": this only ever licenses writing a
+/// record.
 #[cfg(unix)]
 fn shell_inside(sock: &std::path::Path, snapshot: &[(u32, String)], proc_root: &std::path::Path, dir: &std::path::Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(d) = std::fs::metadata(dir) else { return false };
-    let id = (d.dev(), d.ino());
+    let Ok(Some(id)) = crate::dirid::of(dir) else { return false };
+    let id = crate::dirid::Stored::Full(id);
     let own = match crate::procsess::session_of(proc_root, std::process::id()) {
         crate::procsess::Sid::In(s) => Some(s),
         _ => None,
@@ -428,7 +435,7 @@ fn shell_inside(sock: &std::path::Path, snapshot: &[(u32, String)], proc_root: &
     let Some(shells) = crate::procsess::target_sessions(proc_root, &pids_holding(snapshot, sock), own) else { return false };
     shells.iter().any(|shell| {
         let Ok(cwd) = std::fs::read_link(proc_root.join(shell.to_string()).join("cwd")) else { return false };
-        cwd.ancestors().any(|p| std::fs::symlink_metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == id))
+        cwd.ancestors().any(|p| std::fs::symlink_metadata(p).is_ok_and(|m| hit(std::slice::from_ref(&id), &m) == Hit::Full))
     })
 }
 
@@ -443,7 +450,7 @@ fn shell_inside(_sock: &std::path::Path, _snapshot: &[(u32, String)], _proc_root
 /// there is no evidence; one that cannot be looked at, or a `ps` that cannot
 /// be trusted, is "cannot tell".
 pub(crate) fn record_move(roots: &[PathBuf], old_url: &str) -> MoveRecord {
-    let key_dir = sock_root().join(crate::projects::storage_key(old_url));
+    let key_dir = key_dir_of(old_url);
     match std::fs::symlink_metadata(&key_dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return MoveRecord::NoEvidence,
         Err(_) => return MoveRecord::CannotTell,
@@ -471,27 +478,86 @@ fn parse_moved_to(bytes: &[u8]) -> Option<String> {
     Some(s.to_string())
 }
 
-/// The recorded `(device, inode)` of the key's directory (`.origin-ino`).
-fn recorded_identity(key_dir: &std::path::Path) -> Option<(u64, u64)> {
+/// `sock/<key>/` for a project URL — where its sockets and markers live.
+pub(crate) fn key_dir_of(url: &str) -> PathBuf {
+    sock_root().join(crate::projects::storage_key(url))
+}
+
+/// The recorded identity of the key's directory (`.origin-ino`): `Full`, or
+/// `Legacy` from a roost that predates birth time (#183). `None` for a
+/// missing, unreadable or damaged marker — every caller treats all three as
+/// "no identity", which only ever withholds evidence.
+pub(crate) fn recorded_identity(key_dir: &std::path::Path) -> Option<crate::dirid::Stored> {
     identity_at(&origin_identity_path(key_dir))
 }
 
-fn identity_at(path: &std::path::Path) -> Option<(u64, u64)> {
+/// A one-identity marker. A second non-blank line makes it damaged rather
+/// than silently read as its first: `parse_line` splits on whitespace, so
+/// two two-field lines would otherwise read as one four-field identity.
+fn identity_at(path: &std::path::Path) -> Option<crate::dirid::Stored> {
     let s = std::fs::read_to_string(path).ok()?;
-    let mut it = s.split_whitespace();
-    Some((it.next()?.parse::<u64>().ok()?, it.next()?.parse::<u64>().ok()?))
+    let mut lines = s.lines().filter(|l| !l.trim().is_empty());
+    let first = lines.next()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    crate::dirid::parse_line(first)
+}
+
+/// `.occupant-ino`'s identities, oldest first. A damaged line contributes
+/// nothing — the same as a damaged single-slot marker did before #183 — and
+/// an unreadable file contributes nothing either.
+fn occupants(key_dir: &std::path::Path) -> Vec<crate::dirid::Stored> {
+    std::fs::read_to_string(occupant_identity_path(key_dir))
+        .map(|s| s.lines().filter_map(crate::dirid::parse_line).collect())
+        .unwrap_or_default()
 }
 
 /// Every directory identity the key's live sessions may be working in: the
-/// recorded one, and an occupant's while a new directory holds the old
-/// name. Empty means no evidence can be had at all.
-fn identities(key_dir: &std::path::Path) -> Vec<(u64, u64)> {
-    recorded_identity(key_dir).into_iter().chain(identity_at(&occupant_identity_path(key_dir))).collect()
+/// recorded one, and every occupant's that held the old name while a
+/// `.moved-to` lived (#183 §3 — a list, so a third directory cannot erase a
+/// second's). Empty means no evidence can be had at all.
+pub(crate) fn identities(key_dir: &std::path::Path) -> Vec<crate::dirid::Stored> {
+    recorded_identity(key_dir).into_iter().chain(occupants(key_dir)).collect()
+}
+
+/// How a directory matches a key's identities. `Weak` is a match made on
+/// `(dev, ino)` alone — a `Legacy` record, or a `Full` one against a
+/// directory whose birth time cannot be read. It protects from the reap
+/// exactly as a match did before #183, and never licenses a follow: ext4
+/// hands a freed inode to the next directory made, so two fields cannot say
+/// *which* directory was found (`dirid`'s module doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Hit {
+    No,
+    Weak,
+    Full,
+}
+
+#[cfg(unix)]
+fn hit(ids: &[crate::dirid::Stored], md: &std::fs::Metadata) -> Hit {
+    use std::os::unix::fs::MetadataExt;
+    let full = crate::dirid::of_metadata(md).ok();
+    let same_inode = |dev: u64, ino: u64| dev == md.dev() && ino == md.ino();
+    ids.iter()
+        .map(|s| match (*s, full) {
+            (crate::dirid::Stored::Full(_), Some(id)) if crate::dirid::matches(s, &id) => Hit::Full,
+            (crate::dirid::Stored::Full(f), None) if same_inode(f.dev, f.ino) => Hit::Weak,
+            (crate::dirid::Stored::Legacy { dev, ino }, _) if same_inode(dev, ino) => Hit::Weak,
+            _ => Hit::No,
+        })
+        .max()
+        .unwrap_or(Hit::No)
+}
+
+/// `Moved` for a hit — `legacy` when it was only `Weak`.
+fn moved(dir: PathBuf, h: Hit) -> MoveEvidence {
+    MoveEvidence::Moved { dir, legacy: h == Hit::Weak }
 }
 
 /// What the key's own `.moved-to` says, checked against the directory
-/// itself: `Some(Moved(dir))` when it names a URL resolving to a directory
-/// with the key's recorded `(dev, ino)` — the directory followed earlier is
+/// itself: `Some(Moved { dir, .. })` when it names a URL resolving to a
+/// directory carrying one of the key's identities — the one followed earlier is
 /// still alive there, whatever its shells' cwds are now. `Some(CannotTell)`
 /// when the record or that directory cannot be read. `None` — no record,
 /// no identity, the URL gone, or a different directory there — hands the
@@ -502,7 +568,6 @@ fn identities(key_dir: &std::path::Path) -> Vec<(u64, u64)> {
 /// SIGKILLs a session that is working in a directory that exists.
 #[cfg(unix)]
 fn moved_to_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> Option<MoveEvidence> {
-    use std::os::unix::fs::MetadataExt;
     let ids = identities(key_dir);
     if ids.is_empty() {
         return None;
@@ -517,8 +582,10 @@ fn moved_to_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> Option<Mov
     let Some(url) = parse_moved_to(&raw) else { return Some(MoveEvidence::CannotTell) };
     if let Some(dir) = crate::projects::resolve_project(roots, &url) {
         return match std::fs::symlink_metadata(&dir) {
-            Ok(m) if ids.contains(&(m.dev(), m.ino())) => Some(MoveEvidence::Moved(dir)),
-            Ok(_) => None,
+            Ok(m) => match hit(&ids, &m) {
+                Hit::No => None,
+                h => Some(moved(dir, h)),
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => Some(MoveEvidence::CannotTell),
         };
@@ -532,7 +599,7 @@ fn moved_to_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> Option<Mov
         match std::fs::symlink_metadata(r.join(&url)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Some(MoveEvidence::CannotTell),
-            Ok(m) if ids.contains(&(m.dev(), m.ino())) => return Some(MoveEvidence::CannotTell),
+            Ok(m) if hit(&ids, &m) != Hit::No => return Some(MoveEvidence::CannotTell),
             Ok(_) => {}
         }
     }
@@ -560,7 +627,6 @@ fn moved_to_evidence(_roots: &[PathBuf], _key_dir: &std::path::Path) -> Option<M
 #[cfg(unix)]
 fn sibling_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> MoveEvidence {
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
     let ids = identities(key_dir);
     if ids.is_empty() {
         return MoveEvidence::None;
@@ -575,6 +641,9 @@ fn sibling_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> MoveEvidenc
     }
     parents.sort();
     parents.dedup();
+    // A full match wins over a weak one wherever each was found: the weak
+    // one protects, but only the full one can be followed.
+    let mut weak: Option<PathBuf> = None;
     for parent in &parents {
         let entries = match std::fs::read_dir(parent) {
             Ok(rd) => rd,
@@ -585,12 +654,17 @@ fn sibling_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> MoveEvidenc
             let Ok(entry) = entry else { return MoveEvidence::CannotTell };
             let path = entry.path();
             match std::fs::symlink_metadata(&path) {
-                Ok(m) if m.is_dir() && ids.contains(&(m.dev(), m.ino())) => {
-                    return match path.canonicalize() {
-                        Ok(dir) => MoveEvidence::Moved(dir),
-                        Err(_) => MoveEvidence::CannotTell,
-                    };
-                }
+                Ok(m) if m.is_dir() => match hit(&ids, &m) {
+                    Hit::No => {}
+                    Hit::Weak if weak.is_some() => {}
+                    h => {
+                        let Ok(dir) = path.canonicalize() else { return MoveEvidence::CannotTell };
+                        if h == Hit::Full {
+                            return moved(dir, h);
+                        }
+                        weak = Some(dir);
+                    }
+                },
                 Ok(_) => {}
                 // Renamed or removed between the listing and the stat.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -598,7 +672,7 @@ fn sibling_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> MoveEvidenc
             }
         }
     }
-    MoveEvidence::None
+    weak.map_or(MoveEvidence::None, |dir| moved(dir, Hit::Weak))
 }
 
 #[cfg(not(unix))]
@@ -1058,8 +1132,9 @@ fn write_origin(key_dir: &std::path::Path, dir: &std::path::Path) {
     if occupied_by_another(key_dir, dir) {
         // Its identity goes in a sidecar of its own instead, so that a
         // rename of *this* directory is still told from its delete (the
-        // sweep matches shells against either identity).
-        write_identity_at(&occupant_identity_path(key_dir), key_dir, dir);
+        // sweep matches shells against every identity). Appended: an
+        // earlier occupant's renamed sessions still need theirs.
+        let _ = append_occupant(key_dir, dir);
         return;
     }
     // First, not after the unchanged-marker return below: a project whose
@@ -1094,7 +1169,8 @@ fn write_origin(key_dir: &std::path::Path, dir: &std::path::Path) {
     }
 }
 
-/// The project directory's `(device, inode)`, kept beside `.origin` (#178).
+/// The project directory's identity, kept beside `.origin` (#178): `dev ino
+/// btime_secs btime_nsec` since #183, two fields before it (`dirid`).
 ///
 /// `.origin` alone cannot tell "deleted" from "moved": both leave the recorded
 /// path `NotFound`. The inode can — a rename keeps it, a delete destroys it —
@@ -1105,11 +1181,12 @@ fn origin_identity_path(key_dir: &std::path::Path) -> std::path::PathBuf {
     key_dir.join(".origin-ino")
 }
 
-/// The identity of a *different* directory occupying a renamed key's old
-/// name (#158 §5, I2): the key's sessions now fall in two groups — the
-/// followed ones, in the renamed directory (`.origin-ino`), and the
-/// occupant's own (this). Written only while `.moved-to` lives, and removed
-/// with it.
+/// The identities of *different* directories occupying a renamed key's old
+/// name (#158 §5, I2; a list since #183): the key's sessions now fall in
+/// groups — the followed ones, in the renamed directory (`.origin-ino`), and
+/// each occupant's own (this, one identity per line, oldest first, at most
+/// `OCCUPANT_CAP`). Written only while `.moved-to` lives, and removed with
+/// it.
 fn occupant_identity_path(key_dir: &std::path::Path) -> std::path::PathBuf {
     key_dir.join(".occupant-ino")
 }
@@ -1121,35 +1198,63 @@ fn remove_moved_to(key_dir: &std::path::Path) {
     let _ = std::fs::remove_file(occupant_identity_path(key_dir));
 }
 
+/// How many occupant identities `.occupant-ino` keeps (#183 §3). Each is a
+/// different directory made at a renamed key's old name while its
+/// `.moved-to` lived; eight is far past anything seen, and the bound keeps a
+/// loop that keeps recreating the directory from growing the file forever.
+pub(crate) const OCCUPANT_CAP: usize = 8;
+
+/// Appends `dir`'s identity to `.occupant-ino` unless it is already listed,
+/// dropping the oldest past `OCCUPANT_CAP`. Returns the cap's log line when
+/// one was dropped (also printed), so the drop is testable.
+///
+/// Appends, never overwrites: one slot let a third directory at the old
+/// name erase the second's identity, and that occupant's renamed sessions
+/// were reaped as a delete (#183 chain c). A file that exists but cannot be
+/// read is left alone — rewriting it would erase exactly the identities this
+/// list exists to keep — and so is a directory whose identity cannot be read
+/// (no `(dev, ino)` fallback, `dirid`'s rule).
+fn append_occupant(key_dir: &std::path::Path, dir: &std::path::Path) -> Option<String> {
+    let Ok(Some(id)) = crate::dirid::of(dir) else { return None };
+    let path = occupant_identity_path(key_dir);
+    let mut lines: Vec<String> = match std::fs::read_to_string(&path) {
+        Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => return None,
+    };
+    if lines.iter().any(|l| crate::dirid::parse_line(l) == Some(crate::dirid::Stored::Full(id))) {
+        return None;
+    }
+    lines.push(crate::dirid::format(&id));
+    let mut said = None;
+    if lines.len() > OCCUPANT_CAP {
+        lines.drain(..lines.len() - OCCUPANT_CAP);
+        let key = key_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let msg = format!(
+            "roost: {key}'s .occupant-ino is at its cap of {OCCUPANT_CAP} identities; dropped the oldest to record {}",
+            dir.display()
+        );
+        eprintln!("{msg}");
+        said = Some(msg);
+    }
+    crate::dirid::write_lines(&path, &lines).ok()?;
+    said
+}
+
+/// Writes `.origin-ino` four-field (#183), and rewrites it when it differs —
+/// which is also what upgrades a two-field one from #178's roost on the next
+/// pass in which the directory resolves. A directory whose birth time cannot
+/// be read writes nothing and leaves whatever is there: a legacy identity
+/// still protects, and `dirid` never falls back to `(dev, ino)`.
 fn write_origin_identity(key_dir: &std::path::Path, dir: &std::path::Path) {
-    write_identity_at(&origin_identity_path(key_dir), key_dir, dir);
-}
-
-#[cfg(unix)]
-fn write_identity_at(marker: &std::path::Path, key_dir: &std::path::Path, dir: &std::path::Path) {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(m) = std::fs::metadata(dir) else { return };
-    let bytes = format!("{} {}\n", m.dev(), m.ino()).into_bytes();
-    if std::fs::read(marker).map(|cur| cur == bytes).unwrap_or(false) {
+    let Ok(Some(id)) = crate::dirid::of(dir) else { return };
+    let marker = origin_identity_path(key_dir);
+    let line = crate::dirid::format(&id);
+    if std::fs::read_to_string(&marker).is_ok_and(|cur| cur == format!("{line}\n")) {
         return;
     }
-    let leaf = marker.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = key_dir.join(format!("{leaf}.tmp.{}", crate::wsstate::tmp_suffix()));
-    if std::fs::write(&tmp, &bytes).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return;
-    }
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    if std::fs::rename(&tmp, marker).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let _ = crate::dirid::write_lines(&marker, &[line]);
 }
-
-#[cfg(not(unix))]
-fn write_identity_at(_marker: &std::path::Path, _key_dir: &std::path::Path, _dir: &std::path::Path) {}
 
 /// What a live shell says about a project whose recorded path is `NotFound`.
 ///
@@ -1161,8 +1266,11 @@ fn write_identity_at(_marker: &std::path::Path, _key_dir: &std::path::Path, _dir
 pub(crate) enum MoveEvidence {
     /// No evidence of a move (no identity recorded, or no shell inside it).
     None,
-    /// The recorded directory is alive at this absolute path.
-    Moved(std::path::PathBuf),
+    /// The recorded directory is alive at this absolute path. `legacy` when
+    /// it was matched on `(dev, ino)` alone (`Hit::Weak`): enough to keep a
+    /// session from the reap, never enough to follow it (#183 §3), so
+    /// `record_move_with` turns it into `Unfollowable`.
+    Moved { dir: std::path::PathBuf, legacy: bool },
     /// Could not tell (unnamed shell, unreadable cwd, unreadable key dir).
     CannotTell,
 }
@@ -1173,15 +1281,14 @@ pub(crate) enum MoveEvidence {
 ///
 /// The evidence is a live session's shell: its `/proc/<pid>/cwd` still resolves
 /// (not `… (deleted)`), and some directory on that path has the
-/// `(device, inode)` recorded for the project — that directory is the new
-/// path. A rename keeps the inode; a delete destroys it. No recorded identity
+/// identity recorded for the project — that directory is the new path. A
+/// rename keeps the inode and its birth time; a delete destroys them. No recorded identity
 /// (a marker from an older roost) is no evidence, and the sweep proceeds
 /// exactly as before. A shell roost cannot name, or a cwd it cannot read, is
 /// "cannot tell" and suspends the kill: a stale row is recoverable, a killed
 /// shell is not.
 #[cfg(unix)]
 pub(crate) fn move_evidence(key_dir: &std::path::Path, snapshot: &[(u32, String)], proc_root: &std::path::Path) -> MoveEvidence {
-    use std::os::unix::fs::MetadataExt;
     let ids = identities(key_dir);
     if ids.is_empty() {
         return MoveEvidence::None;
@@ -1191,6 +1298,9 @@ pub(crate) fn move_evidence(key_dir: &std::path::Path, snapshot: &[(u32, String)
         crate::procsess::Sid::In(s) => Some(s),
         _ => None,
     };
+    // As in `sibling_evidence`: a weak match is kept while a full one may
+    // still turn up under another shell.
+    let mut weak: Option<PathBuf> = None;
     for e in entries.flatten() {
         if e.file_name().to_string_lossy().starts_with('.') {
             continue;
@@ -1212,15 +1322,17 @@ pub(crate) fn move_evidence(key_dir: &std::path::Path, snapshot: &[(u32, String)
             let mut at = Some(cwd.as_path());
             while let Some(p) = at {
                 if let Ok(m) = std::fs::symlink_metadata(p) {
-                    if ids.contains(&(m.dev(), m.ino())) {
-                        return MoveEvidence::Moved(p.to_path_buf());
+                    match hit(&ids, &m) {
+                        Hit::Full => return moved(p.to_path_buf(), Hit::Full),
+                        Hit::Weak if weak.is_none() => weak = Some(p.to_path_buf()),
+                        _ => {}
                     }
                 }
                 at = p.parent();
             }
         }
     }
-    MoveEvidence::None
+    weak.map_or(MoveEvidence::None, |dir| moved(dir, Hit::Weak))
 }
 
 #[cfg(not(unix))]
@@ -1241,7 +1353,7 @@ pub(crate) fn move_evidence(_key_dir: &std::path::Path, _snapshot: &[(u32, Strin
 /// re-deriving it from a project string here would be a round trip through
 /// `decode_key`/`storage_key` for no gain.
 pub fn record_origin(project: &str, dir: &std::path::Path) {
-    let key_dir = sock_root().join(crate::projects::storage_key(project));
+    let key_dir = key_dir_of(project);
     let _ = std::fs::create_dir_all(&key_dir);
     write_origin(&key_dir, dir);
 }
@@ -1356,9 +1468,11 @@ fn confirmed_gone(key_dir: &std::path::Path, roots: &[PathBuf], url: &str) -> bo
 
 /// Whether `dir`, which the key's URL resolves to again, is *not* the
 /// directory the key's sessions followed: a `.moved-to` is present (or
-/// cannot be looked at) and `dir`'s `(dev, ino)` differs from the recorded
-/// one (or cannot be read). Every doubt answers yes — the answer only ever
-/// keeps a record; "no" is what deletes one.
+/// cannot be looked at) and `dir`'s identity differs from the recorded one
+/// (or cannot be read). Every doubt answers yes — the answer only ever
+/// keeps a record; "no" is what deletes one. A `Full` record needs a full
+/// match (a recreated directory reusing the inode is an occupant); a
+/// `Legacy` one compares `(dev, ino)`, exactly as before #183.
 fn occupied_by_another(key_dir: &std::path::Path, dir: &std::path::Path) -> bool {
     match std::fs::symlink_metadata(moved_to_marker_path(key_dir)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
@@ -1367,11 +1481,14 @@ fn occupied_by_another(key_dir: &std::path::Path, dir: &std::path::Path) -> bool
     let Some(recorded) = recorded_identity(key_dir) else { return false };
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        match std::fs::metadata(dir) {
-            Ok(m) => (m.dev(), m.ino()) != recorded,
-            Err(_) => true,
-        }
+        let same = match std::fs::metadata(dir) {
+            Ok(m) => match recorded {
+                crate::dirid::Stored::Full(_) => hit(&[recorded], &m) == Hit::Full,
+                crate::dirid::Stored::Legacy { .. } => hit(&[recorded], &m) == Hit::Weak,
+            },
+            Err(_) => false,
+        };
+        !same
     }
     #[cfg(not(unix))]
     {
@@ -3517,7 +3634,7 @@ mod tests {
             let snap = process_snapshot().expect("ps");
             assert_eq!(
                 move_evidence(&sock_dir, &snap, std::path::Path::new("/proc")),
-                MoveEvidence::Moved(moved_to.canonicalize().unwrap()),
+                MoveEvidence::Moved { dir: moved_to.canonicalize().unwrap(), legacy: false },
             );
             kill_test_pids(&sock_path);
         });
@@ -4334,6 +4451,243 @@ mod tests {
             assert!(alive, "its master is alive");
             assert_eq!(owner, crate::home::Owner::Elsewhere(d.into()), "it follows D");
             assert!(owned_d.contains(&("own".to_string(), Some(a.to_string()))), "D lists it: {owned_d:?}");
+        });
+    }
+
+    /// `$HOME`-based, for the tests below where inode reuse is the subject:
+    /// this host's `/tmp` is tmpfs, and the reuse `dirid` exists for is an
+    /// ext4 property (see `dirid`'s module doc).
+    fn ext4_tempdir() -> tempfile::TempDir {
+        let base = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        tempfile::Builder::new().prefix("registry-ext4-").tempdir_in(base).unwrap()
+    }
+
+    /// The parsed lines of a key's `.occupant-ino`, damaged ones as `None`.
+    fn occupant_lines(key_dir: &std::path::Path) -> Vec<Option<crate::dirid::Stored>> {
+        fs::read_to_string(occupant_identity_path(key_dir))
+            .unwrap_or_default()
+            .lines()
+            .map(crate::dirid::parse_line)
+            .collect()
+    }
+
+    fn full_id(dir: &std::path::Path) -> crate::dirid::Stored {
+        crate::dirid::Stored::Full(crate::dirid::of(dir).unwrap().expect("the directory exists"))
+    }
+
+    /// #183 §3: `.origin-ino` carries birth time. A new key's attach writes
+    /// the four-field form, and a two-field one from #178's roost is
+    /// rewritten four-field on the next pass in which the directory
+    /// resolves (and is not an occupant) — the upgrade Review Focus 3
+    /// needs on the deploy host, where every `.origin-ino` is two-field.
+    ///
+    /// Revert-checked, run and restored: with `write_origin_identity`
+    /// writing `dev ino` only, fails "a new key's .origin-ino is four-field"
+    /// (left `"64512 9730149\n"`); with its unchanged-check accepting any
+    /// `matches` (so a matching legacy line is left alone), fails "a legacy
+    /// .origin-ino is upgraded on the next resolving pass", left the same
+    /// two-field line. Before the implementation, failed the first.
+    #[test]
+    fn origin_ino_is_written_four_field_and_upgrades_a_legacy_one() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let project_dir = root.path().join("fourproj");
+            fs::create_dir_all(&project_dir).unwrap();
+            let key_dir = state.join("sock/fourproj");
+            let want = format!("{}\n", crate::dirid::format(&crate::dirid::of(&project_dir).unwrap().unwrap()));
+
+            record_origin("fourproj", &project_dir);
+            let fresh = fs::read_to_string(origin_identity_path(&key_dir)).unwrap();
+
+            use std::os::unix::fs::MetadataExt;
+            let m = fs::metadata(&project_dir).unwrap();
+            fs::write(origin_identity_path(&key_dir), format!("{} {}\n", m.dev(), m.ino())).unwrap();
+            assert!(
+                matches!(recorded_identity(&key_dir), Some(crate::dirid::Stored::Legacy { .. })),
+                "setup: a legacy identity is recorded"
+            );
+            let _ = reconcile(&[root.path().to_path_buf()]);
+            let upgraded = fs::read_to_string(origin_identity_path(&key_dir)).unwrap();
+
+            assert_eq!(fresh, want, "a new key's .origin-ino is four-field");
+            assert_eq!(upgraded, want, "a legacy .origin-ino is upgraded on the next resolving pass");
+        });
+    }
+
+    /// #183 §3: occupants are a list. Each new occupant's identity is
+    /// appended, one already listed is not appended twice, and the list
+    /// holds at most `OCCUPANT_CAP`: the ninth drops the oldest and says so,
+    /// naming the cap. On ext4, so nine directories made in a row are real
+    /// distinct identities rather than a tmpfs artefact.
+    ///
+    /// Revert-checked, run and restored: `append_occupant` ignoring the
+    /// existing lines (the old overwrite) fails "nine occupants leave the
+    /// newest eight", left one entry; the `drain` removed fails the same
+    /// assertion with nine entries, the oldest still first; the dedup check
+    /// disabled fails it too (the newest appended twice, a second cap line
+    /// logged).
+    #[test]
+    fn the_occupant_list_appends_and_caps() {
+        with_state(|state| {
+            let base = ext4_tempdir();
+            let key_dir = state.join("sock/capproj");
+            fs::create_dir_all(&key_dir).unwrap();
+            let dirs: Vec<PathBuf> = (0..9)
+                .map(|i| {
+                    let d = base.path().join(format!("occ{i}"));
+                    fs::create_dir(&d).unwrap();
+                    d
+                })
+                .collect();
+            let said: Vec<Option<String>> = dirs.iter().map(|d| append_occupant(&key_dir, d)).collect();
+            let again = append_occupant(&key_dir, &dirs[8]);
+            let lines = occupant_lines(&key_dir);
+
+            let want: Vec<Option<crate::dirid::Stored>> = dirs[1..].iter().map(|d| Some(full_id(d))).collect();
+            assert_eq!(OCCUPANT_CAP, 8);
+            assert_eq!(lines, want, "nine occupants leave the newest eight, the oldest dropped");
+            assert!(said[..8].iter().all(Option::is_none), "nothing is dropped below the cap: {said:?}");
+            let cap_line = said[8].as_deref().unwrap_or_default();
+            assert!(cap_line.contains("cap of 8"), "the drop is logged, naming the cap: {cap_line:?}");
+            assert_eq!(again, None, "an occupant already listed is not appended twice");
+        });
+    }
+
+    /// #183 §3: an `.occupant-ino` written before the list — one line, two
+    /// fields — reads as a one-entry list holding a `Legacy` identity, after
+    /// the origin's.
+    ///
+    /// Revert-checked, run and restored: with `identities` dropping the
+    /// occupant lines (`.take(0)`), fails with only the origin's identity.
+    #[test]
+    fn an_existing_single_occupant_line_is_a_one_entry_list() {
+        with_state(|state| {
+            let base = ext4_tempdir();
+            let key_dir = state.join("sock/oneocc");
+            fs::create_dir_all(&key_dir).unwrap();
+            write_origin_identity(&key_dir, base.path());
+            fs::write(occupant_identity_path(&key_dir), "64512 4242\n").unwrap();
+
+            assert_eq!(
+                identities(&key_dir),
+                vec![full_id(base.path()), crate::dirid::Stored::Legacy { dev: 64512, ino: 4242 }],
+            );
+        });
+    }
+
+    /// #183 chain (c), spec §3's testing bullet: A→B followed, an occupant
+    /// of A renamed to D and followed there, then a *third* directory made
+    /// at A and removed. With one slot, the third's identity overwrote the
+    /// occupant's, so when it went the D session had no identity left
+    /// anywhere — not at `.moved-to`'s D, not under its shell, not among A's
+    /// siblings — and was reaped as a delete. On ext4, so the third
+    /// directory may well reuse B's freed inode; birth time is what keeps it
+    /// from reading as "moved back".
+    ///
+    /// Revert-checked, run and restored: with `append_occupant` overwriting
+    /// (existing lines ignored, the single-slot behaviour), fails "the D
+    /// session survives the third directory's removal" — left 1, right 0,
+    /// logged "reaped session …/own — its recorded directory no longer
+    /// exists": the live master SIGKILLed. Before the implementation (the
+    /// old single slot), failed "occupant 1's identity is still listed".
+    #[test]
+    fn a_third_directory_does_not_erase_an_earlier_occupants_identity() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("ROOST_CMD");
+            let root = ext4_tempdir();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let repo = repo_with_worktree_a(root.path(), "thirdrepo");
+            let a = "thirdrepo/.claude/worktrees/worktree-a";
+            let b = "thirdrepo/.claude/worktrees/worktree-b";
+            let d = "thirdrepo/.claude/worktrees/worktree-d";
+            let sock_dir = state.join("sock").join(crate::projects::storage_key(a));
+            fs::create_dir_all(&sock_dir).unwrap();
+            let followed = sock_dir.join("shell");
+            spawn_detached_dtach_in(&followed, &repo.join(".claude/worktrees/worktree-a"))
+                .unwrap_or_else(|| panic!("dtach must be available for this test"));
+            let _ = reconcile(&roots);
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+            follow_moves(&reconcile(&roots).moved);
+            assert_eq!(crate::home::owner_of(a, "shell"), crate::home::Owner::Elsewhere(b.into()), "setup: followed to B");
+
+            git_in(&repo, &["worktree", "add", "-q", "-b", "worktree-a2", ".claude/worktrees/worktree-a"]);
+            let occupant = crate::projects::resolve_project(&roots, a).expect("setup: the new A resolves");
+            let own = sock_dir.join("own");
+            spawn_detached_dtach_in(&own, &occupant).unwrap_or_else(|| panic!("dtach must be available for this test"));
+            crate::registry::record_origin(a, &occupant); // the new session's attach
+            kill_test_pids(&followed);
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-d"]);
+            git_in(&repo, &["worktree", "remove", "--force", ".claude/worktrees/worktree-b"]);
+            follow_moves(&reconcile(&roots).moved);
+            let occ1 = full_id(&repo.join(".claude/worktrees/worktree-d"));
+            assert_eq!(crate::home::owner_of(a, "own"), crate::home::Owner::Elsewhere(d.into()), "setup: occupant 1 followed to D");
+
+            git_in(&repo, &["worktree", "add", "-q", "-b", "worktree-a3", ".claude/worktrees/worktree-a"]);
+            let third = crate::projects::resolve_project(&roots, a).expect("setup: the third A resolves");
+            let id3 = full_id(&third);
+            let while_third = reconcile(&roots);
+            follow_moves(&while_third.moved);
+            let listed = occupant_lines(&sock_dir);
+            git_in(&repo, &["worktree", "remove", "--force", ".claude/worktrees/worktree-a"]);
+            let after = reconcile(&roots);
+            follow_moves(&after.moved);
+            let alive = socket_has_process(&own);
+            let owner = crate::home::owner_of(a, "own");
+            kill_test_pids(&own);
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert_eq!(while_third.gone_projects, 0, "nothing reaped while the third directory stands");
+            assert_eq!(after.gone_projects, 0, "the D session survives the third directory's removal");
+            assert!(alive, "its master is alive");
+            assert_eq!(owner, crate::home::Owner::Elsewhere(d.into()), "and it is still owned by D");
+            assert!(listed.contains(&Some(occ1)), "occupant 1's identity is still listed: {listed:?}");
+            assert!(listed.contains(&Some(id3)), "and the third directory's beside it: {listed:?}");
+        });
+    }
+
+    /// Review Focus 3: a two-field `.origin-ino` (every one on the deploy
+    /// host today) still protects a renamed project's session from the reap
+    /// — the keep direction, exactly as before #183 — but never licenses a
+    /// follow: ext4 hands a freed inode straight to the next directory, so
+    /// `(dev, ino)` alone cannot say *which* directory it found. So the
+    /// rename is `Unfollowable`: no `.moved-to`, nothing in `moved`.
+    ///
+    /// Revert-checked, run and restored: with `moved()` never setting
+    /// `legacy` (a weak match licensing `Followable`), fails "a legacy-only
+    /// match is unfollowable" — got `Followable(Moved { new_url:
+    /// "legacy-renamed", fresh: true, .. })`. Same failure before the
+    /// implementation.
+    #[test]
+    fn a_legacy_origin_protects_but_never_licenses_a_follow() {
+        with_state(|state| {
+            let root = ext4_tempdir();
+            let roots = vec![root.path().to_path_buf()];
+            let project_dir = root.path().join("legacy-proj");
+            fs::create_dir_all(&project_dir).unwrap();
+            let sock_dir = state.join("sock/legacy-proj");
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            spawn_detached_dtach_in(&sock_path, &project_dir).unwrap_or_else(|| panic!("dtach must be available for this test"));
+            let _ = reconcile(&roots);
+            use std::os::unix::fs::MetadataExt;
+            let m = fs::metadata(&project_dir).unwrap();
+            fs::write(origin_identity_path(&sock_dir), format!("{} {}\n", m.dev(), m.ino())).unwrap();
+
+            fs::rename(&project_dir, root.path().join("legacy-renamed")).unwrap();
+            let snap = process_snapshot().expect("ps");
+            let got = record_move_with(&roots, "legacy-proj", &sock_dir, &snap, std::path::Path::new("/proc"), false);
+            let report = reconcile(&roots);
+            let alive = socket_has_process(&sock_path);
+            let moved_to = sock_dir.join(".moved-to").exists();
+            kill_test_pids(&sock_path);
+
+            assert!(matches!(got, MoveRecord::Unfollowable), "a legacy-only match is unfollowable: {got:?}");
+            assert_eq!(report.gone_projects, 0, "a legacy identity still protects from the reap");
+            assert!(alive, "the session's master is alive");
+            assert!(!moved_to, "no .moved-to is written on a legacy-only match");
+            assert!(report.moved.is_empty(), "nothing follows: {:?}", report.moved);
         });
     }
 
