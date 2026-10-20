@@ -347,8 +347,9 @@ fn replace_record(dir: &Path, name: &str, path: &Path, id: (u64, u64, u64, u64))
 fn allocate_and_link(dir: &Path, basename: &str, path: &Path, id: (u64, u64, u64, u64)) -> Result<String, String> {
     let tmp = dir.join(format!(".outside.{}.tmp", crate::wsstate::tmp_suffix()));
     write_body(&tmp, path, id)?;
-    let mut name = basename.to_string();
+    let base = name_base(basename);
     let mut n: u32 = 1;
+    let mut name = candidate(&base, n);
     let result = loop {
         if let Err(e) = crate::wtname::check(&name) {
             break Err(e);
@@ -360,13 +361,44 @@ fn allocate_and_link(dir: &Path, basename: &str, path: &Path, id: (u64, u64, u64
                 if n > 1000 {
                     break Err(format!("could not allocate a name for {}", path.display()));
                 }
-                name = format!("{basename}-{n}");
+                name = candidate(&base, n);
             }
             Err(e) => break Err(e.to_string()),
         }
     };
     let _ = std::fs::remove_file(&tmp);
     result
+}
+
+/// The name a basename is allowed under, before any `-N` suffix. Every byte
+/// outside `[A-Za-z0-9_-]` becomes `-` and a leading run that is not
+/// alphanumeric is trimmed, falling back to `wt` when nothing is left.
+///
+/// Sanitising rather than refusing, because the basename is the one thing
+/// the user cannot change: the directory is where a Claude is already
+/// working, and renaming it to suit roost breaks that Claude's path. A
+/// refusal here (`wt.v2`, a space, 33 characters) left an outside worktree
+/// with no way in at all. The name is only a URL segment and a record file
+/// name — the record still pins the real path by identity — so a lossy name
+/// costs nothing but a `-2` when two basenames sanitise alike.
+fn name_base(basename: &str) -> String {
+    let mapped: String = basename
+        .bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' { b as char } else { '-' })
+        .collect();
+    let trimmed = mapped.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+    if trimmed.is_empty() { "wt".into() } else { trimmed.into() }
+}
+
+/// The `n`th candidate for `base`: `base` itself, then `base-2`, `base-3`, …,
+/// with `base` truncated so the whole stays within `wtname`'s 32 bytes. The
+/// truncation is per candidate, so a 31- or 32-byte name that needs a `-2`
+/// still gets one instead of failing `wtname::check`. `base` is ASCII by
+/// construction (`name_base`), so slicing at a byte count is safe.
+fn candidate(base: &str, n: u32) -> String {
+    let suffix = if n == 1 { String::new() } else { format!("-{n}") };
+    let keep = base.len().min(32 - suffix.len());
+    format!("{}{suffix}", &base[..keep])
 }
 
 /// Allows `path` under `parent`: validates it, allocates a name, enforces
@@ -390,12 +422,12 @@ fn allocate_and_link(dir: &Path, basename: &str, path: &Path, id: (u64, u64, u64
 /// already chose once must not be blocked by a record of a directory that
 /// no longer exists.
 ///
-/// The name is the directory's basename, with `-2`, `-3`, … appended while
-/// that name is already in use for this parent (scoped to `parent`'s own
-/// directory, so the same basename is free again under a different parent).
-/// Each candidate must itself pass `wtname::check` — a basename of the wrong
-/// shape fails on the first try and no suffix will rescue it, since a
-/// leading character or length problem persists through every suffix.
+/// The name is the directory's basename sanitised by `name_base`, with
+/// `-2`, `-3`, … appended while that name is already in use for this parent
+/// (scoped to `parent`'s own directory, so the same basename is free again
+/// under a different parent). Each candidate still passes `wtname::check`
+/// as the final gate, so a sanitiser bug refuses rather than writing a name
+/// that lands in a URL or a socket path unchecked.
 #[cfg(unix)]
 pub fn allow_in(state: &Path, parent: &str, path: &Path) -> Result<Record, String> {
     use std::os::unix::fs::MetadataExt;
@@ -833,6 +865,53 @@ mod tests {
         let err = allow_in(state.path(), "p", &wt).unwrap_err();
         assert!(err.contains("UTF-8"), "got {err:?}");
         assert!(list_in(state.path(), "p").is_empty(), "nothing must have been written");
+    }
+
+    /// A basename `wtname` refuses is sanitised, not refused: the directory
+    /// is where a Claude already works, so renaming it to suit roost is no
+    /// way round. Each case writes a record that resolves to the real path.
+    ///
+    /// Revert-checked, four runs, each restored from a `cp` backup: (1) with
+    /// `name_base` replaced by the raw basename and `candidate` by the old
+    /// `{basename}-{n}`, fails at `wt.v2 is allowable: "worktree name
+    /// \"wt.v2\" must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$"`; (2) with
+    /// the sanitiser kept but no truncation, fails at `a 40-byte name is
+    /// allowable: "worktree name \"aaaa…(40)\" must match …"`; (3) with
+    /// truncation to 32 but no room left for the suffix, fails at `and so is
+    /// a second one: "worktree name \"aaaa…(32)-2\" must match …"`; (4)
+    /// with the `wt` fallback removed, fails at `a name of only symbols is
+    /// allowable: "worktree name \"\" must match …"`.
+    #[test]
+    fn a_basename_wtname_refuses_is_sanitised_into_a_name() {
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let dotted = outside.path().join("wt.v2");
+        std::fs::create_dir(&dotted).unwrap();
+        let rec = allow_in(state.path(), "p", &dotted).expect("wt.v2 is allowable");
+        assert_eq!(rec.name, "wt-v2");
+        assert_eq!(resolve_in(state.path(), "p", "wt-v2"), Some(dotted.canonicalize().unwrap()));
+
+        // 40 bytes: the first is truncated to 32, and a second directory
+        // whose name shares those 32 bytes still gets a distinct `-2` that
+        // fits — the 31/32-byte name that needs a suffix.
+        let long = "a".repeat(40);
+        let l1 = outside.path().join("x").join(&long);
+        let l2 = outside.path().join("y").join(&long);
+        std::fs::create_dir_all(&l1).unwrap();
+        std::fs::create_dir_all(&l2).unwrap();
+        let r1 = allow_in(state.path(), "p", &l1).expect("a 40-byte name is allowable");
+        let r2 = allow_in(state.path(), "p", &l2).expect("and so is a second one");
+        assert_eq!(r1.name, "a".repeat(32));
+        assert_eq!(r2.name, format!("{}-2", "a".repeat(30)));
+        assert_eq!(resolve_in(state.path(), "p", &r2.name), Some(l2.canonicalize().unwrap()));
+
+        // Nothing usable left after trimming: the fallback.
+        let symbols = outside.path().join("._+.");
+        std::fs::create_dir(&symbols).unwrap();
+        let rs = allow_in(state.path(), "p", &symbols).expect("a name of only symbols is allowable");
+        assert_eq!(rs.name, "wt");
+        assert_eq!(resolve_in(state.path(), "p", "wt"), Some(symbols.canonicalize().unwrap()));
     }
 
     /// Revert-checked: replacing `std::fs::hard_link` with `std::fs::rename`

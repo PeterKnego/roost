@@ -83,19 +83,19 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   roots only through a roost-written allow record at
   `state/outside/<parent key>/<name>`, written after a user confirms, on
   git's own listing of the path as a worktree of a project under the roots.
-  `projects::resolve_project_with`'s first arm (`src/projects.rs:252-266`)
+  `projects::resolve_project_with`'s first arm (the `/.claude/outside/` one)
   decides this shape exhaustively and hands it to `outside::resolve`
-  (`src/outside.rs:184-193`) before any of the ordinary checks run; nothing
+  (`outside::resolve_in`) before any of the ordinary checks run; nothing
   with the outside segment ever falls through to try the literal path on
   disk. The identity it checks is three-part — `(dev, ino, birth time)`, not
   just `(dev, ino)` — because a probe of this project's own ext4 filesystem
   found `rm` followed by `mkdir` at the same path reusing the just-freed
   inode every time; birth time was the one field that changed on every
-  recreation (`src/outside.rs:12-23`). An unreadable birth time refuses the
+  recreation (the module doc of `src/outside.rs`). An unreadable birth time refuses the
   allow and fails the resolve, the same as a mismatch. `AllowOutsideWorktree`
   also refuses a path already under a root and a worktree of anything but
   the parent's *main* checkout, so one directory can never end up with two
-  project keys (`src/hub.rs:2879-2906`).
+  project keys (`Hub::do_allow_outside`).
 
   It is narrow on purpose: the record lives only in roost's own state, never
   in a repository or in project config, so a clone cannot allow itself, and

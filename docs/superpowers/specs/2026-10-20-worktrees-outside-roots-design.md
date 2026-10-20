@@ -12,7 +12,7 @@ On 2026-10-19 a Claude in `ultima_cluster` ran a plain `git worktree add ~/scrat
 
 ## Decisions (2026-10-20, with the user)
 1. **Open in place, after the user allows it.** The worktree is not moved. Moving it would invalidate the path the Claude that made it still uses.
-2. **One worktree per allow.** An allow covers one exact path, pinned by its directory identity `(dev, ino)`, and only while git still lists it as a worktree of a roost project. There is no directory-wide allow.
+2. **One worktree per allow.** An allow covers one exact path, pinned by its directory identity `(dev, ino, birth time)`, and only while git still lists it as a worktree of a roost project. There is no directory-wide allow.
 3. **The URL sits under its parent:** `<parent>/.claude/outside/<name>`. It is resolved only through roost's own record, never through that path on disk.
 4. **The "appeared" banner persists until dismissed.** Dismissal is per project, not per browser.
 
@@ -24,7 +24,7 @@ On 2026-10-19 a Claude in `ultima_cluster` ran a plain `git worktree add ~/scrat
 - Off every lock, the hub checks three things:
   - `parent` resolves under the roots, and `git worktree list` of it reports `path` as a non-main worktree. An empty list is git not answering: refuse, writing nothing.
   - `path` is absolute and equals its own canonicalisation, i.e. no symlink anywhere in it, and it is a directory.
-  - `name` passes `wtname::check`. It is the basename, with `-2`, `-3`, … appended if a record for this parent already uses that name.
+  - `name` passes `wtname::check`. It is the basename sanitised — every byte outside `[A-Za-z0-9_-]` becomes `-`, a leading run that is not alphanumeric is trimmed, `wt` if nothing is left — truncated so that it and any `-2`, `-3`, … suffix (appended if a record for this parent already uses that name) fit in 32 bytes. Sanitising, not refusing: the directory cannot be renamed to suit roost without breaking the path of the Claude working in it.
 - If all three hold, the hub writes `state/outside/<parent key>/<name>`: atomic (`wsstate::tmp_suffix` temp, then `hard_link`; `rename` only when rewriting a stale record), mode 0600. The file holds two lines: the canonical path, and `dev ino btime_secs btime_nsec`; an unreadable birth time refuses the allow and fails the resolve.
 - It then refreshes the parent hub, so the row turns clickable, and replies to the sender with the new URL.
 
@@ -34,7 +34,7 @@ The record lives only in roost's state directory, never in a repository or in pr
 - `projects::resolve_project` gains one arm, checked before anything else, for a URL of exactly the shape `<parent>/.claude/outside/<name>`, where `<parent>` is any valid project URL and `<name>` passes `wtname::valid`. The arm:
   - reads `state/outside/<storage_key(parent)>/<name>`;
   - takes `metadata` of the recorded path;
-  - returns that path only if it is a directory whose `(dev, ino)` equals the recorded identity.
+  - returns that path only if it is a directory whose `(dev, ino, birth time)` equals the recorded identity. An unreadable birth time refuses, the same as a mismatch; it never falls back to `(dev, ino)`, which ext4 reuses immediately after a delete.
 - Anything else returns `None`, and the URL is **not** tried against disk: a missing record, an unreadable or damaged record, a missing directory, a mismatch, or any stat error.
 - So a `<parent>/.claude/outside/<name>` directory planted in a repository is never consulted. The existing dot-segment rule would refuse it in any case.
 - The arm is fork-free (two file reads and one stat), so it is safe under the hub and REGISTRY locks, like `resolve_recorded_project`.
@@ -115,7 +115,7 @@ The "Every filesystem path is confined" bullet gains three things.
 **The exception.**
 - A project URL resolves outside the roots only through a roost-written allow record (`state/outside/<parent key>/<name>`).
 - The record is written after a user confirmation, on git's own listing of the path as a worktree of a project under the roots.
-- It is checked on every resolve against the directory's recorded `(dev, ino)`, fork-free.
+- It is checked on every resolve against the directory's recorded `(dev, ino, birth time)`, fork-free. An unreadable birth time refuses the allow and fails the resolve.
 
 **Why it is narrow.**
 - A cloned repository can point a worktree anywhere.
@@ -136,7 +136,7 @@ Every new test is watched failing with its code reverted, and the failure is rec
   - a path git does not list for this parent;
   - an empty git listing;
   - a path through a symlink;
-  - an invalid name;
+  - (an invalid basename is no longer a refusal: it is sanitised into a name, §1);
   - over `OUTSIDE_CAP`.
 - **Resolution:**
   - a planted `<parent>/.claude/outside/<name>` directory with no record resolves to `None`;

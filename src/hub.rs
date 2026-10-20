@@ -12534,16 +12534,18 @@ mod tests {
         assert!(at_sib.is_empty() && at_parent.is_empty(), "a refusal writes nothing: {at_sib:?} {at_parent:?}");
     }
 
-    /// The deferred fallback from Task 1: a basename `wtname::check` refuses
-    /// gets no invented name — the refusal reaches the clicker as an
-    /// `Error` naming the problem, and nothing is written.
+    /// The deferred fallback from Task 1, settled by the final review: a
+    /// basename `wtname::check` refuses (`_wt`, leading `_`) is sanitised
+    /// into a name, not refused — renaming the directory would break the
+    /// path of the Claude already working there, so a refusal left the user
+    /// no way in. The clicker gets `OutsideAllowed` at the sanitised URL.
     ///
-    /// Revert-checked: with `outside::allow`'s error replaced by a generic
-    /// "could not allow {path}" in the work closure, fails on "the refusal
-    /// names the name and its rule: {"t":"Error","msg":"could not allow
-    /// …/_wt"}".
+    /// Revert-checked: with `outside::name_base` replaced by the raw
+    /// basename (cp backup, restored), fails on `expected an allow, got
+    /// {"t":"Error","msg":"cannot allow …/_wt: worktree name \"_wt\" must
+    /// match ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$"}`.
     #[test]
-    fn allow_refuses_a_name_wtname_refuses_with_its_message() {
+    fn allow_sanitises_a_basename_wtname_refuses() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ROOST_CMD", "cat");
@@ -12557,9 +12559,14 @@ mod tests {
         );
         let got = await_any_of(&rxa, &[r#""t":"Error""#, "OutsideAllowed"]);
         let records = outside_records_on_disk(&fx.project);
-        assert!(got.contains(r#""t":"Error""#), "expected a refusal, got {got}");
-        assert!(got.contains(r#"worktree name \"_wt\" must match"#), "the refusal names the name and its rule: {got}");
-        assert!(records.is_empty(), "a refusal leaves no record and no temp file: {records:?}");
+        let want = format!(r#"{{"t":"OutsideAllowed","url":"{}/.claude/outside/wt"}}"#, fx.project);
+        assert_eq!(got, want, "expected an allow, got {got}");
+        assert_eq!(records, vec!["wt".to_string()], "one record, under the sanitised name");
+        assert_eq!(
+            crate::projects::resolve_project(&crate::projects::roots(), &format!("{}/.claude/outside/wt", fx.project)),
+            Some(fx.wt.clone()),
+            "the sanitised URL resolves to the real directory"
+        );
     }
 
     /// Spec §1 "Revocation": `RevokeOutsideWorktree` deletes the record, the
