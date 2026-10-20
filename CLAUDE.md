@@ -209,9 +209,11 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   **A renamed project's sessions follow it the same way: on evidence, not
   on request.** `.moved-to` (`sock/<old key>/.moved-to`) is written only
   when `registry::move_evidence` confirms #178's inode evidence and the
-  directory's new path resolves as a project. `home::resolves` and
-  `term.rs` widen only for an owner that a `.moved-to` names — nothing else
-  does. `term.rs`'s widened path is attach-only: it calls
+  directory's new path resolves as a project. `term.rs` widens only for
+  an owner that a `.moved-to` names, and `home::resolves` for that owner or
+  for one whose directory carries the record's *own* full `.ino` identity
+  (#183, `home::owner_dir_with`) — never the key's, and nothing else
+  widens. `term.rs`'s widened path is attach-only: it calls
   `session::attach_existing`, a `dtach -a` that fails closed, so a key
   whose directory is gone can be joined but never made to spawn.
 - **Search shares the tree's filter but is not the tree.** `search.rs` walks
@@ -375,7 +377,11 @@ still follows on lighter evidence than its own record: each is re-homed
 first by where its shell actually sits, among the directories carrying one
 of the key's own identities, and only once the shell has left by the
 identity it was started with (`home::own_follow`,
-`registry::record_start_identity`) — so a transient `cd` into any of those
+`registry::record_start_identity`, written only when the session's
+socket is not there yet — a restart's reservation-driven reattach to a
+surviving master is a `Spawn` too, and rewriting it there would stamp
+whatever directory now stands at the URL, an occupant's included, as where
+a shell started that began somewhere else) — so a transient `cd` into any of those
 directories becomes a permanent re-home of that session, not a visit. That
 is spec-mandated, not a bug: the session's own evidence is retired the
 moment stronger evidence (its live shell) appears.
