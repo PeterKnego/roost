@@ -69,24 +69,27 @@ pub enum Stored {
 /// gets a negative `bsec` and a *positive* `bnsec` counting forward from it,
 /// never a negative `bnsec`. An unreadable birth time is `Err`; there is no
 /// fallback, per the module doc.
+/// Converts `before` — how far before the epoch a time is, i.e.
+/// `UNIX_EPOCH - that time`, always non-negative — to the signed `(bsec,
+/// bnsec)` encoding `format`/`parse_line` use, where `bnsec` stays
+/// non-negative by borrowing a second whenever there's a sub-second
+/// remainder. Pulled out of `birth` so the conversion can be unit-tested
+/// without needing a real pre-epoch file (nothing on this host can be
+/// dated before 1970 to order).
+fn pre_epoch(before: std::time::Duration) -> (i64, u32) {
+    if before.subsec_nanos() == 0 {
+        (-(before.as_secs() as i64), 0)
+    } else {
+        (-(before.as_secs() as i64) - 1, 1_000_000_000 - before.subsec_nanos())
+    }
+}
+
 #[cfg(unix)]
 fn birth(md: &std::fs::Metadata) -> Result<(i64, u32), String> {
     let created = md.created().map_err(|e| format!("birth time unreadable: {e}"))?;
     match created.duration_since(std::time::UNIX_EPOCH) {
         Ok(dur) => Ok((dur.as_secs() as i64, dur.subsec_nanos())),
-        Err(e) => {
-            // `e.duration()` is how far before the epoch `created` is, i.e.
-            // `UNIX_EPOCH - created`, as a non-negative Duration. Converting
-            // that back to a signed (bsec, bnsec) with bnsec >= 0 needs the
-            // "borrow a second" step below whenever there's a sub-second
-            // remainder.
-            let before = e.duration();
-            if before.subsec_nanos() == 0 {
-                Ok((-(before.as_secs() as i64), 0))
-            } else {
-                Ok((-(before.as_secs() as i64) - 1, 1_000_000_000 - before.subsec_nanos()))
-            }
-        }
+        Err(e) => Ok(pre_epoch(e.duration())),
     }
 }
 
@@ -217,6 +220,23 @@ mod tests {
         tempfile::Builder::new().prefix("dirid-ext4-").tempdir_in(base).unwrap()
     }
 
+    /// Covers all three of `of`'s outcomes (module doc): an existing
+    /// directory is `Ok(Some)`, a missing path is `Ok(None)`, and anything
+    /// else this process cannot determine — here, a path whose parent
+    /// cannot even be entered — is `Err`, never folded into either of the
+    /// other two.
+    ///
+    /// Revert-checked: changed `id_from` so every error, not just
+    /// `NotFound`, returns `Ok(None)` (`Err(_) => return Ok(None)` in place
+    /// of the `NotFound`-only arm and the `Err(e) => return Err(..)` arm).
+    /// The first two assertions were unaffected — this test's own first
+    /// version only ever exercised `NotFound`, not a *different* error, so
+    /// it could not have caught this; that gap is exactly why the
+    /// permission-denied case below was added. With the break in place,
+    /// observed failure (a plain `assert!`, so only the message prints):
+    /// `panicked at src/dirid.rs:...: a permission error must not read as
+    /// NotFound` — the permission error was silently read as "not there."
+    /// Restored.
     #[test]
     fn of_reads_a_directory_and_says_notfound_for_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -225,6 +245,18 @@ mod tests {
 
         let gone = dir.path().join("does-not-exist");
         assert_eq!(of(&gone).unwrap(), None, "a missing path is NotFound, not an error");
+
+        #[cfg(unix)]
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.path().join("locked");
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let unreachable = locked.join("inner");
+            assert!(of(&unreachable).is_err(), "a permission error must not read as NotFound");
+            // Restore so the tempdir can be cleaned up on drop.
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
     }
 
     /// Real `rm` + `mkdir` at the same path, on ext4 (see `ext4_tempdir`).
@@ -266,11 +298,19 @@ mod tests {
         assert_eq!(parse_line("1 2 3 4"), Some(Stored::Full(DirId { dev: 1, ino: 2, bsec: 3, bnsec: 4 })));
         assert_eq!(parse_line("8 9"), Some(Stored::Legacy { dev: 8, ino: 9 }));
 
-        for damaged in ["1 2 3", "1 2 3 4 5", "", "a b c d", "1 2 x y"] {
+        // One field past u64::MAX: parses as a number, but not as a u64.
+        let overflow = "18446744073709551616 2 3 4";
+        for damaged in ["1 2 3", "1 2 3 4 5", "", "a b c d", "1 2 x y", overflow] {
             assert_eq!(parse_line(damaged), None, "{damaged:?} must be damaged");
         }
     }
 
+    /// Revert-checked: changed `matches`'s `Legacy` arm to `Stored::Legacy
+    /// { .. } => true` (ignoring `dev`/`ino` entirely; the `Full` arm
+    /// untouched). Observed failure (a plain `assert!`, so only the message
+    /// prints): `panicked at src/dirid.rs:...: legacy still requires dev
+    /// and ino` — a `Legacy` matched a directory with a different inode.
+    /// Restored to comparing `(dev, ino)`.
     #[test]
     fn matches_legacy_by_dev_ino_only() {
         let legacy = Stored::Legacy { dev: 1, ino: 2 };
@@ -285,6 +325,12 @@ mod tests {
         assert!(!matches(&full, &DirId { dev: 1, ino: 2, bsec: 5, bnsec: 7 }), "full compares birth time too");
     }
 
+    /// Revert-checked: commented out the `opts.mode(0o600)` call in
+    /// `write_lines` (the `#[cfg(unix)] { use ...; opts.mode(0o600); }`
+    /// block), leaving `create_new`/`rename` untouched. Observed failure:
+    /// `assertion `left == right` failed: the record must be private\n
+    /// left: 436\n right: 384` (436 = 0o664, the default-umask mode
+    /// `create_new` writes without an explicit `mode`). Restored.
     #[test]
     fn write_lines_is_0600_and_atomic() {
         let dir = tempfile::tempdir().unwrap();
@@ -309,5 +355,37 @@ mod tests {
         let leftovers: Vec<_> =
             std::fs::read_dir(dir.path()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains(".tmp")).collect();
         assert!(leftovers.is_empty(), "a successful write must leave no temp file behind");
+    }
+
+    /// `DirId`'s `bsec` is signed (a birth time before the epoch is a real
+    /// time, not an error — see `DirId`'s doc), so `format`/`parse_line`
+    /// must round-trip a negative `bsec` exactly, not just the positive
+    /// case every other test here happens to use.
+    #[test]
+    fn a_birth_time_before_the_epoch_round_trips() {
+        let id = DirId { dev: 7, ino: 11, bsec: -5, bnsec: 250 };
+        let line = format(&id);
+        assert_eq!(parse_line(&line), Some(Stored::Full(id)), "a negative bsec must round-trip through format/parse_line");
+    }
+
+    /// `pre_epoch` is the pure conversion `birth` applies to a pre-epoch
+    /// `Duration`; tested directly because no file on this host can
+    /// actually be dated before 1970 to exercise it through `of`.
+    ///
+    /// Revert-checked: dropped the "borrow a second" adjustment, changing
+    /// the `else` branch to `(-(before.as_secs() as i64), 1_000_000_000 -
+    /// before.subsec_nanos())` (no `- 1` on `bsec`). Observed failure:
+    /// `assertion `left == right` failed\n  left: (-1, 750000000)\n right:
+    /// (-2, 750000000)` — the flipped version reported 1.25s before the
+    /// epoch as `bsec: -1` (i.e. only 0.25s before epoch, off by a whole
+    /// second), instead of the correct `-2` with `bnsec` counting forward
+    /// from it. Restored the `- 1` borrow.
+    #[test]
+    fn pre_epoch_conversion_borrows_a_second() {
+        // 1.25s before the epoch: one whole second borrowed into bsec, the
+        // remaining 0.75s carried forward as bnsec.
+        assert_eq!(pre_epoch(std::time::Duration::new(1, 250_000_000)), (-2, 750_000_000));
+        // Exactly N seconds before the epoch, no remainder: no borrow.
+        assert_eq!(pre_epoch(std::time::Duration::new(3, 0)), (-3, 0));
     }
 }
