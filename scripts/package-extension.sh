@@ -21,6 +21,15 @@
 # roost-extension-<version>-webstore.zip is the same files at the root, minus
 # the README, which a store package has no reader for. extension/store/ — the
 # listing's text and pictures — goes in neither.
+#
+# A third, roost-extension-<version>-firefox.zip, is the same files laid out
+# the same way, with a manifest generated for Firefox: an event page instead
+# of a service worker (Firefox runs MV3 backgrounds as background.scripts),
+# no `debugger` (Firefox has none; extension/drive-page.js stands in), access
+# to all sites as one optional grant (tabs.captureTab needs <all_urls> by
+# that name), and the gecko settings AMO requires. The background script
+# list is read from worker.js's own importScripts line, so the two browsers
+# cannot load different files.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . scripts/lib.sh
@@ -86,4 +95,34 @@ print(f"  ✓ {dest} ({n} files, manifest version {manifest['version']}, shown a
 store = out / f"roost-extension-{version}-webstore.zip"
 n = pack(store, "", skip={"README.md"})
 print(f"  ✓ {store} ({n} files at the root, for the Chrome Web Store)")
+
+worker = (src / manifest["background"]["service_worker"]).read_text()
+imp = re.search(r'importScripts\(([^)]*)\)', worker)
+if not imp:
+    sys.exit("  ✗ worker.js has no importScripts line to take Firefox's background scripts from")
+# drive-cdp.js is Chrome's DevTools-protocol backend. Firefox never runs it
+# (worker.js picks the backend by whether chrome.debugger exists), so it is
+# left out rather than shipped as code AMO's linter flags as unsupported.
+CHROME_ONLY = {"drive-cdp.js"}
+scripts = [f for f in re.findall(r'"([^"]+)"', imp.group(1)) if f not in CHROME_ONLY] + [manifest["background"]["service_worker"]]
+gone = [f for f in scripts if not (src / f).is_file()]
+if gone:
+    sys.exit(f"  ✗ worker.js imports files extension/ does not have: {', '.join(gone)}")
+ff = json.loads(stamped)
+ff.pop("version_name", None)  # Firefox shows `version`; a prerelease suffix has nowhere to go
+ff.pop("minimum_chrome_version", None)
+ff["permissions"] = [x for x in ff["permissions"] if x != "debugger"]
+ff["background"] = {"scripts": scripts}
+ff["optional_host_permissions"] = ["<all_urls>"]
+ff["browser_specific_settings"] = {"gecko": {
+    "id": "roost-bridge@roost",
+    # 140: the first with data_collection_permissions, which AMO requires,
+    # and an ESR; MAIN-world scripts (128) and tab groups (139) come with it.
+    "strict_min_version": "140.0",
+    "data_collection_permissions": {"required": ["websiteContent", "browsingActivity"]},
+}}
+fox = out / f"roost-extension-{version}-firefox.zip"
+stamped = json.dumps(ff, indent=2, ensure_ascii=False) + "\n"
+n = pack(fox, "", skip={"README.md"} | CHROME_ONLY)
+print(f"  ✓ {fox} ({n} files, for Firefox)")
 EOF

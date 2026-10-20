@@ -28,6 +28,13 @@
 <button id="savedeny">Save</button>
 </section>
 
+<section id="sites" hidden>
+<label>Access to websites</label>
+<p class="fine">Firefox has no debugger API, so roost bridge reads, clicks and types by running scripts in the page, and screenshots with captureTab. Both need access to the sites Claude works on. Each Claude session still asks you first.</p>
+<p id="sitestate" class="fine"></p>
+<button id="allowsites" hidden>Allow on all websites</button>
+</section>
+
 <section>
 <label><input id="follow" type="checkbox"> Bring Claude's tabs to the front</label>
 <p class="fine">Pages Claude opens go into a "Claude" tab group in your window. On, each one comes to the front as it opens, so you can watch. Off, they open behind your tab, and a screenshot shows one only for a moment before handing your tab back.</p>

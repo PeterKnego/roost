@@ -69,6 +69,7 @@ deno run -A tests/browser/nodtach.mjs    # a host without dtach says so on the t
 deno run -A tests/browser/revert.mjs     # revert from the Changes pane and a Diff tab: the git menu, the disabled hints, cancel vs confirm, and the stash on disk (#125)
 deno run -A tests/browser/backup.mjs     # backing a workspace up and restoring it into a *different* project (#18 step 3) — needs its own HOME, like claudemenu.mjs
 deno run -A tests/browser/bridge.mjs     # the browser bridge (#161): the extension loaded in Chromium, roost mcp's chrome_* tools through consent, a forged call refused, and the handoff page both ways
+deno run -A tests/browser/bridge-firefox.mjs # the same bridge in a real Firefox (#177): the release's Firefox package over Marionette, the page backend that stands in for the DevTools protocol, and Firefox's limits asserted — needs $FIREFOX or firefox on PATH
 ```
 
 Each scenario is its own file and its own roost, so they can be run in any
