@@ -263,6 +263,9 @@ pub enum Intent {
     /// session, layout or `.base`: the page stops resolving and a live
     /// session stays alive.
     RevokeOutsideWorktree { parent: String, name: String },
+    /// Drop `path` from this project's appeared list (#188 §3), for every
+    /// browser on the project, not just the one that clicked.
+    DismissAppeared { path: String },
     /// Tree visibility for this workspace, overriding the config file's
     /// `show_hidden` for everyone looking at this project. A workspace that
     /// has never been toggled carries `None` and follows the config instead —
@@ -654,6 +657,27 @@ pub struct WorkspaceView {
     /// never persisted (it is a read of the files, not workspace state).
     #[serde(default)]
     pub settings: SettingsView,
+    /// Worktrees that appeared and are not yet dealt with (`appeared.rs`),
+    /// oldest first. Filled by `hub::snapshot_event` from the hub's
+    /// in-memory copy of the persisted list, so a page that connects late,
+    /// or after a restart, still sees every banner.
+    #[serde(default)]
+    pub appeared: Vec<AppearedView>,
+}
+
+/// One entry of `WorkspaceView::appeared`, resolved for display. Built
+/// fork-free under the hub lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AppearedView {
+    pub path: String,
+    pub branch: String,
+    /// The page to link to: the project under a root, or the virtual
+    /// outside URL of an allowed one. `None` when there is nowhere to go.
+    pub url: Option<String>,
+    /// No root contains `path`.
+    pub outside: bool,
+    /// An allow record names `path` and still resolves to it.
+    pub allowed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -928,6 +952,32 @@ mod tests {
         );
         assert!(decode(r#"{"t":"AllowOutsideWorktree","path":"/x"}"#).is_err(), "parent is required");
         assert!(decode(r#"{"t":"RevokeOutsideWorktree","parent":"repo"}"#).is_err(), "name is required");
+    }
+
+    /// The client sends exactly this shape; a renamed field would decode as
+    /// an error and the Dismiss button would do nothing.
+    ///
+    /// Revert-checked: with the variant's field serde-renamed to `p`, fails
+    /// — observed: ``called `Result::unwrap()` on an `Err` value: "missing
+    /// field `p`"``. Restored.
+    #[test]
+    fn dismiss_appeared_decodes_its_path() {
+        let i = decode(r#"{"t":"DismissAppeared","path":"/x/wt"}"#).unwrap();
+        assert!(matches!(i, Intent::DismissAppeared { ref path } if path == "/x/wt"), "got {i:?}");
+        assert!(decode(r#"{"t":"DismissAppeared"}"#).is_err(), "path is required");
+    }
+
+    /// `url` must encode as `null`, not vanish: the client branches on it.
+    ///
+    /// Revert-checked: with `skip_serializing_if = "Option::is_none"` on
+    /// `url`, fails — observed: `left:
+    /// "{\"path\":\"/o/wt\",\"branch\":\"side\",\"outside\":true,\"allowed\":false}"`.
+    /// Restored.
+    #[test]
+    fn appeared_view_encodes_every_field() {
+        let v = AppearedView { path: "/o/wt".into(), branch: "side".into(), url: None, outside: true, allowed: false };
+        let s = serde_json::to_string(&v).unwrap();
+        assert_eq!(s, r#"{"path":"/o/wt","branch":"side","url":null,"outside":true,"allowed":false}"#);
     }
 
     #[test]

@@ -231,6 +231,9 @@ impl Workspace {
             // Same reasoning and same filler, for `Kind::Worktree`.
             worktree_hooks: None,
             settings: proto::SettingsView::default(),
+            // Filled by `hub::snapshot_event` from the hub's copy of
+            // `appeared.rs`'s list, which is not part of the layout.
+            appeared: Vec::new(),
         }
     }
 }

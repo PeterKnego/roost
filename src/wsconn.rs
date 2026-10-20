@@ -256,6 +256,19 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
             .collect();
         (id, rx, dir, snapshot)
     };
+    // #188 §3: opening a worktree's page dismisses its banner on the
+    // parent. After the first `State` and off this hub's lock, on its own
+    // thread: it may lock the *parent's* hub, and a socket thread holding
+    // one hub lock while taking another is the deadlock `for_project`'s
+    // comment above warns of.
+    {
+        let (url, dir) = (project.to_string(), dir.clone());
+        let _ = std::thread::Builder::new().name("appeared-clear".into()).spawn(move || {
+            if std::panic::catch_unwind(|| crate::hub::clear_appeared_on_open(&url, &dir)).is_err() {
+                eprintln!("roost: {url}: clearing its appeared banner panicked; it stays until dismissed");
+            }
+        });
+    }
     // Built here — the first statement after the lock is released — not below
     // the replay, so it covers everything between the subscription and the
     // read loop: the disk reads, `replay_buffer`, and the `try_clone` early

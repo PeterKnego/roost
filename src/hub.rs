@@ -161,6 +161,12 @@ pub struct Hub {
     /// Another watch event arrived while a confirm was running; it runs once
     /// more when it finishes, so the change that event saw is not lost.
     worktrees_again: bool,
+    /// This project's appeared list (`appeared.rs`, #188 §3), as last
+    /// written. Kept in memory because `snapshot_event` runs on every
+    /// debounced keystroke, and every writer of the file updates this from
+    /// what it wrote: the confirm, `DismissAppeared`, and
+    /// `clear_appeared_on_open` through this hub when it is open.
+    appeared: Vec<crate::appeared::Appeared>,
 }
 
 /// How long a worktree roost said it would make stays exempt from the
@@ -435,6 +441,7 @@ impl Hub {
             worktrees_made: Vec::new(),
             worktrees_confirming: false,
             worktrees_again: false,
+            appeared: crate::appeared::load(project),
         };
         // A freshly loaded hub must report reality, not whatever the
         // persisted layout happened to say last time: sessions may have
@@ -755,7 +762,53 @@ impl Hub {
         // See the doc comment on `settings` for why this is cached rather
         // than read on every call.
         ws.settings = self.settings.get_or_insert_with(|| crate::config::settings_view(&self.dir)).clone();
+        ws.appeared = self.appeared_view();
         Event::State { version: self.ws.version, origin: origin.clone(), ws }
+    }
+
+    /// The appeared list resolved for display. Fork-free, since it runs
+    /// under this hub's lock: `project_for_abs` and `outside::resolve` are
+    /// stats and small reads. Nothing is computed for an empty list, which
+    /// is the usual case — not even the roots, which can mean a config read.
+    fn appeared_view(&self) -> Vec<crate::proto::AppearedView> {
+        if self.appeared.is_empty() {
+            return Vec::new();
+        }
+        let roots = crate::projects::roots();
+        let canon_roots: Vec<std::path::PathBuf> =
+            roots.iter().map(|r| r.canonicalize().unwrap_or_else(|_| r.clone())).collect();
+        self.appeared
+            .iter()
+            .map(|a| {
+                let p = std::path::Path::new(&a.path);
+                let outside = !canon_roots.iter().any(|r| p.starts_with(r));
+                let (url, allowed) = if outside {
+                    match crate::outside::find(&self.project, p) {
+                        Some(rec) if crate::outside::resolve(&self.project, &rec.name).is_some() => {
+                            (Some(crate::outside::url_for(&self.project, &rec.name)), true)
+                        }
+                        _ => (None, false),
+                    }
+                } else {
+                    let url = crate::projects::project_for_abs(&roots, p)
+                        .and_then(|(url, rel)| if rel.is_empty() { Some(url) } else { None });
+                    (url, false)
+                };
+                crate::proto::AppearedView { path: a.path.clone(), branch: a.branch.clone(), url, outside, allowed }
+            })
+            .collect()
+    }
+
+    /// Drops `path` from the appeared list and, if that changed anything,
+    /// tells every browser on the project — every one, since a banner one
+    /// tab dismissed must not linger in another.
+    pub fn dismiss_appeared(&mut self, path: &str) {
+        let after = crate::appeared::remove(&self.project, path);
+        if after != self.appeared {
+            self.appeared = after;
+            let snap = self.snapshot_event(&String::new());
+            self.broadcast(&snap);
+        }
     }
 
     /// Every terminal tab in this layout is reserved, so the browser that
@@ -978,6 +1031,7 @@ impl Hub {
             Intent::RevokeOutsideWorktree { parent, name } => {
                 return self.do_revoke_outside(from, parent.clone(), name.clone())
             }
+            Intent::DismissAppeared { path } => return self.dismiss_appeared(&path.clone()),
             Intent::NewTerminal { pane, launch, force, resume, fork } => {
                 return self.do_new_terminal(from, *pane, *launch, *force, resume.clone(), fork.clone())
             }
@@ -3603,6 +3657,20 @@ impl Hub {
     /// forgotten without a word — finishing a worktree is #157's.
     pub fn confirm_worktrees(&mut self, seen: Option<Vec<SeenWorktree>>) -> Vec<Event> {
         let Some(seen) = seen else { return Vec::new() };
+        // An answer, the seeding one included, is a listing git actually
+        // gave: what dropped out of it is gone (§3 "Dismissing", §1
+        // "Revocation"). The main checkout goes in too — `seen` leaves it
+        // out — so an answer of "only main" is the non-empty listing it
+        // really was, and clears the last worktree's entry instead of
+        // reaching the empty-listing guard both callees keep.
+        let mut listed: Vec<std::path::PathBuf> = seen.iter().map(|w| w.path.clone()).collect();
+        if let Ok(main) = self.dir.canonicalize() {
+            listed.push(main);
+        }
+        if !listed.is_empty() {
+            self.appeared = crate::appeared::retain_listed(&self.project, &listed);
+            crate::outside::prune(&self.project, &listed);
+        }
         let now = std::time::Instant::now();
         self.worktrees_made.retain(|(_, at)| now.duration_since(*at) < MADE_WORKTREE_TTL);
         let Some(known) = &self.known_worktrees else {
@@ -3618,11 +3686,21 @@ impl Hub {
                 self.worktrees_made.remove(i);
                 continue;
             }
-            events.push(Event::WorktreeAppeared {
-                path: w.path.to_string_lossy().into_owned(),
-                branch: w.branch.clone(),
-                url: w.url.clone(),
-            });
+            let path = w.path.to_string_lossy().into_owned();
+            eprintln!(
+                "roost: {}: worktree {} ({}) appeared{}",
+                self.project,
+                path,
+                w.branch,
+                if w.url.is_none() { ", outside roost's roots" } else { "" }
+            );
+            // Persisted under the lock: a small atomic write to roost's own
+            // state, the cost `home::record` already pays here. Never git.
+            self.appeared = crate::appeared::add(
+                &self.project,
+                crate::appeared::Appeared { path: path.clone(), branch: w.branch.clone() },
+            );
+            events.push(Event::WorktreeAppeared { path, branch: w.branch.clone(), url: w.url.clone() });
         }
         self.known_worktrees = Some(seen.into_iter().map(|w| w.path).collect());
         events
@@ -3644,8 +3722,15 @@ impl Hub {
 
     /// `confirm_worktrees`, then tell this project's browsers.
     pub fn apply_worktrees(&mut self, seen: Option<Vec<SeenWorktree>>) {
+        let before = self.appeared.clone();
         for ev in self.confirm_worktrees(seen) {
             self.broadcast(&ev);
+        }
+        // After the one-shot events, so a client that still shows those
+        // sees them first; the snapshot is what a later page will see.
+        if self.appeared != before {
+            let snap = self.snapshot_event(&String::new());
+            self.broadcast(&snap);
         }
     }
 
@@ -3695,6 +3780,45 @@ impl Hub {
     fn note_made_worktree(&mut self, path: std::path::PathBuf) {
         self.worktrees_made.retain(|(p, _)| *p != path);
         self.worktrees_made.push((path, std::time::Instant::now()));
+    }
+}
+
+/// The parent project of a worktree page URL, for either shape a worktree
+/// page has: `<parent>/.claude/worktrees/<name>`, or an outside one's
+/// virtual `<parent>/.claude/outside/<name>`. Pure.
+fn worktree_parent(url: &str) -> Option<&str> {
+    if let Some((parent, _)) = crate::outside::split_url(url) {
+        return Some(parent);
+    }
+    const SEP: &str = "/.claude/worktrees/";
+    let i = url.find(SEP)?;
+    let (parent, name) = (&url[..i], &url[i + SEP.len()..]);
+    if parent.is_empty() || name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(parent)
+}
+
+/// A page of `url` (directory `dir`) was opened: that is the user seeing
+/// the worktree, so its banner leaves the *parent's* appeared list (§3).
+/// Runs on its own thread, after the connection's first `State` and with no
+/// lock held (`wsconn` spawns it): the canonicalise and the file read are
+/// off every lock, and only a parent whose list really holds this path is
+/// touched at all. Through the parent's hub when one is open, so its
+/// in-memory copy and every browser on it learn of the change; straight to
+/// the file when none is.
+pub fn clear_appeared_on_open(url: &str, dir: &std::path::Path) {
+    let Some(parent) = worktree_parent(url) else { return };
+    let Ok(canon) = dir.canonicalize() else { return };
+    let path = canon.to_string_lossy().into_owned();
+    if !crate::appeared::load(parent).iter().any(|a| a.path == path) {
+        return;
+    }
+    match open_hub(parent) {
+        Some(arc) => Hub::lock(&arc).dismiss_appeared(&path),
+        None => {
+            crate::appeared::remove(parent, &path);
+        }
     }
 }
 
@@ -12463,5 +12587,196 @@ mod tests {
         assert_eq!(live_after, vec!["term1".to_string()], "roost must still count the session live");
         assert!(dead.is_empty(), "a revoke must leave the session's processes running; gone: {dead:?} of {before:?}");
         assert_eq!(after, None, "and the page stops resolving");
+    }
+
+    // ---- #188 Task 5: the appeared list persists ------------------------
+
+    /// The `appeared` list of every `State` on `rx`, oldest first.
+    fn appeared_states(rx: &Receiver<String>) -> Vec<Vec<serde_json::Value>> {
+        drain(rx)
+            .iter()
+            .map(|m| serde_json::from_str::<serde_json::Value>(m).unwrap())
+            .filter(|v| v["t"] == "State")
+            .map(|v| v["ws"]["appeared"].as_array().cloned().unwrap_or_default())
+            .collect()
+    }
+
+    fn snapshot_appeared(h: &mut Hub) -> Vec<serde_json::Value> {
+        let m = crate::proto::encode(&h.snapshot_event(&String::new()));
+        let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+        v["ws"]["appeared"].as_array().cloned().expect("State carries appeared")
+    }
+
+    /// A hub that has seen `sib` (a sibling worktree under the root, branch
+    /// `sib`) appear. Returns the repo and `sib`'s canonical path.
+    fn hub_with_an_appearance(root: &std::path::Path, project: &str) -> (Hub, std::path::PathBuf, std::path::PathBuf) {
+        let repo = root.join(project);
+        init_repo(&repo);
+        let mut h = Hub::new(project, repo.clone());
+        h.seed_worktrees(seen(&repo, root));
+        let sib_rel = format!("../{project}-sib");
+        git_ok(&repo, &["worktree", "add", "-q", &sib_rel, "-b", "sib"]);
+        h.apply_worktrees(seen(&repo, root));
+        let sib = root.join(format!("{project}-sib")).canonicalize().unwrap();
+        (h, repo, sib)
+    }
+
+    /// The point of the task: a page that connects after the event — here a
+    /// fresh `Hub`, which is what a restart builds — still has the banner.
+    ///
+    /// Revert check (a), run and restored: with the `appeared::add` call in
+    /// `confirm_worktrees` removed, fails — observed: `a new hub still has
+    /// it: []`, `left: 0, right: 1`.
+    #[test]
+    fn an_appearance_survives_a_new_hub() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let (h, repo, sib) = hub_with_an_appearance(root.path(), "ap-survive");
+        drop(h);
+        let mut fresh = Hub::new("ap-survive", repo);
+        let got = snapshot_appeared(&mut fresh);
+        ask_env_clear(&[]);
+        assert_eq!(got.len(), 1, "a new hub still has it: {got:?}");
+        assert_eq!(got[0]["path"], sib.to_string_lossy().as_ref());
+        assert_eq!(got[0]["branch"], "sib");
+        assert_eq!(got[0]["url"], "ap-survive-sib", "under the root it links to its project");
+        assert_eq!(got[0]["outside"], false);
+        assert_eq!(got[0]["allowed"], false);
+    }
+
+    /// Two connections, so a dismissal answered to the clicker alone cannot
+    /// pass: the other tab must lose the banner too.
+    ///
+    /// Revert check (b), run and restored: with the `DismissAppeared` arm
+    /// sending the snapshot to `from` only (`send_to` in place of
+    /// `dismiss_appeared`'s `broadcast`), fails — observed: `the other
+    /// connection hears of it too: []`, `left: None, right: Some(0)`.
+    #[test]
+    fn dismiss_clears_it_for_every_connection() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let (mut h, repo, sib) = hub_with_an_appearance(root.path(), "ap-dismiss");
+        let (a, rxa) = conn(&mut h);
+        let (_b, rxb) = conn(&mut h);
+        h.handle(&a, Intent::DismissAppeared { path: sib.to_string_lossy().into_owned() });
+        let (sa, sb) = (appeared_states(&rxa), appeared_states(&rxb));
+        let on_disk = crate::appeared::load("ap-dismiss");
+        let fresh = snapshot_appeared(&mut Hub::new("ap-dismiss", repo));
+        ask_env_clear(&[]);
+        assert_eq!(sa.last().map(Vec::len), Some(0), "the clicker's banner is gone: {sa:?}");
+        assert_eq!(sb.last().map(Vec::len), Some(0), "the other connection hears of it too: {sb:?}");
+        assert!(on_disk.is_empty(), "and it is gone for good: {on_disk:?}");
+        assert!(fresh.is_empty(), "a later page does not see it either: {fresh:?}");
+    }
+
+    /// Opening the worktree's own page is the user seeing it (§3). The
+    /// parent's browsers learn of it; an unrelated page clears nothing.
+    ///
+    /// Revert-checked, run and restored: with `clear_appeared_on_open`
+    /// returning at once, fails — observed: `the parent's browsers lose the
+    /// banner: []`, `left: None, right: Some(0)` (no State at all). With
+    /// `worktree_parent`'s `.claude/worktrees/` arm made unmatchable, fails
+    /// with the same observation.
+    #[test]
+    fn opening_the_worktree_page_clears_its_entry() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ap-open";
+        let repo = root.path().join(p);
+        init_repo(&repo);
+        let hub = register_for_test(Hub::new(p, repo.clone()));
+        Hub::lock(&hub).seed_worktrees(seen(&repo, root.path()));
+        git_ok(&repo, &["worktree", "add", "-q", "-b", "x", ".claude/worktrees/worktree-x"]);
+        Hub::lock(&hub).apply_worktrees(seen(&repo, root.path()));
+        let (_a, rxa) = conn(&mut Hub::lock(&hub));
+        let (_b, rxb) = conn(&mut Hub::lock(&hub));
+        let wt = repo.join(".claude/worktrees/worktree-x");
+        // Not a worktree page of this parent: nothing changes.
+        clear_appeared_on_open(p, &repo);
+        clear_appeared_on_open("ap-open-other/.claude/worktrees/worktree-x", &wt);
+        let untouched = (appeared_states(&rxa), crate::appeared::load(p).len());
+        clear_appeared_on_open(&format!("{p}/.claude/worktrees/worktree-x"), &wt);
+        let (sa, sb) = (appeared_states(&rxa), appeared_states(&rxb));
+        let on_disk = crate::appeared::load(p);
+        ask_env_clear(&[p]);
+        assert_eq!(untouched, (vec![], 1), "another page's open clears nothing");
+        assert_eq!(sa.last().map(Vec::len), Some(0), "the parent's browsers lose the banner: {sa:?}");
+        assert_eq!(sb.last().map(Vec::len), Some(0), "every one of them: {sb:?}");
+        assert!(on_disk.is_empty(), "{on_disk:?}");
+    }
+
+    /// The outside shape end to end: shown as outside and not allowed, then
+    /// allowed with its virtual URL, then cleared by opening that URL.
+    ///
+    /// Revert-checked, run and restored: with `appeared_view` leaving `url`
+    /// `None` for an allowed outside entry, fails — observed: `left: Null,
+    /// right: "orepo-ap/.claude/outside/wt"`. With `worktree_parent`'s
+    /// `split_url` arm made unmatchable, fails — observed: `opening the
+    /// virtual URL clears it: [Object {…, "url":
+    /// String("orepo-ap/.claude/outside/wt"), "outside": Bool(true),
+    /// "allowed": Bool(true)}]`.
+    #[test]
+    fn an_outside_appearance_is_viewed_and_cleared_by_its_virtual_url() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-ap", "wt");
+        // The fixture already made the worktree; forget it, so the next
+        // confirm sees it as new.
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
+        Hub::lock(&hub).seed_worktrees(Some(Vec::new()));
+        let root = crate::projects::roots()[0].clone();
+        Hub::lock(&hub).apply_worktrees(seen(&fx.repo, &root));
+        let before = snapshot_appeared(&mut Hub::lock(&hub));
+        assert_eq!(before.len(), 1, "{before:?}");
+        assert_eq!(before[0]["path"], fx.wt.to_string_lossy().as_ref());
+        assert_eq!((&before[0]["outside"], &before[0]["allowed"]), (&serde_json::json!(true), &serde_json::json!(false)));
+        assert!(before[0]["url"].is_null(), "not allowed: nowhere to link: {before:?}");
+
+        crate::outside::allow(&fx.project, &fx.wt).unwrap();
+        let allowed = snapshot_appeared(&mut Hub::lock(&hub));
+        let url = crate::outside::url_for(&fx.project, "wt");
+        assert_eq!(allowed[0]["allowed"], true, "{allowed:?}");
+        assert_eq!(allowed[0]["url"], url.as_str());
+
+        clear_appeared_on_open(&url, &fx.wt);
+        let after = snapshot_appeared(&mut Hub::lock(&hub));
+        assert!(after.is_empty(), "opening the virtual URL clears it: {after:?}");
+    }
+
+    /// A non-empty answer without it clears it — including the "only main"
+    /// answer left after removing the last worktree — and no answer clears
+    /// nothing.
+    ///
+    /// Revert-checked, run and restored: with the `retain_listed` call
+    /// removed from `confirm_worktrees`, fails — observed: `a listing
+    /// without it clears it: []`, `left: None, right: Some(0)` (nothing
+    /// changed, so no State went out). With the main checkout left out of
+    /// `listed`, fails with the same observation: "only main" is then an
+    /// empty listing, which both callees refuse to act on.
+    #[test]
+    fn a_listing_without_it_clears_it() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let (mut h, repo, _sib) = hub_with_an_appearance(root.path(), "ap-gone");
+        let (_a, rxa) = conn(&mut h);
+        h.apply_worktrees(seen_worktrees(Vec::new(), &[root.path().to_path_buf()]));
+        let unanswered = (appeared_states(&rxa), crate::appeared::load("ap-gone").len());
+        git_ok(&repo, &["worktree", "remove", "../ap-gone-sib"]);
+        h.apply_worktrees(seen(&repo, root.path()));
+        let states = appeared_states(&rxa);
+        let on_disk = crate::appeared::load("ap-gone");
+        ask_env_clear(&[]);
+        assert_eq!(unanswered, (vec![], 1), "git not answering clears nothing");
+        assert_eq!(states.last().map(Vec::len), Some(0), "a listing without it clears it: {states:?}");
+        assert!(on_disk.is_empty(), "{on_disk:?}");
     }
 }
