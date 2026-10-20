@@ -200,32 +200,50 @@ pub fn resolve_in(_state: &Path, _parent: &str, _name: &str) -> Option<PathBuf> 
     None
 }
 
-/// All records for a parent, sorted by name. A read failure of any kind —
-/// including one existing directory this process simply cannot read right
-/// now — comes back as an empty listing: this function is for display and
-/// enumeration, where "I don't know" and "there is nothing" are both
-/// reasonably shown as nothing. `allow_in` cannot afford that conflation
-/// (see `list_result_in`) and does not use this.
+/// All records for a parent, sorted by name. Lenient, and deliberately its
+/// own loop rather than a call to `list_result_in`: this is the path
+/// display and enumeration go through (`find_in`, `prune_in`, and the
+/// coming switcher), where a directory that cannot be listed, or one entry
+/// inside it `read_in` cannot parse, is skipped rather than hiding every
+/// other record of this parent. Hiding a *healthy* allow because some
+/// unrelated record went bad would be its own fold — the healthy one's URL
+/// keeps resolving regardless, so a listing that stopped mentioning it
+/// would be actively wrong, not just incomplete. `allow_in`'s cap and
+/// re-allow dedupe cannot afford this leniency (a skipped-over damaged
+/// record there hides from the very checks meant to catch it) and go
+/// through the strict `list_result_in` below instead.
 pub fn list_in(state: &Path, parent: &str) -> Vec<Record> {
-    list_result_in(state, parent).unwrap_or_default()
+    let Some(dir) = dir_in(state, parent) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Dot-prefixed names are always our own in-flight temp files.
+        if name.starts_with('.') {
+            continue;
+        }
+        if let Some(rec) = read_in(state, parent, &name) {
+            out.push(rec);
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
-/// `list_in`'s real outcome, with the read failure kept distinct from "zero
-/// records": `Ok(vec![])` only for a parent directory that does not exist
-/// yet (the ordinary case, before any allow), never for one that exists but
-/// could not be fully read. `allow_in` uses this specifically so an
-/// unreadable records directory, or a single damaged record inside an
-/// otherwise-readable one, refuses the allow instead of silently bypassing
-/// the cap and the re-allow dedupe, both of which are counting on this
-/// listing being complete. A present, non-dotfile entry that `read_in`
-/// cannot turn into a `Record` is exactly that: the file exists (this isn't
-/// a race with something else deleting it — dotfiles aside, nothing but
-/// this module's own writers ever touch this directory), so "damaged" and
+/// The strict counterpart to `list_in`, used only by `allow_in`: the read
+/// failure is kept distinct from "zero records" rather than folded into it.
+/// `Ok(vec![])` only for a parent directory that does not exist yet (the
+/// ordinary case, before any allow), never for one that exists but could
+/// not be fully read. `allow_in` uses this specifically so an unreadable
+/// records directory, or a single damaged record inside an otherwise-
+/// readable one, refuses the allow instead of silently bypassing the cap
+/// and the re-allow dedupe, both of which are counting on this listing
+/// being complete. A present, non-dotfile entry that `read_in` cannot turn
+/// into a `Record` is exactly that: the file exists (this isn't a race
+/// with something else deleting it — dotfiles aside, nothing but this
+/// module's own writers ever touch this directory), so "damaged" and
 /// "unreadable" are the only explanations, and both mean the dedupe and
-/// the cap are about to be computed over an incomplete list. Silently
-/// dropping that one entry, as earlier versions of this function did, let
-/// the same real directory be allowed under a second name once its first
-/// record went bad.
+/// the cap are about to be computed over an incomplete list.
 fn list_result_in(state: &Path, parent: &str) -> Result<Vec<Record>, String> {
     let Some(dir) = dir_in(state, parent) else { return Ok(Vec::new()) };
     let entries = match std::fs::read_dir(&dir) {
@@ -246,7 +264,7 @@ fn list_result_in(state: &Path, parent: &str) -> Result<Vec<Record>, String> {
             None => {
                 return Err(format!(
                     "a record in {} cannot be read; revoke or remove it before allowing another",
-                    dir.display()
+                    dir.join(&name).display()
                 ));
             }
         }
@@ -963,12 +981,17 @@ mod tests {
     /// `list_result_in` used to) would let `wt2` get a *second* name, since
     /// the damaged entry counts toward neither the cap nor the dedupe.
     ///
-    /// Revert-checked: replacing the `match read_in(..) { .. None => return
-    /// Err(..) }` arm with the old `if let Some(rec) = read_in(..) {
-    /// out.push(rec); }` (silently skipping the damaged entry) made this
-    /// fail — `unwrap_err()` panicked with `called Result::unwrap_err() on
-    /// an Ok value: Record { name: "wt2", path: "…/wt2", id: (..) }`.
-    /// Restored.
+    /// Revert-checked, two separate runs: replacing the `match read_in(..)
+    /// { .. None => return Err(..) }` arm with the old `if let Some(rec) =
+    /// read_in(..) { out.push(rec); }` (silently skipping the damaged
+    /// entry) made this fail — `unwrap_err()` panicked with `called
+    /// Result::unwrap_err() on an Ok value: Record { name: "wt2", path:
+    /// "…/wt2", id: (..) }`; separately, changing the error message back
+    /// to naming only `dir.display()` (not `dir.join(&name).display()`)
+    /// made the file-name assertion fail: `the message must name the
+    /// damaged file, got "a record in …/outside/p cannot be read; revoke
+    /// or remove it before allowing another"` (the directory, not
+    /// `ghost`). Both restored.
     #[test]
     fn a_damaged_record_blocks_further_allows() {
         let state = tempfile::tempdir().unwrap();
@@ -984,10 +1007,50 @@ mod tests {
         std::fs::create_dir(&wt2).unwrap();
         let err = allow_in(state.path(), "p", &wt2).unwrap_err();
         assert!(err.contains("cannot be read"), "got {err:?}");
+        assert!(err.contains("ghost"), "the message must name the damaged file, got {err:?}");
         assert!(
             dir.join("wt2").symlink_metadata().is_err(),
             "the refused allow must not have written a second record"
         );
+    }
+
+    /// `list_in` must not let one damaged record hide a different,
+    /// perfectly healthy one of the same parent — that healthy record's
+    /// URL still resolves regardless, so a listing that stopped mentioning
+    /// it would be wrong, not merely incomplete. `allow_in` is held to the
+    /// opposite standard on purpose: the same damaged record must still
+    /// refuse a *new* allow, since silently bypassing the cap/dedupe is the
+    /// actual defect this round's #188 review item 2 was about.
+    ///
+    /// Revert-checked: pointing `list_in` back at
+    /// `list_result_in(state, parent).unwrap_or_default()` (the fix-round-2
+    /// shape) made the first assertion fail — the damaged "ghost" record
+    /// turned the whole `list_result_in` call into `Err`, so
+    /// `unwrap_or_default()` silently emptied the listing: `assertion
+    /// `left == right` failed: the healthy record must still be listed\n
+    /// left: []\n right: [Record { name: "healthy", .. }]`. Restored.
+    #[test]
+    fn list_in_is_lenient_while_allow_in_still_refuses() {
+        let state = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let healthy = outside.path().join("healthy");
+        std::fs::create_dir(&healthy).unwrap();
+        let healthy_rec = allow_in(state.path(), "p", &healthy).unwrap();
+
+        let dir = dir_in(state.path(), "p").unwrap();
+        std::fs::write(dir.join("ghost"), "not even close to a record\n").unwrap();
+
+        assert_eq!(list_in(state.path(), "p"), vec![healthy_rec.clone()], "the healthy record must still be listed");
+        assert_eq!(
+            find_in(state.path(), "p", &healthy_rec.path),
+            Some(healthy_rec.clone()),
+            "find_in must still find the healthy record"
+        );
+
+        let other = outside.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let err = allow_in(state.path(), "p", &other).unwrap_err();
+        assert!(err.contains("cannot be read"), "allow_in must still refuse because of the damaged record, got {err:?}");
     }
 
     /// Revert-checked: dropping the `..`-segment check in `dir_in` (keeping
