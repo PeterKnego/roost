@@ -1225,6 +1225,18 @@ fn append_occupant(key_dir: &std::path::Path, dir: &std::path::Path) -> Option<S
     if lines.iter().any(|l| crate::dirid::parse_line(l) == Some(crate::dirid::Stored::Full(id))) {
         return None;
     }
+    // A legacy line for this `(dev, ino)` is this directory, upgraded in
+    // place rather than listed twice. It cannot be an earlier occupant still
+    // alive elsewhere: two live directories never share `(dev, ino)`, so an
+    // earlier one with that pair is gone, and its line protected nothing.
+    let legacy = lines.iter().position(|l| {
+        matches!(crate::dirid::parse_line(l), Some(crate::dirid::Stored::Legacy { dev, ino }) if dev == id.dev && ino == id.ino)
+    });
+    if let Some(i) = legacy {
+        lines[i] = crate::dirid::format(&id);
+        let _ = crate::dirid::write_lines(&path, &lines);
+        return None;
+    }
     lines.push(crate::dirid::format(&id));
     let mut said = None;
     if lines.len() > OCCUPANT_CAP {
@@ -1243,17 +1255,53 @@ fn append_occupant(key_dir: &std::path::Path, dir: &std::path::Path) -> Option<S
 
 /// Writes `.origin-ino` four-field (#183), and rewrites it when it differs —
 /// which is also what upgrades a two-field one from #178's roost on the next
-/// pass in which the directory resolves. A directory whose birth time cannot
-/// be read writes nothing and leaves whatever is there: a legacy identity
-/// still protects, and `dirid` never falls back to `(dev, ino)`.
+/// pass in which the directory resolves. Metadata that cannot be read at all
+/// writes nothing, as before #183.
+#[cfg(unix)]
 fn write_origin_identity(key_dir: &std::path::Path, dir: &std::path::Path) {
-    let Ok(Some(id)) = crate::dirid::of(dir) else { return };
+    use std::os::unix::fs::MetadataExt;
+    let Ok(m) = std::fs::metadata(dir) else { return };
     let marker = origin_identity_path(key_dir);
-    let line = crate::dirid::format(&id);
-    if std::fs::read_to_string(&marker).is_ok_and(|cur| cur == format!("{line}\n")) {
-        return;
+    if let Some(line) = origin_line(identity_at(&marker), crate::dirid::of_metadata(&m), (m.dev(), m.ino())) {
+        let _ = crate::dirid::write_lines(&marker, &[line]);
     }
-    let _ = crate::dirid::write_lines(&marker, &[line]);
+}
+
+#[cfg(not(unix))]
+fn write_origin_identity(_key_dir: &std::path::Path, _dir: &std::path::Path) {}
+
+/// The `.origin-ino` line to write, given what is recorded now, the
+/// directory's identity (`Err` = birth time unreadable) and its `(dev,
+/// ino)` — or `None` to leave the file as it is.
+///
+/// With no birth time the directory is recorded **Legacy**, two fields.
+/// Writing nothing instead left a new key with no identity at all on any
+/// filesystem whose `created()` errs (NFSv3, FUSE, a seccomp'd `statx`):
+/// `identities()` empty, every scan "no evidence", and a renamed project's
+/// live sessions SIGKILLed — protection #178 gave and #183 must not take
+/// away. That is not the fallback `dirid` forbids: what is forbidden is a
+/// `(dev, ino)` *match* counting as a full one, and a Legacy record can only
+/// ever produce a weak match, which protects and never licenses a follow.
+/// A recorded identity that already names these `(dev, ino)` is kept — a
+/// Full one is not downgraded for want of a birth time — and anything else
+/// (a stale pair from a different directory, a damaged file) is replaced.
+fn origin_line(
+    current: Option<crate::dirid::Stored>,
+    id: Result<crate::dirid::DirId, String>,
+    (dev, ino): (u64, u64),
+) -> Option<String> {
+    use crate::dirid::Stored;
+    match id {
+        Ok(id) => (current != Some(Stored::Full(id))).then(|| crate::dirid::format(&id)),
+        Err(_) => {
+            let same = match current {
+                Some(Stored::Full(f)) => f.dev == dev && f.ino == ino,
+                Some(Stored::Legacy { dev: d, ino: i }) => d == dev && i == ino,
+                None => false,
+            };
+            (!same).then(|| format!("{dev} {ino}"))
+        }
+    }
 }
 
 /// What a live shell says about a project whose recorded path is `NotFound`.
@@ -4511,6 +4559,57 @@ mod tests {
 
             assert_eq!(fresh, want, "a new key's .origin-ino is four-field");
             assert_eq!(upgraded, want, "a legacy .origin-ino is upgraded on the next resolving pass");
+        });
+    }
+
+    /// Fix round 1: with no birth time, `.origin-ino` is recorded Legacy
+    /// (protect-only) rather than not at all, a stale pair is replaced, and a
+    /// Full record naming the same `(dev, ino)` is not downgraded. A pure
+    /// seam: this host always has birth time, and nothing in roost can make
+    /// `created()` fail on demand, so there is no reconcile-level version.
+    ///
+    /// Revert-checked, run and restored: with the early return restored
+    /// (`Err(_) => None`, i.e. nothing written without a birth time), fails
+    /// "no birth time still records a protect-only identity" — left `None`,
+    /// right `Some("7 9")`.
+    #[test]
+    fn without_a_birth_time_the_origin_is_recorded_legacy() {
+        use crate::dirid::{DirId, Stored};
+        let id = DirId { dev: 7, ino: 9, bsec: 100, bnsec: 5 };
+        let no_btime = || Err::<DirId, String>("birth time unreadable".into());
+        assert_eq!(origin_line(None, no_btime(), (7, 9)), Some("7 9".into()), "no birth time still records a protect-only identity");
+        assert_eq!(origin_line(Some(Stored::Legacy { dev: 7, ino: 3 }), no_btime(), (7, 9)), Some("7 9".into()), "a stale pair is replaced");
+        assert_eq!(origin_line(Some(Stored::Legacy { dev: 7, ino: 9 }), no_btime(), (7, 9)), None, "a matching pair is left");
+        assert_eq!(origin_line(Some(Stored::Full(id)), no_btime(), (7, 9)), None, "a matching Full record is not downgraded");
+        assert_eq!(
+            origin_line(Some(Stored::Full(DirId { ino: 3, ..id })), no_btime(), (7, 9)),
+            Some("7 9".into()),
+            "a Full record of a different directory is replaced"
+        );
+        assert_eq!(origin_line(Some(Stored::Full(id)), Ok(id), (7, 9)), None, "unchanged is not rewritten");
+        assert_eq!(origin_line(Some(Stored::Legacy { dev: 7, ino: 9 }), Ok(id), (7, 9)), Some("7 9 100 5".into()), "legacy upgrades");
+    }
+
+    /// Fix round 1: an occupant line written two-field is upgraded in place
+    /// when the same directory's full identity arrives, not listed twice.
+    ///
+    /// Revert-checked, run and restored: with the in-place upgrade removed,
+    /// fails "the legacy line is upgraded in place, not duplicated" — left
+    /// `[Some(Legacy { .. }), Some(Full(..))]`, right `[Some(Full(..))]`.
+    #[test]
+    fn a_legacy_occupant_line_is_upgraded_in_place() {
+        with_state(|state| {
+            use std::os::unix::fs::MetadataExt;
+            let base = ext4_tempdir();
+            let key_dir = state.join("sock/upocc");
+            fs::create_dir_all(&key_dir).unwrap();
+            let m = fs::metadata(base.path()).unwrap();
+            fs::write(occupant_identity_path(&key_dir), format!("{} {}\n", m.dev(), m.ino())).unwrap();
+
+            let said = append_occupant(&key_dir, base.path());
+
+            assert_eq!(occupant_lines(&key_dir), vec![Some(full_id(base.path()))], "the legacy line is upgraded in place, not duplicated");
+            assert_eq!(said, None);
         });
     }
 
