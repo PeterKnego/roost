@@ -251,6 +251,18 @@ pub enum Intent {
     /// every "finished" check at this moment; the row that offered the
     /// button is a hint, not an authorisation.
     RemoveWorktree { key: String },
+    /// Allow one git worktree outside roost's roots to open under
+    /// `<parent>/.claude/outside/<name>` (#188). `parent` is carried
+    /// explicitly rather than taken from the sending page: the switcher sits
+    /// in every page's header, sibling worktrees' included, so the sender is
+    /// not necessarily the parent. Every check — `parent` resolves, git lists
+    /// `path` as one of its non-main worktrees — is made against `parent`
+    /// itself, server-side, at this moment; the row is a hint.
+    AllowOutsideWorktree { parent: String, path: String },
+    /// Delete the allow record `name` under `parent`. Revocation touches no
+    /// session, layout or `.base`: the page stops resolving and a live
+    /// session stays alive.
+    RevokeOutsideWorktree { parent: String, name: String },
     /// Tree visibility for this workspace, overriding the config file's
     /// `show_hidden` for everyone looking at this project. A workspace that
     /// has never been toggled carries `None` and follows the config instead —
@@ -701,6 +713,12 @@ pub enum Event {
     /// re-validate (`claudesess::valid_session_id`) before it ever reaches a
     /// command line.
     WorktreeReady { url: String, launch: Option<Launch>, fork: Option<String> },
+    /// The allow record is written; `url` is the virtual
+    /// `<parent>/.claude/outside/<name>` it now resolves under. Sent to the
+    /// clicker only — it is the one that asked and may navigate; every other
+    /// browser learns of the change through the refreshed snapshot and
+    /// `ProjectsChanged`.
+    OutsideAllowed { url: String },
     /// Claude in `session` asked for worktree `worktree-<name>` through the
     /// hook and is blocked until a browser answers with `WorktreeAnswer`.
     /// Broadcast to every browser of the project; `id` is a server counter,
@@ -892,6 +910,30 @@ mod tests {
         });
         assert!(s.contains(r#""fork":"864ee734-e3ab-434e-8278-745a850b16ad""#), "{s}");
         assert!(!s.contains("term3"), "the terminal name the dialog offered must never be on the wire here");
+    }
+
+    /// Pins the wire shape the switcher's Allow…/Revoke actions send: both
+    /// fields required, `parent` explicit (never inferred from the page).
+    #[test]
+    fn outside_worktree_intents_decode_and_require_their_fields() {
+        let i = decode(r#"{"t":"AllowOutsideWorktree","parent":"repo","path":"/home/u/scratch/wt"}"#).unwrap();
+        assert!(
+            matches!(i, Intent::AllowOutsideWorktree { ref parent, ref path } if parent == "repo" && path == "/home/u/scratch/wt"),
+            "got {i:?}"
+        );
+        let i = decode(r#"{"t":"RevokeOutsideWorktree","parent":"repo","name":"wt"}"#).unwrap();
+        assert!(
+            matches!(i, Intent::RevokeOutsideWorktree { ref parent, ref name } if parent == "repo" && name == "wt"),
+            "got {i:?}"
+        );
+        assert!(decode(r#"{"t":"AllowOutsideWorktree","path":"/x"}"#).is_err(), "parent is required");
+        assert!(decode(r#"{"t":"RevokeOutsideWorktree","parent":"repo"}"#).is_err(), "name is required");
+    }
+
+    #[test]
+    fn outside_allowed_encodes_its_url() {
+        let s = encode(&Event::OutsideAllowed { url: "repo/.claude/outside/wt".into() });
+        assert_eq!(s, r#"{"t":"OutsideAllowed","url":"repo/.claude/outside/wt"}"#);
     }
 
     #[test]
