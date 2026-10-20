@@ -217,7 +217,10 @@ pub fn resolve_project(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
 /// forks: it is what lets `home::resolves`, which runs under the hub
 /// registry lock, follow a rename into a `.claude/worktrees/` path. Every
 /// other check, confinement included, is unchanged. The dot-segment vouching
-/// is waived only because every caller passes a `.moved-to`'s contents.
+/// is waived only because every caller passes a URL roost recorded after
+/// vouching for it: a `.moved-to`'s contents, or a re-home record's owner
+/// that `home::owner_dir_with` then accepts only when the directory carries
+/// one of the home key's identities in full (#183 §3).
 pub(crate) fn resolve_recorded_project(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
     resolve_project_with(roots, name, &|_, _| true)
 }

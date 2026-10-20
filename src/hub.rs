@@ -11954,7 +11954,7 @@ mod tests {
             live: vec![],
             fresh: true,
             prev: None,
-            inside: vec![],
+            shells: vec![],
         }]);
         drain(&rx);
         Hub::lock(&hub).apply_worktrees(seen(&repo, root.path()));

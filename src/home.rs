@@ -302,17 +302,28 @@ pub fn owner_dir_in(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBu
 }
 
 /// [`owner_dir_in`] with the state dir injected, and the one place the
-/// `.moved-to` widening (#158 §5) lives — so every caller, `resolves` and
-/// `ide.rs`'s delivery alike, sees a followed session's owner the same way.
-/// The `.claude/worktrees` shape is tried first; failing that, an owner
-/// equal to `home`'s `.moved-to` is its directory when that still resolves,
-/// through the fork-free `resolve_recorded_project` (see [`resolves_with`]).
+/// rename widenings (#158 §5, #183 §3) live — so every caller, `resolves`
+/// and `ide.rs`'s delivery alike, sees a followed session's owner the same
+/// way. The `.claude/worktrees` shape is tried first; failing that, an
+/// owner equal to `home`'s `.moved-to` is its directory when that still
+/// resolves, through the fork-free `resolve_recorded_project` (see
+/// [`resolves_with`]); and failing that, an owner whose directory carries
+/// one of `home`'s key identities in full. That last is where a session
+/// that followed its own shell went when it is not the key's one target:
+/// an occupant renamed to D while B, the `.moved-to`, still stands. Without
+/// it, D's sessions were followed on paper and shown nowhere — the old URL
+/// no longer resolves, and D would not list them.
 pub fn owner_dir_with(state: &Path, roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
-    shaped_owner_dir(roots, home, owner).or_else(|| {
-        (moved_to_in(state, home).as_deref() == Some(owner))
-            .then(|| crate::projects::resolve_recorded_project(roots, owner))
-            .flatten()
-    })
+    shaped_owner_dir(roots, home, owner)
+        .or_else(|| {
+            (moved_to_in(state, home).as_deref() == Some(owner))
+                .then(|| crate::projects::resolve_recorded_project(roots, owner))
+                .flatten()
+        })
+        .or_else(|| {
+            let key_dir = state.join("sock").join(crate::projects::storage_key(home));
+            crate::projects::resolve_recorded_project(roots, owner).filter(|d| crate::registry::carries_identity(&key_dir, d))
+        })
 }
 
 fn shaped_owner_dir(roots: &[PathBuf], home: &str, owner: &str) -> Option<PathBuf> {
@@ -424,11 +435,90 @@ fn copy_if_absent(src: &Path, dst: &Path) -> Result<bool, String> {
     out
 }
 
+/// One of a renamed key's own sessions, and the directory its shell is
+/// working in: an ancestor of its session leader's cwd carrying one of the
+/// key's full identities (`registry::identities`), confirmed by the resolver
+/// to be project `url` — and not the key's own current directory. The
+/// evidence #183 §3 lets a native session follow on: about *that* terminal,
+/// never about the key as a whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellAt {
+    pub name: String,
+    pub url: String,
+    pub dir: PathBuf,
+}
+
+/// What part (a) of [`follow_move_in`] would do for one of the key's own
+/// sessions.
+#[derive(Debug, PartialEq, Eq)]
+enum OwnFollow {
+    /// Re-homed by its own Claude's move, or a record that cannot be read:
+    /// not this rename's to touch.
+    NotOurs,
+    /// Already owned by the directory its shell is in.
+    There,
+    /// No evidence about this terminal: its shell is outside every one of
+    /// the key's directories. It stays where it is.
+    Stays,
+    /// Follows `url`, whose directory is `dir`.
+    To(String, PathBuf),
+}
+
+/// Part (a)'s decision for session `n` of `old_url` (#183 §3). A session
+/// that is `Here`, or that an earlier follow sent to `prev`, follows the
+/// directory its own shell is in (`shells`). Failing that, a session sent
+/// to `prev` follows `new_dir` when its record's own full identity is the
+/// one found there — #182's A→B, `cd` out, B→C, where the shell gives no
+/// evidence but the record still does. Any other `Elsewhere` was re-homed
+/// by its own Claude's move and stays where that put it.
+///
+/// Never "the key moved, so all of its sessions did": a key whose old name
+/// has held an occupant has sessions working in two different directories,
+/// and only each one's own shell says which.
+fn own_follow(state: &Path, old_url: &str, n: &str, new_url: &str, new_dir: Option<&Path>, shells: &[ShellAt], prev: Option<&str>) -> OwnFollow {
+    let owner = owner_of_in(state, old_url, n);
+    let shell = shells.iter().find(|s| s.name == n);
+    if let (Owner::Elsewhere(o), Some(s)) = (&owner, shell) {
+        if *o == s.url {
+            return OwnFollow::There;
+        }
+    }
+    let from_prev = match &owner {
+        Owner::Here => false,
+        Owner::Elsewhere(o) if prev == Some(o.as_str()) => true,
+        _ => return OwnFollow::NotOurs,
+    };
+    if let Some(s) = shell {
+        return OwnFollow::To(s.url.clone(), s.dir.clone());
+    }
+    if from_prev {
+        if let Some(dir) = new_dir {
+            let here = crate::dirid::of(dir).ok().flatten();
+            if matches!((identity_of_in(state, old_url, n), here), (Ok(Some(crate::dirid::Stored::Full(id))), Some(h)) if id == h) {
+                return OwnFollow::To(new_url.to_string(), dir.to_path_buf());
+            }
+        }
+    }
+    log_stays_once(old_url, n);
+    OwnFollow::Stays
+}
+
+/// Once per session for the life of the process: a stranded session is
+/// re-examined every pass, and its reason does not change.
+fn log_stays_once(old_url: &str, n: &str) {
+    static SAID: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    let first = SAID.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).insert(format!("{old_url}/{n}"));
+    if first {
+        eprintln!("roost: {old_url}/{n} did not follow {old_url}'s rename: its shell is outside every directory the key has had, so nothing says where it belongs");
+    }
+}
+
 /// Spec §5 steps a–d: `old_url`'s directory is now `new_url`'s, so its live
-/// sessions become residents of the new project, records naming the old
-/// URL as owner name the new one, and the new key inherits the old key's
-/// `.base` and layout when it has none. `new_live` is `session::live_names
-/// (new_url)` — the R16 gate. Idempotent; returns whether anything changed.
+/// sessions become residents of the project their own shell is in, records
+/// naming the old URL as owner name the new one, and the new key inherits
+/// the old key's `.base` and layout when it has none. `live_in(url)` is
+/// `session::live_names(url)` — the R16 gate, asked of each session's own
+/// target. Idempotent; returns whether anything changed.
 ///
 /// `prev` is the target an earlier follow re-pointed things at, when that
 /// target has since been renamed on (A→B→C, `prev` = B): what that follow
@@ -438,38 +528,47 @@ fn copy_if_absent(src: &Path, dst: &Path) -> Result<bool, String> {
 /// re-points a record only when that record's own identity is the one
 /// found there (#183 §1), and `None` re-points none.
 ///
+/// `shells` is (a)'s evidence, one entry per session whose shell is in one
+/// of the key's directories (#183 §3): each session follows its own, which
+/// need not be `new_url` — an occupant renamed to D while B still stands
+/// takes its sessions to D, and the earlier-followed ones stay with B.
+///
 /// Records and copies only: no hub, no lock, no git. Its caller
-/// (`registry::follow_moves`) refreshes hubs afterwards, one at a time.
+/// (`registry::follow_moves`) resolves `shells` and refreshes hubs.
+#[allow(clippy::too_many_arguments)]
 pub fn follow_move_in(
     state: &Path,
     old_url: &str,
     new_url: &str,
     new_dir: Option<&Path>,
     live: &[String],
-    new_live: &[String],
+    shells: &[ShellAt],
+    live_in: &dyn Fn(&str) -> Vec<String>,
     prev: Option<&str>,
 ) -> bool {
     let mut changed = false;
     let prev = prev.filter(|p| *p != new_url);
     let followed_before = |o: &str| prev == Some(o);
-    // (a) A session that is `Here` follows, and so does one an earlier
-    // follow sent to `prev`. Any other `Elsewhere` was re-homed by its own
-    // Claude's move and stays where that put it; `Unknown` is "cannot
-    // tell", and cannot-tell writes nothing.
+    // (a) The key's own sessions, each on its own shell's evidence. Every
+    // writer of a record writes its target's identity, so a later rename of
+    // that target is found by the record itself (R18, or the fallback in
+    // `own_follow`) once the shell has wandered off.
     for n in live {
-        match owner_of_in(state, old_url, n) {
-            Owner::Here => {}
-            Owner::Elsewhere(ref o) if followed_before(o) => {}
-            _ => continue,
-        }
+        let OwnFollow::To(url, dir) = own_follow(state, old_url, n, new_url, new_dir, shells, prev) else { continue };
         // R16: a resident never shadows a native session of the same name.
-        if new_live.contains(n) {
-            eprintln!("roost: {old_url}/{n} did not follow the rename to {new_url}: {n} already exists there");
+        if live_in(&url).contains(n) {
+            eprintln!("roost: {old_url}/{n} did not follow the rename to {url}: {n} already exists there");
             continue;
         }
-        match record_in(state, old_url, n, new_url) {
-            Ok(()) => changed = true,
-            Err(e) => eprintln!("roost: {old_url}/{n} did not follow the rename to {new_url}: {e}"),
+        match record_in(state, old_url, n, &url) {
+            Ok(()) => {
+                changed = true;
+                if let Err(e) = record_identity_in(state, old_url, n, &dir) {
+                    forget_identity_in(state, old_url, n);
+                    eprintln!("roost: {old_url}/{n} followed the rename to {url}, but its identity was not recorded: {e}");
+                }
+            }
+            Err(e) => eprintln!("roost: {old_url}/{n} did not follow the rename to {url}: {e}"),
         }
     }
     // (b) Residents of the old URL (a main checkout's terminals re-homed
@@ -536,11 +635,23 @@ pub fn follow_move_in(
 }
 
 /// [`follow_move_in`] against the real state dir, with the R16 gate read
-/// from the new project's own live sessions. Never call under a lock:
+/// from each target's own live sessions. Never call under a lock:
 /// `session::live_names` takes `SESSIONS`.
-pub fn follow_move(old_url: &str, new_url: &str, new_dir: Option<&Path>, live: &[String], prev: Option<&str>) -> bool {
-    let new_live = crate::session::live_names(new_url);
-    follow_move_in(&crate::wsstate::state_dir(), old_url, new_url, new_dir, live, &new_live, prev)
+pub fn follow_move(old_url: &str, new_url: &str, new_dir: Option<&Path>, live: &[String], shells: &[ShellAt], prev: Option<&str>) -> bool {
+    follow_move_in(&crate::wsstate::state_dir(), old_url, new_url, new_dir, live, shells, &crate::session::live_names, prev)
+}
+
+/// Whether part (a) of a non-fresh follow has anything left to do: one of
+/// the key's own sessions whose evidence names somewhere it is not yet
+/// owned by, and that R16 would not hold back (that one would only log its
+/// refusal every pass). Never call under a lock, as [`follow_move`].
+pub fn own_follow_pending(old_url: &str, new_url: &str, new_dir: Option<&Path>, live: &[String], shells: &[ShellAt], prev: Option<&str>) -> bool {
+    let state = crate::wsstate::state_dir();
+    let prev = prev.filter(|p| *p != new_url);
+    live.iter().any(|n| match own_follow(&state, old_url, n, new_url, new_dir, shells, prev) {
+        OwnFollow::To(url, _) => !crate::session::live_names(&url).contains(n),
+        _ => false,
+    })
 }
 
 #[cfg(test)]
@@ -836,6 +947,16 @@ mod tests {
     /// (b)'s rewrite removed fails "(b) and that .ino was written by the
     /// follow, not left over" (the content alone cannot tell: a rename keeps
     /// the identity, so only the file's own inode shows a write).
+    ///
+    /// #183 §3 (part (a) on each session's own shell), revert-checked, each
+    /// run and restored: `own_follow` taking `new_url` whenever a shell was
+    /// found fails "(a) a session follows its own shell, not the key's
+    /// move" — left `Elsewhere(".../worktree-b")`; its `Stays` arm answering
+    /// `new_url` fails "(a) a shell outside every directory is no evidence:
+    /// it stays" — left the same; (a)'s R16 check removed fails "R16: the
+    /// new key's native busy is not shadowed"; (a)'s `record_identity_in`
+    /// removed fails "(a) a followed session's record carries its
+    /// directory's identity" — left `Ok(None)`.
     #[test]
     fn follow_move_rewrites_owner_records_and_copies_state_only_when_absent() {
         let st = tempfile::tempdir().unwrap();
@@ -875,13 +996,25 @@ mod tests {
         std::fs::write(s.join(format!("{ok}.json")), r#"{"old":1}"#).unwrap();
         std::fs::write(s.join(format!("{nk}.json")), r#"{"new":1}"#).unwrap();
 
-        let live: Vec<String> = ["shell", "busy", "away", "unsure"].map(String::from).to_vec();
-        assert!(follow_move_in(s, old, new, Some(&new_dir), &live, &["busy".to_string()], None));
+        // (a)'s evidence: each session's own shell. `todee`'s is in another
+        // of the key's directories (an occupant renamed to D), `left`'s is
+        // in none; `away`'s is in B, but its own Claude re-homed it.
+        let d_url = "repo/.claude/worktrees/worktree-d";
+        let at = |n: &str, url: &str, dir: &Path| ShellAt { name: n.into(), url: url.into(), dir: dir.to_path_buf() };
+        let shells = vec![at("shell", new, &new_dir), at("busy", new, &new_dir), at("away", new, &new_dir), at("todee", d_url, &elsewhere)];
+        let busy_in_new = |u: &str| if u == new { vec!["busy".to_string()] } else { vec![] };
+        let live: Vec<String> = ["shell", "busy", "away", "unsure", "todee", "left"].map(String::from).to_vec();
+        assert!(follow_move_in(s, old, new, Some(&new_dir), &live, &shells, &busy_in_new, None));
 
         assert_eq!(owner_of_in(s, old, "shell"), Owner::Elsewhere(new.into()), "(a) a live session follows");
         assert_eq!(owner_of_in(s, old, "busy"), Owner::Here, "R16: the new key's native busy is not shadowed");
         assert_eq!(owner_of_in(s, old, "away"), Owner::Elsewhere(other.into()), "a session already re-homed elsewhere stays there");
         assert!(matches!(owner_of_in(s, old, "unsure"), Owner::Unknown(_)), "cannot tell writes nothing");
+        assert_eq!(owner_of_in(s, old, "todee"), Owner::Elsewhere(d_url.into()), "(a) a session follows its own shell, not the key's move");
+        assert_eq!(owner_of_in(s, old, "left"), Owner::Here, "(a) a shell outside every directory is no evidence: it stays");
+        let id_of = |d: &Path| Ok(Some(crate::dirid::Stored::Full(crate::dirid::of(d).unwrap().unwrap())));
+        assert_eq!(identity_of_in(s, old, "shell"), id_of(&new_dir), "(a) a followed session's record carries its directory's identity");
+        assert_eq!(identity_of_in(s, old, "todee"), id_of(&elsewhere), "(a) its own directory's, not the key's new one");
         assert_eq!(owner_of_in(s, "repo", "term3"), Owner::Elsewhere(new.into()), "(b) a resident of the old URL follows");
         assert_eq!(owner_of_in(s, "repo", "term4"), Owner::Elsewhere(other.into()), "(b) another owner's resident is untouched");
         assert_eq!(owner_of_in(s, "zed", "term5"), Owner::Elsewhere(old.into()), "(b) only to an owner the record's home may name");
@@ -896,10 +1029,10 @@ mod tests {
         assert_eq!(crate::worktree::read_base(s, &nk).as_deref(), Some("main"), "(c) the base is copied to a key that had none");
         assert_eq!(std::fs::read_to_string(s.join(format!("{nk}.json"))).unwrap(), r#"{"new":1}"#, "the new key's own layout is never overwritten");
 
-        assert!(!follow_move_in(s, old, new, Some(&new_dir), &live, &["busy".to_string()], None), "a second pass changes nothing");
+        assert!(!follow_move_in(s, old, new, Some(&new_dir), &live, &shells, &busy_in_new, None), "a second pass changes nothing");
 
         std::fs::remove_file(s.join(format!("{nk}.json"))).unwrap();
-        assert!(follow_move_in(s, old, new, Some(&new_dir), &live, &[], None));
+        assert!(follow_move_in(s, old, new, Some(&new_dir), &live, &shells, &|_| vec![], None));
         assert_eq!(std::fs::read_to_string(s.join(format!("{nk}.json"))).unwrap(), r#"{"old":1}"#, "(d) the layout is copied to a key that had none");
         assert_eq!(owner_of_in(s, old, "busy"), Owner::Elsewhere(new.into()), "once the name is free there, it follows too");
         assert!(std::fs::read_dir(s).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains(".tmp.")), "no temp file left behind");
