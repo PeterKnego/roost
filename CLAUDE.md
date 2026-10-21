@@ -385,10 +385,13 @@ a shell started that began somewhere else) — so a transient `cd` into any of t
 directories becomes a permanent re-home of that session, not a visit. That
 is spec-mandated, not a bug: the session's own evidence is retired the
 moment stronger evidence (its live shell) appears. A session with neither
-shell evidence nor a start identity stays where it is, `Here` under its
-home — which no page lists once that home has been renamed; sessions alive before start identities existed are backfilled once,
-with the key's own recorded identity, while their key is unrenamed
-(`registry::backfill_start_identity`).
+shell evidence nor a start identity stays with its current owner — its
+home, if it was never followed. Once that home is renamed no page lists
+it, and if a new directory then appears at the old name, that occupant's
+page lists it as its own and its Close Project ends it: the one hazard
+this leaves, which is why sessions alive before start identities existed
+are backfilled once, with the key's own recorded identity, while their
+key is unrenamed (`registry::backfill_start_identity`).
 
 **The rule:** "I could not determine X" is a third outcome, never folded into
 "X is false". Concretely:
