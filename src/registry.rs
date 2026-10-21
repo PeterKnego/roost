@@ -6824,13 +6824,23 @@ mod tests {
         });
     }
 
-    /// #183 Review Focus 1, on ext4 where the reuse is real: the record's
-    /// target is removed and a directory made at the same path, which ext4
-    /// gives the same inode (it is made again until it does, so the fixture
-    /// cannot pass without the reuse); that directory becomes a worktree and
-    /// is renamed to C beside it. C has the record's `(dev, ino)` and a new
+    /// #183 Review Focus 1: the record's target is removed and a directory
+    /// made at the same path; that directory becomes a worktree and is
+    /// renamed to C beside it. C has the record's `(dev, ino)` and a new
     /// birth time: it is not the record's directory, and the record must not
     /// follow into it — by the sibling scan, or by a Claude working in C.
+    ///
+    /// On this host's ext4 the reuse is real: the directory is made again
+    /// until ext4 hands back the freed inode. Where it never does — GH's
+    /// runners gave it back 0 times in 64, and the first version of this
+    /// test asserted the reuse and failed there in setup — the record's
+    /// `.ino` is instead rewritten to C's own `(dev, ino)` with the old
+    /// birth time, which is byte-for-byte what the reuse produces. The
+    /// setup assertion below holds in both modes, so neither can pass
+    /// without C carrying the record's `(dev, ino)`; the printed mode says
+    /// which one ran. The forged mode was revert-checked too (reuse forced
+    /// off, compare cut as below): it fails "nothing carries the record's
+    /// identity" with the same `At(".../worktree-c", ...)`.
     ///
     /// Revert-checked, run and restored: with `find_by_identity`'s compare
     /// cut to `(dev, ino)` (`here.dev == id.dev && here.ino == id.ino`),
@@ -6852,7 +6862,7 @@ mod tests {
             let c = format!("{home}/.claude/worktrees/worktree-c");
             let a_dir = repo.join(".claude/worktrees/worktree-a");
             crate::hub::rehome_to(home, "term3", &a).unwrap();
-            let Ok(Some(crate::dirid::Stored::Full(old))) = crate::home::identity_of(home, "term3") else {
+            let Ok(Some(crate::dirid::Stored::Full(mut old))) = crate::home::identity_of(home, "term3") else {
                 panic!("setup: rehome_to records a full identity")
             };
 
@@ -6867,12 +6877,20 @@ mod tests {
                 }
                 same
             });
-            assert!(reused, "setup: ext4 handed the record's inode to a new directory at its path");
+            if !reused {
+                fs::create_dir(&a_dir).unwrap();
+            }
             git_in(&repo, &["worktree", "prune"]);
             git_in(&repo, &["worktree", "add", "-q", "-b", "worktree-a2", ".claude/worktrees/worktree-a"]);
             git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-c"]);
             let c_dir = repo.join(".claude/worktrees/worktree-c").canonicalize().unwrap();
             let now = crate::dirid::of(&c_dir).unwrap().unwrap();
+            if !reused {
+                old = crate::dirid::DirId { dev: now.dev, ino: now.ino, ..old };
+                let ino = _state.join("home").join(crate::projects::storage_key(home)).join(".term3.ino");
+                crate::dirid::write_lines(&ino, &[crate::dirid::format(&old)]).unwrap();
+            }
+            eprintln!("a_recreated_target_is_not_the_records_directory: {}", if reused { "real ext4 inode reuse" } else { "no reuse here; forged the reused identity" });
 
             let direct = find_by_identity(&roots, &a, &old, Some(&c_dir));
             let procs = vec![crate::claudes::ClaudeProc {
