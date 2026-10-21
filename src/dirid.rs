@@ -175,6 +175,23 @@ pub fn matches(stored: &Stored, id: &DirId) -> bool {
 /// mirrors `outside.rs`'s `write_body`/`replace_record` pair, collapsed into
 /// one call because every caller here always wants the final name.
 pub fn write_lines(path: &Path, lines: &[String]) -> Result<(), String> {
+    write_with(path, lines, |tmp, path| std::fs::rename(tmp, path))
+}
+
+/// [`write_lines`] that never replaces: published with `hard_link`, which
+/// fails with `AlreadyExists` when `path` is there — so a check-then-write
+/// cannot overwrite a file another writer made in between. For evidence that
+/// must only ever be added, never changed (`registry`'s start-identity
+/// backfill).
+pub fn write_new(path: &Path, lines: &[String]) -> Result<(), String> {
+    write_with(path, lines, |tmp, path| {
+        let out = std::fs::hard_link(tmp, path);
+        let _ = std::fs::remove_file(tmp);
+        out
+    })
+}
+
+fn write_with(path: &Path, lines: &[String], publish: impl FnOnce(&Path, &Path) -> std::io::Result<()>) -> Result<(), String> {
     let dir = path.parent().ok_or_else(|| format!("{} has no parent directory", path.display()))?;
     let file_name = path
         .file_name()
@@ -204,7 +221,7 @@ pub fn write_lines(path: &Path, lines: &[String]) -> Result<(), String> {
         return Err(e.to_string());
     }
 
-    std::fs::rename(&tmp, path).map_err(|e| {
+    publish(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         e.to_string()
     })

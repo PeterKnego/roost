@@ -1507,6 +1507,63 @@ fn forget_start_identity(sock_path: &std::path::Path) {
     let _ = std::fs::remove_file(start_identity_path(dir, name));
 }
 
+/// The identity a pre-#183 session's start may be backfilled with this
+/// pass, read *before* `confirmed_gone` refreshes the markers: the key's
+/// `.origin-ino`, Full, with no rename ever recorded — `.moved-to` and
+/// `.occupant-ino` both positively `NotFound`. Any doubt is `None`, and
+/// `None` writes nothing.
+///
+/// Before the refresh, not after: `write_origin` re-stamps `.origin-ino`
+/// with whatever directory resolves, so read afterwards it would always
+/// equal the directory it is about to be compared with. Read first, a
+/// directory recreated at the key's path between two passes differs from it
+/// and backfills nothing that pass. A legacy or missing `.origin-ino` is
+/// upgraded or written by this same pass, so a later pass may backfill.
+fn backfill_origin(key_dir: &std::path::Path) -> Option<crate::dirid::DirId> {
+    for marker in [moved_to_marker_path(key_dir), occupant_identity_path(key_dir)] {
+        match std::fs::symlink_metadata(marker) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+    }
+    match recorded_identity(key_dir)? {
+        crate::dirid::Stored::Full(id) => Some(id),
+        crate::dirid::Stored::Legacy { .. } => None,
+    }
+}
+
+/// #183 I1: a one-time start identity for a session alive before start
+/// identities existed. `session::attach_as` writes one only for a socket
+/// that is positively absent, so a session that outlived the deploy never
+/// gets one; with its shell `cd`'d out, a rename then left it `Here`,
+/// unlisted, and endable by an occupant's Close Project.
+///
+/// `origin` is [`backfill_origin`]'s answer, and its caller has checked it
+/// equals the directory the key's URL resolves to right now. So this writes
+/// exactly the answer master gave every such session — the key's directory,
+/// which is where a never-renamed key's sessions started — and never a
+/// worse one, and only before any rename is recorded: never at follow time.
+/// Its one residual doubt is a delete-and-reclone of the directory that no
+/// pass saw (both between two passes): the sessions started in the deleted
+/// directory would be stamped with the clone's identity. That is the same
+/// unrecorded delete-and-reclone CLAUDE.md already documents as unprotected
+/// for `write_origin`.
+///
+/// Only for a `.start-ino` that is positively `NotFound`; present or
+/// unreadable writes nothing, and `dirid::write_new` refuses to replace one
+/// a spawn wrote in between. Returns whether it wrote.
+fn backfill_start_identity(key_dir: &std::path::Path, name: &str, origin: &crate::dirid::DirId) -> bool {
+    if !crate::session::valid_name(name) {
+        return false;
+    }
+    let path = start_identity_path(key_dir, name);
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return false,
+    }
+    crate::dirid::write_new(&path, &[crate::dirid::format(origin)]).is_ok()
+}
+
 /// Ends a rename's redirect for this key: `.moved-to` and the occupant's
 /// identity go together.
 fn remove_moved_to(key_dir: &std::path::Path) {
@@ -1800,8 +1857,8 @@ fn recorded_path_is_gone(recorded: &[u8]) -> bool {
 /// An unreadable *or* damaged marker is the same as no marker: see
 /// `recorded_path_is_gone`, which is where "positive evidence only" is
 /// actually enforced.
-fn confirmed_gone(key_dir: &std::path::Path, roots: &[PathBuf], url: &str) -> bool {
-    match crate::projects::resolve_project(roots, url) {
+fn confirmed_gone(key_dir: &std::path::Path, resolved: Option<&std::path::Path>) -> bool {
+    match resolved {
         Some(dir) => {
             // Resolving again is a move back only when it is the same
             // directory. A new one made under the old name is not: the
@@ -1810,13 +1867,13 @@ fn confirmed_gone(key_dir: &std::path::Path, roots: &[PathBuf], url: &str) -> bo
             // owner widening that keeps them out of the new A's Close
             // Project). The `!any_held` cleanup still ends both with the
             // last session.
-            if occupied_by_another(key_dir, &dir) {
-                log_occupied_once(key_dir, &dir);
+            if occupied_by_another(key_dir, dir) {
+                log_occupied_once(key_dir, dir);
                 // Records the occupant's identity (and nothing else).
-                write_origin(key_dir, &dir);
+                write_origin(key_dir, dir);
                 return false;
             }
-            write_origin(key_dir, &dir);
+            write_origin(key_dir, dir);
             // Moved back: a `.moved-to` from the earlier rename now
             // describes a different place, and must stop widening or
             // redirecting anything for this key.
@@ -2123,8 +2180,12 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
         // not evidence the directory is gone; only a key whose resolved
         // path was previously recorded, and is now confirmed missing,
         // counts.
+        // `resolve_project` once, here, rather than inside `confirmed_gone`:
+        // the start backfill below needs the same answer, and it may run git.
+        let resolved = if roots_ok { crate::projects::resolve_project(roots, &url) } else { None };
+        let origin_before = resolved.as_ref().and_then(|_| backfill_origin(&entry.path()));
         let project_gone = roots_ok
-            && confirmed_gone(&entry.path(), roots, &url)
+            && confirmed_gone(&entry.path(), resolved.as_deref())
             && match record_move_with(roots, &url, &entry.path(), &snapshot, std::path::Path::new("/proc"), true) {
                 MoveRecord::NoEvidence => true,
                 // Moved (followable or not) or cannot tell: never killed.
@@ -2154,6 +2215,13 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
                 );
             }
         }
+        // The key's directory *right now* must be the recorded one: see
+        // `backfill_start_identity`. `project_gone` is false whenever
+        // `resolved` is `Some`, so every socket it reaches is kept.
+        let backfill = match (origin_before, resolved.as_deref()) {
+            (Some(id), Some(dir)) if !project_gone && matches!(crate::dirid::of(dir), Ok(Some(here)) if here == id) => Some(id),
+            _ => None,
+        };
         let Ok(inner) = std::fs::read_dir(entry.path()) else { continue };
         for sock in inner.flatten() {
             // `.origin` (this pass's own `confirmed_gone` may have just
@@ -2172,6 +2240,15 @@ fn reconcile_with(roots: &[PathBuf], snapshot_fn: SnapshotFn) -> ReapReport {
             let held_before = !pids.is_empty();
             let name = sock.file_name().to_string_lossy().into_owned();
             any_held |= held_before;
+            // Live by the evidence this sweep keeps it on: the one snapshot,
+            // no fork of its own.
+            if held_before {
+                if let Some(id) = &backfill {
+                    if backfill_start_identity(&entry.path(), &name, id) {
+                        eprintln!("roost: recorded {key}/{name}'s start as its key's directory (a session older than start identities)");
+                    }
+                }
+            }
 
             if held_before && project_gone {
                 // Covers a session this process never had in memory (one
@@ -4516,7 +4593,10 @@ mod tests {
     /// Decision 3 closed this gap for a session spawned through `attach`,
     /// which records its start (the test below). This one's master is
     /// started directly, so it has no start identity — a session older than
-    /// that change — and for it the contract above still holds.
+    /// that change — and for it the contract above still holds. It is not
+    /// backfilled (I1) because its one pre-rename pass is the one that first
+    /// records `.origin-ino`: the backfill needs that identity Full at the
+    /// start of a pass (`a_session_older_than_start_identities_is_backfilled_and_follows_a_rename`).
     #[test]
     fn a_first_rename_with_no_shell_inside_is_not_reaped_and_stays_here() {
         with_state(|state| {
@@ -4610,7 +4690,9 @@ mod tests {
     /// Decision 3's "no evidence" side: with no usable start identity — none
     /// at all, or a legacy two-field pair (which may keep, never follow) —
     /// a session whose shell left stays `Here`, as before; a damaged one is
-    /// "cannot tell", and stays too. None of the three is reaped.
+    /// "cannot tell", and stays too. None of the three is reaped. The
+    /// "none" session gets no I1 backfill: its one pre-rename pass is the
+    /// one that first records `.origin-ino`.
     ///
     /// Revert-checked, run and restored: with `own_follow` answering
     /// `Start::Missing` with the key's target (`To(new_url, new_dir)`),
@@ -4659,6 +4741,215 @@ mod tests {
             assert_eq!(owners[1], crate::home::Owner::Here, "a legacy start never licenses a follow");
             assert_eq!(owners[2], crate::home::Owner::Here, "a damaged start is cannot tell: stays");
             assert!(alive, "nothing was ended");
+        });
+    }
+
+    /// #183 I1, end to end: a session alive before start identities existed
+    /// (its master started directly, so no `.start-ino`) is backfilled with
+    /// its key's directory by an ordinary pass, once that key's `.origin-ino`
+    /// was already Full at the pass's start and still names the directory.
+    /// Its shell then `cd`s out and A is renamed to B: it follows its
+    /// (backfilled) start to B, as a session spawned after the change does.
+    ///
+    /// Revert-checked, run and restored: with the backfill call in
+    /// `reconcile_with`'s socket loop removed, fails "an ordinary pass
+    /// backfills the start of a session older than start identities" —
+    /// left `Ok(None)`; with only that assertion dropped, fails "and the
+    /// session follows the rename to B" — left `Here`.
+    #[test]
+    fn a_session_older_than_start_identities_is_backfilled_and_follows_a_rename() {
+        with_state(|state| {
+            let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let root = tempfile::tempdir().unwrap();
+            std::env::set_var("ROOST_ROOTS", root.path());
+            let roots = vec![root.path().to_path_buf()];
+            let repo = repo_with_worktree_a(root.path(), "backfillrepo");
+            let a = "backfillrepo/.claude/worktrees/worktree-a";
+            let b = "backfillrepo/.claude/worktrees/worktree-b";
+            let sock_dir = state.join("sock").join(crate::projects::storage_key(a));
+            fs::create_dir_all(&sock_dir).unwrap();
+            let sock_path = sock_dir.join("shell");
+            let flag = root.path().join("leave-now");
+            let _guard = KillOnDrop(vec![sock_path.clone()]);
+            let a_dir = repo.join(".claude/worktrees/worktree-a").canonicalize().unwrap();
+            let a_id = full_id(&a_dir);
+            spawn_leaver(&sock_path, &a_dir, &flag);
+            let _ = reconcile(&roots); // records A's identity: nothing to compare with yet
+            let first = start_identity(&sock_dir, "shell");
+            let _ = reconcile(&roots);
+            let backfilled = start_identity(&sock_dir, "shell");
+            wait_left(&sock_path, &flag);
+
+            git_in(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+            let after = reconcile(&roots);
+            follow_moves(&after.moved);
+            let owner = crate::home::owner_of(a, "shell");
+            let alive = socket_has_process(&sock_path);
+            drop(_guard);
+            std::env::remove_var("ROOST_ROOTS");
+
+            assert_eq!(first, Ok(None), "setup: no backfill on the pass that first records the key's identity");
+            assert_eq!(backfilled, Ok(Some(a_id)), "an ordinary pass backfills the start of a session older than start identities");
+            assert_eq!(after.gone_projects, 0, "not reaped");
+            assert_eq!(after.moved.iter().map(|m| m.shells.len()).collect::<Vec<_>>(), vec![0], "setup: its shell is no evidence");
+            assert_eq!(owner, crate::home::Owner::Elsewhere(b.into()), "and the session follows the rename to B");
+            assert!(alive, "its master is alive");
+        });
+    }
+
+    /// The backfill's fixture: a plain project `proj` under a fresh root, one
+    /// live dtach session `shell` in it with no start identity, and one
+    /// pass already run so that `.origin-ino` is recorded Full. Returns
+    /// `(roots, key dir, socket, project dir)`; the caller kills the socket.
+    fn backfill_fixture(state: &std::path::Path, root: &std::path::Path) -> (Vec<PathBuf>, PathBuf, PathBuf, PathBuf) {
+        let roots = vec![root.to_path_buf()];
+        let dir = root.join("proj");
+        fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let key_dir = state.join("sock/proj");
+        fs::create_dir_all(&key_dir).unwrap();
+        let sock = key_dir.join("shell");
+        spawn_detached_dtach_in(&sock, &dir).unwrap_or_else(|| panic!("dtach must be available for this test"));
+        let live = (0..200).any(|_| {
+            let l = socket_has_process(&sock);
+            if !l {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            l
+        });
+        assert!(live, "setup: the session is live");
+        let _ = reconcile(&roots);
+        assert_eq!(recorded_identity(&key_dir), Some(full_id(&dir)), "setup: the key's identity is recorded Full");
+        assert_eq!(start_identity(&key_dir, "shell"), Ok(None), "setup: no start identity yet");
+        (roots, key_dir, sock, dir)
+    }
+
+    /// Runs one refused pass and then one more. The refused pass must write
+    /// nothing; the next must backfill — which is what shows the fixture
+    /// reaches the backfill at all, so the first `Ok(None)` is the refusal's
+    /// and not the fixture's.
+    fn refused_then_backfilled(roots: &[PathBuf], key_dir: &std::path::Path) -> (Result<Option<crate::dirid::Stored>, String>, Result<Option<crate::dirid::Stored>, String>) {
+        let _ = reconcile(roots);
+        let refused = start_identity(key_dir, "shell");
+        let _ = reconcile(roots);
+        let next = start_identity(key_dir, "shell");
+        (refused, next)
+    }
+
+    /// I1's refusals, one per condition. A `.moved-to` at the pass's start
+    /// means a rename was recorded: no backfill that pass, even though this
+    /// one is a move back that the same pass then clears.
+    ///
+    /// Revert-checked, run and restored: with `backfill_origin`'s marker
+    /// loop checking only `.occupant-ino`, fails "a .moved-to refuses the
+    /// backfill" — left `Ok(Some(Full(..)))`.
+    #[test]
+    fn the_backfill_is_refused_while_a_moved_to_stands() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let (roots, key_dir, sock, dir) = backfill_fixture(state, root.path());
+            let _guard = KillOnDrop(vec![sock.clone()]);
+            fs::write(key_dir.join(".moved-to"), "elsewhere\n").unwrap();
+            let (refused, next) = refused_then_backfilled(&roots, &key_dir);
+            drop(_guard);
+            assert_eq!(refused, Ok(None), "a .moved-to refuses the backfill");
+            assert_eq!(next, Ok(Some(full_id(&dir))), "setup: once it is gone, the fixture backfills");
+        });
+    }
+
+    /// An `.occupant-ino` likewise: a key that has held an occupant has
+    /// sessions started in more than one directory.
+    ///
+    /// Revert-checked, run and restored: with `backfill_origin`'s marker
+    /// loop checking only `.moved-to`, fails "an .occupant-ino refuses the
+    /// backfill" — left `Ok(Some(Full(..)))`.
+    #[test]
+    fn the_backfill_is_refused_while_an_occupant_is_recorded() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let (roots, key_dir, sock, dir) = backfill_fixture(state, root.path());
+            let _guard = KillOnDrop(vec![sock.clone()]);
+            let other = tempfile::tempdir_in(root.path()).unwrap();
+            let crate::dirid::Stored::Full(oid) = full_id(other.path()) else { unreachable!() };
+            fs::write(key_dir.join(".occupant-ino"), format!("{}\n", crate::dirid::format(&oid))).unwrap();
+            let (refused, next) = refused_then_backfilled(&roots, &key_dir);
+            drop(_guard);
+            assert_eq!(refused, Ok(None), "an .occupant-ino refuses the backfill");
+            assert_eq!(next, Ok(Some(full_id(&dir))), "setup: once it is gone, the fixture backfills");
+        });
+    }
+
+    /// A legacy two-field `.origin-ino` (every one on the deploy host)
+    /// cannot say which directory it named: no backfill until the pass
+    /// that upgrades it has run.
+    ///
+    /// Revert-checked, run and restored: with `backfill_origin` answering a
+    /// `Legacy` origin with the directory's current identity, fails "a
+    /// legacy origin refuses the backfill" — left `Ok(Some(Full(..)))`.
+    #[test]
+    fn the_backfill_is_refused_for_a_legacy_origin() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let (roots, key_dir, sock, dir) = backfill_fixture(state, root.path());
+            let _guard = KillOnDrop(vec![sock.clone()]);
+            let crate::dirid::Stored::Full(id) = full_id(&dir) else { unreachable!() };
+            fs::write(key_dir.join(".origin-ino"), format!("{} {}\n", id.dev, id.ino)).unwrap();
+            let (refused, next) = refused_then_backfilled(&roots, &key_dir);
+            drop(_guard);
+            assert_eq!(refused, Ok(None), "a legacy origin refuses the backfill");
+            assert_eq!(next, Ok(Some(full_id(&dir))), "setup: once upgraded, the fixture backfills");
+        });
+    }
+
+    /// A recorded identity that is not the directory there now — recreated
+    /// between two passes — refuses: the sessions may have started in the
+    /// one that is gone. Read before the pass re-stamps it, or the
+    /// comparison could never fail.
+    ///
+    /// Revert-checked, run and restored: with the `here == id` comparison
+    /// in `reconcile_with` dropped, fails "an origin that is not the
+    /// directory there now refuses the backfill" — left
+    /// `Ok(Some(Full(..)))`, the other directory's identity. With
+    /// `backfill_origin` read after `confirmed_gone` instead of before, it
+    /// fails even earlier, in `backfill_fixture`'s "setup: no start identity
+    /// yet" — left the directory's own identity, written by the very pass
+    /// that first recorded `.origin-ino`.
+    #[test]
+    fn the_backfill_is_refused_when_the_origin_is_another_directory() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let (roots, key_dir, sock, dir) = backfill_fixture(state, root.path());
+            let _guard = KillOnDrop(vec![sock.clone()]);
+            let other = tempfile::tempdir_in(root.path()).unwrap();
+            let crate::dirid::Stored::Full(oid) = full_id(other.path()) else { unreachable!() };
+            fs::write(key_dir.join(".origin-ino"), format!("{}\n", crate::dirid::format(&oid))).unwrap();
+            let (refused, next) = refused_then_backfilled(&roots, &key_dir);
+            drop(_guard);
+            assert_eq!(refused, Ok(None), "an origin that is not the directory there now refuses the backfill");
+            assert_eq!(next, Ok(Some(full_id(&dir))), "setup: once re-stamped, the fixture backfills");
+        });
+    }
+
+    /// A start identity already there is never replaced — not even with the
+    /// key's own directory: only a spawn says where a session started.
+    ///
+    /// Revert-checked, run and restored: with `backfill_start_identity`'s
+    /// `NotFound` check removed and `write_new` swapped for `write_lines`,
+    /// fails "an existing start identity is not overwritten" — left the
+    /// key's directory's identity.
+    #[test]
+    fn the_backfill_does_not_overwrite_a_start_identity() {
+        with_state(|state| {
+            let root = tempfile::tempdir().unwrap();
+            let (roots, key_dir, sock, dir) = backfill_fixture(state, root.path());
+            let _guard = KillOnDrop(vec![sock.clone()]);
+            let other = tempfile::tempdir_in(root.path()).unwrap();
+            record_start_identity(&key_dir, "shell", other.path()).unwrap();
+            let (first, second) = refused_then_backfilled(&roots, &key_dir);
+            drop(_guard);
+            assert_ne!(full_id(other.path()), full_id(&dir), "setup: two different directories");
+            assert_eq!(first, Ok(Some(full_id(other.path()))), "an existing start identity is not overwritten");
+            assert_eq!(second, first, "nor on the next pass");
         });
     }
 
