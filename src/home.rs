@@ -689,11 +689,17 @@ pub fn follow_move_in(
             eprintln!("roost: {old_url}/{n} did not follow the rename to {url}: {n} already exists there");
             continue;
         }
+        // The previous owner's `.ino` goes *before* the record names the
+        // new one: a crash between the two writes then leaves a record with
+        // no identity — kept or forgotten, never followed — rather than one
+        // naming `url` while carrying the old directory's identity, which
+        // nothing at `url` matches and no later pass rewrites. A failed
+        // `record_in` costs the old record its `.ino` the same way.
+        forget_identity_in(state, old_url, n);
         match record_in(state, old_url, n, &url) {
             Ok(()) => {
                 changed = true;
                 if let Err(e) = record_identity_in(state, old_url, n, &dir) {
-                    forget_identity_in(state, old_url, n);
                     eprintln!("roost: {old_url}/{n} followed the rename to {url}, but its identity was not recorded: {e}");
                 }
             }

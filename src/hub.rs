@@ -4392,6 +4392,11 @@ pub fn rehome_to(home: &str, session: &str, owner: &str) -> Result<(), String> {
     if crate::session::live_names(owner).contains(&session.to_string()) {
         return Err(format!("{session} already exists in {owner}"));
     }
+    // A previous owner's identity must not stand in for this one, even for
+    // the instant between the two writes: forgotten first, a crash there
+    // leaves a record with no `.ino` (kept or forgotten, never followed)
+    // rather than one naming `owner` with the old directory's identity.
+    crate::home::forget_identity(home, session);
     crate::home::record(home, session, owner)?;
     // The owner directory's identity, so a later rename of a worktree with
     // no session of its own can still be recognised (#158 §5). Best-effort:
@@ -4399,13 +4404,10 @@ pub fn rehome_to(home: &str, session: &str, owner: &str) -> Result<(), String> {
     match crate::home::owner_dir(home, session, owner) {
         Some(dir) => {
             if let Err(e) = crate::home::record_identity(home, session, &dir) {
-                // A previous owner's identity must not stand in for this one.
-                crate::home::forget_identity(home, session);
                 eprintln!("roost: {home}/{session} re-homed to {owner}, but its identity was not recorded: {e}");
             }
         }
         None => {
-            crate::home::forget_identity(home, session);
             eprintln!("roost: {home}/{session} re-homed to {owner}, whose directory did not resolve; identity not recorded");
         }
     }
