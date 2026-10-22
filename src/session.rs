@@ -747,6 +747,35 @@ fn attach_as(project: &str, name: &str, dir: &Path, renamed_to: Option<&str>) ->
                 if renamed_to.is_none() {
                     crate::registry::record_origin(project, dir);
                 }
+                // The directory this shell starts in, for when it later
+                // leaves every directory the key has had (#183 §3, decision
+                // 3). Only for a master `dtach -A` is about to *create*,
+                // and the socket is the only thing that says so. Neither
+                // `spawned` nor `!rejoining` does: after a restart
+                // `Hub::new`'s `sync_reservations` reserves every layout tab,
+                // surviving masters included, so a reconnecting browser gets
+                // `Decision::Spawn` for a shell that outlived the restart and
+                // `-A` joins it. Rewriting its start then would name today's
+                // `dir` for a shell that began somewhere else — through an
+                // occupant, a live session sent to the wrong project, where
+                // Close Project ends it.
+                //
+                // So: socket `NotFound` writes (overwriting a dead session's
+                // leftover start, since names are reused); present, or a stat
+                // that errors, writes nothing — a missing start only means
+                // "stays". What remains open is the master dying between
+                // this stat and `dtach -A`: `-A` then creates a new shell
+                // whose start is the dead one's leftover, if it had one. A
+                // write failure removes the file rather than leave it stale.
+                let creating = matches!(
+                    std::fs::symlink_metadata(sock_path(project, name)),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+                );
+                if renamed_to.is_none() && !rejoining && creating {
+                    if let Err(e) = crate::registry::record_start_identity(sock_dir, name, dir) {
+                        eprintln!("roost: {project}/{name}'s start directory was not recorded: {e}");
+                    }
+                }
             }
         }
         let pty = native_pty_system();
@@ -1176,21 +1205,21 @@ pub fn owned_live_names(project: &str) -> Vec<(String, Option<String>)> {
 /// [`owned_live_names`] with the owner check injected.
 pub(crate) fn owned_live_names_with(
     project: &str,
-    resolves: &dyn Fn(&str, &str) -> bool,
+    resolves: &dyn Fn(&str, &str, &str) -> bool,
 ) -> Vec<(String, Option<String>)> {
     let away: HashMap<String, crate::home::Owner> =
         crate::home::away_from(project).into_iter().collect();
     let mut out: Vec<(String, Option<String>)> = live_names(project)
         .into_iter()
         .filter(|n| match away.get(n) {
-            Some(crate::home::Owner::Elsewhere(o)) => !resolves(project, o),
+            Some(crate::home::Owner::Elsewhere(o)) => !resolves(project, n, o),
             _ => true,
         })
         .map(|n| (n, None))
         .collect();
     let mut home_live: HashMap<String, Vec<String>> = HashMap::new();
     for (home, name) in crate::home::residents_of(project) {
-        if !resolves(&home, project) {
+        if !resolves(&home, &name, project) {
             continue;
         }
         let live = home_live.entry(home.clone()).or_insert_with(|| live_names(&home));
@@ -1420,7 +1449,7 @@ pub fn spares_live(project: &str) -> bool {
 
 /// [`kill_project`] with the owner check injected, so tests do not depend on
 /// the configured roots. `resolves(home, owner)` is `home::resolves`.
-pub(crate) fn kill_project_with(project: &str, resolves: &dyn Fn(&str, &str) -> bool) -> usize {
+pub(crate) fn kill_project_with(project: &str, resolves: &dyn Fn(&str, &str, &str) -> bool) -> usize {
     kill_project_inner(project, resolves, &|_| {})
 }
 
@@ -1453,7 +1482,7 @@ pub(crate) enum CloseStage {
 /// The body of [`kill_project`], with `at` called at each [`CloseStage`].
 pub(crate) fn kill_project_inner(
     project: &str,
-    resolves: &dyn Fn(&str, &str) -> bool,
+    resolves: &dyn Fn(&str, &str, &str) -> bool,
     at: &dyn Fn(CloseStage),
 ) -> usize {
     // Read before `begin_close_ending`, which holds the global session lock:
@@ -1467,7 +1496,7 @@ pub(crate) fn kill_project_inner(
     // function, and a missing worktree is not evidence the session ended.
     let residents: Vec<(String, String)> = crate::home::residents_of(project)
         .into_iter()
-        .filter(|(home, _)| resolves(home, project))
+        .filter(|(home, name)| resolves(home, name, project))
         .collect();
     // `begin_close` does the map drain, and marks the project closing in the
     // same acquisition — so from here on no attach can add to what this
@@ -2761,6 +2790,117 @@ mod tests {
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
+    /// #183 decision 3: only a spawn records where a session started. A
+    /// `Join` (this process already has the session) and a `Probe` (a master
+    /// that outlived a restart, `spawned` in this process's terms) are the
+    /// same shell, and attaching through another directory must not rewrite
+    /// its start. A spawn of a reused name overwrites a dead session's
+    /// leftover start, and the session's end removes it.
+    ///
+    /// And the case production actually takes after a restart (review,
+    /// fix round 1): `Hub::new`'s `sync_reservations` reserves every layout
+    /// tab, so a surviving master is reached by `Decision::Spawn`, not
+    /// `Probe` — `rejoining` false, `dtach -A` joining it. A test whose
+    /// rejoin had no reservation was the dev/prod substitution: it passed
+    /// with the start rewritten on every real reconnect.
+    ///
+    /// Revert-checked, run and restored: with the gate back to bare
+    /// `!rejoining` (no socket check), fails "a reserved rejoin after a
+    /// restart keeps the start" — left dir2's identity, right dir1's. With
+    /// the spawn's `!rejoining` gate dropped as well, fails "a rejoin after
+    /// a restart keeps the start" — the same. With the spawn's write removed, fails "a
+    /// spawn records where it started" — left `Ok(None)`. With
+    /// `kill_and_unlink`'s `forget_start_identity` removed, fails "ending
+    /// the session removes its start" — left `Ok(Some(..))`.
+    #[test]
+    fn an_attach_does_not_overwrite_the_start_identity() {
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD");
+        let state = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let k = format!("startkey{}", std::process::id());
+        let (shell, probe, reused) = (sock_path(&k, "shell"), sock_path(&k, "probe"), sock_path(&k, "reused"));
+        let _reap = ReapOnDrop(vec![shell.clone(), probe.clone(), reused.clone(), sock_path(&k, "kept")]);
+        let key_dir = shell.parent().unwrap().to_path_buf();
+        let id = |d: &Path| Some(crate::dirid::Stored::Full(crate::dirid::of(d).unwrap().unwrap()));
+        let start = |n: &str| crate::registry::start_identity(&key_dir, n);
+        assert_ne!(id(dir1.path()), id(dir2.path()), "setup: two different directories");
+
+        // Spawn, then join through another directory.
+        let att = start_real_dtach(&k, "shell", dir1.path());
+        let spawned = start("shell");
+        let joined = attach(&k, "shell", dir2.path()).expect("a join");
+        let after_join = start("shell");
+
+        // A master that outlived a restart, with the start its spawn wrote.
+        std::fs::create_dir_all(&key_dir).unwrap();
+        crate::registry::record_start_identity(&key_dir, "probe", dir1.path()).unwrap();
+        let st = std::process::Command::new("dtach")
+            .args(["-n", probe.to_str().unwrap(), "-E", "sleep", "30"])
+            .current_dir(dir1.path())
+            .status()
+            .unwrap_or_else(|e| panic!("dtach must be available for this test: {e}"));
+        assert!(st.success(), "test setup: dtach -n failed");
+        let mut waited = 0;
+        while !any_process_holds(&probe) && waited < 200 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            waited += 1;
+        }
+        assert!(!has_session(&k, "probe"), "test setup: no map entry, so the attach must probe");
+        let rejoined = attach(&k, "probe", dir2.path()).expect("a rejoin");
+        let after_probe = start("probe");
+
+        // The same survivor, reached the way a restarted roost reaches it:
+        // its layout tab reserved, so `decide` answers `Spawn`.
+        let kept = sock_path(&k, "kept");
+        crate::registry::record_start_identity(&key_dir, "kept", dir1.path()).unwrap();
+        let st = std::process::Command::new("dtach")
+            .args(["-n", kept.to_str().unwrap(), "-E", "sleep", "30"])
+            .current_dir(dir1.path())
+            .status()
+            .unwrap_or_else(|e| panic!("dtach must be available for this test: {e}"));
+        assert!(st.success(), "test setup: dtach -n failed");
+        let mut waited = 0;
+        while !any_process_holds(&kept) && waited < 200 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            waited += 1;
+        }
+        let masters = crate::registry::pids_holding_path(&crate::registry::holders_snapshot().unwrap(), &kept);
+        assert!(!masters.is_empty(), "test setup: a surviving master");
+        reserve_if_absent(&k, "kept");
+        assert!(has_reservation_for_test(&k, "kept") && !has_session(&k, "kept"), "test setup: reserved, no map entry: decide answers Spawn");
+        let reattached = attach(&k, "kept", dir2.path()).expect("a reserved rejoin");
+        let after_kept = start("kept");
+        let after = crate::registry::pids_holding_path(&crate::registry::holders_snapshot().unwrap(), &kept);
+        assert!(masters.iter().all(|p| after.contains(p)), "test setup: dtach -A joined the surviving master, not a new one");
+
+        // A name whose last session left its start behind.
+        crate::registry::record_start_identity(&key_dir, "reused", dir2.path()).unwrap();
+        let fresh = start_real_dtach(&k, "reused", dir1.path());
+        let after_reuse = start("reused");
+
+        for a in [&att, &joined, &rejoined, &reattached, &fresh] {
+            detach(&a.key, a.id);
+        }
+        let ended = end_session(&k, "shell");
+        let after_end = start("shell");
+        end_session(&k, "probe");
+        end_session(&k, "reused");
+        end_session(&k, "kept");
+        std::env::remove_var("ROOST_STATE_DIR");
+
+        assert_eq!(spawned, Ok(id(dir1.path())), "a spawn records where it started");
+        assert_eq!(after_join, Ok(id(dir1.path())), "a join keeps the start");
+        assert_eq!(after_probe, Ok(id(dir1.path())), "a rejoin after a restart keeps the start");
+        assert_eq!(after_kept, Ok(id(dir1.path())), "a reserved rejoin after a restart keeps the start");
+        assert_eq!(after_reuse, Ok(id(dir1.path())), "a reused name's spawn overwrites the dead session's start");
+        assert!(ended, "setup: the session ended");
+        assert_eq!(after_end, Ok(None), "ending the session removes its start");
+    }
+
     /// The race `attach_existing`'s probe cannot close by itself: a socket
     /// that goes after the probe saw it held. `dtach -A` would then create a
     /// session; `-a` fails.
@@ -2849,7 +2989,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = format!("rehomespare{}", std::process::id());
         let owner = format!("{home}/.claude/worktrees/worktree-x");
-        let yes = |_: &str, _: &str| true;
+        let yes = |_: &str, _: &str, _: &str| true;
 
         let _att = start_real_dtach(&home, "term3", dir.path());
         let sock = sock_path(&home, "term3");
@@ -2888,7 +3028,7 @@ mod tests {
         std::env::set_var("ROOST_STATE_DIR", state.path());
         let dir = tempfile::tempdir().unwrap();
         let home = format!("rehomeunknown{}", std::process::id());
-        let yes = |_: &str, _: &str| true;
+        let yes = |_: &str, _: &str, _: &str| true;
 
         let _att = start_real_dtach(&home, "term3", dir.path());
         let sock = sock_path(&home, "term3");
@@ -2928,7 +3068,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = format!("rehomegone{}", std::process::id());
         let owner = format!("{home}/.claude/worktrees/worktree-x");
-        let no = |_: &str, _: &str| false;
+        let no = |_: &str, _: &str, _: &str| false;
 
         let _att = start_real_dtach(&home, "term3", dir.path());
         let sock = sock_path(&home, "term3");
@@ -2984,7 +3124,7 @@ mod tests {
         fake_socket(home, "term");
         crate::home::record(home, "term", &owner).unwrap();
         let taken: Vec<String> =
-            owned_live_names_with(&owner, &|_, _| true).into_iter().map(|(n, _)| n).collect();
+            owned_live_names_with(&owner, &|_, _, _| true).into_iter().map(|(n, _)| n).collect();
         assert_eq!(taken, vec!["term".to_string()]);
         assert_eq!(next_free_name(&owner, &taken).as_deref(), Some("term1"));
         // And the home keeps the name taken: the socket path is still its.
@@ -3004,7 +3144,7 @@ mod tests {
         crate::home::record(home, "term3", &owner).unwrap();
 
         let seen = std::cell::RefCell::new(Vec::new());
-        let no = |h: &str, o: &str| { seen.borrow_mut().push((h.to_string(), o.to_string())); false };
+        let no = |h: &str, _: &str, o: &str| { seen.borrow_mut().push((h.to_string(), o.to_string())); false };
         assert_eq!(
             owned_live_names_with(home, &no),
             vec![("term3".to_string(), None), ("term4".to_string(), None)]
@@ -3016,7 +3156,7 @@ mod tests {
         // And a resident that is not live is not listed in its owner.
         crate::home::record(home, "gone", &owner).unwrap();
         assert_eq!(
-            owned_live_names_with(&owner, &|_, _| true),
+            owned_live_names_with(&owner, &|_, _, _| true),
             vec![("term3".to_string(), Some(home.to_string()))]
         );
         std::env::remove_var("ROOST_STATE_DIR");
@@ -3054,7 +3194,7 @@ mod tests {
 
         let ran = std::cell::Cell::new(false);
         let mid = std::cell::RefCell::new(None);
-        let ended = kill_project_inner(&owner, &|_, _| true, &|st| {
+        let ended = kill_project_inner(&owner, &|_, _, _| true, &|st| {
             if st == CloseStage::BeforeResidents {
                 crate::home::record(&home, "term3", &other).unwrap();
                 *mid.borrow_mut() = Some(attach(&home, "term3", dir.path()).map(|_| ()));
@@ -3143,7 +3283,7 @@ mod tests {
         crate::home::record(&home, "term3", &owner).unwrap();
 
         let seen = std::cell::RefCell::new(None);
-        kill_project_inner(&home, &|_, _| true, &|st| {
+        kill_project_inner(&home, &|_, _, _| true, &|st| {
             if st == CloseStage::BeforeOwnKills {
                 *seen.borrow_mut() = Some((
                     attach(&home, "term3", dir.path()).map(|_| ()),
@@ -3185,7 +3325,7 @@ mod tests {
         crate::home::record(&home, "term3", &owner).unwrap();
 
         let seen = std::cell::RefCell::new(None);
-        let ended = kill_project_inner(&home, &|_, _| true, &|st| match st {
+        let ended = kill_project_inner(&home, &|_, _, _| true, &|st| match st {
             CloseStage::BeforeOwnRead => crate::home::forget(&home, "term3"),
             CloseStage::BeforeOwnKills => {
                 *seen.borrow_mut() = Some(attach(&home, "term3", dir.path()).map(|_| ()));

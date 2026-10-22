@@ -209,9 +209,11 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   **A renamed project's sessions follow it the same way: on evidence, not
   on request.** `.moved-to` (`sock/<old key>/.moved-to`) is written only
   when `registry::move_evidence` confirms #178's inode evidence and the
-  directory's new path resolves as a project. `home::resolves` and
-  `term.rs` widen only for an owner that a `.moved-to` names — nothing else
-  does. `term.rs`'s widened path is attach-only: it calls
+  directory's new path resolves as a project. `term.rs` widens only for
+  an owner that a `.moved-to` names, and `home::resolves` for that owner or
+  for one whose directory carries the record's *own* full `.ino` identity
+  (#183, `home::owner_dir_with`) — never the key's, and nothing else
+  widens. `term.rs`'s widened path is attach-only: it calls
   `session::attach_existing`, a `dtach -a` that fails closed, so a key
   whose directory is gone can be joined but never made to spawn.
 - **Search shares the tree's filter but is not the tree.** `search.rs` walks
@@ -311,7 +313,9 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   connected browser. Outside worktrees (#188): ≤32 allow records per parent
   (`outside::OUTSIDE_CAP`), and ≤16 appeared-worktree entries per project
   (`appeared::APPEARED_CAP`), oldest dropped first, each naming itself when
-  it fires.
+  it fires. Rename-following (#183): `.occupant-ino` holds at most
+  `OCCUPANT_CAP` (8) identities per key, oldest dropped first and the drop
+  logged once.
 
 ## Absence of evidence is not evidence of absence
 
@@ -343,6 +347,51 @@ directory a `.moved-to` names, a live shell's cwd (`registry::move_evidence`,
 #178), and the siblings of where it last was (`registry::sibling_evidence`,
 #182 — a rename made with no shell inside leaves only the directory itself as
 a witness). A sibling that cannot be listed or stat'd is "cannot tell".
+
+**Rename-following (#183) used to decide a terminal's owner from evidence
+about its whole key; it now decides per terminal.** A record's owner changes
+only when `registry::find_by_identity` finds that record's *own* identity —
+not any directory's — at the `.moved-to` target, among the old path's
+siblings, or at a resident Claude's cwd, and `claudes::rewrite_owner` and
+`home::follow_move_in` then write the *found* directory's identity into the
+record they move, never the key's. A match git cannot vouch for is
+`CannotTell`, not evidence, so a plain `mv` of a worktree — as opposed to
+`git worktree move` — leaves git still listing the old path, and a record
+whose identity turns up there stays suspended (kept, logged once) until
+`git worktree repair` lets git vouch for it again. The same rule runs
+backwards: a record is never forgotten into a home URL that now holds a
+different directory. R18 (`claudes::sweep_gone_owners`) forgets a record
+only when its home resolves to the directory carrying its *own*
+recorded identity, or is gone outright (`claudes::home_is_its_own`); an
+occupant, or an identity that cannot be read, keeps the record instead.
+One case has no evidence to keep it from: a home deleted and recloned with
+no rename ever recorded has no `.moved-to` to make the clone an occupant, so
+the next reconcile stamps the clone's own identity into `.origin-ino`
+(`registry::write_origin`) and the record is still forgotten into it.
+**Reconciling this back to key-level evidence — re-pointing every resident
+on one key's match, or reading "the key's directory moved" as license to
+rewrite every record under it — is the vulnerability this replaced, not the
+cleanup**: that is exactly how an occupant's directory ends up owning
+another project's live session. A key's own sessions are the one place that
+still follows on lighter evidence than its own record: each is re-homed
+first by where its shell actually sits, among the directories carrying one
+of the key's own identities, and only once the shell has left by the
+identity it was started with (`home::own_follow`,
+`registry::record_start_identity`, written only when the session's
+socket is not there yet — a restart's reservation-driven reattach to a
+surviving master is a `Spawn` too, and rewriting it there would stamp
+whatever directory now stands at the URL, an occupant's included, as where
+a shell started that began somewhere else) — so a transient `cd` into any of those
+directories becomes a permanent re-home of that session, not a visit. That
+is spec-mandated, not a bug: the session's own evidence is retired the
+moment stronger evidence (its live shell) appears. A session with neither
+shell evidence nor a start identity stays with its current owner — its
+home, if it was never followed. Once that home is renamed no page lists
+it, and if a new directory then appears at the old name, that occupant's
+page lists it as its own and its Close Project ends it: the one hazard
+this leaves, which is why sessions alive before start identities existed
+are backfilled once, with the key's own recorded identity, while their
+key is unrenamed (`registry::backfill_start_identity`).
 
 **The rule:** "I could not determine X" is a third outcome, never folded into
 "X is false". Concretely:

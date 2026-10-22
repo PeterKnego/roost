@@ -10,6 +10,7 @@ pub mod claudehist;
 pub mod claudesess;
 pub mod cwds;
 pub mod config;
+pub mod dirid;
 pub mod errlog;
 pub mod fileops;
 pub mod gitignore;

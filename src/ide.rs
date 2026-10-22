@@ -553,7 +553,7 @@ fn delivery_target(home_project: &str, conn_id: u64, workspace: &Path, home_rel:
     }
     // `effective_owner` already confirmed `owner` resolves; `owner_dir` is
     // the same check, with the directory kept instead of discarded.
-    let Some(owner_dir) = crate::home::owner_dir(home_project, &owner) else { return home() };
+    let Some(owner_dir) = crate::home::owner_dir(home_project, &s, &owner) else { return home() };
     let Ok(owner_canon) = owner_dir.canonicalize() else { return home() };
     // Re-derives the canonical absolute path from `home_rel` rather than
     // trusting its text — the same canonicalising confinement
@@ -2866,7 +2866,7 @@ mod tests {
             live: vec![],
             fresh: true,
             prev: None,
-            inside: vec![],
+            shells: vec![],
         }]);
 
         let msg = rpc(
