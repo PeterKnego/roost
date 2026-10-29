@@ -138,6 +138,32 @@ pub(crate) fn path_for(project: &str) -> PathBuf {
     state_dir().join(format!("{}.json", crate::projects::storage_key(project)))
 }
 
+/// What a save records as "this tab has had a shell": every live session,
+/// plus every *lost* one whose tab is still there. The lost half is what keeps
+/// a loss across a save made before anyone resumes it — written as only the
+/// live set, the first save after a restart erased the record of every shell
+/// the restart took, and a second restart reported none of them. The tab
+/// filter is what keeps a closed tab's name from claiming a loss for a later
+/// tab that reuses it.
+pub fn sessions_seen(w: &Workspace) -> Vec<String> {
+    let tabs: Vec<&str> = w
+        .panes
+        .iter()
+        .flat_map(|p| p.tabs.iter())
+        .filter_map(|t| match t {
+            crate::proto::Tab::Terminal { session, .. } => Some(session.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut out = w.live_sessions.clone();
+    for s in &w.lost_sessions {
+        if tabs.contains(&s.as_str()) && !out.contains(s) {
+            out.push(s.clone());
+        }
+    }
+    out
+}
+
 pub fn save(project: &str, w: &Workspace) -> Result<(), String> {
     let dir = state_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -148,7 +174,7 @@ pub fn save(project: &str, w: &Workspace) -> Result<(), String> {
     }
     let disk = Disk {
         show_hidden: w.show_hidden,
-        sessions_seen: w.live_sessions.clone(),
+        sessions_seen: sessions_seen(w),
         sizes: w.sizes,
         panes: w
             .panes
@@ -548,6 +574,31 @@ mod tests {
                  restored tab attach to nothing"
             );
         });
+    }
+
+    /// A lost shell stays recorded across a save only while its tab is still
+    /// there. Closing a lost tab must drop it: names are reused
+    /// (`next_free_name` hands `term` back out), and a stale `term` would
+    /// claim the next one's empty tab as a lost shell after a restart.
+    ///
+    /// Revert-checked: with the `tabs.contains` test dropped, fails "a
+    /// closed tab's name is not kept" — left `["term", "gone"]`, right
+    /// `["term"]`.
+    #[test]
+    fn a_lost_shell_is_recorded_only_while_its_tab_remains() {
+        let mut w = Workspace::default_layout();
+        w.live_sessions = vec![];
+        w.lost_sessions = vec!["term".into(), "gone".into()];
+        assert!(
+            w.panes.iter().flat_map(|p| p.tabs.iter()).any(|t| matches!(
+                t,
+                crate::proto::Tab::Terminal { session, .. } if session == "term"
+            )),
+            "setup: the default layout carries a `term` tab and no `gone` tab"
+        );
+        assert_eq!(sessions_seen(&w), vec!["term".to_string()], "a closed tab's name is not kept");
+        w.live_sessions = vec!["term".into()];
+        assert_eq!(sessions_seen(&w), vec!["term".to_string()], "and a live one is not listed twice");
     }
 
     #[test]

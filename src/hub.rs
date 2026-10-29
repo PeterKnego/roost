@@ -452,7 +452,12 @@ impl Hub {
         // persisted layout happened to say last time: sessions may have
         // died (or kept running under dtach) since the last save, and
         // `.git` may have appeared or vanished on disk in the meantime.
-        hub.refresh_live_sessions();
+        // Not `refresh_live_sessions`: that saves when the shells it sees
+        // differ from the file's, and here, before the loss below is
+        // computed, every restored shell that did not survive is such a
+        // difference — saving now would erase the very record the next line
+        // reads.
+        hub.refresh_live_inner();
         // Once, here, and only here: this is the single moment the restored
         // layout can be compared against what actually survived. A tab whose
         // shell is gone is indistinguishable a second later, because by then
@@ -460,6 +465,7 @@ impl Hub {
         hub.ws.lost_sessions = lost_terminal_sessions(&hub.ws, project);
         hub.ws.resumable_sessions = resumable_terminal_sessions(&hub.ws.lost_sessions, project);
         rearm_launches(&hub.ws.lost_sessions, project);
+        hub.save_if_seen_changed();
         hub.reconcile_buffers_with_disk();
         // The restored layout's terminal tabs are as much a request for those
         // sessions as a fresh click is — including `default_layout`'s own
@@ -493,10 +499,11 @@ impl Hub {
         // The same three steps `new` runs for the same reason: a restored
         // layout describes what was true on another machine, and reality here
         // is whatever actually survived.
-        self.refresh_live_sessions();
+        self.refresh_live_inner();
         self.ws.lost_sessions = lost_terminal_sessions(&self.ws, &project);
         self.ws.resumable_sessions =
             resumable_terminal_sessions(&self.ws.lost_sessions, &project);
+        self.save_if_seen_changed();
         self.reconcile_buffers_with_disk();
         self.sync_reservations();
     }
@@ -853,6 +860,9 @@ impl Hub {
     }
 
     fn persist(&mut self) {
+        // What the file now says, so `save_if_seen_changed` compares against
+        // the disk rather than against the set this hub was loaded with.
+        self.ws.sessions_seen = crate::wsstate::sessions_seen(&self.ws);
         if let Err(e) = crate::wsstate::save(&self.project.clone(), &self.ws) {
             eprintln!("roost: state save failed: {e}");
         }
@@ -1831,7 +1841,30 @@ impl Hub {
     /// `Hub::new` — which itself runs under the process-global hub-registry
     /// lock (`for_project`'s `or_insert_with`) — so that cost would stall
     /// every other project's connection setup, not just this one's.
+    /// Rebuilds the live set, and saves when it changed what a save would
+    /// record (`wsstate::sessions_seen`). That save is the only durable
+    /// evidence a tab ever had a shell, and it used to ride on layout saves
+    /// alone: a shell started in an existing tab saves no layout, so a
+    /// terminal nobody rearranged afterwards was never recorded, and a
+    /// reboot — or any container restart — brought it back as a tab with
+    /// nothing lost and nothing to resume. Every attach reaches here
+    /// (`term.rs`), so this is where a new shell gets written down.
     pub fn refresh_live_sessions(&mut self) {
+        self.refresh_live_inner();
+        self.save_if_seen_changed();
+    }
+
+    fn save_if_seen_changed(&mut self) {
+        let mut now = crate::wsstate::sessions_seen(&self.ws);
+        let mut saved = self.ws.sessions_seen.clone();
+        now.sort();
+        saved.sort();
+        if now != saved {
+            self.persist();
+        }
+    }
+
+    fn refresh_live_inner(&mut self) {
         // `owned_live_names`, which is `live_names` adjusted by the re-home
         // records and is fork-free for the same reason.
         let owned = crate::session::owned_live_names(&self.project);
@@ -4977,6 +5010,59 @@ mod tests {
             .map(|n| crate::proto::Tab::Terminal { session: (*n).to_string(), home: None })
             .collect();
         w
+    }
+
+    /// Reproduced in a real container on 2026-10-29: a terminal ran a Claude
+    /// whose hook recorded it, the container restarted, the startup sweep
+    /// reaped the dead socket — and the tab came back as a fresh shell with
+    /// no resume offer. `sessions_seen` was written only by a *layout* save,
+    /// and a shell starting in an existing tab saves no layout, so nothing
+    /// ever said `term` had a shell: no state file existed at all. A host
+    /// roost restart keeps the dtach masters, so only a reboot shows this
+    /// there; in a container every restart is one.
+    ///
+    /// Driven through the real calls: `Hub::new`, then a socket appearing and
+    /// `refresh_live_sessions` — what `term.rs` does after every attach —
+    /// then a fresh `Hub::new` once the socket is gone, as after a restart.
+    ///
+    /// Revert-checked, one part at a time, each failing at its own line with
+    /// `left: []`, `right: ["term"]`: without the save in
+    /// `refresh_live_sessions`, "a shell going live is recorded on disk";
+    /// with `Hub::new` calling `refresh_live_sessions` (which saves) before
+    /// the loss is computed, "after the restart the tab is lost"; and with
+    /// `wsstate::sessions_seen` recording only the live set, "a save before
+    /// the resume keeps the loss". The first is what the container showed.
+    #[test]
+    fn a_shell_started_without_a_layout_save_is_still_lost_after_a_restart() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let project = format!("seenonstart{}", std::process::id());
+        let sock = crate::wsstate::state_dir().join("sock").join(crate::projects::storage_key(&project));
+
+        let mut h = Hub::new(&project, d.path().to_path_buf());
+        assert!(h.ws.lost_sessions.is_empty(), "setup: a brand-new project has lost nothing");
+        std::fs::create_dir_all(&sock).unwrap();
+        std::fs::write(sock.join("term"), b"").unwrap();
+        h.refresh_live_sessions();
+        assert_eq!(h.ws.live_sessions, vec!["term".to_string()], "setup: the shell is live");
+        let (disk, _) = crate::wsstate::load(&project);
+        assert_eq!(disk.sessions_seen, vec!["term".to_string()], "a shell going live is recorded on disk");
+
+        // The restart: the shell died with the container and the sweep
+        // removed its socket.
+        std::fs::remove_file(sock.join("term")).unwrap();
+        let mut after = Hub::new(&project, d.path().to_path_buf());
+        assert_eq!(after.ws.lost_sessions, vec!["term".to_string()], "after the restart the tab is lost");
+
+        // And it stays lost across a save made before anyone resumes it, or
+        // a second restart would forget it.
+        after.persist();
+        let again = Hub::new(&project, d.path().to_path_buf());
+        assert_eq!(again.ws.lost_sessions, vec!["term".to_string()], "a save before the resume keeps the loss");
+
+        crate::session::kill_project(&project);
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     #[test]
