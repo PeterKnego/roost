@@ -6,13 +6,16 @@
 //! inode number in 50 of 50 cycles, and a *different*, unrelated directory
 //! created moments later reused it too. `Metadata::created()` — the
 //! filesystem's birth time — was the one thing that changed on every single
-//! recreation in that same probe, on both ext4 and tmpfs — on that host's
-//! kernel (7.0). Older kernels stamp a new inode from the coarse clock, which
-//! moves once per timer tick, and CI on an `ubuntu-22.04` runner saw `rm` +
-//! `mkdir` inside one tick give the same inode *and* the same birth time to
-//! the nanosecond (#203). So birth time tells a recreation apart only across a
-//! clock tick there; #203 proposes the inode generation number, which does not
-//! depend on a clock. So `DirId` is
+//! recreation in that same probe, on both ext4 and tmpfs — but that probe ran
+//! from a shell, slower than a clock tick. A new inode is stamped from the
+//! coarse clock, which moves once per timer tick (≤4 ms), so `rm` + `mkdir`
+//! inside one tick gives the same inode *and* the same birth time to the
+//! nanosecond: CI on an `ubuntu-22.04` runner saw it, and an in-process probe
+//! on this project's own host (ext4, kernel 7.0) did so 196 times in 200 — it
+//! is not an old-kernel quirk (#203). So birth time tells a recreation apart
+//! only across a clock tick; #203 holds a parked design for adding the inode
+//! generation number, which does not depend on a clock. (APFS needs neither:
+//! a probe on macOS 14, 15 and 26 never saw an inode number reused.) So `DirId` is
 //! `(dev, ino, bsec, bnsec)`, not two fields, and `of`/`of_entry` refuse to
 //! produce an identity at all when the birth time cannot be read — never a
 //! fallback back down to `(dev, ino)` alone, which is exactly the hole the
@@ -363,8 +366,8 @@ fn write_with(path: &Path, lines: &[String], publish: impl FnOnce(&Path, &Path) 
 }
 
 /// Waits past a coarse clock tick (≤4 ms at HZ=250) before a test recreates a
-/// directory at the same path. Before 6.13 a new inode is stamped from that
-/// clock, so a recreation inside one tick gets the old one's birth time *and*
+/// directory at the same path. A new inode is stamped from that clock, on
+/// current kernels too, so a recreation inside one tick gets the old one's birth time *and*
 /// its inode — the same identity, which is #203, not something a test can
 /// assert away. What the tests that call this pin is the guarantee that does
 /// hold: across a tick, a recreation is a new identity.
