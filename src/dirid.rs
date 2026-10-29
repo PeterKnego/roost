@@ -6,7 +6,13 @@
 //! inode number in 50 of 50 cycles, and a *different*, unrelated directory
 //! created moments later reused it too. `Metadata::created()` — the
 //! filesystem's birth time — was the one thing that changed on every single
-//! recreation in that same probe, on both ext4 and tmpfs. So `DirId` is
+//! recreation in that same probe, on both ext4 and tmpfs — on that host's
+//! kernel (7.0). Older kernels stamp a new inode from the coarse clock, which
+//! moves once per timer tick, and CI on an `ubuntu-22.04` runner saw `rm` +
+//! `mkdir` inside one tick give the same inode *and* the same birth time to
+//! the nanosecond (#203). So birth time tells a recreation apart only across a
+//! clock tick there; #203 proposes the inode generation number, which does not
+//! depend on a clock. So `DirId` is
 //! `(dev, ino, bsec, bnsec)`, not two fields, and `of`/`of_entry` refuse to
 //! produce an identity at all when the birth time cannot be read — never a
 //! fallback back down to `(dev, ino)` alone, which is exactly the hole the
@@ -356,9 +362,21 @@ fn write_with(path: &Path, lines: &[String], publish: impl FnOnce(&Path, &Path) 
     })
 }
 
+/// Waits past a coarse clock tick (≤4 ms at HZ=250) before a test recreates a
+/// directory at the same path. Before 6.13 a new inode is stamped from that
+/// clock, so a recreation inside one tick gets the old one's birth time *and*
+/// its inode — the same identity, which is #203, not something a test can
+/// assert away. What the tests that call this pin is the guarantee that does
+/// hold: across a tick, a recreation is a new identity.
+#[cfg(test)]
+pub(crate) fn past_a_clock_tick() {
+    std::thread::sleep(std::time::Duration::from_millis(20));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
 
     /// The hand-written `struct statx` against std's own reading of the same
     /// directory. std uses `statx` too, on glibc only, with libc's layout and
@@ -514,6 +532,10 @@ mod tests {
         let first = of(&target).unwrap().unwrap();
 
         std::fs::remove_dir(&target).unwrap();
+        // Without this, CI on an ubuntu-22.04 runner failed here with both
+        // sides `DirId { dev: 2049, ino: 9040962, bsec: 1793266548, bnsec:
+        // 320282010 }`: a recreation inside one clock tick (#203).
+        past_a_clock_tick();
         std::fs::create_dir(&target).unwrap();
         let second = of(&target).unwrap().unwrap();
 

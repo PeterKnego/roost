@@ -18,7 +18,9 @@
 //! reuse on ext4 is immediate and is not even confined to the same path.
 //! `Metadata::created()` (the filesystem's birth time, read via `statx`) was
 //! the one thing in that same probe that changed on every single recreation,
-//! on both ext4 and tmpfs. So the identity this module pins is `(dev, ino,
+//! on both ext4 and tmpfs — on that host's kernel (7.0). On kernels before
+//! 6.13 a recreation inside one coarse clock tick keeps the birth time too,
+//! so there it changes only across a tick (#203). So the identity this module pins is `(dev, ino,
 //! btime_secs, btime_nsec)`, and an unreadable birth time is refused, not
 //! shrugged off back to `(dev, ino)` — see below.
 //!
@@ -696,6 +698,7 @@ mod tests {
         allow_in(state.path(), "p", &wt).unwrap();
 
         std::fs::remove_dir(&wt).unwrap();
+        crate::dirid::past_a_clock_tick(); // #203
         std::fs::create_dir(&wt).unwrap();
 
         assert_eq!(resolve_in(state.path(), "p", "wt"), None, "a recreated directory must not resolve");
@@ -724,6 +727,7 @@ mod tests {
 
         std::fs::remove_dir(&wt).unwrap();
         let other = outside.path().join("other");
+        crate::dirid::past_a_clock_tick(); // #203
         std::fs::create_dir(&other).unwrap();
         std::os::unix::fs::symlink(&other, &wt).unwrap();
 
@@ -989,6 +993,7 @@ mod tests {
         let first = allow_in(state.path(), "p", &wt).unwrap();
 
         std::fs::remove_dir(&wt).unwrap();
+        crate::dirid::past_a_clock_tick(); // #203
         std::fs::create_dir(&wt).unwrap();
         let second = allow_in(state.path(), "p", &wt).unwrap();
 
