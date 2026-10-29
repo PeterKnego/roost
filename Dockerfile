@@ -208,6 +208,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8123/static/favicon-32.png -o /dev/null || exit 1
 
 # tini as PID 1: dtach masters reparent to it by design, so without an init they
-# accumulate as zombies in a long-lived container.
+# accumulate as zombies in a long-lived container. It has to *be* PID 1: run
+# with compose's `init: true` or `docker run --init`, Docker's own init takes
+# PID 1, tini becomes its child, and it warns on every start that it reaps
+# nothing (#199). The compose file leaves `init` unset for that reason.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/roost"]
 CMD ["8123"]

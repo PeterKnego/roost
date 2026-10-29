@@ -75,7 +75,6 @@ phase "run"
 docker network create "$NET" >/dev/null
 docker run -d --name "$NAME" \
   --network "$NET" \
-  --init \
   --cap-drop ALL \
   -p "127.0.0.1:$PORT:8123" \
   -e ROOST_BIND_ALL=1 \
@@ -121,6 +120,25 @@ check "a dtach socket exists under the state volume" \
   docker exec "$NAME" sh -c 'ls /var/lib/roost/sock/*/ | grep -q .'
 check "and a live dtach is holding it" \
   docker exec "$NAME" sh -c 'ps -Aww -o args= | grep -q "[d]tach.*/var/lib/roost/sock/"' 
+
+phase "the init that reaps"
+# No `--init` above, deliberately: the image's ENTRYPOINT is tini, and a second
+# init in front of it made tini a child that could not reap and said so on
+# every start (#199). Asserted from the process tree rather than read from the
+# Dockerfile, the same way the capabilities above are.
+check "PID 1 is the image's own tini" \
+  docker exec "$NAME" sh -c "test \"\$(cat /proc/1/comm)\" = tini"
+checksh "and it does not warn that it cannot reap" \
+  "! docker logs '$NAME' 2>&1 | grep -q 'Tini is not running as PID 1'"
+# What PID 1 is for here: an orphan, which is what a dtach master becomes when
+# the client that forked it exits first. Not "the master's parent is 1" —
+# while roost is attached the master is the child of roost's own dtach client,
+# and reparents only once that client is gone. So the assertion is the reaping
+# itself: an orphan that exits must not be left a zombie. Revert-checked with
+# `--entrypoint /usr/local/bin/roost` (roost as PID 1, no init): one `Z`
+# process remained and this failed.
+check "and an orphan that exits is reaped, not left a zombie" \
+  docker exec "$NAME" sh -c "sh -c 'sleep 0.2 &'; sleep 1.5; ! ps -A -o stat= | grep -q '^Z'"
 
 phase "the mount path is the host's own"
 # A worktree is discovered by asking git, and git stores absolute paths in the
