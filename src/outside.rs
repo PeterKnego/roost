@@ -128,11 +128,14 @@ fn record_path_in(state: &Path, parent: &str, name: &str) -> Option<PathBuf> {
     Some(dir_in(state, parent)?.join(name))
 }
 
+/// Birth time through `dirid`, the one reader (#198): `Metadata::created()`
+/// is unavailable on musl, which every Linux release and the container image
+/// are, so reading it here refused every allow there. A time before the
+/// epoch stays `None`, as before — the record format has no sign for it.
 #[cfg(unix)]
-fn birth(md: &std::fs::Metadata) -> Option<(u64, u64)> {
-    let created = md.created().ok()?;
-    let dur = created.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some((dur.as_secs(), dur.subsec_nanos() as u64))
+fn birth(path: &Path, md: &std::fs::Metadata) -> Option<(u64, u64)> {
+    let id = crate::dirid::of_metadata(path, md).ok()?;
+    Some((u64::try_from(id.bsec).ok()?, u64::from(id.bnsec)))
 }
 
 /// Reads and validates a record; `None` for missing, damaged, or unreadable
@@ -188,7 +191,7 @@ pub fn resolve_in(state: &Path, parent: &str, name: &str) -> Option<PathBuf> {
     if !md.is_dir() {
         return None;
     }
-    let (bsec, bnsec) = birth(&md)?;
+    let (bsec, bnsec) = birth(&rec.path, &md)?;
     if (md.dev(), md.ino(), bsec, bnsec) != rec.id {
         return None;
     }
@@ -448,7 +451,7 @@ pub fn allow_in(state: &Path, parent: &str, path: &Path) -> Result<Record, Strin
         return Err(format!("not a directory: {}", canon.display()));
     }
     let (bsec, bnsec) =
-        birth(&md).ok_or_else(|| "roost cannot read this directory's birth time, so it cannot pin it".to_string())?;
+        birth(&canon, &md).ok_or_else(|| "roost cannot read this directory's birth time, so it cannot pin it".to_string())?;
     let id = (md.dev(), md.ino(), bsec, bnsec);
 
     let dir = dir_in(state, parent).ok_or_else(|| format!("invalid parent {parent:?}"))?;

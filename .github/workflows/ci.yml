@@ -101,5 +101,13 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
           sudo apt-get update -q && sudo apt-get install -y -q musl-tools
 
+      # Every Linux release and the container image are musl, and the suite
+      # above runs on glibc — the substitution that hid #198: std reads birth
+      # time only on glibc, so on musl no directory identity was ever whole,
+      # and every test of it passed on the runner that could read one. The
+      # identity module, on the target that ships.
+      - name: dirid on musl
+        run: 'cargo test --locked --target x86_64-unknown-linux-musl --lib dirid:: -- --test-threads=1'
+
       - name: Package install tests
         run: scripts/test/install.sh
