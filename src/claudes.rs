@@ -617,7 +617,7 @@ fn home_is_its_own(roots: &[PathBuf], home: &str) -> HomeState {
                 Ok(md) => md,
                 Err(s) => return s,
             };
-            match crate::dirid::of_metadata(&md) {
+            match crate::dirid::of_metadata(&dir, &md) {
                 Ok(now) if now == id => HomeState::Same,
                 Ok(_) => HomeState::Other,
                 // No birth time: a different (dev, ino) is still a different

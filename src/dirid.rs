@@ -6,7 +6,13 @@
 //! inode number in 50 of 50 cycles, and a *different*, unrelated directory
 //! created moments later reused it too. `Metadata::created()` — the
 //! filesystem's birth time — was the one thing that changed on every single
-//! recreation in that same probe, on both ext4 and tmpfs. So `DirId` is
+//! recreation in that same probe, on both ext4 and tmpfs — on that host's
+//! kernel (7.0). Older kernels stamp a new inode from the coarse clock, which
+//! moves once per timer tick, and CI on an `ubuntu-22.04` runner saw `rm` +
+//! `mkdir` inside one tick give the same inode *and* the same birth time to
+//! the nanosecond (#203). So birth time tells a recreation apart only across a
+//! clock tick there; #203 proposes the inode generation number, which does not
+//! depend on a clock. So `DirId` is
 //! `(dev, ino, bsec, bnsec)`, not two fields, and `of`/`of_entry` refuse to
 //! produce an identity at all when the birth time cannot be read — never a
 //! fallback back down to `(dev, ino)` alone, which is exactly the hole the
@@ -76,6 +82,7 @@ pub enum Stored {
 /// remainder. Pulled out of `birth` so the conversion can be unit-tested
 /// without needing a real pre-epoch file (nothing on this host can be
 /// dated before 1970 to order).
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
 fn pre_epoch(before: std::time::Duration) -> (i64, u32) {
     if before.subsec_nanos() == 0 {
         (-(before.as_secs() as i64), 0)
@@ -84,8 +91,135 @@ fn pre_epoch(before: std::time::Duration) -> (i64, u32) {
     }
 }
 
-#[cfg(unix)]
-fn birth(md: &std::fs::Metadata) -> Result<(i64, u32), String> {
+/// Birth time on Linux, read with `statx(2)` directly rather than through
+/// `Metadata::created()` (#198).
+///
+/// std reads birth time with `statx` only under `target_env = "gnu"`; on
+/// musl `created()` always fails ("creation time is not available on this
+/// platform currently"). Both Linux release targets and the container image
+/// are musl, so through std every shipped Linux roost had no birth time at
+/// all — no identity was ever Full, and every check that needs one (#183's
+/// follows, #188's allows) refused, correctly and permanently. The `libc`
+/// crate does not help: its `statx` and `STATX_*` sit behind the same
+/// gnu-or-`musl_v1_2_3` gate. So the syscall is made here, with the kernel's
+/// own layout, on glibc *and* musl alike — one path, which is the point: the
+/// glibc dev host and CI then run exactly the code the musl releases do.
+#[cfg(target_os = "linux")]
+mod statx {
+    /// `struct statx_timestamp` from the kernel uapi.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Timestamp {
+        tv_sec: i64,
+        tv_nsec: u32,
+        _reserved: i32,
+    }
+
+    /// `struct statx` from the kernel uapi (`include/uapi/linux/stat.h`),
+    /// stable since 4.11. Fields this does not read are kept so the offsets
+    /// of the ones it does are the kernel's; the trailing spare words are
+    /// what newer kernels grow into, and a kernel never writes past 256
+    /// bytes for the mask asked here.
+    #[repr(C)]
+    struct Statx {
+        stx_mask: u32,
+        stx_blksize: u32,
+        stx_attributes: u64,
+        stx_nlink: u32,
+        stx_uid: u32,
+        stx_gid: u32,
+        stx_mode: u16,
+        _spare0: u16,
+        stx_ino: u64,
+        stx_size: u64,
+        stx_blocks: u64,
+        stx_attributes_mask: u64,
+        stx_atime: Timestamp,
+        stx_btime: Timestamp,
+        stx_ctime: Timestamp,
+        stx_mtime: Timestamp,
+        stx_rdev_major: u32,
+        stx_rdev_minor: u32,
+        stx_dev_major: u32,
+        stx_dev_minor: u32,
+        _spare2: [u64; 14],
+    }
+
+    // A hand-written mirror of a kernel struct is only as good as its
+    // layout; a field out of place reads some other timestamp as the birth
+    // time, silently. The size pins the whole, the offsets the two fields
+    // this module trusts.
+    const _: () = assert!(std::mem::size_of::<Statx>() == 256);
+    const _: () = assert!(std::mem::offset_of!(Statx, stx_ino) == 32);
+    const _: () = assert!(std::mem::offset_of!(Statx, stx_btime) == 80);
+    const _: () = assert!(std::mem::offset_of!(Statx, stx_dev_major) == 136);
+
+    const STATX_INO: u32 = 0x100;
+    const STATX_BTIME: u32 = 0x800;
+    const AT_STATX_SYNC_AS_STAT: libc::c_int = 0;
+
+    /// What one `statx` call says about a path: `(dev, ino, bsec, bnsec)`.
+    /// `Err` for a failed call, or for a kernel or filesystem that did not
+    /// fill in the inode or the birth time — a mask without `STATX_BTIME`
+    /// leaves `stx_btime` zero, and a zero read as a birth time would be a
+    /// lie every such directory shares.
+    pub(super) fn read(path: &std::path::Path, nofollow: bool) -> Result<(u64, u64, i64, u32), String> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| format!("{}: a path with a NUL byte has no birth time", path.display()))?;
+        let flags = AT_STATX_SYNC_AS_STAT | if nofollow { libc::AT_SYMLINK_NOFOLLOW } else { 0 };
+        let mut buf = std::mem::MaybeUninit::<Statx>::zeroed();
+        // SAFETY: `c` is a NUL-terminated path that outlives the call, and
+        // `buf` is a writable `struct statx`-sized buffer; the kernel writes
+        // nothing beyond it.
+        let rc = unsafe {
+            libc::syscall(libc::SYS_statx, libc::AT_FDCWD, c.as_ptr(), flags, STATX_INO | STATX_BTIME, buf.as_mut_ptr())
+        };
+        if rc != 0 {
+            return Err(format!("birth time unreadable: {}", std::io::Error::last_os_error()));
+        }
+        // SAFETY: zero-initialised, then filled by a successful statx; every
+        // field is a plain integer, so any bit pattern is valid.
+        let sx = unsafe { buf.assume_init() };
+        if sx.stx_mask & STATX_INO == 0 || sx.stx_mask & STATX_BTIME == 0 {
+            return Err("birth time unreadable: this filesystem does not report one".to_string());
+        }
+        if sx.stx_btime.tv_nsec >= 1_000_000_000 {
+            return Err("birth time unreadable: the kernel reported an out-of-range nanosecond".to_string());
+        }
+        let dev = libc::makedev(sx.stx_dev_major, sx.stx_dev_minor) as u64;
+        Ok((dev, sx.stx_ino, sx.stx_btime.tv_sec, sx.stx_btime.tv_nsec))
+    }
+}
+
+/// `statx` and the metadata the caller already has must be the same inode.
+/// They are two calls on one path, and the path can be renamed or replaced
+/// in between; a birth time read from a *different* directory, attached to
+/// this one's `(dev, ino)`, is a forged identity. Disagreeing is "cannot
+/// tell", never a guess at which one is right.
+fn same_inode(md: (u64, u64), sx: (u64, u64)) -> Result<(), String> {
+    if md == sx {
+        Ok(())
+    } else {
+        Err(format!("birth time unreadable: the path changed between two reads ({md:?} then {sx:?})"))
+    }
+}
+
+/// Birth time for the inode `md` describes, reached through `path`. On Linux
+/// through `statx` (see `mod statx`), following a final symlink exactly when
+/// `md` did: metadata that *is* a symlink came from `symlink_metadata`, and
+/// for anything else the two flags reach the same inode.
+#[cfg(target_os = "linux")]
+fn birth(path: &Path, md: &std::fs::Metadata) -> Result<(i64, u32), String> {
+    use std::os::unix::fs::MetadataExt;
+    let (dev, ino, bsec, bnsec) = statx::read(path, md.file_type().is_symlink())?;
+    same_inode((md.dev(), md.ino()), (dev, ino))?;
+    Ok((bsec, bnsec))
+}
+
+/// Elsewhere (macOS) std's `created()` works, and the path is not needed.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn birth(_path: &Path, md: &std::fs::Metadata) -> Result<(i64, u32), String> {
     let created = md.created().map_err(|e| format!("birth time unreadable: {e}"))?;
     match created.duration_since(std::time::UNIX_EPOCH) {
         Ok(dur) => Ok((dur.as_secs() as i64, dur.subsec_nanos())),
@@ -93,29 +227,30 @@ fn birth(md: &std::fs::Metadata) -> Result<(i64, u32), String> {
     }
 }
 
-/// The identity from metadata already in hand — for a caller that also
-/// needs the metadata's own `(dev, ino)` when the birth time turns out to be
-/// unreadable (`registry`'s scans compare a `Legacy` record against it).
-/// `Err` only for an unreadable birth time; there is no fallback.
+/// The identity from metadata already in hand, plus the path it was read
+/// from — for a caller that also needs the metadata's own `(dev, ino)` when
+/// the birth time turns out to be unreadable (`registry`'s scans compare a
+/// `Legacy` record against it). `Err` only for an unreadable birth time;
+/// there is no fallback.
 #[cfg(unix)]
-pub fn of_metadata(md: &std::fs::Metadata) -> Result<DirId, String> {
+pub fn of_metadata(path: &Path, md: &std::fs::Metadata) -> Result<DirId, String> {
     use std::os::unix::fs::MetadataExt;
-    let (bsec, bnsec) = birth(md)?;
+    let (bsec, bnsec) = birth(path, md)?;
     Ok(DirId { dev: md.dev(), ino: md.ino(), bsec, bnsec })
 }
 
 #[cfg(unix)]
-fn id_from(result: std::io::Result<std::fs::Metadata>) -> Result<Option<DirId>, String> {
+fn id_from(path: &Path, result: std::io::Result<std::fs::Metadata>) -> Result<Option<DirId>, String> {
     let md = match result {
         Ok(md) => md,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.to_string()),
     };
-    of_metadata(&md).map(Some)
+    of_metadata(path, &md).map(Some)
 }
 
 #[cfg(not(unix))]
-fn id_from(_result: std::io::Result<std::fs::Metadata>) -> Result<Option<DirId>, String> {
+fn id_from(_path: &Path, _result: std::io::Result<std::fs::Metadata>) -> Result<Option<DirId>, String> {
     Err("dirid requires unix metadata".to_string())
 }
 
@@ -123,13 +258,13 @@ fn id_from(_result: std::io::Result<std::fs::Metadata>) -> Result<Option<DirId>,
 /// symlink, like `outside::resolve_in`). `Ok(None)` = `NotFound`; `Err` =
 /// cannot tell (any other error, or an unreadable birth time).
 pub fn of(path: &Path) -> Result<Option<DirId>, String> {
-    id_from(std::fs::metadata(path))
+    id_from(path, std::fs::metadata(path))
 }
 
 /// Same, but `symlink_metadata` (for scanning directory entries without
 /// resolving the entry itself).
 pub fn of_entry(path: &Path) -> Result<Option<DirId>, String> {
-    id_from(std::fs::symlink_metadata(path))
+    id_from(path, std::fs::symlink_metadata(path))
 }
 
 /// `"dev ino bsec bnsec"`, the on-disk line format for a full identity.
@@ -227,9 +362,99 @@ fn write_with(path: &Path, lines: &[String], publish: impl FnOnce(&Path, &Path) 
     })
 }
 
+/// Waits past a coarse clock tick (≤4 ms at HZ=250) before a test recreates a
+/// directory at the same path. Before 6.13 a new inode is stamped from that
+/// clock, so a recreation inside one tick gets the old one's birth time *and*
+/// its inode — the same identity, which is #203, not something a test can
+/// assert away. What the tests that call this pin is the guarantee that does
+/// hold: across a tick, a recreation is a new identity.
+#[cfg(test)]
+pub(crate) fn past_a_clock_tick() {
+    std::thread::sleep(std::time::Duration::from_millis(20));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// The hand-written `struct statx` against std's own reading of the same
+    /// directory. std uses `statx` too, on glibc only, with libc's layout and
+    /// `st_dev` encoding — so agreeing here is what says the mirror's
+    /// offsets and `makedev` are right, on the one target that can check.
+    /// On musl std cannot read a birth time at all, which is #198; there the
+    /// test says so and checks only that ours can.
+    ///
+    /// Revert-checked: reading `stx_ctime` in place of `stx_btime` fails here
+    /// and in `a_recreated_directory_differs`. Not caught: a pre-`makedev`
+    /// `(major << 8) | minor` encoding stayed green, because this host's
+    /// device (252:0) encodes the same both ways. A wrong encoding still fails
+    /// safe — `same_inode` refuses a `dev` that disagrees with stat's, so the
+    /// identity reads as unreadable, never as another directory's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn statx_agrees_with_std_where_std_can_read_a_birth_time() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Moves the directory's ctime and mtime off its birth time: in a
+        // directory made a moment ago all of them can be the same instant,
+        // and then a mirror that read the wrong timestamp would still agree.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.path().join("touch"), b"").unwrap();
+        let md = std::fs::metadata(dir.path()).unwrap();
+        assert_ne!(
+            (md.ctime(), md.ctime_nsec()),
+            {
+                let d = md.created().map_or(std::time::Duration::ZERO, |t| t.duration_since(std::time::UNIX_EPOCH).unwrap());
+                (d.as_secs() as i64, d.subsec_nanos() as i64)
+            },
+            "setup: ctime is no longer the birth time"
+        );
+        let (dev, ino, bsec, bnsec) = statx::read(dir.path(), false).expect("statx reads a birth time here");
+        assert_eq!((dev, ino), (md.dev(), md.ino()), "statx names the same inode as stat");
+        match md.created() {
+            Ok(t) => {
+                let d = t.duration_since(std::time::UNIX_EPOCH).unwrap();
+                assert_eq!((bsec, bnsec), (d.as_secs() as i64, d.subsec_nanos()), "and the same birth time as std");
+            }
+            Err(e) => eprintln!("std cannot read a birth time on this target ({e}); checked statx alone"),
+        }
+    }
+
+    /// `of` follows a final symlink and `of_entry` does not — and on Linux
+    /// each now reaches its inode through a separate `statx` call, which
+    /// must make the same choice the metadata did, or the cross-check in
+    /// `birth` refuses (and an identity silently becomes "cannot tell").
+    ///
+    /// Revert-checked: with `statx::read(path, false)` (always follow),
+    /// `of_entry(link)` fails "the link's own identity reads" — statx reached
+    /// the target while stat described the link, and the cross-check said so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlink_is_followed_by_of_and_not_by_of_entry() {
+        use std::os::unix::fs::MetadataExt;
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let t = of(&target).unwrap().unwrap();
+        assert_eq!(of(&link).unwrap().unwrap(), t, "through the link: the target's identity");
+        let own = of_entry(&link).expect("the link's own identity reads").unwrap();
+        let lmd = std::fs::symlink_metadata(&link).unwrap();
+        assert_eq!((own.dev, own.ino), (lmd.dev(), lmd.ino()), "of_entry names the link itself");
+        assert_ne!(own, t, "which is not the target");
+    }
+
+    /// Revert-checked: with `same_inode` returning `Ok` unconditionally, fails
+    /// at the `unwrap_err`.
+    #[test]
+    fn two_reads_that_disagree_on_the_inode_are_refused() {
+        assert_eq!(same_inode((7, 9), (7, 9)), Ok(()));
+        let e = same_inode((7, 9), (7, 10)).unwrap_err();
+        assert!(e.contains("the path changed between two reads"), "says why: {e}");
+        assert!(same_inode((7, 9), (8, 9)).is_err(), "another device is another inode");
+    }
     use std::path::PathBuf;
 
     /// `$HOME`, not a hardcoded path or `std::env::tempdir()`: this host's
@@ -307,6 +532,10 @@ mod tests {
         let first = of(&target).unwrap().unwrap();
 
         std::fs::remove_dir(&target).unwrap();
+        // Without this, CI on an ubuntu-22.04 runner failed here with both
+        // sides `DirId { dev: 2049, ino: 9040962, bsec: 1793266548, bnsec:
+        // 320282010 }`: a recreation inside one clock tick (#203).
+        past_a_clock_tick();
         std::fs::create_dir(&target).unwrap();
         let second = of(&target).unwrap().unwrap();
 

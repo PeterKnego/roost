@@ -504,7 +504,7 @@ fn shell_dir(sock: &std::path::Path, snapshot: &[(u32, String)], proc_root: &std
         .filter_map(|shell| {
             let cwd = std::fs::read_link(proc_root.join(shell.to_string()).join("cwd")).ok()?;
             cwd.ancestors()
-                .find(|p| std::fs::symlink_metadata(p).is_ok_and(|m| hit(ids, &m) == Hit::Full))
+                .find(|p| std::fs::symlink_metadata(p).is_ok_and(|m| hit(ids, p, &m) == Hit::Full))
                 .map(|p| p.to_path_buf())
         })
         .collect();
@@ -595,9 +595,9 @@ enum Hit {
 }
 
 #[cfg(unix)]
-fn hit(ids: &[crate::dirid::Stored], md: &std::fs::Metadata) -> Hit {
+fn hit(ids: &[crate::dirid::Stored], path: &std::path::Path, md: &std::fs::Metadata) -> Hit {
     use std::os::unix::fs::MetadataExt;
-    let full = crate::dirid::of_metadata(md).ok();
+    let full = crate::dirid::of_metadata(path, md).ok();
     let same_inode = |dev: u64, ino: u64| dev == md.dev() && ino == md.ino();
     ids.iter()
         .map(|s| match (*s, full) {
@@ -642,7 +642,7 @@ fn moved_to_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> Option<Mov
     let Some(url) = parse_moved_to(&raw) else { return Some(MoveEvidence::CannotTell) };
     if let Some(dir) = crate::projects::resolve_project(roots, &url) {
         return match std::fs::symlink_metadata(&dir) {
-            Ok(m) => match hit(&ids, &m) {
+            Ok(m) => match hit(&ids, &dir, &m) {
                 Hit::No => None,
                 h => Some(moved(dir, h)),
             },
@@ -656,10 +656,11 @@ fn moved_to_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> Option<Mov
     // directory, whatever the resolver said: for a worktree URL it asks
     // git, and a git that failed vouches for nothing (final review N1).
     for r in roots {
-        match std::fs::symlink_metadata(r.join(&url)) {
+        let at = r.join(&url);
+        match std::fs::symlink_metadata(&at) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Some(MoveEvidence::CannotTell),
-            Ok(m) if hit(&ids, &m) != Hit::No => return Some(MoveEvidence::CannotTell),
+            Ok(m) if hit(&ids, &at, &m) != Hit::No => return Some(MoveEvidence::CannotTell),
             Ok(_) => {}
         }
     }
@@ -697,7 +698,7 @@ fn sibling_evidence(roots: &[PathBuf], key_dir: &std::path::Path) -> MoveEvidenc
     // A full match wins over a weak one wherever each was found: the weak
     // one protects, but only the full one can be followed.
     let mut weak: Option<PathBuf> = None;
-    let scanned = scan_siblings(parents, |path, m| match hit(&ids, m) {
+    let scanned = scan_siblings(parents, |path, m| match hit(&ids, path, m) {
         Hit::No => std::ops::ControlFlow::Continue(()),
         Hit::Weak if weak.is_some() => std::ops::ControlFlow::Continue(()),
         h => {
@@ -816,7 +817,7 @@ fn find_by_identity_in(
     // `Ok(None)` = not this one; `Err` = cannot tell.
     let accept = |path: &std::path::Path, md: &std::fs::Metadata| -> Result<Option<(PathBuf, String)>, String> {
         use std::os::unix::fs::MetadataExt;
-        match crate::dirid::of_metadata(md) {
+        match crate::dirid::of_metadata(path, md) {
             Ok(here) if here == *id => {}
             Ok(_) => return Ok(None),
             Err(e) if md.dev() == id.dev && md.ino() == id.ino => return Err(format!("{}: {e}", path.display())),
@@ -1635,7 +1636,7 @@ fn write_origin_identity(key_dir: &std::path::Path, dir: &std::path::Path) {
     use std::os::unix::fs::MetadataExt;
     let Ok(m) = std::fs::metadata(dir) else { return };
     let marker = origin_identity_path(key_dir);
-    if let Some(line) = origin_line(identity_at(&marker), crate::dirid::of_metadata(&m), (m.dev(), m.ino())) {
+    if let Some(line) = origin_line(identity_at(&marker), crate::dirid::of_metadata(dir, &m), (m.dev(), m.ino())) {
         let _ = crate::dirid::write_lines(&marker, &[line]);
     }
 }
@@ -1743,7 +1744,7 @@ pub(crate) fn move_evidence(key_dir: &std::path::Path, snapshot: &[(u32, String)
             let mut at = Some(cwd.as_path());
             while let Some(p) = at {
                 if let Ok(m) = std::fs::symlink_metadata(p) {
-                    match hit(&ids, &m) {
+                    match hit(&ids, p, &m) {
                         Hit::Full => return moved(p.to_path_buf(), Hit::Full),
                         Hit::Weak if weak.is_none() => weak = Some(p.to_path_buf()),
                         _ => {}
@@ -1910,8 +1911,8 @@ fn occupied_by_another(key_dir: &std::path::Path, dir: &std::path::Path) -> bool
     {
         let same = match std::fs::metadata(dir) {
             Ok(m) => match recorded {
-                crate::dirid::Stored::Full(_) => hit(&[recorded], &m) == Hit::Full,
-                crate::dirid::Stored::Legacy { .. } => hit(&[recorded], &m) == Hit::Weak,
+                crate::dirid::Stored::Full(_) => hit(&[recorded], dir, &m) == Hit::Full,
+                crate::dirid::Stored::Legacy { .. } => hit(&[recorded], dir, &m) == Hit::Weak,
             },
             Err(_) => false,
         };

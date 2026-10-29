@@ -18,7 +18,9 @@
 //! reuse on ext4 is immediate and is not even confined to the same path.
 //! `Metadata::created()` (the filesystem's birth time, read via `statx`) was
 //! the one thing in that same probe that changed on every single recreation,
-//! on both ext4 and tmpfs. So the identity this module pins is `(dev, ino,
+//! on both ext4 and tmpfs — on that host's kernel (7.0). On kernels before
+//! 6.13 a recreation inside one coarse clock tick keeps the birth time too,
+//! so there it changes only across a tick (#203). So the identity this module pins is `(dev, ino,
 //! btime_secs, btime_nsec)`, and an unreadable birth time is refused, not
 //! shrugged off back to `(dev, ino)` — see below.
 //!
@@ -128,11 +130,14 @@ fn record_path_in(state: &Path, parent: &str, name: &str) -> Option<PathBuf> {
     Some(dir_in(state, parent)?.join(name))
 }
 
+/// Birth time through `dirid`, the one reader (#198): `Metadata::created()`
+/// is unavailable on musl, which every Linux release and the container image
+/// are, so reading it here refused every allow there. A time before the
+/// epoch stays `None`, as before — the record format has no sign for it.
 #[cfg(unix)]
-fn birth(md: &std::fs::Metadata) -> Option<(u64, u64)> {
-    let created = md.created().ok()?;
-    let dur = created.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some((dur.as_secs(), dur.subsec_nanos() as u64))
+fn birth(path: &Path, md: &std::fs::Metadata) -> Option<(u64, u64)> {
+    let id = crate::dirid::of_metadata(path, md).ok()?;
+    Some((u64::try_from(id.bsec).ok()?, u64::from(id.bnsec)))
 }
 
 /// Reads and validates a record; `None` for missing, damaged, or unreadable
@@ -188,7 +193,7 @@ pub fn resolve_in(state: &Path, parent: &str, name: &str) -> Option<PathBuf> {
     if !md.is_dir() {
         return None;
     }
-    let (bsec, bnsec) = birth(&md)?;
+    let (bsec, bnsec) = birth(&rec.path, &md)?;
     if (md.dev(), md.ino(), bsec, bnsec) != rec.id {
         return None;
     }
@@ -448,7 +453,7 @@ pub fn allow_in(state: &Path, parent: &str, path: &Path) -> Result<Record, Strin
         return Err(format!("not a directory: {}", canon.display()));
     }
     let (bsec, bnsec) =
-        birth(&md).ok_or_else(|| "roost cannot read this directory's birth time, so it cannot pin it".to_string())?;
+        birth(&canon, &md).ok_or_else(|| "roost cannot read this directory's birth time, so it cannot pin it".to_string())?;
     let id = (md.dev(), md.ino(), bsec, bnsec);
 
     let dir = dir_in(state, parent).ok_or_else(|| format!("invalid parent {parent:?}"))?;
@@ -693,6 +698,7 @@ mod tests {
         allow_in(state.path(), "p", &wt).unwrap();
 
         std::fs::remove_dir(&wt).unwrap();
+        crate::dirid::past_a_clock_tick(); // #203
         std::fs::create_dir(&wt).unwrap();
 
         assert_eq!(resolve_in(state.path(), "p", "wt"), None, "a recreated directory must not resolve");
@@ -721,6 +727,7 @@ mod tests {
 
         std::fs::remove_dir(&wt).unwrap();
         let other = outside.path().join("other");
+        crate::dirid::past_a_clock_tick(); // #203
         std::fs::create_dir(&other).unwrap();
         std::os::unix::fs::symlink(&other, &wt).unwrap();
 
@@ -986,6 +993,7 @@ mod tests {
         let first = allow_in(state.path(), "p", &wt).unwrap();
 
         std::fs::remove_dir(&wt).unwrap();
+        crate::dirid::past_a_clock_tick(); // #203
         std::fs::create_dir(&wt).unwrap();
         let second = allow_in(state.path(), "p", &wt).unwrap();
 
