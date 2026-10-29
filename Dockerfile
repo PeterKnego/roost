@@ -48,13 +48,31 @@ ARG BUILD_DATE=unknown
 # --------------------------------------------------------------------------
 # Builder: a static musl binary, cross-compiled rather than emulated
 # --------------------------------------------------------------------------
-# On $BUILDPLATFORM on purpose. The binary has no C dependencies and
-# `.cargo/config.toml` already sets `linker = "rust-lld"` for
-# aarch64-unknown-linux-musl — added for exactly this cross-link, with a comment
-# saying it needs no cross-gcc, `cross` or `zig`. Emulating an arm64 Rust build
-# under QEMU costs tens of minutes for the same bytes.
+# On $BUILDPLATFORM on purpose. `.cargo/config.toml` already sets
+# `linker = "rust-lld"` for aarch64-unknown-linux-musl — added for exactly this
+# cross-link, with a comment saying it needs no cross-gcc, `cross` or `zig`.
+# Emulating an arm64 Rust build under QEMU costs tens of minutes for the same
+# bytes.
+#
+# The binary *does* compile C now: `ring`, through `ureq`, since the version
+# check (#85). Before that this stage said "no C dependencies" and installed no
+# C compiler, and the image stopped building — cc-rs looks for
+# `x86_64-linux-musl-gcc` and finds nothing. clang rather than musl-tools,
+# because one clang targets both triples (cc-rs passes it `--target`), which
+# keeps the arm64 build a cross-compile with no cross-gcc, the property this
+# stage runs on $BUILDPLATFORM for. It is the same pair the release preflight
+# uses on hosts without musl-tools.
 FROM --platform=$BUILDPLATFORM ${BUILDER_IMAGE} AS builder
 ARG TARGETARCH
+
+RUN set -eux; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang llvm; \
+    rm -rf /var/lib/apt/lists/*
+ENV CC_x86_64_unknown_linux_musl=clang \
+    AR_x86_64_unknown_linux_musl=llvm-ar \
+    CC_aarch64_unknown_linux_musl=clang \
+    AR_aarch64_unknown_linux_musl=llvm-ar
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
