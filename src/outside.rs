@@ -18,9 +18,10 @@
 //! reuse on ext4 is immediate and is not even confined to the same path.
 //! `Metadata::created()` (the filesystem's birth time, read via `statx`) was
 //! the one thing in that same probe that changed on every single recreation,
-//! on both ext4 and tmpfs — on that host's kernel (7.0). On kernels before
-//! 6.13 a recreation inside one coarse clock tick keeps the birth time too,
-//! so there it changes only across a tick (#203). So the identity this module pins is `(dev, ino,
+//! on both ext4 and tmpfs — but from a shell, slower than a clock tick. A
+//! recreation inside one coarse clock tick (≤4 ms) keeps the birth time too,
+//! on kernel 7.0 as well (196 of 200 in-process, on ext4), so it changes only
+//! across a tick (#203). So the identity this module pins is `(dev, ino,
 //! btime_secs, btime_nsec)`, and an unreadable birth time is refused, not
 //! shrugged off back to `(dev, ino)` — see below.
 //!

@@ -91,11 +91,13 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   just `(dev, ino)` — because a probe of this project's own ext4 filesystem
   found `rm` followed by `mkdir` at the same path reusing the just-freed
   inode every time; birth time was the one field that changed on every
-  recreation (the module doc of `src/outside.rs`) — on that host's kernel.
-  Before 6.13 a new inode is stamped from the coarse clock, so a recreation
-  inside one tick (≤4 ms) keeps the old birth time as well, and the identity
-  cannot tell it apart; #203 proposes the inode generation number, which
-  needs no clock. An unreadable birth time refuses the
+  recreation (the module doc of `src/outside.rs`) — but that probe ran from
+  a shell, slower than a clock tick. A new inode is stamped from the coarse
+  clock, so a recreation inside one tick (≤4 ms) keeps the old birth time as
+  well: an in-process `rmdir` + `mkdir` did so 196 times in 200 on ext4 on
+  kernel 7.0, not only on old kernels, and the identity cannot tell it
+  apart. #203 holds a parked design for adding the inode generation number,
+  which needs no clock. An unreadable birth time refuses the
   allow and fails the resolve, the same as a mismatch. `AllowOutsideWorktree`
   also refuses a path already under a root and a worktree of anything but
   the parent's *main* checkout, so one directory can never end up with two
