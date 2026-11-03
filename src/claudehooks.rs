@@ -387,6 +387,24 @@ pub fn set_kind(project_dir: &Path, kind: Kind, on: bool) -> Result<(), String> 
     })
 }
 
+/// Mirrors the main checkout's hook settings into a worktree it just made.
+///
+/// `settings.local.json` is gitignored, so `git worktree add` never brings
+/// it along, and a worktree's Claude would otherwise start with neither of
+/// roost's commands however the main checkout was set up. Only enabling
+/// is mirrored: a kind the main checkout lacks (or whose file it cannot
+/// read) is left exactly as it is in `to`, so this never removes anything.
+/// Returns one message per kind it could not install, for the caller to
+/// log — the worktree exists either way, and its creation is not what
+/// failed.
+pub fn inherit(from: &Path, to: &Path) -> Vec<String> {
+    [Kind::Notify, Kind::Worktree]
+        .into_iter()
+        .filter(|k| state_of(from, *k) == HookState::Present)
+        .filter_map(|k| set_kind(to, k, true).err().map(|e| format!("{k:?}: {e}")))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -891,5 +909,61 @@ mod tests {
         let after = std::fs::metadata(&p).unwrap().modified().unwrap();
         assert_eq!(before, after, "mtime changed on a no-op enable");
         assert!(!d.path().join(".claude/settings.local.json.bak").exists(), "no backup on a no-op enable");
+    }
+
+    /// A worktree inherits every kind its main checkout has, and only
+    /// those: `Notify` on with `Worktree` off must give the worktree
+    /// `claude-hook` and no `WorktreeCreate` entry.
+    ///
+    /// Verified this can fail: narrowing `inherit` to `[Kind::Worktree]`
+    /// (the pre-fix behaviour) fails the first `state` assertion with
+    /// `left: Absent right: Present`. Restored.
+    #[test]
+    fn inherit_mirrors_each_present_kind_and_nothing_else() {
+        let main = proj();
+        let wt = proj();
+        set(main.path(), true).unwrap();
+        assert!(inherit(main.path(), wt.path()).is_empty());
+        assert_eq!(state(wt.path()), HookState::Present);
+        assert_eq!(state_of(wt.path(), Kind::Worktree), HookState::Absent);
+        assert!(read_json(wt.path())["hooks"].get("WorktreeCreate").is_none(), "{}", read(wt.path()));
+
+        let wt2 = proj();
+        set_kind(main.path(), Kind::Worktree, true).unwrap();
+        assert!(inherit(main.path(), wt2.path()).is_empty());
+        assert_eq!(state(wt2.path()), HookState::Present);
+        assert_eq!(state_of(wt2.path(), Kind::Worktree), HookState::Present);
+    }
+
+    /// Neither a main checkout without the hooks nor one whose file cannot
+    /// be parsed creates a settings file in the worktree.
+    ///
+    /// Verified this can fail: dropping the `Present` filter fails the last
+    /// assertion ("nothing was created in the worktree"). Restored.
+    #[test]
+    fn inherit_from_absent_or_unknown_writes_nothing() {
+        let wt = proj();
+        assert!(inherit(proj().path(), wt.path()).is_empty());
+        let broken = proj();
+        write(broken.path(), "{ not json");
+        assert!(matches!(state(broken.path()), HookState::Unknown(_)));
+        assert!(inherit(broken.path(), wt.path()).is_empty());
+        assert!(!wt.path().join(".claude").exists(), "nothing was created in the worktree");
+    }
+
+    /// A worktree whose own file cannot be parsed is reported, not rewritten.
+    ///
+    /// Verified this can fail: with `inherit` narrowed to `[Kind::Worktree]`
+    /// the report is empty (`left: 0 right: 1`). Restored.
+    #[test]
+    fn inherit_reports_a_worktree_file_it_cannot_read() {
+        let main = proj();
+        set(main.path(), true).unwrap();
+        let wt = proj();
+        write(wt.path(), "{ not json");
+        let errs = inherit(main.path(), wt.path());
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].starts_with("Notify: "), "{errs:?}");
+        assert_eq!(read(wt.path()), "{ not json");
     }
 }

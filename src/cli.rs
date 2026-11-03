@@ -629,8 +629,12 @@ pub fn run_worktree_hook() -> i32 {
                 Some(project) => crate::projects::storage_key(&format!("{project}/.claude/worktrees/{d}")),
                 None => crate::projects::storage_key(&format!("{}/.claude/worktrees/{d}", repo.display())),
             };
-            crate::worktree::create_named(repo, &crate::wsstate::state_dir(), name, &key_of, &crate::worktree::real_git)
-                .map(|c| c.path.to_string_lossy().into_owned())
+            let c = crate::worktree::create_named(repo, &crate::wsstate::state_dir(), name, &key_of, &crate::worktree::real_git)?;
+            // stderr only: stdout is the hook's whole contract (below).
+            for e in crate::claudehooks::inherit(repo, &c.path) {
+                eprintln!("roost worktree-hook: could not install a hook into {}: {e}", c.path.display());
+            }
+            Ok(c.path.to_string_lossy().into_owned())
         },
     );
     let (code, line) = render_outcome(outcome);

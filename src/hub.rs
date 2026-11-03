@@ -2457,6 +2457,11 @@ impl Hub {
                 note_created_worktree(&project, &p);
             }
             let c = crate::worktree::create_named(&dir, &crate::wsstate::state_dir(), &resolved, &key_of, &crate::worktree::real_git)?;
+            // Logged, not returned, for `approve_ask`'s reason: the
+            // worktree exists, so this is not a failed creation.
+            for e in crate::claudehooks::inherit(&dir, &c.path) {
+                eprintln!("roost: could not install a hook into {}: {e}", c.path.display());
+            }
             Ok(format!("{project}/.claude/worktrees/{}", c.name))
         };
         // Delivers the reply under the hub lock and hands back the url on
@@ -4099,13 +4104,13 @@ fn approve_ask(project: String, dir: std::path::PathBuf, clicker: ConnId, ask: P
         // through `rehome_to` — once `/proc` shows that Claude's cwd inside
         // this exact worktree.
         crate::claudes::expect_move(&project, &session, &owner);
-        // Install the worktree hook into the new worktree's own
+        // Install roost's hooks into the new worktree's own
         // `.claude/settings.local.json`, mirroring whatever the main
-        // checkout has: a worktree Claude never ran `roost worktree-hook`
-        // from `dir` to enable it, so it inherits the setting instead of
-        // starting cold every time. Off the hub lock — `dir` and `c.path`
-        // are plain paths, and `claudehooks::set_kind` does its own file
-        // I/O with no lock involved.
+        // checkout has: nobody ever enabled them from the worktree, so it
+        // inherits the settings instead of starting cold every time. Off
+        // the hub lock — `dir` and `c.path` are plain paths, and
+        // `claudehooks::inherit` does its own file I/O with no lock
+        // involved.
         //
         // Errors are logged and swallowed, not propagated: the worktree
         // already exists by this point, so failing the whole approve now
@@ -4114,12 +4119,8 @@ fn approve_ask(project: String, dir: std::path::PathBuf, clicker: ConnId, ask: P
         // destruction table is about, in its "says something untrue" form.
         // A fresh Claude started there without the hook just starts cold,
         // same as any project that never had it installed.
-        if crate::claudehooks::state_of(&dir, crate::claudehooks::Kind::Worktree)
-            == crate::claudehooks::HookState::Present
-        {
-            if let Err(e) = crate::claudehooks::set_kind(&c.path, crate::claudehooks::Kind::Worktree, true) {
-                eprintln!("roost: could not install the worktree hook into {}: {e}", c.path.display());
-            }
+        for e in crate::claudehooks::inherit(&dir, &c.path) {
+            eprintln!("roost: could not install a hook into {}: {e}", c.path.display());
         }
         // Both hubs refresh before Claude is told anything, so a page that
         // loads the new worktree from `WorktreeReady` sees it as it now
@@ -10062,6 +10063,50 @@ mod tests {
         assert!(rxb.try_recv().is_err(), "the reply is the clicker's alone");
         assert!(repo.join(".claude/worktrees/worktree-fox/a.txt").is_file());
         assert_eq!(crate::worktree::read_base(&crate::wsstate::state_dir(), "repo%2F.claude%2Fworktrees%2Fworktree-fox").as_deref(), Some("main"));
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// The UI path inherits the main checkout's notification hook: before
+    /// this, only `approve_ask` mirrored anything (and only `Worktree`), so
+    /// a worktree opened from the switcher ran its Claude with no
+    /// `roost claude-hook` and never notified.
+    ///
+    /// Verified this can fail: with the `inherit` call in `do_new_worktree`
+    /// removed, the `state` assertion fails `left: Absent right: Present`.
+    /// Restored.
+    #[test]
+    fn new_worktree_inherits_the_main_checkouts_notify_hook() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        // After the commit, so the file is untracked as it is in a real
+        // checkout and `git worktree add` cannot carry it over by itself.
+        crate::claudehooks::set(&repo, true).unwrap();
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::NewWorktree { name: Some("owl".into()), launch: None });
+        let got = rxa.try_recv().expect("clicker answered");
+        assert!(got.contains(r#""t":"WorktreeReady""#), "{got}");
+        let wt = repo.join(".claude/worktrees/worktree-owl");
+        assert!(wt.join("a.txt").is_file());
+        assert_eq!(crate::claudehooks::state(&wt), crate::claudehooks::HookState::Present);
+        assert_eq!(
+            crate::claudehooks::state_of(&wt, crate::claudehooks::Kind::Worktree),
+            crate::claudehooks::HookState::Absent,
+            "a kind the main checkout lacks is not installed"
+        );
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
