@@ -1457,7 +1457,7 @@ fn dispatch(msg: &serde_json::Value, conn: &mut Conn) -> Option<serde_json::Valu
 }
 
 fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: Arc<Mutex<PathBuf>>) {
-    let config = WebSocketConfig { max_message_size: Some(MAX_FRAME_BYTES), ..Default::default() };
+    let config = WebSocketConfig::default().max_message_size(Some(MAX_FRAME_BYTES));
     // Built before the handshake, not after: registration happens inside the
     // handshake callback below (see the comment there for why that ordering
     // is load-bearing, not cosmetic).
@@ -1597,7 +1597,7 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: Arc<Mute
         // this connection, so there is never a second writer to interleave
         // with — see the comment above for why that has to be true here.
         while let Ok(msg) = reply_rx.try_recv() {
-            if ws.send(tungstenite::Message::Text(msg)).is_err() {
+            if ws.send(tungstenite::Message::Text(msg.into())).is_err() {
                 drop(conn);
                 drop(guard);
                 return;
@@ -1625,7 +1625,7 @@ fn serve_conn(stream: TcpStream, token: &str, project: &str, workspace: Arc<Mute
         };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
         if let Some(reply) = dispatch(&v, &mut conn) {
-            if ws.send(tungstenite::Message::Text(reply.to_string())).is_err() {
+            if ws.send(tungstenite::Message::Text(reply.to_string().into())).is_err() {
                 break;
             }
         }
@@ -2314,7 +2314,7 @@ mod tests {
             while let Ok(out) = send_rx.try_recv() {
                 match out {
                     ClientCmd::Text(t) => {
-                        if sock.send(tungstenite::Message::Text(t)).is_err() {
+                        if sock.send(tungstenite::Message::Text(t.into())).is_err() {
                             return;
                         }
                     }
@@ -2325,7 +2325,7 @@ mod tests {
             }
             match sock.read() {
                 Ok(tungstenite::Message::Text(t)) => {
-                    if tx.send(t).is_err() {
+                    if tx.send(t.to_string()).is_err() {
                         return;
                     }
                 }

@@ -22,7 +22,7 @@ fn the_header_toggle_overrides_the_config_file_in_both_directions() {
     let proj = d.path().join("toggleproj");
     std::fs::write(proj.join(".gitignore"), "target\n").unwrap();
     let url = format!("http://127.0.0.1:{port}/frag/toggleproj/tree");
-    let tree = || ureq::get(&url).call().unwrap().into_string().unwrap();
+    let tree = || ureq::get(&url).call().unwrap().into_body().read_to_string().unwrap();
 
     // Config says hide (it says nothing, which is the same thing).
     assert!(!tree().contains(".gitignore"), "hidden by default");
@@ -139,17 +139,17 @@ fn show_hidden_is_read_per_project_on_every_tree_request() {
     let proj = d.path().join("hiddenproj");
     std::fs::write(proj.join(".gitignore"), "target\n").unwrap();
     let url = format!("http://127.0.0.1:{port}/frag/hiddenproj/tree");
-    let before = ureq::get(&url).call().unwrap().into_string().unwrap();
+    let before = ureq::get(&url).call().unwrap().into_body().read_to_string().unwrap();
     assert!(before.contains("data-rel=\"hello.md\""), "ordinary rows render");
     assert!(!before.contains(".gitignore"), "hidden by default");
 
     // Settings are re-read per request, so no restart between these two.
     std::fs::create_dir(proj.join(".roost")).unwrap();
     std::fs::write(proj.join(".roost/config.toml"), "show_hidden = true").unwrap();
-    let after = ureq::get(&url).call().unwrap().into_string().unwrap();
+    let after = ureq::get(&url).call().unwrap().into_body().read_to_string().unwrap();
     assert!(after.contains("data-rel=\".gitignore\""), "the setting took effect");
     assert!(after.contains("data-rel=\".roost\""), "including the config dir itself");
     // The lazy-expand endpoint reads the same setting, not a cached one.
-    let lazy = ureq::get(&format!("{url}?dir=")).call().unwrap().into_string().unwrap();
+    let lazy = ureq::get(&format!("{url}?dir=")).call().unwrap().into_body().read_to_string().unwrap();
     assert!(lazy.contains("data-rel=\".gitignore\""));
 }

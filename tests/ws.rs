@@ -185,7 +185,7 @@ fn terminal_ws_echoes_through_pty() {
     let (_d, port) = fixture();
     let mut ws = ws_connect(port, Some("http://127.0.0.1:8444")).unwrap();
     ws.send(tungstenite::Message::Text("resize:100x30".into())).unwrap();
-    ws.send(tungstenite::Message::Binary(b"hello\r".to_vec())).unwrap();
+    ws.send(tungstenite::Message::Binary(b"hello\r".to_vec().into())).unwrap();
     let mut seen = String::new();
     for _ in 0..100 {
         match ws.read() {
@@ -408,7 +408,7 @@ fn workspace_socket_malformed_json_is_reported_not_fatal() {
 /// that leniency is exactly what let a reasonless refusal pass as "closed".
 fn read_close_frame(
     ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
-) -> Option<tungstenite::protocol::CloseFrame<'static>> {
+) -> Option<tungstenite::protocol::CloseFrame> {
     let mut saw = Vec::new();
     for _ in 0..50 {
         match ws.read() {

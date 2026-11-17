@@ -23,7 +23,7 @@ jobs:
     # self-merged PR at zero approvals and so is not a trusted ref for a token.
     environment: release
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: "peterknego/homebrew-tap"
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
