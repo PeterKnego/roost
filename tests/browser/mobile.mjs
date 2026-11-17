@@ -419,6 +419,57 @@ try {
      `and a TUI in DECCKM gets the application ones: ${JSON.stringify(appSent)}`);
   await evalIn(`[...terms.values()][0].term.write("\u001b[?1l")`);
 
+  console.log("E5b. the key bar follows a terminal into the middle pane");
+  // Reported from a phone: a Claude started with ✻ from the pane showing a
+  // file opened *there*, in pane 2, and came up with no esc/arrows/enter —
+  // the bar was keyed on pane 3 by number. Moving the tab is the same layout
+  // without depending on `claude` being on this host's PATH.
+  //
+  // Reverted to `body[data-mpane="3"]` and pane-3-only `targetTerm`, the
+  // first assertion below fails ("on screen") and so does the byte check.
+  const termPane = () => evalIn(`state.panes.findIndex((p) => p.tabs.some((t) => t.k === "Terminal"))`);
+  const from = await termPane();
+  ok(from === 3, `the fixture's terminal starts in the right pane (pane ${from})`);
+  await evalIn(`send({ t: "MoveTab", from: 3, idx: state.panes[3].active, to: 2, at: state.panes[2].tabs.length }); 0`);
+  ok(await until(async () => (await termPane()) === 2, 10, "the move"), "the terminal is now in the middle pane");
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="2"]').click()`);
+  await sleep(400);
+  ok(await evalIn(`!!document.querySelector('.pane[data-pane="2"] .termhost')?.offsetParent`),
+     "the middle pane is in front, showing the terminal");
+  ok(await evalIn(`!!document.getElementById("termkeys")?.offsetParent`),
+     "the key bar is on screen with it");
+  await evalIn(`window.__sent2 = []; (function () {
+      const host = document.querySelector('.pane[data-pane="2"] .termhost[data-session]');
+      const t = terms.get(host.dataset.session).term; const orig = t.input.bind(t);
+      t.input = (d) => { window.__sent2.push(d); return orig(d); }; })()`);
+  await press("esc");
+  ok(JSON.stringify(await evalIn(`window.__sent2`)) === JSON.stringify(["\u001b"]),
+     "and esc reaches the terminal in that pane");
+  // The other half of "follows": the same pane showing a file has no keys.
+  await evalIn(`send({ t: "OpenTab", pane: 2, tab: { k: "File", rel: "notes.md", mode: "Preview" } }); 0`);
+  ok(await until(async () => !(await evalIn(`!!document.getElementById("termkeys")?.offsetParent`)), 10, "hidden"),
+     "a file brought to the front of that pane takes the key bar away again");
+  // Put the layout back for the sections after this one.
+  await evalIn(`send({ t: "MoveTab", from: 2, idx: state.panes[2].tabs.findIndex((t) => t.k === "Terminal"), to: 3, at: state.panes[3].tabs.length }); 0`);
+  await until(async () => (await termPane()) === 3, 10, "the move back");
+  await evalIn(`(() => { const p = state.panes[3]; send({ t: "ActivateTab", pane: 3, idx: p.tabs.findIndex((t) => t.k === "Terminal") }); })()`);
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="3"]').click()`);
+  await sleep(600);
+
+  console.log("E5c. upload has a button, not only a context menu");
+  // iOS Safari fires no `contextmenu` for a long-press, so the tree menu's
+  // "Upload files…" (#110) was unreachable from an iPhone. Asserted by what
+  // the tap calls, because a real file chooser cannot be driven from here.
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="0"]').click()`);
+  await sleep(400);
+  const up = `document.querySelector('.pane[data-pane="0"] .paneicon.upload')`;
+  ok(await evalIn(`!!${up}?.offsetParent`), "the file tree's header carries an upload button");
+  await evalIn(`window.__picked = []; window.pickAndUpload = (d) => window.__picked.push(d); ${up}.click(); 0`);
+  ok(JSON.stringify(await evalIn(`window.__picked`)) === JSON.stringify([""]),
+     "and tapping it opens the picker for the project root");
+  await evalIn(`document.querySelector('#mobilebar button[data-mpane="3"]').click()`);
+  await sleep(400);
+
   console.log("E7. scrolling a running TUI");
   // Last of the terminal sections on purpose: it puts the terminal on the
   // alternate screen, and the normal-buffer scroll checked above wants its
