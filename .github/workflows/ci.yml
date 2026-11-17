@@ -56,7 +56,7 @@ jobs:
       # cap, staleness pruning) or its defaults changing.
       - name: Cache cargo-deb and cargo-generate-rpm
         id: cache-pkg-tools
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin/cargo-deb

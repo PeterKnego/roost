@@ -290,7 +290,7 @@ pub fn handle_ws(stream: TcpStream) {
     // any page the user visits could extend the directories roost serves.
     // Same check as wsconn.rs and term.rs.
     let allowed = crate::config::allowed_origins();
-    let config = WebSocketConfig { max_message_size: Some(64 * 1024), ..Default::default() };
+    let config = WebSocketConfig::default().max_message_size(Some(64 * 1024));
     let accepted = tungstenite::accept_hdr_with_config(
         stream,
         |req: &WsRequest, resp: WsResponse| {

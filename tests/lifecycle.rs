@@ -31,7 +31,7 @@ fn opening_a_project_spawns_no_terminal_session() {
     let body = ureq::get(&format!("http://127.0.0.1:{port}/spawncheck"))
         .call()
         .unwrap()
-        .into_string()
+        .into_body().read_to_string()
         .unwrap();
     assert!(body.contains("data-project"));
     let mut ws = ws_connect_path(port, "/ws/spawncheck/_workspace").unwrap();
