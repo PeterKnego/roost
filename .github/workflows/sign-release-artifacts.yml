@@ -51,7 +51,7 @@ jobs:
     steps:
       # For keys/roost.pub as the tag has it: the key these binaries were built
       # to trust is the only one worth signing for.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
