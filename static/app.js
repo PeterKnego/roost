@@ -420,6 +420,9 @@ const PANE_ICONS = {
   // as the header's own close button (`SVG_X` in render.rs).
   close: '<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>',
   prloop: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.6 6.4a5.6 5.6 0 0 1 9.3-2.2l1.5 1.4"/><path d="M13.4 9.6a5.6 5.6 0 0 1-9.3 2.2L2.6 10.4"/><path d="M13.6 2.4v3.2h-3.2M2.4 13.6v-3.2h3.2"/></svg>',
+  // A tray with an arrow leaving it: the tree's upload button (see
+  // buildPaneIcons).
+  upload: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M8 10.5V2.5M5 5.5l3-3 3 3M2.5 10v3.5h11V10"/></svg>',
   newterm: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="10.5" height="9.5" rx="1.2"/><path d="M4 6.8l1.7 1.5L4 9.8M8 10.6h2.6"/><path d="M13.3 2.2v3.6M11.5 4h3.6"/></svg>',
 };
 // The official Claude mark (lobehub packaging of Anthropic's starburst,
@@ -1357,8 +1360,10 @@ function render() {
   // is the right contribution there — nothing is taking up that space.
   const mbar = document.getElementById("mobilebar");
   if (mbar) document.documentElement.style.setProperty("--mobilebar-h", mbar.offsetHeight + "px");
-  const tkeys = document.getElementById("termkeys");
-  if (tkeys) document.documentElement.style.setProperty("--termkeys-h", tkeys.offsetHeight + "px");
+  // Before the measurement below, which reads the bar's height: a State
+  // broadcast can put a terminal in front (or take it away) without a pane
+  // switch, e.g. ✻ pressed in the pane that is showing a file.
+  syncTermKeys();
   // htmx swaps into #gitinfo/#wtlabel and the #projcount/#bellcount writes
   // below all change the header's width while the panel is open, and
   // #searchbox uses margin:auto, so the field (and the panel anchored to it)
@@ -1641,6 +1646,12 @@ function buildPaneIcons(host, pi, pane, active, content) {
     }, "newprloop");
   }
   if (active && active.k === "Tree") {
+    // #110 put "Upload files…" in the tree's context menu, but that menu is
+    // reached by `contextmenu`, which iOS Safari never fires for a
+    // long-press — so on an iPhone upload was still unreachable. A button
+    // needs no gesture a phone lacks. Uploads to the project root; the menu
+    // is still the way to aim at a folder where one is available.
+    icon(PANE_ICONS.upload, "upload files to the project root", () => pickAndUpload(""), "upload");
     const hidden = showHidden();
     // Filled ring = dot entries are showing. This drives an intent rather
     // than filtering client-side: the rows do not exist in the fragment the
@@ -4679,9 +4690,34 @@ function showMobilePane(pi) {
   // alone, because switching panes does not go through a State broadcast —
   // without this the grid keeps the previous pane's arithmetic and the
   // terminal is fitted to a frame the wrong size by exactly the bar.
+  syncTermKeys();
+  fitTerminals();
+}
+
+/// Whether the pane the switcher has in front is showing a terminal.
+///
+/// Asked of the layout, not of the pane's number. The key bar used to be
+/// `body[data-mpane="3"]`, on the assumption that terminals live in the right
+/// pane — but every pane header has + and ✻, so a Claude started from the
+/// pane that was showing a file opened there, in pane 2, and came up with no
+/// arrows, Esc or Enter: unusable on a phone, which is what the bar is for.
+function frontIsTerminal() {
+  if (!state) return false;
+  const pane = state.panes[Number(document.body.dataset.mpane)];
+  const t = pane && pane.tabs[pane.active];
+  return !!(t && t.k === "Terminal");
+}
+
+/// Shows the key bar exactly when a terminal is in front, and re-measures the
+/// height #grid subtracts for it. Re-fits only when that height changed, since
+/// `render()` calls this on every State broadcast.
+function syncTermKeys() {
+  const on = frontIsTerminal();
+  const changed = document.body.classList.contains("termfront") !== on;
+  document.body.classList.toggle("termfront", on);
   const tk = document.getElementById("termkeys");
   if (tk) document.documentElement.style.setProperty("--termkeys-h", tk.offsetHeight + "px");
-  fitTerminals();
+  if (changed) fitTerminals();
 }
 
 /// The gesture route: a tap that means "show me this" has to also bring the
@@ -4727,9 +4763,11 @@ function appCursor(t) {
 }
 
 /// The terminal a key press should go to: the one showing in the pane the
-/// switcher has in front, falling back to the last focused session.
+/// switcher has in front, falling back to the last focused session. The front
+/// pane, not pane 3 — see `frontIsTerminal`.
 function targetTerm() {
-  const host = document.querySelector('.pane[data-pane="3"] .termhost[data-session]');
+  const n = String(Number(document.body.dataset.mpane));
+  const host = document.querySelector(`.pane[data-pane="${n}"] .termhost[data-session]`);
   const byPane = host && terms.get(host.dataset.session);
   return byPane || terms.get(lastFocusedSession) || null;
 }

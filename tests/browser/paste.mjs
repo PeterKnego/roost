@@ -58,7 +58,7 @@ const TEXT = "alpha\nbeta";
 try {
   page = await openPage(browser.port, `http://127.0.0.1:${roost.port}/${fx.project}`);
   const { cmd, evalIn } = page;
-  // The bar is mobile-only (`body[data-mpane="3"] #termkeys`), so a desktop
+  // The bar is mobile-only (`body.termfront #termkeys`), so a desktop
   // viewport would find every button zero-sized and every assertion vacuous.
   await cmd("Emulation.setDeviceMetricsOverride",
     { width: 390, height: 844, deviceScaleFactor: 3, mobile: true });
@@ -76,7 +76,7 @@ try {
   await until(async () => (await evalIn("__last()")).trimEnd().endsWith("$"), 60, "prompt");
   // The terminal pane has to be the one in front, or `targetTerm()` resolves
   // by last-focused instead and the bar would be testing a different path.
-  await evalIn(`document.body.dataset.mpane = "3"; __t().term.focus(); 0`);
+  await evalIn(`showMobilePane("3"); __t().term.focus(); 0`);
 
   console.log("A. the bar carries a paste button, and still fits a phone");
   const bar = await evalIn(`(() => {

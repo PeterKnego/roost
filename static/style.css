@@ -1345,7 +1345,7 @@ header button.proj:hover svg { opacity: 1; }
                          border-radius: 50%; background: var(--accent, #d29922); }
 
 /* The terminal key bar. Present in the DOM at every width, shown only on a
-   phone with the terminal pane in front — see the phone block below. */
+   phone with a terminal in front — see the phone block below. */
 #termkeys { display: none; align-items: stretch; gap: 4px; padding: 4px 4px 0;
             background: var(--tool); }
 #termkeys button { flex: 1; min-width: 0; min-height: 44px; border: 1px solid var(--border);
@@ -1442,12 +1442,15 @@ header button.proj:hover svg { opacity: 1; }
   #grid > .divider { display: none; }
 
   #mobilebar { display: flex; }
-  /* Only with the terminal in front: these keys mean nothing over a file tree,
-     and the screen is the scarcest thing here. */
-  body[data-mpane="3"] #termkeys { display: flex; }
+  /* Only with a terminal in front: these keys mean nothing over a file tree,
+     and the screen is the scarcest thing here. `termfront` is set by app.js's
+     `syncTermKeys` from the front pane's active tab, not from the pane's
+     number — a terminal can be in any pane, and a Claude opened from the
+     file pane's ✻ used to come up with no keys at all. */
+  body.termfront #termkeys { display: flex; }
   /* The keys sit inside the frame the grid measures, so the pane gives up
      their height rather than the page growing past the viewport. */
-  body[data-mpane="3"] #grid {
+  body.termfront #grid {
     height: calc(100vh - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
     height: calc(100dvh - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
     height: calc(var(--vvh, 100dvh) - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
