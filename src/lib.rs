@@ -2,6 +2,7 @@ pub mod agents;
 pub mod appeared;
 pub mod assets;
 pub mod backup;
+pub mod chat;
 pub mod bind;
 pub mod cli;
 pub mod claudehooks;
@@ -189,6 +190,11 @@ fn route_ws(stream: TcpStream, roots: &[PathBuf]) {
             return wsconn::handle(stream, &project, dir);
         }
         return;
+    }
+    // `/ws/{project}/chat/{name}`: the chat view of a terminal (`chat.rs`).
+    // Checked before the fallthrough below, whose parser would refuse it.
+    if segs.len() >= 3 && segs[segs.len() - 2] == "chat" {
+        return chat::handle_ws(stream, roots);
     }
     // Anything else (including a well-formed .../term/{name}) is
     // term::handle_ws's own job to parse and validate for real; this

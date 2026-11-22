@@ -423,6 +423,8 @@ const PANE_ICONS = {
   // A tray with an arrow leaving it: the tree's upload button (see
   // buildPaneIcons).
   upload: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M8 10.5V2.5M5 5.5l3-3 3 3M2.5 10v3.5h11V10"/></svg>',
+  // A speech bubble: the chat view of this Claude terminal (static/chat.js).
+  chat: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M2.5 3.5h11v7.5H7l-3 2.5V11H2.5z"/></svg>',
   newterm: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="10.5" height="9.5" rx="1.2"/><path d="M4 6.8l1.7 1.5L4 9.8M8 10.6h2.6"/><path d="M13.3 2.2v3.6M11.5 4h3.6"/></svg>',
 };
 // The official Claude mark (lobehub packaging of Anthropic's starburst,
@@ -1644,6 +1646,12 @@ function buildPaneIcons(host, pi, pane, active, content) {
       });
       if (yes) newTerminal(pi, "prloop");
     }, "newprloop");
+  }
+  // The chat view, offered on a terminal roost knows is running Claude —
+  // anywhere else it would open onto "no Claude here".
+  if (active && active.k === "Terminal" && (state.claude_sessions || []).includes(active.session)
+      && typeof openChat === "function") {
+    icon(PANE_ICONS.chat, "chat with this Claude", () => openChat(active.session, active.home), "openchat");
   }
   if (active && active.k === "Tree") {
     // #110 put "Upload files…" in the tree's context menu, but that menu is

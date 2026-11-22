@@ -2063,6 +2063,7 @@ fn workspace_page_in(
         None => String::new(),
     };
     let (sv, dv, av_js) = (av("style.css"), av("dialog.js"), av("app.js"));
+    let av_chat = av("chat.js");
     format!(
         r#"<!doctype html>
 {html_open}<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
@@ -2232,6 +2233,7 @@ fn workspace_page_in(
 <div id="termpool" hidden></div>
 <script src="/static/dialog.js?v={dv}"></script>
 <script src="/static/app.js?v={av_js}"></script>
+<script src="/static/chat.js?v={av_chat}"></script>
 </body></html>"#,
         SVG_HOME = SVG_HOME,
         icons = icon_links(),

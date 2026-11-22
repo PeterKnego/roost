@@ -1662,3 +1662,113 @@ header button.proj:hover svg { opacity: 1; }
       minmax(0, min(var(--right-w, 520px), 38vw));
   }
 }
+
+/* ============================== chat view ============================== */
+/* static/chat.js. A second view of a Claude terminal: the conversation from
+   its transcript, menus as buttons, a real textarea to type in. On a phone it
+   takes the whole visible viewport — header, pane switcher and key bar are
+   covered, because talking to Claude is the job there — and it follows the
+   soft keyboard the same way the workspace frame does (--vvtop/--vvh, written
+   by watchKeyboard). On a desktop it is a panel on the right with the
+   workspace still beside it. */
+#chat { position: fixed; z-index: 50; right: 0; top: 0; bottom: 0;
+        width: min(720px, 100vw); display: flex; flex-direction: column;
+        background: var(--bg); color: var(--fg); border-left: 1px solid var(--border);
+        box-shadow: -8px 0 24px rgba(0,0,0,.25); }
+#chat[hidden] { display: none; }
+.chathead { display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+            border-bottom: 1px solid var(--border); background: var(--tool); }
+.chathead button, .chatmode { min-height: 44px; min-width: 44px; border: 1px solid var(--border);
+            border-radius: 8px; background: var(--bg2); color: var(--fg); font: inherit; cursor: pointer;
+            padding: 0 10px; -webkit-tap-highlight-color: transparent; }
+.chathead button:active, .chatmode:active { background: var(--tab-hover); }
+.chattitle { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chatmode { display: inline-flex; align-items: center; font-size: 12px; color: var(--muted); }
+.chatmode[hidden] { display: none; }
+.chatbanner { padding: 8px 12px; background: var(--bg2); border-bottom: 1px solid var(--border);
+              color: var(--muted); font-size: 14px; }
+.chatbanner button { margin-left: 6px; min-height: 36px; border: 1px solid var(--border); border-radius: 8px;
+                     background: var(--bg); color: var(--fg); font: inherit; padding: 0 10px; }
+/* The scroller. Native scrolling with momentum, contained so a fling at the
+   end does not drag the page under it. */
+.chatlog { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+           -webkit-overflow-scrolling: touch; padding: 12px 12px 4px; scroll-behavior: auto;
+           display: flex; flex-direction: column; gap: 10px; }
+.chatlog > * { max-width: 100%; }
+.cmsg { line-height: 1.5; overflow-wrap: anywhere; }
+.cuser { align-self: flex-end; max-width: 88%; }
+.cuser .cbubble { white-space: pre-wrap; background: var(--accent); color: var(--bg);
+                  padding: 8px 12px; border-radius: 14px 14px 4px 14px; }
+.cuser .cbubble a { color: inherit; text-decoration: underline; }
+/* github-markdown-css pads .markdown-body for a page; a message is not one. */
+#chat .casst > .markdown-body { padding: 0; margin: 0; max-width: 100%; min-width: 0; font-size: 15px;
+         background: transparent !important; color: var(--fg) !important; }
+.casst .markdown-body > :first-child { margin-top: 0; }
+.casst .markdown-body > :last-child { margin-bottom: 0; }
+.casst pre { overflow-x: auto; max-width: 100%; }
+.casst table { display: block; overflow-x: auto; }
+.chatlog a, .chatlive a { color: var(--accent); }
+.clink, #chat code a, #chat .casst code a { color: var(--accent); text-decoration: underline dotted; cursor: pointer; }
+.ctool { border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); font-size: 13px; }
+.ctoolhead { display: flex; gap: 6px; align-items: baseline; width: 100%; text-align: left; min-height: 36px;
+             padding: 6px 10px; border: 0; background: transparent; color: var(--fg); font: inherit; cursor: pointer; }
+.ctoolst { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); align-self: center; }
+.ctoolst.ok { background: #3fb950; }
+.ctoolst.err { background: #f85149; }
+.ctoolst.run { animation: cpulse 1s ease-in-out infinite; }
+.ctoolname { flex: none; font-weight: 600; }
+.ctoolsum { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            font-family: var(--mono, ui-monospace, monospace); color: var(--muted); }
+.ctoolout { display: none; margin: 0; padding: 8px 10px; border-top: 1px solid var(--border);
+            max-height: 40vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+            font: 12px/1.4 var(--mono, ui-monospace, monospace); }
+.ctool.open .ctoolout { display: block; }
+.cnote { align-self: center; font-size: 12px; color: var(--muted); white-space: pre-wrap; max-width: 92%; }
+.chatdown { position: absolute; right: 16px; bottom: 140px; width: 44px; height: 44px; border-radius: 50%;
+            border: 1px solid var(--border); background: var(--bg2); color: var(--fg); font-size: 18px;
+            box-shadow: 0 2px 8px rgba(0,0,0,.3); }
+.chatdown[hidden] { display: none; }
+.chatlive:empty { display: none; }
+.chatlive { padding: 8px 12px; border-top: 1px solid var(--border); max-height: 55%; overflow-y: auto; }
+.cprompt { display: flex; flex-direction: column; gap: 6px; }
+.cpctx { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.cpq { font-weight: 600; margin-bottom: 2px; }
+.cpopt, .cpesc { display: flex; flex-direction: column; align-items: flex-start; text-align: left; min-height: 44px;
+                 padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2);
+                 color: var(--fg); font: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.cpopt.sel { border-color: var(--accent); }
+.cpopt:active, .cpesc:active { background: var(--tab-hover); }
+.cpopt:disabled { opacity: .5; }
+.cpdetail { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.cpesc { align-items: center; color: var(--muted); }
+.cbusy { display: flex; align-items: center; gap: 10px; color: var(--muted); }
+.cbusy button { margin-left: auto; min-height: 40px; min-width: 64px; border: 1px solid var(--border);
+                border-radius: 8px; background: var(--bg2); color: var(--fg); font: inherit; }
+.cspin { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); animation: cpulse 1s ease-in-out infinite; }
+@keyframes cpulse { 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .cspin, .ctoolst.run { animation: none; } }
+.chatkeys { display: flex; gap: 4px; padding: 4px 8px 0; }
+.chatkeys[hidden] { display: none; }
+.chatkeys button { flex: 1; min-width: 0; min-height: 44px; border: 1px solid var(--border); border-radius: 8px;
+                   background: var(--bg2); color: var(--fg); font: inherit; font-size: 13px; }
+.chatkeys button:active { background: var(--tab-hover); }
+.chatform { display: flex; align-items: flex-end; gap: 6px; padding: 8px;
+            padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px)); }
+.chatinput { flex: 1; min-width: 0; resize: none; max-height: 40vh; min-height: 44px; padding: 10px 12px;
+             border: 1px solid var(--border); border-radius: 18px; background: var(--bg2); color: var(--fg);
+             font: inherit; font-size: 16px; line-height: 1.35; }
+.chatsend, .chatmore { flex: none; width: 44px; height: 44px; border-radius: 50%; border: 1px solid var(--border);
+                       background: var(--bg2); color: var(--fg); font-size: 18px; cursor: pointer; }
+.chatsend { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+.chatsend:active, .chatmore:active { filter: brightness(.85); }
+.chatflash { position: absolute; left: 50%; bottom: 90px; transform: translateX(-50%); max-width: 90%;
+             padding: 8px 12px; border-radius: 8px; background: var(--fg); color: var(--bg); font-size: 14px; }
+#chatpill { position: fixed; z-index: 45; right: 12px; bottom: calc(76px + env(safe-area-inset-bottom, 0px));
+            min-height: 44px; padding: 0 16px; border-radius: 22px; border: 1px solid var(--accent);
+            background: var(--accent); color: var(--bg); font: inherit; font-weight: 600;
+            box-shadow: 0 2px 10px rgba(0,0,0,.35); }
+#chatpill[hidden] { display: none; }
+@media (max-width: 900px) {
+  #chat { left: 0; width: auto; border-left: 0; box-shadow: none;
+          top: var(--vvtop, 0px); bottom: auto; height: var(--vvh, 100dvh); }
+}

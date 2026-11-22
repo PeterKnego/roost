@@ -75,6 +75,10 @@ crc32fast = "1"
 # `browser.rs` signs every call it relays to the browser extension with
 # HMAC-SHA256, and a hand-rolled HMAC is not a thing to own.
 ring = "0.17"
+# The chat view (`chat.rs`) needs the *rendered* screen of a Claude terminal —
+# which menu is up and which option is selected — and `screen.rs` keeps a byte
+# log, not a grid. Pure Rust, no C, so the musl builds are unaffected.
+vt100 = "0.18"
 
 [dev-dependencies]
 tempfile = "3"
