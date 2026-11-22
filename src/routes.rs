@@ -12,7 +12,7 @@
 //!                        into the project's `.roost/theme/` directory
 //! Fragment errors render as 200 + hint (htmx ignores 4xx bodies).
 use crate::{config, gitio, http, launch, projects, registry, render};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read, Seek, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -500,12 +500,32 @@ pub const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "ic
 /// `static/app.js` keeps a copy of THIS list, for the ✎ toggle. Nothing
 /// checks the two agree — the design doc records why neither direction of
 /// mismatch loses data, because `workspace.rs` is the actual guard.
-pub const NO_TEXT_EDIT_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf"];
+pub const NO_TEXT_EDIT_EXT: &[&str] =
+    &["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf", "mp4", "m4v", "mov", "webm"];
 
 /// Extensions served as a document for the browser's own viewer (#121) — not
 /// on `IMAGE_EXT`, because that list also decides what a markdown `<img>` may
 /// embed, and a PDF is not a picture. Deny-by-default like the list above.
 pub const PDF_EXT: &[&str] = &["pdf"];
+
+/// Extensions played in a `<video>` — screencasts, mostly. Separate from
+/// `IMAGE_EXT` for the same reason `PDF_EXT` is: that list also decides what a
+/// markdown `<img>` may embed. Deny-by-default like both.
+pub const VIDEO_EXT: &[&str] = &["mp4", "m4v", "mov", "webm"];
+
+pub fn is_video(rel: &str) -> bool {
+    VIDEO_EXT.contains(&crate::assets::ext_of(rel).as_str())
+}
+
+/// The type a video is served as. From the extension only and pinned by
+/// `nosniff`, like every other type on the raw route.
+fn video_type(rel: &str) -> &'static str {
+    match crate::assets::ext_of(rel).as_str() {
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        _ => "video/mp4",
+    }
+}
 
 pub fn is_pdf(rel: &str) -> bool {
     PDF_EXT.contains(&crate::assets::ext_of(rel).as_str())
@@ -525,12 +545,15 @@ pub fn refuses_text_edit(rel: &str) -> bool {
 /// `metadata` before `read` is not a style preference: a bare `fs::read`
 /// allocates the whole file — a size a cloned repo controls — on this
 /// connection's thread before any cap could reject it.
-fn serve_raw(w: &mut impl Write, dir: &Path, rel: &str) {
+fn serve_raw(w: &mut impl Write, dir: &Path, rel: &str, range: Option<&str>) {
     let Some(rel) = crate::assets::normalize(rel) else {
         return http::not_found(w, "no such asset");
     };
     if is_pdf(rel) {
         return serve_pdf(w, dir, rel);
+    }
+    if is_video(rel) {
+        return serve_video(w, dir, rel, range);
     }
     if !is_image(rel) {
         return http::not_found(w, "not an image");
@@ -661,6 +684,134 @@ fn serve_pdf(w: &mut impl Write, dir: &Path, rel: &str) {
         NOSNIFF.0, NOSNIFF.1, SANDBOX.0, SANDBOX.1
     );
     stream_chunked(w, f, &head);
+}
+
+/// What a `Range` header asks of a file `len` bytes long.
+#[derive(Debug, PartialEq)]
+enum ByteRange {
+    Whole,
+    /// First and last byte, inclusive, as `Content-Range` spells them.
+    Part(u64, u64),
+    Unsatisfiable,
+}
+
+/// One `bytes=` range, the only kind a media element sends. Anything this
+/// cannot read — another unit, a list of ranges, a malformed spec — is
+/// answered with the whole file, which RFC 9110 allows for any range request
+/// and every client accepts; only a well-formed range that starts past the
+/// end is a 416.
+fn byte_range(header: Option<&str>, len: u64) -> ByteRange {
+    let Some(spec) = header.and_then(|h| h.trim().strip_prefix("bytes=")) else {
+        return ByteRange::Whole;
+    };
+    if spec.contains(',') {
+        return ByteRange::Whole;
+    }
+    let Some((a, b)) = spec.trim().split_once('-') else {
+        return ByteRange::Whole;
+    };
+    let num = |t: &str| -> Option<u64> {
+        let t = t.trim();
+        if t.is_empty() || !t.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        t.parse().ok()
+    };
+    match (a.trim().is_empty(), b.trim().is_empty()) {
+        // `bytes=-N`: the last N bytes.
+        (true, false) => match num(b) {
+            Some(0) => ByteRange::Unsatisfiable,
+            Some(n) if len > 0 => ByteRange::Part(len.saturating_sub(n), len - 1),
+            Some(_) => ByteRange::Unsatisfiable,
+            None => ByteRange::Whole,
+        },
+        (false, open_ended) => {
+            let Some(first) = num(a) else { return ByteRange::Whole };
+            let last = if open_ended {
+                u64::MAX
+            } else {
+                match num(b) {
+                    Some(l) if l >= first => l,
+                    _ => return ByteRange::Whole,
+                }
+            };
+            if first >= len {
+                return ByteRange::Unsatisfiable;
+            }
+            ByteRange::Part(first, last.min(len - 1))
+        }
+        (true, true) => ByteRange::Whole,
+    }
+}
+
+/// A video, streamed with `Range` support and no size cap (screencasts are
+/// rarely under `MAX_FILE_BYTES`).
+///
+/// Ranges are not an optimisation here. iOS Safari will not play a video
+/// whose server does not answer a range request with a 206, and Chromium
+/// cannot seek in one: it would have to download up to the point asked for.
+/// The body is sent with a `Content-Length` rather than chunked, so a file
+/// that shrinks mid-read ends the connection short of it — which the browser
+/// reports as a failed load, not as the whole video.
+fn serve_video(w: &mut impl Write, dir: &Path, rel: &str, range: Option<&str>) {
+    let (mut f, _) = match open_regular(dir, rel) {
+        Ok(opened) => opened,
+        Err(msg) => return http::not_found(w, msg),
+    };
+    // The open file's own length, not a second `stat` of the path, which
+    // could name a different file by now.
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return http::not_found(w, "no such file");
+    };
+    let common = format!(
+        "Content-Type: {}\r\nAccept-Ranges: bytes\r\n{}: {}\r\n{}: {}\r\n\
+         Cache-Control: no-cache\r\nConnection: close\r\n",
+        video_type(rel),
+        NOSNIFF.0,
+        NOSNIFF.1,
+        SANDBOX.0,
+        SANDBOX.1
+    );
+    let (head, start, count) = match byte_range(range, len) {
+        ByteRange::Whole => (format!("HTTP/1.1 200 OK\r\n{common}Content-Length: {len}\r\n\r\n"), 0, len),
+        ByteRange::Part(a, b) => (
+            format!(
+                "HTTP/1.1 206 Partial Content\r\n{common}Content-Range: bytes {a}-{b}/{len}\r\n\
+                 Content-Length: {}\r\n\r\n",
+                b - a + 1
+            ),
+            a,
+            b - a + 1,
+        ),
+        ByteRange::Unsatisfiable => (
+            format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\n{common}Content-Range: bytes */{len}\r\n\
+                 Content-Length: 0\r\n\r\n"
+            ),
+            0,
+            0,
+        ),
+    };
+    if w.write_all(head.as_bytes()).is_err() || count == 0 {
+        return;
+    }
+    if f.seek(std::io::SeekFrom::Start(start)).is_err() {
+        return;
+    }
+    let mut body = f.take(count);
+    let mut buf = vec![0u8; DOWNLOAD_CHUNK];
+    loop {
+        match body.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if w.write_all(&buf[..n]).is_err() {
+                    return; // the player moved on — routine when it seeks
+                }
+            }
+            Err(_) => return,
+        }
+    }
+    let _ = w.flush();
 }
 
 /// The file at `rel`, confined and open, if it is a regular file, with the
@@ -1007,7 +1158,8 @@ fn serve_frag(
             //
             // A PDF takes the same arm: it has no text either, and its tab is
             // nothing but an <iframe> on the same raw route (#121).
-            Some(rel) if is_image(rel) || is_pdf(rel) => match crate::assets::normalize(rel) {
+            // So does a video, on a <video> instead.
+            Some(rel) if is_image(rel) || is_pdf(rel) || is_video(rel) => match crate::assets::normalize(rel) {
                 None => http::html(w, &render::file_error_fragment(rel, "path outside project")),
                 Some(rel) => match projects::safe_resolve(&dir, rel) {
                     Ok(path) => {
@@ -1021,6 +1173,8 @@ fn serve_frag(
                             .unwrap_or(0);
                         if is_pdf(rel) {
                             http::html(w, &render::pdf_fragment(project, rel, mtime_secs))
+                        } else if is_video(rel) {
+                            http::html(w, &render::video_fragment(project, rel, mtime_secs))
                         } else {
                             http::html(w, &render::image_fragment(project, rel, mtime_secs))
                         }
@@ -1037,7 +1191,7 @@ fn serve_frag(
         },
         ["raw"] => match req.query.get("path") {
             None => http::not_found(w, "missing path"),
-            Some(rel) => serve_raw(w, &dir, rel),
+            Some(rel) => serve_raw(w, &dir, rel, req.headers.get("range").map(String::as_str)),
         },
         // #120. The other half of upload: roost could put a file on the server
         // and had no way to hand one back.
@@ -2246,6 +2400,141 @@ mod tests {
         // And the real name survives, percent-encoded, in the RFC 5987 form.
         assert!(disp.contains("filename*=UTF-8''"), "{disp}");
         assert!(disp.contains("%C4%8D"), "the real name was lost, not encoded: {disp}");
+    }
+
+    // ---- video ---------------------------------------------------------------
+
+    fn ranged(roots: &[PathBuf], path: &str, range: Option<&str>) -> (String, Vec<u8>) {
+        let extra = range.map(|r| format!("Range: {r}\r\n")).unwrap_or_default();
+        let raw = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra}\r\n");
+        let req = http::parse(&mut std::io::Cursor::new(raw.as_bytes())).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        route(&mut buf, &req, roots);
+        let sep = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("headers end") + 4;
+        (String::from_utf8_lossy(&buf[..sep]).into_owned(), buf[sep..].to_vec())
+    }
+
+    fn video_fixture(name: &str, len: u32) -> (tempfile::TempDir, Vec<PathBuf>, Vec<u8>) {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("p/casts")).unwrap();
+        let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::write(d.path().join("p/casts").join(name), &body).unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        (d, roots, body)
+    }
+
+    #[test]
+    fn byte_range_reads_what_a_player_sends_and_nothing_else() {
+        use ByteRange::*;
+        assert_eq!(byte_range(None, 100), Whole);
+        assert_eq!(byte_range(Some("bytes=0-"), 100), Part(0, 99));
+        assert_eq!(byte_range(Some("bytes=10-19"), 100), Part(10, 19));
+        assert_eq!(byte_range(Some("bytes=90-500"), 100), Part(90, 99), "clamped to the end");
+        assert_eq!(byte_range(Some("bytes=-5"), 100), Part(95, 99));
+        assert_eq!(byte_range(Some("bytes=-500"), 100), Part(0, 99));
+        assert_eq!(byte_range(Some("bytes=100-"), 100), Unsatisfiable);
+        assert_eq!(byte_range(Some("bytes=-0"), 100), Unsatisfiable);
+        assert_eq!(byte_range(Some("bytes=0-"), 0), Unsatisfiable, "an empty file has no byte 0");
+        // Unreadable or unsupported: the whole file, never an error.
+        for h in ["items=0-5", "bytes=5-2", "bytes=0-1,4-5", "bytes=x-", "bytes=-", "bytes=+1-2", "bytes=1"] {
+            assert_eq!(byte_range(Some(h), 100), Whole, "{h}");
+        }
+    }
+
+    /// Past the 2 MB cap: fails if a video goes through the image path's
+    /// `MAX_FILE_BYTES` check. Revert-checked: without the `is_video` branch
+    /// in `serve_raw` this is a 404 "not an image".
+    #[test]
+    fn a_video_past_the_cap_is_served_whole_and_says_it_takes_ranges() {
+        let (_d, roots, want) = video_fixture("demo.mp4", crate::projects::MAX_FILE_BYTES as u32 + 300_000);
+        let (head, body) = ranged(&roots, "/frag/p/raw?path=casts/demo.mp4", None);
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(head.contains("Content-Type: video/mp4\r\n"), "{head}");
+        assert!(head.contains("Accept-Ranges: bytes\r\n"), "{head}");
+        assert!(head.contains(&format!("Content-Length: {}\r\n", want.len())), "{head}");
+        assert!(head.contains("X-Content-Type-Options: nosniff"), "{head}");
+        assert!(head.contains("Content-Security-Policy: sandbox\r\n"), "{head}");
+        assert!(!head.contains("Transfer-Encoding"), "{head}");
+        assert_eq!(body.len(), want.len());
+        assert_eq!(body, want);
+    }
+
+    /// The bytes must be the ones named, not merely the right count: a body
+    /// sent from offset 0 has the right length too. Revert-checked: with the
+    /// `seek` removed the middle range fails on content.
+    #[test]
+    fn a_range_is_answered_with_exactly_those_bytes() {
+        let (_d, roots, all) = video_fixture("demo.webm", 100_000);
+        let (head, body) = ranged(&roots, "/frag/p/raw?path=casts/demo.webm", Some("bytes=70000-70099"));
+        assert!(head.starts_with("HTTP/1.1 206 Partial Content"), "{head}");
+        assert!(head.contains("Content-Type: video/webm\r\n"), "{head}");
+        assert!(head.contains("Content-Range: bytes 70000-70099/100000\r\n"), "{head}");
+        assert!(head.contains("Content-Length: 100\r\n"), "{head}");
+        assert_eq!(body, all[70000..70100]);
+
+        let (head, body) = ranged(&roots, "/frag/p/raw?path=casts/demo.webm", Some("bytes=-10"));
+        assert!(head.contains("Content-Range: bytes 99990-99999/100000\r\n"), "{head}");
+        assert_eq!(body, all[99990..]);
+
+        let (head, body) = ranged(&roots, "/frag/p/raw?path=casts/demo.webm", Some("bytes=100000-"));
+        assert!(head.starts_with("HTTP/1.1 416"), "{head}");
+        assert!(head.contains("Content-Range: bytes */100000\r\n"), "{head}");
+        assert!(body.is_empty());
+    }
+
+    /// HTML named `.mov` is still a video, pinned by `nosniff` and `sandbox`;
+    /// the fixture has a script in it so a sniffing route would show.
+    #[test]
+    fn html_named_mov_is_still_a_video() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("p")).unwrap();
+        std::fs::write(d.path().join("p/x.mov"), "<!doctype html><script>alert(1)</script>").unwrap();
+        let (head, _) = ranged(&[d.path().to_path_buf()], "/frag/p/raw?path=x.mov", None);
+        assert!(head.contains("Content-Type: video/quicktime\r\n"), "{head}");
+        assert!(!head.contains("text/html"), "{head}");
+        assert!(head.contains("Content-Security-Policy: sandbox"), "{head}");
+    }
+
+    #[test]
+    fn a_video_outside_the_project_or_not_a_file_is_refused() {
+        let (d, roots, _) = video_fixture("demo.mp4", 10);
+        std::fs::write(d.path().join("secret.mp4"), b"secret").unwrap();
+        std::os::unix::fs::symlink(d.path().join("secret.mp4"), d.path().join("p/link.mp4")).unwrap();
+        std::fs::create_dir_all(d.path().join("p/dir.mp4")).unwrap();
+        for q in ["../secret.mp4", "%2e%2e/secret.mp4", "link.mp4", "dir.mp4"] {
+            let (head, body) = ranged(&roots, &format!("/frag/p/raw?path={q}"), Some("bytes=0-"));
+            assert!(head.starts_with("HTTP/1.1 404"), "{q}: {head}");
+            assert!(!body.windows(6).any(|w| w == b"secret"), "{q} leaked the file");
+        }
+        // A FIFO would block the connection thread on `read` forever.
+        let made = std::process::Command::new("mkfifo")
+            .arg(d.path().join("p/pipe.mp4"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if made {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(ranged(&roots, "/frag/p/raw?path=pipe.mp4", None).0);
+            });
+            let head = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("blocked on a FIFO");
+            assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+        }
+    }
+
+    /// The fragment is the player, not the text path's "binary file" error,
+    /// and a name with metacharacters is escaped in both URLs.
+    /// Revert-checked: without `|| is_video(rel)` on the `file` arm this
+    /// renders the text path's error.
+    #[test]
+    fn the_file_fragment_for_a_video_is_a_player() {
+        let (d, roots, _) = video_fixture("a&b\"c.mp4", 10);
+        let _ = &d;
+        let out = frag_route(&roots, "/frag/p/file?path=casts%2Fa%26b%22c.mp4");
+        assert!(out.contains("<video class=\"vidview\""), "{out}");
+        assert!(out.contains("playsinline"), "{out}");
+        assert!(out.contains("raw?path=casts/a%26b%22c.mp4&amp;v="), "{out}");
+        assert!(!out.contains("a&b\"c"), "an unescaped name reached the HTML: {out}");
     }
 
     // ---- PDF (#121) ---------------------------------------------------------

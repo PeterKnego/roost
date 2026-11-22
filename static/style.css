@@ -250,6 +250,17 @@ main { flex: 1; min-height: 0; }
   .content > .pdfview { display: none; }
   .content > .pdfopen { align-self: stretch; padding: 14px 16px; min-height: 44px; font-size: 16px; }
 }
+/* A video tab: the player takes what is left under the path, letterboxed,
+   at any width — phones play inline (playsinline), so there is no link-only
+   layout as for a PDF. */
+.content:has(> .vidview) { display: flex; flex-direction: column; overflow: hidden; }
+.content > .vidview { flex: 1 1 auto; min-height: 0; width: 100%; background: #000; object-fit: contain; }
+.content > .vidopen { align-self: flex-end; padding: 6px 10px; font-size: 13px; color: var(--accent, #548af7);
+  text-decoration: none; min-height: 32px; box-sizing: border-box; }
+.content > .vidopen:hover, .content > .vidopen:active { text-decoration: underline; }
+@media (max-width: 640px) {
+  .content > .vidopen { padding: 12px 16px; min-height: 44px; font-size: 15px; }
+}
 /* Inset from the card edge rather than bleeding into it: the fit addon sizes
    the grid from the host's *inner* box, so padding costs a column, not a
    clipped one. Left is roomier than right because the right edge is where the

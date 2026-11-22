@@ -38,6 +38,7 @@ deno run -A tests/browser/claudeterm.mjs # the ✻ button: a terminal with claud
 deno run -A tests/browser/resume.mjs     # the offer to continue the Claude a reboot interrupted (#18 step 2): where the button renders, and what each way of activating the placeholder asks for
 deno run -A tests/browser/claudemenu.mjs # the ✻ menu: New plus this project's past conversations, and no menu at all when there are none (needs its own HOME — the history is Claude Code's directory, not roost's)
 deno run -A tests/browser/worktrees.mjs # the header's worktree switcher chip + panel
+deno run -A tests/browser/video.mjs     # a screencast plays in a video tab and seeks; the raw route answers ranges (needs ffmpeg)
 deno run -A tests/browser/worktree-launch.mjs # the ✻ prompt, worktree creation into a second tab, switcher state and removal; needs a real CDP click for window.open
 deno run -A tests/browser/worktree-rehome.mjs # Claude's WorktreeCreate hook end to end: ask, approve, re-home, close and fork (#156)
 deno run -A tests/browser/outside.mjs    # a worktree outside roost's roots: the persistent appeared banner, Allow… into a virtual URL, and Revoke — from the switcher and the overview (#188)

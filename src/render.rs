@@ -829,6 +829,31 @@ pub fn pdf_fragment(project: &str, rel: &str, mtime_secs: u64) -> String {
     )
 }
 
+/// A video opened as a tab — a screencast, typically: the browser's own
+/// player on the raw route, which answers range requests (`serve_video`).
+/// `playsinline` keeps iOS from taking the whole screen the moment it plays;
+/// `preload="metadata"` fetches enough for the first frame and the length,
+/// not the file. The link is for a video the browser has no codec for (a
+/// HEVC `.mov` in Chromium shows an empty player): opened directly, the
+/// browser either plays it or offers to save it.
+pub fn video_fragment(project: &str, rel: &str, mtime_secs: u64) -> String {
+    let src = format!(
+        "/frag/{}/raw?path={}&v={}",
+        crate::http::percent_encode(project),
+        crate::http::percent_encode(rel),
+        mtime_secs
+    );
+    format!(
+        "<div class=\"path\">{}</div>\
+         <a class=\"vidopen\" href=\"{}\" target=\"_blank\" rel=\"noopener\">open in a new tab ↗</a>\
+         <video class=\"vidview\" src=\"{}\" controls playsinline preload=\"metadata\" title=\"{}\"></video>",
+        esc(rel),
+        esc(&src),
+        esc(&src),
+        esc(rel)
+    )
+}
+
 // Whole-tree eager rendering (the old design) is what made this slow: a
 // 41k-entry project produced 895 KB of HTML and still hit the 4,000-entry
 // budget with ~90% of the tree missing. Instead we render one level at a
