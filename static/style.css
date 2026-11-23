@@ -1784,3 +1784,13 @@ header button.proj:hover svg { opacity: 1; }
   #chat { left: 0; width: auto; border-left: 0; box-shadow: none;
           top: var(--vvtop, 0px); bottom: auto; height: var(--vvh, 100dvh); }
 }
+
+/* A long-press on a tree or Changes row opens roost's menu (app.js,
+   "long-press = right-click"), so the system's own link callout and text
+   selection must not open on top of it. Touch screens only. */
+@media (hover: none) {
+  .content[data-kind="Tree"] a[data-rel], .content[data-kind="Tree"] summary,
+  .content[data-kind="Changes"] a[data-rel] {
+    -webkit-touch-callout: none; -webkit-user-select: none; user-select: none;
+  }
+}
