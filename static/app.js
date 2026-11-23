@@ -1645,13 +1645,20 @@ function buildPaneIcons(host, pi, pane, active, content) {
       if (yes) newTerminal(pi, "prloop");
     }, "newprloop");
   }
-  if (active && active.k === "Tree") {
-    // #110 put "Upload files…" in the tree's context menu, but that menu is
-    // reached by `contextmenu`, which iOS Safari never fires for a
-    // long-press — so on an iPhone upload was still unreachable. A button
-    // needs no gesture a phone lacks. Uploads to the project root; the menu
-    // is still the way to aim at a folder where one is available.
+  // #110 put "Upload files…" in the tree's context menu, but that menu is
+  // reached by `contextmenu`, which iOS Safari never fires for a
+  // long-press — so on an iPhone upload was still unreachable. A button
+  // needs no gesture a phone lacks. Uploads to the project root; the menu
+  // (long-press on a phone) is still the way to aim at a folder.
+  //
+  // On any pane that *holds* the tree, not only while the tree is its active
+  // tab: on a phone, a Claude opened from the Files view lands in that same
+  // pane, and with the terminal in front the button vanished from the one
+  // view a phone user goes to for files.
+  if (pane.tabs.some((t) => t.k === "Tree")) {
     icon(PANE_ICONS.upload, "upload files to the project root", () => pickAndUpload(""), "upload");
+  }
+  if (active && active.k === "Tree") {
     const hidden = showHidden();
     // Filled ring = dot entries are showing. This drives an intent rather
     // than filtering client-side: the rows do not exist in the fragment the
@@ -2535,6 +2542,84 @@ function pickedInTreeOrder() {
   return seen;
 }
 
+// --- long-press = right-click, on a touch screen -------------------------
+//
+// The tree's and the Changes list's menus are reached by `contextmenu`, and
+// iOS Safari never fires one for a long-press. So a held finger on either
+// sends the same event a right-click does, at the finger — every existing
+// handler (a file, a folder, blank space, a change row) answers it unchanged,
+// and there is no second menu implementation to drift.
+//
+// Two things a long-press must not also do. Android *does* fire its own
+// `contextmenu` for the same press, so whichever of the two comes first wins
+// and the other is swallowed. And lifting the finger still clicks, which
+// would open the file or fold the folder under the menu; that one click is
+// swallowed too. Limited to those two panes: in an editor or a terminal a
+// long-press selects text, and that must keep working.
+const LONG_PRESS_MS = 500;
+const LONG_PRESS_SLOP_PX = 10;
+const longPress = { timer: 0, x: 0, y: 0, target: null, fired: false, swallowClickUntil: 0 };
+
+function longPressArea(t) {
+  return t && t.closest && t.closest('.content[data-kind="Tree"], .content[data-kind="Changes"]');
+}
+
+function cancelLongPress() {
+  clearTimeout(longPress.timer);
+  longPress.timer = 0;
+  longPress.target = null;
+}
+
+document.addEventListener("pointerdown", (e) => {
+  cancelLongPress();
+  longPress.fired = false;
+  if (e.pointerType !== "touch" || !longPressArea(e.target)) return;
+  longPress.x = e.clientX;
+  longPress.y = e.clientY;
+  longPress.target = e.target;
+  longPress.timer = setTimeout(() => {
+    const target = longPress.target;
+    longPress.timer = 0;
+    if (!target || !target.isConnected || longPress.fired) return;
+    longPress.fired = true;
+    longPress.swallowClickUntil = Date.now() + 1500;
+    target.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true, cancelable: true, clientX: longPress.x, clientY: longPress.y,
+    }));
+  }, LONG_PRESS_MS);
+}, true);
+
+document.addEventListener("pointermove", (e) => {
+  if (!longPress.timer) return;
+  if (Math.hypot(e.clientX - longPress.x, e.clientY - longPress.y) > LONG_PRESS_SLOP_PX) cancelLongPress();
+}, true);
+document.addEventListener("pointerup", () => { if (longPress.timer) cancelLongPress(); }, true);
+document.addEventListener("pointercancel", cancelLongPress, true);
+
+document.addEventListener("contextmenu", (e) => {
+  // Only the browser's own event for a press this code is tracking.
+  if (!e.isTrusted || !longPressArea(e.target)) return;
+  if (longPress.fired) {
+    e.preventDefault();
+    e.stopPropagation();
+    return;
+  }
+  if (longPress.timer) {
+    // Android got there first: let its event through, and stand down.
+    longPress.fired = true;
+    longPress.swallowClickUntil = Date.now() + 1500;
+    cancelLongPress();
+  }
+}, true);
+
+document.addEventListener("click", (e) => {
+  if (!longPress.fired || Date.now() > longPress.swallowClickUntil) return;
+  longPress.fired = false;
+  if (!longPressArea(e.target)) return;
+  e.preventDefault();
+  e.stopPropagation();
+}, true);
+
 function wireFragment(content) {
   // Changes and Diff show changes, not places: New file, Rename and Delete
   // mean nothing there, and Delete on a change row read as "drop this
@@ -2592,11 +2677,13 @@ async function fileMenu(e, rel, isDir = false) {
   if (rel && !isDir) {
     const dirty = state && state.buffers && state.buffers.some((b) => b.rel === rel && b.dirty);
     items.push({ id: "download", label: dirty ? "Download (saved version)" : "Download" });
-    // #146. Offered when there is a Claude to send to or one can be started;
-    // otherwise it would be an item that can only ever fail.
-    if (LAUNCHES.includes("claude") || (state && (state.claude_sessions || []).length)) {
-      items.push({ id: "claude", label: "Send to Claude" });
-    }
+  }
+  // #146. Offered when there is a Claude to send to or one can be started;
+  // otherwise it would be an item that can only ever fail. A folder too:
+  // Claude Code takes `@dir/` as readily as a file, and the item used to be
+  // missing from a folder's menu altogether.
+  if (rel && (LAUNCHES.includes("claude") || (state && (state.claude_sessions || []).length))) {
+    items.push({ id: "claude", label: "Send to Claude" });
   }
   // #162. A folder — or blank tree space, which is the project root — zips.
   if (isDir || !rel) items.push({ id: "zip", label: "Download as zip" });
@@ -2622,7 +2709,7 @@ async function fileMenu(e, rel, isDir = false) {
   } else if (choice === "zip") {
     downloadZip(rel);
   } else if (choice === "claude") {
-    sendToClaude(rel);
+    sendToClaude(isDir ? `${rel}/` : rel);
   } else if (choice === "upload") {
     pickAndUpload(dir);
   } else if (choice === "rename") {
